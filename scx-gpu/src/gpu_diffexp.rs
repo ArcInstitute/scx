@@ -643,8 +643,21 @@ fn gpu_de_merge_pass(
     Ok(())
 }
 
+/// Threshold below which the host dispatches to the single-thread tie
+/// kernels (`*_simple_kernel`) rather than the 256-thread block-cooperative
+/// variants. The block-cooperative kernels carry ~10 µs of fixed overhead
+/// (BlockReduce + cross-warp shmem relays + boundary stitch) per launch;
+/// for small n_per_gene the work fits in microseconds and the overhead
+/// dominates, so the simple kernel wins. Empirically the crossover sits
+/// near n_per_gene ≈ 8000 on H100; aligned to the block-radix-sort
+/// capacity (`BLOCK_THREADS × ITEMS_PER_THREAD = 8192`) to keep small/large
+/// inputs cleanly separated at the same boundary the sort kernel uses.
+pub const GPU_DE_TIE_BLOCK_THRESHOLD: usize = 8192;
+
 /// Compute Σ(c^3 − c) per gene over a single sorted row. Writes
-/// `tie_out[gene]` for `gene in 0..chunk_size`.
+/// `tie_out[gene]` for `gene in 0..chunk_size`. Dispatches to the
+/// single-thread `_simple_kernel` for `n_per_gene < GPU_DE_TIE_BLOCK_THRESHOLD`
+/// and to the block-cooperative kernel above the threshold.
 pub fn gpu_de_tie_term(
     dev: &GpuDevice,
     sorted_slab: &CudaSlice<f32>,
@@ -656,13 +669,18 @@ pub fn gpu_de_tie_term(
         return Ok(());
     }
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let (kernel_name, block_dim) = if n_per_gene < GPU_DE_TIE_BLOCK_THRESHOLD {
+        ("tie_term_sorted_simple_kernel", 1u32)
+    } else {
+        ("tie_term_sorted_kernel", 256u32)
+    };
     let func = module
-        .load_function("tie_term_sorted_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+        .load_function(kernel_name)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
 
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (block_dim, 1, 1),
         shared_mem_bytes: 0,
     };
     let chunk_i32 = chunk_size as i32;
@@ -676,12 +694,14 @@ pub fn gpu_de_tie_term(
             .arg(&n_per_gene_i32)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
     Ok(())
 }
 
 /// Combined tie term over (ref + group): merge-walks two pre-sorted rows per
-/// gene and writes the result into `tie_out`.
+/// gene and writes the result into `tie_out`. Dispatches by `n_ref + n_g`
+/// against `GPU_DE_TIE_BLOCK_THRESHOLD` — same crossover as the sorted-row
+/// kernel.
 pub fn gpu_de_combined_tie_term(
     dev: &GpuDevice,
     sorted_ref: &CudaSlice<f32>,
@@ -695,13 +715,18 @@ pub fn gpu_de_combined_tie_term(
         return Ok(());
     }
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let (kernel_name, block_dim) = if n_ref + n_g < GPU_DE_TIE_BLOCK_THRESHOLD {
+        ("combined_tie_term_simple_kernel", 1u32)
+    } else {
+        ("combined_tie_term_kernel", 256u32)
+    };
     let func = module
-        .load_function("combined_tie_term_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+        .load_function(kernel_name)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
 
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
-        block_dim: (32, 1, 1),
+        block_dim: (block_dim, 1, 1),
         shared_mem_bytes: 0,
     };
     let chunk_i32 = chunk_size as i32;
@@ -718,7 +743,7 @@ pub fn gpu_de_combined_tie_term(
             .arg(&n_g_i32)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
     Ok(())
 }
 
@@ -1010,7 +1035,7 @@ mod tests {
             }
             let c = (j - i) as i64;
             if c > 1 {
-                s += (c * c * c - c) as f64;
+                s += c as f64 * c as f64 * c as f64 - c as f64;
             }
             i = j;
         }
@@ -1037,6 +1062,214 @@ mod tests {
             .collect();
         cpu_sort_ascending(&mut merged);
         cpu_tie_term(&merged)
+    }
+
+    /// CPU emulator of the GPU `combined_tie_term_kernel` algorithm (per-thread
+    /// merge-walk + boundary stitch). Mirrors the kernel logic line-by-line so
+    /// we can debug algorithmic vs CUDA bugs.
+    fn cpu_emulator_combined_tie(
+        sorted_ref: &[f32],
+        sorted_group: &[f32],
+        block_threads: usize,
+    ) -> f64 {
+        let n_ref = sorted_ref.len();
+        let n_g = sorted_group.len();
+        let total = n_ref + n_g;
+        if total == 0 {
+            return 0.0;
+        }
+        let per_thread = total.div_ceil(block_threads);
+
+        let co_rank = |diag: usize| -> usize {
+            let mut i_lo = if diag > n_g { diag - n_g } else { 0 };
+            let mut i_hi = diag.min(n_ref);
+            while i_lo < i_hi {
+                let i = (i_lo + i_hi) / 2;
+                let j = diag - i;
+                if i > 0 && j < n_g && sorted_ref[i - 1] > sorted_group[j] {
+                    i_hi = i;
+                } else if i < n_ref && j > 0 && sorted_group[j - 1] >= sorted_ref[i] {
+                    i_lo = i + 1;
+                } else {
+                    return i;
+                }
+            }
+            i_lo
+        };
+
+        let mut heads_v = vec![0.0f32; block_threads];
+        let mut heads_c = vec![0i64; block_threads];
+        let mut tails_v = vec![0.0f32; block_threads];
+        let mut tails_c = vec![0i64; block_threads];
+        let mut total_inner = 0.0f64;
+
+        for tid in 0..block_threads {
+            let mut diag_start = tid * per_thread;
+            let mut diag_end = diag_start + per_thread;
+            if diag_start > total {
+                diag_start = total;
+            }
+            if diag_end > total {
+                diag_end = total;
+            }
+            let i_start = co_rank(diag_start);
+            let j_start = diag_start - i_start;
+            let i_end = co_rank(diag_end);
+            let j_end = diag_end - i_end;
+
+            let mut i = i_start;
+            let mut j = j_start;
+            let mut n_runs = 0u32;
+            let mut head_value = 0.0f32;
+            let mut head_count = 0i64;
+            let mut last_value = 0.0f32;
+            let mut last_count = 0i64;
+            let mut inner_sum = 0.0f64;
+
+            while i < i_end || j < j_end {
+                let v = if j >= j_end {
+                    sorted_ref[i]
+                } else if i >= i_end {
+                    sorted_group[j]
+                } else {
+                    sorted_ref[i].min(sorted_group[j])
+                };
+                let mut c = 0i64;
+                while i < i_end && sorted_ref[i] == v {
+                    i += 1;
+                    c += 1;
+                }
+                while j < j_end && sorted_group[j] == v {
+                    j += 1;
+                    c += 1;
+                }
+                if n_runs == 0 {
+                    head_value = v;
+                    head_count = c;
+                } else if n_runs >= 2 && last_count > 1 {
+                    inner_sum += last_count as f64 * last_count as f64 * last_count as f64
+                        - last_count as f64;
+                }
+                last_value = v;
+                last_count = c;
+                n_runs += 1;
+            }
+
+            heads_v[tid] = head_value;
+            heads_c[tid] = head_count;
+            if n_runs == 0 {
+                tails_v[tid] = 0.0;
+                tails_c[tid] = 0;
+            } else {
+                tails_v[tid] = last_value;
+                tails_c[tid] = last_count;
+            }
+            total_inner += inner_sum;
+        }
+
+        let mut t = 0;
+        while t < block_threads && heads_c[t] == 0 {
+            t += 1;
+        }
+        if t >= block_threads {
+            return total_inner;
+        }
+
+        let mut boundary_sum = 0.0f64;
+        let mut open_value;
+        let mut open_count;
+
+        if heads_v[t] == tails_v[t] {
+            open_value = heads_v[t];
+            open_count = heads_c[t];
+        } else {
+            let c = heads_c[t];
+            if c > 1 {
+                boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
+            }
+            open_value = tails_v[t];
+            open_count = tails_c[t];
+        }
+
+        for u in (t + 1)..block_threads {
+            if heads_c[u] == 0 {
+                continue;
+            }
+            let u_single = heads_v[u] == tails_v[u];
+
+            if heads_v[u] == open_value {
+                open_count += heads_c[u];
+                if !u_single {
+                    let c = open_count;
+                    if c > 1 {
+                        boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
+                    }
+                    open_value = tails_v[u];
+                    open_count = tails_c[u];
+                }
+            } else {
+                let c = open_count;
+                if c > 1 {
+                    boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
+                }
+                if !u_single {
+                    let c2 = heads_c[u];
+                    if c2 > 1 {
+                        boundary_sum += c2 as f64 * c2 as f64 * c2 as f64 - c2 as f64;
+                    }
+                    open_value = tails_v[u];
+                    open_count = tails_c[u];
+                } else {
+                    open_value = heads_v[u];
+                    open_count = heads_c[u];
+                }
+            }
+        }
+        let c = open_count;
+        if c > 1 {
+            boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
+        }
+
+        total_inner + boundary_sum
+    }
+
+    /// Sweep small fixtures to verify the CPU emulator (which mirrors the
+    /// kernel algorithm line-for-line) matches brute-force tie computation
+    /// across a range of block-threads, unique-value counts, and sizes.
+    /// Catches algorithmic bugs (e.g. non-monotonic `merge_path_co_rank`)
+    /// independently of CUDA. If this passes, parity issues are downstream
+    /// of the algorithm.
+    #[test]
+    fn test_cpu_emulator_combined_tie_sweeps() {
+        // Sweep block-threads × unique-values × sizes. The
+        // `merge_path_co_rank` monotonicity bug fixed during G1.9
+        // surfaces only on inputs with ties spanning the diagonal AND
+        // a partition fine enough that two adjacent threads share a
+        // tied boundary — small bt with mod-N keys is where it shows.
+        for n_uniq in [5u32, 10, 20] {
+            for &(n_ref, n_g) in &[(20usize, 15), (60, 40), (200, 150)] {
+                let mut state: u64 = 0xFEEDFACE;
+                let mut next = || {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 33) as u32
+                };
+                let mut r: Vec<f32> = (0..n_ref).map(|_| (next() % n_uniq) as f32).collect();
+                cpu_sort_ascending(&mut r);
+                let mut g: Vec<f32> = (0..n_g).map(|_| (next() % n_uniq) as f32).collect();
+                cpu_sort_ascending(&mut g);
+
+                for bt in [4usize, 8, 16, 32, 64] {
+                    let brute = cpu_combined_tie(&r, &g);
+                    let emu = cpu_emulator_combined_tie(&r, &g, bt);
+                    assert_eq!(
+                        emu, brute,
+                        "n_uniq={n_uniq} n_ref={n_ref} n_g={n_g} bt={bt}: emu disagrees"
+                    );
+                }
+            }
+        }
     }
 
     /// End-to-end primitive parity: gene-major scatter + sort + tie + U1 +
@@ -1635,5 +1868,345 @@ mod tests {
         run_case(4, 5);
         // (d) empty intersection — should leave dense fully zero
         run_case(0, 0); // c0 == c1 short-circuits in the wrapper
+    }
+
+    // ----- G1.9: warp-parallel tie-term kernel parity -----
+    //
+    // The kernels are block-cooperative segmented reductions over equal-key
+    // runs; tie correction is exact-integer arithmetic, so parity vs the
+    // CPU reference must hold bit-for-bit (no tolerance).
+
+    fn run_tie_term_sorted(dev: &GpuDevice, rows: &[Vec<f32>]) -> Vec<f64> {
+        let chunk_size = rows.len();
+        let n_per_gene = rows[0].len();
+        for r in rows {
+            assert_eq!(r.len(), n_per_gene);
+        }
+        let mut flat = Vec::with_capacity(chunk_size * n_per_gene);
+        for r in rows {
+            flat.extend_from_slice(r);
+        }
+        let d_slab = dev.htod_copy(&flat).unwrap();
+        let mut d_tie = dev.alloc_zeros::<f64>(chunk_size).unwrap();
+        gpu_de_tie_term(dev, &d_slab, &mut d_tie, chunk_size, n_per_gene).unwrap();
+        dev.synchronize().unwrap();
+        dev.dtoh_copy(&d_tie).unwrap()
+    }
+
+    fn run_combined_tie(
+        dev: &GpuDevice,
+        ref_rows: &[Vec<f32>],
+        group_rows: &[Vec<f32>],
+    ) -> Vec<f64> {
+        let chunk_size = ref_rows.len();
+        assert_eq!(group_rows.len(), chunk_size);
+        let n_ref = ref_rows[0].len();
+        let n_g = group_rows[0].len();
+        for r in ref_rows {
+            assert_eq!(r.len(), n_ref);
+        }
+        for g in group_rows {
+            assert_eq!(g.len(), n_g);
+        }
+        let mut ref_flat = Vec::with_capacity(chunk_size * n_ref);
+        for r in ref_rows {
+            ref_flat.extend_from_slice(r);
+        }
+        let mut g_flat = Vec::with_capacity(chunk_size * n_g);
+        for g in group_rows {
+            g_flat.extend_from_slice(g);
+        }
+        let d_ref = dev.htod_copy(&ref_flat).unwrap();
+        let d_g = dev.htod_copy(&g_flat).unwrap();
+        let mut d_tie = dev.alloc_zeros::<f64>(chunk_size).unwrap();
+        gpu_de_combined_tie_term(dev, &d_ref, &d_g, &mut d_tie, chunk_size, n_ref, n_g).unwrap();
+        dev.synchronize().unwrap();
+        dev.dtoh_copy(&d_tie).unwrap()
+    }
+
+    /// Strictly increasing row → no ties → tie term must be exactly 0.
+    #[test]
+    fn test_tie_term_sorted_no_ties() {
+        let dev = require_gpu!();
+        let n = 5000usize;
+        let row: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+        assert_eq!(got[0], 0.0);
+        assert_eq!(got[0], cpu_tie_term(&row));
+    }
+
+    /// All-tied row of constant value → exactly one run of size `n`,
+    /// tie term = n³ − n.
+    #[test]
+    fn test_tie_term_sorted_all_tied() {
+        let dev = require_gpu!();
+        let n = 4096usize;
+        let row = vec![7.0f32; n];
+        let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+        let n_f64 = n as f64;
+        assert_eq!(got[0], n_f64 * n_f64 * n_f64 - n_f64);
+        assert_eq!(got[0], cpu_tie_term(&row));
+    }
+
+    /// Large sorted row with synthetic ties (LCG keys mod 100). Exercises
+    /// the post-G1.5 `n_per_gene` regime (≫ 8192) where the old single-thread
+    /// walk was the bottleneck. 4 genes × 50_000 cells covers the multi-block
+    /// dispatch as well.
+    #[test]
+    fn test_tie_term_sorted_large_with_ties() {
+        let dev = require_gpu!();
+        let chunk_size = 4usize;
+        let n = 50_000usize;
+        let mut state: u64 = 0xC0DEFACE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut rows: Vec<Vec<f32>> = (0..chunk_size)
+            .map(|_| {
+                let mut r: Vec<f32> = (0..n).map(|_| (next() % 100) as f32).collect();
+                cpu_sort_ascending(&mut r);
+                r
+            })
+            .collect();
+        // Force gene 1 to have a single dominant run that crosses many
+        // per-thread slice boundaries.
+        for v in rows[1].iter_mut().take(n / 2) {
+            *v = 3.0;
+        }
+        cpu_sort_ascending(&mut rows[1]);
+
+        let got = run_tie_term_sorted(&dev, &rows);
+        for (g, r) in rows.iter().enumerate() {
+            assert_eq!(got[g], cpu_tie_term(r), "tie mismatch on gene {g}");
+        }
+    }
+
+    /// A single run of equal values that straddles the per-thread slice
+    /// boundaries inside one block. With `TIE_BLOCK_THREADS = 256` and
+    /// `n_per_gene = 600`, `per_thread = 3`, so a run from position 100 to
+    /// 400 spans ~100 per-thread slices. Stitching must merge them.
+    #[test]
+    fn test_tie_term_sorted_run_spans_tiles() {
+        let dev = require_gpu!();
+        let n = 600usize;
+        // [0..100): strictly increasing; [100..400): constant value 1000; [400..600): strictly increasing
+        let mut row = vec![0.0f32; n];
+        for (i, v) in row.iter_mut().enumerate().take(100) {
+            *v = i as f32;
+        }
+        for v in row.iter_mut().skip(100).take(300) {
+            *v = 1000.0;
+        }
+        for (k, v) in row.iter_mut().skip(400).enumerate() {
+            *v = 1001.0 + k as f32;
+        }
+        // Already sorted: 0..99 < 1000 (× 300) < 1001..1200.
+        let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+        // Expected: only the 300-long run contributes: 300³ − 300.
+        let expected = 300.0f64 * 300.0 * 300.0 - 300.0;
+        assert_eq!(got[0], expected);
+        assert_eq!(got[0], cpu_tie_term(&row));
+    }
+
+    /// Combined tie on a large fixture — `n_ref = 30_000`, `n_g = 20_000`,
+    /// deterministic ties, exercises merge-path partitioning across the
+    /// full block.
+    #[test]
+    fn test_combined_tie_term_large_with_ties() {
+        let dev = require_gpu!();
+        let chunk_size = 4usize;
+        let n_ref = 30_000usize;
+        let n_g = 20_000usize;
+        let mut state: u64 = 0xFEEDFACE;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut ref_rows: Vec<Vec<f32>> = (0..chunk_size)
+            .map(|_| {
+                let mut r: Vec<f32> = (0..n_ref).map(|_| (next() % 80) as f32).collect();
+                cpu_sort_ascending(&mut r);
+                r
+            })
+            .collect();
+        let mut group_rows: Vec<Vec<f32>> = (0..chunk_size)
+            .map(|_| {
+                let mut g: Vec<f32> = (0..n_g).map(|_| (next() % 80) as f32).collect();
+                cpu_sort_ascending(&mut g);
+                g
+            })
+            .collect();
+        // Force gene 2 to have one heavily dominant value shared across both
+        // streams (most thread slices end up as single-run with the same key).
+        for v in ref_rows[2].iter_mut().take(n_ref * 3 / 4) {
+            *v = 42.0;
+        }
+        cpu_sort_ascending(&mut ref_rows[2]);
+        for v in group_rows[2].iter_mut().take(n_g * 3 / 4) {
+            *v = 42.0;
+        }
+        cpu_sort_ascending(&mut group_rows[2]);
+
+        let got = run_combined_tie(&dev, &ref_rows, &group_rows);
+        for g in 0..chunk_size {
+            let expected = cpu_combined_tie(&ref_rows[g], &group_rows[g]);
+            assert_eq!(got[g], expected, "combined tie mismatch on gene {g}");
+        }
+    }
+
+    /// A run spanning multiple merge-path thread partitions: both ref and
+    /// group contain the same dominant value across many positions, so
+    /// adjacent thread slices each see a single-run of the same key.
+    /// Boundary stitching must merge all of them into one long run.
+    #[test]
+    fn test_combined_tie_term_run_spans_threads() {
+        let dev = require_gpu!();
+        // n_ref + n_g = 600 → per_thread = 3 → many adjacent slices that
+        // all see value 5.0.
+        let ref_row = vec![5.0f32; 300];
+        let mut group_row = vec![5.0f32; 300];
+        // Add a few non-tied entries at the ends so head/tail differ from
+        // the middle on some thread slices.
+        group_row[0] = 0.0;
+        group_row[299] = 10.0;
+        // Sort to maintain pre-sort invariant required by the kernel.
+        let mut group_sorted = group_row.clone();
+        cpu_sort_ascending(&mut group_sorted);
+
+        let got = run_combined_tie(
+            &dev,
+            std::slice::from_ref(&ref_row),
+            std::slice::from_ref(&group_sorted),
+        );
+        let expected = cpu_combined_tie(&ref_row, &group_sorted);
+        assert_eq!(got[0], expected);
+        // Sanity: there are 598 copies of 5.0 in the combined sort.
+        let c = 598i64;
+        let manual_tie = c as f64 * c as f64 * c as f64 - c as f64;
+        assert_eq!(got[0], manual_tie);
+    }
+
+    /// Empty group: combined tie must equal `tie_term_sorted_kernel` on
+    /// the ref alone (single-stream fallthrough via merge_path_co_rank).
+    #[test]
+    fn test_combined_tie_term_empty_group() {
+        let dev = require_gpu!();
+        let mut state: u64 = 0xBEEF;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let n_ref = 1024usize;
+        let mut ref_row: Vec<f32> = (0..n_ref).map(|_| (next() % 64) as f32).collect();
+        cpu_sort_ascending(&mut ref_row);
+        let group_row: Vec<f32> = Vec::new();
+
+        let got_combined = run_combined_tie(
+            &dev,
+            std::slice::from_ref(&ref_row),
+            std::slice::from_ref(&group_row),
+        );
+        let got_sorted = run_tie_term_sorted(&dev, std::slice::from_ref(&ref_row));
+        let expected = cpu_tie_term(&ref_row);
+        assert_eq!(got_combined[0], expected);
+        assert_eq!(got_combined[0], got_sorted[0]);
+    }
+
+    /// Lock the simple↔block-cooperative dispatch crossover for the sorted-row
+    /// tie kernel. `gpu_de_tie_term` switches at `n_per_gene == 8192`, so
+    /// 8191 hits the simple kernel and 8192/8193 hit the cooperative one.
+    /// A regression on either side would not surface against the existing
+    /// well-above (50k) and well-below (≤4k) tests.
+    #[test]
+    fn test_tie_term_sorted_threshold_boundary() {
+        let dev = require_gpu!();
+        for &n in &[
+            GPU_DE_TIE_BLOCK_THRESHOLD - 1,
+            GPU_DE_TIE_BLOCK_THRESHOLD,
+            GPU_DE_TIE_BLOCK_THRESHOLD + 1,
+        ] {
+            let mut state: u64 = 0xB0DA_C0DE_u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let mut row: Vec<f32> = (0..n).map(|_| (next() % 64) as f32).collect();
+            cpu_sort_ascending(&mut row);
+            let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+            assert_eq!(got[0], cpu_tie_term(&row), "tie mismatch at n_per_gene={n}");
+        }
+    }
+
+    /// Lock the simple↔block-cooperative dispatch crossover for the combined
+    /// tie kernel. Dispatch is by `n_ref + n_g`. Pairs are chosen so the
+    /// sum spans the threshold.
+    #[test]
+    fn test_combined_tie_term_threshold_boundary() {
+        let dev = require_gpu!();
+        for &(n_ref, n_g) in &[(4096usize, 4095usize), (4096, 4096), (4097, 4096)] {
+            let mut state: u64 = 0xCAFE_F00D_u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let mut r: Vec<f32> = (0..n_ref).map(|_| (next() % 48) as f32).collect();
+            cpu_sort_ascending(&mut r);
+            let mut g: Vec<f32> = (0..n_g).map(|_| (next() % 48) as f32).collect();
+            cpu_sort_ascending(&mut g);
+            let got = run_combined_tie(&dev, std::slice::from_ref(&r), std::slice::from_ref(&g));
+            assert_eq!(
+                got[0],
+                cpu_combined_tie(&r, &g),
+                "combined tie mismatch at (n_ref={n_ref}, n_g={n_g})"
+            );
+        }
+    }
+
+    /// Regression for the i64-cube-overflow bug in `c³ − c`. With a single
+    /// all-tied run of `n = 2_100_000`, `n³` is ~9.26 × 10¹⁸ — strictly
+    /// above i64::MAX (~9.22 × 10¹⁸). If the kernel ever reverts to
+    /// `(double)(c * c * c - c)`, the multiplication overflows i64 before
+    /// the cast and this test catches it. Expected value is computed in
+    /// f64 (exact integer for `n ≤ 2^53`).
+    #[test]
+    fn test_tie_term_sorted_overflow_regression() {
+        let dev = require_gpu!();
+        let n = 2_100_000usize;
+        let row = vec![1.0f32; n];
+        let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+        let n_f64 = n as f64;
+        let expected = n_f64 * n_f64 * n_f64 - n_f64;
+        assert_eq!(got[0], expected);
+    }
+
+    /// Same overflow regression for the combined-tie kernel. The merge of
+    /// two all-`1.0` streams is one run of length `n_ref + n_g = 2_200_000`,
+    /// which cubes to ~1.06 × 10¹⁹ — well past i64::MAX.
+    #[test]
+    fn test_combined_tie_term_overflow_regression() {
+        let dev = require_gpu!();
+        let n_ref = 1_100_000usize;
+        let n_g = 1_100_000usize;
+        let ref_row = vec![1.0f32; n_ref];
+        let group_row = vec![1.0f32; n_g];
+        let got = run_combined_tie(
+            &dev,
+            std::slice::from_ref(&ref_row),
+            std::slice::from_ref(&group_row),
+        );
+        let total = (n_ref + n_g) as f64;
+        let expected = total * total * total - total;
+        assert_eq!(got[0], expected);
     }
 }
