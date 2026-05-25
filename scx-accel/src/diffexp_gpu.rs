@@ -26,10 +26,11 @@
 
 use scx_format::ShardSource;
 use scx_gpu::{
-    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
-    gpu_de_pseudobulk_all_groups, gpu_de_pvalues, gpu_de_scatter_gene_major,
-    gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
-    gpu_de_tie_term, CudaSlice, GpuDevice, GpuShardSource, RawGpuShardSource,
+    cuda_graphs_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort,
+    gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pvalues,
+    gpu_de_scatter_gene_major, gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum,
+    gpu_de_searchsorted_u_stat, gpu_de_tie_term, CudaSlice, GpuDevice, GpuShardSource, GraphKey,
+    RawGpuShardSource,
 };
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -515,6 +516,136 @@ fn populate_dense_from_shard_source<S: GpuShardSource>(
 /// / lazy entry points). Downstream kernels read `scratch.dense` via
 /// global cell positions, so the populate step is responsible for laying
 /// rows out at their global indices.
+/// G10.4: pdex_ref per-chunk GPU kernel sequence (everything after
+/// pseudobulk through per-test-group U/p staging). Factored out so it
+/// can be (1) called directly for the first chunk of a run — warming
+/// the device's module cache so subsequent capture is module-load-free
+/// — or when graph capture is disabled, and (2) called inside
+/// `cuStreamBeginCapture` / `EndCapture` for shape-keyed graph
+/// replay on the remaining chunks.
+///
+/// Pre-condition: `scratch.dense` is fully populated for the chunk
+/// (caller did `populate_dense` and `compute_pdex_means_gpu` first;
+/// the NULL-stream sync inside the pseudobulk dtoh guarantees writes
+/// are visible to the per-thread stream used here).
+///
+/// Post-condition: `scratch.u_per_group` and `scratch.p_per_group`
+/// hold the per-test-group U/p slabs at offsets `tg_idx * chunk_max`,
+/// truncated to `sz` per slot. Empty test groups (`n_g == 0`) are
+/// skipped — those rows in the slabs are LEFT UNINITIALIZED; the
+/// caller must handle the empty-group case via the host-side
+/// post-pass (NaN U / p=1).
+#[allow(clippy::too_many_arguments)]
+fn pdex_ref_chunk_gpu_sequence(
+    dev: &GpuDevice,
+    scratch: &mut scx_gpu::GpuDeChunkScratch,
+    ref_idx_i32: &[i32],
+    group_idx_i32: &[Vec<i32>],
+    test_groups: &[usize],
+    group_indices: &[Vec<usize>],
+    sz: usize,
+    n_obs: usize,
+    n_ref: usize,
+    chunk_max: usize,
+) -> Result<()> {
+    // Ref slab + sort + tie (used as ref-side input to every per-tg
+    // combined-tie call; ref output isn't dtoh-ed — it's read by the
+    // device-side combined-tie kernel directly).
+    gpu_de_scatter_gene_major(
+        dev,
+        &scratch.dense,
+        ref_idx_i32,
+        &mut scratch.ref_slab,
+        n_obs,
+        sz,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
+    gpu_de_block_sort(dev, &mut scratch.ref_slab, &mut scratch.slab_aux, sz, n_ref)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref: {e}")))?;
+    gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, n_ref)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE tie term ref: {e}")))?;
+
+    // Per-test-group sequence.
+    for (tg_idx, &g) in test_groups.iter().enumerate() {
+        let n_g = group_indices[g].len();
+        if n_g == 0 {
+            continue;
+        }
+
+        gpu_de_scatter_gene_major(
+            dev,
+            &scratch.dense,
+            &group_idx_i32[tg_idx],
+            &mut scratch.group_slab,
+            n_obs,
+            sz,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
+
+        gpu_de_searchsorted_u_stat(
+            dev,
+            &scratch.ref_slab,
+            &scratch.group_slab,
+            &mut scratch.u_or_rank,
+            sz,
+            n_ref,
+            n_g,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
+
+        gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
+        gpu_de_combined_tie_term(
+            dev,
+            &scratch.ref_slab,
+            &scratch.group_slab,
+            &mut scratch.tie_term,
+            sz,
+            n_ref,
+            n_g,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie: {e}")))?;
+
+        gpu_de_pvalues(
+            dev,
+            &scratch.u_or_rank,
+            &scratch.tie_term,
+            &mut scratch.p_values,
+            sz,
+            n_g,
+            n_ref,
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE p-value: {e}")))?;
+
+        // Stage U and p into per-group slabs via on-device memcpy_dtod.
+        let u_off = tg_idx * chunk_max;
+        let p_off = tg_idx * chunk_max;
+        let u_src = scratch
+            .u_or_rank
+            .try_slice(..sz)
+            .ok_or_else(|| AccelError::LinAlg("u_or_rank source slice OOB".into()))?;
+        let mut u_dst = scratch
+            .u_per_group
+            .try_slice_mut(u_off..u_off + sz)
+            .ok_or_else(|| AccelError::LinAlg("u_per_group dest slice OOB".into()))?;
+        dev.stream()
+            .memcpy_dtod(&u_src, &mut u_dst)
+            .map_err(|e| AccelError::LinAlg(format!("stage U: {e}")))?;
+        let p_src = scratch
+            .p_values
+            .try_slice(..sz)
+            .ok_or_else(|| AccelError::LinAlg("p_values source slice OOB".into()))?;
+        let mut p_dst = scratch
+            .p_per_group
+            .try_slice_mut(p_off..p_off + sz)
+            .ok_or_else(|| AccelError::LinAlg("p_per_group dest slice OOB".into()))?;
+        dev.stream()
+            .memcpy_dtod(&p_src, &mut p_dst)
+            .map_err(|e| AccelError::LinAlg(format!("stage p: {e}")))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pdex_ref_gpu_chunked<F>(
     dev: &GpuDevice,
@@ -611,6 +742,14 @@ where
 
     // Accumulators (per test group × gene, in input gene order).
     let n_test = test_groups.len();
+    // G10.4: pre-grow per-test-group U / p staging slabs so the per-tg
+    // dtoh fan-out collapses into a single batched dtoh per chunk. The
+    // memcpy_dtod from `scratch.u_or_rank` / `scratch.p_values` into
+    // the per-group slot stays on-device, so the per-tg dispatch becomes
+    // fire-and-forget (no per-tg host sync).
+    scratch
+        .ensure_per_group_capacity(dev, n_test.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure per_group: {e}")))?;
     let mut target_means: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut ref_means: Vec<f64> = Vec::with_capacity(n_vars);
     let mut log2_fold_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
@@ -618,7 +757,20 @@ where
     let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
 
-    for c0 in (0..n_vars).step_by(chunk_size) {
+    // G10.4: side-stream + dev clone for graph capture. `dev_pts` is
+    // the same physical device but with its default stream set to the
+    // CUDA per-thread stream (capturable; doesn't flip cudarc into
+    // multi-stream mode — see gpu_graph module docs). The kernel
+    // functions use `dev.stream()` internally; passing `&dev_pts`
+    // routes them to per_thread_stream without changing any kernel
+    // signature. `dev_pts` shares its module cache with `dev` via
+    // shallow clone (Arc<CudaModule> entries), so the captured region
+    // does not trigger module loads (which would be silently rejected
+    // by stream capture).
+    let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+    let dev_pts = dev.with_stream(pts.clone());
+
+    for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
 
@@ -672,110 +824,151 @@ where
             })
             .collect();
 
-        // 2. Build sorted ref slab and ref tie term. G2 reuses
-        //    `scratch.ref_slab` across chunks — no per-chunk allocation. The
-        //    scatter kernel writes (sz × n_ref) of (chunk_max × n_ref_max)
-        //    capacity; subsequent kernels are told the logical
-        //    `(chunk_size, n_per_gene) = (sz, n_ref)` so the layout matches.
-        gpu_de_scatter_gene_major(
-            dev,
-            &scratch.dense,
-            &ref_idx_i32,
-            &mut scratch.ref_slab,
-            n_obs,
-            sz,
-        )
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
-        gpu_de_block_sort(dev, &mut scratch.ref_slab, &mut scratch.slab_aux, sz, n_ref)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref: {e}")))?;
-        // Ref tie term is reusable across all test groups; keep it on host.
-        gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, n_ref)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE tie term ref: {e}")))?;
-        let mut tie_ref_host = dev
-            .dtoh_copy(&scratch.tie_term)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh ref tie: {e}")))?;
-        tie_ref_host.truncate(sz);
+        // G10.4 capture region: ref scatter+sort+tie + per-tg
+        // (scatter+searchsort+sort+combined_tie+pvalues+stage_dtod).
+        // Runs on `per_thread_stream` when graph-capturable so the
+        // captured graph replays without rebinding cuBLAS/cuSPARSE
+        // handles. Falls back to the direct (NULL-stream) path when
+        // `SCX_DISABLE_CUDA_GRAPHS=1`, when any test group is empty
+        // (capture would bake a chunk-specific n_test kernel count
+        // that doesn't match other chunks), or when capture itself
+        // fails.
+        let chunk_max = scratch.chunk_max();
+        let any_empty = test_groups.iter().any(|&g| group_indices[g].is_empty());
+        let graphs_active = cuda_graphs_enabled() && !any_empty;
 
-        // 3. Per test group: scatter, sort, combined tie, U1, p-value.
+        if !graphs_active || chunk_idx == 0 {
+            // Direct dispatch: either kill-switch / empty-group path,
+            // or the warm-up chunk that populates dev.module_cache so
+            // the subsequent capture doesn't issue a cuModuleLoadData
+            // inside the captured region.
+            //
+            // Use `dev_pts` (per_thread_stream variant) when graphs
+            // are enabled so the same stream context is in play
+            // across warm-up + replays — atomic-race ordering stays
+            // consistent within a run.
+            let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
+            pdex_ref_chunk_gpu_sequence(
+                target_dev,
+                &mut scratch,
+                &ref_idx_i32,
+                &group_idx_i32,
+                &test_groups,
+                &group_indices,
+                sz,
+                n_obs,
+                n_ref,
+                chunk_max,
+            )?;
+        } else {
+            // Graph path. The capture closure runs the same kernel
+            // sequence as the direct path, on `dev_pts`. Cache key
+            // includes `chunk_size_actual` so the tail chunk (with
+            // sz != chunk_size) gets its own graph entry.
+            let key = GraphKey::DeChunk {
+                chunk_size: sz as u32,
+                n_ref: n_ref as u32,
+                n_g_max: n_g_max as u32,
+                n_test_groups: n_test as u32,
+            };
+            let pts_clone = pts.clone();
+            let mut cache = dev.graph_cache();
+            let cache_result = cache.get_or_capture(key, &pts_clone, |_stream| {
+                pdex_ref_chunk_gpu_sequence(
+                    &dev_pts,
+                    &mut scratch,
+                    &ref_idx_i32,
+                    &group_idx_i32,
+                    &test_groups,
+                    &group_indices,
+                    sz,
+                    n_obs,
+                    n_ref,
+                    chunk_max,
+                )
+                .map_err(|e| scx_gpu::GpuError::CudaError(format!("{e}")))
+            });
+            match cache_result {
+                Ok(graph) => {
+                    // `cuStreamBeginCapture` records but does NOT
+                    // execute. Whether this iter just captured or
+                    // hit a cached graph, the launch below actually
+                    // runs the per-chunk GPU work.
+                    graph
+                        .launch()
+                        .map_err(|e| AccelError::LinAlg(format!("pdex_ref graph.launch: {e}")))?;
+                }
+                Err(_) => {
+                    // Capture invalidated (e.g. on a CUDA version
+                    // that rejects something in the sequence). Fall
+                    // back to direct dispatch on dev_pts.
+                    drop(cache);
+                    pdex_ref_chunk_gpu_sequence(
+                        &dev_pts,
+                        &mut scratch,
+                        &ref_idx_i32,
+                        &group_idx_i32,
+                        &test_groups,
+                        &group_indices,
+                        sz,
+                        n_obs,
+                        n_ref,
+                        chunk_max,
+                    )?;
+                }
+            }
+        }
+
+        // Host-side `ref_means` extend happens after the captured /
+        // direct GPU sequence completes (its data was already
+        // available from compute_pdex_means_gpu's dtoh).
         ref_means.extend_from_slice(&chunk_ref_means);
-        for (tg_idx, &g) in test_groups.iter().enumerate() {
-            let group_cells = &group_indices[g];
-            let n_g = group_cells.len();
 
-            // Push the gene-input-order chunk slices into the global accumulators.
+        // G10.4: single batched dtoh of the U / p slabs (was n_test
+        // per-tg dtohs previously). At pbmc10k scale that's ~3 groups
+        // × ~258 chunks = ~774 dtohs collapsed to 2 × ~258 = 516,
+        // each carrying n_test × chunk_size doubles instead of one.
+        let u_batch_len = n_test * chunk_max;
+        let p_batch_len = n_test * chunk_max;
+        let u_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .u_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh U batch: {e}")))?
+        };
+        let p_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .p_per_group
+                .try_slice(..p_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("p_per_group batch slice OOB".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh p batch: {e}")))?
+        };
+
+        // Host accumulator extension — uniform path for empty and non-
+        // empty groups. Sliced from the batched dtoh for non-empty;
+        // synthesized NaN / 1.0 for empty.
+        for (tg_idx, &g) in test_groups.iter().enumerate() {
             target_means[tg_idx].extend_from_slice(&chunk_target_means[tg_idx]);
             log2_fold_changes[tg_idx].extend_from_slice(&chunk_log2_fc[tg_idx]);
             percent_changes[tg_idx].extend_from_slice(&chunk_percent[tg_idx]);
-
-            // Empty target group → NaN U, p = 1.
+            let n_g = group_indices[g].len();
             if n_g == 0 {
                 statistics[tg_idx].extend(std::iter::repeat_n(f64::NAN, sz));
                 p_values[tg_idx].extend(std::iter::repeat_n(1.0, sz));
-                continue;
+            } else {
+                let off = tg_idx * chunk_max;
+                statistics[tg_idx].extend_from_slice(&u_batch[off..off + sz]);
+                p_values[tg_idx].extend(p_batch[off..off + sz].iter().map(|&p| p.clamp(0.0, 1.0)));
             }
-
-            // G2: scratch.group_slab is grown to chunk_size × n_g_max at
-            // driver entry; the scatter writes (sz × n_g) into its prefix.
-            gpu_de_scatter_gene_major(
-                dev,
-                &scratch.dense,
-                &group_idx_i32[tg_idx],
-                &mut scratch.group_slab,
-                n_obs,
-                sz,
-            )
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
-
-            // U1 from searchsorted before sorting the group (the kernel
-            // reads group_slab in any order). Write into scratch.u_or_rank.
-            gpu_de_searchsorted_u_stat(
-                dev,
-                &scratch.ref_slab,
-                &scratch.group_slab,
-                &mut scratch.u_or_rank,
-                sz,
-                n_ref,
-                n_g,
-            )
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
-
-            // Sort group slab for combined tie term.
-            gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
-            gpu_de_combined_tie_term(
-                dev,
-                &scratch.ref_slab,
-                &scratch.group_slab,
-                &mut scratch.tie_term,
-                sz,
-                n_ref,
-                n_g,
-            )
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie: {e}")))?;
-
-            // p-value on device.
-            gpu_de_pvalues(
-                dev,
-                &scratch.u_or_rank,
-                &scratch.tie_term,
-                &mut scratch.p_values,
-                sz,
-                n_g,
-                n_ref,
-            )
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE p-value: {e}")))?;
-
-            let mut u_host = dev
-                .dtoh_copy(&scratch.u_or_rank)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh U: {e}")))?;
-            u_host.truncate(sz);
-            let mut p_host = dev
-                .dtoh_copy(&scratch.p_values)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh p: {e}")))?;
-            p_host.truncate(sz);
-
-            statistics[tg_idx].extend(u_host);
-            p_values[tg_idx].extend(p_host.iter().map(|&p| p.clamp(0.0, 1.0)));
         }
     }
 
@@ -905,6 +1098,13 @@ where
     scratch
         .ensure_aux_capacity(dev, chunk_size * max_pool.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure aux: {e}")))?;
+    // G10.4: pre-grow per-tg U / p / tie slabs so the per-tg dtoh fan-
+    // out collapses to one batched dtoh per chunk (ref mode) or one
+    // (1-vs-rest, where the pool tie is shared across tgs and the
+    // per-tg writes are only U/rank).
+    scratch
+        .ensure_per_group_capacity(dev, test_groups.len().max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE ensure per_group: {e}")))?;
 
     // Flatten the (cell → group) labelling into a CSR-style permutation for
     // `gpu_de_pseudobulk_all_groups` (G1.6). Cells with `groups[i] >= n_groups`
@@ -1040,9 +1240,12 @@ where
             )
             .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
 
-            // For ref mode: U1 via ref-searchsorted. For 1-vs-rest: rank sum
-            // via all-searchsorted → U = R_g − n_g(n_g+1)/2.
-            let (u_host, tie_host_for_p, n1, n2) = if reference.is_some() {
+            // G10.4: GPU-only path. Kernel sequence writes to
+            // `scratch.u_or_rank` (U or rank-sum) and (ref mode only)
+            // `scratch.tie_term` (combined tie). Both get `memcpy_dtod`-
+            // staged into the per-tg slabs; the dtoh batches at chunk
+            // end. No per-tg host sync here.
+            if reference.is_some() {
                 gpu_de_searchsorted_u_stat(
                     dev,
                     &scratch.ref_slab,
@@ -1053,12 +1256,6 @@ where
                     n_g,
                 )
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U: {e}")))?;
-                let mut u_host = dev
-                    .dtoh_copy(&scratch.u_or_rank)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh U: {e}")))?;
-                u_host.truncate(sz);
-
-                // Combined tie term for ref vs group.
                 gpu_de_block_sort(dev, &mut scratch.group_slab, &mut scratch.slab_aux, sz, n_g)
                     .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group: {e}")))?;
                 gpu_de_combined_tie_term(
@@ -1071,11 +1268,19 @@ where
                     n_g,
                 )
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie: {e}")))?;
-                let mut combined_tie = dev
-                    .dtoh_copy(&scratch.tie_term)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh combined tie: {e}")))?;
-                combined_tie.truncate(sz);
-                (u_host, combined_tie, n_g, pool_len)
+                // Stage tie_term → tie_per_group (ref-mode only).
+                let tie_off = tg_idx * chunk_size;
+                let tie_src = scratch
+                    .tie_term
+                    .try_slice(..sz)
+                    .ok_or_else(|| AccelError::LinAlg("tie_term source slice OOB".into()))?;
+                let mut tie_dst = scratch
+                    .tie_per_group
+                    .try_slice_mut(tie_off..tie_off + sz)
+                    .ok_or_else(|| AccelError::LinAlg("tie_per_group dest slice OOB".into()))?;
+                dev.stream()
+                    .memcpy_dtod(&tie_src, &mut tie_dst)
+                    .map_err(|e| AccelError::LinAlg(format!("stage tie: {e}")))?;
             } else {
                 gpu_de_searchsorted_ranksum(
                     dev,
@@ -1087,11 +1292,72 @@ where
                     n_g,
                 )
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted rank: {e}")))?;
-                let mut rank_host = dev
-                    .dtoh_copy(&scratch.u_or_rank)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU DE dtoh ranksum: {e}")))?;
-                rank_host.truncate(sz);
-                // R_g → U_g.
+            }
+            // Stage u_or_rank → u_per_group (both modes).
+            let u_off = tg_idx * chunk_size;
+            let u_src = scratch
+                .u_or_rank
+                .try_slice(..sz)
+                .ok_or_else(|| AccelError::LinAlg("u_or_rank source slice OOB".into()))?;
+            let mut u_dst = scratch
+                .u_per_group
+                .try_slice_mut(u_off..u_off + sz)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group dest slice OOB".into()))?;
+            dev.stream()
+                .memcpy_dtod(&u_src, &mut u_dst)
+                .map_err(|e| AccelError::LinAlg(format!("stage U: {e}")))?;
+        }
+
+        // G10.4: batched dtoh of u_per_group (and tie_per_group in ref
+        // mode). 1-vs-rest reuses the global pool_tie_host already
+        // populated above; ref-mode reads combined tie per tg.
+        let u_batch_len = n_test * chunk_size;
+        let u_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .u_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh U batch: {e}")))?
+        };
+        let tie_batch: Vec<f64> = if reference.is_some() && n_test > 0 {
+            let view = scratch
+                .tie_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("tie_per_group batch slice OOB".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh tie batch: {e}")))?
+        } else {
+            Vec::new()
+        };
+
+        // Host post-pass: per-tg slice from batched dtoh, compute z+p,
+        // logFC, package into chunk_per_group.
+        for (tg_idx, &g) in test_groups.iter().enumerate() {
+            let group_cells = &group_indices[g];
+            let n_g = group_cells.len();
+            let group_name = group_names[g].clone();
+
+            if n_g == 0 {
+                let names = gene_names[c0..c1].to_vec();
+                let scores = vec![f64::NAN; sz];
+                let pvals = vec![1.0f64; sz];
+                let logfc = vec![f64::NAN; sz];
+                chunk_per_group.push((group_name, names, scores, pvals, logfc));
+                continue;
+            }
+
+            let off = tg_idx * chunk_size;
+            let (u_host, tie_host_for_p, n1, n2) = if reference.is_some() {
+                let u_host: Vec<f64> = u_batch[off..off + sz].to_vec();
+                let combined_tie: Vec<f64> = tie_batch[off..off + sz].to_vec();
+                (u_host, combined_tie, n_g, pool_len)
+            } else {
+                let rank_host: &[f64] = &u_batch[off..off + sz];
                 let n1d = n_g as f64;
                 let u_host: Vec<f64> = rank_host
                     .iter()
@@ -1668,6 +1934,102 @@ mod tests {
                     (r_cpu - r_gpu).abs() < 1e-4
                         || (r_cpu - r_gpu).abs() / r_cpu.abs().max(1e-9) < 1e-4,
                     "ref_mean mismatch gene={var}: cpu={r_cpu}, gpu={r_gpu}"
+                );
+            }
+        }
+    }
+
+    /// G10.4 parity: graph-captured per-chunk path produces identical
+    /// results to the direct per-chunk path under the same fixture.
+    /// Unlike UMAP (where atomicAdd races create irreducible run-to-run
+    /// jitter), pdex_ref's kernels are deterministic given fixed input
+    /// — sort + searchsorted + tie-correct + pvalues — so the two
+    /// paths should agree to fp32 tolerance bit-for-bit on U / p /
+    /// log2_fc / means. Any divergence implies the graph-replay path
+    /// is feeding stale buffer pointers or missing a kernel.
+    ///
+    /// Uses `set_cuda_graphs_enabled_override` to flip the kill switch
+    /// in-process so both branches run in the same test invocation
+    /// (the `SCX_DISABLE_CUDA_GRAPHS=1` env var is `OnceLock`-cached
+    /// at process start and can't be re-read).
+    #[test]
+    fn test_pdex_ref_gpu_graph_vs_direct_parity() {
+        let _ = require_gpu_or_skip!();
+
+        let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
+        let mode = crate::pseudobulk::GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
+        let direct = pdex_ref_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            mode,
+            epsilon,
+        )
+        .expect("direct pdex_ref_gpu_dense failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let graph = pdex_ref_gpu_dense(
+            0,
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            mode,
+            epsilon,
+        )
+        .expect("graph pdex_ref_gpu_dense failed");
+
+        scx_gpu::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(direct.group_names, graph.group_names);
+        assert_eq!(direct.feature_names, graph.feature_names);
+
+        // The graph path should produce bit-for-bit identical outputs
+        // to the direct path (same kernels, same inputs, deterministic
+        // sort/searchsort/pvalues — no atomics in this DE family).
+        // A modest tolerance accommodates kernel-launch reordering
+        // between per_thread_stream and NULL stream, but anything
+        // beyond fp32 rounding suggests a real bug.
+        for tg in 0..direct.group_names.len() {
+            for var in 0..n_vars {
+                let u_d = direct.statistics[tg][var];
+                let u_g = graph.statistics[tg][var];
+                if u_d.is_finite() && u_g.is_finite() {
+                    assert!(
+                        (u_d - u_g).abs() < 1e-6,
+                        "U mismatch tg={tg} gene={var}: direct={u_d}, graph={u_g}"
+                    );
+                }
+                let p_d = direct.p_values[tg][var];
+                let p_g = graph.p_values[tg][var];
+                assert!(
+                    (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
+                    "p-value mismatch tg={tg} gene={var}: direct={p_d}, graph={p_g}"
+                );
+                let tm_d = direct.target_means[tg][var];
+                let tm_g = graph.target_means[tg][var];
+                assert!(
+                    (tm_d - tm_g).abs() < 1e-6 || (tm_d - tm_g).abs() / tm_d.abs().max(1e-9) < 1e-6,
+                    "target_mean mismatch tg={tg} gene={var}: direct={tm_d}, graph={tm_g}"
+                );
+            }
+            for var in 0..n_vars {
+                let r_d = direct.ref_means[var];
+                let r_g = graph.ref_means[var];
+                assert!(
+                    (r_d - r_g).abs() < 1e-6 || (r_d - r_g).abs() / r_d.abs().max(1e-9) < 1e-6,
+                    "ref_mean mismatch gene={var}: direct={r_d}, graph={r_g}"
                 );
             }
         }

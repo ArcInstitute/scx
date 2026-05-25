@@ -82,6 +82,21 @@ pub struct GpuDeChunkScratch {
     /// from `compute_pdex_means_gpu` / `compute_group_gene_sums_gpu`. Grow-
     /// only via [`Self::ensure_sums_capacity`].
     pub sums: CudaSlice<f64>,
+    /// `[n_test_groups_max × chunk_max]` f64 per-test-group U / rank-sum
+    /// staging buffer. G10.4 hoist: each test group's U output is
+    /// `memcpy_dtod`-copied here from `u_or_rank` so the host-side
+    /// `dtoh_copy` can batch all groups into a single PCIe transfer at
+    /// chunk end. Grow-only via [`Self::ensure_per_group_capacity`].
+    pub u_per_group: CudaSlice<f64>,
+    /// `[n_test_groups_max × chunk_max]` f64 per-test-group p-value
+    /// staging buffer. Same G10.4 pattern as `u_per_group`.
+    pub p_per_group: CudaSlice<f64>,
+    /// `[n_test_groups_max × chunk_max]` f64 per-test-group combined-tie
+    /// staging buffer. Used by `wilcoxon_rank_sum_gpu_chunked`'s ref-
+    /// mode path, where each tg produces its own combined tie term that
+    /// must round-trip to host for the post-pvalue computation. 1-vs-
+    /// rest reuses the global pool-tie and so doesn't write here.
+    pub tie_per_group: CudaSlice<f64>,
     n_obs: usize,
     chunk_max: usize,
     slab_capacity: usize,
@@ -89,6 +104,7 @@ pub struct GpuDeChunkScratch {
     ref_slab_capacity: usize,
     group_slab_capacity: usize,
     sums_capacity: usize,
+    per_group_capacity: usize,
     alloc_count: u64,
 }
 
@@ -119,6 +135,9 @@ impl GpuDeChunkScratch {
         let ref_slab = dev.alloc_zeros::<f32>(0)?;
         let group_slab = dev.alloc_zeros::<f32>(0)?;
         let sums = dev.alloc_zeros::<f64>(0)?;
+        let u_per_group = dev.alloc_zeros::<f64>(0)?;
+        let p_per_group = dev.alloc_zeros::<f64>(0)?;
+        let tie_per_group = dev.alloc_zeros::<f64>(0)?;
         Ok(Self {
             dense,
             slab,
@@ -129,6 +148,9 @@ impl GpuDeChunkScratch {
             ref_slab,
             group_slab,
             sums,
+            u_per_group,
+            p_per_group,
+            tie_per_group,
             n_obs,
             chunk_max,
             slab_capacity: n_pool_max,
@@ -136,6 +158,7 @@ impl GpuDeChunkScratch {
             ref_slab_capacity: 0,
             group_slab_capacity: 0,
             sums_capacity: 0,
+            per_group_capacity: 0,
             alloc_count: 0,
         })
     }
@@ -226,6 +249,35 @@ impl GpuDeChunkScratch {
         self.sums = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
         self.sums_capacity = new_cap;
         self.alloc_count += 1;
+        Ok(())
+    }
+
+    /// G10.4: grow `u_per_group` and `p_per_group` to hold at least
+    /// `n_test_groups × chunk_max` f64 values each.
+    ///
+    /// Called above the chunk loop in `pdex_ref_gpu_chunked` /
+    /// `wilcoxon_rank_sum_gpu_chunked` so the per-chunk dtoh fan-out
+    /// (one transfer per test group) collapses into a single batched
+    /// dtoh at chunk end. `memcpy_dtod` from `u_or_rank` /
+    /// `p_values` into the per-group slot is `O(chunk_size)` and
+    /// stays on-device, so the per-tg dispatch becomes a fire-and-
+    /// forget GPU operation.
+    pub fn ensure_per_group_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_test_groups: usize,
+    ) -> Result<(), GpuError> {
+        if n_test_groups <= self.per_group_capacity {
+            return Ok(());
+        }
+        let new_cap = n_test_groups
+            .next_power_of_two()
+            .max(self.per_group_capacity * 2);
+        self.u_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        self.p_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        self.tie_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        self.per_group_capacity = new_cap;
+        self.alloc_count += 3;
         Ok(())
     }
 
