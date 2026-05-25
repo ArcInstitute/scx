@@ -187,6 +187,27 @@ impl GpuDevice {
         self.graph_cache.borrow_mut()
     }
 
+    /// Clone this device with a different default stream.
+    /// Used by CUDA-Graph capture sites that need kernel
+    /// launches to flow through a capturable stream
+    /// (e.g. `ctx.per_thread_stream()`) without changing every kernel
+    /// function's signature.
+    ///
+    /// The shared `CudaContext` is reference-counted, and the module
+    /// cache is shallow-cloned — `Arc<CudaModule>` entries shared with
+    /// the original keep the GPU-side module load amortized. The clone
+    /// gets a fresh, empty `GpuGraphCache`; callers that want to share
+    /// graph entries across stream variants must currently route them
+    /// through the original device's cache.
+    pub fn with_stream(&self, stream: Arc<CudaStream>) -> Self {
+        Self {
+            ctx: self.ctx.clone(),
+            stream,
+            module_cache: RefCell::new(self.module_cache.borrow().clone()),
+            graph_cache: RefCell::new(GpuGraphCache::new()),
+        }
+    }
+
     /// Query the human-readable name of the GPU device (e.g. "NVIDIA A100-SXM4-80GB").
     pub fn name(&self) -> Result<String, GpuError> {
         self.ctx

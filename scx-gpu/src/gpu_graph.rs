@@ -268,7 +268,6 @@ where
 /// [`GpuGraphCache::get_or_capture`]; when graphs are disabled they
 /// fall back to direct kernel dispatch.
 pub fn cuda_graphs_enabled() -> bool {
-    #[cfg(test)]
     if let Some(v) = test_override::current() {
         return v;
     }
@@ -281,7 +280,6 @@ pub fn cuda_graphs_enabled() -> bool {
     })
 }
 
-#[cfg(test)]
 mod test_override {
     use std::sync::{Mutex, OnceLock};
 
@@ -303,10 +301,20 @@ mod test_override {
     }
 }
 
-/// Test-only override for `cuda_graphs_enabled` — lets parity tests run
-/// both branches in the same process without restarting. Returns the
-/// previous override value.
-#[cfg(test)]
+/// Diagnostic override for [`cuda_graphs_enabled`] — lets parity tests
+/// (and any other in-process diagnostic) toggle the kill switch
+/// without restarting the process. Returns the previous override value.
+///
+/// `Some(false)` forces graphs off (mirrors `SCX_DISABLE_CUDA_GRAPHS=1`);
+/// `Some(true)` forces graphs on; `None` returns to env-var-controlled
+/// behaviour.
+///
+/// Not gated to `#[cfg(test)]` because downstream crates' integration
+/// tests (`scx-accel`, `pyscx`) consume this via the scx-gpu dependency
+/// graph — Rust strips `cfg(test)` items at the crate boundary.
+/// Calling this from production code is harmless (it only toggles a
+/// thread-local override that affects future capture decisions); the
+/// expected production setting is the default `None`.
 pub fn set_cuda_graphs_enabled_override(enabled: Option<bool>) -> Option<bool> {
     test_override::set(enabled)
 }

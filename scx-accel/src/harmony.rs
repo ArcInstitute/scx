@@ -1503,12 +1503,13 @@ mod gpu_impl {
     use super::*;
     use rand::seq::SliceRandom;
     use scx_gpu::{
-        gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty,
-        gpu_harmony_compute_o_e_full, gpu_harmony_correction_grouped, gpu_harmony_distances,
-        gpu_harmony_distances_gemm, gpu_harmony_l2_normalize_cols, gpu_harmony_obj_cross,
-        gpu_harmony_obj_kmeans_entropy, gpu_harmony_softmax, gpu_harmony_z_sum, CublasHandle,
-        CudaSlice, GpuDevice,
+        capture_graph, cuda_graphs_enabled, gpu_harmony_block_oe_update,
+        gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
+        gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
+        gpu_harmony_l2_normalize_cols, gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy,
+        gpu_harmony_softmax, gpu_harmony_z_sum, CublasHandle, CudaSlice, GpuDevice,
     };
+    use std::sync::Arc;
 
     /// cuBLAS sgemm has fixed launch overhead; the hand-written kernel
     /// is faster at small N. Above this threshold the GEMM path wins.
@@ -1569,6 +1570,125 @@ mod gpu_impl {
         let cross: f64 = cross_kgb.iter().map(|&v| v as f64).sum();
         let norm = 2000.0 / n as f64;
         Ok((kmeans_entropy + cross) * norm)
+    }
+
+    /// Factored kernel sequence for one k-means sub-iteration.
+    /// Runs `n_blocks` × (memcpy_dtod + O/E decrement + block softmax +
+    /// O/E increment), then the two objective-partial kernels.
+    ///
+    /// `dev` may be either the canonical NULL-stream `GpuDevice` (for
+    /// the warm-up sub-iter that populates the module cache, or when
+    /// `SCX_DISABLE_CUDA_GRAPHS=1`) or a `dev.with_stream(per_thread_
+    /// stream)` clone (when the call site wants to capture or replay
+    /// these kernels on a capturable stream).
+    ///
+    /// Does NOT include the `memcpy_htod(order)` (caller must issue
+    /// that on the same stream BEFORE calling, so the captured graph
+    /// reads from a freshly-uploaded `d_order`), nor the post-
+    /// sub-iter sync / dtoh / convergence check (those break stream
+    /// capture and stay on the host orchestrator).
+    #[allow(clippy::too_many_arguments)]
+    fn run_kmeans_subiter_kernels(
+        dev: &GpuDevice,
+        d_order: &CudaSlice<i32>,
+        d_block_cells: &mut CudaSlice<i32>,
+        d_r: &mut CudaSlice<f32>,
+        d_o: &mut CudaSlice<f32>,
+        d_e: &mut CudaSlice<f32>,
+        d_dist: &CudaSlice<f32>,
+        d_sigma: &CudaSlice<f32>,
+        d_theta: &CudaSlice<f32>,
+        d_labels: &CudaSlice<i32>,
+        d_cov_offset: &CudaSlice<i32>,
+        d_pr_b: &CudaSlice<f32>,
+        d_obj_cell: &mut CudaSlice<f32>,
+        d_cross_kgb: &mut CudaSlice<f32>,
+        n: usize,
+        k: usize,
+        b: usize,
+        c_count: usize,
+        n_blocks: usize,
+        block_len: usize,
+    ) -> Result<()> {
+        for blk in 0..n_blocks {
+            let start = blk * block_len;
+            if start >= n {
+                break;
+            }
+            let end = (start + block_len).min(n);
+            let n_block_cells = end - start;
+
+            let order_view = d_order
+                .try_slice(start..end)
+                .ok_or_else(|| AccelError::LinAlg("d_order slice out of bounds".into()))?;
+            let mut block_view = d_block_cells
+                .try_slice_mut(0..n_block_cells)
+                .ok_or_else(|| AccelError::LinAlg("d_block_cells slice out of bounds".into()))?;
+            dev.stream()
+                .memcpy_dtod(&order_view, &mut block_view)
+                .map_err(|e| AccelError::LinAlg(format!("memcpy block_cells: {e}")))?;
+
+            gpu_harmony_block_oe_update(
+                dev,
+                d_r,
+                d_block_cells,
+                d_labels,
+                d_cov_offset,
+                d_pr_b,
+                d_o,
+                d_e,
+                -1.0,
+                c_count,
+                k,
+                n,
+                b,
+                n_block_cells,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU O/E decrement: {e}")))?;
+
+            gpu_harmony_block_softmax_penalty(
+                dev,
+                d_dist,
+                d_sigma,
+                d_o,
+                d_e,
+                d_theta,
+                d_labels,
+                d_cov_offset,
+                d_block_cells,
+                d_r,
+                c_count,
+                k,
+                n,
+                b,
+                n_block_cells,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU block softmax: {e}")))?;
+
+            gpu_harmony_block_oe_update(
+                dev,
+                d_r,
+                d_block_cells,
+                d_labels,
+                d_cov_offset,
+                d_pr_b,
+                d_o,
+                d_e,
+                1.0,
+                c_count,
+                k,
+                n,
+                b,
+                n_block_cells,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU O/E increment: {e}")))?;
+        }
+
+        gpu_harmony_obj_kmeans_entropy(dev, d_r, d_dist, d_sigma, d_obj_cell, k, n)
+            .map_err(|e| AccelError::LinAlg(format!("GPU obj k+e: {e}")))?;
+        gpu_harmony_obj_cross(dev, d_o, d_e, d_sigma, d_theta, d_cross_kgb, k, b)
+            .map_err(|e| AccelError::LinAlg(format!("GPU obj cross: {e}")))?;
+        Ok(())
     }
 
     /// GPU-accelerated Harmony2 integration.
@@ -1760,123 +1880,188 @@ mod gpu_impl {
                 .map_err(|e| AccelError::LinAlg(format!("GPU compute_o_e: {e}")))?;
             }
 
-            // K-means sub-loop on GPU. CPU only shuffles the cell
-            // order (deterministic via state.rng) and checks
-            // convergence after each sub-iter.
+            // G10.2: k-means sub-loop dispatch.
+            //
+            // The sub-iter kernel sequence
+            // (`run_kmeans_subiter_kernels`) is shape-stable across
+            // all sub-iters of all outer iters in this call: block
+            // count, block length, kernel arg pointers, and grid
+            // dimensions are all decided before the iter loop. We
+            // capture it ONCE into a CudaGraph keyed on
+            // (n_obs, k, n_pcs, n_batch_levels) and replay for the
+            // remaining max_iter × max_iter_kmeans − 1 sub-iters,
+            // amortizing the per-launch dispatch overhead across the
+            // n_blocks × 3 + 2 kernel launches per sub-iter.
+            //
+            // Capture stream: `dev_pts = dev.with_stream(per_thread_
+            // stream())`. The per-thread default stream is capturable
+            // and does NOT flip cudarc into multi-stream-mode (see
+            // gpu_graph module docs for why that matters). The clone
+            // shares the module cache via shallow-clone, so the four
+            // captured kernels reuse the HARMONY_PTX module that
+            // sub-iter 0 of iter 0 loaded into `dev`'s cache.
+            //
+            // CPU shuffle + memcpy_htod(d_order) stays outside the
+            // captured region; the captured graph reads the freshly-
+            // shuffled order at replay time (the d_order pointer is
+            // stable, only its contents change). Likewise the
+            // post-sub-iter sync + dtoh + convergence check stay on
+            // the host orchestrator.
+            let graphs_enabled = cuda_graphs_enabled();
+            let pts: Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+            let dev_pts = dev.with_stream(pts.clone());
+            // Captured lazily on the first sub-iter (after warm-up).
+            let mut sub_graph: Option<scx_gpu::CudaGraph> = None;
             let mut local_obj: Vec<f64> = Vec::new();
-            for _sub in 0..state.config.max_iter_kmeans {
+
+            for (sub_idx_overall, _sub) in (0..state.config.max_iter_kmeans).enumerate() {
                 // Reshuffle order for this sub-iter (mirrors CPU
                 // update_r's per-sub-iter shuffle).
                 order_usize.shuffle(&mut state.rng);
                 for (dst, &src) in order_i32.iter_mut().zip(order_usize.iter()) {
                     *dst = src as i32;
                 }
-                dev.stream()
+
+                // Upload onto the same stream the kernels will run
+                // on. When graphs are enabled the kernels run on
+                // per_thread_stream (via dev_pts); upload there too
+                // so the captured graph sees a fully-uploaded order
+                // without a cross-stream wait.
+                let upload_stream = if graphs_enabled {
+                    dev_pts.stream()
+                } else {
+                    dev.stream()
+                };
+                upload_stream
                     .memcpy_htod(&order_i32, &mut d_order)
                     .map_err(|e| AccelError::LinAlg(format!("upload order: {e}")))?;
 
-                // Block loop (sequential on host; each block kicks 3
-                // GPU kernels and the implicit stream ordering keeps
-                // them in order).
-                for blk in 0..n_blocks {
-                    let start = blk * block_len;
-                    if start >= n {
-                        break;
-                    }
-                    let end = (start + block_len).min(n);
-                    let n_block_cells = end - start;
-
-                    // Slice d_order[start..end] into d_block_cells via
-                    // memcpy_dtod (cheap on-device copy).
-                    let order_view = d_order
-                        .try_slice(start..end)
-                        .ok_or_else(|| AccelError::LinAlg("d_order slice out of bounds".into()))?;
-                    let mut block_view =
-                        d_block_cells
-                            .try_slice_mut(0..n_block_cells)
-                            .ok_or_else(|| {
-                                AccelError::LinAlg("d_block_cells slice out of bounds".into())
-                            })?;
-                    dev.stream()
-                        .memcpy_dtod(&order_view, &mut block_view)
-                        .map_err(|e| AccelError::LinAlg(format!("memcpy block_cells: {e}")))?;
-
-                    // (a) Decrement O/E by current R contributions.
-                    gpu_harmony_block_oe_update(
-                        &dev,
-                        &d_r,
-                        &d_block_cells,
-                        &d_labels,
-                        &d_cov_offset,
-                        &d_pr_b,
+                // Sub-iter execution strategy:
+                //
+                // 1. First sub-iter of the whole run + when graphs
+                //    are enabled: run directly to populate `dev`'s
+                //    module cache. dev_pts shares this cache via
+                //    shallow clone, so subsequent capture will not
+                //    issue a module load inside the captured region.
+                // 2. After warm-up: try to capture the sub-iter the
+                //    first time `sub_graph` is None. Subsequent
+                //    sub-iters launch the cached graph.
+                // 3. Kill switch (`!graphs_enabled`) or capture
+                //    failure: run directly on `dev`.
+                if !graphs_enabled || sub_idx_overall == 0 {
+                    // Direct path (warm-up or kill switch).
+                    let active_dev = if graphs_enabled { &dev_pts } else { &dev };
+                    run_kmeans_subiter_kernels(
+                        active_dev,
+                        &d_order,
+                        &mut d_block_cells,
+                        &mut d_r,
                         &mut d_o,
                         &mut d_e,
-                        -1.0,
-                        c_count,
-                        k,
-                        n,
-                        b,
-                        n_block_cells,
-                    )
-                    .map_err(|e| AccelError::LinAlg(format!("GPU O/E decrement: {e}")))?;
-
-                    // (b,c,d) Block softmax+penalty using leave-block-out O/E.
-                    gpu_harmony_block_softmax_penalty(
-                        &dev,
                         &d_dist,
                         &d_sigma,
-                        &d_o,
-                        &d_e,
                         &d_theta,
                         &d_labels,
                         &d_cov_offset,
-                        &d_block_cells,
-                        &mut d_r,
-                        c_count,
-                        k,
-                        n,
-                        b,
-                        n_block_cells,
-                    )
-                    .map_err(|e| AccelError::LinAlg(format!("GPU block softmax: {e}")))?;
-
-                    // (e) Increment O/E with new R contributions.
-                    gpu_harmony_block_oe_update(
-                        &dev,
-                        &d_r,
-                        &d_block_cells,
-                        &d_labels,
-                        &d_cov_offset,
                         &d_pr_b,
-                        &mut d_o,
-                        &mut d_e,
-                        1.0,
-                        c_count,
-                        k,
+                        &mut d_obj_cell,
+                        &mut d_cross_kgb,
                         n,
+                        k,
                         b,
-                        n_block_cells,
-                    )
-                    .map_err(|e| AccelError::LinAlg(format!("GPU O/E increment: {e}")))?;
+                        c_count,
+                        n_blocks,
+                        block_len,
+                    )?;
+                } else if let Some(graph) = &sub_graph {
+                    // Replay path (the common case after the first
+                    // captured sub-iter).
+                    graph.launch().map_err(|e| {
+                        AccelError::LinAlg(format!("harmony sub-iter graph.launch: {e}"))
+                    })?;
+                } else {
+                    // First capture attempt (sub_idx_overall == 1).
+                    // capture_graph records into the graph WITHOUT
+                    // executing; we then launch the returned graph
+                    // to actually run the work for this sub-iter.
+                    let pts_for_capture = pts.clone();
+                    let capture_result = capture_graph(&pts_for_capture, |_stream| {
+                        run_kmeans_subiter_kernels(
+                            &dev_pts,
+                            &d_order,
+                            &mut d_block_cells,
+                            &mut d_r,
+                            &mut d_o,
+                            &mut d_e,
+                            &d_dist,
+                            &d_sigma,
+                            &d_theta,
+                            &d_labels,
+                            &d_cov_offset,
+                            &d_pr_b,
+                            &mut d_obj_cell,
+                            &mut d_cross_kgb,
+                            n,
+                            k,
+                            b,
+                            c_count,
+                            n_blocks,
+                            block_len,
+                        )
+                        .map_err(|e| scx_gpu::GpuError::CudaError(format!("{e}")))
+                    });
+                    match capture_result {
+                        Ok(Some(g)) => {
+                            // Capture succeeded — actually run the
+                            // work via the captured graph and stash
+                            // for subsequent replays.
+                            g.launch().map_err(|e| {
+                                AccelError::LinAlg(format!(
+                                    "harmony sub-iter first graph.launch: {e}"
+                                ))
+                            })?;
+                            sub_graph = Some(g);
+                        }
+                        _ => {
+                            // Capture failed or returned no graph —
+                            // fall back to direct run for THIS
+                            // sub-iter and don't try capture again
+                            // for this call.
+                            run_kmeans_subiter_kernels(
+                                &dev_pts,
+                                &d_order,
+                                &mut d_block_cells,
+                                &mut d_r,
+                                &mut d_o,
+                                &mut d_e,
+                                &d_dist,
+                                &d_sigma,
+                                &d_theta,
+                                &d_labels,
+                                &d_cov_offset,
+                                &d_pr_b,
+                                &mut d_obj_cell,
+                                &mut d_cross_kgb,
+                                n,
+                                k,
+                                b,
+                                c_count,
+                                n_blocks,
+                                block_len,
+                            )?;
+                        }
+                    }
                 }
 
-                // Per-sub-iter objective: reduce per-cell + per-(k, gb)
-                // partials on host (tiny PCIe + sum).
-                gpu_harmony_obj_kmeans_entropy(
-                    &dev,
-                    &d_r,
-                    &d_dist,
-                    &d_sigma,
-                    &mut d_obj_cell,
-                    k,
-                    n,
-                )
-                .map_err(|e| AccelError::LinAlg(format!("GPU obj k+e: {e}")))?;
-                gpu_harmony_obj_cross(&dev, &d_o, &d_e, &d_sigma, &d_theta, &mut d_cross_kgb, k, b)
-                    .map_err(|e| AccelError::LinAlg(format!("GPU obj cross: {e}")))?;
-                dev.synchronize()
+                // Per-sub-iter sync + objective. When graphs are
+                // enabled the kernels ran on per_thread_stream; sync
+                // there. dtoh through dev_pts uses the same stream
+                // so ordering is correct.
+                let active_for_sync = if graphs_enabled { &dev_pts } else { &dev };
+                active_for_sync
+                    .synchronize()
                     .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
-                let obj = compute_objective_gpu(&dev, &d_obj_cell, &d_cross_kgb, n)?;
+                let obj = compute_objective_gpu(active_for_sync, &d_obj_cell, &d_cross_kgb, n)?;
                 local_obj.push(obj);
                 state.objective_kmeans.push(obj);
                 if check_convergence_kmeans(
@@ -2670,6 +2855,93 @@ mod tests {
             // Either strong correlation OR both PCs are near-constant (dx or dy ~ 0).
             if dx > 1e-8 && dy > 1e-8 {
                 assert!(r > 0.95, "PC {pc}: r={r}");
+            }
+        }
+    }
+
+    /// G10.2: graph-capture path matches the direct per-sub-iter
+    /// dispatch path to within the per-PC Pearson-r tolerance the
+    /// pre-existing `test_gpu_vs_cpu_per_pc_correlation` uses as the
+    /// GPU correctness contract.
+    ///
+    /// Harmony's GPU path is already non-bit-exact across runs (the
+    /// docstring on `harmony_integrate_gpu` calls out f32 rounding +
+    /// atomic-ordering nondeterminism in the O/E updates), so a
+    /// fixed-tolerance coordinate-wise check would be brittle. Using
+    /// the same Pearson-r ≥ 0.95 contract as the CPU↔GPU test gives
+    /// us a noise-aware bound that catches "graph replay produced a
+    /// fundamentally different embedding" while accepting legitimate
+    /// jitter.
+    ///
+    /// We flip the kill switch in-process via
+    /// `set_cuda_graphs_enabled_override` so both paths run in the
+    /// same test process.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_harmony_graph_vs_direct_parity() {
+        if scx_gpu::GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU harmony graph parity test");
+            return;
+        }
+        let n_per = 80;
+        let d = 5;
+        let (emb, labels) = batched_gaussian(n_per, d, 123);
+        let n = emb.len() / d;
+        let cov = BatchCovariate {
+            labels,
+            n_levels: 2,
+            name: None,
+        };
+        let config = HarmonyConfig {
+            n_clusters: Some(4),
+            max_iter: 3,
+            random_state: 11,
+            ..Default::default()
+        };
+
+        let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
+        let direct =
+            harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+
+        scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let graph =
+            harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+
+        scx_gpu::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(direct.z_corrected.len(), graph.z_corrected.len());
+        assert!(graph.z_corrected.iter().all(|v| v.is_finite()));
+
+        // Per-PC Pearson r between graph and direct paths.
+        for pc in 0..d {
+            let mut x: Vec<f64> = Vec::with_capacity(n);
+            let mut y: Vec<f64> = Vec::with_capacity(n);
+            for i in 0..n {
+                x.push(direct.z_corrected[i * d + pc]);
+                y.push(graph.z_corrected[i * d + pc]);
+            }
+            let mx: f64 = x.iter().sum::<f64>() / n as f64;
+            let my: f64 = y.iter().sum::<f64>() / n as f64;
+            let mut num = 0f64;
+            let mut dx = 0f64;
+            let mut dy = 0f64;
+            for i in 0..n {
+                let a = x[i] - mx;
+                let b = y[i] - my;
+                num += a * b;
+                dx += a * a;
+                dy += b * b;
+            }
+            let r = num / (dx.sqrt() * dy.sqrt() + 1e-30);
+            if dx > 1e-8 && dy > 1e-8 {
+                assert!(
+                    r > 0.95,
+                    "graph vs direct PC {pc}: r={r:.4} (expected > 0.95). \
+                     Suggests sub-iter capture/replay diverges from the \
+                     direct kernel sequence — likely a stream-binding or \
+                     buffer-pointer bug, NOT atomic-race jitter (which \
+                     stays within the GPU correctness contract)."
+                );
             }
         }
     }
