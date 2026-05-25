@@ -643,8 +643,21 @@ fn gpu_de_merge_pass(
     Ok(())
 }
 
+/// Threshold below which the host dispatches to the single-thread tie
+/// kernels (`*_simple_kernel`) rather than the 256-thread block-cooperative
+/// variants. The block-cooperative kernels carry ~10 µs of fixed overhead
+/// (BlockReduce + cross-warp shmem relays + boundary stitch) per launch;
+/// for small n_per_gene the work fits in microseconds and the overhead
+/// dominates, so the simple kernel wins. Empirically the crossover sits
+/// near n_per_gene ≈ 8000 on H100; aligned to the block-radix-sort
+/// capacity (`BLOCK_THREADS × ITEMS_PER_THREAD = 8192`) to keep small/large
+/// inputs cleanly separated at the same boundary the sort kernel uses.
+pub const GPU_DE_TIE_BLOCK_THRESHOLD: usize = 8192;
+
 /// Compute Σ(c^3 − c) per gene over a single sorted row. Writes
-/// `tie_out[gene]` for `gene in 0..chunk_size`.
+/// `tie_out[gene]` for `gene in 0..chunk_size`. Dispatches to the
+/// single-thread `_simple_kernel` for `n_per_gene < GPU_DE_TIE_BLOCK_THRESHOLD`
+/// and to the block-cooperative kernel above the threshold.
 pub fn gpu_de_tie_term(
     dev: &GpuDevice,
     sorted_slab: &CudaSlice<f32>,
@@ -656,15 +669,18 @@ pub fn gpu_de_tie_term(
         return Ok(());
     }
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let (kernel_name, block_dim) = if n_per_gene < GPU_DE_TIE_BLOCK_THRESHOLD {
+        ("tie_term_sorted_simple_kernel", 1u32)
+    } else {
+        ("tie_term_sorted_kernel", 256u32)
+    };
     let func = module
-        .load_function("tie_term_sorted_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+        .load_function(kernel_name)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
 
-    // Block-cooperative segmented reduction: TIE_BLOCK_THREADS = 256 (must
-    // match the `TIE_BLOCK_THREADS` macro in `kernels/diffexp.cu`).
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
-        block_dim: (256, 1, 1),
+        block_dim: (block_dim, 1, 1),
         shared_mem_bytes: 0,
     };
     let chunk_i32 = chunk_size as i32;
@@ -678,12 +694,14 @@ pub fn gpu_de_tie_term(
             .arg(&n_per_gene_i32)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("tie_term_sorted_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
     Ok(())
 }
 
 /// Combined tie term over (ref + group): merge-walks two pre-sorted rows per
-/// gene and writes the result into `tie_out`.
+/// gene and writes the result into `tie_out`. Dispatches by `n_ref + n_g`
+/// against `GPU_DE_TIE_BLOCK_THRESHOLD` — same crossover as the sorted-row
+/// kernel.
 pub fn gpu_de_combined_tie_term(
     dev: &GpuDevice,
     sorted_ref: &CudaSlice<f32>,
@@ -697,15 +715,18 @@ pub fn gpu_de_combined_tie_term(
         return Ok(());
     }
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let (kernel_name, block_dim) = if n_ref + n_g < GPU_DE_TIE_BLOCK_THRESHOLD {
+        ("combined_tie_term_simple_kernel", 1u32)
+    } else {
+        ("combined_tie_term_kernel", 256u32)
+    };
     let func = module
-        .load_function("combined_tie_term_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+        .load_function(kernel_name)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
 
-    // Merge-path-partitioned segmented reduction: TIE_BLOCK_THREADS = 256
-    // (must match the `TIE_BLOCK_THREADS` macro in `kernels/diffexp.cu`).
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
-        block_dim: (256, 1, 1),
+        block_dim: (block_dim, 1, 1),
         shared_mem_bytes: 0,
     };
     let chunk_i32 = chunk_size as i32;
@@ -722,7 +743,7 @@ pub fn gpu_de_combined_tie_term(
             .arg(&n_g_i32)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("combined_tie_term_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("{kernel_name}: {e}")))?;
     Ok(())
 }
 

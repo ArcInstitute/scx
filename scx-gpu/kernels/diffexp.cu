@@ -422,6 +422,42 @@ extern "C" __global__ void merge_pass_per_gene_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Tie-term Σ(c^3 − c) over a single sorted row — single-thread fast path.
+//
+// One block per gene, one thread active. O(n_per_gene) per gene. The
+// block-cooperative kernel below pays a ~10 µs fixed overhead (BlockReduce
+// + cross-warp shmem relays + boundary stitch) that dominates the work
+// when n_per_gene is small. For n_per_gene < TIE_DISPATCH_THRESHOLD
+// (≈ block-radix-sort capacity, single-tile sort regime) the host dispatches
+// to this simple kernel; above the threshold the block-cooperative kernel
+// wins. See `gpu_de_tie_term` in `scx-gpu/src/gpu_diffexp.rs`.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void tie_term_sorted_simple_kernel(
+    const float*  __restrict__ sorted_slab,
+    double*       __restrict__ tie_term,
+    int chunk_size,
+    int n_per_gene
+) {
+    int gene = blockIdx.x;
+    if (gene >= chunk_size) return;
+    if (threadIdx.x != 0) return;
+
+    const float* row = sorted_slab + (long long)gene * n_per_gene;
+    double sum = 0.0;
+    int i = 0;
+    while (i < n_per_gene) {
+        int j = i + 1;
+        while (j < n_per_gene && row[j] == row[i]) ++j;
+        long long c = (long long)(j - i);
+        if (c > 1) {
+            sum += (double)(c * c * c - c);
+        }
+        i = j;
+    }
+    tie_term[gene] = sum;
+}
+
+// ---------------------------------------------------------------------------
 // Tie-term Σ(c^3 − c) over a single sorted row — block-cooperative.
 //
 // One block per gene; TIE_BLOCK_THREADS threads partition the sorted row
@@ -588,6 +624,45 @@ extern "C" __global__ void tie_term_sorted_kernel(
 
         tie_term[gene] = block_inner + boundary_sum;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Combined tie term Σ((r_v + g_v)^3 − (r_v + g_v)) — single-thread fast path.
+// Mirrors `tie_term_sorted_simple_kernel`: cheaper than the block-cooperative
+// kernel below for small n_ref + n_g (host dispatches by total size).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void combined_tie_term_simple_kernel(
+    const float*  __restrict__ sorted_ref,
+    const float*  __restrict__ sorted_group,
+    double*       __restrict__ tie_term,
+    int chunk_size,
+    int n_ref,
+    int n_g
+) {
+    int gene = blockIdx.x;
+    if (gene >= chunk_size) return;
+    if (threadIdx.x != 0) return;
+
+    const float* R = sorted_ref + (long long)gene * n_ref;
+    const float* G = sorted_group + (long long)gene * n_g;
+
+    double sum = 0.0;
+    int i = 0, j = 0;
+    while (i < n_ref || j < n_g) {
+        float v;
+        if (i >= n_ref)       v = G[j];
+        else if (j >= n_g)    v = R[i];
+        else                  v = fminf(R[i], G[j]);
+
+        long long cr = 0, cg = 0;
+        while (i < n_ref && R[i] == v) { ++i; ++cr; }
+        while (j < n_g   && G[j] == v) { ++j; ++cg; }
+        long long c = cr + cg;
+        if (c > 1) {
+            sum += (double)(c * c * c - c);
+        }
+    }
+    tie_term[gene] = sum;
 }
 
 // ---------------------------------------------------------------------------
