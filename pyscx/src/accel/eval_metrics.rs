@@ -1277,6 +1277,21 @@ pub fn knockdown_efficiency<'py>(
         }
     };
 
+    // Enforce sorted column indices on the CSR before extracting raw arrays.
+    // `scx_accel::compute_knockdown_efficiency` looks up the target gene's
+    // value via `csr_get_value`'s `binary_search` over each row's column
+    // indices (see `scx-accel/src/eval_metrics/knockdown.rs`); on an
+    // unsorted CSR that binary search silently returns 0.0 whenever the
+    // target column is positioned out-of-order, collapsing every
+    // perturbed cell's `KnockDownEfficiency` to `1.0 - 0.0 / (baseline +
+    // eps) ≈ 1.0` regardless of the actual expression — a uniformly
+    // degenerate failure mode. Real h5ad files (e.g. `pbmc10k.h5ad`)
+    // routinely arrive with `has_sorted_indices == False`. `ensure_csr`
+    // short-circuits when sorted (cheap clone for the backed / lazy /
+    // dense-derived CSR branches above) and calls `.sorted_indices()`
+    // when not.
+    let (csr_obj, _) = crate::anndata::ensure_csr(py, &csr_obj, /* in_place */ false)?;
+
     let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
     if shape.0 != n_obs {
         return Err(PyValueError::new_err(format!(

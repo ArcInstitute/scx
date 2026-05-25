@@ -14,19 +14,20 @@ swapping `pdex_ref` for `rank_genes_groups`.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
-import anndata as ad  # noqa: E402
-import scipy.sparse as sp  # noqa: E402
+import anndata as ad
+import scipy.sparse as sp
 
-import pyscx  # noqa: E402
+import pyscx
 
-# Reuse the fixture + helper from the pdex parity test (90 cells × 15 genes,
-# 3 groups with deliberate per-group DE signal).
-from test_pdex_ref_parity import (  # noqa: E402
-    _make_adata,
-    _csr_with_descending_indices,
+# Reuse the fixture + helper from the shared fixtures module
+# (90 cells × 15 genes, 3 groups with deliberate per-group DE signal).
+# Importing from `_pdex_fixtures` instead of `test_pdex_ref_parity` keeps
+# this CPU regression test out of the polars / pdex importorskip cascade.
+from _pdex_fixtures import (
     REFERENCE,
+    _csr_with_descending_indices,
+    _make_adata,
 )
 
 
@@ -119,7 +120,11 @@ def test_rank_genes_groups_cpu_unsorted_scipy_csr_matches_sorted():
     )
 
     # Caller's AnnData must not be mutated (ensure_csr called with in_place=False).
-    assert not adata_unsorted.X.has_sorted_indices, (
+    # `a_unsorted` is the deep-copy that was actually handed to
+    # `rank_genes_groups` — that's the object the function could have
+    # mutated. Checking `adata_unsorted` (the pre-copy original) would
+    # always pass regardless of what the function did.
+    assert not a_unsorted.X.has_sorted_indices, (
         "ensure_csr(in_place=False) mutated caller's CSR — "
         "has_sorted_indices flipped to True after rank_genes_groups"
     )
