@@ -311,6 +311,79 @@ pub fn set_cuda_graphs_enabled_override(enabled: Option<bool>) -> Option<bool> {
     test_override::set(enabled)
 }
 
+/// Enumerate the kernel nodes inside a captured `CUgraph`.
+/// Locate the single kernel-node handle so subsequent
+/// replays can update its scalar params via
+/// [`exec_kernel_node_set_params`] without recapturing.
+///
+/// Returns nodes in the order CUDA returns them; for graphs captured
+/// from a single `launch_builder().launch(cfg)` call there is exactly
+/// one node.
+///
+/// # Safety
+///
+/// `graph` must be a valid, non-destroyed `CUgraph` (typically
+/// `CudaGraph::cu_graph()`).
+pub unsafe fn graph_kernel_nodes(graph: sys::CUgraph) -> Result<Vec<sys::CUgraphNode>, GpuError> {
+    // First call with null nodes pointer → driver writes the node
+    // count into `num_nodes`. Second call passes a buffer of that
+    // size and the driver fills it in. Standard two-pass CUDA
+    // enumeration pattern.
+    let mut num_nodes: usize = 0;
+    let r1 = sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut num_nodes);
+    if r1 != sys::CUresult::CUDA_SUCCESS {
+        return Err(GpuError::CudaError(format!(
+            "cuGraphGetNodes count probe failed: {r1:?}"
+        )));
+    }
+    let mut nodes: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); num_nodes];
+    let r2 = sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut num_nodes);
+    if r2 != sys::CUresult::CUDA_SUCCESS {
+        return Err(GpuError::CudaError(format!(
+            "cuGraphGetNodes failed: {r2:?}"
+        )));
+    }
+    nodes.truncate(num_nodes);
+    // Filter to kernel nodes (the only type we currently care about).
+    let mut kernel_nodes = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let mut ty = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+        let r = sys::cuGraphNodeGetType(node, &mut ty);
+        if r != sys::CUresult::CUDA_SUCCESS {
+            return Err(GpuError::CudaError(format!(
+                "cuGraphNodeGetType failed: {r:?}"
+            )));
+        }
+        if matches!(ty, sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL) {
+            kernel_nodes.push(node);
+        }
+    }
+    Ok(kernel_nodes)
+}
+
+/// Read the current kernel-node params from a captured node. Used by
+/// G10.3 (UMAP) to extract the `CUfunction` and grid/block dimensions
+/// that the capture baked in, so subsequent
+/// [`exec_kernel_node_set_params`] calls can pass them unchanged while
+/// updating only the user-controlled `kernelParams` pointer array.
+///
+/// # Safety
+///
+/// `node` must be a valid kernel node returned by
+/// [`graph_kernel_nodes`].
+pub unsafe fn read_kernel_node_params(
+    node: sys::CUgraphNode,
+) -> Result<sys::CUDA_KERNEL_NODE_PARAMS, GpuError> {
+    let mut params: sys::CUDA_KERNEL_NODE_PARAMS = std::mem::zeroed();
+    let r = sys::cuGraphKernelNodeGetParams_v2(node, &mut params);
+    if r != sys::CUresult::CUDA_SUCCESS {
+        return Err(GpuError::CudaError(format!(
+            "cuGraphKernelNodeGetParams_v2 failed: {r:?}"
+        )));
+    }
+    Ok(params)
+}
+
 /// FFI shim: `cuGraphExecKernelNodeSetParams_v2` — used by G10.3 (UMAP
 /// epoch capture) to swap the per-epoch alpha + epoch_i32 scalars
 /// between replays without re-capture. cudarc 0.19 exposes the raw FFI
