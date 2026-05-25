@@ -381,7 +381,15 @@ fn run_rank_genes_groups_inner(
         if is_sparse {
             // Sparse in-memory: extract CSR arrays and use gene-chunked path
             // to avoid O(n_obs × n_vars) dense materialization.
-            let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
+            //
+            // `ensure_csr` short-circuits when the input is already CSR with
+            // sorted indices (the common h5ad case) and copies-then-sorts
+            // only when the caller's CSR has `has_sorted_indices == False`.
+            // Sorted indices are a precondition of
+            // `scx_engine::project_csr_row`; without this step the CPU
+            // sparse path silently returns U = n_g·n_ref/2 for every gene
+            // on inputs with unsorted CSRs (e.g. pbmc10k.h5ad).
+            let (csr_obj, _) = crate::anndata::ensure_csr(py, &x, /* in_place */ false)?;
             let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
             let np = py.import("numpy")?;
             let indptr: Vec<i64> = np
@@ -1219,7 +1227,10 @@ fn run_pdex_ref_inner(
         .extract::<bool>()?;
 
     if is_sparse {
-        let csr_obj = scipy_sparse.call_method1("csr_matrix", (&x,))?;
+        // `ensure_csr` enforces sorted column indices — required by
+        // `scx_engine::project_csr_row`. Without this, unsorted scipy
+        // CSR inputs silently return U = n_g·n_ref/2 for every gene.
+        let (csr_obj, _) = crate::anndata::ensure_csr(py, &x, /* in_place */ false)?;
         let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
         let np = py.import("numpy")?;
         let indptr: Vec<i64> = np

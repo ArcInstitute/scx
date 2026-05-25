@@ -270,3 +270,89 @@ def test_pdex_ref_schema_matches_pdex():
         scx_df["log2_fold_change"].to_numpy(),
         err_msg="fold_change should mirror log2_fold_change exactly",
     )
+
+
+def _csr_with_descending_indices(adata: ad.AnnData) -> sp.csr_matrix:
+    """Return a `csr_matrix` carrying the same dense values as `adata.X`,
+    but with each row's column indices in **descending** order — i.e.
+    `has_sorted_indices == False`.
+
+    Mirrors the pathological scipy CSR shape seen on real-world datasets
+    like `pbmc10k.h5ad`, which surfaced the
+    `scx_engine::project_csr_row` precondition bug.
+    """
+    base = adata.X
+    if sp.issparse(base):
+        base = base.tocsr().copy()
+        base.sort_indices()  # canonicalise first so the reversal is deterministic
+    else:
+        base = sp.csr_matrix(base)
+
+    indptr = base.indptr.astype(np.int64).copy()
+    indices = base.indices.astype(np.int32).copy()
+    data = base.data.astype(np.float32).copy()
+    # Reverse each row's slice so indices walk col_max → col_min.
+    for r in range(indptr.size - 1):
+        lo, hi = int(indptr[r]), int(indptr[r + 1])
+        if hi - lo > 1:
+            indices[lo:hi] = indices[lo:hi][::-1]
+            data[lo:hi] = data[lo:hi][::-1]
+    out = sp.csr_matrix((data, indices, indptr), shape=base.shape, copy=False)
+    # Tell scipy not to assume sortedness — has_sorted_indices is a cached
+    # flag, so set it explicitly to mirror real h5ad-derived CSRs.
+    out.has_sorted_indices = False
+    return out
+
+
+def test_pdex_ref_cpu_unsorted_scipy_csr_matches_sorted():
+    """Regression test for `scx_engine::project_csr_row` precondition.
+
+    Before this fix, an `adata` whose `X` is a `scipy.sparse.csr_matrix`
+    with `has_sorted_indices=False` (the pbmc10k.h5ad case) made the CPU
+    `pdex_ref` collapse every gene's U to `n_g·n_ref/2` and p-value to
+    1.0 — because `project_csr_row` uses a monotonic merge-scan pointer
+    that silently drops every column index following a larger one.
+
+    The fix is at the pyscx CPU sparse dispatch boundary
+    (`pyscx::accel::de::run_pdex_ref_inner`): we now route through
+    `ensure_csr`, which calls `.sorted_indices()` when the input CSR is
+    unsorted. This test fixes the value of two `pdex_ref` runs against
+    each other — sorted and unsorted — and asserts every numeric column
+    agrees bit-for-bit. Atomically catches the regression without
+    needing pdex.
+    """
+    adata_sorted = _make_adata()
+    # Ensure adata_sorted's X is a sorted CSR for a clean baseline.
+    adata_sorted.X = sp.csr_matrix(adata_sorted.X)
+    adata_sorted.X.sort_indices()
+    assert adata_sorted.X.has_sorted_indices
+
+    adata_unsorted = adata_sorted.copy()
+    adata_unsorted.X = _csr_with_descending_indices(adata_sorted)
+    assert not adata_unsorted.X.has_sorted_indices
+
+    sorted_df = pyscx.accel.pdex_ref(
+        adata_sorted, "target", reference=REFERENCE, device="cpu"
+    )
+    unsorted_df = pyscx.accel.pdex_ref(
+        adata_unsorted, "target", reference=REFERENCE, device="cpu"
+    )
+
+    _assert_frames_close(sorted_df, unsorted_df, atol=0.0, rtol=0.0)
+
+    # Sanity: the fixture has real signal — pdex_ref should NOT return
+    # p=1.0 for every gene. Catches the original "trivial U everywhere"
+    # failure mode directly, in case both runs regress simultaneously.
+    p_vals = sorted_df["p_value"].to_numpy()
+    n_nontrivial = int(np.sum(p_vals < 0.99))
+    assert n_nontrivial > 0, (
+        f"fixture lost DE signal: all {len(p_vals)} p-values ≥ 0.99 — either the "
+        f"_make_adata fixture changed or pdex_ref CPU is broken in a different way"
+    )
+
+    # Caller's AnnData must not be mutated (ensure_csr called with in_place=False).
+    assert not adata_unsorted.X.has_sorted_indices, (
+        "ensure_csr(in_place=False) must not mutate caller's CSR — but "
+        "has_sorted_indices flipped to True after pdex_ref. Check that "
+        "the dispatch site passes `in_place=false`."
+    )

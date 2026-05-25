@@ -14,12 +14,38 @@ use crate::reader::SectionReader;
 /// Project a single CSR row, keeping only entries whose column index
 /// appears in `gene_set`.
 ///
-/// Both `indices` (sorted column indices for one row) and `gene_set`
-/// must be sorted. Uses a sorted merge scan — O(nnz_row + n_genes).
+/// # Precondition
+///
+/// Both `indices` (column indices for one row) and `gene_set` MUST be
+/// sorted ascending. The merge scan uses a monotonic `gi` pointer that
+/// never decreases; on unsorted `indices` it silently drops every
+/// column that follows a larger predecessor in the row, producing a
+/// wrong-but-not-noisy result. Callers passing a scipy `csr_matrix`
+/// must either check `has_sorted_indices` or call `.sort_indices()` /
+/// `.sorted_indices()` before extracting `indices`. The canonical pyscx
+/// boundary helper is `pyscx::anndata::ensure_csr`, which already
+/// enforces this. Debug builds catch violations via `debug_assert!`;
+/// release builds skip the check, so the boundary fix is what holds
+/// correctness in production.
+///
+/// Uses a sorted merge scan — O(nnz_row + n_genes).
 ///
 /// Returns `(projected_indices, projected_data)` where indices are
 /// remapped to `0..gene_set.len()` (position in gene_set).
 pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<i32>, Vec<f32>) {
+    debug_assert!(
+        indices.windows(2).all(|w| w[0] <= w[1]),
+        "project_csr_row: row indices are not sorted ascending — unsorted input \
+         silently produces wrong results because the merge scan uses a monotonic \
+         pointer. Sort indices at the caller (e.g. via scipy `sort_indices()` or \
+         `pyscx::anndata::ensure_csr`) before invoking."
+    );
+    debug_assert!(
+        gene_set.windows(2).all(|w| w[0] <= w[1]),
+        "project_csr_row: gene_set is not sorted ascending — the merge scan \
+         requires it. `project_csr` sorts internally; direct callers must too."
+    );
+
     let mut out_indices = Vec::new();
     let mut out_data = Vec::new();
 
