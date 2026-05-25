@@ -14,6 +14,7 @@ use cudarc::driver::safe::{
 use cudarc::nvrtc::Ptx;
 
 use crate::error::GpuError;
+use crate::gpu_graph::GpuGraphCache;
 
 /// A GPU device handle wrapping a CUDA context and its default stream.
 ///
@@ -27,6 +28,12 @@ pub struct GpuDevice {
     /// Cache of loaded PTX modules, keyed by PTX source string pointer.
     /// Avoids re-parsing and re-loading the same PTX on every kernel call.
     module_cache: RefCell<HashMap<*const str, Arc<CudaModule>>>,
+    /// Cache of captured `cudaGraph_t` keyed by shape signature
+    /// ([`crate::gpu_graph::GraphKey`]). Iteration-heavy stages (PCA
+    /// power, Harmony k-means, UMAP SGD, GPU DE chunk loops) capture
+    /// their stable kernel sequence once and replay on subsequent
+    /// iterations to amortize per-launch latency.
+    graph_cache: RefCell<GpuGraphCache>,
 }
 
 /// Safely initialize the CUDA driver, catching panics from cudarc when
@@ -75,6 +82,7 @@ impl GpuDevice {
             ctx,
             stream,
             module_cache: RefCell::new(HashMap::new()),
+            graph_cache: RefCell::new(GpuGraphCache::new()),
         })
     }
 
@@ -169,6 +177,14 @@ impl GpuDevice {
     /// Access the default [`CudaStream`].
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Borrow the per-device CUDA Graph cache. The cache persists across
+    /// calls — a second `gpu_randomized_pca` / `pdex_ref_gpu_chunked`
+    /// run with the same shape signature replays the cached graph
+    /// rather than recapturing.
+    pub fn graph_cache(&self) -> std::cell::RefMut<'_, GpuGraphCache> {
+        self.graph_cache.borrow_mut()
     }
 
     /// Query the human-readable name of the GPU device (e.g. "NVIDIA A100-SXM4-80GB").

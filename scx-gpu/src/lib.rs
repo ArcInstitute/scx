@@ -52,6 +52,7 @@ pub mod device;
 pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_diffexp;
+pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
 pub mod gpu_knn;
@@ -84,6 +85,7 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
+pub use gpu_graph::{capture_graph, cuda_graphs_enabled, GpuGraphCache, GpuGraphMetrics, GraphKey};
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,
