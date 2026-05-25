@@ -18,6 +18,7 @@
 // kernels; the v1 GPU path falls back to CPU for larger reference pools.
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_reduce.cuh>
 #include <math_constants.h>  // CUDART_INF_F
 
 // Block-sort tunables (must be compile-time constants for cub::BlockRadixSort).
@@ -306,12 +307,23 @@ __device__ __forceinline__ int merge_path_co_rank(
     while (i_lo < i_hi) {
         int i = (i_lo + i_hi) >> 1;
         int j = diag - i;
-        // Two violation checks; ≤ in both directions means stable merge
-        // (ties from A come first when equal values cross the diagonal).
+        // Stable A-first merge invariants at the canonical partition:
+        //   A[i-1] <= B[j]   (A's tie at i-1 went into A's range — `<=` allows tie)
+        //   B[j-1] <  A[i]   (B's tie at j-1 would have been preceded by A — strict)
+        //
+        // Violation checks (the binary search advances on either):
+        //   A[i-1] >  B[j]   → i too large, pull back (consume fewer from A).
+        //   B[j-1] >= A[i]   → i too small, push forward (consume more from A).
+        //
+        // The non-strict `>=` on the second check is what makes the co-rank
+        // monotonic in diag when ties span the diagonal. With strict `>`, an
+        // identical pair (A[i] == B[j-1]) can produce different `i` values for
+        // adjacent diagonals, leading to the same A[i] being consumed by two
+        // different threads when this function partitions across a block.
         if (i > 0 && j < n && A[i - 1] > B[j]) {
             // i too large — pull back, take fewer from A.
             i_hi = i;
-        } else if (i < m && j > 0 && B[j - 1] > A[i]) {
+        } else if (i < m && j > 0 && B[j - 1] >= A[i]) {
             // i too small — push forward, take more from A.
             i_lo = i + 1;
         } else {
@@ -410,14 +422,19 @@ extern "C" __global__ void merge_pass_per_gene_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Tie-term Σ(c^3 − c) over a single sorted row.
+// Tie-term Σ(c^3 − c) over a single sorted row — single-thread fast path.
 //
-// One block per gene; thread 0 walks the row sequentially. The walk is
-// O(n_per_gene) per gene, fine for v1 with n_per_gene ≤ 8192.
+// One block per gene, one thread active. O(n_per_gene) per gene. The
+// block-cooperative kernel below pays a ~10 µs fixed overhead (BlockReduce
+// + cross-warp shmem relays + boundary stitch) that dominates the work
+// when n_per_gene is small. For n_per_gene < TIE_DISPATCH_THRESHOLD
+// (≈ block-radix-sort capacity, single-tile sort regime) the host dispatches
+// to this simple kernel; above the threshold the block-cooperative kernel
+// wins. See `gpu_de_tie_term` in `scx-gpu/src/gpu_diffexp.rs`.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void tie_term_sorted_kernel(
-    const float*  __restrict__ sorted_slab,  // [chunk_size × n_per_gene]
-    double*       __restrict__ tie_term,     // [chunk_size]
+extern "C" __global__ void tie_term_sorted_simple_kernel(
+    const float*  __restrict__ sorted_slab,
+    double*       __restrict__ tie_term,
     int chunk_size,
     int n_per_gene
 ) {
@@ -433,7 +450,7 @@ extern "C" __global__ void tie_term_sorted_kernel(
         while (j < n_per_gene && row[j] == row[i]) ++j;
         long long c = (long long)(j - i);
         if (c > 1) {
-            sum += (double)(c * c * c - c);
+            sum += (double)c * c * c - (double)c;
         }
         i = j;
     }
@@ -441,13 +458,183 @@ extern "C" __global__ void tie_term_sorted_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Combined tie term Σ((r_v + g_v)^3 − (r_v + g_v)) via merge-walk of two
-// pre-sorted rows. One block per gene; thread 0 walks.
+// Tie-term Σ(c^3 − c) over a single sorted row — block-cooperative.
+//
+// One block per gene; TIE_BLOCK_THREADS threads partition the sorted row
+// into contiguous slices and each thread walks its slice in O(n/BT). Each
+// thread reports:
+//   * head: the first run in its slice (which may continue from the
+//           previous thread's tail)
+//   * tail: the last run in its slice (which may continue into the next
+//           thread's head)
+//   * inner_sum: Σ(c³ − c) over runs that fully close inside the slice
+//                (neither the head nor the tail).
+//
+// Thread 0 sequentially stitches the per-thread (head, tail) pairs to
+// detect boundary-spanning runs and compute their corrected c³ − c. The
+// O(BT) stitch is dwarfed by the O(n/BT) per-thread walk on census-tier
+// inputs.
+//
+// Invariant exploited by the stitch: the input slab is sorted, so within
+// any contiguous slice `head.value == tail.value` ⇔ the slice contains
+// a single run.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void combined_tie_term_kernel(
-    const float*  __restrict__ sorted_ref,    // [chunk_size × n_ref]
-    const float*  __restrict__ sorted_group,  // [chunk_size × n_g]
-    double*       __restrict__ tie_term,      // [chunk_size]
+
+#define TIE_BLOCK_THREADS 256
+
+extern "C" __global__ void tie_term_sorted_kernel(
+    const float*  __restrict__ sorted_slab,  // [chunk_size × n_per_gene]
+    double*       __restrict__ tie_term,     // [chunk_size]
+    int chunk_size,
+    int n_per_gene
+) {
+    int gene = blockIdx.x;
+    if (gene >= chunk_size) return;
+    int tid = threadIdx.x;
+
+    if (n_per_gene == 0) {
+        if (tid == 0) tie_term[gene] = 0.0;
+        return;
+    }
+
+    const float* row = sorted_slab + (long long)gene * n_per_gene;
+
+    int per_thread = (n_per_gene + TIE_BLOCK_THREADS - 1) / TIE_BLOCK_THREADS;
+    int start = tid * per_thread;
+    int end   = start + per_thread;
+    if (start > n_per_gene) start = n_per_gene;
+    if (end > n_per_gene)   end   = n_per_gene;
+
+    double inner_sum = 0.0;
+    float  head_value = 0.0f;
+    long long head_count = 0;
+    float  tail_value = 0.0f;
+    long long tail_count = 0;
+
+    if (start < end) {
+        // Head: the first run in this slice.
+        head_value = row[start];
+        int hi = start;
+        while (hi < end && row[hi] == head_value) ++hi;
+        head_count = (long long)(hi - start);
+
+        if (hi == end) {
+            // Slice is a single run; tail mirrors head.
+            tail_value = head_value;
+            tail_count = head_count;
+        } else {
+            // Walk subsequent runs. Each run that fully closes inside the
+            // slice contributes c³ − c. The last run found becomes the tail.
+            int j = hi;
+            float    cur_v = row[j];
+            long long cur_c = 0;
+            while (j < end) {
+                if (row[j] == cur_v) {
+                    ++cur_c;
+                    ++j;
+                } else {
+                    // (cur_v, cur_c) closed strictly inside the slice → inner.
+                    if (cur_c > 1) inner_sum += (double)cur_c * cur_c * cur_c - (double)cur_c;
+                    cur_v = row[j];
+                    cur_c = 1;
+                    ++j;
+                }
+            }
+            tail_value = cur_v;
+            tail_count = cur_c;
+        }
+    }
+
+    // ---- Boundary stitch ----
+    __shared__ float     s_head_value[TIE_BLOCK_THREADS];
+    __shared__ long long s_head_count[TIE_BLOCK_THREADS];
+    __shared__ float     s_tail_value[TIE_BLOCK_THREADS];
+    __shared__ long long s_tail_count[TIE_BLOCK_THREADS];
+
+    s_head_value[tid] = head_value;
+    s_head_count[tid] = head_count;
+    s_tail_value[tid] = tail_value;
+    s_tail_count[tid] = tail_count;
+
+    using Reduce = cub::BlockReduce<double, TIE_BLOCK_THREADS>;
+    __shared__ typename Reduce::TempStorage reduce_tmp;
+    double block_inner = Reduce(reduce_tmp).Sum(inner_sum);
+    __syncthreads();
+
+    if (tid == 0) {
+        double boundary_sum = 0.0;
+
+        // Find the first non-empty slice.
+        int t = 0;
+        while (t < TIE_BLOCK_THREADS && s_head_count[t] == 0) ++t;
+
+        if (t < TIE_BLOCK_THREADS) {
+            float    open_value;
+            long long open_count;
+
+            if (s_head_value[t] == s_tail_value[t]) {
+                // Single-run slice; the open run continues.
+                open_value = s_head_value[t];
+                open_count = s_head_count[t];
+            } else {
+                // Multi-run slice: head closes within this slice (it's the
+                // first run of the whole row, can't continue from earlier).
+                long long c = s_head_count[t];
+                if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                open_value = s_tail_value[t];
+                open_count = s_tail_count[t];
+            }
+
+            for (int u = t + 1; u < TIE_BLOCK_THREADS; ++u) {
+                if (s_head_count[u] == 0) continue;
+                bool u_single = (s_head_value[u] == s_tail_value[u]);
+
+                if (s_head_value[u] == open_value) {
+                    // Open run extends into u's head run.
+                    open_count += s_head_count[u];
+                    if (!u_single) {
+                        // u has more runs after the head → open closes now.
+                        long long c = open_count;
+                        if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                        open_value = s_tail_value[u];
+                        open_count = s_tail_count[u];
+                    }
+                    // u_single: open keeps growing into u's tail (still open).
+                } else {
+                    // Open run closes; u's head does not extend it.
+                    long long c = open_count;
+                    if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                    if (!u_single) {
+                        // u's head closes inside u; only u's tail stays open.
+                        long long c2 = s_head_count[u];
+                        if (c2 > 1) boundary_sum += (double)c2 * c2 * c2 - (double)c2;
+                        open_value = s_tail_value[u];
+                        open_count = s_tail_count[u];
+                    } else {
+                        open_value = s_head_value[u];
+                        open_count = s_head_count[u];
+                    }
+                }
+            }
+
+            // Close the final open run.
+            long long c = open_count;
+            if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+        }
+
+        tie_term[gene] = block_inner + boundary_sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Combined tie term Σ((r_v + g_v)^3 − (r_v + g_v)) — single-thread fast path.
+// Mirrors `tie_term_sorted_simple_kernel`: cheaper than the block-cooperative
+// kernel below for small n_ref + n_g (host dispatches by total size).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void combined_tie_term_simple_kernel(
+    const float*  __restrict__ sorted_ref,
+    const float*  __restrict__ sorted_group,
+    double*       __restrict__ tie_term,
     int chunk_size,
     int n_ref,
     int n_g
@@ -472,10 +659,163 @@ extern "C" __global__ void combined_tie_term_kernel(
         while (j < n_g   && G[j] == v) { ++j; ++cg; }
         long long c = cr + cg;
         if (c > 1) {
-            sum += (double)(c * c * c - c);
+            sum += (double)c * c * c - (double)c;
         }
     }
     tie_term[gene] = sum;
+}
+
+// ---------------------------------------------------------------------------
+// Combined tie term Σ((r_v + g_v)^3 − (r_v + g_v)) over the conceptual merge
+// of two pre-sorted rows — block-cooperative via merge-path partitioning.
+//
+// One block per gene; TIE_BLOCK_THREADS threads partition the combined
+// output of length (n_ref + n_g) via `merge_path_co_rank`. Each
+// thread merge-walks its sub-range of R and G, reporting:
+//   * head: the first merged run in its sub-range
+//   * tail: the last merged run in its sub-range
+//   * inner_sum: Σ(c³ − c) over runs that fully close inside the slice
+// Thread 0 then stitches per-thread (head, tail) pairs the same way as
+// `tie_term_sorted_kernel`. The merge of two sorted streams is itself
+// sorted, so the "head.value == tail.value ⇒ single-run" invariant holds
+// here too.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void combined_tie_term_kernel(
+    const float*  __restrict__ sorted_ref,    // [chunk_size × n_ref]
+    const float*  __restrict__ sorted_group,  // [chunk_size × n_g]
+    double*       __restrict__ tie_term,      // [chunk_size]
+    int chunk_size,
+    int n_ref,
+    int n_g
+) {
+    int gene = blockIdx.x;
+    if (gene >= chunk_size) return;
+    int tid = threadIdx.x;
+
+    int total = n_ref + n_g;
+    if (total == 0) {
+        if (tid == 0) tie_term[gene] = 0.0;
+        return;
+    }
+
+    const float* R = sorted_ref + (long long)gene * n_ref;
+    const float* G = sorted_group + (long long)gene * n_g;
+
+    // Partition the conceptual merge across threads.
+    int per_thread = (total + TIE_BLOCK_THREADS - 1) / TIE_BLOCK_THREADS;
+    int diag_start = tid * per_thread;
+    int diag_end   = diag_start + per_thread;
+    if (diag_start > total) diag_start = total;
+    if (diag_end > total)   diag_end   = total;
+
+    int i_start = merge_path_co_rank(R, n_ref, G, n_g, diag_start);
+    int j_start = diag_start - i_start;
+    int i_end   = merge_path_co_rank(R, n_ref, G, n_g, diag_end);
+    int j_end   = diag_end - i_end;
+
+    // Per-thread merge-walk: emit (head, tail, inner_sum).
+    int i = i_start, j = j_start;
+    int n_runs = 0;
+    float    head_value = 0.0f, last_value = 0.0f;
+    long long head_count = 0, last_count = 0;
+    double inner_sum = 0.0;
+
+    while (i < i_end || j < j_end) {
+        float v;
+        if (j >= j_end)       v = R[i];
+        else if (i >= i_end)  v = G[j];
+        else                  v = fminf(R[i], G[j]);
+
+        long long c = 0;
+        while (i < i_end && R[i] == v) { ++i; ++c; }
+        while (j < j_end && G[j] == v) { ++j; ++c; }
+
+        if (n_runs == 0) {
+            head_value = v;
+            head_count = c;
+        } else if (n_runs >= 2) {
+            // The previous `last` run was displaced by this new run → inner.
+            // (When n_runs == 1, `last` is the head, which we don't promote
+            // to inner here — head is its own slice-boundary category.)
+            if (last_count > 1) inner_sum += (double)last_count * last_count * last_count - (double)last_count;
+        }
+        last_value = v;
+        last_count = c;
+        ++n_runs;
+    }
+
+    float    tail_value = (n_runs == 0) ? 0.0f : last_value;
+    long long tail_count = (n_runs == 0) ? 0 : last_count;
+
+    // ---- Boundary stitch (identical structure to tie_term_sorted_kernel) ----
+    __shared__ float     s_head_value[TIE_BLOCK_THREADS];
+    __shared__ long long s_head_count[TIE_BLOCK_THREADS];
+    __shared__ float     s_tail_value[TIE_BLOCK_THREADS];
+    __shared__ long long s_tail_count[TIE_BLOCK_THREADS];
+
+    s_head_value[tid] = head_value;
+    s_head_count[tid] = head_count;
+    s_tail_value[tid] = tail_value;
+    s_tail_count[tid] = tail_count;
+
+    using Reduce = cub::BlockReduce<double, TIE_BLOCK_THREADS>;
+    __shared__ typename Reduce::TempStorage reduce_tmp;
+    double block_inner = Reduce(reduce_tmp).Sum(inner_sum);
+    __syncthreads();
+
+    if (tid == 0) {
+        double boundary_sum = 0.0;
+
+        int t = 0;
+        while (t < TIE_BLOCK_THREADS && s_head_count[t] == 0) ++t;
+
+        if (t < TIE_BLOCK_THREADS) {
+            float    open_value;
+            long long open_count;
+
+            if (s_head_value[t] == s_tail_value[t]) {
+                open_value = s_head_value[t];
+                open_count = s_head_count[t];
+            } else {
+                long long c = s_head_count[t];
+                if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                open_value = s_tail_value[t];
+                open_count = s_tail_count[t];
+            }
+
+            for (int u = t + 1; u < TIE_BLOCK_THREADS; ++u) {
+                if (s_head_count[u] == 0) continue;
+                bool u_single = (s_head_value[u] == s_tail_value[u]);
+
+                if (s_head_value[u] == open_value) {
+                    open_count += s_head_count[u];
+                    if (!u_single) {
+                        long long c = open_count;
+                        if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                        open_value = s_tail_value[u];
+                        open_count = s_tail_count[u];
+                    }
+                } else {
+                    long long c = open_count;
+                    if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+                    if (!u_single) {
+                        long long c2 = s_head_count[u];
+                        if (c2 > 1) boundary_sum += (double)c2 * c2 * c2 - (double)c2;
+                        open_value = s_tail_value[u];
+                        open_count = s_tail_count[u];
+                    } else {
+                        open_value = s_head_value[u];
+                        open_count = s_head_count[u];
+                    }
+                }
+            }
+
+            long long c = open_count;
+            if (c > 1) boundary_sum += (double)c * c * c - (double)c;
+        }
+
+        tie_term[gene] = block_inner + boundary_sum;
+    }
 }
 
 // ---------------------------------------------------------------------------
