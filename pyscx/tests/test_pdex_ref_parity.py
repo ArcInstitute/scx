@@ -22,44 +22,14 @@ import scipy.sparse as sp  # noqa: E402
 
 import pyscx  # noqa: E402
 
-
-SEED = 0
-N_OBS = 90
-N_VARS = 15
-N_GROUPS = 3
-REFERENCE = "non-targeting"
-
-
-def _make_adata(seed: int = SEED) -> ad.AnnData:
-    """Synthetic count-style AnnData with three groups (one is the reference).
-
-    Group means differ deterministically so DE produces a non-trivial signal.
-    """
-    rng = np.random.default_rng(seed)
-    # Cells per group, evenly split.
-    per_group = N_OBS // N_GROUPS
-    groups = np.repeat([REFERENCE, "ko_a", "ko_b"], per_group)
-    # Per-group mean expression: shape (3, N_VARS). KO groups have a 2× shift
-    # on a subset of genes so MWU has signal, leaving the rest near-equal.
-    base = rng.uniform(0.5, 3.0, size=(N_GROUPS, N_VARS))
-    base[1, : N_VARS // 2] *= 2.0  # ko_a perturbs first half
-    base[2, N_VARS // 2 :] *= 2.5  # ko_b perturbs second half
-    counts = np.zeros((N_OBS, N_VARS), dtype=np.float32)
-    for c in range(N_OBS):
-        g = (c // per_group)
-        counts[c] = rng.poisson(base[g]).astype(np.float32)
-    obs = {
-        "target": groups,
-    }
-    import pandas as pd
-
-    obs_df = pd.DataFrame(obs, index=[f"cell_{i}" for i in range(N_OBS)])
-    var_df = pd.DataFrame(
-        {"gene_id": [f"gene_{j}" for j in range(N_VARS)]},
-        index=[f"gene_{j}" for j in range(N_VARS)],
-    )
-    adata = ad.AnnData(X=counts, obs=obs_df, var=var_df)
-    return adata
+# Synthetic-fixture builder + constants live in a sibling module so that
+# downstream regression tests can reuse them without paying for the
+# polars/pdex importorskip side effects above.
+from _pdex_fixtures import (  # noqa: E402
+    REFERENCE,
+    _csr_with_descending_indices,
+    _make_adata,
+)
 
 
 def _normalize_frame(df: pl.DataFrame) -> pl.DataFrame:
@@ -269,4 +239,58 @@ def test_pdex_ref_schema_matches_pdex():
         scx_df["fold_change"].to_numpy(),
         scx_df["log2_fold_change"].to_numpy(),
         err_msg="fold_change should mirror log2_fold_change exactly",
+    )
+
+
+def test_pdex_ref_cpu_unsorted_scipy_csr_matches_sorted():
+    """Regression test for `scx_engine::project_csr_row` precondition.
+
+    Before this fix, an `adata` whose `X` is a `scipy.sparse.csr_matrix`
+    with `has_sorted_indices=False` (the pbmc10k.h5ad case) made the CPU
+    `pdex_ref` collapse every gene's U to `n_g·n_ref/2` and p-value to
+    1.0 — because `project_csr_row` uses a monotonic merge-scan pointer
+    that silently drops every column index following a larger one.
+
+    The fix is at the pyscx CPU sparse dispatch boundary
+    (`pyscx::accel::de::run_pdex_ref_inner`): we now route through
+    `ensure_csr`, which calls `.sorted_indices()` when the input CSR is
+    unsorted. This test fixes the value of two `pdex_ref` runs against
+    each other — sorted and unsorted — and asserts every numeric column
+    agrees bit-for-bit. Atomically catches the regression without
+    needing pdex.
+    """
+    adata_sorted = _make_adata()
+    # Ensure adata_sorted's X is a sorted CSR for a clean baseline.
+    adata_sorted.X = sp.csr_matrix(adata_sorted.X)
+    adata_sorted.X.sort_indices()
+    assert adata_sorted.X.has_sorted_indices
+
+    adata_unsorted = adata_sorted.copy()
+    adata_unsorted.X = _csr_with_descending_indices(adata_sorted)
+    assert not adata_unsorted.X.has_sorted_indices
+
+    sorted_df = pyscx.accel.pdex_ref(
+        adata_sorted, "target", reference=REFERENCE, device="cpu"
+    )
+    unsorted_df = pyscx.accel.pdex_ref(
+        adata_unsorted, "target", reference=REFERENCE, device="cpu"
+    )
+
+    _assert_frames_close(sorted_df, unsorted_df, atol=0.0, rtol=0.0)
+
+    # Sanity: the fixture has real signal — pdex_ref should NOT return
+    # p=1.0 for every gene. Catches the original "trivial U everywhere"
+    # failure mode directly, in case both runs regress simultaneously.
+    p_vals = sorted_df["p_value"].to_numpy()
+    n_nontrivial = int(np.sum(p_vals < 0.99))
+    assert n_nontrivial > 0, (
+        f"fixture lost DE signal: all {len(p_vals)} p-values ≥ 0.99 — either the "
+        f"_make_adata fixture changed or pdex_ref CPU is broken in a different way"
+    )
+
+    # Caller's AnnData must not be mutated (ensure_csr called with in_place=False).
+    assert not adata_unsorted.X.has_sorted_indices, (
+        "ensure_csr(in_place=False) must not mutate caller's CSR — but "
+        "has_sorted_indices flipped to True after pdex_ref. Check that "
+        "the dispatch site passes `in_place=false`."
     )

@@ -31,8 +31,10 @@ import scipy.sparse as sp  # noqa: E402
 
 import pyscx  # noqa: E402
 
-# Reuse the synthetic-fixture builder + frame comparator from the CPU test.
-from test_pdex_ref_parity import (  # noqa: E402
+# Reuse the synthetic-fixture builder from the shared fixtures module so
+# this test doesn't transitively pull in the pdex importorskip from
+# `test_pdex_ref_parity.py` (which is unrelated to GPU dispatch).
+from _pdex_fixtures import (  # noqa: E402
     REFERENCE,
     _make_adata,
 )

@@ -24,8 +24,10 @@ import anndata as ad  # noqa: E402
 
 import pyscx  # noqa: E402
 
-# Reuse the fixture from the pdex parity test (90 cells × 15 genes, 3 groups).
-from test_pdex_ref_parity import _make_adata, REFERENCE  # noqa: E402
+# Reuse the synthetic-fixture builder from the shared fixtures module
+# (90 cells × 15 genes, 3 groups). Avoids the polars / pdex importorskips
+# in `test_pdex_ref_parity.py` — neither is needed for the GPU Wilcoxon path.
+from _pdex_fixtures import _make_adata, REFERENCE  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(

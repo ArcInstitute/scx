@@ -12,6 +12,7 @@ archive/
 tasks/
 tmp/
 learn/
+.antigravitycli/
 .claude/*.lock
 data/*.h5ad
 *.proptest-regressions

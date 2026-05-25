@@ -92,17 +92,28 @@ pub fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> 
     writer.write_obs(&sample_obs(n_obs)).unwrap();
     writer.write_var(&sample_var(n_vars)).unwrap();
 
-    // Build CSR data: each row has 2 nnz
+    // Build CSR data: each row has 2 nnz at deterministic column positions.
+    // SCX expects ascending column indices per row (see
+    // `scx_engine::project_csr_row`'s precondition); the modulo arithmetic
+    // can produce `col0 > col1` when `row * 2 + 1` wraps past `n_vars`, so
+    // sort the (col, val) pair before writing.
     let mut indptr = vec![0u64];
     let mut indices = Vec::new();
     let mut values = Vec::new();
     for row in 0..n_obs {
         let col0 = (row * 2) % n_vars;
         let col1 = (row * 2 + 1) % n_vars;
-        indices.push(col0 as u32);
-        indices.push(col1 as u32);
-        values.push(((row + 1) % 256) as u8);
-        values.push(((row + 2) % 256) as u8);
+        let val0 = ((row + 1) % 256) as u8;
+        let val1 = ((row + 2) % 256) as u8;
+        let ((c0, v0), (c1, v1)) = if col0 <= col1 {
+            ((col0, val0), (col1, val1))
+        } else {
+            ((col1, val1), (col0, val0))
+        };
+        indices.push(c0 as u32);
+        indices.push(c1 as u32);
+        values.push(v0);
+        values.push(v1);
         indptr.push(indptr.last().unwrap() + 2);
     }
 
