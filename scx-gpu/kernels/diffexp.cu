@@ -450,7 +450,7 @@ extern "C" __global__ void tie_term_sorted_simple_kernel(
         while (j < n_per_gene && row[j] == row[i]) ++j;
         long long c = (long long)(j - i);
         if (c > 1) {
-            sum += (double)(c * c * c - c);
+            sum += (double)c * c * c - (double)c;
         }
         i = j;
     }
@@ -534,7 +534,7 @@ extern "C" __global__ void tie_term_sorted_kernel(
                     ++j;
                 } else {
                     // (cur_v, cur_c) closed strictly inside the slice → inner.
-                    if (cur_c > 1) inner_sum += (double)(cur_c * cur_c * cur_c - cur_c);
+                    if (cur_c > 1) inner_sum += (double)cur_c * cur_c * cur_c - (double)cur_c;
                     cur_v = row[j];
                     cur_c = 1;
                     ++j;
@@ -580,7 +580,7 @@ extern "C" __global__ void tie_term_sorted_kernel(
                 // Multi-run slice: head closes within this slice (it's the
                 // first run of the whole row, can't continue from earlier).
                 long long c = s_head_count[t];
-                if (c > 1) boundary_sum += (double)(c * c * c - c);
+                if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                 open_value = s_tail_value[t];
                 open_count = s_tail_count[t];
             }
@@ -595,7 +595,7 @@ extern "C" __global__ void tie_term_sorted_kernel(
                     if (!u_single) {
                         // u has more runs after the head → open closes now.
                         long long c = open_count;
-                        if (c > 1) boundary_sum += (double)(c * c * c - c);
+                        if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                         open_value = s_tail_value[u];
                         open_count = s_tail_count[u];
                     }
@@ -603,11 +603,11 @@ extern "C" __global__ void tie_term_sorted_kernel(
                 } else {
                     // Open run closes; u's head does not extend it.
                     long long c = open_count;
-                    if (c > 1) boundary_sum += (double)(c * c * c - c);
+                    if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                     if (!u_single) {
                         // u's head closes inside u; only u's tail stays open.
                         long long c2 = s_head_count[u];
-                        if (c2 > 1) boundary_sum += (double)(c2 * c2 * c2 - c2);
+                        if (c2 > 1) boundary_sum += (double)c2 * c2 * c2 - (double)c2;
                         open_value = s_tail_value[u];
                         open_count = s_tail_count[u];
                     } else {
@@ -619,7 +619,7 @@ extern "C" __global__ void tie_term_sorted_kernel(
 
             // Close the final open run.
             long long c = open_count;
-            if (c > 1) boundary_sum += (double)(c * c * c - c);
+            if (c > 1) boundary_sum += (double)c * c * c - (double)c;
         }
 
         tie_term[gene] = block_inner + boundary_sum;
@@ -659,7 +659,7 @@ extern "C" __global__ void combined_tie_term_simple_kernel(
         while (j < n_g   && G[j] == v) { ++j; ++cg; }
         long long c = cr + cg;
         if (c > 1) {
-            sum += (double)(c * c * c - c);
+            sum += (double)c * c * c - (double)c;
         }
     }
     tie_term[gene] = sum;
@@ -737,7 +737,7 @@ extern "C" __global__ void combined_tie_term_kernel(
             // The previous `last` run was displaced by this new run → inner.
             // (When n_runs == 1, `last` is the head, which we don't promote
             // to inner here — head is its own slice-boundary category.)
-            if (last_count > 1) inner_sum += (double)(last_count * last_count * last_count - last_count);
+            if (last_count > 1) inner_sum += (double)last_count * last_count * last_count - (double)last_count;
         }
         last_value = v;
         last_count = c;
@@ -778,7 +778,7 @@ extern "C" __global__ void combined_tie_term_kernel(
                 open_count = s_head_count[t];
             } else {
                 long long c = s_head_count[t];
-                if (c > 1) boundary_sum += (double)(c * c * c - c);
+                if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                 open_value = s_tail_value[t];
                 open_count = s_tail_count[t];
             }
@@ -791,16 +791,16 @@ extern "C" __global__ void combined_tie_term_kernel(
                     open_count += s_head_count[u];
                     if (!u_single) {
                         long long c = open_count;
-                        if (c > 1) boundary_sum += (double)(c * c * c - c);
+                        if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                         open_value = s_tail_value[u];
                         open_count = s_tail_count[u];
                     }
                 } else {
                     long long c = open_count;
-                    if (c > 1) boundary_sum += (double)(c * c * c - c);
+                    if (c > 1) boundary_sum += (double)c * c * c - (double)c;
                     if (!u_single) {
                         long long c2 = s_head_count[u];
-                        if (c2 > 1) boundary_sum += (double)(c2 * c2 * c2 - c2);
+                        if (c2 > 1) boundary_sum += (double)c2 * c2 * c2 - (double)c2;
                         open_value = s_tail_value[u];
                         open_count = s_tail_count[u];
                     } else {
@@ -811,7 +811,7 @@ extern "C" __global__ void combined_tie_term_kernel(
             }
 
             long long c = open_count;
-            if (c > 1) boundary_sum += (double)(c * c * c - c);
+            if (c > 1) boundary_sum += (double)c * c * c - (double)c;
         }
 
         tie_term[gene] = block_inner + boundary_sum;

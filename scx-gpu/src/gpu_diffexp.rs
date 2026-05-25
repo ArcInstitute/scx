@@ -1035,7 +1035,7 @@ mod tests {
             }
             let c = (j - i) as i64;
             if c > 1 {
-                s += (c * c * c - c) as f64;
+                s += c as f64 * c as f64 * c as f64 - c as f64;
             }
             i = j;
         }
@@ -1147,7 +1147,8 @@ mod tests {
                     head_value = v;
                     head_count = c;
                 } else if n_runs >= 2 && last_count > 1 {
-                    inner_sum += (last_count * last_count * last_count - last_count) as f64;
+                    inner_sum += last_count as f64 * last_count as f64 * last_count as f64
+                        - last_count as f64;
                 }
                 last_value = v;
                 last_count = c;
@@ -1184,7 +1185,7 @@ mod tests {
         } else {
             let c = heads_c[t];
             if c > 1 {
-                boundary_sum += (c * c * c - c) as f64;
+                boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
             }
             open_value = tails_v[t];
             open_count = tails_c[t];
@@ -1201,7 +1202,7 @@ mod tests {
                 if !u_single {
                     let c = open_count;
                     if c > 1 {
-                        boundary_sum += (c * c * c - c) as f64;
+                        boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
                     }
                     open_value = tails_v[u];
                     open_count = tails_c[u];
@@ -1209,12 +1210,12 @@ mod tests {
             } else {
                 let c = open_count;
                 if c > 1 {
-                    boundary_sum += (c * c * c - c) as f64;
+                    boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
                 }
                 if !u_single {
                     let c2 = heads_c[u];
                     if c2 > 1 {
-                        boundary_sum += (c2 * c2 * c2 - c2) as f64;
+                        boundary_sum += c2 as f64 * c2 as f64 * c2 as f64 - c2 as f64;
                     }
                     open_value = tails_v[u];
                     open_count = tails_c[u];
@@ -1226,7 +1227,7 @@ mod tests {
         }
         let c = open_count;
         if c > 1 {
-            boundary_sum += (c * c * c - c) as f64;
+            boundary_sum += c as f64 * c as f64 * c as f64 - c as f64;
         }
 
         total_inner + boundary_sum
@@ -1942,8 +1943,8 @@ mod tests {
         let n = 4096usize;
         let row = vec![7.0f32; n];
         let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
-        let n_i64 = n as i64;
-        assert_eq!(got[0], (n_i64 * n_i64 * n_i64 - n_i64) as f64);
+        let n_f64 = n as f64;
+        assert_eq!(got[0], n_f64 * n_f64 * n_f64 - n_f64);
         assert_eq!(got[0], cpu_tie_term(&row));
     }
 
@@ -2005,7 +2006,7 @@ mod tests {
         // Already sorted: 0..99 < 1000 (× 300) < 1001..1200.
         let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
         // Expected: only the 300-long run contributes: 300³ − 300.
-        let expected = (300i64 * 300 * 300 - 300) as f64;
+        let expected = 300.0f64 * 300.0 * 300.0 - 300.0;
         assert_eq!(got[0], expected);
         assert_eq!(got[0], cpu_tie_term(&row));
     }
@@ -2086,7 +2087,7 @@ mod tests {
         assert_eq!(got[0], expected);
         // Sanity: there are 598 copies of 5.0 in the combined sort.
         let c = 598i64;
-        let manual_tie = (c * c * c - c) as f64;
+        let manual_tie = c as f64 * c as f64 * c as f64 - c as f64;
         assert_eq!(got[0], manual_tie);
     }
 
@@ -2116,5 +2117,96 @@ mod tests {
         let expected = cpu_tie_term(&ref_row);
         assert_eq!(got_combined[0], expected);
         assert_eq!(got_combined[0], got_sorted[0]);
+    }
+
+    /// Lock the simple↔block-cooperative dispatch crossover for the sorted-row
+    /// tie kernel. `gpu_de_tie_term` switches at `n_per_gene == 8192`, so
+    /// 8191 hits the simple kernel and 8192/8193 hit the cooperative one.
+    /// A regression on either side would not surface against the existing
+    /// well-above (50k) and well-below (≤4k) tests.
+    #[test]
+    fn test_tie_term_sorted_threshold_boundary() {
+        let dev = require_gpu!();
+        for &n in &[
+            GPU_DE_TIE_BLOCK_THRESHOLD - 1,
+            GPU_DE_TIE_BLOCK_THRESHOLD,
+            GPU_DE_TIE_BLOCK_THRESHOLD + 1,
+        ] {
+            let mut state: u64 = 0xB0DA_C0DE_u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let mut row: Vec<f32> = (0..n).map(|_| (next() % 64) as f32).collect();
+            cpu_sort_ascending(&mut row);
+            let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+            assert_eq!(got[0], cpu_tie_term(&row), "tie mismatch at n_per_gene={n}");
+        }
+    }
+
+    /// Lock the simple↔block-cooperative dispatch crossover for the combined
+    /// tie kernel. Dispatch is by `n_ref + n_g`. Pairs are chosen so the
+    /// sum spans the threshold.
+    #[test]
+    fn test_combined_tie_term_threshold_boundary() {
+        let dev = require_gpu!();
+        for &(n_ref, n_g) in &[(4096usize, 4095usize), (4096, 4096), (4097, 4096)] {
+            let mut state: u64 = 0xCAFE_F00D_u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u32
+            };
+            let mut r: Vec<f32> = (0..n_ref).map(|_| (next() % 48) as f32).collect();
+            cpu_sort_ascending(&mut r);
+            let mut g: Vec<f32> = (0..n_g).map(|_| (next() % 48) as f32).collect();
+            cpu_sort_ascending(&mut g);
+            let got = run_combined_tie(&dev, std::slice::from_ref(&r), std::slice::from_ref(&g));
+            assert_eq!(
+                got[0],
+                cpu_combined_tie(&r, &g),
+                "combined tie mismatch at (n_ref={n_ref}, n_g={n_g})"
+            );
+        }
+    }
+
+    /// Regression for the i64-cube-overflow bug in `c³ − c`. With a single
+    /// all-tied run of `n = 2_100_000`, `n³` is ~9.26 × 10¹⁸ — strictly
+    /// above i64::MAX (~9.22 × 10¹⁸). If the kernel ever reverts to
+    /// `(double)(c * c * c - c)`, the multiplication overflows i64 before
+    /// the cast and this test catches it. Expected value is computed in
+    /// f64 (exact integer for `n ≤ 2^53`).
+    #[test]
+    fn test_tie_term_sorted_overflow_regression() {
+        let dev = require_gpu!();
+        let n = 2_100_000usize;
+        let row = vec![1.0f32; n];
+        let got = run_tie_term_sorted(&dev, std::slice::from_ref(&row));
+        let n_f64 = n as f64;
+        let expected = n_f64 * n_f64 * n_f64 - n_f64;
+        assert_eq!(got[0], expected);
+    }
+
+    /// Same overflow regression for the combined-tie kernel. The merge of
+    /// two all-`1.0` streams is one run of length `n_ref + n_g = 2_200_000`,
+    /// which cubes to ~1.06 × 10¹⁹ — well past i64::MAX.
+    #[test]
+    fn test_combined_tie_term_overflow_regression() {
+        let dev = require_gpu!();
+        let n_ref = 1_100_000usize;
+        let n_g = 1_100_000usize;
+        let ref_row = vec![1.0f32; n_ref];
+        let group_row = vec![1.0f32; n_g];
+        let got = run_combined_tie(
+            &dev,
+            std::slice::from_ref(&ref_row),
+            std::slice::from_ref(&group_row),
+        );
+        let total = (n_ref + n_g) as f64;
+        let expected = total * total * total - total;
+        assert_eq!(got[0], expected);
     }
 }
