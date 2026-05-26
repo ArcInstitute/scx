@@ -26,10 +26,11 @@
 
 use scx_format::ShardSource;
 use scx_gpu::{
-    build_cell_to_group_dev, build_cell_to_pool_dev, cuda_graphs_enabled, de_v2_enabled,
-    de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
-    gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
-    gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_gene_major,
+    build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev, cuda_graphs_enabled,
+    de_v2_enabled, de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort,
+    gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct,
+    gpu_de_pseudobulk_csr_direct, gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major,
+    gpu_de_scatter_csr_to_gene_major_filtered, gpu_de_scatter_gene_major,
     gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum,
     gpu_de_searchsorted_u_stat, gpu_de_tie_term, CudaSlice, GpuCscShardSource, GpuDevice,
     GpuShardSource, GraphKey, RawGpuShardSource,
@@ -1893,16 +1894,17 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
     }
     let mode_id = geom_mean_mode_id(mode);
 
-    // Device-resident inverse permutations.
-    let ref_cell_to_pool_dev = build_cell_to_pool_dev(dev, &ref_idx_i32, n_obs)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc ref cell_to_pool: {e}")))?;
-    let tg_cell_to_pool_devs: Vec<CudaSlice<i32>> = group_idx_i32
-        .iter()
-        .map(|g| build_cell_to_pool_dev(dev, g, n_obs))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc tg cell_to_pool: {e}")))?;
+    // Code-review #6: replace K+1 per-pool `cell_to_pool` tables with two
+    // tables that scale constant in K (group_id table + in-group-pos table).
+    // Device memory: (K+2)·n_obs·4 → 2·n_obs·4 (atlas-scale win — 4 GB → 80 MB
+    // at n_obs=10M, K=100). v3 scatter launches pass `this_group_id` per
+    // launch; the filtered scatter kernel checks `cell_to_group[cell] ==
+    // this_group_id` and writes to `slab[…, cell_to_pos[cell]]`. v2 driver
+    // still uses the per-pool pattern (out of PR #133 scope).
     let cell_to_group_dev = build_cell_to_group_dev(dev, &all_cells_host, &offsets_host, n_obs)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_group: {e}")))?;
+    let cell_to_pos_dev = build_cell_to_pos_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_pos: {e}")))?;
 
     let n_pool_max = n_ref.max(n_g_max).max(1);
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
@@ -1975,10 +1977,14 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
             .for_each_gpu_shard(|_idx, slot| {
                 let view = slot.view();
                 let n_rows = view.shape.0;
-                gpu_de_scatter_shard_to_gene_major(
+                // group_id = 0 is the reference; 1..=n_test are the test groups
+                // (matches offsets_host layout: ref cells first, then each tg).
+                gpu_de_scatter_csr_to_gene_major_filtered(
                     dev,
                     &view,
-                    &ref_cell_to_pool_dev,
+                    &cell_to_group_dev,
+                    &cell_to_pos_dev,
+                    0,
                     &mut scratch.ref_slab,
                     global_row,
                     n_ref,
@@ -1991,10 +1997,12 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
                     if n_g == 0 {
                         continue;
                     }
-                    gpu_de_scatter_shard_to_gene_major(
+                    gpu_de_scatter_csr_to_gene_major_filtered(
                         dev,
                         &view,
-                        &tg_cell_to_pool_devs[tg_idx],
+                        &cell_to_group_dev,
+                        &cell_to_pos_dev,
+                        (tg_idx + 1) as i32,
                         &mut scratch.per_tg_pool_slabs[tg_idx],
                         global_row,
                         n_g,
@@ -2203,15 +2211,13 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
     }
     let mode_id = geom_mean_mode_id(mode);
 
-    let ref_cell_to_pool_dev = build_cell_to_pool_dev(dev, &ref_idx_i32, n_obs)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc ref cell_to_pool: {e}")))?;
-    let tg_cell_to_pool_devs: Vec<CudaSlice<i32>> = group_idx_i32
-        .iter()
-        .map(|g| build_cell_to_pool_dev(dev, g, n_obs))
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc tg cell_to_pool: {e}")))?;
+    // Code-review #6 (same as v3-CSR): collapse K+1 per-pool cell_to_pool
+    // tables to 2 constant-in-K tables. See pdex_ref_gpu_chunked_v3_csr for
+    // the rationale.
     let cell_to_group_dev = build_cell_to_group_dev(dev, &all_cells_host, &offsets_host, n_obs)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_group: {e}")))?;
+    let cell_to_pos_dev = build_cell_to_pos_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_pos: {e}")))?;
 
     let n_pool_max = n_ref.max(n_g_max).max(1);
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
@@ -2285,10 +2291,13 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
                 if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
                     return Ok(());
                 }
+                // group_id = 0 is the reference; 1..=n_test are tg slabs.
                 gpu_de_scatter_csc_to_gene_major(
                     dev,
                     csc_view,
-                    &ref_cell_to_pool_dev,
+                    &cell_to_group_dev,
+                    &cell_to_pos_dev,
+                    0,
                     &mut scratch.ref_slab,
                     c0,
                     c1,
@@ -2303,7 +2312,9 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
                     gpu_de_scatter_csc_to_gene_major(
                         dev,
                         csc_view,
-                        &tg_cell_to_pool_devs[tg_idx],
+                        &cell_to_group_dev,
+                        &cell_to_pos_dev,
+                        (tg_idx + 1) as i32,
                         &mut scratch.per_tg_pool_slabs[tg_idx],
                         c0,
                         c1,

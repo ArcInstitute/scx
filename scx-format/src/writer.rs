@@ -3336,6 +3336,134 @@ mod tests {
         assert_eq!(r1, 3..6);
     }
 
+    /// Regression test for the per-shard `index_dtype` writer fix.
+    ///
+    /// Before the fix, `write_csc_shard` stamped every shard with
+    /// `header.index_dtype` (set from `n_vars` at file creation). Files
+    /// with `n_obs > 65535` and `n_vars ≤ 65535` would attempt to encode
+    /// CSC row indices as u16 and fail with
+    /// `codec error: I/O error: index 65546 exceeds u16 range`.
+    ///
+    /// The fix derives `index_dtype` per shard from the actual minor-axis
+    /// bound: `n_obs` for CSC, `n_vars` for CSR. This test pins that
+    /// behavior with a synthetic file at `n_obs = 70_000, n_vars = 20`
+    /// (the file header still says `index_dtype = 0`/u16 — that's
+    /// correct for the CSR shards — but the CSC shard auto-widens to u32).
+    ///
+    /// Without the writer fix in commit 0bb556e, this test fails at
+    /// `write_csc_shard` with the u16 overflow error.
+    #[test]
+    fn test_csc_shard_large_n_obs_roundtrip() {
+        use crate::reader::ScxReader;
+
+        // n_obs > 65535 so CSC row indices need u32 even though n_vars
+        // (=20) would fit in u16 if indices were column-style.
+        let n_rows: usize = 66_000;
+        let n_cols: usize = 20;
+        // Per-CSR-shard cap is u16 (BlockIndexEntry::new). Split into 2
+        // empty CSR shards of ~33000 rows each.
+        let csr_rows_per_shard: usize = 33_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large_n_obs_csc.scx");
+
+        // File-level header says index_dtype = 0 (u16). CSR indices would
+        // fit (n_vars=20 < 65535); CSC row indices would NOT.
+        let header = csc_test_header(n_rows as u64, n_cols as u64);
+        assert_eq!(header.index_dtype, 0);
+
+        // Build obs/var batches sized to the dimensions.
+        let obs_ids: Vec<String> = (0..n_rows).map(|i| format!("c{i}")).collect();
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let obs = RecordBatch::try_new(
+            Arc::new(obs_schema),
+            vec![Arc::new(StringArray::from(
+                obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let var_ids: Vec<String> = (0..n_cols).map(|i| format!("g{i}")).collect();
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let var = RecordBatch::try_new(
+            Arc::new(var_schema),
+            vec![Arc::new(StringArray::from(
+                var_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&obs).unwrap();
+        writer.write_var(&var).unwrap();
+
+        // Two empty CSR shards (`n_rows + 1` zeros each) to stay under
+        // the 65535 rows-per-block limit.
+        for shard_start in (0..n_rows).step_by(csr_rows_per_shard) {
+            let shard_end = (shard_start + csr_rows_per_shard).min(n_rows);
+            let shard_rows = shard_end - shard_start;
+            let csr_indptr = vec![0u64; shard_rows + 1];
+            writer
+                .write_csr_shard(
+                    &csr_indptr,
+                    &[],
+                    &[],
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    shard_start as u64,
+                )
+                .unwrap();
+        }
+
+        // CSC shard: every gene gets ONE nonzero at row `65535 + col_idx`.
+        // Row indices range from 65535 (just at the u16 boundary) to 65555
+        // (clearly past it). Without the writer fix, this trips the u16
+        // overflow at write time.
+        let mut csc_indptr: Vec<u64> = Vec::with_capacity(n_cols + 1);
+        csc_indptr.push(0);
+        let mut csc_indices: Vec<u32> = Vec::with_capacity(n_cols);
+        let mut csc_values: Vec<u8> = Vec::with_capacity(n_cols);
+        for col in 0..n_cols {
+            let row_idx = (65_535 + col) as u32; // 65535, 65536, …, 65554
+            csc_indices.push(row_idx);
+            csc_values.push(((col % 200) as u8).saturating_add(1));
+            csc_indptr.push(csc_indices.len() as u64);
+        }
+
+        writer
+            .write_csc_shard(
+                &csc_indptr,
+                &csc_indices,
+                &csc_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0, // covers cols [0, n_cols)
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Read back via the high-level CSC API.
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(reader.csc_shard_count(), 1);
+        // File-level index_dtype unchanged from the header (u16); the per-
+        // shard index_dtype is what was widened to u32 internally.
+        assert_eq!(reader.header().index_dtype, 0);
+
+        let csc = reader.read_csc_shard(0).unwrap();
+        assert_eq!(csc.shape, (n_rows, n_cols));
+        // Spot-check every column's single nonzero.
+        for col in 0..n_cols {
+            let start = csc.indptr[col] as usize;
+            let end = csc.indptr[col + 1] as usize;
+            assert_eq!(end - start, 1, "col {col} should have exactly 1 nonzero");
+            let expected_row = (65_535 + col) as i32;
+            assert_eq!(
+                csc.indices[start], expected_row,
+                "col {col}: row index did not roundtrip (n_obs > 65535)"
+            );
+            let expected_val = ((col % 200) as u8).saturating_add(1) as f32;
+            assert_eq!(csc.data[start], expected_val, "col {col}: value mismatch");
+        }
+    }
+
     /// Codec sweep: write a single CSC shard under every supported
     /// codec × value-encoding combination and confirm round-trip
     /// equality. Pcodec exercises a different decode path than

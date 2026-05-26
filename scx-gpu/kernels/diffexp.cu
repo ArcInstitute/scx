@@ -158,6 +158,50 @@ extern "C" __global__ void csr_shard_to_gene_major_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// G4 v3 (post code-review #6, CSR variant): identical scatter shape to
+// `csr_shard_to_gene_major_kernel` above, but reads the cell membership
+// from combined `cell_to_group + cell_to_pos` tables (with a launch-time
+// `this_group_id` filter). Used by the v3 drivers ONLY; the original
+// per-pool kernel above stays in place for v2's caller in G4.1's drivers,
+// since collapsing v2 is out of scope for PR #133.
+//
+// Same race/correctness story as the v2 variant: whole-block early exit
+// when the row's cell is not in `this_group_id`; threads stride the row's
+// nonzeros and write to `slab[gene_local × n_perm + pos]` with `pos =
+// cell_to_pos[cell]`. NO atomicAdd.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_gene_major_filtered_kernel(
+    const long long* __restrict__ indptr,         // [n_shard_rows + 1]
+    const int*       __restrict__ indices,        // [nnz]
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs] group id or -1
+    const int*       __restrict__ cell_to_pos,    // [n_obs] in-group pos or -1
+    int this_group_id,
+    float*           __restrict__ slab,           // [chunk_size × n_perm]
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       n_perm,
+    int       c0,
+    int       c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long cell_global = global_row_offset + (long long)r;
+    if (cell_to_group[cell_global] != this_group_id) return;  // whole-block exit
+    int pos = cell_to_pos[cell_global];
+
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            int gene_local = col - c0;
+            slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // All-groups pseudobulk fold.
 //
 // One block per (gene, group). Threads stride over the group's cell list and
@@ -303,27 +347,31 @@ extern "C" __global__ void csc_shard_pseudobulk_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// G4 v3 (CSC-direct): scatter one CSC shard's nonzeros into a gene-major
-// pool slab. One block per gene; threads stride the column's nonzeros and
-// write `data[e]` into `slab[gene_local × n_perm + pool_pos]` when the
-// cell is in the pool.
+// G4 v3 (CSC-direct, post code-review #6): scatter one CSC shard's nonzeros
+// into a gene-major pool slab using combined cell_to_group + cell_to_pos
+// tables instead of K+1 per-pool `cell_to_pool` tables. Collapses
+// `(K+1) × n_obs × 4` device memory to `2 × n_obs × 4` regardless of K
+// (atlas-scale wins: 4 GB → 80 MB at n_obs=10M, K=100).
 //
-// NO RACE: each (gene_local, pool_pos) cell has at most one writer (each
-// global cell has a unique pool_pos in any given pool, and each cell
-// appears at most once in a given gene's CSC column).
+// One block per gene; threads stride the column's nonzeros. The launch
+// caller passes `this_group_id` (0 = ref, 1..=K = test groups); the kernel
+// writes only the cells where `cell_to_group[cell] == this_group_id`,
+// using `cell_to_pos[cell]` as the in-group position.
 //
-// `slab` MUST be pre-zeroed by the caller before the FIRST shard's
-// scatter — zeros are implicit in the CSC representation.
+// NO RACE, NO atomicAdd: each (gene_local, pos) cell has at most one
+// writer per launch. K+1 launches per shard (one per pool); same launch
+// count as the pre-#6 kernel.
 //
-// One launch per pool (e.g. K+1 launches per shard for K test groups +
-// reference); the caller iterates pools in the driver.
+// `slab` MUST be pre-zeroed by the caller before the FIRST shard's scatter.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void csc_shard_to_gene_major_kernel(
-    const long long* __restrict__ col_indptr,    // [n_cols_in_shard + 1]
-    const int*       __restrict__ row_indices,   // [nnz] global row indices
-    const float*     __restrict__ data,          // [nnz]
-    const int*       __restrict__ cell_to_pool,  // [n_obs], -1 if not in pool
-    float*           __restrict__ slab,          // [chunk_size × n_perm]
+    const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
+    const int*       __restrict__ row_indices,    // [nnz] global row indices
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs] group id or -1
+    const int*       __restrict__ cell_to_pos,    // [n_obs] in-group pos or -1
+    int this_group_id,                            // which group's slab this fills
+    float*           __restrict__ slab,           // [chunk_size × n_perm]
     int n_cols_in_shard,
     int shard_col_start,
     int c0,
@@ -340,9 +388,9 @@ extern "C" __global__ void csc_shard_to_gene_major_kernel(
     long long end   = col_indptr[col_in_shard + 1];
     for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
         int cell = row_indices[e];
-        int pool_pos = cell_to_pool[cell];
-        if (pool_pos >= 0) {
-            slab[(long long)gene_local * (long long)n_perm + (long long)pool_pos] = data[e];
+        if (cell_to_group[cell] == this_group_id) {
+            int pos = cell_to_pos[cell];
+            slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];
         }
     }
 }
