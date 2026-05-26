@@ -432,8 +432,47 @@ def _run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def _slurm_setup_cmds() -> list[str]:
-    """Per-job shell setup: activate the right Python env and clear inherited SLURM vars."""
+def _env_for_format(format_key: str | None) -> str | None:
+    """Map a format key to the conda env that has its deps.
+
+    The bench's env split is documented in
+    ``benchmarks/README.md § "Which environment to use"``: GPU
+    benchmarks live in ``scx-bench-gpu`` (RAPIDS: cuVS, cuGraph),
+    SLAF in ``scx-bench-slaf`` (slafdb / lance — pins conflict with
+    the main env per the slaf yaml), BPCells in ``scx-bench-r`` (R
+    toolchain), and the rest in ``scx-bench``.
+
+    Returns the env name; callers pass it to
+    :func:`_slurm_setup_cmds` so each worker activates the env
+    whose Python interpreter can actually import its deps. The fix
+    eliminates the "cugraph not available" / "cuVS library not
+    found — falling back to CPU HNSW" / "slafdb is not installed"
+    failures that show up when every worker activates the
+    orchestrator's env.
+
+    Returns ``None`` for unknown / missing format keys; the caller
+    then falls back to the orchestrator's ``CONDA_PREFIX``.
+    """
+    if not format_key:
+        return None
+    if "_gpu" in format_key:
+        return "scx-bench-gpu"
+    if "slaf" in format_key:
+        return "scx-bench-slaf"
+    if "bpcells" in format_key:
+        return "scx-bench-r"
+    return "scx-bench"
+
+
+def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
+    """Per-job shell setup: activate the right Python env and clear inherited SLURM vars.
+
+    `env_name` overrides the orchestrator's ``CONDA_PREFIX`` so each
+    worker can land in the env that has its deps (see
+    :func:`_env_for_format`). When ``None``, falls back to the
+    orchestrator's env — preserves the pre-routing behaviour for
+    callers that don't care.
+    """
     import os
     conda_prefix = os.environ.get("CONDA_PREFIX", "")
     env_cleanup = "unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true"
@@ -491,11 +530,21 @@ def _slurm_setup_cmds() -> list[str]:
             val = os.path.expanduser(val) if "DIR" in var else val
             cloud_setup.append(f"export {var}='{val}'")
 
-    if "scx-bench" in conda_prefix:
+    # Prefer the explicitly-routed env from `_env_for_format` over
+    # the orchestrator's own CONDA_PREFIX. Falls back to CONDA_PREFIX
+    # when no route is provided (preserves the legacy "all workers
+    # use the orchestrator's env" behaviour for callers that don't
+    # pass `env_name`).
+    if env_name is None:
+        if "scx-bench" in conda_prefix:
+            env_name = os.path.basename(conda_prefix)
+        else:
+            env_name = None  # fall through to the .venv path below
+
+    if env_name is not None:
         conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
         if not conda_base:
             conda_base = str(Path.home() / "miniforge3")
-        env_name = os.path.basename(conda_prefix)
         return [
             env_cleanup,
             mpi_none,
@@ -526,6 +575,11 @@ def _slurm_params(args, is_conversion: bool = False) -> dict:
         "cpus_per_task": args.cpus,
         "mem_gb": args.mem_gb,
         "timeout_min": timeout_min,
+        # `_slurm_params` is the fallback for callers that don't know
+        # the format yet; without a format we can't route per-env, so
+        # we use the orchestrator's CONDA_PREFIX. The per-job path
+        # below (`_per_job_slurm_params`) is the one that does the
+        # actual routing.
         "slurm_setup": _slurm_setup_cmds(),
     }
 
@@ -631,7 +685,12 @@ def _per_job_slurm_params(
         "cpus_per_task": args.cpus,
         "mem_gb": mem,
         "timeout_min": timeout_min,
-        "slurm_setup": _slurm_setup_cmds(),
+        # Per-job env routing: activate the env that actually has the
+        # format's deps. GPU formats land in scx-bench-gpu (cugraph,
+        # cuvs), slaf in scx-bench-slaf (slafdb), bpcells in
+        # scx-bench-r, everything else in scx-bench. See
+        # `_env_for_format` for the mapping rationale.
+        "slurm_setup": _slurm_setup_cmds(_env_for_format(format_key)),
         # Submitit's ``executor.update_parameters`` mutates the
         # executor's persistent state; values from a previous submit
         # carry over to the next one unless explicitly cleared. This
@@ -795,7 +854,18 @@ def main() -> None:
         logger.info("Phase A: Converting datasets to target formats")
         logger.info("=" * 60)
 
-        executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "convert"))
+        # `slurm_python="python"` overrides submitit's default of baking
+        # the orchestrator's absolute `/path/to/scx-bench/bin/python`
+        # into the srun command. With per-job env routing
+        # (`_env_for_format`) the worker `conda activate`s the right
+        # env in `slurm_setup`; plain `python` then resolves to that
+        # env's interpreter via PATH. Without this override, every
+        # worker uses the orchestrator's python regardless of which
+        # env was activated — defeating the routing fix.
+        executor = submitit.AutoExecutor(
+            folder=str(LOGS_DIR / "convert"),
+            slurm_python="python",
+        )
 
         for ds_name in datasets:
             cfg = DATASETS[ds_name]
@@ -867,7 +937,12 @@ def main() -> None:
     logger.info("Phase B: Submitting benchmark jobs")
     logger.info("=" * 60)
 
-    executor = submitit.AutoExecutor(folder=str(LOGS_DIR / "bench"))
+    # See companion comment on the convert executor above re: why
+    # `slurm_python="python"` is necessary for per-job env routing.
+    executor = submitit.AutoExecutor(
+        folder=str(LOGS_DIR / "bench"),
+        slurm_python="python",
+    )
 
     # Each entry: (label, bench_job, conv_key | None). conv_key points back
     # at conv_jobs so the post-hoc wait loop can attribute a benchmark

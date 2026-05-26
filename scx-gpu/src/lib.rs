@@ -52,6 +52,7 @@ pub mod device;
 pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_diffexp;
+pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
 pub mod gpu_knn;
@@ -84,6 +85,11 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
+pub use gpu_graph::{
+    capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
+    read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,
+    GraphKey,
+};
 pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,
@@ -111,5 +117,5 @@ pub use sparse_dense::{sparse_to_dense_gpu, sparse_to_dense_gpu_into};
 pub use staging::{GpuCsrShardView, GpuCsrSlot, InMemoryCsrShardSource, PinnedCsrSlot};
 
 // Re-export cudarc types used in public API signatures.
-pub use cudarc::driver::safe::{CudaModule, CudaSlice, CudaStream};
+pub use cudarc::driver::safe::{CudaGraph, CudaModule, CudaSlice, CudaStream};
 pub use cudarc::nvrtc::Ptx;
