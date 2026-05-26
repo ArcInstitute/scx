@@ -1511,6 +1511,16 @@ mod gpu_impl {
     };
     use std::sync::Arc;
 
+    /// Test-only counter for `capture_graph` calls made from the
+    /// Harmony k-means sub-iter capture site. Used by the parity test
+    /// to assert "capture once across all outer iters" — pre-G10
+    /// behaviour would have been `max_iter` captures, the hoisted
+    /// behaviour should be exactly 1. Increments live on the capture
+    /// path only; warm-up and replay don't touch this counter.
+    #[cfg(test)]
+    pub(super) static HARMONY_CAPTURE_ATTEMPTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     /// cuBLAS sgemm has fixed launch overhead; the hand-written kernel
     /// is faster at small N. Above this threshold the GEMM path wins.
     const GEMM_N_THRESHOLD: usize = 100_000;
@@ -1840,6 +1850,33 @@ mod gpu_impl {
         let mut order_usize: Vec<usize> = (0..n).collect();
         let mut order_i32: Vec<i32> = vec![0i32; n];
 
+        // G10.2: graph-capture state for the k-means sub-iter kernel
+        // sequence. Hoisted outside the outer iter loop so a single
+        // capture is reused across all max_iter × max_iter_kmeans
+        // sub-iters of this call. All buffers and shape scalars passed
+        // to `run_kmeans_subiter_kernels` (d_order, d_r, d_o, d_e,
+        // d_dist, ..., n, k, b, c_count, n_blocks, block_len) are
+        // allocated/computed above and remain stable for the rest of
+        // the function — the only inter-sub-iter change is d_order's
+        // contents, which the captured graph reads by pointer.
+        let graphs_enabled = cuda_graphs_enabled();
+        let pts: Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+        let dev_pts = dev.with_stream(pts.clone());
+        let mut sub_graph: Option<scx_gpu::CudaGraph> = None;
+        // Warm-up runs once across the entire Harmony call to populate
+        // `dev`'s module cache (so the captured region in the next
+        // sub-iter doesn't trigger a module load). After this flips
+        // true the dispatch picks replay (sub_graph is Some), capture
+        // (sub_graph is None and capture not yet failed), or direct
+        // fallback (capture_failed is true).
+        let mut warmed_up = false;
+        // If the first capture attempt fails, don't keep retrying on
+        // every later sub-iter — fall back to direct dispatch for the
+        // rest of the call. Honours the existing "don't try capture
+        // again for this call" contract that the hoisted layout would
+        // otherwise quietly violate.
+        let mut capture_failed = false;
+
         for iter in 0..state.config.max_iter {
             iters_used = iter + 1;
 
@@ -1880,26 +1917,17 @@ mod gpu_impl {
                 .map_err(|e| AccelError::LinAlg(format!("GPU compute_o_e: {e}")))?;
             }
 
-            // G10.2: k-means sub-loop dispatch.
-            //
-            // The sub-iter kernel sequence
-            // (`run_kmeans_subiter_kernels`) is shape-stable across
-            // all sub-iters of all outer iters in this call: block
-            // count, block length, kernel arg pointers, and grid
-            // dimensions are all decided before the iter loop. We
-            // capture it ONCE into a CudaGraph keyed on
-            // (n_obs, k, n_pcs, n_batch_levels) and replay for the
-            // remaining max_iter × max_iter_kmeans − 1 sub-iters,
-            // amortizing the per-launch dispatch overhead across the
-            // n_blocks × 3 + 2 kernel launches per sub-iter.
+            // G10.2: k-means sub-loop dispatch. See the hoisted
+            // `sub_graph` / `warmed_up` setup above the outer iter
+            // loop for the capture-once contract.
             //
             // Capture stream: `dev_pts = dev.with_stream(per_thread_
             // stream())`. The per-thread default stream is capturable
             // and does NOT flip cudarc into multi-stream-mode (see
             // gpu_graph module docs for why that matters). The clone
-            // shares the module cache via shallow-clone, so the four
-            // captured kernels reuse the HARMONY_PTX module that
-            // sub-iter 0 of iter 0 loaded into `dev`'s cache.
+            // shares the module cache via shallow-clone, so the
+            // captured kernels reuse the HARMONY_PTX module that the
+            // warm-up sub-iter loaded into `dev`'s cache.
             //
             // CPU shuffle + memcpy_htod(d_order) stays outside the
             // captured region; the captured graph reads the freshly-
@@ -1907,14 +1935,15 @@ mod gpu_impl {
             // stable, only its contents change). Likewise the
             // post-sub-iter sync + dtoh + convergence check stay on
             // the host orchestrator.
-            let graphs_enabled = cuda_graphs_enabled();
-            let pts: Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
-            let dev_pts = dev.with_stream(pts.clone());
-            // Captured lazily on the first sub-iter (after warm-up).
-            let mut sub_graph: Option<scx_gpu::CudaGraph> = None;
+            //
+            // `local_obj` is the per-outer-iter k-means objective
+            // window consumed by `check_convergence_kmeans`; it must
+            // reset per outer iter (each outer iter runs an
+            // independent k-means trajectory), so it stays declared
+            // here rather than alongside the hoisted graph state.
             let mut local_obj: Vec<f64> = Vec::new();
 
-            for (sub_idx_overall, _sub) in (0..state.config.max_iter_kmeans).enumerate() {
+            for _sub in 0..state.config.max_iter_kmeans {
                 // Reshuffle order for this sub-iter (mirrors CPU
                 // update_r's per-sub-iter shuffle).
                 order_usize.shuffle(&mut state.rng);
@@ -1938,18 +1967,21 @@ mod gpu_impl {
 
                 // Sub-iter execution strategy:
                 //
-                // 1. First sub-iter of the whole run + when graphs
-                //    are enabled: run directly to populate `dev`'s
-                //    module cache. dev_pts shares this cache via
-                //    shallow clone, so subsequent capture will not
-                //    issue a module load inside the captured region.
+                // 1. First sub-iter of the whole Harmony call (when
+                //    graphs are enabled): run directly to populate
+                //    `dev`'s module cache. dev_pts shares this cache
+                //    via shallow clone, so the subsequent capture
+                //    will not issue a module load inside the captured
+                //    region. Fires once across all outer iters.
                 // 2. After warm-up: try to capture the sub-iter the
                 //    first time `sub_graph` is None. Subsequent
-                //    sub-iters launch the cached graph.
+                //    sub-iters (in this AND every later outer iter)
+                //    launch the cached graph.
                 // 3. Kill switch (`!graphs_enabled`) or capture
                 //    failure: run directly on `dev`.
-                if !graphs_enabled || sub_idx_overall == 0 {
-                    // Direct path (warm-up or kill switch).
+                if !graphs_enabled || !warmed_up || capture_failed {
+                    // Direct path (warm-up, kill switch, or post-
+                    // capture-failure for the rest of the call).
                     let active_dev = if graphs_enabled { &dev_pts } else { &dev };
                     run_kmeans_subiter_kernels(
                         active_dev,
@@ -1973,6 +2005,7 @@ mod gpu_impl {
                         n_blocks,
                         block_len,
                     )?;
+                    warmed_up = true;
                 } else if let Some(graph) = &sub_graph {
                     // Replay path (the common case after the first
                     // captured sub-iter).
@@ -1980,10 +2013,16 @@ mod gpu_impl {
                         AccelError::LinAlg(format!("harmony sub-iter graph.launch: {e}"))
                     })?;
                 } else {
-                    // First capture attempt (sub_idx_overall == 1).
-                    // capture_graph records into the graph WITHOUT
-                    // executing; we then launch the returned graph
-                    // to actually run the work for this sub-iter.
+                    // First capture attempt — fires on the sub-iter
+                    // after the warm-up direct run, then never again
+                    // for the rest of the Harmony call (subsequent
+                    // sub-iters across all outer iters take the
+                    // replay branch above). capture_graph records
+                    // into the graph WITHOUT executing; we then
+                    // launch the returned graph to actually run the
+                    // work for this sub-iter.
+                    #[cfg(test)]
+                    HARMONY_CAPTURE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let pts_for_capture = pts.clone();
                     let capture_result = capture_graph(&pts_for_capture, |_stream| {
                         run_kmeans_subiter_kernels(
@@ -2026,7 +2065,10 @@ mod gpu_impl {
                             // Capture failed or returned no graph —
                             // fall back to direct run for THIS
                             // sub-iter and don't try capture again
-                            // for this call.
+                            // for this call. The `capture_failed`
+                            // flag pushes every later sub-iter through
+                            // the direct path above.
+                            capture_failed = true;
                             run_kmeans_subiter_kernels(
                                 &dev_pts,
                                 &d_order,
@@ -2944,6 +2986,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test for the hoisted `sub_graph` lifecycle: across
+    /// a multi-outer-iter Harmony run, the k-means sub-iter capture
+    /// must fire exactly ONCE (not once per outer iter). Pre-G10.2
+    /// hoist behaviour was `max_iter` captures; post-hoist should be
+    /// exactly 1 (warm-up runs first, capture fires on the second
+    /// sub-iter, every other sub-iter across all later outer iters
+    /// replays).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_gpu_harmony_captures_once_across_outer_iters() {
+        if scx_gpu::GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping Harmony capture-count test");
+            return;
+        }
+        let n_per = 80;
+        let d = 5;
+        let (emb, labels) = batched_gaussian(n_per, d, 123);
+        let n = emb.len() / d;
+        let cov = BatchCovariate {
+            labels,
+            n_levels: 2,
+            name: None,
+        };
+        // max_iter ≥ 2 is the load-bearing parameter: a single outer
+        // iter wouldn't distinguish hoisted vs per-iter capture.
+        let config = HarmonyConfig {
+            n_clusters: Some(4),
+            max_iter: 3,
+            random_state: 11,
+            ..Default::default()
+        };
+
+        let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        gpu_impl::HARMONY_CAPTURE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let _ = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+        let captures =
+            gpu_impl::HARMONY_CAPTURE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+        scx_gpu::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(
+            captures, 1,
+            "Harmony k-means sub-iter capture fired {captures} times across \
+             {} outer iters; expected exactly 1. A count equal to max_iter \
+             means `sub_graph` is still being re-declared inside the outer \
+             loop instead of hoisted above it.",
+            config.max_iter
+        );
     }
 
     #[cfg(feature = "gpu")]

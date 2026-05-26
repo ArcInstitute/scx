@@ -260,13 +260,11 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > **The comprehensive benchmark orchestrators (`run_parallel.py`,
 > `capture_baseline.py`, `gate_candidate.py`) MUST be launched from
 > within the `scx-bench` conda env, not the dev `.venv/`.** This
-> isn't a soft preference — it's load-bearing. `run_parallel.py`'s
-> `_slurm_setup_cmds()` only activates a conda env on each SLURM
-> worker when the orchestrator's own `CONDA_PREFIX` contains
-> `"scx-bench"`. Launched from `.venv/`, every SLURM job's PATH
-> falls back to `.venv/bin` — which does **not** include `mudata`,
-> `slafdb`, `BPCells`, or other format-runner deps. The cascade
-> failure mode is recurring + expensive:
+> isn't a soft preference — it's load-bearing. Launched from `.venv/`,
+> every SLURM job's PATH falls back to `.venv/bin` — which does
+> **not** include `mudata` or other format-runner deps that live in
+> the conda env stack. The cascade failure mode is recurring +
+> expensive:
 >
 > 1. Convert phase: many `convert_from_h5ad` jobs ImportError at runtime
 >    because the dependency isn't on `.venv/bin/python`.
@@ -282,10 +280,37 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 > python benchmarks/comprehensive/scripts/gate_candidate.py --tier small
 > ```
 >
-> The orchestrator now also emits a loud runtime warning when
-> launched from a non-scx-bench env, but it does not refuse — narrow
-> manual runs (e.g. `--accel-only` on a CPU laptop) sometimes work
-> from `.venv/` if the relevant runners' deps happen to be present.
+> `run_parallel.py` then **automatically routes each SLURM worker to
+> the right env per its format key** (see `_env_for_format`):
+> `_gpu*` → `scx-bench-gpu`, `slaf*` → `scx-bench-slaf`,
+> `bpcells*` → `scx-bench-r`, everything else → `scx-bench`. The
+> operator does not need to launch from a different env or pass
+> `--formats` to scope away from "missing deps in current env" — the
+> per-job routing handles it. Workers use `srun python` (via
+> `slurm_python="python"` on the `AutoExecutor`) so the `conda
+> activate <env>` in `slurm_setup` actually determines which
+> interpreter the worker runs under.
+>
+> **Build pyscx with `--features gpu` always.** The editable .so
+> from `maturin develop` is written to the source tree (one .so per
+> repo, shared across all conda envs); a build without
+> `--features gpu` from any env silently disables GPU support
+> everywhere — `pyscx.accel.gpu_info()` then returns `None`, every
+> bench module's `_HAS_PYSCX_GPU` evaluates to `False` at import
+> time, and GPU bench variants are filtered out of submission
+> entirely (jobs "complete successfully" producing no JSON output).
+> The canonical sequence:
+>
+> ```bash
+> cd pyscx
+> conda activate scx-bench-gpu   # any env; only one shared .so
+> maturin develop --release --features gpu
+> ```
+>
+> Then verify: `for env in scx-bench scx-bench-gpu scx-bench-slaf; do
+> conda activate $env && python -c "import pyscx;
+> print(bool(pyscx.accel.gpu_info()))" && conda deactivate; done`
+> — all three should print `True` on a host with CUDA visible.
 
 **Comprehensive benchmark suite** (`comprehensive/`):
 
@@ -296,9 +321,9 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 | `comprehensive/scripts/run_parallel.py` | **`scx-bench`** | `conda activate scx-bench` |
 | `comprehensive/scripts/run_all.py` | `scx-bench` | `conda activate scx-bench` |
 | `comprehensive/scripts/validate_*.py` | `scx-bench` | `conda activate scx-bench` |
-| GPU benchmarks | `scx-bench-gpu` | `conda activate scx-bench-gpu` |
-| BPCells benchmarks | `scx-bench-r` | `conda activate scx-bench-r` |
-| SLAF benchmarks | `scx-bench-slaf` | `conda activate scx-bench-slaf` |
+| GPU benchmark workers (auto-routed) | `scx-bench-gpu` | per-job, via `_env_for_format` |
+| BPCells benchmark workers (auto-routed) | `scx-bench-r` | per-job, via `_env_for_format` |
+| SLAF benchmark workers (auto-routed) | `scx-bench-slaf` | per-job, via `_env_for_format` |
 
 **Legacy scripts** (`scripts/`) still reference the dev `.venv/` (CPU) and the `scx-gpu` conda env (GPU), and are preserved as-is.
 

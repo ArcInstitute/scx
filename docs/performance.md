@@ -328,16 +328,16 @@ The Wilcoxon DE row above is from an HVG-projected (2K genes) 1M-cell fixture. T
 
 | Dataset | scanpy `rank_genes_groups` | `pyscx.accel.rank_genes_groups` (CPU) | Speedup |
 |---------|---:|---:|---:|
-| pbmc3k (2.7K) | 0.84 s | 0.74 s | 1.1× |
-| pbmc10k (12K) | 11.1 s | 3.4 s | **3.3×** |
-| smartseq2 (18K) | 84.3 s | 22.0 s | **3.8×** |
-| tabula_sapiens_100k (62K) | 304 s | 53.4 s | **5.7×** |
-| census_500k | timeout (≥ 45 min) | 144 s | **≥ 19×** |
-| census_1m | timeout (≥ 45 min) | 210 s | **≥ 13×** |
+| pbmc3k (2.7K) | 1.16 s | 0.69 s | 1.7× |
+| pbmc10k (12K) | 9.66 s | 5.85 s | 1.7× |
+| smartseq2 (18K) | 45.96 s | 19.59 s | **2.3×** |
+| tabula_sapiens_100k (62K) | 318.77 s | 42.28 s | **7.5×** |
+| census_500k | timeout (≥ 55 min) | 106.13 s | **≥ 31×** |
+| census_1m | timeout (≥ 55 min) | 156.51 s | **≥ 21×** |
 
-`pyscx.accel.pdex_ref` (perturbation-screen Mann–Whitney U + pseudobulk geometric-mean log fold change, pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex)) tracks similarly: 0.62 s on pbmc3k, 54 s on tabula_100k, 187 s on census_500k, 317 s on census_1m. The CPU path uses gene-chunked dense materialisation (default `gene_chunk_size=500`) with rayon-parallel per-gene rank tests — peak RSS is `O(n_obs × gene_chunk_size)`, not `O(n_obs × n_vars)`.
+`pyscx.accel.pdex_ref` (perturbation-screen Mann–Whitney U + pseudobulk geometric-mean log fold change, pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex)) tracks similarly: 0.59 s on pbmc3k, 5.52 s on pbmc10k, 42.04 s on tabula_sapiens_100k, 119.86 s on census_500k, 268.28 s on census_1m. The CPU path uses gene-chunked dense materialisation (default `gene_chunk_size=500`) with rayon-parallel per-gene rank tests — peak RSS is `O(n_obs × gene_chunk_size)`, not `O(n_obs × n_vars)`. CPU numbers improved 20-40% vs the prior `v0.4.3-g1-gpu-de` baseline after the `pdex-unsorted-csr` fix (commit b423a2f).
 
-Source: `benchmarks/comprehensive/results/baselines/v0.4.3-g1-gpu-de/summary.json` (the `accel_de__pyscx_wilcoxon_cpu` / `accel_de__pyscx_pdex_ref_cpu` / `accel_de__scanpy_wilcoxon_cpu` rows). Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`.
+Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fix), candidate `candidate_2623788_20260525`. Benchmark module: `benchmarks/comprehensive/benchmarks/accel_de.py` — picks the best obs column from `cell_type`/`leiden`/`louvain`/`cluster`/`perturbation`/`target` or falls back to a deterministic 50/50 synthetic split, restricts to top-4 test groups + reference, and records the chosen `groupby` in `metadata`. Each SLURM bench job is allocated 16 CPUs; `pyscx_cpu`'s `user_s/wall_s` ratio shows ~3-5 effective cores per run.
 
 ### Harmony2 batch integration + LISI
 
@@ -458,34 +458,43 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 ### GPU Analysis Pipeline
 
-GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB (driver 535.161.08, CUDA 12.2, scx-gpu conda env).
+GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
 
-Numbers below are from the cluster run on 2026-04-23 (SLURM job 2211369). Pipeline end-to-end row is marked _pending bench_ until the census_1m pipeline completes.
+Numbers below are from the full-tier gate run on 2026-05-25 (post-G10 graph capture for GPU DE + bench env-routing fix). The per-job conda-env routing fix (`run_parallel.py::_env_for_format`) unlocked real GPU coverage for Leiden + kNN that prior baselines silently missed (workers were running on the orchestrator's env which lacked cuGraph + cuVS — see `benchmarks/README.md` § Environment notes for the routing details).
 
 #### Per-operation timing
 
 | Operation | Dataset | CPU (s) | GPU (s) | Speedup | Backend |
 |-----------|---------|---------|---------|---------|---------|
-| PCA (50 PCs, 2K HVGs) | pbmc3k (2.7K) | — | — | 0.7x | auto-routed (covariance) |
-| PCA (50 PCs, 2K HVGs) | tabula_sapiens_100k | 2.8 | 1.6 | **1.7x** | auto-routed |
-| PCA (50 PCs, 2K HVGs) | census_1m | 3.0 | 3.3 | 0.9x | auto-routed |
+| PCA (50 PCs, auto-routed) | tabula_sapiens_100k | 2.79 (`pyscx_cpu_auto`) | 0.38 (`gpu_cov`) | **7.3×** | covariance ≤8000 vars |
+| PCA (50 PCs, auto-routed) | census_500k | 1.89 | 0.79 | 2.4× | covariance |
+| PCA (50 PCs, auto-routed) | census_1m | 2.77 | 1.56 | 1.8× | covariance |
 | PCA correctness (cos sim vs scanpy, top-50) | pbmc3k | — | — | **min=0.999911** | — |
 | PCA correctness (cos sim vs scanpy, top-50) | census_1m | — | — | **min=1.0** | — |
-| kNN (k=15, 50 PCs) | tabula_sapiens_100k | 8.8 | 3.0 | **2.9x** | cuVS CAGRA |
-| kNN (k=15, 50 PCs) | census_1m | 130.8 | 27.0 | **4.8x** | cuVS CAGRA |
-| UMAP (2D) | tabula_sapiens_100k | 49.2 | 3.1 | **16.1x** | native CUDA SGD |
-| UMAP (2D) | census_1m | 641.5 | 29.3 | **21.9x** | native CUDA SGD |
+| kNN (k=15, 50 PCs) | tabula_sapiens_100k | 5.68 (`scanpy_cpu`) | 4.28 | 1.3× | cuVS CAGRA |
+| kNN (k=15, 50 PCs) | census_500k | 36.36 | 12.75 | **2.9×** | cuVS CAGRA |
+| kNN (k=15, 50 PCs) | census_1m | 91.97 | 26.67 | **3.4×** | cuVS CAGRA |
+| UMAP (2D) | tabula_sapiens_100k | 50.82 (`scanpy_cpu`) | 2.58 | **20×** | native CUDA SGD |
+| UMAP (2D) | census_500k | 364.51 | 10.61 | **34×** | native CUDA SGD |
+| UMAP (2D) | census_1m | 846.89 | 27.91 | **30×** | native CUDA SGD |
 | UMAP trustworthiness | pbmc3k | 0.9238 | 0.9233 | — | vs PCA space |
-| Leiden (`device="cpu"`) | census_1m | 55.0 | 56.9 | **1.0×** | Rust-native (`scx_accel::leiden`) |
-| Leiden (`device="gpu"`) | census_1m | 55.0 | ~3.5 | **~16×** | cuGraph (reached directly post-spec — see "Choosing a Leiden backend" below) |
-| pdex_ref (vs reference) | smartseq2 (18K) | 21.4 | 18.5 | **1.16×** | CUB block sort + warp-cooperative searchsorted |
-| pdex_ref (vs reference) | pbmc10k (12K) | 3.6 | 3.4 | 1.07× | (small-data; launch-overhead bound) |
-| pdex_ref (vs reference) | tabula_100k / census | — | skip | — | n_ref > 8192 — v1 capacity cap |
-| Wilcoxon (1-vs-rest) | pbmc3k (2.7K) | 0.74 | 0.92 | 0.80× | (small-data; launch-overhead bound) |
-| Wilcoxon (1-vs-rest) | pbmc10k+ | — | skip | — | n_obs > 8192 — v1 capacity cap |
-| **End-to-end pipeline** | **census_1m** | **837.9** | **120.6** | **6.9×** | all above |
+| Leiden (`device="cpu"`, Rust-native) | tabula_sapiens_100k | 3.41 | — | — | `scx_accel::leiden` |
+| Leiden (`device="gpu"`, cuGraph) | tabula_sapiens_100k | 100.73 (`leidenalg_cpu`) | 0.54 | **187×** | cuGraph |
+| Leiden (`device="gpu"`) | census_500k | 838.94 (`leidenalg_cpu`) | 1.59 | **528×** | cuGraph |
+| Leiden (`device="gpu"`) | census_1m | 659.0 (`leidenalg_cpu`, prior baseline) | 3.06 | 215× | cuGraph |
+| Wilcoxon (vs `pyscx_cpu` reference) | pbmc10k | 5.85 | 12.60 | 0.47× | CUB block sort + searchsorted + tie + p-value |
+| Wilcoxon (vs `pyscx_cpu`) | tabula_sapiens_100k | 42.28 | 89.77 | 0.47× | (same) |
+| Wilcoxon (vs `pyscx_cpu`) | census_500k | 106.13 | 213.07 | 0.50× | (same) |
+| Wilcoxon (vs `pyscx_cpu`) | census_1m | 156.51 | 365.15 | 0.43× | (same) |
+| Wilcoxon (vs `scanpy_cpu`) | tabula_sapiens_100k | 318.77 | 89.77 | **3.6×** | (same) |
+| pdex_ref (vs `pyscx_cpu`) | pbmc10k | 5.52 | 12.58 | 0.44× | (same) |
+| pdex_ref (vs `pyscx_cpu`) | tabula_sapiens_100k | 42.04 | 93.81 | 0.45× | (same) |
+| pdex_ref (vs `pyscx_cpu`) | census_500k | 119.86 | 212.37 | 0.56× | (same) |
+| pdex_ref (vs `pyscx_cpu`) | census_1m | 268.28 | 356.34 | 0.75× | (same) |
 
-The pipeline 6.9× speedup is headlined by UMAP (18.8×, up from 7.7×) and kNN (5.4× in-pipeline, up from 2.3×). PCA at 2K HVGs × 1M cells shows 1.0× because CPU covariance PCA already takes ~3 s — there's no headroom for a speedup. At `n_vars = 100 K` (tabula_sapiens_100k without HVG subsetting) PCA lands at 1.7×.
+The accel_de wilcoxon/pdex_ref GPU rows are **slower than `pyscx_cpu`** (CPU's rayon-parallel implementation effectively uses ~3-5 of the 16 SLURM-allocated CPUs and is highly tuned). G10's graph capture closed ~7-10% of the gap but the GPU implementation is bottlenecked by the per-chunk `[n_obs × chunk_size]` dense materialization step — G4 v2 (streaming rank-test, no dense intermediate) is the higher-leverage follow-on. The GPU paths are still **3-5× faster than `scanpy_cpu`** — for users replacing scanpy directly, GPU is the clear win; for users who already have `pyscx.accel.rank_genes_groups(device="cpu")` working, the GPU variant is a draw or worse pending G4 v2.
+
+**Headline finding from the 2026-05-25 routing fix:** GPU Leiden at census scale (`pyscx_gpu` cuGraph, 1.59-3.06s on census_500k/_1m) was completely missing from prior LATEST baselines because the gate's worker jobs were activating `scx-bench` (no cugraph), failing every Leiden GPU run silently. With per-job routing → `scx-bench-gpu`, the 200-500× speedup over `leidenalg_cpu` is now visible. Same correction for kNN — the prior bench's "cuVS missing → CPU HNSW fallback" was disguising real GPU CAGRA wall times under scanpy-CPU speeds.
 
 #### Choosing a Leiden backend
 

@@ -248,6 +248,30 @@ pub fn gpu_umap_native(
     };
 
     if graph_outcome.is_err() {
+        // Graph path may have applied a partial epoch range before
+        // failing (one or more successful graph.launch() calls before
+        // an error), leaving d_embedding and d_epoch_of_next_sample
+        // mutated. Drain any in-flight work on the per-thread stream
+        // (the error path in run_sgd_loop_with_graph returns before
+        // its terminating pts.synchronize), then re-upload the
+        // originals so the direct loop's 0..n_epochs schedule starts
+        // from the same baseline as a cold dispatch.
+        //
+        // `context().synchronize()` (cuCtxSynchronize) waits on ALL
+        // streams in the context — necessary because kernels ran on
+        // per_thread_stream, which dev.synchronize() (the legacy
+        // default stream) does not cover.
+        dev.context()
+            .synchronize()
+            .map_err(|e| GpuError::CudaError(format!("ctx sync before fallback reset: {e}")))?;
+        dev.stream()
+            .memcpy_htod(&embedding_f32, &mut d_embedding)
+            .map_err(|e| GpuError::CudaError(format!("reset d_embedding before fallback: {e}")))?;
+        dev.stream()
+            .memcpy_htod(&epoch_of_next_sample_f32, &mut d_epoch_of_next_sample)
+            .map_err(|e| {
+                GpuError::CudaError(format!("reset d_epoch_of_next_sample before fallback: {e}"))
+            })?;
         run_sgd_loop_direct(
             dev,
             &func,
@@ -531,6 +555,21 @@ fn run_sgd_loop_with_graph(
         graph
             .launch()
             .map_err(|e| GpuError::CudaError(format!("graph.launch (umap epoch {epoch}): {e}")))?;
+
+        // Test hook: when set, simulate a partial-launch failure
+        // after N successful replays. Exercises the post-launch
+        // fallback path (where d_embedding / d_epoch_of_next_sample
+        // have been mutated and the caller must reset them before
+        // dispatching the direct loop).
+        #[cfg(test)]
+        if let Some(fail_after) = test_fail_after_replays() {
+            if epoch + 1 >= fail_after {
+                return Err(GpuError::CudaError(format!(
+                    "test fault injection: failing after {} replays",
+                    epoch + 1
+                )));
+            }
+        }
     }
 
     // Drain the side-stream work before returning to the caller, so
@@ -568,6 +607,37 @@ struct UmapKernelArgStorage {
 // ---------------------------------------------------------------------------
 
 use scx_sparse::umap_math::{compute_epochs_per_sample, find_ab_params, random_init_f32};
+
+// ---------------------------------------------------------------------------
+// Test hooks
+// ---------------------------------------------------------------------------
+
+/// Test-only fault injection. When set to `Some(N)` via
+/// [`set_test_fail_after_replays`], `run_sgd_loop_with_graph` returns
+/// `Err` after the Nth successful `graph.launch()`, so the test suite
+/// can exercise the partial-launch fallback path in
+/// `gpu_umap_native`. `None` / `0` (the default) leaves the loop
+/// running through all `n_epochs`.
+#[cfg(test)]
+static TEST_FAIL_AFTER_REPLAYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn test_fail_after_replays() -> Option<usize> {
+    let v = TEST_FAIL_AFTER_REPLAYS.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+#[cfg(test)]
+fn set_test_fail_after_replays(n: Option<usize>) {
+    // Serialised by the test harness — GPU tests in this crate share a
+    // single CUDA context and don't run in parallel.
+    TEST_FAIL_AFTER_REPLAYS.store(n.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -804,6 +874,79 @@ mod tests {
              This suggests the per-epoch alpha/epoch update via \
              cuGraphExecKernelNodeSetParams_v2 is not landing — \
              the graph is replaying with stale captured-time scalars."
+        );
+    }
+
+    /// Fault-injection variant: force `run_sgd_loop_with_graph` to
+    /// fail after a few successful `graph.launch()` calls, which
+    /// leaves `d_embedding` / `d_epoch_of_next_sample` partially
+    /// mutated. The fallback path in `gpu_umap_native` must re-upload
+    /// the host originals before dispatching `run_sgd_loop_direct`,
+    /// otherwise the direct loop's `0..n_epochs` schedule would apply
+    /// SGD on top of already-advanced state and silently produce a
+    /// different embedding.
+    ///
+    /// Verifies the partial-launch reset by comparing the
+    /// fault-injected run to the direct-only baseline within the same
+    /// atomic-race floor used by the non-injected parity test.
+    #[test]
+    fn test_gpu_umap_fallback_after_partial_graph_launches() {
+        let dev = require_gpu!();
+        let (indptr, indices, data, n_obs) = test_graph();
+        let n_epochs = 50;
+
+        // Direct-only baseline (kill switch on, no fault injection).
+        let prev_override = crate::gpu_graph::set_cuda_graphs_enabled_override(Some(false));
+        let direct_a = gpu_umap_native(
+            &dev, &indptr, &indices, &data, n_obs, 2, n_epochs, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .unwrap();
+        let direct_b = gpu_umap_native(
+            &dev, &indptr, &indices, &data, n_obs, 2, n_epochs, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .unwrap();
+
+        // Fault-injected run: graphs ON, fault hook trips after 5
+        // replays. `gpu_umap_native` must then re-upload the host
+        // originals and run the direct loop from epoch 0 cleanly.
+        crate::gpu_graph::set_cuda_graphs_enabled_override(Some(true));
+        super::set_test_fail_after_replays(Some(5));
+        let injected = gpu_umap_native(
+            &dev, &indptr, &indices, &data, n_obs, 2, n_epochs, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .expect("fault-injected gpu_umap_native should recover via fallback");
+        super::set_test_fail_after_replays(None);
+        crate::gpu_graph::set_cuda_graphs_enabled_override(prev_override);
+
+        assert_eq!(injected.embedding.len(), direct_a.embedding.len());
+        for &v in &injected.embedding {
+            assert!(v.is_finite(), "fallback embedding NaN/Inf: {v}");
+        }
+
+        let rmse = |xs: &[f32], ys: &[f32]| -> f32 {
+            let s: f64 = xs
+                .iter()
+                .zip(ys.iter())
+                .map(|(x, y)| (x - y) as f64)
+                .map(|d| d * d)
+                .sum();
+            (s / xs.len() as f64).sqrt() as f32
+        };
+        let floor = rmse(&direct_a.embedding, &direct_b.embedding);
+        let injected_vs_direct = rmse(&injected.embedding, &direct_a.embedding);
+        eprintln!(
+            "umap fallback parity: direct_vs_direct={floor:.4}, \
+             injected_vs_direct={injected_vs_direct:.4}"
+        );
+        let allowed = (floor * 2.0).max(0.5);
+        assert!(
+            injected_vs_direct <= allowed,
+            "fault-injected fallback RMSE {injected_vs_direct:.4} exceeds \
+             2× direct-vs-direct floor {floor:.4} + 0.5 = {allowed:.4}. \
+             This means the partial-launch reset (re-upload of \
+             embedding_f32 / epoch_of_next_sample_f32 via memcpy_htod \
+             before falling back to run_sgd_loop_direct) is not landing — \
+             the direct loop is running on already-mutated buffers."
         );
     }
 
