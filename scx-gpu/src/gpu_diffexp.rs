@@ -32,6 +32,7 @@ use cudarc::driver::PushKernelArg;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_csc_shard_source::GpuCscShardView;
 use crate::staging::GpuCsrShardView;
 
 /// PTX source for the GPU DE kernels, compiled at build time by `scx-gpu/build.rs`.
@@ -625,6 +626,256 @@ pub fn gpu_de_scatter_shard_to_gene_major(
     Ok(())
 }
 
+/// G4 v3: CSR-direct pseudobulk fold — accumulate `[n_groups × chunk_size]`
+/// f64 sums by streaming a CSR shard view directly, skipping the
+/// `[n_obs × chunk_size]` dense intermediate that
+/// [`gpu_de_pseudobulk_all_groups`] reads from.
+///
+/// Pairs with [`build_cell_to_group_dev`] (cell→group inverse permutation,
+/// uploaded once per DE call) and is launched per-shard inside the
+/// `for_each_gpu_shard` loop. `sums` MUST be pre-zeroed by the caller
+/// before the first shard's invocation — atomicAdd accumulates.
+///
+/// `mode_id` selects the per-element pre-transform applied before
+/// summation; same encoding as [`gpu_de_pseudobulk_all_groups`]
+/// (0=identity, 1=expm1, 2=log1p, 3=identity). The host divides by the
+/// group's cell count and applies the matching `mode.post` transform.
+///
+/// Grid: one block per shard row. Whole-block early-exit when the cell is
+/// not in any group (`cell_to_group[global_cell] < 0`). f64 atomicAdd is
+/// hardware-native on H100 (CC 6.0+; H100 is 9.0).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_pseudobulk_csr_direct(
+    dev: &GpuDevice,
+    view: &GpuCsrShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    sums: &mut CudaSlice<f64>,
+    global_row_offset: usize,
+    chunk_size: usize,
+    c0: usize,
+    c1: usize,
+    mode_id: i32,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_shard_rows = view.shape.0;
+    if n_shard_rows == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_shard_rows <= i32::MAX as usize,
+        "n_shard_rows {} exceeds i32::MAX — SCX shard layout invariant violated",
+        n_shard_rows
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csr_shard_pseudobulk_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_pseudobulk_kernel: {e}")))?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shard_rows as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_shard_rows_i32 = n_shard_rows as i32;
+    let global_row_offset_i64 = global_row_offset as i64;
+    let chunk_size_i32 = chunk_size as i32;
+    let c0_i32 = c0 as i32;
+    let c1_i32 = c1 as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&view.indptr)
+            .arg(&view.indices)
+            .arg(&view.data)
+            .arg(cell_to_group_dev)
+            .arg(sums)
+            .arg(&n_shard_rows_i32)
+            .arg(&global_row_offset_i64)
+            .arg(&chunk_size_i32)
+            .arg(&c0_i32)
+            .arg(&c1_i32)
+            .arg(&mode_id)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_pseudobulk_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// G4 v3 (CSC-direct): all-groups pseudobulk fold over one CSC shard.
+///
+/// One block per chunk gene; threads tree-reduce per-group accumulators in
+/// shared memory; thread 0 of each block adds the block result into the
+/// running `sums[g * chunk_size + gene_local]`. **No atomicAdd** —
+/// cross-shard accumulation is safe via stream ordering (each launch reads
+/// the running sum, adds this shard's contribution, writes back).
+///
+/// `sums` MUST be pre-zeroed by the caller before the first shard's
+/// invocation. Blocks whose `gene_global` falls outside the shard's column
+/// range `[csc_view.col_start, csc_view.col_end)` early-exit at no cost.
+///
+/// `mode_id` encoding matches [`gpu_de_pseudobulk_all_groups`] (0=identity,
+/// 1=expm1, 2=log1p, 3=identity).
+///
+/// Shared memory: `n_groups × blockDim.x × sizeof(double)` per block.
+/// `blockDim.x = 128` keeps shared usage ≤ 16 KB even at `n_groups = 16`.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_pseudobulk_csc_direct(
+    dev: &GpuDevice,
+    csc_view: &GpuCscShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    sums: &mut CudaSlice<f64>,
+    c0: usize,
+    c1: usize,
+    chunk_size: usize,
+    n_groups: usize,
+    mode_id: i32,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || c0 >= c1 || n_groups == 0 {
+        return Ok(());
+    }
+    let n_cols_in_shard = csc_view.n_cols();
+    if n_cols_in_shard == 0 {
+        return Ok(());
+    }
+    // Skip entirely if the shard's columns don't overlap the chunk.
+    if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_cols_in_shard <= i32::MAX as usize,
+        "n_cols_in_shard {} exceeds i32::MAX",
+        n_cols_in_shard
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csc_shard_pseudobulk_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+
+    let bx: u32 = 128;
+    let shared_mem_bytes = (n_groups * bx as usize * std::mem::size_of::<f64>()) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes,
+    };
+
+    let n_cols_in_shard_i32 = n_cols_in_shard as i32;
+    let shard_col_start_i32 = csc_view.col_start as i32;
+    let c0_i32 = c0 as i32;
+    let chunk_size_i32 = chunk_size as i32;
+    let n_groups_i32 = n_groups as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&csc_view.col_indptr)
+            .arg(&csc_view.row_indices)
+            .arg(&csc_view.data)
+            .arg(cell_to_group_dev)
+            .arg(sums)
+            .arg(&n_cols_in_shard_i32)
+            .arg(&shard_col_start_i32)
+            .arg(&c0_i32)
+            .arg(&chunk_size_i32)
+            .arg(&n_groups_i32)
+            .arg(&mode_id)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// G4 v3 (CSC-direct): scatter one CSC shard's nonzeros into a gene-major
+/// pool slab `[chunk_size × n_perm]`.
+///
+/// One block per chunk gene; threads stride the gene's CSC column and
+/// write `data[e]` into `slab[gene_local * n_perm + cell_to_pool[cell]]`
+/// when the cell is in the pool. **No atomicAdd, no race** — each
+/// `(gene_local, pool_pos)` cell has at most one writer.
+///
+/// Caller dispatches K+1 launches per shard (one per pool: ref + each test
+/// group). `slab` MUST be pre-zeroed before the first shard's scatter.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_scatter_csc_to_gene_major(
+    dev: &GpuDevice,
+    csc_view: &GpuCscShardView<'_>,
+    cell_to_pool_dev: &CudaSlice<i32>,
+    slab: &mut CudaSlice<f32>,
+    c0: usize,
+    c1: usize,
+    chunk_size: usize,
+    n_perm: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || n_perm == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_cols_in_shard = csc_view.n_cols();
+    if n_cols_in_shard == 0 {
+        return Ok(());
+    }
+    if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_cols_in_shard <= i32::MAX as usize,
+        "n_cols_in_shard {} exceeds i32::MAX",
+        n_cols_in_shard
+    );
+    debug_assert!(
+        n_perm <= i32::MAX as usize,
+        "n_perm {} exceeds i32::MAX",
+        n_perm
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csc_shard_to_gene_major_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("csc_shard_to_gene_major_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_cols_in_shard_i32 = n_cols_in_shard as i32;
+    let shard_col_start_i32 = csc_view.col_start as i32;
+    let c0_i32 = c0 as i32;
+    let chunk_size_i32 = chunk_size as i32;
+    let n_perm_i32 = n_perm as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&csc_view.col_indptr)
+            .arg(&csc_view.row_indices)
+            .arg(&csc_view.data)
+            .arg(cell_to_pool_dev)
+            .arg(slab)
+            .arg(&n_cols_in_shard_i32)
+            .arg(&shard_col_start_i32)
+            .arg(&c0_i32)
+            .arg(&chunk_size_i32)
+            .arg(&n_perm_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_to_gene_major_kernel: {e}")))?;
+
+    Ok(())
+}
+
 /// Build a device-resident `cell_to_pool` table from a host-side cell
 /// permutation (the inverse of `cell_indices` used by
 /// [`gpu_de_scatter_gene_major`]).
@@ -649,6 +900,37 @@ pub fn build_cell_to_pool_dev(
         }
     }
     dev.htod_copy(&cell_to_pool)
+}
+
+/// Build a device-resident `cell_to_group` table from the same flat
+/// `all_group_cells` + CSR-style `group_offsets` representation consumed by
+/// [`gpu_de_pseudobulk_all_groups`]. Each entry of the returned buffer is
+/// either `-1` (cell not in any group) or the group's id (`0..n_groups`)
+/// — the inverse of the per-group cell list.
+///
+/// Used by [`gpu_de_pseudobulk_csr_direct`] (G4 v3 driver) to look up which
+/// group a CSR shard row belongs to inside the kernel. Built once per DE
+/// call and reused across the full chunk loop.
+pub fn build_cell_to_group_dev(
+    dev: &GpuDevice,
+    all_group_cells_host: &[i32],
+    group_offsets_host: &[i32],
+    n_obs: usize,
+) -> Result<CudaSlice<i32>, GpuError> {
+    let mut cell_to_group = vec![-1i32; n_obs];
+    if group_offsets_host.len() < 2 {
+        return dev.htod_copy(&cell_to_group);
+    }
+    for g in 0..group_offsets_host.len() - 1 {
+        let start = group_offsets_host[g] as usize;
+        let end = group_offsets_host[g + 1] as usize;
+        for &cell in &all_group_cells_host[start..end] {
+            if cell >= 0 && (cell as usize) < n_obs {
+                cell_to_group[cell as usize] = g as i32;
+            }
+        }
+    }
+    dev.htod_copy(&cell_to_group)
 }
 
 /// Sort each gene's row of a gene-major slab in ascending order, in-place.
@@ -1260,6 +1542,58 @@ mod de_v2_test_override {
 /// Returns the previous override value.
 pub fn set_de_v2_enabled_override(enabled: Option<bool>) -> Option<bool> {
     de_v2_test_override::set(enabled)
+}
+
+/// G4 v3: returns `true` when `SCX_GPU_DE_V3=1` is set. The env var is
+/// read once and cached so repeated dispatch-site checks are free.
+///
+/// In-process override via [`set_de_v3_enabled_override`] takes
+/// precedence; used by parity tests to toggle v2 vs v3 without
+/// restarting the process.
+///
+/// Takes precedence over [`de_v2_enabled`] at the dispatch sites — v3 is
+/// strictly the larger refactor (drops the dense `[n_obs × chunk_size]`
+/// materialization step entirely), so callers gate v3 first.
+///
+/// Default: **off**. Opt-in until the path has been bench-validated.
+pub fn de_v3_enabled() -> bool {
+    if let Some(v) = de_v3_test_override::current() {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SCX_GPU_DE_V3").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
+mod de_v3_test_override {
+    use std::sync::{Mutex, OnceLock};
+
+    static CELL: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<bool>> {
+        CELL.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn current() -> Option<bool> {
+        *slot().lock().unwrap()
+    }
+
+    pub fn set(value: Option<bool>) -> Option<bool> {
+        let mut guard = slot().lock().unwrap();
+        let prev = *guard;
+        *guard = value;
+        prev
+    }
+}
+
+/// Diagnostic override for [`de_v3_enabled`] — lets parity tests flip
+/// the v2/v3 dispatch in-process. Returns the previous override value.
+pub fn set_de_v3_enabled_override(enabled: Option<bool>) -> Option<bool> {
+    de_v3_test_override::set(enabled)
 }
 
 #[cfg(test)]

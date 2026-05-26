@@ -70,7 +70,12 @@ class ScxRunner(FormatRunner):
         "cloud_filtered",
     })
 
-    def __init__(self, codec: str = "auto", codec_per_modality: bool = True) -> None:
+    def __init__(
+        self,
+        codec: str = "auto",
+        codec_per_modality: bool = True,
+        with_csc: bool = False,
+    ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
                 f"Unsupported codec {codec!r}; "
@@ -83,6 +88,13 @@ class ScxRunner(FormatRunner):
         # multimodal compression sweep; ignored on single-modality
         # convert paths.
         self.codec_per_modality = codec_per_modality
+        # G4.3: when True, also write a CSC sidecar (gene-major shards)
+        # at convert time. Required for `pdex_ref_gpu_streaming` to
+        # exercise the v3 CSC-direct path under `SCX_GPU_DE_V3=1`;
+        # default off to preserve back-compat with pre-G4.3 bench fixtures.
+        # Toggle via the `SCX_BENCH_WITH_CSC=1` env var picked up by
+        # the gate orchestrator (`gate_candidate.py`) and forwarded here.
+        self.with_csc = with_csc
 
     @property
     def name(self) -> str:
@@ -135,7 +147,10 @@ class ScxRunner(FormatRunner):
         t0 = time.perf_counter()
 
         adata = anndata.read_h5ad(h5ad_path)
-        pyscx.from_anndata(adata, output_path, codec=self.codec)
+        from_anndata_kwargs: dict[str, object] = {"codec": self.codec}
+        if self.with_csc:
+            from_anndata_kwargs["csc"] = "always"
+        pyscx.from_anndata(adata, output_path, **from_anndata_kwargs)
 
         wall = time.perf_counter() - t0
         u1, s1 = self._get_cpu_times()

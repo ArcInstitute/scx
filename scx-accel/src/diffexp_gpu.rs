@@ -26,10 +26,12 @@
 
 use scx_format::ShardSource;
 use scx_gpu::{
-    build_cell_to_pool_dev, cuda_graphs_enabled, de_v2_enabled, default_gpu_de_gene_chunk_size,
-    gpu_de_block_sort, gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pvalues,
-    gpu_de_scatter_gene_major, gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major,
-    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, CudaSlice, GpuDevice,
+    build_cell_to_group_dev, build_cell_to_pool_dev, cuda_graphs_enabled, de_v2_enabled,
+    de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
+    gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
+    gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_gene_major,
+    gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum,
+    gpu_de_searchsorted_u_stat, gpu_de_tie_term, CudaSlice, GpuCscShardSource, GpuDevice,
     GpuShardSource, GraphKey, RawGpuShardSource,
 };
 
@@ -129,6 +131,22 @@ pub fn pdex_ref_gpu_sparse(
     let src = scx_gpu::InMemoryCsrShardSource::new(csr);
     let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, &src)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+    if de_v3_enabled() {
+        // In-memory CSR has no CSC sidecar; always fall back to CSR-direct.
+        return pdex_ref_gpu_chunked_v3_csr(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+            &mut shard_src,
+        );
+    }
     if de_v2_enabled() {
         return pdex_ref_gpu_chunked_v2(
             &dev,
@@ -162,10 +180,16 @@ pub fn pdex_ref_gpu_sparse(
 }
 
 /// pdex `mode="ref"` on an SCX-backed reader (shard-streaming, gene-chunked).
+///
+/// `csc_reader`: optional gene-major sidecar reader. When `de_v3_enabled()`
+/// is set and `csc_reader.is_some()`, dispatch routes to the v3 CSC-direct
+/// driver (the perf-winning path). With v3 enabled and no CSC sidecar,
+/// falls back to the v3 CSR-direct driver. Callers without CSC pass `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref_gpu_streaming(
     device_id: usize,
     reader: &scx_format::backed::BackedCsrReader,
+    csc_reader: Option<&scx_format::backed::BackedCscReader>,
     gene_names: &[String],
     groups: &[usize],
     group_names: &[String],
@@ -190,11 +214,44 @@ pub fn pdex_ref_gpu_streaming(
     let dev = open_device(device_id)?;
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
 
-    // Device-resident shard pipeline replaces the per-chunk host
-    // materialise (full-matrix project_csr × n_shards + scatter on host)
-    // + `gpu_de_upload_chunk` round-trip. Each shard's CSR uploads once
-    // through the pinned staging ring; per chunk we just zero `scratch.dense`
-    // and dispatch `gpu_de_scatter_shard_to_dense` per shard on device.
+    // V3 dispatch: CSC-first if a sidecar reader was provided, else
+    // CSR-direct fallback. V3 takes precedence over V2.
+    if de_v3_enabled() {
+        if let Some(csc) = csc_reader {
+            let csc_source = csc as &dyn scx_format::shard_source::ColumnShardSource;
+            let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}")))?;
+            return pdex_ref_gpu_chunked_v3_csc(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut gpu_csc_src,
+            );
+        }
+        let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+        return pdex_ref_gpu_chunked_v3_csr(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+            &mut shard_src,
+        );
+    }
+
     let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
     if de_v2_enabled() {
@@ -396,6 +453,25 @@ pub fn pdex_ref_gpu_lazy(
 
     let mut shard_src = RawGpuShardSource::new(&dev, source)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+    if de_v3_enabled() {
+        // Generic `&dyn ShardSource` doesn't expose CSC capability; v3 in
+        // the lazy path is CSR-direct fallback only. The full CSC path
+        // routes through `pdex_ref_gpu_streaming` (which has a concrete
+        // BackedCscReader available).
+        return pdex_ref_gpu_chunked_v3_csr(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+            &mut shard_src,
+        );
+    }
     if de_v2_enabled() {
         return pdex_ref_gpu_chunked_v2(
             &dev,
@@ -1674,6 +1750,662 @@ fn pdex_ref_gpu_chunked_v2<S: GpuShardSource>(
 
     dev.synchronize()
         .map_err(|e| AccelError::LinAlg(format!("GPU DE synchronize: {e}")))?;
+
+    let fdrs: Vec<Vec<f64>> = p_values
+        .iter()
+        .map(|pv| {
+            let clipped: Vec<f64> = pv.iter().map(|&p| p.clamp(0.0, 1.0)).collect();
+            benjamini_hochberg(&clipped)
+        })
+        .collect();
+
+    for pv in p_values.iter_mut() {
+        for p in pv.iter_mut() {
+            *p = p.clamp(0.0, 1.0);
+        }
+    }
+
+    Ok(PdexRefResult {
+        group_names: test_groups
+            .iter()
+            .map(|&g| group_names[g].clone())
+            .collect(),
+        feature_names: gene_names.to_vec(),
+        target_means,
+        ref_means,
+        target_memberships,
+        ref_membership: n_ref,
+        log2_fold_changes,
+        percent_changes,
+        statistics,
+        p_values,
+        fdrs,
+    })
+}
+
+/// G4 v3 helper: compute pdex_ref target/reference means from a
+/// pre-populated `d_sums` `[n_groups × chunk_size]` f64 buffer. Unlike
+/// [`compute_pdex_means_gpu`] this does **not** launch the
+/// `gpu_de_pseudobulk_all_groups` kernel — the v3 driver has already
+/// accumulated sums via either the CSC-direct or CSR-direct pseudobulk
+/// kernels. The only work left is dtoh + per-group divide + `mode.post`.
+fn compute_pdex_means_from_sums(
+    dev: &GpuDevice,
+    d_sums: &CudaSlice<f64>,
+    chunk_size: usize,
+    n_ref: usize,
+    target_memberships: &[usize],
+    mode: GeomMeanMode,
+) -> Result<(Vec<f64>, Vec<Vec<f64>>)> {
+    let n_test = target_memberships.len();
+    let n_groups = 1 + n_test;
+    let host_sums = dev
+        .stream()
+        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 dtoh sums: {e}")))?;
+    let ref_means: Vec<f64> = host_sums
+        .iter()
+        .take(chunk_size)
+        .map(|&s| mode.post(if n_ref == 0 { 0.0 } else { s / n_ref as f64 }))
+        .collect();
+    let mut target_means: Vec<Vec<f64>> = Vec::with_capacity(n_test);
+    for (i, &n_g) in target_memberships.iter().enumerate() {
+        let base = (i + 1) * chunk_size;
+        let mut tm = Vec::with_capacity(chunk_size);
+        for var in 0..chunk_size {
+            if n_g == 0 {
+                tm.push(f64::NAN);
+            } else {
+                let s = host_sums[base + var];
+                tm.push(mode.post(s / n_g as f64));
+            }
+        }
+        target_means.push(tm);
+    }
+    Ok((ref_means, target_means))
+}
+
+/// G4 v3 CSR-fallback driver for `pdex_ref`. Same shape as v2 but drops
+/// the `[n_obs × chunk_size]` dense materialization step: per chunk, zeros
+/// ref + per-tg pool slabs + sums, walks the CSR shard source ONCE per
+/// chunk, populating the per-tg pool slabs (via G4.1's
+/// `gpu_de_scatter_shard_to_gene_major`) and pseudobulk sums (via the new
+/// `gpu_de_pseudobulk_csr_direct`) in a single pass per shard. No dense
+/// scatter, no `gpu_de_pseudobulk_all_groups` call.
+///
+/// Used when `de_v3_enabled()` is true and the input has no CSC sidecar
+/// (in-memory `pdex_ref_gpu_sparse`, or backed/lazy with `has_csc() == false`).
+/// The CSC-direct equivalent [`pdex_ref_gpu_chunked_v3_csc`] is the primary
+/// v3 path when a CSC sidecar is available.
+#[allow(clippy::too_many_arguments)]
+fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
+    dev: &GpuDevice,
+    n_obs: usize,
+    n_vars: usize,
+    chunk_size: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    mode: GeomMeanMode,
+    epsilon: f64,
+    source: &mut S,
+) -> Result<PdexRefResult> {
+    if chunk_size == 0 {
+        return Err(AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let n_groups = group_names.len();
+    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    let ref_cells = &group_indices[reference];
+    let n_ref = ref_cells.len();
+    if n_ref == 0 {
+        return Err(AccelError::InvalidInput(format!(
+            "reference group '{}' has zero cells",
+            group_names[reference]
+        )));
+    }
+    let test_groups: Vec<usize> = (0..n_groups).filter(|&g| g != reference).collect();
+    let target_memberships: Vec<usize> = test_groups
+        .iter()
+        .map(|&g| group_indices[g].len())
+        .collect();
+    let n_g_max = target_memberships.iter().copied().max().unwrap_or(0);
+
+    let ref_idx_i32: Vec<i32> = ref_cells.iter().map(|&c| c as i32).collect();
+    let group_idx_i32: Vec<Vec<i32>> = test_groups
+        .iter()
+        .map(|&g| group_indices[g].iter().map(|&c| c as i32).collect())
+        .collect();
+
+    // Build all_cells / offsets / cell_to_group for the v3 pseudobulk kernel.
+    let n_groups_for_means = 1 + test_groups.len();
+    let mut all_cells_host: Vec<i32> = Vec::with_capacity(n_ref + n_g_max * test_groups.len());
+    let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
+    offsets_host.push(0);
+    all_cells_host.extend(ref_idx_i32.iter().copied());
+    offsets_host.push(all_cells_host.len() as i32);
+    for cells in &group_idx_i32 {
+        all_cells_host.extend(cells.iter().copied());
+        offsets_host.push(all_cells_host.len() as i32);
+    }
+    let mode_id = geom_mean_mode_id(mode);
+
+    // Device-resident inverse permutations.
+    let ref_cell_to_pool_dev = build_cell_to_pool_dev(dev, &ref_idx_i32, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc ref cell_to_pool: {e}")))?;
+    let tg_cell_to_pool_devs: Vec<CudaSlice<i32>> = group_idx_i32
+        .iter()
+        .map(|g| build_cell_to_pool_dev(dev, g, n_obs))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc tg cell_to_pool: {e}")))?;
+    let cell_to_group_dev = build_cell_to_group_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_group: {e}")))?;
+
+    let n_pool_max = n_ref.max(n_g_max).max(1);
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
+    scratch
+        .ensure_ref_slab_capacity(dev, n_ref)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure ref_slab: {e}")))?;
+    scratch
+        .ensure_group_slab_capacity(dev, n_g_max.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure group_slab: {e}")))?;
+    scratch
+        .ensure_sums_capacity(dev, n_groups_for_means)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure sums: {e}")))?;
+    scratch
+        .ensure_aux_capacity(dev, chunk_size * n_pool_max)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
+    let n_test = test_groups.len();
+    scratch
+        .ensure_per_group_capacity(dev, n_test.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_group: {e}")))?;
+    scratch
+        .ensure_per_tg_pool_slabs_capacity(dev, n_test, n_g_max.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_tg_pool_slabs: {e}")))?;
+
+    let mut target_means: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut ref_means: Vec<f64> = Vec::with_capacity(n_vars);
+    let mut log2_fold_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+
+    let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+    let dev_pts = dev.with_stream(pts.clone());
+
+    for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
+        let c1 = (c0 + chunk_size).min(n_vars);
+        let sz = c1 - c0;
+
+        // Pre-zero slabs and sums for atomicAdd accumulation.
+        {
+            let nelem_ref = sz * n_ref;
+            let mut ref_view = scratch.ref_slab.slice_mut(..nelem_ref);
+            dev.stream()
+                .memset_zeros(&mut ref_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset ref_slab: {e}")))?;
+        }
+        for tg_idx in 0..n_test {
+            let n_g = group_indices[test_groups[tg_idx]].len();
+            if n_g == 0 {
+                continue;
+            }
+            let nelem_tg = sz * n_g;
+            let mut tg_view = scratch.per_tg_pool_slabs[tg_idx].slice_mut(..nelem_tg);
+            dev.stream()
+                .memset_zeros(&mut tg_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset tg slab: {e}")))?;
+        }
+        {
+            let nelem_sums = n_groups_for_means * sz;
+            let mut sums_view = scratch.sums.slice_mut(..nelem_sums);
+            dev.stream()
+                .memset_zeros(&mut sums_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset sums: {e}")))?;
+        }
+
+        // Single CSR shard pass per chunk: scatter to ref + per-tg slabs +
+        // accumulate pseudobulk sums via the v3 CSR-direct kernel.
+        let mut global_row = 0usize;
+        source
+            .for_each_gpu_shard(|_idx, slot| {
+                let view = slot.view();
+                let n_rows = view.shape.0;
+                gpu_de_scatter_shard_to_gene_major(
+                    dev,
+                    &view,
+                    &ref_cell_to_pool_dev,
+                    &mut scratch.ref_slab,
+                    global_row,
+                    n_ref,
+                    sz,
+                    c0,
+                    c1,
+                )?;
+                for tg_idx in 0..n_test {
+                    let n_g = group_indices[test_groups[tg_idx]].len();
+                    if n_g == 0 {
+                        continue;
+                    }
+                    gpu_de_scatter_shard_to_gene_major(
+                        dev,
+                        &view,
+                        &tg_cell_to_pool_devs[tg_idx],
+                        &mut scratch.per_tg_pool_slabs[tg_idx],
+                        global_row,
+                        n_g,
+                        sz,
+                        c0,
+                        c1,
+                    )?;
+                }
+                gpu_de_pseudobulk_csr_direct(
+                    dev,
+                    &view,
+                    &cell_to_group_dev,
+                    &mut scratch.sums,
+                    global_row,
+                    sz,
+                    c0,
+                    c1,
+                    mode_id,
+                )?;
+                global_row += n_rows;
+                Ok(())
+            })
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSR shard pass: {e}")))?;
+
+        let (chunk_ref_means, chunk_target_means) =
+            compute_pdex_means_from_sums(dev, &scratch.sums, sz, n_ref, &target_memberships, mode)?;
+
+        let chunk_log2_fc: Vec<Vec<f64>> = chunk_target_means
+            .iter()
+            .map(|tm| {
+                tm.iter()
+                    .zip(chunk_ref_means.iter())
+                    .map(|(t, r)| ((t + epsilon) / (r + epsilon)).log2())
+                    .collect()
+            })
+            .collect();
+        let chunk_percent: Vec<Vec<f64>> = chunk_target_means
+            .iter()
+            .map(|tm| {
+                tm.iter()
+                    .zip(chunk_ref_means.iter())
+                    .map(|(t, r)| (t - r) / (r + epsilon))
+                    .collect()
+            })
+            .collect();
+
+        // Per-chunk DE sequence (sort + tie + searchsort + pvalues) is
+        // unchanged from v2 — reads from per-tg slabs (already populated by
+        // the shard loop). Mode 4 reserved for v3 CSR if graph capture is
+        // later re-enabled; for now skip capture (shard loop count is
+        // dynamic so the per-chunk kernel count diverges from v2).
+        let chunk_max = scratch.chunk_max();
+        let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
+        let _ = chunk_idx;
+        pdex_ref_chunk_gpu_sequence_v2(
+            target_dev,
+            &mut scratch,
+            &test_groups,
+            &group_indices,
+            sz,
+            n_ref,
+            chunk_max,
+        )?;
+
+        ref_means.extend_from_slice(&chunk_ref_means);
+
+        let u_batch_len = n_test * chunk_max;
+        let p_batch_len = n_test * chunk_max;
+        let u_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .u_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (v3csr)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (v3csr): {e}")))?
+        };
+        let p_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .p_per_group
+                .try_slice(..p_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("p_per_group batch slice OOB (v3csr)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh p batch (v3csr): {e}")))?
+        };
+
+        for (tg_idx, &g) in test_groups.iter().enumerate() {
+            target_means[tg_idx].extend_from_slice(&chunk_target_means[tg_idx]);
+            log2_fold_changes[tg_idx].extend_from_slice(&chunk_log2_fc[tg_idx]);
+            percent_changes[tg_idx].extend_from_slice(&chunk_percent[tg_idx]);
+            let n_g = group_indices[g].len();
+            if n_g == 0 {
+                statistics[tg_idx].extend(std::iter::repeat_n(f64::NAN, sz));
+                p_values[tg_idx].extend(std::iter::repeat_n(1.0, sz));
+            } else {
+                let off = tg_idx * chunk_max;
+                statistics[tg_idx].extend_from_slice(&u_batch[off..off + sz]);
+                p_values[tg_idx].extend(p_batch[off..off + sz].iter().map(|&p| p.clamp(0.0, 1.0)));
+            }
+        }
+    }
+
+    dev.synchronize()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSR synchronize: {e}")))?;
+
+    let fdrs: Vec<Vec<f64>> = p_values
+        .iter()
+        .map(|pv| {
+            let clipped: Vec<f64> = pv.iter().map(|&p| p.clamp(0.0, 1.0)).collect();
+            benjamini_hochberg(&clipped)
+        })
+        .collect();
+
+    for pv in p_values.iter_mut() {
+        for p in pv.iter_mut() {
+            *p = p.clamp(0.0, 1.0);
+        }
+    }
+
+    Ok(PdexRefResult {
+        group_names: test_groups
+            .iter()
+            .map(|&g| group_names[g].clone())
+            .collect(),
+        feature_names: gene_names.to_vec(),
+        target_means,
+        ref_means,
+        target_memberships,
+        ref_membership: n_ref,
+        log2_fold_changes,
+        percent_changes,
+        statistics,
+        p_values,
+        fdrs,
+    })
+}
+
+/// G4 v3 CSC-direct driver for `pdex_ref` (primary v3 path when a CSC
+/// sidecar is available). Same shape as the CSR fallback above but the
+/// per-chunk shard pass walks gene columns (CSC) instead of cell rows
+/// (CSR): per CSC shard overlapping `[c0, c1)`, one launch per pool for
+/// the gene-major scatter (K+1 total) + one pseudobulk launch that
+/// tree-reduces per-(gene, group) sums with **no atomicAdd**.
+///
+/// This is the perf-winning v3 path — the CSC tree-reduce matches the
+/// existing `pseudobulk_all_groups_kernel` reduction shape exactly, so the
+/// only thing v3 changes from v2 is dropping the dense intermediate (and
+/// the K+1 dense→slab scatter kernels from v1, already dropped in v2).
+#[allow(clippy::too_many_arguments)]
+fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
+    dev: &GpuDevice,
+    n_obs: usize,
+    n_vars: usize,
+    chunk_size: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    mode: GeomMeanMode,
+    epsilon: f64,
+    source: &mut S,
+) -> Result<PdexRefResult> {
+    if chunk_size == 0 {
+        return Err(AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let n_groups = group_names.len();
+    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    let ref_cells = &group_indices[reference];
+    let n_ref = ref_cells.len();
+    if n_ref == 0 {
+        return Err(AccelError::InvalidInput(format!(
+            "reference group '{}' has zero cells",
+            group_names[reference]
+        )));
+    }
+    let test_groups: Vec<usize> = (0..n_groups).filter(|&g| g != reference).collect();
+    let target_memberships: Vec<usize> = test_groups
+        .iter()
+        .map(|&g| group_indices[g].len())
+        .collect();
+    let n_g_max = target_memberships.iter().copied().max().unwrap_or(0);
+
+    let ref_idx_i32: Vec<i32> = ref_cells.iter().map(|&c| c as i32).collect();
+    let group_idx_i32: Vec<Vec<i32>> = test_groups
+        .iter()
+        .map(|&g| group_indices[g].iter().map(|&c| c as i32).collect())
+        .collect();
+
+    let n_groups_for_means = 1 + test_groups.len();
+    let mut all_cells_host: Vec<i32> = Vec::with_capacity(n_ref + n_g_max * test_groups.len());
+    let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
+    offsets_host.push(0);
+    all_cells_host.extend(ref_idx_i32.iter().copied());
+    offsets_host.push(all_cells_host.len() as i32);
+    for cells in &group_idx_i32 {
+        all_cells_host.extend(cells.iter().copied());
+        offsets_host.push(all_cells_host.len() as i32);
+    }
+    let mode_id = geom_mean_mode_id(mode);
+
+    let ref_cell_to_pool_dev = build_cell_to_pool_dev(dev, &ref_idx_i32, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc ref cell_to_pool: {e}")))?;
+    let tg_cell_to_pool_devs: Vec<CudaSlice<i32>> = group_idx_i32
+        .iter()
+        .map(|g| build_cell_to_pool_dev(dev, g, n_obs))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc tg cell_to_pool: {e}")))?;
+    let cell_to_group_dev = build_cell_to_group_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_group: {e}")))?;
+
+    let n_pool_max = n_ref.max(n_g_max).max(1);
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
+    scratch
+        .ensure_ref_slab_capacity(dev, n_ref)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure ref_slab: {e}")))?;
+    scratch
+        .ensure_group_slab_capacity(dev, n_g_max.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure group_slab: {e}")))?;
+    scratch
+        .ensure_sums_capacity(dev, n_groups_for_means)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure sums: {e}")))?;
+    scratch
+        .ensure_aux_capacity(dev, chunk_size * n_pool_max)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
+    let n_test = test_groups.len();
+    scratch
+        .ensure_per_group_capacity(dev, n_test.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_group: {e}")))?;
+    scratch
+        .ensure_per_tg_pool_slabs_capacity(dev, n_test, n_g_max.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_tg_pool_slabs: {e}")))?;
+
+    let mut target_means: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut ref_means: Vec<f64> = Vec::with_capacity(n_vars);
+    let mut log2_fold_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+
+    let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+    let dev_pts = dev.with_stream(pts.clone());
+
+    for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
+        let c1 = (c0 + chunk_size).min(n_vars);
+        let sz = c1 - c0;
+
+        // Pre-zero ref + per-tg slabs + sums.
+        {
+            let nelem_ref = sz * n_ref;
+            let mut ref_view = scratch.ref_slab.slice_mut(..nelem_ref);
+            dev.stream()
+                .memset_zeros(&mut ref_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset ref_slab: {e}")))?;
+        }
+        for tg_idx in 0..n_test {
+            let n_g = group_indices[test_groups[tg_idx]].len();
+            if n_g == 0 {
+                continue;
+            }
+            let nelem_tg = sz * n_g;
+            let mut tg_view = scratch.per_tg_pool_slabs[tg_idx].slice_mut(..nelem_tg);
+            dev.stream()
+                .memset_zeros(&mut tg_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset tg slab: {e}")))?;
+        }
+        {
+            let nelem_sums = n_groups_for_means * sz;
+            let mut sums_view = scratch.sums.slice_mut(..nelem_sums);
+            dev.stream()
+                .memset_zeros(&mut sums_view)
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset sums: {e}")))?;
+        }
+
+        // Single CSC shard pass per chunk: each shard that overlaps
+        // [c0, c1) launches K+1 scatter-to-gene-major kernels + 1
+        // pseudobulk kernel.
+        source
+            .for_each_gpu_csc_shard(|_idx, csc_view| {
+                if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
+                    return Ok(());
+                }
+                gpu_de_scatter_csc_to_gene_major(
+                    dev,
+                    csc_view,
+                    &ref_cell_to_pool_dev,
+                    &mut scratch.ref_slab,
+                    c0,
+                    c1,
+                    sz,
+                    n_ref,
+                )?;
+                for tg_idx in 0..n_test {
+                    let n_g = group_indices[test_groups[tg_idx]].len();
+                    if n_g == 0 {
+                        continue;
+                    }
+                    gpu_de_scatter_csc_to_gene_major(
+                        dev,
+                        csc_view,
+                        &tg_cell_to_pool_devs[tg_idx],
+                        &mut scratch.per_tg_pool_slabs[tg_idx],
+                        c0,
+                        c1,
+                        sz,
+                        n_g,
+                    )?;
+                }
+                gpu_de_pseudobulk_csc_direct(
+                    dev,
+                    csc_view,
+                    &cell_to_group_dev,
+                    &mut scratch.sums,
+                    c0,
+                    c1,
+                    sz,
+                    n_groups_for_means,
+                    mode_id,
+                )?;
+                Ok(())
+            })
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC shard pass: {e}")))?;
+
+        let (chunk_ref_means, chunk_target_means) =
+            compute_pdex_means_from_sums(dev, &scratch.sums, sz, n_ref, &target_memberships, mode)?;
+
+        let chunk_log2_fc: Vec<Vec<f64>> = chunk_target_means
+            .iter()
+            .map(|tm| {
+                tm.iter()
+                    .zip(chunk_ref_means.iter())
+                    .map(|(t, r)| ((t + epsilon) / (r + epsilon)).log2())
+                    .collect()
+            })
+            .collect();
+        let chunk_percent: Vec<Vec<f64>> = chunk_target_means
+            .iter()
+            .map(|tm| {
+                tm.iter()
+                    .zip(chunk_ref_means.iter())
+                    .map(|(t, r)| (t - r) / (r + epsilon))
+                    .collect()
+            })
+            .collect();
+
+        let chunk_max = scratch.chunk_max();
+        let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
+        let _ = chunk_idx;
+        pdex_ref_chunk_gpu_sequence_v2(
+            target_dev,
+            &mut scratch,
+            &test_groups,
+            &group_indices,
+            sz,
+            n_ref,
+            chunk_max,
+        )?;
+
+        ref_means.extend_from_slice(&chunk_ref_means);
+
+        let u_batch_len = n_test * chunk_max;
+        let p_batch_len = n_test * chunk_max;
+        let u_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .u_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (v3csc)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (v3csc): {e}")))?
+        };
+        let p_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .p_per_group
+                .try_slice(..p_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("p_per_group batch slice OOB (v3csc)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh p batch (v3csc): {e}")))?
+        };
+
+        for (tg_idx, &g) in test_groups.iter().enumerate() {
+            target_means[tg_idx].extend_from_slice(&chunk_target_means[tg_idx]);
+            log2_fold_changes[tg_idx].extend_from_slice(&chunk_log2_fc[tg_idx]);
+            percent_changes[tg_idx].extend_from_slice(&chunk_percent[tg_idx]);
+            let n_g = group_indices[g].len();
+            if n_g == 0 {
+                statistics[tg_idx].extend(std::iter::repeat_n(f64::NAN, sz));
+                p_values[tg_idx].extend(std::iter::repeat_n(1.0, sz));
+            } else {
+                let off = tg_idx * chunk_max;
+                statistics[tg_idx].extend_from_slice(&u_batch[off..off + sz]);
+                p_values[tg_idx].extend(p_batch[off..off + sz].iter().map(|&p| p.clamp(0.0, 1.0)));
+            }
+        }
+    }
+
+    dev.synchronize()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC synchronize: {e}")))?;
 
     let fdrs: Vec<Vec<f64>> = p_values
         .iter()

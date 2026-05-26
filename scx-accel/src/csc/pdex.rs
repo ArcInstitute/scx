@@ -222,4 +222,227 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // G4.3: GPU v3 CSC-direct parity vs CPU CSR baseline.
+    // -----------------------------------------------------------------
+    //
+    // Two tests exercise the v3 dispatch in `pdex_ref_gpu_streaming`:
+    //   (a) v3 CSC-direct path (CSC sidecar provided)
+    //   (b) v3 CSR-direct fallback (no CSC sidecar)
+    //
+    // Both flip `set_de_v3_enabled_override(Some(true))` so the env var
+    // doesn't need to be set when running the test suite. Tolerance is
+    // fp32-tight on U statistic / means since the v3 kernels use f64
+    // atomicAdd (CSR fallback) or f64 shared-mem tree-reduce (CSC) for
+    // the pseudobulk fold — same precision as `gpu_de_pseudobulk_all_groups`.
+    //
+    // Skips via `require_gpu_or_skip!()` if no CUDA device is available
+    // (the test binary still links; the test just returns).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_pdex_ref_gpu_v3_csc_matches_cpu_streaming() {
+        use scx_gpu::device::GpuDevice;
+        if GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU CSC parity test");
+            return;
+        }
+        let n_obs = 64usize;
+        let n_vars = 20usize;
+        let cols_per_csc_shard = 7usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let dir = tempdir().unwrap();
+        let path = write_csr_csc_test_file(
+            dir.path(),
+            "pdex_gpu_v3_csc_parity",
+            n_obs,
+            n_vars,
+            &dense,
+            cols_per_csc_shard,
+        );
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let group_names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+        let reference = 0usize;
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let csc_reader = BackedCscReader::new(ScxReader::open(&path).unwrap(), 0).unwrap();
+
+        // CPU CSR baseline.
+        let cpu_res = pdex_ref_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            7, // gene_chunk_size — multi-chunk on n_vars=20
+            mode,
+            epsilon,
+        )
+        .expect("CPU streaming pdex_ref failed");
+
+        // GPU v3 CSC-direct path.
+        let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
+        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu_streaming(
+            0,
+            &csr_reader,
+            Some(&csc_reader),
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            Some(7),
+            mode,
+            epsilon,
+        );
+        scx_gpu::set_de_v3_enabled_override(prev_override);
+        let gpu_res = gpu_res.expect("GPU v3 CSC streaming pdex_ref failed");
+
+        // Structural equality.
+        assert_eq!(cpu_res.group_names, gpu_res.group_names);
+        assert_eq!(cpu_res.feature_names, gpu_res.feature_names);
+        assert_eq!(cpu_res.ref_membership, gpu_res.ref_membership);
+        assert_eq!(cpu_res.target_memberships, gpu_res.target_memberships);
+
+        let n_test = cpu_res.group_names.len();
+        for tg in 0..n_test {
+            for var in 0..n_vars {
+                let u_cpu = cpu_res.statistics[tg][var];
+                let u_gpu = gpu_res.statistics[tg][var];
+                if u_cpu.is_finite() && u_gpu.is_finite() {
+                    assert!(
+                        (u_cpu - u_gpu).abs() < 1e-3,
+                        "U mismatch (v3 CSC) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                    );
+                }
+                let p_cpu = cpu_res.p_values[tg][var];
+                let p_gpu = gpu_res.p_values[tg][var];
+                let pdiff = (p_cpu - p_gpu).abs();
+                let prel = pdiff / p_cpu.abs().max(1e-30);
+                assert!(
+                    pdiff < 1e-6 || prel < 1e-3,
+                    "p mismatch (v3 CSC) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                );
+                let tm_cpu = cpu_res.target_means[tg][var];
+                let tm_gpu = gpu_res.target_means[tg][var];
+                if tm_cpu.is_finite() && tm_gpu.is_finite() {
+                    let diff = (tm_cpu - tm_gpu).abs();
+                    let rel = diff / tm_cpu.abs().max(1e-12);
+                    assert!(
+                        diff < 1e-4 || rel < 1e-4,
+                        "target_mean mismatch (v3 CSC) tg={tg} gene={var}: cpu={tm_cpu}, gpu={tm_gpu}"
+                    );
+                }
+                let r_cpu = cpu_res.ref_means[var];
+                let r_gpu = gpu_res.ref_means[var];
+                if r_cpu.is_finite() && r_gpu.is_finite() {
+                    let diff = (r_cpu - r_gpu).abs();
+                    let rel = diff / r_cpu.abs().max(1e-12);
+                    assert!(
+                        diff < 1e-4 || rel < 1e-4,
+                        "ref_mean mismatch (v3 CSC) var={var}: cpu={r_cpu}, gpu={r_gpu}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_pdex_ref_gpu_v3_csr_fallback_matches_cpu_streaming() {
+        use scx_gpu::device::GpuDevice;
+        if GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU CSR fallback parity test");
+            return;
+        }
+        let n_obs = 64usize;
+        let n_vars = 20usize;
+        let cols_per_csc_shard = 7usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let dir = tempdir().unwrap();
+        let path = write_csr_csc_test_file(
+            dir.path(),
+            "pdex_gpu_v3_csr_parity",
+            n_obs,
+            n_vars,
+            &dense,
+            cols_per_csc_shard,
+        );
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let group_names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+        let reference = 0usize;
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+
+        let cpu_res = pdex_ref_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            7,
+            mode,
+            epsilon,
+        )
+        .expect("CPU streaming pdex_ref failed");
+
+        // GPU v3 CSR-direct fallback (csc_reader = None).
+        let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
+        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu_streaming(
+            0,
+            &csr_reader,
+            None,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            Some(7),
+            mode,
+            epsilon,
+        );
+        scx_gpu::set_de_v3_enabled_override(prev_override);
+        let gpu_res = gpu_res.expect("GPU v3 CSR-fallback streaming pdex_ref failed");
+
+        assert_eq!(cpu_res.group_names, gpu_res.group_names);
+        assert_eq!(cpu_res.feature_names, gpu_res.feature_names);
+
+        let n_test = cpu_res.group_names.len();
+        for tg in 0..n_test {
+            for var in 0..n_vars {
+                let u_cpu = cpu_res.statistics[tg][var];
+                let u_gpu = gpu_res.statistics[tg][var];
+                if u_cpu.is_finite() && u_gpu.is_finite() {
+                    assert!(
+                        (u_cpu - u_gpu).abs() < 1e-3,
+                        "U mismatch (v3 CSR fallback) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                    );
+                }
+                let p_cpu = cpu_res.p_values[tg][var];
+                let p_gpu = gpu_res.p_values[tg][var];
+                let pdiff = (p_cpu - p_gpu).abs();
+                let prel = pdiff / p_cpu.abs().max(1e-30);
+                assert!(
+                    pdiff < 1e-6 || prel < 1e-3,
+                    "p mismatch (v3 CSR fallback) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                );
+                let tm_cpu = cpu_res.target_means[tg][var];
+                let tm_gpu = gpu_res.target_means[tg][var];
+                if tm_cpu.is_finite() && tm_gpu.is_finite() {
+                    let diff = (tm_cpu - tm_gpu).abs();
+                    let rel = diff / tm_cpu.abs().max(1e-12);
+                    assert!(
+                        diff < 1e-4 || rel < 1e-4,
+                        "target_mean mismatch (v3 CSR fallback) tg={tg} gene={var}: cpu={tm_cpu}, gpu={tm_gpu}"
+                    );
+                }
+            }
+        }
+    }
 }
