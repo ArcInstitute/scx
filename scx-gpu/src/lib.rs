@@ -80,10 +80,11 @@ pub use device::GpuDevice;
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_diffexp::{
-    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
-    gpu_de_pseudobulk_all_groups, gpu_de_pvalues, gpu_de_scatter_gene_major,
-    gpu_de_scatter_shard_to_dense, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
-    gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
+    build_cell_to_pool_dev, de_v2_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort,
+    gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pvalues,
+    gpu_de_scatter_gene_major, gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major,
+    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
+    set_de_v2_enabled_override, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,

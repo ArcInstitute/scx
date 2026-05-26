@@ -105,6 +105,59 @@ extern "C" __global__ void csr_shard_to_dense_chunk_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// G4 v2: Scatter one CSR shard's rows directly into a gene-major slab,
+// skipping the dense `[n_obs × chunk_size]` intermediate.
+//
+// Per-thread output: slab[(col - c0) * n_perm + pool_pos] = data[e]
+//   where pool_pos = cell_to_pool[global_row_offset + r]
+//
+// `cell_to_pool` is a length-n_obs i32 array; entries are -1 for cells
+// that are NOT in this pool (ref or test group) and 0..n_perm-1 for cells
+// that ARE. The caller computes it once per (chunk-loop, pool) via
+// `inverse_perm()`.
+//
+// Whole-block early exit: if the global cell is not in this pool, the
+// block returns before iterating its CSR row — this is the common case
+// for test-group pools (~n_test cells of n_obs).
+//
+// `slab` MUST be pre-zeroed by the caller before the first shard's
+// scatter (`memset_zeros(&mut slab.slice_mut(..n_perm * chunk_size))`),
+// because zeros are implicit in the CSR representation.
+//
+// NO RACE: each (cell_global, col) pair writes one unique output cell
+// — pool_pos is unique per cell (it's an inverse permutation), and CSR
+// rows have strictly increasing column indices (no duplicates).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_gene_major_kernel(
+    const long long* __restrict__ indptr,        // [n_shard_rows + 1]
+    const int*       __restrict__ indices,       // [nnz]
+    const float*     __restrict__ data,          // [nnz]
+    const int*       __restrict__ cell_to_pool,  // [n_obs], -1 if not in pool
+    float*           __restrict__ slab,          // [chunk_size × n_perm]
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       n_perm,
+    int       c0,
+    int       c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long cell_global = global_row_offset + (long long)r;
+    int pool_pos = cell_to_pool[cell_global];
+    if (pool_pos < 0) return;  // cell not in this pool; whole-block early exit
+
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            int gene_local = col - c0;
+            slab[(long long)gene_local * (long long)n_perm + (long long)pool_pos] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // All-groups pseudobulk fold.
 //
 // One block per (gene, group). Threads stride over the group's cell list and
