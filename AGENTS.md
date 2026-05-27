@@ -73,6 +73,7 @@ File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX
 See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlights:
 
 - **Tracked files MUST NOT reference gitignored markdown** (`tasks/*.md`, root scratch docs like `2026-*_REGRESSIONS.md`, `*_CODE-REVIEW.md`, `Phase*.md`). Inline the substance instead of citing.
+- **Do NOT stage/commit all-caps markdown files in the repo root** (e.g., `MERGE-OBS-OFFSET-OVERFLOW.md`, `STATE-CELL-EVAL-INTEGRATE-PT2.md`). These are ephemeral implementation/planning documents that are moved to `./tasks/` after completion, and `./tasks/` is gitignored. Exceptions: `README.md`, `ROADMAP.md`, `AGENTS.md`, `CLAUDE.md`.
 - **On-disk structs**: no `#[repr(C)]`; serialize field-by-field with `byteorder` little-endian; sections at 8-byte-aligned offsets.
 - **Errors**: `thiserror` enums per crate; readers return errors (not panic) on malformed input.
 - **Checksums**: BLAKE3 everywhere (truncated-64 per shard, full-256 for catalog).
@@ -97,3 +98,15 @@ See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlig
 - **CSC storage**: optional gene-major sidecar via `pyscx.from_anndata(csc="always")` / `scx convert --csc=always` / `scx build-csc`; multi-shard layouts via `--csc-cols-per-shard`. Consumers opt-in with `prefer_format="csc"` on supported `pyscx.accel.*` ops (PCA explicitly rejects CSC). Mutating ops drop the sidecar by default with a warning; `--rebuild-csc` to re-emit. See [docs/sharding.md § CSC sharding](docs/sharding.md#csc-sharding).
 - **Multimodal limitations**: `scx merge`, `scx compact`, per-modality CSC sidecar preservation on `scx append`, and `scx subset --modality NAME --filter/--genes` composition all shipped — `scx-ops::{merge_multimodal, compact_multimodal}` dispatch on multimodal inputs and `scx info` exposes a per-modality `has_csc` column. Remaining limitations: cloud `open_cloud(...).to_mudata(backed=True)` (local backed multimodal works), multimodal-aware predicate pushdown via `QueryPipeline` (use `scx subset --modality NAME --filter` instead), and spatial transcriptomics with R-tree spatial index (separate spec).
 - **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to the CPU path.
+
+## Code Review
+
+After implementing changes to the codebase, run an Cursor Agent code review to catch issues after staging and before committing:
+
+```bash
+cursor agent --trust --model composer-2.5-fast --print "Review the staged code changes in this repository. Check for correctness, adherence to project conventions, error handling, test coverage, and potential regressions. Summarize findings and flag any issues."
+```
+
+**When to run**: After any non-trivial code change (new features, refactors, bug fixes, API changes). Skip for documentation-only or formatting-only changes.
+
+**What to look for in the review output**: Correctness issues, convention violations, missing error handling, untested code paths, and potential performance regressions.

@@ -70,6 +70,25 @@ pub enum OpsError {
     #[error("modality mismatch on merge: {detail}")]
     ModalityMismatch { detail: String },
 
+    #[error("var identity mismatch on merge: {detail}")]
+    VarMismatch { detail: String },
+
+    #[error("obs schema mismatch on merge: {detail}")]
+    ObsMismatch { detail: String },
+
+    #[error("dense mapping schema mismatch on merge ({axis}[{key}]): {detail}")]
+    DenseMappingMismatch {
+        axis: &'static str,
+        key: String,
+        detail: String,
+    },
+
+    #[error("uns conflict on merge under policy {policy}: {detail}")]
+    UnsConflict {
+        policy: &'static str,
+        detail: String,
+    },
+
     #[error(
         "{op} is not yet supported for multimodal files; \
          extract individual modalities first with \

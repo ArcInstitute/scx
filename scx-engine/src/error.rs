@@ -26,6 +26,13 @@ pub enum EngineError {
 
     #[error(transparent)]
     CsrError(#[from] scx_sparse::CsrError),
+
+    /// Free-form error for builder/contract violations that don't
+    /// warrant a dedicated variant. Used by
+    /// [`crate::ObsPredicateIndexBuilder`] for shard-order /
+    /// schema-shape checks where the caller is the offender.
+    #[error("{0}")]
+    Generic(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

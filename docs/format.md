@@ -139,7 +139,8 @@ rollback (a new catalog is appended per mutation; older catalogs remain in
 the file until `scx compact`).
 
 ```
-catalog_version: u16             (1 = legacy single-modality, 2 = multimodal)
+catalog_version: u16             (1 = legacy single-modality, 2 = multimodal,
+                                  3 = sharded obs / var metadata supported)
 manifest_sequence: u64           (matches header)
 prev_catalog_offset: u64         (0 if first)
 n_obs: u64                       (observable cells after deletions)
@@ -192,7 +193,9 @@ opening a v1 file.
 | 21 | `varm_embedding_shard` (Arrow IPC; row-shard of a `varm/<name>` dense embedding) |
 | 22 | `obsp_embedding_shard` (Arrow IPC COO; row-shard of an `obsp/<name>` pairwise sparse matrix) |
 | 23 | `varp_embedding_shard` (Arrow IPC COO; row-shard of a `varp/<name>` pairwise sparse matrix) |
-| 24–31 | Reserved for multimodal/spatial extensions |
+| 24 | `obs_metadata_shard` (Arrow IPC; row-shard of the obs metadata batch — see § Sharded metadata layout below) |
+| 25 | `var_metadata_shard` (Arrow IPC; row-shard of the var metadata batch — mirror of `obs_metadata_shard`) |
+| 26–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
@@ -442,6 +445,37 @@ scan the catalog for sharded entries, sort by `shard_idx`, and
 concatenate via `arrow::compute::concat_batches`. Legacy single-section
 files (types 8 / 17 / 18 / 19) keep reading via the fall-through path
 in the same accessor — no migration required.
+
+#### Sharded metadata layout (section types 24–25)
+
+Files written by streaming `scx merge`, `scx append`, and pyscx 0.5+
+`from_anndata` (when `n_obs > shard_target_rows`) shard the obs/var
+metadata batches the same way obsm/varm/obsp/varp are sharded above.
+This bounds peak memory at one shard's worth of metadata during the
+merge/append/ingest hot path and — critically — keeps each shard
+below Arrow IPC's 2 GB narrow-offset ceiling for string columns,
+which the legacy single-section `obs_metadata` / `var_metadata`
+layout could overflow on atlas-scale obs string payloads.
+
+- **`obs_metadata_shard` (24)** — name `obs_metadata/shard_<idx>`. Arrow
+  IPC of one `RecordBatch` covering obs rows
+  `[row_start, row_start + n_shard_rows)` of the logical obs table.
+  Same Arrow schema as the legacy single-section `obs_metadata` —
+  string columns are upcast to `LargeUtf8` on write so per-shard
+  offsets stay in range regardless of cumulative payload. Schema
+  metadata: `shard_idx: u32`, `row_start: u64`, `n_shard_rows: u32`,
+  `n_rows_total: u64`.
+- **`var_metadata_shard` (25)** — symmetric, on the var axis. Name
+  `var_metadata/shard_<idx>`.
+
+A file MUST NOT carry both `obs_metadata` (type 0) and
+`obs_metadata_shard` (type 24); the writer enforces this and reports
+`ScxError::ObsLayoutConflict` if a caller mixes the APIs (same rule
+for the var axis). Legacy single-section `obs_metadata` /
+`var_metadata` files remain fully readable — `ScxReader::read_obs` /
+`read_var` transparently assemble shards on demand for either layout,
+and `scx append` on a legacy file promotes the obs to a single
+`obs_metadata_shard` (shard 0) on the first growth.
 
 ## 6. Predicate Indexes
 
@@ -725,7 +759,7 @@ encrypted section types. For PHI datasets, use filesystem-level encryption
 
 - **`format_version`** — bump for breaking changes. Readers MUST reject files
   with `format_version` higher than their supported maximum.
-- **Unknown section types** (≥20 for the current format) are skipped with a
+- **Unknown section types** (≥26 for the current format) are skipped with a
   warning, enabling incremental extension without breaking old readers.
 - **`header_length`** reserves space for future header growth — older readers
   that only handle 256-byte headers detect a larger `header_length` and exit

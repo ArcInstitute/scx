@@ -332,6 +332,30 @@ enum Commands {
         /// output (current default).
         #[arg(long, value_name = "N")]
         index_auto_threshold: Option<usize>,
+        /// Skip the column-by-column var-identity check across
+        /// inputs (only `n_vars` and modality structure are
+        /// validated). Use when you've already pre-aligned the gene
+        /// axis upstream — otherwise mismatched var rows produce
+        /// silent column-axis corruption in the merged X matrix.
+        #[arg(long, default_value_t = false)]
+        assume_identical_var: bool,
+        /// Skip the obs schema identity check across inputs (column
+        /// names and dtypes, normalised through the logical-lossy
+        /// schema). Use when you've already verified the obs surface
+        /// upstream — otherwise mismatched obs columns produce a
+        /// merged file that errors at `read_obs()` time after the
+        /// output is renamed into place.
+        #[arg(long, default_value_t = false)]
+        assume_identical_obs: bool,
+        /// Policy for combining `uns` (unstructured metadata) across
+        /// inputs. `first` (default) keeps the first input's uns
+        /// verbatim and drops the rest; `require-equal` errors if any
+        /// input's uns differs; `namespace` writes a JSON object with
+        /// each input's uns under an `input_N` key; `summary` keeps
+        /// the first input's uns and appends a `_scx_uns_conflicts`
+        /// array listing per-input disagreements.
+        #[arg(long, value_name = "POLICY")]
+        uns_policy: Option<String>,
     },
     /// Query cells by predicate
     Query {
@@ -644,6 +668,9 @@ fn main() {
             index_var,
             index_preset,
             index_auto_threshold,
+            assume_identical_var,
+            assume_identical_obs,
+            uns_policy,
         } => merge::run_merge(
             &inputs,
             &output,
@@ -653,6 +680,9 @@ fn main() {
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
+            assume_identical_var,
+            assume_identical_obs,
+            uns_policy,
         ),
         Commands::Query {
             source,

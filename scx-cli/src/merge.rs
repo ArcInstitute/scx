@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::reader::ScxReader;
+use scx_ops::{MergeOptions, UnsPolicy};
 
 use crate::index_warnings::emit_index_summary;
 
@@ -18,6 +19,9 @@ pub fn run_merge(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    assume_identical_var: bool,
+    assume_identical_obs: bool,
+    uns_policy: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
     if inputs.len() < 2 {
@@ -64,22 +68,44 @@ pub fn run_merge(
     // Build refs for the ops API
     let input_refs: Vec<&Path> = inputs.iter().map(|p| p.as_path()).collect();
 
-    // Route to `merge` (drops predicate indexes — pre-fix default) when
-    // no `--index-*` flag is set, and to `merge_with_index_options`
-    // (rebuilds / auto-detects) when at least one flag is set.
-    // `--index-auto-threshold N` alone reaches the engine.
+    // Parse the optional --uns-policy flag.
+    let uns_policy = match uns_policy.as_deref() {
+        Some(s) => UnsPolicy::parse(s).ok_or_else(|| {
+            format!(
+                "invalid --uns-policy value '{s}'; expected one of: \
+                 first, require-equal, namespace, summary"
+            )
+        })?,
+        None => UnsPolicy::First,
+    };
+
+    // Route to `merge_with_options` whenever any non-default
+    // policy or index flag is set; fall back to the bare `merge`
+    // wrapper otherwise. Both paths now enforce the default var- and
+    // obs-identity checks; the routing only affects how policy
+    // overrides + index work flow through. `--index-auto-threshold
+    // N` alone reaches the engine.
     let any_index_flag = !index_obs.is_empty()
         || !index_var.is_empty()
         || index_preset.is_some()
         || index_auto_threshold.is_some();
-    if any_index_flag {
+    let any_policy_flag =
+        assume_identical_var || assume_identical_obs || uns_policy != UnsPolicy::First;
+    if any_index_flag || any_policy_flag {
         let index_options = ConversionPredicateIndexOptions {
             index_obs,
             index_var,
             index_preset,
             index_auto_threshold: index_auto_threshold.unwrap_or(1000),
         };
-        let summary = scx_ops::merge_with_index_options(&input_refs, output, &index_options)?;
+        let merge_opts = MergeOptions {
+            index_options,
+            assume_identical_var,
+            assume_identical_obs,
+            uns_policy,
+            shard_target_rows: None,
+        };
+        let summary = scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
         emit_index_summary("merge", &summary);
     } else {
         scx_ops::merge(&input_refs, output)?;

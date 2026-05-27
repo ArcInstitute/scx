@@ -269,6 +269,10 @@ fn test_append_read_back_all_cells() {
     assert_eq!(reader.n_obs(), 10);
     assert_eq!(reader.header().n_csr_shards, 2);
 
+    // Phase 2d: append produces ObsMetadataShard sections via the
+    // convert-on-append path. `read_obs()` transparently reassembles
+    // them — exercise both the streaming view and the assembled view.
+    assert!(reader.obs_metadata_shard_count() > 0);
     let obs = reader.read_obs().unwrap();
     assert_eq!(obs.num_rows(), 10);
 
@@ -488,6 +492,9 @@ fn test_merge_three_files() {
     let reader = ScxReader::open(&output).unwrap();
     assert_eq!(reader.n_obs(), 18); // 4 + 6 + 8
 
+    // Phase 2a: merge now emits ObsMetadataShard sections; `read_obs`
+    // transparently reassembles them across shards.
+    assert!(reader.obs_metadata_shard_count() > 0);
     let obs = reader.read_obs().unwrap();
     assert_eq!(obs.num_rows(), 18);
 
@@ -1643,6 +1650,8 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 7);
 
+    // Phase 2d: append produces ObsMetadataShard sections; use the
+    // assembled reader to materialise the full obs.
     let schema = reader.read_obs_schema().unwrap();
     assert_eq!(schema.field(0).name(), "cell_id");
     assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
@@ -1718,15 +1727,26 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
     let reader = ScxReader::open(&output).unwrap();
     assert_eq!(reader.n_obs(), 12);
 
-    // Schema-only path (read_obs_schema) and full read must both report
-    // the canonical narrow `Utf8` after the LargeUtf8 → Utf8 downcast.
+    // Phase 2a: merge emits ObsMetadataShard sections; use the
+    // assembled reader path for tests that want the merged batch.
+    // Schema-only path (read_obs_schema) and full read must both
+    // report the canonical narrow `Utf8` after the LargeUtf8 → Utf8
+    // downcast on each shard.
     let schema = reader.read_obs_schema().unwrap();
     assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
 
     let obs = reader.read_obs().unwrap();
     assert_eq!(obs.num_rows(), 12);
     assert_eq!(obs.schema().field(0).data_type(), &DataType::Utf8);
-    assert_eq!(obs.schema(), Arc::new(schema));
+    // Compare dtypes column-by-column; `read_obs_schema` returns the
+    // first shard's footer schema (with stamped shard metadata),
+    // while the assembled batch's schema strips per-shard fields
+    // (`shard_idx` / `row_start` / `n_shard_rows`). The field
+    // payload structure is identical.
+    for (i, f) in schema.fields().iter().enumerate() {
+        assert_eq!(obs.schema().field(i).name(), f.name());
+        assert_eq!(obs.schema().field(i).data_type(), f.data_type());
+    }
 
     let cell_ids = obs
         .column(0)
@@ -2815,6 +2835,258 @@ fn test_merge_multimodal_preserves_per_modality_layers() {
         adt_centered.shape.0, 7,
         "adt centered row count = merged n_obs"
     );
+}
+
+/// Multimodal fixture with explicit per-modality var batches, optional
+/// global uns, and optional per-modality uns. Used by the MergeOptions
+/// regression tests below to construct inputs that diverge in only the
+/// targeted axis.
+#[allow(clippy::too_many_arguments)]
+fn write_multimodal_with_options_fixture(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_var: &arrow::array::RecordBatch,
+    adt_var: &arrow::array::RecordBatch,
+    global_uns: Option<&serde_json::Value>,
+    rna_uns: Option<&serde_json::Value>,
+    adt_uns: Option<&serde_json::Value>,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_var.num_rows() as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, rna_var).unwrap();
+    writer.write_var_for(adt_id, adt_var).unwrap();
+    writer
+        .set_modality_n_vars(rna_id, rna_var.num_rows() as u64)
+        .unwrap();
+    writer
+        .set_modality_n_vars(adt_id, adt_var.num_rows() as u64)
+        .unwrap();
+    let (rna_indptr, rna_indices, rna_values) =
+        sample_shard_data(n_obs, rna_var.num_rows() as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) =
+        sample_shard_data(n_obs, adt_var.num_rows() as usize);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    if let Some(g) = global_uns {
+        writer.write_uns(g).unwrap();
+    }
+    if let Some(u) = rna_uns {
+        writer.write_uns_for(rna_id, u).unwrap();
+    }
+    if let Some(u) = adt_uns {
+        writer.write_uns_for(adt_id, u).unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Build an alternative var batch with the same n_vars but a reordered
+/// gene_id column — used to trigger per-modality `VarMismatch`.
+fn sample_var_reordered(n: usize) -> arrow::array::RecordBatch {
+    let ids: Vec<String> = (0..n).rev().map(|i| format!("gene_{i}")).collect();
+    let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_merge_multimodal_per_modality_var_mismatch_errors_by_default() {
+    // Per-modality var identity check fires when adt's gene order
+    // differs between inputs, even though n_vars matches. Before the
+    // MergeOptions threading landed, multimodal silently took input 0's
+    // var and produced a column-axis-corrupted file.
+    let dir = tempfile::tempdir().unwrap();
+    let rna = sample_var(8);
+    let adt_a = sample_var(4);
+    let adt_b = sample_var_reordered(4);
+    let a = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_var_a.scx",
+        3,
+        &rna,
+        &adt_a,
+        None,
+        None,
+        None,
+    );
+    let b = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_var_b.scx",
+        3,
+        &rna,
+        &adt_b,
+        None,
+        None,
+        None,
+    );
+    let out = dir.path().join("mm_var_out.scx");
+    let err = scx_ops::merge(&[&a, &b], &out).unwrap_err();
+    assert!(
+        matches!(err, scx_ops::OpsError::VarMismatch { .. }),
+        "expected VarMismatch on per-modality var disagreement, got: {err:?}"
+    );
+    // With assume_identical_var the merge proceeds and uses input 0's var.
+    let opts = scx_ops::MergeOptions {
+        assume_identical_var: true,
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[a.as_path(), b.as_path()], &out, &opts).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 6);
+}
+
+#[test]
+fn test_merge_multimodal_uns_policy_namespace_applies_at_both_levels() {
+    // UnsPolicy::Namespace wraps every input's payload under
+    // `input_N`. Multimodal applies the policy independently to global
+    // uns and to each modality's uns; both levels must show the wrap.
+    let dir = tempfile::tempdir().unwrap();
+    let rna = sample_var(6);
+    let adt = sample_var(10);
+    let g_a = serde_json::json!({"global": "A"});
+    let g_b = serde_json::json!({"global": "B"});
+    let rna_a = serde_json::json!({"layer": "rna_A"});
+    let rna_b = serde_json::json!({"layer": "rna_B"});
+    let a = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_uns_a.scx",
+        3,
+        &rna,
+        &adt,
+        Some(&g_a),
+        Some(&rna_a),
+        None,
+    );
+    let b = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_uns_b.scx",
+        3,
+        &rna,
+        &adt,
+        Some(&g_b),
+        Some(&rna_b),
+        None,
+    );
+    let out = dir.path().join("mm_uns_out.scx");
+    let opts = scx_ops::MergeOptions {
+        uns_policy: scx_ops::UnsPolicy::Namespace,
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[a.as_path(), b.as_path()], &out, &opts).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    let g = reader.read_uns().unwrap();
+    assert_eq!(g.get("input_0"), Some(&g_a));
+    assert_eq!(g.get("input_1"), Some(&g_b));
+    let rna_combined = reader.read_uns_for(1).unwrap();
+    assert_eq!(rna_combined.get("input_0"), Some(&rna_a));
+    assert_eq!(rna_combined.get("input_1"), Some(&rna_b));
+    // adt had no uns in either input — no section should land.
+    assert!(reader.read_uns_for(2).is_err());
+    // Provenance records the policy + the conflict counter.
+    let prov = reader.read_provenance().unwrap();
+    let merge_op = prov.operations.last().unwrap();
+    assert_eq!(merge_op.action, "merge");
+    assert!(
+        merge_op
+            .params_json
+            .contains("\"uns_policy\":\"namespace\""),
+        "params_json = {}",
+        merge_op.params_json
+    );
+    assert!(
+        merge_op
+            .params_json
+            .contains("\"assume_identical_obs\":false"),
+        "params_json = {}",
+        merge_op.params_json
+    );
+}
+
+#[test]
+fn test_merge_multimodal_shard_target_override() {
+    // `shard_target_rows` override on multimodal merge splits the
+    // global obs into one shard per ceil(n_obs / target) rows.
+    let dir = tempfile::tempdir().unwrap();
+    let rna = sample_var(6);
+    let adt = sample_var(10);
+    let a = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_shard_a.scx",
+        10,
+        &rna,
+        &adt,
+        None,
+        None,
+        None,
+    );
+    let b = write_multimodal_with_options_fixture(
+        &dir,
+        "mm_shard_b.scx",
+        10,
+        &rna,
+        &adt,
+        None,
+        None,
+        None,
+    );
+    let out = dir.path().join("mm_shard_out.scx");
+    let opts = scx_ops::MergeOptions {
+        shard_target_rows: Some(4),
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[a.as_path(), b.as_path()], &out, &opts).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 20);
+    // Each 10-row input gets sliced into ceil(10/4) = 3 shards
+    // (4 + 4 + 2), so 2 inputs → 6 obs shards total.
+    assert_eq!(reader.obs_metadata_shard_count(), 6);
 }
 
 /// Phase 6 follow-up: per-shard streaming refactor of `compact_multimodal`

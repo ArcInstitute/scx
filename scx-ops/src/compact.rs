@@ -75,7 +75,10 @@ pub fn compact_with_index_options(
     // Load deletion vectors
     let dv = reader.read_deletion_vectors()?;
 
-    // Read obs and build deletion mask
+    // Read obs and build deletion mask. `read_obs` / `read_var`
+    // transparently handle both legacy single-section and row-sharded
+    // Phase 2 layouts; the assembled batch is what the deletion-mask
+    // + filter logic expects.
     let obs = reader.read_obs()?;
     let var = reader.read_var()?;
 
@@ -393,7 +396,7 @@ pub fn compact_with_index_options(
             .unwrap_or_default()
             .as_secs() as i64,
         action: "compact".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: "{}".to_string(),
         input_checksums: vec![],
     });
@@ -765,7 +768,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             .unwrap_or_default()
             .as_secs() as i64,
         action: "compact".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: "{}".to_string(),
         input_checksums: vec![],
     });

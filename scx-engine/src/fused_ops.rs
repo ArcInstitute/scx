@@ -179,7 +179,11 @@ pub fn streaming_preprocess(
     let header = build_output_header(reader.header(), CodecId::Zstd as u8);
     let mut writer = ScxWriter::new(target_path, header)?;
 
-    // Copy obs + var (before shards, matching original section order)
+    // Copy obs + var (before shards, matching original section order).
+    // `read_obs` / `read_var` transparently handle both legacy and
+    // Phase 2 row-sharded layouts; for sharded inputs the resulting
+    // copy is single-section on the output (acceptable for fused_ops'
+    // moderate-size paths).
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
@@ -287,7 +291,9 @@ pub fn streaming_save_layer(
     let header = build_output_header(reader.header(), reader.header().codec_id);
     let mut writer = ScxWriter::new(target_path, header)?;
 
-    // Copy obs + var
+    // Copy obs + var (Phase 2 sharded → assembled into a single
+    // section on the output, same trade-off as the streaming variant
+    // above).
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}

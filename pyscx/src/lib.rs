@@ -169,12 +169,31 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
+///
+/// `memory_budget`: Optional budget that surfaces a `UserWarning` when
+///   an obsm / varm / obsp / varp key's estimated peak footprint
+///   exceeds the budget. Accepts `None` (no check), an int byte count,
+///   or a string like `"4G"` / `"512MiB"`. Warn-only — shard size is
+///   not derated. Applies to both the in-memory and backed routing
+///   paths.
+///
+/// `force_legacy_metadata`: when True, write obs/var as a single
+///   `ObsMetadata` / `VarMetadata` section regardless of size. Default
+///   `False`: when `n_obs > shard_size` (or `n_vars > shard_size`)
+///   `from_anndata` emits the Phase 2 sharded layout
+///   (`ObsMetadataShard` / `VarMetadataShard`). The opt-out preserves
+///   the legacy single-section layout for tools that haven't migrated
+///   to `ScxReader::read_obs_shard` / `obs_shards()`. Applies to the
+///   in-memory path only — backed routing goes through the streaming
+///   converter which writes single-section metadata regardless (use
+///   `scx compact --reshape-obs` post-hoc if sharded metadata is
+///   needed for a backed conversion).
 #[pyfunction]
 #[pyo3(signature = (
     adata, path, codec=None, shard_size=None, in_place=false, csc="off",
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
-    bitmap="off",
+    bitmap="off", memory_budget=None, force_legacy_metadata=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -192,7 +211,10 @@ fn from_anndata(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    force_legacy_metadata: bool,
 ) -> PyResult<()> {
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
     anndata::from_anndata_impl(
         py,
         adata,
@@ -208,6 +230,8 @@ fn from_anndata(
         index_preset,
         index_auto_threshold,
         bitmap,
+        memory_budget_bytes,
+        force_legacy_metadata,
     )
 }
 
@@ -381,7 +405,7 @@ fn from_h5ad(
     h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off",
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
-    bitmap="off",
+    bitmap="off", memory_budget=None, force_legacy_metadata=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
@@ -399,6 +423,8 @@ fn from_10x(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    memory_budget: Option<Bound<'_, PyAny>>,
+    force_legacy_metadata: bool,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
         // Only rewrite when scanpy itself is the missing module — if scanpy
@@ -420,6 +446,7 @@ fn from_10x(
         e
     })?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
+    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
     anndata::from_anndata_impl(
         py,
         &adata,
@@ -435,6 +462,8 @@ fn from_10x(
         index_preset,
         index_auto_threshold,
         bitmap,
+        memory_budget_bytes,
+        force_legacy_metadata,
     )
 }
 

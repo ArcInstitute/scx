@@ -93,6 +93,18 @@ pub enum ScxError {
 
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
+
+    #[error(
+        "cannot write '{attempted}' on a writer that already wrote '{existing}' for the same axis: \
+         obs and var metadata must be either entirely single-section ({single_kind}) or entirely \
+         sharded ({sharded_kind}), not mixed"
+    )]
+    ObsLayoutConflict {
+        attempted: &'static str,
+        existing: &'static str,
+        single_kind: &'static str,
+        sharded_kind: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ScxError>;

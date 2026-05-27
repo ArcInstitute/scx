@@ -79,6 +79,13 @@ pub struct ScxWriter {
     total_nnz: u64,
     has_obsm: bool,
     has_obsp: bool,
+    /// Per-axis layout state for obs / var metadata. Mutually exclusive
+    /// — calling [`Self::write_obs`] after [`Self::write_obs_shard`] (or
+    /// vice versa) on the same writer returns
+    /// `ScxError::ObsLayoutConflict`. Tracked here so the guard runs in
+    /// O(1) without scanning [`Self::entries`] on every write.
+    obs_layout: ObsVarLayout,
+    var_layout: ObsVarLayout,
     /// The `modality_id` stamped on every catalog entry created by
     /// the next write call. Defaults to `0` (global / single-modality
     /// shape). Public `*_for` methods set this for the duration of
@@ -123,6 +130,52 @@ pub struct PreEncodedSection {
     pub section_type: SectionType,
     /// NNZ count for this shard.
     pub nnz: u64,
+}
+
+/// Per-axis layout state used by [`ScxWriter`] to enforce that obs (and
+/// var) metadata is written either as a single Arrow IPC section
+/// ([`SectionType::ObsMetadata`] / [`SectionType::VarMetadata`]) or as
+/// a sequence of row-shard sections ([`SectionType::ObsMetadataShard`]
+/// / [`SectionType::VarMetadataShard`]), but never both for the same
+/// axis. Mixing would leave readers without a deterministic way to
+/// reconstruct the logical batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObsVarLayout {
+    /// No obs/var section of either flavour has been written yet for
+    /// this axis. The next write picks the layout.
+    Pending,
+    /// A single-section batch has been written via `write_obs` /
+    /// `write_var`. Subsequent `write_obs_shard` / `write_var_shard`
+    /// calls return [`ScxError::ObsLayoutConflict`].
+    Single,
+    /// Some number of shards has been written via `write_obs_shard` /
+    /// `write_var_shard`. The counter is consulted by writer-side
+    /// asserts; it is not consulted by readers (which enumerate via
+    /// the catalog).
+    Sharded(u32),
+}
+
+/// Reconstruct an [`ObsVarLayout`] from a catalog-entry slice. Used by
+/// [`ScxWriter::adopt_in_place`] so the mixed-mode guard survives an
+/// adopt → write transition (e.g. append-time predicate-index emit
+/// against an already-sharded file).
+fn obs_var_layout_from_entries(
+    entries: &[FullCatalogEntry],
+    single: SectionType,
+    sharded: SectionType,
+) -> ObsVarLayout {
+    let has_single = entries.iter().any(|e| e.section_type == single);
+    let shard_count = entries.iter().filter(|e| e.section_type == sharded).count() as u32;
+    match (has_single, shard_count) {
+        (false, 0) => ObsVarLayout::Pending,
+        (true, 0) => ObsVarLayout::Single,
+        (false, n) => ObsVarLayout::Sharded(n),
+        // Catalogs are not supposed to carry both. Surface as
+        // `Sharded(n)` so the next write picks the safer shard path;
+        // the mixed-mode condition is caught loudly at read time by
+        // `read_obs()` (which prefers shards when both are present).
+        (true, n) => ObsVarLayout::Sharded(n),
+    }
 }
 
 /// Stamp a sharded `obsm` / `varm` / `obsp` / `varp` batch with the
@@ -201,6 +254,8 @@ impl ScxWriter {
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
+            obs_layout: ObsVarLayout::Pending,
+            var_layout: ObsVarLayout::Pending,
             current_modality_id: 0,
             modalities: Vec::new(),
             modality_build_csc: Vec::new(),
@@ -233,6 +288,20 @@ impl ScxWriter {
     ) -> Result<Self> {
         file.seek(SeekFrom::Start(current_offset))?;
         let writer = BufWriter::new(file);
+        // Reconstruct obs/var layout state from existing entries so the
+        // in-place append path doesn't allow a sharded file to suddenly
+        // gain a single-section obs (or vice versa) via the adopted
+        // writer's [`Self::write_obs`] / [`Self::write_obs_shard`].
+        let obs_layout = obs_var_layout_from_entries(
+            &existing_entries,
+            SectionType::ObsMetadata,
+            SectionType::ObsMetadataShard,
+        );
+        let var_layout = obs_var_layout_from_entries(
+            &existing_entries,
+            SectionType::VarMetadata,
+            SectionType::VarMetadataShard,
+        );
         Ok(ScxWriter {
             // `final_path` is only consulted by `finish()`, which adopted
             // writers must not call. Use an empty path to make accidental
@@ -252,6 +321,8 @@ impl ScxWriter {
             total_nnz: 0,
             has_obsm: false,
             has_obsp: false,
+            obs_layout,
+            var_layout,
             current_modality_id: 0,
             modalities: Vec::new(),
             modality_build_csc: Vec::new(),
@@ -350,16 +421,137 @@ impl ScxWriter {
     // Public section write methods
     // -----------------------------------------------------------------------
 
-    /// Write the obs metadata section (Arrow IPC).
+    /// Write the obs metadata section (Arrow IPC, single batch).
+    ///
+    /// Returns [`ScxError::ObsLayoutConflict`] if [`Self::write_obs_shard`]
+    /// has already been called on this writer — the two layouts are
+    /// mutually exclusive within one file. Use the sharded API for files
+    /// whose obs may exceed Arrow IPC's 2 GB narrow-offset ceiling
+    /// (~`i32::MAX` cumulative string-buffer bytes per column).
     pub fn write_obs(&mut self, obs: &RecordBatch) -> Result<()> {
+        if let ObsVarLayout::Sharded(_) = self.obs_layout {
+            return Err(ScxError::ObsLayoutConflict {
+                attempted: "write_obs",
+                existing: "write_obs_shard",
+                single_kind: "ObsMetadata",
+                sharded_kind: "ObsMetadataShard",
+            });
+        }
         let data = Self::write_arrow_ipc(obs)?;
-        self.write_section_bytes("obs", SectionType::ObsMetadata, &data, None)
+        self.write_section_bytes("obs", SectionType::ObsMetadata, &data, None)?;
+        self.obs_layout = ObsVarLayout::Single;
+        Ok(())
     }
 
-    /// Write the var metadata section (Arrow IPC).
+    /// Write the var metadata section (Arrow IPC, single batch).
+    ///
+    /// Returns [`ScxError::ObsLayoutConflict`] if [`Self::write_var_shard`]
+    /// has already been called on this writer.
     pub fn write_var(&mut self, var: &RecordBatch) -> Result<()> {
+        if let ObsVarLayout::Sharded(_) = self.var_layout {
+            return Err(ScxError::ObsLayoutConflict {
+                attempted: "write_var",
+                existing: "write_var_shard",
+                single_kind: "VarMetadata",
+                sharded_kind: "VarMetadataShard",
+            });
+        }
         let data = Self::write_arrow_ipc(var)?;
-        self.write_section_bytes("var", SectionType::VarMetadata, &data, None)
+        self.write_section_bytes("var", SectionType::VarMetadata, &data, None)?;
+        self.var_layout = ObsVarLayout::Single;
+        Ok(())
+    }
+
+    /// Write one row-shard of the obs metadata section ([`SectionType::ObsMetadataShard`]).
+    ///
+    /// Section name: `obs_metadata/shard_<shard_idx>`. Mirror of
+    /// [`Self::write_obsm_shard`] for the obs metadata axis. The batch's
+    /// `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total` are
+    /// stamped into the schema metadata before encoding so the reader
+    /// can verify a contiguous, ordered cover of the logical obs table.
+    /// `write_arrow_ipc` (called internally) upcasts narrow `Utf8` /
+    /// `Binary` to `LargeUtf8` / `LargeBinary` per shard, so each shard
+    /// individually is safe from the 2 GB offset ceiling regardless of
+    /// the merged total.
+    ///
+    /// Returns [`ScxError::ObsLayoutConflict`] if [`Self::write_obs`]
+    /// has already been called on this writer.
+    pub fn write_obs_shard(
+        &mut self,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        match self.obs_layout {
+            ObsVarLayout::Single => {
+                return Err(ScxError::ObsLayoutConflict {
+                    attempted: "write_obs_shard",
+                    existing: "write_obs",
+                    single_kind: "ObsMetadata",
+                    sharded_kind: "ObsMetadataShard",
+                });
+            }
+            ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
+        }
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("obs_metadata/shard_{shard_idx}"),
+            SectionType::ObsMetadataShard,
+            &data,
+            None,
+        )?;
+        let next = match self.obs_layout {
+            ObsVarLayout::Sharded(n) => n.saturating_add(1),
+            _ => 1,
+        };
+        self.obs_layout = ObsVarLayout::Sharded(next);
+        Ok(())
+    }
+
+    /// Write one row-shard of the var metadata section ([`SectionType::VarMetadataShard`]).
+    ///
+    /// Mirror of [`Self::write_obs_shard`] for the var axis. Section
+    /// name: `var_metadata/shard_<shard_idx>`. Var rarely overflows the
+    /// 2 GB ceiling (gene-count rather than cell-count axis), but the
+    /// sharded API is symmetric for catalog ergonomics.
+    pub fn write_var_shard(
+        &mut self,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        match self.var_layout {
+            ObsVarLayout::Single => {
+                return Err(ScxError::ObsLayoutConflict {
+                    attempted: "write_var_shard",
+                    existing: "write_var",
+                    single_kind: "VarMetadata",
+                    sharded_kind: "VarMetadataShard",
+                });
+            }
+            ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
+        }
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        self.write_section_bytes(
+            format!("var_metadata/shard_{shard_idx}"),
+            SectionType::VarMetadataShard,
+            &data,
+            None,
+        )?;
+        let next = match self.var_layout {
+            ObsVarLayout::Sharded(n) => n.saturating_add(1),
+            _ => 1,
+        };
+        self.var_layout = ObsVarLayout::Sharded(next);
+        Ok(())
     }
 
     /// Write the uns (unstructured) section as JSON.
@@ -1351,6 +1543,62 @@ impl ScxWriter {
             info.flags.set_obsm();
         }
         Ok(())
+    }
+
+    /// Per-modality row-shard of an `obsm/{modality_name}/{key}` dense
+    /// embedding. Section name is `obsm/{modality_name}/{key}_shard_{shard_idx}`
+    /// with `SectionType::ObsmEmbeddingShard`. Mirrors the single-modality
+    /// [`Self::write_obsm_shard`] but stamps the modality_id on the catalog
+    /// entry via [`Self::with_modality`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_obsm_shard_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        let name = format!("obsm/{mname}/{key}_shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.has_obsm = true;
+            this.write_section_bytes(name, SectionType::ObsmEmbeddingShard, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsm();
+        }
+        Ok(())
+    }
+
+    /// Per-modality row-shard of a `varm/{modality_name}/{key}` dense
+    /// embedding. Section name is `varm/{modality_name}/{key}_shard_{shard_idx}`
+    /// with `SectionType::VarmEmbeddingShard`. Mirrors the single-modality
+    /// [`Self::write_varm_shard`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_varm_shard_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        let name = format!("varm/{mname}/{key}_shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::VarmEmbeddingShard, &data, None)
+        })
     }
 
     /// Per-modality `write_obsp_shard`. Section name is

@@ -567,15 +567,39 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 /// falls back to a full scan. This was the silent-data-loss bug
 /// reported against multi-input atlas builds.
 ///
+/// Validation kwargs (strict by default; opt back in to the
+/// pre-strict behaviour explicitly):
+///
+/// * `assume_identical_var=False` — when `False` (default), merge
+///   compares every input's var batch column-by-column against
+///   input 0 and errors on mismatch. Set `True` if you've already
+///   verified the gene axis upstream and want the count-only check.
+/// * `assume_identical_obs=False` — when `False` (default), merge
+///   compares every input's obs schema against input 0 (column names
+///   + dtypes, normalised through the logical-lossy schema) and
+///   errors on mismatch. Set `True` when the caller has already
+///   validated obs columns.
+/// * `uns_policy=None` — controls how the merged file's `uns`
+///   section is built. `None` / `"first"` keeps input 0's payload
+///   verbatim; `"require-equal"` errors on any disagreement;
+///   `"namespace"` writes a `{"input_N": ...}` wrapper; `"summary"`
+///   keeps input 0 and records a `_scx_uns_conflicts` array.
+///   Applied independently at the global and per-modality levels
+///   for multimodal inputs.
+///
 /// Example:
 ///     pyscx.merge(["batch1.scx", "batch2.scx", "batch3.scx"], "atlas.scx")
 ///     pyscx.merge(["a.scx", "b.scx"], "merged.scx",
 ///                 index_obs=["perturbation", "cell_type"])
+///     pyscx.merge(["a.scx", "b.scx"], "merged.scx",
+///                 assume_identical_var=True, uns_policy="namespace")
 #[pyfunction]
 #[pyo3(signature = (
     inputs, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn merge(
     py: Python<'_>,
     inputs: Vec<String>,
@@ -584,6 +608,9 @@ pub fn merge(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    assume_identical_var: bool,
+    assume_identical_obs: bool,
+    uns_policy: Option<String>,
 ) -> PyResult<()> {
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
@@ -595,11 +622,54 @@ pub fn merge(
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
     let output_path = PathBuf::from(output);
 
+    // Parse the optional uns_policy kwarg into the enum. Default
+    // (None) preserves `UnsPolicy::First` = today's behaviour: read
+    // the first input's `uns` verbatim, drop the rest.
+    let uns_policy_parsed = match uns_policy.as_deref() {
+        Some(s) => scx_ops::UnsPolicy::parse(s).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "invalid uns_policy '{s}': expected one of \
+                 first, require-equal, namespace, summary"
+            ))
+        })?,
+        None => scx_ops::UnsPolicy::First,
+    };
+
+    let want_policy = assume_identical_var
+        || assume_identical_obs
+        || uns_policy_parsed != scx_ops::UnsPolicy::First;
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
+            let merge_opts = scx_ops::MergeOptions {
+                index_options: index_opts,
+                assume_identical_var,
+                assume_identical_obs,
+                uns_policy: uns_policy_parsed,
+                shard_target_rows: None,
+            };
             let summary = py
                 .allow_threads(|| {
-                    scx_ops::merge_with_index_options(&input_refs, &output_path, &index_opts)
+                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)
+        }
+        None if want_policy => {
+            let merge_opts = scx_ops::MergeOptions {
+                index_options: scx_engine::ConversionPredicateIndexOptions {
+                    index_obs: Vec::new(),
+                    index_var: Vec::new(),
+                    index_preset: None,
+                    index_auto_threshold: 0,
+                },
+                assume_identical_var,
+                assume_identical_obs,
+                uns_policy: uns_policy_parsed,
+                shard_target_rows: None,
+            };
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
