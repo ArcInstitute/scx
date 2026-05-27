@@ -1562,9 +1562,9 @@ mod tests {
         assert_eq!(reader.n_vars(), 50);
 
         // Read data
-        let obs = reader.read_obs().unwrap();
+        let obs = reader.read_obs_assembled().unwrap();
         assert_eq!(obs.num_rows(), 100);
-        let var = reader.read_var().unwrap();
+        let var = reader.read_var_assembled().unwrap();
         assert_eq!(var.num_rows(), 50);
         let csr = reader.read_all_csr_shards().unwrap();
         assert_eq!(csr.shape.0, 100);
@@ -1770,7 +1770,7 @@ mod tests {
         assert_eq!(reader.n_obs(), 50);
         assert_eq!(reader.n_vars(), 50);
 
-        let obs = reader.read_obs().unwrap();
+        let obs = reader.read_obs_assembled().unwrap();
         assert_eq!(obs.num_rows(), 50);
 
         let cell_type_col = obs
@@ -1783,7 +1783,7 @@ mod tests {
             assert_eq!(cell_type_col.value(i), "typeA");
         }
 
-        let var = reader.read_var().unwrap();
+        let var = reader.read_var_assembled().unwrap();
         assert_eq!(var.num_rows(), 50);
     }
 

@@ -1304,7 +1304,7 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
         .map(|s| s.to_string())
         .collect();
     let obs_batch = reader
-        .read_obs()
+        .read_obs_assembled()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
     let obs_df = record_batch_to_dataframe(&obs_batch)?;
 
@@ -1672,7 +1672,7 @@ pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
         ));
     }
     let obs_batch = reader
-        .read_obs()
+        .read_obs_assembled()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
     let obs_df = record_batch_to_dataframe(&obs_batch)?;
 

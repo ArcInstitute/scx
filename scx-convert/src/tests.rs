@@ -608,7 +608,7 @@ fn test_categorical_columns() {
 
     // Verify categorical survived
     let reader = ScxReader::open(&scx_path).unwrap();
-    let obs = reader.read_obs().unwrap();
+    let obs = reader.read_obs_assembled().unwrap();
 
     // Find the cell_type column
     let schema = obs.schema();
@@ -691,7 +691,7 @@ fn h5ad_with_int8_categorical_codes_converts() {
     // order.
     for scx in [&scx_stream, &scx_bulk] {
         let reader = ScxReader::open(scx).unwrap();
-        let var = reader.read_var().unwrap();
+        let var = reader.read_var_assembled().unwrap();
         let ft_idx = var.schema().index_of("feature_types").unwrap();
         let ft_col = var.column(ft_idx);
         assert!(
@@ -756,7 +756,7 @@ macro_rules! categorical_codes_dtype_test {
                 " categorical codes"
             ));
             let reader = ScxReader::open(&scx).unwrap();
-            let var = reader.read_var().unwrap();
+            let var = reader.read_var_assembled().unwrap();
             let ft_idx = var.schema().index_of("feature_types").unwrap();
             assert!(matches!(
                 var.column(ft_idx).data_type(),
@@ -814,7 +814,7 @@ macro_rules! unsigned_dataframe_column_test {
                 " dataframe columns"
             ));
             let reader = ScxReader::open(&scx).unwrap();
-            let var = reader.read_var().unwrap();
+            let var = reader.read_var_assembled().unwrap();
             let idx = var.schema().index_of("n_counts").unwrap();
             assert_eq!(var.column(idx).data_type(), &$arrow_dtype);
         }
@@ -1780,7 +1780,7 @@ fn test_append_for_modality_updates_table() {
     let pre_adt_csr = pre.modality_info(adt_id).unwrap().n_csr_shards;
     let pre_rna_nnz = pre.modality_info(rna_id).unwrap().nnz;
     let pre_adt_nnz = pre.modality_info(adt_id).unwrap().nnz;
-    let pre_obs = pre.read_obs().unwrap();
+    let pre_obs = pre.read_obs_assembled().unwrap();
     drop(pre);
 
     // Build a fresh batch of CSR data appropriate for rna's vars
@@ -6167,7 +6167,7 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
     .expect("streaming convert must succeed");
 
     let reader = ScxReader::open(&scx_path).unwrap();
-    let obs = reader.read_obs().unwrap();
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(
         scx_format::pandas_index_columns(obs.schema_ref()),
         vec!["__index_level_0__".to_string()],
@@ -6185,7 +6185,7 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
     let expected_obs: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
     assert_eq!(obs_values, expected_obs, "obs_names must round-trip");
 
-    let var = reader.read_var().unwrap();
+    let var = reader.read_var_assembled().unwrap();
     assert_eq!(
         scx_format::pandas_index_columns(var.schema_ref()),
         vec!["__index_level_0__".to_string()],

@@ -203,7 +203,9 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         })
         .sum();
 
-    // Step 2: Read obs metadata
+    // Step 2: Read obs metadata. The `SectionReader::read_obs` impl
+    // on `ScxReader` delegates to `read_obs_assembled` so this works
+    // on both legacy single-section and Phase 2 row-sharded layouts.
     let obs_batch = reader.read_obs()?;
     let n_obs = obs_batch.num_rows();
 
@@ -276,7 +278,7 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         }
     }
 
-    // Step 6: Handle var predicates and gene projection
+    // Step 6: Handle var predicates and gene projection (assembled via trait impl)
     let var_batch = reader.read_var()?;
     let mut effective_gene_indices = plan.gene_indices.clone();
 

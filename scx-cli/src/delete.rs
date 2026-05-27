@@ -13,7 +13,7 @@ pub fn run_delete(
     // Open file and read obs metadata
     let reader = ScxReader::open(file)?;
     let obs_schema = reader.read_obs_schema()?;
-    let obs_batch = reader.read_obs()?;
+    let obs_batch = reader.read_obs_assembled()?;
 
     // Parse and evaluate predicate
     let predicate = parse_predicate(filter, &obs_schema, "obs")?;

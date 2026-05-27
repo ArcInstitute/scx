@@ -269,7 +269,11 @@ fn test_append_read_back_all_cells() {
     assert_eq!(reader.n_obs(), 10);
     assert_eq!(reader.header().n_csr_shards, 2);
 
-    let obs = reader.read_obs().unwrap();
+    // Phase 2d: append produces ObsMetadataShard sections via the
+    // convert-on-append path, so the legacy read_obs() errors with
+    // ObsIsSharded. Use the assembled reader to get the full obs.
+    assert!(reader.obs_metadata_shard_count() > 0);
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(obs.num_rows(), 10);
 
     let csr = reader.read_all_csr_shards().unwrap();
@@ -488,7 +492,11 @@ fn test_merge_three_files() {
     let reader = ScxReader::open(&output).unwrap();
     assert_eq!(reader.n_obs(), 18); // 4 + 6 + 8
 
-    let obs = reader.read_obs().unwrap();
+    // Phase 2a: merge now emits ObsMetadataShard sections, so the
+    // legacy read_obs() path errors with ObsIsSharded. Use
+    // read_obs_assembled() for tests that want the merged batch.
+    assert!(reader.obs_metadata_shard_count() > 0);
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(obs.num_rows(), 18);
 
     let csr = reader.read_all_csr_shards().unwrap();
@@ -790,7 +798,7 @@ fn test_merge_preserves_obs_metadata() {
     scx_ops::merge(&[path1.as_path(), path2.as_path()], &output).unwrap();
 
     let reader = ScxReader::open(&output).unwrap();
-    let obs = reader.read_obs().unwrap();
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(obs.num_rows(), 7); // 3 + 4
 
     // Verify cell_ids are from both files in order
@@ -1643,11 +1651,13 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 7);
 
+    // Phase 2d: append produces ObsMetadataShard sections; use the
+    // assembled reader to materialise the full obs.
     let schema = reader.read_obs_schema().unwrap();
     assert_eq!(schema.field(0).name(), "cell_id");
     assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
 
-    let obs = reader.read_obs().unwrap();
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(obs.num_rows(), 7);
     assert_eq!(obs.schema().field(0).data_type(), &DataType::Utf8);
     let cell_ids = obs
@@ -1718,15 +1728,26 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
     let reader = ScxReader::open(&output).unwrap();
     assert_eq!(reader.n_obs(), 12);
 
-    // Schema-only path (read_obs_schema) and full read must both report
-    // the canonical narrow `Utf8` after the LargeUtf8 → Utf8 downcast.
+    // Phase 2a: merge emits ObsMetadataShard sections; use the
+    // assembled reader path for tests that want the merged batch.
+    // Schema-only path (read_obs_schema) and full read must both
+    // report the canonical narrow `Utf8` after the LargeUtf8 → Utf8
+    // downcast on each shard.
     let schema = reader.read_obs_schema().unwrap();
     assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
 
-    let obs = reader.read_obs().unwrap();
+    let obs = reader.read_obs_assembled().unwrap();
     assert_eq!(obs.num_rows(), 12);
     assert_eq!(obs.schema().field(0).data_type(), &DataType::Utf8);
-    assert_eq!(obs.schema(), Arc::new(schema));
+    // Compare dtypes column-by-column; `read_obs_schema` returns the
+    // first shard's footer schema (with stamped shard metadata),
+    // while the assembled batch's schema strips per-shard fields
+    // (`shard_idx` / `row_start` / `n_shard_rows`). The field
+    // payload structure is identical.
+    for (i, f) in schema.fields().iter().enumerate() {
+        assert_eq!(obs.schema().field(i).name(), f.name());
+        assert_eq!(obs.schema().field(i).data_type(), f.data_type());
+    }
 
     let cell_ids = obs
         .column(0)
@@ -1934,8 +1955,8 @@ fn test_streaming_append_matches_bulk_append() {
     assert_eq!(csr_a.indptr, csr_b.indptr);
     assert_eq!(csr_a.indices, csr_b.indices);
     assert_eq!(csr_a.data, csr_b.data);
-    let obs_a = ra.read_obs().unwrap();
-    let obs_b = rb.read_obs().unwrap();
+    let obs_a = ra.read_obs_assembled().unwrap();
+    let obs_b = rb.read_obs_assembled().unwrap();
     assert_eq!(obs_a.num_rows(), obs_b.num_rows());
 }
 

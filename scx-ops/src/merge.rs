@@ -5,7 +5,7 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -17,6 +17,7 @@ use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
+use crate::merge_options::MergeOptions;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
@@ -64,6 +65,24 @@ pub fn merge_with_index_options(
     output_path: &Path,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
+    merge_with_options(
+        input_paths,
+        output_path,
+        &MergeOptions::legacy_with_index_options(index_options.clone()),
+    )
+}
+
+/// Richest merge entry point. Accepts the full [`MergeOptions`]
+/// surface: predicate-index configuration, var-identity strictness,
+/// uns-conflict policy, and shard-target overrides. The flat
+/// [`merge_with_index_options`] / [`merge`] entry points delegate to
+/// this function with the legacy defaults baked in.
+pub fn merge_with_options(
+    input_paths: &[&Path],
+    output_path: &Path,
+    options: &MergeOptions,
+) -> Result<PredicateIndexBuildSummary> {
+    let index_options = &options.index_options;
     if input_paths.is_empty() {
         return Err(OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -188,27 +207,65 @@ pub fn merge_with_index_options(
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
 
-    // Concatenate obs across all inputs, unifying dictionary-encoded columns
-    // to avoid corrupt categoricals when merging files with different dictionaries.
-    let obs_batches: Vec<RecordBatch> = readers
-        .iter()
-        .map(|r| r.read_obs())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let unified_batches: Vec<RecordBatch> = obs_batches
-        .iter()
-        .map(unify_dict_columns)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
+    // ---------------------------------------------------------------
+    // Phase 2: streaming obs across all inputs.
+    //
+    // Replace the legacy `read_obs → unify_dict_columns → concat_batches`
+    // chain (which materialised the entire merged obs table and hit
+    // Arrow IPC's 2 GB narrow-offset ceiling for atlas-scale workloads)
+    // with a shard-by-shard pipeline writing `ObsMetadataShard`
+    // sections. Each input is read either via `obs_shards()` (if it is
+    // already sharded) or by re-chunking its single-section
+    // `read_obs()` into shards bounded by `shard_target`. The
+    // per-shard `write_obs_shard` path upcasts Utf8 → LargeUtf8 inside
+    // `write_arrow_ipc`, so individual shards stay below the offset
+    // ceiling regardless of the merged total.
+    // ---------------------------------------------------------------
 
-    // Write var from first input
-    let var = readers[0].read_var()?;
+    let unified_obs_schema = first_input_obs_schema(&readers)?;
+    let var = read_var_assembled(&readers[0])?;
+    validate_var_identity(&readers, &var, options.assume_identical_var)?;
 
-    // Fail fast if forced columns are missing from the merged schemas.
-    // Runs BEFORE any obs / var / shard writes so the temp output file
-    // is dropped on error and no `output_path` is materialised.
-    validate_forced_columns(index_options, &merged_obs.schema(), &var.schema())?;
+    // Fail fast if forced index columns are missing from the unified
+    // schemas — before any output bytes are written.
+    validate_forced_columns(index_options, &unified_obs_schema, &var.schema())?;
 
-    writer.write_obs(&merged_obs)?;
+    let shard_target_rows: u64 = options
+        .shard_target_rows
+        .unwrap_or(first_header.shard_target_rows) as u64;
+
+    let want_index = user_wants_index(index_options);
+    let mut obs_index_builder = if want_index {
+        Some(obs_predicate_index_builder(
+            unified_obs_schema.clone(),
+            index_options,
+        )?)
+    } else {
+        None
+    };
+
+    let mut out_shard_idx: u32 = 0;
+    let mut cumulative_obs_rows: u64 = 0;
+    for reader in &readers {
+        for chunk in input_obs_chunks(reader, shard_target_rows)? {
+            let chunk = chunk?;
+            let unified = unify_dict_columns(&chunk)?;
+            if let Some(builder) = obs_index_builder.as_mut() {
+                builder.push_shard(&unified, cumulative_obs_rows)?;
+            }
+            let n_shard_rows = unified.num_rows() as u64;
+            writer.write_obs_shard(
+                out_shard_idx,
+                cumulative_obs_rows,
+                n_shard_rows,
+                total_n_obs,
+                &unified,
+            )?;
+            out_shard_idx += 1;
+            cumulative_obs_rows += n_shard_rows;
+        }
+    }
+
     writer.write_var(&var)?;
 
     // For each input: decode CSR shards and write to output with adjusted row_start.
@@ -273,9 +330,16 @@ pub fn merge_with_index_options(
         }
     }
 
-    // Merge uns from first input
-    if let Ok(uns) = readers[0].read_uns() {
-        writer.write_uns(&uns)?;
+    // Merge uns according to the policy. Default `UnsPolicy::First`
+    // matches today's pre-refactor behaviour (read first input's
+    // `uns`, drop the rest); the other policies surface conflicts
+    // explicitly. See [`crate::merge_options::UnsPolicy`] for the
+    // semantics of each policy.
+    let mut uns_conflicts_warned: usize = 0;
+    if let Some(combined_uns) =
+        combine_uns_for_merge(&readers, options.uns_policy, &mut uns_conflicts_warned)?
+    {
+        writer.write_uns(&combined_uns)?;
     }
 
     // Merge layers — collect layer names from ALL inputs, not just the first,
@@ -374,22 +438,53 @@ pub fn merge_with_index_options(
         }
     }
 
-    // Build + write predicate indexes (obs + var) when the caller
-    // requested any. `user_wants_index` treats a non-zero
-    // `index_auto_threshold` as an explicit request — fixes the
-    // pre-fix bug where `--index-auto-threshold N` alone was a no-op.
-    // Forced-column-missing was already caught by
-    // `validate_forced_columns` above, so the engine outcomes here are
-    // limited to preset skips and supported-type checks.
-    let index_result = if user_wants_index(index_options) {
-        Some(build_and_write_conversion_predicate_indexes(
-            &mut writer,
-            &merged_obs,
-            &var,
+    // Build + write predicate indexes (obs + var) using the streaming
+    // builder we accumulated during the obs-shard write loop. The
+    // builder consumed each obs shard inline so peak memory stayed
+    // bounded to one shard at a time. Forced-column-missing was
+    // already caught by `validate_forced_columns` above; engine
+    // outcomes here are limited to preset skips and supported-type
+    // checks.
+    let index_result = if let Some(builder) = obs_index_builder {
+        let mut result = scx_engine::ConversionPredicateIndexResult::default();
+        let obs_bytes = builder.finish(
             &output_shard_row_ranges,
-            n_vars as usize,
-            index_options,
-        )?)
+            &mut result.obs_outcomes,
+            &mut result.obs_indexed_columns,
+        )?;
+        if let Some(bytes) = obs_bytes {
+            writer.write_obs_predicate_index(&bytes)?;
+        }
+        // var stays on the batch-mode builder — var rarely overflows
+        // and the streaming path doesn't help small-axis predicate
+        // indexes. Reuse `build_var_predicate_index_bytes` with the
+        // same column-resolution policy used by
+        // `build_and_write_conversion_predicate_indexes` so behaviour
+        // is byte-identical to the non-streaming entry point.
+        let preset_var = match index_options.index_preset.as_deref() {
+            Some(name) => scx_engine::index_preset_columns(name)
+                .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let var_row_ranges: [(u64, u64); 1] = [(0, n_vars)];
+        let var_build_opts = scx_engine::PredicateIndexBuildOptions {
+            forced_columns: index_options.index_var.clone(),
+            preset_columns: preset_var,
+            auto_threshold: index_options.index_auto_threshold,
+            high_cardinality_threshold: 100_000,
+        };
+        let var_bytes = scx_engine::build_var_predicate_index_bytes(
+            &var,
+            &var_row_ranges,
+            &var_build_opts,
+            &mut result.var_outcomes,
+            &mut result.var_indexed_columns,
+        )?;
+        if let Some(bytes) = var_bytes {
+            writer.write_var_predicate_index(&bytes)?;
+        }
+        Some(result)
     } else {
         None
     };
@@ -408,7 +503,14 @@ pub fn merge_with_index_options(
             .as_secs() as i64,
         action: "merge".to_string(),
         tool: "scx-ops 0.1.0".to_string(),
-        params_json: format!("{{\"n_inputs\":{}}}", input_paths.len()),
+        params_json: format!(
+            "{{\"n_inputs\":{},\"assume_identical_var\":{},\"uns_policy\":\"{}\",\
+             \"uns_conflicts_warned\":{}}}",
+            input_paths.len(),
+            options.assume_identical_var,
+            options.uns_policy.as_str(),
+            uns_conflicts_warned,
+        ),
         input_checksums: readers
             .iter()
             .map(|r| {
@@ -506,18 +608,34 @@ fn merge_multimodal(
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
 
-    // Global obs: concatenate with dict unification (same path as
-    // single-modality merge).
-    let obs_batches: Vec<RecordBatch> = readers
-        .iter()
-        .map(|r| r.read_obs())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let unified_batches: Vec<RecordBatch> = obs_batches
-        .iter()
-        .map(unify_dict_columns)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let merged_obs = concat_batches(&unified_batches[0].schema(), &unified_batches)?;
-    writer.write_obs(&merged_obs)?;
+    // Phase 2b: Global obs streams shard-by-shard exactly as the
+    // single-modality path does (see `merge_with_options`). The
+    // multimodal merge_multimodal entry currently doesn't surface
+    // `MergeOptions` to its callers — the orchestrator
+    // (`merge_with_options`) doesn't pass policy fields here because
+    // multimodal merge has a separate uns / var ownership model
+    // (per-modality var, per-modality uns). Stream obs with the
+    // default shard target from the first input and skip var-identity
+    // / uns-policy enforcement (handled per-modality below).
+    let shard_target_rows: u64 = first_header.shard_target_rows as u64;
+    let mut out_shard_idx: u32 = 0;
+    let mut cumulative_obs_rows: u64 = 0;
+    for reader in readers {
+        for chunk in input_obs_chunks(reader, shard_target_rows)? {
+            let chunk = chunk?;
+            let unified = unify_dict_columns(&chunk)?;
+            let n_shard_rows = unified.num_rows() as u64;
+            writer.write_obs_shard(
+                out_shard_idx,
+                cumulative_obs_rows,
+                n_shard_rows,
+                total_n_obs,
+                &unified,
+            )?;
+            out_shard_idx += 1;
+            cumulative_obs_rows += n_shard_rows;
+        }
+    }
 
     // Global obsm: concatenate across inputs row-wise. Drop a key if
     // any input is missing it (consistent with single-modality merge).
@@ -814,6 +932,324 @@ fn modality_tables_match(
             x.entries.iter().zip(y.entries.iter()).all(|(p, q)| {
                 p.name == q.name && p.modality_type == q.modality_type && p.n_vars == q.n_vars
             })
+        }
+    }
+}
+
+// ============================================================================
+// Phase 2a helpers — unified schema, var validation, obs streaming, uns merge
+// ============================================================================
+
+/// Resolve the first input's unified obs schema. Falls back to the
+/// sharded layout's schema (via `read_obs_schema_*`) when the input is
+/// row-sharded. The schema is used to drive predicate-index column
+/// selection and `validate_forced_columns` — exact per-column widths
+/// (`Utf8` vs `LargeUtf8`) are not load-bearing because the streaming
+/// builder's per-shard check normalises across width via
+/// [`scx_engine::index::column_class_compatible`].
+fn first_input_obs_schema(readers: &[ScxReader]) -> Result<arrow::datatypes::SchemaRef> {
+    let schema = readers[0]
+        .read_obs_schema_physical()
+        .map_err(OpsError::Format)?;
+    Ok(std::sync::Arc::new(schema))
+}
+
+/// Read var from a single reader, handling both legacy single-section
+/// and sharded var layouts. Sharded var is rare today but supported in
+/// Phase 1.
+fn read_var_assembled(reader: &ScxReader) -> Result<RecordBatch> {
+    if reader.var_metadata_shard_count() > 0 {
+        reader.read_var_assembled().map_err(OpsError::Format)
+    } else {
+        reader.read_var().map_err(OpsError::Format)
+    }
+}
+
+/// Validate that every input agrees with the first input on var
+/// identity (column names, types, row count, row content). Each
+/// pairwise mismatch produces a `OpsError::VarMismatch` unless
+/// `assume_identical` is true — in which case the function logs a
+/// warning per mismatch and proceeds with the first input's var.
+///
+/// `n_vars` was already validated upstream (count-only check), so this
+/// is the second, stronger check that prevents silent column-axis
+/// corruption when inputs disagree on gene order.
+fn validate_var_identity(
+    readers: &[ScxReader],
+    first_var: &RecordBatch,
+    assume_identical: bool,
+) -> Result<()> {
+    for (i, reader) in readers.iter().enumerate().skip(1) {
+        let other = read_var_assembled(reader)?;
+        if let Some(detail) = var_diff(first_var, &other) {
+            if assume_identical {
+                log::warn!(
+                    "merge: input {i}'s var differs from input 0 (--assume-identical-var \
+                     in effect; using input 0's var verbatim): {detail}"
+                );
+            } else {
+                return Err(OpsError::VarMismatch {
+                    detail: format!("input 0 vs input {i}: {detail}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare two var `RecordBatch`es for identity. Returns `None` when
+/// they are identical for the purposes of merge (column names, dtypes,
+/// row count, and per-column content all match), or a human-readable
+/// description of the first observed difference.
+fn var_diff(a: &RecordBatch, b: &RecordBatch) -> Option<String> {
+    if a.num_rows() != b.num_rows() {
+        return Some(format!(
+            "n_vars differ ({} vs {})",
+            a.num_rows(),
+            b.num_rows()
+        ));
+    }
+    let a_schema = a.schema();
+    let b_schema = b.schema();
+    let a_names: Vec<&str> = a_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let b_names: Vec<&str> = b_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    if a_names != b_names {
+        return Some(format!(
+            "column names differ ({:?} vs {:?})",
+            a_names, b_names,
+        ));
+    }
+    for (i, (af, bf)) in a_schema
+        .fields()
+        .iter()
+        .zip(b_schema.fields().iter())
+        .enumerate()
+    {
+        if af.data_type() != bf.data_type() {
+            return Some(format!(
+                "column '{}' dtype differs ({:?} vs {:?})",
+                af.name(),
+                af.data_type(),
+                bf.data_type(),
+            ));
+        }
+        let a_col = a.column(i);
+        let b_col = b.column(i);
+        if a_col.as_ref() != b_col.as_ref() {
+            return Some(format!(
+                "column '{}' content differs (use --assume-identical-var to override)",
+                af.name(),
+            ));
+        }
+    }
+    None
+}
+
+/// Construct the streaming obs predicate-index builder using the same
+/// preset resolution and option defaults that
+/// [`scx_engine::build_and_write_conversion_predicate_indexes`] applies.
+fn obs_predicate_index_builder(
+    schema: arrow::datatypes::SchemaRef,
+    index_options: &ConversionPredicateIndexOptions,
+) -> Result<scx_engine::ObsPredicateIndexBuilder> {
+    let preset_obs = match index_options.index_preset.as_deref() {
+        Some(name) => scx_engine::index_preset_columns(name)
+            .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let build_opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: index_options.index_obs.clone(),
+        preset_columns: preset_obs,
+        auto_threshold: index_options.index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    };
+    scx_engine::ObsPredicateIndexBuilder::new(schema, &build_opts).map_err(OpsError::Engine)
+}
+
+/// Yield this input's obs as a sequence of shard batches, each at most
+/// `shard_target_rows` rows. Sharded inputs pass through via
+/// [`ScxReader::obs_shards`]; legacy single-section inputs are sliced
+/// into chunks of `shard_target_rows` so the output keeps a uniform
+/// shard size regardless of the input layout.
+fn input_obs_chunks<'a>(
+    reader: &'a ScxReader,
+    shard_target_rows: u64,
+) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + 'a>> {
+    if reader.obs_metadata_shard_count() > 0 {
+        Ok(Box::new(
+            reader.obs_shards().map(|r| r.map_err(OpsError::Format)),
+        ))
+    } else {
+        let single = reader.read_obs().map_err(OpsError::Format)?;
+        Ok(Box::new(SingleObsChunker {
+            batch: single,
+            shard_target_rows: shard_target_rows.max(1) as usize,
+            cursor: 0,
+        }))
+    }
+}
+
+/// Slices a single legacy obs `RecordBatch` into shard-sized chunks
+/// without allocating a new buffer per chunk — `RecordBatch::slice`
+/// shares the underlying Arrow array.
+struct SingleObsChunker {
+    batch: RecordBatch,
+    shard_target_rows: usize,
+    cursor: usize,
+}
+
+impl Iterator for SingleObsChunker {
+    type Item = Result<RecordBatch>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let n = self.batch.num_rows();
+        if self.cursor >= n {
+            return None;
+        }
+        let take = std::cmp::min(self.shard_target_rows, n - self.cursor);
+        let chunk = self.batch.slice(self.cursor, take);
+        self.cursor += take;
+        Some(Ok(chunk))
+    }
+}
+
+/// Apply [`crate::merge_options::UnsPolicy`] across input `uns`
+/// sections. Returns the JSON payload to write (or `None` when nothing
+/// should be written — e.g. no input had uns, or `Namespace` ended up
+/// with an empty wrapper). Conflicts are counted into
+/// `conflicts_warned` for the provenance stamp.
+fn combine_uns_for_merge(
+    readers: &[ScxReader],
+    policy: crate::merge_options::UnsPolicy,
+    conflicts_warned: &mut usize,
+) -> Result<Option<serde_json::Value>> {
+    use crate::merge_options::UnsPolicy;
+
+    // Collect each input's uns (or `None` when absent). We need the
+    // full set for any policy that compares across inputs.
+    let mut per_input: Vec<Option<serde_json::Value>> = Vec::with_capacity(readers.len());
+    for reader in readers {
+        match reader.read_uns() {
+            Ok(v) => per_input.push(Some(v)),
+            Err(_) => per_input.push(None),
+        }
+    }
+
+    // Pull out the first non-None as the canonical body for `First` /
+    // `Summary`; bail early when no input has uns.
+    let first_present = per_input.iter().position(|v| v.is_some());
+    let Some(first_idx) = first_present else {
+        return Ok(None);
+    };
+
+    match policy {
+        UnsPolicy::First => {
+            // Warn on any input whose uns differs from the chosen one
+            // so silent data loss is at least visible in logs.
+            let canonical = per_input[first_idx].as_ref().unwrap().clone();
+            for (i, other) in per_input.iter().enumerate() {
+                if i == first_idx {
+                    continue;
+                }
+                if let Some(o) = other {
+                    if o != &canonical {
+                        *conflicts_warned += 1;
+                        log::warn!(
+                            "merge: input {i}'s uns differs from input {first_idx}; \
+                             dropping under uns_policy=first"
+                        );
+                    }
+                }
+            }
+            Ok(Some(canonical))
+        }
+        UnsPolicy::RequireEqual => {
+            let canonical = per_input[first_idx].as_ref().unwrap();
+            for (i, other) in per_input.iter().enumerate() {
+                if i == first_idx {
+                    continue;
+                }
+                if let Some(o) = other {
+                    if o != canonical {
+                        return Err(OpsError::UnsConflict {
+                            policy: "require-equal",
+                            detail: format!(
+                                "input {first_idx} vs input {i}: uns differs (see input \
+                                 files for full payload)"
+                            ),
+                        });
+                    }
+                } else {
+                    return Err(OpsError::UnsConflict {
+                        policy: "require-equal",
+                        detail: format!("input {i} has no uns section but input {first_idx} does"),
+                    });
+                }
+            }
+            Ok(Some(canonical.clone()))
+        }
+        UnsPolicy::Namespace => {
+            let mut obj = serde_json::Map::new();
+            for (i, v) in per_input.iter().enumerate() {
+                if let Some(payload) = v {
+                    obj.insert(format!("input_{i}"), payload.clone());
+                }
+            }
+            if obj.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(serde_json::Value::Object(obj)))
+            }
+        }
+        UnsPolicy::Summary => {
+            let canonical = per_input[first_idx].as_ref().unwrap();
+            let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            for (i, other) in per_input.iter().enumerate() {
+                if i == first_idx {
+                    continue;
+                }
+                match other {
+                    Some(o) if o != canonical => {
+                        *conflicts_warned += 1;
+                        conflicts.push(serde_json::json!({
+                            "input": i,
+                            "status": "differs",
+                        }));
+                    }
+                    None => {
+                        conflicts.push(serde_json::json!({
+                            "input": i,
+                            "status": "missing",
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            if conflicts.is_empty() {
+                Ok(Some(canonical.clone()))
+            } else {
+                let mut payload = match canonical.clone() {
+                    serde_json::Value::Object(m) => m,
+                    other => {
+                        let mut wrapper = serde_json::Map::new();
+                        wrapper.insert("_scx_canonical".to_string(), other);
+                        wrapper
+                    }
+                };
+                payload.insert(
+                    "_scx_uns_conflicts".to_string(),
+                    serde_json::Value::Array(conflicts),
+                );
+                Ok(Some(serde_json::Value::Object(payload)))
+            }
         }
     }
 }

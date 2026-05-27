@@ -5,9 +5,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
-use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
@@ -179,7 +178,7 @@ pub fn append_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence.
-    let old_obs = read_existing_arrow_ipc_section(&mut lock, &prep.old_catalog, "obs")?;
+    let old_obs = read_existing_obs_assembled(&mut lock, &prep.old_catalog)?;
     validate_obs_schema(&old_obs, new_obs)?;
 
     // Seek to EOF for appending and run the per-chunk write loop.
@@ -351,7 +350,7 @@ pub fn append_from_reader_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence (before writing).
-    let old_obs = read_existing_arrow_ipc_section(&mut lock, &prep.old_catalog, "obs")?;
+    let old_obs = read_existing_obs_assembled(&mut lock, &prep.old_catalog)?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
     // Per-source-shard streaming loop.
@@ -611,6 +610,72 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, Appe
             old_per_modality_csr,
         },
     ))
+}
+
+/// Read an existing obs payload as a single `RecordBatch`, handling
+/// both legacy single-section [`SectionType::ObsMetadata`] files and
+/// Phase 2 row-sharded [`SectionType::ObsMetadataShard`] files. The
+/// sharded path concatenates shards in `shard_idx` order, matching
+/// what [`scx_format::ScxReader::read_obs_assembled`] returns at
+/// query time. Used by `append` (which needs the full pre-existing
+/// obs in memory for the schema check + the convert-on-append rewrite
+/// to ObsMetadataShard shard 0).
+///
+/// Memory cost: O(old obs size). Same as today's pre-Phase-2 path —
+/// the streaming win shows up in `finalize_append` where new obs is
+/// no longer concatenated with old obs.
+fn read_existing_obs_assembled(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+) -> Result<RecordBatch> {
+    let shard_entries: Vec<(u32, &FullCatalogEntry)> = old_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+        .filter_map(|e| {
+            let suffix = e.name.strip_prefix("obs_metadata/shard_")?;
+            let idx: u32 = suffix.parse().ok()?;
+            Some((idx, e))
+        })
+        .collect();
+    if shard_entries.is_empty() {
+        return read_existing_arrow_ipc_section(lock, old_catalog, "obs");
+    }
+    let mut shards: Vec<(u32, &FullCatalogEntry)> = shard_entries;
+    shards.sort_by_key(|(idx, _)| *idx);
+    let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
+    for (_, entry) in &shards {
+        lock.seek(SeekFrom::Start(entry.offset))?;
+        let mut buf = vec![0u8; entry.length as usize];
+        std::io::Read::read_exact(&mut *lock, &mut buf)?;
+        let cursor = Cursor::new(buf);
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+        let mut iter = reader.into_iter();
+        let batch = iter.next().ok_or_else(|| {
+            OpsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} contains no batches", entry.name),
+            ))
+        })??;
+        batches.push(scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?);
+    }
+    let first_schema = batches[0].schema();
+    let concatenated =
+        arrow::compute::concat_batches(&first_schema, batches.iter()).map_err(OpsError::Arrow)?;
+    // Strip per-shard schema metadata so the schema matches what
+    // `read_obs_assembled` returns at query time.
+    let mut clean_metadata = first_schema.metadata().clone();
+    clean_metadata.remove("shard_idx");
+    clean_metadata.remove("row_start");
+    clean_metadata.remove("n_shard_rows");
+    let clean_schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        first_schema.fields().clone(),
+        clean_metadata,
+    ));
+    Ok(RecordBatch::try_new(
+        clean_schema,
+        concatenated.columns().to_vec(),
+    )?)
 }
 
 /// Read an existing Arrow IPC metadata section (`"obs"` or `"var"`) back
@@ -962,12 +1027,21 @@ fn finalize_append(
     mut write_offset: u64,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
-    let merged_obs = {
-        let old_unified = unify_dict_columns(old_obs)?;
-        let new_unified = unify_dict_columns(new_obs)?;
-        concat_batches(&old_unified.schema(), &[old_unified, new_unified])?
-    };
-    let merged_obs = scx_format::upcast_to_large_types(&merged_obs).map_err(OpsError::Format)?;
+    // Phase 2d: convert-on-append. The legacy path concatenated old +
+    // new obs into one batch and wrote it as a single `ObsMetadata`
+    // section, which:
+    //   (a) doubled peak RSS (full old obs + full new obs + concat
+    //       buffer all live simultaneously), and
+    //   (b) hit Arrow IPC's 2 GB narrow-offset ceiling once cumulative
+    //       string payload exceeded `i32::MAX`.
+    // The new flow writes old obs as `ObsMetadataShard` shard 0 and
+    // new obs as one or more subsequent shards (bounded by
+    // `shard_target_rows`). The per-shard `write_arrow_ipc` upcast
+    // keeps individual shard offsets safe regardless of merged
+    // totals. Predicate-index construction streams the same shards
+    // through `ObsPredicateIndexBuilder`.
+    let old_unified = unify_dict_columns(old_obs)?;
+    let new_unified = unify_dict_columns(new_obs)?;
 
     // Multimodal-skip vs single-modality rebuild decision.
     // `user_wants_index` treats a non-zero `index_auto_threshold` as an
@@ -982,41 +1056,91 @@ fn finalize_append(
     };
     let rebuild_index = want_index && !target_is_multimodal;
 
-    // Fail fast (before any catalog updates) if forced index columns
-    // are missing. The shard-write loop already ran upstream, so on
-    // error the file still reads as pre-append (the header still
-    // points to the old catalog); the orphaned shard bytes are
-    // recoverable via `scx compact`.
-    //
-    // The var read seeks the lock's cursor away from `write_offset`;
-    // we restore it below so the subsequent alignment-padding /
-    // obs-IPC writes land in the right place.
-    if rebuild_index {
-        let var_schema = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
-        validate_forced_columns(index_options, &merged_obs.schema(), &var_schema.schema())?;
-        lock.seek(SeekFrom::Start(write_offset))?;
-    }
+    let new_n_obs = prep.old_n_obs + n_new_rows;
+    let shard_target_rows = prep.header.shard_target_rows.max(1) as usize;
 
-    let obs_ipc_bytes = {
-        let mut buf = Vec::new();
-        let mut writer =
-            arrow::ipc::writer::FileWriter::try_new(&mut buf, merged_obs.schema_ref())?;
-        writer.write(&merged_obs)?;
-        writer.finish()?;
-        buf
+    // Read var first (and validate forced index columns) so the
+    // seek-around-the-lock-cursor dance happens before any obs writes
+    // land. On any forced-column error the file still reads as
+    // pre-append (header still points to old catalog).
+    let var_for_index = if rebuild_index {
+        let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
+        validate_forced_columns(index_options, &old_unified.schema(), &var.schema())?;
+        lock.seek(SeekFrom::Start(write_offset))?;
+        Some(var)
+    } else {
+        None
     };
 
-    let pad = write_alignment_padding(&mut *lock, write_offset)?;
-    write_offset += pad as u64;
-    let new_obs_offset = write_offset;
-    lock.write_all(&obs_ipc_bytes)?;
-    let new_obs_length = obs_ipc_bytes.len() as u64;
-    let new_obs_checksum = blake3_hash(&obs_ipc_bytes);
-    write_offset += new_obs_length;
+    // Hand the open file off to `ScxWriter` for the obs-shard and
+    // predicate-index section emits. The `FileLock` retains the
+    // OS-level lock through the duplicate FD (closed below), so
+    // concurrent appenders stay blocked. The clone's cursor advances
+    // independently of the lock's; we resync via `seek` after
+    // `into_in_place_parts`.
+    let cloned_file = lock.file().try_clone()?;
+    let mut writer =
+        ScxWriter::adopt_in_place(cloned_file, prep.header.clone(), write_offset, Vec::new())?;
 
-    let mut predicate_index_section_entries: Vec<FullCatalogEntry> = Vec::new();
+    let mut obs_index_builder = if rebuild_index {
+        Some(
+            scx_engine::ObsPredicateIndexBuilder::new(
+                old_unified.schema(),
+                &predicate_index_build_options_for_obs(index_options),
+            )
+            .map_err(OpsError::Engine)?,
+        )
+    } else {
+        None
+    };
+
+    let mut out_shard_idx: u32 = 0;
+    let mut cumulative_obs_rows: u64 = 0;
+
+    // Shard 0: the entire old obs. Convert-on-append: even files
+    // whose old obs was a single `ObsMetadata` section land here as
+    // `ObsMetadataShard` shard 0; future appends extend this chain.
+    if let Some(b) = obs_index_builder.as_mut() {
+        b.push_shard(&old_unified, cumulative_obs_rows)
+            .map_err(OpsError::Engine)?;
+    }
+    writer.write_obs_shard(
+        out_shard_idx,
+        cumulative_obs_rows,
+        old_unified.num_rows() as u64,
+        new_n_obs,
+        &old_unified,
+    )?;
+    out_shard_idx += 1;
+    cumulative_obs_rows += old_unified.num_rows() as u64;
+
+    // Shards 1+: the new obs, split into `shard_target_rows`-sized
+    // chunks so each shard stays well under Arrow IPC's narrow-offset
+    // ceiling. `RecordBatch::slice` shares Arrow buffers — no
+    // per-chunk copy.
+    let new_n = new_unified.num_rows();
+    let mut cursor = 0;
+    while cursor < new_n {
+        let take = std::cmp::min(shard_target_rows, new_n - cursor);
+        let chunk = new_unified.slice(cursor, take);
+        if let Some(b) = obs_index_builder.as_mut() {
+            b.push_shard(&chunk, cumulative_obs_rows)
+                .map_err(OpsError::Engine)?;
+        }
+        writer.write_obs_shard(
+            out_shard_idx,
+            cumulative_obs_rows,
+            take as u64,
+            new_n_obs,
+            &chunk,
+        )?;
+        out_shard_idx += 1;
+        cumulative_obs_rows += take as u64;
+        cursor += take;
+    }
+
     let drop_old_predicate_indexes = rebuild_index;
-    let index_result = if rebuild_index {
+    let index_result = if let Some(builder) = obs_index_builder {
         // Per-output-shard `(row_start, row_end)` for the full obs:
         // existing CSR shards (modality_id == 0) sorted by row_start,
         // plus the freshly-appended shards in append order.
@@ -1034,38 +1158,77 @@ fn finalize_append(
                 .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end))),
         );
 
-        // var is untouched by append — read from the existing catalog.
-        let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
-
-        // Hand the open file off to `ScxWriter` for the section emits.
-        // The `FileLock` retains the OS-level lock through the
-        // duplicate FD (closed below), so concurrent appenders stay
-        // blocked. The clone's cursor advances independently of the
-        // lock's; we resync via `seek` after `into_in_place_parts`.
-        let cloned_file = lock.file().try_clone()?;
-        let mut writer =
-            ScxWriter::adopt_in_place(cloned_file, prep.header.clone(), write_offset, Vec::new())?;
-        let result = build_and_write_conversion_predicate_indexes(
-            &mut writer,
-            &merged_obs,
+        let var = var_for_index.expect("var_for_index populated when rebuild_index is true");
+        let mut result = scx_engine::ConversionPredicateIndexResult::default();
+        let obs_bytes = builder
+            .finish(
+                &shard_row_ranges,
+                &mut result.obs_outcomes,
+                &mut result.obs_indexed_columns,
+            )
+            .map_err(OpsError::Engine)?;
+        if let Some(bytes) = obs_bytes {
+            writer.write_obs_predicate_index(&bytes)?;
+        }
+        let preset_var = match index_options.index_preset.as_deref() {
+            Some(name) => scx_engine::index_preset_columns(name)
+                .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let var_row_ranges: [(u64, u64); 1] = [(0, prep.target_n_vars)];
+        let var_build_opts = scx_engine::PredicateIndexBuildOptions {
+            forced_columns: index_options.index_var.clone(),
+            preset_columns: preset_var,
+            auto_threshold: index_options.index_auto_threshold,
+            high_cardinality_threshold: 100_000,
+        };
+        let var_bytes = scx_engine::build_var_predicate_index_bytes(
             &var,
-            &shard_row_ranges,
-            prep.target_n_vars as usize,
-            index_options,
+            &var_row_ranges,
+            &var_build_opts,
+            &mut result.var_outcomes,
+            &mut result.var_indexed_columns,
         )?;
-        let (cloned_file, new_offset, new_entries) = writer.into_in_place_parts()?;
-        drop(cloned_file);
-        // Resync the lock's cursor to the new EOF so subsequent
-        // `lock.write_all(...)` calls land after the predicate-index
-        // sections rather than overwriting them. (`write_offset` is
-        // refreshed via `lock.stream_position()` below the provenance
-        // write, so we don't update it here.)
-        lock.seek(SeekFrom::Start(new_offset))?;
-        predicate_index_section_entries = new_entries;
+        if let Some(bytes) = var_bytes {
+            writer.write_var_predicate_index(&bytes)?;
+        }
         Some(result)
     } else {
         None
     };
+
+    let (cloned_file, new_offset, writer_new_entries) = writer.into_in_place_parts()?;
+    drop(cloned_file);
+    // Resync the lock's cursor to the new EOF so subsequent
+    // `lock.write_all(...)` calls land after the predicate-index
+    // sections rather than overwriting them. `write_offset` is
+    // refreshed via `lock.stream_position()` below the provenance
+    // write, so we don't update it here.
+    lock.seek(SeekFrom::Start(new_offset))?;
+    let _ = new_offset; // mirrors the original code's silent drop
+    let _ = write_offset; // mirrors the original code's silent drop
+
+    // Split the writer's emitted entries by kind so the catalog
+    // assembly below can wire them in the right slots.
+    let mut obs_shard_section_entries: Vec<FullCatalogEntry> = Vec::new();
+    let mut predicate_index_section_entries: Vec<FullCatalogEntry> = Vec::new();
+    for entry in writer_new_entries {
+        match entry.section_type {
+            SectionType::ObsMetadataShard => obs_shard_section_entries.push(entry),
+            SectionType::ObsPredicateIndex | SectionType::VarPredicateIndex => {
+                predicate_index_section_entries.push(entry)
+            }
+            _ => {
+                return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+                    format!(
+                        "finalize_append: unexpected section type {:?} written by adopted writer",
+                        entry.section_type
+                    ),
+                )));
+            }
+        }
+    }
 
     // Provenance
     let prov_entries = {
@@ -1090,7 +1253,14 @@ fn finalize_append(
                 .as_secs() as i64,
             action: "append".to_string(),
             tool: "scx-ops 0.1.0".to_string(),
-            params_json: format!("{{\"n_new_rows\":{n_new_rows}}}"),
+            // Stamp the convert-on-append payload shape so downstream
+            // tools can tell that obs is now sharded. Append doesn't
+            // expose the merge-side policy switches (var identity,
+            // uns policy) — there's only one input, so they have no
+            // meaning here.
+            params_json: format!(
+                "{{\"n_new_rows\":{n_new_rows},\"obs_layout\":\"ObsMetadataShard\"}}",
+            ),
             input_checksums: vec![],
         });
         entries
@@ -1131,13 +1301,19 @@ fn finalize_append(
         .entries
         .into_iter()
         .filter(|e| {
-            // Always drop ObsMetadata / Provenance / CscShard — they
-            // are rewritten or invalidated by the append. Drop
-            // ObsPredicateIndex / VarPredicateIndex only when we are
-            // rebuilding them; otherwise the stale entries remain in
-            // place (matches pre-fix behaviour where the index covers
-            // the original rows but not the freshly-appended ones).
+            // Always drop ObsMetadata / ObsMetadataShard / Provenance
+            // / CscShard — they are rewritten or invalidated by the
+            // append. ObsMetadata bytes from a legacy file become
+            // orphaned (no catalog entry points at them); they are
+            // recoverable by `scx compact`. The Phase 2d convert-on-
+            // append path rewrites old obs as ObsMetadataShard shard 0
+            // and the new rows as shards 1+. Drop ObsPredicateIndex /
+            // VarPredicateIndex only when we are rebuilding them;
+            // otherwise stale entries remain in place (matches pre-fix
+            // behaviour where the index covers the original rows but
+            // not the freshly-appended ones).
             let base_filter = e.section_type != SectionType::ObsMetadata
+                && e.section_type != SectionType::ObsMetadataShard
                 && e.section_type != SectionType::Provenance
                 && e.section_type != SectionType::CscShard;
             if !drop_old_predicate_indexes {
@@ -1157,16 +1333,8 @@ fn finalize_append(
         );
     }
     new_entries.extend(new_shard_entries);
+    new_entries.extend(obs_shard_section_entries);
     new_entries.extend(predicate_index_section_entries);
-    new_entries.push(FullCatalogEntry {
-        name: "obs".to_string(),
-        offset: new_obs_offset,
-        length: new_obs_length,
-        section_type: SectionType::ObsMetadata,
-        checksum: new_obs_checksum,
-        modality_id: 0,
-        stats: None,
-    });
     new_entries.push(FullCatalogEntry {
         name: "provenance".to_string(),
         offset: prov_offset,
@@ -1177,7 +1345,6 @@ fn finalize_append(
         stats: None,
     });
 
-    let new_n_obs = prep.old_n_obs + n_new_rows;
     let new_manifest_sequence = prep.header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
         catalog_version: scx_format::CURRENT_CATALOG_VERSION,
@@ -1289,6 +1456,28 @@ fn finalize_append(
         result: index_result,
         multimodal_skip,
     })
+}
+
+/// Build the obs predicate-index options from a conversion-time
+/// options struct. Mirrors the preset / forced / auto resolution
+/// applied by [`scx_engine::build_and_write_conversion_predicate_indexes`]
+/// so the Phase 2d streaming append produces byte-identical predicate
+/// indexes to the legacy batch path.
+fn predicate_index_build_options_for_obs(
+    index_options: &ConversionPredicateIndexOptions,
+) -> scx_engine::PredicateIndexBuildOptions {
+    let preset_obs = match index_options.index_preset.as_deref() {
+        Some(name) => scx_engine::index_preset_columns(name)
+            .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    scx_engine::PredicateIndexBuildOptions {
+        forced_columns: index_options.index_obs.clone(),
+        preset_columns: preset_obs,
+        auto_threshold: index_options.index_auto_threshold,
+        high_cardinality_threshold: 100_000,
+    }
 }
 
 /// Return the effective (dictionary-stripped) value type of a `DataType`.

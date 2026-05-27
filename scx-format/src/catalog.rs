@@ -594,7 +594,20 @@ pub struct FullCatalogEntry {
 /// (`stats_len == 0`) pay nothing. v2 readers accept both v1 and v2
 /// catalogs; v1 readers reject anything stamped `catalog_version >= 2`
 /// via the file `format_version` check upstream.
-pub const CURRENT_CATALOG_VERSION: u16 = 2;
+///
+/// v3 is a pure forward-compat signal: it doesn't change the catalog
+/// wire format (no new fields, no new layout branches). It declares
+/// that the writer may have emitted the row-sharded obs/var metadata
+/// section types ([`SectionType::ObsMetadataShard`] /
+/// [`SectionType::VarMetadataShard`]) introduced for atlas-scale merge
+/// and append. Older readers that don't know those types skip them via
+/// the existing unknown-section-type warning in
+/// [`FullCatalog::read_from`] and then fail loudly when callers ask for
+/// the global obs section that no longer exists — preferable to a
+/// silent partial read. New readers branching on `catalog_version >= 3`
+/// can short-circuit to the sharded paths without re-scanning the
+/// catalog.
+pub const CURRENT_CATALOG_VERSION: u16 = 3;
 
 #[derive(Debug, Clone)]
 pub struct FullCatalog {

@@ -118,8 +118,8 @@ fn rewrite_with_current_version(
     };
 
     // Read metadata
-    let obs = reader.read_obs()?;
-    let var = reader.read_var()?;
+    let obs = reader.read_obs_assembled()?;
+    let var = reader.read_var_assembled()?;
 
     // Create writer
     let mut writer = ScxWriter::new(output, out_header)?;
@@ -218,14 +218,14 @@ mod tests {
         assert_eq!(new_csr.data, orig_csr.data);
 
         // Verify obs metadata
-        let orig_obs = orig_reader.read_obs().unwrap();
-        let new_obs = new_reader.read_obs().unwrap();
+        let orig_obs = orig_reader.read_obs_assembled().unwrap();
+        let new_obs = new_reader.read_obs_assembled().unwrap();
         assert_eq!(new_obs.num_rows(), orig_obs.num_rows());
         assert_eq!(new_obs.num_columns(), orig_obs.num_columns());
 
         // Verify var metadata
-        let orig_var = orig_reader.read_var().unwrap();
-        let new_var = new_reader.read_var().unwrap();
+        let orig_var = orig_reader.read_var_assembled().unwrap();
+        let new_var = new_reader.read_var_assembled().unwrap();
         assert_eq!(new_var.num_rows(), orig_var.num_rows());
     }
 

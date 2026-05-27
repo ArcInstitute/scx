@@ -72,7 +72,7 @@ impl ScxExperiment {
     fn obs(&self) -> Result<Robj> {
         let batch = self
             .reader
-            .read_obs()
+            .read_obs_assembled()
             .map_err(|e| Error::Other(e.to_string()))?;
         interop::record_batch_to_dataframe(&batch)
     }
@@ -81,7 +81,7 @@ impl ScxExperiment {
     fn var(&self) -> Result<Robj> {
         let batch = self
             .reader
-            .read_var()
+            .read_var_assembled()
             .map_err(|e| Error::Other(e.to_string()))?;
         interop::record_batch_to_dataframe(&batch)
     }
@@ -160,11 +160,11 @@ impl ScxExperiment {
                 .map_err(|e| Error::Other(e.to_string()))?;
             let obs = self
                 .reader
-                .read_obs()
+                .read_obs_assembled()
                 .map_err(|e| Error::Other(e.to_string()))?;
             let var = self
                 .reader
-                .read_var()
+                .read_var_assembled()
                 .map_err(|e| Error::Other(e.to_string()))?;
             let result = QueryResult {
                 x: csr,

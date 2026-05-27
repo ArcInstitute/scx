@@ -332,7 +332,7 @@ fn resolve_gene_names(
     names: &[String],
     reader: &ScxReader,
 ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let var = reader.read_var()?;
+    let var = reader.read_var_assembled()?;
     resolve_gene_names_from_var(names, &var, "var")
 }
 
@@ -440,7 +440,7 @@ fn extract_modality(
 
     let csr = reader.read_all_csr_shards_for(modality_id)?;
     let var = reader.read_var_for(modality_id)?;
-    let obs = reader.read_obs()?;
+    let obs = reader.read_obs_assembled()?;
     // PR #68: preserve metadata when extracting a single modality.
     // Per-modality `uns/{name}` wins; fall back to the file-wide
     // `uns` so a multimodal file with only one of the two still
@@ -596,7 +596,7 @@ fn extract_modality_with_filter(
     let n_vars = info.n_vars;
 
     // Read the global obs and apply the optional filter.
-    let obs = reader.read_obs()?;
+    let obs = reader.read_obs_assembled()?;
     let n_obs_global = reader.header().n_obs as usize;
     let row_mask: Option<Vec<bool>> = if let Some(expr) = filter {
         let schema = obs.schema();

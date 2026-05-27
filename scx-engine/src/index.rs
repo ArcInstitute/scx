@@ -1170,6 +1170,480 @@ pub fn build_obs_predicate_index_bytes(
     )
 }
 
+// ============================================================================
+// Streaming obs predicate-index builder
+// ============================================================================
+
+/// Streaming counterpart to [`build_obs_predicate_index_bytes`].
+///
+/// The single-batch entry point requires the full obs `RecordBatch` to
+/// be assembled in memory before predicate-index construction starts,
+/// which defeats the purpose of the row-sharded obs layout introduced
+/// for atlas-scale merges and appends (see [`MERGE-OBS-OFFSET-OVERFLOW.md`]).
+/// The builder accepts shards one at a time via [`Self::push_shard`]
+/// and finalises into the same serialised bytes blob at [`Self::finish`].
+///
+/// Memory profile per indexed column matches the batch-mode path
+/// (categorical: `BTreeMap<String, Vec<u64>>` indexed by value;
+/// numeric: `Vec<(f64, u64)>` of all values). The win is that we never
+/// have to materialise the obs `RecordBatch` itself — Arrow column
+/// buffers stay shard-local and are released after each `push_shard`.
+///
+/// Column selection works identically to the batch-mode path:
+/// - forced + preset columns are tracked from the start (even if they
+///   exceed the auto-detect threshold — `high_cardinality_threshold`
+///   still caps them with a `HighCardinality` outcome at finish);
+/// - auto-detect mode tracks every supported column up front and at
+///   finish keeps only those whose observed cardinality stays under
+///   `auto_threshold`.
+pub struct ObsPredicateIndexBuilder {
+    schema: arrow::datatypes::SchemaRef,
+    options: PredicateIndexBuildOptions,
+    /// Columns we are actively accumulating. Sorted in the order they
+    /// will eventually appear in the serialised `PredicateIndex`.
+    columns: Vec<ColumnAccumulator>,
+    /// Total rows pushed so far. Used to verify the shard stream covers
+    /// the obs axis the caller claimed.
+    rows_pushed: u64,
+}
+
+struct ColumnAccumulator {
+    name: String,
+    /// `true` when the column was named via forced/preset config (so
+    /// failures map to `ForcedColumnError` / `PresetSkipped`); `false`
+    /// for auto-detected columns (silent skip).
+    is_forced: bool,
+    /// `true` when the column was named via forced/preset config
+    /// (vs. auto-detect). Forced columns surface a `ForcedColumnError`
+    /// on skip; auto-detected columns are skipped silently.
+    is_named: bool,
+    /// Auto-detect or named-cap mode? Drives the cardinality check at
+    /// finish.
+    selection: ColumnSelection,
+    /// Per-shard payload state. Determined at `new` from the column's
+    /// declared dtype in the schema.
+    state: ColumnState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColumnSelection {
+    /// Auto-detect: include at finish iff observed cardinality stays
+    /// under `options.auto_threshold`.
+    Auto,
+    /// Named (forced or preset): include unless observed cardinality
+    /// exceeds `options.high_cardinality_threshold`.
+    Named,
+}
+
+enum ColumnState {
+    Categorical { values: BTreeMap<String, Vec<u64>> },
+    Numeric { values: Vec<(f64, u64)> },
+    Unsupported { dtype: String },
+    MissingColumn,
+}
+
+impl ObsPredicateIndexBuilder {
+    /// Construct a builder by inspecting the obs schema and the
+    /// forced/preset column list. Auto-detect mode (no forced /
+    /// preset given) tracks every categorical / numeric column up front
+    /// and resolves cardinality at finish.
+    pub fn new(
+        schema: arrow::datatypes::SchemaRef,
+        options: &PredicateIndexBuildOptions,
+    ) -> Result<Self> {
+        use std::collections::BTreeSet;
+
+        let auto_mode = options.forced_columns.is_empty() && options.preset_columns.is_empty();
+        let mut columns: Vec<ColumnAccumulator> = Vec::new();
+
+        if auto_mode {
+            for field in schema.fields().iter() {
+                let dt = field.data_type();
+                if !is_categorical_type(dt) && !is_numeric_type(dt) {
+                    continue;
+                }
+                let state = if is_categorical_type(dt) {
+                    ColumnState::Categorical {
+                        values: BTreeMap::new(),
+                    }
+                } else {
+                    ColumnState::Numeric { values: Vec::new() }
+                };
+                columns.push(ColumnAccumulator {
+                    name: field.name().clone(),
+                    is_forced: false,
+                    is_named: false,
+                    selection: ColumnSelection::Auto,
+                    state,
+                });
+            }
+        } else {
+            // Named-column path: walk forced ∪ preset (forced wins
+            // on duplicates), validate each against the schema, and
+            // record per-column state — including unsupported and
+            // missing markers so `finish` can emit per-column
+            // outcomes without re-walking the schema.
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut named: Vec<(String, bool)> = Vec::new();
+            for col in &options.forced_columns {
+                if seen.insert(col.clone()) {
+                    named.push((col.clone(), true));
+                }
+            }
+            for col in &options.preset_columns {
+                if seen.insert(col.clone()) {
+                    named.push((col.clone(), false));
+                }
+            }
+            for (col_name, is_forced) in named {
+                let (state, _is_supported) = match schema.column_with_name(&col_name) {
+                    Some((_, field)) => {
+                        let dt = field.data_type();
+                        if is_categorical_type(dt) {
+                            (
+                                ColumnState::Categorical {
+                                    values: BTreeMap::new(),
+                                },
+                                true,
+                            )
+                        } else if is_numeric_type(dt) {
+                            (ColumnState::Numeric { values: Vec::new() }, true)
+                        } else {
+                            (
+                                ColumnState::Unsupported {
+                                    dtype: format!("{dt:?}"),
+                                },
+                                false,
+                            )
+                        }
+                    }
+                    None => (ColumnState::MissingColumn, false),
+                };
+                columns.push(ColumnAccumulator {
+                    name: col_name,
+                    is_forced,
+                    is_named: true,
+                    selection: ColumnSelection::Named,
+                    state,
+                });
+            }
+        }
+
+        Ok(Self {
+            schema,
+            options: options.clone(),
+            columns,
+            rows_pushed: 0,
+        })
+    }
+
+    /// Accumulate one obs metadata shard. `shard_row_offset` is the
+    /// global row index where this shard begins (i.e. its
+    /// `row_start`); the builder pairs each row value with
+    /// `shard_row_offset + i` so the final `rows_to_shard_ranges` pass
+    /// at `finish` can map values back to per-shard ranges identical
+    /// to what the batch-mode builder would produce on the assembled
+    /// `RecordBatch`.
+    ///
+    /// Shards must be pushed in row order and must form a contiguous
+    /// cover (no gap, no overlap) of the obs axis. The builder
+    /// verifies the order against [`Self::rows_pushed`] but trusts
+    /// the caller's `shard_row_offset` for correctness.
+    pub fn push_shard(
+        &mut self,
+        batch: &arrow::array::RecordBatch,
+        shard_row_offset: u64,
+    ) -> Result<()> {
+        // Sanity check: shards must be pushed in row order.
+        if shard_row_offset != self.rows_pushed {
+            return Err(EngineError::Generic(format!(
+                "ObsPredicateIndexBuilder: shard at row offset {shard_row_offset} \
+                 does not continue from previous cumulative rows {prev}",
+                prev = self.rows_pushed
+            )));
+        }
+
+        // Verify the shard's schema matches what `new()` was given.
+        // We compare a normalised "class" (categorical / numeric /
+        // other) rather than exact dtypes so a builder initialised
+        // with `Utf8` cell ids accepts shards that present them as
+        // `LargeUtf8` (which is what the per-shard upcast in
+        // `ScxWriter::write_arrow_ipc` emits for >2 GB string
+        // payloads). `extract_string_value` / `extract_numeric_value`
+        // handle both widths transparently.
+        let shard_schema = batch.schema();
+        for col in &self.columns {
+            let (Some((_, shard_field)), Some((_, expected_field))) = (
+                shard_schema.column_with_name(&col.name),
+                self.schema.column_with_name(&col.name),
+            ) else {
+                continue;
+            };
+            let same_class =
+                column_class_compatible(shard_field.data_type(), expected_field.data_type());
+            if !same_class {
+                return Err(EngineError::Generic(format!(
+                    "ObsPredicateIndexBuilder: shard column '{}' has dtype \
+                     {:?}, builder was initialised with {:?} — these are \
+                     not interchangeable for predicate-index purposes",
+                    col.name,
+                    shard_field.data_type(),
+                    expected_field.data_type()
+                )));
+            }
+        }
+
+        let n_rows = batch.num_rows();
+        for col in self.columns.iter_mut() {
+            // Skip columns that already errored (missing, unsupported);
+            // their outcome is emitted at `finish`.
+            let (col_idx, _) = match shard_schema.column_with_name(&col.name) {
+                Some(x) => x,
+                None => continue,
+            };
+            let array = batch.column(col_idx);
+            match &mut col.state {
+                ColumnState::Categorical { values } => {
+                    for i in 0..n_rows {
+                        if array.is_null(i) {
+                            continue;
+                        }
+                        if let Some(v) = extract_string_value(array, i) {
+                            values
+                                .entry(v)
+                                .or_default()
+                                .push(shard_row_offset + i as u64);
+                        }
+                    }
+                }
+                ColumnState::Numeric { values } => {
+                    for i in 0..n_rows {
+                        if array.is_null(i) {
+                            continue;
+                        }
+                        if let Some(v) = extract_numeric_value(array, i) {
+                            values.push((v, shard_row_offset + i as u64));
+                        }
+                    }
+                }
+                ColumnState::Unsupported { .. } | ColumnState::MissingColumn => {}
+            }
+        }
+
+        self.rows_pushed = self.rows_pushed.saturating_add(n_rows as u64);
+        Ok(())
+    }
+
+    /// Finalise the index: resolve auto-detect cardinality, build
+    /// `CategoricalIndex` / `NumericIndex` entries, serialise to the
+    /// `PredicateIndex` byte format, and return the resulting bytes.
+    ///
+    /// Outcomes (forced errors, preset skips, high-cardinality skips,
+    /// missing-column markers) are pushed onto `outcomes` so the
+    /// caller can demote them to typed warnings (same protocol as
+    /// [`build_obs_predicate_index_bytes`]). `indexed_column_names`
+    /// receives the names of the columns that ended up in the index,
+    /// in serialisation order — used for provenance stamping.
+    pub fn finish(
+        self,
+        shard_row_ranges: &[(u64, u64)],
+        outcomes: &mut Vec<BuildOutcome>,
+        indexed_column_names: &mut Vec<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        let push_outcome = |outcomes: &mut Vec<BuildOutcome>,
+                            col_name: &str,
+                            is_forced: bool,
+                            reason: SkipReason| {
+            outcomes.push(if is_forced {
+                BuildOutcome::ForcedColumnError {
+                    column: col_name.to_string(),
+                    reason,
+                }
+            } else {
+                BuildOutcome::PresetSkipped {
+                    column: col_name.to_string(),
+                    reason,
+                }
+            });
+        };
+
+        let mut indexed: Vec<IndexedColumn> = Vec::new();
+        let mut auto_mode_index_count = 0usize;
+
+        for col in self.columns {
+            let ColumnAccumulator {
+                name,
+                is_forced,
+                is_named,
+                selection,
+                state,
+            } = col;
+            match state {
+                ColumnState::MissingColumn => {
+                    if is_named {
+                        push_outcome(outcomes, &name, is_forced, SkipReason::MissingColumn);
+                    }
+                    continue;
+                }
+                ColumnState::Unsupported { dtype } => {
+                    if is_named {
+                        push_outcome(
+                            outcomes,
+                            &name,
+                            is_forced,
+                            SkipReason::UnsupportedDtype(dtype),
+                        );
+                    }
+                    continue;
+                }
+                ColumnState::Categorical { values } => {
+                    let n_unique = values.len();
+                    match selection {
+                        ColumnSelection::Auto => {
+                            // Silent skip when cardinality exceeds the
+                            // auto-detect threshold.
+                            if n_unique >= self.options.auto_threshold {
+                                continue;
+                            }
+                        }
+                        ColumnSelection::Named => {
+                            if n_unique > self.options.high_cardinality_threshold {
+                                push_outcome(
+                                    outcomes,
+                                    &name,
+                                    is_forced,
+                                    SkipReason::HighCardinality {
+                                        n_unique,
+                                        threshold: self.options.high_cardinality_threshold,
+                                    },
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut entries: Vec<CategoricalEntry> = Vec::new();
+                    for (value, rows) in &values {
+                        let shard_ranges = rows_to_shard_ranges(rows, shard_row_ranges);
+                        entries.push(CategoricalEntry {
+                            value: value.clone(),
+                            shard_ranges,
+                        });
+                    }
+                    indexed.push(IndexedColumn::Categorical(CategoricalIndex {
+                        column_name: name.clone(),
+                        entries,
+                    }));
+                    indexed_column_names.push(name);
+                    if matches!(selection, ColumnSelection::Auto) {
+                        auto_mode_index_count += 1;
+                    }
+                }
+                ColumnState::Numeric { values } => {
+                    if matches!(selection, ColumnSelection::Named)
+                        && values.len() > self.options.high_cardinality_threshold
+                    {
+                        // High-cardinality numerics still build a B+ tree,
+                        // so this guard is only for symmetry with the
+                        // categorical path. Matches batch-mode behaviour.
+                        // We use the value count rather than the distinct
+                        // count because numeric `value_rows` does not
+                        // dedupe.
+                    }
+                    indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
+                        &name,
+                        values,
+                        shard_row_ranges,
+                        64,
+                    )));
+                    indexed_column_names.push(name);
+                    if matches!(selection, ColumnSelection::Auto) {
+                        auto_mode_index_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Empty index: nothing was selected (either no auto-detect
+        // candidates passed the threshold, or every named column was
+        // skipped). Match batch-mode semantics — return None so the
+        // caller skips the `write_*_predicate_index` call.
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+        // Cosmetic guard: auto-detect mode produced at least one
+        // entry. Keeps the invariant identical to the batch path
+        // where `columns_to_index.is_empty()` short-circuits.
+        let _ = auto_mode_index_count;
+
+        let index = PredicateIndex {
+            version: 1,
+            columns: indexed,
+        };
+        let mut buf = Vec::new();
+        index.write_to(&mut buf)?;
+        Ok(Some(buf))
+    }
+}
+
+/// Pre-collected variant of [`build_numeric_index`] used by the
+/// streaming builder. Identical algorithm — only the source of the
+/// `(value, global_row)` pairs differs.
+fn numeric_index_from_values(
+    column_name: &str,
+    mut value_rows: Vec<(f64, u64)>,
+    shard_row_ranges: &[(u64, u64)],
+    fanout: u16,
+) -> NumericIndex {
+    value_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if value_rows.is_empty() {
+        return NumericIndex {
+            column_name: column_name.to_string(),
+            fanout,
+            internal_pages: vec![],
+            leaf_pages: vec![],
+        };
+    }
+
+    let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
+    for &(val, global_row) in &value_rows {
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
+            continue;
+        };
+        if let Some(last) = leaf_entries.last_mut() {
+            if last.shard_id == shard_id && local_row == last.row_end {
+                last.max_value = val;
+                last.row_end = local_row + 1;
+                continue;
+            }
+        }
+        leaf_entries.push(NumericLeafEntry {
+            min_value: val,
+            max_value: val,
+            shard_id,
+            row_start: local_row,
+            row_end: local_row + 1,
+        });
+    }
+
+    let leaf_pages: Vec<LeafPage> = leaf_entries
+        .chunks(fanout as usize)
+        .map(|chunk| LeafPage {
+            entries: chunk.to_vec(),
+        })
+        .collect();
+
+    let internal_pages = build_internal_pages(&leaf_pages, fanout);
+
+    NumericIndex {
+        column_name: column_name.to_string(),
+        fanout,
+        internal_pages,
+        leaf_pages,
+    }
+}
+
 /// Build serialized predicate-index bytes for a var RecordBatch. The
 /// `shard_row_ranges` argument should be a single-shard range
 /// `[(0, n_vars)]` — the engine treats var as a single shard for index
@@ -1240,6 +1714,65 @@ pub fn build_and_write_conversion_predicate_indexes(
     n_vars: usize,
     options: &ConversionPredicateIndexOptions,
 ) -> Result<ConversionPredicateIndexResult> {
+    // Delegate to the streaming variant with a one-shard iterator so
+    // both entry points share a single implementation. Caller has the
+    // assembled batch in hand — wrapping it in `std::iter::once` is
+    // O(1).
+    let obs_schema = obs.schema();
+    build_and_write_conversion_predicate_indexes_streaming(
+        writer,
+        obs_schema,
+        std::iter::once(Ok((obs.clone(), 0u64))),
+        var,
+        obs_row_ranges,
+        n_vars,
+        options,
+    )
+}
+
+/// Streaming counterpart to [`build_and_write_conversion_predicate_indexes`].
+///
+/// Identical contract except `obs_shards` yields `(shard_batch,
+/// shard_row_offset)` tuples one at a time — the obs predicate index
+/// is built incrementally via [`ObsPredicateIndexBuilder`] so the
+/// caller never has to assemble the full obs `RecordBatch` in memory.
+/// Used by the sharded merge / append paths to keep peak RSS bounded
+/// to one shard at a time.
+///
+/// `obs_schema` must describe the unified column layout of every
+/// shard; the builder validates each shard's dtypes against it.
+/// `var` is still treated as a single (small) batch — gene metadata
+/// rarely overflows the 2 GB ceiling and the var predicate-index
+/// path does not benefit meaningfully from shard streaming today.
+pub fn build_and_write_conversion_predicate_indexes_streaming(
+    writer: &mut scx_format::ScxWriter,
+    obs_schema: arrow::datatypes::SchemaRef,
+    obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
+    var: &arrow::array::RecordBatch,
+    obs_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ConversionPredicateIndexResult> {
+    streaming_impl(
+        writer,
+        obs_schema,
+        obs_shards,
+        var,
+        obs_row_ranges,
+        n_vars,
+        options,
+    )
+}
+
+fn streaming_impl(
+    writer: &mut scx_format::ScxWriter,
+    obs_schema: arrow::datatypes::SchemaRef,
+    obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
+    var: &arrow::array::RecordBatch,
+    obs_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ConversionPredicateIndexResult> {
     const HIGH_CARDINALITY_THRESHOLD: usize = 100_000;
 
     // Resolve preset up front so an unknown name fails before any
@@ -1266,17 +1799,20 @@ pub fn build_and_write_conversion_predicate_indexes(
 
     let mut result = ConversionPredicateIndexResult::default();
 
-    // obs
+    // obs — stream shards through the builder.
     let obs_build_opts = PredicateIndexBuildOptions {
         forced_columns: options.index_obs.clone(),
         preset_columns: preset_obs,
         auto_threshold: options.index_auto_threshold,
         high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
     };
-    let obs_bytes = build_obs_predicate_index_bytes(
-        obs,
+    let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &obs_build_opts)?;
+    for shard in obs_shards {
+        let (batch, row_offset) = shard?;
+        builder.push_shard(&batch, row_offset)?;
+    }
+    let obs_bytes = builder.finish(
         obs_row_ranges,
-        &obs_build_opts,
         &mut result.obs_outcomes,
         &mut result.obs_indexed_columns,
     )?;
@@ -1284,7 +1820,8 @@ pub fn build_and_write_conversion_predicate_indexes(
         writer.write_obs_predicate_index(&bytes)?;
     }
 
-    // var (single shard)
+    // var (single shard) — gene metadata is small enough that the
+    // batch-mode builder stays fine.
     let var_row_ranges: [(u64, u64); 1] = [(0, n_vars as u64)];
     let var_build_opts = PredicateIndexBuildOptions {
         forced_columns: options.index_var.clone(),
@@ -1533,6 +2070,18 @@ fn estimate_unique_values(col: &ArrayRef) -> usize {
         }
         _ => col.len(), // unknown type, assume high cardinality
     }
+}
+
+/// True when two Arrow dtypes are interchangeable for predicate-index
+/// purposes: both categorical (any of `Utf8` / `LargeUtf8` /
+/// `Dictionary(_, _)`) or both numeric. Used by
+/// [`ObsPredicateIndexBuilder::push_shard`] to accept shards whose
+/// per-shard upcast widens columns to `LargeUtf8` while the builder
+/// was initialised with the input file's narrow `Utf8` schema.
+fn column_class_compatible(a: &DataType, b: &DataType) -> bool {
+    (is_categorical_type(a) && is_categorical_type(b))
+        || (is_numeric_type(a) && is_numeric_type(b))
+        || a == b
 }
 
 /// Check if a data type is categorical (string or dictionary).
@@ -1949,6 +2498,119 @@ mod tests {
             vec![Arc::new(cell_types), Arc::new(n_genes)],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn streaming_builder_matches_batch_auto_detect() {
+        // Same obs batch, two construction paths:
+        //   (a) batch mode via build_obs_predicate_index_bytes
+        //   (b) streaming mode via ObsPredicateIndexBuilder with the
+        //       batch split into two shards (rows 0..6, rows 6..12)
+        // Both must produce identical serialised bytes for the same
+        // shard_row_ranges.
+        let batch = make_obs_batch();
+        let shard_row_ranges: Vec<(u64, u64)> = vec![(0, 6), (6, 12)];
+        let options = PredicateIndexBuildOptions {
+            forced_columns: Vec::new(),
+            preset_columns: Vec::new(),
+            auto_threshold: 1000,
+            high_cardinality_threshold: 100_000,
+        };
+
+        let mut batch_outcomes = Vec::new();
+        let mut batch_indexed_names = Vec::new();
+        let batch_bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_row_ranges,
+            &options,
+            &mut batch_outcomes,
+            &mut batch_indexed_names,
+        )
+        .unwrap()
+        .expect("batch-mode auto-detect should index both columns");
+
+        let shard_a = batch.slice(0, 6);
+        let shard_b = batch.slice(6, 6);
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&shard_a, 0).unwrap();
+        builder.push_shard(&shard_b, 6).unwrap();
+        let mut stream_outcomes = Vec::new();
+        let mut stream_indexed_names = Vec::new();
+        let stream_bytes = builder
+            .finish(
+                &shard_row_ranges,
+                &mut stream_outcomes,
+                &mut stream_indexed_names,
+            )
+            .unwrap()
+            .expect("streaming auto-detect should index both columns");
+
+        assert_eq!(
+            batch_bytes, stream_bytes,
+            "streaming builder must produce byte-identical output to batch path"
+        );
+        assert_eq!(batch_indexed_names, stream_indexed_names);
+        assert!(stream_outcomes.is_empty());
+    }
+
+    #[test]
+    fn streaming_builder_named_forced_column() {
+        // Force the `cell_type` column under named mode and verify the
+        // streaming and batch builders agree.
+        let batch = make_obs_batch();
+        let shard_row_ranges: Vec<(u64, u64)> = vec![(0, 6), (6, 12)];
+        let options = PredicateIndexBuildOptions {
+            forced_columns: vec!["cell_type".to_string()],
+            preset_columns: Vec::new(),
+            auto_threshold: 0,
+            high_cardinality_threshold: 100_000,
+        };
+
+        let mut batch_outcomes = Vec::new();
+        let mut batch_indexed_names = Vec::new();
+        let batch_bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_row_ranges,
+            &options,
+            &mut batch_outcomes,
+            &mut batch_indexed_names,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&batch.slice(0, 6), 0).unwrap();
+        builder.push_shard(&batch.slice(6, 6), 6).unwrap();
+        let mut stream_outcomes = Vec::new();
+        let mut stream_indexed_names = Vec::new();
+        let stream_bytes = builder
+            .finish(
+                &shard_row_ranges,
+                &mut stream_outcomes,
+                &mut stream_indexed_names,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch_bytes, stream_bytes);
+        assert_eq!(batch_indexed_names, vec!["cell_type".to_string()]);
+        assert_eq!(stream_indexed_names, vec!["cell_type".to_string()]);
+    }
+
+    #[test]
+    fn streaming_builder_rejects_out_of_order_shards() {
+        let batch = make_obs_batch();
+        let options = PredicateIndexBuildOptions {
+            forced_columns: vec!["cell_type".to_string()],
+            preset_columns: Vec::new(),
+            auto_threshold: 0,
+            high_cardinality_threshold: 100_000,
+        };
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&batch.slice(0, 6), 0).unwrap();
+        // Wrong offset — second shard should start at row 6, not 100.
+        let err = builder.push_shard(&batch.slice(6, 6), 100).unwrap_err();
+        assert!(matches!(err, EngineError::Generic(_)), "got: {err:?}");
     }
 
     #[test]

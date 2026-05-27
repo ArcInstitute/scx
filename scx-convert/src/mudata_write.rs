@@ -158,7 +158,7 @@ fn write_h5mu_root_attrs_and_global_blocks(
         .write_scalar(&vlu("0.1.0"))?;
 
     // Global obs.
-    if let Ok(obs) = reader.read_obs() {
+    if let Ok(obs) = reader.read_obs_assembled() {
         write_dataframe_group_at(root, "obs", &obs)?;
     }
 
@@ -223,7 +223,7 @@ fn write_h5mu_per_modality_non_x_blocks(
     // requires per-modality obs; we point each modality at the
     // same data so downstream loaders that read /mod/{m}/obs
     // see consistent cell metadata).
-    if let Ok(obs) = reader.read_obs() {
+    if let Ok(obs) = reader.read_obs_assembled() {
         write_dataframe_group_at(modality_root, "obs", &obs)?;
     }
 
@@ -349,7 +349,7 @@ fn write_modality_to_h5ad_non_x_blocks(
     modality_id: u8,
     modality_name: &str,
 ) -> Result<(), ConvertError> {
-    if let Ok(obs) = reader.read_obs() {
+    if let Ok(obs) = reader.read_obs_assembled() {
         write_dataframe_group_at(root, "obs", &obs)?;
     }
     let var = reader.read_var_for(modality_id)?;

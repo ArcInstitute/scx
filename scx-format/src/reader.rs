@@ -407,28 +407,131 @@ impl ScxReader {
         crate::arrow_compat::downcast_large_types(&batch)
     }
 
-    /// Read the obs schema without deserializing the full RecordBatch.
-    /// Uses the Arrow IPC footer to extract field names and types.
+    /// Read the obs schema. Uses the Arrow IPC footer fast path, falling
+    /// back to a per-column wide-vs-narrow refinement (via
+    /// [`crate::arrow_compat::downcast_large_types`]) when any column on
+    /// disk is `LargeUtf8` / `LargeBinary` / `Dictionary(_, Large*)`.
+    /// For atlas-scale obs that legitimately remain wide on disk, the
+    /// refinement deserialises the first batch — for sharded files this
+    /// is bounded to one shard rather than the whole obs table, but is
+    /// still O(MB). Use [`Self::read_obs_schema_physical`] (no
+    /// deserialisation) or [`Self::read_obs_schema_logical_lossy`]
+    /// (unconditional schema-level narrowing) for the cheap paths.
     pub fn read_obs_schema(&self) -> Result<arrow::datatypes::Schema> {
-        let entry = self
-            .full_catalog
-            .get("obs")
-            .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+        let entry = self.first_obs_section_entry()?;
         self.read_arrow_ipc_schema(entry)
     }
 
-    /// Read the var schema without deserializing the full RecordBatch.
-    /// Uses the Arrow IPC footer to extract field names and types.
+    /// Read the var schema. Mirror of [`Self::read_obs_schema`].
     pub fn read_var_schema(&self) -> Result<arrow::datatypes::Schema> {
-        let entry = self
-            .full_catalog
-            .get("var")
-            .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
+        let entry = self.first_var_section_entry()?;
         self.read_arrow_ipc_schema(entry)
+    }
+
+    /// Return the obs schema **exactly as stored on disk** — including
+    /// any `LargeUtf8` / `LargeBinary` columns left wide for >2 GB
+    /// payloads. Pure Arrow IPC footer read; no batch deserialisation.
+    /// Constant cost regardless of obs size.
+    ///
+    /// Use this when your code can handle wide types and you want a
+    /// faithful picture of what the writer emitted. Pair with
+    /// [`Self::read_obs_schema_logical_lossy`] if you'd rather always
+    /// see narrow types and don't mind the lossy conversion.
+    pub fn read_obs_schema_physical(&self) -> Result<arrow::datatypes::Schema> {
+        let entry = self.first_obs_section_entry()?;
+        self.read_arrow_ipc_schema_physical(entry)
+    }
+
+    /// Read var schema as on disk. Mirror of
+    /// [`Self::read_obs_schema_physical`].
+    pub fn read_var_schema_physical(&self) -> Result<arrow::datatypes::Schema> {
+        let entry = self.first_var_section_entry()?;
+        self.read_arrow_ipc_schema_physical(entry)
+    }
+
+    /// Return the obs schema with `LargeUtf8 → Utf8` / `LargeBinary →
+    /// Binary` (and `Dictionary` variants) **unconditionally narrowed**
+    /// at the schema level. Pure Arrow IPC footer read; no batch
+    /// deserialisation. Lossy in the technical sense — a column the
+    /// reader reports as `Utf8` may, on the data path, still come back
+    /// as `LargeUtf8` if its actual offsets overflow `i32::MAX`. The
+    /// trade-off is constant-cost schema reads for predicate parsing
+    /// and validation paths that prefer the historical narrow types.
+    pub fn read_obs_schema_logical_lossy(&self) -> Result<arrow::datatypes::Schema> {
+        let physical = self.read_obs_schema_physical()?;
+        Ok(crate::arrow_compat::downcast_large_types_schema(&physical))
+    }
+
+    /// Lossy logical schema for var. Mirror of
+    /// [`Self::read_obs_schema_logical_lossy`].
+    pub fn read_var_schema_logical_lossy(&self) -> Result<arrow::datatypes::Schema> {
+        let physical = self.read_var_schema_physical()?;
+        Ok(crate::arrow_compat::downcast_large_types_schema(&physical))
+    }
+
+    /// Resolve the first obs section catalog entry: shard 0 if obs is
+    /// sharded, else the legacy single section. Used by both schema
+    /// APIs and the assembled-batch fallback.
+    fn first_obs_section_entry(&self) -> Result<&FullCatalogEntry> {
+        if self.obs_metadata_shard_count() > 0 {
+            let key = "obs_metadata/shard_0";
+            self.full_catalog
+                .get(key)
+                .ok_or_else(|| ScxError::SectionNotFound(key.to_string()))
+        } else {
+            self.full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))
+        }
+    }
+
+    /// Mirror of [`Self::first_obs_section_entry`] for var.
+    fn first_var_section_entry(&self) -> Result<&FullCatalogEntry> {
+        if self.var_metadata_shard_count() > 0 {
+            let key = "var_metadata/shard_0";
+            self.full_catalog
+                .get(key)
+                .ok_or_else(|| ScxError::SectionNotFound(key.to_string()))
+        } else {
+            self.full_catalog
+                .get("var")
+                .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))
+        }
+    }
+
+    /// Pure Arrow IPC footer read: no batch deserialisation, no wide-vs-
+    /// narrow refinement. Returns whatever the writer recorded in the
+    /// footer schema. Counterpart to [`Self::read_arrow_ipc_schema`]
+    /// which does the conditional first-batch re-read.
+    fn read_arrow_ipc_schema_physical(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<arrow::datatypes::Schema> {
+        let slice = self.section_bytes(entry)?;
+        let cursor = Cursor::new(slice);
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+        Ok(reader.schema().as_ref().clone())
     }
 
     /// Read the obs (observation) metadata as an Arrow RecordBatch.
+    ///
+    /// Returns [`ScxError::ObsIsSharded`] if the file was written with
+    /// row-sharded obs ([`SectionType::ObsMetadataShard`]) — atlas-scale
+    /// merges and appends emit obs as shards rather than one batch to
+    /// stay below Arrow IPC's 2 GB narrow-offset ceiling. Use
+    /// [`Self::obs_shards`], [`Self::read_obs_shard`], or — at the cost
+    /// of bounded peak memory — [`Self::read_obs_assembled`] instead.
     pub fn read_obs(&self) -> Result<RecordBatch> {
+        let shard_count = self.obs_metadata_shard_count();
+        if shard_count > 0 {
+            return Err(ScxError::ObsIsSharded {
+                axis: "obs",
+                shard_count,
+                shard_kind: "ObsMetadataShard",
+                hint_api: "obs_shards / read_obs_shard",
+                assembled_api: "read_obs_assembled",
+            });
+        }
         let entry = self
             .full_catalog
             .get("obs")
@@ -437,12 +540,162 @@ impl ScxReader {
     }
 
     /// Read the var (variable/gene) metadata as an Arrow RecordBatch.
+    ///
+    /// Returns [`ScxError::ObsIsSharded`] (with `axis: "var"`) if var
+    /// is row-sharded; mirror of [`Self::read_obs`].
     pub fn read_var(&self) -> Result<RecordBatch> {
+        let shard_count = self.var_metadata_shard_count();
+        if shard_count > 0 {
+            return Err(ScxError::ObsIsSharded {
+                axis: "var",
+                shard_count,
+                shard_kind: "VarMetadataShard",
+                hint_api: "var_shards / read_var_shard",
+                assembled_api: "read_var_assembled",
+            });
+        }
         let entry = self
             .full_catalog
             .get("var")
             .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
         self.read_arrow_ipc(entry)
+    }
+
+    /// Number of [`SectionType::ObsMetadataShard`] sections in the
+    /// catalog. Pure catalog scan — no payload read. Zero on legacy
+    /// single-section ([`SectionType::ObsMetadata`]) files.
+    pub fn obs_metadata_shard_count(&self) -> usize {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .count()
+    }
+
+    /// Number of [`SectionType::VarMetadataShard`] sections in the
+    /// catalog. Mirror of [`Self::obs_metadata_shard_count`].
+    pub fn var_metadata_shard_count(&self) -> usize {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::VarMetadataShard)
+            .count()
+    }
+
+    /// Read one row-shard of obs metadata by index. Returns the on-disk
+    /// `RecordBatch` with its stamped shard schema metadata
+    /// (`shard_idx`, `row_start`, `n_shard_rows`, `n_rows_total`)
+    /// preserved — callers may consult those fields directly.
+    pub fn read_obs_shard(&self, shard_idx: u32) -> Result<RecordBatch> {
+        let key = format!("obs_metadata/shard_{shard_idx}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or(ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Read one row-shard of var metadata. Mirror of
+    /// [`Self::read_obs_shard`].
+    pub fn read_var_shard(&self, shard_idx: u32) -> Result<RecordBatch> {
+        let key = format!("var_metadata/shard_{shard_idx}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or(ScxError::SectionNotFound(key))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Iterate obs metadata shards in `shard_idx` order, yielding one
+    /// `RecordBatch` per shard. The iterator never materialises more
+    /// than one shard at a time, so peak memory is bounded by the
+    /// largest single shard regardless of the logical obs size.
+    ///
+    /// Returns an empty iterator on legacy single-section files; use
+    /// [`Self::read_obs`] (or, if you accept the memory cost,
+    /// [`Self::read_obs_assembled`]) on those files instead.
+    pub fn obs_shards(&self) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
+        self.metadata_shards_iter(SectionType::ObsMetadataShard, "obs_metadata/shard_")
+    }
+
+    /// Iterate var metadata shards in `shard_idx` order. Mirror of
+    /// [`Self::obs_shards`].
+    pub fn var_shards(&self) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
+        self.metadata_shards_iter(SectionType::VarMetadataShard, "var_metadata/shard_")
+    }
+
+    /// Shared iterator builder for [`Self::obs_shards`] /
+    /// [`Self::var_shards`]. Materialises only the sorted catalog
+    /// entries up front (cheap pointer slice); each shard's payload is
+    /// fetched lazily as the consumer advances the iterator.
+    fn metadata_shards_iter(
+        &self,
+        shard_type: SectionType,
+        name_prefix: &'static str,
+    ) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
+        let mut entries: Vec<(u32, &FullCatalogEntry)> = self
+            .full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(name_prefix))
+            .filter_map(|e| {
+                let suffix = e.name.strip_prefix(name_prefix)?;
+                let idx: u32 = suffix.parse().ok()?;
+                Some((idx, e))
+            })
+            .collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+        entries
+            .into_iter()
+            .map(move |(_, e)| self.read_arrow_ipc(e))
+    }
+
+    /// Concatenate all obs metadata shards into a single `RecordBatch`.
+    /// **Memory hazard:** allocates a buffer the size of the entire
+    /// logical obs table — for atlas-scale files this can be many GB
+    /// and may exceed Arrow IPC's 2 GB narrow-offset ceiling if the
+    /// shards' string buffers cumulatively overflow `i32::MAX` bytes.
+    /// Prefer [`Self::obs_shards`] for streaming workloads.
+    ///
+    /// Falls through to [`Self::read_obs`] on legacy single-section
+    /// files so callers that need "give me the whole table" can stay
+    /// agnostic to the storage layout. Verifies the catalog entries
+    /// form a contiguous, ordered cover (any gap or duplicate is
+    /// [`ScxError::InvalidCatalog`]).
+    pub fn read_obs_assembled(&self) -> Result<RecordBatch> {
+        if self.obs_metadata_shard_count() > 0 {
+            self.read_sharded_layout_by_prefix(
+                "obs_metadata/shard_",
+                "obs_metadata",
+                SectionType::ObsMetadataShard,
+            )?
+            .ok_or_else(|| ScxError::SectionNotFound("obs_metadata/shard_*".to_string()))
+        } else {
+            let entry = self
+                .full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+            self.read_arrow_ipc(entry)
+        }
+    }
+
+    /// Concatenate all var metadata shards into a single `RecordBatch`.
+    /// Mirror of [`Self::read_obs_assembled`].
+    pub fn read_var_assembled(&self) -> Result<RecordBatch> {
+        if self.var_metadata_shard_count() > 0 {
+            self.read_sharded_layout_by_prefix(
+                "var_metadata/shard_",
+                "var_metadata",
+                SectionType::VarMetadataShard,
+            )?
+            .ok_or_else(|| ScxError::SectionNotFound("var_metadata/shard_*".to_string()))
+        } else {
+            let entry = self
+                .full_catalog
+                .get("var")
+                .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
+            self.read_arrow_ipc(entry)
+        }
     }
 
     /// Read a named obsm embedding as an Arrow RecordBatch.
@@ -621,13 +874,30 @@ impl ScxReader {
         shard_type: SectionType,
     ) -> Result<Option<RecordBatch>> {
         let shard_name_prefix = format!("{prefix}/{name}_shard_");
+        let logical = format!("{prefix}/{name}");
+        self.read_sharded_layout_by_prefix(&shard_name_prefix, &logical, shard_type)
+    }
+
+    /// Generic worker shared by [`Self::read_sharded_layout`] (which
+    /// handles `<prefix>/<name>_shard_<idx>` naming) and the obs/var
+    /// metadata shard readers (which use the flatter
+    /// `<axis>/shard_<idx>` naming because there is no logical
+    /// sub-name). All cover-verification and metadata-stripping logic
+    /// lives here; callers just supply the shard-name prefix to scan
+    /// for and the display string used in error messages.
+    fn read_sharded_layout_by_prefix(
+        &self,
+        shard_name_prefix: &str,
+        logical: &str,
+        shard_type: SectionType,
+    ) -> Result<Option<RecordBatch>> {
         let mut shards: Vec<(u32, &FullCatalogEntry)> = self
             .full_catalog
             .entries
             .iter()
-            .filter(|e| e.section_type == shard_type && e.name.starts_with(&shard_name_prefix))
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(shard_name_prefix))
             .filter_map(|e| {
-                let suffix = e.name.strip_prefix(&shard_name_prefix)?;
+                let suffix = e.name.strip_prefix(shard_name_prefix)?;
                 let idx: u32 = suffix.parse().ok()?;
                 Some((idx, e))
             })
@@ -645,8 +915,7 @@ impl ScxReader {
         // Verify the shards form a contiguous, ordered cover by walking
         // their stamped metadata. Any gap, duplicate, mismatch, or
         // missing metadata is a hard error.
-        let logical = format!("{prefix}/{name}");
-        let first_hdr = parse_shard_metadata(&logical, &batches[0])?;
+        let first_hdr = parse_shard_metadata(logical, &batches[0])?;
         if first_hdr.shard_idx != 0 {
             return Err(ScxError::InvalidCatalog(format!(
                 "{logical}: first shard has shard_idx={} (expected 0)",
@@ -662,7 +931,7 @@ impl ScxReader {
         let n_rows_total = first_hdr.n_rows_total;
         let mut next_expected_row_start = first_hdr.n_shard_rows;
         for (i, batch) in batches.iter().enumerate().skip(1) {
-            let hdr = parse_shard_metadata(&logical, batch)?;
+            let hdr = parse_shard_metadata(logical, batch)?;
             let expected_idx = i as u32;
             if hdr.shard_idx != expected_idx {
                 return Err(ScxError::InvalidCatalog(format!(

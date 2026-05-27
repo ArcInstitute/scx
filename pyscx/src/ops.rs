@@ -575,6 +575,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
 #[pyo3(signature = (
     inputs, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    assume_identical_var=false, uns_policy=None,
 ))]
 pub fn merge(
     py: Python<'_>,
@@ -584,6 +585,8 @@ pub fn merge(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    assume_identical_var: bool,
+    uns_policy: Option<String>,
 ) -> PyResult<()> {
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
@@ -595,11 +598,50 @@ pub fn merge(
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
     let output_path = PathBuf::from(output);
 
+    // Parse the optional uns_policy kwarg into the enum. Default
+    // (None) preserves `UnsPolicy::First` = today's behaviour: read
+    // the first input's `uns` verbatim, drop the rest.
+    let uns_policy_parsed = match uns_policy.as_deref() {
+        Some(s) => scx_ops::UnsPolicy::parse(s).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "invalid uns_policy '{s}': expected one of \
+                 first, require-equal, namespace, summary"
+            ))
+        })?,
+        None => scx_ops::UnsPolicy::First,
+    };
+
+    let want_policy = assume_identical_var || uns_policy_parsed != scx_ops::UnsPolicy::First;
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
+            let merge_opts = scx_ops::MergeOptions {
+                index_options: index_opts,
+                assume_identical_var,
+                uns_policy: uns_policy_parsed,
+                shard_target_rows: None,
+            };
             let summary = py
                 .allow_threads(|| {
-                    scx_ops::merge_with_index_options(&input_refs, &output_path, &index_opts)
+                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)
+        }
+        None if want_policy => {
+            let merge_opts = scx_ops::MergeOptions {
+                index_options: scx_engine::ConversionPredicateIndexOptions {
+                    index_obs: Vec::new(),
+                    index_var: Vec::new(),
+                    index_preset: None,
+                    index_auto_threshold: 0,
+                },
+                assume_identical_var,
+                uns_policy: uns_policy_parsed,
+                shard_target_rows: None,
+            };
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)

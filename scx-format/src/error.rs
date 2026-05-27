@@ -93,6 +93,32 @@ pub enum ScxError {
 
     #[error(transparent)]
     Arrow(#[from] arrow::error::ArrowError),
+
+    #[error(
+        "cannot write '{attempted}' on a writer that already wrote '{existing}' for the same axis: \
+         obs and var metadata must be either entirely single-section ({single_kind}) or entirely \
+         sharded ({sharded_kind}), not mixed"
+    )]
+    ObsLayoutConflict {
+        attempted: &'static str,
+        existing: &'static str,
+        single_kind: &'static str,
+        sharded_kind: &'static str,
+    },
+
+    #[error(
+        "{axis} on this file is stored as {shard_count} {shard_kind} section(s); the legacy \
+         single-section reader cannot return one batch without unbounded memory growth. \
+         Use the sharded reader API ({hint_api}) or `{assembled_api}()` if you accept the \
+         memory cost."
+    )]
+    ObsIsSharded {
+        axis: &'static str,
+        shard_count: usize,
+        shard_kind: &'static str,
+        hint_api: &'static str,
+        assembled_api: &'static str,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ScxError>;

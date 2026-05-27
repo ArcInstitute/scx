@@ -2290,7 +2290,7 @@ impl ScxBackedMuDataset {
         // Slow path: read obs, convert to pandas, cache.
         let batch = self
             .meta_reader
-            .read_obs()
+            .read_obs_assembled()
             .map_err(|e| PyRuntimeError::new_err(format!("read_obs: {e}")))?;
         let table = crate::anndata::record_batch_to_pyarrow(py, &batch)?;
         let df = crate::anndata::pyarrow_table_to_pandas(&table)?;
