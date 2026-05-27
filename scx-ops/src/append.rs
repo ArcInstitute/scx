@@ -662,6 +662,12 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
     }
     let mut shards: Vec<(u32, &FullCatalogEntry)> = shard_entries;
     shards.sort_by_key(|(idx, _)| *idx);
+    // Decode each shard and force the wide encoding before concat —
+    // mirrors `ScxReader::read_sharded_layout_by_prefix`. Concatenating
+    // narrow-offset batches would re-trigger Arrow's `Offset overflow
+    // error` once the cumulative per-column string payload exceeds
+    // `i32::MAX`, which is exactly the failure mode the streaming
+    // merge-write path eliminated.
     let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
     for (_, entry) in &shards {
         lock.seek(SeekFrom::Start(entry.offset))?;
@@ -676,24 +682,29 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
                 format!("{} contains no batches", entry.name),
             ))
         })??;
-        batches.push(scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?);
+        batches.push(scx_format::upcast_to_large_types(&batch).map_err(OpsError::Format)?);
     }
-    let first_schema = batches[0].schema();
+    let wide_schema = batches[0].schema();
     let concatenated =
-        arrow::compute::concat_batches(&first_schema, batches.iter()).map_err(OpsError::Arrow)?;
+        arrow::compute::concat_batches(&wide_schema, batches.iter()).map_err(OpsError::Arrow)?;
+    // Narrow back to `Utf8` / `Binary` for columns whose combined
+    // offsets fit; columns above `i32::MAX` stay wide so the >2 GB
+    // append case still reads cleanly.
+    let narrowed = scx_format::downcast_large_types(&concatenated).map_err(OpsError::Format)?;
     // Strip per-shard schema metadata so the schema matches what
     // `ScxReader::read_obs` returns at query time.
-    let mut clean_metadata = first_schema.metadata().clone();
+    let narrowed_schema = narrowed.schema();
+    let mut clean_metadata = narrowed_schema.metadata().clone();
     clean_metadata.remove("shard_idx");
     clean_metadata.remove("row_start");
     clean_metadata.remove("n_shard_rows");
     let clean_schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        first_schema.fields().clone(),
+        narrowed_schema.fields().clone(),
         clean_metadata,
     ));
     Ok(RecordBatch::try_new(
         clean_schema,
-        concatenated.columns().to_vec(),
+        narrowed.columns().to_vec(),
     )?)
 }
 

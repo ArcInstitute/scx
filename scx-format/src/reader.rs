@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
+#[cfg(debug_assertions)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -34,6 +37,24 @@ use crate::RootCatalog;
 /// Opens an SCX file, validates the header and catalog checksums,
 /// and provides methods to read obs/var metadata, CSR shards, layers,
 /// obsm embeddings, uns JSON, and provenance.
+/// Phase 3c: debug-only call counters used by the streaming-merge test suite
+/// to assert that whole-batch materialising paths (`read_layer`, `read_obsm`,
+/// `read_all_obsm`, etc.) are not invoked during merge. In release builds the
+/// `fetch_add` sites are `cfg(debug_assertions)`-gated and compile away; the
+/// (small) struct itself remains so the public accessor stays available across
+/// build profiles for cross-crate tests.
+#[derive(Default, Debug)]
+pub struct ReaderDebugCounts {
+    pub read_layer: AtomicU64,
+    pub read_layer_for: AtomicU64,
+    pub read_obsm: AtomicU64,
+    pub read_all_obsm: AtomicU64,
+    pub read_obsm_for: AtomicU64,
+    pub read_varm: AtomicU64,
+    pub read_all_varm: AtomicU64,
+    pub read_varm_for: AtomicU64,
+}
+
 pub struct ScxReader {
     mmap: Mmap,
     header: FileHeader,
@@ -51,6 +72,11 @@ pub struct ScxReader {
     /// files. Parsed lazily-eagerly: the table is parsed once during
     /// `open()` so subsequent `modality_*` accessors are zero-cost.
     modality_table: Option<ModalityTable>,
+    /// Phase 3c: per-instance call counters for whole-batch materialising
+    /// reader methods (`read_layer`, `read_obsm`, ...). Always present so the
+    /// `debug_counts()` accessor is stable across build profiles, but the
+    /// increment sites are `cfg(debug_assertions)`-gated.
+    debug_counts: ReaderDebugCounts,
 }
 
 impl ScxReader {
@@ -176,6 +202,7 @@ impl ScxReader {
             root_catalog,
             full_catalog: Arc::new(full_catalog),
             modality_table,
+            debug_counts: ReaderDebugCounts::default(),
         })
     }
 
@@ -287,7 +314,17 @@ impl ScxReader {
             root_catalog,
             full_catalog: catalog,
             modality_table,
+            debug_counts: ReaderDebugCounts::default(),
         })
+    }
+
+    /// Per-instance counters for whole-batch reader entry points
+    /// (`read_layer`, `read_obsm`, ...). Increments are
+    /// `cfg(debug_assertions)`-gated and compile away in release builds —
+    /// the test suite uses these to assert that streaming merge / append
+    /// never reaches a materialising read path.
+    pub fn debug_counts(&self) -> &ReaderDebugCounts {
+        &self.debug_counts
     }
 
     // -----------------------------------------------------------------------
@@ -390,12 +427,27 @@ impl ScxReader {
     /// always see canonical narrow types regardless of the on-disk
     /// encoding (see [`crate::arrow_compat`]).
     fn read_arrow_ipc(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
+        let batch = self.read_arrow_ipc_raw(entry)?;
+        crate::arrow_compat::downcast_large_types(&batch)
+    }
+
+    /// Decode a single Arrow IPC entry **without** the wide→narrow
+    /// downcast. The writer always upcasts to `LargeUtf8`/`LargeBinary`
+    /// before serialising (so the bytes-on-disk are typically wide), but
+    /// columns whose payload fits in narrow offsets may still come back
+    /// downcast-eligible. This helper preserves the on-disk encoding so
+    /// callers that need to concatenate batches across shards can defer
+    /// the narrow choice until after [`arrow::compute::concat_batches`]
+    /// — concatenating on narrow offsets reproduces the original
+    /// `Offset overflow error` once the combined per-column string
+    /// payload exceeds `i32::MAX` (the same failure mode the streaming
+    /// merge-write path eliminated).
+    fn read_arrow_ipc_raw(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
         let slice = self.section_bytes(entry)?;
         let cursor = Cursor::new(slice);
         let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        // Read the first (and typically only) batch
         let mut batches = reader.into_iter();
-        let batch = batches
+        batches
             .next()
             .ok_or_else(|| {
                 ScxError::Io(std::io::Error::new(
@@ -403,8 +455,19 @@ impl ScxReader {
                     "Arrow IPC file contains no batches",
                 ))
             })?
-            .map_err(ScxError::Arrow)?;
-        crate::arrow_compat::downcast_large_types(&batch)
+            .map_err(ScxError::Arrow)
+    }
+
+    /// Phase 3b: decode a single Arrow IPC dense-mapping section by
+    /// catalog entry, applying the same wide→narrow downcast as the
+    /// whole-batch readers. Public counterpart to
+    /// [`Self::read_shard_from_entry`] (which targets encoded CSR
+    /// shards): used by the streaming merge path to walk
+    /// `Obsm/VarmEmbeddingShard` (and their legacy single-section
+    /// counterparts) one shard at a time without going through
+    /// `read_obsm` / `read_varm` (which reassemble the full mapping).
+    pub fn read_dense_mapping_entry(&self, entry: &FullCatalogEntry) -> Result<RecordBatch> {
+        self.read_arrow_ipc(entry)
     }
 
     /// Read the obs schema. Uses the Arrow IPC footer fast path, falling
@@ -661,6 +724,8 @@ impl ScxReader {
     /// to the legacy single-section [`SectionType::ObsmEmbedding`]
     /// layout for files written before sharding was introduced.
     pub fn read_obsm(&self, name: &str) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts.read_obsm.fetch_add(1, Ordering::Relaxed);
         if let Some(batch) =
             self.read_sharded_layout("obsm", name, SectionType::ObsmEmbeddingShard)?
         {
@@ -676,6 +741,10 @@ impl ScxReader {
 
     /// Read all obsm embeddings, keyed by name.
     pub fn read_all_obsm(&self) -> Result<HashMap<String, RecordBatch>> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_all_obsm
+            .fetch_add(1, Ordering::Relaxed);
         self.read_all_sharded_or_single(
             "obsm",
             SectionType::ObsmEmbedding,
@@ -687,6 +756,8 @@ impl ScxReader {
     ///
     /// See [`Self::read_obsm`] for the sharded / legacy layout handling.
     pub fn read_varm(&self, name: &str) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts.read_varm.fetch_add(1, Ordering::Relaxed);
         if let Some(batch) =
             self.read_sharded_layout("varm", name, SectionType::VarmEmbeddingShard)?
         {
@@ -702,6 +773,10 @@ impl ScxReader {
 
     /// Read all varm embeddings, keyed by name.
     pub fn read_all_varm(&self) -> Result<HashMap<String, RecordBatch>> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_all_varm
+            .fetch_add(1, Ordering::Relaxed);
         self.read_all_sharded_or_single(
             "varm",
             SectionType::VarmEmbedding,
@@ -863,9 +938,22 @@ impl ScxReader {
         }
         shards.sort_by_key(|(idx, _)| *idx);
 
+        // Decode shards **without** the per-shard wide→narrow downcast
+        // and force every batch to the wide encoding before concat. The
+        // writer's `write_arrow_ipc` always upcasts to LargeUtf8 /
+        // LargeBinary before serialising, so per-shard reads typically
+        // come back wide already; upcasting is a no-op in that case but
+        // covers shards whose individual payload was narrow on disk.
+        // Concatenating on narrow offsets would otherwise reproduce the
+        // original `Offset overflow error` once the combined string
+        // payload exceeds `i32::MAX` — the same failure mode the
+        // streaming merge-write path eliminated. After concat we apply
+        // [`downcast_large_types`], which narrows columns whose
+        // combined offsets fit and leaves wider columns wide.
         let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
         for (_, entry) in &shards {
-            batches.push(self.read_arrow_ipc(entry)?);
+            let raw = self.read_arrow_ipc_raw(entry)?;
+            batches.push(crate::arrow_compat::upcast_to_large_types(&raw)?);
         }
 
         // Verify the shards form a contiguous, ordered cover by walking
@@ -932,21 +1020,32 @@ impl ScxReader {
             )));
         }
 
-        let first_schema = batches[0].schema();
-        let concatenated = arrow::compute::concat_batches(&first_schema, batches.iter())?;
+        // Concat on the wide schema (every batch was upcast above).
+        // Concatenating large types is safe up to `i64::MAX` offsets,
+        // which dwarfs any realistic obs string payload.
+        let wide_schema = batches[0].schema();
+        let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
+
+        // Opportunistically narrow back to `Utf8`/`Binary` for columns
+        // whose combined offsets still fit in `i32::MAX`. Columns above
+        // that limit stay `LargeUtf8` / `LargeBinary` so the >2 GB obs
+        // case still reads cleanly — same fall-back the merge-write
+        // path relies on.
+        let narrowed = crate::arrow_compat::downcast_large_types(&concatenated)?;
 
         // Strip the per-shard metadata (shard_idx / row_start /
         // n_shard_rows) from the merged batch's schema. Keep
         // n_rows_total and any payload-level metadata.
-        let mut clean_metadata = first_schema.metadata().clone();
+        let narrowed_schema = narrowed.schema();
+        let mut clean_metadata = narrowed_schema.metadata().clone();
         clean_metadata.remove("shard_idx");
         clean_metadata.remove("row_start");
         clean_metadata.remove("n_shard_rows");
         let clean_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-            first_schema.fields().clone(),
+            narrowed_schema.fields().clone(),
             clean_metadata,
         ));
-        let clean_batch = RecordBatch::try_new(clean_schema, concatenated.columns().to_vec())?;
+        let clean_batch = RecordBatch::try_new(clean_schema, narrowed.columns().to_vec())?;
         Ok(Some(clean_batch))
     }
 
@@ -1309,6 +1408,10 @@ impl ScxReader {
     /// Output `n_cols` is patched from `modality_info(id).n_vars`
     /// (matching `read_all_csr_shards_for`).
     pub fn read_layer_for(&self, modality_id: u8, layer_name: &str) -> Result<ScxCsr> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_layer_for
+            .fetch_add(1, Ordering::Relaxed);
         let shards = self
             .full_catalog
             .layer_csr_shards_for_modality(modality_id, layer_name);
@@ -1360,16 +1463,64 @@ impl ScxReader {
     /// names are `obsm/{modality_name}/{key}` for `modality_id >= 1`
     /// and `obsm/{key}` for `modality_id == 0` (global).
     pub fn read_obsm_for(&self, modality_id: u8, key: &str) -> Result<RecordBatch> {
-        let section_name = if modality_id == 0 {
-            format!("obsm/{key}")
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_obsm_for
+            .fetch_add(1, Ordering::Relaxed);
+        let (shard_prefix, logical) = if modality_id == 0 {
+            (format!("obsm/{key}_shard_"), format!("obsm/{key}"))
         } else {
             let mname = self.modality_name_for_id(modality_id)?;
-            format!("obsm/{mname}/{key}")
+            (
+                format!("obsm/{mname}/{key}_shard_"),
+                format!("obsm/{mname}/{key}"),
+            )
         };
+        if let Some(batch) = self.read_sharded_layout_by_prefix(
+            &shard_prefix,
+            &logical,
+            SectionType::ObsmEmbeddingShard,
+        )? {
+            return Ok(batch);
+        }
         let entry = self
             .full_catalog
-            .get(&section_name)
-            .ok_or_else(|| ScxError::SectionNotFound(section_name))?;
+            .get(&logical)
+            .ok_or_else(|| ScxError::SectionNotFound(logical))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Read a per-modality varm embedding as an Arrow RecordBatch.
+    ///
+    /// Mirrors [`Self::read_obsm_for`]: tries the sharded layout
+    /// (`varm/{modality_name}/{key}_shard_<idx>`, section type
+    /// [`SectionType::VarmEmbeddingShard`]) first, falling back to the
+    /// legacy single-section [`SectionType::VarmEmbedding`].
+    pub fn read_varm_for(&self, modality_id: u8, key: &str) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_varm_for
+            .fetch_add(1, Ordering::Relaxed);
+        let (shard_prefix, logical) = if modality_id == 0 {
+            (format!("varm/{key}_shard_"), format!("varm/{key}"))
+        } else {
+            let mname = self.modality_name_for_id(modality_id)?;
+            (
+                format!("varm/{mname}/{key}_shard_"),
+                format!("varm/{mname}/{key}"),
+            )
+        };
+        if let Some(batch) = self.read_sharded_layout_by_prefix(
+            &shard_prefix,
+            &logical,
+            SectionType::VarmEmbeddingShard,
+        )? {
+            return Ok(batch);
+        }
+        let entry = self
+            .full_catalog
+            .get(&logical)
+            .ok_or_else(|| ScxError::SectionNotFound(logical))?;
         self.read_arrow_ipc(entry)
     }
 
@@ -1709,6 +1860,8 @@ impl ScxReader {
 
     /// Read a named layer, assembling all its shards into a ScxCsr.
     pub fn read_layer(&self, name: &str) -> Result<ScxCsr> {
+        #[cfg(debug_assertions)]
+        self.debug_counts.read_layer.fetch_add(1, Ordering::Relaxed);
         let mut shards = self.legacy_layer_shards(name);
 
         if shards.is_empty() {

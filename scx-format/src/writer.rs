@@ -1545,6 +1545,62 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Per-modality row-shard of an `obsm/{modality_name}/{key}` dense
+    /// embedding. Section name is `obsm/{modality_name}/{key}_shard_{shard_idx}`
+    /// with `SectionType::ObsmEmbeddingShard`. Mirrors the single-modality
+    /// [`Self::write_obsm_shard`] but stamps the modality_id on the catalog
+    /// entry via [`Self::with_modality`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_obsm_shard_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        let name = format!("obsm/{mname}/{key}_shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.has_obsm = true;
+            this.write_section_bytes(name, SectionType::ObsmEmbeddingShard, &data, None)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.flags.set_obsm();
+        }
+        Ok(())
+    }
+
+    /// Per-modality row-shard of a `varm/{modality_name}/{key}` dense
+    /// embedding. Section name is `varm/{modality_name}/{key}_shard_{shard_idx}`
+    /// with `SectionType::VarmEmbeddingShard`. Mirrors the single-modality
+    /// [`Self::write_varm_shard`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_varm_shard_for(
+        &mut self,
+        modality_id: u8,
+        key: &str,
+        shard_idx: u32,
+        row_start: u64,
+        n_shard_rows: u64,
+        n_rows_total: u64,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let stamped =
+            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let data = Self::write_arrow_ipc(&stamped)?;
+        let name = format!("varm/{mname}/{key}_shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_section_bytes(name, SectionType::VarmEmbeddingShard, &data, None)
+        })
+    }
+
     /// Per-modality `write_obsp_shard`. Section name is
     /// `obsp/{modality_name}/{name}/shard_{shard_idx}`.
     #[allow(clippy::too_many_arguments)]

@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::codec_select::select_codec;
@@ -315,20 +314,13 @@ pub fn merge_with_options(
         }
     }
 
-    // Merge obsm
-    let first_obsm = readers[0].read_all_obsm()?;
-    for name in first_obsm.keys() {
-        let mut batches = Vec::new();
-        for reader in &readers {
-            if let Ok(batch) = reader.read_obsm(name) {
-                batches.push(batch);
-            }
-        }
-        if batches.len() == readers.len() {
-            let merged = concat_batches(&batches[0].schema(), &batches)?;
-            writer.write_obsm(name, &merged)?;
-        }
-    }
+    // Phase 3b: stream global obsm and varm shard-by-shard. Each input's
+    // shards are re-stamped with cumulative `row_start` and emitted as
+    // the next output shard via `write_obsm_shard` / `write_varm_shard`.
+    // Legacy single-section inputs are treated as one source shard. Keys
+    // missing from any input are dropped (existing semantic).
+    merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
+    merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
 
     // Merge uns according to the policy. Default `UnsPolicy::First`
     // matches today's pre-refactor behaviour (read first input's
@@ -380,43 +372,63 @@ pub fn merge_with_options(
         let mut layer_shard_idx = 0u32;
         let mut emitted_layer_rows = 0u64;
 
+        // Phase 3a: stream each input's `LayerCsrShard` entries one at a
+        // time and re-pack into output shards bounded by `shard_target`.
+        // Mirror of the multimodal per-modality layer streaming pattern
+        // (see `merge_multimodal` below). No `read_layer` call — peak
+        // memory is one input shard plus the in-flight output shard.
         for (file_idx, reader) in readers.iter().enumerate() {
-            let layer = reader
-                .read_layer(layer_name)
-                .map_err(|_| OpsError::LayerMissing {
+            let mut input_shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::LayerCsrShard
+                        && e.modality_id == 0
+                        && e.name.starts_with(&layer_prefix)
+                })
+                .collect();
+            if input_shards.is_empty() {
+                return Err(OpsError::LayerMissing {
                     name: layer_name.clone(),
                     file_index: file_idx,
-                })?;
-            for row_idx in 0..layer.shape.0 {
-                let row_start = layer.indptr[row_idx] as usize;
-                let row_end = layer.indptr[row_idx + 1] as usize;
-                for j in row_start..row_end {
-                    layer_indices.push(layer.indices[j] as u32);
-                    encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
-                }
-                let prev = *layer_indptr.last().unwrap();
-                layer_indptr.push(prev + (row_end - row_start) as u64);
-                layer_row_count += 1;
+                });
+            }
+            input_shards.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
 
-                if layer_row_count >= shard_target as u64 {
-                    // Auto-select codec per layer shard
-                    let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
-                    writer.write_layer_csr_shard(
-                        &layer_indptr,
-                        &layer_indices,
-                        &layer_values,
-                        layer_shard_codec,
-                        layer_value_encoding,
-                        emitted_layer_rows,
-                        layer_name,
-                        layer_shard_idx,
-                    )?;
-                    emitted_layer_rows += layer_row_count;
-                    layer_indptr = vec![0];
-                    layer_indices.clear();
-                    layer_values.clear();
-                    layer_row_count = 0;
-                    layer_shard_idx += 1;
+            for shard_entry in input_shards {
+                let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
+                let n_rows = indptr.len() - 1;
+                for local_row in 0..n_rows {
+                    let s = indptr[local_row] as usize;
+                    let e = indptr[local_row + 1] as usize;
+                    for j in s..e {
+                        layer_indices.push(indices[j] as u32);
+                        encode_value(&mut layer_values, data[j], layer_value_encoding)?;
+                    }
+                    let prev = *layer_indptr.last().unwrap();
+                    layer_indptr.push(prev + (e - s) as u64);
+                    layer_row_count += 1;
+
+                    if layer_row_count >= shard_target as u64 {
+                        let layer_shard_codec = select_codec(&layer_values, layer_value_encoding);
+                        writer.write_layer_csr_shard(
+                            &layer_indptr,
+                            &layer_indices,
+                            &layer_values,
+                            layer_shard_codec,
+                            layer_value_encoding,
+                            emitted_layer_rows,
+                            layer_name,
+                            layer_shard_idx,
+                        )?;
+                        emitted_layer_rows += layer_row_count;
+                        layer_indptr = vec![0];
+                        layer_indices.clear();
+                        layer_values.clear();
+                        layer_row_count = 0;
+                        layer_shard_idx += 1;
+                    }
                 }
             }
         }
@@ -637,21 +649,14 @@ fn merge_multimodal(
         }
     }
 
-    // Global obsm: concatenate across inputs row-wise. Drop a key if
-    // any input is missing it (consistent with single-modality merge).
-    let first_obsm = readers[0].read_all_obsm()?;
-    for name in first_obsm.keys() {
-        let mut batches = Vec::new();
-        for reader in readers {
-            if let Ok(batch) = reader.read_obsm(name) {
-                batches.push(batch);
-            }
-        }
-        if batches.len() == readers.len() {
-            let merged = concat_batches(&batches[0].schema(), &batches)?;
-            writer.write_obsm(name, &merged)?;
-        }
-    }
+    // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
+    // pattern as single-modality: every input's shards (or legacy
+    // single-section as one source shard) are re-stamped and emitted
+    // as the next output shard. Keys missing from any input are dropped.
+    // Multimodal global varm is omitted by design — `n_vars` differs
+    // per modality, so there is no canonical `n_rows_total` for a
+    // global varm shard. Per-modality varm is handled below in Step 5.
+    merge_global_dense_mapping_sharded(readers, &mut writer, DenseMappingAxis::Obsm, total_n_obs)?;
 
     // Register modalities in input order.
     for info in &table.entries {
@@ -713,39 +718,30 @@ fn merge_multimodal(
         }
     }
 
-    // Per-modality obsm: concatenate across inputs row-wise. Drop if
-    // any input is missing it (consistent with single-modality merge).
+    // Phase 3b: stream per-modality obsm and varm shard-by-shard via
+    // the new `write_obsm_shard_for` / `write_varm_shard_for` writer
+    // APIs. Each input's shards (or legacy single-section as one source
+    // shard) are re-stamped and emitted as the next output shard. Keys
+    // missing from any input are dropped. Per-modality varm support is
+    // newly added in Phase 3b — it was silently dropped pre-Phase-3.
     for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
-        let prefix = format!("obsm/{}/", info.name);
-        let mut obsm_keys = std::collections::BTreeSet::new();
-        for entry in &readers[0].catalog().entries {
-            if entry.section_type == SectionType::ObsmEmbedding
-                && entry.modality_id == modality_id
-                && entry.name.starts_with(&prefix)
-            {
-                if let Some(k) = entry.name.strip_prefix(&prefix) {
-                    obsm_keys.insert(k.to_string());
-                }
-            }
-        }
-        for key in obsm_keys {
-            let mut batches = Vec::new();
-            let mut all_present = true;
-            for reader in readers {
-                match reader.read_obsm_for(modality_id, &key) {
-                    Ok(b) => batches.push(b),
-                    Err(_) => {
-                        all_present = false;
-                        break;
-                    }
-                }
-            }
-            if all_present && !batches.is_empty() {
-                let merged = concat_batches(&batches[0].schema(), &batches)?;
-                writer.write_obsm_for(modality_id, &key, &merged)?;
-            }
-        }
+        merge_per_modality_dense_mapping_sharded(
+            readers,
+            &mut writer,
+            DenseMappingAxis::Obsm,
+            modality_id,
+            &info.name,
+            total_n_obs,
+        )?;
+        merge_per_modality_dense_mapping_sharded(
+            readers,
+            &mut writer,
+            DenseMappingAxis::Varm,
+            modality_id,
+            &info.name,
+            info.n_vars,
+        )?;
     }
 
     // Per-modality layers: concatenate per-modality `layer/{mod}/{layer}/...`
@@ -1062,6 +1058,354 @@ fn obs_predicate_index_builder(
         high_cardinality_threshold: 100_000,
     };
     scx_engine::ObsPredicateIndexBuilder::new(schema, &build_opts).map_err(OpsError::Engine)
+}
+
+/// Phase 3b: which dense-mapping axis to stream during merge.
+#[derive(Clone, Copy)]
+enum DenseMappingAxis {
+    Obsm,
+    Varm,
+}
+
+impl DenseMappingAxis {
+    fn prefix(self) -> &'static str {
+        match self {
+            DenseMappingAxis::Obsm => "obsm",
+            DenseMappingAxis::Varm => "varm",
+        }
+    }
+
+    fn shard_type(self) -> SectionType {
+        match self {
+            DenseMappingAxis::Obsm => SectionType::ObsmEmbeddingShard,
+            DenseMappingAxis::Varm => SectionType::VarmEmbeddingShard,
+        }
+    }
+
+    fn legacy_type(self) -> SectionType {
+        match self {
+            DenseMappingAxis::Obsm => SectionType::ObsmEmbedding,
+            DenseMappingAxis::Varm => SectionType::VarmEmbedding,
+        }
+    }
+}
+
+/// Phase 3b: stream merge of a global (modality_id == 0) dense mapping
+/// axis (obsm or varm) shard-by-shard.
+///
+/// Row semantics differ by axis:
+/// - **obsm**: rows align with `obs`, which is concatenated across
+///   inputs, so this helper walks every input's shards in order and
+///   re-stamps each as the next output shard. Keys missing from any
+///   input are dropped (existing semantic).
+/// - **varm**: rows align with `var`, which is **shared** across
+///   inputs (validated by var-identity check at merge entry).
+///   Concatenating varm would duplicate rows, so this helper takes
+///   only input 0's varm shards as the canonical output — matching
+///   the way `var` itself is taken from input 0.
+///
+/// Legacy single-section inputs are treated as a one-source-shard
+/// input per the Phase 3b spec. Peak memory is one input shard at a time.
+fn merge_global_dense_mapping_sharded(
+    readers: &[ScxReader],
+    writer: &mut ScxWriter,
+    axis: DenseMappingAxis,
+    n_rows_total: u64,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let prefix = axis.prefix();
+    let shard_type = axis.shard_type();
+    let legacy_type = axis.legacy_type();
+    let prefix_slash = format!("{prefix}/");
+
+    // varm rows align with the shared var axis; take input 0 only.
+    let source_readers: &[ScxReader] = match axis {
+        DenseMappingAxis::Obsm => readers,
+        DenseMappingAxis::Varm => &readers[..1],
+    };
+
+    let keys: BTreeSet<String> = readers[0]
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.modality_id == 0)
+        .filter_map(|e| {
+            if e.section_type == shard_type {
+                let stem = e.name.strip_prefix(&prefix_slash)?;
+                // Global obsm/varm names: `{prefix}/{key}_shard_{idx}`. We
+                // need the key, not the multimodal subpath, so reject
+                // anything with a `/` (those belong to a per-modality
+                // namespace).
+                if stem.contains('/') {
+                    return None;
+                }
+                let pos = stem.rfind("_shard_")?;
+                Some(stem[..pos].to_string())
+            } else if e.section_type == legacy_type {
+                let stem = e.name.strip_prefix(&prefix_slash)?;
+                if stem.contains('/') || stem.contains("_shard_") {
+                    return None;
+                }
+                Some(stem.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    'next_key: for key in &keys {
+        // Validate presence in every *source* input before writing
+        // anything. For obsm, source_readers == readers (concatenate).
+        // For varm, source_readers == &readers[..1] (input 0 only).
+        let mut per_input: Vec<(
+            usize,
+            Vec<&scx_format::catalog::FullCatalogEntry>,
+            Option<&scx_format::catalog::FullCatalogEntry>,
+        )> = Vec::with_capacity(source_readers.len());
+        let shard_name_prefix = format!("{prefix_slash}{key}_shard_");
+        let legacy_name = format!("{prefix_slash}{key}");
+        for (idx, reader) in source_readers.iter().enumerate() {
+            let shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == shard_type
+                        && e.modality_id == 0
+                        && e.name.starts_with(&shard_name_prefix)
+                })
+                .collect();
+            let legacy = if shards.is_empty() {
+                reader.catalog().entries.iter().find(|e| {
+                    e.section_type == legacy_type && e.modality_id == 0 && e.name == legacy_name
+                })
+            } else {
+                None
+            };
+            if shards.is_empty() && legacy.is_none() {
+                continue 'next_key;
+            }
+            per_input.push((idx, shards, legacy));
+        }
+
+        // All inputs present — stream-write the merged shard chain.
+        let mut out_shard_idx: u32 = 0;
+        let mut cumulative_rows: u64 = 0;
+        for (idx, shards, legacy) in &per_input {
+            let reader = &source_readers[*idx];
+            if let Some(entry) = legacy {
+                let batch = reader
+                    .read_dense_mapping_entry(entry)
+                    .map_err(OpsError::Format)?;
+                let n = batch.num_rows() as u64;
+                match axis {
+                    DenseMappingAxis::Obsm => writer.write_obsm_shard(
+                        key,
+                        out_shard_idx,
+                        cumulative_rows,
+                        n,
+                        n_rows_total,
+                        &batch,
+                    )?,
+                    DenseMappingAxis::Varm => writer.write_varm_shard(
+                        key,
+                        out_shard_idx,
+                        cumulative_rows,
+                        n,
+                        n_rows_total,
+                        &batch,
+                    )?,
+                }
+                cumulative_rows += n;
+                out_shard_idx += 1;
+            } else {
+                let mut sorted = shards.clone();
+                sorted.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+                for shard_entry in sorted {
+                    let batch = reader
+                        .read_dense_mapping_entry(shard_entry)
+                        .map_err(OpsError::Format)?;
+                    let n = batch.num_rows() as u64;
+                    match axis {
+                        DenseMappingAxis::Obsm => writer.write_obsm_shard(
+                            key,
+                            out_shard_idx,
+                            cumulative_rows,
+                            n,
+                            n_rows_total,
+                            &batch,
+                        )?,
+                        DenseMappingAxis::Varm => writer.write_varm_shard(
+                            key,
+                            out_shard_idx,
+                            cumulative_rows,
+                            n,
+                            n_rows_total,
+                            &batch,
+                        )?,
+                    }
+                    cumulative_rows += n;
+                    out_shard_idx += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 3b: per-modality counterpart to
+/// [`merge_global_dense_mapping_sharded`]. Walks each input's catalog
+/// for `obsm/{mname}/{key}_shard_*` (sharded) or `obsm/{mname}/{key}`
+/// (legacy), filtered by `modality_id`, and re-stamps via the new
+/// `write_obsm_shard_for` / `write_varm_shard_for` writer APIs. Keys
+/// missing from any input are dropped. Inputs that have no entries
+/// for this modality+axis combination are also tolerated — the helper
+/// is a no-op when there's nothing to merge (consistent with the
+/// existing varm-not-present behaviour in multimodal files).
+fn merge_per_modality_dense_mapping_sharded(
+    readers: &[ScxReader],
+    writer: &mut ScxWriter,
+    axis: DenseMappingAxis,
+    modality_id: u8,
+    modality_name: &str,
+    n_rows_total: u64,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let prefix = axis.prefix();
+    let shard_type = axis.shard_type();
+    let legacy_type = axis.legacy_type();
+    let key_prefix = format!("{prefix}/{modality_name}/");
+
+    // Per-modality varm rows align with the shared per-modality `var`
+    // axis (validated identical across inputs), so take input 0 only —
+    // same rule as the global helper.
+    let source_readers: &[ScxReader] = match axis {
+        DenseMappingAxis::Obsm => readers,
+        DenseMappingAxis::Varm => &readers[..1],
+    };
+
+    let keys: BTreeSet<String> = readers[0]
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.modality_id == modality_id && e.name.starts_with(&key_prefix))
+        .filter_map(|e| {
+            let stem = e.name.strip_prefix(&key_prefix)?;
+            if e.section_type == shard_type {
+                let pos = stem.rfind("_shard_")?;
+                Some(stem[..pos].to_string())
+            } else if e.section_type == legacy_type {
+                if stem.contains("_shard_") {
+                    None
+                } else {
+                    Some(stem.to_string())
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    'next_key: for key in &keys {
+        let shard_name_prefix = format!("{key_prefix}{key}_shard_");
+        let legacy_name = format!("{key_prefix}{key}");
+        let mut per_input: Vec<(
+            usize,
+            Vec<&scx_format::catalog::FullCatalogEntry>,
+            Option<&scx_format::catalog::FullCatalogEntry>,
+        )> = Vec::with_capacity(source_readers.len());
+        for (idx, reader) in source_readers.iter().enumerate() {
+            let shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == shard_type
+                        && e.modality_id == modality_id
+                        && e.name.starts_with(&shard_name_prefix)
+                })
+                .collect();
+            let legacy = if shards.is_empty() {
+                reader.catalog().entries.iter().find(|e| {
+                    e.section_type == legacy_type
+                        && e.modality_id == modality_id
+                        && e.name == legacy_name
+                })
+            } else {
+                None
+            };
+            if shards.is_empty() && legacy.is_none() {
+                continue 'next_key;
+            }
+            per_input.push((idx, shards, legacy));
+        }
+
+        let mut out_shard_idx: u32 = 0;
+        let mut cumulative_rows: u64 = 0;
+        for (idx, shards, legacy) in &per_input {
+            let reader = &source_readers[*idx];
+            if let Some(entry) = legacy {
+                let batch = reader
+                    .read_dense_mapping_entry(entry)
+                    .map_err(OpsError::Format)?;
+                let n = batch.num_rows() as u64;
+                match axis {
+                    DenseMappingAxis::Obsm => writer.write_obsm_shard_for(
+                        modality_id,
+                        key,
+                        out_shard_idx,
+                        cumulative_rows,
+                        n,
+                        n_rows_total,
+                        &batch,
+                    )?,
+                    DenseMappingAxis::Varm => writer.write_varm_shard_for(
+                        modality_id,
+                        key,
+                        out_shard_idx,
+                        cumulative_rows,
+                        n,
+                        n_rows_total,
+                        &batch,
+                    )?,
+                }
+                cumulative_rows += n;
+                out_shard_idx += 1;
+            } else {
+                let mut sorted = shards.clone();
+                sorted.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
+                for shard_entry in sorted {
+                    let batch = reader
+                        .read_dense_mapping_entry(shard_entry)
+                        .map_err(OpsError::Format)?;
+                    let n = batch.num_rows() as u64;
+                    match axis {
+                        DenseMappingAxis::Obsm => writer.write_obsm_shard_for(
+                            modality_id,
+                            key,
+                            out_shard_idx,
+                            cumulative_rows,
+                            n,
+                            n_rows_total,
+                            &batch,
+                        )?,
+                        DenseMappingAxis::Varm => writer.write_varm_shard_for(
+                            modality_id,
+                            key,
+                            out_shard_idx,
+                            cumulative_rows,
+                            n,
+                            n_rows_total,
+                            &batch,
+                        )?,
+                    }
+                    cumulative_rows += n;
+                    out_shard_idx += 1;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Yield this input's obs as a sequence of shard batches, each at most
