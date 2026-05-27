@@ -99,8 +99,8 @@ catalog for O(1) random access to any component.
 │ ROOT CATALOG          (offset 256, max 4096 bytes)   │  Compact index of section groups
 ├──────────────────────────────────────────────────-───┤
 │ SECTIONS              (8-byte aligned)               │
-│   obs metadata        (Arrow IPC)                    │
-│   var metadata        (Arrow IPC)                    │
+│   obs metadata        (Arrow IPC, single or sharded) │
+│   var metadata        (Arrow IPC, single or sharded) │
 │   predicate indexes                                  │
 │   X/csr/000000..N-1   (CSR shards — expression data) │
 │   layers, obsm, obsp, uns, provenance                │
@@ -173,7 +173,7 @@ float data routes to Pcodec. LZ4+shuffle is available via `codec="lz4"` but not 
 | indptr | `u64` | `i64` (matches scipy) |
 | indices | `u16` or `u32` | `i32` (matches scipy) |
 | values | `u8`, `u16`, `u32`, `f32`, `f16` | `f32` (always) |
-| obs/var metadata | Arrow IPC | Arrow RecordBatch → pandas |
+| obs/var metadata | Arrow IPC (single section or row-sharded) | Arrow RecordBatch → pandas |
 
 The `ScxCsr` struct (in `scx-sparse`) uses the exact memory layout scipy expects —
 `i64` indptr, `i32` indices, `f32` data — enabling **zero-copy** transfer to Python
@@ -235,6 +235,22 @@ All section access is via offset+length from the catalog — no sequential scann
 - `scx-engine` predicate pushdown still reads `ShardStats` via `FullCatalog` — `LazyShardStats` is wired up but the pushdown evaluator has not been migrated. The shape of `LazyShardStats` is the eventual landing site for the cold-column-stats deferral.
 
 **Fork safety:** `Arc<FullCatalog>` and `Arc<CatalogView>` have no interior mutability. `FullCatalog::reconcile_v1_csr_col_range` mutates entries once during `read_from` *before* the `Arc` wrap; after that point every reader path treats both types as frozen. A `fork()` from a Python DataLoader worker COW-duplicates the parent's catalog into each child — no shared mutex, no shared singleflight table, no atomic refcount contention across processes. See [docs/multithreading.md § Fork safety](multithreading.md#fork-safety).
+
+### Sharded obs/var metadata reader APIs
+
+Files produced by streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when `n_obs > shard_target_rows`) store obs/var metadata as row-sharded Arrow IPC sections (types 24/25) instead of a single monolithic section. `ScxReader` exposes a parallel set of shard-aware accessors alongside the legacy single-section API:
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `obs_shard_count()` | `usize` | Catalog-only; no payload read. Returns 0 for legacy single-section files. |
+| `read_obs_shard(idx)` | `RecordBatch` | Returns on-disk wide types (e.g. `LargeUtf8`) as-is — no downcast. |
+| `obs_shards()` | `impl Iterator<Item = RecordBatch>` | Iterator over all shards in shard-index order. |
+| `read_obs_assembled()` | `RecordBatch` | Reassembles all shards into a single batch. **Explicit memory hazard** at atlas scale. |
+| `read_obs_schema_physical()` | `Schema` | On-disk Arrow schema without reading payload. |
+| `read_obs_schema_logical_lossy()` | `Schema` | Downcast schema (e.g. `LargeUtf8 → Utf8`) without reading payload. |
+| `read_obs()` | `RecordBatch` | Returns the single-section batch. **Errors on sharded files** with a diagnostic directing callers to the shard APIs above. |
+
+Mirror `var_shard_count`, `read_var_shard`, `var_shards`, `read_var_assembled`, `read_var_schema_physical`, `read_var_schema_logical_lossy`, and `read_var` accessors exist for var metadata, with identical semantics on the var axis.
 
 ---
 

@@ -422,6 +422,12 @@ relative to a cloud-optimized layout.
 - A batched async section fetcher; today each cloud read uses
   `block_on` from a rayon worker, so cloud bandwidth is bounded by
   the rayon thread pool rather than fully saturated.
+- **Sharded obs** (`ObsMetadataShard`, section type 24): the cloud
+  section reader does not yet support row-sharded obs metadata
+  emitted by `merge`, `append`, and `from_anndata` (when
+  `n_obs > shard_target_rows`). Files containing
+  `ObsMetadataShard` sections will fail on `open_cloud` until the
+  cloud reader assembles sharded metadata on open.
 
 ### `explode` / `pack` — convert layouts locally
 

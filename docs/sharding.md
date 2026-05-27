@@ -283,6 +283,30 @@ enabling per-shard adaptive codec selection and mixed integer/float layers.
 
 For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).
 
+## Obs/var metadata sharding
+
+Streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when
+`n_obs > shard_target_rows`) write obs and var metadata as row-sharded
+Arrow IPC sections (section types 24/25) instead of a single monolithic
+`obs_metadata` / `var_metadata` section. This bounds peak memory at one
+shard's worth of metadata during the merge/append/ingest hot path and
+avoids Arrow IPC's 2 GB narrow-offset ceiling for string columns at atlas
+scale.
+
+Each shard covers rows `[row_start, row_start + n_shard_rows)` of the
+logical metadata table and carries schema metadata (`shard_idx`,
+`row_start`, `n_shard_rows`, `n_rows_total`). Readers reassemble shards
+transparently via the shard-aware APIs (`obs_shard_count`,
+`read_obs_shard`, `obs_shards`, `read_obs_assembled`); the legacy
+`read_obs` accessor errors on sharded files with a diagnostic directing
+callers to the shard APIs.
+
+A file MUST NOT carry both a single-section `obs_metadata` (type 0) and
+sharded `obs_metadata_shard` (type 24) entries — the writer enforces
+this. Legacy single-section files remain fully readable. See
+[format.md § Sharded metadata layout](format.md#sharded-metadata-layout-section-types-2425)
+for the binary layout.
+
 ## CSC sharding
 
 A CSC sidecar is an optional **column-major view** of the same matrix

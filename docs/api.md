@@ -2,7 +2,7 @@
 
 ## Section Types
 
-20 section types are defined in `scx-format/src/section.rs`:
+26 section types are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -42,6 +42,15 @@ ObspEmbedding (18)     — Sparse obs×obs pairwise matrices (e.g.
                          stored as float32.
 VarpEmbedding (19)     — Sparse var×var pairwise matrices. Same wire
                          format as ObspEmbedding.
+ObsmEmbeddingShard (20)— Row-sharded obsm (section per shard × key).
+VarmEmbeddingShard (21)— Row-sharded varm (mirror of 20).
+ObspEmbeddingShard (22)— Row-sharded obsp (section per shard × key).
+VarpEmbeddingShard (23)— Row-sharded varp (mirror of 22).
+ObsMetadataShard (24)  — Row-sharded obs Arrow IPC. Produced by merge,
+                         append, and from_anndata when n_obs exceeds
+                         shard_target_rows. Mutually exclusive with
+                         ObsMetadata (0) in the same file.
+VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24).
 ```
 
 ## ScxReader (`scx-format/src/reader.rs`)
@@ -68,6 +77,13 @@ VarpEmbedding (19)     — Sparse var×var pairwise matrices. Same wire
 - `validate()` — Check all section BLAKE3 checksums
 - `section_bytes(entry)` — Direct byte access to a section
 - `read_obs_schema()` / `read_var_schema()` — Arrow schema (without data)
+- `read_obs_schema_physical()` / `read_var_schema_physical()` — Physical Arrow schema from the first on-disk section (without data)
+- `read_obs_schema_logical_lossy()` / `read_var_schema_logical_lossy()` — Logical schema assembled from all shards (field union; lossy because cross-shard type conflicts are resolved by first-seen-wins)
+- `obs_shard_count()` / `var_shard_count()` — Number of `ObsMetadataShard` / `VarMetadataShard` sections (0 on legacy single-section files)
+- `read_obs_shard(idx)` / `read_var_shard(idx)` — Single metadata shard as Arrow RecordBatch
+- `obs_shards()` / `var_shards()` — Iterator over all metadata shards
+- `read_obs_assembled()` / `read_var_assembled()` — Reassemble all metadata shards into one Arrow RecordBatch (transparent on legacy single-section files)
+- `debug_counts()` — `ReaderDebugCounts` with `AtomicU64` I/O counters (`cfg(debug_assertions)` only)
 - `read_obs_predicate_index_bytes()` / `read_var_predicate_index_bytes()` — Predicate index raw bytes
 - `read_deletion_vectors()` — Roaring Bitmap deletion vectors
 - `read_all_csr_shards_filtered()` — Full matrix with deletion vector filtering
@@ -299,6 +315,8 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `PredicateIndexSkippedMultimodal` | Predicate-index builder | Predicate indexes are unimodal-only on the read side today; emitted (and indexes skipped) when conversion input is multimodal. |
 | `BitmapSkipped { reason }` | Detection bitmap auto policy | `--bitmap auto` rejected emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
 | `DroppedObsp { name, reason }` | `scx merge` (multimodal) | `obsp` could not be merged (axis semantics don't compose); default-dropped with a warning. |
+| `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
+| `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `PyExperiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
 | `ThreadsafeHdf5Unavailable` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
 
 ## Memory budgets
@@ -694,7 +712,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — Write AnnData to SCX.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None, shard_target_rows=None)` — Write AnnData to SCX.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
   Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
@@ -704,6 +722,14 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   underlying mechanics. `index_*` / `bitmap` materialise query
   predicate indexes and detection bitmaps at conversion time — see
   [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+  `force_legacy_metadata=True` forces a single `ObsMetadata` /
+  `VarMetadata` section regardless of size; the default (`False`)
+  emits `ObsMetadataShard` / `VarMetadataShard` sections when
+  `n_obs > shard_target_rows`. `memory_budget` (`"4G"`, `"512M"`,
+  bytes) emits `MappingPeakFootprintHigh` when an individual mapping's
+  estimated footprint exceeds the budget. `shard_target_rows` overrides
+  the default obs shard size. Obsm, varm, obsp, and varp are extracted
+  and written one key at a time (incremental, not collected).
 - `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
@@ -823,7 +849,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output.
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
-- `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file.
+- `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `uns_policy` controls conflicting uns sections: `"first"` (keep first input), `"require_equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (write conflict report as `uns["_merge_uns_summary"]`). `shard_target_rows` overrides the default obs shard size during merge. Merge now streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
 ### Cloud operations (requires `--features cloud`)
 - `pyscx.pull(source, dest, filter=None, parallelism=None)` — Streaming cloud → local
@@ -835,7 +861,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
   - `layers`: list of layer names to load (default: all)
@@ -862,6 +888,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (use this before closing the experiment or shipping the AnnData
     to a subprocess). `obsm` and `uns` are always eager regardless of
     this flag.
+  - `memory_budget` (default `None`, treated as 8 GiB): emits
+    `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
+    footprint exceeds the budget. Warn-only — does not block
+    assembly.
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are

@@ -205,6 +205,30 @@ The `codec` parameter accepts `"auto"` (default — selects best codec per shard
 `"lz4"` (byte-shuffle + LZ4 frame), or `"none"`. With `"auto"`, integer data uses Scx1 or Zstd
 and float data (e.g., log-normalized layers) uses Pcodec for 7–16% better compression than Zstd.
 
+#### Sharded obs/var metadata
+
+For datasets with `n_obs > shard_target_rows` (default 16,384),
+`from_anndata` emits obs and var as sharded `ObsMetadataShard` /
+`VarMetadataShard` sections rather than single monolithic sections.
+This bounds metadata write memory and produces files compatible with the
+streaming merge pipeline. Pass `force_legacy_metadata=True` to opt into
+single-section metadata when needed for backward compatibility:
+
+```python
+pyscx.from_anndata(adata, "output.scx", force_legacy_metadata=True)
+```
+
+#### Incremental mapping writes
+
+Obsm, varm, obsp, and varp are extracted and written one key at a time —
+the full set of mappings is never collected in memory simultaneously.
+When a single mapping's estimated peak footprint exceeds `memory_budget`,
+a `MappingPeakFootprintHigh` warning is emitted:
+
+```python
+pyscx.from_anndata(adata, "output.scx", memory_budget="4G")
+```
+
 ### From h5ad on disk — streaming (`from_h5ad`)
 
 For h5ad files that don't fit in RAM, use `pyscx.from_h5ad(path, out)`. It
@@ -354,6 +378,10 @@ exp.to_anndata(
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
                           # AnnData is fully detached from the SCX file handle.
+    memory_budget=None,   # None (default: 8 GiB), int (bytes), or str ("4G" / "512MiB").
+                          # When the estimated eager assembly footprint exceeds this
+                          # budget, a UserWarning is emitted recommending backed mode.
+                          # Advisory only — assembly still proceeds.
 )
 ```
 
@@ -470,6 +498,17 @@ memory ≈ (n_obs + 1) × 8 bytes           # indptr (i64)
 > metadata reads with 80 GB of RAM available. As a rule of thumb, budget
 > **2–3× the CSR size** for a comfortable working set, or use backed mode
 > for datasets over ~500K cells.
+
+`to_anndata()` performs a catalog-only estimate of the eager assembly
+footprint before loading data. When the estimate exceeds `memory_budget`
+(default 8 GiB), a `UserWarning` is emitted recommending `backed=True`
+or `pyscx.open(path).query()`. The warning is advisory — assembly still
+proceeds. Override the threshold with `memory_budget=`:
+
+```python
+exp.to_anndata(memory_budget="16G")   # raise the threshold
+exp.to_anndata(backed=True)           # or use backed mode instead
+```
 
 If this exceeds your available memory, use
 [selective loading](#selective-loading) or the
@@ -2163,10 +2202,18 @@ pyscx.append_from_anndata("atlas.scx", new_adata)
 (or raw-copied when codec and encoding match) one at a time, so memory
 usage is bounded by a single shard rather than the full source matrix.
 
+Obs metadata is appended as new `ObsMetadataShard` sections — the
+existing obs is not rewritten. Legacy single-section obs files are
+promoted to shard 0 on first append, and new obs rows are added as
+subsequent shards.
+
 ### Merging datasets
 
+`pyscx.merge` combines multiple SCX files into one atlas-scale output.
+All inputs must share the same var axis (gene set, order, and metadata).
+
 ```python
-# Merge multiple SCX files (must have same n_vars)
+# Basic merge — var identity validated by default
 pyscx.merge(["batch1.scx", "batch2.scx", "batch3.scx"], "atlas.scx")
 
 # Then analyze the merged atlas
@@ -2174,6 +2221,85 @@ adata = pyscx.open("atlas.scx").to_anndata()
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 sc.pp.combat(adata, key="batch")  # batch correction
+```
+
+#### Full merge signature
+
+```python
+pyscx.merge(
+    inputs,                              # list[str] — at least 2 SCX file paths
+    output,                              # str — output SCX path
+    index_obs=None,                      # list[str] — obs columns to index for query pushdown
+    index_var=None,                      # list[str] — var columns to index
+    index_preset=None,                   # "cellxgene" | "perturbseq" | "training"
+    index_auto_threshold=None,           # int — auto-index cardinality threshold
+    assume_identical_var=False,          # skip var identity validation
+    assume_identical_obs=False,          # skip obs schema validation
+    uns_policy=None,                     # "first" | "require-equal" | "namespace" | "summary"
+)
+```
+
+#### Streaming behavior
+
+Merge operates shard-by-shard at every level — **no full-dataset
+materialization** at any point in the pipeline:
+
+- **Obs metadata**: each input's obs is read one shard at a time and
+  written as `ObsMetadataShard` sections in the output. Peak obs memory
+  is bounded by one shard (~16K rows) rather than the total cell count.
+  This removes the previous ~2 GB Arrow IPC narrow-offset ceiling.
+- **X and layers**: CSR shards are decoded one at a time per input and
+  re-encoded into output shards. Single-modality merge now matches the
+  multimodal streaming pattern.
+- **Obsm / varm**: dense mapping sections are read and written one shard
+  at a time. Legacy single-section inputs are treated as one source shard.
+- **Predicate indexes**: built incrementally from the obs shard stream
+  without materializing a full obs table.
+
+> [!TIP]
+> For atlas-scale merges (>10M cells), merge's peak RSS is now dominated by
+> the per-shard working set (~128 MB) rather than total obs/layer size.
+> Merges that previously OOM'd or hit Arrow offset overflows at ~67M cells
+> now complete with bounded memory.
+
+#### Var identity validation
+
+> [!IMPORTANT]
+> **Breaking change**: `merge()` now validates var identity by default.
+> Pre-existing code that merged files with different var metadata (but
+> the same `n_vars`) will error. This prevents silent column-axis
+> corruption where gene indices in later inputs are misinterpreted
+> against the first input's var table.
+
+By default (`assume_identical_var=False`), merge compares every input's
+var batch column-by-column against input 0 and errors on mismatch. If
+you have already validated var identity upstream:
+
+```python
+pyscx.merge(inputs, output, assume_identical_var=True)
+```
+
+Similarly, `assume_identical_obs=False` validates obs schema (column
+names and dtypes) across inputs.
+
+#### Uns conflict policy
+
+The `uns_policy` kwarg controls how conflicting `uns` sections are
+handled across inputs:
+
+| Policy | Behavior |
+|--------|----------|
+| `"first"` (default) | Keep the first input's uns verbatim; warn on disagreement |
+| `"require-equal"` | Error if any input's uns differs from the first |
+| `"namespace"` | Wrap each input's uns under `"input_0"`, `"input_1"`, etc. |
+| `"summary"` | Keep the first input's uns and record conflicts in `uns["_scx_uns_conflicts"]` |
+
+```python
+# Error if uns sections differ across inputs
+pyscx.merge(inputs, output, uns_policy="require-equal")
+
+# Namespace each input's uns to preserve all metadata
+pyscx.merge(inputs, output, uns_policy="namespace")
 ```
 
 ## GPU-accelerated training with scVI / scANVI

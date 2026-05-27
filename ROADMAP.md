@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-05-13
+**Last updated**: 2026-05-27
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -194,6 +194,15 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] `scx compact` — rewrite file reclaiming space (docs/format.md §Compaction)
 - [x] `scx rollback` — revert to previous manifest (docs/format.md §Rollback)
 - [x] `scx merge` — streaming merge of multiple .scx files
+- [x] Streaming merge: obs/layers/obsm merged shard-by-shard (no full obs materialization)
+- [x] `ObsMetadataShard` / `VarMetadataShard` section types (ids 24–25) for row-sharded metadata emitted by merge, append, and from_anndata when n_obs exceeds shard_target_rows
+- [x] `pyscx.merge` var identity validation (index, column names, values) — `assume_identical_var=False` default (breaking change from unchecked)
+- [x] `pyscx.merge` `uns_policy` kwarg (`"first"` / `"require_equal"` / `"namespace"` / `"summary"`)
+- [x] `pyscx.merge` `shard_target_rows` kwarg for override
+- [x] Predicate indexes built incrementally from shard stream during merge
+- [x] `pyscx.from_anndata` `force_legacy_metadata` / `memory_budget` / `shard_target_rows` kwargs
+- [x] `PyExperiment.to_anndata` `memory_budget` kwarg with `EagerAssemblyMemoryHigh` warning
+- [x] Append writes new obs as `ObsMetadataShard` sections (no rewrite of existing obs)
 - [x] Advisory `flock()` for concurrent append safety
 - [x] Python API: `scx.open("file.scx", mode="append")`
 
@@ -206,6 +215,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] `object_store` integration (S3, GCS, Azure backends)
 - [x] Python API: `scx.pull()`, `scx.push()`, `scx.open_cloud("gs://...")`
 - [x] `CloudReader` for direct cloud reads without full download
+- [ ] Cloud reader support for sharded obs (`ObsMetadataShard`) — **DEFERRED** (Phase 6b); files produced by streaming merge/append/from_anndata with sharded obs fail on `open_cloud` until the cloud reader assembles sharded metadata
 
 ### 2.6 Fused Operations (performance, not analysis reimplementation)
 - [x] Fused normalize + log1p (single CSR row scan)

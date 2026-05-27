@@ -268,7 +268,12 @@ Multimodal `scx merge` and `scx compact` now dispatch to
 concatenation is applied across every modality's CSR shards and
 layers, the modality table and per-modality var / obsm / uns are
 preserved, and per-modality CSC sidecars are dropped (rebuild via
-`--rebuild-csc`).
+`--rebuild-csc`). Merge validates var identity (index, column names,
+values) across all inputs by default; pass `assume_identical_var=True`
+to check only `n_vars`. Obs is streamed shard-by-shard (no full obs
+materialization). The `uns_policy` kwarg (`"first"` / `"require_equal"`
+/ `"namespace"` / `"summary"`) controls how conflicting uns sections
+are resolved.
 
 ---
 
