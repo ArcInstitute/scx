@@ -603,7 +603,12 @@ impl PredicateIndex {
 
             match column_type {
                 0 => {
-                    let n_cat_entries = _n_entries_u64 as usize;
+                    let n_cat_entries = usize::try_from(_n_entries_u64).map_err(|_| {
+                        EngineError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "v2 categorical entries count exceeds system pointer width",
+                        ))
+                    })?;
                     check_count_bound(
                         n_cat_entries,
                         MAX_CATEGORICAL_ENTRIES,
@@ -643,8 +648,20 @@ impl PredicateIndex {
                 }
                 1 => {
                     let fanout = r.read_u16::<LittleEndian>()?;
-                    let n_leaf_pages = r.read_u64::<LittleEndian>()? as usize;
-                    let n_internal_pages = r.read_u64::<LittleEndian>()? as usize;
+                    let n_leaf_pages =
+                        usize::try_from(r.read_u64::<LittleEndian>()?).map_err(|_| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "v2 leaf pages count exceeds system pointer width",
+                            ))
+                        })?;
+                    let n_internal_pages =
+                        usize::try_from(r.read_u64::<LittleEndian>()?).map_err(|_| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "v2 internal pages count exceeds system pointer width",
+                            ))
+                        })?;
                     check_count_bound(n_leaf_pages, MAX_NUMERIC_PAGES, "v2 leaf pages")?;
                     check_count_bound(n_internal_pages, MAX_NUMERIC_PAGES, "v2 internal pages")?;
 
@@ -668,7 +685,13 @@ impl PredicateIndex {
 
                     let mut leaf_pages = Vec::with_capacity(capacity_hint(n_leaf_pages));
                     for _ in 0..n_leaf_pages {
-                        let n_leaf_entries = r.read_u64::<LittleEndian>()? as usize;
+                        let n_leaf_entries = usize::try_from(r.read_u64::<LittleEndian>()?)
+                            .map_err(|_| {
+                                EngineError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "v2 leaf entries count exceeds system pointer width",
+                                ))
+                            })?;
                         check_count_bound(
                             n_leaf_entries,
                             MAX_NUMERIC_LEAF_ENTRIES_PER_PAGE,
@@ -2738,11 +2761,112 @@ mod tests {
             }
             _ => panic!("expected Categorical"),
         }
+
+        // Full structural round-trip: any field-order / width regression
+        // in `read_from_v2` for the categorical branch fails here.
+        // `write_to` ignores `self.version`; the on-disk byte is the
+        // source of truth, so set the expected version to 2 to compare.
+        let expected = PredicateIndex {
+            version: 2,
+            columns: index.columns.clone(),
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    /// Above the v1 numeric column name length ceiling (u16::MAX): writer
+    /// must auto-route to v2 and the round-tripped numeric B+ tree
+    /// (internal pages + leaf pages + entries) must compare structurally
+    /// equal. Covers the numeric branch of `read_from_v2`
+    /// (lines 644–696) — `write_to_auto_picks_v2_when_shard_ranges_exceed_u16`
+    /// only exercises the categorical branch.
+    #[test]
+    fn roundtrip_numeric_index_v2() {
+        // Tiny but structurally complete B+ tree: 1 internal page pointing
+        // at 2 leaf pages, each with 2 entries. Forced onto the v2 path by
+        // a numeric column name longer than u16::MAX.
+        let long_name = "n".repeat((u16::MAX as usize) + 1);
+        let index = PredicateIndex {
+            version: 1, // hint ignored — auto-routing wins
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: long_name,
+                fanout: 64,
+                internal_pages: vec![InternalPage {
+                    n_keys: 1,
+                    keys: vec![5.0],
+                    children: vec![0, 1],
+                }],
+                leaf_pages: vec![
+                    LeafPage {
+                        entries: vec![
+                            NumericLeafEntry {
+                                min_value: 0.0,
+                                max_value: 2.5,
+                                shard_id: 0,
+                                row_start: 0,
+                                row_end: 100,
+                            },
+                            NumericLeafEntry {
+                                min_value: 2.5,
+                                max_value: 5.0,
+                                shard_id: 0,
+                                row_start: 100,
+                                row_end: 200,
+                            },
+                        ],
+                    },
+                    LeafPage {
+                        entries: vec![
+                            NumericLeafEntry {
+                                min_value: 5.0,
+                                max_value: 7.5,
+                                shard_id: 1,
+                                row_start: 0,
+                                row_end: 50,
+                            },
+                            NumericLeafEntry {
+                                min_value: 7.5,
+                                max_value: 10.0,
+                                shard_id: 1,
+                                row_start: 50,
+                                row_end: 150,
+                            },
+                        ],
+                    },
+                ],
+            })],
+        };
+
+        let mut buf = Vec::new();
+        index.write_to(&mut buf).unwrap();
+        assert_eq!(buf[0], 2, "over-u16 numeric column_name must promote to v2");
+
+        let decoded = PredicateIndex::read_from(&mut Cursor::new(&buf)).unwrap();
+        let expected = PredicateIndex {
+            version: 2,
+            columns: index.columns.clone(),
+        };
+        assert_eq!(decoded, expected);
     }
 
     /// `requires_v2_encoding` is the routing oracle for `write_to`. Each
     /// widened v1→v2 field should independently trip the oracle so a future
     /// regression that narrows one but not the others is caught.
+    ///
+    /// **Coverage:** the oracle has 10 distinct return-`true` paths. Five
+    /// are exercised below (cheap to materialise); the other five gate on
+    /// `Vec::len() > u32::MAX`, which would require allocating > 4B
+    /// elements and is infeasible to construct in a unit test. The
+    /// inspected-only triggers, with the line in `requires_v2_encoding`
+    /// that handles each:
+    ///
+    /// - `cat.entries.len() > u32::MAX` (inspected at `requires_v2_encoding`, line 180)
+    /// - `leaf_pages.len() > u32::MAX` (line 196)
+    /// - `internal_pages.len() > u32::MAX` (line 199)
+    /// - per-leaf-page `entries.len() > u32::MAX` (line 204)
+    /// - summed numeric `total_entries > u32::MAX` (line 209)
+    ///
+    /// If `requires_v2_encoding` is refactored, audit those five paths
+    /// manually and treat them as code-review coverage, not test coverage.
     #[test]
     fn requires_v2_encoding_triggers_on_each_widened_field() {
         // Baseline: empty index stays v1.
@@ -2790,12 +2914,58 @@ mod tests {
             })],
         }));
 
-        // d) negative: small categorical stays v1.
+        // d) total columns count > u16::MAX → v2. Cheap because each
+        //    column is an empty Categorical placeholder.
+        let many_columns: Vec<IndexedColumn> = (0..(u16::MAX as usize) + 1)
+            .map(|_| {
+                IndexedColumn::Categorical(CategoricalIndex {
+                    column_name: String::new(),
+                    entries: Vec::new(),
+                })
+            })
+            .collect();
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: many_columns,
+        }));
+
+        // e) numeric column name length > u16::MAX → v2. Independent of
+        //    the categorical paths above.
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: "n".repeat((u16::MAX as usize) + 1),
+                fanout: 64,
+                internal_pages: Vec::new(),
+                leaf_pages: Vec::new(),
+            })],
+        }));
+
+        // f) negative: small categorical stays v1.
         assert!(!requires_v2_encoding(&PredicateIndex {
             version: 1,
             columns: vec![IndexedColumn::Categorical(CategoricalIndex {
                 column_name: "small".to_string(),
                 entries: vec![cat_entry("v".to_string(), 4)],
+            })],
+        }));
+
+        // g) negative: small numeric stays v1.
+        assert!(!requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: "score".to_string(),
+                fanout: 64,
+                internal_pages: Vec::new(),
+                leaf_pages: vec![LeafPage {
+                    entries: vec![NumericLeafEntry {
+                        min_value: 0.0,
+                        max_value: 1.0,
+                        shard_id: 0,
+                        row_start: 0,
+                        row_end: 1,
+                    }],
+                }],
             })],
         }));
     }

@@ -4471,68 +4471,21 @@ where
     };
 
     // Width-generic: accept both v1 (Int32) and v2 (Int64) row/col columns,
-    // and emit shards with the same coord dtype as the input.
-    let row_dt = batch.column(0).data_type().clone();
-    let col_dt = batch.column(1).data_type().clone();
-    let coord_dt = match (&row_dt, &col_dt) {
-        (DataType::Int32, DataType::Int32) => DataType::Int32,
-        (DataType::Int64, DataType::Int64) => DataType::Int64,
-        _ => {
-            return Err(invalid(format!(
-                "sparse override: row/col dtypes must both be Int32 or both Int64 (got row={row_dt:?}, col={col_dt:?})"
-            )));
-        }
+    // and emit shards with the same coord dtype as the input. Reuse
+    // `coo_coords_from_batch` so the inner bucketing loop dispatches on
+    // `CooCoordsRef` (static match) rather than `Box<dyn Fn>` (per-element
+    // vtable call + heap alloc).
+    let coords = coo_coords_from_batch(batch).map_err(|e| invalid(e.to_string()))?;
+    let coord_dt = match &coords {
+        CooCoordsRef::Int32(_, _) => DataType::Int32,
+        CooCoordsRef::Int64(_, _) => DataType::Int64,
     };
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| invalid("sparse override: column 2 must be Float32".into()))?;
-    let nnz = batch.column(0).len();
-
-    // Pull row/col as i64 for shard-bucketing math, regardless of width.
-    let row_i64: Box<dyn Fn(usize) -> i64> = match &coord_dt {
-        DataType::Int32 => {
-            let arr = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .clone();
-            Box::new(move |i| arr.value(i) as i64)
-        }
-        DataType::Int64 => {
-            let arr = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .clone();
-            Box::new(move |i| arr.value(i))
-        }
-        _ => unreachable!(),
-    };
-    let col_i64: Box<dyn Fn(usize) -> i64> = match &coord_dt {
-        DataType::Int32 => {
-            let arr = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .clone();
-            Box::new(move |i| arr.value(i) as i64)
-        }
-        DataType::Int64 => {
-            let arr = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .clone();
-            Box::new(move |i| arr.value(i))
-        }
-        _ => unreachable!(),
-    };
+    let nnz = coords.len();
 
     let metadata = batch.schema_ref().metadata().clone();
     let n_rows: usize = metadata
@@ -4568,7 +4521,7 @@ where
     let mut bucket_col: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
     let mut bucket_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
     for i in 0..nnz {
-        let r = row_i64(i);
+        let r = coords.row_i64(i);
         if r < 0 {
             return Err(invalid(format!("sparse override: negative row index {r}")));
         }
@@ -4580,7 +4533,7 @@ where
             )));
         }
         bucket_row[shard].push(r);
-        bucket_col[shard].push(col_i64(i));
+        bucket_col[shard].push(coords.col_i64(i));
         bucket_data[shard].push(data_arr.value(i));
     }
 

@@ -99,14 +99,3 @@ See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlig
 - **Multimodal limitations**: `scx merge`, `scx compact`, per-modality CSC sidecar preservation on `scx append`, and `scx subset --modality NAME --filter/--genes` composition all shipped — `scx-ops::{merge_multimodal, compact_multimodal}` dispatch on multimodal inputs and `scx info` exposes a per-modality `has_csc` column. Remaining limitations: cloud `open_cloud(...).to_mudata(backed=True)` (local backed multimodal works), multimodal-aware predicate pushdown via `QueryPipeline` (use `scx subset --modality NAME --filter` instead), and spatial transcriptomics with R-tree spatial index (separate spec).
 - **GDS**: GPUDirect Storage requires local NVMe + nvidia-fs drivers + ext4/XFS; always falls back to the CPU path.
 
-## Code Review
-
-After implementing changes to the codebase, run an Cursor Agent code review to catch issues after staging and before committing:
-
-```bash
-cursor agent --trust --model composer-2.5-fast --print "Review the staged code changes in this repository. Check for correctness, adherence to project conventions, error handling, test coverage, and potential regressions. Summarize findings and flag any issues."
-```
-
-**When to run**: After any non-trivial code change (new features, refactors, bug fixes, API changes). Skip for documentation-only or formatting-only changes.
-
-**What to look for in the review output**: Correctness issues, convention violations, missing error handling, untested code paths, and potential performance regressions.
