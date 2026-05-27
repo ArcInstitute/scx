@@ -407,16 +407,24 @@ section.
   Each component is a column. Stored as float32 by convention.
 - **`obsp_embedding` (18) / `varp_embedding` (19)** — Arrow IPC RecordBatch
   representing a sparse matrix in COO form. The batch has three columns
-  (`row: Int32`, `col: Int32`, `data: Float32`, length `nnz`) plus
-  schema-level metadata (`n_rows`, `n_cols`) recording the logical shape.
+  (`row`, `col`, `data: Float32`, length `nnz`) plus schema-level metadata
+  (`n_rows`, `n_cols`) recording the logical shape. The row/col coordinate
+  width is carried by the Arrow IPC schema itself — no extra section-header
+  byte — and is chosen by the routing oracle `coo_needs_int64_coords(n_rows,
+  n_cols)`:
+  - **v1 layout (`Int32` row/col)** when both axes ≤ `i32::MAX`. This is the
+    byte-identical layout used for every workload below sub-`2³¹` axes.
+  - **v2 layout (`Int64` row/col)** when either axis exceeds `i32::MAX`.
+    Same Arrow schema shape, wider coordinate columns.
+
   pyscx readers reconstruct a scipy CSR via
-  `scipy.sparse.csr_matrix((data, (row, col)), shape=(n_rows, n_cols))`.
-  Data is stored as float32; higher-precision inputs are downcast on write.
-  The on-disk section always retains the original axis lengths. When a
-  deletion vector (or backed-mode `obs_filter`) is active, pyscx subsets
-  `obsp` to the kept rows and columns at read time so the materialized
-  AnnData satisfies `obsp[k].shape == (n_obs, n_obs)`. `varp` lives on the
-  var axis and is not affected by deletion vectors.
+  `scipy.sparse.csr_matrix((data, (row, col)), shape=(n_rows, n_cols))`
+  for either width. Data is stored as float32; higher-precision inputs are
+  downcast on write. The on-disk section always retains the original axis
+  lengths. When a deletion vector (or backed-mode `obs_filter`) is active,
+  pyscx subsets `obsp` to the kept rows and columns at read time so the
+  materialized AnnData satisfies `obsp[k].shape == (n_obs, n_obs)`. `varp`
+  lives on the var axis and is not affected by deletion vectors.
 
 #### Sharded layout (section types 20–23)
 
@@ -433,10 +441,12 @@ chunks so the converter and the consumer can bound peak RSS at one
   `n_rows_total: u64`.
 - **`varm_embedding_shard` (21)** — symmetric, on the var axis.
 - **`obsp_embedding_shard` (22)** — name `obsp/<key>_shard_<idx>`. Arrow
-  IPC COO `RecordBatch` (`row: Int32`, `col: Int32`, `data: Float32`)
-  containing the non-zero triples whose `row` is in
-  `[row_start, row_start + n_local_rows)`. Schema metadata carries
-  `n_rows` / `n_cols` (logical matrix shape) plus `row_start` /
+  IPC COO `RecordBatch` (`row`, `col`, `data: Float32`) containing the
+  non-zero triples whose `row` is in
+  `[row_start, row_start + n_local_rows)`. Row/col width follows the same
+  `Int32` (v1) / `Int64` (v2) routing as the unsharded `obsp_embedding`
+  layout above; the Arrow schema is the width signal. Schema metadata
+  carries `n_rows` / `n_cols` (logical matrix shape) plus `row_start` /
   `shard_idx` / `n_rows_total`. `row` values are global indices.
 - **`varp_embedding_shard` (23)** — symmetric, on the var axis.
 
@@ -482,10 +492,18 @@ and `scx append` on a legacy file promotes the obs to a single
 Sorted mappings from column values to shard-local row ranges, attached to
 `obs_metadata` and `var_metadata`.
 
+Two layouts coexist: **v1** (narrow counters) is byte-identical for every
+workload below the v1 ceilings; **v2** (wide counters) widens the on-disk
+counters that v1 stored as `u16` / `u32` to `u32` / `u64` so extreme-cardinality
+columns or multi-billion-row obs axes can be represented without silent
+truncation. Writers auto-select via a pre-scan: v1 when every counter fits its
+v1 width, v2 otherwise. Readers dispatch on the leading `index_version` byte;
+an unknown version returns `InvalidData`.
+
 ```
-PREDICATE INDEX SECTION:
+PREDICATE INDEX SECTION (v1 — narrow counters):
   index_version: u8              (1)
-  n_indexed_columns: u8
+  n_indexed_columns: u16
   For each column:
     column_name_length: u16
     column_name: [u8]            (UTF-8)
@@ -511,13 +529,41 @@ PREDICATE INDEX SECTION:
         keys: [f64; n_keys]
         children: [u32; n_keys + 1]
       For each leaf page:
-        n_entries: u16
+        n_entries: u32
         For each entry:
           min_value: f64
           max_value: f64
           shard_id: u32
           row_start: u32
           row_end: u32
+```
+
+```
+PREDICATE INDEX SECTION (v2 — wide counters):
+  index_version: u8              (2)
+  n_indexed_columns: u32         (was u16 in v1)
+  For each column:
+    column_name_length: u32      (was u16)
+    column_name: [u8]            (UTF-8)
+    column_type: u8              (0 = categorical, 1 = numeric)
+    n_entries: u64               (was u32)
+
+    If categorical:
+      For each unique value (lexicographic):
+        value_length: u32        (was u16)
+        value_bytes: [u8]        (UTF-8 category label)
+        n_shard_ranges: u32      (was u16)
+        For each range: shard_id / row_start / row_end (u32 each, unchanged)
+
+    If numeric:
+      fanout: u16                (unchanged)
+      n_leaf_pages: u64          (was u32)
+      n_internal_pages: u64      (was u32)
+      For each internal page:
+        n_keys: u16, keys: [f64; n_keys], children: [u32; n_keys + 1]   (all unchanged)
+      For each leaf page:
+        n_entries: u64           (was u32)
+        For each entry: min_value / max_value (f64), shard_id / row_start / row_end (u32 each, unchanged)
 ```
 
 **High-cardinality columns** (> 10,000 unique values, e.g. `donor_id`): the
