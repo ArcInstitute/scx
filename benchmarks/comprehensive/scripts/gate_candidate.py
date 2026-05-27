@@ -70,6 +70,7 @@ import dataclasses
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -780,14 +781,125 @@ def _translate_probe_result(r: dict) -> list[CheckResult]:
     p = r.get("pyscx_accel") or {}
     if p.get("ok"):
         info = p.get("gpu_info")
-        info_s = f" gpu_info={info!s:.80}" if info else ""
-        out.append(CheckResult("pyscx_accel", "ok", f"import + gpu_info ok{info_s}"))
+        # A falsy `gpu_info` (None / empty dict) means pyscx imported but
+        # was built without `--features gpu` — accel.gpu_info() returns
+        # None when the GPU build path is compiled out. Every downstream
+        # GPU bench silently skips with `_HAS_PYSCX_GPU = False`, which
+        # used to slip past the gate. Treat as a hard fail here.
+        if not info:
+            out.append(CheckResult(
+                "pyscx_accel", "fail",
+                f"pyscx imports but gpu_info() returned {info!r} — likely "
+                f"built without --features gpu. Rebuild: cd pyscx && "
+                f".venv/bin/maturin develop --release --features gpu",
+            ))
+        else:
+            info_s = f" gpu_info={info!s:.80}"
+            out.append(CheckResult("pyscx_accel", "ok", f"import + gpu_info ok{info_s}"))
     else:
         out.append(CheckResult(
             "pyscx_accel", "fail",
             f"probe import failed: {p.get('error', '(no detail)')}",
         ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Defensive worker-pyscx-GPU sanity check
+# ---------------------------------------------------------------------------
+
+
+def _check_worker_gpu_pyscx(env_name: str | None) -> CheckResult:
+    """Verify the worker GPU conda env has a pyscx built with ``--features gpu``.
+
+    Background: pyscx's editable .so is shared across conda envs via the
+    maturin install path. A rebuild from a non-GPU shell silently
+    overwrites the shared .so with a no-GPU build. Every downstream GPU
+    benchmark then skips with ``_HAS_PYSCX_GPU = False`` and the gate
+    completes "successfully" with zero GPU rows — which we only noticed
+    after a 6h full-tier bench in this session.
+
+    This check spawns a ~1s subprocess in the worker GPU env, imports
+    pyscx, and asserts ``accel.gpu_info()`` is truthy. Runs
+    unconditionally when GPU is in scope, even when ``--skip-preflight``
+    is passed (the SLURM gpu_probe is the heavier preflight piece — this
+    is the cheap local one we always want).
+
+    Returns ``CheckResult(level="ok" | "fail" | "warn")``.
+    """
+    if not env_name:
+        return CheckResult(
+            "worker_gpu_pyscx", "warn",
+            "no GPU worker env resolved — sanity check skipped",
+        )
+
+    conda_base = os.environ.get("CONDA_EXE", "").replace("/bin/conda", "")
+    if not conda_base:
+        conda_base = str(Path.home() / "miniforge3")
+    conda_hook = f"{conda_base}/bin/conda"
+    if not Path(conda_hook).is_file():
+        return CheckResult(
+            "worker_gpu_pyscx", "warn",
+            f"conda not found at {conda_hook} — sanity check skipped",
+        )
+
+    probe = (
+        "import sys\n"
+        "try:\n"
+        "    from pyscx import accel\n"
+        "    info = accel.gpu_info()\n"
+        "except ImportError as e:\n"
+        "    print(f'IMPORT_FAIL: {type(e).__name__}: {e}')\n"
+        "    sys.exit(2)\n"
+        "except Exception as e:\n"
+        "    print(f'CALL_FAIL: {type(e).__name__}: {e}')\n"
+        "    sys.exit(2)\n"
+        "if not info:\n"
+        "    print(f'GPU_INFO_FALSY: {info!r}')\n"
+        "    sys.exit(2)\n"
+        "print(f'OK: {info!r}')\n"
+    )
+    cmd = [
+        "bash", "-lc",
+        f'eval "$({conda_hook} shell.bash hook)" && '
+        f"conda activate {env_name} && python -c {shlex.quote(probe)}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return CheckResult(
+            "worker_gpu_pyscx", "fail",
+            f"subprocess timed out (60s) in env={env_name}",
+        )
+    out = (proc.stdout + proc.stderr).strip().splitlines()
+    last = out[-1] if out else ""
+    if proc.returncode == 0 and last.startswith("OK:"):
+        return CheckResult("worker_gpu_pyscx", "ok", f"env={env_name}: {last}")
+
+    rebuild_hint = (
+        "rebuild with: cd pyscx && "
+        "/path/to/.venv/bin/maturin develop --release --features gpu"
+    )
+    return CheckResult(
+        "worker_gpu_pyscx", "fail",
+        f"env={env_name}: {last or 'no output'} (rc={proc.returncode}); {rebuild_hint}",
+    )
+
+
+def _resolve_worker_gpu_env() -> str | None:
+    """Return the conda env name workers use for GPU benchmarks.
+
+    Delegates to ``run_parallel._env_for_format`` so the lookup mirrors the
+    actual SLURM submission path one-to-one. Falls back to
+    ``"scx-bench-gpu"`` when the import fails (e.g. running outside the
+    workspace), which is the historical default.
+    """
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"))
+        from run_parallel import _env_for_format  # type: ignore[import-not-found]
+        return _env_for_format("accel_de__pyscx_pdex_ref_gpu")
+    except Exception:
+        return "scx-bench-gpu"
 
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1269,25 @@ def main() -> int:
                 raise GateError("pre-flight", 2, cause)
 
         plan = coverage_plan(args)
+
+        # Always-on cheap GPU sanity check (~1s) when GPU benchmarks are
+        # in scope. Catches the "pyscx editable .so rebuilt without
+        # --features gpu" case independently of --skip-preflight — that
+        # silently breaks every GPU bench with `_HAS_PYSCX_GPU = False`
+        # and we only learn after the full gate runs.
+        if plan.get("accel_gpu"):
+            phase = "worker-gpu-sanity"
+            gpu_env = _resolve_worker_gpu_env()
+            sanity = _check_worker_gpu_pyscx(gpu_env)
+            log = phase_logger("worker-gpu-sanity")
+            log_method = "info" if sanity.level == "ok" else sanity.level
+            getattr(log, log_method)(
+                "%s [%s]: %s", sanity.name, sanity.level, sanity.msg,
+            )
+            if sanity.level == "fail":
+                cause = f"worker_gpu_pyscx: {sanity.msg}"
+                raise GateError("worker-gpu-sanity", 2, cause)
+
         print_banner(args, candidate_dir, log_file, plan)
 
         if args.dry_run:
