@@ -219,7 +219,7 @@ pub fn pdex_ref_gpu_streaming(
     // CSR-direct fallback. V3 takes precedence over V2.
     if de_v3_enabled() {
         if let Some(csc) = csc_reader {
-            let csc_source = csc as &dyn scx_format::shard_source::ColumnShardSource;
+            let csc_source = csc as &(dyn scx_format::shard_source::ColumnShardSource + Sync);
             let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
                 .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}")))?;
             return pdex_ref_gpu_chunked_v3_csc(
@@ -2300,12 +2300,11 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
 
         // Single CSC shard pass per chunk: each shard that overlaps
         // [c0, c1) launches K+1 scatter-to-gene-major kernels + 1
-        // pseudobulk kernel.
+        // pseudobulk kernel. `for_each_gpu_csc_shard_in_range` pre-
+        // filters non-overlapping shards via cheap catalog lookup, so
+        // they're never decoded or uploaded.
         source
-            .for_each_gpu_csc_shard(|_idx, csc_view| {
-                if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
-                    return Ok(());
-                }
+            .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, |_idx, csc_view| {
                 // group_id = 0 is the reference; 1..=n_test are tg slabs.
                 gpu_de_scatter_csc_to_gene_major(
                     dev,
