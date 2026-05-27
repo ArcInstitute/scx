@@ -168,7 +168,7 @@ fn merge_small_inputs_emits_shards() {
             .any(|e| e.section_type == SectionType::ObsMetadata),
         "merge output must not contain a single-section ObsMetadata entry"
     );
-    let obs = reader.read_obs_assembled().unwrap();
+    let obs = reader.read_obs().unwrap();
     assert_eq!(obs.num_rows(), 300);
     let donors = obs
         .column_by_name("donor")
@@ -215,7 +215,7 @@ fn merge_var_mismatch_assume_identical_var_proceeds() {
     };
     scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
     let reader = ScxReader::open(&out).unwrap();
-    let var = reader.read_var_assembled().unwrap();
+    let var = reader.read_var().unwrap();
     let gene_ids = var
         .column(0)
         .as_any()
@@ -445,7 +445,7 @@ fn append_legacy_to_sharded_promotes() {
         Some("6")
     );
     // Assembled batch matches old + new row contents.
-    let assembled = post.read_obs_assembled().unwrap();
+    let assembled = post.read_obs().unwrap();
     let cell_ids = assembled
         .column_by_name("cell_id")
         .unwrap()
@@ -509,7 +509,7 @@ fn append_then_append_extends_shards() {
 
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 9);
-    let assembled = reader.read_obs_assembled().unwrap();
+    let assembled = reader.read_obs().unwrap();
     assert_eq!(assembled.num_rows(), 9);
     let donors = assembled
         .column_by_name("donor")
@@ -577,7 +577,7 @@ fn merge_dict_columns_round_trip() {
     let out = dir.path().join("merged.scx");
     scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap();
 
-    let assembled = ScxReader::open(&out).unwrap().read_obs_assembled().unwrap();
+    let assembled = ScxReader::open(&out).unwrap().read_obs().unwrap();
     assert_eq!(assembled.num_rows(), 8);
     // After unify_dict_columns the label column lands as Utf8 (the
     // dictionary's value type).
@@ -634,7 +634,7 @@ fn merge_with_index_options_streaming_matches_batch() {
     // Compute the batch-mode reference. obs has 128 rows split into
     // two shards of 64 each; each output shard had row_start 0 and 64
     // respectively (one shard per input).
-    let assembled = reader.read_obs_assembled().unwrap();
+    let assembled = reader.read_obs().unwrap();
     let shard_row_ranges: Vec<(u64, u64)> = reader
         .catalog()
         .entries
@@ -667,6 +667,164 @@ fn merge_with_index_options_streaming_matches_batch() {
         on_disk, reference,
         "streaming and batch predicate-index byte serialisations must match exactly"
     );
+}
+
+#[test]
+fn append_from_reader_single_modality() {
+    // append_from_reader is the streaming SCX→SCX path. After the
+    // Phase 2 refactor + the read_obs/read_obs_assembled collapse,
+    // it correctly handles both a sharded target and a sharded
+    // source. This test exercises the convert-on-append target
+    // promoted to sharded after the first call.
+    use scx_codec::CodecSelection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.scx");
+    let source = dir.path().join("source.scx");
+    write_legacy_input(&target, 5, "donor_A", &var_batch(), None);
+    // Source is itself written via merge so that it lands as a
+    // sharded file — the path we want to stress.
+    let s0 = dir.path().join("src_in0.scx");
+    let s1 = dir.path().join("src_in1.scx");
+    write_legacy_input(&s0, 4, "donor_X", &var_batch(), None);
+    write_legacy_input(&s1, 3, "donor_Y", &var_batch(), None);
+    scx_ops::merge(&[s0.as_path(), s1.as_path()], &source).unwrap();
+    {
+        let src_reader = ScxReader::open(&source).unwrap();
+        assert!(src_reader.obs_metadata_shard_count() > 0);
+        assert_eq!(src_reader.n_obs(), 7);
+    }
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        &scx_ops::AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: std::num::NonZeroU32::new(16384).unwrap(),
+            modality_id: 0,
+        },
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let post = ScxReader::open(&target).unwrap();
+    assert_eq!(post.n_obs(), 12); // 5 + 7
+                                  // Convert-on-append produced shard 0 = old 5 rows + at least one
+                                  // shard for the appended 7 rows. obs is sharded post-append.
+    assert!(post.obs_metadata_shard_count() >= 2);
+    let assembled = post.read_obs().unwrap();
+    assert_eq!(assembled.num_rows(), 12);
+    let donors = assembled
+        .column_by_name("donor")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(donors.value(0), "donor_A"); // target's original rows
+    assert_eq!(donors.value(4), "donor_A");
+    assert_eq!(donors.value(5), "donor_X"); // first source input
+    assert_eq!(donors.value(9), "donor_Y"); // second source input
+}
+
+#[test]
+fn append_to_already_sharded_preserves_old_shards() {
+    // Verifies the bug 2 fix: appending to a file whose obs is
+    // already sharded must NOT rewrite the existing shards. We
+    // snapshot the (name, offset, checksum) triple for every
+    // ObsMetadataShard entry before the append and assert each
+    // is still present unchanged after the append.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("already_sharded.scx");
+
+    // Build a sharded file via merge (3 inputs → 3 shards).
+    let p0 = dir.path().join("in0.scx");
+    let p1 = dir.path().join("in1.scx");
+    let p2 = dir.path().join("in2.scx");
+    write_legacy_input(&p0, 8, "donor_A", &var_batch(), None);
+    write_legacy_input(&p1, 8, "donor_B", &var_batch(), None);
+    write_legacy_input(&p2, 8, "donor_C", &var_batch(), None);
+    scx_ops::merge(&[p0.as_path(), p1.as_path(), p2.as_path()], &path).unwrap();
+
+    // Snapshot the pre-append shard catalog (name, offset, checksum).
+    let pre_shards: Vec<(String, u64, [u8; 32])> = {
+        let pre = ScxReader::open(&path).unwrap();
+        assert_eq!(pre.obs_metadata_shard_count(), 3);
+        pre.catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .map(|e| (e.name.clone(), e.offset, e.checksum))
+            .collect()
+    };
+
+    // Append 5 more rows. The raw-copy path should preserve every
+    // pre-existing shard entry bit-for-bit and add exactly one new
+    // shard for the new rows.
+    let n_vars = 4usize;
+    let new_obs = obs_batch(24, 5, "donor_D");
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for row in 0..5usize {
+        indices.push(((row * 2) % n_vars) as u32);
+        indices.push(((row * 2 + 1) % n_vars) as u32);
+        values.push(((row + 1) % 256) as u8);
+        values.push(((row + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions::default(),
+    )
+    .unwrap();
+
+    let post = ScxReader::open(&path).unwrap();
+    assert_eq!(post.n_obs(), 29); // 24 + 5
+    assert_eq!(post.obs_metadata_shard_count(), 4); // 3 old + 1 new
+
+    let post_shards: std::collections::HashMap<String, (u64, [u8; 32])> = post
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+        .map(|e| (e.name.clone(), (e.offset, e.checksum)))
+        .collect();
+    for (name, offset, checksum) in &pre_shards {
+        let after = post_shards.get(name).unwrap_or_else(|| {
+            panic!("pre-existing shard '{name}' missing from post-append catalog")
+        });
+        assert_eq!(
+            after.0, *offset,
+            "pre-existing shard '{name}' offset changed (raw-copy path must not rewrite)"
+        );
+        assert_eq!(
+            after.1, *checksum,
+            "pre-existing shard '{name}' checksum changed (raw-copy path must not rewrite)"
+        );
+    }
+
+    // The assembled obs must still read back correctly: 24 pre-existing
+    // rows from the 3 merged inputs + 5 newly-appended rows.
+    let assembled = post.read_obs().unwrap();
+    assert_eq!(assembled.num_rows(), 29);
+    let donors = assembled
+        .column_by_name("donor")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(donors.value(0), "donor_A");
+    assert_eq!(donors.value(8), "donor_B");
+    assert_eq!(donors.value(16), "donor_C");
+    assert_eq!(donors.value(24), "donor_D");
+    assert_eq!(donors.value(28), "donor_D");
 }
 
 #[test]

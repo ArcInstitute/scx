@@ -84,12 +84,12 @@ pub fn write_scx_to_h5ad_streaming(
     )?;
 
     // obs.
-    if let Ok(obs) = reader.read_obs_assembled() {
+    if let Ok(obs) = reader.read_obs() {
         write_dataframe_group_at(&root, "obs", &obs)?;
     }
 
     // var.
-    if let Ok(var) = reader.read_var_assembled() {
+    if let Ok(var) = reader.read_var() {
         write_dataframe_group_at(&root, "var", &var)?;
     }
 

@@ -173,7 +173,7 @@ fn obs_var_layout_from_entries(
         // Catalogs are not supposed to carry both. Surface as
         // `Sharded(n)` so the next write picks the safer shard path;
         // the mixed-mode condition is caught loudly at read time by
-        // `read_obs()` / `read_obs_assembled()`.
+        // `read_obs()` (which prefers shards when both are present).
         (true, n) => ObsVarLayout::Sharded(n),
     }
 }

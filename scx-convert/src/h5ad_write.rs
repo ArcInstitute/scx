@@ -49,12 +49,12 @@ pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), Conver
     )?;
 
     // Write obs
-    if let Ok(obs) = reader.read_obs_assembled() {
+    if let Ok(obs) = reader.read_obs() {
         write_dataframe_group(&file, "obs", &obs)?;
     }
 
     // Write var
-    if let Ok(var) = reader.read_var_assembled() {
+    if let Ok(var) = reader.read_var() {
         write_dataframe_group(&file, "var", &var)?;
     }
 

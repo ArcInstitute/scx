@@ -93,7 +93,7 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
 
     // Read obs metadata
     let obs = input_reader
-        .read_obs_assembled()
+        .read_obs()
         .map_err(|e| Error::Other(format!("failed to read obs: {e}")))?;
 
     // Codec is auto-selected per shard inside scx_ops::append

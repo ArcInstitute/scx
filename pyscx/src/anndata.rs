@@ -737,7 +737,7 @@ fn to_anndata_with_layers<'py>(
     let x = csr_to_scipy(py, csr)?;
 
     // obs metadata — filter by deletion vectors if present
-    let obs = match reader.read_obs_assembled() {
+    let obs = match reader.read_obs() {
         Ok(batch) => {
             let filtered_batch = filter_obs_by_deletion_vectors(reader, batch)?;
             let table = record_batch_to_pyarrow(py, &filtered_batch)?;
@@ -748,7 +748,7 @@ fn to_anndata_with_layers<'py>(
     };
 
     // var metadata
-    let var = match reader.read_var_assembled() {
+    let var = match reader.read_var() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
@@ -1086,7 +1086,7 @@ pub fn to_anndata_filtered<'py>(
 
 /// Resolve gene names to column indices using the var metadata.
 fn resolve_var_names_to_indices(reader: &ScxReader, names: &[String]) -> PyResult<Vec<u32>> {
-    let var_batch = match reader.read_var_assembled() {
+    let var_batch = match reader.read_var() {
         Ok(batch) => batch,
         Err(scx_format::ScxError::SectionNotFound(_)) => {
             return Err(PyRuntimeError::new_err(
@@ -1221,7 +1221,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     let mut kept_to_global = dv_kept_to_global.clone();
 
     // --- obs (eager, optionally filtered by deletion vectors) ---
-    let obs = match reader.read_obs_assembled() {
+    let obs = match reader.read_obs() {
         Ok(batch) => {
             let filtered_batch = if apply_deletion_vectors {
                 filter_obs_by_deletion_vectors(&reader, batch)?
@@ -1324,7 +1324,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     }
 
     // --- var (eager, optionally filtered by var_names) ---
-    let var = match reader.read_var_assembled() {
+    let var = match reader.read_var() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             let df = pyarrow_table_to_pandas(&table)?;
@@ -5079,7 +5079,7 @@ pub fn to_anndata_backed_for_modality<'py>(
         .map(|i| i.name.clone())
         .unwrap_or_else(|| modality.to_string());
 
-    let obs_df = match reader.read_obs_assembled() {
+    let obs_df = match reader.read_obs() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)

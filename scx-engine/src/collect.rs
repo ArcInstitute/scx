@@ -203,9 +203,8 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         })
         .sum();
 
-    // Step 2: Read obs metadata. The `SectionReader::read_obs` impl
-    // on `ScxReader` delegates to `read_obs_assembled` so this works
-    // on both legacy single-section and Phase 2 row-sharded layouts.
+    // Step 2: Read obs metadata. `read_obs` transparently handles
+    // both legacy single-section and Phase 2 row-sharded layouts.
     let obs_batch = reader.read_obs()?;
     let n_obs = obs_batch.num_rows();
 

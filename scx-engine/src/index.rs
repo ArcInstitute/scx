@@ -1430,7 +1430,18 @@ impl ObsPredicateIndexBuilder {
             }
         }
 
-        self.rows_pushed = self.rows_pushed.saturating_add(n_rows as u64);
+        // Defense-in-depth: a u64 cumulative-row counter can't realistically
+        // overflow (would require > 2^64 rows pushed across a single
+        // builder invocation), but use `checked_add` so a malformed shard
+        // claiming `n_rows >= 2^64 - rows_pushed` fails loudly instead of
+        // silently saturating and corrupting the downstream row-offset
+        // arithmetic.
+        self.rows_pushed = self.rows_pushed.checked_add(n_rows as u64).ok_or_else(|| {
+            EngineError::Generic(format!(
+                "ObsPredicateIndexBuilder: cumulative row count overflowed u64 \
+                     pushing shard at offset {shard_row_offset} with {n_rows} rows",
+            ))
+        })?;
         Ok(())
     }
 
@@ -1540,16 +1551,18 @@ impl ObsPredicateIndexBuilder {
                     }
                 }
                 ColumnState::Numeric { values } => {
-                    if matches!(selection, ColumnSelection::Named)
-                        && values.len() > self.options.high_cardinality_threshold
-                    {
-                        // High-cardinality numerics still build a B+ tree,
-                        // so this guard is only for symmetry with the
-                        // categorical path. Matches batch-mode behaviour.
-                        // We use the value count rather than the distinct
-                        // count because numeric `value_rows` does not
-                        // dedupe.
-                    }
+                    // Intentional no-op: numeric columns always build a
+                    // B+ tree regardless of cardinality, so unlike the
+                    // categorical path there's no "skip on high
+                    // cardinality" branch. The condition is kept (as
+                    // a `let _` below) only so future readers see that
+                    // we considered cardinality and chose to ignore
+                    // it — `values.len()` is the row count, not the
+                    // distinct count (numeric accumulators don't
+                    // dedupe), so a cardinality check here would be
+                    // misleading anyway. Matches batch-mode behaviour.
+                    let _ = matches!(selection, ColumnSelection::Named)
+                        && values.len() > self.options.high_cardinality_threshold;
                     indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
                         &name,
                         values,

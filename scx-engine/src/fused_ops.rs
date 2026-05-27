@@ -180,15 +180,16 @@ pub fn streaming_preprocess(
     let mut writer = ScxWriter::new(target_path, header)?;
 
     // Copy obs + var (before shards, matching original section order).
-    // `*_assembled` handles both legacy and Phase 2 row-sharded
-    // layouts; for sharded inputs the resulting copy is single-section
-    // on the output (acceptable for fused_ops' moderate-size paths).
-    match reader.read_obs_assembled() {
+    // `read_obs` / `read_var` transparently handle both legacy and
+    // Phase 2 row-sharded layouts; for sharded inputs the resulting
+    // copy is single-section on the output (acceptable for fused_ops'
+    // moderate-size paths).
+    match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-    match reader.read_var_assembled() {
+    match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
@@ -293,12 +294,12 @@ pub fn streaming_save_layer(
     // Copy obs + var (Phase 2 sharded → assembled into a single
     // section on the output, same trade-off as the streaming variant
     // above).
-    match reader.read_obs_assembled() {
+    match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
-    match reader.read_var_assembled() {
+    match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
         Err(scx_format::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),

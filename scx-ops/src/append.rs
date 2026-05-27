@@ -178,7 +178,7 @@ pub fn append_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence.
-    let old_obs = read_existing_obs_assembled(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
     validate_obs_schema(&old_obs, new_obs)?;
 
     // Seek to EOF for appending and run the per-chunk write loop.
@@ -208,7 +208,7 @@ pub fn append_with_index_options(
         let val_end = idx_end * value_byte_size;
         let shard_values = &new_values[val_start..val_end];
 
-        let shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+        let shard_idx = next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;
         let global_row_start = prep.old_n_obs + row_offset as u64;
 
         let entry = write_csr_chunk(
@@ -340,17 +340,35 @@ pub fn append_from_reader_with_index_options(
         total_source_rows += sh.n_major as u64;
     }
 
-    // Read obs from the source (cells are global across modalities).
+    // Read obs from the source (cells are global across modalities,
+    // even in v2 multimodal files — every modality covers the global
+    // obs row axis). Compare row count against the source's declared
+    // global `n_obs`, not the per-modality CSR shard row sum: those
+    // happen to coincide for any modality whose shards span the full
+    // axis, but the global `n_obs` is the authoritative invariant the
+    // append-time validation should enforce.
     let new_obs = source.read_obs().map_err(OpsError::Format)?;
-    if new_obs.num_rows() as u64 != total_source_rows {
+    if new_obs.num_rows() as u64 != source.n_obs() {
         return Err(OpsError::VarLengthMismatch {
-            expected: total_source_rows as usize,
+            expected: source.n_obs() as usize,
             found: new_obs.num_rows(),
+        });
+    }
+    // The per-modality CSR shard sum still needs to equal global
+    // `n_obs` for the convert-on-append row-bookkeeping to be sound;
+    // surface a clear error if a malformed source violates this.
+    if total_source_rows != source.n_obs() {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "source modality {source_modality_id} CSR shards cover {total_source_rows} \
+                 rows but source declares n_obs={}; refuse to append from an inconsistent file",
+                source.n_obs()
+            ),
         });
     }
 
     // Read existing obs and validate schema equivalence (before writing).
-    let old_obs = read_existing_obs_assembled(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
     // Per-source-shard streaming loop.
@@ -377,7 +395,7 @@ pub fn append_from_reader_with_index_options(
             };
 
         if raw_copy_ok {
-            let shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+            let shard_idx = next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;
             let new_entry = raw_copy_csr_shard(
                 &mut lock,
                 &mut write_offset,
@@ -452,7 +470,8 @@ pub fn append_from_reader_with_index_options(
             let chunk_values = &shard_values[val_start..val_end];
 
             let chunk_global_row_start = global_row_start + row_offset as u64;
-            let chunk_shard_idx = prep.old_per_modality_csr + new_shard_entries.len() as u32;
+            let chunk_shard_idx =
+                next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;
             let new_entry = write_csr_chunk(
                 &mut lock,
                 &mut write_offset,
@@ -616,18 +635,18 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, Appe
 /// both legacy single-section [`SectionType::ObsMetadata`] files and
 /// Phase 2 row-sharded [`SectionType::ObsMetadataShard`] files. The
 /// sharded path concatenates shards in `shard_idx` order, matching
-/// what [`scx_format::ScxReader::read_obs_assembled`] returns at
-/// query time. Used by `append` (which needs the full pre-existing
-/// obs in memory for the schema check + the convert-on-append rewrite
-/// to ObsMetadataShard shard 0).
+/// what [`scx_format::ScxReader::read_obs`] returns at query time —
+/// but goes through the lock-held file handle instead of the mmap
+/// `ScxReader` because the append path already holds the write lock
+/// and can't open a second reader concurrently. Used by `append`
+/// (which needs the full pre-existing obs in memory for the schema
+/// check + the convert-on-append rewrite to `ObsMetadataShard` shard
+/// 0).
 ///
 /// Memory cost: O(old obs size). Same as today's pre-Phase-2 path —
 /// the streaming win shows up in `finalize_append` where new obs is
 /// no longer concatenated with old obs.
-fn read_existing_obs_assembled(
-    lock: &mut FileLock,
-    old_catalog: &FullCatalog,
-) -> Result<RecordBatch> {
+fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
     let shard_entries: Vec<(u32, &FullCatalogEntry)> = old_catalog
         .entries
         .iter()
@@ -663,7 +682,7 @@ fn read_existing_obs_assembled(
     let concatenated =
         arrow::compute::concat_batches(&first_schema, batches.iter()).map_err(OpsError::Arrow)?;
     // Strip per-shard schema metadata so the schema matches what
-    // `read_obs_assembled` returns at query time.
+    // `ScxReader::read_obs` returns at query time.
     let mut clean_metadata = first_schema.metadata().clone();
     clean_metadata.remove("shard_idx");
     clean_metadata.remove("row_start");
@@ -1027,20 +1046,29 @@ fn finalize_append(
     mut write_offset: u64,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
-    // Phase 2d: convert-on-append. The legacy path concatenated old +
-    // new obs into one batch and wrote it as a single `ObsMetadata`
-    // section, which:
-    //   (a) doubled peak RSS (full old obs + full new obs + concat
-    //       buffer all live simultaneously), and
-    //   (b) hit Arrow IPC's 2 GB narrow-offset ceiling once cumulative
-    //       string payload exceeded `i32::MAX`.
-    // The new flow writes old obs as `ObsMetadataShard` shard 0 and
-    // new obs as one or more subsequent shards (bounded by
-    // `shard_target_rows`). The per-shard `write_arrow_ipc` upcast
-    // keeps individual shard offsets safe regardless of merged
-    // totals. Predicate-index construction streams the same shards
-    // through `ObsPredicateIndexBuilder`.
-    let old_unified = unify_dict_columns(old_obs)?;
+    // Phase 2d + post-review bug 2 fix.
+    //
+    // Two append flows depending on input layout:
+    //
+    // 1. **Convert-on-append (legacy single-section input)** — input
+    //    has an `ObsMetadata` section but no `ObsMetadataShard`s. We
+    //    rewrite old obs as `ObsMetadataShard` shard 0 (one-time
+    //    O(old_n_obs) cost) and write new obs as shards 1+.
+    //    Subsequent appends to the file fall through to flow 2.
+    //
+    // 2. **Raw-copy-extend (already-sharded input)** — input already
+    //    has `ObsMetadataShard` entries. We keep those entries in
+    //    place (their bytes don't move, their catalog entries
+    //    pass through the filter below), compute `next_shard_idx`
+    //    after the highest existing index, and write new obs as
+    //    shards continuing from there. No re-write of historical
+    //    obs — every append after the first costs O(n_new_rows)
+    //    instead of O(total_obs_so_far).
+    //
+    // The reader's cover-verification accepts the resulting
+    // monotonically-non-decreasing `n_rows_total` stamps across
+    // shards (each writer stamps the file's total at write time;
+    // older shards retain their original smaller stamps).
     let new_unified = unify_dict_columns(new_obs)?;
 
     // Multimodal-skip vs single-modality rebuild decision.
@@ -1059,17 +1087,71 @@ fn finalize_append(
     let new_n_obs = prep.old_n_obs + n_new_rows;
     let shard_target_rows = prep.header.shard_target_rows.max(1) as usize;
 
+    // Detect input layout. Sorted by shard_idx so we can both
+    // determine `next_shard_idx` and iterate them in order when
+    // feeding the predicate-index builder.
+    let mut existing_obs_shards: Vec<(u32, &FullCatalogEntry)> = prep
+        .old_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+        .filter_map(|e| {
+            let suffix = e.name.strip_prefix("obs_metadata/shard_")?;
+            let idx: u32 = suffix.parse().ok()?;
+            Some((idx, e))
+        })
+        .collect();
+    existing_obs_shards.sort_by_key(|(idx, _)| *idx);
+    let input_is_sharded = !existing_obs_shards.is_empty();
+
+    // For the convert-on-append path, we need the old obs payload in
+    // memory once (to write as shard 0). For the raw-copy path, we
+    // skip the materialization entirely — the predicate-index builder
+    // reads each existing shard incrementally from the lock-held file.
+    let old_unified_for_convert: Option<RecordBatch> = if input_is_sharded {
+        None
+    } else {
+        Some(unify_dict_columns(old_obs)?)
+    };
+
+    // Pick a representative obs batch for forced-column schema
+    // validation: either the convert-path's unified old obs, or
+    // (for the raw-copy path) the new obs itself — they share the
+    // same schema after the `validate_obs_schema` check at the
+    // call sites.
+    let schema_for_validate: &RecordBatch =
+        old_unified_for_convert.as_ref().unwrap_or(&new_unified);
+
     // Read var first (and validate forced index columns) so the
     // seek-around-the-lock-cursor dance happens before any obs writes
     // land. On any forced-column error the file still reads as
     // pre-append (header still points to old catalog).
     let var_for_index = if rebuild_index {
         let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
-        validate_forced_columns(index_options, &old_unified.schema(), &var.schema())?;
+        validate_forced_columns(index_options, &schema_for_validate.schema(), &var.schema())?;
         lock.seek(SeekFrom::Start(write_offset))?;
         Some(var)
     } else {
         None
+    };
+
+    // For the raw-copy path, snapshot the bytes of each existing
+    // shard before handing the file off to `ScxWriter` (the writer's
+    // adopted cursor would conflict with concurrent reads through the
+    // same lock). Cheap: only the shard payloads we'd already read
+    // for predicate-index construction; one read each rather than two.
+    let existing_shard_payloads: Vec<Vec<u8>> = if input_is_sharded && rebuild_index {
+        let mut out = Vec::with_capacity(existing_obs_shards.len());
+        for (_, entry) in &existing_obs_shards {
+            lock.seek(SeekFrom::Start(entry.offset))?;
+            let mut buf = vec![0u8; entry.length as usize];
+            std::io::Read::read_exact(&mut *lock, &mut buf)?;
+            out.push(buf);
+        }
+        lock.seek(SeekFrom::Start(write_offset))?;
+        out
+    } else {
+        Vec::new()
     };
 
     // Hand the open file off to `ScxWriter` for the obs-shard and
@@ -1085,7 +1167,7 @@ fn finalize_append(
     let mut obs_index_builder = if rebuild_index {
         Some(
             scx_engine::ObsPredicateIndexBuilder::new(
-                old_unified.schema(),
+                schema_for_validate.schema(),
                 &predicate_index_build_options_for_obs(index_options),
             )
             .map_err(OpsError::Engine)?,
@@ -1094,30 +1176,64 @@ fn finalize_append(
         None
     };
 
-    let mut out_shard_idx: u32 = 0;
-    let mut cumulative_obs_rows: u64 = 0;
+    let mut out_shard_idx: u32;
+    let mut cumulative_obs_rows: u64;
 
-    // Shard 0: the entire old obs. Convert-on-append: even files
-    // whose old obs was a single `ObsMetadata` section land here as
-    // `ObsMetadataShard` shard 0; future appends extend this chain.
-    if let Some(b) = obs_index_builder.as_mut() {
-        b.push_shard(&old_unified, cumulative_obs_rows)
-            .map_err(OpsError::Engine)?;
+    if input_is_sharded {
+        // Raw-copy path: existing shards stay in place. Feed each
+        // into the predicate-index builder by decoding the snapshot
+        // bytes we captured before handing the file to ScxWriter.
+        // Compute the next shard_idx from the existing chain.
+        out_shard_idx = existing_obs_shards
+            .last()
+            .map(|(idx, _)| idx.saturating_add(1))
+            .unwrap_or(0);
+        cumulative_obs_rows = prep.old_n_obs;
+        if let Some(b) = obs_index_builder.as_mut() {
+            let mut row_offset: u64 = 0;
+            for buf in &existing_shard_payloads {
+                let cursor = Cursor::new(buf);
+                let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+                let mut iter = reader.into_iter();
+                let batch = iter.next().ok_or_else(|| {
+                    OpsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ObsMetadataShard contains no batches",
+                    ))
+                })??;
+                let batch = scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?;
+                let n = batch.num_rows() as u64;
+                b.push_shard(&batch, row_offset).map_err(OpsError::Engine)?;
+                row_offset += n;
+            }
+        }
+    } else {
+        // Convert-on-append path: write old obs as ObsMetadataShard
+        // shard 0 (one-time O(old_n_obs) cost), then continue with
+        // new obs as shards 1+.
+        let old_unified = old_unified_for_convert
+            .as_ref()
+            .expect("legacy convert path populates old_unified_for_convert");
+        out_shard_idx = 0;
+        cumulative_obs_rows = 0;
+        if let Some(b) = obs_index_builder.as_mut() {
+            b.push_shard(old_unified, cumulative_obs_rows)
+                .map_err(OpsError::Engine)?;
+        }
+        writer.write_obs_shard(
+            out_shard_idx,
+            cumulative_obs_rows,
+            old_unified.num_rows() as u64,
+            new_n_obs,
+            old_unified,
+        )?;
+        out_shard_idx += 1;
+        cumulative_obs_rows += old_unified.num_rows() as u64;
     }
-    writer.write_obs_shard(
-        out_shard_idx,
-        cumulative_obs_rows,
-        old_unified.num_rows() as u64,
-        new_n_obs,
-        &old_unified,
-    )?;
-    out_shard_idx += 1;
-    cumulative_obs_rows += old_unified.num_rows() as u64;
 
-    // Shards 1+: the new obs, split into `shard_target_rows`-sized
-    // chunks so each shard stays well under Arrow IPC's narrow-offset
-    // ceiling. `RecordBatch::slice` shares Arrow buffers — no
-    // per-chunk copy.
+    // New obs, split into `shard_target_rows`-sized chunks so each
+    // shard stays well under Arrow IPC's narrow-offset ceiling.
+    // `RecordBatch::slice` shares Arrow buffers — no per-chunk copy.
     let new_n = new_unified.num_rows();
     let mut cursor = 0;
     while cursor < new_n {
@@ -1252,7 +1368,7 @@ fn finalize_append(
                 .unwrap_or_default()
                 .as_secs() as i64,
             action: "append".to_string(),
-            tool: "scx-ops 0.1.0".to_string(),
+            tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
             // Stamp the convert-on-append payload shape so downstream
             // tools can tell that obs is now sharded. Append doesn't
             // expose the merge-side policy switches (var identity,
@@ -1295,25 +1411,38 @@ fn finalize_append(
         .filter(|e| e.section_type == SectionType::CscShard)
         .count();
     let had_csc = n_dropped_csc > 0;
-    let n_new_csr_shards = new_shard_entries.len() as u32;
+    let n_new_csr_shards =
+        u32::try_from(new_shard_entries.len()).map_err(|_| OpsError::ShapeMismatch {
+            detail: format!(
+                "appended CSR shard count {} exceeds u32::MAX",
+                new_shard_entries.len(),
+            ),
+        })?;
     let mut new_entries: Vec<FullCatalogEntry> = prep
         .old_catalog
         .entries
         .into_iter()
         .filter(|e| {
-            // Always drop ObsMetadata / ObsMetadataShard / Provenance
-            // / CscShard — they are rewritten or invalidated by the
-            // append. ObsMetadata bytes from a legacy file become
-            // orphaned (no catalog entry points at them); they are
-            // recoverable by `scx compact`. The Phase 2d convert-on-
-            // append path rewrites old obs as ObsMetadataShard shard 0
-            // and the new rows as shards 1+. Drop ObsPredicateIndex /
-            // VarPredicateIndex only when we are rebuilding them;
-            // otherwise stale entries remain in place (matches pre-fix
-            // behaviour where the index covers the original rows but
-            // not the freshly-appended ones).
+            // Always drop ObsMetadata / Provenance / CscShard — they
+            // are rewritten or invalidated by the append. ObsMetadata
+            // bytes from a legacy file become orphaned (no catalog
+            // entry points at them); they are recoverable by `scx
+            // compact`. The convert-on-append path rewrites old obs
+            // as `ObsMetadataShard` shard 0 and new rows as shards
+            // 1+. Drop ObsPredicateIndex / VarPredicateIndex only
+            // when we are rebuilding them; otherwise stale entries
+            // remain in place (matches pre-fix behaviour where the
+            // index covers the original rows but not the freshly-
+            // appended ones).
+            //
+            // Bug 2 fix: we keep existing `ObsMetadataShard` entries
+            // in the new catalog. The raw-copy-extend path relies on
+            // them surviving the filter; the convert-on-append path
+            // produces a brand-new shard 0 with the same name
+            // (`obs_metadata/shard_0`) which never collides because
+            // the legacy file by definition had no `ObsMetadataShard`
+            // entries.
             let base_filter = e.section_type != SectionType::ObsMetadata
-                && e.section_type != SectionType::ObsMetadataShard
                 && e.section_type != SectionType::Provenance
                 && e.section_type != SectionType::CscShard;
             if !drop_old_predicate_indexes {
@@ -1456,6 +1585,25 @@ fn finalize_append(
         result: index_result,
         multimodal_skip,
     })
+}
+
+/// Compute the next CSR shard index for an append: the modality's
+/// existing shard count plus the number of new shards already
+/// emitted in this append call. Returns an error if the cumulative
+/// count would overflow `u32` (the wire-format shard-index width) —
+/// a defensive check; SCX `ScxWriter` rejects shards above
+/// `u32::MAX` upstream too.
+fn next_shard_idx(old_per_modality_csr: u32, n_appended_so_far: usize) -> Result<u32> {
+    let added = u32::try_from(n_appended_so_far).map_err(|_| OpsError::ShapeMismatch {
+        detail: format!(
+            "appended CSR shard count {n_appended_so_far} exceeds u32::MAX (1 per call)"
+        ),
+    })?;
+    old_per_modality_csr
+        .checked_add(added)
+        .ok_or_else(|| OpsError::ShapeMismatch {
+            detail: format!("next CSR shard index overflows u32: {old_per_modality_csr} + {added}"),
+        })
 }
 
 /// Build the obs predicate-index options from a conversion-time

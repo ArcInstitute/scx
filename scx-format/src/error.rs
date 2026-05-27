@@ -105,20 +105,6 @@ pub enum ScxError {
         single_kind: &'static str,
         sharded_kind: &'static str,
     },
-
-    #[error(
-        "{axis} on this file is stored as {shard_count} {shard_kind} section(s); the legacy \
-         single-section reader cannot return one batch without unbounded memory growth. \
-         Use the sharded reader API ({hint_api}) or `{assembled_api}()` if you accept the \
-         memory cost."
-    )]
-    ObsIsSharded {
-        axis: &'static str,
-        shard_count: usize,
-        shard_kind: &'static str,
-        hint_api: &'static str,
-        assembled_api: &'static str,
-    },
 }
 
 pub type Result<T> = std::result::Result<T, ScxError>;

@@ -515,50 +515,54 @@ impl ScxReader {
 
     /// Read the obs (observation) metadata as an Arrow RecordBatch.
     ///
-    /// Returns [`ScxError::ObsIsSharded`] if the file was written with
-    /// row-sharded obs ([`SectionType::ObsMetadataShard`]) — atlas-scale
-    /// merges and appends emit obs as shards rather than one batch to
-    /// stay below Arrow IPC's 2 GB narrow-offset ceiling. Use
-    /// [`Self::obs_shards`], [`Self::read_obs_shard`], or — at the cost
-    /// of bounded peak memory — [`Self::read_obs_assembled`] instead.
+    /// Transparently handles both file layouts: returns the single
+    /// [`SectionType::ObsMetadata`] section on legacy files, or
+    /// reassembles every [`SectionType::ObsMetadataShard`] section in
+    /// `shard_idx` order on Phase 2 sharded files (with a contiguous-
+    /// cover verification — any gap, duplicate, or shrinking
+    /// `n_rows_total` is rejected as [`ScxError::InvalidCatalog`]).
+    ///
+    /// **Memory cost:** allocates a buffer sized to the entire logical
+    /// obs table. For atlas-scale files (tens of GB) this can dominate
+    /// peak RSS. Prefer the streaming [`Self::obs_shards`] iterator or
+    /// per-shard [`Self::read_obs_shard`] when you can process the
+    /// table in chunks.
     pub fn read_obs(&self) -> Result<RecordBatch> {
-        let shard_count = self.obs_metadata_shard_count();
-        if shard_count > 0 {
-            return Err(ScxError::ObsIsSharded {
-                axis: "obs",
-                shard_count,
-                shard_kind: "ObsMetadataShard",
-                hint_api: "obs_shards / read_obs_shard",
-                assembled_api: "read_obs_assembled",
-            });
+        if self.obs_metadata_shard_count() > 0 {
+            self.read_sharded_layout_by_prefix(
+                "obs_metadata/shard_",
+                "obs_metadata",
+                SectionType::ObsMetadataShard,
+            )?
+            .ok_or_else(|| ScxError::SectionNotFound("obs_metadata/shard_*".to_string()))
+        } else {
+            let entry = self
+                .full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+            self.read_arrow_ipc(entry)
         }
-        let entry = self
-            .full_catalog
-            .get("obs")
-            .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
-        self.read_arrow_ipc(entry)
     }
 
     /// Read the var (variable/gene) metadata as an Arrow RecordBatch.
-    ///
-    /// Returns [`ScxError::ObsIsSharded`] (with `axis: "var"`) if var
-    /// is row-sharded; mirror of [`Self::read_obs`].
+    /// Mirror of [`Self::read_obs`] for the var axis — same dual-layout
+    /// handling, same memory cost caveat, and same streaming
+    /// alternatives ([`Self::var_shards`], [`Self::read_var_shard`]).
     pub fn read_var(&self) -> Result<RecordBatch> {
-        let shard_count = self.var_metadata_shard_count();
-        if shard_count > 0 {
-            return Err(ScxError::ObsIsSharded {
-                axis: "var",
-                shard_count,
-                shard_kind: "VarMetadataShard",
-                hint_api: "var_shards / read_var_shard",
-                assembled_api: "read_var_assembled",
-            });
+        if self.var_metadata_shard_count() > 0 {
+            self.read_sharded_layout_by_prefix(
+                "var_metadata/shard_",
+                "var_metadata",
+                SectionType::VarMetadataShard,
+            )?
+            .ok_or_else(|| ScxError::SectionNotFound("var_metadata/shard_*".to_string()))
+        } else {
+            let entry = self
+                .full_catalog
+                .get("var")
+                .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
+            self.read_arrow_ipc(entry)
         }
-        let entry = self
-            .full_catalog
-            .get("var")
-            .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
-        self.read_arrow_ipc(entry)
     }
 
     /// Number of [`SectionType::ObsMetadataShard`] sections in the
@@ -611,9 +615,9 @@ impl ScxReader {
     /// than one shard at a time, so peak memory is bounded by the
     /// largest single shard regardless of the logical obs size.
     ///
-    /// Returns an empty iterator on legacy single-section files; use
-    /// [`Self::read_obs`] (or, if you accept the memory cost,
-    /// [`Self::read_obs_assembled`]) on those files instead.
+    /// Returns an empty iterator on legacy single-section files; call
+    /// [`Self::read_obs`] for those (and for any caller that genuinely
+    /// needs the full obs table).
     pub fn obs_shards(&self) -> impl Iterator<Item = Result<RecordBatch>> + '_ {
         self.metadata_shards_iter(SectionType::ObsMetadataShard, "obs_metadata/shard_")
     }
@@ -648,54 +652,6 @@ impl ScxReader {
         entries
             .into_iter()
             .map(move |(_, e)| self.read_arrow_ipc(e))
-    }
-
-    /// Concatenate all obs metadata shards into a single `RecordBatch`.
-    /// **Memory hazard:** allocates a buffer the size of the entire
-    /// logical obs table — for atlas-scale files this can be many GB
-    /// and may exceed Arrow IPC's 2 GB narrow-offset ceiling if the
-    /// shards' string buffers cumulatively overflow `i32::MAX` bytes.
-    /// Prefer [`Self::obs_shards`] for streaming workloads.
-    ///
-    /// Falls through to [`Self::read_obs`] on legacy single-section
-    /// files so callers that need "give me the whole table" can stay
-    /// agnostic to the storage layout. Verifies the catalog entries
-    /// form a contiguous, ordered cover (any gap or duplicate is
-    /// [`ScxError::InvalidCatalog`]).
-    pub fn read_obs_assembled(&self) -> Result<RecordBatch> {
-        if self.obs_metadata_shard_count() > 0 {
-            self.read_sharded_layout_by_prefix(
-                "obs_metadata/shard_",
-                "obs_metadata",
-                SectionType::ObsMetadataShard,
-            )?
-            .ok_or_else(|| ScxError::SectionNotFound("obs_metadata/shard_*".to_string()))
-        } else {
-            let entry = self
-                .full_catalog
-                .get("obs")
-                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
-            self.read_arrow_ipc(entry)
-        }
-    }
-
-    /// Concatenate all var metadata shards into a single `RecordBatch`.
-    /// Mirror of [`Self::read_obs_assembled`].
-    pub fn read_var_assembled(&self) -> Result<RecordBatch> {
-        if self.var_metadata_shard_count() > 0 {
-            self.read_sharded_layout_by_prefix(
-                "var_metadata/shard_",
-                "var_metadata",
-                SectionType::VarMetadataShard,
-            )?
-            .ok_or_else(|| ScxError::SectionNotFound("var_metadata/shard_*".to_string()))
-        } else {
-            let entry = self
-                .full_catalog
-                .get("var")
-                .ok_or_else(|| ScxError::SectionNotFound("var".to_string()))?;
-            self.read_arrow_ipc(entry)
-        }
     }
 
     /// Read a named obsm embedding as an Arrow RecordBatch.
@@ -913,8 +869,17 @@ impl ScxReader {
         }
 
         // Verify the shards form a contiguous, ordered cover by walking
-        // their stamped metadata. Any gap, duplicate, mismatch, or
-        // missing metadata is a hard error.
+        // their stamped metadata. Each shard's `n_rows_total` is the
+        // file's logical row count *at the time that shard was
+        // written* — for single-pass writes (merge, `from_anndata`)
+        // every shard carries the same value, but for append-grown
+        // files older shards carry their smaller original stamps
+        // while later-appended shards carry the bumped total. So the
+        // invariant is: `n_rows_total` is monotonically non-decreasing
+        // across shards, and the **last shard's** `n_rows_total`
+        // equals the cumulative row cover (the authoritative file
+        // total). Any gap, duplicate, ordering violation, or
+        // contracting-`n_rows_total` is rejected.
         let first_hdr = parse_shard_metadata(logical, &batches[0])?;
         if first_hdr.shard_idx != 0 {
             return Err(ScxError::InvalidCatalog(format!(
@@ -928,7 +893,7 @@ impl ScxReader {
                 first_hdr.row_start
             )));
         }
-        let n_rows_total = first_hdr.n_rows_total;
+        let mut prev_n_rows_total = first_hdr.n_rows_total;
         let mut next_expected_row_start = first_hdr.n_shard_rows;
         for (i, batch) in batches.iter().enumerate().skip(1) {
             let hdr = parse_shard_metadata(logical, batch)?;
@@ -939,9 +904,11 @@ impl ScxReader {
                     hdr.shard_idx
                 )));
             }
-            if hdr.n_rows_total != n_rows_total {
+            if hdr.n_rows_total < prev_n_rows_total {
                 return Err(ScxError::InvalidCatalog(format!(
-                    "{logical}: shard {i} has n_rows_total={} but shard 0 has {n_rows_total}",
+                    "{logical}: shard {i} has n_rows_total={} which contracts the prior \
+                     shard's stamp of {prev_n_rows_total} — append-grown obs must stamp \
+                     monotonically non-decreasing totals",
                     hdr.n_rows_total
                 )));
             }
@@ -952,10 +919,16 @@ impl ScxReader {
                 )));
             }
             next_expected_row_start = next_expected_row_start.saturating_add(hdr.n_shard_rows);
+            prev_n_rows_total = hdr.n_rows_total;
         }
-        if next_expected_row_start != n_rows_total {
+        // The last shard's `n_rows_total` is canonical — every writer
+        // stamps it as "total rows in the file after this append /
+        // merge call". The cumulative-cover sum must equal it; any
+        // gap is a hard error.
+        if next_expected_row_start != prev_n_rows_total {
             return Err(ScxError::InvalidCatalog(format!(
-                "{logical}: shards cover {next_expected_row_start} rows but n_rows_total={n_rows_total}"
+                "{logical}: shards cover {next_expected_row_start} rows but the last shard's \
+                 n_rows_total is {prev_n_rows_total}"
             )));
         }
 

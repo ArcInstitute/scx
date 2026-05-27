@@ -274,14 +274,14 @@ fn test_obs_shard_round_trip() {
 }
 
 #[test]
-fn test_obs_shards_assembled_matches_legacy() {
+fn test_obs_shards_read_obs_matches_legacy() {
     // Same obs payload written two ways:
     //   (a) one legacy `ObsMetadata` section,
     //   (b) three `ObsMetadataShard` sections (rows 0..100, 100..250, 250..400).
-    // `read_obs()` on (a) and `read_obs_assembled()` on (b) must agree
-    // on column data, with the assembly path's schema differing only
-    // by the absence of per-shard metadata keys (shard_idx, row_start,
-    // n_shard_rows) — `n_rows_total` survives the strip.
+    // `read_obs()` must transparently handle both layouts and return
+    // identical column data. Schemas differ only by the absence of
+    // per-shard metadata keys (shard_idx, row_start, n_shard_rows) on
+    // the sharded side — `n_rows_total` survives the strip.
     let dir = tempfile::tempdir().unwrap();
     let legacy_path = dir.path().join("legacy.scx");
     let sharded_path = dir.path().join("sharded.scx");
@@ -308,10 +308,7 @@ fn test_obs_shards_assembled_matches_legacy() {
     }
 
     let legacy_obs = ScxReader::open(&legacy_path).unwrap().read_obs().unwrap();
-    let sharded_obs = ScxReader::open(&sharded_path)
-        .unwrap()
-        .read_obs_assembled()
-        .unwrap();
+    let sharded_obs = ScxReader::open(&sharded_path).unwrap().read_obs().unwrap();
     assert_eq!(legacy_obs.num_rows(), sharded_obs.num_rows());
     assert_eq!(legacy_obs.num_columns(), sharded_obs.num_columns());
     for col in 0..legacy_obs.num_columns() {
@@ -354,7 +351,12 @@ fn test_mixed_obs_writes_rejected() {
 }
 
 #[test]
-fn test_read_obs_on_sharded_errors() {
+fn test_read_obs_on_sharded_assembles_transparently() {
+    // After the read_obs / read_obs_assembled collapse, `read_obs()`
+    // transparently reassembles row-sharded obs into one RecordBatch.
+    // The cover-verification is exercised by
+    // `test_obs_shards_read_obs_matches_legacy`; this test just
+    // confirms `read_obs()` no longer errors on a sharded file.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sharded.scx");
     {
@@ -368,20 +370,8 @@ fn test_read_obs_on_sharded_errors() {
         w.finish().unwrap();
     }
     let reader = ScxReader::open(&path).unwrap();
-    let err = reader.read_obs().unwrap_err();
-    assert!(
-        matches!(
-            err,
-            scx_format::ScxError::ObsIsSharded {
-                axis: "obs",
-                shard_count: 2,
-                ..
-            }
-        ),
-        "expected ObsIsSharded {{ axis: \"obs\", shard_count: 2, .. }}, got: {err:?}"
-    );
-    // read_obs_assembled still works (memory hazard but functionally correct).
-    let assembled = reader.read_obs_assembled().unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 2);
+    let assembled = reader.read_obs().unwrap();
     assert_eq!(assembled.num_rows(), 200);
 }
 
@@ -517,4 +507,63 @@ fn test_obs_shards_largeutf8_overflow_round_trip() {
         total_rows += shard.num_rows();
     }
     assert_eq!(total_rows as u64, n_obs);
+}
+
+#[test]
+fn test_reader_accepts_mixed_n_rows_total_across_shards() {
+    // Append-grown obs leaves older shards stamped with their original
+    // (smaller) `n_rows_total` value while later-appended shards carry
+    // the bumped total. The reader's cover-verification must accept
+    // this monotonically-non-decreasing pattern; only the LAST shard's
+    // `n_rows_total` is canonical.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed_totals.scx");
+    {
+        let mut w = ScxWriter::new(&path, header(150, 4, 0)).unwrap();
+        // Shard 0 stamped with the file's pre-append total (100).
+        w.write_obs_shard(0, 0, 100, 100, &obs_batch(0, 100))
+            .unwrap();
+        // Shard 1 stamped with the post-append total (150). The
+        // writer doesn't validate consistency between shards; that's
+        // the reader's job.
+        w.write_obs_shard(1, 100, 50, 150, &obs_batch(100, 50))
+            .unwrap();
+        write_zero_csr_shard(&mut w, 0, 150);
+        w.write_var(&small_var_batch()).unwrap();
+        w.finish().unwrap();
+    }
+    let reader = ScxReader::open(&path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(
+        obs.num_rows(),
+        150,
+        "cover sum (100 + 50) becomes the total"
+    );
+}
+
+#[test]
+fn test_reader_rejects_contracting_n_rows_total() {
+    // The inverse case: shard 1's `n_rows_total` is *smaller* than
+    // shard 0's. That can't happen under correct append semantics
+    // (totals only grow) and indicates either catalog corruption or
+    // a writer bug. Reject it.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contracting_totals.scx");
+    {
+        let mut w = ScxWriter::new(&path, header(150, 4, 0)).unwrap();
+        w.write_obs_shard(0, 0, 100, 150, &obs_batch(0, 100))
+            .unwrap();
+        // Shard 1 contracts the stamp to 50 — invalid.
+        w.write_obs_shard(1, 100, 50, 50, &obs_batch(100, 50))
+            .unwrap();
+        write_zero_csr_shard(&mut w, 0, 150);
+        w.write_var(&small_var_batch()).unwrap();
+        w.finish().unwrap();
+    }
+    let reader = ScxReader::open(&path).unwrap();
+    let err = reader.read_obs().unwrap_err();
+    assert!(
+        matches!(err, scx_format::ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog for contracting n_rows_total, got: {err:?}"
+    );
 }

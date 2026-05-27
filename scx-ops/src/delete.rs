@@ -156,7 +156,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
             .unwrap_or_default()
             .as_secs() as i64,
         action: "delete".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: format!("{{\"n_cells_deleted\":{}}}", cell_indices.len()),
         input_checksums: vec![],
     });

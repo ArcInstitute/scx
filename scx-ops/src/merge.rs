@@ -223,7 +223,7 @@ pub fn merge_with_options(
     // ---------------------------------------------------------------
 
     let unified_obs_schema = first_input_obs_schema(&readers)?;
-    let var = read_var_assembled(&readers[0])?;
+    let var = readers[0].read_var().map_err(OpsError::Format)?;
     validate_var_identity(&readers, &var, options.assume_identical_var)?;
 
     // Fail fast if forced index columns are missing from the unified
@@ -502,7 +502,7 @@ pub fn merge_with_options(
             .unwrap_or_default()
             .as_secs() as i64,
         action: "merge".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: format!(
             "{{\"n_inputs\":{},\"assume_identical_var\":{},\"uns_policy\":\"{}\",\
              \"uns_conflicts_warned\":{}}}",
@@ -898,7 +898,7 @@ fn merge_multimodal(
             .unwrap_or_default()
             .as_secs() as i64,
         action: "merge".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: format!("{{\"n_inputs\":{}}}", input_paths.len()),
         input_checksums: readers
             .iter()
@@ -954,17 +954,6 @@ fn first_input_obs_schema(readers: &[ScxReader]) -> Result<arrow::datatypes::Sch
     Ok(std::sync::Arc::new(schema))
 }
 
-/// Read var from a single reader, handling both legacy single-section
-/// and sharded var layouts. Sharded var is rare today but supported in
-/// Phase 1.
-fn read_var_assembled(reader: &ScxReader) -> Result<RecordBatch> {
-    if reader.var_metadata_shard_count() > 0 {
-        reader.read_var_assembled().map_err(OpsError::Format)
-    } else {
-        reader.read_var().map_err(OpsError::Format)
-    }
-}
-
 /// Validate that every input agrees with the first input on var
 /// identity (column names, types, row count, row content). Each
 /// pairwise mismatch produces a `OpsError::VarMismatch` unless
@@ -980,7 +969,7 @@ fn validate_var_identity(
     assume_identical: bool,
 ) -> Result<()> {
     for (i, reader) in readers.iter().enumerate().skip(1) {
-        let other = read_var_assembled(reader)?;
+        let other = reader.read_var().map_err(OpsError::Format)?;
         if let Some(detail) = var_diff(first_var, &other) {
             if assume_identical {
                 log::warn!(

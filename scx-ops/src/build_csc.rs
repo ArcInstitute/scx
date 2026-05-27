@@ -119,8 +119,8 @@ pub fn run_build_csc(
     };
 
     // 10. Read all metadata from input
-    let obs = reader.read_obs_assembled()?;
-    let var = reader.read_var_assembled()?;
+    let obs = reader.read_obs()?;
+    let var = reader.read_var()?;
 
     // 11. Create writer and write metadata
     pb.set_message("Writing output file...");

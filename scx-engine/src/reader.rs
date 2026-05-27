@@ -94,17 +94,11 @@ impl SectionReader for ScxReader {
     }
 
     fn read_obs(&self) -> Result<RecordBatch> {
-        // Phase 2: route through the assembled reader so query-engine
-        // callers (predicate evaluation, projection, full-table reads
-        // via [`crate::collect`]) work transparently against both
-        // legacy single-section and row-sharded ObsMetadataShard
-        // layouts. `read_obs_assembled` falls through to `read_obs`
-        // on legacy files, so the behaviour is unchanged there.
-        Ok(ScxReader::read_obs_assembled(self)?)
+        Ok(ScxReader::read_obs(self)?)
     }
 
     fn read_var(&self) -> Result<RecordBatch> {
-        Ok(ScxReader::read_var_assembled(self)?)
+        Ok(ScxReader::read_var(self)?)
     }
 
     fn read_obs_predicate_index_bytes(&self) -> Result<Option<Vec<u8>>> {

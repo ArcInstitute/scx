@@ -619,9 +619,9 @@ mod tests {
         assert_eq!(reader.n_vars(), 50);
 
         // Verify obs/var data
-        let obs = reader.read_obs_assembled().unwrap();
+        let obs = reader.read_obs().unwrap();
         assert_eq!(obs.num_rows(), 100);
-        let var = reader.read_var_assembled().unwrap();
+        let var = reader.read_var().unwrap();
         assert_eq!(var.num_rows(), 50);
 
         // Verify CSR

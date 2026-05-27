@@ -83,7 +83,7 @@ pub fn to_mudata_backed<'py>(
     let mudata_mod = import_mudata(py)?;
 
     // Build the global obs once.
-    let global_obs = match reader.read_obs_assembled() {
+    let global_obs = match reader.read_obs() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
@@ -166,7 +166,7 @@ pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py
     let mudata_mod = import_mudata(py)?;
 
     // Build the global obs once; per-modality AnnData objects share it.
-    let global_obs = match reader.read_obs_assembled() {
+    let global_obs = match reader.read_obs() {
         Ok(batch) => {
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)

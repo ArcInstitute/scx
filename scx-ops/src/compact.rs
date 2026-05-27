@@ -75,13 +75,12 @@ pub fn compact_with_index_options(
     // Load deletion vectors
     let dv = reader.read_deletion_vectors()?;
 
-    // Read obs and build deletion mask. `read_obs_assembled` handles
-    // both legacy single-section ObsMetadata and the row-sharded
-    // ObsMetadataShard layout produced by Phase 2 merge / append; the
-    // assembled batch is what the deletion-mask + filter logic
-    // expects.
-    let obs = reader.read_obs_assembled()?;
-    let var = reader.read_var_assembled()?;
+    // Read obs and build deletion mask. `read_obs` / `read_var`
+    // transparently handle both legacy single-section and row-sharded
+    // Phase 2 layouts; the assembled batch is what the deletion-mask
+    // + filter logic expects.
+    let obs = reader.read_obs()?;
+    let var = reader.read_var()?;
 
     let n_obs = in_header.n_obs as usize;
     let n_vars = in_header.n_vars;
@@ -397,7 +396,7 @@ pub fn compact_with_index_options(
             .unwrap_or_default()
             .as_secs() as i64,
         action: "compact".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: "{}".to_string(),
         input_checksums: vec![],
     });
@@ -420,7 +419,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
 
     let n_obs = in_header.n_obs as usize;
     let keep_mask = build_keep_mask(n_obs, &dv, reader.catalog());
-    let obs = reader.read_obs_assembled()?;
+    let obs = reader.read_obs()?;
     let filtered_obs = if let Some(ref mask) = keep_mask {
         let bool_array = arrow::array::BooleanArray::from(mask.clone());
         compute::filter_record_batch(&obs, &bool_array)?
@@ -769,7 +768,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             .unwrap_or_default()
             .as_secs() as i64,
         action: "compact".to_string(),
-        tool: "scx-ops 0.1.0".to_string(),
+        tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: "{}".to_string(),
         input_checksums: vec![],
     });
