@@ -170,7 +170,15 @@ def _run_pyscx_wilcoxon_cpu(adata: Any, groupby: str, reference: str) -> str:
 
 def _run_pyscx_wilcoxon_gpu(adata: Any, groupby: str, reference: str) -> str:
     import pyscx
-    pyscx.accel.rank_genes_groups(adata, groupby, reference=reference, device="gpu")
+    scx_adata = _as_scx_backed_if_available(adata)
+    if scx_adata is not None:
+        pyscx.accel.rank_genes_groups(
+            scx_adata, groupby, reference=reference, device="gpu",
+        )
+    else:
+        pyscx.accel.rank_genes_groups(
+            adata, groupby, reference=reference, device="gpu",
+        )
     return "pyscx-gpu-wilcoxon"
 
 
@@ -180,8 +188,118 @@ def _run_pyscx_pdex_ref_cpu(adata: Any, groupby: str, reference: str) -> Any:
 
 
 def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
+    """Run pdex_ref on GPU.
+
+    When the bench has built an SCX-backed fixture for this dataset (with a
+    CSC sidecar), route through ``pyscx.open(scx_path)`` so the dataset
+    arrives as a ``ScxBackedSparseDataset`` with ``backed_csc=Some(...)``.
+    That makes pyscx's dispatch route to ``pdex_ref_gpu_streaming(...,
+    csc_reader=Some(...))``, which under ``SCX_GPU_DE_V3=1`` exercises the
+    v3 CSC-direct kernels (the path we actually want to bench). The
+    in-memory scipy CSR fallback routes through ``pdex_ref_gpu_sparse`` →
+    v3 CSR-fallback, which is NOT the path G4.3 is trying to measure.
+    """
     import pyscx
+    scx_adata = _as_scx_backed_if_available(adata)
+    if scx_adata is not None:
+        return pyscx.accel.pdex_ref(
+            scx_adata, groupby, reference=reference, device="gpu",
+        )
     return pyscx.accel.pdex_ref(adata, groupby, reference=reference, device="gpu")
+
+
+def _as_scx_backed_if_available(adata: Any) -> Any:
+    """Open the bench-built SCX fixture (with CSC sidecar) for this adata
+    via ``pyscx.open(...)`` if one was built, returning an AnnData whose
+    ``.X`` is a ``ScxBackedSparseDataset``. Returns ``None`` when no SCX
+    fixture has been built (older bench paths or non-pyscx contexts).
+
+    Path is stashed in ``adata.uns["_bench_scx_with_csc_path"]`` by
+    ``_ensure_scx_csc_fixture`` at fixture-build time.
+    """
+    scx_path = None
+    try:
+        scx_path = adata.uns.get("_bench_scx_with_csc_path")
+    except Exception:
+        scx_path = None
+    if not scx_path:
+        return None
+    try:
+        import pyscx
+        # `pyscx.open()` returns a `PyExperiment`. To get an AnnData
+        # whose `.X` is `ScxBackedSparseDataset` (with `backed_csc=Some(...)`
+        # set when the file has a CSC sidecar), we have to go through
+        # `Experiment.to_anndata(backed=True)`. Without `backed=True` we
+        # get a fully-materialised AnnData with a scipy CSR X, which
+        # routes through `pdex_ref_gpu_sparse` and never exercises CSC.
+        exp = pyscx.open(str(scx_path))
+        return exp.to_anndata(backed=True)
+    except Exception as e:
+        logger.warning(
+            "accel_de: failed to open SCX fixture %s (%s); "
+            "falling back to in-memory AnnData (CSR path)",
+            scx_path, e,
+        )
+        return None
+
+
+def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
+    """Materialise the bench's prepared adata (groupby-tagged + subset to
+    top groups) as a temp SCX file with a CSC sidecar.
+
+    Required so the GPU pdex_ref / wilcoxon impls can route through
+    ``pyscx.open(scx_path)`` → ``ScxBackedSparseDataset`` with
+    ``backed_csc=Some(...)``. With only the h5ad-loaded scipy CSR in
+    memory, pyscx routes to the in-memory `pdex_ref_gpu_sparse` entry
+    point which has no CSC reader, and v3 dispatch always falls back to
+    the CSR-direct path even when SCX_GPU_DE_V3=1.
+
+    Returns the path on success or None if pyscx is missing or the
+    conversion failed. Cached on disk under
+    ``$SCX_BENCH_TMPDIR/scx_csc_fixtures/`` (default
+    ``/tmp/scx_csc_fixtures``); ``SCX_BENCH_REBUILD_CSC=1`` forces a
+    rebuild.
+    """
+    import os
+    if not _HAS_PYSCX:
+        return None
+    base = Path(
+        os.environ.get("SCX_BENCH_TMPDIR")
+        or os.environ.get("SCX_WORK_DIR", "")
+    )
+    if base.is_dir():
+        out_dir = base / "scx_csc_fixtures"
+    else:
+        out_dir = Path("/tmp/scx_csc_fixtures")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("accel_de: cannot create %s (%s); skipping CSC fixture",
+                       out_dir, e)
+        return None
+    scx_path = out_dir / f"{dataset_name}.bench_csc.scx"
+    rebuild = os.environ.get("SCX_BENCH_REBUILD_CSC", "") in ("1", "true", "TRUE")
+    if scx_path.exists() and not rebuild:
+        logger.info("accel_de: reusing cached SCX-with-CSC fixture %s", scx_path)
+        return scx_path
+    if scx_path.exists():
+        scx_path.unlink()
+    try:
+        import pyscx
+        logger.info(
+            "accel_de: building SCX-with-CSC fixture for %s -> %s "
+            "(n_obs=%d n_vars=%d)",
+            dataset_name, scx_path, int(adata.n_obs), int(adata.n_vars),
+        )
+        pyscx.from_anndata(adata, str(scx_path), csc="always")
+    except Exception as e:
+        logger.warning(
+            "accel_de: pyscx.from_anndata(%s, csc='always') failed: %s; "
+            "GPU impls will fall back to in-memory CSR path (no CSC bench)",
+            dataset_name, e,
+        )
+        return None
+    return scx_path
 
 
 # (impl_callable, requires_gpu, kind)  where kind ∈ {"wilcoxon", "pdex_ref"}.
@@ -383,6 +501,15 @@ def run(
         adata_for_pick = raw.copy()
         groupby, reference, synthetic = _select_groupby(adata_for_pick)
         adata_for_pick, _ = _restrict_to_top_groups(adata_for_pick, groupby, reference)
+        # Persist the (groupby-tagged, subset) adata to a temp SCX file
+        # with CSC sidecar so the GPU pdex_ref / wilcoxon impls can load
+        # it via pyscx.open() and exercise the v3-CSC dispatch path. With
+        # only the in-memory scipy CSR, pyscx routes to
+        # `pdex_ref_gpu_sparse` → v3-CSR fallback, which never touches
+        # the new CSC kernels.
+        scx_csc_path = _ensure_scx_csc_fixture(adata_for_pick, dataset.name)
+        if scx_csc_path is not None:
+            adata_for_pick.uns["_bench_scx_with_csc_path"] = str(scx_csc_path)
         _fixture_cache[groupby_key] = (groupby, reference, synthetic, adata_for_pick)
     groupby, reference, synthetic, base_adata = _fixture_cache[groupby_key]
 

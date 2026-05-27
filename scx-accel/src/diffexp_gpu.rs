@@ -1858,6 +1858,15 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
         ));
     }
 
+    // One-shot dispatch trace for bench validation. Gated on a separate
+    // env var so it doesn't fire in unit tests or production. Sets
+    // SCX_GPU_DE_V3_DISPATCH=v3-csr in the process env as a parallel
+    // signal that callers (bench harness) can read post-call if they
+    // can't capture stderr.
+    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
+        eprintln!("[scx-accel/pdex_ref] v3 dispatch route: csr-direct (no CSC sidecar)");
+    }
+
     let n_groups = group_names.len();
     let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
     let ref_cells = &group_indices[reference];
@@ -2174,6 +2183,12 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
         return Err(AccelError::InvalidInput(
             "gene_chunk_size must be > 0".to_string(),
         ));
+    }
+
+    // One-shot dispatch trace for bench validation. See the matching
+    // trace in `pdex_ref_gpu_chunked_v3_csr`.
+    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
+        eprintln!("[scx-accel/pdex_ref] v3 dispatch route: csc-direct (CSC sidecar present)");
     }
 
     let n_groups = group_names.len();
