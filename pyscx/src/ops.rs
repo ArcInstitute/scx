@@ -577,6 +577,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, uns_policy=None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn merge(
     py: Python<'_>,
     inputs: Vec<String>,

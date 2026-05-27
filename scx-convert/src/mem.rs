@@ -8,8 +8,6 @@
 // usual 1000 vs 1024 ambiguity — users who want decimal magnitudes
 // can pass the explicit byte count.
 
-use super::pipeline::ConvertError;
-
 /// Namespacing struct; constructors live as associated functions.
 pub struct MemoryBudget;
 
@@ -25,14 +23,15 @@ impl MemoryBudget {
     /// - explicit binary suffixes: `"4KiB"`, `"2MiB"`, `"8GiB"`,
     ///   `"1TiB"`
     ///
-    /// Returns [`ConvertError::Other`] for empty input, malformed
-    /// numbers, unrecognised suffixes, or overflow.
-    pub fn parse(s: &str) -> Result<u64, ConvertError> {
+    /// Returns a descriptive error string for empty input, malformed
+    /// numbers, unrecognised suffixes, or overflow. The error type is
+    /// `String` (not [`crate::pipeline::ConvertError`]) so the parser is
+    /// usable from non-hdf5 callers (`pyscx::from_anndata`'s in-memory
+    /// path); CLI callers wrap it via `?` / `Box::<dyn Error>::from`.
+    pub fn parse(s: &str) -> Result<u64, String> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return Err(ConvertError::Other(
-                "memory budget is empty; expected e.g. '2GiB'".into(),
-            ));
+            return Err("memory budget is empty; expected e.g. '2GiB'".into());
         }
 
         let lower = trimmed.to_ascii_lowercase();
@@ -45,25 +44,25 @@ impl MemoryBudget {
         } else if let Some(rest) = lower.strip_suffix("kib") {
             (rest, 1u64 << 10)
         } else if let Some(rest) = lower.strip_suffix("kb") {
-            return Err(ConvertError::Other(format!(
+            return Err(format!(
                 "decimal suffix in '{}' is ambiguous; use 'KiB' or a bare byte count",
                 rest.trim()
-            )));
+            ));
         } else if let Some(rest) = lower.strip_suffix("mb") {
-            return Err(ConvertError::Other(format!(
+            return Err(format!(
                 "decimal suffix in '{}' is ambiguous; use 'MiB' or a bare byte count",
                 rest.trim()
-            )));
+            ));
         } else if let Some(rest) = lower.strip_suffix("gb") {
-            return Err(ConvertError::Other(format!(
+            return Err(format!(
                 "decimal suffix in '{}' is ambiguous; use 'GiB' or a bare byte count",
                 rest.trim()
-            )));
+            ));
         } else if let Some(rest) = lower.strip_suffix("tb") {
-            return Err(ConvertError::Other(format!(
+            return Err(format!(
                 "decimal suffix in '{}' is ambiguous; use 'TiB' or a bare byte count",
                 rest.trim()
-            )));
+            ));
         } else if let Some(rest) = lower.strip_suffix('t') {
             (rest, 1u64 << 40)
         } else if let Some(rest) = lower.strip_suffix('g') {
@@ -80,22 +79,18 @@ impl MemoryBudget {
 
         let num_str = num_str.trim();
         if num_str.is_empty() {
-            return Err(ConvertError::Other(format!(
-                "no number in memory budget '{}'",
-                trimmed
-            )));
+            return Err(format!("no number in memory budget '{}'", trimmed));
         }
 
         let n: u64 = num_str.parse().map_err(|_| {
-            ConvertError::Other(format!(
+            format!(
                 "invalid memory budget number '{}' in '{}'",
                 num_str, trimmed
-            ))
+            )
         })?;
 
-        n.checked_mul(multiplier).ok_or_else(|| {
-            ConvertError::Other(format!("memory budget '{}' overflows u64", trimmed))
-        })
+        n.checked_mul(multiplier)
+            .ok_or_else(|| format!("memory budget '{}' overflows u64", trimmed))
     }
 }
 

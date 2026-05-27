@@ -73,6 +73,7 @@ File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX
 See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlights:
 
 - **Tracked files MUST NOT reference gitignored markdown** (`tasks/*.md`, root scratch docs like `2026-*_REGRESSIONS.md`, `*_CODE-REVIEW.md`, `Phase*.md`). Inline the substance instead of citing.
+- **Do NOT stage/commit all-caps markdown files in the repo root** (e.g., `MERGE-OBS-OFFSET-OVERFLOW.md`, `STATE-CELL-EVAL-INTEGRATE-PT2.md`). These are ephemeral implementation/planning documents that are moved to `./tasks/` after completion, and `./tasks/` is gitignored. Exceptions: `README.md`, `ROADMAP.md`, `AGENTS.md`, `CLAUDE.md`.
 - **On-disk structs**: no `#[repr(C)]`; serialize field-by-field with `byteorder` little-endian; sections at 8-byte-aligned offsets.
 - **Errors**: `thiserror` enums per crate; readers return errors (not panic) on malformed input.
 - **Checksums**: BLAKE3 everywhere (truncated-64 per shard, full-256 for catalog).
@@ -100,10 +101,10 @@ See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlig
 
 ## Code Review
 
-After implementing changes to the codebase, run an Antigravity code review to catch issues after staging and before committing:
+After implementing changes to the codebase, run an Cursor Agent code review to catch issues after staging and before committing:
 
 ```bash
-agy --dangerously-skip-permissions --print "Review the staged code changes in this repository. Check for correctness, adherence to project conventions, error handling, test coverage, and potential regressions. Summarize findings and flag any issues."
+cursor agent --trust --model composer-2.5-fast --print "Review the staged code changes in this repository. Check for correctness, adherence to project conventions, error handling, test coverage, and potential regressions. Summarize findings and flag any issues."
 ```
 
 **When to run**: After any non-trivial code change (new features, refactors, bug fixes, API changes). Skip for documentation-only or formatting-only changes.

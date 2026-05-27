@@ -87,6 +87,25 @@ pub enum ConvertWarning {
         granted: usize,
         reason: String,
     },
+    /// In-memory `from_anndata` ingest detected an obsm / varm / obsp /
+    /// varp key whose estimated peak footprint exceeds `memory_budget`.
+    /// The shard is still written (no derating); the warning surfaces so
+    /// the caller can shrink `shard_size` or route through the streaming
+    /// path for files of this scale.
+    MappingPeakFootprintHigh {
+        key: String,
+        axis: &'static str,
+        estimated_bytes: u64,
+        budget_bytes: u64,
+    },
+    /// Eager `to_anndata()` estimated that assembling the full X matrix
+    /// will exceed `memory_budget`. The assembly still proceeds; the
+    /// warning recommends `to_anndata(backed=True)` or
+    /// `pyscx.open(path).query()` for atlas-scale files.
+    EagerAssemblyMemoryHigh {
+        estimated_bytes: u64,
+        budget_bytes: u64,
+    },
 }
 
 impl ConvertWarning {
@@ -109,6 +128,8 @@ impl ConvertWarning {
             Self::BitmapSkipped { .. } => "bitmap_skipped",
             Self::Hdf5NotThreadsafe => "hdf5_not_threadsafe",
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
+            Self::MappingPeakFootprintHigh { .. } => "mapping_peak_footprint_high",
+            Self::EagerAssemblyMemoryHigh { .. } => "eager_assembly_memory_high",
         }
     }
 }
