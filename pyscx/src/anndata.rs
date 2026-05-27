@@ -522,16 +522,110 @@ pub(crate) fn obsm_batch_to_numpy<'py>(
     df.getattr("values")
 }
 
+/// Returns true if either axis would overflow Int32 coordinates and the
+/// COO batch must therefore use the Int64 row/col encoding ("v2 layout").
+/// For all current workloads — even atlas-scale sub-billion-cell files —
+/// both axes fit in Int32 and this returns false, keeping coordinates
+/// at 4 bytes each on disk. Only axes ≥ 2^31 trip the Int64 path.
+fn coo_needs_int64_coords(n_rows: usize, n_cols: usize) -> bool {
+    n_rows > i32::MAX as usize || n_cols > i32::MAX as usize
+}
+
+/// Borrowed view of the row/col columns of a pairwise COO RecordBatch,
+/// dispatched on whichever Int32 / Int64 dtype the on-disk batch uses.
+/// Lets every consumer treat both wire-format widths uniformly.
+enum CooCoordsRef<'a> {
+    Int32(&'a arrow::array::Int32Array, &'a arrow::array::Int32Array),
+    Int64(&'a arrow::array::Int64Array, &'a arrow::array::Int64Array),
+}
+
+impl CooCoordsRef<'_> {
+    fn len(&self) -> usize {
+        use arrow::array::Array;
+        match self {
+            CooCoordsRef::Int32(r, _) => r.len(),
+            CooCoordsRef::Int64(r, _) => r.len(),
+        }
+    }
+
+    fn row_i64(&self, i: usize) -> i64 {
+        match self {
+            CooCoordsRef::Int32(r, _) => r.value(i) as i64,
+            CooCoordsRef::Int64(r, _) => r.value(i),
+        }
+    }
+
+    fn col_i64(&self, i: usize) -> i64 {
+        match self {
+            CooCoordsRef::Int32(_, c) => c.value(i) as i64,
+            CooCoordsRef::Int64(_, c) => c.value(i),
+        }
+    }
+}
+
+/// Extract the row/col columns of a pairwise COO RecordBatch, accepting
+/// either Int32 (v1 layout) or Int64 (v2 layout). Returns an error if
+/// the columns are not both Int32 or both Int64. The data column is
+/// validated separately by each caller.
+fn coo_coords_from_batch(batch: &RecordBatch) -> PyResult<CooCoordsRef<'_>> {
+    use arrow::array::{Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+    let row_dt = batch.column(0).data_type().clone();
+    let col_dt = batch.column(1).data_type().clone();
+    match (&row_dt, &col_dt) {
+        (DataType::Int32, DataType::Int32) => {
+            let r = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO row column claims Int32 but downcast failed")
+                })?;
+            let c = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO col column claims Int32 but downcast failed")
+                })?;
+            Ok(CooCoordsRef::Int32(r, c))
+        }
+        (DataType::Int64, DataType::Int64) => {
+            let r = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO row column claims Int64 but downcast failed")
+                })?;
+            let c = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO col column claims Int64 but downcast failed")
+                })?;
+            Ok(CooCoordsRef::Int64(r, c))
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "Pairwise COO RecordBatch has mismatched or unsupported coord dtypes \
+             (row={row_dt:?}, col={col_dt:?}); expected matching Int32 (v1) or Int64 (v2)."
+        ))),
+    }
+}
+
 /// Convert a scipy sparse matrix to a COO Arrow RecordBatch.
 ///
-/// The resulting batch has columns `row: Int32`, `col: Int32`, `data: Float32`
-/// (nnz rows) and schema metadata `n_rows` and `n_cols`.  Data is cast to
+/// The resulting batch has columns `row: Int32 | Int64`, `col: Int32 | Int64`,
+/// `data: Float32` (nnz rows) and schema metadata `n_rows` and `n_cols`.
+/// Coordinate width is chosen by [`coo_needs_int64_coords`] so files at
+/// sub-2^31 axes stay byte-identical to the v1 layout. Data is cast to
 /// float32; precision is reduced if the source uses float64.
 pub(crate) fn sparse_to_coo_record_batch(
     py: Python<'_>,
     mat: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
 
@@ -540,14 +634,41 @@ pub(crate) fn sparse_to_coo_record_batch(
     let shape: (usize, usize) = coo.getattr("shape")?.extract()?;
     let np = py.import("numpy")?;
 
-    let row: Vec<i32> = np
-        .call_method1("asarray", (coo.getattr("row")?,))?
-        .call_method1("astype", ("int32",))?
-        .extract()?;
-    let col: Vec<i32> = np
-        .call_method1("asarray", (coo.getattr("col")?,))?
-        .call_method1("astype", ("int32",))?
-        .extract()?;
+    let need_i64 = coo_needs_int64_coords(shape.0, shape.1);
+
+    let (row_col_dtype, row_array, col_array): (
+        DataType,
+        Arc<dyn arrow::array::Array>,
+        Arc<dyn arrow::array::Array>,
+    ) = if need_i64 {
+        let row: Vec<i64> = np
+            .call_method1("asarray", (coo.getattr("row")?,))?
+            .call_method1("astype", ("int64",))?
+            .extract()?;
+        let col: Vec<i64> = np
+            .call_method1("asarray", (coo.getattr("col")?,))?
+            .call_method1("astype", ("int64",))?
+            .extract()?;
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(row)),
+            Arc::new(Int64Array::from(col)),
+        )
+    } else {
+        let row: Vec<i32> = np
+            .call_method1("asarray", (coo.getattr("row")?,))?
+            .call_method1("astype", ("int32",))?
+            .extract()?;
+        let col: Vec<i32> = np
+            .call_method1("asarray", (coo.getattr("col")?,))?
+            .call_method1("astype", ("int32",))?
+            .extract()?;
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(row)),
+            Arc::new(Int32Array::from(col)),
+        )
+    };
     let data: Vec<f32> = np
         .call_method1("asarray", (coo.getattr("data")?,))?
         .call_method1("astype", ("float32",))?
@@ -555,8 +676,8 @@ pub(crate) fn sparse_to_coo_record_batch(
 
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
-            Field::new("row", DataType::Int32, false),
-            Field::new("col", DataType::Int32, false),
+            Field::new("row", row_col_dtype.clone(), false),
+            Field::new("col", row_col_dtype, false),
             Field::new("data", DataType::Float32, false),
         ],
         HashMap::from([
@@ -566,11 +687,7 @@ pub(crate) fn sparse_to_coo_record_batch(
     ));
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(row)),
-            Arc::new(Int32Array::from(col)),
-            Arc::new(Float32Array::from(data)),
-        ],
+        vec![row_array, col_array, Arc::new(Float32Array::from(data))],
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -578,11 +695,12 @@ pub(crate) fn sparse_to_coo_record_batch(
 /// Convert a COO Arrow RecordBatch back to a scipy.sparse.csr_matrix.
 ///
 /// Reads `row`, `col`, `data` columns and `n_rows`/`n_cols` schema metadata.
+/// Accepts both v1 (`Int32` row/col) and v2 (`Int64` row/col) layouts.
 pub(crate) fn coo_record_batch_to_scipy<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::Float32Array;
     use numpy::PyArray1;
 
     let meta = batch.schema().metadata().clone();
@@ -595,24 +713,23 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let coords = coo_coords_from_batch(batch)?;
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
 
-    let row_np = PyArray1::from_slice(py, row_arr.values());
-    let col_np = PyArray1::from_slice(py, col_arr.values());
+    let (row_np, col_np): (Bound<'_, PyAny>, Bound<'_, PyAny>) = match &coords {
+        CooCoordsRef::Int32(r, c) => (
+            PyArray1::from_slice(py, r.values()).into_any(),
+            PyArray1::from_slice(py, c.values()).into_any(),
+        ),
+        CooCoordsRef::Int64(r, c) => (
+            PyArray1::from_slice(py, r.values()).into_any(),
+            PyArray1::from_slice(py, c.values()).into_any(),
+        ),
+    };
     let data_np = PyArray1::from_slice(py, data_arr.values());
 
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -627,11 +744,19 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
 /// Returns a new batch containing only the entries whose row AND col are kept,
 /// with indices remapped to the user-visible 0..kept_rows.len() range and the
 /// `n_rows` / `n_cols` schema metadata updated to `kept_rows.len()`.
+///
+/// Width-generic: accepts both v1 (`Int32`) and v2 (`Int64`) COO inputs.
+/// Output width is chosen by [`coo_needs_int64_coords`] on `kept_rows.len()`
+/// so the remap shrinks the on-disk footprint when an extreme axis is filtered
+/// down. `kept_rows` MUST be sorted ascending — that is the construction
+/// invariant of `compose_kept_to_global` and lets the remap run as a
+/// `binary_search` instead of allocating a dense `Vec<i32>` of length `n_rows`
+/// (≈ 2.24 GB at 561M cells).
 pub(crate) fn filter_coo_obsp_by_kept_rows(
     batch: &RecordBatch,
     kept_rows: &[u64],
 ) -> PyResult<RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
 
@@ -645,77 +770,77 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let coords = coo_coords_from_batch(batch)?;
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
 
-    // Build original→user-visible remaps. -1 means dropped.
-    let mut row_remap = vec![-1i32; n_rows];
-    for (new_idx, &orig) in kept_rows.iter().enumerate() {
-        let orig_usize = orig as usize;
-        if orig_usize < n_rows {
-            row_remap[orig_usize] = new_idx as i32;
-        }
+    // Binary-search correctness requires sorted input. `kept_rows` is
+    // produced sorted by `compose_kept_to_global` today, but enforce in
+    // release too so a future unsorted caller fails loudly rather than
+    // silently dropping or misrouting entries.
+    if kept_rows.windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err(
+            "filter_coo_obsp_by_kept_rows requires kept_rows sorted ascending",
+        ));
     }
-    // For obsp the axes are identical, but n_cols may legitimately differ from
-    // n_rows on a malformed file — build the col remap independently.
-    let col_remap: Vec<i32> = if n_cols == n_rows {
-        row_remap.clone()
-    } else {
-        let mut r = vec![-1i32; n_cols];
-        for (new_idx, &orig) in kept_rows.iter().enumerate() {
-            let orig_usize = orig as usize;
-            if orig_usize < n_cols {
-                r[orig_usize] = new_idx as i32;
-            }
+    let kept_len = kept_rows.len();
+    let output_i64 = coo_needs_int64_coords(kept_len, kept_len);
+
+    // Binary-search remap: O(nnz log kept_len) time, zero extra memory
+    // beyond the kept_rows slice (which the caller already owns).
+    let remap = |orig: i64, axis_len: usize| -> Option<i64> {
+        if orig < 0 {
+            return None;
         }
-        r
+        let orig_u = orig as u64;
+        if (orig as usize) >= axis_len {
+            return None;
+        }
+        kept_rows.binary_search(&orig_u).ok().map(|i| i as i64)
     };
 
-    let nnz = row_arr.len();
-    let mut new_row: Vec<i32> = Vec::with_capacity(nnz);
-    let mut new_col: Vec<i32> = Vec::with_capacity(nnz);
-    let mut new_data: Vec<f32> = Vec::with_capacity(nnz);
-    let row_vals = row_arr.values();
-    let col_vals = col_arr.values();
+    let nnz = coords.len();
     let data_vals = data_arr.values();
+    let mut new_row_i64: Vec<i64> = Vec::with_capacity(nnz);
+    let mut new_col_i64: Vec<i64> = Vec::with_capacity(nnz);
+    let mut new_data: Vec<f32> = Vec::with_capacity(nnz);
     for k in 0..nnz {
-        let r = row_vals[k];
-        let c = col_vals[k];
-        if r < 0 || c < 0 {
-            continue;
-        }
-        let r_us = r as usize;
-        let c_us = c as usize;
-        if r_us >= n_rows || c_us >= n_cols {
-            continue;
-        }
-        let nr = row_remap[r_us];
-        let nc = col_remap[c_us];
-        if nr >= 0 && nc >= 0 {
-            new_row.push(nr);
-            new_col.push(nc);
-            new_data.push(data_vals[k]);
-        }
+        let r = coords.row_i64(k);
+        let c = coords.col_i64(k);
+        let Some(nr) = remap(r, n_rows) else { continue };
+        let Some(nc) = remap(c, n_cols) else { continue };
+        new_row_i64.push(nr);
+        new_col_i64.push(nc);
+        new_data.push(data_vals[k]);
     }
 
-    let kept_len = kept_rows.len();
+    let (row_dtype, row_array, col_array): (
+        DataType,
+        Arc<dyn arrow::array::Array>,
+        Arc<dyn arrow::array::Array>,
+    ) = if output_i64 {
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(new_row_i64)),
+            Arc::new(Int64Array::from(new_col_i64)),
+        )
+    } else {
+        let new_row_i32: Vec<i32> = new_row_i64.into_iter().map(|v| v as i32).collect();
+        let new_col_i32: Vec<i32> = new_col_i64.into_iter().map(|v| v as i32).collect();
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(new_row_i32)),
+            Arc::new(Int32Array::from(new_col_i32)),
+        )
+    };
+
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
-            Field::new("row", DataType::Int32, false),
-            Field::new("col", DataType::Int32, false),
+            Field::new("row", row_dtype.clone(), false),
+            Field::new("col", row_dtype, false),
             Field::new("data", DataType::Float32, false),
         ],
         HashMap::from([
@@ -725,11 +850,7 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
     ));
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(new_row)),
-            Arc::new(Int32Array::from(new_col)),
-            Arc::new(Float32Array::from(new_data)),
-        ],
+        vec![row_array, col_array, Arc::new(Float32Array::from(new_data))],
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -4342,28 +4463,76 @@ fn for_each_coo_shard<F>(
 where
     F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
 {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Array, Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     let invalid = |msg: String| {
         scx_format::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
     };
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| invalid("sparse override: column 0 must be Int32".into()))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| invalid("sparse override: column 1 must be Int32".into()))?;
+    // Width-generic: accept both v1 (Int32) and v2 (Int64) row/col columns,
+    // and emit shards with the same coord dtype as the input.
+    let row_dt = batch.column(0).data_type().clone();
+    let col_dt = batch.column(1).data_type().clone();
+    let coord_dt = match (&row_dt, &col_dt) {
+        (DataType::Int32, DataType::Int32) => DataType::Int32,
+        (DataType::Int64, DataType::Int64) => DataType::Int64,
+        _ => {
+            return Err(invalid(format!(
+                "sparse override: row/col dtypes must both be Int32 or both Int64 (got row={row_dt:?}, col={col_dt:?})"
+            )));
+        }
+    };
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| invalid("sparse override: column 2 must be Float32".into()))?;
+    let nnz = batch.column(0).len();
+
+    // Pull row/col as i64 for shard-bucketing math, regardless of width.
+    let row_i64: Box<dyn Fn(usize) -> i64> = match &coord_dt {
+        DataType::Int32 => {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .clone();
+            Box::new(move |i| arr.value(i) as i64)
+        }
+        DataType::Int64 => {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            Box::new(move |i| arr.value(i))
+        }
+        _ => unreachable!(),
+    };
+    let col_i64: Box<dyn Fn(usize) -> i64> = match &coord_dt {
+        DataType::Int32 => {
+            let arr = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .clone();
+            Box::new(move |i| arr.value(i) as i64)
+        }
+        DataType::Int64 => {
+            let arr = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            Box::new(move |i| arr.value(i))
+        }
+        _ => unreachable!(),
+    };
 
     let metadata = batch.schema_ref().metadata().clone();
     let n_rows: usize = metadata
@@ -4380,23 +4549,38 @@ where
         return f(0, 0, 0, 0, batch);
     }
 
+    // Bucket count scales with the logical row axis. For atlas-scale v2
+    // obsp (axis ≥ 2^31) this would allocate hundreds of thousands of
+    // empty `Vec`s up-front — fail fast with a clear message rather than
+    // silently OOM. Real callers either route through the streaming
+    // converter (which writes shards incrementally without this bucket
+    // table) or use Phase 6's dedicated huge-obsp path.
     let n_shards = n_rows.div_ceil(step);
-    let mut bucket_row: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut bucket_col: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    const MAX_BUCKETS: usize = 1_000_000;
+    if n_shards > MAX_BUCKETS {
+        return Err(invalid(format!(
+            "for_each_coo_shard: logical n_rows={n_rows} would require {n_shards} shard buckets \
+             (cap {MAX_BUCKETS}). Route this obsp / varp through the streaming converter \
+             or pre-split it into row bands before re-shading."
+        )));
+    }
+    let mut bucket_row: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut bucket_col: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
     let mut bucket_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    for i in 0..row_arr.len() {
-        let r = row_arr.value(i);
+    for i in 0..nnz {
+        let r = row_i64(i);
         if r < 0 {
             return Err(invalid(format!("sparse override: negative row index {r}")));
         }
-        let shard = (r as usize) / step;
+        let r_us = r as usize;
+        let shard = r_us / step;
         if shard >= n_shards {
             return Err(invalid(format!(
                 "sparse override: row {r} exceeds n_rows={n_rows}"
             )));
         }
         bucket_row[shard].push(r);
-        bucket_col[shard].push(col_arr.value(i));
+        bucket_col[shard].push(col_i64(i));
         bucket_data[shard].push(data_arr.value(i));
     }
 
@@ -4406,8 +4590,8 @@ where
         let n_shard_rows = step.min(n_rows - row_start);
         let schema = Arc::new(Schema::new_with_metadata(
             vec![
-                Field::new("row", DataType::Int32, false),
-                Field::new("col", DataType::Int32, false),
+                Field::new("row", coord_dt.clone(), false),
+                Field::new("col", coord_dt.clone(), false),
                 Field::new("data", DataType::Float32, false),
             ],
             std::collections::HashMap::from([
@@ -4415,11 +4599,34 @@ where
                 ("n_cols".to_string(), n_cols.to_string()),
             ]),
         ));
+        let row_i64_taken = std::mem::take(&mut bucket_row[shard_idx]);
+        let col_i64_taken = std::mem::take(&mut bucket_col[shard_idx]);
+        let (row_array, col_array): (Arc<dyn Array>, Arc<dyn Array>) = match &coord_dt {
+            DataType::Int32 => (
+                Arc::new(Int32Array::from(
+                    row_i64_taken
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    col_i64_taken
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            DataType::Int64 => (
+                Arc::new(Int64Array::from(row_i64_taken)),
+                Arc::new(Int64Array::from(col_i64_taken)),
+            ),
+            _ => unreachable!(),
+        };
         let shard_batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(std::mem::take(&mut bucket_row[shard_idx]))),
-                Arc::new(Int32Array::from(std::mem::take(&mut bucket_col[shard_idx]))),
+                row_array,
+                col_array,
                 Arc::new(Float32Array::from(std::mem::take(
                     &mut bucket_data[shard_idx],
                 ))),
