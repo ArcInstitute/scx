@@ -1,5 +1,7 @@
-//! Phase 2g — streaming merge & append regression suite for
-//! `MERGE-OBS-OFFSET-OVERFLOW.md`.
+//! Streaming merge & append regression suite. Covers the row-sharded
+//! obs / var metadata layout that replaces the legacy single-section
+//! Arrow IPC batches (which would overflow narrow `i32` offsets on
+//! atlas-scale string-heavy obs).
 //!
 //! Covers:
 //! - Merge of many inputs emitting `ObsMetadataShard` sections;
@@ -92,6 +94,52 @@ fn var_batch_reordered() -> RecordBatch {
     let gene_ids = StringArray::from(vec!["g0", "g2", "g1", "g3"]);
     let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(gene_ids)]).unwrap()
+}
+
+/// Obs batch carrying an extra `batch` column on top of the standard
+/// `cell_id` / `donor` columns. Used to trigger `OpsError::ObsMismatch`
+/// against `obs_batch`.
+fn obs_batch_with_extra_column(start_row: usize, n: usize, donor: &str) -> RecordBatch {
+    let cell_ids: Vec<String> = (start_row..start_row + n)
+        .map(|i| format!("cell_{i:07}"))
+        .collect();
+    let donors: Vec<String> = std::iter::repeat_n(donor.to_string(), n).collect();
+    let batch_vals: Vec<i32> = (0..n as i32).collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("donor", DataType::Utf8, false),
+        Field::new("batch", DataType::Int32, false),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(cell_ids)),
+            Arc::new(StringArray::from(donors)),
+            Arc::new(Int32Array::from(batch_vals)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Variant of `write_legacy_input` that takes an explicit obs batch.
+/// Used by obs-identity tests that need divergent obs schemas across
+/// inputs while keeping the same row count.
+fn write_legacy_input_with_obs(path: &std::path::Path, obs: &RecordBatch, var: &RecordBatch) {
+    let n_obs = obs.num_rows() as u64;
+    let mut writer = ScxWriter::new(path, header(n_obs, var.num_rows() as u64)).unwrap();
+    writer.write_obs(obs).unwrap();
+    writer.write_var(var).unwrap();
+    write_zero_csr_shard(&mut writer, 0, n_obs);
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "streaming_merge_append test fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
 }
 
 fn write_zero_csr_shard(writer: &mut ScxWriter, row_start: u64, n_rows: u64) {
@@ -226,6 +274,58 @@ fn merge_var_mismatch_assume_identical_var_proceeds() {
         "g1",
         "merged var must come from input 0 (canonical order)"
     );
+}
+
+#[test]
+fn merge_obs_mismatch_errors_by_default() {
+    // Default (assume_identical_obs = false): obs schema identity
+    // check rejects inputs whose obs columns differ. Without the
+    // check, mismatched shards write cleanly and only fail later
+    // inside `ScxReader::read_obs()` after the temp file has been
+    // renamed into place.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_legacy_input_with_obs(&p0, &obs_batch(0, 30, "donor_A"), &var_batch());
+    write_legacy_input_with_obs(
+        &p1,
+        &obs_batch_with_extra_column(30, 30, "donor_B"),
+        &var_batch(),
+    );
+    let out = dir.path().join("out.scx");
+    let err = scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap_err();
+    assert!(
+        matches!(err, scx_ops::OpsError::ObsMismatch { .. }),
+        "expected OpsError::ObsMismatch, got: {err:?}"
+    );
+    assert!(
+        !out.exists(),
+        "merge must not rename a temp output into place when obs validation fails"
+    );
+}
+
+#[test]
+fn merge_obs_mismatch_assume_identical_obs_proceeds() {
+    // With assume_identical_obs = true the obs identity check is
+    // skipped (a warning is logged instead). The merge proceeds; the
+    // resulting file may still fail later at `read_obs()` if the
+    // schemas truly disagree — the flag is documented as caller-
+    // trust escape hatch, not a fixer.
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    // Use the same obs schema on both inputs so the resulting file
+    // is still readable; the flag only affects whether the check runs.
+    write_legacy_input_with_obs(&p0, &obs_batch(0, 30, "donor_A"), &var_batch());
+    write_legacy_input_with_obs(&p1, &obs_batch(30, 30, "donor_B"), &var_batch());
+    let out = dir.path().join("out.scx");
+    let opts = scx_ops::MergeOptions {
+        assume_identical_obs: true,
+        ..Default::default()
+    };
+    scx_ops::merge_with_options(&[p0.as_path(), p1.as_path()], &out, &opts).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.n_obs(), 60);
 }
 
 #[test]
@@ -932,6 +1032,34 @@ fn obsm_batch(start_row: usize, n: usize) -> RecordBatch {
     .unwrap()
 }
 
+/// 3-column Float32 embedding — same shape as `obsm_batch` but one
+/// extra component. Used to trigger
+/// `OpsError::DenseMappingMismatch` when merging against an input
+/// that emits a 2-column embedding for the same key.
+fn obsm_batch_wider(start_row: usize, n: usize) -> RecordBatch {
+    let schema = Schema::new(vec![
+        Field::new("pc1", DataType::Float32, false),
+        Field::new("pc2", DataType::Float32, false),
+        Field::new("pc3", DataType::Float32, false),
+    ]);
+    let pc1: Vec<f32> = (start_row..start_row + n).map(|i| i as f32).collect();
+    let pc2: Vec<f32> = (start_row..start_row + n)
+        .map(|i| (i as f32) * 2.0)
+        .collect();
+    let pc3: Vec<f32> = (start_row..start_row + n)
+        .map(|i| (i as f32) * 3.0)
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Float32Array::from(pc1)),
+            Arc::new(Float32Array::from(pc2)),
+            Arc::new(Float32Array::from(pc3)),
+        ],
+    )
+    .unwrap()
+}
+
 /// 2-column Float32 varm batch covering rows `[0, n_vars)`. The standard
 /// 4-gene `var_batch()` has n_vars = 4, so tests use n_vars = 4 here too.
 fn varm_batch(n_vars: usize) -> RecordBatch {
@@ -1126,6 +1254,60 @@ fn merge_streams_global_obsm_without_assembly() {
     assert_eq!(pc1.value(109), 59.0); // input 1's last row
     assert_eq!(pc1.value(110), 0.0); // input 2's row 0
     assert_eq!(pc1.value(149), 39.0); // input 2's last row
+}
+
+#[test]
+fn merge_obsm_width_mismatch_errors() {
+    // Two inputs whose obsm["X_pca"] disagree on column count
+    // (2 vs 3 components). Pre-fix merge succeeded and the resulting
+    // file failed at `read_obsm()` time; the new validation rejects
+    // the mismatch before any obsm shard is written.
+    let dir = tempfile::tempdir().unwrap();
+    let var = var_batch();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+
+    // Input 0: standard 2-column obsm via the sharded helper.
+    write_sharded_input(&p0, 50, "donor_A", &var, 25, false, 0);
+
+    // Input 1: 3-column obsm written directly so we control the schema.
+    {
+        let n_obs = 50u64;
+        let mut writer = ScxWriter::new(&p1, header(n_obs, 4)).unwrap();
+        writer
+            .write_obs(&obs_batch(0, n_obs as usize, "donor_B"))
+            .unwrap();
+        writer.write_var(&var).unwrap();
+        write_zero_csr_shard(&mut writer, 0, n_obs);
+        let batch = obsm_batch_wider(0, n_obs as usize);
+        writer
+            .write_obsm_shard("X_pca", 0, 0, n_obs, n_obs, &batch)
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1710000000,
+                action: "convert".to_string(),
+                tool: "streaming_merge_append width-mismatch fixture".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    let out = dir.path().join("out.scx");
+    let err = scx_ops::merge(&[p0.as_path(), p1.as_path()], &out).unwrap_err();
+    match err {
+        scx_ops::OpsError::DenseMappingMismatch { axis, ref key, .. } => {
+            assert_eq!(axis, "obsm");
+            assert_eq!(key, "X_pca");
+        }
+        other => panic!("expected DenseMappingMismatch, got: {other:?}"),
+    }
+    assert!(
+        !out.exists(),
+        "merge must not produce an output file when obsm schemas disagree"
+    );
 }
 
 #[test]

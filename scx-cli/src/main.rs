@@ -339,6 +339,14 @@ enum Commands {
         /// silent column-axis corruption in the merged X matrix.
         #[arg(long, default_value_t = false)]
         assume_identical_var: bool,
+        /// Skip the obs schema identity check across inputs (column
+        /// names and dtypes, normalised through the logical-lossy
+        /// schema). Use when you've already verified the obs surface
+        /// upstream — otherwise mismatched obs columns produce a
+        /// merged file that errors at `read_obs()` time after the
+        /// output is renamed into place.
+        #[arg(long, default_value_t = false)]
+        assume_identical_obs: bool,
         /// Policy for combining `uns` (unstructured metadata) across
         /// inputs. `first` (default) keeps the first input's uns
         /// verbatim and drops the rest; `require-equal` errors if any
@@ -661,6 +669,7 @@ fn main() {
             index_preset,
             index_auto_threshold,
             assume_identical_var,
+            assume_identical_obs,
             uns_policy,
         } => merge::run_merge(
             &inputs,
@@ -672,6 +681,7 @@ fn main() {
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
             assume_identical_var,
+            assume_identical_obs,
             uns_policy,
         ),
         Commands::Query {

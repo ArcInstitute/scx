@@ -1785,6 +1785,7 @@ fn numpy_or_pandas_to_record_batch(
 ) -> PyResult<RecordBatch> {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use pyo3::types::PyBytes;
 
     let np = py.import("numpy")?;
     let np_ndarray = np.getattr("ndarray")?;
@@ -1803,33 +1804,28 @@ fn numpy_or_pandas_to_record_batch(
     let dtype = arr.getattr("dtype")?;
     let kind: String = dtype.getattr("kind")?.extract()?;
 
-    // Force C-contiguous so the flat buffer is row-major and we can
-    // recover column `c` as elements at strides of `n_cols` starting
-    // from `c` — single Python→Rust boundary crossing per column.
-    let arr_c = np.call_method1("ascontiguousarray", (arr,))?;
-    let shape: (usize, usize) = arr_c.getattr("shape")?.extract()?;
+    let shape: (usize, usize) = arr.getattr("shape")?.extract()?;
     let (n_rows, n_cols) = shape;
     let total = n_rows.saturating_mul(n_cols);
 
-    // Numeric dtypes are widened to the closest Arrow type we serialise
-    // round-trip via `pandas_to_record_batch`. Everything outside this
-    // set falls through to the pandas path so dtype handling stays in
+    // Numeric dtypes route to the fast path; everything else falls
+    // through to the pandas-backed builder so dtype handling stays in
     // one place.
-    let arrow_dtype: DataType = match kind.as_str() {
+    let target: &str = match kind.as_str() {
         "f" => {
             let dtype_str: String = dtype.getattr("str")?.extract()?;
             if dtype_str.ends_with("f4") {
-                DataType::Float32
+                "float32"
             } else {
-                DataType::Float64
+                "float64"
             }
         }
         "i" => {
             let dtype_str: String = dtype.getattr("str")?.extract()?;
             if dtype_str.ends_with("i4") {
-                DataType::Int32
+                "int32"
             } else {
-                DataType::Int64
+                "int64"
             }
         }
         _ => {
@@ -1839,61 +1835,80 @@ fn numpy_or_pandas_to_record_batch(
         }
     };
 
+    // Transpose then `ascontiguousarray` so the flat buffer is
+    // column-major relative to the input shape — column `c` lives in a
+    // contiguous range `[c * n_rows, (c+1) * n_rows)`. Compared to the
+    // legacy `.reshape(-1).tolist()` + strided indexing, this skips
+    // both the per-element Python scalar allocation and the per-column
+    // strided Rust loop. The `astype(..., copy=False)` enforces native
+    // byte order (no copy when the dtype already matches).
+    let arr_t = arr.getattr("T")?;
+    let arr_cast = arr_t.call_method(
+        "astype",
+        (target,),
+        Some(&{
+            let kw = pyo3::types::PyDict::new(py);
+            kw.set_item("copy", false)?;
+            kw
+        }),
+    )?;
+    let arr_c = np.call_method1("ascontiguousarray", (arr_cast,))?;
+    let bytes_obj = arr_c.call_method0("tobytes")?;
+    let bytes: &[u8] = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+
     let mut fields = Vec::with_capacity(n_cols);
     let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(n_cols);
 
-    match arrow_dtype {
-        DataType::Float32 => {
-            let cast = arr_c.call_method1("astype", ("float32",))?;
-            let flat: Vec<f32> = cast
-                .call_method1("reshape", ((-1i64,),))?
-                .call_method0("tolist")?
-                .extract()?;
-            debug_assert_eq!(flat.len(), total);
+    match target {
+        "float32" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(4));
+            let flat: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
             for c in 0..n_cols {
-                let v: Vec<f32> = (0..n_rows).map(|r| flat[r * n_cols + c]).collect();
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
                 fields.push(Field::new(c.to_string(), DataType::Float32, false));
                 columns.push(Arc::new(Float32Array::from(v)));
             }
         }
-        DataType::Float64 => {
-            let flat: Vec<f64> = arr_c
-                .call_method1("reshape", ((-1i64,),))?
-                .call_method0("tolist")?
-                .extract()?;
-            debug_assert_eq!(flat.len(), total);
+        "float64" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(8));
+            let flat: Vec<f64> = bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
             for c in 0..n_cols {
-                let v: Vec<f64> = (0..n_rows).map(|r| flat[r * n_cols + c]).collect();
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
                 fields.push(Field::new(c.to_string(), DataType::Float64, false));
                 columns.push(Arc::new(Float64Array::from(v)));
             }
         }
-        DataType::Int32 => {
-            let cast = arr_c.call_method1("astype", ("int32",))?;
-            let flat: Vec<i32> = cast
-                .call_method1("reshape", ((-1i64,),))?
-                .call_method0("tolist")?
-                .extract()?;
-            debug_assert_eq!(flat.len(), total);
+        "int32" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(4));
+            let flat: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
             for c in 0..n_cols {
-                let v: Vec<i32> = (0..n_rows).map(|r| flat[r * n_cols + c]).collect();
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
                 fields.push(Field::new(c.to_string(), DataType::Int32, false));
                 columns.push(Arc::new(Int32Array::from(v)));
             }
         }
-        DataType::Int64 => {
-            let flat: Vec<i64> = arr_c
-                .call_method1("reshape", ((-1i64,),))?
-                .call_method0("tolist")?
-                .extract()?;
-            debug_assert_eq!(flat.len(), total);
+        "int64" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(8));
+            let flat: Vec<i64> = bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
             for c in 0..n_cols {
-                let v: Vec<i64> = (0..n_rows).map(|r| flat[r * n_cols + c]).collect();
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
                 fields.push(Field::new(c.to_string(), DataType::Int64, false));
                 columns.push(Arc::new(Int64Array::from(v)));
             }
         }
-        _ => unreachable!("arrow_dtype is one of f32/f64/i32/i64 here"),
+        _ => unreachable!("target is one of f32/f64/i32/i64"),
     }
 
     let schema = Arc::new(Schema::new(fields));

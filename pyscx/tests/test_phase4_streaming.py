@@ -139,6 +139,41 @@ def test_from_anndata_streams_obsm_varm_obsp_varp_round_trip(tmp_path):
     assert out_varp.nnz == src_varp.nnz
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [np.float32, np.float64, np.int32, np.int64],
+    ids=["f32", "f64", "i32", "i64"],
+)
+def test_from_anndata_obsm_dtype_round_trip(tmp_path, dtype):
+    """All four `numpy_or_pandas_to_record_batch` fast-path dtypes
+    must round-trip through SCX byte-identically. The `.tobytes()` +
+    transpose path is sensitive to (a) byte ordering and (b) per-column
+    extraction logic; either bug shows up as wrong values per cell.
+    """
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 40, 5
+    adata = _build_adata(n_obs=n_obs, n_vars=n_vars, with_obsm=False)
+    # Build a 2-D embedding of the parametrised dtype. Use small ints
+    # so int32/int64 round-trip exactly under astype.
+    if np.issubdtype(dtype, np.floating):
+        embedding = rng.standard_normal((n_obs, 6)).astype(dtype)
+    else:
+        embedding = rng.integers(-1_000, 1_000, size=(n_obs, 6)).astype(dtype)
+    adata.obsm["embed"] = embedding
+    out = str(tmp_path / f"embed_{dtype.__name__}.scx")
+    pyscx.from_anndata(adata, out)
+
+    ad = pyscx.open(out).to_anndata(eager=True)
+    got = ad.obsm["embed"]
+    if np.issubdtype(dtype, np.floating):
+        np.testing.assert_allclose(got, embedding, rtol=1e-6)
+    else:
+        # Integer dtypes must round-trip exactly through the fast path.
+        np.testing.assert_array_equal(got.astype(dtype), embedding)
+
+
 def test_mapping_peak_footprint_high_warning_fires(tmp_path):
     """Phase 4b: tiny `memory_budget` triggers MappingPeakFootprintHigh."""
     import pyscx

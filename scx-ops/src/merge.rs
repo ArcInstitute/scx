@@ -30,8 +30,10 @@ use crate::predicate_index::{
 /// merged file in the same pass.
 pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
     // `index_auto_threshold = 0` is the sentinel that disables all
-    // index work (no forced columns, no preset, no auto-detect). Keeps
-    // legacy `merge(...)` byte-identical to its pre-fix behaviour.
+    // index work (no forced columns, no preset, no auto-detect). The
+    // bare `merge(...)` entry now also enforces the default var- and
+    // obs-identity checks via `MergeOptions::default()` — pre-strict
+    // pipelines opt back in via the richer entry point.
     merge_with_index_options(
         input_paths,
         output_path,
@@ -73,9 +75,19 @@ pub fn merge_with_index_options(
 
 /// Richest merge entry point. Accepts the full [`MergeOptions`]
 /// surface: predicate-index configuration, var-identity strictness,
-/// uns-conflict policy, and shard-target overrides. The flat
-/// [`merge_with_index_options`] / [`merge`] entry points delegate to
-/// this function with the legacy defaults baked in.
+/// obs-schema strictness, uns-conflict policy, and shard-target
+/// overrides. The flat [`merge_with_index_options`] / [`merge`]
+/// entry points delegate to this function with the legacy defaults
+/// baked in.
+///
+/// Peak RSS: legacy single-section obs inputs go through
+/// [`input_obs_chunks`], which calls `read_obs()` once per input to
+/// load the full obs batch before slicing it into shard-sized
+/// chunks. Peak memory is therefore bounded by the largest
+/// individual input's obs payload — not by the merged total — and
+/// the output is still emitted shard-by-shard. Already-sharded
+/// inputs stream without that one-shot read. Mixed inputs hit the
+/// worst case only for their legacy members.
 pub fn merge_with_options(
     input_paths: &[&Path],
     output_path: &Path,
@@ -140,7 +152,7 @@ pub fn merge_with_options(
         // emit a single `PredicateIndexSkippedMultimodal` warning.
         let multimodal_skip =
             user_wants_index(index_options).then(|| requested_columns(index_options));
-        merge_multimodal(&readers, input_paths, output_path)?;
+        merge_multimodal(&readers, input_paths, output_path, options)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
             multimodal_skip,
@@ -224,6 +236,19 @@ pub fn merge_with_options(
     let unified_obs_schema = first_input_obs_schema(&readers)?;
     let var = readers[0].read_var().map_err(OpsError::Format)?;
     validate_var_identity(&readers, &var, options.assume_identical_var)?;
+
+    // Obs schema identity is checked through the logical-lossy schema
+    // so legacy single-section inputs (typically narrow `Utf8`) and
+    // already-sharded inputs (typically `LargeUtf8` post-upcast) line
+    // up. Schema-only — row contents intentionally differ.
+    let first_obs_schema_lossy = readers[0]
+        .read_obs_schema_logical_lossy()
+        .map_err(OpsError::Format)?;
+    validate_obs_identity(
+        &readers,
+        &first_obs_schema_lossy,
+        options.assume_identical_obs,
+    )?;
 
     // Fail fast if forced index columns are missing from the unified
     // schemas — before any output bytes are written.
@@ -516,10 +541,11 @@ pub fn merge_with_options(
         action: "merge".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
         params_json: format!(
-            "{{\"n_inputs\":{},\"assume_identical_var\":{},\"uns_policy\":\"{}\",\
-             \"uns_conflicts_warned\":{}}}",
+            "{{\"n_inputs\":{},\"assume_identical_var\":{},\"assume_identical_obs\":{},\
+             \"uns_policy\":\"{}\",\"uns_conflicts_warned\":{}}}",
             input_paths.len(),
             options.assume_identical_var,
+            options.assume_identical_obs,
             options.uns_policy.as_str(),
             uns_conflicts_warned,
         ),
@@ -546,15 +572,32 @@ pub fn merge_with_options(
 /// concatenated in input order with `row_start` adjusted for the
 /// cumulative global obs offset; global `obsm` and per-modality
 /// `obsm` are concatenated row-wise (any key missing in any input is
-/// dropped, matching single-modality semantics); per-modality var
-/// and per-modality / global `uns` are copied from the first input
-/// (var is already validated identical by the modality-table check;
-/// uns is treated as a single source of truth). Per-modality CSC
+/// dropped, matching single-modality semantics). Per-modality CSC
 /// sidecars are dropped (caller can `--rebuild-csc`).
+///
+/// Honours [`MergeOptions`] in full:
+/// * `assume_identical_var` gates the per-modality var-identity
+///   check (each modality's var is validated independently against
+///   input 0).
+/// * `assume_identical_obs` gates the global obs schema check.
+/// * `shard_target_rows` overrides the obs-shard target on the
+///   merged output.
+/// * `uns_policy` applies independently to global uns and to each
+///   modality's uns; the conflict counter aggregates across both
+///   levels and lands in the merge provenance entry.
+///
+/// Predicate-index construction is intentionally skipped — the
+/// dispatch in `merge_with_options` records the skip so the caller
+/// emits a single `PredicateIndexSkippedMultimodal` warning.
+///
+/// Peak RSS for all-legacy obs inputs is bounded by one input's
+/// `read_obs()` plus the in-flight output shard (sharded inputs
+/// stream directly without that materialisation).
 fn merge_multimodal(
     readers: &[ScxReader],
     input_paths: &[&Path],
     output_path: &Path,
+    options: &MergeOptions,
 ) -> Result<()> {
     let table = readers[0]
         .modality_table()
@@ -620,16 +663,22 @@ fn merge_multimodal(
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
 
+    // Validate global obs schema across all inputs before any output
+    // bytes are written. Mirrors the single-modality call site.
+    let first_obs_schema_lossy = readers[0]
+        .read_obs_schema_logical_lossy()
+        .map_err(OpsError::Format)?;
+    validate_obs_identity(
+        readers,
+        &first_obs_schema_lossy,
+        options.assume_identical_obs,
+    )?;
+
     // Phase 2b: Global obs streams shard-by-shard exactly as the
-    // single-modality path does (see `merge_with_options`). The
-    // multimodal merge_multimodal entry currently doesn't surface
-    // `MergeOptions` to its callers — the orchestrator
-    // (`merge_with_options`) doesn't pass policy fields here because
-    // multimodal merge has a separate uns / var ownership model
-    // (per-modality var, per-modality uns). Stream obs with the
-    // default shard target from the first input and skip var-identity
-    // / uns-policy enforcement (handled per-modality below).
-    let shard_target_rows: u64 = first_header.shard_target_rows as u64;
+    // single-modality path does (see `merge_with_options`).
+    let shard_target_rows: u64 = options
+        .shard_target_rows
+        .unwrap_or(first_header.shard_target_rows) as u64;
     let mut out_shard_idx: u32 = 0;
     let mut cumulative_obs_rows: u64 = 0;
     for reader in readers {
@@ -668,10 +717,21 @@ fn merge_multimodal(
         writer.set_modality_n_vars(writer.n_modalities() as u8, info.n_vars)?;
     }
 
-    // Per-modality var (from first input — already validated identical).
+    // Per-modality var: validate every input's var matches input 0
+    // (column-by-column, not just `n_vars`), then write input 0's
+    // copy. The modality-table check only confirms shape + name —
+    // it can't catch reordered genes or differing feature IDs.
     for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
-        let var = readers[0].read_var_for(modality_id)?;
+        let var = readers[0]
+            .read_var_for(modality_id)
+            .map_err(OpsError::Format)?;
+        validate_var_identity_for_modality(
+            readers,
+            modality_id,
+            &var,
+            options.assume_identical_var,
+        )?;
         writer.write_var_for(modality_id, &var)?;
         let _ = info; // suppress unused if no other field needed
     }
@@ -868,17 +928,30 @@ fn merge_multimodal(
         }
     }
 
-    // Per-modality uns: copy from first input (single source of truth).
+    // Per-modality uns: apply `options.uns_policy` independently at
+    // each modality level. A modality whose readers all lack a uns
+    // section emits no section (matches today's behaviour). Conflicts
+    // aggregate into the same counter as the global level so the
+    // single provenance entry reflects total drift across the file.
+    let mut uns_conflicts_warned: usize = 0;
     for (idx, _info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
-        if let Ok(uns) = readers[0].read_uns_for(modality_id) {
-            writer.write_uns_for(modality_id, &uns)?;
+        let per_input: Vec<Option<serde_json::Value>> = readers
+            .iter()
+            .map(|r| r.read_uns_for(modality_id).ok())
+            .collect();
+        if let Some(combined) =
+            combine_uns_per_input(&per_input, options.uns_policy, &mut uns_conflicts_warned)?
+        {
+            writer.write_uns_for(modality_id, &combined)?;
         }
     }
 
-    // Global uns from first input.
-    if let Ok(uns) = readers[0].read_uns() {
-        writer.write_uns(&uns)?;
+    // Global uns: same policy applied at the global level.
+    if let Some(combined) =
+        combine_uns_for_merge(readers, options.uns_policy, &mut uns_conflicts_warned)?
+    {
+        writer.write_uns(&combined)?;
     }
 
     // Provenance: concatenate input chains, then stamp merge op.
@@ -895,7 +968,15 @@ fn merge_multimodal(
             .as_secs() as i64,
         action: "merge".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: format!("{{\"n_inputs\":{}}}", input_paths.len()),
+        params_json: format!(
+            "{{\"n_inputs\":{},\"assume_identical_var\":{},\"assume_identical_obs\":{},\
+             \"uns_policy\":\"{}\",\"uns_conflicts_warned\":{}}}",
+            input_paths.len(),
+            options.assume_identical_var,
+            options.assume_identical_obs,
+            options.uns_policy.as_str(),
+            uns_conflicts_warned,
+        ),
         input_checksums: readers
             .iter()
             .map(|r| {
@@ -1036,6 +1117,175 @@ fn var_diff(a: &RecordBatch, b: &RecordBatch) -> Option<String> {
         }
     }
     None
+}
+
+/// Per-modality counterpart to [`validate_var_identity`]. Reads
+/// each input's `var_for(modality_id)` and compares it to the first
+/// input's. `assume_identical` downgrades errors to log warnings —
+/// same semantics and CLI flag wiring as the global path.
+fn validate_var_identity_for_modality(
+    readers: &[ScxReader],
+    modality_id: u8,
+    first_var: &RecordBatch,
+    assume_identical: bool,
+) -> Result<()> {
+    for (i, reader) in readers.iter().enumerate().skip(1) {
+        let other = reader.read_var_for(modality_id).map_err(OpsError::Format)?;
+        if let Some(detail) = var_diff(first_var, &other) {
+            if assume_identical {
+                log::warn!(
+                    "merge: input {i}'s var (modality_id={modality_id}) differs from input 0 \
+                     (--assume-identical-var in effect; using input 0's var verbatim): {detail}"
+                );
+            } else {
+                return Err(OpsError::VarMismatch {
+                    detail: format!("modality_id={modality_id}: input 0 vs input {i}: {detail}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every input agrees with the first input on obs
+/// schema (column names + dtypes, normalised through the
+/// logical-lossy schema so `Utf8` and `LargeUtf8` count as the same
+/// column). Each pairwise mismatch produces a
+/// [`OpsError::ObsMismatch`] unless `assume_identical` is true — in
+/// which case the function logs a warning per mismatch and trusts
+/// the caller's assertion that columns line up.
+///
+/// Schema-only (no content comparison): obs row content
+/// intentionally differs across merge inputs — that's the whole
+/// point. The check that matters is that the per-shard schemas line
+/// up well enough for [`ScxReader::read_obs`]'s `concat_batches` to
+/// succeed after the merge completes.
+fn validate_obs_identity(
+    readers: &[ScxReader],
+    first_schema: &arrow::datatypes::Schema,
+    assume_identical: bool,
+) -> Result<()> {
+    for (i, reader) in readers.iter().enumerate().skip(1) {
+        let other = reader
+            .read_obs_schema_logical_lossy()
+            .map_err(OpsError::Format)?;
+        if let Some(detail) = schema_field_diff(first_schema, &other) {
+            if assume_identical {
+                log::warn!(
+                    "merge: input {i}'s obs schema differs from input 0 \
+                     (--assume-identical-obs in effect; trusting columns line up): {detail}"
+                );
+            } else {
+                return Err(OpsError::ObsMismatch {
+                    detail: format!("input 0 vs input {i}: {detail}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compare two schemas field-by-field (names + dtypes). Returns
+/// `None` when they line up, or a human-readable description of the
+/// first observed difference. Used by both obs identity validation
+/// (where widths are normalised through `read_obs_schema_logical_lossy`)
+/// and dense-mapping schema validation.
+fn schema_field_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema) -> Option<String> {
+    let a_names: Vec<&str> = a.fields().iter().map(|f| f.name().as_str()).collect();
+    let b_names: Vec<&str> = b.fields().iter().map(|f| f.name().as_str()).collect();
+    if a_names.len() != b_names.len() {
+        return Some(format!(
+            "column count differs ({} vs {})",
+            a_names.len(),
+            b_names.len(),
+        ));
+    }
+    if a_names != b_names {
+        return Some(format!(
+            "column names differ ({:?} vs {:?})",
+            a_names, b_names,
+        ));
+    }
+    for (af, bf) in a.fields().iter().zip(b.fields().iter()) {
+        if af.data_type() != bf.data_type() {
+            return Some(format!(
+                "column '{}' dtype differs ({:?} vs {:?})",
+                af.name(),
+                af.data_type(),
+                bf.data_type(),
+            ));
+        }
+    }
+    None
+}
+
+/// Resolve which catalog entry to read first for a given input's
+/// dense-mapping presence — used by [`validate_dense_mapping_schemas`]
+/// to compare across inputs without re-implementing the legacy-vs-
+/// sharded fallback at every call site.
+fn dense_mapping_first_entry<'a>(
+    per_input_entry: &'a (
+        usize,
+        Vec<&scx_format::catalog::FullCatalogEntry>,
+        Option<&scx_format::catalog::FullCatalogEntry>,
+    ),
+) -> &'a scx_format::catalog::FullCatalogEntry {
+    if let Some(legacy) = per_input_entry.2 {
+        return legacy;
+    }
+    per_input_entry
+        .1
+        .iter()
+        .min_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
+        .copied()
+        .expect("per_input is only populated when the input has at least one shard or legacy entry")
+}
+
+/// Compare each input's first dense-mapping batch schema against
+/// input 0's for a shared key. Catches mismatched embedding widths
+/// (e.g. PCA 50 vs 100) or dtype drift before any shard is written
+/// — without that, the merge succeeds and only fails later when
+/// `ScxReader::read_obsm()` tries to concatenate heterogeneous
+/// shards.
+///
+/// Reads one batch per input per shared key (small bounded cost: a
+/// shard's worth of float / int data, typically tens of KB). The
+/// subsequent write loop re-reads the same entry; we accept the
+/// duplicate read to keep the validation surface readable.
+fn validate_dense_mapping_schemas(
+    axis: &'static str,
+    key: &str,
+    source_readers: &[ScxReader],
+    per_input: &[(
+        usize,
+        Vec<&scx_format::catalog::FullCatalogEntry>,
+        Option<&scx_format::catalog::FullCatalogEntry>,
+    )],
+) -> Result<()> {
+    if per_input.len() < 2 {
+        return Ok(());
+    }
+    let first_entry = dense_mapping_first_entry(&per_input[0]);
+    let first_reader = &source_readers[per_input[0].0];
+    let first_batch = first_reader
+        .read_dense_mapping_entry(first_entry)
+        .map_err(OpsError::Format)?;
+    let first_schema = first_batch.schema();
+    for per in &per_input[1..] {
+        let other_entry = dense_mapping_first_entry(per);
+        let other_reader = &source_readers[per.0];
+        let other_batch = other_reader
+            .read_dense_mapping_entry(other_entry)
+            .map_err(OpsError::Format)?;
+        if let Some(detail) = schema_field_diff(&first_schema, &other_batch.schema()) {
+            return Err(OpsError::DenseMappingMismatch {
+                axis,
+                key: key.to_string(),
+                detail: format!("input 0 vs input {}: {}", per.0, detail),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Construct the streaming obs predicate-index builder using the same
@@ -1187,6 +1437,12 @@ fn merge_global_dense_mapping_sharded(
             }
             per_input.push((idx, shards, legacy));
         }
+
+        // Validate every input's first batch schema against input 0's
+        // before writing any shard for this key. Catches embedding-
+        // width / dtype drift (e.g. PCA 50 vs 100) at merge time
+        // rather than at `read_obsm()` time.
+        validate_dense_mapping_schemas(prefix, key, source_readers, &per_input)?;
 
         // All inputs present — stream-write the merged shard chain.
         let mut out_shard_idx: u32 = 0;
@@ -1340,6 +1596,9 @@ fn merge_per_modality_dense_mapping_sharded(
             per_input.push((idx, shards, legacy));
         }
 
+        // Mirror the global helper's pre-write schema validation.
+        validate_dense_mapping_schemas(prefix, key, source_readers, &per_input)?;
+
         let mut out_shard_idx: u32 = 0;
         let mut cumulative_rows: u64 = 0;
         for (idx, shards, legacy) in &per_input {
@@ -1464,17 +1723,26 @@ fn combine_uns_for_merge(
     policy: crate::merge_options::UnsPolicy,
     conflicts_warned: &mut usize,
 ) -> Result<Option<serde_json::Value>> {
-    use crate::merge_options::UnsPolicy;
+    // Collect each input's global uns (or `None` when absent) and
+    // hand off to the per-input combiner. Splitting the read step out
+    // lets the per-modality multimodal path reuse the same policy
+    // logic with `read_uns_for(modality_id)`.
+    let per_input: Vec<Option<serde_json::Value>> =
+        readers.iter().map(|r| r.read_uns().ok()).collect();
+    combine_uns_per_input(&per_input, policy, conflicts_warned)
+}
 
-    // Collect each input's uns (or `None` when absent). We need the
-    // full set for any policy that compares across inputs.
-    let mut per_input: Vec<Option<serde_json::Value>> = Vec::with_capacity(readers.len());
-    for reader in readers {
-        match reader.read_uns() {
-            Ok(v) => per_input.push(Some(v)),
-            Err(_) => per_input.push(None),
-        }
-    }
+/// Lower-level uns merge: combine an already-collected
+/// `per_input` vec under the given [`UnsPolicy`]. Used by
+/// [`combine_uns_for_merge`] for global uns and by the multimodal
+/// merge path for each modality's uns. `None` entries represent
+/// inputs that had no uns section.
+fn combine_uns_per_input(
+    per_input: &[Option<serde_json::Value>],
+    policy: crate::merge_options::UnsPolicy,
+    conflicts_warned: &mut usize,
+) -> Result<Option<serde_json::Value>> {
+    use crate::merge_options::UnsPolicy;
 
     // Pull out the first non-None as the canonical body for `First` /
     // `Summary`; bail early when no input has uns.

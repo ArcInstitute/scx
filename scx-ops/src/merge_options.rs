@@ -6,10 +6,14 @@
 
 use scx_engine::ConversionPredicateIndexOptions;
 
-/// Top-level merge configuration. Default reproduces today's behaviour
-/// (no predicate-index work, accept var identity on count alone, keep
-/// first input's uns) so callers that didn't opt in stay byte-identical
-/// across the Phase 2 refactor.
+/// Top-level merge configuration. Default skips predicate-index
+/// construction, validates var and obs identity strictly, and keeps
+/// the first input's uns. The defaults trade off backward
+/// compatibility for safety: the count-only var check used to permit
+/// silent column-axis corruption, and the new defaults reject that
+/// class of input. Pipelines that need the permissive pre-Phase-2
+/// behaviour opt back in via `assume_identical_var` /
+/// `assume_identical_obs`.
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
     /// Predicate-index build configuration. Threaded down to
@@ -22,13 +26,33 @@ pub struct MergeOptions {
     /// When `true`, skip the var identity check (column names, types,
     /// row order) and trust callers' assertion that every input shares
     /// an identical var table. Equivalent to today's silent
-    /// behaviour. Default `false` — Phase 2 strictness, which would
-    /// otherwise silently corrupt the column axis when inputs disagree
-    /// on gene order (see Issue 9 in MERGE-OBS-OFFSET-OVERFLOW.md).
+    /// behaviour. Default `false` — strict by default, because two
+    /// inputs that happen to agree on `n_vars` but disagree on gene
+    /// order (or carry different gene IDs / feature names) produce
+    /// silent column-axis corruption: every later input's X indices
+    /// get reinterpreted against the first input's var table. The
+    /// count-only check that ran before this flag landed could not
+    /// catch that.
     pub assume_identical_var: bool,
+
+    /// When `true`, skip the obs schema identity check (column names
+    /// and dtypes, normalised through the logical-lossy schema so
+    /// `Utf8` and `LargeUtf8` count as the same column). Default
+    /// `false`. Without this guard a later input with extra columns,
+    /// reordered columns, or a dtype change writes heterogeneous obs
+    /// shards that `ScxReader::read_obs()` rejects at concat time —
+    /// after the temp file has already been renamed into place. Set
+    /// to `true` only when callers have already verified the obs
+    /// surface upstream.
+    pub assume_identical_obs: bool,
 
     /// Policy for combining `uns` (unstructured metadata) across
     /// inputs. Default [`UnsPolicy::First`] = today's behaviour.
+    /// `uns` is free-form (preprocessing parameters, model metadata,
+    /// colour palettes, source-specific annotations) so silently
+    /// keeping only the first input's payload can drop downstream-
+    /// relevant data; the policy lets the caller name a non-default
+    /// merge strategy explicitly.
     pub uns_policy: UnsPolicy,
 
     /// Override `shard_target_rows` for the output's obs metadata
@@ -48,6 +72,7 @@ impl Default for MergeOptions {
                 index_auto_threshold: 0,
             },
             assume_identical_var: false,
+            assume_identical_obs: false,
             uns_policy: UnsPolicy::default(),
             shard_target_rows: None,
         }
@@ -63,6 +88,7 @@ impl MergeOptions {
         Self {
             index_options,
             assume_identical_var: false,
+            assume_identical_obs: false,
             uns_policy: UnsPolicy::First,
             shard_target_rows: None,
         }
@@ -70,7 +96,7 @@ impl MergeOptions {
 }
 
 /// Policy for combining `uns` (unstructured) sections across merge
-/// inputs. See Issue 9 in MERGE-OBS-OFFSET-OVERFLOW.md.
+/// inputs.
 ///
 /// `uns` is typically a free-form JSON blob carrying preprocessing
 /// parameters, model metadata, colour palettes, and source-specific

@@ -1179,7 +1179,7 @@ pub fn build_obs_predicate_index_bytes(
 /// The single-batch entry point requires the full obs `RecordBatch` to
 /// be assembled in memory before predicate-index construction starts,
 /// which defeats the purpose of the row-sharded obs layout introduced
-/// for atlas-scale merges and appends (see [`MERGE-OBS-OFFSET-OVERFLOW.md`]).
+/// for atlas-scale merges and appends.
 /// The builder accepts shards one at a time via [`Self::push_shard`]
 /// and finalises into the same serialised bytes blob at [`Self::finish`].
 ///

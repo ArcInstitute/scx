@@ -79,13 +79,13 @@ impl SectionReader for CloudSectionReader {
     }
 
     fn read_obs(&self) -> scx_engine::Result<RecordBatch> {
-        // Cloud reader doesn't yet implement sharded obs assembly
-        // (that's part of MERGE-OBS-OFFSET-OVERFLOW.md Phase 6b —
-        // cloud-native incremental predicate index across appended
-        // shards). For now the cloud path stays on the single-section
-        // read; cloud files written before Phase 2 are guaranteed
-        // single-section, and Phase 2-written sharded files won't open
-        // via the cloud path until Phase 6b.
+        // Cloud reader doesn't yet implement sharded obs assembly —
+        // separate work item for the cloud-native incremental
+        // predicate index across appended shards. For now the cloud
+        // path stays on the single-section read; cloud files written
+        // before the sharded-obs layout are guaranteed single-section,
+        // and sharded files won't open via the cloud path until that
+        // work lands.
         self.rt
             .block_on(self.inner.read_obs())
             .map_err(cloud_to_engine)

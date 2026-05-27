@@ -20,6 +20,7 @@ pub fn run_merge(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
     assume_identical_var: bool,
+    assume_identical_obs: bool,
     uns_policy: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
@@ -80,15 +81,16 @@ pub fn run_merge(
 
     // Route to `merge_with_options` whenever any non-default
     // policy or index flag is set; fall back to the bare `merge`
-    // wrapper otherwise so the unchanged-default callers stay
-    // byte-identical with the pre-Phase-2 path apart from the
-    // sharded obs layout. `--index-auto-threshold N` alone reaches
-    // the engine.
+    // wrapper otherwise. Both paths now enforce the default var- and
+    // obs-identity checks; the routing only affects how policy
+    // overrides + index work flow through. `--index-auto-threshold
+    // N` alone reaches the engine.
     let any_index_flag = !index_obs.is_empty()
         || !index_var.is_empty()
         || index_preset.is_some()
         || index_auto_threshold.is_some();
-    let any_policy_flag = assume_identical_var || uns_policy != UnsPolicy::First;
+    let any_policy_flag =
+        assume_identical_var || assume_identical_obs || uns_policy != UnsPolicy::First;
     if any_index_flag || any_policy_flag {
         let index_options = ConversionPredicateIndexOptions {
             index_obs,
@@ -99,6 +101,7 @@ pub fn run_merge(
         let merge_opts = MergeOptions {
             index_options,
             assume_identical_var,
+            assume_identical_obs,
             uns_policy,
             shard_target_rows: None,
         };
