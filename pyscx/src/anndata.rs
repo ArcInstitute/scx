@@ -26,6 +26,49 @@ use crate::to_pyerr;
 /// transpose working set.
 const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Default memory budget for the eager [`to_anndata`] full-assembly
+/// path (Phase 4d). Estimated bytes above this threshold trigger a
+/// `UserWarning` that recommends `to_anndata(backed=True)` or
+/// `pyscx.open(path).query()`. Assembly still proceeds — the warning
+/// is advisory.
+const DEFAULT_EAGER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Catalog-only estimate of the bytes required to assemble the full X
+/// matrix plus obs / var metadata into an in-memory AnnData. Sums
+/// `nnz × 16` for CSR shards (i32 indices + f32 data), `n_rows × 8`
+/// for the assembled CSR indptr (i64), and the on-disk size of every
+/// obs / var section (sharded or single). Walks `reader.catalog()`
+/// only — no payload reads.
+fn estimate_eager_assembly_bytes(reader: &ScxReader) -> u64 {
+    let entries = &reader.catalog().entries;
+    let mut nnz: u64 = 0;
+    let mut x_rows: u64 = 0;
+    for entry in entries {
+        if entry.section_type != SectionType::CsrShard || entry.modality_id != 0 {
+            continue;
+        }
+        if let Some(stats) = &entry.stats {
+            nnz = nnz.saturating_add(stats.nnz);
+            x_rows = x_rows.saturating_add(stats.row_end.saturating_sub(stats.row_start));
+        }
+    }
+    let mut meta_bytes: u64 = 0;
+    for entry in entries {
+        match entry.section_type {
+            SectionType::ObsMetadata
+            | SectionType::VarMetadata
+            | SectionType::ObsMetadataShard
+            | SectionType::VarMetadataShard => {
+                meta_bytes = meta_bytes.saturating_add(entry.length);
+            }
+            _ => {}
+        }
+    }
+    nnz.saturating_mul(16)
+        .saturating_add(x_rows.saturating_mul(8))
+        .saturating_add(meta_bytes)
+}
+
 /// Phase 5b: build and (conditionally) write a detection-bitmap shard
 /// for the in-memory `from_anndata` write path. Mirrors
 /// `scx_convert::pipeline::build_and_write_bitmap_for_shard` but emits
@@ -479,16 +522,110 @@ pub(crate) fn obsm_batch_to_numpy<'py>(
     df.getattr("values")
 }
 
+/// Returns true if either axis would overflow Int32 coordinates and the
+/// COO batch must therefore use the Int64 row/col encoding ("v2 layout").
+/// For all current workloads — even atlas-scale sub-billion-cell files —
+/// both axes fit in Int32 and this returns false, keeping coordinates
+/// at 4 bytes each on disk. Only axes ≥ 2^31 trip the Int64 path.
+fn coo_needs_int64_coords(n_rows: usize, n_cols: usize) -> bool {
+    n_rows > i32::MAX as usize || n_cols > i32::MAX as usize
+}
+
+/// Borrowed view of the row/col columns of a pairwise COO RecordBatch,
+/// dispatched on whichever Int32 / Int64 dtype the on-disk batch uses.
+/// Lets every consumer treat both wire-format widths uniformly.
+enum CooCoordsRef<'a> {
+    Int32(&'a arrow::array::Int32Array, &'a arrow::array::Int32Array),
+    Int64(&'a arrow::array::Int64Array, &'a arrow::array::Int64Array),
+}
+
+impl CooCoordsRef<'_> {
+    fn len(&self) -> usize {
+        use arrow::array::Array;
+        match self {
+            CooCoordsRef::Int32(r, _) => r.len(),
+            CooCoordsRef::Int64(r, _) => r.len(),
+        }
+    }
+
+    fn row_i64(&self, i: usize) -> i64 {
+        match self {
+            CooCoordsRef::Int32(r, _) => r.value(i) as i64,
+            CooCoordsRef::Int64(r, _) => r.value(i),
+        }
+    }
+
+    fn col_i64(&self, i: usize) -> i64 {
+        match self {
+            CooCoordsRef::Int32(_, c) => c.value(i) as i64,
+            CooCoordsRef::Int64(_, c) => c.value(i),
+        }
+    }
+}
+
+/// Extract the row/col columns of a pairwise COO RecordBatch, accepting
+/// either Int32 (v1 layout) or Int64 (v2 layout). Returns an error if
+/// the columns are not both Int32 or both Int64. The data column is
+/// validated separately by each caller.
+fn coo_coords_from_batch(batch: &RecordBatch) -> PyResult<CooCoordsRef<'_>> {
+    use arrow::array::{Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+    let row_dt = batch.column(0).data_type().clone();
+    let col_dt = batch.column(1).data_type().clone();
+    match (&row_dt, &col_dt) {
+        (DataType::Int32, DataType::Int32) => {
+            let r = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO row column claims Int32 but downcast failed")
+                })?;
+            let c = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO col column claims Int32 but downcast failed")
+                })?;
+            Ok(CooCoordsRef::Int32(r, c))
+        }
+        (DataType::Int64, DataType::Int64) => {
+            let r = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO row column claims Int64 but downcast failed")
+                })?;
+            let c = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err("COO col column claims Int64 but downcast failed")
+                })?;
+            Ok(CooCoordsRef::Int64(r, c))
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "Pairwise COO RecordBatch has mismatched or unsupported coord dtypes \
+             (row={row_dt:?}, col={col_dt:?}); expected matching Int32 (v1) or Int64 (v2)."
+        ))),
+    }
+}
+
 /// Convert a scipy sparse matrix to a COO Arrow RecordBatch.
 ///
-/// The resulting batch has columns `row: Int32`, `col: Int32`, `data: Float32`
-/// (nnz rows) and schema metadata `n_rows` and `n_cols`.  Data is cast to
+/// The resulting batch has columns `row: Int32 | Int64`, `col: Int32 | Int64`,
+/// `data: Float32` (nnz rows) and schema metadata `n_rows` and `n_cols`.
+/// Coordinate width is chosen by [`coo_needs_int64_coords`] so files at
+/// sub-2^31 axes stay byte-identical to the v1 layout. Data is cast to
 /// float32; precision is reduced if the source uses float64.
 pub(crate) fn sparse_to_coo_record_batch(
     py: Python<'_>,
     mat: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
 
@@ -497,14 +634,41 @@ pub(crate) fn sparse_to_coo_record_batch(
     let shape: (usize, usize) = coo.getattr("shape")?.extract()?;
     let np = py.import("numpy")?;
 
-    let row: Vec<i32> = np
-        .call_method1("asarray", (coo.getattr("row")?,))?
-        .call_method1("astype", ("int32",))?
-        .extract()?;
-    let col: Vec<i32> = np
-        .call_method1("asarray", (coo.getattr("col")?,))?
-        .call_method1("astype", ("int32",))?
-        .extract()?;
+    let need_i64 = coo_needs_int64_coords(shape.0, shape.1);
+
+    let (row_col_dtype, row_array, col_array): (
+        DataType,
+        Arc<dyn arrow::array::Array>,
+        Arc<dyn arrow::array::Array>,
+    ) = if need_i64 {
+        let row: Vec<i64> = np
+            .call_method1("asarray", (coo.getattr("row")?,))?
+            .call_method1("astype", ("int64",))?
+            .extract()?;
+        let col: Vec<i64> = np
+            .call_method1("asarray", (coo.getattr("col")?,))?
+            .call_method1("astype", ("int64",))?
+            .extract()?;
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(row)),
+            Arc::new(Int64Array::from(col)),
+        )
+    } else {
+        let row: Vec<i32> = np
+            .call_method1("asarray", (coo.getattr("row")?,))?
+            .call_method1("astype", ("int32",))?
+            .extract()?;
+        let col: Vec<i32> = np
+            .call_method1("asarray", (coo.getattr("col")?,))?
+            .call_method1("astype", ("int32",))?
+            .extract()?;
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(row)),
+            Arc::new(Int32Array::from(col)),
+        )
+    };
     let data: Vec<f32> = np
         .call_method1("asarray", (coo.getattr("data")?,))?
         .call_method1("astype", ("float32",))?
@@ -512,8 +676,8 @@ pub(crate) fn sparse_to_coo_record_batch(
 
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
-            Field::new("row", DataType::Int32, false),
-            Field::new("col", DataType::Int32, false),
+            Field::new("row", row_col_dtype.clone(), false),
+            Field::new("col", row_col_dtype, false),
             Field::new("data", DataType::Float32, false),
         ],
         HashMap::from([
@@ -523,11 +687,7 @@ pub(crate) fn sparse_to_coo_record_batch(
     ));
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(row)),
-            Arc::new(Int32Array::from(col)),
-            Arc::new(Float32Array::from(data)),
-        ],
+        vec![row_array, col_array, Arc::new(Float32Array::from(data))],
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
@@ -535,11 +695,12 @@ pub(crate) fn sparse_to_coo_record_batch(
 /// Convert a COO Arrow RecordBatch back to a scipy.sparse.csr_matrix.
 ///
 /// Reads `row`, `col`, `data` columns and `n_rows`/`n_cols` schema metadata.
+/// Accepts both v1 (`Int32` row/col) and v2 (`Int64` row/col) layouts.
 pub(crate) fn coo_record_batch_to_scipy<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::Float32Array;
     use numpy::PyArray1;
 
     let meta = batch.schema().metadata().clone();
@@ -552,24 +713,23 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let coords = coo_coords_from_batch(batch)?;
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
 
-    let row_np = PyArray1::from_slice(py, row_arr.values());
-    let col_np = PyArray1::from_slice(py, col_arr.values());
+    let (row_np, col_np): (Bound<'_, PyAny>, Bound<'_, PyAny>) = match &coords {
+        CooCoordsRef::Int32(r, c) => (
+            PyArray1::from_slice(py, r.values()).into_any(),
+            PyArray1::from_slice(py, c.values()).into_any(),
+        ),
+        CooCoordsRef::Int64(r, c) => (
+            PyArray1::from_slice(py, r.values()).into_any(),
+            PyArray1::from_slice(py, c.values()).into_any(),
+        ),
+    };
     let data_np = PyArray1::from_slice(py, data_arr.values());
 
     let scipy_sparse = py.import("scipy.sparse")?;
@@ -584,11 +744,19 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
 /// Returns a new batch containing only the entries whose row AND col are kept,
 /// with indices remapped to the user-visible 0..kept_rows.len() range and the
 /// `n_rows` / `n_cols` schema metadata updated to `kept_rows.len()`.
+///
+/// Width-generic: accepts both v1 (`Int32`) and v2 (`Int64`) COO inputs.
+/// Output width is chosen by [`coo_needs_int64_coords`] on `kept_rows.len()`
+/// so the remap shrinks the on-disk footprint when an extreme axis is filtered
+/// down. `kept_rows` MUST be sorted ascending — that is the construction
+/// invariant of `compose_kept_to_global` and lets the remap run as a
+/// `binary_search` instead of allocating a dense `Vec<i32>` of length `n_rows`
+/// (≈ 2.24 GB at 561M cells).
 pub(crate) fn filter_coo_obsp_by_kept_rows(
     batch: &RecordBatch,
     kept_rows: &[u64],
 ) -> PyResult<RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
 
@@ -602,77 +770,77 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| PyRuntimeError::new_err("Missing n_cols in sparse matrix metadata"))?;
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid row column in sparse matrix batch"))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| PyRuntimeError::new_err("Invalid col column in sparse matrix batch"))?;
+    let coords = coo_coords_from_batch(batch)?;
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyRuntimeError::new_err("Invalid data column in sparse matrix batch"))?;
 
-    // Build original→user-visible remaps. -1 means dropped.
-    let mut row_remap = vec![-1i32; n_rows];
-    for (new_idx, &orig) in kept_rows.iter().enumerate() {
-        let orig_usize = orig as usize;
-        if orig_usize < n_rows {
-            row_remap[orig_usize] = new_idx as i32;
-        }
+    // Binary-search correctness requires sorted input. `kept_rows` is
+    // produced sorted by `compose_kept_to_global` today, but enforce in
+    // release too so a future unsorted caller fails loudly rather than
+    // silently dropping or misrouting entries.
+    if kept_rows.windows(2).any(|w| w[0] > w[1]) {
+        return Err(PyValueError::new_err(
+            "filter_coo_obsp_by_kept_rows requires kept_rows sorted ascending",
+        ));
     }
-    // For obsp the axes are identical, but n_cols may legitimately differ from
-    // n_rows on a malformed file — build the col remap independently.
-    let col_remap: Vec<i32> = if n_cols == n_rows {
-        row_remap.clone()
-    } else {
-        let mut r = vec![-1i32; n_cols];
-        for (new_idx, &orig) in kept_rows.iter().enumerate() {
-            let orig_usize = orig as usize;
-            if orig_usize < n_cols {
-                r[orig_usize] = new_idx as i32;
-            }
+    let kept_len = kept_rows.len();
+    let output_i64 = coo_needs_int64_coords(kept_len, kept_len);
+
+    // Binary-search remap: O(nnz log kept_len) time, zero extra memory
+    // beyond the kept_rows slice (which the caller already owns).
+    let remap = |orig: i64, axis_len: usize| -> Option<i64> {
+        if orig < 0 {
+            return None;
         }
-        r
+        let orig_u = orig as u64;
+        if (orig as usize) >= axis_len {
+            return None;
+        }
+        kept_rows.binary_search(&orig_u).ok().map(|i| i as i64)
     };
 
-    let nnz = row_arr.len();
-    let mut new_row: Vec<i32> = Vec::with_capacity(nnz);
-    let mut new_col: Vec<i32> = Vec::with_capacity(nnz);
-    let mut new_data: Vec<f32> = Vec::with_capacity(nnz);
-    let row_vals = row_arr.values();
-    let col_vals = col_arr.values();
+    let nnz = coords.len();
     let data_vals = data_arr.values();
+    let mut new_row_i64: Vec<i64> = Vec::with_capacity(nnz);
+    let mut new_col_i64: Vec<i64> = Vec::with_capacity(nnz);
+    let mut new_data: Vec<f32> = Vec::with_capacity(nnz);
     for k in 0..nnz {
-        let r = row_vals[k];
-        let c = col_vals[k];
-        if r < 0 || c < 0 {
-            continue;
-        }
-        let r_us = r as usize;
-        let c_us = c as usize;
-        if r_us >= n_rows || c_us >= n_cols {
-            continue;
-        }
-        let nr = row_remap[r_us];
-        let nc = col_remap[c_us];
-        if nr >= 0 && nc >= 0 {
-            new_row.push(nr);
-            new_col.push(nc);
-            new_data.push(data_vals[k]);
-        }
+        let r = coords.row_i64(k);
+        let c = coords.col_i64(k);
+        let Some(nr) = remap(r, n_rows) else { continue };
+        let Some(nc) = remap(c, n_cols) else { continue };
+        new_row_i64.push(nr);
+        new_col_i64.push(nc);
+        new_data.push(data_vals[k]);
     }
 
-    let kept_len = kept_rows.len();
+    let (row_dtype, row_array, col_array): (
+        DataType,
+        Arc<dyn arrow::array::Array>,
+        Arc<dyn arrow::array::Array>,
+    ) = if output_i64 {
+        (
+            DataType::Int64,
+            Arc::new(Int64Array::from(new_row_i64)),
+            Arc::new(Int64Array::from(new_col_i64)),
+        )
+    } else {
+        let new_row_i32: Vec<i32> = new_row_i64.into_iter().map(|v| v as i32).collect();
+        let new_col_i32: Vec<i32> = new_col_i64.into_iter().map(|v| v as i32).collect();
+        (
+            DataType::Int32,
+            Arc::new(Int32Array::from(new_row_i32)),
+            Arc::new(Int32Array::from(new_col_i32)),
+        )
+    };
+
     let schema = Arc::new(Schema::new_with_metadata(
         vec![
-            Field::new("row", DataType::Int32, false),
-            Field::new("col", DataType::Int32, false),
+            Field::new("row", row_dtype.clone(), false),
+            Field::new("col", row_dtype, false),
             Field::new("data", DataType::Float32, false),
         ],
         HashMap::from([
@@ -682,26 +850,9 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
     ));
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(Int32Array::from(new_row)),
-            Arc::new(Int32Array::from(new_col)),
-            Arc::new(Float32Array::from(new_data)),
-        ],
+        vec![row_array, col_array, Arc::new(Float32Array::from(new_data))],
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-}
-
-/// Build an AnnData object from an ScxReader.
-///
-/// When deletion vectors are present, deleted cells are excluded from
-/// both the CSR matrix and the obs metadata.
-pub fn to_anndata<'py>(
-    py: Python<'py>,
-    path: &std::path::Path,
-    reader: &ScxReader,
-    eager: bool,
-) -> PyResult<Bound<'py, PyAny>> {
-    to_anndata_with_layers(py, path, reader, None, eager)
 }
 
 /// Build an AnnData object from an ScxReader with optional layer filtering.
@@ -724,6 +875,7 @@ fn to_anndata_with_layers<'py>(
     reader: &ScxReader,
     layer_filter: Option<&[String]>,
     eager: bool,
+    memory_budget: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyLayersMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
@@ -731,6 +883,23 @@ fn to_anndata_with_layers<'py>(
     use std::sync::Arc;
 
     let anndata_mod = py.import("anndata")?;
+
+    // Phase 4d: catalog-only estimate of the full-assembly bytes. If
+    // the estimate exceeds the budget (caller's `memory_budget` kwarg,
+    // or `DEFAULT_EAGER_MEMORY_BUDGET_BYTES` = 8 GiB when unset) emit a
+    // `UserWarning` recommending the backed / query alternatives.
+    // Assembly proceeds regardless — the warning is advisory.
+    let budget = memory_budget.unwrap_or(DEFAULT_EAGER_MEMORY_BUDGET_BYTES);
+    let est_bytes = estimate_eager_assembly_bytes(reader);
+    if est_bytes > budget {
+        warn_python_convert(
+            py,
+            &scx_convert::ConvertWarning::EagerAssemblyMemoryHigh {
+                estimated_bytes: est_bytes,
+                budget_bytes: budget,
+            },
+        )?;
+    }
 
     // X — assemble all CSR shards (with deletion vector filtering)
     let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
@@ -905,10 +1074,11 @@ pub fn to_anndata_filtered<'py>(
     layer_filter: Option<&[String]>,
     preserve_slots: bool,
     eager: bool,
+    memory_budget: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Fast path: no filtering → use existing implementation
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
-        return to_anndata(py, path, reader, eager);
+        return to_anndata_with_layers(py, path, reader, None, eager, memory_budget);
     }
 
     // preserve_slots=true with obs_filter: load full AnnData, then filter
@@ -918,7 +1088,7 @@ pub fn to_anndata_filtered<'py>(
     // than lazy bridges (which AnnData iterates / validates during
     // `.copy()` anyway).
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
-        let full = to_anndata_with_layers(py, path, reader, layer_filter, true)?;
+        let full = to_anndata_with_layers(py, path, reader, layer_filter, true, memory_budget)?;
 
         let obs_attr = full.getattr("obs")?;
         let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
@@ -1062,7 +1232,7 @@ pub fn to_anndata_filtered<'py>(
     // validation across all aligned slots (obsp / varp / varm), which
     // would materialize through the lazy bridges anyway — doing it up
     // front avoids fragmenting the cost across implicit slicing.
-    let adata = to_anndata_with_layers(py, path, reader, layer_filter, true)?;
+    let adata = to_anndata_with_layers(py, path, reader, layer_filter, true, memory_budget)?;
 
     if let Some(names) = var_names {
         // Resolve via the same path as backed / query-engine: scans all string
@@ -1720,6 +1890,194 @@ pub(crate) fn pandas_to_record_batch(
     scx_format::downcast_large_types(&batch).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Build an Arrow RecordBatch from an obsm/varm value, skipping the
+/// `pd.DataFrame(arr) → pyarrow` round-trip when the input is a plain
+/// 2D numpy ndarray of a supported numeric dtype (`float32`, `float64`,
+/// `int32`, `int64`). Falls back to [`pandas_to_record_batch`] for
+/// pandas DataFrames, structured arrays, or other dtypes.
+///
+/// The fast path emits one Arrow column per ndarray column with the
+/// column name `"0".."N-1"`, matching the shape that
+/// `scx-convert::pipeline::read_dense_mapping_shard` emits on the
+/// streaming ingest side.
+fn numpy_or_pandas_to_record_batch(
+    py: Python<'_>,
+    arr: &Bound<'_, PyAny>,
+) -> PyResult<RecordBatch> {
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use pyo3::types::PyBytes;
+
+    let np = py.import("numpy")?;
+    let np_ndarray = np.getattr("ndarray")?;
+    let is_ndarray: bool = arr.is_instance(&np_ndarray)?;
+    if !is_ndarray {
+        let pd = py.import("pandas")?;
+        let df = pd.call_method1("DataFrame", (arr,))?;
+        return pandas_to_record_batch(py, &df);
+    }
+    let ndim: usize = arr.getattr("ndim")?.extract()?;
+    if ndim != 2 {
+        let pd = py.import("pandas")?;
+        let df = pd.call_method1("DataFrame", (arr,))?;
+        return pandas_to_record_batch(py, &df);
+    }
+    let dtype = arr.getattr("dtype")?;
+    let kind: String = dtype.getattr("kind")?.extract()?;
+
+    let shape: (usize, usize) = arr.getattr("shape")?.extract()?;
+    let (n_rows, n_cols) = shape;
+    let total = n_rows.saturating_mul(n_cols);
+
+    // Numeric dtypes route to the fast path; everything else falls
+    // through to the pandas-backed builder so dtype handling stays in
+    // one place.
+    let target: &str = match kind.as_str() {
+        "f" => {
+            let dtype_str: String = dtype.getattr("str")?.extract()?;
+            if dtype_str.ends_with("f4") {
+                "float32"
+            } else {
+                "float64"
+            }
+        }
+        "i" => {
+            let dtype_str: String = dtype.getattr("str")?.extract()?;
+            if dtype_str.ends_with("i4") {
+                "int32"
+            } else {
+                "int64"
+            }
+        }
+        _ => {
+            let pd = py.import("pandas")?;
+            let df = pd.call_method1("DataFrame", (arr,))?;
+            return pandas_to_record_batch(py, &df);
+        }
+    };
+
+    // Transpose then `ascontiguousarray` so the flat buffer is
+    // column-major relative to the input shape — column `c` lives in a
+    // contiguous range `[c * n_rows, (c+1) * n_rows)`. Compared to the
+    // legacy `.reshape(-1).tolist()` + strided indexing, this skips
+    // both the per-element Python scalar allocation and the per-column
+    // strided Rust loop. The `astype(..., copy=False)` enforces native
+    // byte order (no copy when the dtype already matches).
+    let arr_t = arr.getattr("T")?;
+    let arr_cast = arr_t.call_method(
+        "astype",
+        (target,),
+        Some(&{
+            let kw = pyo3::types::PyDict::new(py);
+            kw.set_item("copy", false)?;
+            kw
+        }),
+    )?;
+    let arr_c = np.call_method1("ascontiguousarray", (arr_cast,))?;
+    let bytes_obj = arr_c.call_method0("tobytes")?;
+    let bytes: &[u8] = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+
+    let mut fields = Vec::with_capacity(n_cols);
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(n_cols);
+
+    match target {
+        "float32" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(4));
+            let flat: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
+            for c in 0..n_cols {
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
+                fields.push(Field::new(c.to_string(), DataType::Float32, false));
+                columns.push(Arc::new(Float32Array::from(v)));
+            }
+        }
+        "float64" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(8));
+            let flat: Vec<f64> = bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
+            for c in 0..n_cols {
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
+                fields.push(Field::new(c.to_string(), DataType::Float64, false));
+                columns.push(Arc::new(Float64Array::from(v)));
+            }
+        }
+        "int32" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(4));
+            let flat: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
+            for c in 0..n_cols {
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
+                fields.push(Field::new(c.to_string(), DataType::Int32, false));
+                columns.push(Arc::new(Int32Array::from(v)));
+            }
+        }
+        "int64" => {
+            debug_assert_eq!(bytes.len(), total.saturating_mul(8));
+            let flat: Vec<i64> = bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+                .collect();
+            for c in 0..n_cols {
+                let v = flat[c * n_rows..(c + 1) * n_rows].to_vec();
+                fields.push(Field::new(c.to_string(), DataType::Int64, false));
+                columns.push(Arc::new(Int64Array::from(v)));
+            }
+        }
+        _ => unreachable!("target is one of f32/f64/i32/i64"),
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Estimated in-memory footprint (bytes) of a dense obsm/varm batch.
+/// Sums per-column buffer sizes from the Arrow array data; small
+/// constant factor overhead (validity bitmaps, metadata) is ignored.
+fn estimate_dense_bytes(batch: &RecordBatch) -> u64 {
+    batch
+        .columns()
+        .iter()
+        .map(|c| (c.len() as u64) * (data_type_byte_width(c.data_type()) as u64))
+        .sum()
+}
+
+fn data_type_byte_width(dt: &arrow::datatypes::DataType) -> usize {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Float32 | DataType::Int32 | DataType::UInt32 => 4,
+        DataType::Float64 | DataType::Int64 | DataType::UInt64 => 8,
+        DataType::Int16 | DataType::UInt16 => 2,
+        DataType::Int8 | DataType::UInt8 | DataType::Boolean => 1,
+        _ => 8,
+    }
+}
+
+/// Estimated in-memory footprint (bytes) of a sparse COO obsp/varp
+/// batch. `nnz × 12` (Int32 row + Int32 col + Float32 data); ignores
+/// schema/metadata overhead.
+fn estimate_coo_bytes(batch: &RecordBatch) -> u64 {
+    (batch.num_rows() as u64) * 12
+}
+
+/// Forward a [`scx_convert::ConvertWarning`] to Python's `warnings.warn`
+/// as a `UserWarning`, with the category name prefixed so consumers
+/// can filter on it. Mirrors the per-key warning surface used by the
+/// streaming pipeline; the in-memory `from_anndata` path doesn't wire
+/// a [`WarningSink`] today so we emit live instead of summarising.
+fn warn_python_convert(py: Python<'_>, w: &scx_convert::ConvertWarning) -> PyResult<()> {
+    let warnings_mod = py.import("warnings")?;
+    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let msg = format!("{}: {}", w.category(), w);
+    warnings_mod.getattr("warn")?.call1((msg, user_warning))?;
+    Ok(())
+}
+
 /// Ensure X is a CSR matrix; convert from dense or CSC if needed.
 /// Extract a matrix as CSR, avoiding unnecessary copies when possible (1C.1/1C.5).
 ///
@@ -1828,7 +2186,6 @@ pub(crate) fn parse_uns_format(s: &str) -> PyResult<UnsFormat> {
 /// parsed via [`scx_convert::MemoryBudget::parse`] (`"2GiB"`,
 /// `"512M"`), or `None` for "use default heuristics". Anything else
 /// returns a `TypeError`.
-#[cfg(feature = "hdf5")]
 pub(crate) fn parse_memory_budget(v: Option<&Bound<'_, PyAny>>) -> PyResult<Option<u64>> {
     let Some(obj) = v else { return Ok(None) };
     if obj.is_none() {
@@ -1838,8 +2195,7 @@ pub(crate) fn parse_memory_budget(v: Option<&Bound<'_, PyAny>>) -> PyResult<Opti
         return Ok(Some(n));
     }
     if let Ok(s) = obj.extract::<String>() {
-        let bytes = scx_convert::MemoryBudget::parse(&s)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let bytes = scx_convert::MemoryBudget::parse(&s).map_err(PyValueError::new_err)?;
         return Ok(Some(bytes));
     }
     Err(PyValueError::new_err(
@@ -4107,28 +4463,29 @@ fn for_each_coo_shard<F>(
 where
     F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
 {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Array, Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     let invalid = |msg: String| {
         scx_format::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
     };
 
-    let row_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| invalid("sparse override: column 0 must be Int32".into()))?;
-    let col_arr = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| invalid("sparse override: column 1 must be Int32".into()))?;
+    // Width-generic: accept both v1 (Int32) and v2 (Int64) row/col columns,
+    // and emit shards with the same coord dtype as the input. Reuse
+    // `coo_coords_from_batch` so the inner bucketing loop dispatches on
+    // `CooCoordsRef` (static match) rather than `Box<dyn Fn>` (per-element
+    // vtable call + heap alloc).
+    let coords = coo_coords_from_batch(batch).map_err(|e| invalid(e.to_string()))?;
+    let coord_dt = match &coords {
+        CooCoordsRef::Int32(_, _) => DataType::Int32,
+        CooCoordsRef::Int64(_, _) => DataType::Int64,
+    };
     let data_arr = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| invalid("sparse override: column 2 must be Float32".into()))?;
+    let nnz = coords.len();
 
     let metadata = batch.schema_ref().metadata().clone();
     let n_rows: usize = metadata
@@ -4145,23 +4502,38 @@ where
         return f(0, 0, 0, 0, batch);
     }
 
+    // Bucket count scales with the logical row axis. For atlas-scale v2
+    // obsp (axis ≥ 2^31) this would allocate hundreds of thousands of
+    // empty `Vec`s up-front — fail fast with a clear message rather than
+    // silently OOM. Real callers either route through the streaming
+    // converter (which writes shards incrementally without this bucket
+    // table) or use Phase 6's dedicated huge-obsp path.
     let n_shards = n_rows.div_ceil(step);
-    let mut bucket_row: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    let mut bucket_col: Vec<Vec<i32>> = (0..n_shards).map(|_| Vec::new()).collect();
+    const MAX_BUCKETS: usize = 1_000_000;
+    if n_shards > MAX_BUCKETS {
+        return Err(invalid(format!(
+            "for_each_coo_shard: logical n_rows={n_rows} would require {n_shards} shard buckets \
+             (cap {MAX_BUCKETS}). Route this obsp / varp through the streaming converter \
+             or pre-split it into row bands before re-shading."
+        )));
+    }
+    let mut bucket_row: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut bucket_col: Vec<Vec<i64>> = (0..n_shards).map(|_| Vec::new()).collect();
     let mut bucket_data: Vec<Vec<f32>> = (0..n_shards).map(|_| Vec::new()).collect();
-    for i in 0..row_arr.len() {
-        let r = row_arr.value(i);
+    for i in 0..nnz {
+        let r = coords.row_i64(i);
         if r < 0 {
             return Err(invalid(format!("sparse override: negative row index {r}")));
         }
-        let shard = (r as usize) / step;
+        let r_us = r as usize;
+        let shard = r_us / step;
         if shard >= n_shards {
             return Err(invalid(format!(
                 "sparse override: row {r} exceeds n_rows={n_rows}"
             )));
         }
         bucket_row[shard].push(r);
-        bucket_col[shard].push(col_arr.value(i));
+        bucket_col[shard].push(coords.col_i64(i));
         bucket_data[shard].push(data_arr.value(i));
     }
 
@@ -4171,8 +4543,8 @@ where
         let n_shard_rows = step.min(n_rows - row_start);
         let schema = Arc::new(Schema::new_with_metadata(
             vec![
-                Field::new("row", DataType::Int32, false),
-                Field::new("col", DataType::Int32, false),
+                Field::new("row", coord_dt.clone(), false),
+                Field::new("col", coord_dt.clone(), false),
                 Field::new("data", DataType::Float32, false),
             ],
             std::collections::HashMap::from([
@@ -4180,11 +4552,34 @@ where
                 ("n_cols".to_string(), n_cols.to_string()),
             ]),
         ));
+        let row_i64_taken = std::mem::take(&mut bucket_row[shard_idx]);
+        let col_i64_taken = std::mem::take(&mut bucket_col[shard_idx]);
+        let (row_array, col_array): (Arc<dyn Array>, Arc<dyn Array>) = match &coord_dt {
+            DataType::Int32 => (
+                Arc::new(Int32Array::from(
+                    row_i64_taken
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    col_i64_taken
+                        .into_iter()
+                        .map(|v| v as i32)
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+            DataType::Int64 => (
+                Arc::new(Int64Array::from(row_i64_taken)),
+                Arc::new(Int64Array::from(col_i64_taken)),
+            ),
+            _ => unreachable!(),
+        };
         let shard_batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(std::mem::take(&mut bucket_row[shard_idx]))),
-                Arc::new(Int32Array::from(std::mem::take(&mut bucket_col[shard_idx]))),
+                row_array,
+                col_array,
                 Arc::new(Float32Array::from(std::mem::take(
                     &mut bucket_data[shard_idx],
                 ))),
@@ -4297,6 +4692,8 @@ pub fn from_anndata_impl(
     index_preset: Option<String>,
     index_auto_threshold: usize,
     bitmap: &str,
+    memory_budget: Option<u64>,
+    force_legacy_metadata: bool,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
@@ -4344,8 +4741,8 @@ pub fn from_anndata_impl(
                 true,  // stream
                 false, // strict_uns
                 0.0,   // dense_zero_epsilon
-                None,  // memory_budget
-                None,  // temp_dir
+                memory_budget,
+                None, // temp_dir
                 index_obs,
                 index_var,
                 index_preset,
@@ -4559,11 +4956,47 @@ pub fn from_anndata_impl(
     let var_df = adata.getattr("var")?;
     let var_batch = pandas_to_record_batch(py, &var_df)?;
 
-    // 1E.2: Write obs/var outside GIL (pure Rust Arrow IPC serialization + I/O)
-    py.allow_threads(|| {
-        writer.write_obs(&obs_batch)?;
-        writer.write_var(&var_batch)?;
-        Ok::<(), scx_format::ScxError>(())
+    // Phase 4c: shard obs/var when row counts exceed shard_target_rows so
+    // `from_anndata` emits the same `ObsMetadataShard` / `VarMetadataShard`
+    // layout that merge / append / streaming ingest produce at atlas scale.
+    // `force_legacy_metadata=true` opts back into single-section writes.
+    let step = shard_target_rows as usize;
+    let obs_rows = obs_batch.num_rows();
+    let var_rows = var_batch.num_rows();
+    let shard_obs = !force_legacy_metadata && obs_rows > step;
+    let shard_var = !force_legacy_metadata && var_rows > step;
+    py.allow_threads(|| -> std::result::Result<(), scx_format::ScxError> {
+        if shard_obs {
+            let n_total = obs_rows as u64;
+            let mut shard_idx: u32 = 0;
+            let mut row_start: usize = 0;
+            while row_start < obs_rows {
+                let lo = row_start;
+                let hi = (lo + step).min(obs_rows);
+                let shard = obs_batch.slice(lo, hi - lo);
+                writer.write_obs_shard(shard_idx, lo as u64, (hi - lo) as u64, n_total, &shard)?;
+                shard_idx += 1;
+                row_start = hi;
+            }
+        } else {
+            writer.write_obs(&obs_batch)?;
+        }
+        if shard_var {
+            let n_total = var_rows as u64;
+            let mut shard_idx: u32 = 0;
+            let mut row_start: usize = 0;
+            while row_start < var_rows {
+                let lo = row_start;
+                let hi = (lo + step).min(var_rows);
+                let shard = var_batch.slice(lo, hi - lo);
+                writer.write_var_shard(shard_idx, lo as u64, (hi - lo) as u64, n_total, &shard)?;
+                shard_idx += 1;
+                row_start = hi;
+            }
+        } else {
+            writer.write_var(&var_batch)?;
+        }
+        Ok(())
     })
     .map_err(to_pyerr)?;
 
@@ -4650,83 +5083,170 @@ pub fn from_anndata_impl(
         }
     }
 
-    // 1E.2: Collect obsm RecordBatches under GIL
+    // Phase 4a/4b: stream obsm/varm/obsp/varp one key at a time.
+    // Each iteration extracts a single key's value under the GIL,
+    // builds one RecordBatch (numpy fast-path for plain numeric ndarrays
+    // skips the `pd.DataFrame(arr)` roundtrip), optionally warns when
+    // the estimated peak footprint exceeds `memory_budget`, then writes
+    // shards in `py.allow_threads` and drops the batch before moving on.
+    // This bounds peak RSS to one key's payload at a time instead of
+    // the full sum of all mappings.
     let obsm = adata.getattr("obsm")?;
     let obsm_keys: Vec<String> = py
         .import("builtins")?
         .call_method1("list", (obsm.call_method0("keys")?,))?
         .extract()?;
-    let obsm_batches: Vec<(String, RecordBatch)> = obsm_keys
-        .iter()
-        .map(|key| {
-            let arr = obsm.call_method1("__getitem__", (key,))?;
-            let pd = py.import("pandas")?;
-            let df = pd.call_method1("DataFrame", (&arr,))?;
-            let batch = pandas_to_record_batch(py, &df)?;
-            Ok((key.clone(), batch))
+    for key in &obsm_keys {
+        let arr = obsm.call_method1("__getitem__", (key,))?;
+        let batch = numpy_or_pandas_to_record_batch(py, &arr)?;
+        let est = estimate_dense_bytes(&batch);
+        if let Some(budget) = memory_budget {
+            if est > budget {
+                warn_python_convert(
+                    py,
+                    &scx_convert::ConvertWarning::MappingPeakFootprintHigh {
+                        key: key.clone(),
+                        axis: "obsm",
+                        estimated_bytes: est,
+                        budget_bytes: budget,
+                    },
+                )?;
+            }
+        }
+        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            for_each_dense_shard(
+                &batch,
+                shard_target_rows,
+                |idx, row_start, n_shard_rows, n_total, shard| {
+                    writer.write_obsm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
+                },
+            )
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .map_err(to_pyerr)?;
+    }
 
-    // 1E.2: Collect varm RecordBatches under GIL (dense, like obsm).
-    // Duck-typed AnnData-likes may omit `varm`/`obsp`/`varp` entirely —
-    // missing attrs are treated as empty, matching the obsm contract.
-    let varm_batches: Vec<(String, RecordBatch)> = match adata.getattr("varm") {
-        Ok(varm) => {
-            let varm_keys: Vec<String> = py
-                .import("builtins")?
-                .call_method1("list", (varm.call_method0("keys")?,))?
-                .extract()?;
-            varm_keys
-                .iter()
-                .map(|key| {
-                    let arr = varm.call_method1("__getitem__", (key,))?;
-                    let pd = py.import("pandas")?;
-                    let df = pd.call_method1("DataFrame", (&arr,))?;
-                    let batch = pandas_to_record_batch(py, &df)?;
-                    Ok((key.clone(), batch))
-                })
-                .collect::<PyResult<Vec<_>>>()?
+    // varm — same pattern. Duck-typed AnnData-likes may omit
+    // `varm`/`obsp`/`varp` entirely; missing attrs are treated as empty.
+    if let Ok(varm) = adata.getattr("varm") {
+        let varm_keys: Vec<String> = py
+            .import("builtins")?
+            .call_method1("list", (varm.call_method0("keys")?,))?
+            .extract()?;
+        for key in &varm_keys {
+            let arr = varm.call_method1("__getitem__", (key,))?;
+            let batch = numpy_or_pandas_to_record_batch(py, &arr)?;
+            let est = estimate_dense_bytes(&batch);
+            if let Some(budget) = memory_budget {
+                if est > budget {
+                    warn_python_convert(
+                        py,
+                        &scx_convert::ConvertWarning::MappingPeakFootprintHigh {
+                            key: key.clone(),
+                            axis: "varm",
+                            estimated_bytes: est,
+                            budget_bytes: budget,
+                        },
+                    )?;
+                }
+            }
+            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+                for_each_dense_shard(
+                    &batch,
+                    shard_target_rows,
+                    |idx, row_start, n_shard_rows, n_total, shard| {
+                        writer.write_varm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
+                    },
+                )
+            })
+            .map_err(to_pyerr)?;
         }
-        Err(_) => Vec::new(),
-    };
+    }
 
-    // 1E.2: Collect obsp COO RecordBatches under GIL (obs × obs sparse).
-    let obsp_batches: Vec<(String, RecordBatch)> = match adata.getattr("obsp") {
-        Ok(obsp) => {
-            let obsp_keys: Vec<String> = py
-                .import("builtins")?
-                .call_method1("list", (obsp.call_method0("keys")?,))?
-                .extract()?;
-            obsp_keys
-                .iter()
-                .map(|key| {
-                    let mat = obsp.call_method1("__getitem__", (key,))?;
-                    let batch = sparse_to_coo_record_batch(py, &mat)?;
-                    Ok((key.clone(), batch))
-                })
-                .collect::<PyResult<Vec<_>>>()?
+    // obsp — sparse COO, one key at a time.
+    if let Ok(obsp) = adata.getattr("obsp") {
+        let obsp_keys: Vec<String> = py
+            .import("builtins")?
+            .call_method1("list", (obsp.call_method0("keys")?,))?
+            .extract()?;
+        for key in &obsp_keys {
+            let mat = obsp.call_method1("__getitem__", (key,))?;
+            let batch = sparse_to_coo_record_batch(py, &mat)?;
+            let est = estimate_coo_bytes(&batch);
+            if let Some(budget) = memory_budget {
+                if est > budget {
+                    warn_python_convert(
+                        py,
+                        &scx_convert::ConvertWarning::MappingPeakFootprintHigh {
+                            key: key.clone(),
+                            axis: "obsp",
+                            estimated_bytes: est,
+                            budget_bytes: budget,
+                        },
+                    )?;
+                }
+            }
+            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+                for_each_coo_shard(
+                    &batch,
+                    shard_target_rows,
+                    |idx, row_start, n_shard_rows, n_total, shard| {
+                        writer.write_obsp_shard_coo(
+                            key,
+                            idx,
+                            row_start,
+                            n_shard_rows,
+                            n_total,
+                            shard,
+                        )
+                    },
+                )
+            })
+            .map_err(to_pyerr)?;
         }
-        Err(_) => Vec::new(),
-    };
+    }
 
-    // 1E.2: Collect varp COO RecordBatches under GIL (var × var sparse).
-    let varp_batches: Vec<(String, RecordBatch)> = match adata.getattr("varp") {
-        Ok(varp) => {
-            let varp_keys: Vec<String> = py
-                .import("builtins")?
-                .call_method1("list", (varp.call_method0("keys")?,))?
-                .extract()?;
-            varp_keys
-                .iter()
-                .map(|key| {
-                    let mat = varp.call_method1("__getitem__", (key,))?;
-                    let batch = sparse_to_coo_record_batch(py, &mat)?;
-                    Ok((key.clone(), batch))
-                })
-                .collect::<PyResult<Vec<_>>>()?
+    // varp — sparse COO, one key at a time.
+    if let Ok(varp) = adata.getattr("varp") {
+        let varp_keys: Vec<String> = py
+            .import("builtins")?
+            .call_method1("list", (varp.call_method0("keys")?,))?
+            .extract()?;
+        for key in &varp_keys {
+            let mat = varp.call_method1("__getitem__", (key,))?;
+            let batch = sparse_to_coo_record_batch(py, &mat)?;
+            let est = estimate_coo_bytes(&batch);
+            if let Some(budget) = memory_budget {
+                if est > budget {
+                    warn_python_convert(
+                        py,
+                        &scx_convert::ConvertWarning::MappingPeakFootprintHigh {
+                            key: key.clone(),
+                            axis: "varp",
+                            estimated_bytes: est,
+                            budget_bytes: budget,
+                        },
+                    )?;
+                }
+            }
+            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+                for_each_coo_shard(
+                    &batch,
+                    shard_target_rows,
+                    |idx, row_start, n_shard_rows, n_total, shard| {
+                        writer.write_varp_shard_coo(
+                            key,
+                            idx,
+                            row_start,
+                            n_shard_rows,
+                            n_total,
+                            shard,
+                        )
+                    },
+                )
+            })
+            .map_err(to_pyerr)?;
         }
-        Err(_) => Vec::new(),
-    };
+    }
 
     // 1E.2: Collect uns JSON under GIL.
     // Use a recursive Python-side normalizer so common AnnData payloads
@@ -4745,52 +5265,11 @@ pub fn from_anndata_impl(
         None
     };
 
-    // 1E.2: Write obsm, varm, obsp, varp, and uns outside GIL (pure
-    // Rust). obsm / varm / obsp / varp are sharded so the on-disk
-    // layout matches the streaming pipeline.
-    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
-        for (key, batch) in &obsm_batches {
-            for_each_dense_shard(
-                batch,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (key, batch) in &varm_batches {
-            for_each_dense_shard(
-                batch,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varm_shard(key, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (key, batch) in &obsp_batches {
-            for_each_coo_shard(
-                batch,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_obsp_shard_coo(key, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        for (key, batch) in &varp_batches {
-            for_each_coo_shard(
-                batch,
-                shard_target_rows,
-                |idx, row_start, n_shard_rows, n_total, shard| {
-                    writer.write_varp_shard_coo(key, idx, row_start, n_shard_rows, n_total, shard)
-                },
-            )?;
-        }
-        if let Some(ref json_val) = uns_json {
-            writer.write_uns(json_val)?;
-        }
-        Ok(())
-    })
-    .map_err(to_pyerr)?;
+    // Write uns outside GIL.
+    if let Some(ref json_val) = uns_json {
+        py.allow_threads(|| writer.write_uns(json_val))
+            .map_err(to_pyerr)?;
+    }
 
     // Write layers
     let layers = adata.getattr("layers")?;

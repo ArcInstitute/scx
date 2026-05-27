@@ -556,6 +556,10 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
         | SectionType::VarmEmbeddingShard
         | SectionType::ObspEmbeddingShard
         | SectionType::VarpEmbeddingShard => name.to_string(),
+        // Section names already include the axis prefix
+        // (`obs_metadata/shard_N` / `var_metadata/shard_N`), so use them
+        // verbatim — `scx info` displays them grouped by axis.
+        SectionType::ObsMetadataShard | SectionType::VarMetadataShard => name.to_string(),
     }
 }
 

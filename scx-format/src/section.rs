@@ -60,6 +60,24 @@ pub enum SectionType {
     /// Row-shard of a `varp/<name>` pairwise sparse matrix. Mirror of
     /// [`ObspEmbeddingShard`] for the `varp/` axis.
     VarpEmbeddingShard = 23,
+    /// Row-shard of the obs metadata Arrow IPC batch.
+    /// Section name: `obs_metadata/shard_<idx>`. Same payload schema as
+    /// [`ObsMetadata`] (one Arrow IPC `RecordBatch`); Arrow schema
+    /// metadata carries `shard_idx` / `row_start` / `n_shard_rows` /
+    /// `n_rows_total` so the reader can verify the catalog entries form
+    /// a contiguous, ordered cover of the logical obs table.
+    ///
+    /// Sharded obs lets atlas-scale merges and appends keep peak memory
+    /// bounded to one shard at a time. Files written with sharded obs
+    /// MUST NOT also write a single [`ObsMetadata`] section; the writer
+    /// enforces this. Legacy single-section [`ObsMetadata`] files remain
+    /// readable and are converted to a single shard on the first
+    /// `scx append` that grows the file.
+    ObsMetadataShard = 24,
+    /// Row-shard of the var metadata Arrow IPC batch. Mirror of
+    /// [`ObsMetadataShard`] for the var axis. Section name:
+    /// `var_metadata/shard_<idx>`.
+    VarMetadataShard = 25,
 }
 
 impl SectionType {
@@ -90,6 +108,8 @@ impl SectionType {
             21 => Some(Self::VarmEmbeddingShard),
             22 => Some(Self::ObspEmbeddingShard),
             23 => Some(Self::VarpEmbeddingShard),
+            24 => Some(Self::ObsMetadataShard),
+            25 => Some(Self::VarMetadataShard),
             _ => None,
         }
     }
@@ -158,11 +178,19 @@ mod tests {
             SectionType::from_u8(23),
             Some(SectionType::VarpEmbeddingShard)
         );
+        assert_eq!(
+            SectionType::from_u8(24),
+            Some(SectionType::ObsMetadataShard)
+        );
+        assert_eq!(
+            SectionType::from_u8(25),
+            Some(SectionType::VarMetadataShard)
+        );
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(24), None);
+        assert_eq!(SectionType::from_u8(26), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 

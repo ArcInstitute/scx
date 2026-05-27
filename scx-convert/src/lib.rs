@@ -35,11 +35,9 @@ mod tenx_read;
 
 #[cfg(feature = "hdf5")]
 mod hdf5_threadsafe;
-#[cfg(feature = "hdf5")]
 mod mem;
 #[cfg(feature = "hdf5")]
 mod stream;
-#[cfg(feature = "hdf5")]
 mod warnings;
 
 #[cfg(feature = "hdf5")]
@@ -49,11 +47,9 @@ pub use dense_stream::{open_dense_layer_streaming, open_dense_streaming, DenseXS
 #[cfg(feature = "hdf5")]
 pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
 
-#[cfg(feature = "hdf5")]
 pub use mem::MemoryBudget;
 #[cfg(feature = "hdf5")]
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
-#[cfg(feature = "hdf5")]
 pub use warnings::{ConvertWarning, WarningSink};
 
 #[cfg(feature = "hdf5")]

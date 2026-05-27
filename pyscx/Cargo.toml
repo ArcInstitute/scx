@@ -1,6 +1,6 @@
 [package]
 name = "pyscx"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 description = "Python bindings for SCX via PyO3"
 license.workspace = true
@@ -22,7 +22,7 @@ scx-engine = { path = "../scx-engine" }
 scx-mtx = { path = "../scx-mtx" }
 scx-ops = { path = "../scx-ops" }
 scx-accel = { path = "../scx-accel" }
-scx-convert = { path = "../scx-convert", optional = true }
+scx-convert = { path = "../scx-convert" }
 scx-cloud = { path = "../scx-cloud", optional = true }
 tokio = { workspace = true, optional = true }
 serde_json = { workspace = true }
@@ -42,7 +42,7 @@ tracing-subscriber = { workspace = true }
 # bindings still build (CPU-only CI lane), but backed AnnDatas raise
 # `NotImplementedError` directing the caller to rebuild with
 # `maturin develop --features hdf5`.
-hdf5 = ["dep:scx-convert", "scx-convert/hdf5"]
+hdf5 = ["scx-convert/hdf5"]
 # Bundles libhdf5 + zlib statically — mirrors scx-cli's hdf5-static
 # feature. Used by `maturin build --features hdf5-static` so wheel
 # builds don't depend on a system libhdf5.

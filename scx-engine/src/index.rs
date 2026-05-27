@@ -137,27 +137,136 @@ fn check_count_bound(count: usize, max: usize, descriptor: &str) -> Result<()> {
     Ok(())
 }
 
+/// Defensive writer-side cast: reject a value that doesn't fit in the
+/// target on-disk integer width with a descriptive error rather than
+/// silently wrapping via `as uN`. Used in the v1 `PredicateIndex` writer
+/// where the on-disk format uses `u16` / `u32` for several counters that
+/// could in principle be hit at multi-billion-row / extreme-cardinality
+/// scale. The v2 encoding (negotiated via the `version` byte) widens
+/// these to `u32` / `u64`; for now, surface the limit cleanly.
+fn write_cast<T, U>(value: T, descriptor: &str) -> Result<U>
+where
+    U: TryFrom<T>,
+    T: std::fmt::Display + Copy,
+{
+    U::try_from(value).map_err(|_| {
+        EngineError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "PredicateIndex v1 writer: {descriptor} value {value} exceeds the on-disk \
+                 narrow-counter width. Use PredicateIndex v2 (wider counters) for inputs \
+                 at this scale."
+            ),
+        ))
+    })
+}
+
+/// Returns true if any counter in `index` exceeds the v1 (narrow) on-disk
+/// widths and the index must therefore be written with the v2 layout
+/// (`u32` value lengths and per-value range counts, `u64` entry totals).
+/// Pre-scan is O(total entries) but allocates nothing, and lets the
+/// writer pick the narrowest correct encoding rather than blindly
+/// promoting every file to v2.
+fn requires_v2_encoding(index: &PredicateIndex) -> bool {
+    if u16::try_from(index.columns.len()).is_err() {
+        return true;
+    }
+    for col in &index.columns {
+        match col {
+            IndexedColumn::Categorical(cat) => {
+                if u16::try_from(cat.column_name.len()).is_err() {
+                    return true;
+                }
+                if u32::try_from(cat.entries.len()).is_err() {
+                    return true;
+                }
+                for entry in &cat.entries {
+                    if u16::try_from(entry.value.len()).is_err() {
+                        return true;
+                    }
+                    if u16::try_from(entry.shard_ranges.len()).is_err() {
+                        return true;
+                    }
+                }
+            }
+            IndexedColumn::Numeric(num) => {
+                if u16::try_from(num.column_name.len()).is_err() {
+                    return true;
+                }
+                if u32::try_from(num.leaf_pages.len()).is_err() {
+                    return true;
+                }
+                if u32::try_from(num.internal_pages.len()).is_err() {
+                    return true;
+                }
+                let mut total: u64 = 0;
+                for lp in &num.leaf_pages {
+                    if u32::try_from(lp.entries.len()).is_err() {
+                        return true;
+                    }
+                    total = total.saturating_add(lp.entries.len() as u64);
+                }
+                if u32::try_from(total).is_err() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 impl PredicateIndex {
     /// Serialize the predicate index per docs/format.md (Predicate Indexes).
+    ///
+    /// The on-disk version byte is auto-selected: v1 (narrow counters) when
+    /// every counter fits the v1 widths (`u16` value lengths and per-value
+    /// range counts, `u32` entry totals), v2 otherwise. v2 widens to `u32` /
+    /// `u64` so extreme-cardinality columns and >1B-row obs axes can be
+    /// represented without overflow. The `version` field on `self` is
+    /// ignored — the encoding is determined by the data alone, and the
+    /// on-disk byte is the source of truth on read.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
-        w.write_u8(self.version)?;
-        w.write_u16::<LittleEndian>(self.columns.len() as u16)?;
+        if requires_v2_encoding(self) {
+            self.write_to_v2(w)
+        } else {
+            self.write_to_v1(w)
+        }
+    }
+
+    /// Write the v1 (narrow-counter) layout. Returns `InvalidData` if a
+    /// counter doesn't fit — callers should use [`Self::write_to`] which
+    /// auto-routes to v2 in that case.
+    fn write_to_v1<W: Write>(&self, w: &mut W) -> Result<()> {
+        w.write_u8(1)?;
+        w.write_u16::<LittleEndian>(write_cast::<_, u16>(self.columns.len(), "columns.len()")?)?;
         for col in &self.columns {
             match col {
                 IndexedColumn::Categorical(cat) => {
                     // column name
                     let name_bytes = cat.column_name.as_bytes();
-                    w.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
+                    w.write_u16::<LittleEndian>(write_cast::<_, u16>(
+                        name_bytes.len(),
+                        "categorical column_name.len()",
+                    )?)?;
                     w.write_all(name_bytes)?;
                     // column_type = 0 (categorical)
                     w.write_u8(0)?;
                     // n_entries
-                    w.write_u32::<LittleEndian>(cat.entries.len() as u32)?;
+                    w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                        cat.entries.len(),
+                        "categorical entries.len()",
+                    )?)?;
                     for entry in &cat.entries {
                         let val_bytes = entry.value.as_bytes();
-                        w.write_u16::<LittleEndian>(val_bytes.len() as u16)?;
+                        w.write_u16::<LittleEndian>(write_cast::<_, u16>(
+                            val_bytes.len(),
+                            "categorical value.len()",
+                        )?)?;
                         w.write_all(val_bytes)?;
-                        w.write_u16::<LittleEndian>(entry.shard_ranges.len() as u16)?;
+                        w.write_u16::<LittleEndian>(write_cast::<_, u16>(
+                            entry.shard_ranges.len(),
+                            "categorical shard_ranges.len()",
+                        )?)?;
                         for sr in &entry.shard_ranges {
                             w.write_u32::<LittleEndian>(sr.shard_id)?;
                             w.write_u32::<LittleEndian>(sr.row_start)?;
@@ -168,21 +277,37 @@ impl PredicateIndex {
                 IndexedColumn::Numeric(num) => {
                     // column name
                     let name_bytes = num.column_name.as_bytes();
-                    w.write_u16::<LittleEndian>(name_bytes.len() as u16)?;
+                    w.write_u16::<LittleEndian>(write_cast::<_, u16>(
+                        name_bytes.len(),
+                        "numeric column_name.len()",
+                    )?)?;
                     w.write_all(name_bytes)?;
                     // column_type = 1 (numeric)
                     w.write_u8(1)?;
-                    // n_entries (total leaf entries for the header)
-                    let total_entries: u32 = num
-                        .leaf_pages
-                        .iter()
-                        .map(|lp| lp.entries.len() as u32)
-                        .sum();
+                    // n_entries (total leaf entries for the header) — checked sum
+                    let mut total_entries: u32 = 0;
+                    for lp in &num.leaf_pages {
+                        let n =
+                            write_cast::<_, u32>(lp.entries.len(), "numeric leaf entries.len()")?;
+                        total_entries = total_entries.checked_add(n).ok_or_else(|| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "PredicateIndex v1 writer: numeric total_entries overflows u32; \
+                                 use PredicateIndex v2 (u64 entry totals) for inputs at this scale.",
+                            ))
+                        })?;
+                    }
                     w.write_u32::<LittleEndian>(total_entries)?;
                     // B+ tree metadata
                     w.write_u16::<LittleEndian>(num.fanout)?;
-                    w.write_u32::<LittleEndian>(num.leaf_pages.len() as u32)?;
-                    w.write_u32::<LittleEndian>(num.internal_pages.len() as u32)?;
+                    w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                        num.leaf_pages.len(),
+                        "numeric leaf_pages.len()",
+                    )?)?;
+                    w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                        num.internal_pages.len(),
+                        "numeric internal_pages.len()",
+                    )?)?;
                     // Internal pages
                     for page in &num.internal_pages {
                         w.write_u16::<LittleEndian>(page.n_keys)?;
@@ -195,7 +320,107 @@ impl PredicateIndex {
                     }
                     // Leaf pages
                     for page in &num.leaf_pages {
-                        w.write_u32::<LittleEndian>(page.entries.len() as u32)?;
+                        w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                            page.entries.len(),
+                            "numeric per-page entries.len()",
+                        )?)?;
+                        for entry in &page.entries {
+                            w.write_f64::<LittleEndian>(entry.min_value)?;
+                            w.write_f64::<LittleEndian>(entry.max_value)?;
+                            w.write_u32::<LittleEndian>(entry.shard_id)?;
+                            w.write_u32::<LittleEndian>(entry.row_start)?;
+                            w.write_u32::<LittleEndian>(entry.row_end)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the v2 (wide-counter) layout. v2 widens the on-disk counters
+    /// that v1 stored as `u16` / `u32` to `u32` / `u64`, so extreme-cardinality
+    /// columns or multi-billion-row obs axes can be represented without
+    /// silent truncation. Wire format:
+    ///
+    /// - `version = 2` (u8)
+    /// - `n_columns` (u32)            ← was u16 in v1
+    /// - per column:
+    ///   - `name_len` (u32)           ← was u16
+    ///   - name bytes
+    ///   - `column_type` (u8)
+    ///   - `n_entries` (u64)          ← was u32
+    ///   - categorical:
+    ///     - `val_len` (u32)          ← was u16
+    ///     - value bytes
+    ///     - `n_ranges` (u32)         ← was u16
+    ///     - per range: shard_id/row_start/row_end (u32 each, unchanged)
+    ///   - numeric:
+    ///     - `fanout` (u16, unchanged)
+    ///     - `n_leaf_pages` (u64)     ← was u32
+    ///     - `n_internal_pages` (u64) ← was u32
+    ///     - internal pages: n_keys (u16), keys (f64), children (u32) [unchanged]
+    ///     - per leaf page: `n_entries` (u64) ← was u32, then entries [unchanged]
+    fn write_to_v2<W: Write>(&self, w: &mut W) -> Result<()> {
+        w.write_u8(2)?;
+        w.write_u32::<LittleEndian>(write_cast::<_, u32>(self.columns.len(), "columns.len()")?)?;
+        for col in &self.columns {
+            match col {
+                IndexedColumn::Categorical(cat) => {
+                    let name_bytes = cat.column_name.as_bytes();
+                    w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                        name_bytes.len(),
+                        "categorical column_name.len()",
+                    )?)?;
+                    w.write_all(name_bytes)?;
+                    w.write_u8(0)?;
+                    w.write_u64::<LittleEndian>(cat.entries.len() as u64)?;
+                    for entry in &cat.entries {
+                        let val_bytes = entry.value.as_bytes();
+                        w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                            val_bytes.len(),
+                            "categorical value.len()",
+                        )?)?;
+                        w.write_all(val_bytes)?;
+                        w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                            entry.shard_ranges.len(),
+                            "categorical shard_ranges.len()",
+                        )?)?;
+                        for sr in &entry.shard_ranges {
+                            w.write_u32::<LittleEndian>(sr.shard_id)?;
+                            w.write_u32::<LittleEndian>(sr.row_start)?;
+                            w.write_u32::<LittleEndian>(sr.row_end)?;
+                        }
+                    }
+                }
+                IndexedColumn::Numeric(num) => {
+                    let name_bytes = num.column_name.as_bytes();
+                    w.write_u32::<LittleEndian>(write_cast::<_, u32>(
+                        name_bytes.len(),
+                        "numeric column_name.len()",
+                    )?)?;
+                    w.write_all(name_bytes)?;
+                    w.write_u8(1)?;
+                    let total_entries: u64 = num
+                        .leaf_pages
+                        .iter()
+                        .map(|lp| lp.entries.len() as u64)
+                        .sum();
+                    w.write_u64::<LittleEndian>(total_entries)?;
+                    w.write_u16::<LittleEndian>(num.fanout)?;
+                    w.write_u64::<LittleEndian>(num.leaf_pages.len() as u64)?;
+                    w.write_u64::<LittleEndian>(num.internal_pages.len() as u64)?;
+                    for page in &num.internal_pages {
+                        w.write_u16::<LittleEndian>(page.n_keys)?;
+                        for &key in &page.keys {
+                            w.write_f64::<LittleEndian>(key)?;
+                        }
+                        for &child in &page.children {
+                            w.write_u32::<LittleEndian>(child)?;
+                        }
+                    }
+                    for page in &num.leaf_pages {
+                        w.write_u64::<LittleEndian>(page.entries.len() as u64)?;
                         for entry in &page.entries {
                             w.write_f64::<LittleEndian>(entry.min_value)?;
                             w.write_f64::<LittleEndian>(entry.max_value)?;
@@ -220,6 +445,18 @@ impl PredicateIndex {
     /// below the caps.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self> {
         let version = r.read_u8()?;
+        match version {
+            1 => Self::read_from_v1(r),
+            2 => Self::read_from_v2(r),
+            v => Err(EngineError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown predicate index version: {v}"),
+            ))),
+        }
+    }
+
+    fn read_from_v1<R: Read>(r: &mut R) -> Result<Self> {
+        let version = 1u8;
         let n_columns = r.read_u16::<LittleEndian>()?;
         let mut columns = Vec::with_capacity(n_columns as usize);
 
@@ -332,6 +569,158 @@ impl PredicateIndex {
                     return Err(EngineError::IoError(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("unknown predicate index column type: {column_type}"),
+                    )));
+                }
+            }
+        }
+
+        Ok(PredicateIndex { version, columns })
+    }
+
+    /// Read the v2 (wide-counter) layout. See [`Self::write_to_v2`] for the
+    /// wire format. The defensive `check_count_bound` / `capacity_hint`
+    /// guards mirror the v1 path so the same allocation-DOS / malformed-
+    /// input protections apply.
+    fn read_from_v2<R: Read>(r: &mut R) -> Result<Self> {
+        let version = 2u8;
+        let n_columns = r.read_u32::<LittleEndian>()? as usize;
+        // Bound the column count: v1 capped at u16::MAX (65535); even v2
+        // realistic obs/var has <1000 columns, so a cap of 1M is generous.
+        check_count_bound(n_columns, 1_000_000, "v2 columns")?;
+        let mut columns = Vec::with_capacity(capacity_hint(n_columns));
+
+        for _ in 0..n_columns {
+            let name_len = r.read_u32::<LittleEndian>()? as usize;
+            check_count_bound(name_len, 1_000_000, "v2 column_name length")?;
+            let mut name_bytes = vec![0u8; name_len];
+            r.read_exact(&mut name_bytes)?;
+            let column_name = String::from_utf8(name_bytes).map_err(|e| {
+                EngineError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+
+            let column_type = r.read_u8()?;
+            let _n_entries_u64 = r.read_u64::<LittleEndian>()?;
+
+            match column_type {
+                0 => {
+                    let n_cat_entries = usize::try_from(_n_entries_u64).map_err(|_| {
+                        EngineError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "v2 categorical entries count exceeds system pointer width",
+                        ))
+                    })?;
+                    check_count_bound(
+                        n_cat_entries,
+                        MAX_CATEGORICAL_ENTRIES,
+                        "v2 categorical entries",
+                    )?;
+                    let mut entries = Vec::with_capacity(capacity_hint(n_cat_entries));
+                    for _ in 0..n_cat_entries {
+                        let val_len = r.read_u32::<LittleEndian>()? as usize;
+                        check_count_bound(val_len, 1_000_000, "v2 categorical value length")?;
+                        let mut val_bytes = vec![0u8; val_len];
+                        r.read_exact(&mut val_bytes)?;
+                        let value = String::from_utf8(val_bytes).map_err(|e| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e,
+                            ))
+                        })?;
+                        let n_ranges = r.read_u32::<LittleEndian>()? as usize;
+                        check_count_bound(n_ranges, 1_000_000_000, "v2 categorical shard_ranges")?;
+                        let mut shard_ranges = Vec::with_capacity(capacity_hint(n_ranges));
+                        for _ in 0..n_ranges {
+                            shard_ranges.push(ShardRange {
+                                shard_id: r.read_u32::<LittleEndian>()?,
+                                row_start: r.read_u32::<LittleEndian>()?,
+                                row_end: r.read_u32::<LittleEndian>()?,
+                            });
+                        }
+                        entries.push(CategoricalEntry {
+                            value,
+                            shard_ranges,
+                        });
+                    }
+                    columns.push(IndexedColumn::Categorical(CategoricalIndex {
+                        column_name,
+                        entries,
+                    }));
+                }
+                1 => {
+                    let fanout = r.read_u16::<LittleEndian>()?;
+                    let n_leaf_pages =
+                        usize::try_from(r.read_u64::<LittleEndian>()?).map_err(|_| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "v2 leaf pages count exceeds system pointer width",
+                            ))
+                        })?;
+                    let n_internal_pages =
+                        usize::try_from(r.read_u64::<LittleEndian>()?).map_err(|_| {
+                            EngineError::IoError(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "v2 internal pages count exceeds system pointer width",
+                            ))
+                        })?;
+                    check_count_bound(n_leaf_pages, MAX_NUMERIC_PAGES, "v2 leaf pages")?;
+                    check_count_bound(n_internal_pages, MAX_NUMERIC_PAGES, "v2 internal pages")?;
+
+                    let mut internal_pages = Vec::with_capacity(capacity_hint(n_internal_pages));
+                    for _ in 0..n_internal_pages {
+                        let n_keys = r.read_u16::<LittleEndian>()?;
+                        let mut keys = Vec::with_capacity(n_keys as usize);
+                        for _ in 0..n_keys {
+                            keys.push(r.read_f64::<LittleEndian>()?);
+                        }
+                        let mut children = Vec::with_capacity(n_keys as usize + 1);
+                        for _ in 0..=n_keys {
+                            children.push(r.read_u32::<LittleEndian>()?);
+                        }
+                        internal_pages.push(InternalPage {
+                            n_keys,
+                            keys,
+                            children,
+                        });
+                    }
+
+                    let mut leaf_pages = Vec::with_capacity(capacity_hint(n_leaf_pages));
+                    for _ in 0..n_leaf_pages {
+                        let n_leaf_entries = usize::try_from(r.read_u64::<LittleEndian>()?)
+                            .map_err(|_| {
+                                EngineError::IoError(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "v2 leaf entries count exceeds system pointer width",
+                                ))
+                            })?;
+                        check_count_bound(
+                            n_leaf_entries,
+                            MAX_NUMERIC_LEAF_ENTRIES_PER_PAGE,
+                            "v2 leaf entries",
+                        )?;
+                        let mut entries = Vec::with_capacity(capacity_hint(n_leaf_entries));
+                        for _ in 0..n_leaf_entries {
+                            entries.push(NumericLeafEntry {
+                                min_value: r.read_f64::<LittleEndian>()?,
+                                max_value: r.read_f64::<LittleEndian>()?,
+                                shard_id: r.read_u32::<LittleEndian>()?,
+                                row_start: r.read_u32::<LittleEndian>()?,
+                                row_end: r.read_u32::<LittleEndian>()?,
+                            });
+                        }
+                        leaf_pages.push(LeafPage { entries });
+                    }
+
+                    columns.push(IndexedColumn::Numeric(NumericIndex {
+                        column_name,
+                        fanout,
+                        internal_pages,
+                        leaf_pages,
+                    }));
+                }
+                _ => {
+                    return Err(EngineError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown v2 predicate index column type: {column_type}"),
                     )));
                 }
             }
@@ -1170,6 +1559,493 @@ pub fn build_obs_predicate_index_bytes(
     )
 }
 
+// ============================================================================
+// Streaming obs predicate-index builder
+// ============================================================================
+
+/// Streaming counterpart to [`build_obs_predicate_index_bytes`].
+///
+/// The single-batch entry point requires the full obs `RecordBatch` to
+/// be assembled in memory before predicate-index construction starts,
+/// which defeats the purpose of the row-sharded obs layout introduced
+/// for atlas-scale merges and appends.
+/// The builder accepts shards one at a time via [`Self::push_shard`]
+/// and finalises into the same serialised bytes blob at [`Self::finish`].
+///
+/// Memory profile per indexed column matches the batch-mode path
+/// (categorical: `BTreeMap<String, Vec<u64>>` indexed by value;
+/// numeric: `Vec<(f64, u64)>` of all values). The win is that we never
+/// have to materialise the obs `RecordBatch` itself — Arrow column
+/// buffers stay shard-local and are released after each `push_shard`.
+///
+/// Column selection works identically to the batch-mode path:
+/// - forced + preset columns are tracked from the start (even if they
+///   exceed the auto-detect threshold — `high_cardinality_threshold`
+///   still caps them with a `HighCardinality` outcome at finish);
+/// - auto-detect mode tracks every supported column up front and at
+///   finish keeps only those whose observed cardinality stays under
+///   `auto_threshold`.
+pub struct ObsPredicateIndexBuilder {
+    schema: arrow::datatypes::SchemaRef,
+    options: PredicateIndexBuildOptions,
+    /// Columns we are actively accumulating. Sorted in the order they
+    /// will eventually appear in the serialised `PredicateIndex`.
+    columns: Vec<ColumnAccumulator>,
+    /// Total rows pushed so far. Used to verify the shard stream covers
+    /// the obs axis the caller claimed.
+    rows_pushed: u64,
+}
+
+struct ColumnAccumulator {
+    name: String,
+    /// `true` when the column was named via forced/preset config (so
+    /// failures map to `ForcedColumnError` / `PresetSkipped`); `false`
+    /// for auto-detected columns (silent skip).
+    is_forced: bool,
+    /// `true` when the column was named via forced/preset config
+    /// (vs. auto-detect). Forced columns surface a `ForcedColumnError`
+    /// on skip; auto-detected columns are skipped silently.
+    is_named: bool,
+    /// Auto-detect or named-cap mode? Drives the cardinality check at
+    /// finish.
+    selection: ColumnSelection,
+    /// Per-shard payload state. Determined at `new` from the column's
+    /// declared dtype in the schema.
+    state: ColumnState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColumnSelection {
+    /// Auto-detect: include at finish iff observed cardinality stays
+    /// under `options.auto_threshold`.
+    Auto,
+    /// Named (forced or preset): include unless observed cardinality
+    /// exceeds `options.high_cardinality_threshold`.
+    Named,
+}
+
+enum ColumnState {
+    Categorical { values: BTreeMap<String, Vec<u64>> },
+    Numeric { values: Vec<(f64, u64)> },
+    Unsupported { dtype: String },
+    MissingColumn,
+}
+
+impl ObsPredicateIndexBuilder {
+    /// Construct a builder by inspecting the obs schema and the
+    /// forced/preset column list. Auto-detect mode (no forced /
+    /// preset given) tracks every categorical / numeric column up front
+    /// and resolves cardinality at finish.
+    pub fn new(
+        schema: arrow::datatypes::SchemaRef,
+        options: &PredicateIndexBuildOptions,
+    ) -> Result<Self> {
+        use std::collections::BTreeSet;
+
+        let auto_mode = options.forced_columns.is_empty() && options.preset_columns.is_empty();
+        let mut columns: Vec<ColumnAccumulator> = Vec::new();
+
+        if auto_mode {
+            for field in schema.fields().iter() {
+                let dt = field.data_type();
+                if !is_categorical_type(dt) && !is_numeric_type(dt) {
+                    continue;
+                }
+                let state = if is_categorical_type(dt) {
+                    ColumnState::Categorical {
+                        values: BTreeMap::new(),
+                    }
+                } else {
+                    ColumnState::Numeric { values: Vec::new() }
+                };
+                columns.push(ColumnAccumulator {
+                    name: field.name().clone(),
+                    is_forced: false,
+                    is_named: false,
+                    selection: ColumnSelection::Auto,
+                    state,
+                });
+            }
+        } else {
+            // Named-column path: walk forced ∪ preset (forced wins
+            // on duplicates), validate each against the schema, and
+            // record per-column state — including unsupported and
+            // missing markers so `finish` can emit per-column
+            // outcomes without re-walking the schema.
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            let mut named: Vec<(String, bool)> = Vec::new();
+            for col in &options.forced_columns {
+                if seen.insert(col.clone()) {
+                    named.push((col.clone(), true));
+                }
+            }
+            for col in &options.preset_columns {
+                if seen.insert(col.clone()) {
+                    named.push((col.clone(), false));
+                }
+            }
+            for (col_name, is_forced) in named {
+                let (state, _is_supported) = match schema.column_with_name(&col_name) {
+                    Some((_, field)) => {
+                        let dt = field.data_type();
+                        if is_categorical_type(dt) {
+                            (
+                                ColumnState::Categorical {
+                                    values: BTreeMap::new(),
+                                },
+                                true,
+                            )
+                        } else if is_numeric_type(dt) {
+                            (ColumnState::Numeric { values: Vec::new() }, true)
+                        } else {
+                            (
+                                ColumnState::Unsupported {
+                                    dtype: format!("{dt:?}"),
+                                },
+                                false,
+                            )
+                        }
+                    }
+                    None => (ColumnState::MissingColumn, false),
+                };
+                columns.push(ColumnAccumulator {
+                    name: col_name,
+                    is_forced,
+                    is_named: true,
+                    selection: ColumnSelection::Named,
+                    state,
+                });
+            }
+        }
+
+        Ok(Self {
+            schema,
+            options: options.clone(),
+            columns,
+            rows_pushed: 0,
+        })
+    }
+
+    /// Accumulate one obs metadata shard. `shard_row_offset` is the
+    /// global row index where this shard begins (i.e. its
+    /// `row_start`); the builder pairs each row value with
+    /// `shard_row_offset + i` so the final `rows_to_shard_ranges` pass
+    /// at `finish` can map values back to per-shard ranges identical
+    /// to what the batch-mode builder would produce on the assembled
+    /// `RecordBatch`.
+    ///
+    /// Shards must be pushed in row order and must form a contiguous
+    /// cover (no gap, no overlap) of the obs axis. The builder
+    /// verifies the order against [`Self::rows_pushed`] but trusts
+    /// the caller's `shard_row_offset` for correctness.
+    pub fn push_shard(
+        &mut self,
+        batch: &arrow::array::RecordBatch,
+        shard_row_offset: u64,
+    ) -> Result<()> {
+        // Sanity check: shards must be pushed in row order.
+        if shard_row_offset != self.rows_pushed {
+            return Err(EngineError::Generic(format!(
+                "ObsPredicateIndexBuilder: shard at row offset {shard_row_offset} \
+                 does not continue from previous cumulative rows {prev}",
+                prev = self.rows_pushed
+            )));
+        }
+
+        // Verify the shard's schema matches what `new()` was given.
+        // We compare a normalised "class" (categorical / numeric /
+        // other) rather than exact dtypes so a builder initialised
+        // with `Utf8` cell ids accepts shards that present them as
+        // `LargeUtf8` (which is what the per-shard upcast in
+        // `ScxWriter::write_arrow_ipc` emits for >2 GB string
+        // payloads). `extract_string_value` / `extract_numeric_value`
+        // handle both widths transparently.
+        let shard_schema = batch.schema();
+        for col in &self.columns {
+            let (Some((_, shard_field)), Some((_, expected_field))) = (
+                shard_schema.column_with_name(&col.name),
+                self.schema.column_with_name(&col.name),
+            ) else {
+                continue;
+            };
+            let same_class =
+                column_class_compatible(shard_field.data_type(), expected_field.data_type());
+            if !same_class {
+                return Err(EngineError::Generic(format!(
+                    "ObsPredicateIndexBuilder: shard column '{}' has dtype \
+                     {:?}, builder was initialised with {:?} — these are \
+                     not interchangeable for predicate-index purposes",
+                    col.name,
+                    shard_field.data_type(),
+                    expected_field.data_type()
+                )));
+            }
+        }
+
+        let n_rows = batch.num_rows();
+        for col in self.columns.iter_mut() {
+            // Skip columns that already errored (missing, unsupported);
+            // their outcome is emitted at `finish`.
+            let (col_idx, _) = match shard_schema.column_with_name(&col.name) {
+                Some(x) => x,
+                None => continue,
+            };
+            let array = batch.column(col_idx);
+            match &mut col.state {
+                ColumnState::Categorical { values } => {
+                    for i in 0..n_rows {
+                        if array.is_null(i) {
+                            continue;
+                        }
+                        if let Some(v) = extract_string_value(array, i) {
+                            values
+                                .entry(v)
+                                .or_default()
+                                .push(shard_row_offset + i as u64);
+                        }
+                    }
+                }
+                ColumnState::Numeric { values } => {
+                    for i in 0..n_rows {
+                        if array.is_null(i) {
+                            continue;
+                        }
+                        if let Some(v) = extract_numeric_value(array, i) {
+                            values.push((v, shard_row_offset + i as u64));
+                        }
+                    }
+                }
+                ColumnState::Unsupported { .. } | ColumnState::MissingColumn => {}
+            }
+        }
+
+        // Defense-in-depth: a u64 cumulative-row counter can't realistically
+        // overflow (would require > 2^64 rows pushed across a single
+        // builder invocation), but use `checked_add` so a malformed shard
+        // claiming `n_rows >= 2^64 - rows_pushed` fails loudly instead of
+        // silently saturating and corrupting the downstream row-offset
+        // arithmetic.
+        self.rows_pushed = self.rows_pushed.checked_add(n_rows as u64).ok_or_else(|| {
+            EngineError::Generic(format!(
+                "ObsPredicateIndexBuilder: cumulative row count overflowed u64 \
+                     pushing shard at offset {shard_row_offset} with {n_rows} rows",
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Finalise the index: resolve auto-detect cardinality, build
+    /// `CategoricalIndex` / `NumericIndex` entries, serialise to the
+    /// `PredicateIndex` byte format, and return the resulting bytes.
+    ///
+    /// Outcomes (forced errors, preset skips, high-cardinality skips,
+    /// missing-column markers) are pushed onto `outcomes` so the
+    /// caller can demote them to typed warnings (same protocol as
+    /// [`build_obs_predicate_index_bytes`]). `indexed_column_names`
+    /// receives the names of the columns that ended up in the index,
+    /// in serialisation order — used for provenance stamping.
+    pub fn finish(
+        self,
+        shard_row_ranges: &[(u64, u64)],
+        outcomes: &mut Vec<BuildOutcome>,
+        indexed_column_names: &mut Vec<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        let push_outcome = |outcomes: &mut Vec<BuildOutcome>,
+                            col_name: &str,
+                            is_forced: bool,
+                            reason: SkipReason| {
+            outcomes.push(if is_forced {
+                BuildOutcome::ForcedColumnError {
+                    column: col_name.to_string(),
+                    reason,
+                }
+            } else {
+                BuildOutcome::PresetSkipped {
+                    column: col_name.to_string(),
+                    reason,
+                }
+            });
+        };
+
+        let mut indexed: Vec<IndexedColumn> = Vec::new();
+        let mut auto_mode_index_count = 0usize;
+
+        for col in self.columns {
+            let ColumnAccumulator {
+                name,
+                is_forced,
+                is_named,
+                selection,
+                state,
+            } = col;
+            match state {
+                ColumnState::MissingColumn => {
+                    if is_named {
+                        push_outcome(outcomes, &name, is_forced, SkipReason::MissingColumn);
+                    }
+                    continue;
+                }
+                ColumnState::Unsupported { dtype } => {
+                    if is_named {
+                        push_outcome(
+                            outcomes,
+                            &name,
+                            is_forced,
+                            SkipReason::UnsupportedDtype(dtype),
+                        );
+                    }
+                    continue;
+                }
+                ColumnState::Categorical { values } => {
+                    let n_unique = values.len();
+                    match selection {
+                        ColumnSelection::Auto => {
+                            // Silent skip when cardinality exceeds the
+                            // auto-detect threshold.
+                            if n_unique >= self.options.auto_threshold {
+                                continue;
+                            }
+                        }
+                        ColumnSelection::Named => {
+                            if n_unique > self.options.high_cardinality_threshold {
+                                push_outcome(
+                                    outcomes,
+                                    &name,
+                                    is_forced,
+                                    SkipReason::HighCardinality {
+                                        n_unique,
+                                        threshold: self.options.high_cardinality_threshold,
+                                    },
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut entries: Vec<CategoricalEntry> = Vec::new();
+                    for (value, rows) in &values {
+                        let shard_ranges = rows_to_shard_ranges(rows, shard_row_ranges);
+                        entries.push(CategoricalEntry {
+                            value: value.clone(),
+                            shard_ranges,
+                        });
+                    }
+                    indexed.push(IndexedColumn::Categorical(CategoricalIndex {
+                        column_name: name.clone(),
+                        entries,
+                    }));
+                    indexed_column_names.push(name);
+                    if matches!(selection, ColumnSelection::Auto) {
+                        auto_mode_index_count += 1;
+                    }
+                }
+                ColumnState::Numeric { values } => {
+                    // Intentional no-op: numeric columns always build a
+                    // B+ tree regardless of cardinality, so unlike the
+                    // categorical path there's no "skip on high
+                    // cardinality" branch. The condition is kept (as
+                    // a `let _` below) only so future readers see that
+                    // we considered cardinality and chose to ignore
+                    // it — `values.len()` is the row count, not the
+                    // distinct count (numeric accumulators don't
+                    // dedupe), so a cardinality check here would be
+                    // misleading anyway. Matches batch-mode behaviour.
+                    let _ = matches!(selection, ColumnSelection::Named)
+                        && values.len() > self.options.high_cardinality_threshold;
+                    indexed.push(IndexedColumn::Numeric(numeric_index_from_values(
+                        &name,
+                        values,
+                        shard_row_ranges,
+                        64,
+                    )));
+                    indexed_column_names.push(name);
+                    if matches!(selection, ColumnSelection::Auto) {
+                        auto_mode_index_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Empty index: nothing was selected (either no auto-detect
+        // candidates passed the threshold, or every named column was
+        // skipped). Match batch-mode semantics — return None so the
+        // caller skips the `write_*_predicate_index` call.
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+        // Cosmetic guard: auto-detect mode produced at least one
+        // entry. Keeps the invariant identical to the batch path
+        // where `columns_to_index.is_empty()` short-circuits.
+        let _ = auto_mode_index_count;
+
+        let index = PredicateIndex {
+            version: 1,
+            columns: indexed,
+        };
+        let mut buf = Vec::new();
+        index.write_to(&mut buf)?;
+        Ok(Some(buf))
+    }
+}
+
+/// Pre-collected variant of [`build_numeric_index`] used by the
+/// streaming builder. Identical algorithm — only the source of the
+/// `(value, global_row)` pairs differs.
+fn numeric_index_from_values(
+    column_name: &str,
+    mut value_rows: Vec<(f64, u64)>,
+    shard_row_ranges: &[(u64, u64)],
+    fanout: u16,
+) -> NumericIndex {
+    value_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if value_rows.is_empty() {
+        return NumericIndex {
+            column_name: column_name.to_string(),
+            fanout,
+            internal_pages: vec![],
+            leaf_pages: vec![],
+        };
+    }
+
+    let mut leaf_entries: Vec<NumericLeafEntry> = Vec::new();
+    for &(val, global_row) in &value_rows {
+        let Some((shard_id, local_row)) = global_row_to_shard(global_row, shard_row_ranges) else {
+            continue;
+        };
+        if let Some(last) = leaf_entries.last_mut() {
+            if last.shard_id == shard_id && local_row == last.row_end {
+                last.max_value = val;
+                last.row_end = local_row + 1;
+                continue;
+            }
+        }
+        leaf_entries.push(NumericLeafEntry {
+            min_value: val,
+            max_value: val,
+            shard_id,
+            row_start: local_row,
+            row_end: local_row + 1,
+        });
+    }
+
+    let leaf_pages: Vec<LeafPage> = leaf_entries
+        .chunks(fanout as usize)
+        .map(|chunk| LeafPage {
+            entries: chunk.to_vec(),
+        })
+        .collect();
+
+    let internal_pages = build_internal_pages(&leaf_pages, fanout);
+
+    NumericIndex {
+        column_name: column_name.to_string(),
+        fanout,
+        internal_pages,
+        leaf_pages,
+    }
+}
+
 /// Build serialized predicate-index bytes for a var RecordBatch. The
 /// `shard_row_ranges` argument should be a single-shard range
 /// `[(0, n_vars)]` — the engine treats var as a single shard for index
@@ -1240,6 +2116,65 @@ pub fn build_and_write_conversion_predicate_indexes(
     n_vars: usize,
     options: &ConversionPredicateIndexOptions,
 ) -> Result<ConversionPredicateIndexResult> {
+    // Delegate to the streaming variant with a one-shard iterator so
+    // both entry points share a single implementation. Caller has the
+    // assembled batch in hand — wrapping it in `std::iter::once` is
+    // O(1).
+    let obs_schema = obs.schema();
+    build_and_write_conversion_predicate_indexes_streaming(
+        writer,
+        obs_schema,
+        std::iter::once(Ok((obs.clone(), 0u64))),
+        var,
+        obs_row_ranges,
+        n_vars,
+        options,
+    )
+}
+
+/// Streaming counterpart to [`build_and_write_conversion_predicate_indexes`].
+///
+/// Identical contract except `obs_shards` yields `(shard_batch,
+/// shard_row_offset)` tuples one at a time — the obs predicate index
+/// is built incrementally via [`ObsPredicateIndexBuilder`] so the
+/// caller never has to assemble the full obs `RecordBatch` in memory.
+/// Used by the sharded merge / append paths to keep peak RSS bounded
+/// to one shard at a time.
+///
+/// `obs_schema` must describe the unified column layout of every
+/// shard; the builder validates each shard's dtypes against it.
+/// `var` is still treated as a single (small) batch — gene metadata
+/// rarely overflows the 2 GB ceiling and the var predicate-index
+/// path does not benefit meaningfully from shard streaming today.
+pub fn build_and_write_conversion_predicate_indexes_streaming(
+    writer: &mut scx_format::ScxWriter,
+    obs_schema: arrow::datatypes::SchemaRef,
+    obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
+    var: &arrow::array::RecordBatch,
+    obs_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ConversionPredicateIndexResult> {
+    streaming_impl(
+        writer,
+        obs_schema,
+        obs_shards,
+        var,
+        obs_row_ranges,
+        n_vars,
+        options,
+    )
+}
+
+fn streaming_impl(
+    writer: &mut scx_format::ScxWriter,
+    obs_schema: arrow::datatypes::SchemaRef,
+    obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
+    var: &arrow::array::RecordBatch,
+    obs_row_ranges: &[(u64, u64)],
+    n_vars: usize,
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ConversionPredicateIndexResult> {
     const HIGH_CARDINALITY_THRESHOLD: usize = 100_000;
 
     // Resolve preset up front so an unknown name fails before any
@@ -1266,17 +2201,20 @@ pub fn build_and_write_conversion_predicate_indexes(
 
     let mut result = ConversionPredicateIndexResult::default();
 
-    // obs
+    // obs — stream shards through the builder.
     let obs_build_opts = PredicateIndexBuildOptions {
         forced_columns: options.index_obs.clone(),
         preset_columns: preset_obs,
         auto_threshold: options.index_auto_threshold,
         high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
     };
-    let obs_bytes = build_obs_predicate_index_bytes(
-        obs,
+    let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &obs_build_opts)?;
+    for shard in obs_shards {
+        let (batch, row_offset) = shard?;
+        builder.push_shard(&batch, row_offset)?;
+    }
+    let obs_bytes = builder.finish(
         obs_row_ranges,
-        &obs_build_opts,
         &mut result.obs_outcomes,
         &mut result.obs_indexed_columns,
     )?;
@@ -1284,7 +2222,8 @@ pub fn build_and_write_conversion_predicate_indexes(
         writer.write_obs_predicate_index(&bytes)?;
     }
 
-    // var (single shard)
+    // var (single shard) — gene metadata is small enough that the
+    // batch-mode builder stays fine.
     let var_row_ranges: [(u64, u64); 1] = [(0, n_vars as u64)];
     let var_build_opts = PredicateIndexBuildOptions {
         forced_columns: options.index_var.clone(),
@@ -1535,6 +2474,18 @@ fn estimate_unique_values(col: &ArrayRef) -> usize {
     }
 }
 
+/// True when two Arrow dtypes are interchangeable for predicate-index
+/// purposes: both categorical (any of `Utf8` / `LargeUtf8` /
+/// `Dictionary(_, _)`) or both numeric. Used by
+/// [`ObsPredicateIndexBuilder::push_shard`] to accept shards whose
+/// per-shard upcast widens columns to `LargeUtf8` while the builder
+/// was initialised with the input file's narrow `Utf8` schema.
+fn column_class_compatible(a: &DataType, b: &DataType) -> bool {
+    (is_categorical_type(a) && is_categorical_type(b))
+        || (is_numeric_type(a) && is_numeric_type(b))
+        || a == b
+}
+
 /// Check if a data type is categorical (string or dictionary).
 fn is_categorical_type(dt: &DataType) -> bool {
     matches!(
@@ -1738,6 +2689,301 @@ mod tests {
         assert_eq!(decoded, index);
     }
 
+    // -------------------------------------------------------------------
+    // Phase 5b — v1 / v2 encoding boundary tests
+    // -------------------------------------------------------------------
+
+    /// Below the v1 narrow-counter ceiling: writer must pick v1
+    /// (one-byte version = 1) and round-trip cleanly through the v1 reader.
+    #[test]
+    fn write_to_picks_v1_when_counters_fit() {
+        let index = PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "cell_type".to_string(),
+                entries: vec![CategoricalEntry {
+                    value: "B cell".to_string(),
+                    shard_ranges: vec![ShardRange {
+                        shard_id: 0,
+                        row_start: 0,
+                        row_end: 100,
+                    }],
+                }],
+            })],
+        };
+        let mut buf = Vec::new();
+        index.write_to(&mut buf).unwrap();
+        assert_eq!(buf[0], 1, "small index must serialise as v1");
+
+        let decoded = PredicateIndex::read_from(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.columns.len(), 1);
+    }
+
+    /// Above the v1 per-value range count ceiling (u16::MAX = 65,535):
+    /// writer must auto-route to v2 (one-byte version = 2) and the
+    /// round-tripped values must match. This is the most plausibly-hit
+    /// v2 trigger — a single ubiquitous categorical value crossing
+    /// `u16::MAX` shard ranges (≈ 1.07B rows at 16384-row shards).
+    #[test]
+    fn write_to_auto_picks_v2_when_shard_ranges_exceed_u16() {
+        let n_ranges = (u16::MAX as usize) + 5;
+        let shard_ranges: Vec<ShardRange> = (0..n_ranges)
+            .map(|i| ShardRange {
+                shard_id: i as u32,
+                row_start: 0,
+                row_end: 16_384,
+            })
+            .collect();
+        let index = PredicateIndex {
+            version: 1, // hint ignored — auto-routing wins
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "cell_type".to_string(),
+                entries: vec![CategoricalEntry {
+                    value: "B cell".to_string(),
+                    shard_ranges,
+                }],
+            })],
+        };
+        let mut buf = Vec::new();
+        index.write_to(&mut buf).unwrap();
+        assert_eq!(buf[0], 2, "over-u16 shard_ranges must promote to v2");
+
+        let decoded = PredicateIndex::read_from(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.version, 2);
+        match &decoded.columns[0] {
+            IndexedColumn::Categorical(cat) => {
+                assert_eq!(cat.entries[0].shard_ranges.len(), n_ranges);
+                assert_eq!(
+                    cat.entries[0].shard_ranges[n_ranges - 1].shard_id,
+                    (n_ranges - 1) as u32
+                );
+            }
+            _ => panic!("expected Categorical"),
+        }
+
+        // Full structural round-trip: any field-order / width regression
+        // in `read_from_v2` for the categorical branch fails here.
+        // `write_to` ignores `self.version`; the on-disk byte is the
+        // source of truth, so set the expected version to 2 to compare.
+        let expected = PredicateIndex {
+            version: 2,
+            columns: index.columns.clone(),
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    /// Above the v1 numeric column name length ceiling (u16::MAX): writer
+    /// must auto-route to v2 and the round-tripped numeric B+ tree
+    /// (internal pages + leaf pages + entries) must compare structurally
+    /// equal. Covers the numeric branch of `read_from_v2`
+    /// (lines 644–696) — `write_to_auto_picks_v2_when_shard_ranges_exceed_u16`
+    /// only exercises the categorical branch.
+    #[test]
+    fn roundtrip_numeric_index_v2() {
+        // Tiny but structurally complete B+ tree: 1 internal page pointing
+        // at 2 leaf pages, each with 2 entries. Forced onto the v2 path by
+        // a numeric column name longer than u16::MAX.
+        let long_name = "n".repeat((u16::MAX as usize) + 1);
+        let index = PredicateIndex {
+            version: 1, // hint ignored — auto-routing wins
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: long_name,
+                fanout: 64,
+                internal_pages: vec![InternalPage {
+                    n_keys: 1,
+                    keys: vec![5.0],
+                    children: vec![0, 1],
+                }],
+                leaf_pages: vec![
+                    LeafPage {
+                        entries: vec![
+                            NumericLeafEntry {
+                                min_value: 0.0,
+                                max_value: 2.5,
+                                shard_id: 0,
+                                row_start: 0,
+                                row_end: 100,
+                            },
+                            NumericLeafEntry {
+                                min_value: 2.5,
+                                max_value: 5.0,
+                                shard_id: 0,
+                                row_start: 100,
+                                row_end: 200,
+                            },
+                        ],
+                    },
+                    LeafPage {
+                        entries: vec![
+                            NumericLeafEntry {
+                                min_value: 5.0,
+                                max_value: 7.5,
+                                shard_id: 1,
+                                row_start: 0,
+                                row_end: 50,
+                            },
+                            NumericLeafEntry {
+                                min_value: 7.5,
+                                max_value: 10.0,
+                                shard_id: 1,
+                                row_start: 50,
+                                row_end: 150,
+                            },
+                        ],
+                    },
+                ],
+            })],
+        };
+
+        let mut buf = Vec::new();
+        index.write_to(&mut buf).unwrap();
+        assert_eq!(buf[0], 2, "over-u16 numeric column_name must promote to v2");
+
+        let decoded = PredicateIndex::read_from(&mut Cursor::new(&buf)).unwrap();
+        let expected = PredicateIndex {
+            version: 2,
+            columns: index.columns.clone(),
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    /// `requires_v2_encoding` is the routing oracle for `write_to`. Each
+    /// widened v1→v2 field should independently trip the oracle so a future
+    /// regression that narrows one but not the others is caught.
+    ///
+    /// **Coverage:** the oracle has 10 distinct return-`true` paths. Five
+    /// are exercised below (cheap to materialise); the other five gate on
+    /// `Vec::len() > u32::MAX`, which would require allocating > 4B
+    /// elements and is infeasible to construct in a unit test. The
+    /// inspected-only triggers, with the line in `requires_v2_encoding`
+    /// that handles each:
+    ///
+    /// - `cat.entries.len() > u32::MAX` (inspected at `requires_v2_encoding`, line 180)
+    /// - `leaf_pages.len() > u32::MAX` (line 196)
+    /// - `internal_pages.len() > u32::MAX` (line 199)
+    /// - per-leaf-page `entries.len() > u32::MAX` (line 204)
+    /// - summed numeric `total_entries > u32::MAX` (line 209)
+    ///
+    /// If `requires_v2_encoding` is refactored, audit those five paths
+    /// manually and treat them as code-review coverage, not test coverage.
+    #[test]
+    fn requires_v2_encoding_triggers_on_each_widened_field() {
+        // Baseline: empty index stays v1.
+        assert!(!requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![],
+        }));
+
+        let cat_entry = |value: String, n_ranges: usize| CategoricalEntry {
+            value,
+            shard_ranges: (0..n_ranges)
+                .map(|i| ShardRange {
+                    shard_id: i as u32,
+                    row_start: 0,
+                    row_end: 0,
+                })
+                .collect(),
+        };
+
+        // a) categorical value length > u16::MAX → v2.
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "c".to_string(),
+                entries: vec![cat_entry("x".repeat((u16::MAX as usize) + 1), 0)],
+            })],
+        }));
+
+        // b) per-value shard_ranges count > u16::MAX → v2 (the most
+        //    plausibly-hit trigger at multi-billion-row obs scale).
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "c".to_string(),
+                entries: vec![cat_entry("v".to_string(), (u16::MAX as usize) + 1)],
+            })],
+        }));
+
+        // c) categorical column name length > u16::MAX → v2.
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "n".repeat((u16::MAX as usize) + 1),
+                entries: vec![],
+            })],
+        }));
+
+        // d) total columns count > u16::MAX → v2. Cheap because each
+        //    column is an empty Categorical placeholder.
+        let many_columns: Vec<IndexedColumn> = (0..(u16::MAX as usize) + 1)
+            .map(|_| {
+                IndexedColumn::Categorical(CategoricalIndex {
+                    column_name: String::new(),
+                    entries: Vec::new(),
+                })
+            })
+            .collect();
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: many_columns,
+        }));
+
+        // e) numeric column name length > u16::MAX → v2. Independent of
+        //    the categorical paths above.
+        assert!(requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: "n".repeat((u16::MAX as usize) + 1),
+                fanout: 64,
+                internal_pages: Vec::new(),
+                leaf_pages: Vec::new(),
+            })],
+        }));
+
+        // f) negative: small categorical stays v1.
+        assert!(!requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Categorical(CategoricalIndex {
+                column_name: "small".to_string(),
+                entries: vec![cat_entry("v".to_string(), 4)],
+            })],
+        }));
+
+        // g) negative: small numeric stays v1.
+        assert!(!requires_v2_encoding(&PredicateIndex {
+            version: 1,
+            columns: vec![IndexedColumn::Numeric(NumericIndex {
+                column_name: "score".to_string(),
+                fanout: 64,
+                internal_pages: Vec::new(),
+                leaf_pages: vec![LeafPage {
+                    entries: vec![NumericLeafEntry {
+                        min_value: 0.0,
+                        max_value: 1.0,
+                        shard_id: 0,
+                        row_start: 0,
+                        row_end: 1,
+                    }],
+                }],
+            })],
+        }));
+    }
+
+    /// Reader must reject an unknown version byte cleanly (defense against
+    /// future format changes / corruption / fuzz inputs).
+    #[test]
+    fn read_from_rejects_unknown_version() {
+        let buf: [u8; 1] = [99];
+        let err = PredicateIndex::read_from(&mut Cursor::new(&buf[..]))
+            .expect_err("unknown version must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown predicate index version"),
+            "expected unknown-version error, got: {msg}"
+        );
+    }
+
     /// Regression: a 10-byte malformed input that declared
     /// `n_cat_entries = 0x2d000000` (~755 million) used to trigger a
     /// ~36 GB `Vec::with_capacity` and OOM the process. Found by the
@@ -1747,8 +2993,11 @@ mod tests {
     #[test]
     fn read_from_rejects_oversized_categorical_count() {
         // version | n_columns(LE) | name_len(LE) | column_type | n_entries(LE)
-        //   0xfb  |   0x000a      |   0x0000     |    0x00     |  0x2d000000
-        let crash_input: [u8; 10] = [0xfb, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2d];
+        //   0x01  |   0x000a      |   0x0000     |    0x00     |  0x2d000000
+        // Version pinned to 1 so the v1 dispatcher (which owns
+        // `MAX_CATEGORICAL_ENTRIES`) runs; unknown version bytes are
+        // rejected separately by `read_from`.
+        let crash_input: [u8; 10] = [0x01, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2d];
         let err = PredicateIndex::read_from(&mut Cursor::new(&crash_input[..]))
             .expect_err("oversized n_entries must be rejected, not allocated");
         let msg = format!("{err}");
@@ -1949,6 +3198,119 @@ mod tests {
             vec![Arc::new(cell_types), Arc::new(n_genes)],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn streaming_builder_matches_batch_auto_detect() {
+        // Same obs batch, two construction paths:
+        //   (a) batch mode via build_obs_predicate_index_bytes
+        //   (b) streaming mode via ObsPredicateIndexBuilder with the
+        //       batch split into two shards (rows 0..6, rows 6..12)
+        // Both must produce identical serialised bytes for the same
+        // shard_row_ranges.
+        let batch = make_obs_batch();
+        let shard_row_ranges: Vec<(u64, u64)> = vec![(0, 6), (6, 12)];
+        let options = PredicateIndexBuildOptions {
+            forced_columns: Vec::new(),
+            preset_columns: Vec::new(),
+            auto_threshold: 1000,
+            high_cardinality_threshold: 100_000,
+        };
+
+        let mut batch_outcomes = Vec::new();
+        let mut batch_indexed_names = Vec::new();
+        let batch_bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_row_ranges,
+            &options,
+            &mut batch_outcomes,
+            &mut batch_indexed_names,
+        )
+        .unwrap()
+        .expect("batch-mode auto-detect should index both columns");
+
+        let shard_a = batch.slice(0, 6);
+        let shard_b = batch.slice(6, 6);
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&shard_a, 0).unwrap();
+        builder.push_shard(&shard_b, 6).unwrap();
+        let mut stream_outcomes = Vec::new();
+        let mut stream_indexed_names = Vec::new();
+        let stream_bytes = builder
+            .finish(
+                &shard_row_ranges,
+                &mut stream_outcomes,
+                &mut stream_indexed_names,
+            )
+            .unwrap()
+            .expect("streaming auto-detect should index both columns");
+
+        assert_eq!(
+            batch_bytes, stream_bytes,
+            "streaming builder must produce byte-identical output to batch path"
+        );
+        assert_eq!(batch_indexed_names, stream_indexed_names);
+        assert!(stream_outcomes.is_empty());
+    }
+
+    #[test]
+    fn streaming_builder_named_forced_column() {
+        // Force the `cell_type` column under named mode and verify the
+        // streaming and batch builders agree.
+        let batch = make_obs_batch();
+        let shard_row_ranges: Vec<(u64, u64)> = vec![(0, 6), (6, 12)];
+        let options = PredicateIndexBuildOptions {
+            forced_columns: vec!["cell_type".to_string()],
+            preset_columns: Vec::new(),
+            auto_threshold: 0,
+            high_cardinality_threshold: 100_000,
+        };
+
+        let mut batch_outcomes = Vec::new();
+        let mut batch_indexed_names = Vec::new();
+        let batch_bytes = build_obs_predicate_index_bytes(
+            &batch,
+            &shard_row_ranges,
+            &options,
+            &mut batch_outcomes,
+            &mut batch_indexed_names,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&batch.slice(0, 6), 0).unwrap();
+        builder.push_shard(&batch.slice(6, 6), 6).unwrap();
+        let mut stream_outcomes = Vec::new();
+        let mut stream_indexed_names = Vec::new();
+        let stream_bytes = builder
+            .finish(
+                &shard_row_ranges,
+                &mut stream_outcomes,
+                &mut stream_indexed_names,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch_bytes, stream_bytes);
+        assert_eq!(batch_indexed_names, vec!["cell_type".to_string()]);
+        assert_eq!(stream_indexed_names, vec!["cell_type".to_string()]);
+    }
+
+    #[test]
+    fn streaming_builder_rejects_out_of_order_shards() {
+        let batch = make_obs_batch();
+        let options = PredicateIndexBuildOptions {
+            forced_columns: vec!["cell_type".to_string()],
+            preset_columns: Vec::new(),
+            auto_threshold: 0,
+            high_cardinality_threshold: 100_000,
+        };
+        let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+        builder.push_shard(&batch.slice(0, 6), 0).unwrap();
+        // Wrong offset — second shard should start at row 6, not 100.
+        let err = builder.push_shard(&batch.slice(6, 6), 100).unwrap_err();
+        assert!(matches!(err, EngineError::Generic(_)), "got: {err:?}");
     }
 
     #[test]

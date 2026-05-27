@@ -197,6 +197,22 @@ impl PyExperiment {
         self.reader.header().n_csr_shards
     }
 
+    /// Number of `ObsMetadataShard` sections in the catalog. Zero on
+    /// legacy single-section files (`obs` is one `ObsMetadata` section);
+    /// `>= 1` on Phase 2 / 4 sharded files written by merge, append, or
+    /// `from_anndata` when `n_obs > shard_target_rows`.
+    #[getter]
+    fn obs_metadata_shard_count(&self) -> usize {
+        self.reader.obs_metadata_shard_count()
+    }
+
+    /// Number of `VarMetadataShard` sections. Mirror of
+    /// [`Self::obs_metadata_shard_count`].
+    #[getter]
+    fn var_metadata_shard_count(&self) -> usize {
+        self.reader.var_metadata_shard_count()
+    }
+
     /// Format version (currently 1).
     #[getter]
     fn format_version(&self) -> u16 {
@@ -366,10 +382,21 @@ impl PyExperiment {
     ///            front and detach the returned AnnData from the SCX
     ///            file handle (e.g., before closing the experiment or
     ///            handing the AnnData to a subprocess).
+    ///     memory_budget: Optional budget for the eager non-backed
+    ///            assembly path. Accepts `None` (default 8 GiB), an int
+    ///            byte count, or a string like `"4G"` / `"512MiB"`.
+    ///            When the catalog-only estimate of the assembled
+    ///            `X` + indptr + obs/var bytes exceeds the budget,
+    ///            `to_anndata()` emits a `UserWarning` recommending
+    ///            `backed=True` or `pyscx.open(path).query()`.
+    ///            Assembly still proceeds — the warning is advisory.
+    ///            Has no effect when `backed=True` (backed mode is
+    ///            already memory-bounded) or in the query-engine path
+    ///            (`obs_filter` without `preserve_slots`).
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -382,7 +409,9 @@ impl PyExperiment {
         preserve_slots: bool,
         modality: Option<String>,
         eager: bool,
+        memory_budget: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
         if let Some(name) = modality.as_deref() {
             if !backed {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -420,6 +449,7 @@ impl PyExperiment {
                 layers.as_deref(),
                 preserve_slots,
                 eager,
+                memory_budget_bytes,
             )
         }
     }
