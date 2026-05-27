@@ -30,6 +30,8 @@ benchmarks/comprehensive/results/baseline_*/
 benchmarks/comprehensive/results/candidate_*/
 benchmarks/comprehensive/results/accel_smoke_*/
 benchmarks/comprehensive/results/tier*/
+benchmarks/comprehensive/results/g4*/
+benchmarks/scripts/g4*
 
 build_artifacts/
 LINT_WARNINGS.json

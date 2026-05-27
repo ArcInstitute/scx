@@ -37,7 +37,7 @@ use cudarc::driver::safe::{
     CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, PinnedHostSlice,
 };
 
-use scx_sparse::ScxCsr;
+use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::cusparse::CusparseSpMatDescr;
 use crate::device::GpuDevice;
@@ -302,6 +302,143 @@ impl PinnedCsrSlot {
         // built for one shape would silently produce wrong results if
         // reused after a shape change.
         dst.maybe_invalidate_descr_on_shape_change(n_rows, n_cols, nnz);
+        Ok(())
+    }
+}
+
+// --------------------------------------------------------------------------
+// PinnedCscSlot
+// --------------------------------------------------------------------------
+
+/// Three pinned-or-pageable host buffers staging a CSC shard's
+/// `(col_indptr, row_indices, data)` arrays.
+///
+/// Column-major counterpart to [`PinnedCsrSlot`]. Used by the pipelined
+/// [`crate::gpu_csc_shard_source::RawGpuCscShardSource`] adapter to
+/// overlap shard decode + H→D copy with the previous shard's GPU
+/// compute, in the same shape as the CSR `RawGpuShardSource`.
+///
+/// Grow-only: `ensure_capacity` may reallocate any buffer that needs to
+/// be larger, but never shrinks. Pinned alloc failure transparently
+/// falls back to pageable for each buffer independently.
+pub struct PinnedCscSlot {
+    ctx: Arc<CudaContext>,
+    col_indptr: HostBuf<i64>,
+    row_indices: HostBuf<i32>,
+    data: HostBuf<f32>,
+    /// True if all three buffers are currently pinned. Monotone-downward
+    /// on `ensure_capacity` if any grow falls back to pageable; not
+    /// load-bearing for correctness — H→D dispatches on the actual
+    /// `HostBuf` variant per buffer.
+    is_pinned: bool,
+}
+
+impl PinnedCscSlot {
+    /// Construct a slot with initial capacities (in elements).
+    pub fn new(ctx: &Arc<CudaContext>, col_indptr_cap: usize, nnz_cap: usize) -> Self {
+        let col_indptr = HostBuf::<i64>::new(ctx, col_indptr_cap.max(1));
+        let row_indices = HostBuf::<i32>::new(ctx, nnz_cap.max(1));
+        let data = HostBuf::<f32>::new(ctx, nnz_cap.max(1));
+        let is_pinned = matches!(col_indptr, HostBuf::Pinned(_))
+            && matches!(row_indices, HostBuf::Pinned(_))
+            && matches!(data, HostBuf::Pinned(_));
+        Self {
+            ctx: ctx.clone(),
+            col_indptr,
+            row_indices,
+            data,
+            is_pinned,
+        }
+    }
+
+    /// Whether all three buffers are pinned (true) or any fell back to
+    /// pageable (false). Useful for tests and per-shard metrics.
+    pub fn is_pinned(&self) -> bool {
+        self.is_pinned
+    }
+
+    /// Grow buffers if needed. No-op when current capacity suffices.
+    pub fn ensure_capacity(&mut self, col_indptr_len: usize, nnz: usize) {
+        if self.col_indptr.capacity() < col_indptr_len {
+            let new_cap = col_indptr_len.next_power_of_two();
+            let new_buf = HostBuf::<i64>::new(&self.ctx, new_cap);
+            if matches!(self.col_indptr, HostBuf::Pinned(_))
+                && !matches!(new_buf, HostBuf::Pinned(_))
+            {
+                self.is_pinned = false;
+            }
+            self.col_indptr = new_buf;
+        }
+        if self.row_indices.capacity() < nnz {
+            let new_cap = nnz.next_power_of_two();
+            let new_buf = HostBuf::<i32>::new(&self.ctx, new_cap);
+            if matches!(self.row_indices, HostBuf::Pinned(_))
+                && !matches!(new_buf, HostBuf::Pinned(_))
+            {
+                self.is_pinned = false;
+            }
+            self.row_indices = new_buf;
+        }
+        if self.data.capacity() < nnz {
+            let new_cap = nnz.next_power_of_two();
+            let new_buf = HostBuf::<f32>::new(&self.ctx, new_cap);
+            if matches!(self.data, HostBuf::Pinned(_)) && !matches!(new_buf, HostBuf::Pinned(_)) {
+                self.is_pinned = false;
+            }
+            self.data = new_buf;
+        }
+    }
+
+    /// Stage an [`ScxCsc`] shard into the host slot. Grows the slot if
+    /// needed.
+    pub fn stage(&mut self, csc: &ScxCsc) -> Result<(), GpuError> {
+        self.ensure_capacity(csc.indptr.len(), csc.data.len());
+        self.col_indptr.fill_from(&csc.indptr)?;
+        self.row_indices.fill_from(&csc.indices)?;
+        self.data.fill_from(&csc.data)?;
+        Ok(())
+    }
+
+    /// Issue async H→D from the pinned slot into the supplied device
+    /// buffers on `stream`.
+    ///
+    /// The destination `CudaSlice`s must already have capacity ≥
+    /// `col_indptr_len` (for `dst_col_indptr`) / `nnz` (for
+    /// `dst_row_indices` and `dst_data`). Callers grow them via the
+    /// outer source's own capacity tracking before invoking this method.
+    pub fn upload_to(
+        &self,
+        stream: &Arc<CudaStream>,
+        dst_col_indptr: &mut CudaSlice<i64>,
+        dst_row_indices: &mut CudaSlice<i32>,
+        dst_data: &mut CudaSlice<f32>,
+        col_indptr_len: usize,
+        nnz: usize,
+    ) -> Result<(), GpuError> {
+        macro_rules! upload {
+            ($src:expr, $dst:expr, $len:expr) => {{
+                match $src {
+                    HostBuf::Pinned(p) => {
+                        let host_slice = p
+                            .as_slice()
+                            .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
+                        let mut dst_view = $dst.slice_mut(..$len);
+                        stream
+                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
+                            .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
+                    }
+                    HostBuf::Pageable(v) => {
+                        let mut dst_view = $dst.slice_mut(..$len);
+                        stream
+                            .memcpy_htod(&v[..$len], &mut dst_view)
+                            .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
+                    }
+                }
+            }};
+        }
+        upload!(&self.col_indptr, dst_col_indptr, col_indptr_len);
+        upload!(&self.row_indices, dst_row_indices, nnz);
+        upload!(&self.data, dst_data, nnz);
         Ok(())
     }
 }

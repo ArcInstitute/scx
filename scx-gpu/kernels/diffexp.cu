@@ -105,6 +105,103 @@ extern "C" __global__ void csr_shard_to_dense_chunk_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// G4 v2: Scatter one CSR shard's rows directly into a gene-major slab,
+// skipping the dense `[n_obs × chunk_size]` intermediate.
+//
+// Per-thread output: slab[(col - c0) * n_perm + pool_pos] = data[e]
+//   where pool_pos = cell_to_pool[global_row_offset + r]
+//
+// `cell_to_pool` is a length-n_obs i32 array; entries are -1 for cells
+// that are NOT in this pool (ref or test group) and 0..n_perm-1 for cells
+// that ARE. The caller computes it once per (chunk-loop, pool) via
+// `inverse_perm()`.
+//
+// Whole-block early exit: if the global cell is not in this pool, the
+// block returns before iterating its CSR row — this is the common case
+// for test-group pools (~n_test cells of n_obs).
+//
+// `slab` MUST be pre-zeroed by the caller before the first shard's
+// scatter (`memset_zeros(&mut slab.slice_mut(..n_perm * chunk_size))`),
+// because zeros are implicit in the CSR representation.
+//
+// NO RACE: each (cell_global, col) pair writes one unique output cell
+// — pool_pos is unique per cell (it's an inverse permutation), and CSR
+// rows have strictly increasing column indices (no duplicates).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_gene_major_kernel(
+    const long long* __restrict__ indptr,        // [n_shard_rows + 1]
+    const int*       __restrict__ indices,       // [nnz]
+    const float*     __restrict__ data,          // [nnz]
+    const int*       __restrict__ cell_to_pool,  // [n_obs], -1 if not in pool
+    float*           __restrict__ slab,          // [chunk_size × n_perm]
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       n_perm,
+    int       c0,
+    int       c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long cell_global = global_row_offset + (long long)r;
+    int pool_pos = cell_to_pool[cell_global];
+    if (pool_pos < 0) return;  // cell not in this pool; whole-block early exit
+
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            int gene_local = col - c0;
+            slab[(long long)gene_local * (long long)n_perm + (long long)pool_pos] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G4 v3 (post code-review #6, CSR variant): identical scatter shape to
+// `csr_shard_to_gene_major_kernel` above, but reads the cell membership
+// from combined `cell_to_group + cell_to_pos` tables (with a launch-time
+// `this_group_id` filter). Used by the v3 drivers ONLY; the original
+// per-pool kernel above stays in place for v2's caller in G4.1's drivers,
+// since collapsing v2 is out of scope for PR #133.
+//
+// Same race/correctness story as the v2 variant: whole-block early exit
+// when the row's cell is not in `this_group_id`; threads stride the row's
+// nonzeros and write to `slab[gene_local × n_perm + pos]` with `pos =
+// cell_to_pos[cell]`. NO atomicAdd.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_to_gene_major_filtered_kernel(
+    const long long* __restrict__ indptr,         // [n_shard_rows + 1]
+    const int*       __restrict__ indices,        // [nnz]
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs] group id or -1
+    const int*       __restrict__ cell_to_pos,    // [n_obs] in-group pos or -1
+    int this_group_id,
+    float*           __restrict__ slab,           // [chunk_size × n_perm]
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       n_perm,
+    int       c0,
+    int       c1
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long cell_global = global_row_offset + (long long)r;
+    if (cell_to_group[cell_global] != this_group_id) return;  // whole-block exit
+    int pos = cell_to_pos[cell_global];
+
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            int gene_local = col - c0;
+            slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // All-groups pseudobulk fold.
 //
 // One block per (gene, group). Threads stride over the group's cell list and
@@ -173,6 +270,181 @@ extern "C" __global__ void pseudobulk_all_groups_kernel(
         __syncthreads();
     }
     if (tid == 0) sums[(long long)group * chunk_size + gene] = sdata[0];
+}
+
+// ---------------------------------------------------------------------------
+// G4 v3 (CSC-direct): all-groups pseudobulk fold over a CSC shard.
+//
+// One block per gene in the chunk; threads cooperate over the column's
+// nonzeros, accumulating per-thread per-group sums in shared memory, then
+// tree-reducing. Thread 0 of the block adds the block's result to the
+// running per-(group, gene_local) sum.
+//
+// NO ATOMICS: each (gene, group) pair has exactly one writer (block 0 of
+// gene_local). Cross-shard accumulation is safe because shards are
+// serialized on the device stream — each launch reads the running sum,
+// adds this shard's contribution, writes back.
+//
+// Shared memory: [n_groups × blockDim.x] doubles. With blockDim.x = 128
+// and n_groups ≤ 32, that's ≤ 32 KB per block — fits comfortably in the
+// 48 KB default shared-mem allocation.
+//
+// `sums` MUST be pre-zeroed before the FIRST shard's invocation.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csc_shard_pseudobulk_kernel(
+    const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
+    const int*       __restrict__ row_indices,    // [nnz] global row indices
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs], -1 if not in any group
+    double*          __restrict__ sums,           // [n_groups × chunk_size]
+    int n_cols_in_shard,
+    int shard_col_start,
+    int c0,
+    int chunk_size,
+    int n_groups,
+    int mode_id
+) {
+    int gene_local = blockIdx.x;
+    if (gene_local >= chunk_size) return;
+    int gene_global = c0 + gene_local;
+    int col_in_shard = gene_global - shard_col_start;
+    if (col_in_shard < 0 || col_in_shard >= n_cols_in_shard) return;
+
+    extern __shared__ double sdata[];
+    int tid  = threadIdx.x;
+    int nthr = blockDim.x;
+    for (int g = 0; g < n_groups; g++) {
+        sdata[(long long)g * nthr + tid] = 0.0;
+    }
+    __syncthreads();
+
+    long long start = col_indptr[col_in_shard];
+    long long end   = col_indptr[col_in_shard + 1];
+    for (long long e = start + tid; e < end; e += nthr) {
+        int cell = row_indices[e];
+        int g = cell_to_group[cell];
+        if (g >= 0 && g < n_groups) {
+            sdata[(long long)g * nthr + tid] += apply_pre_transform(data[e], mode_id);
+        }
+    }
+    __syncthreads();
+
+    // Tree-reduce per group.
+    for (int s = nthr >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            for (int g = 0; g < n_groups; g++) {
+                sdata[(long long)g * nthr + tid] +=
+                    sdata[(long long)g * nthr + tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        for (int g = 0; g < n_groups; g++) {
+            sums[(long long)g * chunk_size + gene_local] += sdata[(long long)g * nthr];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G4 v3 (CSC-direct, post code-review #6): scatter one CSC shard's nonzeros
+// into a gene-major pool slab using combined cell_to_group + cell_to_pos
+// tables instead of K+1 per-pool `cell_to_pool` tables. Collapses
+// `(K+1) × n_obs × 4` device memory to `2 × n_obs × 4` regardless of K
+// (atlas-scale wins: 4 GB → 80 MB at n_obs=10M, K=100).
+//
+// One block per gene; threads stride the column's nonzeros. The launch
+// caller passes `this_group_id` (0 = ref, 1..=K = test groups); the kernel
+// writes only the cells where `cell_to_group[cell] == this_group_id`,
+// using `cell_to_pos[cell]` as the in-group position.
+//
+// NO RACE, NO atomicAdd: each (gene_local, pos) cell has at most one
+// writer per launch. K+1 launches per shard (one per pool); same launch
+// count as the pre-#6 kernel.
+//
+// `slab` MUST be pre-zeroed by the caller before the FIRST shard's scatter.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csc_shard_to_gene_major_kernel(
+    const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
+    const int*       __restrict__ row_indices,    // [nnz] global row indices
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs] group id or -1
+    const int*       __restrict__ cell_to_pos,    // [n_obs] in-group pos or -1
+    int this_group_id,                            // which group's slab this fills
+    float*           __restrict__ slab,           // [chunk_size × n_perm]
+    int n_cols_in_shard,
+    int shard_col_start,
+    int c0,
+    int chunk_size,
+    int n_perm
+) {
+    int gene_local = blockIdx.x;
+    if (gene_local >= chunk_size) return;
+    int gene_global = c0 + gene_local;
+    int col_in_shard = gene_global - shard_col_start;
+    if (col_in_shard < 0 || col_in_shard >= n_cols_in_shard) return;
+
+    long long start = col_indptr[col_in_shard];
+    long long end   = col_indptr[col_in_shard + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int cell = row_indices[e];
+        if (cell_to_group[cell] == this_group_id) {
+            int pos = cell_to_pos[cell];
+            slab[(long long)gene_local * (long long)n_perm + (long long)pos] = data[e];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G4 v3 (CSR-direct): CSR-shard pseudobulk fallback for SCX files without
+// a CSC sidecar. Accumulates per-(group, gene) f64 sums by streaming a CSR
+// shard view directly, skipping the [n_obs × chunk_size] dense intermediate
+// that `pseudobulk_all_groups_kernel` reads from.
+//
+// One block per shard row; whole-block early exit when the cell is not in
+// any group (`cell_to_group[global_cell] < 0`). Threads stride over the
+// row's nonzeros, apply the matching `pre()` transform per element, and
+// f64-atomicAdd into `sums[group × chunk_size + gene_local]`. f64 atomicAdd
+// is hardware-native on H100 (CC 9.0; shipped in CC 6.0).
+//
+// Implicit zeros (CSR sparsity) contribute nothing because
+// `apply_pre_transform(0.0)` is 0.0 for all four mode_ids — iterating only
+// over nonzeros is mathematically equivalent to the dense-read path.
+//
+// `sums` MUST be pre-zeroed before the FIRST shard's invocation; atomicAdd
+// accumulates. NO RACE within a single CSR row (column indices strictly
+// increasing); cross-cell contention on hot (group, gene) cells is what
+// atomicAdd handles.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csr_shard_pseudobulk_kernel(
+    const long long* __restrict__ indptr,         // [n_shard_rows + 1]
+    const int*       __restrict__ indices,        // [nnz]
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs], -1 if not in any group
+    double*          __restrict__ sums,           // [n_groups × chunk_size]
+    int       n_shard_rows,
+    long long global_row_offset,
+    int       chunk_size,
+    int       c0,
+    int       c1,
+    int       mode_id
+) {
+    int r = blockIdx.x;
+    if (r >= n_shard_rows) return;
+    long long cell_global = global_row_offset + (long long)r;
+    int g = cell_to_group[cell_global];
+    if (g < 0) return;  // cell not in any group; whole-block early exit
+
+    long long start = indptr[r];
+    long long end   = indptr[r + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int col = indices[e];
+        if (col >= c0 && col < c1) {
+            int gene_local = col - c0;
+            double val = apply_pre_transform(data[e], mode_id);
+            atomicAdd(&sums[(long long)g * (long long)chunk_size + (long long)gene_local], val);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

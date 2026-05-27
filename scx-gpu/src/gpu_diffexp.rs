@@ -32,6 +32,7 @@ use cudarc::driver::PushKernelArg;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_csc_shard_source::GpuCscShardView;
 use crate::staging::GpuCsrShardView;
 
 /// PTX source for the GPU DE kernels, compiled at build time by `scx-gpu/build.rs`.
@@ -97,6 +98,17 @@ pub struct GpuDeChunkScratch {
     /// must round-trip to host for the post-pvalue computation. 1-vs-
     /// rest reuses the global pool-tie and so doesn't write here.
     pub tie_per_group: CudaSlice<f64>,
+    /// G4 v2: per-test-group gene-major slabs (one slab per test group,
+    /// each `[chunk_max × n_g_max]` f32). The v2 streaming path pre-zeros
+    /// all of these once per chunk, then a single shard iteration
+    /// scatters each shard's CSR rows into ref_slab + every tg slab in
+    /// parallel — eliminating the dense→slab gather kernel (one launch
+    /// per tg per chunk in v1).
+    ///
+    /// Empty on v1 paths; grown by [`Self::ensure_per_tg_pool_slabs_capacity`]
+    /// in the v2 driver above the chunk loop. The vec length equals
+    /// `n_test_groups`.
+    pub per_tg_pool_slabs: Vec<CudaSlice<f32>>,
     n_obs: usize,
     chunk_max: usize,
     slab_capacity: usize,
@@ -105,6 +117,7 @@ pub struct GpuDeChunkScratch {
     group_slab_capacity: usize,
     sums_capacity: usize,
     per_group_capacity: usize,
+    per_tg_pool_slabs_capacity: usize,
     alloc_count: u64,
 }
 
@@ -151,6 +164,7 @@ impl GpuDeChunkScratch {
             u_per_group,
             p_per_group,
             tie_per_group,
+            per_tg_pool_slabs: Vec::new(),
             n_obs,
             chunk_max,
             slab_capacity: n_pool_max,
@@ -159,6 +173,7 @@ impl GpuDeChunkScratch {
             group_slab_capacity: 0,
             sums_capacity: 0,
             per_group_capacity: 0,
+            per_tg_pool_slabs_capacity: 0,
             alloc_count: 0,
         })
     }
@@ -278,6 +293,41 @@ impl GpuDeChunkScratch {
         self.tie_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
         self.per_group_capacity = new_cap;
         self.alloc_count += 3;
+        Ok(())
+    }
+
+    /// G4 v2: grow `per_tg_pool_slabs` to a vec of length `n_test_groups`,
+    /// each slab `[chunk_max × n_g_max]` f32. Called above the chunk loop
+    /// in the v2 driver. Slabs are pre-zeroed by the chunk loop before
+    /// each chunk's shard iteration.
+    ///
+    /// Idempotent — only re-allocates when the test-group count grows or
+    /// the per-tg pool size grows.
+    pub fn ensure_per_tg_pool_slabs_capacity(
+        &mut self,
+        dev: &GpuDevice,
+        n_test_groups: usize,
+        n_g_max: usize,
+    ) -> Result<(), GpuError> {
+        let n_g_max = n_g_max.max(1);
+        let need_grow = n_test_groups > self.per_tg_pool_slabs.len()
+            || n_g_max > self.per_tg_pool_slabs_capacity;
+        if !need_grow {
+            return Ok(());
+        }
+        let new_cap = n_g_max
+            .next_power_of_two()
+            .max(self.per_tg_pool_slabs_capacity * 2)
+            .max(n_g_max);
+        // Always re-allocate the full vec when growing — the per-slab
+        // capacity is uniform.
+        self.per_tg_pool_slabs.clear();
+        for _ in 0..n_test_groups {
+            self.per_tg_pool_slabs
+                .push(dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?);
+            self.alloc_count += 1;
+        }
+        self.per_tg_pool_slabs_capacity = new_cap;
         Ok(())
     }
 
@@ -476,6 +526,603 @@ pub fn gpu_de_scatter_shard_to_dense(
     .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_to_dense_chunk_kernel: {e}")))?;
 
     Ok(())
+}
+
+/// G4 v2: Scatter one CSR shard's rows directly into a gene-major slab,
+/// skipping the dense `[n_obs × chunk_size]` intermediate that the v1 path
+/// uses.
+///
+/// Output: `slab[(col - c0) * n_perm + cell_to_pool[global_row]] = data[e]`
+/// for each nonzero in `[c0, c1)` where `cell_to_pool[...] >= 0`.
+///
+/// `cell_to_pool_dev` is a device-resident `[n_obs]` i32 buffer where each
+/// entry is either `-1` (cell not in this pool) or the cell's position in
+/// the gene-major slab (`0..n_perm`). Callers build it once per DE call
+/// via [`build_cell_to_pool_dev`] (host-side inverse-permutation upload)
+/// and reuse across the chunk loop.
+///
+/// `slab` MUST be pre-zeroed by the caller before the FIRST shard's
+/// scatter — zeros are implicit in the CSR representation. Use
+/// `dev.stream().memset_zeros(&mut slab.slice_mut(..chunk_size * n_perm))`
+/// once per chunk before the `for_each_gpu_shard` loop.
+///
+/// Grid: one block per shard row (`gridDim.x = n_shard_rows`). Whole-block
+/// early-exit when the cell is not in the pool — common case for
+/// test-group pools where `n_g ≪ n_obs`.
+///
+/// # Precondition: no duplicate column indices per row
+///
+/// Same invariant as [`gpu_de_scatter_shard_to_dense`]. Duplicates would
+/// race between threads writing the same `slab[gene_local, pool_pos]`.
+/// SCX canonicalisation enforces this; `RawGpuShardSource` checks via
+/// `check_no_duplicate_columns` in debug builds.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_scatter_shard_to_gene_major(
+    dev: &GpuDevice,
+    view: &GpuCsrShardView<'_>,
+    cell_to_pool_dev: &CudaSlice<i32>,
+    slab: &mut CudaSlice<f32>,
+    global_row_offset: usize,
+    n_perm: usize,
+    chunk_size: usize,
+    c0: usize,
+    c1: usize,
+) -> Result<(), GpuError> {
+    if n_perm == 0 || chunk_size == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_shard_rows = view.shape.0;
+    if n_shard_rows == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_shard_rows <= i32::MAX as usize,
+        "n_shard_rows {} exceeds i32::MAX — SCX shard layout invariant violated",
+        n_shard_rows
+    );
+    debug_assert!(
+        n_perm <= i32::MAX as usize,
+        "n_perm {} exceeds i32::MAX",
+        n_perm
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csr_shard_to_gene_major_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("csr_shard_to_gene_major_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shard_rows as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_shard_rows_i32 = n_shard_rows as i32;
+    let global_row_offset_i64 = global_row_offset as i64;
+    let n_perm_i32 = n_perm as i32;
+    let c0_i32 = c0 as i32;
+    let c1_i32 = c1 as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&view.indptr)
+            .arg(&view.indices)
+            .arg(&view.data)
+            .arg(cell_to_pool_dev)
+            .arg(slab)
+            .arg(&n_shard_rows_i32)
+            .arg(&global_row_offset_i64)
+            .arg(&n_perm_i32)
+            .arg(&c0_i32)
+            .arg(&c1_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_to_gene_major_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// G4 v3 CSR scatter with combined cell_to_group + cell_to_pos tables
+/// (post code-review #6). Same launch shape as
+/// [`gpu_de_scatter_shard_to_gene_major`] but the per-pool lookup goes
+/// through the shared `cell_to_group_dev` + `cell_to_pos_dev` device
+/// tables instead of K+1 per-pool inverse-permutation buffers. Used by
+/// the v3-CSR-fallback driver only; G4.1's v2 driver still uses the
+/// per-pool kernel above.
+///
+/// Caller dispatches K+1 launches per shard (one per pool: `group_id=0`
+/// for ref, `group_id=k+1` for tg_k). The whole-block early exit triggers
+/// when the row's cell isn't in `this_group_id`; otherwise threads stride
+/// the row's nonzeros and write to
+/// `slab[gene_local × n_perm + cell_to_pos[cell]]`. No atomicAdd, no race.
+///
+/// `slab` MUST be pre-zeroed before the FIRST shard's scatter for each
+/// pool (zeros are implicit in the CSR representation).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_scatter_csr_to_gene_major_filtered(
+    dev: &GpuDevice,
+    view: &GpuCsrShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    cell_to_pos_dev: &CudaSlice<i32>,
+    this_group_id: i32,
+    slab: &mut CudaSlice<f32>,
+    global_row_offset: usize,
+    n_perm: usize,
+    chunk_size: usize,
+    c0: usize,
+    c1: usize,
+) -> Result<(), GpuError> {
+    if n_perm == 0 || chunk_size == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_shard_rows = view.shape.0;
+    if n_shard_rows == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_shard_rows <= i32::MAX as usize,
+        "n_shard_rows {} exceeds i32::MAX — SCX shard layout invariant violated",
+        n_shard_rows
+    );
+    debug_assert!(
+        n_perm <= i32::MAX as usize,
+        "n_perm {} exceeds i32::MAX",
+        n_perm
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csr_shard_to_gene_major_filtered_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("csr_shard_to_gene_major_filtered_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shard_rows as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_shard_rows_i32 = n_shard_rows as i32;
+    let global_row_offset_i64 = global_row_offset as i64;
+    let n_perm_i32 = n_perm as i32;
+    let c0_i32 = c0 as i32;
+    let c1_i32 = c1 as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&view.indptr)
+            .arg(&view.indices)
+            .arg(&view.data)
+            .arg(cell_to_group_dev)
+            .arg(cell_to_pos_dev)
+            .arg(&this_group_id)
+            .arg(slab)
+            .arg(&n_shard_rows_i32)
+            .arg(&global_row_offset_i64)
+            .arg(&n_perm_i32)
+            .arg(&c0_i32)
+            .arg(&c1_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| {
+        GpuError::KernelLaunchFailed(format!("csr_shard_to_gene_major_filtered_kernel: {e}"))
+    })?;
+    let _ = chunk_size;
+    Ok(())
+}
+
+/// G4 v3: CSR-direct pseudobulk fold — accumulate `[n_groups × chunk_size]`
+/// f64 sums by streaming a CSR shard view directly, skipping the
+/// `[n_obs × chunk_size]` dense intermediate that
+/// [`gpu_de_pseudobulk_all_groups`] reads from.
+///
+/// Pairs with [`build_cell_to_group_dev`] (cell→group inverse permutation,
+/// uploaded once per DE call) and is launched per-shard inside the
+/// `for_each_gpu_shard` loop. `sums` MUST be pre-zeroed by the caller
+/// before the first shard's invocation — atomicAdd accumulates.
+///
+/// `mode_id` selects the per-element pre-transform applied before
+/// summation; same encoding as [`gpu_de_pseudobulk_all_groups`]
+/// (0=identity, 1=expm1, 2=log1p, 3=identity). The host divides by the
+/// group's cell count and applies the matching `mode.post` transform.
+///
+/// Grid: one block per shard row. Whole-block early-exit when the cell is
+/// not in any group (`cell_to_group[global_cell] < 0`). f64 atomicAdd is
+/// hardware-native on H100 (CC 6.0+; H100 is 9.0).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_pseudobulk_csr_direct(
+    dev: &GpuDevice,
+    view: &GpuCsrShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    sums: &mut CudaSlice<f64>,
+    global_row_offset: usize,
+    chunk_size: usize,
+    c0: usize,
+    c1: usize,
+    mode_id: i32,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_shard_rows = view.shape.0;
+    if n_shard_rows == 0 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_shard_rows <= i32::MAX as usize,
+        "n_shard_rows {} exceeds i32::MAX — SCX shard layout invariant violated",
+        n_shard_rows
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csr_shard_pseudobulk_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_pseudobulk_kernel: {e}")))?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_shard_rows as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_shard_rows_i32 = n_shard_rows as i32;
+    let global_row_offset_i64 = global_row_offset as i64;
+    let chunk_size_i32 = chunk_size as i32;
+    let c0_i32 = c0 as i32;
+    let c1_i32 = c1 as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&view.indptr)
+            .arg(&view.indices)
+            .arg(&view.data)
+            .arg(cell_to_group_dev)
+            .arg(sums)
+            .arg(&n_shard_rows_i32)
+            .arg(&global_row_offset_i64)
+            .arg(&chunk_size_i32)
+            .arg(&c0_i32)
+            .arg(&c1_i32)
+            .arg(&mode_id)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csr_shard_pseudobulk_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// G4 v3 (CSC-direct): all-groups pseudobulk fold over one CSC shard.
+///
+/// One block per chunk gene; threads tree-reduce per-group accumulators in
+/// shared memory; thread 0 of each block adds the block result into the
+/// running `sums[g * chunk_size + gene_local]`. **No atomicAdd** —
+/// cross-shard accumulation is safe via stream ordering (each launch reads
+/// the running sum, adds this shard's contribution, writes back).
+///
+/// `sums` MUST be pre-zeroed by the caller before the first shard's
+/// invocation. Blocks whose `gene_global` falls outside the shard's column
+/// range `[csc_view.col_start, csc_view.col_end)` early-exit at no cost.
+///
+/// `mode_id` encoding matches [`gpu_de_pseudobulk_all_groups`] (0=identity,
+/// 1=expm1, 2=log1p, 3=identity).
+///
+/// Shared memory: `n_groups × blockDim.x × sizeof(double)` per block.
+///
+/// The wrapper chooses `blockDim.x` and per-function SMEM opt-in to fit the
+/// requested usage:
+/// * `n_groups × 128 × 8 ≤ 48 KB` (i.e. `n_groups ≤ 48`): launch with
+///   `bx=128`, no opt-in.
+/// * `n_groups × 128 × 8 ≤ device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
+///   (~100 KB on H100): launch with `bx=128`, opt into >48 KB via
+///   `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`.
+/// * Otherwise: halve `bx` to 64 and re-check; on H100 this lifts the
+///   ceiling to roughly `n_groups ≤ 200`.
+/// * Beyond that the call returns `GpuError::KernelLaunchFailed` rather
+///   than triggering a runtime CUDA error. Real workloads in this regime
+///   would need an algorithmic restructure (per-group tiling).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_pseudobulk_csc_direct(
+    dev: &GpuDevice,
+    csc_view: &GpuCscShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    sums: &mut CudaSlice<f64>,
+    c0: usize,
+    c1: usize,
+    chunk_size: usize,
+    n_groups: usize,
+    mode_id: i32,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || c0 >= c1 || n_groups == 0 {
+        return Ok(());
+    }
+    let n_cols_in_shard = csc_view.n_cols();
+    if n_cols_in_shard == 0 {
+        return Ok(());
+    }
+    // Skip entirely if the shard's columns don't overlap the chunk.
+    if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_cols_in_shard <= i32::MAX as usize,
+        "n_cols_in_shard {} exceeds i32::MAX",
+        n_cols_in_shard
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csc_shard_pseudobulk_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+
+    // Adaptive SMEM policy. Prefer bx=128; drop to 64 if SMEM at 128 doesn't
+    // fit even after opt-in. Treat 48 KB as the default ceiling — that's the
+    // documented per-block default on every CUDA-capable arch we care about
+    // (H100 / A100 / consumer Ada) and matches `CU_DEVICE_ATTRIBUTE_MAX_
+    // SHARED_MEMORY_PER_BLOCK`.
+    const DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
+    let opt_in_limit = dev
+        .max_dynamic_shared_mem_per_block()
+        .unwrap_or(DEFAULT_SMEM_LIMIT);
+    let elem_bytes = std::mem::size_of::<f64>();
+
+    let mut bx: u32 = 128;
+    let mut required = n_groups * bx as usize * elem_bytes;
+    if required > opt_in_limit {
+        bx = 64;
+        required = n_groups * bx as usize * elem_bytes;
+    }
+    if required > opt_in_limit {
+        return Err(GpuError::KernelLaunchFailed(format!(
+            "csc_shard_pseudobulk: n_groups={n_groups} exceeds SMEM budget \
+             ({} bytes at bx=64, device opt-in limit {opt_in_limit} bytes); \
+             use the CSR fallback (SCX_GPU_DE_V3 still routes here through \
+             pdex_ref_gpu_streaming when CSC sidecar is absent)",
+            required
+        )));
+    }
+    // Opt into >48 KB on this function when required. The call is per-function
+    // sticky (no per-launch reset needed) but idempotent — safe to call each
+    // launch with the same value. Only call when actually exceeding the
+    // default to avoid making the function less flexible on devices that
+    // can't opt-in.
+    if required > DEFAULT_SMEM_LIMIT {
+        func.set_attribute(
+            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            required as i32,
+        )
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!(
+                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={required}) on \
+                 csc_shard_pseudobulk_kernel failed: {e}"
+            ))
+        })?;
+    }
+    let shared_mem_bytes = required as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes,
+    };
+
+    let n_cols_in_shard_i32 = n_cols_in_shard as i32;
+    let shard_col_start_i32 = csc_view.col_start as i32;
+    let c0_i32 = c0 as i32;
+    let chunk_size_i32 = chunk_size as i32;
+    let n_groups_i32 = n_groups as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&csc_view.col_indptr)
+            .arg(&csc_view.row_indices)
+            .arg(&csc_view.data)
+            .arg(cell_to_group_dev)
+            .arg(sums)
+            .arg(&n_cols_in_shard_i32)
+            .arg(&shard_col_start_i32)
+            .arg(&c0_i32)
+            .arg(&chunk_size_i32)
+            .arg(&n_groups_i32)
+            .arg(&mode_id)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// G4 v3 (CSC-direct, post code-review #6): scatter one CSC shard's
+/// nonzeros into a gene-major pool slab `[chunk_size × n_perm]` using
+/// combined `cell_to_group + cell_to_pos` tables and a launch-time
+/// `this_group_id` filter.
+///
+/// One block per chunk gene; threads stride the gene's CSC column. The
+/// kernel writes only the cells where `cell_to_group[cell] ==
+/// this_group_id`, using `cell_to_pos[cell]` as the in-group position.
+/// **No atomicAdd, no race** — each `(gene_local, pos)` cell has at most
+/// one writer per launch.
+///
+/// Caller dispatches K+1 launches per shard (one per pool: `group_id=0`
+/// for ref, `group_id=k+1` for tg_k), reusing the same combined device
+/// tables — total cell-permutation memory is `2 n_obs * 4` bytes
+/// regardless of K (vs `(K+1) * n_obs * 4` in the pre-#6 per-pool design).
+///
+/// `slab` MUST be pre-zeroed before the first shard's scatter.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_de_scatter_csc_to_gene_major(
+    dev: &GpuDevice,
+    csc_view: &GpuCscShardView<'_>,
+    cell_to_group_dev: &CudaSlice<i32>,
+    cell_to_pos_dev: &CudaSlice<i32>,
+    this_group_id: i32,
+    slab: &mut CudaSlice<f32>,
+    c0: usize,
+    c1: usize,
+    chunk_size: usize,
+    n_perm: usize,
+) -> Result<(), GpuError> {
+    if chunk_size == 0 || n_perm == 0 || c0 >= c1 {
+        return Ok(());
+    }
+    let n_cols_in_shard = csc_view.n_cols();
+    if n_cols_in_shard == 0 {
+        return Ok(());
+    }
+    if csc_view.col_end <= c0 || csc_view.col_start >= c1 {
+        return Ok(());
+    }
+    debug_assert!(
+        n_cols_in_shard <= i32::MAX as usize,
+        "n_cols_in_shard {} exceeds i32::MAX",
+        n_cols_in_shard
+    );
+    debug_assert!(
+        n_perm <= i32::MAX as usize,
+        "n_perm {} exceeds i32::MAX",
+        n_perm
+    );
+
+    let module = dev.load_module_cached(DIFFEXP_PTX)?;
+    let func = module
+        .load_function("csc_shard_to_gene_major_kernel")
+        .map_err(|e| {
+            GpuError::KernelLaunchFailed(format!("csc_shard_to_gene_major_kernel: {e}"))
+        })?;
+
+    let bx: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (chunk_size as u32, 1, 1),
+        block_dim: (bx, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let n_cols_in_shard_i32 = n_cols_in_shard as i32;
+    let shard_col_start_i32 = csc_view.col_start as i32;
+    let c0_i32 = c0 as i32;
+    let chunk_size_i32 = chunk_size as i32;
+    let n_perm_i32 = n_perm as i32;
+
+    unsafe {
+        dev.stream()
+            .launch_builder(&func)
+            .arg(&csc_view.col_indptr)
+            .arg(&csc_view.row_indices)
+            .arg(&csc_view.data)
+            .arg(cell_to_group_dev)
+            .arg(cell_to_pos_dev)
+            .arg(&this_group_id)
+            .arg(slab)
+            .arg(&n_cols_in_shard_i32)
+            .arg(&shard_col_start_i32)
+            .arg(&c0_i32)
+            .arg(&chunk_size_i32)
+            .arg(&n_perm_i32)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_to_gene_major_kernel: {e}")))?;
+
+    Ok(())
+}
+
+/// Build a device-resident `cell_to_pool` table from a host-side cell
+/// permutation (the inverse of `cell_indices` used by
+/// [`gpu_de_scatter_gene_major`]).
+///
+/// `cell_indices_host[pool_pos] = global_cell_id` is the existing
+/// representation (length `n_perm`); this function constructs the inverse:
+/// `cell_to_pool[global_cell_id] = pool_pos`, with `-1` for cells not in
+/// the pool. The result is uploaded once per DE call and reused across
+/// all chunks for the same pool.
+///
+/// Returns the device-resident `[n_obs]` i32 buffer ready to pass as
+/// `cell_to_pool_dev` to [`gpu_de_scatter_shard_to_gene_major`].
+pub fn build_cell_to_pool_dev(
+    dev: &GpuDevice,
+    cell_indices_host: &[i32],
+    n_obs: usize,
+) -> Result<CudaSlice<i32>, GpuError> {
+    let mut cell_to_pool = vec![-1i32; n_obs];
+    for (pool_pos, &cell) in cell_indices_host.iter().enumerate() {
+        if cell >= 0 && (cell as usize) < n_obs {
+            cell_to_pool[cell as usize] = pool_pos as i32;
+        }
+    }
+    dev.htod_copy(&cell_to_pool)
+}
+
+/// Build a device-resident `cell_to_group` table from the same flat
+/// `all_group_cells` + CSR-style `group_offsets` representation consumed by
+/// [`gpu_de_pseudobulk_all_groups`]. Each entry of the returned buffer is
+/// either `-1` (cell not in any group) or the group's id (`0..n_groups`)
+/// — the inverse of the per-group cell list.
+///
+/// Used by [`gpu_de_pseudobulk_csr_direct`] (G4 v3 driver) to look up which
+/// group a CSR shard row belongs to inside the kernel. Built once per DE
+/// call and reused across the full chunk loop.
+pub fn build_cell_to_group_dev(
+    dev: &GpuDevice,
+    all_group_cells_host: &[i32],
+    group_offsets_host: &[i32],
+    n_obs: usize,
+) -> Result<CudaSlice<i32>, GpuError> {
+    let mut cell_to_group = vec![-1i32; n_obs];
+    if group_offsets_host.len() < 2 {
+        return dev.htod_copy(&cell_to_group);
+    }
+    for g in 0..group_offsets_host.len() - 1 {
+        let start = group_offsets_host[g] as usize;
+        let end = group_offsets_host[g + 1] as usize;
+        for &cell in &all_group_cells_host[start..end] {
+            if cell >= 0 && (cell as usize) < n_obs {
+                cell_to_group[cell as usize] = g as i32;
+            }
+        }
+    }
+    dev.htod_copy(&cell_to_group)
+}
+
+/// Build the cell→position-within-group inverse permutation used by the
+/// post-#6 v3 scatter kernels.
+///
+/// Mirrors [`build_cell_to_group_dev`] in shape but writes the in-group
+/// position (offset within the cell's group, `0..n_g_k - 1`) instead of
+/// the group id. Each cell that belongs to a group `g` gets
+/// `cell_to_pos[cell] = i - group_offsets[g]` where `i` is the cell's
+/// position within `all_group_cells_host[group_offsets[g]..group_offsets[g+1]]`.
+/// Cells not in any group keep the `-1` sentinel.
+///
+/// Used together with `cell_to_group_dev` + a launch-time `this_group_id`
+/// to replace the previous K+1 per-pool `cell_to_pool` tables —
+/// constant-in-K device memory at `2 × n_obs × 4` bytes.
+pub fn build_cell_to_pos_dev(
+    dev: &GpuDevice,
+    all_group_cells_host: &[i32],
+    group_offsets_host: &[i32],
+    n_obs: usize,
+) -> Result<CudaSlice<i32>, GpuError> {
+    let mut cell_to_pos = vec![-1i32; n_obs];
+    if group_offsets_host.len() < 2 {
+        return dev.htod_copy(&cell_to_pos);
+    }
+    for g in 0..group_offsets_host.len() - 1 {
+        let start = group_offsets_host[g] as usize;
+        let end = group_offsets_host[g + 1] as usize;
+        for (offset, &cell) in all_group_cells_host[start..end].iter().enumerate() {
+            if cell >= 0 && (cell as usize) < n_obs {
+                cell_to_pos[cell as usize] = offset as i32;
+            }
+        }
+    }
+    dev.htod_copy(&cell_to_pos)
 }
 
 /// Sort each gene's row of a gene-major slab in ascending order, in-place.
@@ -1034,6 +1681,111 @@ pub fn default_gpu_de_gene_chunk_size(dev: &GpuDevice, n_obs: usize, n_pool_max:
     let budget = (free_bytes as f64 * 0.18) as usize;
     let raw = budget.max(per_gene_bytes) / per_gene_bytes;
     ((raw / 64).max(1)) * 64
+}
+
+/// G4 v2: returns `true` when `SCX_GPU_DE_V2=1` is set. The env var is
+/// read once and cached so repeated dispatch-site checks are free.
+///
+/// In-process override via [`set_de_v2_enabled_override`] takes
+/// precedence; used by parity tests to toggle v1 vs v2 without
+/// restarting the process.
+///
+/// Default: **off**. Opt-in until the path has been bench-validated on
+/// Chimera. The opt-in default mirrors how `SCX_GPU_DE_GENE_CHUNK_SIZE`
+/// stays user-controllable.
+pub fn de_v2_enabled() -> bool {
+    if let Some(v) = de_v2_test_override::current() {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SCX_GPU_DE_V2").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
+mod de_v2_test_override {
+    use std::sync::{Mutex, OnceLock};
+
+    static CELL: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<bool>> {
+        CELL.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn current() -> Option<bool> {
+        *slot().lock().unwrap()
+    }
+
+    pub fn set(value: Option<bool>) -> Option<bool> {
+        let mut guard = slot().lock().unwrap();
+        let prev = *guard;
+        *guard = value;
+        prev
+    }
+}
+
+/// Diagnostic override for [`de_v2_enabled`] — lets parity tests flip
+/// the v1/v2 dispatch in-process. Mirrors
+/// [`crate::gpu_graph::set_cuda_graphs_enabled_override`].
+///
+/// Returns the previous override value.
+pub fn set_de_v2_enabled_override(enabled: Option<bool>) -> Option<bool> {
+    de_v2_test_override::set(enabled)
+}
+
+/// G4 v3: returns `true` when `SCX_GPU_DE_V3=1` is set. The env var is
+/// read once and cached so repeated dispatch-site checks are free.
+///
+/// In-process override via [`set_de_v3_enabled_override`] takes
+/// precedence; used by parity tests to toggle v2 vs v3 without
+/// restarting the process.
+///
+/// Takes precedence over [`de_v2_enabled`] at the dispatch sites — v3 is
+/// strictly the larger refactor (drops the dense `[n_obs × chunk_size]`
+/// materialization step entirely), so callers gate v3 first.
+///
+/// Default: **off**. Opt-in until the path has been bench-validated.
+pub fn de_v3_enabled() -> bool {
+    if let Some(v) = de_v3_test_override::current() {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("SCX_GPU_DE_V3").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
+mod de_v3_test_override {
+    use std::sync::{Mutex, OnceLock};
+
+    static CELL: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<bool>> {
+        CELL.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn current() -> Option<bool> {
+        *slot().lock().unwrap()
+    }
+
+    pub fn set(value: Option<bool>) -> Option<bool> {
+        let mut guard = slot().lock().unwrap();
+        let prev = *guard;
+        *guard = value;
+        prev
+    }
+}
+
+/// Diagnostic override for [`de_v3_enabled`] — lets parity tests flip
+/// the v2/v3 dispatch in-process. Returns the previous override value.
+pub fn set_de_v3_enabled_override(enabled: Option<bool>) -> Option<bool> {
+    de_v3_test_override::set(enabled)
 }
 
 #[cfg(test)]

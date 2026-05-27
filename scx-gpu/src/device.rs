@@ -120,6 +120,35 @@ impl GpuDevice {
             .map_err(|e| GpuError::CudaError(format!("cuMemGetInfo failed: {e}")))
     }
 
+    /// Maximum opt-in dynamic shared memory per block, in bytes.
+    ///
+    /// Returns `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` — the
+    /// upper bound a kernel may request via
+    /// `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`.
+    /// Distinct from the default per-block ceiling
+    /// (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`, typically 48 KB):
+    /// crossing the default requires per-function opt-in. On H100 (CC 9.0)
+    /// this returns ~100 KB; on older devices that don't support opt-in it
+    /// falls back to the default ceiling.
+    ///
+    /// Used by `gpu_de_pseudobulk_csc_direct` to decide between default-SMEM
+    /// launch, opt-in launch, or adaptive `blockDim.x` when `n_groups` is
+    /// large enough that `n_groups × blockDim.x × sizeof(f64)` would exceed
+    /// the default 48 KB.
+    pub fn max_dynamic_shared_mem_per_block(&self) -> Result<usize, GpuError> {
+        let v = self
+            .ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )
+            .map_err(|e| {
+                GpuError::CudaError(format!(
+                    "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN) failed: {e}"
+                ))
+            })?;
+        Ok(v.max(0) as usize)
+    }
+
     /// Copy host data to device (synchronous).
     ///
     /// Allocates a new device buffer and copies all elements from the host

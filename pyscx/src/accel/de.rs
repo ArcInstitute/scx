@@ -1158,6 +1158,13 @@ fn run_pdex_ref_inner(
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
+        // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
+        // the GPU streaming path so v3 (`SCX_GPU_DE_V3=1`) can dispatch to
+        // the CSC-direct driver. None falls through to the v3 CSR-direct
+        // fallback (or v2 / v1 when v3 is disabled). Only bind under the
+        // gpu feature — the CPU branch doesn't take a CSC reader.
+        #[cfg(feature = "gpu")]
+        let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
         drop(backed);
         return match gpu_device_id {
             #[cfg(feature = "gpu")]
@@ -1166,6 +1173,7 @@ fn run_pdex_ref_inner(
                     scx_accel::pdex_ref_gpu_streaming(
                         device_id,
                         &reader,
+                        csc_reader.as_deref(),
                         &gene_names,
                         &groups,
                         &unique_groups,
