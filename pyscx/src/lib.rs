@@ -175,9 +175,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// `memory_budget`: Optional budget that surfaces a `UserWarning` when
 ///   an obsm / varm / obsp / varp key's estimated peak footprint
 ///   exceeds the budget. Accepts `None` (no check), an int byte count,
-///   or a string like `"4G"` / `"512MiB"`. Warn-only — shard size is
-///   not derated. Applies to both the in-memory and backed routing
-///   paths.
+///   or a binary-prefixed size string — `K`/`M`/`G`/`T` or
+///   `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024; decimal
+///   `KB`/`MB`/`GB`/`TB` is rejected), e.g. `"4G"` / `"512MiB"`.
+///   Warn-only — shard size is not derated. Applies to both the
+///   in-memory and backed routing paths.
 ///
 /// `force_legacy_metadata`: when True, write obs/var as a single
 ///   `ObsMetadata` / `VarMetadata` section regardless of size. Default
@@ -296,10 +298,11 @@ fn from_anndata(
 ///   * `strict_uns`: when `True`, the first unrepresentable `uns`
 ///     entry raises; default `False` emits a `UserWarning` per
 ///     skipped key (`SkippedUnsKey`).
-///   * `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
-///     dense slabs and the CSC external-transpose buffers. Binary
-///     prefixes only (`K/M/G/T`, `KiB/MiB/GiB/TiB`); decimal
-///     `KB/MB/GB/TB` is rejected to avoid ambiguity.
+///   * `memory_budget`: caps dense slabs and the CSC external-
+///     transpose buffers. Accepts an int byte count or a binary-
+///     prefixed size — `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB`
+///     (powers of 1024); decimal `KB`/`MB`/`GB`/`TB` is rejected to
+///     avoid 1000-vs-1024 ambiguity. E.g. `"4G"` / `"512M"` / `"2GiB"`.
 ///   * `temp_dir`: directory for CSC external transpose runs.
 ///     Cleaned on success and on drop; defaults to the system temp.
 ///   * `index_obs` / `index_var` / `index_preset`

@@ -11,6 +11,7 @@ pub mod deletion_vectors;
 pub mod encoder;
 pub mod error;
 pub mod header;
+pub mod mem;
 pub mod modality;
 pub mod provenance;
 pub mod reader;
@@ -50,6 +51,7 @@ pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use encoder::encode_one_shard;
 pub use error::{validate_allocation, Result, ScxError};
 pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
+pub use mem::MemoryBudget;
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,
     MODALITY_NAME_MAX_BYTES, MODALITY_TABLE_MAGIC, MODALITY_TABLE_VERSION,

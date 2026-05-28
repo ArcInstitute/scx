@@ -1,12 +1,15 @@
-// Memory-budget parser shared across the conversion pipelines.
+// Memory-budget / size-string parser shared across the workspace.
 //
-// Dense slab sizing, CSC transpose buffers, cloud in-flight bytes,
-// and worker derate all reference `ConvertOptions::memory_budget`,
-// so the same parser must accept `K`/`M`/`G`/`T` (powers of two by
-// convention), explicit `KiB`/`MiB`/`GiB`/`TiB`, and bare byte
-// counts. Decimal suffixes (`KB`, `MB`) are rejected to avoid the
-// usual 1000 vs 1024 ambiguity — users who want decimal magnitudes
-// can pass the explicit byte count.
+// One parser backs every size knob users type: `scx convert
+// --memory-budget`, `scx build-csc --memory-limit`, and the pyscx
+// `memory_budget=` kwargs. It accepts a bare byte count or a
+// binary-prefixed size — `K`/`M`/`G`/`T` (powers of 1024 by
+// convention, matching `dd` / `du -h`) or explicit `KiB`/`MiB`/`GiB`/
+// `TiB`. Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are rejected to avoid
+// the usual 1000-vs-1024 ambiguity — pass the exact byte count for
+// decimal magnitudes. It lives in `scx-format` (rather than
+// `scx-convert`) so sibling crates like `scx-ops` can share it without
+// a dependency cycle.
 
 /// Namespacing struct; constructors live as associated functions.
 pub struct MemoryBudget;
@@ -23,11 +26,12 @@ impl MemoryBudget {
     /// - explicit binary suffixes: `"4KiB"`, `"2MiB"`, `"8GiB"`,
     ///   `"1TiB"`
     ///
-    /// Returns a descriptive error string for empty input, malformed
-    /// numbers, unrecognised suffixes, or overflow. The error type is
-    /// `String` (not [`crate::pipeline::ConvertError`]) so the parser is
-    /// usable from non-hdf5 callers (`pyscx::from_anndata`'s in-memory
-    /// path); CLI callers wrap it via `?` / `Box::<dyn Error>::from`.
+    /// Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are rejected as
+    /// ambiguous. Returns a descriptive error string for empty input,
+    /// malformed numbers, unrecognised suffixes, or overflow. The error
+    /// type is `String` (not a crate error enum) so the parser is
+    /// usable from any caller; CLI callers wrap it via `?` /
+    /// `Box::<dyn Error>::from`.
     pub fn parse(s: &str) -> Result<u64, String> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
