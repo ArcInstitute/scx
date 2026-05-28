@@ -307,6 +307,23 @@ this. Legacy single-section files remain fully readable. See
 [format.md § Sharded metadata layout](format.md#sharded-metadata-layout-section-types-2425)
 for the binary layout.
 
+### Streaming export over sharded obs/var
+
+`pyscx.to_h5ad` / `pyscx.to_h5mu` (and `scx convert --to h5ad/h5mu`)
+stream sharded obs/var through `write_dataframe_group_streaming` in
+`scx-convert/src/h5ad_write.rs`: HDF5 datasets are pre-allocated to
+`n_rows_kept` (computed catalog-only from `obs_metadata_shard_count`
++ catalog stats, minus deletion-vector kept-count when active), then
+`obs_shards()` / `var_shards()` are drained one shard at a time and
+hyperslab-written per column. Categorical (`Dictionary<_, Utf8>`)
+columns maintain a running global dictionary across shards — disjoint
+per-shard vocabularies (which `scx append` can produce when categories
+diverge) are unified on the fly without a second pass over the data.
+Peak RSS during export is bounded to one shard per matrix plus one
+shard per obs/var column, even at multi-million-row scale. Legacy
+single-section obs/var sources transparently fall back to the eager
+`write_dataframe_group_at` writer.
+
 ## CSC sharding
 
 A CSC sidecar is an optional **column-major view** of the same matrix

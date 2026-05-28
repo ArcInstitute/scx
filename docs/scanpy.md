@@ -182,10 +182,13 @@ sc.pl.umap(adata, color="leiden")
 > `pyscx.from_h5ad`, `pyscx.from_h5mu`, `pyscx.to_h5ad`, and
 > `pyscx.to_h5mu` all default to `stream=True`; `pyscx.from_anndata`
 > auto-routes to the streaming pipeline when given a backed AnnData.
-> Peak RSS is bounded by one shard's worth of CSR per matrix regardless
-> of total file size. Pass `stream=False` to opt into the legacy
-> materialising paths (only useful when you specifically need the
-> in-memory shape, e.g. for AnnData mutations the streaming path
+> Peak RSS is bounded by one shard's worth of CSR per matrix
+> (plus one shard's worth of obs/var per column when the source
+> carries `ObsMetadataShard` / `VarMetadataShard` sections — atlas-scale
+> obs no longer needs to live in memory at once during export)
+> regardless of total file size. Pass `stream=False` to opt into the
+> legacy materialising paths (only useful when you specifically need
+> the in-memory shape, e.g. for AnnData mutations the streaming path
 > doesn't forward).
 
 ```python
@@ -311,10 +314,18 @@ pyscx.to_mtx("dataset.scx", "/path/to/output_dir")
 
 Symmetric to `from_h5ad` / `from_h5mu`. Both default to `stream=True`
 — peak RSS is bounded by one shard's worth of CSR per matrix
-written, regardless of total file size. Deletion vectors are
-respected (only kept rows appear in the output); for high-cardinality
-categorical obs columns the writer emits the modern `categorical`
-group form so `anndata.read_h5ad` reads them cleanly at census scale.
+written, regardless of total file size. When the source SCX file
+carries sharded obs/var (`ObsMetadataShard` / `VarMetadataShard`
+sections — produced by `from_anndata` for `n_obs > shard_target_rows`,
+or by `merge` / `append` on atlas-scale inputs), obs and var also
+stream column-by-column through pre-allocated HDF5 datasets with
+hyperslab writes per shard; categorical columns unify disjoint
+per-shard vocabularies via a running global dictionary. Legacy
+single-section obs/var sources transparently fall back to the eager
+writer. Deletion vectors are respected on every column (obs row
+count matches `/X[0]`); for high-cardinality categorical obs columns
+the writer emits the modern `categorical` group form so
+`anndata.read_h5ad` reads them cleanly at census scale.
 
 ```python
 import pyscx

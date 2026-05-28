@@ -1,16 +1,18 @@
 // Write scx file back to h5ad format
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use arrow::array::{
     Array, AsArray, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch,
+    Int64Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{
-    DataType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type,
-    UInt8Type,
+    DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, UInt16Type, UInt32Type,
+    UInt64Type, UInt8Type,
 };
 use hdf5::types::VarLenUnicode;
+use ndarray::ArrayView1;
 
 /// Convert &str to VarLenUnicode, validating no NUL bytes are present.
 fn vlu(s: &str) -> VarLenUnicode {
@@ -552,6 +554,632 @@ fn write_obsm_entry(
     ds.write(&nd_array)?;
 
     Ok(())
+}
+
+/// Streaming counterpart of [`write_dataframe_group_at`]. Pre-allocates
+/// one HDF5 dataset per column at fixed size `n_rows_kept`, then drains
+/// `shards` and hyperslab-writes the kept-row slice of each column.
+///
+/// Mirrors the pre-allocate-then-hyperslab pattern in
+/// `h5ad_stream_write::create_csr_triplet` + `stream_csr_to_group_at`
+/// (the `/X` and `/layers/{name}` path). Peak RSS per column is bounded
+/// to one shard's worth — atlas-scale obs no longer needs to live in
+/// memory at once.
+///
+/// `schema` is taken from `ScxReader::read_obs_schema_logical_lossy()`
+/// (resp. var). It carries the same `pandas` index metadata as a
+/// `read_obs()` batch, so index resolution mirrors `write_dataframe_body`.
+/// Per-shard batches may carry `LargeUtf8` / `Dictionary(_, LargeUtf8)`
+/// even when the schema says narrow — the runtime dispatch accepts both.
+///
+/// `keep_mask_opt` is the global (length `n_obs`) deletion-vector keep
+/// mask; `None` means no filtering. The mask is indexed by global row,
+/// so this is consumed only on the obs axis (var has no DV).
+pub(super) fn write_dataframe_group_streaming<I>(
+    parent: &hdf5::Group,
+    name: &str,
+    schema: &Schema,
+    shards: I,
+    n_rows_kept: usize,
+    keep_mask_opt: Option<&[bool]>,
+) -> Result<(), ConvertError>
+where
+    I: IntoIterator<Item = Result<RecordBatch, scx_format::error::ScxError>>,
+{
+    let group = parent.group(name).or_else(|_| parent.create_group(name))?;
+
+    // Dataframe-level encoding attrs. Same shape as `write_dataframe_body`
+    // — anndata.read_h5ad requires these even on empty obs.
+    group
+        .new_attr::<VarLenUnicode>()
+        .create("encoding-type")?
+        .write_scalar(&vlu("dataframe"))?;
+    group
+        .new_attr::<VarLenUnicode>()
+        .create("encoding-version")?
+        .write_scalar(&vlu("0.2.0"))?;
+
+    // Resolve the pandas index field (same probe order as
+    // `write_dataframe_body`: pandas metadata first, else field(0)).
+    let pandas_idx_cols = scx_format::pandas_index_columns(schema);
+    let index_field_name: Option<String> = pandas_idx_cols
+        .into_iter()
+        .find(|n| schema.field_with_name(n).is_ok())
+        .or_else(|| schema.fields().first().map(|f| f.name().clone()));
+
+    let on_disk_index: &str = match index_field_name.as_deref() {
+        Some("__index_level_0__") => "_index",
+        Some(n) => n,
+        None => "_index",
+    };
+
+    if !schema.fields().is_empty() {
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("_index")?
+            .write_scalar(&vlu(on_disk_index))?;
+    }
+
+    // Pre-allocate column writers and assemble `column-order` in schema
+    // order (index excluded).
+    let mut col_order: Vec<VarLenUnicode> =
+        Vec::with_capacity(schema.fields().len().saturating_sub(1));
+    let mut col_writers: Vec<(usize, ColumnStreamWriter)> = Vec::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let on_disk_name: &str = if Some(field.name()) == index_field_name.as_ref() {
+            on_disk_index
+        } else {
+            col_order.push(vlu(field.name()));
+            field.name()
+        };
+        let writer = create_column_writer(&group, on_disk_name, field, n_rows_kept)?;
+        col_writers.push((col_idx, writer));
+    }
+
+    // anndata requires `column-order` even when empty (matches
+    // `write_dataframe_body`).
+    group
+        .new_attr::<VarLenUnicode>()
+        .shape(col_order.len())
+        .create("column-order")?
+        .write_raw(&col_order)?;
+
+    // Drain shards. Each shard's stamped `row_start` schema metadata
+    // (set by the writer via `stamp_dense_shard_metadata`) gives its
+    // global row offset; the cumulative shard row count is verified
+    // against it for defense-in-depth against producers that might
+    // emit shards out of order.
+    let mut cumulative_rows: usize = 0;
+    for batch_result in shards {
+        let batch = batch_result?;
+        let n_shard_rows = batch.num_rows();
+
+        if batch.num_columns() != schema.fields().len() {
+            return Err(ConvertError::Other(format!(
+                "shard schema mismatch for '{name}': schema has {} fields, batch has {}",
+                schema.fields().len(),
+                batch.num_columns()
+            )));
+        }
+
+        // Prefer the stamped `row_start` over cumulative counting so
+        // out-of-order producers fail loudly instead of writing into
+        // wrong hyperslab offsets.
+        let row_start_global = parse_shard_row_start(&batch).unwrap_or(cumulative_rows);
+        if row_start_global != cumulative_rows {
+            return Err(ConvertError::Other(format!(
+                "shard '{name}' row_start {row_start_global} does not match cumulative \
+                 row count {cumulative_rows} — shards must arrive in order",
+            )));
+        }
+
+        // Kept-row local indices for this shard.
+        let kept_local: Vec<usize> = match keep_mask_opt {
+            None => (0..n_shard_rows).collect(),
+            Some(mask) => {
+                let upper = row_start_global + n_shard_rows;
+                if mask.len() < upper {
+                    return Err(ConvertError::Other(format!(
+                        "keep_mask length {} < shard upper row {upper} for '{name}' \
+                         (catalog/header drift)",
+                        mask.len(),
+                    )));
+                }
+                (0..n_shard_rows)
+                    .filter(|&i| mask[row_start_global + i])
+                    .collect()
+            }
+        };
+
+        if !kept_local.is_empty() {
+            for (col_idx, writer) in col_writers.iter_mut() {
+                let array = batch.column(*col_idx);
+                let field_name = schema.fields()[*col_idx].name();
+                append_shard_to_column(writer, array, &kept_local, field_name)?;
+            }
+        }
+
+        cumulative_rows += n_shard_rows;
+    }
+
+    // Validate every non-skipped column filled its pre-allocated
+    // dataset exactly — a partial fill would leave default-initialised
+    // trailing rows that look valid but encode incorrect data.
+    for (col_idx, writer) in &col_writers {
+        let field_name = schema.fields()[*col_idx].name();
+        let written = column_writer_offset(writer);
+        if let Some(written) = written {
+            if written != n_rows_kept {
+                return Err(ConvertError::Other(format!(
+                    "column '{field_name}' wrote {written} rows but dataframe was \
+                     pre-allocated to {n_rows_kept}",
+                )));
+            }
+        }
+    }
+
+    // Finalize categorical writers (write `categories` + attrs).
+    for (_, writer) in &col_writers {
+        finalize_column_writer(writer)?;
+    }
+
+    Ok(())
+}
+
+/// Parse `row_start` from a shard's stamped schema metadata. Returns
+/// `None` for legacy or non-stamped batches (callers fall back to
+/// cumulative counting in that case).
+fn parse_shard_row_start(batch: &RecordBatch) -> Option<usize> {
+    batch
+        .schema_ref()
+        .metadata()
+        .get("row_start")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|v| v as usize)
+}
+
+/// Number of rows written by a column streaming writer so far. Returns
+/// `None` for `Unsupported` (no dataset to validate).
+fn column_writer_offset(writer: &ColumnStreamWriter) -> Option<usize> {
+    match writer {
+        ColumnStreamWriter::Int32 { offset, .. }
+        | ColumnStreamWriter::Int64 { offset, .. }
+        | ColumnStreamWriter::Float32 { offset, .. }
+        | ColumnStreamWriter::Float64 { offset, .. }
+        | ColumnStreamWriter::Utf8 { offset, .. }
+        | ColumnStreamWriter::Boolean { offset, .. }
+        | ColumnStreamWriter::Categorical { offset, .. } => Some(*offset),
+        ColumnStreamWriter::Unsupported => None,
+    }
+}
+
+/// Per-column streaming writer state. Pre-allocated HDF5 datasets +
+/// running offset (for hyperslab writes) + categorical accumulator
+/// (for `Dictionary(_, Utf8)` columns).
+enum ColumnStreamWriter {
+    Int32 {
+        ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Int64 {
+        ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Float32 {
+        ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Float64 {
+        ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Utf8 {
+        ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Boolean {
+        // Group is created with `encoding-type` / `encoding-version`
+        // attributes up front; kept here so its lifetime extends
+        // through the streaming loop (the nested datasets borrow it).
+        #[allow(dead_code)]
+        group: hdf5::Group,
+        values_ds: hdf5::Dataset,
+        mask_ds: hdf5::Dataset,
+        offset: usize,
+    },
+    Categorical {
+        group: hdf5::Group,
+        codes_ds: hdf5::Dataset,
+        offset: usize,
+        // `dict` keys come from the per-shard dictionary values; the
+        // insertion order is preserved by walking `cat_order` at finalize.
+        dict: HashMap<String, i32>,
+        cat_order: Vec<String>,
+    },
+    Unsupported,
+}
+
+fn create_column_writer(
+    group: &hdf5::Group,
+    on_disk_name: &str,
+    field: &Field,
+    n_rows_kept: usize,
+) -> Result<ColumnStreamWriter, ConvertError> {
+    match field.data_type() {
+        DataType::Int32 => {
+            let ds = group
+                .new_dataset::<i32>()
+                .shape([n_rows_kept])
+                .create(on_disk_name)?;
+            Ok(ColumnStreamWriter::Int32 { ds, offset: 0 })
+        }
+        DataType::Int64 => {
+            let ds = group
+                .new_dataset::<i64>()
+                .shape([n_rows_kept])
+                .create(on_disk_name)?;
+            Ok(ColumnStreamWriter::Int64 { ds, offset: 0 })
+        }
+        DataType::Float32 => {
+            let ds = group
+                .new_dataset::<f32>()
+                .shape([n_rows_kept])
+                .create(on_disk_name)?;
+            Ok(ColumnStreamWriter::Float32 { ds, offset: 0 })
+        }
+        DataType::Float64 => {
+            let ds = group
+                .new_dataset::<f64>()
+                .shape([n_rows_kept])
+                .create(on_disk_name)?;
+            Ok(ColumnStreamWriter::Float64 { ds, offset: 0 })
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let ds = group
+                .new_dataset::<VarLenUnicode>()
+                .shape([n_rows_kept])
+                .create(on_disk_name)?;
+            Ok(ColumnStreamWriter::Utf8 { ds, offset: 0 })
+        }
+        DataType::Boolean => {
+            // nullable-boolean v0.1.0: group with `values` + `mask`.
+            let bool_group = group.create_group(on_disk_name)?;
+            let values_ds = bool_group
+                .new_dataset::<bool>()
+                .shape([n_rows_kept])
+                .create("values")?;
+            let mask_ds = bool_group
+                .new_dataset::<bool>()
+                .shape([n_rows_kept])
+                .create("mask")?;
+            bool_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-type")?
+                .write_scalar(&vlu("nullable-boolean"))?;
+            bool_group
+                .new_attr::<VarLenUnicode>()
+                .create("encoding-version")?
+                .write_scalar(&vlu("0.1.0"))?;
+            Ok(ColumnStreamWriter::Boolean {
+                group: bool_group,
+                values_ds,
+                mask_ds,
+                offset: 0,
+            })
+        }
+        DataType::Dictionary(_, value_type)
+            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            let cat_group = group.create_group(on_disk_name)?;
+            let codes_ds = cat_group
+                .new_dataset::<i32>()
+                .shape([n_rows_kept])
+                .create("codes")?;
+            Ok(ColumnStreamWriter::Categorical {
+                group: cat_group,
+                codes_ds,
+                offset: 0,
+                dict: HashMap::new(),
+                cat_order: Vec::new(),
+            })
+        }
+        other => {
+            // Mirrors `write_column_to_hdf5`'s warn-and-skip arm so the
+            // streaming and eager paths behave identically on
+            // unsupported types.
+            eprintln!(
+                "warning: skipping column '{}' with unsupported type {other:?}",
+                field.name()
+            );
+            Ok(ColumnStreamWriter::Unsupported)
+        }
+    }
+}
+
+fn append_shard_to_column(
+    writer: &mut ColumnStreamWriter,
+    array: &dyn Array,
+    kept_local: &[usize],
+    name: &str,
+) -> Result<(), ConvertError> {
+    match writer {
+        ColumnStreamWriter::Int32 { ds, offset } => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| downcast_err(name, "Int32"))?;
+            let values: Vec<i32> = kept_local
+                .iter()
+                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                .collect();
+            ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Int64 { ds, offset } => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| downcast_err(name, "Int64"))?;
+            let values: Vec<i64> = kept_local
+                .iter()
+                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                .collect();
+            ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Float32 { ds, offset } => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| downcast_err(name, "Float32"))?;
+            let values: Vec<f32> = kept_local
+                .iter()
+                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0.0 })
+                .collect();
+            ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Float64 { ds, offset } => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| downcast_err(name, "Float64"))?;
+            let values: Vec<f64> = kept_local
+                .iter()
+                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0.0 })
+                .collect();
+            ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Utf8 { ds, offset } => {
+            let values: Vec<VarLenUnicode> = match array.data_type() {
+                DataType::Utf8 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| downcast_err(name, "Utf8"))?;
+                    kept_local
+                        .iter()
+                        .map(|&i| {
+                            if arr.is_valid(i) {
+                                vlu(arr.value(i))
+                            } else {
+                                vlu("")
+                            }
+                        })
+                        .collect()
+                }
+                DataType::LargeUtf8 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .ok_or_else(|| downcast_err(name, "LargeUtf8"))?;
+                    kept_local
+                        .iter()
+                        .map(|&i| {
+                            if arr.is_valid(i) {
+                                vlu(arr.value(i))
+                            } else {
+                                vlu("")
+                            }
+                        })
+                        .collect()
+                }
+                other => {
+                    return Err(ConvertError::Other(format!(
+                        "column '{name}': expected Utf8/LargeUtf8, got {other:?}"
+                    )));
+                }
+            };
+            ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Boolean {
+            values_ds,
+            mask_ds,
+            offset,
+            ..
+        } => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err(name, "Boolean"))?;
+            let values: Vec<bool> = kept_local
+                .iter()
+                .map(|&i| arr.is_valid(i) && arr.value(i))
+                .collect();
+            let mask: Vec<bool> = kept_local.iter().map(|&i| !arr.is_valid(i)).collect();
+            values_ds.write_slice(
+                ArrayView1::from(values.as_slice()),
+                ndarray::s![*offset..*offset + values.len()],
+            )?;
+            mask_ds.write_slice(
+                ArrayView1::from(mask.as_slice()),
+                ndarray::s![*offset..*offset + mask.len()],
+            )?;
+            *offset += values.len();
+        }
+        ColumnStreamWriter::Categorical {
+            codes_ds,
+            offset,
+            dict,
+            cat_order,
+            ..
+        } => {
+            let (local_codes, local_values) = dict_local_codes_and_string_values(array, name)?;
+            // Build local→global remap (extends `dict` / `cat_order`
+            // for any value not seen before).
+            let mut remap: Vec<i32> = Vec::with_capacity(local_values.len());
+            for v in local_values {
+                let g = match dict.get(&v) {
+                    Some(&g) => g,
+                    None => {
+                        // Cap at i32::MAX. Practical categorical
+                        // cardinalities (cell_type, donor_id) stay
+                        // well below this; saturating is defensive.
+                        let g: i32 = cat_order.len().try_into().map_err(|_| {
+                            ConvertError::Other(format!(
+                                "column '{name}': categorical cardinality exceeds i32::MAX"
+                            ))
+                        })?;
+                        dict.insert(v.clone(), g);
+                        cat_order.push(v);
+                        g
+                    }
+                };
+                remap.push(g);
+            }
+            let kept_codes: Vec<i32> = kept_local
+                .iter()
+                .map(|&i| {
+                    let lc = local_codes[i];
+                    if lc < 0 {
+                        -1
+                    } else {
+                        remap[lc as usize]
+                    }
+                })
+                .collect();
+            codes_ds.write_slice(
+                ArrayView1::from(kept_codes.as_slice()),
+                ndarray::s![*offset..*offset + kept_codes.len()],
+            )?;
+            *offset += kept_codes.len();
+        }
+        ColumnStreamWriter::Unsupported => {
+            // Warning emitted once at writer creation; per-shard
+            // append is a no-op (mirrors the eager path's skip).
+        }
+    }
+    Ok(())
+}
+
+fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertError> {
+    if let ColumnStreamWriter::Categorical {
+        group, cat_order, ..
+    } = writer
+    {
+        let cats: Vec<VarLenUnicode> = cat_order.iter().map(|s| vlu(s)).collect();
+        group
+            .new_dataset::<VarLenUnicode>()
+            .shape([cats.len()])
+            .create("categories")?
+            .write(&cats)?;
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-type")?
+            .write_scalar(&vlu("categorical"))?;
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-version")?
+            .write_scalar(&vlu("0.2.0"))?;
+        group
+            .new_attr::<bool>()
+            .create("ordered")?
+            .write_scalar(&false)?;
+    }
+    Ok(())
+}
+
+/// Streaming counterpart of [`dict_codes_and_categories_i32`]: extracts
+/// local codes (promoted to i32, -1 for null) and the local dictionary
+/// values as owned `Vec<String>` so callers can fold values into a
+/// running global dictionary across shards. Accepts both
+/// `Dictionary(_, Utf8)` and `Dictionary(_, LargeUtf8)` value types so
+/// shard runtime arrays match whatever the per-shard downcast left.
+fn dict_local_codes_and_string_values(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<i32>, Vec<String>), ConvertError> {
+    macro_rules! extract {
+        ($t:ty, $label:literal) => {{
+            let dict = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<$t>>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            let codes: Vec<i32> = dict
+                .keys()
+                .iter()
+                .map(|v| match v {
+                    Some(k) => k as i32,
+                    None => -1,
+                })
+                .collect();
+            let values: Vec<String> = match dict.values().data_type() {
+                DataType::Utf8 => {
+                    let arr = dict.values().as_string::<i32>();
+                    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+                }
+                DataType::LargeUtf8 => {
+                    let arr = dict.values().as_string::<i64>();
+                    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+                }
+                other => {
+                    return Err(ConvertError::Other(format!(
+                        "column '{name}': unsupported dictionary value type {other:?}"
+                    )));
+                }
+            };
+            Ok::<_, ConvertError>((codes, values))
+        }};
+    }
+    let key_type = match array.data_type() {
+        DataType::Dictionary(k, _) => k.as_ref(),
+        _ => {
+            return Err(ConvertError::Other(format!(
+                "column '{name}': expected Dictionary, got {:?}",
+                array.data_type()
+            )));
+        }
+    };
+    match key_type {
+        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, _>"),
+        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, _>"),
+        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, _>"),
+        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, _>"),
+        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, _>"),
+        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, _>"),
+        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, _>"),
+        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, _>"),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': unsupported categorical key type {other:?}"
+        ))),
+    }
 }
 
 fn write_uns_entries(group: &hdf5::Group, value: &serde_json::Value) -> Result<(), ConvertError> {
