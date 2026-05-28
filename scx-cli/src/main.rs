@@ -290,6 +290,12 @@ enum Commands {
         /// output (current default).
         #[arg(long, value_name = "N")]
         index_auto_threshold: Option<usize>,
+        /// Rewrite obs metadata as row-sharded `ObsMetadataShard` sections
+        /// (legacy single-section → sharded). Migrates files written
+        /// before sharded obs metadata existed; idempotent on already-
+        /// sharded inputs.
+        #[arg(long)]
+        reshape_obs: bool,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -651,6 +657,7 @@ fn main() {
             index_var,
             index_preset,
             index_auto_threshold,
+            reshape_obs,
         } => compact::run_compact(
             &input,
             &output,
@@ -661,6 +668,7 @@ fn main() {
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
+            reshape_obs,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::Merge {

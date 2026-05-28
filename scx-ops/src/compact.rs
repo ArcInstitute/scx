@@ -37,6 +37,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             index_preset: None,
             index_auto_threshold: 0,
         },
+        false,
     )
     .map(|_| ())
 }
@@ -44,10 +45,17 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 /// Compact an SCX file and optionally rebuild predicate indexes on the
 /// output. See [`merge_with_index_options`](crate::merge_with_index_options)
 /// for the shape of `index_options` and the multimodal-skip semantics.
+///
+/// When `reshape_obs` is true the output's obs metadata is written as
+/// row-sharded [`SectionType::ObsMetadataShard`] sections (bounded by the
+/// file's `shard_target_rows`) instead of a single legacy `ObsMetadata`
+/// section. This is the in-place migration path for files written before
+/// sharded obs metadata existed; it is idempotent on already-sharded inputs.
 pub fn compact_with_index_options(
     input_path: &Path,
     output_path: &Path,
     index_options: &ConversionPredicateIndexOptions,
+    reshape_obs: bool,
 ) -> Result<PredicateIndexBuildSummary> {
     // Acquire shared lock to prevent concurrent writers from modifying the
     // file while we read it. The lock is held until `_lock` is dropped.
@@ -64,7 +72,7 @@ pub fn compact_with_index_options(
         // warning.
         let multimodal_skip =
             user_wants_index(index_options).then(|| requested_columns(index_options));
-        compact_multimodal(reader, in_header, output_path)?;
+        compact_multimodal(reader, in_header, output_path, reshape_obs)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
             multimodal_skip,
@@ -157,7 +165,12 @@ pub fn compact_with_index_options(
     let has_obsm = in_header.has_obsm();
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
-    writer.write_obs(&filtered_obs)?;
+    write_obs_section(
+        &mut writer,
+        &filtered_obs,
+        reshape_obs,
+        in_header.shard_target_rows,
+    )?;
     writer.write_var(&var)?;
 
     // Process CSR shards: decode, filter deleted rows, re-shard.
@@ -397,7 +410,7 @@ pub fn compact_with_index_options(
             .as_secs() as i64,
         action: "compact".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: "{}".to_string(),
+        params_json: format!("{{\"reshape_obs\":{reshape_obs}}}"),
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
@@ -409,12 +422,53 @@ pub fn compact_with_index_options(
     })
 }
 
+/// Write the (filtered) obs metadata batch to `writer`.
+///
+/// When `reshape` is false this writes a single legacy `ObsMetadata`
+/// section (the historical compact behaviour). When true the batch is
+/// sliced into `shard_target_rows`-sized chunks and emitted as
+/// `ObsMetadataShard` sections — the in-place migration path for files
+/// written before sharded obs metadata existed. `write_obs_shard`
+/// upcasts `Utf8 → LargeUtf8` per shard internally, so individual shards
+/// never hit the Arrow IPC 2 GB narrow-offset ceiling.
+fn write_obs_section(
+    writer: &mut ScxWriter,
+    obs: &arrow::array::RecordBatch,
+    reshape: bool,
+    shard_target_rows: u32,
+) -> Result<()> {
+    let n = obs.num_rows();
+    if !reshape || n == 0 {
+        // Nothing to shard (or reshape not requested); a single section
+        // keeps an empty file well-formed.
+        writer.write_obs(obs)?;
+        return Ok(());
+    }
+    let chunk = (shard_target_rows.max(1)) as usize;
+    let total = n as u64;
+    let (mut shard_idx, mut row_start, mut cursor) = (0u32, 0u64, 0usize);
+    while cursor < n {
+        let take = chunk.min(n - cursor);
+        let slice = obs.slice(cursor, take); // zero-copy
+        writer.write_obs_shard(shard_idx, row_start, take as u64, total, &slice)?;
+        shard_idx += 1;
+        row_start += take as u64;
+        cursor += take;
+    }
+    Ok(())
+}
+
 /// Phase 6: compact a multimodal SCX file. Applies the global keep
 /// mask to every modality's CSR shards (and per-modality layers) while
 /// preserving the ModalityTable and per-modality var / obsm / uns.
 /// Per-modality CSC sidecars are dropped (rebuild via
 /// `--rebuild-csc`).
-fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Path) -> Result<()> {
+fn compact_multimodal(
+    reader: ScxReader,
+    in_header: FileHeader,
+    output_path: &Path,
+    reshape_obs: bool,
+) -> Result<()> {
     let dv = reader.read_deletion_vectors()?;
 
     let n_obs = in_header.n_obs as usize;
@@ -489,7 +543,12 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
     };
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
-    writer.write_obs(&filtered_obs)?;
+    write_obs_section(
+        &mut writer,
+        &filtered_obs,
+        reshape_obs,
+        in_header.shard_target_rows,
+    )?;
 
     let shard_target = in_header.shard_target_rows;
 
@@ -769,7 +828,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             .as_secs() as i64,
         action: "compact".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: "{}".to_string(),
+        params_json: format!("{{\"reshape_obs\":{reshape_obs}}}"),
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;

@@ -519,7 +519,12 @@ pub fn compact(
         Some(index_opts) => {
             let summary = py
                 .allow_threads(|| {
-                    scx_ops::compact_with_index_options(&input_path, &output_path, &index_opts)
+                    scx_ops::compact_with_index_options(
+                        &input_path,
+                        &output_path,
+                        &index_opts,
+                        false,
+                    )
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
