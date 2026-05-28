@@ -63,12 +63,14 @@ try:
     from .pyscx import to_h5ad as _to_h5ad_native      # noqa: E402
     from .pyscx import from_h5mu as _from_h5mu_native  # noqa: E402
     from .pyscx import to_h5mu as _to_h5mu_native      # noqa: E402
+    from .pyscx import read_h5ad_metadata as _read_h5ad_metadata_native  # noqa: E402
     _HAS_HDF5 = True
 except ImportError:
     _from_h5ad_native = None
     _to_h5ad_native = None
     _from_h5mu_native = None
     _to_h5mu_native = None
+    _read_h5ad_metadata_native = None
     _HAS_HDF5 = False
 
 
@@ -148,6 +150,23 @@ def from_h5ad(path, out, **kwargs):
         _coerce_path(path, allow_experiment=False),
         _coerce_path(out),
         **kwargs,
+    )
+
+
+def read_h5ad_metadata(path, strict_uns=False):
+    """Read obs / var / uns / X shape from an h5ad file via pure-Rust
+    HDF5 readers, without going through `anndata.read_h5ad` (which
+    eagerly materialises `obsm` on every call). Accepts str or
+    `os.PathLike` for `path`. Returns an `H5adMetadata` object whose
+    `obs`, `var`, `uns`, `n_obs`, `n_vars`, and `x_format` attributes
+    can be inspected / mutated and passed back to
+    `pyscx.from_h5ad(path, out, obs_override=..., uns_override=...)`
+    for read-mutate-write flows that need to stay under tight memory
+    budgets."""
+    _require_hdf5("read_h5ad_metadata")
+    return _read_h5ad_metadata_native(
+        _coerce_path(path, allow_experiment=False),
+        strict_uns=strict_uns,
     )
 
 

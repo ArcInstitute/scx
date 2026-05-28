@@ -11,12 +11,112 @@ use hdf5::types::TypeDescriptor;
 use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
-use super::detect::MatrixFormat;
+use super::detect::{detect_matrix_format, MatrixFormat};
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
 
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
 type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);
+
+/// Path-based wrapper around [`read_h5ad_x_shape`]. Opens the file and
+/// returns `(n_obs, n_vars, x_format)`; lets consumers that don't link
+/// the `hdf5` crate directly (e.g. pyscx) check shape without taking on
+/// the dep.
+pub fn read_h5ad_x_shape_from_path(
+    path: &std::path::Path,
+    sink: &mut WarningSink,
+) -> Result<(usize, usize, &'static str), ConvertError> {
+    let file = hdf5::File::open(path)?;
+    read_h5ad_x_shape(&file, sink)
+}
+
+/// Bundle of metadata returned by [`read_h5ad_metadata_from_path`]. obs
+/// and var come back as Arrow RecordBatches (caller picks the
+/// presentation); uns as a JSON tree or `None` when the file has no
+/// `/uns` group.
+pub struct H5adMetadataParts {
+    pub obs: RecordBatch,
+    pub var: RecordBatch,
+    pub uns: Option<serde_json::Value>,
+    pub n_obs: usize,
+    pub n_vars: usize,
+    pub x_format: &'static str,
+}
+
+/// Single-shot pure-Rust h5ad metadata read: opens the file, reads
+/// obs / var / uns / X shape, and returns everything as Arrow + JSON.
+/// X data, obsm, varm, obsp, varp, and layers are not touched. Used by
+/// `pyscx.read_h5ad_metadata` to avoid the obsm-materialisation OOM
+/// that `anndata.read_h5ad(path, backed="r")` triggers.
+pub fn read_h5ad_metadata_from_path(
+    path: &std::path::Path,
+    strict_uns: bool,
+    sink: &mut WarningSink,
+) -> Result<H5adMetadataParts, ConvertError> {
+    let file = hdf5::File::open(path)?;
+    let (n_obs, n_vars, x_format) = read_h5ad_x_shape(&file, sink)?;
+    let obs = read_dataframe_group(&file, "obs")?;
+    let var = read_dataframe_group(&file, "var")?;
+    let uns = if file.group("uns").is_ok() {
+        Some(read_uns(&file, strict_uns, sink)?)
+    } else {
+        None
+    };
+    Ok(H5adMetadataParts {
+        obs,
+        var,
+        uns,
+        n_obs,
+        n_vars,
+        x_format,
+    })
+}
+
+/// Read just the `/X` shape and storage format from an h5ad file without
+/// loading any matrix data. Used by lightweight metadata readers
+/// (e.g. pyscx.read_h5ad_metadata) that need `(n_obs, n_vars)` to validate
+/// caller-supplied overrides without paying for an obsm-materialising
+/// anndata.read_h5ad call.
+///
+/// Returns `(n_obs, n_vars, x_format)` where `x_format` is the lowercase
+/// string `"csr"`, `"csc"`, or `"dense"`. Errors with
+/// `ConvertError::FormatMismatch` for non-h5ad inputs.
+pub fn read_h5ad_x_shape(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<(usize, usize, &'static str), ConvertError> {
+    let matrix_format = detect_matrix_format(file, sink)?;
+    let (n_obs, n_vars) = match matrix_format {
+        MatrixFormat::Csr | MatrixFormat::Csc => {
+            let group = file.group("X")?;
+            let shape: Vec<i64> = group.attr("shape")?.read_1d()?.to_vec();
+            if shape.len() != 2 {
+                return Err(ConvertError::Other(format!(
+                    "X group shape attribute must have length 2, got {}",
+                    shape.len()
+                )));
+            }
+            (shape[0] as usize, shape[1] as usize)
+        }
+        MatrixFormat::Dense => {
+            let ds = file.dataset("X")?;
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(ConvertError::Other(format!(
+                    "dense X must be 2D, got {}-D",
+                    shape.len()
+                )));
+            }
+            (shape[0], shape[1])
+        }
+    };
+    let fmt_str = match matrix_format {
+        MatrixFormat::Csr => "csr",
+        MatrixFormat::Csc => "csc",
+        MatrixFormat::Dense => "dense",
+    };
+    Ok((n_obs, n_vars, fmt_str))
+}
 
 /// Read the X matrix from an h5ad file, returning CSR arrays and shape.
 pub fn read_x_matrix(file: &hdf5::File, format: MatrixFormat) -> Result<CsrArrays, ConvertError> {

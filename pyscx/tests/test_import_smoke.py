@@ -25,7 +25,7 @@ def test_default_build_exposes_hdf5_entrypoints():
     the venv was built with `--no-default-features` or the pyproject
     default-features list regressed."""
     import pyscx
-    for name in ("from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu"):
+    for name in ("from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu", "read_h5ad_metadata"):
         fn = getattr(pyscx, name, None)
         assert callable(fn), (
             f"pyscx.{name} should be callable on a default `maturin develop` "
@@ -50,9 +50,12 @@ def _patch_no_hdf5(monkeypatch):
     monkeypatch.setattr(pyscx, "_to_h5ad_native", None)
     monkeypatch.setattr(pyscx, "_from_h5mu_native", None)
     monkeypatch.setattr(pyscx, "_to_h5mu_native", None)
+    monkeypatch.setattr(pyscx, "_read_h5ad_metadata_native", None)
 
 
-@pytest.mark.parametrize("fn_name", ["from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu"])
+@pytest.mark.parametrize(
+    "fn_name", ["from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu", "read_h5ad_metadata"]
+)
 def test_wrappers_raise_when_hdf5_unavailable(monkeypatch, fn_name):
     """Each wrapper raises NotImplementedError naming `hdf5` when the
     native symbol is absent. The message must point at the rebuild
@@ -60,8 +63,10 @@ def test_wrappers_raise_when_hdf5_unavailable(monkeypatch, fn_name):
     _patch_no_hdf5(monkeypatch)
     import pyscx
     fn = getattr(pyscx, fn_name)
+    # `read_h5ad_metadata` takes a single path; the others take (path, out).
+    args = ("input.h5ad",) if fn_name == "read_h5ad_metadata" else ("input.h5ad", "output.scx")
     with pytest.raises(NotImplementedError) as excinfo:
-        fn("input.h5ad", "output.scx")
+        fn(*args)
     msg = str(excinfo.value)
     assert "hdf5" in msg, f"Expected 'hdf5' in error message; got: {msg!r}"
     assert f"pyscx.{fn_name}" in msg, (
@@ -82,7 +87,7 @@ def test_import_pyscx_succeeds_with_no_hdf5_natives(monkeypatch):
     _patch_no_hdf5(monkeypatch)
     import pyscx
     # Wrappers must still be callable (raising at call-time is OK).
-    for name in ("from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu"):
+    for name in ("from_h5ad", "to_h5ad", "from_h5mu", "to_h5mu", "read_h5ad_metadata"):
         assert callable(getattr(pyscx, name))
     # Non-hdf5 surface must still work.
     assert callable(pyscx.open)

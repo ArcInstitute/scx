@@ -47,6 +47,12 @@ pub use dense_stream::{open_dense_layer_streaming, open_dense_streaming, DenseXS
 #[cfg(feature = "hdf5")]
 pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
 
+#[cfg(feature = "hdf5")]
+pub use h5ad_read::{
+    read_dataframe_group, read_h5ad_metadata_from_path, read_h5ad_x_shape,
+    read_h5ad_x_shape_from_path, read_uns, H5adMetadataParts,
+};
+
 pub use mem::MemoryBudget;
 #[cfg(feature = "hdf5")]
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
