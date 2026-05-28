@@ -242,7 +242,10 @@ impl CloudReader {
         let raw_batches: Vec<(u32, RecordBatch)> = futures::stream::iter(entries)
             .map(|(idx, e)| async move {
                 let bytes = self.read_section_for_entry(e).await?;
-                Ok::<(u32, RecordBatch), CloudError>((idx, decode_arrow_ipc_batch(&bytes, logical)?))
+                Ok::<(u32, RecordBatch), CloudError>((
+                    idx,
+                    decode_arrow_ipc_batch(&bytes, logical)?,
+                ))
             })
             .buffer_unordered(METADATA_SHARD_FETCH_CONCURRENCY)
             .try_collect()
