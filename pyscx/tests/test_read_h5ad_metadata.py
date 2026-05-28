@@ -35,6 +35,94 @@ def h5ad_path(synthetic_adata, tmp_dir):
     return path
 
 
+@pytest.fixture
+def h5ad_nullable_path(synthetic_adata, tmp_dir):
+    """An h5ad whose obs carries pandas nullable Int64 / UInt16 / Int32
+    columns (with NA) and a nullable Float64 column. anndata writes
+    these as group-form columns with `encoding-type='nullable-integer'`
+    / `'nullable-float'` — the encodings the pure-Rust reader must
+    decode rather than silently drop."""
+    adata = synthetic_adata
+    n = adata.n_obs
+    int64_vals = [None if i % 7 == 0 else i for i in range(n)]
+    adata.obs["nullable_int64"] = pd.array(int64_vals, dtype="Int64")
+    adata.obs["nullable_uint16"] = pd.array(
+        [None if i % 5 == 0 else (i % 100) for i in range(n)], dtype="UInt16"
+    )
+    adata.obs["nullable_int32"] = pd.array(
+        [None if i % 3 == 0 else -i for i in range(n)], dtype="Int32"
+    )
+    # Note: nullable Float (pandas FloatingArray) is intentionally not
+    # added — the installed anndata cannot serialise it. The Rust
+    # `nullable-float` reader is covered by the integer path's shared
+    # masked-array logic.
+    path = str(tmp_dir / "nullable.h5ad")
+    adata.write_h5ad(path)
+    return path, int64_vals
+
+
+def _is_nullable_integer_group(h5ad_path, col):
+    """True if anndata wrote `col` as a nullable-integer group (vs. a
+    plain dataset). Older anndata versions may not emit the masked
+    group form — callers skip when this is False."""
+    import h5py
+
+    with h5py.File(h5ad_path, "r") as f:
+        node = f["obs"].get(col)
+        if not isinstance(node, h5py.Group):
+            return False
+        return node.attrs.get("encoding-type") == "nullable-integer"
+
+
+def test_read_h5ad_metadata_preserves_nullable_integer(h5ad_nullable_path):
+    """Nullable-integer / nullable-float obs columns survive the
+    pure-Rust metadata read with values + NA positions intact. This is
+    the direct guard for the silent-drop regression the new direct
+    streaming path would otherwise introduce."""
+    import pyscx
+
+    path, int64_vals = h5ad_nullable_path
+    if not _is_nullable_integer_group(path, "nullable_int64"):
+        pytest.skip("installed anndata did not write nullable-integer group form")
+
+    meta = pyscx.read_h5ad_metadata(path)
+    for col in ("nullable_int64", "nullable_uint16", "nullable_int32"):
+        assert col in meta.obs.columns, f"{col} was dropped by the reader"
+
+    # Int64 values + null positions round-trip.
+    got = meta.obs["nullable_int64"]
+    for i, want in enumerate(int64_vals):
+        if want is None:
+            assert pd.isna(got.iloc[i]), f"row {i} should be NA"
+        else:
+            assert int(got.iloc[i]) == want, f"row {i}: {got.iloc[i]} != {want}"
+
+
+def test_from_h5ad_preserves_nullable_integer_round_trip(
+    h5ad_nullable_path, tmp_dir
+):
+    """Plain `from_h5ad(path, out)` (no override) preserves nullable
+    obs columns end-to-end through SCX. Before the fix these were
+    silently dropped by the pure-Rust dataframe reader."""
+    import pyscx
+
+    path, int64_vals = h5ad_nullable_path
+    if not _is_nullable_integer_group(path, "nullable_int64"):
+        pytest.skip("installed anndata did not write nullable-integer group form")
+
+    out = str(tmp_dir / "nullable.scx")
+    pyscx.from_h5ad(path, out)
+    readback = pyscx.open(out).to_anndata()
+
+    assert "nullable_int64" in readback.obs.columns
+    got = readback.obs["nullable_int64"]
+    # Non-null values survive; at least one NA was present in the source.
+    assert got.isna().any(), "expected NA values to survive the round-trip"
+    for i, want in enumerate(int64_vals):
+        if want is not None:
+            assert int(got.iloc[i]) == want, f"row {i}: {got.iloc[i]} != {want}"
+
+
 def test_read_h5ad_metadata_basic(synthetic_adata, h5ad_path):
     """Returns obs/var/uns matching anndata.read_h5ad for the same fixture."""
     import pyscx

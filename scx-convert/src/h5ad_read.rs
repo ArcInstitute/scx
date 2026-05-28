@@ -437,10 +437,49 @@ pub fn read_dataframe_group(
                     }
                     continue;
                 }
-                _ => {
-                    // Non-categorical / non-nullable-boolean subgroups
-                    // (nested uns dicts, etc.) are not dataframe
-                    // columns — leave them out silently.
+                "nullable-integer" => {
+                    match read_nullable_integer_group(&subgroup, name) {
+                        Ok((field, array)) => {
+                            fields.push(field);
+                            arrays.push(array);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: skipping nullable-integer group '{name}' in {group_name}: {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                "nullable-float" => {
+                    match read_nullable_float_group(&subgroup, name) {
+                        Ok((field, array)) => {
+                            fields.push(field);
+                            arrays.push(array);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: skipping nullable-float group '{name}' in {group_name}: {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                "" => {
+                    // No `encoding-type` attribute: a genuine non-column
+                    // nested group (e.g. a nested uns dict). anndata
+                    // always stamps `encoding-type` on real dataframe
+                    // columns, so leave these out silently.
+                }
+                other => {
+                    // A column-order member carrying an `encoding-type`
+                    // we don't decode (some future / exotic anndata
+                    // encoding). Don't drop it silently — that's how the
+                    // nullable-integer regression slipped through.
+                    eprintln!(
+                        "warning: skipping unsupported group column '{name}' \
+                         (encoding-type='{other}') in {group_name}"
+                    );
                 }
             }
         }
@@ -751,6 +790,179 @@ fn read_nullable_boolean_group(
             .collect::<Vec<_>>(),
     );
     Ok((Field::new(name, DataType::Boolean, true), Arc::new(arr)))
+}
+
+/// Read anndata's `nullable-integer` group form: a subgroup with
+/// `values` (integer dataset) and `mask` (bool/u8) datasets, written
+/// for pandas nullable integer dtypes (`Int8`..`Int64`,
+/// `UInt8`..`UInt64`). `mask[i] == true` marks the row as null. The
+/// resulting Arrow array carries the corresponding validity bit; the
+/// integer width is mapped to the same Arrow type
+/// [`read_column_to_arrow`] uses for the equivalent plain column, so
+/// downstream handling is identical to a non-nullable integer column.
+fn read_nullable_integer_group(
+    int_group: &hdf5::Group,
+    name: &str,
+) -> Result<(Field, ArrayRef), ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+
+    let values_ds = int_group.dataset("values")?;
+    let mask = read_bool_or_u8(&int_group.dataset("mask")?)?;
+    let desc = values_ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "nullable-integer '{name}': unsupported values dtype: {desc:?}"
+        ))
+    })?;
+
+    // Build `Vec<Option<T>>` from values + mask, validating lengths.
+    macro_rules! opt_vec {
+        ($read_ty:ty, $cast_ty:ty) => {{
+            let values: Vec<$read_ty> = values_ds.read_1d()?.to_vec();
+            if values.len() != mask.len() {
+                return Err(ConvertError::Other(format!(
+                    "nullable-integer '{name}': values len {} != mask len {}",
+                    values.len(),
+                    mask.len()
+                )));
+            }
+            values
+                .iter()
+                .zip(mask.iter())
+                .map(|(v, m)| if *m { None } else { Some(*v as $cast_ty) })
+                .collect::<Vec<Option<$cast_ty>>>()
+        }};
+    }
+
+    let (field, array): (Field, ArrayRef) = match dt {
+        HdfNumericDtype::I8 => (
+            Field::new(name, DataType::Int32, true),
+            Arc::new(Int32Array::from(opt_vec!(i8, i32))),
+        ),
+        HdfNumericDtype::I16 => (
+            Field::new(name, DataType::Int32, true),
+            Arc::new(Int32Array::from(opt_vec!(i16, i32))),
+        ),
+        HdfNumericDtype::I32 => (
+            Field::new(name, DataType::Int32, true),
+            Arc::new(Int32Array::from(opt_vec!(i32, i32))),
+        ),
+        HdfNumericDtype::U8 => (
+            Field::new(name, DataType::Int32, true),
+            Arc::new(Int32Array::from(opt_vec!(u8, i32))),
+        ),
+        HdfNumericDtype::U16 => (
+            Field::new(name, DataType::Int32, true),
+            Arc::new(Int32Array::from(opt_vec!(u16, i32))),
+        ),
+        HdfNumericDtype::I64 => (
+            Field::new(name, DataType::Int64, true),
+            Arc::new(Int64Array::from(opt_vec!(i64, i64))),
+        ),
+        HdfNumericDtype::U32 => (
+            Field::new(name, DataType::Int64, true),
+            Arc::new(Int64Array::from(opt_vec!(u32, i64))),
+        ),
+        // u64 → i64 may overflow. Range-check loudly instead of silently
+        // truncating — same precedent as the plain-column reader.
+        HdfNumericDtype::U64 => {
+            let values: Vec<u64> = values_ds.read_1d()?.to_vec();
+            if values.len() != mask.len() {
+                return Err(ConvertError::Other(format!(
+                    "nullable-integer '{name}': values len {} != mask len {}",
+                    values.len(),
+                    mask.len()
+                )));
+            }
+            if let Some(&v) = values
+                .iter()
+                .zip(mask.iter())
+                .filter(|(_, m)| !**m)
+                .map(|(v, _)| v)
+                .find(|&&v| v > i64::MAX as u64)
+            {
+                return Err(ConvertError::IndexOverflow {
+                    path: values_ds.name(),
+                    source_dtype: dt.name(),
+                    target: "i64",
+                    value: v.to_string(),
+                });
+            }
+            let opt = values
+                .iter()
+                .zip(mask.iter())
+                .map(|(v, m)| if *m { None } else { Some(*v as i64) })
+                .collect::<Vec<Option<i64>>>();
+            (
+                Field::new(name, DataType::Int64, true),
+                Arc::new(Int64Array::from(opt)),
+            )
+        }
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            return Err(ConvertError::UnsupportedDtype(format!(
+                "nullable-integer '{name}': values dtype is float ({}); expected integer",
+                dt.name()
+            )));
+        }
+    };
+    Ok((field, array))
+}
+
+/// Read anndata's `nullable-float` group form: a subgroup with `values`
+/// (float dataset) and `mask` (bool/u8) datasets, written for pandas
+/// nullable float dtypes (`Float32` / `Float64`). `mask[i] == true`
+/// marks the row as null. Mirrors [`read_nullable_integer_group`] for
+/// floating-point widths.
+fn read_nullable_float_group(
+    float_group: &hdf5::Group,
+    name: &str,
+) -> Result<(Field, ArrayRef), ConvertError> {
+    use super::hdf_dtype::HdfNumericDtype;
+
+    let values_ds = float_group.dataset("values")?;
+    let mask = read_bool_or_u8(&float_group.dataset("mask")?)?;
+    let desc = values_ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "nullable-float '{name}': unsupported values dtype: {desc:?}"
+        ))
+    })?;
+
+    macro_rules! opt_vec {
+        ($read_ty:ty) => {{
+            let values: Vec<$read_ty> = values_ds.read_1d()?.to_vec();
+            if values.len() != mask.len() {
+                return Err(ConvertError::Other(format!(
+                    "nullable-float '{name}': values len {} != mask len {}",
+                    values.len(),
+                    mask.len()
+                )));
+            }
+            values
+                .iter()
+                .zip(mask.iter())
+                .map(|(v, m)| if *m { None } else { Some(*v) })
+                .collect::<Vec<Option<$read_ty>>>()
+        }};
+    }
+
+    let (field, array): (Field, ArrayRef) = match dt {
+        HdfNumericDtype::F32 => (
+            Field::new(name, DataType::Float32, true),
+            Arc::new(Float32Array::from(opt_vec!(f32))),
+        ),
+        HdfNumericDtype::F64 => (
+            Field::new(name, DataType::Float64, true),
+            Arc::new(Float64Array::from(opt_vec!(f64))),
+        ),
+        other => {
+            return Err(ConvertError::UnsupportedDtype(format!(
+                "nullable-float '{name}': values dtype is {}; expected float",
+                other.name()
+            )));
+        }
+    };
+    Ok((field, array))
 }
 
 /// Read a 1D dataset that may be encoded as native HDF5 boolean
