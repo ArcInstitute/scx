@@ -2209,7 +2209,10 @@ const SCX_TYPE_KEY: &str = "__scx_type__";
 /// Convert a `serde_json::Value` (uns JSON tree) into a Python dict
 /// using the existing `__scx_type__` envelope decoder. Thin wrapper
 /// around [`json_to_py`] for use from other pyscx modules that don't
-/// want to construct [`UnsReadCtx`] directly.
+/// want to construct [`UnsReadCtx`] directly. Gated on the `hdf5`
+/// feature because its sole callers (`pyscx.read_h5ad_metadata`,
+/// `pyscx.from_h5ad`) are h5ad-only.
+#[cfg(feature = "hdf5")]
 pub(crate) fn uns_json_to_py<'py>(
     py: Python<'py>,
     val: &serde_json::Value,
@@ -2220,7 +2223,9 @@ pub(crate) fn uns_json_to_py<'py>(
 
 /// Convert a Python object (typically a dict supplied as `uns_override`)
 /// into a `serde_json::Value` using the existing tagged-envelope writer.
-/// Thin wrapper around [`normalize_uns_value`].
+/// Thin wrapper around [`normalize_uns_value`]. Gated on the `hdf5`
+/// feature because its sole caller (`pyscx.from_h5ad`) is h5ad-only.
+#[cfg(feature = "hdf5")]
 pub(crate) fn uns_py_to_json<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
