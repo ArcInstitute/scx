@@ -215,7 +215,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] `object_store` integration (S3, GCS, Azure backends)
 - [x] Python API: `scx.pull()`, `scx.push()`, `scx.open_cloud("gs://...")`
 - [x] `CloudReader` for direct cloud reads without full download
-- [ ] Cloud reader support for sharded obs (`ObsMetadataShard`) — **DEFERRED** (Phase 6b); files produced by streaming merge/append/from_anndata with sharded obs fail on `open_cloud` until the cloud reader assembles sharded metadata
+- [x] Cloud reader support for sharded obs (`ObsMetadataShard` / `VarMetadataShard`) — `CloudReader::read_obs`/`read_var` assemble row-sharded metadata over parallel range reads via the shared `scx_format::assemble_sharded_metadata`, so files from streaming merge/append/from_anndata open over `open_cloud`. The single file-scope `ObsPredicateIndex` is read unchanged. Caveat: a *stale* file-scope index after `scx append --rebuild-index=false` is not auto-merged across appended shards (the incremental delta-index design remains deferred); rebuild the index or expect a full obs scan over appended rows
 
 ### 2.6 Fused Operations (performance, not analysis reimplementation)
 - [x] Fused normalize + log1p (single CSR row scan)

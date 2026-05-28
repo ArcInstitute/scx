@@ -143,6 +143,51 @@ fn write_test_scx(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> PathB
     path
 }
 
+/// Write a Phase 2 sharded-obs test SCX: obs is emitted as multiple
+/// `ObsMetadataShard` sections instead of one `ObsMetadata`. Used to
+/// verify the cloud query path assembles sharded obs and returns the
+/// same `QueryResult` as the local in-process path.
+fn write_sharded_test_scx(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> PathBuf {
+    let path = dir.path().join("sharded.scx");
+    let header = test_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = sample_obs(n_obs);
+    let obs_rows_per_shard = 40usize;
+    let mut shard_idx = 0u32;
+    let mut off = 0usize;
+    while off < n_obs {
+        let len = std::cmp::min(obs_rows_per_shard, n_obs - off);
+        let chunk = obs.slice(off, len);
+        writer
+            .write_obs_shard(shard_idx, off as u64, len as u64, n_obs as u64, &chunk)
+            .unwrap();
+        off += len;
+        shard_idx += 1;
+    }
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let rows_per_shard = 50;
+    let mut row_offset = 0;
+    while row_offset < n_obs {
+        let shard_rows = std::cmp::min(rows_per_shard, n_obs - row_offset);
+        let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_offset as u64,
+            )
+            .unwrap();
+        row_offset += shard_rows;
+    }
+    writer.finish().unwrap();
+    path
+}
+
 fn build_cloud_pipeline(rt: &Arc<tokio::runtime::Runtime>, url: &str) -> QueryPipeline {
     let reader = rt.block_on(scx_cloud::open_cloud(url)).unwrap();
     let adapter = CloudSectionReader::new(Arc::new(reader), Arc::clone(rt));
@@ -423,4 +468,59 @@ fn cloud_read_obs_schema_narrows_dictionary_large_utf8() {
         assert_eq!(lf.name(), cf.name());
         assert_eq!(lf.data_type(), cf.data_type());
     }
+}
+
+/// Sharded-obs exploded `.scxd/` query matches the local in-process
+/// query — verifies the cloud reader assembles `ObsMetadataShard`
+/// sections rather than failing on the missing single `obs` section.
+#[test]
+fn cloud_query_sharded_obs_exploded_matches_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_sharded_test_scx(&dir, 100, 50);
+    let exploded_path = dir.path().join("sharded.scxd");
+    explode(&scx_path, &exploded_path).unwrap();
+
+    let local = QueryPipeline::open(&scx_path)
+        .unwrap()
+        .filter_obs("cell_type == 'T_cell'")
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let cloud = build_cloud_pipeline(&rt, &exploded_path.to_string_lossy())
+        .filter_obs("cell_type == 'T_cell'")
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_results_match(&local, &cloud);
+    assert!(local.x.n_rows() > 0, "filter should keep at least one cell");
+}
+
+/// Sharded-obs cloud-optimized packed `.scx` (range reads by offset)
+/// matches the local query.
+#[test]
+fn cloud_query_sharded_obs_packed_matches_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = write_sharded_test_scx(&dir, 100, 50);
+    let optimized_path = dir.path().join("sharded_optimized.scx");
+    cloud_optimize(&scx_path, &optimized_path).unwrap();
+
+    let local = QueryPipeline::open(&scx_path)
+        .unwrap()
+        .filter_obs("cell_type == 'B_cell'")
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let cloud = build_cloud_pipeline(&rt, &optimized_path.to_string_lossy())
+        .filter_obs("cell_type == 'B_cell'")
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_results_match(&local, &cloud);
+    assert!(local.x.n_rows() > 0, "filter should keep at least one cell");
 }

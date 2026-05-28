@@ -938,115 +938,15 @@ impl ScxReader {
         }
         shards.sort_by_key(|(idx, _)| *idx);
 
-        // Decode shards **without** the per-shard wide→narrow downcast
-        // and force every batch to the wide encoding before concat. The
-        // writer's `write_arrow_ipc` always upcasts to LargeUtf8 /
-        // LargeBinary before serialising, so per-shard reads typically
-        // come back wide already; upcasting is a no-op in that case but
-        // covers shards whose individual payload was narrow on disk.
-        // Concatenating on narrow offsets would otherwise reproduce the
-        // original `Offset overflow error` once the combined string
-        // payload exceeds `i32::MAX` — the same failure mode the
-        // streaming merge-write path eliminated. After concat we apply
-        // [`downcast_large_types`], which narrows columns whose
-        // combined offsets fit and leaves wider columns wide.
-        let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
-        for (_, entry) in &shards {
-            let raw = self.read_arrow_ipc_raw(entry)?;
-            batches.push(crate::arrow_compat::upcast_to_large_types(&raw)?);
-        }
-
-        // Verify the shards form a contiguous, ordered cover by walking
-        // their stamped metadata. Each shard's `n_rows_total` is the
-        // file's logical row count *at the time that shard was
-        // written* — for single-pass writes (merge, `from_anndata`)
-        // every shard carries the same value, but for append-grown
-        // files older shards carry their smaller original stamps
-        // while later-appended shards carry the bumped total. So the
-        // invariant is: `n_rows_total` is monotonically non-decreasing
-        // across shards, and the **last shard's** `n_rows_total`
-        // equals the cumulative row cover (the authoritative file
-        // total). Any gap, duplicate, ordering violation, or
-        // contracting-`n_rows_total` is rejected.
-        let first_hdr = parse_shard_metadata(logical, &batches[0])?;
-        if first_hdr.shard_idx != 0 {
-            return Err(ScxError::InvalidCatalog(format!(
-                "{logical}: first shard has shard_idx={} (expected 0)",
-                first_hdr.shard_idx
-            )));
-        }
-        if first_hdr.row_start != 0 {
-            return Err(ScxError::InvalidCatalog(format!(
-                "{logical}: first shard has row_start={} (expected 0)",
-                first_hdr.row_start
-            )));
-        }
-        let mut prev_n_rows_total = first_hdr.n_rows_total;
-        let mut next_expected_row_start = first_hdr.n_shard_rows;
-        for (i, batch) in batches.iter().enumerate().skip(1) {
-            let hdr = parse_shard_metadata(logical, batch)?;
-            let expected_idx = i as u32;
-            if hdr.shard_idx != expected_idx {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "{logical}: shard at position {i} has shard_idx={} (expected {expected_idx})",
-                    hdr.shard_idx
-                )));
-            }
-            if hdr.n_rows_total < prev_n_rows_total {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "{logical}: shard {i} has n_rows_total={} which contracts the prior \
-                     shard's stamp of {prev_n_rows_total} — append-grown obs must stamp \
-                     monotonically non-decreasing totals",
-                    hdr.n_rows_total
-                )));
-            }
-            if hdr.row_start != next_expected_row_start {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "{logical}: shard {i} has row_start={} (expected {next_expected_row_start})",
-                    hdr.row_start
-                )));
-            }
-            next_expected_row_start = next_expected_row_start.saturating_add(hdr.n_shard_rows);
-            prev_n_rows_total = hdr.n_rows_total;
-        }
-        // The last shard's `n_rows_total` is canonical — every writer
-        // stamps it as "total rows in the file after this append /
-        // merge call". The cumulative-cover sum must equal it; any
-        // gap is a hard error.
-        if next_expected_row_start != prev_n_rows_total {
-            return Err(ScxError::InvalidCatalog(format!(
-                "{logical}: shards cover {next_expected_row_start} rows but the last shard's \
-                 n_rows_total is {prev_n_rows_total}"
-            )));
-        }
-
-        // Concat on the wide schema (every batch was upcast above).
-        // Concatenating large types is safe up to `i64::MAX` offsets,
-        // which dwarfs any realistic obs string payload.
-        let wide_schema = batches[0].schema();
-        let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
-
-        // Opportunistically narrow back to `Utf8`/`Binary` for columns
-        // whose combined offsets still fit in `i32::MAX`. Columns above
-        // that limit stay `LargeUtf8` / `LargeBinary` so the >2 GB obs
-        // case still reads cleanly — same fall-back the merge-write
-        // path relies on.
-        let narrowed = crate::arrow_compat::downcast_large_types(&concatenated)?;
-
-        // Strip the per-shard metadata (shard_idx / row_start /
-        // n_shard_rows) from the merged batch's schema. Keep
-        // n_rows_total and any payload-level metadata.
-        let narrowed_schema = narrowed.schema();
-        let mut clean_metadata = narrowed_schema.metadata().clone();
-        clean_metadata.remove("shard_idx");
-        clean_metadata.remove("row_start");
-        clean_metadata.remove("n_shard_rows");
-        let clean_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-            narrowed_schema.fields().clone(),
-            clean_metadata,
-        ));
-        let clean_batch = RecordBatch::try_new(clean_schema, narrowed.columns().to_vec())?;
-        Ok(Some(clean_batch))
+        // Decode shards **without** the per-shard wide→narrow downcast;
+        // [`assemble_sharded_metadata`] handles the upcast → cover
+        // validation → concat → downcast pipeline (shared with the cloud
+        // reader so both paths produce byte-identical results).
+        let raw_batches: Vec<(u32, RecordBatch)> = shards
+            .iter()
+            .map(|(idx, entry)| Ok((*idx, self.read_arrow_ipc_raw(entry)?)))
+            .collect::<Result<_>>()?;
+        Ok(Some(assemble_sharded_metadata(logical, raw_batches)?))
     }
 
     /// Walk the catalog for both single-section and sharded entries
@@ -1784,6 +1684,131 @@ fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardM
         n_shard_rows: get("n_shard_rows")?,
         n_rows_total: get("n_rows_total")?,
     })
+}
+
+/// Assemble a set of raw (un-downcast) metadata-shard `RecordBatch`es into
+/// one logical batch.
+///
+/// `raw_batches` are `(shard_idx, batch)` pairs decoded from disk or an
+/// object store **without** any wide→narrow downcast — the caller is
+/// responsible only for fetching and Arrow-IPC-decoding the shard bytes.
+/// The shared assembly steps live here so the local mmap reader
+/// ([`ScxReader::read_sharded_layout_by_prefix`]) and the cloud reader
+/// produce byte-identical results:
+///
+/// 1. upcast every batch to `LargeUtf8` / `LargeBinary` (no-op when the
+///    writer already serialised wide types);
+/// 2. validate the shards form a contiguous, ordered cover via the stamped
+///    `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total` metadata
+///    (monotonic non-decreasing `n_rows_total`, the last shard's total
+///    equals the cumulative cover);
+/// 3. concat on the wide schema (safe to `i64::MAX` offsets);
+/// 4. downcast back to narrow `Utf8` / `Binary` for columns whose combined
+///    offsets fit, leaving over-`i32::MAX` columns wide;
+/// 5. strip the per-shard metadata keys from the result schema.
+///
+/// Errors with `InvalidCatalog` on any cover violation and
+/// `SectionNotFound` when `raw_batches` is empty.
+pub fn assemble_sharded_metadata(
+    logical: &str,
+    mut raw_batches: Vec<(u32, RecordBatch)>,
+) -> Result<RecordBatch> {
+    if raw_batches.is_empty() {
+        return Err(ScxError::SectionNotFound(format!("{logical} (no shards)")));
+    }
+    raw_batches.sort_by_key(|(idx, _)| *idx);
+
+    // Force every batch to the wide encoding before concat. The writer's
+    // `write_arrow_ipc` always upcasts to LargeUtf8 / LargeBinary before
+    // serialising, so per-shard reads typically come back wide already;
+    // upcasting is a no-op in that case but covers shards whose individual
+    // payload was narrow on disk. Concatenating on narrow offsets would
+    // otherwise reproduce the original `Offset overflow error` once the
+    // combined string payload exceeds `i32::MAX`.
+    let batches: Vec<RecordBatch> = raw_batches
+        .iter()
+        .map(|(_, b)| crate::arrow_compat::upcast_to_large_types(b))
+        .collect::<Result<_>>()?;
+
+    // Verify the shards form a contiguous, ordered cover by walking their
+    // stamped metadata. Each shard's `n_rows_total` is the file's logical
+    // row count *at the time that shard was written* — for single-pass
+    // writes every shard carries the same value, but for append-grown files
+    // older shards carry their smaller original stamps while later-appended
+    // shards carry the bumped total. So the invariant is: `n_rows_total` is
+    // monotonically non-decreasing across shards, and the **last shard's**
+    // `n_rows_total` equals the cumulative row cover.
+    let first_hdr = parse_shard_metadata(logical, &batches[0])?;
+    if first_hdr.shard_idx != 0 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: first shard has shard_idx={} (expected 0)",
+            first_hdr.shard_idx
+        )));
+    }
+    if first_hdr.row_start != 0 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: first shard has row_start={} (expected 0)",
+            first_hdr.row_start
+        )));
+    }
+    let mut prev_n_rows_total = first_hdr.n_rows_total;
+    let mut next_expected_row_start = first_hdr.n_shard_rows;
+    for (i, batch) in batches.iter().enumerate().skip(1) {
+        let hdr = parse_shard_metadata(logical, batch)?;
+        let expected_idx = i as u32;
+        if hdr.shard_idx != expected_idx {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: shard at position {i} has shard_idx={} (expected {expected_idx})",
+                hdr.shard_idx
+            )));
+        }
+        if hdr.n_rows_total < prev_n_rows_total {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: shard {i} has n_rows_total={} which contracts the prior \
+                 shard's stamp of {prev_n_rows_total} — append-grown obs must stamp \
+                 monotonically non-decreasing totals",
+                hdr.n_rows_total
+            )));
+        }
+        if hdr.row_start != next_expected_row_start {
+            return Err(ScxError::InvalidCatalog(format!(
+                "{logical}: shard {i} has row_start={} (expected {next_expected_row_start})",
+                hdr.row_start
+            )));
+        }
+        next_expected_row_start = next_expected_row_start.saturating_add(hdr.n_shard_rows);
+        prev_n_rows_total = hdr.n_rows_total;
+    }
+    if next_expected_row_start != prev_n_rows_total {
+        return Err(ScxError::InvalidCatalog(format!(
+            "{logical}: shards cover {next_expected_row_start} rows but the last shard's \
+             n_rows_total is {prev_n_rows_total}"
+        )));
+    }
+
+    // Concat on the wide schema (every batch was upcast above), then
+    // opportunistically narrow back to `Utf8`/`Binary` for columns whose
+    // combined offsets still fit in `i32::MAX`.
+    let wide_schema = batches[0].schema();
+    let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
+    let narrowed = crate::arrow_compat::downcast_large_types(&concatenated)?;
+
+    // Strip the per-shard metadata (shard_idx / row_start / n_shard_rows)
+    // from the merged batch's schema. Keep n_rows_total and any
+    // payload-level metadata.
+    let narrowed_schema = narrowed.schema();
+    let mut clean_metadata = narrowed_schema.metadata().clone();
+    clean_metadata.remove("shard_idx");
+    clean_metadata.remove("row_start");
+    clean_metadata.remove("n_shard_rows");
+    let clean_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        narrowed_schema.fields().clone(),
+        clean_metadata,
+    ));
+    Ok(RecordBatch::try_new(
+        clean_schema,
+        narrowed.columns().to_vec(),
+    )?)
 }
 
 /// Concatenate a list of CSC shards along the column axis.

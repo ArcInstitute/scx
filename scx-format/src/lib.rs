@@ -57,7 +57,7 @@ pub use modality::{
     MODALITY_NAME_MAX_BYTES, MODALITY_TABLE_MAGIC, MODALITY_TABLE_VERSION,
 };
 pub use provenance::{Provenance, ProvenanceEntry};
-pub use reader::ScxReader;
+pub use reader::{assemble_sharded_metadata, ScxReader};
 pub use section::{align_to_8, SectionType};
 pub use shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE,

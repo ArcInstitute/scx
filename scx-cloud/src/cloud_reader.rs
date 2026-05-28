@@ -70,6 +70,27 @@ impl CloudReader {
         self.header.n_csr_shards
     }
 
+    /// Number of [`SectionType::ObsMetadataShard`] sections — non-zero
+    /// only for Phase 2 sharded-obs files. Mirror of
+    /// `ScxReader::obs_metadata_shard_count`.
+    pub fn obs_metadata_shard_count(&self) -> usize {
+        self.catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+            .count()
+    }
+
+    /// Number of [`SectionType::VarMetadataShard`] sections. Mirror of
+    /// [`Self::obs_metadata_shard_count`].
+    pub fn var_metadata_shard_count(&self) -> usize {
+        self.catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::VarMetadataShard)
+            .count()
+    }
+
     /// Reference to the file header.
     pub fn header(&self) -> &FileHeader {
         &self.header
@@ -138,50 +159,85 @@ impl CloudReader {
 
     /// Read obs metadata as an Arrow RecordBatch.
     ///
-    /// Bypasses `ScxReader::read_arrow_ipc`, so applies
+    /// Transparently handles both layouts: assembles every
+    /// [`SectionType::ObsMetadataShard`] section in `shard_idx` order on
+    /// Phase 2 sharded files (parallel range reads → shared
+    /// [`scx_format::assemble_sharded_metadata`]), or reads the single
+    /// legacy [`SectionType::ObsMetadata`] section otherwise. Bypasses
+    /// `ScxReader::read_arrow_ipc`, so applies
     /// `scx_format::downcast_large_types` explicitly to surface the
     /// canonical narrow `Utf8` / `Binary` types regardless of the
     /// on-disk encoding.
     pub async fn read_obs(&self) -> Result<RecordBatch> {
+        if self.obs_metadata_shard_count() > 0 {
+            return self
+                .read_sharded_metadata(
+                    SectionType::ObsMetadataShard,
+                    "obs_metadata/shard_",
+                    "obs_metadata",
+                )
+                .await;
+        }
         let obs_data = self.read_metadata_section("obs").await?;
-        let cursor = Cursor::new(&obs_data);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
-            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        let batch = reader
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                CloudError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "obs Arrow IPC contains no batches",
-                ))
-            })?
-            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        Ok(scx_format::downcast_large_types(&batch)?)
+        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
+            &obs_data, "obs",
+        )?)?)
     }
 
-    /// Read var metadata as an Arrow RecordBatch.
-    ///
-    /// Bypasses `ScxReader::read_arrow_ipc`, so applies
-    /// `scx_format::downcast_large_types` explicitly to surface the
-    /// canonical narrow `Utf8` / `Binary` types regardless of the
-    /// on-disk encoding.
+    /// Read var metadata as an Arrow RecordBatch. Mirror of
+    /// [`Self::read_obs`] for the var axis — same dual-layout handling.
     pub async fn read_var(&self) -> Result<RecordBatch> {
+        if self.var_metadata_shard_count() > 0 {
+            return self
+                .read_sharded_metadata(
+                    SectionType::VarMetadataShard,
+                    "var_metadata/shard_",
+                    "var_metadata",
+                )
+                .await;
+        }
         let var_data = self.read_metadata_section("var").await?;
-        let cursor = Cursor::new(&var_data);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
-            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        let batch = reader
+        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
+            &var_data, "var",
+        )?)?)
+    }
+
+    /// Fetch every metadata shard of `shard_type` whose name starts with
+    /// `prefix` (e.g. `"obs_metadata/shard_"`), decode each Arrow IPC
+    /// batch **without** downcast, and assemble into one logical batch
+    /// via [`scx_format::assemble_sharded_metadata`] — the same
+    /// upcast → cover-validation → concat → downcast pipeline the local
+    /// `ScxReader` uses, so the cloud and local read paths return
+    /// byte-identical batches. Shard reads are issued in parallel.
+    async fn read_sharded_metadata(
+        &self,
+        shard_type: SectionType,
+        prefix: &str,
+        logical: &str,
+    ) -> Result<RecordBatch> {
+        let mut entries: Vec<(u32, FullCatalogEntry)> = self
+            .catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(prefix))
+            .filter_map(|e| {
+                let idx: u32 = e.name.strip_prefix(prefix)?.parse().ok()?;
+                Some((idx, e.clone()))
+            })
+            .collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+
+        let fetches = entries.iter().map(|(_, e)| self.read_section_for_entry(e));
+        let bytes_list = futures::future::join_all(fetches)
+            .await
             .into_iter()
-            .next()
-            .ok_or_else(|| {
-                CloudError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "var Arrow IPC contains no batches",
-                ))
-            })?
-            .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        Ok(scx_format::downcast_large_types(&batch)?)
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut raw_batches: Vec<(u32, RecordBatch)> = Vec::with_capacity(entries.len());
+        for ((idx, _), bytes) in entries.iter().zip(bytes_list) {
+            raw_batches.push((*idx, decode_arrow_ipc_batch(&bytes, logical)?));
+        }
+        Ok(scx_format::assemble_sharded_metadata(logical, raw_batches)?)
     }
 
     /// Read multiple shard sections in parallel.
@@ -224,15 +280,26 @@ impl CloudReader {
 
     /// Read the obs schema without materialising the full RecordBatch.
     ///
-    /// Decodes only the Arrow IPC footer from the obs section bytes.
+    /// Decodes only the Arrow IPC footer. On sharded files the schema is
+    /// read from `obs_metadata/shard_0` (every shard shares one schema),
+    /// mirroring `ScxReader::read_obs_schema`.
     pub async fn read_obs_schema(&self) -> Result<Schema> {
-        let data = self.read_metadata_section("obs").await?;
+        let data = if self.obs_metadata_shard_count() > 0 {
+            self.read_section("obs_metadata/shard_0").await?
+        } else {
+            self.read_metadata_section("obs").await?
+        };
         decode_arrow_ipc_schema(&data)
     }
 
     /// Read the var schema without materialising the full RecordBatch.
+    /// Mirror of [`Self::read_obs_schema`].
     pub async fn read_var_schema(&self) -> Result<Schema> {
-        let data = self.read_metadata_section("var").await?;
+        let data = if self.var_metadata_shard_count() > 0 {
+            self.read_section("var_metadata/shard_0").await?
+        } else {
+            self.read_metadata_section("var").await?
+        };
         decode_arrow_ipc_schema(&data)
     }
 
@@ -291,6 +358,27 @@ impl CloudReader {
 /// `Dictionary(_, Large*)`. (Local fast path preserves narrow types as
 /// data fits; cloud schemas are eagerly narrowed since we don't have
 /// the offsets to inspect.)
+/// Decode the first `RecordBatch` from an Arrow IPC file **without** any
+/// wide→narrow downcast — used for both single-section reads (caller
+/// downcasts afterward) and per-shard reads (the shared assembler upcasts
+/// then downcasts the concatenated result). `logical` names the section
+/// for error messages.
+fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
+    let cursor = Cursor::new(bytes);
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    reader
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{logical} Arrow IPC contains no batches"),
+            ))
+        })?
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
 fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<Schema> {
     let cursor = Cursor::new(bytes);
     let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
@@ -661,5 +749,140 @@ mod tests {
         assert_eq!(shard_data.len(), 2);
         assert!(!shard_data[0].is_empty());
         assert!(!shard_data[1].is_empty());
+    }
+
+    /// Write a Phase 2 sharded-metadata `.scx`: obs is emitted as
+    /// multiple `ObsMetadataShard` sections and var as multiple
+    /// `VarMetadataShard` sections (both small enough to fit a single
+    /// section, but split to exercise the assembly path).
+    fn write_sharded_test_file(
+        dir: &tempfile::TempDir,
+        n_obs: usize,
+        n_vars: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join("sharded.scx");
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        // Sharded obs: 40 rows per shard.
+        let obs = sample_obs(n_obs);
+        let obs_rows_per_shard = 40usize;
+        let mut shard_idx = 0u32;
+        let mut off = 0usize;
+        while off < n_obs {
+            let len = std::cmp::min(obs_rows_per_shard, n_obs - off);
+            let chunk = obs.slice(off, len);
+            writer
+                .write_obs_shard(shard_idx, off as u64, len as u64, n_obs as u64, &chunk)
+                .unwrap();
+            off += len;
+            shard_idx += 1;
+        }
+
+        // Sharded var: 20 rows per shard.
+        let var = sample_var(n_vars);
+        let var_rows_per_shard = 20usize;
+        let mut vshard_idx = 0u32;
+        let mut voff = 0usize;
+        while voff < n_vars {
+            let len = std::cmp::min(var_rows_per_shard, n_vars - voff);
+            let chunk = var.slice(voff, len);
+            writer
+                .write_var_shard(vshard_idx, voff as u64, len as u64, n_vars as u64, &chunk)
+                .unwrap();
+            voff += len;
+            vshard_idx += 1;
+        }
+
+        let rows_per_shard = 50;
+        let mut row_offset = 0;
+        while row_offset < n_obs {
+            let shard_rows = std::cmp::min(rows_per_shard, n_obs - row_offset);
+            let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+            row_offset += shard_rows;
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Assert a reader opened over a sharded-obs file returns the fully
+    /// assembled obs/var batches and correct schemas. Shared by the
+    /// three-layout tests below.
+    async fn assert_sharded_reads(reader: &CloudReader, n_obs: usize, n_vars: usize) {
+        assert!(reader.obs_metadata_shard_count() > 1);
+        assert!(reader.var_metadata_shard_count() > 1);
+
+        let obs = reader.read_obs().await.unwrap();
+        assert_eq!(obs.num_rows(), n_obs);
+        assert_eq!(obs.num_columns(), 2);
+        let cell_id = obs
+            .column_by_name("cell_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Values must round-trip across the shard boundaries (40 rows each).
+        assert_eq!(cell_id.value(0), "cell_0");
+        assert_eq!(cell_id.value(39), "cell_39");
+        assert_eq!(cell_id.value(40), "cell_40");
+        assert_eq!(cell_id.value(n_obs - 1), format!("cell_{}", n_obs - 1));
+
+        let var = reader.read_var().await.unwrap();
+        assert_eq!(var.num_rows(), n_vars);
+        let gene_id = var
+            .column_by_name("gene_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(gene_id.value(0), "gene_0");
+        assert_eq!(gene_id.value(n_vars - 1), format!("gene_{}", n_vars - 1));
+
+        // Schema reads must not require materialising the full batch.
+        let obs_schema = reader.read_obs_schema().await.unwrap();
+        assert!(obs_schema.field_with_name("cell_type").is_ok());
+        let var_schema = reader.read_var_schema().await.unwrap();
+        assert!(var_schema.field_with_name("gene_id").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sharded_obs_from_exploded() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let exploded = dir.path().join("sharded.scxd");
+        crate::explode::explode(&input, &exploded).unwrap();
+
+        let reader = open_cloud(&exploded.to_string_lossy()).await.unwrap();
+        assert_sharded_reads(&reader, 100, 50).await;
+    }
+
+    #[tokio::test]
+    async fn test_sharded_obs_from_cloud_ready_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let optimized = dir.path().join("sharded_ready.scx");
+        crate::cloud_optimize::cloud_optimize(&input, &optimized).unwrap();
+
+        let reader = open_cloud(&optimized.to_string_lossy()).await.unwrap();
+        assert_sharded_reads(&reader, 100, 50).await;
+    }
+
+    #[tokio::test]
+    async fn test_sharded_obs_from_non_cloud_ready_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+        assert_sharded_reads(&reader, 100, 50).await;
     }
 }
