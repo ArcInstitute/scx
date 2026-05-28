@@ -93,9 +93,11 @@ enum Commands {
         stream: bool,
         /// Memory budget for slab-sizing heuristics (Phase 1 dense
         /// streaming, Phase 2 transpose buffers, Phase 8c worker
-        /// derate). Accepts bare bytes, `K`/`M`/`G`/`T`, or
-        /// `KiB`/`MiB`/`GiB`/`TiB`. Decimal suffixes (`KB`, `MB`)
-        /// are rejected as ambiguous. None = each phase's default.
+        /// derate). Accepts a bare byte count or a binary-prefixed
+        /// size — `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers
+        /// of 1024). Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are
+        /// rejected to avoid 1000-vs-1024 ambiguity. None = each
+        /// phase's default.
         #[arg(long, value_name = "SIZE")]
         memory_budget: Option<String>,
         /// Fail conversion on the first unsupported `uns` key
@@ -468,8 +470,10 @@ enum Commands {
         input: PathBuf,
         /// Output SCX file (will contain both CSR and CSC shards)
         output: PathBuf,
-        /// Maximum memory for transpose working set (default: 4G)
-        /// Accepts suffixes: K, M, G (e.g., "100M", "4G")
+        /// Maximum memory for the transpose working set (default: 4G).
+        /// Accepts a bare byte count or a binary-prefixed size —
+        /// `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024);
+        /// decimal `KB`/`MB`/`GB`/`TB` is rejected as ambiguous.
         #[arg(long, default_value = "4G")]
         memory_limit: String,
         /// Overwrite output if it exists

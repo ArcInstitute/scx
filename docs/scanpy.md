@@ -389,7 +389,8 @@ exp.to_anndata(
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
                           # AnnData is fully detached from the SCX file handle.
-    memory_budget=None,   # None (default: 8 GiB), int (bytes), or str ("4G" / "512MiB").
+    memory_budget=None,   # None (default: 8 GiB), int (bytes), or a binary-prefixed
+                          # size str: K/M/G/T or KiB/MiB/GiB/TiB ("4G" / "512MiB"); decimal KB/MB rejected.
                           # When the estimated eager assembly footprint exceeds this
                           # budget, a UserWarning is emitted recommending backed mode.
                           # Advisory only — assembly still proceeds.

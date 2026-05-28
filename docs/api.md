@@ -321,12 +321,14 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 
 ## Memory budgets
 
-`MemoryBudget::parse(s)` (`scx-convert/src/mem.rs`) is the shared parser
-behind `--memory-budget` (CLI) and the `memory_budget=` kwarg on
-`from_h5ad` / `from_h5mu`. It caps dense row slabs in the h5ad
-streaming reader, CSC external-transpose buffers when CSC-on-disk
-exceeds the budget, and the parallel streaming reader's worker
-derate.
+`MemoryBudget::parse(s)` (`scx-format/src/mem.rs`) is the shared parser
+behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
+`memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
+slabs in the h5ad streaming reader, CSC external-transpose buffers when
+CSC-on-disk exceeds the budget, and the parallel streaming reader's
+worker derate. It lives in `scx-format` (re-exported as
+`scx_convert::MemoryBudget`) so sibling crates such as `scx-ops` —
+which owns `build-csc` — can share it without a dependency cycle.
 
 Accepted forms:
 
@@ -778,10 +780,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (h5ad encoding-type missing/ambiguous), `DenseSparsified`,
     `DuplicateCoordinatesMerged`. See
     [Conversion warnings](#conversion-warnings-convertwarning).
-  - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
-    dense slabs and the CSC external-transpose buffers. Binary
-    prefixes only — `KB/MB/GB/TB` is rejected to avoid ambiguity
-    (see [Memory budgets](#memory-budgets)).
+  - `memory_budget`: caps dense slabs and the CSC external-transpose
+    buffers. Accepts an int byte count or a binary-prefixed size —
+    `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024); decimal
+    `KB`/`MB`/`GB`/`TB` is rejected to avoid 1000-vs-1024 ambiguity
+    (see [Memory budgets](#memory-budgets)). E.g. `"4G"` / `"512M"` / `"2GiB"`.
   - `stream=False` falls back to the materialising path (kept for
     parity / debugging).
   - `obsm` / `varm` / `obsp` / `varp` on the input are hyperslab-read
@@ -1542,7 +1545,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
-- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
+- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 
 ### Cloud operations (`--features cloud`)
