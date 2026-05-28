@@ -412,6 +412,23 @@ Plain packed `.scx` (no front catalog) also works — `open_cloud`
 range-reads the EOF catalog on open, with one extra round-trip
 relative to a cloud-optimized layout.
 
+**Sharded obs/var metadata** (`ObsMetadataShard` / `VarMetadataShard`,
+section types 24–25) emitted by `merge`, `append`, and `from_anndata`
+(when `n_obs > shard_target_rows`) is supported on the cloud path:
+`open_cloud(...).query()` assembles the per-shard sections over parallel
+range reads (the same upcast → cover-validation → concat → downcast
+pipeline the local reader uses, via `scx_format::assemble_sharded_metadata`)
+and returns results identical to the local in-process query. The single
+file-scope `ObsPredicateIndex` is read unchanged, so catalog-level
+predicate pushdown still applies.
+
+> **Caveat — stale index after append.** `scx append` with the default
+> `--rebuild-index=false` leaves the file-scope predicate index covering
+> only the original rows; it is *not* auto-merged across the appended
+> shards. A cloud query over such a file falls back to a full obs scan of
+> the appended rows (correct, but slower). Rebuild the index on append, or
+> treat the incremental delta-index design as a separate follow-on.
+
 **Deferred to follow-on PRs:**
 
 - `CloudQueryOptions` (parallelism, max-inflight bytes, cache-dir,
@@ -422,12 +439,8 @@ relative to a cloud-optimized layout.
 - A batched async section fetcher; today each cloud read uses
   `block_on` from a rayon worker, so cloud bandwidth is bounded by
   the rayon thread pool rather than fully saturated.
-- **Sharded obs** (`ObsMetadataShard`, section type 24): the cloud
-  section reader does not yet support row-sharded obs metadata
-  emitted by `merge`, `append`, and `from_anndata` (when
-  `n_obs > shard_target_rows`). Files containing
-  `ObsMetadataShard` sections will fail on `open_cloud` until the
-  cloud reader assembles sharded metadata on open.
+- Incremental per-shard predicate-index merge so appended shards are
+  covered without a full index rebuild (see the append caveat above).
 
 ### `explode` / `pack` — convert layouts locally
 

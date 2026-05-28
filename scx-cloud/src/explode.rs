@@ -201,6 +201,27 @@ pub(crate) fn section_name_to_path(
         SectionType::DeletionVectors => Ok("_deletion_vectors.bin".to_string()),
         SectionType::ObsPredicateIndex => Ok("_obs_predicate_index.bin".to_string()),
         SectionType::VarPredicateIndex => Ok("_var_predicate_index.bin".to_string()),
+        // Phase 2 sharded obs/var metadata: "obs_metadata/shard_N" →
+        // "obs/NNNNNN.arrow" (own subdirectory so it never collides with
+        // the single-section "obs.arrow"). Mirror for var.
+        SectionType::ObsMetadataShard => {
+            let idx: u32 = name
+                .strip_prefix("obs_metadata/shard_")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    format!("invalid ObsMetadataShard name: expected 'obs_metadata/shard_N', got '{name}'")
+                })?;
+            Ok(format!("obs/{idx:06}.arrow"))
+        }
+        SectionType::VarMetadataShard => {
+            let idx: u32 = name
+                .strip_prefix("var_metadata/shard_")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| {
+                    format!("invalid VarMetadataShard name: expected 'var_metadata/shard_N', got '{name}'")
+                })?;
+            Ok(format!("var/{idx:06}.arrow"))
+        }
         // Phase G.2: modality table is a single global section, written
         // as a top-level file in the exploded layout. The pack reader
         // reattaches it via `path_to_section_name`.
@@ -265,6 +286,35 @@ pub(crate) fn path_to_section_name(rel_path: &str) -> Option<(String, SectionTyp
             }
             let idx: u32 = inner.parse().ok()?;
             Some((format!("X_csc_shard_{idx}"), SectionType::CscShard))
+        }
+        // "obs/NNNNNN.arrow" → "obs_metadata/shard_N" (Phase 2 sharded
+        // obs). Mirror for var. Checked before the generic "obsm/"
+        // arm; the distinct "obs/" / "var/" prefixes avoid collision.
+        _ if rel_path.starts_with("obs/") && rel_path.ends_with(".arrow") => {
+            let idx: u32 = rel_path
+                .strip_prefix("obs/")
+                .unwrap()
+                .strip_suffix(".arrow")
+                .unwrap()
+                .parse()
+                .ok()?;
+            Some((
+                format!("obs_metadata/shard_{idx}"),
+                SectionType::ObsMetadataShard,
+            ))
+        }
+        _ if rel_path.starts_with("var/") && rel_path.ends_with(".arrow") => {
+            let idx: u32 = rel_path
+                .strip_prefix("var/")
+                .unwrap()
+                .strip_suffix(".arrow")
+                .unwrap()
+                .parse()
+                .ok()?;
+            Some((
+                format!("var_metadata/shard_{idx}"),
+                SectionType::VarMetadataShard,
+            ))
         }
         _ if rel_path.starts_with("obsm/") && rel_path.ends_with(".arrow") => {
             let name = rel_path
@@ -360,6 +410,14 @@ mod tests {
             section_name_to_path("obs_predicate_index", SectionType::ObsPredicateIndex).unwrap(),
             "_obs_predicate_index.bin"
         );
+        assert_eq!(
+            section_name_to_path("obs_metadata/shard_0", SectionType::ObsMetadataShard).unwrap(),
+            "obs/000000.arrow"
+        );
+        assert_eq!(
+            section_name_to_path("var_metadata/shard_7", SectionType::VarMetadataShard).unwrap(),
+            "var/000007.arrow"
+        );
     }
 
     #[test]
@@ -401,6 +459,10 @@ mod tests {
             ("deletion_vectors", SectionType::DeletionVectors),
             ("obs_predicate_index", SectionType::ObsPredicateIndex),
             ("var_predicate_index", SectionType::VarPredicateIndex),
+            ("obs_metadata/shard_0", SectionType::ObsMetadataShard),
+            ("obs_metadata/shard_13", SectionType::ObsMetadataShard),
+            ("var_metadata/shard_0", SectionType::VarMetadataShard),
+            ("var_metadata/shard_9", SectionType::VarMetadataShard),
         ];
 
         for (name, st) in cases {
