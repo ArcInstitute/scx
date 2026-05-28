@@ -176,11 +176,16 @@ of `(perturbed_cell, control_cell)` pairs. Use this for perturbation training
 ```python
 import pyscx
 import numpy as np
+from collections.abc import Iterator
 
 # Build pairing plans from your strategy
-def plan_generator(perturbed_indices, control_map, batch_size):
+def plan_generator(
+    perturbed_indices: list[int],
+    control_map,
+    batch_size: int,
+) -> Iterator[list[tuple[int, int]]]:
     """Yield batches of (perturbed_idx, control_idx) pairs."""
-    buf = []
+    buf: list[tuple[int, int]] = []
     for p_idx in perturbed_indices:
         c_idx = control_map.get_control(p_idx)
         if c_idx is not None:
