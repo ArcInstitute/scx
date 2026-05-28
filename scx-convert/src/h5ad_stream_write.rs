@@ -29,9 +29,107 @@ use scx_format::catalog::{FullCatalogEntry, ShardStats};
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 
-use super::h5ad_write::{write_dataframe_group_at, write_obsm_entry_at, write_uns_entries_at};
+use super::h5ad_write::{
+    write_dataframe_group_at, write_dataframe_group_streaming, write_obsm_entry_at,
+    write_uns_entries_at,
+};
 use super::pipeline::{ConvertError, ConvertOptions};
 use super::warnings::{ConvertWarning, WarningSink};
+
+/// Write obs into `parent` under `name="obs"`. Routes to the streaming
+/// path when the source has `ObsMetadataShard` sections, else falls back
+/// to the eager `read_obs() + write_dataframe_group_at` path (a single
+/// `ObsMetadata` section has nothing to stream).
+///
+/// `keep_mask_opt` is the global deletion-vector keep mask. The
+/// streaming path filters per shard; the eager fallback filters the
+/// assembled batch before writing so both branches honour the mask
+/// symmetrically (and match the `/X` streaming path's filtered row
+/// count). Pre-task-6a, this fallback ignored the mask — a latent
+/// row-count mismatch with `/X` when DVs were active on a legacy file.
+pub(super) fn write_obs_streaming_or_eager(
+    parent: &hdf5::Group,
+    reader: &ScxReader,
+    keep_mask_opt: Option<&[bool]>,
+) -> Result<(), ConvertError> {
+    if reader.obs_metadata_shard_count() == 0 {
+        // Legacy single-section path: nothing to stream — produce the
+        // same output as before by going through the eager helper.
+        match reader.read_obs() {
+            Ok(obs) => {
+                let filtered = match keep_mask_opt {
+                    Some(mask) => filter_record_batch_by_mask(&obs, mask)?,
+                    None => obs,
+                };
+                write_dataframe_group_at(parent, "obs", &filtered)?;
+            }
+            Err(_) => {
+                // No obs section at all; mirror the eager path that
+                // silently skips on read failure.
+            }
+        }
+        return Ok(());
+    }
+
+    let schema = reader.read_obs_schema_logical_lossy()?;
+    let n_rows_total = reader.n_obs() as usize;
+    let n_rows_kept = match keep_mask_opt {
+        Some(mask) => mask.iter().take(n_rows_total).filter(|&&b| b).count(),
+        None => n_rows_total,
+    };
+    write_dataframe_group_streaming(
+        parent,
+        "obs",
+        &schema,
+        reader.obs_shards(),
+        n_rows_kept,
+        keep_mask_opt,
+    )
+}
+
+/// Var counterpart of `write_obs_streaming_or_eager`. Deletion vectors
+/// never apply on the var axis.
+pub(super) fn write_var_streaming_or_eager(
+    parent: &hdf5::Group,
+    reader: &ScxReader,
+) -> Result<(), ConvertError> {
+    if reader.var_metadata_shard_count() == 0 {
+        if let Ok(var) = reader.read_var() {
+            write_dataframe_group_at(parent, "var", &var)?;
+        }
+        return Ok(());
+    }
+
+    let schema = reader.read_var_schema_logical_lossy()?;
+    let n_rows_total = reader.n_vars() as usize;
+    write_dataframe_group_streaming(
+        parent,
+        "var",
+        &schema,
+        reader.var_shards(),
+        n_rows_total,
+        None,
+    )
+}
+
+/// Filter a `RecordBatch` by a global keep mask. Used by the legacy
+/// obs path and by obsm writers so eager / streaming branches honour
+/// the deletion-vector filter symmetrically.
+pub(super) fn filter_record_batch_by_mask(
+    batch: &arrow::array::RecordBatch,
+    mask: &[bool],
+) -> Result<arrow::array::RecordBatch, ConvertError> {
+    use arrow::array::BooleanArray;
+    let n = batch.num_rows();
+    if mask.len() < n {
+        return Err(ConvertError::Other(format!(
+            "keep_mask length {} < obs batch rows {n} (catalog/header drift)",
+            mask.len()
+        )));
+    }
+    let bool_arr = BooleanArray::from(mask[..n].to_vec());
+    arrow::compute::filter_record_batch(batch, &bool_arr).map_err(ConvertError::Arrow)
+}
 
 fn vlu(s: &str) -> VarLenUnicode {
     s.parse::<VarLenUnicode>().unwrap_or_else(|_| {
@@ -83,27 +181,31 @@ pub fn write_scx_to_h5ad_streaming(
         sink,
     )?;
 
-    // obs.
-    if let Ok(obs) = reader.read_obs() {
-        write_dataframe_group_at(&root, "obs", &obs)?;
-    }
+    // obs. Stream over `ObsMetadataShard` sections when present; fall
+    // back to the eager path for legacy single-section `ObsMetadata`.
+    write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref())?;
 
-    // var.
-    if let Ok(var) = reader.read_var() {
-        write_dataframe_group_at(&root, "var", &var)?;
-    }
+    // var. Mirror of obs. The keep mask is obs-only (deletion vectors
+    // do not filter var), so var streaming never carries a mask.
+    write_var_streaming_or_eager(&root, &reader)?;
 
-    // obsm.
+    // obsm. Obs-axis embeddings must be filtered by the same keep
+    // mask as /X and obs so anndata sees consistent row counts.
     if let Ok(obsm_map) = reader.read_all_obsm() {
         if !obsm_map.is_empty() {
             let obsm_group = root.create_group("obsm")?;
             for (name, batch) in &obsm_map {
-                write_obsm_entry_at(&obsm_group, name, batch)?;
+                let filtered = match keep_mask.as_deref() {
+                    Some(mask) => filter_record_batch_by_mask(batch, mask)?,
+                    None => batch.clone(),
+                };
+                write_obsm_entry_at(&obsm_group, name, &filtered)?;
             }
         }
     }
 
-    // varm.
+    // varm. Var-axis features are not affected by deletion vectors
+    // (DVs are obs-only), so no filtering here.
     if let Ok(varm_map) = reader.read_all_varm() {
         if !varm_map.is_empty() {
             let varm_group = root.create_group("varm")?;

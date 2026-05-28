@@ -24,7 +24,9 @@ use hdf5::types::VarLenUnicode;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 
-use super::h5ad_stream_write::{stream_csr_to_group_at, stream_layers_at};
+use super::h5ad_stream_write::{
+    stream_csr_to_group_at, stream_layers_at, write_obs_streaming_or_eager,
+};
 use super::h5ad_write::{
     write_dataframe_group_at, write_obsm_entry_at, write_sparse_group_at, write_uns_entries_at,
 };
@@ -47,7 +49,14 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
 
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root)?;
+    // Build the keep mask once and apply it symmetrically across
+    // /X (via `read_all_csr_shards_for_filtered`) and obs (via the
+    // streaming-or-eager dispatcher). Pre-fix, this path silently
+    // dropped DVs on both legs — the per-modality eager CSR reader
+    // does *not* filter internally, contrary to what the prior
+    // "preserves prior behavior" comment claimed.
+    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref())?;
 
     // Per-modality blocks under /mod/{name}.
     let mod_group = root.create_group("mod")?;
@@ -60,8 +69,8 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
         let mname = info.name.clone();
         let modality_root = create_modality_group_with_attrs(&mod_group, &mname)?;
 
-        // Per-modality X matrix (materialising path).
-        let csr = reader.read_all_csr_shards_for(modality_id)?;
+        // Per-modality X matrix (materialising path, DV-filtered).
+        let csr = reader.read_all_csr_shards_for_filtered(modality_id)?;
         write_sparse_group_at(
             &modality_root,
             "X",
@@ -72,7 +81,13 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
             csr.shape.1,
         )?;
 
-        write_h5mu_per_modality_non_x_blocks(&reader, &modality_root, modality_id, &mname)?;
+        write_h5mu_per_modality_non_x_blocks(
+            &reader,
+            &modality_root,
+            modality_id,
+            &mname,
+            keep_mask.as_deref(),
+        )?;
     }
 
     Ok(())
@@ -99,9 +114,9 @@ pub fn scx_to_h5mu_streaming(
 
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root)?;
-
     let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref())?;
+
     let mod_group = root.create_group("mod")?;
     for modality_id in 1..=reader.n_modalities() as u8 {
         let info = reader.modality_info(modality_id).ok_or_else(|| {
@@ -127,7 +142,13 @@ pub fn scx_to_h5mu_streaming(
             sink,
         )?;
 
-        write_h5mu_per_modality_non_x_blocks(&reader, &modality_root, modality_id, &mname)?;
+        write_h5mu_per_modality_non_x_blocks(
+            &reader,
+            &modality_root,
+            modality_id,
+            &mname,
+            keep_mask.as_deref(),
+        )?;
 
         // Per-modality layers (streaming).
         stream_layers_at(
@@ -147,6 +168,7 @@ fn write_h5mu_root_attrs_and_global_blocks(
     reader: &ScxReader,
     file: &hdf5::File,
     root: &hdf5::Group,
+    keep_mask_opt: Option<&[bool]>,
 ) -> Result<(), ConvertError> {
     // Mark file as MuData (mudata HDF5 convention — readers may
     // look for these attributes).
@@ -157,10 +179,11 @@ fn write_h5mu_root_attrs_and_global_blocks(
         .create("encoding-version")?
         .write_scalar(&vlu("0.1.0"))?;
 
-    // Global obs.
-    if let Ok(obs) = reader.read_obs() {
-        write_dataframe_group_at(root, "obs", &obs)?;
-    }
+    // Global obs. Sharded sources auto-stream via
+    // `write_obs_streaming_or_eager` regardless of the caller's
+    // `--stream` choice (the alternative is to materialise the full
+    // assembled obs, which is exactly what task 6a eliminates).
+    write_obs_streaming_or_eager(root, reader, keep_mask_opt)?;
 
     // Global obsm — entries with modality_id == 0 and section name
     // starting with "obsm/" but with no modality slash.
@@ -178,7 +201,13 @@ fn write_h5mu_root_attrs_and_global_blocks(
             for entry in global_obsm {
                 let key = entry.name.strip_prefix("obsm/").unwrap_or(&entry.name);
                 if let Ok(batch) = reader.read_obsm(key) {
-                    write_obsm_entry_at(&obsm_group, key, &batch)?;
+                    let filtered = match keep_mask_opt {
+                        Some(mask) => {
+                            crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                        }
+                        None => batch,
+                    };
+                    write_obsm_entry_at(&obsm_group, key, &filtered)?;
                 }
             }
         }
@@ -214,18 +243,18 @@ fn write_h5mu_per_modality_non_x_blocks(
     modality_root: &hdf5::Group,
     modality_id: u8,
     mname: &str,
+    keep_mask_opt: Option<&[bool]>,
 ) -> Result<(), ConvertError> {
-    // Per-modality var.
+    // Per-modality var. Var is per-modality in v2 (small, never
+    // sharded in the current format) — stays on the eager path.
     let var = reader.read_var_for(modality_id)?;
     write_dataframe_group_at(modality_root, "var", &var)?;
 
     // Per-modality obs is the shared global obs (mudata spec
     // requires per-modality obs; we point each modality at the
     // same data so downstream loaders that read /mod/{m}/obs
-    // see consistent cell metadata).
-    if let Ok(obs) = reader.read_obs() {
-        write_dataframe_group_at(modality_root, "obs", &obs)?;
-    }
+    // see consistent cell metadata). Streams from sharded sources.
+    write_obs_streaming_or_eager(modality_root, reader, keep_mask_opt)?;
 
     // Per-modality obsm: entries named `obsm/{mname}/{key}`.
     let mod_obsm: Vec<_> = reader
@@ -244,7 +273,13 @@ fn write_h5mu_per_modality_non_x_blocks(
                 .unwrap_or(&entry.name)
                 .to_string();
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
-                write_obsm_entry_at(&obsm_group, &key, &batch)?;
+                let filtered = match keep_mask_opt {
+                    Some(mask) => {
+                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                    }
+                    None => batch,
+                };
+                write_obsm_entry_at(&obsm_group, &key, &filtered)?;
             }
         }
     }
@@ -271,7 +306,12 @@ pub fn scx_modality_to_h5ad(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let csr = reader.read_all_csr_shards_for(modality_id)?;
+    // Mirror the streaming entry point: honor DVs symmetrically on
+    // /X and obs via `read_all_csr_shards_for_filtered` + the shared
+    // streaming-or-eager obs dispatcher.
+    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+
+    let csr = reader.read_all_csr_shards_for_filtered(modality_id)?;
     write_sparse_group_at(
         &root,
         "X",
@@ -282,7 +322,13 @@ pub fn scx_modality_to_h5ad(
         csr.shape.1,
     )?;
 
-    write_modality_to_h5ad_non_x_blocks(&reader, &root, modality_id, modality_name)?;
+    write_modality_to_h5ad_non_x_blocks(
+        &reader,
+        &root,
+        modality_id,
+        modality_name,
+        keep_mask.as_deref(),
+    )?;
 
     Ok(())
 }
@@ -329,7 +375,13 @@ pub fn scx_modality_to_h5ad_streaming(
         sink,
     )?;
 
-    write_modality_to_h5ad_non_x_blocks(&reader, &root, modality_id, modality_name)?;
+    write_modality_to_h5ad_non_x_blocks(
+        &reader,
+        &root,
+        modality_id,
+        modality_name,
+        keep_mask.as_deref(),
+    )?;
 
     stream_layers_at(
         &root,
@@ -348,10 +400,10 @@ fn write_modality_to_h5ad_non_x_blocks(
     root: &hdf5::Group,
     modality_id: u8,
     modality_name: &str,
+    keep_mask_opt: Option<&[bool]>,
 ) -> Result<(), ConvertError> {
-    if let Ok(obs) = reader.read_obs() {
-        write_dataframe_group_at(root, "obs", &obs)?;
-    }
+    // Shared global obs (cell axis); streams from sharded sources.
+    write_obs_streaming_or_eager(root, reader, keep_mask_opt)?;
     let var = reader.read_var_for(modality_id)?;
     write_dataframe_group_at(root, "var", &var)?;
 
@@ -371,7 +423,13 @@ fn write_modality_to_h5ad_non_x_blocks(
                 .unwrap_or(&entry.name)
                 .to_string();
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
-                write_obsm_entry_at(&obsm_group, &key, &batch)?;
+                let filtered = match keep_mask_opt {
+                    Some(mask) => {
+                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                    }
+                    None => batch,
+                };
+                write_obsm_entry_at(&obsm_group, &key, &filtered)?;
             }
         }
     }

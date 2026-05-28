@@ -180,11 +180,18 @@ datasets.
 Peak RSS bound: one shard's worth of CSR per matrix written
 (~`stats.nnz × 16` bytes for indices + data), plus the
 always-resident kept-row indptr (`(n_obs_kept + 1) × 8` bytes — same
-floor the ingestion side carries). Multimodal h5mu export reuses
-the same writer per modality so the bound applies per-modality, not
-cumulatively. Pass `--stream=false` / `stream=False` to opt into
-the legacy materialising path (`scx_to_h5ad` /
-`scx_to_h5mu`).
+floor the ingestion side carries). When the source SCX file carries
+`ObsMetadataShard` / `VarMetadataShard` sections, obs and var also
+stream through `h5ad_write::write_dataframe_group_streaming` (pre-
+allocated HDF5 datasets per column, hyperslab writes per shard,
+single-pass running global dictionary for categoricals) so the bound
+covers metadata too — atlas-scale obs no longer materialises during
+export. Multimodal h5mu export reuses the same writer per modality
+so the bound applies per-modality, not cumulatively. Pass
+`--stream=false` / `stream=False` to opt into the legacy materialising
+path (`scx_to_h5ad` / `scx_to_h5mu`); sharded obs/var still stream
+on that fallback because the alternative would re-introduce the full
+obs materialisation step.
 
 For regression coverage, see
 `benchmarks/comprehensive/benchmarks/export_streaming.py` (paired

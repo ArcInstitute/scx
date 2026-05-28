@@ -2158,6 +2158,17 @@ impl ScxReader {
         self.filter_csr_rows_by_deletion_vectors(csr)
     }
 
+    /// Per-modality counterpart of [`Self::read_all_csr_shards_filtered`].
+    /// Assembles the modality's CSR via [`Self::read_all_csr_shards_for`]
+    /// and applies the file-wide deletion-vector keep mask. The mask is
+    /// obs-indexed and shared across modalities (h5mu invariant), so
+    /// each modality's filtered CSR has `n_obs - n_deleted` rows.
+    #[cfg(feature = "deletion-vectors")]
+    pub fn read_all_csr_shards_for_filtered(&self, modality_id: u8) -> Result<ScxCsr> {
+        let csr = self.read_all_csr_shards_for(modality_id)?;
+        self.filter_csr_rows_by_deletion_vectors(csr)
+    }
+
     /// Read a named layer with deletion vectors applied.
     /// Deleted rows are excluded from the returned ScxCsr.
     /// If no deletion vectors are present, returns the same result as `read_layer()`.

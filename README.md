@@ -615,9 +615,11 @@ SCX supports **roundtrip conversion** with h5ad, 10x HDF5, and Cell Ranger MTX f
 convert in, work with SCX, convert back out.
 
 All ingestion and export paths **stream by default** — peak RSS is
-bounded by one shard's worth of CSR per matrix regardless of total
-file size. Pass `--stream=false` (CLI) or `stream=False` (Python) to
-opt into the legacy materialising paths.
+bounded by one shard's worth of CSR per matrix (and one shard's worth
+of obs/var per column when the source carries `ObsMetadataShard` /
+`VarMetadataShard` sections) regardless of total file size. Pass
+`--stream=false` (CLI) or `stream=False` (Python) to opt into the
+legacy materialising paths.
 
 ```bash
 # h5ad ↔ SCX (roundtrip, streaming by default)
