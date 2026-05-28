@@ -2206,6 +2206,38 @@ pub(crate) fn parse_memory_budget(v: Option<&Bound<'_, PyAny>>) -> PyResult<Opti
 /// Sentinel key marking a tagged envelope in the on-disk JSON.
 const SCX_TYPE_KEY: &str = "__scx_type__";
 
+/// Convert a `serde_json::Value` (uns JSON tree) into a Python dict
+/// using the existing `__scx_type__` envelope decoder. Thin wrapper
+/// around [`json_to_py`] for use from other pyscx modules that don't
+/// want to construct [`UnsReadCtx`] directly. Gated on the `hdf5`
+/// feature because its sole callers (`pyscx.read_h5ad_metadata`,
+/// `pyscx.from_h5ad`) are h5ad-only.
+#[cfg(feature = "hdf5")]
+pub(crate) fn uns_json_to_py<'py>(
+    py: Python<'py>,
+    val: &serde_json::Value,
+) -> PyResult<Bound<'py, PyAny>> {
+    let mut ctx = UnsReadCtx::new(py)?;
+    json_to_py(val, &mut ctx)
+}
+
+/// Convert a Python object (typically a dict supplied as `uns_override`)
+/// into a `serde_json::Value` using the existing tagged-envelope writer.
+/// Thin wrapper around [`normalize_uns_value`]. Gated on the `hdf5`
+/// feature because its sole caller (`pyscx.from_h5ad`) is h5ad-only.
+#[cfg(feature = "hdf5")]
+pub(crate) fn uns_py_to_json<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    uns_format: UnsFormat,
+) -> PyResult<serde_json::Value> {
+    let np = py.import("numpy")?;
+    let np_generic = np.getattr("generic")?;
+    let np_ndarray = np.getattr("ndarray")?;
+    let mut ctx = UnsWriteCtx::new(uns_format, &np_generic, &np_ndarray);
+    normalize_uns_value(obj, "uns", &mut ctx)
+}
+
 /// Mutable context threaded through the writer so per-value handlers share
 /// the NumPy module handles and a lazy-imported pandas module without
 /// repeating `py.import("pandas")` on every dispatch.

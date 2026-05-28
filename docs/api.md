@@ -730,7 +730,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   estimated footprint exceeds the budget. `shard_target_rows` overrides
   the default obs shard size. Obsm, varm, obsp, and varp are extracted
   and written one key at a time (incremental, not collected).
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, obs_override=None, var_override=None, uns_override=None)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
   `obsp` / `varp` matrix (each is now hyperslab-read and emitted as
@@ -740,9 +740,31 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   entry point for files larger than RAM. `csc="always"` performs a
   two-pass write (streaming CSR → `rebuild_csc_inplace` on the
   finished file) — peak disk briefly reaches ~2× the output size during
-  the rebuild. `uns_format` is accepted for API parity with
-  `from_anndata` but is a no-op here (streaming reads `uns` from the
-  h5ad file directly, not from Python).
+  the rebuild. `uns_format` is a no-op for the on-disk `uns` read but
+  controls the envelope shape applied to `uns_override` when supplied
+  (`"tagged"` default wraps NumPy / pandas containers in `__scx_type__`
+  envelopes for bit-exact round-trip; `"plain"` collapses them to JSON
+  primitives). Internally bypasses
+  `anndata.read_h5ad` entirely — obs/var/uns are read via pure-Rust
+  HDF5, so callers that don't supply overrides also dodge the eager
+  `obsm` materialisation that `anndata.read_h5ad(path, backed='r')`
+  performs (anndata reads `obsm` into Python heap on every call,
+  including in backed mode).
+  - `obs_override`, `var_override`, `uns_override` (optional): supply a
+    pandas DataFrame (obs/var) or Python dict (uns) to use in place of
+    the on-disk values. Intended for read-mutate-write flows where the
+    caller wants to add annotations without paying the full `obsm`
+    allocation that `anndata.read_h5ad` would trigger. Typically paired
+    with `pyscx.read_h5ad_metadata(path)` (below): fetch on-disk obs /
+    var / uns cheaply, mutate them, pass them back. `obs_override.shape[0]`
+    must equal n_obs on disk; `var_override.shape[0]` must equal n_vars
+    on disk. `uns_override` replaces the entire `uns` section (not a
+    merge). Any override with `stream=False` raises `ValueError`
+    because the non-streaming path does not apply overrides. `obsm` /
+    `varm` / `obsp` / `varp` are intentionally not exposed as overrides
+    — accepting them would re-introduce the OOM class this API exists
+    to avoid; mutate them via `pyscx.from_anndata(backed_adata, ...)`
+    instead if needed.
   - Source layout: CSR streams natively. Dense `/X`
     streams via row-slab sparsification — set `dense_zero_epsilon` to
     threshold near-zero values (default `0.0` matches scipy's
@@ -789,6 +811,20 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     the total shard count. Larger values give a slow shard a deeper
     look-ahead buffer; smaller values risk starving encoders when
     one shard takes much longer than its siblings.
+- `pyscx.read_h5ad_metadata(path, strict_uns=False) -> H5adMetadata` —
+  Read just `obs`, `var`, `uns`, and the X shape from an h5ad file via
+  pure-Rust HDF5 readers. Skips `anndata.read_h5ad` (and therefore
+  anndata's eager `obsm` allocation) entirely. Returns an
+  `H5adMetadata` object with attributes `obs` (`pandas.DataFrame`),
+  `var` (`pandas.DataFrame`), `uns` (`dict`), `n_obs` (`int`),
+  `n_vars` (`int`), `x_format` (`"csr"` / `"csc"` / `"dense"`). Intended
+  for read-mutate-write flows: read this, mutate `obs` / `uns`, pass
+  the mutated values back via `pyscx.from_h5ad(..., obs_override=, uns_override=)`.
+  Categoricals, pandas Index metadata, and nullable-boolean columns
+  round-trip through the same Arrow IPC path that `pyscx.open(...).to_anndata()`
+  uses, so the result is semantically equivalent to the obs / var that
+  `anndata.read_h5ad` would have returned — without the obsm allocation
+  cost. `strict_uns=True` mirrors `from_h5ad`'s strict-uns semantics.
 - `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the
