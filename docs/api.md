@@ -1217,12 +1217,76 @@ model.train(datamodule=dm)
 
 ### TrainingDataset
 
+High-throughput sequential streaming dataset. Wraps the triple-buffered
+Rust pipeline (tokio I/O → rayon decode → Python/GPU). Each `for batch in dataset:`
+loop is one epoch; shards are reshuffled between epochs for training randomization.
+
+**Constructor kwargs**
+
+| Argument | Default | Notes |
+|---|---|---|
+| `path` | — | Path to `.scx` file. |
+| `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `obs_columns` | `[]` | Obs metadata column names included in each batch. |
+| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). |
+| `log1p` | `True` | Apply `log1p` after normalize. |
+| `target_sum` | `1e4` | Normalization target sum. |
+| `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
+| `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
+| `seed` | `42` | RNG seed for reproducibility. Deterministic shuffle via `(seed, epoch)`. |
+| `max_memory_mb` | `512` | Memory budget. Pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` to fit. |
+| `modality` | `None` | For multimodal v2 files: name of the modality to load (e.g. `"rna"`). Ignored on single-modality files. |
+
+**Properties**
+
+- `n_obs` → `int` — Total number of observations (cells) in the dataset.
+- `n_vars` → `int` — Total number of variables (genes) in the dataset.
+- `n_output_genes` → `int` — Genes per batch (HVG count if projection active, else `n_vars`).
+- `effective_batch_size` → `int` — Actual batch size after memory budget auto-tuning.
+
+**Methods**
+
+- `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0).
+- `memory_budget()` → `dict` — Memory budget diagnostics including `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`, and a nested `breakdown` dict.
+
+**Batch dict schema**
+
+```python
+{
+    "X":            np.ndarray[B, n_output_genes, float32],   # dense expression
+    "obs":          dict[str, np.ndarray | {"codes", "categories"}],
+    "cell_indices":  np.ndarray[B, int64],   # global row indices
+}
+```
+
+Categorical obs columns encode as `{"codes": ndarray[int32], "categories": list[str]}`.
+Numeric obs columns are `ndarray[int64]` or `ndarray[float64]`.
+
+**Epoch and shuffling semantics**
+
+Each `for batch in dataset:` loop is one epoch. On each epoch:
+- **Level 1 (shard order)**: Shard indices `[0..n_shards)` are randomly permuted using a
+  deterministic RNG seeded from `(seed, epoch_number)`. Permuted shards are grouped into
+  contiguous I/O groups of `shard_group_size` for disk-sequential reads.
+- **Level 2 (row shuffle)**: Within each shard group, cell indices are Fisher-Yates shuffled
+  and sliced into `batch_size`-sized batches.
+
+This two-level shuffle provides training randomization without random I/O. The same `seed`
+and epoch always produce the identical ordering.
+
 ```python
 dataset = pyscx.TrainingDataset("file.scx", batch_size=1024,
-    hvg_indices=hvg_array, normalize=True, log1p=True)
-for batch in dataset:
-    x = batch["X"]      # dense f32 numpy array
-    obs = batch["obs"]   # dict of obs columns
+    hvg_indices=hvg_array, normalize=True, log1p=True,
+    obs_columns=["cell_type", "batch"])
+
+for epoch in range(n_epochs):
+    for batch in dataset:
+        x = batch["X"]              # [B, n_output_genes] float32
+        obs = batch["obs"]          # {"cell_type": {"codes": ..., "categories": ...}, ...}
+        idx = batch["cell_indices"]  # [B] int64 — global row indices
+
+dataset.close()
 ```
 
 ### IndexPlanDataset
