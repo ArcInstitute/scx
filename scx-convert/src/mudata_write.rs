@@ -49,10 +49,14 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
 
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    // Eager path: don't pass a keep mask (preserves prior behavior;
-    // the eager CSR reader applies DV filtering internally so this
-    // path historically wrote unfiltered obs even with DVs active).
-    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, None)?;
+    // Build the keep mask once and apply it symmetrically across
+    // /X (via `read_all_csr_shards_for_filtered`) and obs (via the
+    // streaming-or-eager dispatcher). Pre-fix, this path silently
+    // dropped DVs on both legs — the per-modality eager CSR reader
+    // does *not* filter internally, contrary to what the prior
+    // "preserves prior behavior" comment claimed.
+    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref())?;
 
     // Per-modality blocks under /mod/{name}.
     let mod_group = root.create_group("mod")?;
@@ -65,8 +69,8 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
         let mname = info.name.clone();
         let modality_root = create_modality_group_with_attrs(&mod_group, &mname)?;
 
-        // Per-modality X matrix (materialising path).
-        let csr = reader.read_all_csr_shards_for(modality_id)?;
+        // Per-modality X matrix (materialising path, DV-filtered).
+        let csr = reader.read_all_csr_shards_for_filtered(modality_id)?;
         write_sparse_group_at(
             &modality_root,
             "X",
@@ -77,7 +81,13 @@ pub fn scx_to_h5mu(scx_path: &Path, h5mu_path: &Path) -> Result<(), ConvertError
             csr.shape.1,
         )?;
 
-        write_h5mu_per_modality_non_x_blocks(&reader, &modality_root, modality_id, &mname, None)?;
+        write_h5mu_per_modality_non_x_blocks(
+            &reader,
+            &modality_root,
+            modality_id,
+            &mname,
+            keep_mask.as_deref(),
+        )?;
     }
 
     Ok(())
@@ -191,7 +201,13 @@ fn write_h5mu_root_attrs_and_global_blocks(
             for entry in global_obsm {
                 let key = entry.name.strip_prefix("obsm/").unwrap_or(&entry.name);
                 if let Ok(batch) = reader.read_obsm(key) {
-                    write_obsm_entry_at(&obsm_group, key, &batch)?;
+                    let filtered = match keep_mask_opt {
+                        Some(mask) => {
+                            crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                        }
+                        None => batch,
+                    };
+                    write_obsm_entry_at(&obsm_group, key, &filtered)?;
                 }
             }
         }
@@ -257,7 +273,13 @@ fn write_h5mu_per_modality_non_x_blocks(
                 .unwrap_or(&entry.name)
                 .to_string();
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
-                write_obsm_entry_at(&obsm_group, &key, &batch)?;
+                let filtered = match keep_mask_opt {
+                    Some(mask) => {
+                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                    }
+                    None => batch,
+                };
+                write_obsm_entry_at(&obsm_group, &key, &filtered)?;
             }
         }
     }
@@ -284,7 +306,12 @@ pub fn scx_modality_to_h5ad(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let csr = reader.read_all_csr_shards_for(modality_id)?;
+    // Mirror the streaming entry point: honor DVs symmetrically on
+    // /X and obs via `read_all_csr_shards_for_filtered` + the shared
+    // streaming-or-eager obs dispatcher.
+    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+
+    let csr = reader.read_all_csr_shards_for_filtered(modality_id)?;
     write_sparse_group_at(
         &root,
         "X",
@@ -295,7 +322,13 @@ pub fn scx_modality_to_h5ad(
         csr.shape.1,
     )?;
 
-    write_modality_to_h5ad_non_x_blocks(&reader, &root, modality_id, modality_name, None)?;
+    write_modality_to_h5ad_non_x_blocks(
+        &reader,
+        &root,
+        modality_id,
+        modality_name,
+        keep_mask.as_deref(),
+    )?;
 
     Ok(())
 }
@@ -390,7 +423,13 @@ fn write_modality_to_h5ad_non_x_blocks(
                 .unwrap_or(&entry.name)
                 .to_string();
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
-                write_obsm_entry_at(&obsm_group, &key, &batch)?;
+                let filtered = match keep_mask_opt {
+                    Some(mask) => {
+                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                    }
+                    None => batch,
+                };
+                write_obsm_entry_at(&obsm_group, &key, &filtered)?;
             }
         }
     }

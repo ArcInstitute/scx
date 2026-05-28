@@ -34,8 +34,15 @@ pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), Conver
     let reader = ScxReader::open(scx_path)?;
     let file = hdf5::File::create(h5ad_path)?;
 
-    // Read the full CSR matrix
-    let csr = reader.read_all_csr_shards()?;
+    // Honor deletion vectors on every leg (X, obs, layers). The CSR
+    // and layer readers filter by DV directly; obs goes through the
+    // shared streaming-or-eager dispatcher which applies the same
+    // global keep mask. Pre-fix, this path silently dropped DV
+    // semantics — both /X and obs were written unfiltered.
+    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+
+    // Read the full CSR matrix (DV-filtered when active)
+    let csr = reader.read_all_csr_shards_filtered()?;
     let n_obs = csr.shape.0;
     let n_vars = csr.shape.1;
 
@@ -50,22 +57,26 @@ pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), Conver
         n_vars,
     )?;
 
-    // Write obs
-    if let Ok(obs) = reader.read_obs() {
-        write_dataframe_group(&file, "obs", &obs)?;
-    }
+    // Write obs / var via the shared dispatcher so legacy + sharded
+    // sources both flow through one code path and the DV keep mask
+    // is honored.
+    let root = file.as_group()?;
+    crate::h5ad_stream_write::write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref())?;
+    crate::h5ad_stream_write::write_var_streaming_or_eager(&root, &reader)?;
 
-    // Write var
-    if let Ok(var) = reader.read_var() {
-        write_dataframe_group(&file, "var", &var)?;
-    }
-
-    // Write obsm
+    // Write obsm (DV-filtered when active — obs-axis rows must match
+    // /X and /obs).
     if let Ok(obsm_map) = reader.read_all_obsm() {
         if !obsm_map.is_empty() {
             let obsm_group = file.create_group("obsm")?;
             for (name, batch) in &obsm_map {
-                write_obsm_entry(&obsm_group, name, batch)?;
+                let filtered = match keep_mask.as_deref() {
+                    Some(mask) => {
+                        crate::h5ad_stream_write::filter_record_batch_by_mask(batch, mask)?
+                    }
+                    None => batch.clone(),
+                };
+                write_obsm_entry(&obsm_group, name, &filtered)?;
             }
         }
     }
@@ -76,12 +87,13 @@ pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), Conver
         write_uns_entries(&uns_group, &uns)?;
     }
 
-    // Write layers
+    // Write layers (DV-filtered when active — layers share X's
+    // row count by AnnData invariant)
     let layer_names = reader.layer_names();
     if !layer_names.is_empty() {
         let layers_group = file.create_group("layers")?;
         for layer_name in &layer_names {
-            if let Ok(layer_csr) = reader.read_layer(layer_name) {
+            if let Ok(layer_csr) = reader.read_layer_filtered(layer_name) {
                 let lg = layers_group.create_group(layer_name)?;
                 write_sparse_arrays(
                     &lg,
@@ -138,7 +150,7 @@ pub(super) fn write_dataframe_group_at(
     write_dataframe_body(&group, batch)
 }
 
-/// Shared body for `write_dataframe_group{,_at}`. Caller is responsible
+/// Shared body for `write_dataframe_group_at`. Caller is responsible
 /// for opening or creating `group`. Resolves the pandas index from
 /// schema metadata, renames pyarrow's `__index_level_0__` to anndata's
 /// `_index` literal on disk (named indexes keep their original name),
@@ -196,8 +208,10 @@ fn write_dataframe_body(
             // Index column → write under the anndata on-disk name and
             // exclude from `column-order` (matches anndata convention).
             write_column_to_hdf5(group, on_disk_index, col, field.data_type())?;
-        } else {
-            write_column_to_hdf5(group, field.name(), col, field.data_type())?;
+        } else if write_column_to_hdf5(group, field.name(), col, field.data_type())? {
+            // Only list the column in `column-order` when a dataset
+            // was actually created — unsupported types are
+            // warn-and-skipped and must not appear in the index.
             col_order.push(vlu(field.name()));
         }
     }
@@ -281,15 +295,6 @@ fn write_sparse_arrays(
     Ok(())
 }
 
-fn write_dataframe_group(
-    file: &hdf5::File,
-    name: &str,
-    batch: &RecordBatch,
-) -> Result<(), ConvertError> {
-    let group = file.create_group(name)?;
-    write_dataframe_body(&group, batch)
-}
-
 fn downcast_err(name: &str, expected: &str) -> ConvertError {
     ConvertError::Other(format!(
         "column '{name}': expected {expected} array but downcast failed"
@@ -350,12 +355,18 @@ fn dict_codes_and_categories_i32(
     }
 }
 
+/// Write one Arrow column into `group/name`. Returns `Ok(true)` on a
+/// supported type (dataset created), `Ok(false)` when the type is
+/// not yet supported and the column was warn-and-skipped. The caller
+/// uses the boolean to decide whether to add `name` to `column-order`
+/// — adding a name without a backing dataset breaks
+/// `anndata.read_h5ad`'s lookup.
 fn write_column_to_hdf5(
     group: &hdf5::Group,
     name: &str,
     array: &dyn Array,
     dtype: &DataType,
-) -> Result<(), ConvertError> {
+) -> Result<bool, ConvertError> {
     match dtype {
         DataType::Int32 => {
             let arr = array
@@ -510,9 +521,10 @@ fn write_column_to_hdf5(
         }
         _ => {
             eprintln!("warning: skipping column '{name}' with unsupported type {dtype:?}");
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn write_obsm_entry(
@@ -621,18 +633,24 @@ where
     }
 
     // Pre-allocate column writers and assemble `column-order` in schema
-    // order (index excluded).
+    // order (index excluded). Unsupported types are warn-and-skipped
+    // inside `create_column_writer` (no dataset created) and must
+    // also stay out of `column-order` so anndata's reader doesn't
+    // look up a missing dataset.
     let mut col_order: Vec<VarLenUnicode> =
         Vec::with_capacity(schema.fields().len().saturating_sub(1));
     let mut col_writers: Vec<(usize, ColumnStreamWriter)> = Vec::new();
     for (col_idx, field) in schema.fields().iter().enumerate() {
-        let on_disk_name: &str = if Some(field.name()) == index_field_name.as_ref() {
+        let is_index = Some(field.name()) == index_field_name.as_ref();
+        let on_disk_name: &str = if is_index {
             on_disk_index
         } else {
-            col_order.push(vlu(field.name()));
             field.name()
         };
         let writer = create_column_writer(&group, on_disk_name, field, n_rows_kept)?;
+        if !is_index && !matches!(writer, ColumnStreamWriter::Unsupported) {
+            col_order.push(vlu(field.name()));
+        }
         col_writers.push((col_idx, writer));
     }
 
@@ -664,7 +682,9 @@ where
 
         // Prefer the stamped `row_start` over cumulative counting so
         // out-of-order producers fail loudly instead of writing into
-        // wrong hyperslab offsets.
+        // wrong hyperslab offsets. Legacy shards lack the stamp and
+        // fall back to `cumulative_rows` — the next cross-check is a
+        // no-op for them, but v2 sharded obs always stamps it.
         let row_start_global = parse_shard_row_start(&batch).unwrap_or(cumulative_rows);
         if row_start_global != cumulative_rows {
             return Err(ConvertError::Other(format!(

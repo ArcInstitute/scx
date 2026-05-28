@@ -6740,6 +6740,239 @@ mod streaming_obs_hdf5 {
         assert_eq!(s.value(0), "cell_000000");
     }
 
+    /// Non-streaming `write_scx_to_h5ad` on a sharded source with
+    /// active deletion vectors. Pre-fix, this path passed `None` as
+    /// the keep mask and dropped DVs silently on both /X (via the
+    /// unfiltered `read_all_csr_shards`) and obs (via unfiltered
+    /// `read_obs`). The fix routes both legs through the
+    /// `_filtered` reader and the shared streaming-or-eager obs
+    /// dispatcher, so the kept-row count is honored symmetrically.
+    #[test]
+    fn test_eager_obs_with_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("dv_eager.scx");
+        let h5ad_out = dir.path().join("eager_out.h5ad");
+
+        // Same fixture as the streaming DV test: 4×20 rows, delete 4.
+        build_sharded_obs_scx(&scx_path, 4, 20);
+        let deleted: Vec<u64> = vec![3, 15, 27, 60];
+        scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+        write_scx_to_h5ad(&scx_path, &h5ad_out).unwrap();
+
+        let file = hdf5::File::open(&h5ad_out).unwrap();
+        let shape: Vec<i64> = file
+            .group("X")
+            .unwrap()
+            .attr("shape")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        assert_eq!(shape[0], 76, "non-streaming /X must filter DVs");
+
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(
+            obs.num_rows(),
+            76,
+            "non-streaming obs row count must match /X (was unfiltered pre-fix)"
+        );
+        let cell_id_col = obs.column(obs.schema().index_of("cell_id").unwrap());
+        let s = cell_id_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let deleted_strings: std::collections::HashSet<String> =
+            deleted.iter().map(|&i| format!("cell_{i:06}")).collect();
+        for i in 0..s.len() {
+            assert!(
+                !deleted_strings.contains(s.value(i)),
+                "obs row {i} ({}) was supposed to be deleted",
+                s.value(i)
+            );
+        }
+        assert_eq!(s.value(0), "cell_000000");
+    }
+
+    /// Obsm DV regression: after the eager / streaming paths started
+    /// filtering /X and obs by the keep mask, a latent row-count
+    /// mismatch on obsm became user-visible (obs.n_obs == X.shape[0]
+    /// but obsm[key].shape[0] still equalled pre-deletion n_obs).
+    /// This test locks in obsm filtering on both entry points.
+    #[test]
+    fn test_obsm_with_deletion_vectors() {
+        use arrow::array::Float32Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("dv_obsm.scx");
+        let h5ad_stream_out = dir.path().join("stream.h5ad");
+        let h5ad_eager_out = dir.path().join("eager.h5ad");
+
+        // 4×20 = 80 obs; add an X_pca-like obsm with 3 components.
+        let n_shards: u32 = 4;
+        let rows_per_shard: u64 = 20;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let batch = obs_shard_batch(row_start as usize, rows_per_shard as usize, shard_idx);
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            // Obsm: 80 × 3 dense Float32. Values encode (row, comp)
+            // so we can verify post-filter alignment in the assert.
+            let n = n_obs as usize;
+            let c0: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| i as f32).collect::<Vec<f32>>(),
+            ));
+            let c1: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| (i as f32) + 0.5).collect::<Vec<f32>>(),
+            ));
+            let c2: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| -(i as f32)).collect::<Vec<f32>>(),
+            ));
+            let obsm_schema = Schema::new(vec![
+                Field::new("c0", DataType::Float32, false),
+                Field::new("c1", DataType::Float32, false),
+                Field::new("c2", DataType::Float32, false),
+            ]);
+            let obsm_batch = RecordBatch::try_new(Arc::new(obsm_schema), vec![c0, c1, c2]).unwrap();
+            writer.write_obsm("X_pca", &obsm_batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let deleted: Vec<u64> = vec![3, 15, 27, 60];
+        scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream_out, &opts, &mut WarningSink::log())
+            .unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager_out).unwrap();
+
+        let kept_rows: Vec<usize> = (0..n_obs as usize)
+            .filter(|i| !deleted.contains(&(*i as u64)))
+            .collect();
+        assert_eq!(kept_rows.len(), 76);
+
+        for path in [&h5ad_stream_out, &h5ad_eager_out] {
+            let file = hdf5::File::open(path).unwrap();
+            let obsm_pca = file.dataset("obsm/X_pca").unwrap();
+            let shape = obsm_pca.shape();
+            assert_eq!(
+                shape,
+                vec![76, 3],
+                "obsm/X_pca shape mismatch at {path:?} — must equal kept-row count after DV filter",
+            );
+            // First-row spot-check: kept_rows[0] == 0 (row 0 is kept),
+            // so the first surviving row's c0 should be `0.0`.
+            let arr: ndarray::Array2<f32> = obsm_pca.read_2d().unwrap();
+            assert_eq!(arr[[0, 0]], 0.0, "first kept row's c0 at {path:?}");
+            assert_eq!(arr[[0, 1]], 0.5, "first kept row's c1 at {path:?}");
+            // Last surviving row's c0 should equal kept_rows.last().
+            let last_kept = *kept_rows.last().unwrap() as f32;
+            assert_eq!(arr[[75, 0]], last_kept, "last kept row's c0 at {path:?}",);
+        }
+    }
+
+    /// Build an obs shard fixture with an Arrow type the writer
+    /// cannot encode (`Date32`) alongside the standard columns. Used
+    /// by the issue-5 regression test.
+    fn obs_shard_batch_with_unsupported(start_row: usize, n: usize, shard_idx: u32) -> RecordBatch {
+        use arrow::array::Date32Array;
+        let base = obs_shard_batch(start_row, n, shard_idx);
+        // Append a Date32 column. Days-since-epoch values are arbitrary.
+        let dates: Vec<i32> = (0..n).map(|i| (start_row + i) as i32).collect();
+        let dates_arr: ArrayRef = Arc::new(Date32Array::from(dates));
+
+        let mut fields: Vec<Field> = base
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("captured_on", DataType::Date32, false));
+        let new_schema = Arc::new(Schema::new(fields));
+        let mut cols: Vec<ArrayRef> = (0..base.num_columns())
+            .map(|i| base.column(i).clone())
+            .collect();
+        cols.push(dates_arr);
+        RecordBatch::try_new(new_schema, cols).unwrap()
+    }
+
+    /// Issue 5: when a shard carries a column with an Arrow type the
+    /// writer cannot encode (e.g. `Date32`), the streaming + eager
+    /// paths warn-and-skip the column. The column must NOT appear in
+    /// the `column-order` HDF5 attribute — otherwise
+    /// `anndata.read_h5ad` raises a `KeyError` looking up a missing
+    /// dataset.
+    #[test]
+    fn test_streaming_obs_unsupported_column_excluded_from_column_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("unsupported.scx");
+        let h5ad_stream = dir.path().join("stream.h5ad");
+        let h5ad_eager = dir.path().join("eager.h5ad");
+
+        // Build a sharded obs SCX with the unsupported `captured_on`
+        // (Date32) column tacked onto each shard's batch.
+        let n_shards: u32 = 2;
+        let rows_per_shard: u64 = 20;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let batch = obs_shard_batch_with_unsupported(
+                    row_start as usize,
+                    rows_per_shard as usize,
+                    shard_idx,
+                );
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
+            .unwrap();
+        // Eager path also routes through the streaming-or-eager
+        // dispatcher post-issue-2 fix, but the assertion is the same:
+        // the unsupported column must not leak into `column-order`.
+        write_scx_to_h5ad(&scx_path, &h5ad_eager).unwrap();
+
+        for path in [&h5ad_stream, &h5ad_eager] {
+            let file = hdf5::File::open(path).unwrap();
+            let obs = file.group("obs").unwrap();
+            let column_order: Vec<hdf5::types::VarLenUnicode> = obs
+                .attr("column-order")
+                .unwrap()
+                .read_1d()
+                .unwrap()
+                .to_vec();
+            let names: Vec<String> = column_order.iter().map(|v| v.to_string()).collect();
+            assert!(
+                !names.iter().any(|n| n == "captured_on"),
+                "unsupported `captured_on` (Date32) leaked into column-order at {path:?}: {names:?}",
+            );
+            // The supported columns must still be present.
+            for expected in ["n_genes", "is_doublet", "cell_type"] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "supported column `{expected}` missing from column-order at {path:?}: {names:?}",
+                );
+            }
+            // No HDF5 dataset for the skipped column either.
+            assert!(
+                obs.dataset("captured_on").is_err(),
+                "skipped column should not have a backing dataset at {path:?}",
+            );
+        }
+    }
+
     /// Sharded **var** export: var has its own `VarMetadataShard`
     /// section type, and the streaming dispatcher must take the
     /// sharded var path when shards are present. var-axis deletion

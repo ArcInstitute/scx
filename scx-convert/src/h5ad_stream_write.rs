@@ -113,16 +113,21 @@ pub(super) fn write_var_streaming_or_eager(
 }
 
 /// Filter a `RecordBatch` by a global keep mask. Used by the legacy
-/// obs path so the eager and streaming branches both honour the
-/// deletion-vector filter symmetrically.
-fn filter_record_batch_by_mask(
+/// obs path and by obsm writers so eager / streaming branches honour
+/// the deletion-vector filter symmetrically.
+pub(super) fn filter_record_batch_by_mask(
     batch: &arrow::array::RecordBatch,
     mask: &[bool],
 ) -> Result<arrow::array::RecordBatch, ConvertError> {
     use arrow::array::BooleanArray;
     let n = batch.num_rows();
-    let mask_slice = if mask.len() >= n { &mask[..n] } else { mask };
-    let bool_arr = BooleanArray::from(mask_slice.to_vec());
+    if mask.len() < n {
+        return Err(ConvertError::Other(format!(
+            "keep_mask length {} < obs batch rows {n} (catalog/header drift)",
+            mask.len()
+        )));
+    }
+    let bool_arr = BooleanArray::from(mask[..n].to_vec());
     arrow::compute::filter_record_batch(batch, &bool_arr).map_err(ConvertError::Arrow)
 }
 
@@ -184,17 +189,23 @@ pub fn write_scx_to_h5ad_streaming(
     // do not filter var), so var streaming never carries a mask.
     write_var_streaming_or_eager(&root, &reader)?;
 
-    // obsm.
+    // obsm. Obs-axis embeddings must be filtered by the same keep
+    // mask as /X and obs so anndata sees consistent row counts.
     if let Ok(obsm_map) = reader.read_all_obsm() {
         if !obsm_map.is_empty() {
             let obsm_group = root.create_group("obsm")?;
             for (name, batch) in &obsm_map {
-                write_obsm_entry_at(&obsm_group, name, batch)?;
+                let filtered = match keep_mask.as_deref() {
+                    Some(mask) => filter_record_batch_by_mask(batch, mask)?,
+                    None => batch.clone(),
+                };
+                write_obsm_entry_at(&obsm_group, name, &filtered)?;
             }
         }
     }
 
-    // varm.
+    // varm. Var-axis features are not affected by deletion vectors
+    // (DVs are obs-only), so no filtering here.
     if let Ok(varm_map) = reader.read_all_varm() {
         if !varm_map.is_empty() {
             let varm_group = root.create_group("varm")?;
