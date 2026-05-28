@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 
@@ -22,6 +23,14 @@ use scx_format::section::SectionType;
 use crate::backend::CloudLocation;
 use crate::error::{CloudError, Result};
 use crate::explode::section_name_to_path;
+
+/// Maximum number of metadata-shard range reads issued concurrently when
+/// assembling sharded obs/var. Caps inflight requests so atlas-scale files
+/// (thousands of `ObsMetadataShard` / `VarMetadataShard` sections) don't
+/// fire an unbounded number of simultaneous fetches. Matches the default
+/// `PullOptions::parallelism`; a configurable `CloudQueryOptions` is a
+/// deferred follow-on (see docs/cloud.md).
+const METADATA_SHARD_FETCH_CONCURRENCY: usize = 8;
 
 /// Layout of the cloud reader source.
 enum ReaderLayout {
@@ -208,35 +217,37 @@ impl CloudReader {
     /// via [`scx_format::assemble_sharded_metadata`] — the same
     /// upcast → cover-validation → concat → downcast pipeline the local
     /// `ScxReader` uses, so the cloud and local read paths return
-    /// byte-identical batches. Shard reads are issued in parallel.
+    /// byte-identical batches. Shard reads are issued concurrently, capped
+    /// at [`METADATA_SHARD_FETCH_CONCURRENCY`] inflight requests.
     async fn read_sharded_metadata(
         &self,
         shard_type: SectionType,
         prefix: &str,
         logical: &str,
     ) -> Result<RecordBatch> {
-        let mut entries: Vec<(u32, FullCatalogEntry)> = self
+        let entries: Vec<(u32, &FullCatalogEntry)> = self
             .catalog
             .entries
             .iter()
             .filter(|e| e.section_type == shard_type && e.name.starts_with(prefix))
             .filter_map(|e| {
                 let idx: u32 = e.name.strip_prefix(prefix)?.parse().ok()?;
-                Some((idx, e.clone()))
+                Some((idx, e))
             })
             .collect();
-        entries.sort_by_key(|(idx, _)| *idx);
 
-        let fetches = entries.iter().map(|(_, e)| self.read_section_for_entry(e));
-        let bytes_list = futures::future::join_all(fetches)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
+        // Fetch + decode each shard with bounded concurrency.
+        // `assemble_sharded_metadata` re-sorts by `shard_idx`, so the
+        // out-of-order completion from `buffer_unordered` is fine.
+        let raw_batches: Vec<(u32, RecordBatch)> = futures::stream::iter(entries)
+            .map(|(idx, e)| async move {
+                let bytes = self.read_section_for_entry(e).await?;
+                Ok::<(u32, RecordBatch), CloudError>((idx, decode_arrow_ipc_batch(&bytes, logical)?))
+            })
+            .buffer_unordered(METADATA_SHARD_FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
 
-        let mut raw_batches: Vec<(u32, RecordBatch)> = Vec::with_capacity(entries.len());
-        for ((idx, _), bytes) in entries.iter().zip(bytes_list) {
-            raw_batches.push((*idx, decode_arrow_ipc_batch(&bytes, logical)?));
-        }
         Ok(scx_format::assemble_sharded_metadata(logical, raw_batches)?)
     }
 
