@@ -1213,6 +1213,88 @@ fn test_compact_filters_obsp_with_deletions() {
     assert_eq!(reader.read_all_varp().unwrap()["corr"].num_rows(), 2);
 }
 
+/// Compact remaps a v2 (`Int64` coordinate) obsp under deletions. The v2 wire
+/// format self-describes the coordinate width; this pins that compaction
+/// accepts Int64 coordinates rather than rejecting them as "not Int32". The
+/// surviving axis is small so the output narrows back to Int32.
+#[test]
+fn test_compact_filters_obsp_int64_with_deletions() {
+    use std::collections::HashMap;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("maps_i64.scx");
+    let n_obs = 6usize;
+    let n_vars = 10usize;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Same edge layout as `write_test_file_with_all_mappings`, but with
+    // Int64 coordinate columns (the v2 width).
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int64, false),
+            Field::new("col", DataType::Int64, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), n_obs.to_string()),
+            ("n_cols".to_string(), n_obs.to_string()),
+        ]),
+    );
+    let obsp = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![0i64, 1, 2, 3, 4, 1])),
+            Arc::new(arrow::array::Int64Array::from(vec![1i64, 2, 3, 4, 5, 4])),
+            Arc::new(arrow::array::Float32Array::from(vec![
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 9.0,
+            ])),
+        ],
+    )
+    .unwrap();
+    writer.write_obsp("connectivities", &obsp).unwrap();
+    writer.finish().unwrap();
+
+    scx_ops::mark_deleted(&path, &[1, 4]).unwrap();
+    let out = dir.path().join("maps_i64_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let obsp = reader.read_all_obsp().unwrap();
+    let conn = obsp.get("connectivities").expect("obsp preserved");
+    // Only the (2,3) edge survives, remapped to (1,2). Small axis → Int32 out.
+    assert_eq!(conn.num_rows(), 1);
+    let rows = conn
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .expect("output narrowed to Int32 for a small compacted axis");
+    let cols = conn
+        .column_by_name("col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(rows.value(0), 1);
+    assert_eq!(cols.value(0), 2);
+    let md = conn.schema().metadata().clone();
+    assert_eq!(md.get("n_rows").map(String::as_str), Some("4"));
+    assert_eq!(md.get("n_cols").map(String::as_str), Some("4"));
+}
+
 /// Multimodal file whose RNA modality carries a *sharded* per-modality obsm
 /// (`ObsmEmbeddingShard`, type 20) and a per-modality varm.
 fn write_multimodal_with_per_modality_mappings(

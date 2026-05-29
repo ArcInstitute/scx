@@ -450,17 +450,42 @@ pub fn compact_with_index_options(
     })
 }
 
+/// Read a COO coordinate column (`row` / `col`) as `i64`, accepting either
+/// the v1 `Int32` or the v2 `Int64` coordinate width. The Arrow schema
+/// self-describes the width (see `scx-format/tests/pairwise_v2_int64.rs`), so
+/// compact must round-trip both.
+fn obsp_coords_as_i64(batch: &arrow::array::RecordBatch, name: &str) -> Result<Vec<i64>> {
+    use arrow::array::{Int32Array, Int64Array};
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        crate::error::OpsError::InvalidInput(format!("obsp COO column `{name}` is missing"))
+    })?;
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        Ok((0..a.len()).map(|i| a.value(i)).collect())
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        Ok((0..a.len()).map(|i| a.value(i) as i64).collect())
+    } else {
+        Err(crate::error::OpsError::InvalidInput(format!(
+            "obsp COO column `{name}` is neither Int32 nor Int64"
+        )))
+    }
+}
+
 /// Remap an obsp COO `RecordBatch` (obs×obs) through the obs keep-mask.
 ///
 /// Drops entries whose `row` OR `col` references a deleted obs and renumbers
 /// surviving endpoints into the compacted index space. The `n_rows` /
 /// `n_cols` schema metadata is rewritten to the kept count; all other
 /// metadata keys are preserved. `keep_mask[i] == true` means obs `i` is kept.
+///
+/// Both the v1 `Int32` and v2 `Int64` coordinate widths are accepted on input;
+/// the output width is chosen from the compacted dimension so a >`i32::MAX`
+/// axis that survives compaction stays `Int64` (no silent wrap).
 fn filter_obsp_coo(
     batch: &arrow::array::RecordBatch,
     keep_mask: &[bool],
 ) -> Result<arrow::array::RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array};
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field};
 
     // old obs index -> new obs index (or -1 if the obs was deleted).
     let mut old_to_new = vec![-1i64; keep_mask.len()];
@@ -473,18 +498,8 @@ fn filter_obsp_coo(
     }
     let new_dim = next;
 
-    let downcast_i32 = |name: &str| -> Result<&Int32Array> {
-        batch
-            .column_by_name(name)
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .ok_or_else(|| {
-                crate::error::OpsError::InvalidInput(format!(
-                    "obsp COO column `{name}` is missing or not Int32"
-                ))
-            })
-    };
-    let rows = downcast_i32("row")?;
-    let cols = downcast_i32("col")?;
+    let rows = obsp_coords_as_i64(batch, "row")?;
+    let cols = obsp_coords_as_i64(batch, "col")?;
     let data = batch
         .column_by_name("data")
         .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
@@ -494,34 +509,70 @@ fn filter_obsp_coo(
             )
         })?;
 
-    let mut out_rows: Vec<i32> = Vec::new();
-    let mut out_cols: Vec<i32> = Vec::new();
+    let mut out_rows: Vec<i64> = Vec::new();
+    let mut out_cols: Vec<i64> = Vec::new();
     let mut out_data: Vec<f32> = Vec::new();
     for i in 0..batch.num_rows() {
-        let r = rows.value(i) as usize;
-        let c = cols.value(i) as usize;
-        let (nr, nc) = match (old_to_new.get(r), old_to_new.get(c)) {
+        let r = usize::try_from(rows[i]).ok();
+        let c = usize::try_from(cols[i]).ok();
+        let (nr, nc) = match (
+            r.and_then(|r| old_to_new.get(r)),
+            c.and_then(|c| old_to_new.get(c)),
+        ) {
             (Some(&nr), Some(&nc)) if nr >= 0 && nc >= 0 => (nr, nc),
             _ => continue,
         };
-        out_rows.push(nr as i32);
-        out_cols.push(nc as i32);
+        out_rows.push(nr);
+        out_cols.push(nc);
         out_data.push(data.value(i));
     }
 
-    // Preserve the original field schema; rewrite n_rows / n_cols metadata.
+    // Choose the output coordinate width from the compacted dimension: keep
+    // Int64 when the surviving axis still exceeds i32::MAX, otherwise narrow
+    // to Int32 (the common case).
+    let use_i64 = new_dim > i64::from(i32::MAX);
+    let coord_type = if use_i64 {
+        DataType::Int64
+    } else {
+        DataType::Int32
+    };
+    let (row_arr, col_arr): (
+        std::sync::Arc<dyn arrow::array::Array>,
+        std::sync::Arc<dyn arrow::array::Array>,
+    ) = if use_i64 {
+        (
+            std::sync::Arc::new(Int64Array::from(out_rows)),
+            std::sync::Arc::new(Int64Array::from(out_cols)),
+        )
+    } else {
+        (
+            std::sync::Arc::new(Int32Array::from(
+                out_rows.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(Int32Array::from(
+                out_cols.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+        )
+    };
+
+    // Rebuild the schema with the chosen coordinate width; rewrite
+    // n_rows / n_cols metadata and preserve all other metadata keys.
     let mut metadata = batch.schema().metadata().clone();
     metadata.insert("n_rows".to_string(), new_dim.to_string());
     metadata.insert("n_cols".to_string(), new_dim.to_string());
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        batch.schema().fields().clone(),
+        vec![
+            Field::new("row", coord_type.clone(), false),
+            Field::new("col", coord_type, false),
+            Field::new("data", DataType::Float32, false),
+        ],
         metadata,
     ));
     Ok(arrow::array::RecordBatch::try_new(
         schema,
         vec![
-            std::sync::Arc::new(Int32Array::from(out_rows)),
-            std::sync::Arc::new(Int32Array::from(out_cols)),
+            row_arr,
+            col_arr,
             std::sync::Arc::new(Float32Array::from(out_data)),
         ],
     )?)
