@@ -99,7 +99,11 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
   column lists: `"cellxgene"` (cell_type / disease / tissue / assay / donor_id /
   development_stage / sex / suspension_type), `"perturbseq"`, `"training"`.
   **Without an index, `query().filter_obs(...)` silently regresses to a full obs
-  scan.** Set these whenever the file will be queried.
+  scan.** Set these whenever the file will be queried. The CLI `--index-*` flags
+  only build indexes on SCX-writing ingest (`h5ad → scx`, `10x → scx`; `h5mu → scx`
+  accepts and skips with a warning); on `mtx → scx` and the SCX-export directions
+  (`scx → h5ad/h5mu/mtx`) they are a **hard error**, not a silent no-op. Rebuild an
+  index on an existing SCX file with `scx compact` / `scx append` / `scx merge`.
 - **`bitmap`**: `"off"` / `"auto"` / `"always"` — per-shard gene→row detection
   bitmaps consumed by `Experiment.detection_counts()` / `cells_expressing()`.
 - **`memory_budget`**: a bare byte count or a binary-prefixed size — `K`/`M`/`G`/`T`
