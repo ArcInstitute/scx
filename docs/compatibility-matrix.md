@@ -21,7 +21,7 @@ the lower caps reflect the oldest version we are willing to support.
 | `numpy` | 1.24 | 3 | Covers the NumPy 1.x → 2.x transition |
 | `scipy` | 1.10 | 2 | CSR / CSC zero-copy contract |
 | `pyarrow` | 14 | 24 | Used for `obs` / `var` Arrow tables |
-| `anndata` | 0.10 | 0.13 | Includes the `0.11` / `0.12` API |
+| `anndata` | 0.11 | 0.13 | Floor is `0.11` because SCX → h5ad export emits the `nullable-string-array` encoding for null-bearing string columns, whose reader was added in anndata `0.11` |
 
 Optional extras follow the same convention:
 
@@ -50,7 +50,7 @@ not a blocker.
 
 | Python | numpy | scipy | pyarrow | anndata | scanpy | OS | Status |
 |---|---|---|---|---|---|---|---|
-| 3.11 | pip-resolved (≥1.24) | pip-resolved (≥1.10) | 23.0.1 (pinned) | pip-resolved (≥0.10,<0.13) | pip-resolved (≥1.10) | ubuntu-latest | ✅ `ci.yml::python` job |
+| 3.11 | pip-resolved (≥1.24) | pip-resolved (≥1.10) | 23.0.1 (pinned) | pip-resolved (≥0.11,<0.13) | pip-resolved (≥1.10) | ubuntu-latest | ✅ `ci.yml::python` job |
 | 3.11 | n/a (wheel build) | n/a | n/a | n/a | n/a | manylinux x86_64 | ✅ `pyscx-release.yml` |
 | 3.12 | n/a (wheel build) | n/a | n/a | n/a | n/a | manylinux x86_64 | ✅ `pyscx-release.yml` |
 

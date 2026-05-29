@@ -673,7 +673,7 @@ fn to_h5ad(
                 &mut sink,
             ),
             (Some(name), false) => {
-                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name)
+                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name, &mut sink)
             }
             (None, true) => scx_convert::scx_to_h5ad_streaming(
                 Path::new(path),
@@ -723,7 +723,7 @@ fn to_h5mu(
         if stream {
             scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
         } else {
-            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out))
+            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out), &mut sink)
         }
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))

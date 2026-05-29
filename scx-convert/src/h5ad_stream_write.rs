@@ -26,12 +26,13 @@ use std::path::Path;
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
 use scx_format::catalog::{FullCatalogEntry, ShardStats};
+use scx_format::error::ScxError;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 
 use super::h5ad_write::{
-    write_dataframe_group_at, write_dataframe_group_streaming, write_obsm_entry_at,
-    write_uns_entries_at,
+    scan_nullable_columns, write_dataframe_group_at, write_dataframe_group_streaming,
+    write_obsm_entry_at, write_uns_entries_at,
 };
 use super::pipeline::{ConvertError, ConvertOptions};
 use super::warnings::{ConvertWarning, WarningSink};
@@ -51,6 +52,7 @@ pub(super) fn write_obs_streaming_or_eager(
     parent: &hdf5::Group,
     reader: &ScxReader,
     keep_mask_opt: Option<&[bool]>,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if reader.obs_metadata_shard_count() == 0 {
         // Legacy single-section path: nothing to stream — produce the
@@ -61,11 +63,19 @@ pub(super) fn write_obs_streaming_or_eager(
                     Some(mask) => filter_record_batch_by_mask(&obs, mask)?,
                     None => obs,
                 };
-                write_dataframe_group_at(parent, "obs", &filtered)?;
+                write_dataframe_group_at(parent, "obs", &filtered, sink)?;
             }
-            Err(_) => {
-                // No obs section at all; mirror the eager path that
-                // silently skips on read failure.
+            // A genuinely absent obs section is the only tolerable
+            // miss (some legacy files carry none). Any other failure —
+            // decode error, schema mismatch, checksum, IO — must
+            // surface: AnnData requires an `/obs` group, so silently
+            // skipping turns a corrupt section into a malformed h5ad
+            // instead of a clear conversion error.
+            Err(ScxError::SectionNotFound(_)) => {}
+            Err(e) => {
+                return Err(ConvertError::Other(format!(
+                    "failed to read obs section for h5ad export: {e}"
+                )));
             }
         }
         return Ok(());
@@ -77,6 +87,9 @@ pub(super) fn write_obs_streaming_or_eager(
         Some(mask) => mask.iter().take(n_rows_total).filter(|&&b| b).count(),
         None => n_rows_total,
     };
+    // Pre-scan to decide plain-dataset vs nullable-group layout per
+    // int/string column (datasets are allocated before any shard is seen).
+    let needs_nullable = scan_nullable_columns(reader.obs_shards(), &schema)?;
     write_dataframe_group_streaming(
         parent,
         "obs",
@@ -84,6 +97,8 @@ pub(super) fn write_obs_streaming_or_eager(
         reader.obs_shards(),
         n_rows_kept,
         keep_mask_opt,
+        &needs_nullable,
+        sink,
     )
 }
 
@@ -92,16 +107,30 @@ pub(super) fn write_obs_streaming_or_eager(
 pub(super) fn write_var_streaming_or_eager(
     parent: &hdf5::Group,
     reader: &ScxReader,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if reader.var_metadata_shard_count() == 0 {
-        if let Ok(var) = reader.read_var() {
-            write_dataframe_group_at(parent, "var", &var)?;
+        match reader.read_var() {
+            Ok(var) => {
+                write_dataframe_group_at(parent, "var", &var, sink)?;
+            }
+            // Mirror the obs path: tolerate only an absent section;
+            // propagate decode / schema / IO failures so a corrupt var
+            // section fails the conversion instead of producing a
+            // malformed h5ad.
+            Err(ScxError::SectionNotFound(_)) => {}
+            Err(e) => {
+                return Err(ConvertError::Other(format!(
+                    "failed to read var section for h5ad export: {e}"
+                )));
+            }
         }
         return Ok(());
     }
 
     let schema = reader.read_var_schema_logical_lossy()?;
     let n_rows_total = reader.n_vars() as usize;
+    let needs_nullable = scan_nullable_columns(reader.var_shards(), &schema)?;
     write_dataframe_group_streaming(
         parent,
         "var",
@@ -109,6 +138,8 @@ pub(super) fn write_var_streaming_or_eager(
         reader.var_shards(),
         n_rows_total,
         None,
+        &needs_nullable,
+        sink,
     )
 }
 
@@ -183,11 +214,11 @@ pub fn write_scx_to_h5ad_streaming(
 
     // obs. Stream over `ObsMetadataShard` sections when present; fall
     // back to the eager path for legacy single-section `ObsMetadata`.
-    write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref())?;
+    write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref(), sink)?;
 
     // var. Mirror of obs. The keep mask is obs-only (deletion vectors
     // do not filter var), so var streaming never carries a mask.
-    write_var_streaming_or_eager(&root, &reader)?;
+    write_var_streaming_or_eager(&root, &reader, sink)?;
 
     // obsm. Obs-axis embeddings must be filtered by the same keep
     // mask as /X and obs so anndata sees consistent row counts.

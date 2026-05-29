@@ -232,3 +232,65 @@ def test_to_h5ad_modality_extract(tmp_dir):
     np.testing.assert_array_equal(
         _dense_from_anndata_x(rna), _dense_from_anndata_x(out)
     )
+
+
+def test_to_h5ad_preserves_nullable_int_and_string(tmp_dir):
+    """Null entries in nullable-integer and string obs columns survive
+    SCX → h5ad export via anndata's `nullable-integer` /
+    `nullable-string-array` group encodings; null floats survive as NaN.
+
+    This is the Patch 2 contract: nulls are no longer silently coerced
+    to `0` / `""`.
+    """
+    import anndata
+    import pandas as pd
+    import pyscx
+    import scipy.sparse as sp
+
+    n_obs, n_vars = 24, 8
+    rng = np.random.default_rng(1)
+    x = sp.csr_matrix(rng.integers(0, 10, (n_obs, n_vars)).astype(np.float32))
+
+    qc_int = pd.array(
+        [None if i % 5 == 0 else i for i in range(n_obs)], dtype="Int32"
+    )
+    qc_str = pd.array(
+        [None if i % 4 == 0 else f"grp{i % 3}" for i in range(n_obs)],
+        dtype="string",
+    )
+    pct = np.arange(n_obs, dtype=np.float32)
+    pct[::3] = np.nan  # explicit NaN floats
+    obs = pd.DataFrame(
+        {"qc_int": qc_int, "qc_str": qc_str, "pct": pct},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_vars)])
+    adata = anndata.AnnData(X=x, obs=obs, var=var)
+
+    scx_path = str(tmp_dir / "nullable.scx")
+    h5ad_out = str(tmp_dir / "nullable.h5ad")
+    pyscx.from_anndata(adata, scx_path)
+    pyscx.to_h5ad(scx_path, h5ad_out)
+
+    out = anndata.read_h5ad(h5ad_out)
+
+    # Nullable integer: dtype stays a pandas nullable integer and the
+    # null mask is preserved (not coerced to 0).
+    assert pd.api.types.is_integer_dtype(out.obs["qc_int"].dtype)
+    np.testing.assert_array_equal(
+        out.obs["qc_int"].isna().to_numpy(),
+        np.array([i % 5 == 0 for i in range(n_obs)]),
+    )
+    for i in range(n_obs):
+        if i % 5 != 0:
+            assert int(out.obs["qc_int"].iloc[i]) == i
+
+    # Nullable string: null mask preserved (not coerced to "").
+    np.testing.assert_array_equal(
+        out.obs["qc_str"].isna().to_numpy(),
+        np.array([i % 4 == 0 for i in range(n_obs)]),
+    )
+
+    # Float nulls survive as NaN (anndata has no nullable-float spec).
+    got_pct = np.asarray(out.obs["pct"], dtype=np.float32)
+    assert np.isnan(got_pct[::3]).all()

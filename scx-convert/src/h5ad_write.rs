@@ -28,9 +28,14 @@ fn vlu(s: &str) -> VarLenUnicode {
 use scx_format::reader::ScxReader;
 
 use super::pipeline::ConvertError;
+use super::warnings::{ConvertWarning, WarningSink};
 
 /// Write an SCX file to h5ad format.
-pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), ConvertError> {
+pub fn write_scx_to_h5ad(
+    scx_path: &Path,
+    h5ad_path: &Path,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
     let reader = ScxReader::open(scx_path)?;
     let file = hdf5::File::create(h5ad_path)?;
 
@@ -61,8 +66,13 @@ pub fn write_scx_to_h5ad(scx_path: &Path, h5ad_path: &Path) -> Result<(), Conver
     // sources both flow through one code path and the DV keep mask
     // is honored.
     let root = file.as_group()?;
-    crate::h5ad_stream_write::write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref())?;
-    crate::h5ad_stream_write::write_var_streaming_or_eager(&root, &reader)?;
+    crate::h5ad_stream_write::write_obs_streaming_or_eager(
+        &root,
+        &reader,
+        keep_mask.as_deref(),
+        sink,
+    )?;
+    crate::h5ad_stream_write::write_var_streaming_or_eager(&root, &reader, sink)?;
 
     // Write obsm (DV-filtered when active — obs-axis rows must match
     // /X and /obs).
@@ -145,9 +155,10 @@ pub(super) fn write_dataframe_group_at(
     parent: &hdf5::Group,
     name: &str,
     batch: &arrow::array::RecordBatch,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let group = parent.group(name).or_else(|_| parent.create_group(name))?;
-    write_dataframe_body(&group, batch)
+    write_dataframe_body(&group, name, batch, sink)
 }
 
 /// Shared body for `write_dataframe_group_at`. Caller is responsible
@@ -159,7 +170,9 @@ pub(super) fn write_dataframe_group_at(
 /// attribute to be present.
 fn write_dataframe_body(
     group: &hdf5::Group,
+    df_name: &str,
     batch: &arrow::array::RecordBatch,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let schema = batch.schema();
     group
@@ -207,8 +220,26 @@ fn write_dataframe_body(
         if Some(field.name()) == index_field_name.as_ref() {
             // Index column → write under the anndata on-disk name and
             // exclude from `column-order` (matches anndata convention).
-            write_column_to_hdf5(group, on_disk_index, col, field.data_type())?;
-        } else if write_column_to_hdf5(group, field.name(), col, field.data_type())? {
+            // anndata requires `_index` to be a plain dataset, so the
+            // nullable-group encoding is disabled for it.
+            write_column_to_hdf5(
+                group,
+                df_name,
+                on_disk_index,
+                col,
+                field.data_type(),
+                false,
+                sink,
+            )?;
+        } else if write_column_to_hdf5(
+            group,
+            df_name,
+            field.name(),
+            col,
+            field.data_type(),
+            true,
+            sink,
+        )? {
             // Only list the column in `column-order` when a dataset
             // was actually created — unsupported types are
             // warn-and-skipped and must not appear in the index.
@@ -324,10 +355,28 @@ fn dict_codes_and_categories_i32(
                     None => -1,
                 })
                 .collect();
-            let values_arr = dict.values().as_string::<i32>();
-            let cats: Vec<VarLenUnicode> = (0..values_arr.len())
-                .map(|i| vlu(values_arr.value(i)))
-                .collect();
+            // Categories may be narrow (`Utf8`) or wide (`LargeUtf8`);
+            // dispatch on the value type like the streaming sibling
+            // `dict_local_codes_and_string_values`.
+            let cats: Vec<VarLenUnicode> = match dict.values().data_type() {
+                DataType::Utf8 => {
+                    let values_arr = dict.values().as_string::<i32>();
+                    (0..values_arr.len())
+                        .map(|i| vlu(values_arr.value(i)))
+                        .collect()
+                }
+                DataType::LargeUtf8 => {
+                    let values_arr = dict.values().as_string::<i64>();
+                    (0..values_arr.len())
+                        .map(|i| vlu(values_arr.value(i)))
+                        .collect()
+                }
+                other => {
+                    return Err(ConvertError::Other(format!(
+                        "column '{name}': unsupported dictionary value type {other:?}"
+                    )));
+                }
+            };
             Ok::<_, ConvertError>((codes, cats))
         }};
     }
@@ -341,16 +390,54 @@ fn dict_codes_and_categories_i32(
         }
     };
     match key_type {
-        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, Utf8>"),
-        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, Utf8>"),
-        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, Utf8>"),
-        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, Utf8>"),
-        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, Utf8>"),
-        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, Utf8>"),
-        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, Utf8>"),
-        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, Utf8>"),
+        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, _>"),
+        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, _>"),
+        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, _>"),
+        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, _>"),
+        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, _>"),
+        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, _>"),
+        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, _>"),
+        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, _>"),
         other => Err(ConvertError::Other(format!(
             "column '{name}': unsupported categorical key type {other:?}"
+        ))),
+    }
+}
+
+/// Collect a `Utf8` / `LargeUtf8` string column into `(values, mask)`:
+/// `values[i]` is the string with null positions filled with `""`, and
+/// `mask[i] == true` ⇔ row `i` is null. Dispatches on the concrete array
+/// type so both narrow (`StringArray`) and wide (`LargeStringArray`)
+/// offsets are handled, mirroring the streaming string writer's
+/// `Utf8 | LargeUtf8` arm.
+fn string_values_and_mask(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<VarLenUnicode>, Vec<bool>), ConvertError> {
+    macro_rules! collect {
+        ($t:ty, $label:literal) => {{
+            let arr = array
+                .as_any()
+                .downcast_ref::<$t>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            let values: Vec<VarLenUnicode> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_valid(i) {
+                        vlu(arr.value(i))
+                    } else {
+                        vlu("")
+                    }
+                })
+                .collect();
+            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+            Ok((values, mask))
+        }};
+    }
+    match array.data_type() {
+        DataType::Utf8 => collect!(arrow::array::StringArray, "Utf8"),
+        DataType::LargeUtf8 => collect!(LargeStringArray, "LargeUtf8"),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': expected Utf8/LargeUtf8, got {other:?}"
         ))),
     }
 }
@@ -361,11 +448,25 @@ fn dict_codes_and_categories_i32(
 /// uses the boolean to decide whether to add `name` to `column-order`
 /// — adding a name without a backing dataset breaks
 /// `anndata.read_h5ad`'s lookup.
+///
+/// `allow_nullable_group` is `false` for the pandas index column
+/// (`_index`), which anndata requires to be a plain dataset, never a
+/// nullable group. For every other column, integer / string columns
+/// that actually contain nulls are written using anndata's
+/// `nullable-integer` / `nullable-string-array` group encodings
+/// (`values` + `mask`), preserving null state; null-free columns stay
+/// plain datasets (byte-identical to the pre-fix output). Floats are
+/// always plain datasets with `NaN` at null positions — anndata has no
+/// `nullable-float` encoding, so `NaN` is the canonical missing-float
+/// representation.
 fn write_column_to_hdf5(
     group: &hdf5::Group,
+    df_name: &str,
     name: &str,
     array: &dyn Array,
     dtype: &DataType,
+    allow_nullable_group: bool,
+    sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
     match dtype {
         DataType::Int32 => {
@@ -373,31 +474,51 @@ fn write_column_to_hdf5(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| downcast_err(name, "Int32"))?;
-            let values: Vec<i32> = arr.iter().map(|v| v.unwrap_or(0)).collect();
-            group
-                .new_dataset::<i32>()
-                .shape([values.len()])
-                .create(name)?
-                .write(&values)?;
+            if allow_nullable_group && arr.null_count() > 0 {
+                let values: Vec<i32> = (0..arr.len())
+                    .map(|i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                    .collect();
+                let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+                write_nullable_group(group, name, &values, &mask, "nullable-integer")?;
+            } else {
+                warn_index_coerced_nulls(sink, df_name, name, "Int32", arr, allow_nullable_group);
+                let values: Vec<i32> = arr.iter().map(|v| v.unwrap_or(0)).collect();
+                group
+                    .new_dataset::<i32>()
+                    .shape([values.len()])
+                    .create(name)?
+                    .write(&values)?;
+            }
         }
         DataType::Int64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| downcast_err(name, "Int64"))?;
-            let values: Vec<i64> = arr.iter().map(|v| v.unwrap_or(0)).collect();
-            group
-                .new_dataset::<i64>()
-                .shape([values.len()])
-                .create(name)?
-                .write(&values)?;
+            if allow_nullable_group && arr.null_count() > 0 {
+                let values: Vec<i64> = (0..arr.len())
+                    .map(|i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                    .collect();
+                let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+                write_nullable_group(group, name, &values, &mask, "nullable-integer")?;
+            } else {
+                warn_index_coerced_nulls(sink, df_name, name, "Int64", arr, allow_nullable_group);
+                let values: Vec<i64> = arr.iter().map(|v| v.unwrap_or(0)).collect();
+                group
+                    .new_dataset::<i64>()
+                    .shape([values.len()])
+                    .create(name)?
+                    .write(&values)?;
+            }
         }
         DataType::Float32 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| downcast_err(name, "Float32"))?;
-            let values: Vec<f32> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
+            // NaN is anndata's canonical missing-float value — lossless,
+            // unlike the prior `0.0` coercion.
+            let values: Vec<f32> = arr.iter().map(|v| v.unwrap_or(f32::NAN)).collect();
             group
                 .new_dataset::<f32>()
                 .shape([values.len()])
@@ -409,24 +530,30 @@ fn write_column_to_hdf5(
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| downcast_err(name, "Float64"))?;
-            let values: Vec<f64> = arr.iter().map(|v| v.unwrap_or(0.0)).collect();
+            let values: Vec<f64> = arr.iter().map(|v| v.unwrap_or(f64::NAN)).collect();
             group
                 .new_dataset::<f64>()
                 .shape([values.len()])
                 .create(name)?
                 .write(&values)?;
         }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| downcast_err(name, "Utf8"))?;
-            let values: Vec<VarLenUnicode> = arr.iter().map(|v| vlu(v.unwrap_or(""))).collect();
-            group
-                .new_dataset::<VarLenUnicode>()
-                .shape([values.len()])
-                .create(name)?
-                .write(&values)?;
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // Handle both narrow (`StringArray`, i32 offsets) and wide
+            // (`LargeStringArray`, i64 offsets) string columns; the eager
+            // assembled-obs path can legitimately carry either, matching
+            // the streaming writer's `Utf8 | LargeUtf8` handling.
+            let (values, mask) = string_values_and_mask(array, name)?;
+            let null_count = mask.iter().filter(|&&m| m).count();
+            if allow_nullable_group && null_count > 0 {
+                write_nullable_group(group, name, &values, &mask, "nullable-string-array")?;
+            } else {
+                warn_index_coerced_nulls(sink, df_name, name, "Utf8", array, allow_nullable_group);
+                group
+                    .new_dataset::<VarLenUnicode>()
+                    .shape([values.len()])
+                    .create(name)?
+                    .write(&values)?;
+            }
         }
         DataType::Boolean => {
             let arr = array
@@ -473,7 +600,9 @@ fn write_column_to_hdf5(
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.1.0"))?;
         }
-        DataType::Dictionary(_key_type, value_type) if **value_type == DataType::Utf8 => {
+        DataType::Dictionary(_key_type, value_type)
+            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
             // Modern anndata categorical (encoding-version 0.2.0):
             // write as a group with `codes` + `categories` as
             // separate datasets, NOT as a `categories` attribute on
@@ -520,11 +649,69 @@ fn write_column_to_hdf5(
                 .write_scalar(&false)?;
         }
         _ => {
-            eprintln!("warning: skipping column '{name}' with unsupported type {dtype:?}");
+            sink.emit(ConvertWarning::UnsupportedExportColumn {
+                column: format!("{df_name}/{name}"),
+                dtype: format!("{dtype:?}"),
+            });
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Write an anndata nullable group (`encoding-type` ∈ {`nullable-integer`,
+/// `nullable-string-array`}, version `0.1.0`): a subgroup with a `values`
+/// dataset (null positions filled with `0` / `""`) and a boolean `mask`
+/// dataset (`mask[i] == true` ⇔ null). Byte-for-byte the shape anndata's
+/// `write_nullable` emits and `_read_nullable` consumes. Generic over the
+/// HDF5 element type so the same helper serves integer and string values.
+fn write_nullable_group<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    values: &[T],
+    mask: &[bool],
+    encoding_type: &str,
+) -> Result<(), ConvertError> {
+    let g = group.create_group(name)?;
+    g.new_dataset::<T>()
+        .shape([values.len()])
+        .create("values")?
+        .write(values)?;
+    g.new_dataset::<bool>()
+        .shape([mask.len()])
+        .create("mask")?
+        .write(mask)?;
+    g.new_attr::<VarLenUnicode>()
+        .create("encoding-type")?
+        .write_scalar(&vlu(encoding_type))?;
+    g.new_attr::<VarLenUnicode>()
+        .create("encoding-version")?
+        .write_scalar(&vlu("0.1.0"))?;
+    Ok(())
+}
+
+/// Surface the one residual null-coercion case: the pandas index column
+/// (`_index`), which anndata requires to be a plain dataset and so can
+/// never use a nullable group. Indexes virtually never carry nulls, but
+/// if one does its null becomes `0` / `""` — emit
+/// [`ConvertWarning::CoercedNulls`] so that is visible. No-op for
+/// non-index columns (`allow_nullable_group == true`) or when there are
+/// no nulls.
+fn warn_index_coerced_nulls(
+    sink: &mut WarningSink,
+    df_name: &str,
+    col_name: &str,
+    dtype: &str,
+    array: &dyn Array,
+    allow_nullable_group: bool,
+) {
+    if !allow_nullable_group && array.null_count() > 0 {
+        sink.emit(ConvertWarning::CoercedNulls {
+            column: format!("{df_name}/{col_name}"),
+            dtype: dtype.to_string(),
+            count: array.null_count() as u64,
+        });
+    }
 }
 
 fn write_obsm_entry(
@@ -568,6 +755,55 @@ fn write_obsm_entry(
     Ok(())
 }
 
+/// Pre-scan metadata shards to decide which integer / string columns
+/// need anndata's nullable group encoding. Returns a `Vec` aligned with
+/// `schema.fields()`: `true` ⇔ the field is an `Int32` / `Int64` /
+/// `Utf8` / `LargeUtf8` column that actually contains ≥1 null across the
+/// shards. Float and every other type always map to `false` — floats use
+/// `NaN`, and bool / categorical already preserve nulls.
+///
+/// The streaming writer must allocate each HDF5 dataset (plain vs.
+/// nullable group) before it sees any shard data, so this exact
+/// null-presence signal cannot be derived from the static schema (Arrow
+/// field nullability is set unconditionally by pandas → Arrow). The cost
+/// is one extra decode pass over the metadata-only shards.
+pub(super) fn scan_nullable_columns<I>(
+    shards: I,
+    schema: &Schema,
+) -> Result<Vec<bool>, ConvertError>
+where
+    I: IntoIterator<Item = Result<RecordBatch, scx_format::error::ScxError>>,
+{
+    let eligible: Vec<bool> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            matches!(
+                f.data_type(),
+                DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::LargeUtf8
+            )
+        })
+        .collect();
+    let mut needs = vec![false; schema.fields().len()];
+    for batch_result in shards {
+        let batch = batch_result?;
+        for i in 0..schema.fields().len() {
+            if eligible[i]
+                && !needs[i]
+                && i < batch.num_columns()
+                && batch.column(i).null_count() > 0
+            {
+                needs[i] = true;
+            }
+        }
+        // Early exit once every eligible column is already flagged.
+        if eligible.iter().zip(&needs).all(|(e, n)| !e || *n) {
+            break;
+        }
+    }
+    Ok(needs)
+}
+
 /// Streaming counterpart of [`write_dataframe_group_at`]. Pre-allocates
 /// one HDF5 dataset per column at fixed size `n_rows_kept`, then drains
 /// `shards` and hyperslab-writes the kept-row slice of each column.
@@ -587,6 +823,16 @@ fn write_obsm_entry(
 /// `keep_mask_opt` is the global (length `n_obs`) deletion-vector keep
 /// mask; `None` means no filtering. The mask is indexed by global row,
 /// so this is consumed only on the obs axis (var has no DV).
+///
+/// `needs_nullable` is aligned with `schema.fields()`: when
+/// `needs_nullable[i]` is `true`, the integer / string column at field
+/// `i` is written with anndata's `nullable-integer` /
+/// `nullable-string-array` group encoding (it contains nulls); otherwise
+/// it is written as a plain dataset. Computed up front by
+/// [`crate::h5ad_stream_write::scan_nullable_columns`] because the HDF5
+/// datasets must be allocated before any shard is seen. Float columns
+/// ignore this flag (always plain datasets with `NaN` at nulls).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_dataframe_group_streaming<I>(
     parent: &hdf5::Group,
     name: &str,
@@ -594,6 +840,8 @@ pub(super) fn write_dataframe_group_streaming<I>(
     shards: I,
     n_rows_kept: usize,
     keep_mask_opt: Option<&[bool]>,
+    needs_nullable: &[bool],
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError>
 where
     I: IntoIterator<Item = Result<RecordBatch, scx_format::error::ScxError>>,
@@ -647,8 +895,16 @@ where
         } else {
             field.name()
         };
-        let writer = create_column_writer(&group, on_disk_name, field, n_rows_kept)?;
-        if !is_index && !matches!(writer, ColumnStreamWriter::Unsupported) {
+        // The index column is forced to a plain dataset (anndata requires
+        // `_index` to be a plain dataset, never a nullable group).
+        let want_nullable = !is_index && needs_nullable.get(col_idx).copied().unwrap_or(false);
+        let writer = create_column_writer(&group, on_disk_name, field, n_rows_kept, want_nullable)?;
+        if matches!(writer, ColumnStreamWriter::Unsupported) {
+            sink.emit(ConvertWarning::UnsupportedExportColumn {
+                column: format!("{name}/{}", field.name()),
+                dtype: format!("{:?}", field.data_type()),
+            });
+        } else if !is_index {
             col_order.push(vlu(field.name()));
         }
         col_writers.push((col_idx, writer));
@@ -672,13 +928,13 @@ where
         let batch = batch_result?;
         let n_shard_rows = batch.num_rows();
 
-        if batch.num_columns() != schema.fields().len() {
-            return Err(ConvertError::Other(format!(
-                "shard schema mismatch for '{name}': schema has {} fields, batch has {}",
-                schema.fields().len(),
-                batch.num_columns()
-            )));
-        }
+        // Validate the shard's schema against the declared dataframe
+        // schema before touching any HDF5 dataset. A producer that
+        // emits the right column *count* but reordered or retyped
+        // columns would otherwise write values into the wrong
+        // hyperslab — the streaming path is part of the trust boundary
+        // for pipeline-generated files, so this fails loudly instead.
+        validate_shard_schema(schema, &batch, name)?;
 
         // Prefer the stamped `row_start` over cumulative counting so
         // out-of-order producers fail loudly instead of writing into
@@ -768,9 +1024,72 @@ fn column_writer_offset(writer: &ColumnStreamWriter) -> Option<usize> {
         | ColumnStreamWriter::Float64 { offset, .. }
         | ColumnStreamWriter::Utf8 { offset, .. }
         | ColumnStreamWriter::Boolean { offset, .. }
-        | ColumnStreamWriter::Categorical { offset, .. } => Some(*offset),
+        | ColumnStreamWriter::Categorical { offset, .. }
+        | ColumnStreamWriter::Nullable { offset, .. } => Some(*offset),
         ColumnStreamWriter::Unsupported => None,
     }
+}
+
+/// Validate a per-shard `RecordBatch` against the declared dataframe
+/// `schema`: same column count, same field names in the same order,
+/// and logically-compatible data types. This is the streaming
+/// counterpart of the assembly-time validation in
+/// `assemble_sharded_metadata` — `obs_shards()` yields raw shards
+/// lazily and skips that assembly, so without this a reordered or
+/// retyped shard would silently land in the wrong HDF5 column.
+fn validate_shard_schema(
+    schema: &Schema,
+    batch: &RecordBatch,
+    name: &str,
+) -> Result<(), ConvertError> {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(ConvertError::Other(format!(
+            "shard schema mismatch for '{name}': schema has {} fields, batch has {}",
+            schema.fields().len(),
+            batch.num_columns()
+        )));
+    }
+    let batch_schema = batch.schema();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let shard_field = batch_schema.field(i);
+        if shard_field.name() != field.name() {
+            return Err(ConvertError::Other(format!(
+                "shard schema mismatch for '{name}': column {i} is '{}' in the dataframe \
+                 schema but '{}' in the shard (columns must match by name and order)",
+                field.name(),
+                shard_field.name(),
+            )));
+        }
+        if !logical_type_compatible(field.data_type(), shard_field.data_type()) {
+            return Err(ConvertError::Other(format!(
+                "shard schema mismatch for '{name}': column '{}' is {:?} in the dataframe \
+                 schema but {:?} in the shard",
+                field.name(),
+                field.data_type(),
+                shard_field.data_type(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// True when a per-shard column type is interchangeable with the
+/// declared schema type for the purpose of streaming export. Exact
+/// equality always passes; additionally `Utf8`/`LargeUtf8` are treated
+/// as equivalent and `Dictionary(_, Utf8|LargeUtf8)` are equivalent
+/// regardless of key width — per-shard batches legitimately carry the
+/// wide string / wide dictionary forms even when the schema says narrow
+/// (the column writers dispatch on both at runtime).
+fn logical_type_compatible(schema_dt: &DataType, shard_dt: &DataType) -> bool {
+    fn is_string_like(t: &DataType) -> bool {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8)
+    }
+    fn is_dict_string(t: &DataType) -> bool {
+        matches!(t, DataType::Dictionary(_, v) if is_string_like(v.as_ref()))
+    }
+    schema_dt == shard_dt
+        || (is_string_like(schema_dt) && is_string_like(shard_dt))
+        || (is_dict_string(schema_dt) && is_dict_string(shard_dt))
 }
 
 /// Per-column streaming writer state. Pre-allocated HDF5 datasets +
@@ -816,7 +1135,62 @@ enum ColumnStreamWriter {
         dict: HashMap<String, i32>,
         cat_order: Vec<String>,
     },
+    /// anndata `nullable-integer` / `nullable-string-array` group: a
+    /// `values` dataset (nulls filled with `0` / `""`) + a boolean `mask`
+    /// (`mask[i] == true` ⇔ null). Allocated only when a pre-scan found
+    /// the column actually contains nulls, so null-free columns stay
+    /// plain datasets. `kind` selects the Arrow downcast / value dtype.
+    Nullable {
+        kind: NullableKind,
+        // Held so the group outlives the borrowed `values_ds`/`mask_ds`.
+        #[allow(dead_code)]
+        group: hdf5::Group,
+        values_ds: hdf5::Dataset,
+        mask_ds: hdf5::Dataset,
+        offset: usize,
+    },
     Unsupported,
+}
+
+/// Value dtype of a [`ColumnStreamWriter::Nullable`] column.
+#[derive(Clone, Copy)]
+enum NullableKind {
+    Int32,
+    Int64,
+    String,
+}
+
+/// Pre-allocate an anndata nullable group (`values` + `mask` datasets +
+/// encoding attrs) for the streaming path. Generic over the HDF5 value
+/// element type so it serves both `nullable-integer` (i32/i64) and
+/// `nullable-string-array` (`VarLenUnicode`). The streaming sibling of
+/// [`write_nullable_group`].
+fn create_nullable_writer<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    on_disk_name: &str,
+    n_rows_kept: usize,
+    encoding_type: &str,
+    kind: NullableKind,
+) -> Result<ColumnStreamWriter, ConvertError> {
+    let g = group.create_group(on_disk_name)?;
+    let values_ds = g.new_dataset::<T>().shape([n_rows_kept]).create("values")?;
+    let mask_ds = g
+        .new_dataset::<bool>()
+        .shape([n_rows_kept])
+        .create("mask")?;
+    g.new_attr::<VarLenUnicode>()
+        .create("encoding-type")?
+        .write_scalar(&vlu(encoding_type))?;
+    g.new_attr::<VarLenUnicode>()
+        .create("encoding-version")?
+        .write_scalar(&vlu("0.1.0"))?;
+    Ok(ColumnStreamWriter::Nullable {
+        kind,
+        group: g,
+        values_ds,
+        mask_ds,
+        offset: 0,
+    })
 }
 
 fn create_column_writer(
@@ -824,9 +1198,19 @@ fn create_column_writer(
     on_disk_name: &str,
     field: &Field,
     n_rows_kept: usize,
+    want_nullable: bool,
 ) -> Result<ColumnStreamWriter, ConvertError> {
     match field.data_type() {
         DataType::Int32 => {
+            if want_nullable {
+                return create_nullable_writer::<i32>(
+                    group,
+                    on_disk_name,
+                    n_rows_kept,
+                    "nullable-integer",
+                    NullableKind::Int32,
+                );
+            }
             let ds = group
                 .new_dataset::<i32>()
                 .shape([n_rows_kept])
@@ -834,6 +1218,15 @@ fn create_column_writer(
             Ok(ColumnStreamWriter::Int32 { ds, offset: 0 })
         }
         DataType::Int64 => {
+            if want_nullable {
+                return create_nullable_writer::<i64>(
+                    group,
+                    on_disk_name,
+                    n_rows_kept,
+                    "nullable-integer",
+                    NullableKind::Int64,
+                );
+            }
             let ds = group
                 .new_dataset::<i64>()
                 .shape([n_rows_kept])
@@ -855,6 +1248,15 @@ fn create_column_writer(
             Ok(ColumnStreamWriter::Float64 { ds, offset: 0 })
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
+            if want_nullable {
+                return create_nullable_writer::<VarLenUnicode>(
+                    group,
+                    on_disk_name,
+                    n_rows_kept,
+                    "nullable-string-array",
+                    NullableKind::String,
+                );
+            }
             let ds = group
                 .new_dataset::<VarLenUnicode>()
                 .shape([n_rows_kept])
@@ -903,14 +1305,11 @@ fn create_column_writer(
                 cat_order: Vec::new(),
             })
         }
-        other => {
+        _ => {
             // Mirrors `write_column_to_hdf5`'s warn-and-skip arm so the
             // streaming and eager paths behave identically on
-            // unsupported types.
-            eprintln!(
-                "warning: skipping column '{}' with unsupported type {other:?}",
-                field.name()
-            );
+            // unsupported types. The `UnsupportedExportColumn` warning
+            // is emitted by the caller (which holds the `WarningSink`).
             Ok(ColumnStreamWriter::Unsupported)
         }
     }
@@ -960,7 +1359,13 @@ fn append_shard_to_column(
                 .ok_or_else(|| downcast_err(name, "Float32"))?;
             let values: Vec<f32> = kept_local
                 .iter()
-                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0.0 })
+                .map(|&i| {
+                    if arr.is_valid(i) {
+                        arr.value(i)
+                    } else {
+                        f32::NAN
+                    }
+                })
                 .collect();
             ds.write_slice(
                 ArrayView1::from(values.as_slice()),
@@ -975,7 +1380,13 @@ fn append_shard_to_column(
                 .ok_or_else(|| downcast_err(name, "Float64"))?;
             let values: Vec<f64> = kept_local
                 .iter()
-                .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0.0 })
+                .map(|&i| {
+                    if arr.is_valid(i) {
+                        arr.value(i)
+                    } else {
+                        f64::NAN
+                    }
+                })
                 .collect();
             ds.write_slice(
                 ArrayView1::from(values.as_slice()),
@@ -1100,6 +1511,97 @@ fn append_shard_to_column(
                 ndarray::s![*offset..*offset + kept_codes.len()],
             )?;
             *offset += kept_codes.len();
+        }
+        ColumnStreamWriter::Nullable {
+            kind,
+            values_ds,
+            mask_ds,
+            offset,
+            ..
+        } => {
+            let mask: Vec<bool> = kept_local.iter().map(|&i| !array.is_valid(i)).collect();
+            match kind {
+                NullableKind::Int32 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| downcast_err(name, "Int32"))?;
+                    let values: Vec<i32> = kept_local
+                        .iter()
+                        .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                        .collect();
+                    values_ds.write_slice(
+                        ArrayView1::from(values.as_slice()),
+                        ndarray::s![*offset..*offset + values.len()],
+                    )?;
+                }
+                NullableKind::Int64 => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| downcast_err(name, "Int64"))?;
+                    let values: Vec<i64> = kept_local
+                        .iter()
+                        .map(|&i| if arr.is_valid(i) { arr.value(i) } else { 0 })
+                        .collect();
+                    values_ds.write_slice(
+                        ArrayView1::from(values.as_slice()),
+                        ndarray::s![*offset..*offset + values.len()],
+                    )?;
+                }
+                NullableKind::String => {
+                    // Per-shard arrays may be Utf8 or LargeUtf8 (mirrors the
+                    // plain `Utf8` writer arm).
+                    let values: Vec<VarLenUnicode> = match array.data_type() {
+                        DataType::Utf8 => {
+                            let arr = array
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| downcast_err(name, "Utf8"))?;
+                            kept_local
+                                .iter()
+                                .map(|&i| {
+                                    if arr.is_valid(i) {
+                                        vlu(arr.value(i))
+                                    } else {
+                                        vlu("")
+                                    }
+                                })
+                                .collect()
+                        }
+                        DataType::LargeUtf8 => {
+                            let arr = array
+                                .as_any()
+                                .downcast_ref::<LargeStringArray>()
+                                .ok_or_else(|| downcast_err(name, "LargeUtf8"))?;
+                            kept_local
+                                .iter()
+                                .map(|&i| {
+                                    if arr.is_valid(i) {
+                                        vlu(arr.value(i))
+                                    } else {
+                                        vlu("")
+                                    }
+                                })
+                                .collect()
+                        }
+                        other => {
+                            return Err(ConvertError::Other(format!(
+                                "column '{name}': expected Utf8/LargeUtf8, got {other:?}"
+                            )));
+                        }
+                    };
+                    values_ds.write_slice(
+                        ArrayView1::from(values.as_slice()),
+                        ndarray::s![*offset..*offset + values.len()],
+                    )?;
+                }
+            }
+            mask_ds.write_slice(
+                ArrayView1::from(mask.as_slice()),
+                ndarray::s![*offset..*offset + mask.len()],
+            )?;
+            *offset += mask.len();
         }
         ColumnStreamWriter::Unsupported => {
             // Warning emitted once at writer creation; per-shard

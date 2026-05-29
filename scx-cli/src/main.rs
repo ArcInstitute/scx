@@ -1104,7 +1104,7 @@ fn dispatch_convert(
                 if opts.stream {
                     convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
                 } else {
-                    convert::scx_modality_to_h5ad(input, output, name)
+                    convert::scx_modality_to_h5ad(input, output, name, &mut sink)
                 }
             }
             None => {
@@ -1135,7 +1135,7 @@ fn dispatch_convert(
             if opts.stream {
                 convert::scx_to_h5mu_streaming(input, output, &opts, &mut sink)
             } else {
-                convert::scx_to_h5mu(input, output)
+                convert::scx_to_h5mu(input, output, &mut sink)
             }
         }
         _ => unreachable!(),

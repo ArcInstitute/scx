@@ -106,6 +106,27 @@ pub enum ConvertWarning {
         estimated_bytes: u64,
         budget_bytes: u64,
     },
+    /// SCX → h5ad export coerced null entries in an obs/var column to a
+    /// sentinel value (`0` / `""`) because the column cannot carry a null
+    /// mask. Regular integer / string columns now round-trip losslessly
+    /// via anndata's `nullable-integer` / `nullable-string-array` group
+    /// encodings, and floats use `NaN`; `nullable-boolean` and
+    /// `categorical` columns preserve null state too. This warning is
+    /// therefore limited to the pandas index column (`_index`), which
+    /// anndata requires to be a plain dataset and so can never use a
+    /// nullable group — its nulls (virtually never present) coerce to
+    /// `0` / `""`. The column's non-null values are written faithfully.
+    CoercedNulls {
+        column: String,
+        dtype: String,
+        count: u64,
+    },
+    /// A dataframe column type is not supported by the SCX → h5ad
+    /// writer and was skipped (no dataset written, name excluded from
+    /// `column-order`). Replaces the prior `eprintln!` so Python
+    /// callers can intercept via `warnings.warn` and CLI callers get a
+    /// machine-readable per-category count.
+    UnsupportedExportColumn { column: String, dtype: String },
 }
 
 impl ConvertWarning {
@@ -130,6 +151,8 @@ impl ConvertWarning {
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
             Self::MappingPeakFootprintHigh { .. } => "mapping_peak_footprint_high",
             Self::EagerAssemblyMemoryHigh { .. } => "eager_assembly_memory_high",
+            Self::CoercedNulls { .. } => "coerced_nulls",
+            Self::UnsupportedExportColumn { .. } => "unsupported_export_column",
         }
     }
 }
