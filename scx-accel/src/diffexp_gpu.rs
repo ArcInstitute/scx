@@ -3149,7 +3149,6 @@ fn assemble_chunk_diffexp_result(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// GPU DE kernels pass cell indices/offsets to CUDA as `i32` and stage dense
 /// buffers as `n_obs × chunk`. Reject dimensions that overflow the 32-bit index
 /// space or the `usize` element-count product before any device allocation, so
@@ -3166,7 +3165,10 @@ fn validate_gpu_de_dims(n_obs: usize, n_vars: usize) -> Result<usize> {
         )));
     }
     n_obs.checked_mul(n_vars).ok_or_else(|| {
-        AccelError::InvalidInput(format!("n_obs {n_obs} × n_vars {n_vars} overflows usize"))
+        AccelError::InvalidInput(format!(
+            "n_obs {n_obs} × n_vars {n_vars} overflows usize; use the CPU \
+             differential-expression path for datasets of this size."
+        ))
     })
 }
 
@@ -3181,6 +3183,7 @@ fn checked_offset_i32(v: usize, ctx: &str) -> Result<i32> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_pdex_inputs(
     data_len: Option<usize>,
     n_obs: usize,
