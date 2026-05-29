@@ -65,7 +65,7 @@ pub fn pdex_ref_gpu_dense(
     epsilon: f64,
 ) -> Result<PdexRefResult> {
     validate_pdex_inputs(
-        data.len(),
+        Some(data.len()),
         n_obs,
         n_vars,
         gene_names.len(),
@@ -113,7 +113,7 @@ pub fn pdex_ref_gpu_sparse(
 ) -> Result<PdexRefResult> {
     let (n_obs, n_vars) = csr.shape;
     validate_pdex_inputs(
-        n_obs * n_vars, // length match
+        None, // no dense buffer (sparse) — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -202,7 +202,7 @@ pub fn pdex_ref_gpu_streaming(
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
     validate_pdex_inputs(
-        n_obs * n_vars,
+        None, // no dense buffer — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -302,7 +302,13 @@ pub fn wilcoxon_rank_sum_gpu_dense(
     rankby_abs: bool,
     tie_correct: bool,
 ) -> Result<DiffExpResult> {
-    validate_wilcoxon_inputs(data.len(), n_obs, n_vars, gene_names.len(), groups.len())?;
+    validate_wilcoxon_inputs(
+        Some(data.len()),
+        n_obs,
+        n_vars,
+        gene_names.len(),
+        groups.len(),
+    )?;
 
     let dev = open_device(device_id)?;
     let chunk_size = n_vars.min(default_gpu_de_gene_chunk_size(&dev, n_obs, n_obs));
@@ -341,7 +347,7 @@ pub fn wilcoxon_rank_sum_gpu_sparse(
 ) -> Result<DiffExpResult> {
     let (n_obs, n_vars) = csr.shape;
     validate_wilcoxon_inputs(
-        n_obs * n_vars,
+        None, // no dense buffer — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -389,7 +395,7 @@ pub fn wilcoxon_rank_sum_gpu_streaming(
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
     validate_wilcoxon_inputs(
-        n_obs * n_vars,
+        None, // no dense buffer — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -439,7 +445,7 @@ pub fn pdex_ref_gpu_lazy(
     let n_obs = source.n_obs();
     let n_vars = source.n_vars();
     validate_pdex_inputs(
-        n_obs * n_vars,
+        None, // no dense buffer — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -523,7 +529,7 @@ pub fn wilcoxon_rank_sum_gpu_lazy(
     let n_obs = source.n_obs();
     let n_vars = source.n_vars();
     validate_wilcoxon_inputs(
-        n_obs * n_vars,
+        None, // no dense buffer — dim guard still runs in the validator
         n_obs,
         n_vars,
         gene_names.len(),
@@ -976,10 +982,16 @@ where
     let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
     offsets_host.push(0);
     all_cells_host.extend(ref_idx_i32.iter().copied());
-    offsets_host.push(all_cells_host.len() as i32);
+    offsets_host.push(checked_offset_i32(
+        all_cells_host.len(),
+        "GPU DE cell-permutation offsets",
+    )?);
     for cells in &group_idx_i32 {
         all_cells_host.extend(cells.iter().copied());
-        offsets_host.push(all_cells_host.len() as i32);
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "GPU DE cell-permutation offsets",
+        )?);
     }
     let d_all_cells = dev
         .htod_copy(&all_cells_host)
@@ -1468,10 +1480,16 @@ fn pdex_ref_gpu_chunked_v2<S: GpuShardSource>(
     let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
     offsets_host.push(0);
     all_cells_host.extend(ref_idx_i32.iter().copied());
-    offsets_host.push(all_cells_host.len() as i32);
+    offsets_host.push(checked_offset_i32(
+        all_cells_host.len(),
+        "GPU DE cell-permutation offsets",
+    )?);
     for cells in &group_idx_i32 {
         all_cells_host.extend(cells.iter().copied());
-        offsets_host.push(all_cells_host.len() as i32);
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "GPU DE cell-permutation offsets",
+        )?);
     }
     let d_all_cells = dev
         .htod_copy(&all_cells_host)
@@ -1896,10 +1914,16 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
     let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
     offsets_host.push(0);
     all_cells_host.extend(ref_idx_i32.iter().copied());
-    offsets_host.push(all_cells_host.len() as i32);
+    offsets_host.push(checked_offset_i32(
+        all_cells_host.len(),
+        "GPU DE cell-permutation offsets",
+    )?);
     for cells in &group_idx_i32 {
         all_cells_host.extend(cells.iter().copied());
-        offsets_host.push(all_cells_host.len() as i32);
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "GPU DE cell-permutation offsets",
+        )?);
     }
     let mode_id = geom_mean_mode_id(mode);
 
@@ -2219,10 +2243,16 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
     let mut offsets_host: Vec<i32> = Vec::with_capacity(n_groups_for_means + 1);
     offsets_host.push(0);
     all_cells_host.extend(ref_idx_i32.iter().copied());
-    offsets_host.push(all_cells_host.len() as i32);
+    offsets_host.push(checked_offset_i32(
+        all_cells_host.len(),
+        "GPU DE cell-permutation offsets",
+    )?);
     for cells in &group_idx_i32 {
         all_cells_host.extend(cells.iter().copied());
-        offsets_host.push(all_cells_host.len() as i32);
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "GPU DE cell-permutation offsets",
+        )?);
     }
     let mode_id = geom_mean_mode_id(mode);
 
@@ -2576,7 +2606,10 @@ where
     offsets_host.push(0);
     for cells in &wilcoxon_cells_by_group {
         all_cells_host.extend(cells.iter().copied());
-        offsets_host.push(all_cells_host.len() as i32);
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "GPU DE Wilcoxon cell-permutation offsets",
+        )?);
     }
     let d_all_cells = dev
         .htod_copy(&all_cells_host)
@@ -3117,8 +3150,39 @@ fn assemble_chunk_diffexp_result(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// GPU DE kernels pass cell indices/offsets to CUDA as `i32` and stage dense
+/// buffers as `n_obs × chunk`. Reject dimensions that overflow the 32-bit index
+/// space or the `usize` element-count product before any device allocation, so
+/// atlas-scale callers get a clear error pointing at the CPU path instead of
+/// silent integer wraparound. Returns the checked `n_obs × n_vars` product.
+fn validate_gpu_de_dims(n_obs: usize, n_vars: usize) -> Result<usize> {
+    if n_obs > i32::MAX as usize {
+        return Err(AccelError::InvalidInput(format!(
+            "n_obs {n_obs} exceeds the GPU DE limit of i32::MAX ({}); GPU cell \
+             indices are 32-bit. Use the CPU differential-expression path for \
+             datasets with more than {} cells.",
+            i32::MAX,
+            i32::MAX
+        )));
+    }
+    n_obs.checked_mul(n_vars).ok_or_else(|| {
+        AccelError::InvalidInput(format!("n_obs {n_obs} × n_vars {n_vars} overflows usize"))
+    })
+}
+
+/// Checked `usize → i32` for cumulative cell / permutation offsets, which can
+/// exceed `n_obs` (a cell may appear in both the reference and a test group).
+fn checked_offset_i32(v: usize, ctx: &str) -> Result<i32> {
+    i32::try_from(v).map_err(|_| {
+        AccelError::InvalidInput(format!(
+            "{ctx}: cumulative cell offset {v} exceeds i32::MAX ({})",
+            i32::MAX
+        ))
+    })
+}
+
 fn validate_pdex_inputs(
-    data_len: usize,
+    data_len: Option<usize>,
     n_obs: usize,
     n_vars: usize,
     gene_names_len: usize,
@@ -3133,10 +3197,13 @@ fn validate_pdex_inputs(
     if groups_len == 0 {
         return Err(AccelError::InvalidInput("groups is empty".into()));
     }
-    if data_len != n_obs * n_vars {
-        return Err(AccelError::InvalidInput(format!(
-            "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
-        )));
+    let expected = validate_gpu_de_dims(n_obs, n_vars)?;
+    if let Some(data_len) = data_len {
+        if data_len != expected {
+            return Err(AccelError::InvalidInput(format!(
+                "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
+            )));
+        }
     }
     if groups_len != n_obs {
         return Err(AccelError::InvalidInput(format!(
@@ -3162,7 +3229,7 @@ fn validate_pdex_inputs(
 }
 
 fn validate_wilcoxon_inputs(
-    data_len: usize,
+    data_len: Option<usize>,
     n_obs: usize,
     n_vars: usize,
     gene_names_len: usize,
@@ -3174,10 +3241,13 @@ fn validate_wilcoxon_inputs(
     if groups_len == 0 {
         return Err(AccelError::InvalidInput("groups is empty".into()));
     }
-    if data_len != n_obs * n_vars {
-        return Err(AccelError::InvalidInput(format!(
-            "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
-        )));
+    let expected = validate_gpu_de_dims(n_obs, n_vars)?;
+    if let Some(data_len) = data_len {
+        if data_len != expected {
+            return Err(AccelError::InvalidInput(format!(
+                "data length {data_len} != n_obs {n_obs} × n_vars {n_vars}"
+            )));
+        }
     }
     if groups_len != n_obs {
         return Err(AccelError::InvalidInput(format!(
@@ -3208,6 +3278,60 @@ mod tests {
                 }
             }
         };
+    }
+
+    // ---- Synthetic dimension-bound guards (pure, no GPU required) ----
+
+    #[test]
+    fn test_validate_gpu_de_dims_rejects_oversized_n_obs() {
+        // n_obs above i32::MAX cannot be expressed as 32-bit GPU cell indices.
+        let too_many = i32::MAX as usize + 1;
+        let err = validate_gpu_de_dims(too_many, 10).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+        // A normal case returns the checked product.
+        assert_eq!(validate_gpu_de_dims(1_000, 50).unwrap(), 50_000);
+    }
+
+    #[test]
+    fn test_validate_gpu_de_dims_rejects_product_overflow() {
+        // n_obs within i32 but n_obs × n_vars overflows usize.
+        let n_obs = i32::MAX as usize;
+        let n_vars = usize::MAX / 2;
+        let err = validate_gpu_de_dims(n_obs, n_vars).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_checked_offset_i32_boundary() {
+        assert_eq!(
+            checked_offset_i32(i32::MAX as usize, "ctx").unwrap(),
+            i32::MAX
+        );
+        let err = checked_offset_i32(i32::MAX as usize + 1, "ctx").unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_validate_pdex_inputs_enforces_dim_guard_without_buffer() {
+        // No dense buffer (sparse/streaming) still rejects oversized n_obs.
+        let n_obs = i32::MAX as usize + 1;
+        let err = validate_pdex_inputs(None, n_obs, 10, 10, n_obs, 3, 0, 1e-6).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+        // A dense buffer whose length disagrees with n_obs × n_vars still errors.
+        let err = validate_pdex_inputs(Some(99), 10, 10, 10, 10, 3, 0, 1e-6).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+        // Consistent small dims pass.
+        validate_pdex_inputs(Some(100), 10, 10, 10, 10, 3, 0, 1e-6).unwrap();
+    }
+
+    #[test]
+    fn test_validate_wilcoxon_inputs_enforces_dim_guard_without_buffer() {
+        let n_obs = i32::MAX as usize + 1;
+        let err = validate_wilcoxon_inputs(None, n_obs, 10, 10, n_obs).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+        let err = validate_wilcoxon_inputs(Some(99), 10, 10, 10, 10).unwrap_err();
+        assert!(matches!(err, AccelError::InvalidInput(_)), "got {err:?}");
+        validate_wilcoxon_inputs(Some(100), 10, 10, 10, 10).unwrap();
     }
 
     /// Deterministic small fixture: 60 cells × 8 genes, 3 groups (ref +

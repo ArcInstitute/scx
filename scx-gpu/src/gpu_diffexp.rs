@@ -121,6 +121,17 @@ pub struct GpuDeChunkScratch {
     alloc_count: u64,
 }
 
+/// Checked element-count product for GPU DE device allocations. Mirrors the
+/// `gpu_de_block_sort` overflow guard so an atlas-scale dimension fails with a
+/// clear `ShapeMismatch` instead of wrapping into an under-sized buffer.
+fn de_alloc_elems(rows: usize, cols: usize) -> Result<usize, GpuError> {
+    rows.checked_mul(cols)
+        .ok_or_else(|| GpuError::ShapeMismatch {
+            expected: "rows × cols fits in usize".into(),
+            got: format!("rows={rows}, cols={cols}"),
+        })
+}
+
 impl GpuDeChunkScratch {
     /// Allocate scratch buffers sized for `n_obs` cells, up to `chunk_max`
     /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
@@ -133,8 +144,8 @@ impl GpuDeChunkScratch {
         chunk_max: usize,
         n_pool_max: usize,
     ) -> Result<Self, GpuError> {
-        let dense = dev.alloc_zeros::<f32>(n_obs * chunk_max)?;
-        let slab = dev.alloc_zeros::<f32>(chunk_max * n_pool_max)?;
+        let dense = dev.alloc_zeros::<f32>(de_alloc_elems(n_obs, chunk_max)?)?;
+        let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
         // cheap (a few bytes of metadata) and avoids paying VRAM for the
@@ -185,7 +196,7 @@ impl GpuDeChunkScratch {
         }
         // Bump to a round multiple to avoid thrashing on small growths.
         let new_cap = n_pool.next_power_of_two().max(self.slab_capacity * 2);
-        self.slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.slab_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
@@ -225,7 +236,7 @@ impl GpuDeChunkScratch {
             return Ok(());
         }
         let new_cap = n_ref.next_power_of_two().max(self.ref_slab_capacity * 2);
-        self.ref_slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.ref_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.ref_slab_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
@@ -243,7 +254,7 @@ impl GpuDeChunkScratch {
             return Ok(());
         }
         let new_cap = n_g.next_power_of_two().max(self.group_slab_capacity * 2);
-        self.group_slab = dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?;
+        self.group_slab = dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.group_slab_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
@@ -261,7 +272,7 @@ impl GpuDeChunkScratch {
             return Ok(());
         }
         let new_cap = n_groups.next_power_of_two().max(self.sums_capacity * 2);
-        self.sums = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        self.sums = dev.alloc_zeros::<f64>(de_alloc_elems(self.chunk_max, new_cap)?)?;
         self.sums_capacity = new_cap;
         self.alloc_count += 1;
         Ok(())
@@ -288,9 +299,10 @@ impl GpuDeChunkScratch {
         let new_cap = n_test_groups
             .next_power_of_two()
             .max(self.per_group_capacity * 2);
-        self.u_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
-        self.p_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
-        self.tie_per_group = dev.alloc_zeros::<f64>(self.chunk_max * new_cap)?;
+        let elems = de_alloc_elems(self.chunk_max, new_cap)?;
+        self.u_per_group = dev.alloc_zeros::<f64>(elems)?;
+        self.p_per_group = dev.alloc_zeros::<f64>(elems)?;
+        self.tie_per_group = dev.alloc_zeros::<f64>(elems)?;
         self.per_group_capacity = new_cap;
         self.alloc_count += 3;
         Ok(())
@@ -324,7 +336,7 @@ impl GpuDeChunkScratch {
         self.per_tg_pool_slabs.clear();
         for _ in 0..n_test_groups {
             self.per_tg_pool_slabs
-                .push(dev.alloc_zeros::<f32>(self.chunk_max * new_cap)?);
+                .push(dev.alloc_zeros::<f32>(de_alloc_elems(self.chunk_max, new_cap)?)?);
             self.alloc_count += 1;
         }
         self.per_tg_pool_slabs_capacity = new_cap;
@@ -361,14 +373,10 @@ pub fn gpu_de_upload_chunk(
     n_obs: usize,
     chunk_size: usize,
 ) -> Result<(), GpuError> {
-    if dense_host.len() != n_obs * chunk_size {
+    let nelem = de_alloc_elems(n_obs, chunk_size)?;
+    if dense_host.len() != nelem {
         return Err(GpuError::ShapeMismatch {
-            expected: format!(
-                "{} (n_obs={} × chunk_size={})",
-                n_obs * chunk_size,
-                n_obs,
-                chunk_size
-            ),
+            expected: format!("{nelem} (n_obs={n_obs} × chunk_size={chunk_size})"),
             got: format!("{}", dense_host.len()),
         });
     }
@@ -381,7 +389,6 @@ pub fn gpu_de_upload_chunk(
             got: format!("n_obs={n_obs}, chunk_size={chunk_size}"),
         });
     }
-    let nelem = n_obs * chunk_size;
     // CudaSlice supports a slice view via .slice(...) in cudarc 0.19.
     let mut view = scratch.dense.slice_mut(..nelem);
     dev.stream()
@@ -1791,6 +1798,16 @@ pub fn set_de_v3_enabled_override(enabled: Option<bool>) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_de_alloc_elems_rejects_overflow() {
+        // Normal dimensions multiply cleanly.
+        assert_eq!(de_alloc_elems(1_000, 50).unwrap(), 50_000);
+        // A product that overflows usize is rejected up-front with a clear
+        // ShapeMismatch instead of wrapping into an under-sized allocation.
+        let err = de_alloc_elems(usize::MAX, 2).unwrap_err();
+        assert!(matches!(err, GpuError::ShapeMismatch { .. }), "got {err:?}");
+    }
 
     #[test]
     fn test_block_sort_capacity_constant_matches_kernel() {
