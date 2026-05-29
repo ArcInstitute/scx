@@ -45,6 +45,7 @@ use crate::RootCatalog;
 /// build profiles for cross-crate tests.
 #[derive(Default, Debug)]
 pub struct ReaderDebugCounts {
+    pub read_obs: AtomicU64,
     pub read_layer: AtomicU64,
     pub read_layer_for: AtomicU64,
     pub read_obsm: AtomicU64,
@@ -591,6 +592,8 @@ impl ScxReader {
     /// per-shard [`Self::read_obs_shard`] when you can process the
     /// table in chunks.
     pub fn read_obs(&self) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts.read_obs.fetch_add(1, Ordering::Relaxed);
         if self.obs_metadata_shard_count() > 0 {
             self.read_sharded_layout_by_prefix(
                 "obs_metadata/shard_",
