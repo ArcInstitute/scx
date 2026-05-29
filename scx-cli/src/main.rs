@@ -859,8 +859,9 @@ fn run_convert(
     if index_requested && !matches!(direction, "h5ad_to_scx" | "tenx_to_scx" | "h5mu_to_scx") {
         return Err(format!(
             "--index-obs / --index-var / --index-preset are only supported when writing SCX \
-             from h5ad or 10x input; got direction '{direction}'. (For an existing SCX file, \
-             rebuild indexes with `scx compact` / `scx append`, or pyscx.from_anndata.)"
+             from h5ad or 10x input (h5mu → scx accepts them but skips the index build with a \
+             warning); got direction '{direction}'. (For an existing SCX file, rebuild indexes \
+             with `scx compact` / `scx append` / `scx merge`, or pyscx.from_anndata.)"
         )
         .into());
     }

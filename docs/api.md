@@ -376,6 +376,14 @@ Behaviour:
   predicate-index emission entirely — the read path is unimodal-only
   today. The same skip-with-warning applies to multimodal
   `merge` / `append` / `compact`.
+- The flags only build indexes on the SCX-writing ingest directions
+  (`h5ad → scx`, `10x → scx`; `h5mu → scx` accepts them and skips with
+  the warning above). On any other `scx convert` direction —
+  `mtx → scx` and the SCX-export directions `scx → h5ad/h5mu/mtx` —
+  passing `--index-*` is a **hard error** rather than a silent no-op,
+  since those paths cannot build a predicate index. To (re)build an
+  index on an existing SCX file, use `scx compact` / `scx append` /
+  `scx merge` or `pyscx.from_anndata`.
 
 Index presets:
 
