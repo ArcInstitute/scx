@@ -3109,3 +3109,234 @@ fn test_compact_multimodal_layers_streaming() {
     let adt_centered = reader.read_layer_for(2, "centered").unwrap();
     assert_eq!(adt_centered.shape.0, n_obs - 2);
 }
+
+// ---------------------------------------------------------------------------
+// compact --reshape-obs (task 6c): legacy single-section obs → sharded
+// ---------------------------------------------------------------------------
+
+/// Write a single-section-obs SCX file with a caller-chosen
+/// `shard_target_rows` so `compact --reshape-obs` produces multiple obs
+/// shards from a small fixture.
+fn write_single_section_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    shard_target_rows: u32,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64);
+    header.shard_target_rows = shard_target_rows;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+fn no_index_options() -> scx_engine::ConversionPredicateIndexOptions {
+    scx_engine::ConversionPredicateIndexOptions {
+        index_obs: Vec::new(),
+        index_var: Vec::new(),
+        index_preset: None,
+        index_auto_threshold: 0,
+    }
+}
+
+#[test]
+fn compact_reshape_obs_converts_legacy_single_section_to_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, shard_target_rows = 4 → ceil(10/4) = 3 obs shards.
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    // Precondition: input is legacy single-section obs.
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    drop(reader);
+
+    let out = dir.path().join("reshaped.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    // Legacy single `obs` section must be absent (ObsVarLayout forbids mixing).
+    assert!(reader.catalog().get("obs").is_none());
+
+    // obs round-trips intact through the assembled read path.
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+
+    // Provenance records the migration.
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "compact");
+    assert!(last.params_json.contains("\"reshape_obs\":true"));
+}
+
+#[test]
+fn compact_without_reshape_keeps_single_section_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    let out = dir.path().join("compacted.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), false).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    assert_eq!(reader.read_obs().unwrap().num_rows(), 10);
+}
+
+#[test]
+fn compact_reshape_obs_is_idempotent_on_sharded_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    let once = dir.path().join("once.scx");
+    scx_ops::compact_with_index_options(&input, &once, &no_index_options(), true).unwrap();
+    let twice = dir.path().join("twice.scx");
+    scx_ops::compact_with_index_options(&once, &twice, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&twice).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+}
+
+/// Write a two-modality (rna + adt) SCX file with single-section obs and a
+/// caller-chosen `shard_target_rows`, so `compact --reshape-obs` exercises
+/// the multimodal write path (`compact_multimodal`) and produces multiple
+/// obs shards from a small fixture.
+fn write_multimodal_single_section_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+    adt_n_vars: u64,
+    shard_target_rows: u32,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, rna_n_vars);
+    header.shard_target_rows = shard_target_rows;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+    let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn compact_reshape_obs_converts_multimodal_legacy_to_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, shard_target_rows = 4 → ceil(10/4) = 3 obs shards.
+    let input = write_multimodal_single_section_obs_file(&dir, "legacy_mm.scx", 10, 30, 10, 4);
+
+    // Precondition: input is legacy single-section obs.
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    drop(reader);
+
+    let out = dir.path().join("reshaped_mm.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    // Obs migrated to sharded layout; legacy single section is gone.
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    assert!(reader.catalog().get("obs").is_none());
+
+    // Obs round-trips through the assembled multimodal read path.
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+
+    // Both modalities and their CSR data are preserved.
+    let table = reader.modality_table().expect("modality table preserved");
+    assert_eq!(table.entries.len(), 2);
+    for modality_id in 1u8..=2u8 {
+        let csr = reader.read_all_csr_shards_for(modality_id).unwrap();
+        assert_eq!(csr.shape.0, 10, "modality {modality_id} row count");
+    }
+
+    // Provenance records the migration.
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "compact");
+    assert!(last.params_json.contains("\"reshape_obs\":true"));
+}
