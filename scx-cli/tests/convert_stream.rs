@@ -260,6 +260,249 @@ fn convert_stream_skips_unreadable_layer() {
     );
 }
 
+/// Attach a string `obs/cell_type` column (2-value palette) to an
+/// existing h5ad fixture so predicate-index builds have something to
+/// index. Mirrors the convert-layer `create_test_h5ad_with_cell_type`
+/// fixture in `scx-convert/src/tests.rs`.
+fn attach_cell_type_obs(h5ad: &Path, n_obs: usize) {
+    let file = hdf5::File::open_rw(h5ad).unwrap();
+    let obs = file.group("obs").unwrap();
+    let labels = ["A", "B"];
+    let col: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(labels[i % labels.len()])).collect();
+    obs.new_dataset::<VarLenUnicode>()
+        .shape([n_obs])
+        .create("cell_type")
+        .unwrap()
+        .write(&col)
+        .unwrap();
+}
+
+#[test]
+fn convert_index_obs_writes_predicate_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 8);
+    attach_cell_type_obs(&h5ad, 16);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--index-obs",
+            "cell_type",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert --index-obs failed to spawn");
+    assert!(
+        output.status.success(),
+        "convert --index-obs exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let bytes = reader.read_obs_predicate_index_bytes().unwrap();
+    assert!(
+        bytes.is_some(),
+        "expected an obs predicate index section after --index-obs cell_type"
+    );
+}
+
+#[test]
+fn convert_index_obs_missing_column_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 8);
+    attach_cell_type_obs(&h5ad, 16);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--index-obs",
+            "nonexistent_column",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert --index-obs failed to spawn");
+    assert!(
+        !output.status.success(),
+        "a forced missing index column must fail the convert"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nonexistent_column"),
+        "expected the missing column name in the error; got: {stderr}"
+    );
+}
+
+#[test]
+fn convert_unknown_index_preset_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 8);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--index-preset",
+            "bogus",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert --index-preset failed to spawn");
+    assert!(
+        !output.status.success(),
+        "an unknown --index-preset must fail the convert"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("preset"),
+        "expected an unknown-preset error; got: {stderr}"
+    );
+}
+
+#[test]
+fn convert_index_obs_lenient_trailing_comma() {
+    // The CSV parser drops empty tokens (see `parse_index_columns`), so
+    // a trailing comma resolves to just `cell_type` and the convert
+    // succeeds rather than erroring on an empty column name.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 16, 8);
+    attach_cell_type_obs(&h5ad, 16);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--index-obs",
+            "cell_type,",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert --index-obs failed to spawn");
+    assert!(
+        output.status.success(),
+        "a trailing comma should be dropped, not fail: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert!(
+        reader.read_obs_predicate_index_bytes().unwrap().is_some(),
+        "cell_type should still be indexed after dropping the empty token"
+    );
+}
+
+#[test]
+fn convert_index_flags_rejected_on_scx_to_h5ad() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("mid.scx");
+    let out_h5ad = dir.path().join("out.h5ad");
+    create_test_h5ad(&h5ad, 16, 8);
+    attach_cell_type_obs(&h5ad, 16);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    // First produce an SCX file to export from.
+    let status = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("convert h5ad→scx failed to spawn");
+    assert!(status.success(), "setup convert h5ad→scx exited {status}");
+
+    // Index flags are meaningless on an export direction and must be
+    // rejected up front rather than silently ignored.
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--to",
+            "h5ad",
+            "--index-obs",
+            "cell_type",
+            scx_path.to_str().unwrap(),
+            out_h5ad.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert failed to spawn");
+    assert!(
+        !output.status.success(),
+        "index flags on scx→h5ad must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--index-obs") && stderr.contains("scx_to_h5ad"),
+        "expected an index-direction rejection mentioning the direction; got: {stderr}"
+    );
+}
+
+#[test]
+fn convert_index_flags_rejected_on_mtx_to_scx() {
+    // The direction guard fires before any file I/O, so an empty input
+    // directory is enough — the failure must be the index rejection,
+    // not an MTX-parse error.
+    let dir = tempfile::tempdir().unwrap();
+    let mtx_dir = dir.path().join("mtx_in");
+    std::fs::create_dir(&mtx_dir).unwrap();
+    let out = dir.path().join("out.scx");
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let output = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "mtx",
+            "--index-obs",
+            "cell_type",
+            mtx_dir.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("scx convert failed to spawn");
+    assert!(
+        !output.status.success(),
+        "index flags on mtx→scx must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--index-obs") && stderr.contains("mtx_to_scx"),
+        "expected an index-direction rejection mentioning the direction; got: {stderr}"
+    );
+}
+
 #[test]
 fn convert_stream_rejects_h5mu_direction() {
     // We don't need a valid h5mu file — `--from h5mu` selects the

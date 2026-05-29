@@ -837,6 +837,34 @@ fn run_convert(
         other => return Err(format!("invalid --csc value: {other}").into()),
     };
 
+    // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
+    // empty / whitespace-only inputs are treated as no override. Parsed
+    // up front so the direction guard below can reject manual index
+    // flags on conversions that cannot build predicate indexes — before
+    // the `--stream` guard and the mtx early-return, so the user always
+    // gets the specific index-direction message rather than a confusing
+    // proxy error.
+    let index_obs_list = parse_index_columns(index_obs);
+    let index_var_list = parse_index_columns(index_var);
+    let index_preset_value = index_preset.filter(|s| !s.trim().is_empty());
+
+    // Manual predicate-index flags only have an effect on conversions
+    // that write SCX from h5ad / 10x (which build indexes inline) and on
+    // h5mu → scx (which accepts them and downstream emits
+    // `PredicateIndexSkippedMultimodal`). On every other direction the
+    // flags were previously dropped silently — a footgun. Reject them
+    // up front, before any file I/O, with an actionable message.
+    let index_requested =
+        !index_obs_list.is_empty() || !index_var_list.is_empty() || index_preset_value.is_some();
+    if index_requested && !matches!(direction, "h5ad_to_scx" | "tenx_to_scx" | "h5mu_to_scx") {
+        return Err(format!(
+            "--index-obs / --index-var / --index-preset are only supported when writing SCX \
+             from h5ad or 10x input; got direction '{direction}'. (For an existing SCX file, \
+             rebuild indexes with `scx compact` / `scx append`, or pyscx.from_anndata.)"
+        )
+        .into());
+    }
+
     // `--stream` is supported for h5ad → scx (Phase 0/1/2), h5mu →
     // scx (Phase 3), and scx → h5ad / h5mu (Phase 8). Reject for
     // other directions so the user gets a clear error rather than a
@@ -912,12 +940,6 @@ fn run_convert(
             Some(s) if s.trim().is_empty() => Vec::new(),
             Some(s) => parse_modality_types(s)?,
         };
-
-    // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
-    // empty / whitespace-only inputs are treated as no override.
-    let index_obs_list = parse_index_columns(index_obs);
-    let index_var_list = parse_index_columns(index_var);
-    let index_preset_value = index_preset.filter(|s| !s.trim().is_empty());
 
     dispatch_convert(
         direction,
