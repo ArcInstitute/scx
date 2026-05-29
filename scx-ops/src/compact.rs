@@ -123,7 +123,14 @@ pub fn compact_with_index_options(
     // Eager path materialises obs + a filtered copy; streaming path only needs
     // the obs schema (one bounded shard read) and never calls `read_obs`.
     let (obs_schema, eager_filtered_obs) = if stream_obs {
-        (reader.read_obs_shard(0)?.schema(), None)
+        // Footer-only schema read (constant cost, no batch decode) — matches
+        // the `merge` convention (`read_obs_schema_physical`) and feeds the
+        // same streaming predicate-index builder. Wrapped in `Arc` to keep the
+        // `SchemaRef` shape the eager branch's `filtered.schema()` produces.
+        (
+            std::sync::Arc::new(reader.read_obs_schema_physical()?),
+            None,
+        )
     } else {
         let obs = reader.read_obs()?;
         let filtered = if let Some(ref mask) = keep_mask {
@@ -723,8 +730,12 @@ fn filtered_obs_shards<'a>(
         let filtered = match keep_mask {
             None => batch,
             Some(mask) => {
-                let bools: Vec<bool> = (0..n).map(|i| mask[input_cursor + i]).collect();
-                let bool_array = arrow::array::BooleanArray::from(bools);
+                // Slice the keep-mask for this shard's row range in one shot
+                // (avoids per-element bounds checks on wide obs shards). Panics
+                // on a malformed file whose shards sum past `n_obs`; the
+                // `build_keep_mask(n_obs, ...)` invariant rules that out.
+                let bool_array =
+                    arrow::array::BooleanArray::from(mask[input_cursor..input_cursor + n].to_vec());
                 compute::filter_record_batch(&batch, &bool_array)?
             }
         };
@@ -748,7 +759,9 @@ fn write_obs_shards_streaming(
     total_kept: usize,
 ) -> Result<()> {
     if total_kept == 0 {
-        let schema = reader.read_obs_shard(0)?.schema();
+        // Footer-only schema read (no batch decode); see streaming branch in
+        // `compact_with_index_options`.
+        let schema = std::sync::Arc::new(reader.read_obs_schema_physical()?);
         writer.write_obs(&arrow::array::RecordBatch::new_empty(schema))?;
         return Ok(());
     }
@@ -1345,6 +1358,29 @@ mod streaming_tests {
         .unwrap()
     }
 
+    /// obs batch with a `cell_id` column plus a low-cardinality `cluster`
+    /// column suitable for forced predicate indexing.
+    fn obs_batch_with_cluster(n: usize) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cluster", DataType::Utf8, false),
+        ]);
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let clusters: Vec<String> = (0..n).map(|i| format!("c{}", i % 3)).collect();
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    clusters.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
     /// The streaming obs write path must never materialise the full obs table:
     /// `write_obs_shards_streaming` reads only one shard at a time, so the
     /// reader's `read_obs` counter must stay at zero. (Increments are
@@ -1410,5 +1446,95 @@ mod streaming_tests {
             let _ = reader.read_obs().unwrap();
             assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 1);
         }
+    }
+
+    /// The streaming *predicate-index* pass must also never materialise the
+    /// full obs table: it drives `filtered_obs_shards` +
+    /// `build_and_write_conversion_predicate_indexes_streaming` shard-by-shard,
+    /// so the reader's `read_obs` counter must stay at zero across both the
+    /// write pass and the index pass. Closes the review's "fail if `read_obs()`
+    /// is invoked" guard for the index path, not just the write helper.
+    #[test]
+    fn streaming_predicate_index_never_calls_read_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+
+        let n = 9usize;
+        let obs = obs_batch_with_cluster(n);
+        let var = utf8_batch(
+            "gene_id",
+            &(0..4).map(|i| format!("gene_{i}")).collect::<Vec<_>>(),
+        );
+
+        // Sharded-obs input: 9 rows across 3 obs shards of 3.
+        {
+            let mut w = ScxWriter::new(&input, test_header(n as u64)).unwrap();
+            let mut idx = 0u32;
+            let mut start = 0usize;
+            while start < n {
+                let take = 3usize.min(n - start);
+                w.write_obs_shard(
+                    idx,
+                    start as u64,
+                    take as u64,
+                    n as u64,
+                    &obs.slice(start, take),
+                )
+                .unwrap();
+                idx += 1;
+                start += take;
+            }
+            w.write_var(&var).unwrap();
+            w.finish().unwrap();
+        }
+
+        let reader = ScxReader::open(&input).unwrap();
+        assert_eq!(reader.obs_metadata_shard_count(), 3);
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
+
+        // Drive both streaming passes — the obs-shard write and the
+        // predicate-index build — exactly as compact's streaming reshape does.
+        let output = dir.path().join("out.scx");
+        let mut w = ScxWriter::new(&output, test_header(n as u64)).unwrap();
+        write_obs_shards_streaming(&reader, &mut w, None, n).unwrap();
+        w.write_var(&var).unwrap();
+
+        let opts = ConversionPredicateIndexOptions {
+            index_obs: vec!["cluster".to_string()],
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        };
+        let obs_schema = Arc::new(reader.read_obs_schema_physical().unwrap());
+        let output_shard_row_ranges = vec![(0u64, n as u64)];
+        let result = build_and_write_conversion_predicate_indexes_streaming(
+            &mut w,
+            obs_schema,
+            filtered_obs_shards(&reader, None),
+            &var,
+            &output_shard_row_ranges,
+            4,
+            &opts,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The forced column was indexed via the streaming path.
+        assert!(result.obs_indexed_columns.iter().any(|c| c == "cluster"));
+
+        // Neither streaming pass went through read_obs.
+        assert_eq!(
+            reader.debug_counts().read_obs.load(Ordering::Relaxed),
+            0,
+            "streaming obs write + predicate-index build must not call read_obs()"
+        );
+
+        // Output is well-formed: obs reassembles and the index is present.
+        let out_reader = ScxReader::open(&output).unwrap();
+        assert_eq!(out_reader.read_obs().unwrap().num_rows(), n);
+        assert!(out_reader
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_some());
     }
 }
