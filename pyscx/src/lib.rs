@@ -190,8 +190,9 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///   to `ScxReader::read_obs_shard` / `obs_shards()`. Applies to the
 ///   in-memory path only — backed routing goes through the streaming
 ///   converter which writes single-section metadata regardless (use
-///   `scx compact --reshape-obs` post-hoc if sharded metadata is
-///   needed for a backed conversion).
+///   `pyscx.compact(..., reshape_obs=True)` or `scx compact
+///   --reshape-obs` post-hoc if sharded metadata is needed for a backed
+///   conversion).
 #[pyfunction]
 #[pyo3(signature = (
     adata, path, codec=None, shard_size=None, in_place=false, csc="off",

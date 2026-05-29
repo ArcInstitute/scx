@@ -495,15 +495,24 @@ pub fn mark_deleted(path: &str, cell_indices: Vec<i64>) -> PyResult<u64> {
 /// sections are dropped as before (the row layout is re-sharded against
 /// the post-deletion row count).
 ///
+/// `reshape_obs`: when True, migrate legacy single-section obs metadata
+/// to the atlas-scale sharded `ObsMetadataShard` layout. Mirrors
+/// `scx compact --reshape-obs`; useful after a backed `from_anndata`
+/// conversion (which always writes single-section metadata regardless of
+/// `n_obs`). Composes with the `index_*` kwargs.
+///
 /// Example:
 ///     pyscx.compact("experiment.scx", "compacted.scx")
 ///     pyscx.compact("experiment.scx", "compacted.scx",
 ///                   index_obs=["perturbation", "cell_type"])
+///     pyscx.compact("experiment.scx", "compacted.scx", reshape_obs=True)
 #[pyfunction]
 #[pyo3(signature = (
     input, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    reshape_obs=false,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub fn compact(
     py: Python<'_>,
     input: &str,
@@ -512,6 +521,7 @@ pub fn compact(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    reshape_obs: bool,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -523,8 +533,27 @@ pub fn compact(
                         &input_path,
                         &output_path,
                         &index_opts,
-                        false,
+                        reshape_obs,
                     )
+                })
+                .map_err(ops_to_pyerr)?;
+            process_index_summary(py, summary)
+        }
+        // `reshape_obs` must reach the index-options path even with no
+        // `index_*` kwarg set. The `index_auto_threshold = 0` sentinel
+        // keeps `user_wants_index()` false (no index built), matching
+        // bare `compact()`, while still migrating obs to sharded
+        // sections. Mirrors `scx-cli/src/compact.rs`.
+        None if reshape_obs => {
+            let sentinel = ConversionPredicateIndexOptions {
+                index_obs: Vec::new(),
+                index_var: Vec::new(),
+                index_preset: None,
+                index_auto_threshold: 0,
+            };
+            let summary = py
+                .allow_threads(|| {
+                    scx_ops::compact_with_index_options(&input_path, &output_path, &sentinel, true)
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
