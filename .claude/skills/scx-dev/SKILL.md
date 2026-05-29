@@ -79,23 +79,57 @@ Run from the bumped commit before tagging.
 
 ### Release steps
 
-1. **Bump versions** as described above. Verify with `grep -E '^version' */Cargo.toml pyscx/pyproject.toml; grep '^Version' rscx/DESCRIPTION` — all should report the new version (except the integration tests crate, which stays at `0.0.0`).
+"Bumping the version" is the **whole pipeline below**, not just editing files. A bump is not done until the pre-release checks pass, the PR is merged to `main`, *and* the release workflows have been triggered. The six phases: **edit files → run pre-release checks → commit on a branch → open & merge a PR → tag the merged commit → push tags (this creates the GitHub Release)**.
+
+The repo's remote is named `github`, NOT `origin`. Never commit the version bump directly to `main` — `main` is protected and the bump must land via a reviewed/merged PR.
+
+**Phase 1 — Edit files**
+
+1. **Bump versions** as described in [Version-bump scope](#version-bump-scope). Verify with `grep -E '^version' */Cargo.toml pyscx/pyproject.toml; grep '^Version' rscx/DESCRIPTION` — all should report the new version (except the integration tests crate, which stays at `0.0.0`).
 2. **Refresh the lockfile:** `cargo update --workspace --offline`.
-3. **Sanity build:** `cargo check` (default-members only). Expect the rscx/extendr failure on `cargo check --workspace`; that's pre-existing.
-4. **Commit on `main`** with a message summarizing the headline changes. Past commits follow `chore: bump workspace to vX.Y.Z` as the subject — see `git log v0.3.0~1..v0.3.0` and the v0.4.0 commit `c21e833` for the body shape.
-5. **Tag with both prefixes**, pointing at the commit (use `^{}` to avoid the nested-tag trap if you're tagging an existing tag):
+3. **Bump the `ROADMAP.md` "Last updated" date stamp** to today.
+
+**Phase 2 — Run pre-release checks (mandatory, not optional)**
+
+4. **Sanity build:** `cargo check` (default-members only). Expect the rscx/extendr failure on `cargo check --workspace`; that's pre-existing.
+5. **Run the full [Pre-release verification](#pre-release-verification) checklist** appropriate to what changed — this is part of the bump, not a separate later step. For a version-only bump the format/codec/Python checks should be unaffected, but at minimum **all three of** `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`, and `cargo test --workspace` MUST be clean before you commit and open the PR. Run them locally first; let CI be the second signal, not the first. Do not proceed to Phase 3 with a failing check.
+
+**Phase 3 — Commit on a branch**
+
+6. **Create a release branch** (e.g. `bump-version-X.Y.Z`) off `main` and **commit** the bump there. Past commits follow `chore: bump workspace version to X.Y.Z` as the subject — see `git log v0.3.0~1..v0.3.0` and the v0.4.0 commit `c21e833` for the body shape. Stage only tracked files (`git add -u`) so untracked scratch docs (e.g. ALL-CAPS root markdown) are never swept in.
+
+**Phase 4 — Open and merge the PR**
+
+7. **Push the branch and open a PR:**
    ```
+   git push -u github bump-version-X.Y.Z
+   gh pr create --repo ArcInstitute/scx --base main --title "chore: bump workspace version to X.Y.Z" --body "..."
+   ```
+8. **Wait for CI green**, then **merge the PR** to `main` and **clean up the branch**. The `--delete-branch` flag deletes *both* the remote and the local branch (gh switches you back to `main` first):
+   ```
+   gh pr checks --repo ArcInstitute/scx --watch
+   gh pr merge --repo ArcInstitute/scx --squash --delete-branch
+   ```
+   Match the merge method the repo uses for prior bump PRs (squash unless the project convention differs). Confirm cleanup with `git branch` (no local `bump-version-X.Y.Z`) and `git branch -r` (no remote one); delete any leftover manually with `git branch -d bump-version-X.Y.Z` / `git push github :bump-version-X.Y.Z`.
+
+**Phase 5 — Tag the merged commit**
+
+9. **Sync `main` and tag the merge commit with both prefixes.** The two artifacts are released independently with prefixed tags — a unified `vX.Y.Z` tag triggers **nothing** (see [Tag scheme](#tag-scheme-critical--easy-to-get-wrong)). Tag the post-merge `main` HEAD:
+   ```
+   git checkout main && git pull github main
    git tag -a pyscx-vX.Y.Z   -m "Release pyscx vX.Y.Z"
    git tag -a scx-cli-vX.Y.Z -m "Release scx-cli vX.Y.Z"
    ```
-   If only one artifact changed (e.g. pyscx-only patch), tag only that artifact.
-6. **Push to the `github` remote** (this repo's remote is named `github`, NOT `origin`):
-   ```
-   git push github main
-   git push github pyscx-vX.Y.Z scx-cli-vX.Y.Z
-   ```
-   Pushing the tag triggers the corresponding workflow, which creates the GitHub Release entry and uploads wheels/binaries. **Do not run `gh release create`** — the workflow owns that.
-7. **Verify** with `gh run list --repo ArcInstitute/scx --limit 5`; both `pyscx release wheels` and `scx-cli release binaries` should appear `in_progress`. The releases appear at https://github.com/ArcInstitute/scx/releases when the workflows finish.
+   If only one artifact changed (e.g. a pyscx-only patch), tag only that artifact. Use `^{}` to deref if you ever tag an existing tag.
+
+**Phase 6 — Push tags and verify the release**
+
+10. **Push the tags to `github`:**
+    ```
+    git push github pyscx-vX.Y.Z scx-cli-vX.Y.Z
+    ```
+    Pushing each tag triggers its workflow, which creates the GitHub Release entry and uploads wheels/binaries. **Do not run `gh release create`** — the workflow owns that.
+11. **Verify** with `gh run list --repo ArcInstitute/scx --limit 5`; both `pyscx release wheels` and `scx-cli release binaries` should appear `in_progress`. The releases appear at https://github.com/ArcInstitute/scx/releases when the workflows finish.
 
 ### Recovering from a wrong tag
 
