@@ -6450,9 +6450,9 @@ mod streaming_obs_hdf5 {
 
     use arrow::array::{
         Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
-        Int64Array, RecordBatch, StringArray,
+        Int64Array, LargeStringArray, RecordBatch, StringArray,
     };
-    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int8Type, Schema};
 
     use scx_codec::{CodecId, ValueEncoding};
     use scx_format::header::{HEADER_SIZE, MAGIC};
@@ -6460,7 +6460,9 @@ mod streaming_obs_hdf5 {
 
     use crate::h5ad_read::read_dataframe_group;
     use crate::h5ad_stream_write::write_scx_to_h5ad_streaming;
-    use crate::h5ad_write::{write_dataframe_group_streaming, write_scx_to_h5ad};
+    use crate::h5ad_write::{
+        write_dataframe_group_at, write_dataframe_group_streaming, write_scx_to_h5ad,
+    };
     use crate::pipeline::ConvertOptions;
     use crate::warnings::WarningSink;
 
@@ -7544,5 +7546,90 @@ mod streaming_obs_hdf5 {
             format!("{err}").contains("shard schema mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The eager dataframe writer must handle wide string columns
+    /// (`LargeUtf8`) and `Dictionary(_, LargeUtf8)` categoricals the same
+    /// way the streaming writer does, rather than dropping them to
+    /// `UnsupportedExportColumn`. A null-bearing `LargeUtf8` column must
+    /// round-trip via a `nullable-string-array` group; a
+    /// `Dictionary(Int32, LargeUtf8)` categorical (with a null code) must
+    /// round-trip via a `categorical` group.
+    #[test]
+    fn test_eager_writes_largeutf8_and_largeutf8_categorical() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("largeutf8.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+
+        // First field is the index (no pandas metadata → field 0).
+        // `note` is a null-bearing wide-string column; `ct` is a
+        // categorical whose dictionary values are LargeUtf8 with a null
+        // code at row 2.
+        let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let cat_values: ArrayRef = Arc::new(LargeStringArray::from(vec!["typeA", "typeB"]));
+        let ct = DictionaryArray::<Int32Type>::new(keys, cat_values);
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("note", DataType::LargeUtf8, true),
+            Field::new("ct", ct.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1", "c2", "c3"])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("d"),
+                ])),
+                Arc::new(ct),
+            ],
+        )
+        .unwrap();
+
+        write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log()).unwrap();
+        drop(file);
+
+        let file = hdf5::File::open(dir.path().join("largeutf8.h5ad")).unwrap();
+        // Neither column was dropped to UnsupportedExportColumn.
+        assert_eq!(
+            obs_col_encoding(&file, "note").as_deref(),
+            Some("nullable-string-array"),
+            "null-bearing LargeUtf8 column must use a nullable-string-array group"
+        );
+        assert_eq!(
+            obs_col_encoding(&file, "ct").as_deref(),
+            Some("categorical"),
+            "Dictionary(_, LargeUtf8) column must use a categorical group"
+        );
+
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), 4);
+
+        // `note`: null mask + values survive (reader yields Utf8).
+        let note = obs.column(obs.schema().index_of("note").unwrap());
+        let note = note.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(note.is_null(1), "note row 1 should be null");
+        assert_eq!(note.value(0), "a");
+        assert_eq!(note.value(2), "c");
+        assert_eq!(note.value(3), "d");
+
+        // `ct`: categorical round-trips (reader yields Dictionary<Int32, Utf8>).
+        let ct_out = obs.column(obs.schema().index_of("ct").unwrap());
+        let ct_out = ct_out
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let cats = ct_out
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(ct_out.keys().is_null(2), "ct row 2 should be null");
+        assert_eq!(cats.value(ct_out.keys().value(0) as usize), "typeA");
+        assert_eq!(cats.value(ct_out.keys().value(1) as usize), "typeB");
+        assert_eq!(cats.value(ct_out.keys().value(3) as usize), "typeA");
     }
 }

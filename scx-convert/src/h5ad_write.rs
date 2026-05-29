@@ -355,10 +355,28 @@ fn dict_codes_and_categories_i32(
                     None => -1,
                 })
                 .collect();
-            let values_arr = dict.values().as_string::<i32>();
-            let cats: Vec<VarLenUnicode> = (0..values_arr.len())
-                .map(|i| vlu(values_arr.value(i)))
-                .collect();
+            // Categories may be narrow (`Utf8`) or wide (`LargeUtf8`);
+            // dispatch on the value type like the streaming sibling
+            // `dict_local_codes_and_string_values`.
+            let cats: Vec<VarLenUnicode> = match dict.values().data_type() {
+                DataType::Utf8 => {
+                    let values_arr = dict.values().as_string::<i32>();
+                    (0..values_arr.len())
+                        .map(|i| vlu(values_arr.value(i)))
+                        .collect()
+                }
+                DataType::LargeUtf8 => {
+                    let values_arr = dict.values().as_string::<i64>();
+                    (0..values_arr.len())
+                        .map(|i| vlu(values_arr.value(i)))
+                        .collect()
+                }
+                other => {
+                    return Err(ConvertError::Other(format!(
+                        "column '{name}': unsupported dictionary value type {other:?}"
+                    )));
+                }
+            };
             Ok::<_, ConvertError>((codes, cats))
         }};
     }
@@ -372,16 +390,54 @@ fn dict_codes_and_categories_i32(
         }
     };
     match key_type {
-        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, Utf8>"),
-        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, Utf8>"),
-        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, Utf8>"),
-        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, Utf8>"),
-        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, Utf8>"),
-        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, Utf8>"),
-        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, Utf8>"),
-        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, Utf8>"),
+        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, _>"),
+        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, _>"),
+        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, _>"),
+        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, _>"),
+        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, _>"),
+        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, _>"),
+        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, _>"),
+        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, _>"),
         other => Err(ConvertError::Other(format!(
             "column '{name}': unsupported categorical key type {other:?}"
+        ))),
+    }
+}
+
+/// Collect a `Utf8` / `LargeUtf8` string column into `(values, mask)`:
+/// `values[i]` is the string with null positions filled with `""`, and
+/// `mask[i] == true` ⇔ row `i` is null. Dispatches on the concrete array
+/// type so both narrow (`StringArray`) and wide (`LargeStringArray`)
+/// offsets are handled, mirroring the streaming string writer's
+/// `Utf8 | LargeUtf8` arm.
+fn string_values_and_mask(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<VarLenUnicode>, Vec<bool>), ConvertError> {
+    macro_rules! collect {
+        ($t:ty, $label:literal) => {{
+            let arr = array
+                .as_any()
+                .downcast_ref::<$t>()
+                .ok_or_else(|| downcast_err(name, $label))?;
+            let values: Vec<VarLenUnicode> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_valid(i) {
+                        vlu(arr.value(i))
+                    } else {
+                        vlu("")
+                    }
+                })
+                .collect();
+            let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+            Ok((values, mask))
+        }};
+    }
+    match array.data_type() {
+        DataType::Utf8 => collect!(arrow::array::StringArray, "Utf8"),
+        DataType::LargeUtf8 => collect!(LargeStringArray, "LargeUtf8"),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': expected Utf8/LargeUtf8, got {other:?}"
         ))),
     }
 }
@@ -481,26 +537,17 @@ fn write_column_to_hdf5(
                 .create(name)?
                 .write(&values)?;
         }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| downcast_err(name, "Utf8"))?;
-            if allow_nullable_group && arr.null_count() > 0 {
-                let values: Vec<VarLenUnicode> = (0..arr.len())
-                    .map(|i| {
-                        if arr.is_valid(i) {
-                            vlu(arr.value(i))
-                        } else {
-                            vlu("")
-                        }
-                    })
-                    .collect();
-                let mask: Vec<bool> = (0..arr.len()).map(|i| !arr.is_valid(i)).collect();
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            // Handle both narrow (`StringArray`, i32 offsets) and wide
+            // (`LargeStringArray`, i64 offsets) string columns; the eager
+            // assembled-obs path can legitimately carry either, matching
+            // the streaming writer's `Utf8 | LargeUtf8` handling.
+            let (values, mask) = string_values_and_mask(array, name)?;
+            let null_count = mask.iter().filter(|&&m| m).count();
+            if allow_nullable_group && null_count > 0 {
                 write_nullable_group(group, name, &values, &mask, "nullable-string-array")?;
             } else {
-                warn_index_coerced_nulls(sink, df_name, name, "Utf8", arr, allow_nullable_group);
-                let values: Vec<VarLenUnicode> = arr.iter().map(|v| vlu(v.unwrap_or(""))).collect();
+                warn_index_coerced_nulls(sink, df_name, name, "Utf8", array, allow_nullable_group);
                 group
                     .new_dataset::<VarLenUnicode>()
                     .shape([values.len()])
@@ -553,7 +600,9 @@ fn write_column_to_hdf5(
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.1.0"))?;
         }
-        DataType::Dictionary(_key_type, value_type) if **value_type == DataType::Utf8 => {
+        DataType::Dictionary(_key_type, value_type)
+            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
             // Modern anndata categorical (encoding-version 0.2.0):
             // write as a group with `codes` + `categories` as
             // separate datasets, NOT as a `categories` attribute on

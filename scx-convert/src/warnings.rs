@@ -106,13 +106,16 @@ pub enum ConvertWarning {
         estimated_bytes: u64,
         budget_bytes: u64,
     },
-    /// SCX → h5ad export coerced null entries in a numeric or string
-    /// obs/var column to a sentinel value (`0` / `0.0` / `""`) because
-    /// anndata-compatible nullable integer / float / string encodings
-    /// are not yet emitted on the export side. `nullable-boolean` and
-    /// `categorical` columns preserve null state; only Int32 / Int64 /
-    /// Float32 / Float64 / Utf8 / LargeUtf8 columns are affected. The
-    /// column's non-null values are written faithfully.
+    /// SCX → h5ad export coerced null entries in an obs/var column to a
+    /// sentinel value (`0` / `""`) because the column cannot carry a null
+    /// mask. Regular integer / string columns now round-trip losslessly
+    /// via anndata's `nullable-integer` / `nullable-string-array` group
+    /// encodings, and floats use `NaN`; `nullable-boolean` and
+    /// `categorical` columns preserve null state too. This warning is
+    /// therefore limited to the pandas index column (`_index`), which
+    /// anndata requires to be a plain dataset and so can never use a
+    /// nullable group — its nulls (virtually never present) coerce to
+    /// `0` / `""`. The column's non-null values are written faithfully.
     CoercedNulls {
         column: String,
         dtype: String,
