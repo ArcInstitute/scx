@@ -40,7 +40,7 @@ pub fn gpu_available() -> bool {
 ///     if info is not None:
 ///         print(f"GPU: {info['device']}, {info['free_vram_gb']:.1f} GB free")
 #[pyfunction]
-pub fn gpu_info(py: Python<'_>) -> PyResult<PyObject> {
+pub fn gpu_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
     #[cfg(feature = "gpu")]
     {
         match scx_accel::gpu_info() {
@@ -85,7 +85,7 @@ pub fn estimate_gpu_memory<'py>(
     adata: &Bound<'py, PyAny>,
     operation: &str,
     kwargs: Option<&Bound<'py, PyDict>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // Helper to extract a kwarg with a default
     let get_kwarg_usize = |key: &str, default: usize| -> PyResult<usize> {
         if let Some(kw) = kwargs {

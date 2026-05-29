@@ -479,7 +479,7 @@ pub fn pca(
         let (_n_obs, n_vars) = reader.shape();
         drop(backed);
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca(&*reader, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
                 &*reader,
@@ -497,7 +497,7 @@ pub fn pca(
         let (_n_obs, n_vars) = source.shape();
         drop(lazy);
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca(&source, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
                 &source,
@@ -514,7 +514,7 @@ pub fn pca(
         let csr = extract_materialized_csr(py, &x)?;
         let n_vars = csr.n_cols();
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center),
             _ => scx_accel::randomized_pca_inmemory(
                 &csr,

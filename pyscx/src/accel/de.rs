@@ -247,7 +247,7 @@ fn run_rank_genes_groups_inner(
             // Pass the concrete `BackedCscReader` (not `&dyn`) so the
             // closure is `Send` — `dyn ColumnShardSource` is not `Send`.
             let result = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming_csc(
                         csc_reader.as_ref(),
                         &gene_names,
@@ -273,7 +273,7 @@ fn run_rank_genes_groups_inner(
             })?;
             drop(lazy);
             let result = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming_csc(
                         &lazy_src,
                         &gene_names,
@@ -304,7 +304,7 @@ fn run_rank_genes_groups_inner(
         match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::wilcoxon_rank_sum_gpu_streaming(
                         device_id,
                         &reader,
@@ -322,7 +322,7 @@ fn run_rank_genes_groups_inner(
             #[cfg(not(feature = "gpu"))]
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
             None => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
                         &reader,
                         &gene_names,
@@ -352,7 +352,7 @@ fn run_rank_genes_groups_inner(
                     let lazy_src = lazy.as_shard_source();
                     drop(lazy);
                     let result = py
-                        .allow_threads(|| {
+                        .detach(|| {
                             scx_accel::wilcoxon_rank_sum_gpu_lazy(
                                 device_id,
                                 &lazy_src,
@@ -410,7 +410,7 @@ fn run_rank_genes_groups_inner(
             match gpu_device_id {
                 #[cfg(feature = "gpu")]
                 Some(device_id) => py
-                    .allow_threads(|| {
+                    .detach(|| {
                         scx_accel::wilcoxon_rank_sum_gpu_sparse(
                             device_id,
                             &csr,
@@ -428,7 +428,7 @@ fn run_rank_genes_groups_inner(
                 #[cfg(not(feature = "gpu"))]
                 Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
                 None => py
-                    .allow_threads(|| {
+                    .detach(|| {
                         scx_accel::wilcoxon_rank_sum_sparse(
                             &csr,
                             &gene_names,
@@ -457,7 +457,7 @@ fn run_rank_genes_groups_inner(
             match gpu_device_id {
                 #[cfg(feature = "gpu")]
                 Some(device_id) => py
-                    .allow_threads(|| {
+                    .detach(|| {
                         scx_accel::wilcoxon_rank_sum_gpu_dense(
                             device_id,
                             &data,
@@ -476,7 +476,7 @@ fn run_rank_genes_groups_inner(
                 #[cfg(not(feature = "gpu"))]
                 Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
                 None => py
-                    .allow_threads(|| {
+                    .detach(|| {
                         scx_accel::wilcoxon_rank_sum(
                             &data,
                             n_obs,
@@ -578,7 +578,7 @@ pub fn rank_genes_groups(
     tie_correct: bool,
     prefer_format: &str,
     device: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
             "unsupported method '{method}': only 'wilcoxon' is currently supported"
@@ -929,7 +929,7 @@ pub fn rank_genes_groups_df(
     rankby_abs: bool,
     tie_correct: bool,
     device: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -1111,7 +1111,7 @@ fn run_pdex_ref_inner(
                 .clone();
             drop(backed);
             return py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_streaming_csc(
                         csc_reader.as_ref(),
                         &gene_names,
@@ -1135,7 +1135,7 @@ fn run_pdex_ref_inner(
             })?;
             drop(lazy);
             return py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_streaming_csc(
                         &lazy_src,
                         &gene_names,
@@ -1169,7 +1169,7 @@ fn run_pdex_ref_inner(
         return match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_gpu_streaming(
                         device_id,
                         &reader,
@@ -1187,7 +1187,7 @@ fn run_pdex_ref_inner(
             #[cfg(not(feature = "gpu"))]
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
             None => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_streaming(
                         &reader,
                         &gene_names,
@@ -1213,7 +1213,7 @@ fn run_pdex_ref_inner(
             let lazy_src = lazy.as_shard_source();
             drop(lazy);
             return py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_gpu_lazy(
                         device_id,
                         &lazy_src,
@@ -1259,7 +1259,7 @@ fn run_pdex_ref_inner(
         match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_gpu_sparse(
                         device_id,
                         &csr,
@@ -1276,7 +1276,7 @@ fn run_pdex_ref_inner(
             #[cfg(not(feature = "gpu"))]
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
             None => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_sparse(
                         &csr,
                         &gene_names,
@@ -1302,7 +1302,7 @@ fn run_pdex_ref_inner(
         match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref_gpu_dense(
                         device_id,
                         &data,
@@ -1320,7 +1320,7 @@ fn run_pdex_ref_inner(
             #[cfg(not(feature = "gpu"))]
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
             None => py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::pdex_ref(
                         &data,
                         n_obs,
@@ -1470,7 +1470,7 @@ pub fn pdex_ref(
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
     device: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
             "epsilon must be non-negative and finite (got {epsilon})"

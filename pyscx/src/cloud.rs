@@ -79,7 +79,7 @@ pub fn pull(
     filter: Option<&str>,
     parallelism: Option<usize>,
     filter_mode: Option<&str>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let mode = match filter_mode.unwrap_or("shard") {
         "shard" => scx_cloud::FilterMode::Shard,
         "exact" => scx_cloud::FilterMode::Exact,
@@ -107,7 +107,7 @@ pub fn pull(
         let source = source.to_string();
         let filter_expr = filter_expr.to_string();
         let stats = py
-            .allow_threads(|| {
+            .detach(|| {
                 rt.block_on(scx_cloud::pull_filtered(
                     &source,
                     &dest_path,
@@ -142,7 +142,7 @@ pub fn pull(
     } else {
         let source = source.to_string();
         let stats = py
-            .allow_threads(|| rt.block_on(scx_cloud::pull(&source, &dest_path, opts)))
+            .detach(|| rt.block_on(scx_cloud::pull(&source, &dest_path, opts)))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
         let dict = PyDict::new(py);
@@ -170,7 +170,7 @@ pub fn push(
     source: &str,
     dest: &str,
     parallelism: Option<usize>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let opts = scx_cloud::PushOptions {
         parallelism: parallelism.unwrap_or(8),
     };
@@ -182,7 +182,7 @@ pub fn push(
     let dest = dest.to_string();
     // Release the GIL during blocking cloud I/O (finding 9.3).
     let stats = py
-        .allow_threads(|| rt.block_on(scx_cloud::push(&source_path, &dest, opts)))
+        .detach(|| rt.block_on(scx_cloud::push(&source_path, &dest, opts)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let dict = PyDict::new(py);
@@ -301,7 +301,7 @@ impl PyCloudExperiment {
         let reader = Arc::clone(&self.reader);
         let rt = Arc::clone(&self.rt);
         let pipeline = py
-            .allow_threads(|| {
+            .detach(|| {
                 let adapter = scx_cloud::CloudSectionReader::new(reader, rt);
                 QueryPipeline::from_reader(Box::new(adapter))
             })
@@ -328,7 +328,7 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
     // Release the GIL during blocking cloud I/O (finding 9.3).
     let url = url.to_string();
     let reader = py
-        .allow_threads(|| rt.block_on(scx_cloud::open_cloud(&url)))
+        .detach(|| rt.block_on(scx_cloud::open_cloud(&url)))
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(PyCloudExperiment {

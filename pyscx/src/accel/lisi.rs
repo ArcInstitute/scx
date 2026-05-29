@@ -101,7 +101,7 @@ pub fn compute_lisi<'py>(
     let emb_f32 = np
         .call_method1("ascontiguousarray", (&emb_obj,))?
         .call_method1("astype", ("float32",))?;
-    let emb_arr: &Bound<'_, PyArray2<f32>> = emb_f32.downcast::<PyArray2<f32>>().map_err(|e| {
+    let emb_arr: &Bound<'_, PyArray2<f32>> = emb_f32.cast::<PyArray2<f32>>().map_err(|e| {
         PyRuntimeError::new_err(format!("failed to view '{basis}' as 2D float32: {e}"))
     })?;
     let shape = emb_arr.shape();
@@ -148,7 +148,7 @@ pub fn compute_lisi<'py>(
     };
 
     let result = py
-        .allow_threads(|| scx_accel::compute_lisi(&embeddings, n_obs, n_dims, &labels, &config))
+        .detach(|| scx_accel::compute_lisi(&embeddings, n_obs, n_dims, &labels, &config))
         .map_err(|e: scx_accel::AccelError| {
             PyRuntimeError::new_err(format!("compute_lisi: {e}"))
         })?;

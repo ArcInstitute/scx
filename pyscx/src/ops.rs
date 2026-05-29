@@ -270,7 +270,7 @@ pub fn append(
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_ops::append_from_reader_with_index_options(
                         &target_path,
                         &input_reader,
@@ -283,10 +283,8 @@ pub fn append(
             process_index_summary(py, summary)?;
         }
         None => {
-            py.allow_threads(|| {
-                scx_ops::append_from_reader(&target_path, &input_reader, &options, 0)
-            })
-            .map_err(ops_to_pyerr)?;
+            py.detach(|| scx_ops::append_from_reader(&target_path, &input_reader, &options, 0))
+                .map_err(ops_to_pyerr)?;
         }
     }
 
@@ -418,7 +416,7 @@ pub fn append_from_anndata(
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_ops::append_with_index_options(
                         &target_path,
                         &obs,
@@ -434,7 +432,7 @@ pub fn append_from_anndata(
             process_index_summary(py, summary)?;
         }
         None => {
-            py.allow_threads(|| {
+            py.detach(|| {
                 scx_ops::append(
                     &target_path,
                     &obs,
@@ -528,7 +526,7 @@ pub fn compact(
     match build_index_options(index_obs, index_var, index_preset, index_auto_threshold) {
         Some(index_opts) => {
             let summary = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_ops::compact_with_index_options(
                         &input_path,
                         &output_path,
@@ -552,14 +550,14 @@ pub fn compact(
                 index_auto_threshold: 0,
             };
             let summary = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_ops::compact_with_index_options(&input_path, &output_path, &sentinel, true)
                 })
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
         None => py
-            .allow_threads(|| scx_ops::compact(&input_path, &output_path))
+            .detach(|| scx_ops::compact(&input_path, &output_path))
             .map_err(ops_to_pyerr),
     }
 }
@@ -682,9 +680,7 @@ pub fn merge(
                 shard_target_rows: None,
             };
             let summary = py
-                .allow_threads(|| {
-                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
-                })
+                .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
@@ -702,14 +698,12 @@ pub fn merge(
                 shard_target_rows: None,
             };
             let summary = py
-                .allow_threads(|| {
-                    scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts)
-                })
+                .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
         None => py
-            .allow_threads(|| scx_ops::merge(&input_refs, &output_path))
+            .detach(|| scx_ops::merge(&input_refs, &output_path))
             .map_err(ops_to_pyerr),
     }
 }

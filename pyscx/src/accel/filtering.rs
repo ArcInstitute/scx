@@ -228,14 +228,14 @@ pub(super) fn update_layers_kept_to_global(
     if let Ok(keys) = keys_result {
         for key in &keys {
             let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.downcast::<ScxBackedLayerDataset>() {
+            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
                 layer
                     .borrow_mut()
                     .inner
                     .set_kept_to_global(new_kept.to_vec());
             }
             // ScxLazyTransformedDataset layers are unlikely but handle them
-            if let Ok(lazy_layer) = layer_obj.downcast::<ScxLazyTransformedDataset>() {
+            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
                 lazy_layer
                     .borrow_mut()
                     .set_kept_to_global(new_kept.to_vec());
@@ -259,13 +259,13 @@ pub(super) fn update_layers_col_projection(
     if let Ok(keys) = keys_result {
         for key in &keys {
             let layer_obj = layers.get_item(key)?;
-            if let Ok(layer) = layer_obj.downcast::<ScxBackedLayerDataset>() {
+            if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
                 layer
                     .borrow_mut()
                     .inner
                     .set_col_projection(new_cols.to_vec());
             }
-            if let Ok(lazy_layer) = layer_obj.downcast::<ScxLazyTransformedDataset>() {
+            if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
                 lazy_layer
                     .borrow_mut()
                     .set_col_projection(new_cols.to_vec());
@@ -317,7 +317,7 @@ pub fn filter_cells(
     let need_sums = min_counts.is_some() || max_counts.is_some();
 
     // Case 1: X is ScxBackedSparseDataset
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let n_obs = backed.borrow().shape_val.0;
         // Fused: compute both NNZ and sums in a single shard scan when both are needed
         let (row_nnz, row_sums) = if need_nnz && need_sums {
@@ -364,7 +364,7 @@ pub fn filter_cells(
     }
 
     // Case 2: X is ScxLazyTransformedDataset
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
         let n_obs = lazy_ref.shape_val.0;
 
@@ -483,7 +483,7 @@ pub fn filter_genes(
     let need_sums = min_counts.is_some() || max_counts.is_some();
 
     // Case 1: X is ScxBackedSparseDataset
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let n_vars = backed.borrow().shape_val.1;
         let col_nnz: Option<Vec<i64>> = if need_nnz {
             Some(
@@ -544,7 +544,7 @@ pub fn filter_genes(
     }
 
     // Case 2: X is ScxLazyTransformedDataset
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
         let n_vars = lazy_ref.shape_val.1;
 
@@ -772,7 +772,7 @@ pub fn subset_obs(
     let x = adata.getattr("X")?;
 
     // Case 1: X is ScxBackedSparseDataset
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let new_kept = compose_kept_to_global(
             &keep,
             backed
@@ -788,7 +788,7 @@ pub fn subset_obs(
     }
 
     // Case 2: X is ScxLazyTransformedDataset
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let new_kept = compose_kept_to_global(
             &keep,
             lazy.borrow().kept_to_global.as_ref().map(|v| v.as_slice()),

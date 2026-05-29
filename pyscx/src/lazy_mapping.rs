@@ -65,7 +65,7 @@ pub struct ScxLazyPairwiseMapping {
     /// Materialization state. `None` = key exists on disk but has not
     /// yet been read; `Some(obj)` = cached value (either disk-loaded
     /// and validated, or user-inserted via `__setitem__`).
-    state: Mutex<HashMap<String, Option<PyObject>>>,
+    state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
 }
 
 impl ScxLazyPairwiseMapping {
@@ -78,7 +78,7 @@ impl ScxLazyPairwiseMapping {
             PairwiseAxis::Obsp => reader.list_obsp(),
             PairwiseAxis::Varp => reader.list_varp(),
         };
-        let state: HashMap<String, Option<PyObject>> =
+        let state: HashMap<String, Option<Py<PyAny>>> =
             keys.into_iter().map(|k| (k, None)).collect();
         Self {
             reader,
@@ -100,7 +100,7 @@ impl ScxLazyPairwiseMapping {
         Ok(dict)
     }
 
-    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
             let state = self.state.lock().unwrap();
             match state.get(key) {
@@ -121,11 +121,11 @@ impl ScxLazyPairwiseMapping {
             }
             _ => coo_record_batch_to_scipy(py, &batch)?,
         };
-        let obj: PyObject = bound.unbind();
+        let obj: Py<PyAny> = bound.unbind();
         let mut state = self.state.lock().unwrap();
         // Re-check: a concurrent fetch may have populated the slot while
         // we were decoding. Return whatever's already there so callers
-        // converge on the same PyObject identity (the `a is b` invariant
+        // converge on the same Py<PyAny> identity (the `a is b` invariant
         // asserted by `test_to_anndata_obsp_is_lazy`).
         if let Some(Some(cached)) = state.get(key) {
             return Ok(cached.clone_ref(py));
@@ -137,11 +137,11 @@ impl ScxLazyPairwiseMapping {
 
 #[pymethods]
 impl ScxLazyPairwiseMapping {
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         self.fetch(py, key)
     }
 
-    fn __setitem__(&self, key: String, value: PyObject) {
+    fn __setitem__(&self, key: String, value: Py<PyAny>) {
         self.state.lock().unwrap().insert(key, Some(value));
     }
 
@@ -157,7 +157,7 @@ impl ScxLazyPairwiseMapping {
         self.state.lock().unwrap().contains_key(key)
     }
 
-    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
@@ -200,7 +200,7 @@ impl ScxLazyPairwiseMapping {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.fetch(py, key) {
             Ok(v) => Ok(v),
             Err(e) if e.is_instance_of::<PyKeyError>(py) => {
@@ -229,12 +229,12 @@ impl ScxLazyPairwiseMapping {
 #[pyclass(name = "ScxLazyVarmMapping", mapping)]
 pub struct ScxLazyVarmMapping {
     reader: Arc<ScxReader>,
-    state: Mutex<HashMap<String, Option<PyObject>>>,
+    state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
 }
 
 impl ScxLazyVarmMapping {
     pub(crate) fn new(reader: Arc<ScxReader>) -> Self {
-        let state: HashMap<String, Option<PyObject>> =
+        let state: HashMap<String, Option<Py<PyAny>>> =
             reader.list_varm().into_iter().map(|k| (k, None)).collect();
         Self {
             reader,
@@ -252,7 +252,7 @@ impl ScxLazyVarmMapping {
         Ok(dict)
     }
 
-    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
             let state = self.state.lock().unwrap();
             match state.get(key) {
@@ -263,7 +263,7 @@ impl ScxLazyVarmMapping {
         }
         let batch = self.reader.read_varm(key).map_err(to_pyerr)?;
         let bound = obsm_batch_to_numpy(py, &batch)?;
-        let obj: PyObject = bound.unbind();
+        let obj: Py<PyAny> = bound.unbind();
         let mut state = self.state.lock().unwrap();
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
@@ -276,11 +276,11 @@ impl ScxLazyVarmMapping {
 
 #[pymethods]
 impl ScxLazyVarmMapping {
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         self.fetch(py, key)
     }
 
-    fn __setitem__(&self, key: String, value: PyObject) {
+    fn __setitem__(&self, key: String, value: Py<PyAny>) {
         self.state.lock().unwrap().insert(key, Some(value));
     }
 
@@ -296,7 +296,7 @@ impl ScxLazyVarmMapping {
         self.state.lock().unwrap().contains_key(key)
     }
 
-    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
@@ -339,7 +339,7 @@ impl ScxLazyVarmMapping {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.fetch(py, key) {
             Ok(v) => Ok(v),
             Err(e) if e.is_instance_of::<PyKeyError>(py) => {
@@ -372,7 +372,7 @@ impl ScxLazyVarmMapping {
 #[pyclass(name = "ScxLazyLayersMapping", mapping)]
 pub struct ScxLazyLayersMapping {
     reader: Arc<ScxReader>,
-    state: Mutex<HashMap<String, Option<PyObject>>>,
+    state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
 }
 
 impl ScxLazyLayersMapping {
@@ -381,7 +381,7 @@ impl ScxLazyLayersMapping {
         if let Some(filter) = layer_filter {
             keys.retain(|n| filter.iter().any(|f| f == n));
         }
-        let state: HashMap<String, Option<PyObject>> =
+        let state: HashMap<String, Option<Py<PyAny>>> =
             keys.into_iter().map(|k| (k, None)).collect();
         Self {
             reader,
@@ -399,7 +399,7 @@ impl ScxLazyLayersMapping {
         Ok(dict)
     }
 
-    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
             let state = self.state.lock().unwrap();
             match state.get(key) {
@@ -410,7 +410,7 @@ impl ScxLazyLayersMapping {
         }
         let csr = self.reader.read_layer_filtered(key).map_err(to_pyerr)?;
         let bound = csr_to_scipy(py, csr)?;
-        let obj: PyObject = bound.unbind();
+        let obj: Py<PyAny> = bound.unbind();
         let mut state = self.state.lock().unwrap();
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
@@ -423,11 +423,11 @@ impl ScxLazyLayersMapping {
 
 #[pymethods]
 impl ScxLazyLayersMapping {
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<PyObject> {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         self.fetch(py, key)
     }
 
-    fn __setitem__(&self, key: String, value: PyObject) {
+    fn __setitem__(&self, key: String, value: Py<PyAny>) {
         self.state.lock().unwrap().insert(key, Some(value));
     }
 
@@ -443,7 +443,7 @@ impl ScxLazyLayersMapping {
         self.state.lock().unwrap().contains_key(key)
     }
 
-    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
@@ -486,7 +486,7 @@ impl ScxLazyLayersMapping {
     }
 
     #[pyo3(signature = (key, default=None))]
-    fn get(&self, py: Python<'_>, key: &str, default: Option<PyObject>) -> PyResult<PyObject> {
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match self.fetch(py, key) {
             Ok(v) => Ok(v),
             Err(e) if e.is_instance_of::<PyKeyError>(py) => {
@@ -525,7 +525,7 @@ impl ScxLazyValueIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
         let Some(k) = slf.keys.next() else {
             return Ok(None);
@@ -549,7 +549,7 @@ impl ScxLazyItemIterator {
         slf
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyObject>> {
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
         let py = slf.py();
         let Some(k) = slf.keys.next() else {
             return Ok(None);

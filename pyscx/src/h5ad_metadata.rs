@@ -27,11 +27,11 @@ use crate::anndata::{
 #[pyclass(module = "pyscx", name = "H5adMetadata")]
 pub struct PyH5adMetadata {
     #[pyo3(get)]
-    obs: PyObject,
+    obs: Py<PyAny>,
     #[pyo3(get)]
-    var: PyObject,
+    var: Py<PyAny>,
     #[pyo3(get)]
-    uns: PyObject,
+    uns: Py<PyAny>,
     #[pyo3(get)]
     n_obs: usize,
     #[pyo3(get)]
@@ -84,9 +84,7 @@ pub fn read_h5ad_metadata(
     let path_buf = std::path::PathBuf::from(path);
     let mut sink = scx_convert::WarningSink::log();
     let parts = py
-        .allow_threads(|| {
-            scx_convert::read_h5ad_metadata_from_path(&path_buf, strict_uns, &mut sink)
-        })
+        .detach(|| scx_convert::read_h5ad_metadata_from_path(&path_buf, strict_uns, &mut sink))
         .map_err(|e| PyRuntimeError::new_err(format!("read_h5ad_metadata('{path}'): {e}")))?;
     emit_python_warnings(py, &sink)?;
 
