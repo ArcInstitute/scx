@@ -465,6 +465,20 @@ pub fn read_dataframe_group(
                     }
                     continue;
                 }
+                "nullable-string-array" => {
+                    match read_nullable_string_group(&subgroup, name) {
+                        Ok((field, array)) => {
+                            fields.push(field);
+                            arrays.push(array);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: skipping nullable-string-array group '{name}' in {group_name}: {e}"
+                            );
+                        }
+                    }
+                    continue;
+                }
                 "" => {
                     // No `encoding-type` attribute: a genuine non-column
                     // nested group (e.g. a nested uns dict). anndata
@@ -963,6 +977,37 @@ fn read_nullable_float_group(
         }
     };
     Ok((field, array))
+}
+
+/// Read anndata's `nullable-string-array` group form (encoding-version
+/// 0.1.0): a subgroup with a variable-length-UTF8 `values` dataset (null
+/// positions filled with `""`) and a bool/u8 `mask` (`mask[i] == true` ⇔
+/// null). Produces an Arrow `Utf8` array carrying the corresponding
+/// validity bits, so it round-trips with the writer's
+/// `nullable-string-array` output. Mirrors [`read_nullable_integer_group`].
+fn read_nullable_string_group(
+    str_group: &hdf5::Group,
+    name: &str,
+) -> Result<(Field, ArrayRef), ConvertError> {
+    let values_ds = str_group.dataset("values")?;
+    let mask = read_bool_or_u8(&str_group.dataset("mask")?)?;
+    let values: Vec<hdf5::types::VarLenUnicode> = values_ds.read_1d()?.to_vec();
+    if values.len() != mask.len() {
+        return Err(ConvertError::Other(format!(
+            "nullable-string-array '{name}': values len {} != mask len {}",
+            values.len(),
+            mask.len()
+        )));
+    }
+    let strings: Vec<String> = values.iter().map(|s| s.to_string()).collect();
+    let arr = StringArray::from(
+        strings
+            .iter()
+            .zip(mask.iter())
+            .map(|(v, m)| if *m { None } else { Some(v.as_str()) })
+            .collect::<Vec<Option<&str>>>(),
+    );
+    Ok((Field::new(name, DataType::Utf8, true), Arc::new(arr)))
 }
 
 /// Read a 1D dataset that may be encoded as native HDF5 boolean

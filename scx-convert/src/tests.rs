@@ -1579,7 +1579,7 @@ fn test_scx_to_h5mu_round_trip() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_to_h5mu(&scx_path, &h5mu_out).unwrap();
+    scx_to_h5mu(&scx_path, &h5mu_out, &mut WarningSink::log()).unwrap();
 
     let file = hdf5::File::open(&h5mu_out).unwrap();
     // /mod/rna/X and /mod/adt/X exist.
@@ -1611,7 +1611,7 @@ fn test_modality_extract_to_h5ad() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna").unwrap();
+    scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna", &mut WarningSink::log()).unwrap();
 
     let file = hdf5::File::open(&h5ad_out).unwrap();
     assert!(file.group("X").is_ok());
@@ -4304,7 +4304,7 @@ fn test_scx_to_h5mu_streaming_round_trip() {
 
     // Cross-check streaming vs. materialising writer on the same SCX.
     let h5mu_mat = dir.path().join("out_mat.h5mu");
-    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat).unwrap();
+    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat, &mut WarningSink::log()).unwrap();
     let mat_file = hdf5::File::open(&h5mu_mat).unwrap();
     let stream_rna_data: Vec<f32> = file
         .dataset("mod/rna/X/data")
@@ -4342,8 +4342,10 @@ fn test_h5ad_streaming_multi_shard_round_trip() {
     let n_vars = 12;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
 
-    let mut opts = ConvertOptions::default();
-    opts.shard_target_rows = 7; // 5 shards for 32 rows
+    let opts = ConvertOptions {
+        shard_target_rows: 7, // 5 shards for 32 rows
+        ..Default::default()
+    };
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     assert!(
         ScxReader::open(&scx_path)
@@ -5752,7 +5754,8 @@ fn write_dataframe_group_honors_pandas_index_metadata_unnamed() {
         "__index_level_0__",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -5797,7 +5800,8 @@ fn write_dataframe_group_honors_pandas_index_metadata_named() {
         "gene_symbols",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -5855,7 +5859,8 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
     let symbols = Arc::new(StringArray::from(vec!["GENE_A", "GENE_B"]));
     let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
     let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![symbols, gene_ids]).unwrap();
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -6444,7 +6449,8 @@ mod streaming_obs_hdf5 {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BooleanArray, DictionaryArray, Int32Array, RecordBatch, StringArray,
+        Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, RecordBatch, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 
@@ -6454,7 +6460,7 @@ mod streaming_obs_hdf5 {
 
     use crate::h5ad_read::read_dataframe_group;
     use crate::h5ad_stream_write::write_scx_to_h5ad_streaming;
-    use crate::h5ad_write::write_scx_to_h5ad;
+    use crate::h5ad_write::{write_dataframe_group_streaming, write_scx_to_h5ad};
     use crate::pipeline::ConvertOptions;
     use crate::warnings::WarningSink;
 
@@ -6609,7 +6615,7 @@ mod streaming_obs_hdf5 {
             .unwrap();
         // Eager baseline (the existing materialising writer reads
         // assembled obs and writes via `write_dataframe_group_at`).
-        write_scx_to_h5ad(&scx_path, &h5ad_eager).unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
 
         // Re-read both via the SCX writer's own h5ad reader and
         // compare obs column-by-column. The eager baseline is the
@@ -6672,7 +6678,7 @@ mod streaming_obs_hdf5 {
         let opts = ConvertOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
             .unwrap();
-        write_scx_to_h5ad(&scx_path, &h5ad_eager).unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
 
         // Logical column equality is the user-visible contract.
         let stream_file = hdf5::File::open(&h5ad_stream).unwrap();
@@ -6758,7 +6764,7 @@ mod streaming_obs_hdf5 {
         let deleted: Vec<u64> = vec![3, 15, 27, 60];
         scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
 
-        write_scx_to_h5ad(&scx_path, &h5ad_out).unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad_out).unwrap();
         let shape: Vec<i64> = file
@@ -6848,7 +6854,7 @@ mod streaming_obs_hdf5 {
         let opts = ConvertOptions::default();
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream_out, &opts, &mut WarningSink::log())
             .unwrap();
-        write_scx_to_h5ad(&scx_path, &h5ad_eager_out).unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager_out, &mut WarningSink::log()).unwrap();
 
         let kept_rows: Vec<usize> = (0..n_obs as usize)
             .filter(|i| !deleted.contains(&(*i as u64)))
@@ -6942,7 +6948,7 @@ mod streaming_obs_hdf5 {
         // Eager path also routes through the streaming-or-eager
         // dispatcher post-issue-2 fix, but the assertion is the same:
         // the unsupported column must not leak into `column-order`.
-        write_scx_to_h5ad(&scx_path, &h5ad_eager).unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
 
         for path in [&h5ad_stream, &h5ad_eager] {
             let file = hdf5::File::open(path).unwrap();
@@ -7237,5 +7243,306 @@ mod streaming_obs_hdf5 {
                 }
             })
             .collect()
+    }
+
+    // ---- Nullable-encoding round-trip coverage (Patch 2) ----------------
+
+    /// obs shard batch with explicitly nullable numeric / string columns.
+    /// Besides the `cell_id` index (non-null):
+    ///   - `ncount` Int32,   null when global row % 5 == 0
+    ///   - `umi`    Int64,   null when global row % 3 == 0
+    ///   - `pct`    Float32, null when global row % 4 == 0
+    ///   - `score`  Float64, null when global row % 6 == 0
+    ///   - `batch`  Utf8,    null when global row % 7 == 0
+    fn nullable_obs_shard_batch(start_row: usize, n: usize) -> RecordBatch {
+        let cell_ids: Vec<String> = (start_row..start_row + n)
+            .map(|i| format!("cell_{i:06}"))
+            .collect();
+        let ncount: Vec<Option<i32>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(5)).then_some(g as i32)
+            })
+            .collect();
+        let umi: Vec<Option<i64>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(3)).then_some(g as i64 * 1000)
+            })
+            .collect();
+        let pct: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(4)).then_some(g as f32 * 0.5)
+            })
+            .collect();
+        let score: Vec<Option<f64>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(6)).then_some(g as f64 * 1.5)
+            })
+            .collect();
+        let batch: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(7)).then(|| format!("batch_{}", g % 3))
+            })
+            .collect();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("ncount", DataType::Int32, true),
+            Field::new("umi", DataType::Int64, true),
+            Field::new("pct", DataType::Float32, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("batch", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)),
+                Arc::new(Int32Array::from(ncount)),
+                Arc::new(Int64Array::from(umi)),
+                Arc::new(Float32Array::from(pct)),
+                Arc::new(Float64Array::from(score)),
+                Arc::new(StringArray::from(batch)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn build_nullable_sharded_scx(path: &std::path::Path, n_shards: u32, rows_per_shard: u64) {
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+        for shard_idx in 0..n_shards {
+            let row_start = u64::from(shard_idx) * rows_per_shard;
+            let batch = nullable_obs_shard_batch(row_start as usize, rows_per_shard as usize);
+            writer
+                .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                .unwrap();
+            write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+        }
+        writer.write_var(&small_var_batch()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// On-disk `encoding-type` of an obs column when it is a group
+    /// (categorical / nullable-*); `None` when the column is a plain
+    /// dataset.
+    fn obs_col_encoding(file: &hdf5::File, col: &str) -> Option<String> {
+        file.group("obs")
+            .unwrap()
+            .group(col)
+            .ok()
+            .and_then(|g| g.attr("encoding-type").ok())
+            .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+            .map(|v| v.to_string())
+    }
+
+    /// Assert the per-row null state + values of the nullable fixture
+    /// survive the round trip through `read_dataframe_group`.
+    fn assert_nullable_values(obs: &RecordBatch, n_obs: usize) {
+        let ncount = obs.column(obs.schema().index_of("ncount").unwrap());
+        let ncount = ncount.as_any().downcast_ref::<Int32Array>().unwrap();
+        let umi = obs.column(obs.schema().index_of("umi").unwrap());
+        let umi = umi.as_any().downcast_ref::<Int64Array>().unwrap();
+        let pct = obs.column(obs.schema().index_of("pct").unwrap());
+        let pct = pct.as_any().downcast_ref::<Float32Array>().unwrap();
+        let score = obs.column(obs.schema().index_of("score").unwrap());
+        let score = score.as_any().downcast_ref::<Float64Array>().unwrap();
+        let batch = obs.column(obs.schema().index_of("batch").unwrap());
+        let batch = batch.as_any().downcast_ref::<StringArray>().unwrap();
+
+        for g in 0..n_obs {
+            // Integer / string nulls preserve validity (mask).
+            if g.is_multiple_of(5) {
+                assert!(ncount.is_null(g), "ncount row {g} should be null");
+            } else {
+                assert_eq!(ncount.value(g), g as i32, "ncount row {g}");
+            }
+            if g.is_multiple_of(3) {
+                assert!(umi.is_null(g), "umi row {g} should be null");
+            } else {
+                assert_eq!(umi.value(g), g as i64 * 1000, "umi row {g}");
+            }
+            if g.is_multiple_of(7) {
+                assert!(batch.is_null(g), "batch row {g} should be null");
+            } else {
+                assert_eq!(batch.value(g), format!("batch_{}", g % 3), "batch row {g}");
+            }
+            // Float nulls become NaN (plain dataset, no validity).
+            if g.is_multiple_of(4) {
+                assert!(pct.value(g).is_nan(), "pct row {g} should be NaN");
+            } else {
+                assert_eq!(pct.value(g), g as f32 * 0.5, "pct row {g}");
+            }
+            if g.is_multiple_of(6) {
+                assert!(score.value(g).is_nan(), "score row {g} should be NaN");
+            } else {
+                assert_eq!(score.value(g), g as f64 * 1.5, "score row {g}");
+            }
+        }
+    }
+
+    /// Assert the on-disk encodings: int/string → nullable group; float →
+    /// plain dataset (anndata has no nullable-float spec).
+    fn assert_nullable_encodings(file: &hdf5::File) {
+        assert_eq!(
+            obs_col_encoding(file, "ncount").as_deref(),
+            Some("nullable-integer")
+        );
+        assert_eq!(
+            obs_col_encoding(file, "umi").as_deref(),
+            Some("nullable-integer")
+        );
+        assert_eq!(
+            obs_col_encoding(file, "batch").as_deref(),
+            Some("nullable-string-array")
+        );
+        // Floats stay plain datasets.
+        assert_eq!(obs_col_encoding(file, "pct"), None, "pct must be plain");
+        assert_eq!(obs_col_encoding(file, "score"), None, "score must be plain");
+    }
+
+    /// Eager export (legacy single-section obs): null int/string columns
+    /// round-trip via nullable groups, floats via NaN.
+    #[test]
+    fn test_nullable_round_trip_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullable_legacy.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        let n_obs: u64 = 60;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            writer
+                .write_obs(&nullable_obs_shard_batch(0, n_obs as usize))
+                .unwrap();
+            write_zero_csr_shard(&mut writer, 0, n_obs);
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(
+            ScxReader::open(&scx_path)
+                .unwrap()
+                .obs_metadata_shard_count(),
+            0,
+            "fixture must be legacy single-section"
+        );
+
+        write_scx_to_h5ad(&scx_path, &h5ad, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        assert_nullable_encodings(&file);
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), n_obs as usize);
+        assert_nullable_values(&obs, n_obs as usize);
+    }
+
+    /// Streaming export (sharded obs): same nullable contract, exercised
+    /// through the pre-scan + per-shard nullable group writers.
+    #[test]
+    fn test_nullable_round_trip_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullable_sharded.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        // 3 shards × 20 rows = 60 obs.
+        build_nullable_sharded_scx(&scx_path, 3, 20);
+        assert_eq!(
+            ScxReader::open(&scx_path)
+                .unwrap()
+                .obs_metadata_shard_count(),
+            3
+        );
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        assert_nullable_encodings(&file);
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), 60);
+        assert_nullable_values(&obs, 60);
+    }
+
+    /// A null-free integer column must still be written as a plain
+    /// dataset (no behaviour change for the common case). Uses the
+    /// existing all-valid `n_genes` Int32 fixture column.
+    #[test]
+    fn test_null_free_int_column_stays_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullfree.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        build_sharded_obs_scx(&scx_path, 2, 25);
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        // `n_genes` has no nulls → plain dataset, not a nullable group.
+        assert_eq!(
+            obs_col_encoding(&file, "n_genes"),
+            None,
+            "null-free int column must remain a plain dataset"
+        );
+    }
+
+    /// The streaming writer must reject a shard whose columns are
+    /// reordered relative to the declared schema (same count) rather than
+    /// writing values into the wrong HDF5 column.
+    #[test]
+    fn test_streaming_rejects_reordered_shard_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("x.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let good = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+        // Same column count + types but `a`/`b` names swapped.
+        let bad_schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let bad = RecordBatch::try_new(
+            Arc::new(bad_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c2", "c3"])),
+                Arc::new(Int32Array::from(vec![5, 6])),
+                Arc::new(Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap();
+
+        let needs_nullable = vec![false; schema.fields().len()];
+        let shards: Vec<Result<RecordBatch, scx_format::error::ScxError>> = vec![Ok(good), Ok(bad)];
+        let res = write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &schema,
+            shards,
+            4,
+            None,
+            &needs_nullable,
+            &mut WarningSink::log(),
+        );
+        let err = res.expect_err("reordered shard must be rejected");
+        assert!(
+            format!("{err}").contains("shard schema mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }

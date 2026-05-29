@@ -106,6 +106,24 @@ pub enum ConvertWarning {
         estimated_bytes: u64,
         budget_bytes: u64,
     },
+    /// SCX → h5ad export coerced null entries in a numeric or string
+    /// obs/var column to a sentinel value (`0` / `0.0` / `""`) because
+    /// anndata-compatible nullable integer / float / string encodings
+    /// are not yet emitted on the export side. `nullable-boolean` and
+    /// `categorical` columns preserve null state; only Int32 / Int64 /
+    /// Float32 / Float64 / Utf8 / LargeUtf8 columns are affected. The
+    /// column's non-null values are written faithfully.
+    CoercedNulls {
+        column: String,
+        dtype: String,
+        count: u64,
+    },
+    /// A dataframe column type is not supported by the SCX → h5ad
+    /// writer and was skipped (no dataset written, name excluded from
+    /// `column-order`). Replaces the prior `eprintln!` so Python
+    /// callers can intercept via `warnings.warn` and CLI callers get a
+    /// machine-readable per-category count.
+    UnsupportedExportColumn { column: String, dtype: String },
 }
 
 impl ConvertWarning {
@@ -130,6 +148,8 @@ impl ConvertWarning {
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",
             Self::MappingPeakFootprintHigh { .. } => "mapping_peak_footprint_high",
             Self::EagerAssemblyMemoryHigh { .. } => "eager_assembly_memory_high",
+            Self::CoercedNulls { .. } => "coerced_nulls",
+            Self::UnsupportedExportColumn { .. } => "unsupported_export_column",
         }
     }
 }

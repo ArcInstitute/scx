@@ -891,10 +891,7 @@ pub fn scx_to_h5ad(
     h5ad_path: &Path,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let _ = sink; // Phase 8 reverse-conversion will emit through this sink
-                  // (e.g. unsupported uns shape, dropped predicate indexes);
-                  // Phase 0 only threads the parameter.
-    write_scx_to_h5ad(scx_path, h5ad_path)
+    write_scx_to_h5ad(scx_path, h5ad_path, sink)
 }
 
 /// Streaming SCX → h5ad. Walks SCX CSR shards in row order and writes
