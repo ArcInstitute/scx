@@ -83,7 +83,7 @@ pub fn umap(
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _gpu_id {
         // Try native CUDA SGD kernel first — release GIL for duration
-        let gpu_result = py.allow_threads(|| {
+        let gpu_result = py.detach(|| {
             scx_accel::compute_umap_gpu(
                 device_id,
                 &indptr,
@@ -138,7 +138,7 @@ pub fn umap(
 
     // CPU path (default or fallback) — release GIL for the computation
     let result = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::compute_umap(
                 &indptr,
                 &indices,

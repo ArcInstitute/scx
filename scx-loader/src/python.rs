@@ -196,7 +196,7 @@ impl TrainingDataset {
         // Release the GIL while waiting for the next batch from the Rust
         // pipeline. This allows other Python threads (e.g., PyTorch CUDA
         // threads) to run while Stage 2 builds the next batch.
-        let batch_opt = py.allow_threads(|| self.pipeline.next_batch());
+        let batch_opt = py.detach(|| self.pipeline.next_batch());
 
         match batch_opt {
             Some(batch) => {
@@ -272,7 +272,7 @@ impl TrainingDataset {
     /// so the pool / runtime are torn down before interpreter teardown
     /// (where `Drop`'s GIL probe might still be too late).
     fn close(&mut self, py: Python<'_>) {
-        py.allow_threads(|| self.pipeline.shutdown());
+        py.detach(|| self.pipeline.shutdown());
     }
 
     fn __repr__(&self) -> String {
@@ -487,7 +487,7 @@ impl MultimodalTrainingDataset {
         // GIL once around all pulls is the simplest correct
         // implementation; with the same seed the pipelines should
         // produce in roughly aligned cadence.
-        let batches_opt: Option<Vec<Batch>> = py.allow_threads(|| {
+        let batches_opt: Option<Vec<Batch>> = py.detach(|| {
             let mut out = Vec::with_capacity(self.pipelines.len());
             for p in self.pipelines.iter_mut() {
                 match p.next_batch() {
@@ -533,7 +533,7 @@ impl MultimodalTrainingDataset {
         } else {
             // Tuple of X arrays in modality order.
             let x_dict = dict.get_item("X")?.expect("X key always present");
-            let x_dict = x_dict.downcast::<PyDict>()?;
+            let x_dict = x_dict.cast::<PyDict>()?;
             let mut tuple_items: Vec<Bound<'_, PyAny>> =
                 Vec::with_capacity(self.modality_names.len());
             for name in &self.modality_names {
@@ -570,7 +570,7 @@ impl MultimodalTrainingDataset {
     }
 
     fn close(&mut self, py: Python<'_>) {
-        py.allow_threads(|| {
+        py.detach(|| {
             for p in self.pipelines.iter_mut() {
                 p.shutdown();
             }
@@ -835,7 +835,7 @@ impl IndexPlanDataset {
         let lookahead = lookahead.unwrap_or_else(|| self.loader.effective_lookahead());
 
         // Bind plans → its iter, hold an owned Py<PyAny> Send-safe handle.
-        let py_iter: Py<PyAny> = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+        let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
             Ok(plans.bind(py).call_method0("__iter__")?.unbind())
         })?;
 
@@ -934,7 +934,7 @@ impl IndexPlanDataset {
 
         let loader = Arc::clone(&self.loader);
         let batch = py
-            .allow_threads(move || loader.process_plan(plan))
+            .detach(move || loader.process_plan(plan))
             .map_err(loader_err_to_py)?;
 
         index_plan_batch_to_dict(py, batch)
@@ -963,7 +963,7 @@ impl Iterator for PyPlanIterator {
     type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let bound = self.py_iter.bind(py);
             match bound.call_method0("__next__") {
                 Ok(obj) => match obj.extract::<Vec<(u64, u64)>>() {
@@ -1018,7 +1018,7 @@ impl IndexPlanBatchIter {
         // Release the GIL for both the prefetch await and the decode work,
         // so the plan-pull worker can call __next__ on the user iterator
         // without contention.
-        let next = py.allow_threads(|| inner.next());
+        let next = py.detach(|| inner.next());
         match next {
             Some(Ok(batch)) => Ok(Some(index_plan_batch_to_dict(py, batch)?)),
             Some(Err(e)) => Err(loader_err_to_py(e)),

@@ -163,7 +163,7 @@ fn run_rust_leiden(
 
     // Run Rust-native Leiden — releases the GIL for the compute-heavy part.
     let result = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::leiden(
                 &indptr,
                 &indices,

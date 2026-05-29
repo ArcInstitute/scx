@@ -145,7 +145,7 @@ pub fn highly_variable_genes<'py>(
     };
 
     // ── Try SCX backed dataset ──────────────────────────────────────────
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
         let reader = Arc::clone(&backed_ref.backed);
         let n_vars = backed_ref.shape_val.1;
@@ -175,7 +175,7 @@ pub fn highly_variable_genes<'py>(
     }
 
     // ── Try SCX lazy-transformed dataset ────────────────────────────────
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
         let reader = Arc::clone(&lazy_ref.backed);
         let transforms = lazy_ref.transforms.clone();
@@ -469,7 +469,7 @@ fn hvg_seurat_v3<'py>(
     // accumulator on host, matching the CPU formula byte-for-byte.
     #[cfg(feature = "gpu")]
     let batched_stats = if let Some(dev_id) = _device_id {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_accel::streaming_mean_var_batched_with_device(
                 &source,
                 &cell_batch,
@@ -480,16 +480,12 @@ fn hvg_seurat_v3<'py>(
         })
         .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var_batched: {e}")))?
     } else {
-        py.allow_threads(|| {
-            scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?
+        py.detach(|| scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual))
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?
     };
     #[cfg(not(feature = "gpu"))]
     let batched_stats = py
-        .allow_threads(|| {
-            scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual)
-        })
+        .detach(|| scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual))
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?;
 
     let global_stats = batched_stats.global.clone();
@@ -620,7 +616,7 @@ fn hvg_seurat_v3<'py>(
     // ── 4. Batched streaming clipped sums (single pass for ALL batches) ──
     #[cfg(feature = "gpu")]
     let all_clipped = if let Some(dev_id) = _device_id {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_accel::streaming_clip_square_sum_batched_with_device(
                 &source,
                 &cell_batch,
@@ -634,7 +630,7 @@ fn hvg_seurat_v3<'py>(
             PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum_batched: {e}"))
         })?
     } else {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_accel::streaming_clip_square_sum_batched(
                 &source,
                 &cell_batch,
@@ -646,7 +642,7 @@ fn hvg_seurat_v3<'py>(
     };
     #[cfg(not(feature = "gpu"))]
     let all_clipped = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::streaming_clip_square_sum_batched(
                 &source,
                 &cell_batch,
@@ -859,7 +855,7 @@ fn hvg_seurat<'py>(
         None,
     );
     let stats = py
-        .allow_threads(|| scx_accel::streaming_mean_var(&source))
+        .detach(|| scx_accel::streaming_mean_var(&source))
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
 
     // ── 2. Compute dispersion (matching scanpy's seurat flavor) ────────
@@ -948,7 +944,7 @@ fn apply_hvg_subset(
 ) -> PyResult<()> {
     let mask_arr = numpy::PyArray::from_vec(py, hvg_mask.to_vec());
 
-    if let Ok(backed) = x_obj.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x_obj.cast::<ScxBackedSparseDataset>() {
         let new_col_indices: Vec<u32> = match backed.borrow().col_projection() {
             Some(existing) => hvg_mask
                 .iter()
@@ -978,7 +974,7 @@ fn apply_hvg_subset(
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
         adata.setattr("_var", filtered_var)?;
-    } else if let Ok(lazy) = x_obj.downcast::<ScxLazyTransformedDataset>() {
+    } else if let Ok(lazy) = x_obj.cast::<ScxLazyTransformedDataset>() {
         let new_col_indices: Vec<u32> = match lazy.borrow().col_projection() {
             Some(existing) => hvg_mask
                 .iter()
@@ -1148,7 +1144,7 @@ fn hvg_seurat_v3_csc(
 
     // Dispatch: backed yields a borrowed `&dyn`, lazy yields an owned
     // `LazyShardSource` (we then borrow from it).
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
         let source = backed_ref.as_column_source().ok_or_else(|| {
             PyRuntimeError::new_err(
@@ -1160,7 +1156,7 @@ fn hvg_seurat_v3_csc(
         return run_pipeline(source, &x);
     }
 
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
         let lazy_src = lazy_ref.as_column_source().ok_or_else(|| {
             PyRuntimeError::new_err(

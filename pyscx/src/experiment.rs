@@ -574,7 +574,7 @@ impl PyExperiment {
         }
         let backed = open_backed_csr(&self.path, modality)?;
         let counts: Vec<i64> = py
-            .allow_threads(|| backed.gene_detection_counts())
+            .detach(|| backed.gene_detection_counts())
             .map_err(to_pyerr)?
             .into_iter()
             .map(|c| c as i64)
@@ -608,7 +608,7 @@ impl PyExperiment {
             resolve_gene_name(&self.reader, modality, &name)?
         };
         let rows = py
-            .allow_threads(|| backed.cells_expressing_gene(gene_idx))
+            .detach(|| backed.cells_expressing_gene(gene_idx))
             .map_err(to_pyerr)?;
         Ok(PyArray1::from_vec(py, rows))
     }

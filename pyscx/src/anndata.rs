@@ -430,7 +430,7 @@ fn extract_scx_envelope_info<'py>(table: &Bound<'py, PyAny>) -> PyResult<Option<
             Err(_) => return Ok(None),
         },
     };
-    let raw_bytes: &[u8] = if let Ok(b) = raw.downcast::<pyo3::types::PyBytes>() {
+    let raw_bytes: &[u8] = if let Ok(b) = raw.cast::<pyo3::types::PyBytes>() {
         b.as_bytes()
     } else if let Ok(s) = raw.extract::<&str>() {
         s.as_bytes()
@@ -475,7 +475,7 @@ fn strip_pandas_metadata<'py>(table: &Bound<'py, PyAny>) -> PyResult<Bound<'py, 
         let item = item?;
         let key = item.get_item(0)?;
         let value = item.get_item(1)?;
-        let key_bytes: &[u8] = if let Ok(b) = key.downcast::<pyo3::types::PyBytes>() {
+        let key_bytes: &[u8] = if let Ok(b) = key.cast::<pyo3::types::PyBytes>() {
             b.as_bytes()
         } else if let Ok(s) = key.extract::<&str>() {
             s.as_bytes()
@@ -1975,7 +1975,7 @@ fn numpy_or_pandas_to_record_batch(
     )?;
     let arr_c = np.call_method1("ascontiguousarray", (arr_cast,))?;
     let bytes_obj = arr_c.call_method0("tobytes")?;
-    let bytes: &[u8] = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+    let bytes: &[u8] = bytes_obj.cast::<PyBytes>()?.as_bytes();
 
     let mut fields = Vec::with_capacity(n_cols);
     let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(n_cols);
@@ -2310,7 +2310,7 @@ fn is_numeric_kind(kind: &str) -> bool {
 /// `key_path` accumulates a Python-style accessor (e.g.
 /// `uns['rank_genes_groups']['names'][0]`) for inclusion in error messages.
 ///
-/// `ctx.visiting` tracks PyObject identities currently on the recursion stack
+/// `ctx.visiting` tracks Py<PyAny> identities currently on the recursion stack
 /// for container branches (dict / list / tuple / `.tolist()` fallback). A
 /// repeat hit means the input contains a cycle (e.g. `d = {}; d["x"] = d`).
 /// We raise `ValueError` instead of recursing into a Rust stack overflow.
@@ -2349,11 +2349,11 @@ fn normalize_uns_value<'py>(
     }
 
     // bool before int: Python bool is a subclass of int.
-    if obj.downcast::<PyBool>().is_ok() {
+    if obj.cast::<PyBool>().is_ok() {
         return Ok(serde_json::Value::Bool(obj.extract::<bool>()?));
     }
 
-    if obj.downcast::<PyInt>().is_ok() {
+    if obj.cast::<PyInt>().is_ok() {
         if let Ok(i) = obj.extract::<i64>() {
             return Ok(serde_json::Value::Number(i.into()));
         }
@@ -2365,7 +2365,7 @@ fn normalize_uns_value<'py>(
         )));
     }
 
-    if obj.downcast::<PyFloat>().is_ok() {
+    if obj.cast::<PyFloat>().is_ok() {
         let f: f64 = obj.extract()?;
         if !f.is_finite() {
             return Err(PyValueError::new_err(format!(
@@ -2381,11 +2381,11 @@ fn normalize_uns_value<'py>(
             });
     }
 
-    if let Ok(s) = obj.downcast::<PyString>() {
+    if let Ok(s) = obj.cast::<PyString>() {
         return Ok(serde_json::Value::String(s.extract()?));
     }
 
-    if obj.downcast::<PyBytes>().is_ok() {
+    if obj.cast::<PyBytes>().is_ok() {
         return Err(PyValueError::new_err(format!(
             "uns at {key_path}: bytes are not JSON-serializable"
         )));
@@ -2409,7 +2409,7 @@ fn normalize_container<'py>(
     key_path: &str,
     ctx: &mut UnsWriteCtx<'_, 'py>,
 ) -> PyResult<serde_json::Value> {
-    if let Ok(dict) = obj.downcast::<PyDict>() {
+    if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (k, v) in dict.iter() {
             let key_str: String = k.str()?.extract()?;
@@ -2419,7 +2419,7 @@ fn normalize_container<'py>(
         return Ok(serde_json::Value::Object(map));
     }
 
-    if let Ok(lst) = obj.downcast::<PyList>() {
+    if let Ok(lst) = obj.cast::<PyList>() {
         let mut arr = Vec::with_capacity(lst.len());
         for (i, item) in lst.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
@@ -2428,7 +2428,7 @@ fn normalize_container<'py>(
         return Ok(serde_json::Value::Array(arr));
     }
 
-    if let Ok(tup) = obj.downcast::<PyTuple>() {
+    if let Ok(tup) = obj.cast::<PyTuple>() {
         let mut arr = Vec::with_capacity(tup.len());
         for (i, item) in tup.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
@@ -2613,7 +2613,7 @@ fn pylist_to_string_json_array<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
 ) -> PyResult<serde_json::Value> {
-    if let Ok(lst) = obj.downcast::<PyList>() {
+    if let Ok(lst) = obj.cast::<PyList>() {
         let mut arr = Vec::with_capacity(lst.len());
         for (i, item) in lst.iter().enumerate() {
             let new_path = format!("{key_path}[{i}]");
@@ -2621,15 +2621,15 @@ fn pylist_to_string_json_array<'py>(
         }
         return Ok(serde_json::Value::Array(arr));
     }
-    if let Ok(s) = obj.downcast::<PyString>() {
+    if let Ok(s) = obj.cast::<PyString>() {
         return Ok(serde_json::Value::String(s.extract()?));
     }
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
     }
-    if obj.downcast::<PyBytes>().is_ok() {
+    if obj.cast::<PyBytes>().is_ok() {
         // Decode UTF-8 bytes; reject otherwise.
-        let b: &[u8] = obj.downcast::<PyBytes>().unwrap().as_bytes();
+        let b: &[u8] = obj.cast::<PyBytes>().unwrap().as_bytes();
         let s = std::str::from_utf8(b).map_err(|_| {
             PyValueError::new_err(format!(
                 "uns at {key_path}: bytes element in object/string array is not valid UTF-8"
@@ -2649,23 +2649,23 @@ fn pytuple_descr_to_json<'py>(
     descr: &Bound<'py, PyAny>,
     key_path: &str,
 ) -> PyResult<serde_json::Value> {
-    let lst = descr.downcast::<PyList>().map_err(|_| {
+    let lst = descr.cast::<PyList>().map_err(|_| {
         PyValueError::new_err(format!(
             "uns at {key_path}: structured dtype.descr is not a list"
         ))
     })?;
     let mut out = Vec::with_capacity(lst.len());
     for (i, item) in lst.iter().enumerate() {
-        let tup = item.downcast::<PyTuple>().map_err(|_| {
+        let tup = item.cast::<PyTuple>().map_err(|_| {
             PyValueError::new_err(format!(
                 "uns at {key_path}: dtype.descr[{i}] is not a tuple"
             ))
         })?;
         let mut row = Vec::with_capacity(tup.len());
         for el in tup.iter() {
-            if let Ok(s) = el.downcast::<PyString>() {
+            if let Ok(s) = el.cast::<PyString>() {
                 row.push(serde_json::Value::String(s.extract()?));
-            } else if let Ok(t) = el.downcast::<PyTuple>() {
+            } else if let Ok(t) = el.cast::<PyTuple>() {
                 // Nested shape tuple, e.g. ('a', '<i4', (3,)).
                 let mut inner = Vec::with_capacity(t.len());
                 for d in t.iter() {
@@ -2673,7 +2673,7 @@ fn pytuple_descr_to_json<'py>(
                     inner.push(serde_json::Value::Number(n.into()));
                 }
                 row.push(serde_json::Value::Array(inner));
-            } else if let Ok(l) = el.downcast::<PyList>() {
+            } else if let Ok(l) = el.cast::<PyList>() {
                 // Nested descr for sub-record (recursive).
                 let nested = pytuple_descr_to_json(l.as_any(), key_path)?;
                 row.push(nested);
@@ -2700,7 +2700,7 @@ fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> PyResult<Ve
     let np = arr.py().import("numpy")?;
     let arr_c = np.call_method1("ascontiguousarray", (arr_le,))?;
     let bytes_obj = arr_c.call_method0("tobytes")?;
-    let pybytes = bytes_obj.downcast::<PyBytes>().map_err(|_| {
+    let pybytes = bytes_obj.cast::<PyBytes>().map_err(|_| {
         PyValueError::new_err(format!(
             "uns at {key_path}: ndarray.tobytes() did not return bytes"
         ))
@@ -2784,13 +2784,13 @@ fn pyobj_to_simple_json<'py>(
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
     }
-    if let Ok(s) = obj.downcast::<PyString>() {
+    if let Ok(s) = obj.cast::<PyString>() {
         return Ok(serde_json::Value::String(s.extract()?));
     }
-    if obj.downcast::<PyBool>().is_ok() {
+    if obj.cast::<PyBool>().is_ok() {
         return Ok(serde_json::Value::Bool(obj.extract()?));
     }
-    if obj.downcast::<PyInt>().is_ok() {
+    if obj.cast::<PyInt>().is_ok() {
         if let Ok(i) = obj.extract::<i64>() {
             return Ok(serde_json::Value::Number(i.into()));
         }
@@ -2798,7 +2798,7 @@ fn pyobj_to_simple_json<'py>(
             return Ok(serde_json::Value::Number(u.into()));
         }
     }
-    if obj.downcast::<PyFloat>().is_ok() {
+    if obj.cast::<PyFloat>().is_ok() {
         let f: f64 = obj.extract()?;
         if f.is_finite() {
             if let Some(n) = serde_json::Number::from_f64(f) {
@@ -3266,7 +3266,7 @@ struct ShardBoundary {
 /// Parallel-encode CSR shards using rayon.
 ///
 /// Clones the numpy-borrowed arrays into Rust-owned `Arc` slices for thread
-/// safety, then encodes all shards in parallel under `py.allow_threads()`.
+/// safety, then encodes all shards in parallel under `py.detach()`.
 /// Returns `PreEncodedSection`s in shard order, ready for sequential write.
 #[allow(clippy::too_many_arguments)]
 fn parallel_encode_csr_shards(
@@ -3292,7 +3292,7 @@ fn parallel_encode_csr_shards(
     let data_owned: Arc<[f32]> = data.to_vec().into();
     let name_prefix = name_prefix.to_string();
 
-    let result: Result<Vec<PreEncodedSection>, String> = py.allow_threads(|| {
+    let result: Result<Vec<PreEncodedSection>, String> = py.detach(|| {
         boundaries
             .par_iter()
             .map(|b| {
@@ -3362,7 +3362,7 @@ fn parallel_encode_csr_shards(
 /// Forward each non-empty category in `sink` as a single
 /// `warnings.warn(..., UserWarning)` call on the Python side.
 ///
-/// The conversion itself runs under `py.allow_threads`, so emission
+/// The conversion itself runs under `py.detach`, so emission
 /// happens after the GIL is reacquired. One Python-side warning per
 /// category (with its aggregate count) is enough for Phase 0; per-
 /// emission forwarding would require holding the GIL across the
@@ -3601,12 +3601,12 @@ pub(crate) fn route_backed_anndata_to_streaming(
     // those mutations need preserving.
     let mut sink = scx_convert::WarningSink::log();
     if stream {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     } else {
-        py.allow_threads(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
+        py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
     emit_python_warnings(py, &sink)?;
@@ -3912,7 +3912,7 @@ fn route_scx_backed_to_scx(
     }
 
     // Write obs/var first.
-    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format::ScxError> {
         writer.write_obs(&ov.obs)?;
         writer.write_var(&ov.var)?;
         Ok(())
@@ -3934,7 +3934,7 @@ fn route_scx_backed_to_scx(
         // enforced above, so we can write at the global modality
         // (current_modality_id == 0).
         let csr_shards = src_reader.catalog().csr_shards_sorted();
-        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format::ScxError> {
             for entry in csr_shards {
                 let bytes = src_reader.read_raw_shard_bytes(entry)?;
                 writer.copy_section_verbatim(entry, bytes)?;
@@ -3955,7 +3955,7 @@ fn route_scx_backed_to_scx(
             // the wrapper's __getitem__ (returns scipy CSR).
             let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-                py.allow_threads(|| {
+                py.detach(|| {
                     scx_format::encode_one_shard(
                         indptr,
                         indices,
@@ -3971,7 +3971,7 @@ fn route_scx_backed_to_scx(
                 })
                 .map_err(to_pyerr)
             })?;
-            py.allow_threads(|| writer.write_preencoded_shard(pre))
+            py.detach(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
         }
     }
@@ -3996,7 +3996,7 @@ fn route_scx_backed_to_scx(
     // varp are emitted as row-sharded sections so the on-disk layout
     // matches what the streaming pipeline produces (readers handle
     // both sharded and legacy single-section layouts transparently).
-    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
             for_each_dense_shard(
                 b,
@@ -4065,7 +4065,7 @@ fn route_scx_backed_to_scx(
 
     // Optional CSC sidecar rebuild over the just-written file.
     if csc_always {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
                 .map_err(|e| e.to_string())
         })
@@ -4126,7 +4126,7 @@ fn route_scx_lazy_to_scx(
 
     let ov = extract_scx_overrides(py, adata, uns_format_parsed)?;
 
-    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format::ScxError> {
         writer.write_obs(&ov.obs)?;
         writer.write_var(&ov.var)?;
         Ok(())
@@ -4145,7 +4145,7 @@ fn route_scx_lazy_to_scx(
         let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
         let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-            py.allow_threads(|| {
+            py.detach(|| {
                 scx_format::encode_one_shard(
                     indptr,
                     indices,
@@ -4161,7 +4161,7 @@ fn route_scx_lazy_to_scx(
             })
             .map_err(to_pyerr)
         })?;
-        py.allow_threads(|| writer.write_preencoded_shard(pre))
+        py.detach(|| writer.write_preencoded_shard(pre))
             .map_err(to_pyerr)?;
     }
 
@@ -4178,7 +4178,7 @@ fn route_scx_lazy_to_scx(
         index_dtype,
     )?;
 
-    py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format::ScxError> {
         for (k, b) in &ov.obsm {
             for_each_dense_shard(
                 b,
@@ -4272,7 +4272,7 @@ fn route_scx_lazy_to_scx(
     writer.finish().map_err(to_pyerr)?;
 
     if csc_always {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
                 .map_err(|e| e.to_string())
         })
@@ -4366,7 +4366,7 @@ fn stream_write_layers(
             let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
             let shard_obj = layer.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-                py.allow_threads(|| {
+                py.detach(|| {
                     scx_format::encode_one_shard(
                         indptr,
                         indices,
@@ -4382,7 +4382,7 @@ fn stream_write_layers(
                 })
                 .map_err(to_pyerr)
             })?;
-            py.allow_threads(|| writer.write_preencoded_shard(pre))
+            py.detach(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
         }
     }
@@ -4486,7 +4486,7 @@ where
 /// then emits one shard per non-empty bucket. Used by the in-Python
 /// override paths to keep on-disk obsp/varp layout symmetric with the
 /// streaming pipeline. Returns `ScxError` (not `PyResult`) so callers
-/// can drive it from inside `py.allow_threads(...)`.
+/// can drive it from inside `py.detach(...)`.
 fn for_each_coo_shard<F>(
     batch: &RecordBatch,
     shard_target_rows: u32,
@@ -4997,7 +4997,7 @@ pub fn from_anndata_impl(
     let var_rows = var_batch.num_rows();
     let shard_obs = !force_legacy_metadata && obs_rows > step;
     let shard_var = !force_legacy_metadata && var_rows > step;
-    py.allow_threads(|| -> std::result::Result<(), scx_format::ScxError> {
+    py.detach(|| -> std::result::Result<(), scx_format::ScxError> {
         if shard_obs {
             let n_total = obs_rows as u64;
             let mut shard_idx: u32 = 0;
@@ -5120,7 +5120,7 @@ pub fn from_anndata_impl(
     // builds one RecordBatch (numpy fast-path for plain numeric ndarrays
     // skips the `pd.DataFrame(arr)` roundtrip), optionally warns when
     // the estimated peak footprint exceeds `memory_budget`, then writes
-    // shards in `py.allow_threads` and drops the batch before moving on.
+    // shards in `py.detach` and drops the batch before moving on.
     // This bounds peak RSS to one key's payload at a time instead of
     // the full sum of all mappings.
     let obsm = adata.getattr("obsm")?;
@@ -5145,7 +5145,7 @@ pub fn from_anndata_impl(
                 )?;
             }
         }
-        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format::ScxError> {
             for_each_dense_shard(
                 &batch,
                 shard_target_rows,
@@ -5181,7 +5181,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format::ScxError> {
                 for_each_dense_shard(
                     &batch,
                     shard_target_rows,
@@ -5217,7 +5217,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format::ScxError> {
                 for_each_coo_shard(
                     &batch,
                     shard_target_rows,
@@ -5260,7 +5260,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format::ScxError> {
                 for_each_coo_shard(
                     &batch,
                     shard_target_rows,
@@ -5299,8 +5299,7 @@ pub fn from_anndata_impl(
 
     // Write uns outside GIL.
     if let Some(ref json_val) = uns_json {
-        py.allow_threads(|| writer.write_uns(json_val))
-            .map_err(to_pyerr)?;
+        py.detach(|| writer.write_uns(json_val)).map_err(to_pyerr)?;
     }
 
     // Write layers
@@ -5404,7 +5403,7 @@ pub fn from_anndata_impl(
     // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
     // a `LayerCscShard` section type would need to land first).
     if csc_always {
-        py.allow_threads(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format::ScxError> {
             write_csc_shards_from_csr(
                 &mut writer,
                 indptr_slice,

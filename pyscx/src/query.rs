@@ -163,9 +163,7 @@ impl PyQueryPipeline {
     fn collect(&mut self, py: Python<'_>) -> PyResult<PyQueryResult> {
         let pipeline = self.take_pipeline()?;
         // Note: pipeline is NOT put back — collect() consumes it
-        let result = py
-            .allow_threads(|| pipeline.collect())
-            .map_err(engine_to_pyerr)?;
+        let result = py.detach(|| pipeline.collect()).map_err(engine_to_pyerr)?;
         Ok(PyQueryResult::from_result(result))
     }
 

@@ -1712,6 +1712,42 @@ fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardM
 ///
 /// Errors with `InvalidCatalog` on any cover violation and
 /// `SectionNotFound` when `raw_batches` is empty.
+/// Collapse every dictionary (categorical) column in `batch` to a unified
+/// dictionary with distinct values.
+///
+/// `arrow::compute::concat` concatenates per-shard dictionary value arrays
+/// without deduplicating, so concatenating N shards that each hold the same
+/// category produces a dictionary with that category repeated N times. Such a
+/// batch round-trips through Arrow IPC fine, but `pyarrow.Table.to_pandas()`
+/// raises `ValueError: Categorical categories must be unique`. Casting each
+/// dictionary column to its value type (decode) and back to the original
+/// dictionary type (re-encode) rebuilds a deduplicated dictionary with keys
+/// remapped to the surviving values. Non-dictionary columns pass through
+/// untouched; the schema (and its `pandas` index metadata) is preserved.
+fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::datatypes::DataType;
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+    {
+        return Ok(batch.clone());
+    }
+    let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        match field.data_type() {
+            DataType::Dictionary(_, value_type) => {
+                let values = arrow::compute::cast(col, value_type.as_ref())?;
+                new_columns.push(arrow::compute::cast(&values, field.data_type())?);
+            }
+            _ => new_columns.push(col.clone()),
+        }
+    }
+    Ok(RecordBatch::try_new(schema, new_columns)?)
+}
+
 pub fn assemble_sharded_metadata(
     logical: &str,
     mut raw_batches: Vec<(u32, RecordBatch)>,
@@ -1794,7 +1830,13 @@ pub fn assemble_sharded_metadata(
     // combined offsets still fit in `i32::MAX`.
     let wide_schema = batches[0].schema();
     let concatenated = arrow::compute::concat_batches(&wide_schema, batches.iter())?;
-    let narrowed = crate::arrow_compat::downcast_large_types(&concatenated)?;
+    // Arrow's `concat` appends each shard's dictionary verbatim without
+    // deduplicating, so a categorical column that is `["batch1"]` in every
+    // one of N shards comes back with a dictionary of `["batch1"; N]`. pandas
+    // (`pyarrow.Table.to_pandas()`) rejects non-unique categories, so collapse
+    // every dictionary column to a unified dictionary before narrowing.
+    let unified = unify_dictionary_columns(&concatenated)?;
+    let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
 
     // Strip the per-shard metadata (shard_idx / row_start / n_shard_rows)
     // from the merged batch's schema. Keep n_rows_total and any
@@ -3303,6 +3345,71 @@ mod tests {
             Some("6"),
             "n_rows_total should survive (got metadata: {md:?})"
         );
+    }
+
+    /// Regression: when every shard carries the *same* categorical value,
+    /// Arrow's `concat` appends each shard's one-element dictionary, yielding
+    /// `["batch1", "batch1", "batch1", "batch1"]`. `to_pandas()` then raises
+    /// `ValueError: Categorical categories must be unique`. `assemble_sharded_metadata`
+    /// must collapse dictionary columns to a unified dictionary with distinct
+    /// values.
+    #[test]
+    fn test_assemble_unifies_duplicate_dictionary_categories() {
+        use arrow::array::{Array, DictionaryArray};
+        use arrow::datatypes::Int32Type;
+
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let n_shards = 4u32;
+
+        let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+            .map(|shard_idx| {
+                // One row per shard, all the same category — the duplicate
+                // dictionary the writer's per-shard categoricals produce.
+                let strs = StringArray::from(vec!["batch1"]);
+                let dict =
+                    arrow::compute::cast(&(Arc::new(strs) as arrow::array::ArrayRef), &dict_dt)
+                        .unwrap();
+                let metadata = std::collections::HashMap::from([
+                    ("shard_idx".to_string(), shard_idx.to_string()),
+                    ("row_start".to_string(), shard_idx.to_string()),
+                    ("n_shard_rows".to_string(), "1".to_string()),
+                    ("n_rows_total".to_string(), n_shards.to_string()),
+                ]);
+                let schema = Arc::new(
+                    Schema::new(vec![Field::new("gem_group", dict_dt.clone(), false)])
+                        .with_metadata(metadata),
+                );
+                let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+                (shard_idx, batch)
+            })
+            .collect();
+
+        let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+        assert_eq!(merged.num_rows(), n_shards as usize);
+
+        let col = merged.column(0);
+        let dict = col
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("gem_group should remain dictionary-encoded");
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dictionary values should be Utf8");
+        assert_eq!(
+            values.len(),
+            1,
+            "duplicate categories must be collapsed (got {:?})",
+            (0..values.len())
+                .map(|i| values.value(i))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(values.value(0), "batch1");
+        // Every row still resolves to the single surviving category.
+        for i in 0..dict.len() {
+            assert_eq!(values.value(dict.keys().value(i) as usize), "batch1");
+        }
     }
 
     #[test]

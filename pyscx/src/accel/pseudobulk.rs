@@ -42,7 +42,7 @@ pub fn pseudobulk_dex(
     min_cells_per_stratum: usize,
     prefer_format: &str,
     gene_indices: Option<Vec<u32>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"

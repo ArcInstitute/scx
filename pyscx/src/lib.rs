@@ -396,7 +396,7 @@ fn from_h5ad(
         let path_buf = std::path::PathBuf::from(path);
         let mut shape_sink = scx_convert::WarningSink::log();
         let (n_obs_disk, n_vars_disk, _x_format) = py
-            .allow_threads(|| scx_convert::read_h5ad_x_shape_from_path(&path_buf, &mut shape_sink))
+            .detach(|| scx_convert::read_h5ad_x_shape_from_path(&path_buf, &mut shape_sink))
             .map_err(|e| PyRuntimeError::new_err(format!("read X shape '{path}': {e}")))?;
         anndata::emit_python_warnings(py, &shape_sink)?;
         if let Some(obs) = obs_override.as_ref() {
@@ -451,12 +451,12 @@ fn from_h5ad(
     let output = std::path::PathBuf::from(out);
     let mut sink = scx_convert::WarningSink::log();
     if stream {
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     } else {
-        py.allow_threads(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
+        py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
     anndata::emit_python_warnings(py, &sink)?;
@@ -662,7 +662,7 @@ fn to_h5ad(
         memory_budget: memory_budget_bytes,
         ..Default::default()
     };
-    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+    py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
         match (modality, stream) {
             (Some(name), true) => scx_convert::scx_modality_to_h5ad_streaming(
@@ -718,7 +718,7 @@ fn to_h5mu(
         memory_budget: memory_budget_bytes,
         ..Default::default()
     };
-    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+    py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
         if stream {
             scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
