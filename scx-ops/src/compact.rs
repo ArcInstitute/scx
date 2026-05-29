@@ -72,7 +72,7 @@ pub fn compact_with_index_options(
         // warning.
         let multimodal_skip =
             user_wants_index(index_options).then(|| requested_columns(index_options));
-        compact_multimodal(reader, in_header, output_path, reshape_obs)?;
+        compact_multimodal(reader, in_header, input_path, output_path, reshape_obs)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
             multimodal_skip,
@@ -378,6 +378,34 @@ pub fn compact_with_index_options(
         }
     }
 
+    // Copy varm (var-axis; vars are not deleted by compact, so unfiltered).
+    // `read_all_varm` transparently assembles legacy + sharded layouts and
+    // returns an empty map when absent, so no header-flag guard is needed.
+    let mut varm: Vec<_> = reader.read_all_varm()?.into_iter().collect();
+    varm.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &varm {
+        writer.write_varm(name, batch)?;
+    }
+
+    // Copy varp (var×var; var-axis on both dimensions → unfiltered).
+    let mut varp: Vec<_> = reader.read_all_varp()?.into_iter().collect();
+    varp.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &varp {
+        writer.write_varp(name, batch)?;
+    }
+
+    // Copy obsp (obs×obs COO). Under deletions both COO axes are remapped
+    // through the obs keep-mask; entries touching a deleted obs are dropped.
+    let mut obsp: Vec<_> = reader.read_all_obsp()?.into_iter().collect();
+    obsp.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &obsp {
+        let out = match keep_mask {
+            Some(ref mask) => filter_obsp_coo(batch, mask)?,
+            None => batch.clone(),
+        };
+        writer.write_obsp(name, &out)?;
+    }
+
     // Predicate indexes: rebuild against the post-deletion obs + the
     // freshly emitted shard row ranges. `user_wants_index` treats a
     // non-zero `index_auto_threshold` as an explicit request — fixes
@@ -420,6 +448,166 @@ pub fn compact_with_index_options(
         result: index_result,
         multimodal_skip: None,
     })
+}
+
+/// Read a COO coordinate column (`row` / `col`) as `i64`, accepting either
+/// the v1 `Int32` or the v2 `Int64` coordinate width. The Arrow schema
+/// self-describes the width (see `scx-format/tests/pairwise_v2_int64.rs`), so
+/// compact must round-trip both.
+fn obsp_coords_as_i64(batch: &arrow::array::RecordBatch, name: &str) -> Result<Vec<i64>> {
+    use arrow::array::{Int32Array, Int64Array};
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        crate::error::OpsError::InvalidInput(format!("obsp COO column `{name}` is missing"))
+    })?;
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        Ok((0..a.len()).map(|i| a.value(i)).collect())
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        Ok((0..a.len()).map(|i| a.value(i) as i64).collect())
+    } else {
+        Err(crate::error::OpsError::InvalidInput(format!(
+            "obsp COO column `{name}` is neither Int32 nor Int64"
+        )))
+    }
+}
+
+/// Remap an obsp COO `RecordBatch` (obs×obs) through the obs keep-mask.
+///
+/// Drops entries whose `row` OR `col` references a deleted obs and renumbers
+/// surviving endpoints into the compacted index space. The `n_rows` /
+/// `n_cols` schema metadata is rewritten to the kept count; all other
+/// metadata keys are preserved. `keep_mask[i] == true` means obs `i` is kept.
+///
+/// Both the v1 `Int32` and v2 `Int64` coordinate widths are accepted on input;
+/// the output width is chosen from the compacted dimension so a >`i32::MAX`
+/// axis that survives compaction stays `Int64` (no silent wrap).
+fn filter_obsp_coo(
+    batch: &arrow::array::RecordBatch,
+    keep_mask: &[bool],
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field};
+
+    // old obs index -> new obs index (or -1 if the obs was deleted).
+    let mut old_to_new = vec![-1i64; keep_mask.len()];
+    let mut next = 0i64;
+    for (i, &keep) in keep_mask.iter().enumerate() {
+        if keep {
+            old_to_new[i] = next;
+            next += 1;
+        }
+    }
+    let new_dim = next;
+
+    let rows = obsp_coords_as_i64(batch, "row")?;
+    let cols = obsp_coords_as_i64(batch, "col")?;
+    let data = batch
+        .column_by_name("data")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+        .ok_or_else(|| {
+            crate::error::OpsError::InvalidInput(
+                "obsp COO column `data` is missing or not Float32".to_string(),
+            )
+        })?;
+
+    let mut out_rows: Vec<i64> = Vec::new();
+    let mut out_cols: Vec<i64> = Vec::new();
+    let mut out_data: Vec<f32> = Vec::new();
+    for i in 0..batch.num_rows() {
+        let r = usize::try_from(rows[i]).ok();
+        let c = usize::try_from(cols[i]).ok();
+        let (nr, nc) = match (
+            r.and_then(|r| old_to_new.get(r)),
+            c.and_then(|c| old_to_new.get(c)),
+        ) {
+            (Some(&nr), Some(&nc)) if nr >= 0 && nc >= 0 => (nr, nc),
+            _ => continue,
+        };
+        out_rows.push(nr);
+        out_cols.push(nc);
+        out_data.push(data.value(i));
+    }
+
+    // Choose the output coordinate width from the compacted dimension: keep
+    // Int64 when the surviving axis still exceeds i32::MAX, otherwise narrow
+    // to Int32 (the common case).
+    let use_i64 = new_dim > i64::from(i32::MAX);
+    let coord_type = if use_i64 {
+        DataType::Int64
+    } else {
+        DataType::Int32
+    };
+    let (row_arr, col_arr): (
+        std::sync::Arc<dyn arrow::array::Array>,
+        std::sync::Arc<dyn arrow::array::Array>,
+    ) = if use_i64 {
+        (
+            std::sync::Arc::new(Int64Array::from(out_rows)),
+            std::sync::Arc::new(Int64Array::from(out_cols)),
+        )
+    } else {
+        (
+            std::sync::Arc::new(Int32Array::from(
+                out_rows.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(Int32Array::from(
+                out_cols.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+        )
+    };
+
+    // Rebuild the schema with the chosen coordinate width; rewrite
+    // n_rows / n_cols metadata and preserve all other metadata keys.
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.insert("n_rows".to_string(), new_dim.to_string());
+    metadata.insert("n_cols".to_string(), new_dim.to_string());
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        vec![
+            Field::new("row", coord_type.clone(), false),
+            Field::new("col", coord_type, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        metadata,
+    ));
+    Ok(arrow::array::RecordBatch::try_new(
+        schema,
+        vec![
+            row_arr,
+            col_arr,
+            std::sync::Arc::new(Float32Array::from(out_data)),
+        ],
+    )?)
+}
+
+/// Discover the deduplicated logical keys for a per-modality dense-mapping
+/// family (obsm/varm), spanning both the legacy single-section type and the
+/// sharded type. Shard entry names (`{key}_shard_{idx}`) are reduced to their
+/// logical `{key}`. Keys are returned sorted for deterministic output order.
+fn discover_modality_keys(
+    reader: &ScxReader,
+    modality_id: u8,
+    prefix: &str,
+    single: SectionType,
+    shard: SectionType,
+) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in &reader.catalog().entries {
+        if entry.modality_id != modality_id || !entry.name.starts_with(prefix) {
+            continue;
+        }
+        let Some(rest) = entry.name.strip_prefix(prefix) else {
+            continue;
+        };
+        if entry.section_type == single {
+            keys.insert(rest.to_string());
+        } else if entry.section_type == shard {
+            let key = match rest.rfind("_shard_") {
+                Some(pos) => &rest[..pos],
+                None => rest,
+            };
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
 }
 
 /// Write the (filtered) obs metadata batch to `writer`.
@@ -466,6 +654,7 @@ fn write_obs_section(
 fn compact_multimodal(
     reader: ScxReader,
     in_header: FileHeader,
+    input_path: &Path,
     output_path: &Path,
     reshape_obs: bool,
 ) -> Result<()> {
@@ -501,7 +690,7 @@ fn compact_multimodal(
             "compact dropped per-modality CSC shards from {input}: \
              rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
              column-major sidecar",
-            input = output_path.display()
+            input = input_path.display()
         );
     }
 
@@ -656,30 +845,67 @@ fn compact_multimodal(
             )?;
         }
 
-        // Per-modality obsm — row-filter by keep_mask. Section names
-        // are `obsm/{modality_name}/{key}`.
+        // Per-modality obsm — row-filter by keep_mask. Section names are
+        // `obsm/{modality_name}/{key}`. Discovery spans both the legacy
+        // single-section (`ObsmEmbedding`) and the sharded
+        // (`ObsmEmbeddingShard`) layouts; `read_obsm_for` reassembles a
+        // sharded input transparently.
         let obsm_prefix = format!("obsm/{}/", info.name);
-        let obsm_entries: Vec<scx_format::FullCatalogEntry> = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| {
-                e.section_type == SectionType::ObsmEmbedding
-                    && e.modality_id == in_modality_id
-                    && e.name.starts_with(&obsm_prefix)
-            })
-            .cloned()
-            .collect();
-        for entry in &obsm_entries {
-            let key = entry.name.strip_prefix(&obsm_prefix).unwrap_or(&entry.name);
-            let batch = reader.read_obsm_for(in_modality_id, key)?;
+        for key in discover_modality_keys(
+            &reader,
+            in_modality_id,
+            &obsm_prefix,
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        ) {
+            let batch = reader.read_obsm_for(in_modality_id, &key)?;
             let filtered = if let Some(ref mask) = keep_mask {
                 let bool_array = arrow::array::BooleanArray::from(mask.clone());
                 compute::filter_record_batch(&batch, &bool_array)?
             } else {
                 batch
             };
-            writer.write_obsm_for(out_modality_id, key, &filtered)?;
+            writer.write_obsm_for(out_modality_id, &key, &filtered)?;
+        }
+
+        // Per-modality varm — var-axis (not row-filtered). Only a sharded
+        // per-modality writer exists, so emit each as one full-coverage
+        // shard; `read_varm_for` reads it back transparently.
+        let varm_prefix = format!("varm/{}/", info.name);
+        for key in discover_modality_keys(
+            &reader,
+            in_modality_id,
+            &varm_prefix,
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        ) {
+            let batch = reader.read_varm_for(in_modality_id, &key)?;
+            let n = batch.num_rows() as u64;
+            writer.write_varm_shard_for(out_modality_id, &key, 0, 0, n, n, &batch)?;
+        }
+
+        // Per-modality obsp/varp are not preserved: the format has no
+        // per-modality pairwise reader, so they cannot be round-tripped.
+        // Warn rather than drop them silently.
+        let has_pairwise = reader.catalog().entries.iter().any(|e| {
+            e.modality_id == in_modality_id
+                && matches!(
+                    e.section_type,
+                    SectionType::ObspEmbedding
+                        | SectionType::ObspEmbeddingShard
+                        | SectionType::ObspCsrShard
+                        | SectionType::VarpEmbedding
+                        | SectionType::VarpEmbeddingShard
+                )
+        });
+        if has_pairwise {
+            log::warn!(
+                "compact does not preserve per-modality obsp/varp for modality \
+                 `{name}` (no per-modality pairwise reader); these sections are \
+                 dropped from {input}",
+                name = info.name,
+                input = input_path.display()
+            );
         }
 
         // Per-modality uns.
@@ -796,19 +1022,71 @@ fn compact_multimodal(
         }
     }
 
-    // Global obsm (modality_id == 0). Single-modality compact handles
-    // these via the `has_obsm` branch; mirror that path for multimodal.
-    if in_header.has_obsm() {
-        let all_obsm = reader.read_all_obsm()?;
-        for (name, batch) in &all_obsm {
-            let filtered_batch = if let Some(ref mask) = keep_mask {
-                let bool_array = arrow::array::BooleanArray::from(mask.clone());
-                compute::filter_record_batch(batch, &bool_array)?
-            } else {
-                batch.clone()
-            };
-            writer.write_obsm(name, &filtered_batch)?;
-        }
+    // Global mappings (modality_id == 0), mirroring the single-modality
+    // path. `read_all_*` scans by name prefix and does NOT filter by
+    // modality, so it would also return per-modality entries (keyed
+    // `{modality}/{key}`) and re-emit them as spurious global sections.
+    // `discover_modality_keys(&reader, 0, ...)` filters on `modality_id == 0`,
+    // isolating the true globals; the bare-key readers
+    // (`read_obsm`/`read_varm`/`read_varp`/`read_obsp`) use exact-name lookup
+    // so they never pick up a per-modality `{prefix}/{modality}/...` section.
+
+    // Global obsm (obs-axis → row-filter under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsm/",
+        SectionType::ObsmEmbedding,
+        SectionType::ObsmEmbeddingShard,
+    ) {
+        let batch = reader.read_obsm(&key)?;
+        let filtered = if let Some(ref mask) = keep_mask {
+            let bool_array = arrow::array::BooleanArray::from(mask.clone());
+            compute::filter_record_batch(&batch, &bool_array)?
+        } else {
+            batch
+        };
+        writer.write_obsm(&key, &filtered)?;
+    }
+
+    // Global varm (var-axis → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varm/",
+        SectionType::VarmEmbedding,
+        SectionType::VarmEmbeddingShard,
+    ) {
+        let batch = reader.read_varm(&key)?;
+        writer.write_varm(&key, &batch)?;
+    }
+
+    // Global varp (var×var → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varp/",
+        SectionType::VarpEmbedding,
+        SectionType::VarpEmbeddingShard,
+    ) {
+        let batch = reader.read_varp(&key)?;
+        writer.write_varp(&key, &batch)?;
+    }
+
+    // Global obsp (obs×obs COO → remap both axes under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsp/",
+        SectionType::ObspEmbedding,
+        SectionType::ObspEmbeddingShard,
+    ) {
+        let batch = reader.read_obsp(&key)?;
+        let out = match keep_mask {
+            Some(ref mask) => filter_obsp_coo(&batch, mask)?,
+            None => batch,
+        };
+        writer.write_obsp(&key, &out)?;
     }
 
     // Global uns.
