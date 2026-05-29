@@ -1022,19 +1022,71 @@ fn compact_multimodal(
         }
     }
 
-    // Global obsm (modality_id == 0). Single-modality compact handles
-    // these via the `has_obsm` branch; mirror that path for multimodal.
-    if in_header.has_obsm() {
-        let all_obsm = reader.read_all_obsm()?;
-        for (name, batch) in &all_obsm {
-            let filtered_batch = if let Some(ref mask) = keep_mask {
-                let bool_array = arrow::array::BooleanArray::from(mask.clone());
-                compute::filter_record_batch(batch, &bool_array)?
-            } else {
-                batch.clone()
-            };
-            writer.write_obsm(name, &filtered_batch)?;
-        }
+    // Global mappings (modality_id == 0), mirroring the single-modality
+    // path. `read_all_*` scans by name prefix and does NOT filter by
+    // modality, so it would also return per-modality entries (keyed
+    // `{modality}/{key}`) and re-emit them as spurious global sections.
+    // `discover_modality_keys(&reader, 0, ...)` filters on `modality_id == 0`,
+    // isolating the true globals; the bare-key readers
+    // (`read_obsm`/`read_varm`/`read_varp`/`read_obsp`) use exact-name lookup
+    // so they never pick up a per-modality `{prefix}/{modality}/...` section.
+
+    // Global obsm (obs-axis → row-filter under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsm/",
+        SectionType::ObsmEmbedding,
+        SectionType::ObsmEmbeddingShard,
+    ) {
+        let batch = reader.read_obsm(&key)?;
+        let filtered = if let Some(ref mask) = keep_mask {
+            let bool_array = arrow::array::BooleanArray::from(mask.clone());
+            compute::filter_record_batch(&batch, &bool_array)?
+        } else {
+            batch
+        };
+        writer.write_obsm(&key, &filtered)?;
+    }
+
+    // Global varm (var-axis → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varm/",
+        SectionType::VarmEmbedding,
+        SectionType::VarmEmbeddingShard,
+    ) {
+        let batch = reader.read_varm(&key)?;
+        writer.write_varm(&key, &batch)?;
+    }
+
+    // Global varp (var×var → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varp/",
+        SectionType::VarpEmbedding,
+        SectionType::VarpEmbeddingShard,
+    ) {
+        let batch = reader.read_varp(&key)?;
+        writer.write_varp(&key, &batch)?;
+    }
+
+    // Global obsp (obs×obs COO → remap both axes under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsp/",
+        SectionType::ObspEmbedding,
+        SectionType::ObspEmbeddingShard,
+    ) {
+        let batch = reader.read_obsp(&key)?;
+        let out = match keep_mask {
+            Some(ref mask) => filter_obsp_coo(&batch, mask)?,
+            None => batch,
+        };
+        writer.write_obsp(&key, &out)?;
     }
 
     // Global uns.
