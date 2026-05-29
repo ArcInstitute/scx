@@ -110,6 +110,48 @@ def test_compact_with_index_options_writes_predicate_index(tmp_dir):
     assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 64
 
 
+def test_compact_reshape_obs_no_index(tmp_dir):
+    """reshape_obs=True with no index kwargs migrates legacy single-section
+    obs to the sharded layout without building a predicate index. Asserts the
+    read path round-trips (catalog-level shard shape is covered by the Rust
+    integration tests)."""
+    src = tmp_dir / "src.scx"
+    out = tmp_dir / "reshaped.scx"
+    # force_legacy_metadata + small shard_size: source has single-section
+    # obs, and reshape will split it across multiple ObsMetadataShard rows.
+    pyscx.from_anndata(
+        _mk_adata(64, 16, "DRUG_A"),
+        str(src),
+        force_legacy_metadata=True,
+        shard_size=16,
+    )
+
+    pyscx.compact(str(src), str(out), reshape_obs=True)
+
+    exp = pyscx.open(str(out))
+    assert exp.n_obs == 64
+    # Pushdown still works post-reshape even without an explicit index.
+    assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 64
+
+
+def test_compact_reshape_obs_with_index(tmp_dir):
+    """reshape_obs composes with the indexed compact path."""
+    src = tmp_dir / "src.scx"
+    out = tmp_dir / "reshaped_indexed.scx"
+    pyscx.from_anndata(
+        _mk_adata(64, 16, "DRUG_A"),
+        str(src),
+        force_legacy_metadata=True,
+        shard_size=16,
+    )
+
+    pyscx.compact(str(src), str(out), reshape_obs=True, index_obs=["perturbation"])
+
+    exp = pyscx.open(str(out))
+    assert exp.n_obs == 64
+    assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 64
+
+
 def test_append_from_anndata_with_index_options_writes_predicate_index(tmp_dir):
     target = tmp_dir / "target.scx"
     pyscx.from_anndata(_mk_adata(32, 16, "DRUG_A"), str(target))
