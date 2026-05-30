@@ -3,12 +3,10 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use scx_codec::ValueEncoding;
 use scx_engine::QueryPipeline;
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
-use scx_format::shard::SHARD_HEADER_SIZE;
 use scx_format::writer::ScxWriter;
 
 #[allow(clippy::too_many_arguments)]
@@ -78,15 +76,7 @@ pub fn run_subset(
     // value encoding) from the underlying `ScxReader`. Collect
     // everything in one borrow scope; `pipeline.select_genes()` below
     // consumes `pipeline`, so the borrow must end before that point.
-    let (
-        in_header,
-        value_encoding,
-        dropped_layers,
-        has_obs_pred_idx,
-        has_var_pred_idx,
-        uns,
-        gene_indices_opt,
-    ) = {
+    let (in_header, dropped_layers, has_obs_pred_idx, has_var_pred_idx, uns, gene_indices_opt) = {
         let local_reader = pipeline
             .local_reader()
             .ok_or("scx subset requires a local SCX file")?;
@@ -95,7 +85,6 @@ pub fn run_subset(
             .transpose()?;
         (
             local_reader.header().clone(),
-            detect_value_encoding_from_reader(local_reader)?,
             local_reader.layer_names(),
             local_reader
                 .read_obs_predicate_index_bytes()
@@ -190,7 +179,6 @@ pub fn run_subset(
         output,
         &result,
         shard_size,
-        value_encoding,
         explicit_codec,
         filter,
         gene_indices.as_deref(),
@@ -336,27 +324,73 @@ fn resolve_gene_names(
     resolve_gene_names_from_var(names, &var, "var")
 }
 
-/// Detect the ValueEncoding from the first CSR shard using an existing reader.
-fn detect_value_encoding_from_reader(
-    reader: &ScxReader,
-) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    let csr_entries = reader.catalog().shards(SectionType::CsrShard);
+/// Write an in-memory CSR matrix to `writer` as row-major shards, routing
+/// each shard through the shared [`scx_format::encode_one_shard`] path that
+/// `scx convert` and pyscx use.
+///
+/// Value encoding (uint8/uint16/uint32/float32) is auto-detected **per shard**
+/// from the actual `f32` values, so a subset/projection that retains values
+/// wider than the input file's first-shard encoding still writes a valid file
+/// (B3). `index_dtype` (the file-wide gene-index width) is threaded through so
+/// every shard header agrees with the file header.
+#[allow(clippy::too_many_arguments)]
+fn write_csr_shards_auto(
+    writer: &mut ScxWriter,
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_vars: u32,
+    shard_size: u32,
+    index_dtype: u8,
+    explicit_codec: Option<scx_codec::CodecId>,
+    modality_type: scx_format::ModalityType,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shard_target = shard_size as usize;
+    // `indptr.len() - 1` would underflow on an empty indptr; `saturating_sub`
+    // yields 0 rows (no shards written), matching the convert/from_mudata
+    // row-sharding template.
+    let total_rows = indptr.len().saturating_sub(1);
+    let mut row_offset = 0usize;
+    let mut shard_idx = 0usize;
+    while row_offset < total_rows {
+        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
+        let shard_indptr_start = indptr[row_offset];
 
-    if let Some(first) = csr_entries.first() {
-        let bytes = reader.section_bytes(first)?;
-        if bytes.len() >= SHARD_HEADER_SIZE {
-            let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &bytes[..SHARD_HEADER_SIZE],
-            ))?;
-            ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or_else(|| format!("unknown value encoding: {}", sh.value_encoding).into())
-        } else {
-            Err("CSR shard too small to read header".into())
-        }
-    } else {
-        // Default for files with no shards
-        Ok(ValueEncoding::Uint16)
+        // Shard-local indptr, rebased to 0 (on-disk u64).
+        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
+            .iter()
+            .map(|&v| (v - shard_indptr_start) as u64)
+            .collect();
+
+        let idx_start = shard_indptr_start as usize;
+        let idx_end = *indptr[row_offset..=row_offset + shard_rows].last().unwrap() as usize;
+
+        // Shard-local indices (on-disk u32) and raw f32 values — the encoder
+        // detects the value encoding and selects the codec per shard.
+        let shard_indices: Vec<u32> = indices[idx_start..idx_end]
+            .iter()
+            .map(|&v| v as u32)
+            .collect();
+        let shard_values = &data[idx_start..idx_end];
+
+        let pre = scx_format::encode_one_shard(
+            &shard_indptr,
+            &shard_indices,
+            shard_values,
+            explicit_codec,
+            index_dtype,
+            n_vars,
+            row_offset as u64,
+            SectionType::CsrShard,
+            modality_type,
+            format!("X_shard_{shard_idx}"),
+        )?;
+        writer.write_preencoded_shard(pre)?;
+
+        row_offset += shard_rows;
+        shard_idx += 1;
     }
+    Ok(())
 }
 
 /// Phase F.4: extract a single modality from a multimodal SCX file
@@ -389,38 +423,6 @@ fn extract_modality(
 
     let n_obs = reader.header().n_obs;
     let n_vars = info.n_vars;
-
-    // Detect value encoding from the chosen modality's first CSR shard.
-    let value_encoding = {
-        let csr_entries: Vec<&scx_format::FullCatalogEntry> = reader
-            .catalog()
-            .shards(SectionType::CsrShard)
-            .into_iter()
-            .filter(|e| e.modality_id == modality_id)
-            .collect();
-        if let Some(first_shard) = csr_entries.first() {
-            let bytes = reader.section_bytes(first_shard)?;
-            if bytes.len() >= SHARD_HEADER_SIZE {
-                let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-                    &bytes[..SHARD_HEADER_SIZE],
-                ))?;
-                ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {
-                    format!(
-                        "unknown value encoding {} on modality '{modality_name}'",
-                        sh.value_encoding
-                    )
-                })?
-            } else {
-                return Err("input CSR shard too small to read header".into());
-            }
-        } else {
-            return Err(format!(
-                "modality '{modality_name}' has no CSR shards in {}",
-                input.display()
-            )
-            .into());
-        }
-    };
 
     let explicit_codec = match codec {
         "auto" => None,
@@ -485,48 +487,17 @@ fn extract_modality(
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
-    let indptr: Vec<u64> = csr.indptr.iter().map(|&v| v as u64).collect();
-    let indices: Vec<u32> = csr.indices.iter().map(|&v| v as u32).collect();
-    let raw_values = value_encoding.encode_f32_batch(&csr.data)?;
-
-    let shard_target = shard_size as usize;
-    // `indptr.len() - 1` would underflow on an empty indptr;
-    // `saturating_sub` matches the row-sharding template in
-    // pyscx::from_mudata and is also rust-1.95 clippy-clean
-    // (`unnecessary_min_or_max` flags the prior `.max(0)`).
-    let total_rows = indptr.len().saturating_sub(1);
-    let mut row_offset = 0usize;
-    while row_offset < total_rows {
-        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
-        let shard_indptr_start = indptr[row_offset];
-        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
-            .iter()
-            .map(|&v| v - shard_indptr_start)
-            .collect();
-        let shard_nnz = *shard_indptr.last().unwrap();
-        let idx_start = shard_indptr_start as usize;
-        let idx_end = (shard_indptr_start + shard_nnz) as usize;
-        let shard_indices = &indices[idx_start..idx_end];
-        let value_byte_size = value_encoding.byte_width();
-        let val_start = idx_start * value_byte_size;
-        let val_end = idx_end * value_byte_size;
-        let shard_values = &raw_values[val_start..val_end];
-        let codec_id = match explicit_codec {
-            Some(c) => c,
-            None => {
-                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
-            }
-        };
-        writer.write_csr_shard(
-            &shard_indptr,
-            shard_indices,
-            shard_values,
-            codec_id,
-            value_encoding,
-            row_offset as u64,
-        )?;
-        row_offset += shard_rows;
-    }
+    write_csr_shards_auto(
+        &mut writer,
+        &csr.indptr,
+        &csr.indices,
+        &csr.data,
+        n_vars as u32,
+        shard_size,
+        index_dtype,
+        explicit_codec,
+        modality_type,
+    )?;
 
     // PR #68: preserve uns + provenance — `write_subset_scx` does this
     // for filter/gene-index subsets; the modality-extraction path was
@@ -573,7 +544,6 @@ fn extract_modality_with_filter(
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
-    use scx_format::section::SectionType;
 
     let reader = ScxReader::open(input)?;
     if !reader.is_multimodal() {
@@ -712,33 +682,6 @@ fn extract_modality_with_filter(
         return Ok(());
     }
 
-    let value_encoding = {
-        let entries: Vec<&scx_format::FullCatalogEntry> = reader
-            .catalog()
-            .shards(SectionType::CsrShard)
-            .into_iter()
-            .filter(|e| e.modality_id == modality_id)
-            .collect();
-        if let Some(first) = entries.first() {
-            let bytes = reader.section_bytes(first)?;
-            if bytes.len() >= SHARD_HEADER_SIZE {
-                let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-                    &bytes[..SHARD_HEADER_SIZE],
-                ))?;
-                ValueEncoding::from_u8(sh.value_encoding).ok_or_else(|| {
-                    format!(
-                        "unknown value encoding {} on modality '{modality_name}'",
-                        sh.value_encoding
-                    )
-                })?
-            } else {
-                ValueEncoding::Uint16
-            }
-        } else {
-            ValueEncoding::Uint16
-        }
-    };
-
     let explicit_codec = match codec {
         "auto" => None,
         "none" => Some(scx_codec::CodecId::None),
@@ -792,44 +735,17 @@ fn extract_modality_with_filter(
     writer.write_obs(&filtered_obs)?;
     writer.write_var(&projected_var)?;
 
-    let indptr: Vec<u64> = projected_csr.indptr.iter().map(|&v| v as u64).collect();
-    let indices: Vec<u32> = projected_csr.indices.iter().map(|&v| v as u32).collect();
-    let raw_values = value_encoding.encode_f32_batch(&projected_csr.data)?;
-
-    let shard_target = shard_size as usize;
-    let total_rows = indptr.len().saturating_sub(1);
-    let mut row_offset = 0usize;
-    while row_offset < total_rows {
-        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
-        let shard_indptr_start = indptr[row_offset];
-        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
-            .iter()
-            .map(|&v| v - shard_indptr_start)
-            .collect();
-        let shard_nnz = *shard_indptr.last().unwrap();
-        let idx_start = shard_indptr_start as usize;
-        let idx_end = (shard_indptr_start + shard_nnz) as usize;
-        let shard_indices = &indices[idx_start..idx_end];
-        let value_byte_size = value_encoding.byte_width();
-        let val_start = idx_start * value_byte_size;
-        let val_end = idx_end * value_byte_size;
-        let shard_values = &raw_values[val_start..val_end];
-        let codec_id = match explicit_codec {
-            Some(c) => c,
-            None => {
-                scx_format::select_codec_for_modality(shard_values, value_encoding, modality_type)
-            }
-        };
-        writer.write_csr_shard(
-            &shard_indptr,
-            shard_indices,
-            shard_values,
-            codec_id,
-            value_encoding,
-            row_offset as u64,
-        )?;
-        row_offset += shard_rows;
-    }
+    write_csr_shards_auto(
+        &mut writer,
+        &projected_csr.indptr,
+        &projected_csr.indices,
+        &projected_csr.data,
+        n_vars_out as u32,
+        shard_size,
+        index_dtype,
+        explicit_codec,
+        modality_type,
+    )?;
 
     // Preserve uns: prefer per-modality, fall back to global.
     let uns = reader
@@ -872,7 +788,6 @@ fn write_subset_scx(
     output: &Path,
     result: &scx_engine::QueryResult,
     shard_size: u32,
-    value_encoding: ValueEncoding,
     explicit_codec: Option<scx_codec::CodecId>,
     filter_expr: Option<&str>,
     gene_indices: Option<&[u32]>,
@@ -919,61 +834,20 @@ fn write_subset_scx(
     writer.write_obs(&result.obs)?;
     writer.write_var(&result.var)?;
 
-    // Convert from in-memory types (i64/i32/f32) to on-disk types (u64/u32/u8-raw)
-    let indptr: Vec<u64> = result.x.indptr.iter().map(|&v| v as u64).collect();
-    let indices: Vec<u32> = result.x.indices.iter().map(|&v| v as u32).collect();
-    let raw_values = value_encoding.encode_f32_batch(&result.x.data)?;
-
-    // Shard the data
-    let shard_target = shard_size as usize;
-    let total_rows = indptr.len() - 1;
-    let mut row_offset = 0usize;
-
-    while row_offset < total_rows {
-        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
-        let shard_indptr_start = indptr[row_offset];
-
-        // Extract shard-local indptr (rebased to 0)
-        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
-            .iter()
-            .map(|&v| v - shard_indptr_start)
-            .collect();
-
-        let shard_nnz = *shard_indptr.last().unwrap();
-
-        // Extract shard-local indices
-        let idx_start = shard_indptr_start as usize;
-        let idx_end = (shard_indptr_start + shard_nnz) as usize;
-        let shard_indices = &indices[idx_start..idx_end];
-
-        // Extract shard-local values
-        let value_byte_size = value_encoding.byte_width();
-        let val_start = idx_start * value_byte_size;
-        let val_end = idx_end * value_byte_size;
-        let shard_values = &raw_values[val_start..val_end];
-
-        // Codec selection: explicit or auto
-        let codec_id = if let Some(c) = explicit_codec {
-            c
-        } else {
-            scx_format::select_codec_for_modality(
-                shard_values,
-                value_encoding,
-                scx_format::ModalityType::Rna,
-            )
-        };
-
-        writer.write_csr_shard(
-            &shard_indptr,
-            shard_indices,
-            shard_values,
-            codec_id,
-            value_encoding,
-            row_offset as u64,
-        )?;
-
-        row_offset += shard_rows;
-    }
+    // Write X as row-major shards. Value encoding is auto-detected per shard
+    // from the projected f32 values (so retained values wider than the input
+    // file's first-shard encoding are handled — B3).
+    write_csr_shards_auto(
+        &mut writer,
+        &result.x.indptr,
+        &result.x.indices,
+        &result.x.data,
+        n_vars as u32,
+        shard_size,
+        index_dtype,
+        explicit_codec,
+        scx_format::ModalityType::Rna,
+    )?;
 
     // Write uns if present in the input file
     if let Some(uns_data) = uns {
@@ -1543,5 +1417,174 @@ mod tests {
             2,
             "should have 2 genes after filtering comments"
         );
+    }
+
+    /// Build a 2-shard SCX file where shard 0 holds uint16-range values and
+    /// shard 1 holds a value (66279) that overflows uint16. The first shard's
+    /// header therefore reports a *narrower* encoding than some later shard —
+    /// the exact precondition that made `scx subset` crash (B3) when it
+    /// inherited the first shard's encoding for the whole output.
+    ///
+    /// All 4 rows get `cell_type == "KEEP"` so a `--filter` retains them.
+    fn write_mixed_encoding_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use scx_codec::ValueEncoding;
+        use std::sync::Arc;
+
+        let path = dir.path().join("mixed_enc.scx");
+        let mut header = crate::test_utils::sample_header(4, 5);
+        header.shard_target_rows = 2;
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        // obs: 4 cells, all cell_type "KEEP".
+        let obs = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("cell_type", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "cell_0", "cell_1", "cell_2", "cell_3",
+                ])),
+                Arc::new(StringArray::from(vec!["KEEP", "KEEP", "KEEP", "KEEP"])),
+            ],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+        writer.write_var(&crate::test_utils::sample_var(5)).unwrap();
+
+        // Shard 0: rows 0,1 — values in (255, 65535] → Uint16.
+        let s0_vals = ValueEncoding::Uint16
+            .encode_f32_batch(&[300.0, 400.0, 500.0, 600.0])
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &s0_vals,
+                CodecId::None,
+                ValueEncoding::Uint16,
+                0,
+            )
+            .unwrap();
+
+        // Shard 1: rows 2,3 — contains 66279 (> u16 max) → Uint32.
+        let s1_vals = ValueEncoding::Uint32
+            .encode_f32_batch(&[66279.0, 5.0, 7.0, 8.0])
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &s1_vals,
+                CodecId::None,
+                ValueEncoding::Uint32,
+                2,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+        path
+    }
+
+    /// Collect the per-shard value encodings of all CSR shards in a file.
+    fn output_value_encodings(path: &std::path::Path) -> Vec<scx_codec::ValueEncoding> {
+        let reader = ScxReader::open(path).unwrap();
+        reader
+            .catalog()
+            .shards(SectionType::CsrShard)
+            .iter()
+            .map(|e| {
+                let sh = reader.read_shard_header(e).unwrap();
+                scx_codec::ValueEncoding::from_u8(sh.value_encoding).unwrap()
+            })
+            .collect()
+    }
+
+    /// B3 regression: subsetting a file whose first shard is narrower than a
+    /// later shard must auto-widen the output value encoding per shard rather
+    /// than inheriting the first shard's width (which used to crash with
+    /// `value 66279 out of range for uint16`).
+    #[test]
+    fn test_subset_auto_widens_value_encoding() {
+        use scx_codec::ValueEncoding;
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_mixed_encoding_file(&dir);
+
+        // Anti-vacuous: confirm the input actually has mixed per-shard
+        // encodings (shard 0 Uint16, shard 1 Uint32).
+        assert_eq!(
+            output_value_encodings(&input),
+            vec![ValueEncoding::Uint16, ValueEncoding::Uint32],
+            "fixture precondition: input must have mixed per-shard encodings"
+        );
+
+        let output = dir.path().join("subset_widened.scx");
+        // shard_size = 2 keeps the small- and large-value rows in separate
+        // output shards so we can assert per-shard differentiation.
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'KEEP'"),
+            None,
+            None,
+            false,
+            2,
+            "auto",
+            false,
+            5000,
+        )
+        .expect("subset must succeed (pre-fix this returned `out of range for uint16`)");
+
+        // (i) all rows retained, (ii) the >65535 value round-trips exactly.
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.header().n_obs, 4);
+        let csr = reader.read_all_csr_shards().unwrap();
+        assert_eq!(csr.indptr.last().copied().unwrap_or(0), 8, "nnz preserved");
+        assert!(
+            csr.data.contains(&66279.0),
+            "the >u16 value must survive the subset round-trip"
+        );
+
+        // (iii) per-shard auto-detection: the small-value output shard stays
+        // Uint16 while the shard holding 66279 widens to Uint32.
+        let encs = output_value_encodings(&output);
+        assert!(
+            encs.contains(&ValueEncoding::Uint32),
+            "output shard with 66279 must be Uint32, got {encs:?}"
+        );
+        assert!(
+            encs.contains(&ValueEncoding::Uint16),
+            "small-value output shard should stay Uint16, got {encs:?}"
+        );
+    }
+
+    /// A subset whose predicate matches no rows must write a valid 0-row file
+    /// (guards the `saturating_sub` empty-indptr path in `write_csr_shards_auto`).
+    #[test]
+    fn test_subset_zero_rows_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_mixed_encoding_file(&dir);
+        let output = dir.path().join("subset_empty.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'NONE'"),
+            None,
+            None,
+            false,
+            2,
+            "auto",
+            false,
+            5000,
+        )
+        .expect("0-row subset must not panic or error");
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(reader.header().n_obs, 0, "no rows should match");
+        let csr = reader.read_all_csr_shards().unwrap();
+        assert_eq!(csr.indptr.last().copied().unwrap_or(0), 0, "empty matrix");
     }
 }
