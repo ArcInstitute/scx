@@ -245,8 +245,21 @@ _THROTTLE_STATE: dict[str, float] = {
 _THROTTLE_RESUME_COOLDOWN_S = 60.0  # don't re-log "Throttling" within 60s of resume
 
 
-def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
-    """Block until ``squeue`` reports fewer than ``cap`` PD+R jobs.
+def _wait_under_pending_cap(cap: int, *, kind: str, headroom: int = 0) -> None:
+    """Block until ``squeue`` has room for ``headroom`` more PD+R jobs.
+
+    Blocks until the active (PD+R) job count drops below ``cap - headroom``,
+    i.e. until there is room to submit ``headroom`` more jobs and still stay
+    under ``cap``. With the default ``headroom=0`` this is the original
+    "block until ``active < cap``" behaviour. ``headroom`` is used by the
+    cohort-array submitter: a ``map_array`` call registers N tasks that each
+    count individually against ``QOSMaxSubmitJobPerUserLimit``, so the
+    throttle must reserve room for the whole cohort before submitting.
+
+    The effective threshold is clamped to ``>= 1`` so a cohort larger than
+    ``cap`` waits for the queue to fully drain and then submits anyway
+    (unavoidable overshoot, absorbed by the QOS retry loop and
+    ``slurm_array_parallelism``) rather than spinning forever.
 
     No-op when ``cap <= 0`` (throttle disabled). Polls every 30s.
     Auto-cancels jobs stuck in ``DependencyNeverSatisfied`` (zombies
@@ -267,19 +280,24 @@ def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
     if cap <= 0:
         return
 
+    # Reserve room for the whole cohort: block until active < cap - headroom.
+    # Clamp to >= 1 so an oversized cohort waits for a full drain instead of
+    # looping forever on an unsatisfiable threshold.
+    threshold = max(cap - headroom, 1)
+
     now = _time.monotonic()
 
-    # Fast path: queue is below cap. Emit "Resumed" once when we exit
+    # Fast path: queue is below threshold. Emit "Resumed" once when we exit
     # a logged throttling episode; subsequent calls stay silent. The
     # ``in_throttle`` slot is a timestamp (0.0 when not throttling) so
     # a future log-line could surface elapsed-throttle duration; the
     # boolean check is value-truthiness on the timestamp.
     initial_active = _count_active_user_jobs()
-    if initial_active < cap:
+    if initial_active < threshold:
         if _THROTTLE_STATE["in_throttle"]:
             logger.info(
-                "  Resumed %s submission (active=%d < cap=%d)",
-                kind, initial_active, cap,
+                "  Resumed %s submission (active=%d < threshold=%d, cap=%d)",
+                kind, initial_active, threshold, cap,
             )
             _THROTTLE_STATE["in_throttle"] = 0.0
             _THROTTLE_STATE["last_resumed_at"] = now
@@ -296,9 +314,10 @@ def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
     )
     if is_fresh_episode:
         logger.info(
-            "  Throttling %s submission: active=%d >= cap=%d; "
-            "polling squeue every 30s until queue drops below cap.",
-            kind, initial_active, cap,
+            "  Throttling %s submission: active=%d >= threshold=%d "
+            "(cap=%d, headroom=%d); polling squeue every 30s until "
+            "queue drops below threshold.",
+            kind, initial_active, threshold, cap, headroom,
         )
         _THROTTLE_STATE["in_throttle"] = now
     elif not _THROTTLE_STATE["in_throttle"]:
@@ -308,7 +327,7 @@ def _wait_under_pending_cap(cap: int, *, kind: str) -> None:
 
     while True:
         active = _count_active_user_jobs()
-        if active < cap:
+        if active < threshold:
             # Don't log "Resumed" here — the next call into
             # `_wait_under_pending_cap` will emit it via the fast
             # path above. This keeps the resume message attached to
@@ -1182,7 +1201,14 @@ def main() -> None:
     bench_jobs: list[tuple[str, submitit.Job, tuple[str, str] | None]] = []
     dep_jobid_for_label: dict[str, str | None] = {}
 
-    for cohort_key, group_benches in cohorts.items():
+    def _submit_cohort(cohort_key: tuple, group_benches: list[str]) -> None:
+        """Submit a single resource cohort as a SLURM Job Array.
+
+        Mutates the enclosing ``bench_jobs`` / ``dep_jobid_for_label`` in
+        place. ``return`` short-circuits the current cohort (the former
+        loop-level ``continue``). May raise on QOS-limit exhaustion — the
+        caller's ``finally`` persists the manifest before it propagates.
+        """
         ds_name, fmt_key, partition, gres, needs_conv = cohort_key
 
         # --- Resource envelope for this cohort ---
@@ -1203,7 +1229,7 @@ def main() -> None:
                     "Skipping cohort %s/%s — upstream conversion %s is %s",
                     ds_name, fmt_key, conv_job.job_id, head_state,
                 )
-                continue
+                return
             dep_jobid = conv_job.job_id
             update_kwargs["slurm_additional_parameters"] = {
                 "dependency": f"afterok:{dep_jobid}"
@@ -1268,7 +1294,7 @@ def main() -> None:
                     "  SKIP cohort %s/%s: no converted file available",
                     ds_name, fmt_key,
                 )
-                continue
+                return
 
         # --- Dry-run: print plan without submitting ---
         if args.dry_run:
@@ -1282,19 +1308,23 @@ def main() -> None:
             )
             for bn in group_benches:
                 logger.info("  task: %s/%s/%s", bn, ds_name, fmt_key)
-            continue
+            return
 
-        # --- QOS-aware throttle: block until squeue is below cap ---
+        # --- QOS-aware throttle: reserve headroom for the whole cohort ---
         # Always throttle, even when --max-pending-jobs is explicitly
         # zeroed; the May 2026 tier-xl run observed
         # QOSMaxSubmitJobPerUserLimit rejections at queue depth 80–110
         # on cpu_preemptible (the documented ~500 cap does not reflect
         # what the scheduler actually enforces). Each map_array call
         # counts as N individual array tasks against the QOS limit, so
-        # we include the upcoming cohort's size below.
+        # we pass the upcoming cohort's size as ``headroom`` — the
+        # throttle then blocks until there is room for every task in the
+        # cohort, not just one more job.
         tasks_in_cohort = len(group_benches)
         effective_cap = args.max_pending_jobs if args.max_pending_jobs > 0 else 75
-        _wait_under_pending_cap(effective_cap, kind="bench")
+        _wait_under_pending_cap(
+            effective_cap, kind="bench", headroom=tasks_in_cohort
+        )
 
         executor.update_parameters(**update_kwargs)
 
@@ -1327,7 +1357,9 @@ def main() -> None:
                         )
                         time.sleep(60)
                         _cancel_dep_never_satisfied()
-                        _wait_under_pending_cap(effective_cap, kind="bench")
+                        _wait_under_pending_cap(
+                            effective_cap, kind="bench", headroom=tasks_in_cohort
+                        )
                         continue
                 raise  # re-raise non-QOS errors or final attempt
 
@@ -1348,25 +1380,35 @@ def main() -> None:
         )
 
     # ── Write manifest (single JSON dump, matching existing pattern) ──
+    def _persist_bench_manifest() -> None:
+        if not args.dry_run and bench_jobs:
+            manifest_path = LOGS_DIR / "run_manifest.json"
+            manifest = {
+                "run_id": run_id,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "submitted": [
+                    {
+                        "label": label,
+                        "job_id": job.job_id,
+                        "submitit_folder": str(job.paths.folder),
+                        "dependency": dep_jobid_for_label.get(label),
+                    }
+                    for label, job, _conv_key in bench_jobs
+                ],
+            }
+            import json as _json
+            manifest_path.write_text(_json.dumps(manifest, indent=2, default=str))
+            logger.info("Run manifest: %s", manifest_path)
 
-    if not args.dry_run and bench_jobs:
-        manifest_path = LOGS_DIR / "run_manifest.json"
-        manifest = {
-            "run_id": run_id,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "submitted": [
-                {
-                    "label": label,
-                    "job_id": job.job_id,
-                    "submitit_folder": str(job.paths.folder),
-                    "dependency": dep_jobid_for_label.get(label),
-                }
-                for label, job, _conv_key in bench_jobs
-            ],
-        }
-        import json as _json
-        manifest_path.write_text(_json.dumps(manifest, indent=2, default=str))
-        logger.info("Run manifest: %s", manifest_path)
+    # Submit every cohort, persisting the manifest in a ``finally`` so that
+    # cohorts already submitted are recorded even if a later cohort raises
+    # (e.g. QOSMaxSubmitJobPerUserLimit exhaustion in the retry loop) —
+    # otherwise watch.py would lose track of the in-flight arrays.
+    try:
+        for cohort_key, group_benches in cohorts.items():
+            _submit_cohort(cohort_key, group_benches)
+    finally:
+        _persist_bench_manifest()
 
     if args.dry_run:
         n_conv = sum(
@@ -1617,9 +1659,13 @@ def parse_args() -> argparse.Namespace:
              "documented ~500 limit doesn't reflect what the scheduler "
              "actually enforces). The launcher polls `squeue -u $USER` "
              "between submissions and sleeps when the cap is reached, "
-             "resuming as jobs land or fail; the cohort retry loop "
-             "absorbs any race-window overshoot. Set to 0 to disable "
-             "throttling (legacy behaviour). Default: 75.",
+             "resuming as jobs land or fail; before each cohort array it "
+             "reserves headroom for the whole cohort, and the cohort retry "
+             "loop absorbs any race-window overshoot. The benchmark phase "
+             "is ALWAYS throttled: values <= 0 are floored to 75 (an "
+             "unthrottled bench phase trips QOSMaxSubmitJobPerUserLimit on "
+             "Chimera). 0 disables throttling only for the lighter "
+             "conversion phase. Default: 75.",
     )
 
     return parser.parse_args()

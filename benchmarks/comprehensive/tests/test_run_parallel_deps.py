@@ -522,3 +522,115 @@ def test_required_capabilities_filters_cohort_grouping(isolated_work_dir):
     assert ("read_full", "pbmc3k", "scx_auto") in by_label
     assert ("read_full", "pbmc3k", "h5ad_none") in by_label
 
+
+
+# ---------------------------------------------------------------------------
+# Throttle headroom + manifest-on-failure
+# ---------------------------------------------------------------------------
+
+
+def test_wait_under_pending_cap_reserves_headroom(monkeypatch: pytest.MonkeyPatch):
+    """``headroom`` blocks until there is room for the whole cohort.
+
+    The throttle must return only when ``active < cap - headroom`` (clamped
+    to >= 1), not merely ``active < cap`` — otherwise a multi-task array
+    overshoots ``QOSMaxSubmitJobPerUserLimit``.
+    """
+    import benchmarks.comprehensive.scripts.run_parallel as rp
+
+    # Keep the episode logging deterministic across cases.
+    monkeypatch.setattr(rp, "_cancel_dep_never_satisfied", lambda: 0)
+    monkeypatch.setattr(rp.time, "sleep", lambda *_a, **_k: None, raising=False)
+
+    def _patch_active(seq):
+        """Return successive squeue counts, repeating the last forever."""
+        values = list(seq)
+
+        def _stub():
+            return values.pop(0) if len(values) > 1 else values[0]
+
+        monkeypatch.setattr(rp, "_count_active_user_jobs", _stub)
+
+    def _reset_state():
+        rp._THROTTLE_STATE["in_throttle"] = 0.0
+        rp._THROTTLE_STATE["last_resumed_at"] = 0.0
+
+    # headroom=0 → identical to the legacy ``active < cap`` boundary.
+    _reset_state()
+    _patch_active([99])
+    rp._wait_under_pending_cap(100, kind="bench", headroom=0)  # 99 < 100 → return
+
+    # headroom reserves room: active=85, cap=100, headroom=20 → threshold=80,
+    # so it must block until the queue drains below 80.
+    _reset_state()
+    _patch_active([85, 70])
+    rp._wait_under_pending_cap(100, kind="bench", headroom=20)  # blocks then 70<80
+
+    # Returns immediately when there is already room for the cohort.
+    _reset_state()
+    _patch_active([70])
+    rp._wait_under_pending_cap(100, kind="bench", headroom=20)  # 70 < 80 → return
+
+    # Clamp: a cohort larger than the cap waits for a full drain (threshold
+    # floored to 1) rather than spinning on an unsatisfiable threshold.
+    _reset_state()
+    _patch_active([0])
+    rp._wait_under_pending_cap(5, kind="bench", headroom=100)  # 0 < 1 → return
+
+    # cap <= 0 stays a hard no-op regardless of headroom (convert phase).
+    _reset_state()
+    _patch_active([10_000])
+    rp._wait_under_pending_cap(0, kind="convert", headroom=50)
+
+
+def test_manifest_written_on_qos_exhaustion(
+    isolated_work_dir, monkeypatch: pytest.MonkeyPatch
+):
+    """A QOS-limit failure after retries still persists the manifest for the
+    cohorts already submitted, then re-raises — so watch.py can track them."""
+    _FakeAutoExecutor.reset()
+    _install_fake_submitit()
+
+    class _QOSFailingExecutor(_FakeAutoExecutor):
+        """Succeeds on the first cohort, then raises QOS on every later call
+        (exhausting the retry loop)."""
+
+        _map_calls = 0
+
+        def map_array(self, fn, *arg_sequences):
+            _QOSFailingExecutor._map_calls += 1
+            if _QOSFailingExecutor._map_calls >= 2:
+                raise RuntimeError(
+                    "sbatch: error: QOSMaxSubmitJobPerUserLimit"
+                )
+            return super().map_array(fn, *arg_sequences)
+
+    sys.modules["submitit"].AutoExecutor = _QOSFailingExecutor
+
+    import benchmarks.comprehensive.scripts.run_parallel as rp
+
+    # Neutralise the retry-loop backoff so the test doesn't sleep 3×60s.
+    monkeypatch.setattr(rp.time, "sleep", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(rp, "_count_active_user_jobs", lambda: 0)
+    monkeypatch.setattr(rp, "_cancel_dep_never_satisfied", lambda: 0)
+
+    # read_full on two formats → two cohorts; the first lands, the second
+    # exhausts the QOS retry loop and raises.
+    with pytest.raises(RuntimeError, match="QOSMaxSubmitJobPerUserLimit"):
+        _run_main_with_argv([
+            "--datasets", "pbmc3k",
+            "--formats", "scx_auto", "h5ad_none",
+            "--benchmarks", "read_full",
+            "--skip-smoke",
+        ])
+
+    # The manifest exists and records the cohort that submitted before the
+    # failure (one array task), so watch.py is not left blind.
+    manifest_path = rp.LOGS_DIR / "run_manifest.json"
+    assert manifest_path.exists(), f"Manifest missing at {manifest_path}"
+
+    import json
+    manifest = json.loads(manifest_path.read_text())
+    labels = {e["label"] for e in manifest["submitted"]}
+    assert labels, "Manifest should record the already-submitted cohort"
+    assert all("read_full/pbmc3k/" in lbl for lbl in labels), labels
