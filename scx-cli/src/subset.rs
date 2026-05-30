@@ -346,6 +346,7 @@ fn write_csr_shards_auto(
     modality_type: scx_format::ModalityType,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_target = shard_size as usize;
+    debug_assert!(shard_target > 0, "shard_size must be greater than 0");
     // `indptr.len() - 1` would underflow on an empty indptr; `saturating_sub`
     // yields 0 rows (no shards written), matching the convert/from_mudata
     // row-sharding template.
@@ -363,7 +364,7 @@ fn write_csr_shards_auto(
             .collect();
 
         let idx_start = shard_indptr_start as usize;
-        let idx_end = *indptr[row_offset..=row_offset + shard_rows].last().unwrap() as usize;
+        let idx_end = indptr[row_offset + shard_rows] as usize;
 
         // Shard-local indices (on-disk u32) and raw f32 values — the encoder
         // detects the value encoding and selects the codec per shard.
