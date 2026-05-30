@@ -17,7 +17,7 @@ three approaches; pick one based on dataset size and what you need out.
 | | In-memory | Backed + lazy | Query pipeline |
 |--|-----------|---------------|----------------|
 | API | `to_anndata()` + `sc.pp.*` | `to_anndata(backed=True)` + `pyscx.accel.*` | `.query().filter_obs().collect()` |
-| Peak memory | full matrix | ~1 shard (~128 MB) | subset only |
+| Peak memory | full matrix | ~1 shard (~128 MB) | subset (materialized) |
 | scanpy compat | full | partial (use `accel.*` for preprocessing) | full (result is a regular AnnData) |
 | GPU accel | `accel.*(device="gpu")` | `accel.*(device="gpu")` | preprocess after `.to_anndata()` |
 | Predicate pushdown | no | no (filters via deletion vectors) | yes (skips non-matching shards) |
@@ -35,7 +35,7 @@ h5ad. **Hybrid:** query a subset, then go in-memory with standard scanpy.
 
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — convert to AnnData.
   - `var_names`: gene-name list to project (column subset).
-  - `obs_filter`: predicate string (uses the query engine with pushdown in non-backed mode).
+  - `obs_filter`: predicate string. **Non-backed mode** routes through the query engine (shard pushdown). **Backed mode** evaluates it with **pandas `.query()`** (richer grammar, no pushdown) and folds the matches into the dataset's row set — so the same expression can resolve via different engines depending on `backed`.
   - `layers`: layer names to load (default all).
   - `backed=True`: `X` and layers are lazy `ScxBackedSparseDataset`.
   - `modality`: select one modality of a multimodal file (requires `backed=True`; incompatible with `var_names`/`obs_filter`/`layers`).
@@ -53,10 +53,14 @@ h5ad. **Hybrid:** query a subset, then go in-memory with standard scanpy.
 - `limit(n)`, `count() -> int`, `collect() -> PyQueryResult`.
 - `PyQueryResult.to_anndata()` — zero-copy CSR.
 
-Pushdown skips non-matching shards **only if predicate indexes were written at
-convert time** (`index_obs`/`index_preset`). If the matching subset is still too
-big to materialize, use `to_anndata(backed=True, obs_filter=...)` so data stays
-on disk and preprocess lazily.
+`collect()` **always materializes** the matching subset into an in-memory scipy
+CSR (there is no `collect(backed=True)` today). Pushdown skips non-matching
+shards **only if predicate indexes were written at convert time**
+(`index_obs`/`index_preset`); otherwise the filter still applies, just via a full
+obs scan. If the matching subset is still too big to materialize, use
+`to_anndata(backed=True, obs_filter=...)` for a lazy on-disk filtered view —
+note that path evaluates the predicate via pandas `.query()`, not the engine
+grammar that `filter_obs` uses.
 
 ## ScxBackedSparseDataset (backed `adata.X`)
 Lazy CSR; only requested shards decode on access. `shape`, `dtype` (always
@@ -77,7 +81,7 @@ take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
 - `filter_genes(adata, min_cells=None, max_cells=None, min_counts=None, max_counts=None)` — streaming; sets the column projection.
 - `subset_obs(adata, mask_or_indices)` — boolean mask **or** integer array. **Integer arrays become a boolean mask: order not preserved, duplicates collapsed** (unlike NumPy fancy indexing). Use a boolean mask for unambiguous results.
 - `calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True, prefer_format="csr")` — streaming per-cell `n_genes_by_counts`/`total_counts` and per-gene `n_cells_by_counts`/`total_counts`. `qc_vars=["mt"]` needs `adata.var["mt"]` tagged yourself (else `pct_counts_mt` is not produced).
-- `highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr")` — streaming. **seurat_v3 expects raw counts** — run before normalize/log1p or pass `layer="counts"`. Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
+- `highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr", layer=None)` — streaming. **seurat_v3 expects raw counts** — run before normalize/log1p or pass `layer="counts"`. Runs the scx-native kernel on backed, lazy, **and** in-memory scipy/dense `X` for `flavor` in `seurat_v3`/`seurat_v3_paper`/`seurat` (a materialized `X` is wrapped in a single-shard `ShardSource`); only `cell_ranger` delegates to scanpy. **High-cardinality `batch_key`** (e.g. CELLxGENE `dataset_id` → many <150-cell batches) makes some per-batch loess fits singular; the native path catches each, warns naming the batch, and drops it from the ranking, so HVG completes — prefer a coarser `batch_key` if many drop (`filter_genes(min_cells=10)` only helps the no-`batch_key` global fit). Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
 
 **Dimensionality reduction / graph:**
 - `pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — randomized SVD with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. **PCA rejects CSC.**

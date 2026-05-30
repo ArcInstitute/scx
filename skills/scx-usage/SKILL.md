@@ -86,16 +86,29 @@ Most-used kwargs (shared across ingest entry points):
 
 ## 2. Processing data
 
-**Decide the approach first** (details + tradeoff table in `reference/processing.md`):
+**Decide the approach first** — by two questions: **(a)** do you need only a
+*subset* (a filter)? **(b)** does the working set *fit in RAM*? In-memory CSR ≈
+`8·n_obs + 8·nnz` bytes (i32 indices + f32 data); e.g. 1M cells × 30K genes @ 5%
+density ≈ 12 GB. (Details + tradeoff table in `reference/processing.md`.)
 
-| Approach | Use when | API | Peak mem |
+| Scenario | Approach | API | Peak mem |
 |---|---|---|---|
-| **In-memory** | Fits in RAM (≲ 500K cells) | `to_anndata()` then standard `sc.pp.*` / `sc.tl.*` | full matrix |
-| **Backed + lazy** | Atlas-scale (500K–10M+) | `to_anndata(backed=True)` then `pyscx.accel.*` | ~1 shard (~128 MB) |
-| **Query pipeline** | Want a *subset* of a big file | `.query().filter_obs(...).collect().to_anndata()` | subset only |
+| Whole dataset, fits in RAM | **In-memory** | `to_anndata()` then `sc.pp.*` / `sc.tl.*` | full matrix |
+| Whole dataset, too big | **Backed + lazy** | `to_anndata(backed=True)` then `pyscx.accel.*` | ~1 shard (~128 MB) |
+| Subset, fits in RAM | **Query → collect** | `.query().filter_obs(...).collect().to_anndata()` then `sc.pp.*` | subset (materialized) |
+| Subset, still too big | **Backed + filter** | `to_anndata(backed=True, obs_filter="...")` then `pyscx.accel.*` | ~1 shard |
 
-In-memory CSR ≈ `8·n_obs + 8·nnz` bytes (i32 indices + f32 data); e.g. 1M cells
-× 30K genes @ 5% density ≈ 12 GB. If that won't fit, use backed or query.
+`query().collect()` **always materializes** the subset into scipy — pick it only
+when the *filtered* result fits in RAM. For a lazy, out-of-core filtered view
+(filter, then `accel.*`), use `to_anndata(backed=True, obs_filter=...)`; there is
+no `query().collect(backed=True)` today.
+
+**Two predicate entry points, two grammars.** `query().filter_obs(expr)` is
+evaluated by the scx engine and does *shard pushdown* — but only skips shards if
+`index_obs=` / `--index-preset` was set at convert time (otherwise a full obs
+scan, still correct, just not faster). The backed `obs_filter="expr"` kwarg is
+evaluated by **pandas `.query()`** (richer grammar, no pushdown). Same intent,
+different engines — don't assume an expression behaves identically in both.
 
 ### In-memory (full scanpy compatibility)
 ```python
@@ -135,9 +148,9 @@ adata = (pyscx.open("atlas.scx").query()
          .collect().to_anndata())
 sc.pp.pca(adata)   # regular scanpy from here
 ```
-Pushdown only skips shards if predicate indexes exist (see `index_*` at convert
-time). If the subset is still too big to materialize, use backed mode with
-`to_anndata(backed=True, obs_filter="tissue == 'lung'")` instead.
+`collect()` materializes the subset (see the decision table above): use this
+only when the filtered result fits in RAM, else switch to
+`to_anndata(backed=True, obs_filter="tissue == 'lung'")`.
 
 ### Critical processing gotchas
 - **MT genes are not auto-tagged.** Set `adata.var["mt"] =
@@ -212,6 +225,8 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 ---
 
 ## Quick gotcha checklist
+- Pick the approach by *subset?* × *fits in RAM?* — `query().collect()` materializes, so a too-big subset needs `to_anndata(backed=True, obs_filter=...)`.
+- Predicate grammar differs: `query().filter_obs()` (engine + pushdown) vs backed `obs_filter=` (pandas `.query()`).
 - Convert with `index_obs=`/`--index-preset` if the file will be queried, else pushdown is a full scan.
 - `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).

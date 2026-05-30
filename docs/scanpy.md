@@ -552,7 +552,10 @@ disk, but only the requested columns are retained in the returned CSR.
 
 Filter cells using a predicate string. In non-backed mode, this leverages
 the query engine with predicate pushdown (shard skipping). In backed mode,
-it evaluates the predicate on the obs DataFrame:
+it evaluates the predicate with pandas `.query()` on the (already
+deletion-vector-filtered) obs DataFrame and folds the matches into the backed
+dataset's row set — a different grammar (see [Filter Expression
+Compatibility](#filter-expression-compatibility) below):
 
 ```python
 # Load only T cells from lung tissue
@@ -563,14 +566,22 @@ adata = pyscx.open("atlas.scx").to_anndata(
 
 ##### Filter Expression Compatibility
 
-`to_anndata()` has two filter-evaluation paths that accept overlapping but
-**not identical** grammars. Knowing which subset is portable matters when a
-filter string is reused across calls or pipelines.
+`to_anndata()` evaluates `obs_filter` via one of three paths that fall into
+**two grammars** — the `scx-engine` parser or pandas. They accept overlapping
+but **not identical** expressions, so knowing which fires matters when a filter
+string is reused across calls or pipelines (e.g. moving a filter from a
+`query().filter_obs()` call to `to_anndata(backed=True, obs_filter=...)`).
 
-| Path | Engine | When it fires |
-|---|---|---|
-| SCX predicate engine | `scx-engine` predicate parser | `preserve_slots=False` (default), `backed=True`, `pyscx.pull(...)` selective pulls |
-| pandas.eval | `pandas.DataFrame.eval` | `preserve_slots=True` with `obs_filter` set |
+| Path | Engine | Grammar | When it fires |
+|---|---|---|---|
+| SCX predicate engine | `scx-engine` predicate parser | engine | non-backed default (`preserve_slots=False`); `query().filter_obs(...)`; `pyscx.pull(...)` selective pulls |
+| pandas `.query()` | `pandas.DataFrame.query` | pandas | `backed=True` with `obs_filter` set |
+| pandas `.eval()` | `pandas.DataFrame.eval` | pandas | non-backed `preserve_slots=True` with `obs_filter` set |
+
+`.query()` and `.eval()` share pandas's grammar, so the only split that matters
+in practice is **engine vs pandas**: `backed=True` and `preserve_slots=True` both
+accept the pandas-only forms below, while the default non-backed path and
+`query().filter_obs()` use the stricter engine grammar.
 
 **Portable subset (works in both paths):**
 
@@ -589,9 +600,10 @@ against a `[...]` list literal, and parenthesised sub-expressions. Tests in
 `pyscx/tests/test_to_anndata_integration.py` (`test_obs_filter_grammar_parity_common_ground`)
 assert that both paths select identical rows for the entries above.
 
-**Divergences (work in one path only):**
+**Divergences (work in one grammar only)** — the "pandas" column covers both
+`backed=True` (`.query()`) and `preserve_slots=True` (`.eval()`):
 
-| Expression | SCX engine | pandas.eval |
+| Expression | SCX engine | pandas (`.query()` / `.eval()`) |
 |---|---|---|
 | `n_counts > 50 & cell_type == 'T cell'` | ❌ parse error — use `and` | ✅ accepted as bitwise-and |
 | `cell_type in ('T cell', 'B cell')` (tuple) | ❌ parse error — `in` requires `[...]` | ✅ accepted |

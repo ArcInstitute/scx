@@ -24,6 +24,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/compatibility-matrix.md](docs/compatibility-matrix.md)** — Tested vs. declared Python / numpy / scipy / pyarrow / anndata / scanpy combinations for `pyscx`.
 - **[benchmarks/README.md](benchmarks/README.md)** — Practical guide: SLURM job submission, dataset prep, [Regression Gating](benchmarks/README.md#regression-gating) (`gate_candidate.py` against `results/baselines/LATEST`), and the [GPU accelerator regression workflow](benchmarks/README.md#gpu-accelerator-regression-workflow). **Always use parallel SLURM job submission** (one job per benchmark × dataset pair). No CI-side gate today — local gate is the canonical signal.
 - **[.claude/skills/scx-dev/SKILL.md](.claude/skills/scx-dev/SKILL.md)** — Release workflow (pyscx + scx-cli tag-prefix scheme, version-bump scope, pre-release checks) and dev-env quick reference. Invoke when cutting a release or bumping versions.
+- **[skills/scx-usage/SKILL.md](skills/scx-usage/SKILL.md)** — How to USE scx (pyscx + scx-cli) to get real work done (converting data, backed/lazy processing, accelerators, and ML loading). Invoke when writing/debugging scx usage code.
 
 ## Build and Test
 
