@@ -28,7 +28,7 @@ from benchmarks.comprehensive.cloud_fixtures import (
     CloudIOCounters,
     cloud_path_exists,
     cloud_url_for,
-    require_gcp_credentials,
+    ensure_gcp_credentials_or_skip,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -41,7 +41,10 @@ from benchmarks.comprehensive.runners.base import FormatRunner
 
 logger = logging.getLogger(__name__)
 
-_SCX_TRIGGER_KEY = "scx_auto"
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 # Performance-model bound for pyscx.pull's residency. Original docs/cloud.md
 # constant was 240 MB, tuned on census_10m. Empirically (2026-05-10 tier-full
@@ -119,12 +122,17 @@ def run(
         raise ValueError(
             f"Only 'gcs' provider is supported in Phase 5 (got {provider!r})"
         )
-    if format_variant.key != _SCX_TRIGGER_KEY:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
 
     import pyscx
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cloud_large_atlas",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
     cloud_url = cloud_url_for(dataset, format_variant, provider=provider)
     if not cloud_path_exists(cloud_url):
         raise FileNotFoundError(

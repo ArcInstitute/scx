@@ -353,27 +353,50 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --conda-env scx-bench-gpu
 
 The serial orchestrator (`run_all.py`) processes benchmarks sequentially within a single SLURM job. For faster execution, `run_parallel.py` uses two-phase parallel execution via `submitit`:
 
-**Convert phase — Convert once.** Each (dataset, format) pair is converted exactly once and written to a persistent path. Conversions run as independent parallel SLURM jobs. Existing files are skipped automatically (`--overwrite` to force).
+**Phase A — Conversions (individual jobs).** Each (dataset, format) pair is converted exactly once and written to a persistent path. Conversions run as independent parallel SLURM jobs submitted via `executor.submit(...)`. Existing files are skipped automatically (`--overwrite` to force). The conversion population is small (typically 20–40 jobs) and resource-heterogeneous, so individual submissions are appropriate.
 
-**Benchmark phase — Benchmark in parallel.** Each (benchmark, dataset, format) triple is submitted as an independent SLURM job reading from the pre-converted file. All jobs run concurrently.
+**Phase B — Benchmarks as resource-cohort SLURM Job Arrays.** Each (benchmark, dataset, format) triple is grouped into a *resource cohort* keyed by `(dataset, format_key, partition, gres, needs_conversion)`, and every cohort is submitted as a single SLURM Job Array via `executor.map_array(...)`. Because SLURM requires every task within an array to share identical resource parameters (partition, gres, mem, time, cpu), the 5-tuple key guarantees uniformity while still letting the orchestrator separate:
+
+- **GPU vs. CPU** — `ml_loader` on `scx_auto` routes to GPU; `read_full` on the same `(dataset, format)` stays on CPU and lands in a different array.
+- **High-memory vs. standard** — `partition_for_memory` promotes cohorts past `MEM_HIGH_MEM_THRESHOLD_GB` (200 GB) to `cpu_high_mem`. When an estimate exceeds `MEM_CEILING_GB` (1000 GB) the request is clamped and a `logger.warning("...clamped to MEM_CEILING_GB...")` line lands in the orchestrator log so the truncation is greppable.
+- **Dependent vs. independent** — `_NO_CONVERSION` benchmarks (`write`, `parallel_write_scaling`, `cell_eval_parity_perf`) sit in cohorts with `needs_conversion=False` and skip the `afterok` edge entirely.
+
+Per-bench compatibility — `_bench_format_compatible` applies three layered filters at cohort-build time so non-applicable (bench, format) combinations never get submitted:
+
+1. **Accel/CSC pairing** — `accel_pca` only groups with `accel_pca__*` formats; `bench_csc_dispatch` only groups with `bench_csc__*` formats; non-accel benchmarks skip both.
+2. **`SUPPORTED_FORMATS`** — benches that only run on a fixed format set (e.g. `cloud_push`, `correctness`, `roundtrip`, `ml_loader`) expose a module-level `SUPPORTED_FORMATS: frozenset[str]` and the cohort builder enforces it. Adding a new such bench is a single-line declaration next to the runtime guard.
+3. **`REQUIRED_CAPABILITIES`** — benches that need a specific runner capability (e.g. `cloud_read` needs `"cloud_read"`, `read_streaming_vs_inmemory` needs `"backed_mode"`) expose `REQUIRED_CAPABILITIES: frozenset[str]`. The cohort builder reads `runner.capabilities` via a cached `make_runner(fmt)` (cheap, side-effect-free) and filters incompatible cells.
+
+Cohorts that need conversion attach an `--dependency=afterok:<convert_jobid>` so their array waits for Phase A to finish for the matching `(dataset, format)`. Cohorts that don't need conversion start immediately.
+
+Throttling is layered:
+1. **Native cluster-side**: `slurm_array_parallelism` caps how many tasks within an array run concurrently (`sbatch --array=0-N%M`).
+2. **QOS-aware client-side**: SLURM counts each array task individually against Chimera's `QOSMaxSubmitJobPerUserLimit`. The documented cap is ~500 on `cpu_preemptible`, but the May 2026 tier-xl run observed rejections at queue depth 80–110, so the default is conservative. Before each `map_array` call, `run_parallel.py` blocks on `_wait_under_pending_cap(args.max_pending_jobs)` (default 75). On a transient `QOSMaxSubmitJobPerUserLimit` rejection (race between squeue and SLURM's internal counter), the cohort submission retries up to 3× with a 60s drain.
+
+Result: ~30–40 conversion submits + ~40–80 cohort array submits replaces ~500 individual `sbatch` calls — an >80% reduction in scheduler load with no per-task client-side polling between successful submissions. The three-layer compatibility filter additionally eliminates ~800 phantom `missing_result` entries per full-tier run (cells where a bench would otherwise have been submitted, returned `None` for an incompatible format, and produced no JSON).
 
 ```
-Serial (run_all.py):     420 tasks x avg 3 min = ~21 hours wall time
-Parallel (run_parallel.py): conversions + benchmarks, all concurrent
-                            Wall time ~ max(single slowest job) ~ 50 min
+Serial (run_all.py):        420 tasks × ~3 min = ~21 hours wall time
+Parallel (run_parallel.py): Phase A conversions + Phase B cohort arrays
+                            Wall time ≈ max(single slowest job)
 ```
+
+`watch.py` consumes `comprehensive/logs/submitit/run_manifest.json` to render a live status table. Submitit names per-task files `<SLURM_jobid>_<task_idx>_*` for both individual jobs (`2306028_0_result.pkl`) and array tasks (`2374101_0_0_result.pkl` for array `2374101` task `0`) — the array-task ID is part of the SLURM job ID, so `watch.py` always appends the `_0` task-index suffix uniformly.
 
 ### Usage
 
-```bash
-# Small datasets (D1-D4)
-python benchmarks/comprehensive/scripts/run_parallel.py \
-    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
+`run_parallel.py` takes an explicit `--datasets` list — tier selection (`--tier small|full|xl`) lives on the higher-level entry points `gate_candidate.py` and `capture_baseline.py`, which translate the tier into the appropriate dataset list and forward it to `run_parallel.py`.
 
-# Large datasets — high-memory partition
+```bash
+# Recommended: go through gate_candidate.py for the canonical tier flow
+python benchmarks/comprehensive/scripts/gate_candidate.py --tier small  # ~1h
+python benchmarks/comprehensive/scripts/gate_candidate.py --tier full   # ~4-6h
+python benchmarks/comprehensive/scripts/gate_candidate.py --tier xl     # adds census_5m
+
+# Direct run_parallel.py invocation — small tier
 python benchmarks/comprehensive/scripts/run_parallel.py \
-    --datasets census_500k census_1m census_5m \
-    --partition cpu_preemptible --mem-gb 500 --timeout 480
+    --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k \
+        cite_seq_pbmc multiome_pbmc
 
 # Specific benchmarks and formats only
 python benchmarks/comprehensive/scripts/run_parallel.py \
@@ -381,14 +404,28 @@ python benchmarks/comprehensive/scripts/run_parallel.py \
     --formats scx_auto zarr_zstd h5ad_gzip \
     --datasets census_1m
 
-# Dry run — show job count without submitting
-python benchmarks/comprehensive/scripts/run_parallel.py --dry-run
+# Dry run — print cohort plan + total task count without submitting
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k --benchmarks read_full --dry-run
 
 # Skip conversion phase (reuse existing pre-converted files)
 python benchmarks/comprehensive/scripts/run_parallel.py --skip-convert
+
+# Override the conservative QOS throttle (default --max-pending-jobs 75
+# is sized for Chimera's observed limit; raise it on clusters with a
+# higher QOSMaxSubmitJobPerUserLimit)
+python benchmarks/comprehensive/scripts/run_parallel.py \
+    --datasets pbmc3k --max-pending-jobs 200
 ```
 
-submitit logs are written to `comprehensive/logs/submitit/`. Each SLURM job writes its result JSON independently to `comprehensive/results/raw/` — filenames are unique per triple, so concurrent writes are safe.
+submitit logs are written to `comprehensive/logs/submitit/{convert,bench}/`. Each SLURM job writes its result JSON independently to `comprehensive/results/raw/` — filenames are unique per triple, so concurrent writes are safe.
+
+> [!TIP]
+> For long-running orchestrators (full / xl tiers), wrap `gate_candidate.py` or
+> `run_parallel.py` in an ``sbatch`` sentinel rather than running it interactively
+> on the login node: the sentinel survives ssh drops and can be monitored via
+> ``squeue`` and ``watch.py``. The orchestrator itself needs only a few CPUs
+> and modest RAM; the heavy work happens in the cohort arrays it spawns.
 
 ---
 
@@ -439,7 +476,9 @@ python benchmarks/comprehensive/scripts/run_parallel.py \
     --formats scx_auto zarr_zstd tiledb_soma slaf
 ```
 
-Fixtures self-heal on first run: if the expected cloud object doesn't exist, `cloud_fixtures.ensure_cloud_fixture` uploads it from the local converted file via `pyscx.push` (SCX) or `gsutil -m rsync` (other formats). SCX-only benchmarks return `None` for non-SCX formats so the orchestrator silently skips those triples.
+Fixtures self-heal on first run: if the expected cloud object doesn't exist, `cloud_fixtures.ensure_cloud_fixture` uploads it from the local converted file via `pyscx.push` (SCX) or `gsutil -m rsync` (other formats).
+
+**Skip behavior** — when GCP credentials can't be resolved (no env var, no `.env` entry, no `~/.gcp/scx-bench.json`), `cloud_fixtures.ensure_gcp_credentials_or_skip` writes a typed `{"missing_reason": "no_gcp_credentials"}` stub JSON via `results.write_missing_result` and the bench returns `None`. The reporting pipeline classifies the cell as a credential-absence skip instead of an undifferentiated `missing_result`. Format-incompatible (bench, format) combinations (e.g. `cloud_push` on `h5ad_*`) are filtered at cohort-build time via `SUPPORTED_FORMATS` / `REQUIRED_CAPABILITIES` and never submitted at all.
 
 The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted; use the launcher above.
 
@@ -593,10 +632,12 @@ deleted. Submit benchmarks through the comprehensive launcher:
     --datasets census_500k census_1m census_5m
 ```
 
-The launcher submits one SLURM job per (benchmark × format × dataset)
-triple via submitit, sized per-job by `estimate_memory_gb` /
-`estimate_time_minutes` (`comprehensive/config.py`), with
-`partition_for_memory` auto-routing to `cpu_high_mem` past 200 GB.
+The launcher submits (benchmark × format × dataset) triples as
+resource-cohort SLURM Job Arrays via `submitit.AutoExecutor.map_array`.
+Each task is sized by `estimate_memory_gb` / `estimate_time_minutes`
+(`comprehensive/config.py`); the cohort takes the per-task `max(mem, time)`.
+`partition_for_memory` auto-routes to `cpu_high_mem` past 200 GB; estimates
+above `MEM_CEILING_GB` (1000 GB) are clamped with a logged warning.
 
 #### Phase 6b — streaming vs in-memory sweep
 
@@ -691,7 +732,7 @@ bash benchmarks/comprehensive/scripts/run_slurm.sh --partition cpu_batch
 ## Submitting SLURM Jobs
 
 > [!IMPORTANT]
-> **Always prefer parallel job submission over sequential single-job scripts.** Each independent (benchmark, dataset) combination should be submitted as a separate SLURM job so they run concurrently across cluster nodes. This dramatically reduces wall-clock time (e.g., 24 parallel jobs finishing in ~2h vs one sequential job taking ~4h). Use `--dependency=afterok:$JOB1:$JOB2:...` for any post-processing that must wait for all benchmarks to complete (e.g., archiving results). Scale memory per dataset — not every job needs the largest allocation. The reference pattern is `comprehensive/scripts/run_parallel.py` (one submitit job per triple, sized via `estimate_memory_gb` / `estimate_time_minutes`).
+> **Always prefer parallel job submission over sequential single-job scripts.** Each independent (benchmark, dataset) combination should run concurrently across cluster nodes. This dramatically reduces wall-clock time (e.g., 24 parallel jobs finishing in ~2h vs one sequential job taking ~4h). Use `--dependency=afterok:$JOB1:$JOB2:...` for any post-processing that must wait for all benchmarks to complete (e.g., archiving results). Scale memory per dataset — not every job needs the largest allocation. The reference pattern is `comprehensive/scripts/run_parallel.py` — Phase A conversions submit individually, Phase B benchmarks submit as resource-cohort SLURM Job Arrays (`executor.map_array`) sized via `estimate_memory_gb` / `estimate_time_minutes`.
 
 ### Basic submission
 
@@ -719,11 +760,12 @@ dataset-prep, ML-loader, and standalone GPU/Harmony scripts remain
    sbatch benchmarks/scripts/slurm_build_census_10m.sh   # (optional, high-memory)
 
 2. Run benchmarks via the unified comprehensive launcher
-   (one submitit job per benchmark × format × dataset triple):
+   (Phase A: per-(dataset, format) conversion jobs; Phase B: cohort-array
+   benchmark jobs grouped by (dataset, format, partition, gres, needs_conv)):
    python benchmarks/comprehensive/scripts/run_parallel.py \
        --datasets pbmc3k pbmc10k smartseq2 tabula_sapiens_100k
    python benchmarks/comprehensive/scripts/run_parallel.py \
-       --datasets census_500k census_1m census_5m --tier large
+       --datasets census_500k census_1m census_5m
 
 3. Cloud benchmarks (GCP — requires GOOGLE_APPLICATION_CREDENTIALS;
    see check_gcp_auth.py preflight):

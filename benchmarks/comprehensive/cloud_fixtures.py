@@ -84,6 +84,47 @@ def require_gcp_credentials() -> str:
     return creds
 
 
+def ensure_gcp_credentials_or_skip(
+    benchmark: str,
+    format_key: str,
+    dataset_name: str,
+    notes: str = "",
+) -> bool:
+    """Resolve GCP credentials or write a ``missing_result`` skip stub.
+
+    Returns ``True`` when credentials resolved (caller continues); ``False``
+    when they're absent (caller should ``return None``). The stub JSON
+    keeps the triple out of ``watch.py``'s undifferentiated
+    ``missing_result`` bucket — it shows up as a classified
+    ``no_gcp_credentials`` skip in the reporting pipeline instead.
+
+    Resolution honours the same chain as :func:`require_gcp_credentials`:
+    ``GOOGLE_APPLICATION_CREDENTIALS`` from the process environment (loaded
+    from the repo-root ``.env`` at import time), then the default
+    ``~/.gcp/scx-bench.json`` if the env var is unset.
+    """
+    try:
+        require_gcp_credentials()
+        return True
+    except CloudCredentialsError as exc:
+        logger.warning(
+            "Skipping %s/%s/%s: %s",
+            benchmark, format_key, dataset_name, exc,
+        )
+        # Import lazily — results.py pulls in heavy deps (BenchmarkResult
+        # depends on the whole bench result model) we don't want every
+        # cloud_fixtures consumer paying for at import time.
+        from benchmarks.comprehensive.results import write_missing_result
+        write_missing_result(
+            benchmark=benchmark,
+            format_key=format_key,
+            dataset=dataset_name,
+            missing_reason="no_gcp_credentials",
+            notes=notes or str(exc),
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # URI helpers
 # ---------------------------------------------------------------------------

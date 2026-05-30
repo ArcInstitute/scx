@@ -68,6 +68,7 @@ class ScxRunner(FormatRunner):
         "cloud_push",
         "cloud_pull",
         "cloud_filtered",
+        "cloud_metadata",
     })
 
     def __init__(

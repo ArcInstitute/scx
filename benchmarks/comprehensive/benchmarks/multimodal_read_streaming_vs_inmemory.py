@@ -43,6 +43,12 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"backed_mode"})
+"""Runner-capability requirement — read by ``run_parallel.py``'s cohort
+builder so incompatible (bench, format) cells never get submitted. Mirrors
+the runtime guard at the top of ``run()`` (defense-in-depth for direct
+invocation)."""
+
 # Multimodal SCX variants — the only runners that pair
 # ``convert_from_h5mu`` with the Phase 6b backed ``to_mudata`` path.
 _SCX_MULTIMODAL_KEYS = (

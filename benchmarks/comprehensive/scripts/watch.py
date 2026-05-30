@@ -88,11 +88,17 @@ def _result_exists(label: str) -> bool:
 def _state_from_submitit(folder: Path, job_id: str) -> tuple[str, str]:
     """Inspect submitit's per-job folder for completion markers.
 
-    Submitit writes `<jid>_0_result.pkl` on success, `<jid>_0_log.err` on
-    failure / in-progress. Returns (state, error_tail).
+    Submitit names per-task files ``<slurm_job_id>_<task_idx>_*`` where
+    ``task_idx`` is the index inside the submitit "job" (always ``0`` for
+    single-process benchmarks). This holds for **both** individual jobs
+    (``2306028_0_result.pkl``) and SLURM array tasks
+    (``2374101_0_0_result.pkl`` for array ``2374101`` task ``0``) — the
+    array-task ID is just part of the SLURM job ID. We always append
+    ``_0``.
     """
     if not folder.is_dir():
         return "missing_folder", ""
+
     result_pkl = folder / f"{job_id}_0_result.pkl"
     log_err = folder / f"{job_id}_0_log.err"
     log_out = folder / f"{job_id}_0_log.out"

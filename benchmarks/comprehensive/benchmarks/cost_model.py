@@ -42,7 +42,7 @@ from pathlib import Path
 from benchmarks.comprehensive.cloud_fixtures import (
     CloudIOCounters,
     ensure_cloud_fixture,
-    require_gcp_credentials,
+    ensure_gcp_credentials_or_skip,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -56,7 +56,10 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
-_SCX_TRIGGER_KEY = "scx_auto"
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 # Currently only the exploded layout is wired for cloud (``.scxd/`` on GCS).
 # Future layouts (packed `.scx` with front catalog, region-replicated) plug
@@ -129,7 +132,7 @@ def run(
         raise ValueError(
             f"Only 'gcs' provider is supported in Phase 5 (got {provider!r})"
         )
-    if format_variant.key != _SCX_TRIGGER_KEY:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
     if converted_path is None or not Path(converted_path).exists():
         raise FileNotFoundError(
@@ -139,7 +142,12 @@ def run(
 
     import pyscx
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cost_model",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
     runner = make_runner(format_variant)
 
     result = BenchmarkResult(

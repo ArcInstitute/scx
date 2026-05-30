@@ -63,6 +63,13 @@ from benchmarks.comprehensive.results import BenchmarkResult  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. The on-disk codec
+does not affect this benchmark (operates on in-memory AnnData from the
+synthetic generator), so we trigger once per dataset on ``scx_auto`` and
+the runtime guard below catches direct invocation."""
+
 # ---------------------------------------------------------------------------
 # Skip rules — which operations to run at each n_obs tier
 # ---------------------------------------------------------------------------
@@ -217,7 +224,7 @@ def run(
     but unused — synthetic datasets are generated in-process via
     ``_pert_synth.make_paired_adata()``.
     """
-    if format_variant.key != "scx_auto":
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
 
     # pyscx is a hard project dependency — import unconditionally so a

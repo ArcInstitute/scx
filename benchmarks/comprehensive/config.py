@@ -7,11 +7,14 @@ and system-level settings. All benchmark scripts import from here.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -977,7 +980,16 @@ def estimate_memory_gb(
     # Clamp at the cluster's largest single-task allocation. Combinations
     # whose true footprint exceeds this (e.g. dense-h5ad read on census_5m)
     # would OOM either way; the cap keeps submitit from rejecting the job.
-    return min(total, MEM_CEILING_GB)
+    # Emit a warning so an orchestrator log search for "clamped" surfaces
+    # every cell where the estimate was truncated.
+    if total > MEM_CEILING_GB:
+        logger.warning(
+            "estimate_memory_gb(%s/%s/%s): %d GB clamped to MEM_CEILING_GB=%d GB "
+            "(true peak may OOM)",
+            benchmark, format_key, dataset.name, total, MEM_CEILING_GB,
+        )
+        return MEM_CEILING_GB
+    return total
 
 
 def estimate_time_minutes(

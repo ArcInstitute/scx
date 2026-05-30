@@ -73,7 +73,10 @@ logger = logging.getLogger(__name__)
 
 # Only triggered for scx_auto. We don't re-measure across codecs since the
 # IndexPlanDataset path is codec-agnostic at the API level.
-_SCX_TRIGGER_KEY = "scx_auto"
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 # Defaults: 1024 pairs/batch, 1000 batches. Capped against dataset.n_obs
 # at runtime so a 100-cell test fixture doesn't blow up.
@@ -500,7 +503,7 @@ def run(
     ``RunRecord.extra`` so the gate aggregates across each scenario's own
     runs without aliasing.
     """
-    if format_variant.key != _SCX_TRIGGER_KEY:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
     if not _have_pyscx():
         logger.warning("Skipping index_plan: pyscx not importable")
