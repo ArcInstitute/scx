@@ -899,16 +899,34 @@ single-pass `normalize+log1p` fusion via the marker on
 and `log1p` (that materialises X to scipy CSR and unreachably forfeits the
 fast path for the rest of the pipeline).
 
+**HVG input — backed, lazy, or materialized X.** `flavor` in `seurat_v3` /
+`seurat_v3_paper` / `seurat` runs the scx-native streaming kernel whether
+`adata.X` is an `ScxBackedSparseDataset`, an `ScxLazyTransformedDataset`, or a
+plain materialized scipy/dense matrix (a materialized `X` is wrapped in a
+single-shard `ShardSource`). So the common `pyscx.open(...).query()...collect()
+.to_anndata()` (eager) idiom gets the same numerics — and the same per-batch
+LOESS-singularity tolerance — as the backed path. Only flavors scx does not
+implement natively (today `cell_ranger`) delegate to
+`scanpy.pp.highly_variable_genes`, with a one-shot `UserWarning`.
+
+> **`batch_key` cardinality is the usual LOESS-singularity trigger.** `seurat_v3`
+> fits one `skmisc.loess` per batch; a high-cardinality key such as CELLxGENE
+> `dataset_id` produces many tiny batches whose log-mean / log-variance
+> regression is singular. The native path catches each such fit, warns naming
+> the batch, and drops it from the ranking — so HVG completes. If many batches
+> drop, prefer a coarser `batch_key` (or none). `filter_genes(min_cells=10)`
+> only helps the single global fit, not the per-batch case.
+
 **HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
 through GPU atomicAdd kernels for `streaming_mean_var` and
 `streaming_clip_square_sum`, including per-batch variants when `batch_key`
-is set. GPU dispatch is active for any `seurat_v3` configuration regardless
-of `batch_key`; `flavor="seurat"` still falls back to CPU with a
-`UserWarning`. The per-batch loess fits run on CPU via `skmisc.loess` — a
-batch whose log-mean / log-variance regression is too degenerate to fit
-(small batch sizes, near-collinear inputs) is caught, surfaced as a
-`UserWarning` naming the batch, and excluded from the per-batch ranking;
-other batches proceed normally.
+is set (materialized X uses the same single-shard `ShardSource`). GPU dispatch
+is active for any `seurat_v3` configuration regardless of `batch_key`;
+`flavor="seurat"` still falls back to CPU with a `UserWarning`. The per-batch
+loess fits run on CPU via `skmisc.loess` — a batch whose log-mean / log-variance
+regression is too degenerate to fit (small batch sizes, near-collinear inputs)
+is caught, surfaced as a `UserWarning` naming the batch, and excluded from the
+per-batch ranking; other batches proceed normally.
 
 
 ### Quick example
