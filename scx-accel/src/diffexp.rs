@@ -33,6 +33,9 @@ pub struct DiffExpResult {
     pub pvals_adj: Vec<Vec<f64>>,
     /// log2 fold-changes (group mean / reference mean). `[n_groups][n_genes]`
     pub logfoldchanges: Vec<Vec<f64>>,
+    /// Which execution route produced this result (stamped by the dispatch
+    /// entry point; `AccelRoute::Unknown` until then).
+    pub exec_info: crate::route::AccelExecutionInfo,
 }
 
 /// Per-gene test result (before sorting/grouping).
@@ -258,6 +261,7 @@ pub fn wilcoxon_rank_sum(
         pvals: result_pvals,
         pvals_adj: result_pvals_adj,
         logfoldchanges: result_logfc,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -726,6 +730,7 @@ pub fn merge_diff_exp_results(
             pvals: vec![],
             pvals_adj: vec![],
             logfoldchanges: vec![],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         });
     }
     if chunks.len() == 1 {
@@ -735,6 +740,9 @@ pub fn merge_diff_exp_results(
     // All chunks must have the same group structure.
     let group_names = chunks[0].group_names.clone();
     let n_groups = group_names.len();
+    // Carry the route metadata of the first chunk onto the merged result —
+    // every chunk shares the same dispatch route.
+    let merged_exec_info = chunks[0].exec_info.clone();
 
     let mut merged_names = Vec::with_capacity(n_groups);
     let mut merged_scores = Vec::with_capacity(n_groups);
@@ -796,6 +804,7 @@ pub fn merge_diff_exp_results(
         pvals: merged_pvals,
         pvals_adj: merged_pvals_adj,
         logfoldchanges: merged_logfc,
+        exec_info: merged_exec_info,
     })
 }
 
@@ -835,6 +844,9 @@ pub struct PdexRefResult {
     pub p_values: Vec<Vec<f64>>,
     /// Benjamini-Hochberg adjusted p-values per group across genes.
     pub fdrs: Vec<Vec<f64>>,
+    /// Which execution route produced this result (stamped by the dispatch
+    /// entry point; `AccelRoute::Unknown` until then).
+    pub exec_info: crate::route::AccelExecutionInfo,
 }
 
 /// Per-cell value transform `f(x)` applied before averaging for pdex pseudobulk.
@@ -1091,6 +1103,7 @@ pub fn pdex_ref(
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -1293,6 +1306,7 @@ pub(crate) fn empty_pdex_result(group_names: &[String], reference: usize) -> Pde
         statistics: vec![vec![]; n_test],
         p_values: vec![vec![]; n_test],
         fdrs: vec![vec![]; n_test],
+        exec_info: crate::route::AccelExecutionInfo::default(),
     }
 }
 
@@ -1608,6 +1622,7 @@ mod tests {
             pvals: vec![vec![0.001, 0.05]],
             pvals_adj: vec![vec![0.002, 0.05]],
             logfoldchanges: vec![vec![2.0, 0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let merged = merge_diff_exp_results(vec![chunk.clone()], false).unwrap();
         assert_eq!(merged.group_names, chunk.group_names);
@@ -1626,6 +1641,7 @@ mod tests {
             pvals: vec![vec![0.3]],
             pvals_adj: vec![vec![0.3]],
             logfoldchanges: vec![vec![0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
@@ -1634,6 +1650,7 @@ mod tests {
             pvals: vec![vec![0.001]],
             pvals_adj: vec![vec![0.001]],
             logfoldchanges: vec![vec![2.0]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
 
         let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();
@@ -1656,6 +1673,7 @@ mod tests {
             pvals: vec![vec![0.04]],
             pvals_adj: vec![vec![0.04]], // per-chunk BH with n=1
             logfoldchanges: vec![vec![1.0]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
@@ -1664,6 +1682,7 @@ mod tests {
             pvals: vec![vec![0.03]],
             pvals_adj: vec![vec![0.03]],
             logfoldchanges: vec![vec![0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
 
         let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();

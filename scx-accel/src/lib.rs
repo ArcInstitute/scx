@@ -22,6 +22,7 @@ pub mod lisi;
 pub mod neighbors;
 pub mod pca;
 pub mod pseudobulk;
+pub mod route;
 pub mod umap;
 
 pub use csc::{
@@ -61,6 +62,9 @@ pub use pseudobulk::{
     build_group_mapping, pseudobulk_aggregate, pseudobulk_aggregate_dense,
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
     GeomMeanMode, PseudobulkResult,
+};
+pub use route::{
+    plan_de_route, AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout,
 };
 pub use umap::{compute_umap, UmapResult};
 

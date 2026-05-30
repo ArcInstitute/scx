@@ -75,6 +75,14 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   Linux to return freed arenas to the OS after large reductions.
 - Pseudobulk aggregation streams via `BackedCsrReader`; statistical
   testing delegated to `pydeseq2`.
+- **Execution route is recorded, not implicit.** DE entry points stamp an
+  `AccelExecutionInfo` (route + fallback reason) onto their result via the
+  single planner `scx_accel::route::plan_de_route`. GPU entry points stamp the
+  authoritative route (v2 / v3 / CSC) at the kernel branch; CPU routes are
+  stamped at the pyscx dispatch point. New GPU routes MUST register an
+  `AccelRoute` variant and stamp it — no silent fallbacks. The route surfaces to
+  Python on `adata.uns["scx_accel"]`, and any performance claim must cite the
+  recorded route. `SCX_GPU_DE_V3_TRACE` is a debug-only fallback, not the signal.
 
 ## Parallel streaming reader (scx-convert)
 
