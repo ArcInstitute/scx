@@ -1021,6 +1021,619 @@ fn test_compact_preserves_layers_obsm_uns() {
     assert_eq!(uns["method"], "test");
 }
 
+// --- Patch 3: compact preservation of varm / obsp / varp ------------------
+
+/// Build a COO pairwise `RecordBatch` (`row: Int32`, `col: Int32`,
+/// `data: Float32`) with `n_rows`/`n_cols` schema metadata, matching the
+/// wire format expected by `write_obsp` / `write_varp`.
+fn coo_batch(
+    rows: Vec<i32>,
+    cols: Vec<i32>,
+    data: Vec<f32>,
+    n: usize,
+) -> arrow::array::RecordBatch {
+    use std::collections::HashMap;
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), n.to_string()),
+            ("n_cols".to_string(), n.to_string()),
+        ]),
+    );
+    arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(arrow::array::Int32Array::from(rows)),
+            Arc::new(arrow::array::Int32Array::from(cols)),
+            Arc::new(arrow::array::Float32Array::from(data)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Single-modality file with X plus a global `obsm`, `varm`, `obsp`, and
+/// `varp` — used to verify compact preserves every mapping family.
+///
+/// The `obsp` entries are chosen so that deleting obs 1 and 4 leaves exactly
+/// one survivor edge, `(2, 3)`, which remaps to `(1, 2)` in the compacted
+/// index space `{0→0, 2→1, 3→2, 5→3}`.
+fn write_test_file_with_all_mappings(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Global obsm: n_obs × 2.
+    let emb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.1).collect();
+    let obsm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("PC1", DataType::Float64, false),
+            Field::new("PC2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(emb[..n_obs].to_vec())),
+            Arc::new(Float64Array::from(emb[n_obs..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_obsm("X_pca", &obsm).unwrap();
+
+    // Global varm: n_vars × 2.
+    let vemb: Vec<f64> = (0..n_vars * 2).map(|i| i as f64 * 0.5).collect();
+    let varm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("L1", DataType::Float64, false),
+            Field::new("L2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(vemb[..n_vars].to_vec())),
+            Arc::new(Float64Array::from(vemb[n_vars..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_varm("PCs", &varm).unwrap();
+
+    // obsp (obs×obs COO).
+    writer
+        .write_obsp(
+            "connectivities",
+            &coo_batch(
+                vec![0, 1, 2, 3, 4, 1],
+                vec![1, 2, 3, 4, 5, 4],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 9.0],
+                n_obs,
+            ),
+        )
+        .unwrap();
+
+    // varp (var×var COO) — never filtered by compact.
+    writer
+        .write_varp(
+            "corr",
+            &coo_batch(vec![0, 3], vec![1, 7], vec![1.5, 2.5], n_vars),
+        )
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// Compact with no deletions preserves global varm, varp, and obsp.
+#[test]
+fn test_compact_preserves_varm_varp_obsp_no_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file_with_all_mappings(&dir, "maps.scx", 6, 10);
+    let out = dir.path().join("maps_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+
+    let varm = reader.read_all_varm().unwrap();
+    assert_eq!(varm.get("PCs").expect("varm PCs preserved").num_rows(), 10);
+
+    let varp = reader.read_all_varp().unwrap();
+    assert_eq!(varp.get("corr").expect("varp corr preserved").num_rows(), 2);
+
+    let obsp = reader.read_all_obsp().unwrap();
+    assert_eq!(
+        obsp.get("connectivities")
+            .expect("obsp preserved")
+            .num_rows(),
+        6
+    );
+}
+
+/// Compact remaps obsp COO through the obs keep-mask under deletions.
+#[test]
+fn test_compact_filters_obsp_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file_with_all_mappings(&dir, "maps_del.scx", 6, 10);
+    scx_ops::mark_deleted(&path, &[1, 4]).unwrap();
+    let out = dir.path().join("maps_del_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.n_obs(), 4);
+
+    let obsp = reader.read_all_obsp().unwrap();
+    let conn = obsp.get("connectivities").expect("obsp preserved");
+    // Only the (2,3) edge survives; both endpoints kept, remapped to (1,2).
+    assert_eq!(conn.num_rows(), 1);
+    let rows = conn
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    let cols = conn
+        .column_by_name("col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    let data = conn
+        .column_by_name("data")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .unwrap();
+    assert_eq!(rows.value(0), 1);
+    assert_eq!(cols.value(0), 2);
+    assert_eq!(data.value(0), 3.0);
+
+    // n_rows / n_cols metadata reflect the compacted obs count.
+    let md = conn.schema().metadata().clone();
+    assert_eq!(md.get("n_rows").map(String::as_str), Some("4"));
+    assert_eq!(md.get("n_cols").map(String::as_str), Some("4"));
+
+    // var-axis mappings are unaffected by obs deletions.
+    assert_eq!(reader.read_all_varm().unwrap()["PCs"].num_rows(), 10);
+    assert_eq!(reader.read_all_varp().unwrap()["corr"].num_rows(), 2);
+}
+
+/// Compact remaps a v2 (`Int64` coordinate) obsp under deletions. The v2 wire
+/// format self-describes the coordinate width; this pins that compaction
+/// accepts Int64 coordinates rather than rejecting them as "not Int32". The
+/// surviving axis is small so the output narrows back to Int32.
+#[test]
+fn test_compact_filters_obsp_int64_with_deletions() {
+    use std::collections::HashMap;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("maps_i64.scx");
+    let n_obs = 6usize;
+    let n_vars = 10usize;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Same edge layout as `write_test_file_with_all_mappings`, but with
+    // Int64 coordinate columns (the v2 width).
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int64, false),
+            Field::new("col", DataType::Int64, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), n_obs.to_string()),
+            ("n_cols".to_string(), n_obs.to_string()),
+        ]),
+    );
+    let obsp = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(vec![0i64, 1, 2, 3, 4, 1])),
+            Arc::new(arrow::array::Int64Array::from(vec![1i64, 2, 3, 4, 5, 4])),
+            Arc::new(arrow::array::Float32Array::from(vec![
+                1.0f32, 2.0, 3.0, 4.0, 5.0, 9.0,
+            ])),
+        ],
+    )
+    .unwrap();
+    writer.write_obsp("connectivities", &obsp).unwrap();
+    writer.finish().unwrap();
+
+    scx_ops::mark_deleted(&path, &[1, 4]).unwrap();
+    let out = dir.path().join("maps_i64_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let obsp = reader.read_all_obsp().unwrap();
+    let conn = obsp.get("connectivities").expect("obsp preserved");
+    // Only the (2,3) edge survives, remapped to (1,2). Small axis → Int32 out.
+    assert_eq!(conn.num_rows(), 1);
+    let rows = conn
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .expect("output narrowed to Int32 for a small compacted axis");
+    let cols = conn
+        .column_by_name("col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(rows.value(0), 1);
+    assert_eq!(cols.value(0), 2);
+    let md = conn.schema().metadata().clone();
+    assert_eq!(md.get("n_rows").map(String::as_str), Some("4"));
+    assert_eq!(md.get("n_cols").map(String::as_str), Some("4"));
+}
+
+/// Multimodal file whose RNA modality carries a *sharded* per-modality obsm
+/// (`ObsmEmbeddingShard`, type 20) and a per-modality varm.
+fn write_multimodal_with_per_modality_mappings(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Per-modality obsm as a SHARDED section (forces ObsmEmbeddingShard).
+    let emb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.1).collect();
+    let obsm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("UMAP1", DataType::Float64, false),
+            Field::new("UMAP2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(emb[..n_obs].to_vec())),
+            Arc::new(Float64Array::from(emb[n_obs..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer
+        .write_obsm_shard_for(rna_id, "X_umap", 0, 0, n_obs as u64, n_obs as u64, &obsm)
+        .unwrap();
+
+    // Per-modality varm.
+    let nv = rna_n_vars as usize;
+    let vemb: Vec<f64> = (0..nv * 2).map(|i| i as f64 * 0.3).collect();
+    let varm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("L1", DataType::Float64, false),
+            Field::new("L2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(vemb[..nv].to_vec())),
+            Arc::new(Float64Array::from(vemb[nv..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer
+        .write_varm_shard_for(rna_id, "PCs", 0, 0, rna_n_vars, rna_n_vars, &varm)
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// Compact preserves a sharded per-modality obsm and a per-modality varm.
+#[test]
+fn test_compact_preserves_per_modality_sharded_obsm_and_varm() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_per_modality_mappings(&dir, "mm_maps.scx", 6, 8);
+    let out = dir.path().join("mm_maps_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.is_multimodal());
+    // Sharded per-modality obsm survives the type-20 discovery fix.
+    assert_eq!(reader.read_obsm_for(1, "X_umap").unwrap().num_rows(), 6);
+    // Per-modality varm survives compaction.
+    assert_eq!(reader.read_varm_for(1, "PCs").unwrap().num_rows(), 8);
+}
+
+/// Compact row-filters a per-modality obsm under deletions; varm is
+/// var-axis and stays full.
+#[test]
+fn test_compact_filters_per_modality_obsm_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_per_modality_mappings(&dir, "mm_del.scx", 6, 8);
+    scx_ops::mark_deleted(&path, &[1, 4]).unwrap();
+    let out = dir.path().join("mm_del_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.read_obsm_for(1, "X_umap").unwrap().num_rows(), 4);
+    assert_eq!(reader.read_varm_for(1, "PCs").unwrap().num_rows(), 8);
+}
+
+/// Multimodal file carrying BOTH per-modality mappings (sharded obsm + varm on
+/// the RNA modality) AND file-level global `obsm`/`varm`/`varp`/`obsp`
+/// (`modality_id == 0`). Used to verify multimodal compact preserves the
+/// globals without re-emitting the per-modality entries as spurious globals.
+///
+/// The global `obsp` edge layout matches the single-modality fixture: deleting
+/// obs 1 and 4 leaves exactly one survivor edge, `(2, 3)` → `(1, 2)`.
+fn write_multimodal_with_global_and_per_modality_mappings(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, rna_n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Per-modality sharded obsm + varm on the RNA modality (modality_id 1).
+    let emb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.1).collect();
+    let pm_obsm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("UMAP1", DataType::Float64, false),
+            Field::new("UMAP2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(emb[..n_obs].to_vec())),
+            Arc::new(Float64Array::from(emb[n_obs..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer
+        .write_obsm_shard_for(rna_id, "X_umap", 0, 0, n_obs as u64, n_obs as u64, &pm_obsm)
+        .unwrap();
+    let nv = rna_n_vars as usize;
+    let pm_vemb: Vec<f64> = (0..nv * 2).map(|i| i as f64 * 0.3).collect();
+    let pm_varm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("L1", DataType::Float64, false),
+            Field::new("L2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(pm_vemb[..nv].to_vec())),
+            Arc::new(Float64Array::from(pm_vemb[nv..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer
+        .write_varm_shard_for(rna_id, "PCs", 0, 0, rna_n_vars, rna_n_vars, &pm_varm)
+        .unwrap();
+
+    // Global mappings (modality_id 0) — written at top level.
+    let gemb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.2).collect();
+    let g_obsm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("PC1", DataType::Float64, false),
+            Field::new("PC2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(gemb[..n_obs].to_vec())),
+            Arc::new(Float64Array::from(gemb[n_obs..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_obsm("X_pca_g", &g_obsm).unwrap();
+
+    let gvemb: Vec<f64> = (0..nv * 2).map(|i| i as f64 * 0.7).collect();
+    let g_varm = arrow::array::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("G1", DataType::Float64, false),
+            Field::new("G2", DataType::Float64, false),
+        ])),
+        vec![
+            Arc::new(Float64Array::from(gvemb[..nv].to_vec())),
+            Arc::new(Float64Array::from(gvemb[nv..].to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_varm("PCs_g", &g_varm).unwrap();
+
+    writer
+        .write_obsp(
+            "conn_g",
+            &coo_batch(
+                vec![0, 1, 2, 3, 4, 1],
+                vec![1, 2, 3, 4, 5, 4],
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 9.0],
+                n_obs,
+            ),
+        )
+        .unwrap();
+    writer
+        .write_varp(
+            "corr_g",
+            &coo_batch(vec![0, 3], vec![1, 7], vec![1.5, 2.5], nv),
+        )
+        .unwrap();
+
+    writer.finish().unwrap();
+    path
+}
+
+/// Count catalog entries that are global (`modality_id == 0`) and live under a
+/// per-modality `{prefix}/{modality}/` path — i.e. spurious globals re-emitted
+/// from per-modality sections. Should always be zero after compact.
+fn spurious_global_under(reader: &ScxReader, prefix: &str) -> usize {
+    reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.modality_id == 0 && e.name.starts_with(prefix))
+        .count()
+}
+
+/// Multimodal compact (no deletions) preserves global obsm/varm/varp/obsp and
+/// leaves per-modality mappings intact, without re-emitting per-modality
+/// sections as spurious globals.
+#[test]
+fn test_compact_multimodal_preserves_global_varm_varp_obsp() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multimodal_with_global_and_per_modality_mappings(&dir, "mm_glob.scx", 6, 8);
+    let out = dir.path().join("mm_glob_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.is_multimodal());
+
+    // Globals preserved.
+    assert_eq!(
+        reader.read_all_obsm().unwrap()["X_pca_g"].num_rows(),
+        6,
+        "global obsm preserved"
+    );
+    assert_eq!(
+        reader.read_all_varm().unwrap()["PCs_g"].num_rows(),
+        8,
+        "global varm preserved"
+    );
+    assert_eq!(
+        reader.read_all_varp().unwrap()["corr_g"].num_rows(),
+        2,
+        "global varp preserved"
+    );
+    assert_eq!(
+        reader.read_all_obsp().unwrap()["conn_g"].num_rows(),
+        6,
+        "global obsp preserved"
+    );
+
+    // Per-modality mappings intact.
+    assert_eq!(reader.read_obsm_for(1, "X_umap").unwrap().num_rows(), 6);
+    assert_eq!(reader.read_varm_for(1, "PCs").unwrap().num_rows(), 8);
+
+    // No per-modality embedding re-emitted as a global (modality_id 0) section.
+    assert_eq!(spurious_global_under(&reader, "obsm/rna/"), 0);
+    assert_eq!(spurious_global_under(&reader, "varm/rna/"), 0);
+}
+
+/// Multimodal compact under deletions remaps the global obsp COO and
+/// row-filters obs-axis mappings; var-axis globals stay full.
+#[test]
+fn test_compact_multimodal_filters_global_obsp_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path =
+        write_multimodal_with_global_and_per_modality_mappings(&dir, "mm_glob_del.scx", 6, 8);
+    scx_ops::mark_deleted(&path, &[1, 4]).unwrap();
+    let out = dir.path().join("mm_glob_del_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.n_obs(), 4);
+
+    // Global obsp: only the (2,3) edge survives, remapped to (1,2).
+    let obsp = reader.read_all_obsp().unwrap();
+    let conn = obsp.get("conn_g").expect("global obsp preserved");
+    assert_eq!(conn.num_rows(), 1);
+    let rows = conn
+        .column_by_name("row")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    let cols = conn
+        .column_by_name("col")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int32Array>()
+        .unwrap();
+    assert_eq!(rows.value(0), 1);
+    assert_eq!(cols.value(0), 2);
+    let md = conn.schema().metadata().clone();
+    assert_eq!(md.get("n_rows").map(String::as_str), Some("4"));
+    assert_eq!(md.get("n_cols").map(String::as_str), Some("4"));
+
+    // Obs-axis globals + per-modality obsm row-filtered; var-axis stays full.
+    assert_eq!(reader.read_all_obsm().unwrap()["X_pca_g"].num_rows(), 4);
+    assert_eq!(reader.read_obsm_for(1, "X_umap").unwrap().num_rows(), 4);
+    assert_eq!(reader.read_all_varm().unwrap()["PCs_g"].num_rows(), 8);
+    assert_eq!(reader.read_all_varp().unwrap()["corr_g"].num_rows(), 2);
+    assert_eq!(reader.read_varm_for(1, "PCs").unwrap().num_rows(), 8);
+}
+
 /// Read the codec_id from the most recently appended CSR shard.
 fn last_appended_shard_codec(path: &std::path::Path) -> CodecId {
     use scx_format::section::SectionType;
@@ -2883,8 +3496,7 @@ fn write_multimodal_with_options_fixture(
     writer
         .set_modality_n_vars(adt_id, adt_var.num_rows() as u64)
         .unwrap();
-    let (rna_indptr, rna_indices, rna_values) =
-        sample_shard_data(n_obs, rna_var.num_rows() as usize);
+    let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_var.num_rows());
     writer
         .write_csr_shard_for(
             rna_id,
@@ -2896,8 +3508,7 @@ fn write_multimodal_with_options_fixture(
             0,
         )
         .unwrap();
-    let (adt_indptr, adt_indices, adt_values) =
-        sample_shard_data(n_obs, adt_var.num_rows() as usize);
+    let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_var.num_rows());
     writer
         .write_csr_shard_for(
             adt_id,
@@ -3108,4 +3719,513 @@ fn test_compact_multimodal_layers_streaming() {
     assert_eq!(rna_counts.shape.0, n_obs - 2);
     let adt_centered = reader.read_layer_for(2, "centered").unwrap();
     assert_eq!(adt_centered.shape.0, n_obs - 2);
+}
+
+// ---------------------------------------------------------------------------
+// compact --reshape-obs (task 6c): legacy single-section obs → sharded
+// ---------------------------------------------------------------------------
+
+/// Write a single-section-obs SCX file with a caller-chosen
+/// `shard_target_rows` so `compact --reshape-obs` produces multiple obs
+/// shards from a small fixture.
+fn write_single_section_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    shard_target_rows: u32,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64);
+    header.shard_target_rows = shard_target_rows;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+fn no_index_options() -> scx_engine::ConversionPredicateIndexOptions {
+    scx_engine::ConversionPredicateIndexOptions {
+        index_obs: Vec::new(),
+        index_var: Vec::new(),
+        index_preset: None,
+        index_auto_threshold: 0,
+    }
+}
+
+#[test]
+fn compact_reshape_obs_converts_legacy_single_section_to_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, shard_target_rows = 4 → ceil(10/4) = 3 obs shards.
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    // Precondition: input is legacy single-section obs.
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    drop(reader);
+
+    let out = dir.path().join("reshaped.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    // Legacy single `obs` section must be absent (ObsVarLayout forbids mixing).
+    assert!(reader.catalog().get("obs").is_none());
+
+    // obs round-trips intact through the assembled read path.
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+
+    // Provenance records the migration.
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "compact");
+    assert!(last.params_json.contains("\"reshape_obs\":true"));
+}
+
+#[test]
+fn compact_without_reshape_keeps_single_section_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    let out = dir.path().join("compacted.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), false).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    assert_eq!(reader.read_obs().unwrap().num_rows(), 10);
+}
+
+#[test]
+fn compact_reshape_obs_is_idempotent_on_sharded_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_single_section_obs_file(&dir, "legacy.scx", 10, 10, 4);
+
+    let once = dir.path().join("once.scx");
+    scx_ops::compact_with_index_options(&input, &once, &no_index_options(), true).unwrap();
+    let twice = dir.path().join("twice.scx");
+    scx_ops::compact_with_index_options(&once, &twice, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&twice).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+}
+
+/// Write a two-modality (rna + adt) SCX file with single-section obs and a
+/// caller-chosen `shard_target_rows`, so `compact --reshape-obs` exercises
+/// the multimodal write path (`compact_multimodal`) and produces multiple
+/// obs shards from a small fixture.
+fn write_multimodal_single_section_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+    adt_n_vars: u64,
+    shard_target_rows: u32,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, rna_n_vars);
+    header.shard_target_rows = shard_target_rows;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+    let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
+    writer
+        .write_csr_shard_for(
+            adt_id,
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn compact_reshape_obs_converts_multimodal_legacy_to_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, shard_target_rows = 4 → ceil(10/4) = 3 obs shards.
+    let input = write_multimodal_single_section_obs_file(&dir, "legacy_mm.scx", 10, 30, 10, 4);
+
+    // Precondition: input is legacy single-section obs.
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    drop(reader);
+
+    let out = dir.path().join("reshaped_mm.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    // Obs migrated to sharded layout; legacy single section is gone.
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    assert!(reader.catalog().get("obs").is_none());
+
+    // Obs round-trips through the assembled multimodal read path.
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+
+    // Both modalities and their CSR data are preserved.
+    let table = reader.modality_table().expect("modality table preserved");
+    assert_eq!(table.entries.len(), 2);
+    for modality_id in 1u8..=2u8 {
+        let csr = reader.read_all_csr_shards_for(modality_id).unwrap();
+        assert_eq!(csr.shape.0, 10, "modality {modality_id} row count");
+    }
+
+    // Provenance records the migration.
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "compact");
+    assert!(last.params_json.contains("\"reshape_obs\":true"));
+}
+
+// ---------------------------------------------------------------------------
+// compact --reshape-obs (Patch 4): streaming obs path on already-sharded input
+// ---------------------------------------------------------------------------
+
+/// Write an SCX file whose obs is **already** stored as multiple
+/// `ObsMetadataShard` sections (via `write_obs_shard`), so
+/// `compact --reshape-obs` takes the streaming obs path
+/// (`write_obs_shards_streaming`) instead of the eager re-slice. X is a single
+/// CSR shard. When `with_cluster` is set, obs carries a low-cardinality
+/// `cluster` dictionary column for predicate-index tests.
+fn write_sharded_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    obs_shard_rows: usize,
+    with_cluster: bool,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64);
+    header.shard_target_rows = obs_shard_rows as u32;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = if with_cluster {
+        sample_obs_with_cluster(n_obs)
+    } else {
+        sample_obs(n_obs)
+    };
+    let mut shard_idx = 0u32;
+    let mut row_start = 0usize;
+    while row_start < n_obs {
+        let take = obs_shard_rows.min(n_obs - row_start);
+        writer
+            .write_obs_shard(
+                shard_idx,
+                row_start as u64,
+                take as u64,
+                n_obs as u64,
+                &obs.slice(row_start, take),
+            )
+            .unwrap();
+        shard_idx += 1;
+        row_start += take;
+    }
+
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Multimodal variant of [`write_sharded_obs_file`]: global obs is pre-sharded;
+/// two modalities (rna + adt) each carry a single CSR shard.
+fn write_multimodal_sharded_obs_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    rna_n_vars: u64,
+    adt_n_vars: u64,
+    obs_shard_rows: usize,
+) -> PathBuf {
+    use scx_format::modality::ModalityType;
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, rna_n_vars);
+    header.shard_target_rows = obs_shard_rows as u32;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = sample_obs(n_obs);
+    let mut shard_idx = 0u32;
+    let mut row_start = 0usize;
+    while row_start < n_obs {
+        let take = obs_shard_rows.min(n_obs - row_start);
+        writer
+            .write_obs_shard(
+                shard_idx,
+                row_start as u64,
+                take as u64,
+                n_obs as u64,
+                &obs.slice(row_start, take),
+            )
+            .unwrap();
+        shard_idx += 1;
+        row_start += take;
+    }
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(rna_n_vars as usize))
+        .unwrap();
+    writer
+        .write_var_for(adt_id, &sample_var(adt_n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
+    writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
+
+    let (i, j, v) = sample_shard_data(n_obs, rna_n_vars as usize);
+    writer
+        .write_csr_shard_for(rna_id, &i, &j, &v, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    let (i, j, v) = sample_shard_data(n_obs, adt_n_vars as usize);
+    writer
+        .write_csr_shard_for(adt_id, &i, &j, &v, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn compact_reshape_streams_sharded_obs_no_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, obs shards of 4 → 3 input obs shards.
+    let input = write_sharded_obs_file(&dir, "sharded.scx", 10, 8, 4, false);
+
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    drop(reader);
+
+    let out = dir.path().join("out.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    // Per-input-shard streaming: 3 shards in → 3 shards out (no deletions).
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    assert!(reader.catalog().get("obs").is_none());
+
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+}
+
+#[test]
+fn compact_reshape_streams_sharded_obs_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_sharded_obs_file(&dir, "sharded.scx", 10, 8, 4, false);
+    // Delete global obs rows 1 and 4.
+    scx_ops::mark_deleted(&input, &[1, 4]).unwrap();
+
+    let out = dir.path().join("out.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.obs_metadata_shard_count() > 0);
+    assert!(reader.catalog().get("obs").is_none());
+    assert_eq!(reader.header().n_obs, 8);
+
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 8);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    // Kept ids are the originals minus cell_1 / cell_4, in order.
+    let expected: Vec<String> = (0..10)
+        .filter(|i| *i != 1 && *i != 4)
+        .map(|i| format!("cell_{i}"))
+        .collect();
+    let got: Vec<String> = (0..obs.num_rows())
+        .map(|i| ids.value(i).to_string())
+        .collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn compact_reshape_sharded_obs_builds_streaming_predicate_index() {
+    let dir = tempfile::tempdir().unwrap();
+    // 12 rows, obs shards of 4 → 3 input obs shards, with a `cluster` column.
+    let input = write_sharded_obs_file(&dir, "sharded.scx", 12, 8, 4, true);
+
+    let opts = scx_engine::ConversionPredicateIndexOptions {
+        index_obs: vec!["cluster".to_string()],
+        index_var: Vec::new(),
+        index_preset: None,
+        index_auto_threshold: 0,
+    };
+    let out = dir.path().join("out.scx");
+    let summary = scx_ops::compact_with_index_options(&input, &out, &opts, true).unwrap();
+
+    // The streaming index pass indexed the forced column.
+    let result = summary.result.expect("predicate index built");
+    assert!(result.obs_indexed_columns.iter().any(|c| c == "cluster"));
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert!(reader.obs_metadata_shard_count() > 0);
+    assert!(reader.read_obs_predicate_index_bytes().unwrap().is_some());
+
+    // obs still round-trips with the cluster column intact.
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 12);
+    assert!(obs.schema().column_with_name("cluster").is_some());
+}
+
+#[test]
+fn compact_reshape_all_obs_deleted_writes_single_empty_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_sharded_obs_file(&dir, "sharded.scx", 6, 8, 3, false);
+    scx_ops::mark_deleted(&input, &[0, 1, 2, 3, 4, 5]).unwrap();
+
+    let out = dir.path().join("out.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    // No obs shards; one empty single section keeps the file well-formed.
+    assert_eq!(reader.obs_metadata_shard_count(), 0);
+    assert_eq!(reader.read_obs().unwrap().num_rows(), 0);
+}
+
+#[test]
+fn compact_reshape_multimodal_streams_sharded_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    // 10 rows, obs shards of 4 → 3 input obs shards.
+    let input = write_multimodal_sharded_obs_file(&dir, "mm_sharded.scx", 10, 30, 10, 4);
+
+    let reader = ScxReader::open(&input).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    drop(reader);
+
+    let out = dir.path().join("out.scx");
+    scx_ops::compact_with_index_options(&input, &out, &no_index_options(), true).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.obs_metadata_shard_count(), 3);
+    assert!(reader.catalog().get("obs").is_none());
+
+    let obs = reader.read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let ids = obs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for i in 0..10 {
+        assert_eq!(ids.value(i), format!("cell_{i}"));
+    }
+
+    let table = reader.modality_table().expect("modality table preserved");
+    assert_eq!(table.entries.len(), 2);
+    for modality_id in 1u8..=2u8 {
+        let csr = reader.read_all_csr_shards_for(modality_id).unwrap();
+        assert_eq!(csr.shape.0, 10, "modality {modality_id} row count");
+    }
 }

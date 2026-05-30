@@ -106,7 +106,7 @@ pub fn normalize_total(
     let x = adata.getattr("X")?;
 
     // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
 
         // Scanpy compat: sum only over projected (user-visible) genes.
@@ -152,7 +152,7 @@ pub fn normalize_total(
     }
 
     // Case 2: X is already ScxLazyTransformedDataset — append transform
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
         // Scanpy compat: sum only over projected (user-visible) genes.
         // streaming_row_sums_projected() applies transforms to the full-width
@@ -222,7 +222,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
     let x = adata.getattr("X")?;
 
     // Case 1: X is ScxBackedSparseDataset — create new lazy wrapper with Log1p
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
 
         let non_negative = backed_ref.non_negative;
@@ -246,7 +246,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
     }
 
     // Case 2: X is already ScxLazyTransformedDataset — append Log1p transform
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let mut lazy_ref = lazy.borrow_mut();
         lazy_ref.transforms.push(Transform::Log1p);
         return Ok(());
@@ -304,8 +304,8 @@ pub fn calculate_qc_metrics<'py>(
     emit_qc_advisories(py, adata, &qc_vars)?;
 
     // Detect backed or lazy-transformed SCX dataset
-    let is_backed = x.downcast::<ScxBackedSparseDataset>().is_ok();
-    let is_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+    let is_backed = x.cast::<ScxBackedSparseDataset>().is_ok();
+    let is_lazy = x.cast::<ScxLazyTransformedDataset>().is_ok();
 
     if !is_backed && !is_lazy {
         // Delegate to scanpy for regular scipy/dense. CSC on a non-SCX
@@ -668,7 +668,7 @@ struct GpuShardSource {
 fn source_from_x(x: &Bound<'_, PyAny>) -> PyResult<Option<GpuShardSource>> {
     use crate::lazy_transform::LazyShardSource;
 
-    if let Ok(backed) = x.downcast::<ScxBackedSparseDataset>() {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let r = backed.borrow();
         let backed_arc = Arc::clone(&r.backed);
         let kept = r.kept_to_global.clone();
@@ -692,7 +692,7 @@ fn source_from_x(x: &Bound<'_, PyAny>) -> PyResult<Option<GpuShardSource>> {
         }));
     }
 
-    if let Ok(lazy) = x.downcast::<ScxLazyTransformedDataset>() {
+    if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let r = lazy.borrow();
         let source = r.as_shard_source();
         let backed_arc = Arc::clone(&r.backed);
@@ -737,7 +737,7 @@ fn gpu_normalize_total(
         return Ok(());
     };
 
-    let was_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+    let was_lazy = x.cast::<ScxLazyTransformedDataset>().is_ok();
     let GpuShardSource {
         source,
         backed,
@@ -791,7 +791,7 @@ fn gpu_log1p_dispatch(
     // 1) Fusion marker path: re-run fused normalize+log1p over ORIGINAL source.
     let marker_obj = uns.call_method1("get", (GPU_NORMALIZE_MARKER_KEY,))?;
     if !marker_obj.is_none() {
-        if let Ok(marker_ref) = marker_obj.downcast::<ScxGpuNormalizeMarker>() {
+        if let Ok(marker_ref) = marker_obj.cast::<ScxGpuNormalizeMarker>() {
             let m = marker_ref.borrow();
             let source = crate::lazy_transform::LazyShardSource::new(
                 Arc::clone(&m.backed),
@@ -828,7 +828,7 @@ fn gpu_log1p_dispatch(
     // 2) Backed/lazy X: stream through gpu_preprocess_to_csr with log1p only.
     let x = adata.getattr("X")?;
     if let Some(gs) = source_from_x(&x)? {
-        let was_lazy = x.downcast::<ScxLazyTransformedDataset>().is_ok();
+        let was_lazy = x.cast::<ScxLazyTransformedDataset>().is_ok();
         let dev = scx_accel::GpuDevice::new(device_id)
             .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
         let csr = scx_accel::gpu_preprocess_to_csr(&dev, &gs.source, None, true)

@@ -2,6 +2,8 @@ mod accel;
 mod anndata;
 pub(crate) mod backed;
 mod experiment;
+#[cfg(feature = "hdf5")]
+mod h5ad_metadata;
 pub(crate) mod lazy_mapping;
 pub(crate) mod lazy_transform;
 pub(crate) mod mudata;
@@ -173,9 +175,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 /// `memory_budget`: Optional budget that surfaces a `UserWarning` when
 ///   an obsm / varm / obsp / varp key's estimated peak footprint
 ///   exceeds the budget. Accepts `None` (no check), an int byte count,
-///   or a string like `"4G"` / `"512MiB"`. Warn-only — shard size is
-///   not derated. Applies to both the in-memory and backed routing
-///   paths.
+///   or a binary-prefixed size string — `K`/`M`/`G`/`T` or
+///   `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024; decimal
+///   `KB`/`MB`/`GB`/`TB` is rejected), e.g. `"4G"` / `"512MiB"`.
+///   Warn-only — shard size is not derated. Applies to both the
+///   in-memory and backed routing paths.
 ///
 /// `force_legacy_metadata`: when True, write obs/var as a single
 ///   `ObsMetadata` / `VarMetadata` section regardless of size. Default
@@ -186,8 +190,9 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///   to `ScxReader::read_obs_shard` / `obs_shards()`. Applies to the
 ///   in-memory path only — backed routing goes through the streaming
 ///   converter which writes single-section metadata regardless (use
-///   `scx compact --reshape-obs` post-hoc if sharded metadata is
-///   needed for a backed conversion).
+///   `pyscx.compact(..., reshape_obs=True)` or `scx compact
+///   --reshape-obs` post-hoc if sharded metadata is needed for a backed
+///   conversion).
 #[pyfunction]
 #[pyo3(signature = (
     adata, path, codec=None, shard_size=None, in_place=false, csc="off",
@@ -253,14 +258,23 @@ fn from_anndata(
 /// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
 /// `from_anndata` exactly.
 ///
-/// Internally this opens the h5ad in `anndata.read_h5ad(path,
-/// backed="r")` mode and delegates to the same backed-AnnData router
-/// `from_anndata` uses on backed input. Backed mode only reads
-/// metadata (obs / var / obsm / varm / uns) into Python; X and layers
-/// stay on disk and are streamed shard-by-shard by `scx-convert`.
-/// Going through Python's pyarrow on the metadata path preserves the
-/// pandas `index_columns` schema metadata so `obs.index` round-trips
-/// correctly through SCX → `to_anndata()`.
+/// Internally this routes straight to `scx_convert::h5ad_to_scx_streaming`
+/// with the on-disk h5ad path — no `anndata.read_h5ad` call, no
+/// backed-AnnData round-trip. obs / var / uns are read via pure-Rust
+/// HDF5 (`scx-convert/src/h5ad_read.rs`) when no override is supplied,
+/// which dodges anndata's eager `obsm` materialisation on `read_h5ad`
+/// (anndata 0.12 reads `obsm` into Python heap on every call, including
+/// in `backed='r'` mode). The pure-Rust path stamps the same pandas
+/// `index_columns` schema metadata used by the rest of the pipeline so
+/// `obs.index` still round-trips through `to_anndata()`.
+///
+/// Supply `obs_override` / `var_override` / `uns_override` to inject
+/// caller-mutated values (typically from
+/// `pyscx.read_h5ad_metadata(path)`): row counts are validated against
+/// the on-disk X shape; `uns_override` is a full-section replacement.
+/// `obsm` / `varm` / `obsp` / `varp` are deliberately *not* exposed as
+/// overrides — accepting them would re-introduce the eager-materialisation
+/// OOM class this entrypoint exists to avoid.
 ///
 /// `csc="always"` performs a two-pass write: the streaming converter
 /// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
@@ -285,10 +299,11 @@ fn from_anndata(
 ///   * `strict_uns`: when `True`, the first unrepresentable `uns`
 ///     entry raises; default `False` emits a `UserWarning` per
 ///     skipped key (`SkippedUnsKey`).
-///   * `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
-///     dense slabs and the CSC external-transpose buffers. Binary
-///     prefixes only (`K/M/G/T`, `KiB/MiB/GiB/TiB`); decimal
-///     `KB/MB/GB/TB` is rejected to avoid ambiguity.
+///   * `memory_budget`: caps dense slabs and the CSC external-
+///     transpose buffers. Accepts an int byte count or a binary-
+///     prefixed size — `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB`
+///     (powers of 1024); decimal `KB`/`MB`/`GB`/`TB` is rejected to
+///     avoid 1000-vs-1024 ambiguity. E.g. `"4G"` / `"512M"` / `"2GiB"`.
 ///   * `temp_dir`: directory for CSC external transpose runs.
 ///     Cleaned on success and on drop; defaults to the system temp.
 ///   * `index_obs` / `index_var` / `index_preset`
@@ -318,6 +333,7 @@ fn from_anndata(
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", reader_threads=None, writer_queue_depth=4,
+    obs_override=None, var_override=None, uns_override=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -341,6 +357,9 @@ fn from_h5ad(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    obs_override: Option<Bound<'_, PyAny>>,
+    var_override: Option<Bound<'_, PyAny>>,
+    uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc_always = match csc {
@@ -355,40 +374,93 @@ fn from_h5ad(
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    // Open the h5ad in backed mode so obs / var / obsm / varm / uns
-    // are extractable as Python objects but X stays on disk. The
-    // backed-router then runs the same Python → Arrow conversion path
-    // `from_anndata` uses, which embeds pandas metadata in the obs /
-    // var schemas — the bit that's missing if we let scx-convert's
-    // pure-Rust `read_dataframe_group` build the records.
-    let anndata_mod = py.import("anndata")?;
-    let kwargs = pyo3::types::PyDict::new(py);
-    kwargs.set_item("backed", "r")?;
-    let backed = anndata_mod.call_method("read_h5ad", (path,), Some(&kwargs))?;
+    let has_override = obs_override.is_some() || var_override.is_some() || uns_override.is_some();
+    if has_override && !stream {
+        return Err(PyValueError::new_err(
+            "obs_override / var_override / uns_override require stream=True; the \
+             non-streaming h5ad_to_scx path does not apply overrides",
+        ));
+    }
 
-    anndata::route_backed_anndata_to_streaming(
-        py,
-        &backed,
-        out,
-        explicit_codec,
+    // Build StreamingOverrides from caller-supplied Python objects.
+    // Validate obs / var row counts against the on-disk X shape so a
+    // mismatched override doesn't silently desynchronise the SCX file.
+    // obsm / varm / obsp / varp are intentionally not surfaced on the
+    // Python API — accepting them would re-introduce the very obsm OOM
+    // class this entrypoint exists to avoid.
+    let mut overrides = scx_convert::StreamingOverrides::default();
+    if obs_override.is_some() || var_override.is_some() {
+        let path_buf = std::path::PathBuf::from(path);
+        let mut shape_sink = scx_convert::WarningSink::log();
+        let (n_obs_disk, n_vars_disk, _x_format) = py
+            .detach(|| scx_convert::read_h5ad_x_shape_from_path(&path_buf, &mut shape_sink))
+            .map_err(|e| PyRuntimeError::new_err(format!("read X shape '{path}': {e}")))?;
+        anndata::emit_python_warnings(py, &shape_sink)?;
+        if let Some(obs) = obs_override.as_ref() {
+            let rows: usize = obs.getattr("shape")?.get_item(0)?.extract()?;
+            if rows != n_obs_disk {
+                return Err(PyValueError::new_err(format!(
+                    "obs_override has {rows} rows but X has n_obs={n_obs_disk}"
+                )));
+            }
+            overrides.obs = Some(anndata::pandas_to_record_batch(py, obs)?);
+        }
+        if let Some(var) = var_override.as_ref() {
+            let rows: usize = var.getattr("shape")?.get_item(0)?.extract()?;
+            if rows != n_vars_disk {
+                return Err(PyValueError::new_err(format!(
+                    "var_override has {rows} rows but X has n_vars={n_vars_disk}"
+                )));
+            }
+            overrides.var = Some(anndata::pandas_to_record_batch(py, var)?);
+        }
+    }
+    if let Some(uns) = uns_override.as_ref() {
+        // Replace-not-merge semantics: the supplied dict is the new uns
+        // section in full, matching the existing backed-router behaviour
+        // when section_keys_match returns false.
+        overrides.uns = Some(anndata::uns_py_to_json(py, uns, uns_format_parsed)?);
+    }
+
+    let opts = scx_convert::ConvertOptions {
         shard_target_rows,
-        csc_always,
+        codec: explicit_codec,
+        csc: csc_always,
         csc_cols_per_shard,
-        uns_format_parsed,
+        tool: "pyscx".into(),
+        memory_budget: memory_budget_bytes,
         stream,
         strict_uns,
         dense_zero_epsilon,
-        memory_budget_bytes,
-        temp_dir,
-        index_obs.unwrap_or_default(),
-        index_var.unwrap_or_default(),
+        temp_dir: temp_dir.map(std::path::PathBuf::from),
+        modalities: None,
+        modality_types: Vec::new(),
+        index_obs: index_obs.unwrap_or_default(),
+        index_var: index_var.unwrap_or_default(),
         index_preset,
         index_auto_threshold,
-        bitmap,
+        bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
-    )
+    };
+
+    let input = std::path::PathBuf::from(path);
+    let output = std::path::PathBuf::from(out);
+    let mut sink = scx_convert::WarningSink::log();
+    if stream {
+        py.detach(|| {
+            scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    } else {
+        py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    anndata::emit_python_warnings(py, &sink)?;
+    Ok(())
 }
 
 /// Convert a 10x HDF5 file to SCX via scanpy.
@@ -590,7 +662,7 @@ fn to_h5ad(
         memory_budget: memory_budget_bytes,
         ..Default::default()
     };
-    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+    py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
         match (modality, stream) {
             (Some(name), true) => scx_convert::scx_modality_to_h5ad_streaming(
@@ -601,7 +673,7 @@ fn to_h5ad(
                 &mut sink,
             ),
             (Some(name), false) => {
-                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name)
+                scx_convert::scx_modality_to_h5ad(Path::new(path), Path::new(out), name, &mut sink)
             }
             (None, true) => scx_convert::scx_to_h5ad_streaming(
                 Path::new(path),
@@ -646,12 +718,12 @@ fn to_h5mu(
         memory_budget: memory_budget_bytes,
         ..Default::default()
     };
-    py.allow_threads(|| -> Result<(), scx_convert::ConvertError> {
+    py.detach(|| -> Result<(), scx_convert::ConvertError> {
         let mut sink = scx_convert::WarningSink::log();
         if stream {
             scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
         } else {
-            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out))
+            scx_convert::scx_to_h5mu(Path::new(path), Path::new(out), &mut sink)
         }
     })
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -764,6 +836,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;
+    #[cfg(feature = "hdf5")]
+    m.add_function(wrap_pyfunction!(h5ad_metadata::read_h5ad_metadata, m)?)?;
     m.add_function(wrap_pyfunction!(from_10x, m)?)?;
     m.add_function(wrap_pyfunction!(from_mtx, m)?)?;
     m.add_function(wrap_pyfunction!(to_mtx, m)?)?;
@@ -804,6 +878,8 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<lazy_mapping::ScxLazyLayersMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyValueIterator>()?;
     m.add_class::<lazy_mapping::ScxLazyItemIterator>()?;
+    #[cfg(feature = "hdf5")]
+    m.add_class::<h5ad_metadata::PyH5adMetadata>()?;
 
     // Accelerators submodule.  Functions are grouped by domain into
     // `register_*` helpers so adding a new accelerator only touches one

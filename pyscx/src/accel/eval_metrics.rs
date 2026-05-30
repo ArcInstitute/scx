@@ -45,7 +45,7 @@ pub fn pseudobulk_means<'py>(
     adata: &Bound<'py, PyAny>,
     groupby: &str,
     min_cells_per_group: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let np = py.import("numpy")?;
 
     // Extract groupby column from adata.obs as Vec<String>.
@@ -71,12 +71,12 @@ pub fn pseudobulk_means<'py>(
     // Perform aggregation with Mean method: backed, lazy-transformed, or in-memory.
     // Each branch releases the GIL around the Rust kernel. `PyReadonlyArray1`
     // guards are held in the branch's outer scope (keeping numpy buffers alive);
-    // only the plain `&[T]` slices cross `allow_threads`.
+    // only the plain `&[T]` slices cross `detach`.
     let x = adata.getattr("X")?;
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         let backed_reader = std::sync::Arc::clone(&backed.backed);
         drop(backed);
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_accel::pseudobulk_aggregate(
                 &backed_reader,
                 &obs_groups,
@@ -119,7 +119,7 @@ pub fn pseudobulk_means<'py>(
             .as_slice()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        py.allow_threads(|| {
+        py.detach(|| {
             scx_accel::pseudobulk_aggregate_from_slices(
                 shape,
                 indptr_slice,
@@ -165,7 +165,7 @@ pub fn pseudobulk_means<'py>(
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            py.allow_threads(|| {
+            py.detach(|| {
                 scx_accel::pseudobulk_aggregate_dense(
                     data_slice,
                     shape,
@@ -209,7 +209,7 @@ pub fn pseudobulk_means<'py>(
                 .as_slice()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-            py.allow_threads(|| {
+            py.detach(|| {
                 scx_accel::pseudobulk_aggregate_from_slices(
                     shape,
                     indptr_slice,
@@ -656,7 +656,7 @@ pub fn perturbation_metrics<'py>(
     metrics: Option<Vec<String>>,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // Determine which metrics to compute.
     let default_metrics = vec![
         "pearson_delta".to_string(),
@@ -704,7 +704,7 @@ pub fn perturbation_metrics<'py>(
     // Call Rust bulk metrics computation. Release the GIL — all inputs are
     // owned Vecs / plain scalars, so the closure is Ungil+Send.
     let result = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::compute_bulk_metrics(
                 &means_real_flat,
                 &means_pred_flat,
@@ -892,7 +892,7 @@ where
 
     // Release the GIL for the O(N²) rayon-parallel kernel. All arguments are
     // owned Vecs or plain scalars.
-    py.allow_threads(|| {
+    py.detach(|| {
         scx_accel::compute_energy_distance::<F>(
             &real_flat,
             &pred_flat,
@@ -1015,7 +1015,7 @@ pub fn energy_distance_details<'py>(
     embed_key: Option<&str>,
     backend: Option<&str>,
     dtype: Option<&str>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let result = run_energy_distance(
         py, adata_real, adata_pred, pert_col, control, metric, embed_key, backend, dtype,
     )?;
@@ -1089,7 +1089,7 @@ pub fn discrimination_score<'py>(
     exclude_target_gene: bool,
     embed_key: Option<&str>,
     min_cells_per_group: usize,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     // Parse distance metric.
     let dist_metric = match metric.to_lowercase().as_str() {
         "euclidean" | "l2" => scx_accel::DistanceMetric::Euclidean,
@@ -1175,7 +1175,7 @@ pub fn discrimination_score<'py>(
     // ── Call Rust discrimination score ───────────────────────────────
     // Release the GIL for the rayon-parallel inner loop.
     let result = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::compute_discrimination_score(
                 &real_effects,
                 &pred_effects,
@@ -1310,7 +1310,7 @@ pub fn knockdown_efficiency<'py>(
     let slices = extract_csr_slices(py, &np, &csr_obj, "knockdown_efficiency", 1)?;
     // Lift the slice references out of `slices` (keeps `slices` alive as the
     // numpy-buffer anchor) so the closures are Ungil+Send — `CsrSlices` itself
-    // holds `PyReadonlyArray1`, which is GIL-bound and cannot cross allow_threads.
+    // holds `PyReadonlyArray1`, which is GIL-bound and cannot cross detach.
     let indptr = slices.indptr();
     let indices = slices.indices();
     let data = slices.data();
@@ -1319,7 +1319,7 @@ pub fn knockdown_efficiency<'py>(
     // Release the GIL for all three kernels. The log-transform allocations
     // also happen inside the closure to avoid a round-trip.
     let (efficiency, log_fc) = py
-        .allow_threads(|| -> scx_accel::Result<_> {
+        .detach(|| -> scx_accel::Result<_> {
             let baseline = scx_accel::compute_control_baseline(
                 indptr,
                 indices,
@@ -1415,7 +1415,7 @@ pub fn clustering_agreement<'py>(
     min_cells_per_group: usize,
 ) -> PyResult<f64> {
     // Native-Rust path: kNN graph + Leiden clustering live entirely in
-    // `scx_accel`, so the entire hot path runs under `py.allow_threads`.
+    // `scx_accel`, so the entire hot path runs under `py.detach`.
     // No scanpy / anndata / igraph imports — the Leiden defaults
     // (`seed=0`, `parallel=false`, `max_iterations=2`) are calibrated
     // against the C++ leidenalg / python-igraph references; HNSW defaults
@@ -1528,7 +1528,7 @@ pub fn clustering_agreement<'py>(
     use std::time::Instant;
     let resolutions_owned = resolutions.clone();
     let n_resolutions = resolutions_owned.len();
-    let best_score: scx_accel::Result<f64> = py.allow_threads(|| {
+    let best_score: scx_accel::Result<f64> = py.detach(|| {
         let t_total = Instant::now();
 
         // Phase: real-side kNN graph build.
@@ -1663,7 +1663,7 @@ pub fn adjusted_mutual_info(
             b.len()
         )));
     }
-    Ok(py.allow_threads(|| scx_accel::adjusted_mutual_info(&a, &b)))
+    Ok(py.detach(|| scx_accel::adjusted_mutual_info(&a, &b)))
 }
 
 /// Normalized Mutual Information (sklearn arithmetic-mean convention).
@@ -1685,7 +1685,7 @@ pub fn normalized_mutual_info(
             b.len()
         )));
     }
-    Ok(py.allow_threads(|| scx_accel::normalized_mutual_info(&a, &b)))
+    Ok(py.detach(|| scx_accel::normalized_mutual_info(&a, &b)))
 }
 
 /// Adjusted Rand Index, rescaled to [0, 1] via `(ARI + 1) / 2`.
@@ -1708,5 +1708,5 @@ pub fn adjusted_rand_index(
             b.len()
         )));
     }
-    Ok(py.allow_threads(|| scx_accel::adjusted_rand_index_rescaled(&a, &b)))
+    Ok(py.detach(|| scx_accel::adjusted_rand_index_rescaled(&a, &b)))
 }

@@ -345,10 +345,10 @@ pub fn from_h5mu_impl(
     let output = std::path::PathBuf::from(out);
     let mut sink = scx_convert::WarningSink::log();
     if stream {
-        py.allow_threads(|| scx_convert::h5mu_to_scx_streaming(&input, &output, &opts, &mut sink))
+        py.detach(|| scx_convert::h5mu_to_scx_streaming(&input, &output, &opts, &mut sink))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     } else {
-        py.allow_threads(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
+        py.detach(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
     crate::anndata::emit_python_warnings(py, &sink)?;
@@ -470,13 +470,16 @@ pub fn from_mudata_impl(
         let indices_np = indices_arr.call_method1("astype", ("int32",))?;
         let data_np = data_arr.call_method1("astype", ("float32",))?;
 
-        let indptr: Vec<i64> = numpy::PyReadonlyArray1::extract_bound(&indptr_np)?
+        let indptr: Vec<i64> = indptr_np
+            .extract::<numpy::PyReadonlyArray1<i64>>()?
             .as_slice()?
             .to_vec();
-        let indices: Vec<i32> = numpy::PyReadonlyArray1::extract_bound(&indices_np)?
+        let indices: Vec<i32> = indices_np
+            .extract::<numpy::PyReadonlyArray1<i32>>()?
             .as_slice()?
             .to_vec();
-        let data: Vec<f32> = numpy::PyReadonlyArray1::extract_bound(&data_np)?
+        let data: Vec<f32> = data_np
+            .extract::<numpy::PyReadonlyArray1<f32>>()?
             .as_slice()?
             .to_vec();
         let nnz = *indptr.last().unwrap_or(&0) as u64;

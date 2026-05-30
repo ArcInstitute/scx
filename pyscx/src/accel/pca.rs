@@ -11,6 +11,7 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 use super::gpu::resolve_device;
+use super::util::extract_materialized_csr;
 #[cfg(feature = "gpu")]
 use super::util::{extract_csr_slices, CsrSlices};
 
@@ -479,7 +480,7 @@ pub fn pca(
         let (_n_obs, n_vars) = reader.shape();
         drop(backed);
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca(&*reader, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
                 &*reader,
@@ -497,7 +498,7 @@ pub fn pca(
         let (_n_obs, n_vars) = source.shape();
         drop(lazy);
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca(&source, n_comps, zero_center),
             _ => scx_accel::randomized_pca(
                 &source,
@@ -514,7 +515,7 @@ pub fn pca(
         let csr = extract_materialized_csr(py, &x)?;
         let n_vars = csr.n_cols();
         let m = pick_cpu_method(n_vars);
-        py.allow_threads(|| match m {
+        py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center),
             _ => scx_accel::randomized_pca_inmemory(
                 &csr,
@@ -531,56 +532,6 @@ pub fn pca(
     write_pca_to_adata(py, adata, &result, backend)?;
 
     Ok(())
-}
-
-/// Extract a materialized scipy sparse or dense `X` into an in-memory
-/// [`ScxCsr`]. Handles both `scipy.sparse.*` and dense numpy arrays.
-fn extract_materialized_csr(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
-    let scipy_sparse = py.import("scipy.sparse")?;
-    let is_sparse = scipy_sparse
-        .call_method1("issparse", (x,))?
-        .extract::<bool>()?;
-
-    let csr_py = scipy_sparse.call_method1("csr_matrix", (x,))?;
-    let shape: (usize, usize) = csr_py.getattr("shape")?.extract()?;
-
-    let (indptr, indices, data): (Vec<i64>, Vec<i32>, Vec<f32>) = if is_sparse {
-        let np = py.import("numpy")?;
-        let indptr_np = csr_py.getattr("indptr")?;
-        let indices_np = csr_py.getattr("indices")?;
-        let data_np = csr_py.getattr("data")?;
-        let indptr = np
-            .call_method1("asarray", (&indptr_np,))?
-            .call_method1("astype", ("int64",))?
-            .extract::<Vec<i64>>()?;
-        let indices = np
-            .call_method1("asarray", (&indices_np,))?
-            .call_method1("astype", ("int32",))?
-            .extract::<Vec<i32>>()?;
-        let data = np
-            .call_method1("asarray", (&data_np,))?
-            .call_method1("astype", ("float32",))?
-            .extract::<Vec<f32>>()?;
-        (indptr, indices, data)
-    } else {
-        let indptr = csr_py
-            .getattr("indptr")?
-            .call_method1("astype", ("int64",))?
-            .extract::<Vec<i64>>()?;
-        let indices = csr_py
-            .getattr("indices")?
-            .call_method1("astype", ("int32",))?
-            .extract::<Vec<i32>>()?;
-        let data = csr_py
-            .getattr("data")?
-            .call_method1("astype", ("float32",))?
-            .extract::<Vec<f32>>()?;
-        (indptr, indices, data)
-    };
-
-    Ok(scx_sparse::ScxCsr::new_unchecked(
-        shape, indptr, indices, data,
-    ))
 }
 
 /// Write PCA results to AnnData slots matching scanpy's format.

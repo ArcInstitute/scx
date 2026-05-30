@@ -109,7 +109,7 @@ pub fn harmony_integrate(
     let emb_f32 = np
         .call_method1("ascontiguousarray", (&emb_obj,))?
         .call_method1("astype", ("float32",))?;
-    let emb_arr: &Bound<'_, PyArray2<f32>> = emb_f32.downcast::<PyArray2<f32>>().map_err(|e| {
+    let emb_arr: &Bound<'_, PyArray2<f32>> = emb_f32.cast::<PyArray2<f32>>().map_err(|e| {
         PyRuntimeError::new_err(format!("failed to view '{basis}' as 2D float32: {e}"))
     })?;
     let shape = emb_arr.shape();
@@ -211,7 +211,7 @@ pub fn harmony_integrate(
     #[cfg(feature = "gpu")]
     let (result, backend) = if let Some(device_id) = _gpu_id {
         let r = py
-            .allow_threads(|| {
+            .detach(|| {
                 scx_accel::harmony_integrate_gpu(
                     device_id,
                     &embeddings,
@@ -227,7 +227,7 @@ pub fn harmony_integrate(
         (r, "scx-gpu")
     } else {
         let r = py
-            .allow_threads(|| {
+            .detach(|| {
                 scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
             })
             .map_err(|e: scx_accel::AccelError| {
@@ -242,7 +242,7 @@ pub fn harmony_integrate(
         // "auto" collapses to CPU.
         let _ = _device;
         let r = py
-            .allow_threads(|| {
+            .detach(|| {
                 scx_accel::harmony_integrate(&embeddings, n_obs, n_pcs, &covariates, &config)
             })
             .map_err(|e: scx_accel::AccelError| {

@@ -718,7 +718,7 @@ impl ScxLazyTransformedDataset {
         index: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Case 1: Tuple index (rows, cols)
-        if let Ok(tuple) = index.downcast::<PyTuple>() {
+        if let Ok(tuple) = index.cast::<PyTuple>() {
             if tuple.len() == 2 {
                 let row_idx = tuple.get_item(0)?;
                 let col_idx = tuple.get_item(1)?;
@@ -1283,7 +1283,7 @@ impl ScxLazyTransformedDataset {
         }
 
         // Slice index
-        if let Ok(slice) = row_idx.downcast::<PySlice>() {
+        if let Ok(slice) = row_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.0 as isize)?;
             let start = indices.start.max(0) as u64;
             let stop = indices.stop.max(0) as u64;
@@ -1329,7 +1329,7 @@ impl ScxLazyTransformedDataset {
         if dtype_str == "bool" {
             // Boolean mask → extract True indices
             let nonzero = arr.call_method0("nonzero")?;
-            let idx_tuple = nonzero.downcast::<PyTuple>()?;
+            let idx_tuple = nonzero.cast::<PyTuple>()?;
             let idx_arr = idx_tuple.get_item(0)?;
             let flat = idx_arr.call_method1("astype", (np.getattr("int64")?,))?;
             let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
@@ -1455,7 +1455,7 @@ impl ScxLazyTransformedDataset {
         let row_csr = self.getitem_rows(py, row_idx)?;
 
         // Check if col_idx is a full slice (`:`)
-        if let Ok(slice) = col_idx.downcast::<PySlice>() {
+        if let Ok(slice) = col_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.1 as isize)?;
             if indices.start == 0 && indices.stop == self.shape_val.1 as isize && indices.step == 1
             {
@@ -1472,7 +1472,7 @@ impl ScxLazyTransformedDataset {
 
     /// Check whether `row_idx` selects all rows (is `slice(None)` / `:`).
     fn is_all_rows_slice(&self, _py: Python<'_>, row_idx: &Bound<'_, PyAny>) -> PyResult<bool> {
-        if let Ok(slice) = row_idx.downcast::<PySlice>() {
+        if let Ok(slice) = row_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.0 as isize)?;
             Ok(
                 indices.start == 0
@@ -1859,28 +1859,6 @@ impl LazyShardSource {
             backed_csc,
             transforms,
             kept_to_global,
-            col_projection,
-            shape_val: (n_obs, n_vars),
-        }
-    }
-
-    /// Create a batch-filtered shard source for streaming HVG computation.
-    ///
-    /// `kept_to_global` contains the global row indices for cells in this batch.
-    /// Reuses the existing deletion vector infrastructure in `read_shard()`.
-    pub(crate) fn with_kept_rows(
-        backed: Arc<BackedCsrReader>,
-        transforms: Vec<Transform>,
-        kept_to_global: Vec<u64>,
-        col_projection: Option<Arc<Vec<u32>>>,
-        n_vars: usize,
-    ) -> Self {
-        let n_obs = kept_to_global.len();
-        LazyShardSource {
-            backed,
-            backed_csc: None,
-            transforms,
-            kept_to_global: Some(Arc::new(kept_to_global)),
             col_projection,
             shape_val: (n_obs, n_vars),
         }

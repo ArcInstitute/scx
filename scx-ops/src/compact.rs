@@ -4,7 +4,10 @@ use std::path::Path;
 
 use arrow::compute;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_engine::{build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions};
+use scx_engine::{
+    build_and_write_conversion_predicate_indexes,
+    build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
+};
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
@@ -37,6 +40,7 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
             index_preset: None,
             index_auto_threshold: 0,
         },
+        false,
     )
     .map(|_| ())
 }
@@ -44,10 +48,17 @@ pub fn compact(input_path: &Path, output_path: &Path) -> Result<()> {
 /// Compact an SCX file and optionally rebuild predicate indexes on the
 /// output. See [`merge_with_index_options`](crate::merge_with_index_options)
 /// for the shape of `index_options` and the multimodal-skip semantics.
+///
+/// When `reshape_obs` is true the output's obs metadata is written as
+/// row-sharded [`SectionType::ObsMetadataShard`] sections (bounded by the
+/// file's `shard_target_rows`) instead of a single legacy `ObsMetadata`
+/// section. This is the in-place migration path for files written before
+/// sharded obs metadata existed; it is idempotent on already-sharded inputs.
 pub fn compact_with_index_options(
     input_path: &Path,
     output_path: &Path,
     index_options: &ConversionPredicateIndexOptions,
+    reshape_obs: bool,
 ) -> Result<PredicateIndexBuildSummary> {
     // Acquire shared lock to prevent concurrent writers from modifying the
     // file while we read it. The lock is held until `_lock` is dropped.
@@ -64,7 +75,7 @@ pub fn compact_with_index_options(
         // warning.
         let multimodal_skip =
             user_wants_index(index_options).then(|| requested_columns(index_options));
-        compact_multimodal(reader, in_header, output_path)?;
+        compact_multimodal(reader, in_header, input_path, output_path, reshape_obs)?;
         return Ok(PredicateIndexBuildSummary {
             result: None,
             multimodal_skip,
@@ -75,33 +86,68 @@ pub fn compact_with_index_options(
     // Load deletion vectors
     let dv = reader.read_deletion_vectors()?;
 
-    // Read obs and build deletion mask. `read_obs` / `read_var`
-    // transparently handle both legacy single-section and row-sharded
-    // Phase 2 layouts; the assembled batch is what the deletion-mask
-    // + filter logic expects.
-    let obs = reader.read_obs()?;
+    // `read_var` transparently handles both legacy single-section and
+    // row-sharded layouts; var is always materialised (gene metadata is
+    // small and the var predicate-index path needs the whole batch).
     let var = reader.read_var()?;
 
     let n_obs = in_header.n_obs as usize;
     let n_vars = in_header.n_vars;
 
-    // Build a boolean array: true = keep, false = deleted
+    // Build the keep-mask (true = keep, false = deleted) from the deletion
+    // vectors + catalog shard order. Needs only `n_obs` + the catalog, so it
+    // runs before any obs read. `total_kept` is the post-deletion obs row
+    // count (== the filtered batch's row count on the eager path).
     let keep_mask = build_keep_mask(n_obs, &dv, reader.catalog());
+    let total_kept = keep_mask
+        .as_ref()
+        .map(|m| m.iter().filter(|&&k| k).count())
+        .unwrap_or(n_obs);
 
-    // Filter obs
-    let filtered_obs = if let Some(ref mask) = keep_mask {
-        let bool_array = arrow::array::BooleanArray::from(mask.clone());
-        compute::filter_record_batch(&obs, &bool_array)?
+    // Stream obs shard-by-shard only when reshaping AND the input is already
+    // sharded. Legacy single-section obs (`obs_metadata_shard_count() == 0`)
+    // has no per-shard reader, and `reshape_obs == false` writes a single
+    // section that needs the full batch anyway — both fall through to the
+    // eager (materialising) path. This avoids the atlas-scale `read_obs()`
+    // OOM the sharded layout was designed to remove.
+    let stream_obs = reshape_obs && reader.obs_metadata_shard_count() > 0;
+    if reshape_obs && !stream_obs {
+        log::warn!(
+            "compact --reshape-obs on legacy single-section obs in {input}: \
+             the obs table is materialised in full (no streaming path exists \
+             for single-section input)",
+            input = input_path.display()
+        );
+    }
+
+    // Eager path materialises obs + a filtered copy; streaming path only needs
+    // the obs schema (one bounded shard read) and never calls `read_obs`.
+    let (obs_schema, eager_filtered_obs) = if stream_obs {
+        // Footer-only schema read (constant cost, no batch decode) — matches
+        // the `merge` convention (`read_obs_schema_physical`) and feeds the
+        // same streaming predicate-index builder. Wrapped in `Arc` to keep the
+        // `SchemaRef` shape the eager branch's `filtered.schema()` produces.
+        (
+            std::sync::Arc::new(reader.read_obs_schema_physical()?),
+            None,
+        )
     } else {
-        obs
+        let obs = reader.read_obs()?;
+        let filtered = if let Some(ref mask) = keep_mask {
+            let bool_array = arrow::array::BooleanArray::from(mask.clone());
+            compute::filter_record_batch(&obs, &bool_array)?
+        } else {
+            obs
+        };
+        (filtered.schema(), Some(filtered))
     };
 
     // Fail fast if forced index columns are missing from the compacted
     // schemas. Must run before `ScxWriter::new` materialises a temp
     // output file so an invalid request leaves no on-disk artefact.
-    validate_forced_columns(index_options, &filtered_obs.schema(), &var.schema())?;
+    validate_forced_columns(index_options, &obs_schema, &var.schema())?;
 
-    let new_n_obs = filtered_obs.num_rows();
+    let new_n_obs = total_kept;
 
     // CSC sidecars (column-major shards) are dropped by `compact`: the
     // operation re-shards CSR rows on a different row layout, so any
@@ -157,7 +203,18 @@ pub fn compact_with_index_options(
     let has_obsm = in_header.has_obsm();
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
-    writer.write_obs(&filtered_obs)?;
+    if let Some(ref filtered_obs) = eager_filtered_obs {
+        write_obs_section(
+            &mut writer,
+            filtered_obs,
+            reshape_obs,
+            in_header.shard_target_rows,
+        )?;
+    } else {
+        // Streaming reshape: filter + write one obs shard per input shard,
+        // never materialising the full obs table.
+        write_obs_shards_streaming(&reader, &mut writer, keep_mask.as_deref(), total_kept)?;
+    }
     writer.write_var(&var)?;
 
     // Process CSR shards: decode, filter deleted rows, re-shard.
@@ -365,6 +422,34 @@ pub fn compact_with_index_options(
         }
     }
 
+    // Copy varm (var-axis; vars are not deleted by compact, so unfiltered).
+    // `read_all_varm` transparently assembles legacy + sharded layouts and
+    // returns an empty map when absent, so no header-flag guard is needed.
+    let mut varm: Vec<_> = reader.read_all_varm()?.into_iter().collect();
+    varm.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &varm {
+        writer.write_varm(name, batch)?;
+    }
+
+    // Copy varp (var×var; var-axis on both dimensions → unfiltered).
+    let mut varp: Vec<_> = reader.read_all_varp()?.into_iter().collect();
+    varp.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &varp {
+        writer.write_varp(name, batch)?;
+    }
+
+    // Copy obsp (obs×obs COO). Under deletions both COO axes are remapped
+    // through the obs keep-mask; entries touching a deleted obs are dropped.
+    let mut obsp: Vec<_> = reader.read_all_obsp()?.into_iter().collect();
+    obsp.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &obsp {
+        let out = match keep_mask {
+            Some(ref mask) => filter_obsp_coo(batch, mask)?,
+            None => batch.clone(),
+        };
+        writer.write_obsp(name, &out)?;
+    }
+
     // Predicate indexes: rebuild against the post-deletion obs + the
     // freshly emitted shard row ranges. `user_wants_index` treats a
     // non-zero `index_auto_threshold` as an explicit request — fixes
@@ -372,14 +457,30 @@ pub fn compact_with_index_options(
     // no-op. Forced-column-missing was caught upfront by
     // `validate_forced_columns`.
     let index_result = if user_wants_index(index_options) {
-        Some(build_and_write_conversion_predicate_indexes(
-            &mut writer,
-            &filtered_obs,
-            &var,
-            &output_shard_row_ranges,
-            n_vars as usize,
-            index_options,
-        )?)
+        let result = if let Some(ref filtered_obs) = eager_filtered_obs {
+            build_and_write_conversion_predicate_indexes(
+                &mut writer,
+                filtered_obs,
+                &var,
+                &output_shard_row_ranges,
+                n_vars as usize,
+                index_options,
+            )?
+        } else {
+            // Streaming reshape: re-read + re-filter the input obs shards
+            // (pass 2) so the predicate index builds incrementally without
+            // ever assembling the full obs batch.
+            build_and_write_conversion_predicate_indexes_streaming(
+                &mut writer,
+                obs_schema.clone(),
+                filtered_obs_shards(&reader, keep_mask.as_deref()),
+                &var,
+                &output_shard_row_ranges,
+                n_vars as usize,
+                index_options,
+            )?
+        };
+        Some(result)
     } else {
         None
     };
@@ -397,7 +498,7 @@ pub fn compact_with_index_options(
             .as_secs() as i64,
         action: "compact".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: "{}".to_string(),
+        params_json: format!("{{\"reshape_obs\":{reshape_obs}}}"),
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
@@ -409,24 +510,321 @@ pub fn compact_with_index_options(
     })
 }
 
+/// Read a COO coordinate column (`row` / `col`) as `i64`, accepting either
+/// the v1 `Int32` or the v2 `Int64` coordinate width. The Arrow schema
+/// self-describes the width (see `scx-format/tests/pairwise_v2_int64.rs`), so
+/// compact must round-trip both.
+fn obsp_coords_as_i64(batch: &arrow::array::RecordBatch, name: &str) -> Result<Vec<i64>> {
+    use arrow::array::{Int32Array, Int64Array};
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        crate::error::OpsError::InvalidInput(format!("obsp COO column `{name}` is missing"))
+    })?;
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        Ok((0..a.len()).map(|i| a.value(i)).collect())
+    } else if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        Ok((0..a.len()).map(|i| a.value(i) as i64).collect())
+    } else {
+        Err(crate::error::OpsError::InvalidInput(format!(
+            "obsp COO column `{name}` is neither Int32 nor Int64"
+        )))
+    }
+}
+
+/// Remap an obsp COO `RecordBatch` (obs×obs) through the obs keep-mask.
+///
+/// Drops entries whose `row` OR `col` references a deleted obs and renumbers
+/// surviving endpoints into the compacted index space. The `n_rows` /
+/// `n_cols` schema metadata is rewritten to the kept count; all other
+/// metadata keys are preserved. `keep_mask[i] == true` means obs `i` is kept.
+///
+/// Both the v1 `Int32` and v2 `Int64` coordinate widths are accepted on input;
+/// the output width is chosen from the compacted dimension so a >`i32::MAX`
+/// axis that survives compaction stays `Int64` (no silent wrap).
+fn filter_obsp_coo(
+    batch: &arrow::array::RecordBatch,
+    keep_mask: &[bool],
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{Float32Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field};
+
+    // old obs index -> new obs index (or -1 if the obs was deleted).
+    let mut old_to_new = vec![-1i64; keep_mask.len()];
+    let mut next = 0i64;
+    for (i, &keep) in keep_mask.iter().enumerate() {
+        if keep {
+            old_to_new[i] = next;
+            next += 1;
+        }
+    }
+    let new_dim = next;
+
+    let rows = obsp_coords_as_i64(batch, "row")?;
+    let cols = obsp_coords_as_i64(batch, "col")?;
+    let data = batch
+        .column_by_name("data")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+        .ok_or_else(|| {
+            crate::error::OpsError::InvalidInput(
+                "obsp COO column `data` is missing or not Float32".to_string(),
+            )
+        })?;
+
+    let mut out_rows: Vec<i64> = Vec::new();
+    let mut out_cols: Vec<i64> = Vec::new();
+    let mut out_data: Vec<f32> = Vec::new();
+    for i in 0..batch.num_rows() {
+        let r = usize::try_from(rows[i]).ok();
+        let c = usize::try_from(cols[i]).ok();
+        let (nr, nc) = match (
+            r.and_then(|r| old_to_new.get(r)),
+            c.and_then(|c| old_to_new.get(c)),
+        ) {
+            (Some(&nr), Some(&nc)) if nr >= 0 && nc >= 0 => (nr, nc),
+            _ => continue,
+        };
+        out_rows.push(nr);
+        out_cols.push(nc);
+        out_data.push(data.value(i));
+    }
+
+    // Choose the output coordinate width from the compacted dimension: keep
+    // Int64 when the surviving axis still exceeds i32::MAX, otherwise narrow
+    // to Int32 (the common case).
+    let use_i64 = new_dim > i64::from(i32::MAX);
+    let coord_type = if use_i64 {
+        DataType::Int64
+    } else {
+        DataType::Int32
+    };
+    let (row_arr, col_arr): (
+        std::sync::Arc<dyn arrow::array::Array>,
+        std::sync::Arc<dyn arrow::array::Array>,
+    ) = if use_i64 {
+        (
+            std::sync::Arc::new(Int64Array::from(out_rows)),
+            std::sync::Arc::new(Int64Array::from(out_cols)),
+        )
+    } else {
+        (
+            std::sync::Arc::new(Int32Array::from(
+                out_rows.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(Int32Array::from(
+                out_cols.into_iter().map(|v| v as i32).collect::<Vec<_>>(),
+            )),
+        )
+    };
+
+    // Rebuild the schema with the chosen coordinate width; rewrite
+    // n_rows / n_cols metadata and preserve all other metadata keys.
+    let mut metadata = batch.schema().metadata().clone();
+    metadata.insert("n_rows".to_string(), new_dim.to_string());
+    metadata.insert("n_cols".to_string(), new_dim.to_string());
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        vec![
+            Field::new("row", coord_type.clone(), false),
+            Field::new("col", coord_type, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        metadata,
+    ));
+    Ok(arrow::array::RecordBatch::try_new(
+        schema,
+        vec![
+            row_arr,
+            col_arr,
+            std::sync::Arc::new(Float32Array::from(out_data)),
+        ],
+    )?)
+}
+
+/// Discover the deduplicated logical keys for a per-modality dense-mapping
+/// family (obsm/varm), spanning both the legacy single-section type and the
+/// sharded type. Shard entry names (`{key}_shard_{idx}`) are reduced to their
+/// logical `{key}`. Keys are returned sorted for deterministic output order.
+fn discover_modality_keys(
+    reader: &ScxReader,
+    modality_id: u8,
+    prefix: &str,
+    single: SectionType,
+    shard: SectionType,
+) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in &reader.catalog().entries {
+        if entry.modality_id != modality_id || !entry.name.starts_with(prefix) {
+            continue;
+        }
+        let Some(rest) = entry.name.strip_prefix(prefix) else {
+            continue;
+        };
+        if entry.section_type == single {
+            keys.insert(rest.to_string());
+        } else if entry.section_type == shard {
+            let key = match rest.rfind("_shard_") {
+                Some(pos) => &rest[..pos],
+                None => rest,
+            };
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+/// Write the (filtered) obs metadata batch to `writer`.
+///
+/// When `reshape` is false this writes a single legacy `ObsMetadata`
+/// section (the historical compact behaviour). When true the batch is
+/// sliced into `shard_target_rows`-sized chunks and emitted as
+/// `ObsMetadataShard` sections — the in-place migration path for files
+/// written before sharded obs metadata existed. `write_obs_shard`
+/// upcasts `Utf8 → LargeUtf8` per shard internally, so individual shards
+/// never hit the Arrow IPC 2 GB narrow-offset ceiling.
+fn write_obs_section(
+    writer: &mut ScxWriter,
+    obs: &arrow::array::RecordBatch,
+    reshape: bool,
+    shard_target_rows: u32,
+) -> Result<()> {
+    let n = obs.num_rows();
+    if !reshape || n == 0 {
+        // Nothing to shard (or reshape not requested); a single section
+        // keeps an empty file well-formed.
+        writer.write_obs(obs)?;
+        return Ok(());
+    }
+    let chunk = (shard_target_rows.max(1)) as usize;
+    let total = n as u64;
+    let (mut shard_idx, mut row_start, mut cursor) = (0u32, 0u64, 0usize);
+    while cursor < n {
+        let take = chunk.min(n - cursor);
+        let slice = obs.slice(cursor, take); // zero-copy
+        writer.write_obs_shard(shard_idx, row_start, take as u64, total, &slice)?;
+        shard_idx += 1;
+        row_start += take as u64;
+        cursor += take;
+    }
+    Ok(())
+}
+
+/// Stream input obs shards, applying the obs `keep_mask` (true = keep) per
+/// shard and yielding `(filtered_batch, cumulative_kept_offset)`. Never
+/// materialises the full obs table — peak memory is one input shard. Shared by
+/// the obs-shard write pass and the streaming predicate-index pass so the two
+/// see a byte-identical shard sequence. Relies on `obs_shards()` yielding
+/// shards in row order (it does — `metadata_shards_iter` sorts by shard index).
+///
+/// Items are `scx_engine::EngineError`-typed so the iterator feeds
+/// [`build_and_write_conversion_predicate_indexes_streaming`] directly; the
+/// write pass converts to `OpsError` via `?` (`OpsError: From<EngineError>`).
+fn filtered_obs_shards<'a>(
+    reader: &'a ScxReader,
+    keep_mask: Option<&'a [bool]>,
+) -> impl Iterator<
+    Item = std::result::Result<(arrow::array::RecordBatch, u64), scx_engine::EngineError>,
+> + 'a {
+    let mut input_cursor = 0usize; // global input obs row
+    let mut filtered_offset = 0u64; // cumulative kept rows so far
+    reader.obs_shards().map(move |res| {
+        let batch = res?;
+        let n = batch.num_rows();
+        let filtered = match keep_mask {
+            None => batch,
+            Some(mask) => {
+                // Slice the keep-mask for this shard's row range in one shot
+                // (avoids per-element bounds checks on wide obs shards). Panics
+                // on a malformed file whose shards sum past `n_obs`; the
+                // `build_keep_mask(n_obs, ...)` invariant rules that out.
+                let bool_array =
+                    arrow::array::BooleanArray::from(mask[input_cursor..input_cursor + n].to_vec());
+                compute::filter_record_batch(&batch, &bool_array)?
+            }
+        };
+        let offset = filtered_offset;
+        input_cursor += n;
+        filtered_offset += filtered.num_rows() as u64;
+        Ok((filtered, offset))
+    })
+}
+
+/// Stream obs shards from `reader` straight to sharded output, filtering each
+/// input shard by `keep_mask` (true = keep) and writing one output shard per
+/// non-empty input shard. Peak memory is one shard — `read_obs()` is never
+/// called. `total_kept` is the post-deletion obs row count (stamped as each
+/// shard's `n_rows_total`). When every row is deleted, a single empty obs
+/// section keeps the file well-formed.
+fn write_obs_shards_streaming(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    keep_mask: Option<&[bool]>,
+    total_kept: usize,
+) -> Result<()> {
+    if total_kept == 0 {
+        // Footer-only schema read (no batch decode); see streaming branch in
+        // `compact_with_index_options`.
+        let schema = std::sync::Arc::new(reader.read_obs_schema_physical()?);
+        writer.write_obs(&arrow::array::RecordBatch::new_empty(schema))?;
+        return Ok(());
+    }
+    let mut out_idx = 0u32;
+    for item in filtered_obs_shards(reader, keep_mask) {
+        let (batch, offset) = item?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let n = batch.num_rows() as u64;
+        writer.write_obs_shard(out_idx, offset, n, total_kept as u64, &batch)?;
+        out_idx += 1;
+    }
+    Ok(())
+}
+
 /// Phase 6: compact a multimodal SCX file. Applies the global keep
 /// mask to every modality's CSR shards (and per-modality layers) while
 /// preserving the ModalityTable and per-modality var / obsm / uns.
 /// Per-modality CSC sidecars are dropped (rebuild via
 /// `--rebuild-csc`).
-fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Path) -> Result<()> {
+fn compact_multimodal(
+    reader: ScxReader,
+    in_header: FileHeader,
+    input_path: &Path,
+    output_path: &Path,
+    reshape_obs: bool,
+) -> Result<()> {
     let dv = reader.read_deletion_vectors()?;
 
     let n_obs = in_header.n_obs as usize;
     let keep_mask = build_keep_mask(n_obs, &dv, reader.catalog());
-    let obs = reader.read_obs()?;
-    let filtered_obs = if let Some(ref mask) = keep_mask {
-        let bool_array = arrow::array::BooleanArray::from(mask.clone());
-        compute::filter_record_batch(&obs, &bool_array)?
+    let total_kept = keep_mask
+        .as_ref()
+        .map(|m| m.iter().filter(|&&k| k).count())
+        .unwrap_or(n_obs);
+    let new_n_obs = total_kept;
+
+    // Global obs is shared across modalities, so the same streaming gate as
+    // the single-modality path applies: stream shard-by-shard only when
+    // reshaping an already-sharded obs. Multimodal compact builds no
+    // predicate index, so there is no second (index) pass.
+    let stream_obs = reshape_obs && reader.obs_metadata_shard_count() > 0;
+    if reshape_obs && !stream_obs {
+        log::warn!(
+            "compact --reshape-obs on legacy single-section obs in {input}: \
+             the obs table is materialised in full (no streaming path exists \
+             for single-section input)",
+            input = input_path.display()
+        );
+    }
+    let eager_filtered_obs = if stream_obs {
+        None
     } else {
-        obs
+        let obs = reader.read_obs()?;
+        let filtered = if let Some(ref mask) = keep_mask {
+            let bool_array = arrow::array::BooleanArray::from(mask.clone());
+            compute::filter_record_batch(&obs, &bool_array)?
+        } else {
+            obs
+        };
+        Some(filtered)
     };
-    let new_n_obs = filtered_obs.num_rows();
 
     // Carry input flags except has_deletion_vectors (applied) and
     // has_csc (per-modality CSC sidecars are dropped on compact;
@@ -447,7 +845,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             "compact dropped per-modality CSC shards from {input}: \
              rerun `scx build-csc` (or pass --rebuild-csc) to restore the \
              column-major sidecar",
-            input = output_path.display()
+            input = input_path.display()
         );
     }
 
@@ -489,7 +887,16 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
     };
 
     let mut writer = ScxWriter::new(output_path, out_header)?;
-    writer.write_obs(&filtered_obs)?;
+    if let Some(ref filtered_obs) = eager_filtered_obs {
+        write_obs_section(
+            &mut writer,
+            filtered_obs,
+            reshape_obs,
+            in_header.shard_target_rows,
+        )?;
+    } else {
+        write_obs_shards_streaming(&reader, &mut writer, keep_mask.as_deref(), total_kept)?;
+    }
 
     let shard_target = in_header.shard_target_rows;
 
@@ -597,30 +1004,67 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             )?;
         }
 
-        // Per-modality obsm — row-filter by keep_mask. Section names
-        // are `obsm/{modality_name}/{key}`.
+        // Per-modality obsm — row-filter by keep_mask. Section names are
+        // `obsm/{modality_name}/{key}`. Discovery spans both the legacy
+        // single-section (`ObsmEmbedding`) and the sharded
+        // (`ObsmEmbeddingShard`) layouts; `read_obsm_for` reassembles a
+        // sharded input transparently.
         let obsm_prefix = format!("obsm/{}/", info.name);
-        let obsm_entries: Vec<scx_format::FullCatalogEntry> = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| {
-                e.section_type == SectionType::ObsmEmbedding
-                    && e.modality_id == in_modality_id
-                    && e.name.starts_with(&obsm_prefix)
-            })
-            .cloned()
-            .collect();
-        for entry in &obsm_entries {
-            let key = entry.name.strip_prefix(&obsm_prefix).unwrap_or(&entry.name);
-            let batch = reader.read_obsm_for(in_modality_id, key)?;
+        for key in discover_modality_keys(
+            &reader,
+            in_modality_id,
+            &obsm_prefix,
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        ) {
+            let batch = reader.read_obsm_for(in_modality_id, &key)?;
             let filtered = if let Some(ref mask) = keep_mask {
                 let bool_array = arrow::array::BooleanArray::from(mask.clone());
                 compute::filter_record_batch(&batch, &bool_array)?
             } else {
                 batch
             };
-            writer.write_obsm_for(out_modality_id, key, &filtered)?;
+            writer.write_obsm_for(out_modality_id, &key, &filtered)?;
+        }
+
+        // Per-modality varm — var-axis (not row-filtered). Only a sharded
+        // per-modality writer exists, so emit each as one full-coverage
+        // shard; `read_varm_for` reads it back transparently.
+        let varm_prefix = format!("varm/{}/", info.name);
+        for key in discover_modality_keys(
+            &reader,
+            in_modality_id,
+            &varm_prefix,
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        ) {
+            let batch = reader.read_varm_for(in_modality_id, &key)?;
+            let n = batch.num_rows() as u64;
+            writer.write_varm_shard_for(out_modality_id, &key, 0, 0, n, n, &batch)?;
+        }
+
+        // Per-modality obsp/varp are not preserved: the format has no
+        // per-modality pairwise reader, so they cannot be round-tripped.
+        // Warn rather than drop them silently.
+        let has_pairwise = reader.catalog().entries.iter().any(|e| {
+            e.modality_id == in_modality_id
+                && matches!(
+                    e.section_type,
+                    SectionType::ObspEmbedding
+                        | SectionType::ObspEmbeddingShard
+                        | SectionType::ObspCsrShard
+                        | SectionType::VarpEmbedding
+                        | SectionType::VarpEmbeddingShard
+                )
+        });
+        if has_pairwise {
+            log::warn!(
+                "compact does not preserve per-modality obsp/varp for modality \
+                 `{name}` (no per-modality pairwise reader); these sections are \
+                 dropped from {input}",
+                name = info.name,
+                input = input_path.display()
+            );
         }
 
         // Per-modality uns.
@@ -737,19 +1181,71 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
         }
     }
 
-    // Global obsm (modality_id == 0). Single-modality compact handles
-    // these via the `has_obsm` branch; mirror that path for multimodal.
-    if in_header.has_obsm() {
-        let all_obsm = reader.read_all_obsm()?;
-        for (name, batch) in &all_obsm {
-            let filtered_batch = if let Some(ref mask) = keep_mask {
-                let bool_array = arrow::array::BooleanArray::from(mask.clone());
-                compute::filter_record_batch(batch, &bool_array)?
-            } else {
-                batch.clone()
-            };
-            writer.write_obsm(name, &filtered_batch)?;
-        }
+    // Global mappings (modality_id == 0), mirroring the single-modality
+    // path. `read_all_*` scans by name prefix and does NOT filter by
+    // modality, so it would also return per-modality entries (keyed
+    // `{modality}/{key}`) and re-emit them as spurious global sections.
+    // `discover_modality_keys(&reader, 0, ...)` filters on `modality_id == 0`,
+    // isolating the true globals; the bare-key readers
+    // (`read_obsm`/`read_varm`/`read_varp`/`read_obsp`) use exact-name lookup
+    // so they never pick up a per-modality `{prefix}/{modality}/...` section.
+
+    // Global obsm (obs-axis → row-filter under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsm/",
+        SectionType::ObsmEmbedding,
+        SectionType::ObsmEmbeddingShard,
+    ) {
+        let batch = reader.read_obsm(&key)?;
+        let filtered = if let Some(ref mask) = keep_mask {
+            let bool_array = arrow::array::BooleanArray::from(mask.clone());
+            compute::filter_record_batch(&batch, &bool_array)?
+        } else {
+            batch
+        };
+        writer.write_obsm(&key, &filtered)?;
+    }
+
+    // Global varm (var-axis → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varm/",
+        SectionType::VarmEmbedding,
+        SectionType::VarmEmbeddingShard,
+    ) {
+        let batch = reader.read_varm(&key)?;
+        writer.write_varm(&key, &batch)?;
+    }
+
+    // Global varp (var×var → unfiltered).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "varp/",
+        SectionType::VarpEmbedding,
+        SectionType::VarpEmbeddingShard,
+    ) {
+        let batch = reader.read_varp(&key)?;
+        writer.write_varp(&key, &batch)?;
+    }
+
+    // Global obsp (obs×obs COO → remap both axes under deletions).
+    for key in discover_modality_keys(
+        &reader,
+        0,
+        "obsp/",
+        SectionType::ObspEmbedding,
+        SectionType::ObspEmbeddingShard,
+    ) {
+        let batch = reader.read_obsp(&key)?;
+        let out = match keep_mask {
+            Some(ref mask) => filter_obsp_coo(&batch, mask)?,
+            None => batch,
+        };
+        writer.write_obsp(&key, &out)?;
     }
 
     // Global uns.
@@ -769,7 +1265,7 @@ fn compact_multimodal(reader: ScxReader, in_header: FileHeader, output_path: &Pa
             .as_secs() as i64,
         action: "compact".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: "{}".to_string(),
+        params_json: format!("{{\"reshape_obs\":{reshape_obs}}}"),
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
@@ -809,4 +1305,236 @@ fn build_keep_mask(
     }
 
     Some(mask)
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn test_header(n_obs: u64) -> FileHeader {
+        FileHeader {
+            magic: MAGIC,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            header_length: 256,
+            flags: 0,
+            n_obs,
+            n_vars: 4,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 4,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        }
+    }
+
+    fn utf8_batch(col: &str, vals: &[String]) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new(col, DataType::Utf8, false)]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(
+                vals.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap()
+    }
+
+    /// obs batch with a `cell_id` column plus a low-cardinality `cluster`
+    /// column suitable for forced predicate indexing.
+    fn obs_batch_with_cluster(n: usize) -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cluster", DataType::Utf8, false),
+        ]);
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let clusters: Vec<String> = (0..n).map(|i| format!("c{}", i % 3)).collect();
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    clusters.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The streaming obs write path must never materialise the full obs table:
+    /// `write_obs_shards_streaming` reads only one shard at a time, so the
+    /// reader's `read_obs` counter must stay at zero. (Increments are
+    /// `debug_assertions`-gated — meaningful in debug/test builds, trivially
+    /// true in release.) This is the concrete realization of the code review's
+    /// "fail if `read_obs()` is invoked on sharded obs input" guard.
+    #[test]
+    fn streaming_obs_write_never_calls_read_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+
+        let ids: Vec<String> = (0..10).map(|i| format!("cell_{i}")).collect();
+        let obs = utf8_batch("cell_id", &ids);
+        let var = utf8_batch(
+            "gene_id",
+            &(0..4).map(|i| format!("gene_{i}")).collect::<Vec<_>>(),
+        );
+
+        // Build a sharded-obs input: 10 rows across 3 obs shards.
+        {
+            let mut w = ScxWriter::new(&input, test_header(10)).unwrap();
+            let mut idx = 0u32;
+            let mut start = 0usize;
+            while start < 10 {
+                let take = 4usize.min(10 - start);
+                w.write_obs_shard(idx, start as u64, take as u64, 10, &obs.slice(start, take))
+                    .unwrap();
+                idx += 1;
+                start += take;
+            }
+            w.write_var(&var).unwrap();
+            w.finish().unwrap();
+        }
+
+        let reader = ScxReader::open(&input).unwrap();
+        assert_eq!(reader.obs_metadata_shard_count(), 3);
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
+
+        // Stream obs into a fresh output — exactly what compact's streaming
+        // reshape path drives.
+        let output = dir.path().join("out.scx");
+        let mut w = ScxWriter::new(&output, test_header(10)).unwrap();
+        write_obs_shards_streaming(&reader, &mut w, None, 10).unwrap();
+        w.write_var(&var).unwrap();
+        w.finish().unwrap();
+
+        // The streaming write must NOT have gone through read_obs.
+        assert_eq!(
+            reader.debug_counts().read_obs.load(Ordering::Relaxed),
+            0,
+            "streaming obs write must not call read_obs()"
+        );
+
+        // Output reassembles to the full obs.
+        let out_reader = ScxReader::open(&output).unwrap();
+        assert_eq!(out_reader.obs_metadata_shard_count(), 3);
+        assert_eq!(out_reader.read_obs().unwrap().num_rows(), 10);
+
+        // Sanity: the counter does increment when read_obs IS called (only
+        // observable under debug_assertions).
+        #[cfg(debug_assertions)]
+        {
+            let _ = reader.read_obs().unwrap();
+            assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    /// The streaming *predicate-index* pass must also never materialise the
+    /// full obs table: it drives `filtered_obs_shards` +
+    /// `build_and_write_conversion_predicate_indexes_streaming` shard-by-shard,
+    /// so the reader's `read_obs` counter must stay at zero across both the
+    /// write pass and the index pass. Closes the review's "fail if `read_obs()`
+    /// is invoked" guard for the index path, not just the write helper.
+    #[test]
+    fn streaming_predicate_index_never_calls_read_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+
+        let n = 9usize;
+        let obs = obs_batch_with_cluster(n);
+        let var = utf8_batch(
+            "gene_id",
+            &(0..4).map(|i| format!("gene_{i}")).collect::<Vec<_>>(),
+        );
+
+        // Sharded-obs input: 9 rows across 3 obs shards of 3.
+        {
+            let mut w = ScxWriter::new(&input, test_header(n as u64)).unwrap();
+            let mut idx = 0u32;
+            let mut start = 0usize;
+            while start < n {
+                let take = 3usize.min(n - start);
+                w.write_obs_shard(
+                    idx,
+                    start as u64,
+                    take as u64,
+                    n as u64,
+                    &obs.slice(start, take),
+                )
+                .unwrap();
+                idx += 1;
+                start += take;
+            }
+            w.write_var(&var).unwrap();
+            w.finish().unwrap();
+        }
+
+        let reader = ScxReader::open(&input).unwrap();
+        assert_eq!(reader.obs_metadata_shard_count(), 3);
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
+
+        // Drive both streaming passes — the obs-shard write and the
+        // predicate-index build — exactly as compact's streaming reshape does.
+        let output = dir.path().join("out.scx");
+        let mut w = ScxWriter::new(&output, test_header(n as u64)).unwrap();
+        write_obs_shards_streaming(&reader, &mut w, None, n).unwrap();
+        w.write_var(&var).unwrap();
+
+        let opts = ConversionPredicateIndexOptions {
+            index_obs: vec!["cluster".to_string()],
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 0,
+        };
+        let obs_schema = Arc::new(reader.read_obs_schema_physical().unwrap());
+        let output_shard_row_ranges = vec![(0u64, n as u64)];
+        let result = build_and_write_conversion_predicate_indexes_streaming(
+            &mut w,
+            obs_schema,
+            filtered_obs_shards(&reader, None),
+            &var,
+            &output_shard_row_ranges,
+            4,
+            &opts,
+        )
+        .unwrap();
+        w.finish().unwrap();
+
+        // The forced column was indexed via the streaming path.
+        assert!(result.obs_indexed_columns.iter().any(|c| c == "cluster"));
+
+        // Neither streaming pass went through read_obs.
+        assert_eq!(
+            reader.debug_counts().read_obs.load(Ordering::Relaxed),
+            0,
+            "streaming obs write + predicate-index build must not call read_obs()"
+        );
+
+        // Output is well-formed: obs reassembles and the index is present.
+        let out_reader = ScxReader::open(&output).unwrap();
+        assert_eq!(out_reader.read_obs().unwrap().num_rows(), n);
+        assert!(out_reader
+            .read_obs_predicate_index_bytes()
+            .unwrap()
+            .is_some());
+    }
 }

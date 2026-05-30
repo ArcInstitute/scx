@@ -54,6 +54,7 @@ Benchmarks, operational semantics (append/delete/compact), and test infrastructu
 :hidden:
 
 quickstart
+training
 scanpy
 gpu-setup
 cloud

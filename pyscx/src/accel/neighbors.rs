@@ -73,7 +73,7 @@ pub fn neighbors(
         // Check if cuVS CAGRA is available
         if scx_accel::cuvs_available() {
             let result = py
-                .allow_threads(|| {
+                .detach(|| {
                     scx_accel::build_knn_graph_gpu(device_id, &data, n_obs, n_vars, n_neighbors)
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -98,7 +98,7 @@ pub fn neighbors(
 
     // CPU path (default or fallback) — release GIL for the computation
     let result = py
-        .allow_threads(|| {
+        .detach(|| {
             scx_accel::build_knn_graph(
                 &data,
                 n_obs,

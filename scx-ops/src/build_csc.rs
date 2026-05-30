@@ -6,6 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::writer::ScxWriter;
+use scx_format::MemoryBudget;
 use scx_format::ScxReader;
 
 use crate::rewrite_helpers;
@@ -17,8 +18,11 @@ pub fn run_build_csc(
     force: bool,
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Parse memory limit string ("4G" → 4 * 1024^3 bytes)
-    let max_bytes = parse_memory_limit(memory_limit)?;
+    // 1. Parse memory limit string ("4G" → 4 * 1024^3 bytes). Shares the
+    //    workspace parser so --memory-limit accepts the same forms as
+    //    `scx convert --memory-budget` (K/M/G/T, KiB/MiB/GiB/TiB; decimals
+    //    rejected).
+    let max_bytes = usize::try_from(MemoryBudget::parse(memory_limit)?)?;
 
     // 2. Validate input exists
     if !input.exists() {
@@ -213,19 +217,6 @@ pub fn run_build_csc(
         if n_csc_shards_written == 1 { "" } else { "s" },
     );
     Ok(())
-}
-
-/// Parse human-readable memory limit ("100M", "4G", "1024K") to bytes.
-fn parse_memory_limit(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
-    let s = s.trim();
-    let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'K' | b'k') => (&s[..s.len() - 1], 1024usize),
-        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
-        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        _ => (s, 1),
-    };
-    let n: usize = num_str.parse()?;
-    Ok(n * multiplier)
 }
 
 #[cfg(test)]
@@ -560,15 +551,5 @@ mod tests {
                 "round-trip mismatch for codec={codec:?}"
             );
         }
-    }
-
-    #[test]
-    fn test_parse_memory_limit() {
-        assert_eq!(parse_memory_limit("100").unwrap(), 100);
-        assert_eq!(parse_memory_limit("1K").unwrap(), 1024);
-        assert_eq!(parse_memory_limit("1k").unwrap(), 1024);
-        assert_eq!(parse_memory_limit("100M").unwrap(), 100 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("4G").unwrap(), 4 * 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_limit("2g").unwrap(), 2 * 1024 * 1024 * 1024);
     }
 }

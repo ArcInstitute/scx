@@ -1,0 +1,5 @@
+{
+    "name": "scx-usage",
+    "description": "How to use scx (pyscx + scx-cli) for single-cell RNA-seq: conversion, processing, and ML data loading",
+    "version": "1.0.0"
+}

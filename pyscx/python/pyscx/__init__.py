@@ -63,12 +63,14 @@ try:
     from .pyscx import to_h5ad as _to_h5ad_native      # noqa: E402
     from .pyscx import from_h5mu as _from_h5mu_native  # noqa: E402
     from .pyscx import to_h5mu as _to_h5mu_native      # noqa: E402
+    from .pyscx import read_h5ad_metadata as _read_h5ad_metadata_native  # noqa: E402
     _HAS_HDF5 = True
 except ImportError:
     _from_h5ad_native = None
     _to_h5ad_native = None
     _from_h5mu_native = None
     _to_h5mu_native = None
+    _read_h5ad_metadata_native = None
     _HAS_HDF5 = False
 
 
@@ -140,9 +142,75 @@ def validate(path):
 
 
 def from_h5ad(path, out, **kwargs):
-    """Convert an h5ad file to SCX. Accepts str or `os.PathLike` for
-    `path` and `out`. (Source must be an h5ad file, not an open SCX
-    Experiment.)"""
+    """Convert an h5ad file to SCX, streaming by default.
+
+    Accepts str or `os.PathLike` for `path` and `out`. (Source must be an
+    h5ad file, not an open SCX Experiment.) Peak RSS is bounded by one
+    shard's worth of CSR regardless of file size; obs/var/uns are read via
+    pure-Rust HDF5 (no `anndata.read_h5ad`, no eager `obsm` allocation).
+
+    Args:
+        path: Source h5ad file (str or os.PathLike).
+        out: Destination SCX file (str or os.PathLike).
+        codec: Per-shard codec. None (default) auto-selects; also "scx1"
+            (integer-only), "zstd", "pcodec" (best for float layers),
+            "lz4", "none".
+        shard_size: Rows per CSR X shard. None uses the default.
+        csc: "off" (default) or "always". "always" adds a column-major
+            sidecar via a two-pass CSR-then-rebuild write (transient disk
+            ~2x the output); required for prefer_format="csc" accel paths.
+        csc_cols_per_shard: Columns per CSC shard when csc="always"
+            (default 5000); 0 = single CSC shard.
+        uns_format: "tagged" (default) wraps NumPy/pandas containers in
+            __scx_type__ envelopes for bit-exact round-trip; "plain"
+            collapses to JSON primitives. Controls the envelope applied to
+            uns_override; a no-op for the on-disk uns read.
+        stream: Stream the conversion (default True). False falls back to
+            the legacy materializing path (does not apply overrides).
+        strict_uns: True raises on the first unrepresentable uns entry;
+            False (default) emits a UserWarning per skipped key.
+        dense_zero_epsilon: Threshold for dropping near-zero values when
+            sparsifying a dense /X (default 0.0, matching
+            scipy.csr_matrix(dense)).
+        memory_budget: Caps dense row slabs and CSC external-transpose
+            buffers, and derates reader_threads. Accepts an int byte count
+            or a binary-prefixed size string — K/M/G/T or KiB/MiB/GiB/TiB
+            (powers of 1024); decimal KB/MB/GB/TB is rejected. E.g. "4G" /
+            "512M" / "2GiB". None = per-phase default.
+        temp_dir: Scratch directory for the CSC external transpose (used
+            only when memory_budget forces the external path). Defaults to
+            the system temp dir.
+        index_obs: List of obs column names to materialize predicate
+            indexes for, so pyscx.open(...).query().filter_obs(...) pushes
+            filters down. Forced missing columns hard-error.
+        index_var: List of var column names to index.
+        index_preset: Expand a curated column list: "cellxgene",
+            "perturbseq", or "training". Preset misses emit
+            MissingPresetIndexColumn.
+        index_auto_threshold: Max cardinality for automatic categorical
+            indexing (default 1000).
+        bitmap: "off" (default), "auto", or "always". Writes per-shard
+            gene->row detection bitmap sidecars consumed by
+            detection_counts / cells_expressing.
+        reader_threads: Parallel streaming-reader worker count. None
+            (default) resolves to RAYON_NUM_THREADS or os.cpu_count(); 1
+            forces the sequential coordinator; >1 requests rayon workers
+            (output byte-identical). Requires a thread-safe libhdf5
+            (conda-forge default); a non-threadsafe build falls back to
+            sequential with a one-shot Hdf5NotThreadsafe warning.
+        writer_queue_depth: Backpressure window between the encoder pool
+            and the ordered writer (default 4); outstanding shards are
+            capped at reader_threads + writer_queue_depth.
+        obs_override: Optional pandas DataFrame used in place of the
+            on-disk obs (shape[0] must equal on-disk n_obs), for
+            read-mutate-write flows via pyscx.read_h5ad_metadata. Requires
+            stream=True.
+        var_override: Optional pandas DataFrame used in place of the
+            on-disk var (shape[0] must equal on-disk n_vars). Requires
+            stream=True.
+        uns_override: Optional dict replacing the entire uns section (not
+            merged). Requires stream=True.
+    """
     _require_hdf5("from_h5ad")
     return _from_h5ad_native(
         _coerce_path(path, allow_experiment=False),
@@ -151,17 +219,96 @@ def from_h5ad(path, out, **kwargs):
     )
 
 
+def read_h5ad_metadata(path, strict_uns=False):
+    """Read obs / var / uns / X shape from an h5ad file via pure-Rust
+    HDF5 readers, without going through `anndata.read_h5ad` (which
+    eagerly materialises `obsm` on every call). Accepts str or
+    `os.PathLike` for `path`. Returns an `H5adMetadata` object whose
+    `obs`, `var`, `uns`, `n_obs`, `n_vars`, and `x_format` attributes
+    can be inspected / mutated and passed back to
+    `pyscx.from_h5ad(path, out, obs_override=..., uns_override=...)`
+    for read-mutate-write flows that need to stay under tight memory
+    budgets."""
+    _require_hdf5("read_h5ad_metadata")
+    return _read_h5ad_metadata_native(
+        _coerce_path(path, allow_experiment=False),
+        strict_uns=strict_uns,
+    )
+
+
 def to_h5ad(path, out, **kwargs):
-    """Convert an SCX file to h5ad. Accepts str, `os.PathLike`, or a
-    pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
+    """Convert an SCX file to h5ad, streaming by default.
+
+    Accepts str, `os.PathLike`, or a pyscx Experiment for `path`; str or
+    `os.PathLike` for `out`. Mirror of `pyscx.from_h5ad`. Peak RSS is
+    bounded by one shard's worth of CSR per matrix written. When deletion
+    vectors are present, only kept rows are written.
+
+    Args:
+        path: Source SCX file (str, os.PathLike, or pyscx Experiment).
+        out: Destination h5ad file (str or os.PathLike).
+        stream: Stream the conversion (default True). False falls back to
+            the legacy materializing path.
+        modality: For a multimodal SCX file, the modality to extract as
+            h5ad (e.g. "rna"); single-modality files ignore it and
+            multimodal files raise without it (use pyscx.to_h5mu).
+        reader_threads: Parallel shard-decoder worker count. None (default)
+            resolves to RAYON_NUM_THREADS or os.cpu_count(); 1 forces
+            sequential; >1 requests rayon workers (output byte-identical).
+            HDF5 writes stay on the calling thread, so this does NOT require
+            a thread-safe libhdf5 (unlike the ingest direction).
+        writer_queue_depth: Bounded reorder-buffer depth between the
+            decoder pool and the ordered HDF5 writer (default 4).
+        memory_budget: Derates reader_threads against the exact per-shard
+            byte size (from catalog nnz). Accepts an int byte count or a
+            binary-prefixed size string — K/M/G/T or KiB/MiB/GiB/TiB
+            (powers of 1024); decimal KB/MB/GB/TB is rejected. E.g. "4G" /
+            "512M" / "2GiB". A single shard exceeding the budget raises;
+            smaller mismatches emit ReaderThreadsDerated.
+    """
     _require_hdf5("to_h5ad")
     return _to_h5ad_native(_coerce_path(path), _coerce_path(out), **kwargs)
 
 
 def from_h5mu(path, out, **kwargs):
-    """Convert an h5mu file to SCX. Accepts str or `os.PathLike` for
-    `path` and `out`. (Source must be an h5mu file, not an open SCX
-    Experiment.)"""
+    """Convert an h5mu file to a multimodal SCX v2 file, streaming by default.
+
+    Accepts str or `os.PathLike` for `path` and `out`. (Source must be an
+    h5mu file, not an open SCX Experiment.) Mirrors `pyscx.from_h5ad`; each
+    modality runs through the same dispatcher independently.
+
+    Args:
+        path: Source h5mu file (str or os.PathLike).
+        out: Destination SCX file (str or os.PathLike).
+        codec: Per-shard codec (see pyscx.from_h5ad). None auto-selects.
+        shard_size: Rows per CSR X shard. None uses the default.
+        csc: "off" (default) or "always" (column-major sidecar).
+        csc_cols_per_shard: Columns per CSC shard when csc="always"
+            (default 5000).
+        stream: Stream the conversion (default True).
+        strict_uns: True raises on the first unrepresentable uns entry;
+            False (default) warns per skipped key.
+        memory_budget: Caps dense slabs and CSC external-transpose buffers,
+            and derates reader_threads. Int byte count or a binary-prefixed
+            size string — K/M/G/T or KiB/MiB/GiB/TiB (powers of 1024);
+            decimal KB/MB/GB/TB is rejected. E.g. "4G".
+        temp_dir: Scratch directory for the CSC external transpose.
+        modalities: Optional list of modality names to keep
+            (case-sensitive). Unknown names raise with the available list.
+        modality_types: Optional dict mapping modality name to one of
+            "rna", "protein", "atac", "spatial", "methylation", "custom".
+            Modalities not listed fall back to name inference and emit
+            ModalityTypeInferred.
+        index_obs: obs column names to index for query pushdown.
+        index_var: var column names to index.
+        index_preset: "cellxgene", "perturbseq", or "training".
+        index_auto_threshold: Max cardinality for auto categorical
+            indexing (default 1000).
+        bitmap: "off" (default), "auto", or "always".
+        reader_threads: Parallel reader worker count (see pyscx.from_h5ad);
+            >1 requires a thread-safe libhdf5.
+        writer_queue_depth: Encoder->writer backpressure window (default 4).
+    """
     _require_hdf5("from_h5mu")
     return _from_h5mu_native(
         _coerce_path(path, allow_experiment=False),
@@ -171,8 +318,26 @@ def from_h5mu(path, out, **kwargs):
 
 
 def to_h5mu(path, out, **kwargs):
-    """Convert an SCX file to h5mu. Accepts str, `os.PathLike`, or a
-    pyscx Experiment for `path`; str or `os.PathLike` for `out`."""
+    """Convert a multimodal SCX file to h5mu, streaming by default.
+
+    Accepts str, `os.PathLike`, or a pyscx Experiment for `path`; str or
+    `os.PathLike` for `out`. Requires a multimodal SCX file
+    (single-modality files raise — use `pyscx.to_h5ad`). Each modality's
+    /mod/{name}/X and any layers are written shard-by-shard.
+
+    Args:
+        path: Source multimodal SCX file (str, os.PathLike, or Experiment).
+        out: Destination h5mu file (str or os.PathLike).
+        stream: Stream the conversion (default True).
+        reader_threads: Parallel shard-decoder worker count (see
+            pyscx.to_h5ad). HDF5 writes stay on the calling thread, so this
+            does not require a thread-safe libhdf5.
+        writer_queue_depth: Decoder->writer reorder-buffer depth (default 4).
+        memory_budget: Derates reader_threads against the exact per-shard
+            byte size. Int byte count or a binary-prefixed size string —
+            K/M/G/T or KiB/MiB/GiB/TiB (powers of 1024); decimal
+            KB/MB/GB/TB is rejected. E.g. "4G".
+    """
     _require_hdf5("to_h5mu")
     return _to_h5mu_native(_coerce_path(path), _coerce_path(out), **kwargs)
 

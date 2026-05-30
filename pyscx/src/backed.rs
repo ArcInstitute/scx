@@ -299,7 +299,7 @@ impl ScxBackedSparseDataset {
         index: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Case 1: Tuple index (rows, cols)
-        if let Ok(tuple) = index.downcast::<PyTuple>() {
+        if let Ok(tuple) = index.cast::<PyTuple>() {
             if tuple.len() == 2 {
                 let row_idx = tuple.get_item(0)?;
                 let col_idx = tuple.get_item(1)?;
@@ -1170,7 +1170,7 @@ impl ScxBackedSparseDataset {
         }
 
         // Slice index
-        if let Ok(slice) = row_idx.downcast::<PySlice>() {
+        if let Ok(slice) = row_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.0 as isize)?;
             let start = indices.start.max(0) as u64;
             let stop = indices.stop.max(0) as u64;
@@ -1215,7 +1215,7 @@ impl ScxBackedSparseDataset {
             // Boolean mask → extract True indices
             let nonzero = arr.call_method0("nonzero")?;
             // nonzero returns a tuple of arrays; for 1D, it's (array_of_indices,)
-            let idx_tuple = nonzero.downcast::<PyTuple>()?;
+            let idx_tuple = nonzero.cast::<PyTuple>()?;
             let idx_arr = idx_tuple.get_item(0)?;
             let flat = idx_arr.call_method1("astype", (np.getattr("int64")?,))?;
             let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
@@ -1343,7 +1343,7 @@ impl ScxBackedSparseDataset {
         let row_csr = self.getitem_rows(py, row_idx)?;
 
         // Check if col_idx is a full slice (`:`) — if so, return as-is
-        if let Ok(slice) = col_idx.downcast::<PySlice>() {
+        if let Ok(slice) = col_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.1 as isize)?;
             if indices.start == 0 && indices.stop == self.shape_val.1 as isize && indices.step == 1
             {
@@ -1361,7 +1361,7 @@ impl ScxBackedSparseDataset {
 
     /// Check whether `row_idx` selects all rows (is `slice(None)` / `:`).
     fn is_all_rows_slice(&self, _py: Python<'_>, row_idx: &Bound<'_, PyAny>) -> PyResult<bool> {
-        if let Ok(slice) = row_idx.downcast::<PySlice>() {
+        if let Ok(slice) = row_idx.cast::<PySlice>() {
             let indices = slice.indices(self.shape_val.0 as isize)?;
             Ok(
                 indices.start == 0
@@ -2199,7 +2199,7 @@ pub struct ScxBackedMuDataset {
     meta_reader: Arc<ScxReader>,
     /// Cached global obs as a pandas DataFrame. Computed on first
     /// `obs` access; reused thereafter.
-    cached_obs: StdMutex<Option<PyObject>>,
+    cached_obs: StdMutex<Option<Py<PyAny>>>,
     /// CSR cache size to use when constructing per-modality
     /// `BackedCsrReader`s. Defaults to 4 (matches the experiment
     /// default).
@@ -2279,7 +2279,7 @@ impl ScxBackedMuDataset {
     /// Lazy global obs. First call materialises the obs as a pandas
     /// DataFrame; subsequent calls return the same Python object.
     #[getter]
-    fn obs(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn obs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Fast path: cached obs already constructed.
         {
             let guard = self.cached_obs.lock().expect("cached_obs poisoned");
@@ -2294,7 +2294,7 @@ impl ScxBackedMuDataset {
             .map_err(|e| PyRuntimeError::new_err(format!("read_obs: {e}")))?;
         let table = crate::anndata::record_batch_to_pyarrow(py, &batch)?;
         let df = crate::anndata::pyarrow_table_to_pandas(&table)?;
-        let obj: PyObject = df.unbind();
+        let obj: Py<PyAny> = df.unbind();
         let mut guard = self.cached_obs.lock().expect("cached_obs poisoned");
         *guard = Some(obj.clone_ref(py));
         Ok(obj)
@@ -2398,7 +2398,7 @@ impl ScxBackedMuModality {
         self.modality_names.iter().any(|n| n == name)
     }
 
-    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Yield modality names. Easiest cross-version: convert to a
         // PyList and call its __iter__.
         let list = pyo3::types::PyList::new(py, &slf.modality_names)?;

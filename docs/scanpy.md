@@ -182,10 +182,13 @@ sc.pl.umap(adata, color="leiden")
 > `pyscx.from_h5ad`, `pyscx.from_h5mu`, `pyscx.to_h5ad`, and
 > `pyscx.to_h5mu` all default to `stream=True`; `pyscx.from_anndata`
 > auto-routes to the streaming pipeline when given a backed AnnData.
-> Peak RSS is bounded by one shard's worth of CSR per matrix regardless
-> of total file size. Pass `stream=False` to opt into the legacy
-> materialising paths (only useful when you specifically need the
-> in-memory shape, e.g. for AnnData mutations the streaming path
+> Peak RSS is bounded by one shard's worth of CSR per matrix
+> (plus one shard's worth of obs/var per column when the source
+> carries `ObsMetadataShard` / `VarMetadataShard` sections — atlas-scale
+> obs no longer needs to live in memory at once during export)
+> regardless of total file size. Pass `stream=False` to opt into the
+> legacy materialising paths (only useful when you specifically need
+> the in-memory shape, e.g. for AnnData mutations the streaming path
 > doesn't forward).
 
 ```python
@@ -311,10 +314,18 @@ pyscx.to_mtx("dataset.scx", "/path/to/output_dir")
 
 Symmetric to `from_h5ad` / `from_h5mu`. Both default to `stream=True`
 — peak RSS is bounded by one shard's worth of CSR per matrix
-written, regardless of total file size. Deletion vectors are
-respected (only kept rows appear in the output); for high-cardinality
-categorical obs columns the writer emits the modern `categorical`
-group form so `anndata.read_h5ad` reads them cleanly at census scale.
+written, regardless of total file size. When the source SCX file
+carries sharded obs/var (`ObsMetadataShard` / `VarMetadataShard`
+sections — produced by `from_anndata` for `n_obs > shard_target_rows`,
+or by `merge` / `append` on atlas-scale inputs), obs and var also
+stream column-by-column through pre-allocated HDF5 datasets with
+hyperslab writes per shard; categorical columns unify disjoint
+per-shard vocabularies via a running global dictionary. Legacy
+single-section obs/var sources transparently fall back to the eager
+writer. Deletion vectors are respected on every column (obs row
+count matches `/X[0]`); for high-cardinality categorical obs columns
+the writer emits the modern `categorical` group form so
+`anndata.read_h5ad` reads them cleanly at census scale.
 
 ```python
 import pyscx
@@ -378,7 +389,8 @@ exp.to_anndata(
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
                           # AnnData is fully detached from the SCX file handle.
-    memory_budget=None,   # None (default: 8 GiB), int (bytes), or str ("4G" / "512MiB").
+    memory_budget=None,   # None (default: 8 GiB), int (bytes), or a binary-prefixed
+                          # size str: K/M/G/T or KiB/MiB/GiB/TiB ("4G" / "512MiB"); decimal KB/MB rejected.
                           # When the estimated eager assembly footprint exceeds this
                           # budget, a UserWarning is emitted recommending backed mode.
                           # Advisory only — assembly still proceeds.
@@ -540,7 +552,10 @@ disk, but only the requested columns are retained in the returned CSR.
 
 Filter cells using a predicate string. In non-backed mode, this leverages
 the query engine with predicate pushdown (shard skipping). In backed mode,
-it evaluates the predicate on the obs DataFrame:
+it evaluates the predicate with pandas `.query()` on the (already
+deletion-vector-filtered) obs DataFrame and folds the matches into the backed
+dataset's row set — a different grammar (see [Filter Expression
+Compatibility](#filter-expression-compatibility) below):
 
 ```python
 # Load only T cells from lung tissue
@@ -551,14 +566,22 @@ adata = pyscx.open("atlas.scx").to_anndata(
 
 ##### Filter Expression Compatibility
 
-`to_anndata()` has two filter-evaluation paths that accept overlapping but
-**not identical** grammars. Knowing which subset is portable matters when a
-filter string is reused across calls or pipelines.
+`to_anndata()` evaluates `obs_filter` via one of three paths that fall into
+**two grammars** — the `scx-engine` parser or pandas. They accept overlapping
+but **not identical** expressions, so knowing which fires matters when a filter
+string is reused across calls or pipelines (e.g. moving a filter from a
+`query().filter_obs()` call to `to_anndata(backed=True, obs_filter=...)`).
 
-| Path | Engine | When it fires |
-|---|---|---|
-| SCX predicate engine | `scx-engine` predicate parser | `preserve_slots=False` (default), `backed=True`, `pyscx.pull(...)` selective pulls |
-| pandas.eval | `pandas.DataFrame.eval` | `preserve_slots=True` with `obs_filter` set |
+| Path | Engine | Grammar | When it fires |
+|---|---|---|---|
+| SCX predicate engine | `scx-engine` predicate parser | engine | non-backed default (`preserve_slots=False`); `query().filter_obs(...)`; `pyscx.pull(...)` selective pulls |
+| pandas `.query()` | `pandas.DataFrame.query` | pandas | `backed=True` with `obs_filter` set |
+| pandas `.eval()` | `pandas.DataFrame.eval` | pandas | non-backed `preserve_slots=True` with `obs_filter` set |
+
+`.query()` and `.eval()` share pandas's grammar, so the only split that matters
+in practice is **engine vs pandas**: `backed=True` and `preserve_slots=True` both
+accept the pandas-only forms below, while the default non-backed path and
+`query().filter_obs()` use the stricter engine grammar.
 
 **Portable subset (works in both paths):**
 
@@ -577,9 +600,10 @@ against a `[...]` list literal, and parenthesised sub-expressions. Tests in
 `pyscx/tests/test_to_anndata_integration.py` (`test_obs_filter_grammar_parity_common_ground`)
 assert that both paths select identical rows for the entries above.
 
-**Divergences (work in one path only):**
+**Divergences (work in one grammar only)** — the "pandas" column covers both
+`backed=True` (`.query()`) and `preserve_slots=True` (`.eval()`):
 
-| Expression | SCX engine | pandas.eval |
+| Expression | SCX engine | pandas (`.query()` / `.eval()`) |
 |---|---|---|
 | `n_counts > 50 & cell_type == 'T cell'` | ❌ parse error — use `and` | ✅ accepted as bitwise-and |
 | `cell_type in ('T cell', 'B cell')` (tuple) | ❌ parse error — `in` requires `[...]` | ✅ accepted |
@@ -887,16 +911,34 @@ single-pass `normalize+log1p` fusion via the marker on
 and `log1p` (that materialises X to scipy CSR and unreachably forfeits the
 fast path for the rest of the pipeline).
 
+**HVG input — backed, lazy, or materialized X.** `flavor` in `seurat_v3` /
+`seurat_v3_paper` / `seurat` runs the scx-native streaming kernel whether
+`adata.X` is an `ScxBackedSparseDataset`, an `ScxLazyTransformedDataset`, or a
+plain materialized scipy/dense matrix (a materialized `X` is wrapped in a
+single-shard `ShardSource`). So the common `pyscx.open(...).query()...collect()
+.to_anndata()` (eager) idiom gets the same numerics — and the same per-batch
+LOESS-singularity tolerance — as the backed path. Only flavors scx does not
+implement natively (today `cell_ranger`) delegate to
+`scanpy.pp.highly_variable_genes`, with a one-shot `UserWarning`.
+
+> **`batch_key` cardinality is the usual LOESS-singularity trigger.** `seurat_v3`
+> fits one `skmisc.loess` per batch; a high-cardinality key such as CELLxGENE
+> `dataset_id` produces many tiny batches whose log-mean / log-variance
+> regression is singular. The native path catches each such fit, warns naming
+> the batch, and drops it from the ranking — so HVG completes. If many batches
+> drop, prefer a coarser `batch_key` (or none). `filter_genes(min_cells=10)`
+> only helps the single global fit, not the per-batch case.
+
 **HVG on GPU** — `pyscx.accel.highly_variable_genes(device="gpu")` routes
 through GPU atomicAdd kernels for `streaming_mean_var` and
 `streaming_clip_square_sum`, including per-batch variants when `batch_key`
-is set. GPU dispatch is active for any `seurat_v3` configuration regardless
-of `batch_key`; `flavor="seurat"` still falls back to CPU with a
-`UserWarning`. The per-batch loess fits run on CPU via `skmisc.loess` — a
-batch whose log-mean / log-variance regression is too degenerate to fit
-(small batch sizes, near-collinear inputs) is caught, surfaced as a
-`UserWarning` naming the batch, and excluded from the per-batch ranking;
-other batches proceed normally.
+is set (materialized X uses the same single-shard `ShardSource`). GPU dispatch
+is active for any `seurat_v3` configuration regardless of `batch_key`;
+`flavor="seurat"` still falls back to CPU with a `UserWarning`. The per-batch
+loess fits run on CPU via `skmisc.loess` — a batch whose log-mean / log-variance
+regression is too degenerate to fit (small batch sizes, near-collinear inputs)
+is caught, surfaced as a `UserWarning` naming the batch, and excluded from the
+per-batch ranking; other batches proceed normally.
 
 
 ### Quick example
@@ -2302,10 +2344,18 @@ pyscx.merge(inputs, output, uns_policy="require-equal")
 pyscx.merge(inputs, output, uns_policy="namespace")
 ```
 
-## GPU-accelerated training with scVI / scANVI
+## ML training data loading
 
 For large-scale model training, SCX provides a high-performance data loader
-that bypasses Python I/O entirely:
+that bypasses Python I/O entirely. Three dataset types cover different
+ML patterns:
+
+- **`TrainingDataset`** — sequential streaming for standard training loops
+  (autoencoder, scVI, scGPT). 82× faster than TileDB-SOMA-ML on 1M cells.
+- **`IndexPlanDataset`** — paired `(perturbed, control)` cell reads for
+  perturbation training, contrastive learning, and donor-matched designs.
+- **`MultimodalTrainingDataset`** — cell-aligned multi-assay batches
+  (RNA + ADT + ATAC) from a single multimodal SCX file.
 
 ```python
 import pyscx
@@ -2317,15 +2367,25 @@ dataset = pyscx.TrainingDataset(
     hvg_indices=hvg_array,   # decode only HVGs → less data
     normalize=True,
     log1p=True,
+    obs_columns=["cell_type", "batch"],  # metadata in each batch
 )
 
 for batch in dataset:
     x = torch.from_numpy(batch["X"]).to(device)
+    cell_types = batch["obs"]["cell_type"]  # {"codes": ndarray, "categories": list}
     # model.forward(), loss.backward(), ...
+
+dataset.close()
 ```
 
 The training loader uses a triple-buffered Rust pipeline (I/O → decode → GPU)
-with zero Python on the hot path.
+with zero Python on the hot path. For scVI, use the built-in
+[`ScxDataModule`](api.md#scvi-integration-pyscxscx_integrationsscvi)
+PyTorch Lightning DataModule.
+
+See the dedicated [ML Training Guide](training.md) for end-to-end examples,
+train/val split handling, PyTorch DataLoader compatibility, and migration
+from h5ad-based training loops.
 
 ## File inspection
 

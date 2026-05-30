@@ -18,6 +18,7 @@ pub fn run_compact(
     index_var: Vec<String>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    reshape_obs: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
     if !input.exists() {
@@ -54,14 +55,28 @@ pub fn run_compact(
         || !index_var.is_empty()
         || index_preset.is_some()
         || index_auto_threshold.is_some();
-    if any_index_flag {
-        let index_options = ConversionPredicateIndexOptions {
-            index_obs,
-            index_var,
-            index_preset,
-            index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+    // `--reshape-obs` must reach the index-options path even with no
+    // `--index-*` flag set. The `index_auto_threshold = 0` sentinel keeps
+    // `user_wants_index()` false (no index built), matching bare
+    // `compact()`, while still migrating obs to sharded sections.
+    if any_index_flag || reshape_obs {
+        let index_options = if any_index_flag {
+            ConversionPredicateIndexOptions {
+                index_obs,
+                index_var,
+                index_preset,
+                index_auto_threshold: index_auto_threshold.unwrap_or(1000),
+            }
+        } else {
+            ConversionPredicateIndexOptions {
+                index_obs: Vec::new(),
+                index_var: Vec::new(),
+                index_preset: None,
+                index_auto_threshold: 0,
+            }
         };
-        let summary = scx_ops::compact_with_index_options(input, output, &index_options)?;
+        let summary =
+            scx_ops::compact_with_index_options(input, output, &index_options, reshape_obs)?;
         emit_index_summary("compact", &summary);
     } else {
         scx_ops::compact(input, output)?;

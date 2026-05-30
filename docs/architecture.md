@@ -855,11 +855,22 @@ write hyperslab slices into pre-allocated `/X/{indptr,indices,data}`
 HDF5 datasets. The total `nnz` is computed up front from catalog
 `ShardStats` (single pre-scan decode when deletion vectors are
 active) so the on-disk layout is deterministic — no extendable HDF5
-datasets. Metadata writers (`obs` / `var` / `obsm` / `uns` / etc.) are
-reused verbatim from the non-streaming path. Peak memory is bounded
-by one shard's worth of CSR per matrix written. `--stream=false`
-falls back to the legacy materialising `scx_to_h5ad` /
-`scx_to_h5mu` / `scx_modality_to_h5ad` paths.
+datasets. Obs and var metadata stream through the symmetric
+`h5ad_write::write_dataframe_group_streaming`: schema comes from
+`read_obs_schema_logical_lossy()` (catalog-only), HDF5 datasets are
+pre-allocated to `n_rows_kept`, then `obs_shards()` / `var_shards()`
+are drained shard-by-shard with kept-row hyperslab writes per column.
+Categorical columns unify disjoint per-shard vocabularies via a
+single-pass running global dictionary (codes remapped on the fly,
+final `categories` dataset emitted at finalize). Legacy single-section
+obs/var sources transparently fall through to the eager
+`write_dataframe_group_at` writer. Obsm / varm / uns / mappings still
+reuse the materialising helpers. Peak memory is bounded by one
+shard's worth of CSR per matrix written, plus one shard's worth of
+obs/var per column when sharded. `--stream=false` falls back to the
+legacy materialising `scx_to_h5ad` / `scx_to_h5mu` /
+`scx_modality_to_h5ad` paths; sharded obs/var still stream there
+because the alternative is to materialise the full obs table.
 
 ### Conversion: MTX ↔ SCX
 

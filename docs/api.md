@@ -321,12 +321,14 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 
 ## Memory budgets
 
-`MemoryBudget::parse(s)` (`scx-convert/src/mem.rs`) is the shared parser
-behind `--memory-budget` (CLI) and the `memory_budget=` kwarg on
-`from_h5ad` / `from_h5mu`. It caps dense row slabs in the h5ad
-streaming reader, CSC external-transpose buffers when CSC-on-disk
-exceeds the budget, and the parallel streaming reader's worker
-derate.
+`MemoryBudget::parse(s)` (`scx-format/src/mem.rs`) is the shared parser
+behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
+`memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
+slabs in the h5ad streaming reader, CSC external-transpose buffers when
+CSC-on-disk exceeds the budget, and the parallel streaming reader's
+worker derate. It lives in `scx-format` (re-exported as
+`scx_convert::MemoryBudget`) so sibling crates such as `scx-ops` —
+which owns `build-csc` — can share it without a dependency cycle.
 
 Accepted forms:
 
@@ -374,6 +376,14 @@ Behaviour:
   predicate-index emission entirely — the read path is unimodal-only
   today. The same skip-with-warning applies to multimodal
   `merge` / `append` / `compact`.
+- The flags only build indexes on the SCX-writing ingest directions
+  (`h5ad → scx`, `10x → scx`; `h5mu → scx` accepts them and skips with
+  the warning above). On any other `scx convert` direction —
+  `mtx → scx` and the SCX-export directions `scx → h5ad/h5mu/mtx` —
+  passing `--index-*` is a **hard error** rather than a silent no-op,
+  since those paths cannot build a predicate index. To (re)build an
+  index on an existing SCX file, use `scx compact` / `scx append` /
+  `scx merge` or `pyscx.from_anndata`.
 
 Index presets:
 
@@ -730,7 +740,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   estimated footprint exceeds the budget. `shard_target_rows` overrides
   the default obs shard size. Obsm, varm, obsp, and varp are extracted
   and written one key at a time (incremental, not collected).
-- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
+- `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, obs_override=None, var_override=None, uns_override=None)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
   `obsp` / `varp` matrix (each is now hyperslab-read and emitted as
@@ -740,9 +750,31 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   entry point for files larger than RAM. `csc="always"` performs a
   two-pass write (streaming CSR → `rebuild_csc_inplace` on the
   finished file) — peak disk briefly reaches ~2× the output size during
-  the rebuild. `uns_format` is accepted for API parity with
-  `from_anndata` but is a no-op here (streaming reads `uns` from the
-  h5ad file directly, not from Python).
+  the rebuild. `uns_format` is a no-op for the on-disk `uns` read but
+  controls the envelope shape applied to `uns_override` when supplied
+  (`"tagged"` default wraps NumPy / pandas containers in `__scx_type__`
+  envelopes for bit-exact round-trip; `"plain"` collapses them to JSON
+  primitives). Internally bypasses
+  `anndata.read_h5ad` entirely — obs/var/uns are read via pure-Rust
+  HDF5, so callers that don't supply overrides also dodge the eager
+  `obsm` materialisation that `anndata.read_h5ad(path, backed='r')`
+  performs (anndata reads `obsm` into Python heap on every call,
+  including in backed mode).
+  - `obs_override`, `var_override`, `uns_override` (optional): supply a
+    pandas DataFrame (obs/var) or Python dict (uns) to use in place of
+    the on-disk values. Intended for read-mutate-write flows where the
+    caller wants to add annotations without paying the full `obsm`
+    allocation that `anndata.read_h5ad` would trigger. Typically paired
+    with `pyscx.read_h5ad_metadata(path)` (below): fetch on-disk obs /
+    var / uns cheaply, mutate them, pass them back. `obs_override.shape[0]`
+    must equal n_obs on disk; `var_override.shape[0]` must equal n_vars
+    on disk. `uns_override` replaces the entire `uns` section (not a
+    merge). Any override with `stream=False` raises `ValueError`
+    because the non-streaming path does not apply overrides. `obsm` /
+    `varm` / `obsp` / `varp` are intentionally not exposed as overrides
+    — accepting them would re-introduce the OOM class this API exists
+    to avoid; mutate them via `pyscx.from_anndata(backed_adata, ...)`
+    instead if needed.
   - Source layout: CSR streams natively. Dense `/X`
     streams via row-slab sparsification — set `dense_zero_epsilon` to
     threshold near-zero values (default `0.0` matches scipy's
@@ -756,10 +788,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     (h5ad encoding-type missing/ambiguous), `DenseSparsified`,
     `DuplicateCoordinatesMerged`. See
     [Conversion warnings](#conversion-warnings-convertwarning).
-  - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes. Caps
-    dense slabs and the CSC external-transpose buffers. Binary
-    prefixes only — `KB/MB/GB/TB` is rejected to avoid ambiguity
-    (see [Memory budgets](#memory-budgets)).
+  - `memory_budget`: caps dense slabs and the CSC external-transpose
+    buffers. Accepts an int byte count or a binary-prefixed size —
+    `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024); decimal
+    `KB`/`MB`/`GB`/`TB` is rejected to avoid 1000-vs-1024 ambiguity
+    (see [Memory budgets](#memory-budgets)). E.g. `"4G"` / `"512M"` / `"2GiB"`.
   - `stream=False` falls back to the materialising path (kept for
     parity / debugging).
   - `obsm` / `varm` / `obsp` / `varp` on the input are hyperslab-read
@@ -789,6 +822,20 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     the total shard count. Larger values give a slow shard a deeper
     look-ahead buffer; smaller values risk starving encoders when
     one shard takes much longer than its siblings.
+- `pyscx.read_h5ad_metadata(path, strict_uns=False) -> H5adMetadata` —
+  Read just `obs`, `var`, `uns`, and the X shape from an h5ad file via
+  pure-Rust HDF5 readers. Skips `anndata.read_h5ad` (and therefore
+  anndata's eager `obsm` allocation) entirely. Returns an
+  `H5adMetadata` object with attributes `obs` (`pandas.DataFrame`),
+  `var` (`pandas.DataFrame`), `uns` (`dict`), `n_obs` (`int`),
+  `n_vars` (`int`), `x_format` (`"csr"` / `"csc"` / `"dense"`). Intended
+  for read-mutate-write flows: read this, mutate `obs` / `uns`, pass
+  the mutated values back via `pyscx.from_h5ad(..., obs_override=, uns_override=)`.
+  Categoricals, pandas Index metadata, and nullable-boolean columns
+  round-trip through the same Arrow IPC path that `pyscx.open(...).to_anndata()`
+  uses, so the result is semantically equivalent to the obs / var that
+  `anndata.read_h5ad` would have returned — without the obsm allocation
+  cost. `strict_uns=True` mirrors `from_h5ad`'s strict-uns semantics.
 - `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — Stream an h5mu file to a multimodal SCX v2 file. Mirrors `from_h5ad` for h5mu inputs; per-modality `n_vars`/`nnz` come from `/mod/{name}/X` attributes so there is no pre-pass materialisation. `reader_threads`/`writer_queue_depth` carry the same semantics as `from_h5ad` — each modality runs through the same dispatcher independently.
   - `modalities`: optional list of modality names to keep
     (case-sensitive). Unknown names raise `ValueError` with the
@@ -847,7 +894,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None, in_place=False, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Append from AnnData. Same `index_*` semantics as `append`.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
-- `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output.
+- `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, reshape_obs=False)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output. `reshape_obs=True` migrates legacy single-section obs metadata to the sharded `ObsMetadataShard` layout (mirrors `scx compact --reshape-obs`; useful after a backed `from_anndata` conversion).
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
 - `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `uns_policy` controls conflicting uns sections: `"first"` (keep first input), `"require_equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (write conflict report as `uns["_merge_uns_summary"]`). `shard_target_rows` overrides the default obs shard size during merge. Merge now streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
@@ -863,7 +910,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
-  - `obs_filter`: predicate string for cell filtering (uses query engine with pushdown in non-backed mode)
+  - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
   - `modality`: select one modality of a multimodal file and
@@ -1046,7 +1093,7 @@ for the full dispatch rules and requirements.
 
   Raises `ValueError` for unknown operations. Note: estimates are approximate — cuSOLVER QR workspace may be undercounted by ~1.5×.
 - `pyscx.accel.calculate_qc_metrics(adata, qc_vars=None, log1p=True, inplace=True, prefer_format="csr")` — Streaming QC metrics for backed/lazy data without materialization. Computes per-cell `n_genes_by_counts`, `total_counts` and per-gene `n_cells_by_counts`, `total_counts`. Supports `qc_vars` for gene subsets (e.g., `["mt"]` for mitochondrial percentage). When `inplace=True`, writes to `adata.obs`/`adata.var`; when `False`, returns `(obs_df, var_df)`. `prefer_format="csc"` routes the gene-axis aggregation through the CSC sidecar (cell-axis stays CSR — row aggregations have no CSC win). Falls back to `sc.pp.calculate_qc_metrics()` for scipy/dense.
-- `pyscx.accel.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr")` — Streaming HVG selection. Default CPU + CSR streams `mean_var` and clipped sums shard-by-shard via `ShardSource`; multi-batch runs CSR. `prefer_format="csc"` routes single-batch seurat_v3 through `streaming_mean_var_csc` and `streaming_clip_square_sum_csc` (multi-batch + GPU + non-seurat_v3 flavors raise on CSC). Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
+- `pyscx.accel.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr", layer=None)` — Streaming HVG selection. Default CPU + CSR streams `mean_var` and clipped sums shard-by-shard via `ShardSource`; multi-batch runs CSR. Works on `ScxBackedSparseDataset`, `ScxLazyTransformedDataset`, **and a materialized scipy/dense `X`** for `flavor` in `seurat_v3` / `seurat_v3_paper` / `seurat` (a materialized `X` is wrapped in a single-shard `ShardSource`), so the eager `to_anndata()` idiom gets the same numerics and the same per-batch LOESS-singularity tolerance as the backed path. Only flavors scx does not implement natively (e.g. `cell_ranger`) delegate to `scanpy.pp.highly_variable_genes` (one-shot `UserWarning`). `prefer_format="csc"` routes single-batch seurat_v3 through `streaming_mean_var_csc` and `streaming_clip_square_sum_csc` (multi-batch + GPU + non-seurat_v3 flavors raise on CSC). Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
 - `pyscx.accel.col_sums(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column sums on `ScxBackedSparseDataset`. Honors `col_projection` and `kept_to_global` on the CSR path; CSC dispatch requires no row deletion vector and (currently) only supports `ScxBackedSparseDataset` and `ScxLazyTransformedDataset` (CSR scipy / dense raises a helpful message — use the array-protocol `dataset.sum(axis=0)` for those).
 - `pyscx.accel.col_nnz(dataset, prefer_format="csr") → np.ndarray (i64)` — Streaming per-column NNZ. Same dispatch as `col_sums`.
 - `pyscx.accel.col_min(dataset, prefer_format="csr") → np.ndarray (f64)` — Streaming per-column min. Implicit-zero correction (`mins[c] = min(mins[c], 0.0)` when `col_nnz[c] < n_obs`) applied on both paths.
@@ -1217,12 +1264,76 @@ model.train(datamodule=dm)
 
 ### TrainingDataset
 
+High-throughput sequential streaming dataset. Wraps the triple-buffered
+Rust pipeline (tokio I/O → rayon decode → Python/GPU). Each `for batch in dataset:`
+loop is one epoch; shards are reshuffled between epochs for training randomization.
+
+**Constructor kwargs**
+
+| Argument | Default | Notes |
+|---|---|---|
+| `path` | — | Path to `.scx` file. |
+| `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded. |
+| `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
+| `obs_columns` | `[]` | Obs metadata column names included in each batch. |
+| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). |
+| `log1p` | `True` | Apply `log1p` after normalize. |
+| `target_sum` | `1e4` | Normalization target sum. |
+| `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
+| `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
+| `seed` | `42` | RNG seed for reproducibility. Deterministic shuffle via `(seed, epoch)`. |
+| `max_memory_mb` | `512` | Memory budget. Pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` to fit. |
+| `modality` | `None` | For multimodal v2 files: name of the modality to load (e.g. `"rna"`). Ignored on single-modality files. |
+
+**Properties**
+
+- `n_obs` → `int` — Total number of observations (cells) in the dataset.
+- `n_vars` → `int` — Total number of variables (genes) in the dataset.
+- `n_output_genes` → `int` — Genes per batch (HVG count if projection active, else `n_vars`).
+- `effective_batch_size` → `int` — Actual batch size after memory budget auto-tuning.
+
+**Methods**
+
+- `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0).
+- `memory_budget()` → `dict` — Memory budget diagnostics including `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`, and a nested `breakdown` dict.
+
+**Batch dict schema**
+
+```python
+{
+    "X":            np.ndarray[B, n_output_genes, float32],   # dense expression
+    "obs":          dict[str, np.ndarray | {"codes", "categories"}],
+    "cell_indices":  np.ndarray[B, int64],   # global row indices
+}
+```
+
+Categorical obs columns encode as `{"codes": ndarray[int32], "categories": list[str]}`.
+Numeric obs columns are `ndarray[int64]` or `ndarray[float64]`.
+
+**Epoch and shuffling semantics**
+
+Each `for batch in dataset:` loop is one epoch. On each epoch:
+- **Level 1 (shard order)**: Shard indices `[0..n_shards)` are randomly permuted using a
+  deterministic RNG seeded from `(seed, epoch_number)`. Permuted shards are grouped into
+  contiguous I/O groups of `shard_group_size` for disk-sequential reads.
+- **Level 2 (row shuffle)**: Within each shard group, cell indices are Fisher-Yates shuffled
+  and sliced into `batch_size`-sized batches.
+
+This two-level shuffle provides training randomization without random I/O. The same `seed`
+and epoch always produce the identical ordering.
+
 ```python
 dataset = pyscx.TrainingDataset("file.scx", batch_size=1024,
-    hvg_indices=hvg_array, normalize=True, log1p=True)
-for batch in dataset:
-    x = batch["X"]      # dense f32 numpy array
-    obs = batch["obs"]   # dict of obs columns
+    hvg_indices=hvg_array, normalize=True, log1p=True,
+    obs_columns=["cell_type", "batch"])
+
+for epoch in range(n_epochs):
+    for batch in dataset:
+        x = batch["X"]              # [B, n_output_genes] float32
+        obs = batch["obs"]          # {"cell_type": {"codes": ..., "categories": ...}, ...}
+        idx = batch["cell_indices"]  # [B] int64 — global row indices
+
+dataset.close()
 ```
 
 ### IndexPlanDataset
@@ -1442,7 +1553,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
 - `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
-- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data
+- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 
 ### Cloud operations (`--features cloud`)

@@ -93,9 +93,11 @@ enum Commands {
         stream: bool,
         /// Memory budget for slab-sizing heuristics (Phase 1 dense
         /// streaming, Phase 2 transpose buffers, Phase 8c worker
-        /// derate). Accepts bare bytes, `K`/`M`/`G`/`T`, or
-        /// `KiB`/`MiB`/`GiB`/`TiB`. Decimal suffixes (`KB`, `MB`)
-        /// are rejected as ambiguous. None = each phase's default.
+        /// derate). Accepts a bare byte count or a binary-prefixed
+        /// size — `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers
+        /// of 1024). Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are
+        /// rejected to avoid 1000-vs-1024 ambiguity. None = each
+        /// phase's default.
         #[arg(long, value_name = "SIZE")]
         memory_budget: Option<String>,
         /// Fail conversion on the first unsupported `uns` key
@@ -288,6 +290,12 @@ enum Commands {
         /// output (current default).
         #[arg(long, value_name = "N")]
         index_auto_threshold: Option<usize>,
+        /// Rewrite obs metadata as row-sharded `ObsMetadataShard` sections
+        /// (legacy single-section → sharded). Migrates files written
+        /// before sharded obs metadata existed; idempotent on already-
+        /// sharded inputs.
+        #[arg(long)]
+        reshape_obs: bool,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -468,8 +476,10 @@ enum Commands {
         input: PathBuf,
         /// Output SCX file (will contain both CSR and CSC shards)
         output: PathBuf,
-        /// Maximum memory for transpose working set (default: 4G)
-        /// Accepts suffixes: K, M, G (e.g., "100M", "4G")
+        /// Maximum memory for the transpose working set (default: 4G).
+        /// Accepts a bare byte count or a binary-prefixed size —
+        /// `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB` (powers of 1024);
+        /// decimal `KB`/`MB`/`GB`/`TB` is rejected as ambiguous.
         #[arg(long, default_value = "4G")]
         memory_limit: String,
         /// Overwrite output if it exists
@@ -647,6 +657,7 @@ fn main() {
             index_var,
             index_preset,
             index_auto_threshold,
+            reshape_obs,
         } => compact::run_compact(
             &input,
             &output,
@@ -657,6 +668,7 @@ fn main() {
             parse_index_columns(index_var.as_deref()),
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
+            reshape_obs,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::Merge {
@@ -825,6 +837,35 @@ fn run_convert(
         other => return Err(format!("invalid --csc value: {other}").into()),
     };
 
+    // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
+    // empty / whitespace-only inputs are treated as no override. Parsed
+    // up front so the direction guard below can reject manual index
+    // flags on conversions that cannot build predicate indexes — before
+    // the `--stream` guard and the mtx early-return, so the user always
+    // gets the specific index-direction message rather than a confusing
+    // proxy error.
+    let index_obs_list = parse_index_columns(index_obs);
+    let index_var_list = parse_index_columns(index_var);
+    let index_preset_value = index_preset.filter(|s| !s.trim().is_empty());
+
+    // Manual predicate-index flags only have an effect on conversions
+    // that write SCX from h5ad / 10x (which build indexes inline) and on
+    // h5mu → scx (which accepts them and downstream emits
+    // `PredicateIndexSkippedMultimodal`). On every other direction the
+    // flags were previously dropped silently — a footgun. Reject them
+    // up front, before any file I/O, with an actionable message.
+    let index_requested =
+        !index_obs_list.is_empty() || !index_var_list.is_empty() || index_preset_value.is_some();
+    if index_requested && !matches!(direction, "h5ad_to_scx" | "tenx_to_scx" | "h5mu_to_scx") {
+        return Err(format!(
+            "--index-obs / --index-var / --index-preset are only supported when writing SCX \
+             from h5ad or 10x input (h5mu → scx accepts them but skips the index build with a \
+             warning); got direction '{direction}'. (For an existing SCX file, rebuild indexes \
+             with `scx compact` / `scx append` / `scx merge`, or pyscx.from_anndata.)"
+        )
+        .into());
+    }
+
     // `--stream` is supported for h5ad → scx (Phase 0/1/2), h5mu →
     // scx (Phase 3), and scx → h5ad / h5mu (Phase 8). Reject for
     // other directions so the user gets a clear error rather than a
@@ -900,12 +941,6 @@ fn run_convert(
             Some(s) if s.trim().is_empty() => Vec::new(),
             Some(s) => parse_modality_types(s)?,
         };
-
-    // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
-    // empty / whitespace-only inputs are treated as no override.
-    let index_obs_list = parse_index_columns(index_obs);
-    let index_var_list = parse_index_columns(index_var);
-    let index_preset_value = index_preset.filter(|s| !s.trim().is_empty());
 
     dispatch_convert(
         direction,
@@ -1092,7 +1127,7 @@ fn dispatch_convert(
                 if opts.stream {
                     convert::scx_modality_to_h5ad_streaming(input, output, name, &opts, &mut sink)
                 } else {
-                    convert::scx_modality_to_h5ad(input, output, name)
+                    convert::scx_modality_to_h5ad(input, output, name, &mut sink)
                 }
             }
             None => {
@@ -1123,7 +1158,7 @@ fn dispatch_convert(
             if opts.stream {
                 convert::scx_to_h5mu_streaming(input, output, &opts, &mut sink)
             } else {
-                convert::scx_to_h5mu(input, output)
+                convert::scx_to_h5mu(input, output, &mut sink)
             }
         }
         _ => unreachable!(),

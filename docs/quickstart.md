@@ -74,6 +74,41 @@ accel.rank_genes_groups(adata, groupby="leiden")
 adata.write_h5ad("pbmc10k_processed.h5ad")
 ```
 
+## Train a model
+
+SCX includes a high-performance training data loader that replaces PyTorch
+`DataLoader` workers with a triple-buffered Rust pipeline. No `num_workers`
+needed — I/O, decompression, and normalization all happen in compiled Rust.
+
+```python
+import pyscx
+import torch
+
+hvg_indices = np.where(adata.var["highly_variable"])[0].astype(np.uint32)
+
+dataset = pyscx.TrainingDataset(
+    "pbmc10k.scx",
+    batch_size=1024,
+    hvg_indices=hvg_indices,
+    normalize=True,
+    log1p=True,
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+for batch in dataset:
+    x = torch.from_numpy(batch["X"]).to(device)
+    cell_indices = batch["cell_indices"]
+    # model.forward(x), loss.backward(), optimizer.step()
+
+dataset.close()
+```
+
+For perturbation training with `(perturbed, control)` cell pairs, use
+`pyscx.IndexPlanDataset`. For multimodal data (CITE-seq, Multiome), use
+`pyscx.MultimodalTrainingDataset`. See the full
+[ML Training Guide](training.md) for end-to-end examples, PyTorch Lightning
+integration, and migration from h5ad-based training loops.
+
 ## What's different from scanpy
 
 A few places where pyscx behaves slightly differently from scanpy. These are
@@ -99,6 +134,7 @@ intentional and documented:
 
 ## Next steps
 
+- [docs/training.md](training.md) — ML training data loading guide (TrainingDataset, IndexPlanDataset, PyTorch Lightning).
 - [docs/scanpy.md](scanpy.md) — full scanpy integration guide and accelerator reference.
 - [docs/gpu-setup.md](gpu-setup.md) — CUDA / RAPIDS / SLURM setup for `device="gpu"`.
 - [docs/architecture.md](architecture.md) — crate graph, file format, codec system.

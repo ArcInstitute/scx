@@ -1579,7 +1579,7 @@ fn test_scx_to_h5mu_round_trip() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_to_h5mu(&scx_path, &h5mu_out).unwrap();
+    scx_to_h5mu(&scx_path, &h5mu_out, &mut WarningSink::log()).unwrap();
 
     let file = hdf5::File::open(&h5mu_out).unwrap();
     // /mod/rna/X and /mod/adt/X exist.
@@ -1611,7 +1611,7 @@ fn test_modality_extract_to_h5ad() {
 
     let opts = ConvertOptions::default();
     h5mu_to_scx(&h5mu_in, &scx_path, &opts, &mut WarningSink::log()).unwrap();
-    scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna").unwrap();
+    scx_modality_to_h5ad(&scx_path, &h5ad_out, "rna", &mut WarningSink::log()).unwrap();
 
     let file = hdf5::File::open(&h5ad_out).unwrap();
     assert!(file.group("X").is_ok());
@@ -4304,7 +4304,7 @@ fn test_scx_to_h5mu_streaming_round_trip() {
 
     // Cross-check streaming vs. materialising writer on the same SCX.
     let h5mu_mat = dir.path().join("out_mat.h5mu");
-    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat).unwrap();
+    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat, &mut WarningSink::log()).unwrap();
     let mat_file = hdf5::File::open(&h5mu_mat).unwrap();
     let stream_rna_data: Vec<f32> = file
         .dataset("mod/rna/X/data")
@@ -4342,8 +4342,10 @@ fn test_h5ad_streaming_multi_shard_round_trip() {
     let n_vars = 12;
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
 
-    let mut opts = ConvertOptions::default();
-    opts.shard_target_rows = 7; // 5 shards for 32 rows
+    let opts = ConvertOptions {
+        shard_target_rows: 7, // 5 shards for 32 rows
+        ..Default::default()
+    };
     h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
     assert!(
         ScxReader::open(&scx_path)
@@ -5752,7 +5754,8 @@ fn write_dataframe_group_honors_pandas_index_metadata_unnamed() {
         "__index_level_0__",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -5797,7 +5800,8 @@ fn write_dataframe_group_honors_pandas_index_metadata_named() {
         "gene_symbols",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -5855,7 +5859,8 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
     let symbols = Arc::new(StringArray::from(vec!["GENE_A", "GENE_B"]));
     let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
     let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![symbols, gene_ids]).unwrap();
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch).unwrap();
+    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+        .unwrap();
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
@@ -6419,4 +6424,1212 @@ fn process_outcomes_non_missing_forced_error_stays_fail_fast() {
         !msg.contains("Did you mean"),
         "non-missing reason should not strsim: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Task 6a: streaming obs/var HDF5 hyperslab writes over sharded obs.
+// ---------------------------------------------------------------------
+
+mod streaming_obs_hdf5 {
+    //! Round-trip and edge-case tests for the
+    //! [`write_dataframe_group_streaming`] obs/var writer wired into
+    //! `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming`.
+    //!
+    //! Fixtures construct sharded-obs SCX files directly via
+    //! `ScxWriter::write_obs_shard` so test inputs span numeric, string,
+    //! disjoint-dictionary, and nullable-boolean columns. Outputs are
+    //! validated by re-reading the h5ad on disk via the SCX writer's own
+    //! `read_dataframe_group` helper (the same code AnnData uses) and
+    //! asserting column equality with the assembled-eager baseline.
+    //!
+    //! Pre-existing tests in `scx-format/tests/large_obs.rs` cover the
+    //! format-level sharded round-trip; this module covers the export
+    //! direction (sharded obs → h5ad/h5mu via hyperslab writes).
+
+    use std::sync::Arc;
+
+    use arrow::array::{
+        Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
+        Int64Array, LargeStringArray, RecordBatch, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int32Type, Int8Type, Schema};
+
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format::header::{HEADER_SIZE, MAGIC};
+    use scx_format::{FileHeader, ScxReader, ScxWriter};
+
+    use crate::h5ad_read::read_dataframe_group;
+    use crate::h5ad_stream_write::write_scx_to_h5ad_streaming;
+    use crate::h5ad_write::{
+        write_dataframe_group_at, write_dataframe_group_streaming, write_scx_to_h5ad,
+    };
+    use crate::pipeline::ConvertOptions;
+    use crate::warnings::WarningSink;
+
+    fn header(n_obs: u64, n_vars: u64) -> FileHeader {
+        FileHeader {
+            magic: MAGIC,
+            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            header_length: HEADER_SIZE as u16,
+            flags: 0,
+            n_obs,
+            n_vars,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 16384,
+            codec_id: 0,
+            index_dtype: if n_vars <= 65535 { 0 } else { 1 },
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        }
+    }
+
+    /// Build an obs `RecordBatch` for a shard. Columns:
+    ///   - `_index`: Utf8 "cell_{i}".
+    ///   - `n_genes`: Int32 (i % 100).
+    ///   - `is_doublet`: Boolean, alternating; nulls at every 7th row.
+    ///   - `cell_type`: Dictionary<Int8, Utf8> with a per-shard subset
+    ///     of category strings so streaming must unify across shards.
+    fn obs_shard_batch(start_row: usize, n: usize, shard_idx: u32) -> RecordBatch {
+        let cell_ids: Vec<String> = (start_row..start_row + n)
+            .map(|i| format!("cell_{i:06}"))
+            .collect();
+        let n_genes: Vec<i32> = (0..n).map(|i| ((start_row + i) % 100) as i32).collect();
+        let is_doublet_values: Vec<Option<bool>> = (0..n)
+            .map(|i| {
+                if (start_row + i).is_multiple_of(7) {
+                    None
+                } else {
+                    Some(!(start_row + i).is_multiple_of(2))
+                }
+            })
+            .collect();
+        // Per-shard categorical vocabulary (disjoint across shards):
+        //   shard 0 → {"T cell", "B cell"}
+        //   shard 1 → {"NK cell", "Monocyte"}
+        //   shard 2 → {"T cell", "Macrophage"}
+        //   shard 3 → {"B cell"}
+        let vocab: Vec<&'static str> = match shard_idx {
+            0 => vec!["T cell", "B cell"],
+            1 => vec!["NK cell", "Monocyte"],
+            2 => vec!["T cell", "Macrophage"],
+            _ => vec!["B cell"],
+        };
+        let cat_array: Vec<&str> = (0..n).map(|i| vocab[i % vocab.len()]).collect();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("n_genes", DataType::Int32, false),
+            Field::new("is_doublet", DataType::Boolean, true),
+            Field::new(
+                "cell_type",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]);
+        let cell_ids_arr: ArrayRef = Arc::new(StringArray::from(cell_ids));
+        let n_genes_arr: ArrayRef = Arc::new(Int32Array::from(n_genes));
+        let is_doublet_arr: ArrayRef = Arc::new(BooleanArray::from(is_doublet_values));
+        let cat_arr: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::from_iter(
+            cat_array.into_iter().map(Some),
+        ));
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![cell_ids_arr, n_genes_arr, is_doublet_arr, cat_arr],
+        )
+        .unwrap()
+    }
+
+    fn small_var_batch() -> RecordBatch {
+        let gene_ids = StringArray::from(vec!["ENSG0", "ENSG1", "ENSG2", "ENSG3"]);
+        let schema = Schema::new(vec![Field::new("_index", DataType::Utf8, false)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(gene_ids)]).unwrap()
+    }
+
+    /// One empty CSR shard per obs shard so CSR row counts match obs.
+    fn write_zero_csr_shard(writer: &mut ScxWriter, row_start: u64, n_rows: u64) {
+        let indptr: Vec<u64> = vec![0u64; (n_rows + 1) as usize];
+        writer
+            .write_csr_shard(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start,
+            )
+            .unwrap();
+    }
+
+    /// Build a sharded-obs SCX file with the per-shard fixture above.
+    fn build_sharded_obs_scx(path: &std::path::Path, n_shards: u32, rows_per_shard: u64) {
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+        for shard_idx in 0..n_shards {
+            let row_start = u64::from(shard_idx) * rows_per_shard;
+            let batch = obs_shard_batch(row_start as usize, rows_per_shard as usize, shard_idx);
+            writer
+                .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                .unwrap();
+            write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+        }
+        writer.write_var(&small_var_batch()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// Sharded-obs SCX → streaming h5ad export. Confirms that each
+    /// column round-trips with the same values as the eager (assembled)
+    /// baseline — and that the categorical column's running global
+    /// dictionary correctly unifies disjoint per-shard vocabularies.
+    #[test]
+    fn test_streaming_obs_round_trip_sharded_to_h5ad() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("sharded.scx");
+        let h5ad_stream = dir.path().join("stream.h5ad");
+        let h5ad_eager = dir.path().join("eager.h5ad");
+
+        // 4 shards × 50 rows = 200 obs. Disjoint dict per shard exposes
+        // the running-global-dictionary code path.
+        build_sharded_obs_scx(&scx_path, 4, 50);
+
+        // Sanity: the fixture is actually sharded.
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(reader.obs_metadata_shard_count(), 4);
+        assert_eq!(reader.n_obs(), 200);
+
+        // Streaming export.
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
+            .unwrap();
+        // Eager baseline (the existing materialising writer reads
+        // assembled obs and writes via `write_dataframe_group_at`).
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
+
+        // Re-read both via the SCX writer's own h5ad reader and
+        // compare obs column-by-column. The eager baseline is the
+        // source of truth (it goes through `reader.read_obs()` and
+        // the existing eager column writer — same code path as before
+        // task 6a).
+        let stream_file = hdf5::File::open(&h5ad_stream).unwrap();
+        let eager_file = hdf5::File::open(&h5ad_eager).unwrap();
+        let stream_obs = read_dataframe_group(&stream_file, "obs").unwrap();
+        let eager_obs = read_dataframe_group(&eager_file, "obs").unwrap();
+
+        assert_eq!(stream_obs.num_rows(), 200);
+        assert_eq!(stream_obs.num_rows(), eager_obs.num_rows());
+        assert_eq!(stream_obs.num_columns(), eager_obs.num_columns());
+
+        for col_name in ["cell_id", "n_genes", "is_doublet", "cell_type"] {
+            let s_idx = stream_obs
+                .schema()
+                .index_of(col_name)
+                .unwrap_or_else(|_| panic!("streaming output missing column {col_name}"));
+            let e_idx = eager_obs.schema().index_of(col_name).unwrap();
+            let s = stream_obs.column(s_idx);
+            let e = eager_obs.column(e_idx);
+            // Categorical reassembly may use different dictionary
+            // key widths (eager uses i32 promoted; streaming reads
+            // back as whatever AnnData's reader produces). Compare
+            // logical values column-by-column, not dictionary codes.
+            compare_columns_logical(s, e, col_name);
+        }
+    }
+
+    /// Streaming export when the entry point is called on a legacy
+    /// single-section SCX file. The dispatcher must fall back to the
+    /// eager path; output is byte-identical to the prior behavior.
+    #[test]
+    fn test_streaming_obs_legacy_single_section_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("legacy.scx");
+        let h5ad_stream = dir.path().join("stream.h5ad");
+        let h5ad_eager = dir.path().join("eager.h5ad");
+
+        // Legacy single-section obs.
+        {
+            let n_obs: u64 = 80;
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            let batch = obs_shard_batch(0, n_obs as usize, 0);
+            writer.write_obs(&batch).unwrap();
+            write_zero_csr_shard(&mut writer, 0, n_obs);
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(
+            reader.obs_metadata_shard_count(),
+            0,
+            "fixture must be legacy"
+        );
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
+            .unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
+
+        // Logical column equality is the user-visible contract.
+        let stream_file = hdf5::File::open(&h5ad_stream).unwrap();
+        let eager_file = hdf5::File::open(&h5ad_eager).unwrap();
+        let stream_obs = read_dataframe_group(&stream_file, "obs").unwrap();
+        let eager_obs = read_dataframe_group(&eager_file, "obs").unwrap();
+
+        assert_eq!(stream_obs.num_rows(), eager_obs.num_rows());
+        assert_eq!(stream_obs.num_columns(), eager_obs.num_columns());
+        for col_name in ["cell_id", "n_genes", "is_doublet", "cell_type"] {
+            let s = stream_obs.column(stream_obs.schema().index_of(col_name).unwrap());
+            let e = eager_obs.column(eager_obs.schema().index_of(col_name).unwrap());
+            compare_columns_logical(s, e, col_name);
+        }
+    }
+
+    /// Sharded obs + active deletion vectors: only kept-row obs values
+    /// must appear in the h5ad output, and the row count must match
+    /// `/X/shape[0]` (which the streaming `/X` writer already filters
+    /// by the same keep mask).
+    #[test]
+    fn test_streaming_obs_with_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("dv.scx");
+        let h5ad_out = dir.path().join("out.h5ad");
+
+        // 4 shards × 20 rows = 80 obs. Delete rows {3, 15, 27, 60} —
+        // 76 kept rows, spread across shards (1st in shard 0, 2nd in
+        // shard 0, 3rd in shard 1, 4th in shard 3).
+        build_sharded_obs_scx(&scx_path, 4, 20);
+        let deleted: Vec<u64> = vec![3, 15, 27, 60];
+        scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad_out).unwrap();
+        let shape: Vec<i64> = file
+            .group("X")
+            .unwrap()
+            .attr("shape")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        assert_eq!(shape[0], 76, "X kept-row count");
+
+        // Read obs back and verify row count + that deleted cell_ids
+        // do not appear.
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), 76, "obs kept-row count must match /X");
+        let cell_id_col = obs.column(obs.schema().index_of("cell_id").unwrap());
+        let s = cell_id_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let deleted_strings: std::collections::HashSet<String> =
+            deleted.iter().map(|&i| format!("cell_{i:06}")).collect();
+        for i in 0..s.len() {
+            assert!(
+                !deleted_strings.contains(s.value(i)),
+                "obs row {i} ({}) was supposed to be deleted",
+                s.value(i)
+            );
+        }
+        // First-non-deleted row check: row 0 must be "cell_000000"
+        // (row 0 was kept).
+        assert_eq!(s.value(0), "cell_000000");
+    }
+
+    /// Non-streaming `write_scx_to_h5ad` on a sharded source with
+    /// active deletion vectors. Pre-fix, this path passed `None` as
+    /// the keep mask and dropped DVs silently on both /X (via the
+    /// unfiltered `read_all_csr_shards`) and obs (via unfiltered
+    /// `read_obs`). The fix routes both legs through the
+    /// `_filtered` reader and the shared streaming-or-eager obs
+    /// dispatcher, so the kept-row count is honored symmetrically.
+    #[test]
+    fn test_eager_obs_with_deletion_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("dv_eager.scx");
+        let h5ad_out = dir.path().join("eager_out.h5ad");
+
+        // Same fixture as the streaming DV test: 4×20 rows, delete 4.
+        build_sharded_obs_scx(&scx_path, 4, 20);
+        let deleted: Vec<u64> = vec![3, 15, 27, 60];
+        scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+        write_scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad_out).unwrap();
+        let shape: Vec<i64> = file
+            .group("X")
+            .unwrap()
+            .attr("shape")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        assert_eq!(shape[0], 76, "non-streaming /X must filter DVs");
+
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(
+            obs.num_rows(),
+            76,
+            "non-streaming obs row count must match /X (was unfiltered pre-fix)"
+        );
+        let cell_id_col = obs.column(obs.schema().index_of("cell_id").unwrap());
+        let s = cell_id_col.as_any().downcast_ref::<StringArray>().unwrap();
+        let deleted_strings: std::collections::HashSet<String> =
+            deleted.iter().map(|&i| format!("cell_{i:06}")).collect();
+        for i in 0..s.len() {
+            assert!(
+                !deleted_strings.contains(s.value(i)),
+                "obs row {i} ({}) was supposed to be deleted",
+                s.value(i)
+            );
+        }
+        assert_eq!(s.value(0), "cell_000000");
+    }
+
+    /// Obsm DV regression: after the eager / streaming paths started
+    /// filtering /X and obs by the keep mask, a latent row-count
+    /// mismatch on obsm became user-visible (obs.n_obs == X.shape[0]
+    /// but obsm[key].shape[0] still equalled pre-deletion n_obs).
+    /// This test locks in obsm filtering on both entry points.
+    #[test]
+    fn test_obsm_with_deletion_vectors() {
+        use arrow::array::Float32Array;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("dv_obsm.scx");
+        let h5ad_stream_out = dir.path().join("stream.h5ad");
+        let h5ad_eager_out = dir.path().join("eager.h5ad");
+
+        // 4×20 = 80 obs; add an X_pca-like obsm with 3 components.
+        let n_shards: u32 = 4;
+        let rows_per_shard: u64 = 20;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let batch = obs_shard_batch(row_start as usize, rows_per_shard as usize, shard_idx);
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            // Obsm: 80 × 3 dense Float32. Values encode (row, comp)
+            // so we can verify post-filter alignment in the assert.
+            let n = n_obs as usize;
+            let c0: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| i as f32).collect::<Vec<f32>>(),
+            ));
+            let c1: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| (i as f32) + 0.5).collect::<Vec<f32>>(),
+            ));
+            let c2: ArrayRef = Arc::new(Float32Array::from(
+                (0..n).map(|i| -(i as f32)).collect::<Vec<f32>>(),
+            ));
+            let obsm_schema = Schema::new(vec![
+                Field::new("c0", DataType::Float32, false),
+                Field::new("c1", DataType::Float32, false),
+                Field::new("c2", DataType::Float32, false),
+            ]);
+            let obsm_batch = RecordBatch::try_new(Arc::new(obsm_schema), vec![c0, c1, c2]).unwrap();
+            writer.write_obsm("X_pca", &obsm_batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let deleted: Vec<u64> = vec![3, 15, 27, 60];
+        scx_ops::mark_deleted(&scx_path, &deleted).unwrap();
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream_out, &opts, &mut WarningSink::log())
+            .unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager_out, &mut WarningSink::log()).unwrap();
+
+        let kept_rows: Vec<usize> = (0..n_obs as usize)
+            .filter(|i| !deleted.contains(&(*i as u64)))
+            .collect();
+        assert_eq!(kept_rows.len(), 76);
+
+        for path in [&h5ad_stream_out, &h5ad_eager_out] {
+            let file = hdf5::File::open(path).unwrap();
+            let obsm_pca = file.dataset("obsm/X_pca").unwrap();
+            let shape = obsm_pca.shape();
+            assert_eq!(
+                shape,
+                vec![76, 3],
+                "obsm/X_pca shape mismatch at {path:?} — must equal kept-row count after DV filter",
+            );
+            // First-row spot-check: kept_rows[0] == 0 (row 0 is kept),
+            // so the first surviving row's c0 should be `0.0`.
+            let arr: ndarray::Array2<f32> = obsm_pca.read_2d().unwrap();
+            assert_eq!(arr[[0, 0]], 0.0, "first kept row's c0 at {path:?}");
+            assert_eq!(arr[[0, 1]], 0.5, "first kept row's c1 at {path:?}");
+            // Last surviving row's c0 should equal kept_rows.last().
+            let last_kept = *kept_rows.last().unwrap() as f32;
+            assert_eq!(arr[[75, 0]], last_kept, "last kept row's c0 at {path:?}",);
+        }
+    }
+
+    /// Build an obs shard fixture with an Arrow type the writer
+    /// cannot encode (`Date32`) alongside the standard columns. Used
+    /// by the issue-5 regression test.
+    fn obs_shard_batch_with_unsupported(start_row: usize, n: usize, shard_idx: u32) -> RecordBatch {
+        use arrow::array::Date32Array;
+        let base = obs_shard_batch(start_row, n, shard_idx);
+        // Append a Date32 column. Days-since-epoch values are arbitrary.
+        let dates: Vec<i32> = (0..n).map(|i| (start_row + i) as i32).collect();
+        let dates_arr: ArrayRef = Arc::new(Date32Array::from(dates));
+
+        let mut fields: Vec<Field> = base
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("captured_on", DataType::Date32, false));
+        let new_schema = Arc::new(Schema::new(fields));
+        let mut cols: Vec<ArrayRef> = (0..base.num_columns())
+            .map(|i| base.column(i).clone())
+            .collect();
+        cols.push(dates_arr);
+        RecordBatch::try_new(new_schema, cols).unwrap()
+    }
+
+    /// Issue 5: when a shard carries a column with an Arrow type the
+    /// writer cannot encode (e.g. `Date32`), the streaming + eager
+    /// paths warn-and-skip the column. The column must NOT appear in
+    /// the `column-order` HDF5 attribute — otherwise
+    /// `anndata.read_h5ad` raises a `KeyError` looking up a missing
+    /// dataset.
+    #[test]
+    fn test_streaming_obs_unsupported_column_excluded_from_column_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("unsupported.scx");
+        let h5ad_stream = dir.path().join("stream.h5ad");
+        let h5ad_eager = dir.path().join("eager.h5ad");
+
+        // Build a sharded obs SCX with the unsupported `captured_on`
+        // (Date32) column tacked onto each shard's batch.
+        let n_shards: u32 = 2;
+        let rows_per_shard: u64 = 20;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let batch = obs_shard_batch_with_unsupported(
+                    row_start as usize,
+                    rows_per_shard as usize,
+                    shard_idx,
+                );
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
+            .unwrap();
+        // Eager path also routes through the streaming-or-eager
+        // dispatcher post-issue-2 fix, but the assertion is the same:
+        // the unsupported column must not leak into `column-order`.
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
+
+        for path in [&h5ad_stream, &h5ad_eager] {
+            let file = hdf5::File::open(path).unwrap();
+            let obs = file.group("obs").unwrap();
+            let column_order: Vec<hdf5::types::VarLenUnicode> = obs
+                .attr("column-order")
+                .unwrap()
+                .read_1d()
+                .unwrap()
+                .to_vec();
+            let names: Vec<String> = column_order.iter().map(|v| v.to_string()).collect();
+            assert!(
+                !names.iter().any(|n| n == "captured_on"),
+                "unsupported `captured_on` (Date32) leaked into column-order at {path:?}: {names:?}",
+            );
+            // The supported columns must still be present.
+            for expected in ["n_genes", "is_doublet", "cell_type"] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "supported column `{expected}` missing from column-order at {path:?}: {names:?}",
+                );
+            }
+            // No HDF5 dataset for the skipped column either.
+            assert!(
+                obs.dataset("captured_on").is_err(),
+                "skipped column should not have a backing dataset at {path:?}",
+            );
+        }
+    }
+
+    /// Sharded **var** export: var has its own `VarMetadataShard`
+    /// section type, and the streaming dispatcher must take the
+    /// sharded var path when shards are present. var-axis deletion
+    /// vectors don't exist, so this only validates the schema-only
+    /// shard count plus pre-allocate + hyperslab round-trip.
+    #[test]
+    fn test_streaming_var_round_trip_sharded_to_h5ad() {
+        use arrow::array::ArrayRef;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("sharded_var.scx");
+        let h5ad_out = dir.path().join("out.h5ad");
+
+        // 3 var shards × 5 rows = 15 genes. Two columns:
+        // `gene_id: Utf8` (the index), `gene_type: Dictionary<Int8, Utf8>`.
+        // The single-section obs path runs in parallel to keep the
+        // fixture small.
+        let n_obs: u64 = 10;
+        let n_vars: u64 = 15;
+        let var_shards: u32 = 3;
+        let rows_per_var_shard: u64 = 5;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, n_vars)).unwrap();
+            // Tiny legacy obs.
+            let obs_batch = obs_shard_batch(0, n_obs as usize, 0);
+            writer.write_obs(&obs_batch).unwrap();
+            // Sharded var.
+            for s in 0..var_shards {
+                let row_start = u64::from(s) * rows_per_var_shard;
+                let gene_ids: Vec<String> = (row_start..row_start + rows_per_var_shard)
+                    .map(|i| format!("ENSG{i:05}"))
+                    .collect();
+                let gene_types: Vec<&'static str> = (0..rows_per_var_shard)
+                    .map(|i| {
+                        if i.is_multiple_of(2) {
+                            "protein_coding"
+                        } else {
+                            "lncRNA"
+                        }
+                    })
+                    .collect();
+                let var_schema = Schema::new(vec![
+                    Field::new("gene_id", DataType::Utf8, false),
+                    Field::new(
+                        "gene_type",
+                        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                        false,
+                    ),
+                ]);
+                let gene_id_arr: ArrayRef = Arc::new(StringArray::from(gene_ids));
+                let gene_type_arr: ArrayRef = Arc::new(DictionaryArray::<Int8Type>::from_iter(
+                    gene_types.into_iter().map(Some),
+                ));
+                let batch =
+                    RecordBatch::try_new(Arc::new(var_schema), vec![gene_id_arr, gene_type_arr])
+                        .unwrap();
+                writer
+                    .write_var_shard(s, row_start, rows_per_var_shard, n_vars, &batch)
+                    .unwrap();
+            }
+            // One CSR shard matching obs rows.
+            write_zero_csr_shard(&mut writer, 0, n_obs);
+            writer.finish().unwrap();
+        }
+
+        // Sanity: var actually sharded.
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(reader.var_metadata_shard_count(), var_shards as usize);
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad_out).unwrap();
+        let var = read_dataframe_group(&file, "var").unwrap();
+        assert_eq!(var.num_rows(), n_vars as usize);
+        let gene_id_col = var.column(var.schema().index_of("gene_id").unwrap());
+        let s = gene_id_col.as_any().downcast_ref::<StringArray>().unwrap();
+        // Sharded contents arrived in order under the streaming write.
+        assert_eq!(s.value(0), "ENSG00000");
+        assert_eq!(
+            s.value((n_vars - 1) as usize),
+            format!("ENSG{:05}", n_vars - 1)
+        );
+    }
+
+    /// h5mu equivalent: sharded global obs + multimodal CSR. The
+    /// streaming h5mu writer must emit obs once at root and again
+    /// per-modality (mudata convention).
+    #[test]
+    fn test_streaming_obs_round_trip_sharded_to_h5mu() {
+        use crate::mudata_write::scx_to_h5mu_streaming;
+        use scx_format::modality::ModalityType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("sharded_mm.scx");
+        let h5mu_out = dir.path().join("out.h5mu");
+
+        // Build a minimal multimodal SCX with sharded global obs.
+        // Two modalities, one CSR shard each. 3 obs shards × 30 rows.
+        let n_shards: u32 = 3;
+        let rows_per_shard: u64 = 30;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 0)).unwrap();
+            let rna_id = writer
+                .add_modality(
+                    "rna",
+                    ModalityType::Rna,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    false,
+                )
+                .unwrap();
+            let adt_id = writer
+                .add_modality(
+                    "adt",
+                    ModalityType::Protein,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    false,
+                )
+                .unwrap();
+            // Per-modality var (small, not sharded). Must be written
+            // before write_csr_shard_for picks up the n_vars from the
+            // modality table.
+            writer.write_var_for(rna_id, &small_var_batch()).unwrap();
+            let adt_var = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "_index",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![Arc::new(StringArray::from(vec!["CD4", "CD8"]))],
+            )
+            .unwrap();
+            writer.write_var_for(adt_id, &adt_var).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let batch = obs_shard_batch(row_start as usize, rows_per_shard as usize, shard_idx);
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+            }
+            // One zero-nnz CSR shard per modality covering all rows.
+            let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
+            writer
+                .write_csr_shard_for(
+                    rna_id,
+                    &indptr,
+                    &[],
+                    &[],
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+            writer
+                .write_csr_shard_for(
+                    adt_id,
+                    &indptr,
+                    &[],
+                    &[],
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    0,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let opts = ConvertOptions::default();
+        scx_to_h5mu_streaming(&scx_path, &h5mu_out, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5mu_out).unwrap();
+        // Global obs present.
+        let root_obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(root_obs.num_rows(), n_obs as usize);
+        // Each column survived the streaming export.
+        for col_name in ["cell_id", "n_genes", "is_doublet", "cell_type"] {
+            assert!(
+                root_obs.schema().index_of(col_name).is_ok(),
+                "root obs missing column '{col_name}'"
+            );
+        }
+        // Per-modality obs is also written (mudata convention) and
+        // carries the same row count.
+        let rna_obs = read_dataframe_group(&file, "mod/rna/obs").unwrap();
+        assert_eq!(rna_obs.num_rows(), n_obs as usize);
+        let adt_obs = read_dataframe_group(&file, "mod/adt/obs").unwrap();
+        assert_eq!(adt_obs.num_rows(), n_obs as usize);
+    }
+
+    /// Helper: compare two h5ad-read columns by logical values.
+    /// Handles the case where streaming and eager may pick different
+    /// dictionary key widths or coerce strings differently — what
+    /// matters is the user-visible string / int / bool.
+    fn compare_columns_logical(s: &ArrayRef, e: &ArrayRef, col_name: &str) {
+        let n = s.len();
+        assert_eq!(e.len(), n, "{col_name}: length mismatch");
+        match (s.data_type(), e.data_type()) {
+            (DataType::Int32, DataType::Int32) => {
+                let s = s.as_any().downcast_ref::<Int32Array>().unwrap();
+                let e = e.as_any().downcast_ref::<Int32Array>().unwrap();
+                for i in 0..n {
+                    assert_eq!(
+                        s.value(i),
+                        e.value(i),
+                        "{col_name} row {i}: streaming={} eager={}",
+                        s.value(i),
+                        e.value(i)
+                    );
+                }
+            }
+            (DataType::Utf8, DataType::Utf8) => {
+                let s = s.as_any().downcast_ref::<StringArray>().unwrap();
+                let e = e.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.value(i), e.value(i), "{col_name} row {i}");
+                }
+            }
+            (DataType::Boolean, DataType::Boolean) => {
+                let s = s.as_any().downcast_ref::<BooleanArray>().unwrap();
+                let e = e.as_any().downcast_ref::<BooleanArray>().unwrap();
+                for i in 0..n {
+                    assert_eq!(s.is_valid(i), e.is_valid(i), "{col_name} mask row {i}");
+                    if s.is_valid(i) {
+                        assert_eq!(s.value(i), e.value(i), "{col_name} value row {i}");
+                    }
+                }
+            }
+            // Dictionary <K, Utf8> — compare by resolved strings.
+            (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
+                let s_strings = dict_to_strings(s, col_name);
+                let e_strings = dict_to_strings(e, col_name);
+                assert_eq!(s_strings, e_strings, "{col_name}: categorical mismatch");
+            }
+            (lhs, rhs) => panic!("{col_name}: dtype mismatch (streaming={lhs:?}, eager={rhs:?})"),
+        }
+    }
+
+    fn dict_to_strings(arr: &ArrayRef, col_name: &str) -> Vec<Option<String>> {
+        // The h5ad reader produces Dictionary<Int32, Utf8> regardless
+        // of the input key width (`dict_codes_and_categories_i32`
+        // promotes everything to i32 on the eager path; the streaming
+        // path does the same via the running global dict).
+        let dict = arr
+            .as_any()
+            .downcast_ref::<DictionaryArray<arrow::datatypes::Int32Type>>()
+            .unwrap_or_else(|| panic!("{col_name}: expected Dictionary<Int32, Utf8>"));
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("{col_name}: expected Utf8 dict values"));
+        (0..dict.len())
+            .map(|i| {
+                if dict.is_valid(i) {
+                    let code = dict.keys().value(i) as usize;
+                    Some(values.value(code).to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ---- Nullable-encoding round-trip coverage (Patch 2) ----------------
+
+    /// obs shard batch with explicitly nullable numeric / string columns.
+    /// Besides the `cell_id` index (non-null):
+    ///   - `ncount` Int32,   null when global row % 5 == 0
+    ///   - `umi`    Int64,   null when global row % 3 == 0
+    ///   - `pct`    Float32, null when global row % 4 == 0
+    ///   - `score`  Float64, null when global row % 6 == 0
+    ///   - `batch`  Utf8,    null when global row % 7 == 0
+    fn nullable_obs_shard_batch(start_row: usize, n: usize) -> RecordBatch {
+        let cell_ids: Vec<String> = (start_row..start_row + n)
+            .map(|i| format!("cell_{i:06}"))
+            .collect();
+        let ncount: Vec<Option<i32>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(5)).then_some(g as i32)
+            })
+            .collect();
+        let umi: Vec<Option<i64>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(3)).then_some(g as i64 * 1000)
+            })
+            .collect();
+        let pct: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(4)).then_some(g as f32 * 0.5)
+            })
+            .collect();
+        let score: Vec<Option<f64>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(6)).then_some(g as f64 * 1.5)
+            })
+            .collect();
+        let batch: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                let g = start_row + i;
+                (!g.is_multiple_of(7)).then(|| format!("batch_{}", g % 3))
+            })
+            .collect();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("ncount", DataType::Int32, true),
+            Field::new("umi", DataType::Int64, true),
+            Field::new("pct", DataType::Float32, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("batch", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)),
+                Arc::new(Int32Array::from(ncount)),
+                Arc::new(Int64Array::from(umi)),
+                Arc::new(Float32Array::from(pct)),
+                Arc::new(Float64Array::from(score)),
+                Arc::new(StringArray::from(batch)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn build_nullable_sharded_scx(path: &std::path::Path, n_shards: u32, rows_per_shard: u64) {
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+        for shard_idx in 0..n_shards {
+            let row_start = u64::from(shard_idx) * rows_per_shard;
+            let batch = nullable_obs_shard_batch(row_start as usize, rows_per_shard as usize);
+            writer
+                .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                .unwrap();
+            write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+        }
+        writer.write_var(&small_var_batch()).unwrap();
+        writer.finish().unwrap();
+    }
+
+    /// On-disk `encoding-type` of an obs column when it is a group
+    /// (categorical / nullable-*); `None` when the column is a plain
+    /// dataset.
+    fn obs_col_encoding(file: &hdf5::File, col: &str) -> Option<String> {
+        file.group("obs")
+            .unwrap()
+            .group(col)
+            .ok()
+            .and_then(|g| g.attr("encoding-type").ok())
+            .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+            .map(|v| v.to_string())
+    }
+
+    /// Assert the per-row null state + values of the nullable fixture
+    /// survive the round trip through `read_dataframe_group`.
+    fn assert_nullable_values(obs: &RecordBatch, n_obs: usize) {
+        let ncount = obs.column(obs.schema().index_of("ncount").unwrap());
+        let ncount = ncount.as_any().downcast_ref::<Int32Array>().unwrap();
+        let umi = obs.column(obs.schema().index_of("umi").unwrap());
+        let umi = umi.as_any().downcast_ref::<Int64Array>().unwrap();
+        let pct = obs.column(obs.schema().index_of("pct").unwrap());
+        let pct = pct.as_any().downcast_ref::<Float32Array>().unwrap();
+        let score = obs.column(obs.schema().index_of("score").unwrap());
+        let score = score.as_any().downcast_ref::<Float64Array>().unwrap();
+        let batch = obs.column(obs.schema().index_of("batch").unwrap());
+        let batch = batch.as_any().downcast_ref::<StringArray>().unwrap();
+
+        for g in 0..n_obs {
+            // Integer / string nulls preserve validity (mask).
+            if g.is_multiple_of(5) {
+                assert!(ncount.is_null(g), "ncount row {g} should be null");
+            } else {
+                assert_eq!(ncount.value(g), g as i32, "ncount row {g}");
+            }
+            if g.is_multiple_of(3) {
+                assert!(umi.is_null(g), "umi row {g} should be null");
+            } else {
+                assert_eq!(umi.value(g), g as i64 * 1000, "umi row {g}");
+            }
+            if g.is_multiple_of(7) {
+                assert!(batch.is_null(g), "batch row {g} should be null");
+            } else {
+                assert_eq!(batch.value(g), format!("batch_{}", g % 3), "batch row {g}");
+            }
+            // Float nulls become NaN (plain dataset, no validity).
+            if g.is_multiple_of(4) {
+                assert!(pct.value(g).is_nan(), "pct row {g} should be NaN");
+            } else {
+                assert_eq!(pct.value(g), g as f32 * 0.5, "pct row {g}");
+            }
+            if g.is_multiple_of(6) {
+                assert!(score.value(g).is_nan(), "score row {g} should be NaN");
+            } else {
+                assert_eq!(score.value(g), g as f64 * 1.5, "score row {g}");
+            }
+        }
+    }
+
+    /// Assert the on-disk encodings: int/string → nullable group; float →
+    /// plain dataset (anndata has no nullable-float spec).
+    fn assert_nullable_encodings(file: &hdf5::File) {
+        assert_eq!(
+            obs_col_encoding(file, "ncount").as_deref(),
+            Some("nullable-integer")
+        );
+        assert_eq!(
+            obs_col_encoding(file, "umi").as_deref(),
+            Some("nullable-integer")
+        );
+        assert_eq!(
+            obs_col_encoding(file, "batch").as_deref(),
+            Some("nullable-string-array")
+        );
+        // Floats stay plain datasets.
+        assert_eq!(obs_col_encoding(file, "pct"), None, "pct must be plain");
+        assert_eq!(obs_col_encoding(file, "score"), None, "score must be plain");
+    }
+
+    /// Eager export (legacy single-section obs): null int/string columns
+    /// round-trip via nullable groups, floats via NaN.
+    #[test]
+    fn test_nullable_round_trip_eager() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullable_legacy.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        let n_obs: u64 = 60;
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            writer
+                .write_obs(&nullable_obs_shard_batch(0, n_obs as usize))
+                .unwrap();
+            write_zero_csr_shard(&mut writer, 0, n_obs);
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(
+            ScxReader::open(&scx_path)
+                .unwrap()
+                .obs_metadata_shard_count(),
+            0,
+            "fixture must be legacy single-section"
+        );
+
+        write_scx_to_h5ad(&scx_path, &h5ad, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        assert_nullable_encodings(&file);
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), n_obs as usize);
+        assert_nullable_values(&obs, n_obs as usize);
+    }
+
+    /// Streaming export (sharded obs): same nullable contract, exercised
+    /// through the pre-scan + per-shard nullable group writers.
+    #[test]
+    fn test_nullable_round_trip_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullable_sharded.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        // 3 shards × 20 rows = 60 obs.
+        build_nullable_sharded_scx(&scx_path, 3, 20);
+        assert_eq!(
+            ScxReader::open(&scx_path)
+                .unwrap()
+                .obs_metadata_shard_count(),
+            3
+        );
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        assert_nullable_encodings(&file);
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), 60);
+        assert_nullable_values(&obs, 60);
+    }
+
+    /// A null-free integer column must still be written as a plain
+    /// dataset (no behaviour change for the common case). Uses the
+    /// existing all-valid `n_genes` Int32 fixture column.
+    #[test]
+    fn test_null_free_int_column_stays_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("nullfree.scx");
+        let h5ad = dir.path().join("out.h5ad");
+
+        build_sharded_obs_scx(&scx_path, 2, 25);
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad, &opts, &mut WarningSink::log()).unwrap();
+
+        let file = hdf5::File::open(&h5ad).unwrap();
+        // `n_genes` has no nulls → plain dataset, not a nullable group.
+        assert_eq!(
+            obs_col_encoding(&file, "n_genes"),
+            None,
+            "null-free int column must remain a plain dataset"
+        );
+    }
+
+    /// The streaming writer must reject a shard whose columns are
+    /// reordered relative to the declared schema (same count) rather than
+    /// writing values into the wrong HDF5 column.
+    #[test]
+    fn test_streaming_rejects_reordered_shard_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("x.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let good = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![3, 4])),
+            ],
+        )
+        .unwrap();
+        // Same column count + types but `a`/`b` names swapped.
+        let bad_schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        let bad = RecordBatch::try_new(
+            Arc::new(bad_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c2", "c3"])),
+                Arc::new(Int32Array::from(vec![5, 6])),
+                Arc::new(Int32Array::from(vec![7, 8])),
+            ],
+        )
+        .unwrap();
+
+        let needs_nullable = vec![false; schema.fields().len()];
+        let shards: Vec<Result<RecordBatch, scx_format::error::ScxError>> = vec![Ok(good), Ok(bad)];
+        let res = write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &schema,
+            shards,
+            4,
+            None,
+            &needs_nullable,
+            &mut WarningSink::log(),
+        );
+        let err = res.expect_err("reordered shard must be rejected");
+        assert!(
+            format!("{err}").contains("shard schema mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The eager dataframe writer must handle wide string columns
+    /// (`LargeUtf8`) and `Dictionary(_, LargeUtf8)` categoricals the same
+    /// way the streaming writer does, rather than dropping them to
+    /// `UnsupportedExportColumn`. A null-bearing `LargeUtf8` column must
+    /// round-trip via a `nullable-string-array` group; a
+    /// `Dictionary(Int32, LargeUtf8)` categorical (with a null code) must
+    /// round-trip via a `categorical` group.
+    #[test]
+    fn test_eager_writes_largeutf8_and_largeutf8_categorical() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("largeutf8.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+
+        // First field is the index (no pandas metadata → field 0).
+        // `note` is a null-bearing wide-string column; `ct` is a
+        // categorical whose dictionary values are LargeUtf8 with a null
+        // code at row 2.
+        let keys = Int32Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let cat_values: ArrayRef = Arc::new(LargeStringArray::from(vec!["typeA", "typeB"]));
+        let ct = DictionaryArray::<Int32Type>::new(keys, cat_values);
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("note", DataType::LargeUtf8, true),
+            Field::new("ct", ct.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1", "c2", "c3"])),
+                Arc::new(LargeStringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("d"),
+                ])),
+                Arc::new(ct),
+            ],
+        )
+        .unwrap();
+
+        write_dataframe_group_at(&root, "obs", &batch, &mut WarningSink::log()).unwrap();
+        drop(file);
+
+        let file = hdf5::File::open(dir.path().join("largeutf8.h5ad")).unwrap();
+        // Neither column was dropped to UnsupportedExportColumn.
+        assert_eq!(
+            obs_col_encoding(&file, "note").as_deref(),
+            Some("nullable-string-array"),
+            "null-bearing LargeUtf8 column must use a nullable-string-array group"
+        );
+        assert_eq!(
+            obs_col_encoding(&file, "ct").as_deref(),
+            Some("categorical"),
+            "Dictionary(_, LargeUtf8) column must use a categorical group"
+        );
+
+        let obs = read_dataframe_group(&file, "obs").unwrap();
+        assert_eq!(obs.num_rows(), 4);
+
+        // `note`: null mask + values survive (reader yields Utf8).
+        let note = obs.column(obs.schema().index_of("note").unwrap());
+        let note = note.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(note.is_null(1), "note row 1 should be null");
+        assert_eq!(note.value(0), "a");
+        assert_eq!(note.value(2), "c");
+        assert_eq!(note.value(3), "d");
+
+        // `ct`: categorical round-trips (reader yields Dictionary<Int32, Utf8>).
+        let ct_out = obs.column(obs.schema().index_of("ct").unwrap());
+        let ct_out = ct_out
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let cats = ct_out
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(ct_out.keys().is_null(2), "ct row 2 should be null");
+        assert_eq!(cats.value(ct_out.keys().value(0) as usize), "typeA");
+        assert_eq!(cats.value(ct_out.keys().value(1) as usize), "typeB");
+        assert_eq!(cats.value(ct_out.keys().value(3) as usize), "typeA");
+    }
 }

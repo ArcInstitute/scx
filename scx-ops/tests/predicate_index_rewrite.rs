@@ -253,7 +253,8 @@ fn compact_with_index_options_writes_predicate_index() {
     let out = dir.path().join("compacted.scx");
 
     let summary =
-        scx_ops::compact_with_index_options(&input, &out, &forced_obs_pert_options()).unwrap();
+        scx_ops::compact_with_index_options(&input, &out, &forced_obs_pert_options(), false)
+            .unwrap();
 
     assert!(summary.result.is_some());
     assert!(summary.multimodal_skip.is_none());
@@ -515,7 +516,7 @@ fn append_stale_predicate_index_survives_without_index_options() {
     // into a test fixture without poking at the engine directly).
     let src = write_test_file(&dir, "src.scx", 32, 8, "DRUG_A");
     let target = dir.path().join("target.scx");
-    scx_ops::compact_with_index_options(&src, &target, &forced_obs_pert_options()).unwrap();
+    scx_ops::compact_with_index_options(&src, &target, &forced_obs_pert_options(), false).unwrap();
     assert_eq!(
         count_section(&target, SectionType::ObsPredicateIndex),
         1,
