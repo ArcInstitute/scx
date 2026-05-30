@@ -191,10 +191,17 @@ pub enum InputLayout {
 
 /// Decide the DE execution route from the dispatch inputs.
 ///
-/// This is the **single source of truth** for the route label. The actual
-/// control flow (which kernel function gets called) is driven by the same
-/// inputs at the dispatch sites; this function exists so that decision is
-/// recorded consistently and is testable without a GPU.
+/// This is the **single source of truth** for the route. The GPU `pdex_ref`
+/// dispatch sites `match` on the returned [`AccelRoute`] to select the kernel,
+/// and the pyscx CPU dispatch sites stamp the returned info directly — so the
+/// recorded route always matches the code that ran, and the whole decision
+/// matrix is testable without a GPU. (Wilcoxon GPU has a single fixed v1
+/// kernel and stamps its route directly, *not* through this planner.)
+///
+/// `gpu_eligible` distinguishes "the GPU has no kernel for this op+layout"
+/// (e.g. `prefer_format="csc"`, which has no GPU CSC kernel) from CUDA simply
+/// being absent: a GPU/auto request with `gpu_available && !gpu_eligible`
+/// records a CPU route with [`FallbackReason::UnsupportedInputLayout`].
 ///
 /// Precedence on GPU: v3 > v2 > v1 (mirrors `diffexp_gpu.rs`). CSC-direct
 /// (`GpuCscV3`) is only taken when the layout actually carries a CSC sidecar
@@ -204,6 +211,7 @@ pub fn plan_de_route(
     device: DeviceRequest,
     layout: InputLayout,
     gpu_available: bool,
+    gpu_eligible: bool,
     v2_enabled: bool,
     v3_enabled: bool,
     csc_available: bool,
@@ -212,10 +220,15 @@ pub fn plan_de_route(
     let (use_gpu, cpu_reason) = match device {
         DeviceRequest::Cpu => (false, FallbackReason::UserForcedCpu),
         DeviceRequest::Gpu | DeviceRequest::Auto => {
-            if gpu_available {
-                (true, FallbackReason::None)
-            } else {
+            if !gpu_available {
                 (false, FallbackReason::NoCuda)
+            } else if !gpu_eligible {
+                // GPU is present but this op+layout has no GPU kernel (e.g.
+                // prefer_format="csc"): run CPU, record the layout as the
+                // reason rather than implying CUDA was missing.
+                (false, FallbackReason::UnsupportedInputLayout)
+            } else {
+                (true, FallbackReason::None)
             }
         }
     };
@@ -272,6 +285,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
         assert_eq!(info.route, AccelRoute::GpuDenseV1);
         assert_ne!(info.route, AccelRoute::GpuCscV3);
@@ -280,6 +294,7 @@ mod tests {
         let info = plan_de_route(
             DeviceRequest::Cpu,
             InputLayout::DenseHost,
+            true,
             true,
             false,
             false,
@@ -295,6 +310,7 @@ mod tests {
             DeviceRequest::Gpu,
             InputLayout::CsrHost,
             true,
+            true,
             false,
             true,
             false,
@@ -308,6 +324,7 @@ mod tests {
         let info = plan_de_route(
             DeviceRequest::Gpu,
             InputLayout::BackedCsc,
+            true,
             true,
             false,
             true,
@@ -324,6 +341,7 @@ mod tests {
             DeviceRequest::Gpu,
             InputLayout::LazyCsr,
             true,
+            true,
             false,
             true,
             false,
@@ -339,6 +357,7 @@ mod tests {
             DeviceRequest::Gpu,
             InputLayout::BackedCsr,
             true,
+            true,
             false,
             true,
             false,
@@ -352,6 +371,7 @@ mod tests {
         let info = plan_de_route(
             DeviceRequest::Cpu,
             InputLayout::BackedCsr,
+            true,
             true,
             false,
             true,
@@ -367,6 +387,7 @@ mod tests {
             DeviceRequest::Auto,
             InputLayout::BackedCsc,
             false,
+            true,
             false,
             true,
             true,
@@ -377,11 +398,35 @@ mod tests {
     }
 
     #[test]
+    fn gpu_present_but_layout_ineligible_records_unsupported_layout() {
+        // prefer_format="csc" on a GPU host: GPU is available but there is no
+        // GPU CSC kernel, so dispatch runs CPU CSC. The reason must be the
+        // layout, not NoCuda (CUDA is present) or UserForcedCpu (user asked
+        // for gpu/auto). This is the case `finalize_exec_info` used to infer.
+        for device in [DeviceRequest::Gpu, DeviceRequest::Auto] {
+            let info = plan_de_route(
+                device,
+                InputLayout::BackedCsc,
+                true,  // gpu_available
+                false, // gpu_eligible — no GPU CSC kernel
+                false,
+                true,
+                true,
+            );
+            assert!(!info.route.is_gpu());
+            assert_eq!(info.route, AccelRoute::CpuCsc);
+            assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
+            assert_eq!(info.csc_available, Some(true));
+        }
+    }
+
+    #[test]
     fn version_precedence_v3_beats_v2_beats_v1() {
         // v3 + v2 both on → v3 wins.
         let info = plan_de_route(
             DeviceRequest::Gpu,
             InputLayout::BackedCsr,
+            true,
             true,
             true,
             true,
@@ -395,6 +440,7 @@ mod tests {
             InputLayout::BackedCsr,
             true,
             true,
+            true,
             false,
             false,
         );
@@ -404,6 +450,7 @@ mod tests {
         let info = plan_de_route(
             DeviceRequest::Gpu,
             InputLayout::BackedCsr,
+            true,
             true,
             false,
             false,

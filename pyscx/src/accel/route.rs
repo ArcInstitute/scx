@@ -1,15 +1,17 @@
 //! Surfacing the accelerator execution route to Python.
 //!
 //! Every DE call stamps a [`scx_accel::route::AccelExecutionInfo`] onto its
-//! result (GPU routes are stamped authoritatively inside `scx-accel`; CPU
-//! routes are stamped at the pyscx dispatch point where the input layout is
-//! known). These helpers serialise that info into `adata.uns["scx_accel"][op]`
-//! so users and benchmarks can see exactly which route ran and why any
-//! fallback happened.
+//! result. GPU routes are stamped authoritatively inside `scx-accel` (the
+//! dispatch `match`es on the planned route); CPU routes call
+//! [`scx_accel::route::plan_de_route`] at the pyscx dispatch point where the
+//! input layout is known. Either way the route + fallback reason come from the
+//! single planner, so there is no post-hoc reason inference here. These helpers
+//! serialise that info into `adata.uns["scx_accel"][op]` so users and
+//! benchmarks can see exactly which route ran and why any fallback happened.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scx_accel::route::{AccelExecutionInfo, FallbackReason};
+use scx_accel::route::{plan_de_route, AccelExecutionInfo, DeviceRequest, InputLayout};
 
 /// Serialise an [`AccelExecutionInfo`] into a Python dict. `Option` fields map
 /// to `None`/value.
@@ -28,28 +30,45 @@ pub(crate) fn exec_info_to_pydict<'py>(
     Ok(d)
 }
 
-/// Fill in the device-level fallback reason for a CPU route from the user's
-/// `device` request and GPU availability. GPU routes keep the reason
-/// `scx-accel` already stamped (`None` / `NoCscSidecar`).
-pub(crate) fn finalize_exec_info(
-    mut info: AccelExecutionInfo,
-    device: &str,
-    gpu_available: bool,
-) -> AccelExecutionInfo {
-    if info.route.is_gpu() {
-        return info;
-    }
-    info.fallback_reason = if device == "cpu" {
-        FallbackReason::UserForcedCpu
-    } else if !gpu_available {
-        FallbackReason::NoCuda
+/// Map the pyscx `device` string to a [`DeviceRequest`] intent. `resolve_device`
+/// collapses `"auto"` to CPU when no GPU is present (losing the user's intent),
+/// so the planner — which needs to distinguish `NoCuda` from `UserForcedCpu` —
+/// takes the raw intent from here. Validation/errors stay in `resolve_device`.
+pub(crate) fn device_request(device: &str) -> DeviceRequest {
+    if device == "cpu" {
+        DeviceRequest::Cpu
+    } else if device == "auto" {
+        DeviceRequest::Auto
     } else {
-        // Auto/GPU requested with a GPU present, yet a CPU route ran — e.g.
-        // prefer_format="csc" (no GPU CSC kernel) or a layout with no GPU
-        // path. Records the layout as the reason rather than implying CUDA
-        // was missing.
-        FallbackReason::UnsupportedInputLayout
-    };
+        // "gpu" / "gpu:N"
+        DeviceRequest::Gpu
+    }
+}
+
+/// Build the execution info for a CPU DE dispatch via the single planner.
+///
+/// `gpu_eligible` is `false` for layouts the GPU has no kernel for (e.g.
+/// `prefer_format="csc"` → no GPU CSC kernel), so a `device="auto"`/`"gpu"`
+/// request on a GPU host records `FallbackReason::UnsupportedInputLayout`
+/// rather than implying CUDA was absent. `v2`/`v3` are irrelevant on CPU and
+/// passed `false` (the planner's CPU branch ignores them).
+pub(crate) fn cpu_exec_info(
+    device: &str,
+    layout: InputLayout,
+    gpu_eligible: bool,
+    csc_available: bool,
+    chunk_size: Option<usize>,
+) -> AccelExecutionInfo {
+    let mut info = plan_de_route(
+        device_request(device),
+        layout,
+        gpu_available(),
+        gpu_eligible,
+        false,
+        false,
+        csc_available,
+    );
+    info.chunk_size = chunk_size;
     info
 }
 

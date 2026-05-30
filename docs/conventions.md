@@ -75,14 +75,23 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   Linux to return freed arenas to the OS after large reductions.
 - Pseudobulk aggregation streams via `BackedCsrReader`; statistical
   testing delegated to `pydeseq2`.
-- **Execution route is recorded, not implicit.** DE entry points stamp an
-  `AccelExecutionInfo` (route + fallback reason) onto their result via the
-  single planner `scx_accel::route::plan_de_route`. GPU entry points stamp the
-  authoritative route (v2 / v3 / CSC) at the kernel branch; CPU routes are
-  stamped at the pyscx dispatch point. New GPU routes MUST register an
-  `AccelRoute` variant and stamp it — no silent fallbacks. The route surfaces to
-  Python on `adata.uns["scx_accel"]`, and any performance claim must cite the
-  recorded route. `SCX_GPU_DE_V3_TRACE` is a debug-only fallback, not the signal.
+- **Execution route is computed once and *drives* dispatch.** The single
+  planner `scx_accel::route::plan_de_route` is the source of truth for the
+  `pdex_ref` route + fallback reason. The GPU `pdex_ref` entry points `match`
+  on the planned `AccelRoute` to pick the kernel (the env flags
+  `SCX_GPU_DE_V2`/`V3` are read only when calling the planner, never re-checked
+  at dispatch), and the pyscx CPU dispatch calls `plan_de_route` too — so the
+  recorded route can never diverge from the code that ran. `gpu_eligible`
+  models "GPU present but this op+layout has no GPU kernel" (e.g.
+  `prefer_format="csc"`), recording `UnsupportedInputLayout` rather than
+  implying CUDA was missing. **Exception:** Wilcoxon GPU has a single fixed v1
+  kernel, so its entry points stamp `GpuDenseV1`/`GpuCsrV1` directly — do *not*
+  route Wilcoxon through `plan_de_route` (it would wrongly report a v3 route
+  under `SCX_GPU_DE_V3=1`). New planner-driven GPU routes MUST register an
+  `AccelRoute` variant and a dispatch arm — no silent fallbacks. The route
+  surfaces to Python on `adata.uns["scx_accel"]`, and any performance claim
+  must cite the recorded route. `SCX_GPU_DE_V3_TRACE` is a debug-only fallback,
+  not the signal.
 
 ## Parallel streaming reader (scx-convert)
 

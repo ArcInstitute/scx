@@ -118,8 +118,17 @@ pub fn pdex_ref_gpu_dense(
     // `memcpy_htod` per chunk is optimal. No CSR construction tax.
     let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
     // Dense host input always uses the legacy single-upload v1 path — no
-    // v2/v3, never CSC.
-    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuDenseV1, FallbackReason::None);
+    // v2/v3, never CSC. Routed through `plan_de_route` for consistency: the
+    // `DenseHost` layout always resolves to `GpuDenseV1` regardless of flags.
+    let mut exec_info = plan_de_route(
+        DeviceRequest::Gpu,
+        InputLayout::DenseHost,
+        true,
+        true,
+        de_v2_enabled(),
+        de_v3_enabled(),
+        false,
+    );
     exec_info.chunk_size = Some(chunk_size);
     finish_pdex(
         pdex_ref_gpu_chunked(
@@ -191,44 +200,44 @@ pub fn pdex_ref_gpu_sparse(
         DeviceRequest::Gpu,
         InputLayout::CsrHost,
         true,
+        true,
         de_v2_enabled(),
         de_v3_enabled(),
         false,
     );
     exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route — no second read of
+    // `de_v*_enabled()` — so the stamped route can never diverge from the
+    // kernel that runs. CsrHost can only plan to a GpuCsr{V1,V2,V3} route.
     finish_pdex(
-        (|| {
-            if de_v3_enabled() {
-                return pdex_ref_gpu_chunked_v3_csr(
-                    &dev,
-                    n_obs,
-                    n_vars,
-                    chunk_size,
-                    gene_names,
-                    groups,
-                    group_names,
-                    reference,
-                    mode,
-                    epsilon,
-                    &mut shard_src,
-                );
-            }
-            if de_v2_enabled() {
-                return pdex_ref_gpu_chunked_v2(
-                    &dev,
-                    n_obs,
-                    n_vars,
-                    chunk_size,
-                    gene_names,
-                    groups,
-                    group_names,
-                    reference,
-                    mode,
-                    epsilon,
-                    &mut shard_src,
-                );
-            }
-            pdex_ref_gpu_chunked(
+        match exec_info.route {
+            AccelRoute::GpuCsrV3 => pdex_ref_gpu_chunked_v3_csr(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV2 => pdex_ref_gpu_chunked_v2(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV1 => pdex_ref_gpu_chunked(
                 &dev,
                 n_obs,
                 n_vars,
@@ -242,8 +251,12 @@ pub fn pdex_ref_gpu_sparse(
                 |dev, dense, c0, sz| {
                     populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
                 },
-            )
-        })(),
+            ),
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_sparse: planner returned unreachable route {} for CsrHost",
+                other.as_str()
+            ))),
+        },
         exec_info,
     )
 }
@@ -297,38 +310,50 @@ pub fn pdex_ref_gpu_streaming(
             InputLayout::BackedCsr
         },
         true,
+        true,
         de_v2_enabled(),
         de_v3_enabled(),
         csc_available,
     );
     exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route. Each arm constructs its own
+    // shard source: the CSC-direct arm needs a `RawGpuCscShardSource`
+    // (`GpuCscShardSource`), the CSR arms a `RawGpuShardSource`
+    // (`GpuShardSource`) — distinct concrete types, so per-arm construction
+    // (in each arm's own scope) avoids any mutable-borrow conflict.
     finish_pdex(
-        (|| {
-            if de_v3_enabled() {
-                if let Some(csc) = csc_reader {
-                    let csc_source =
-                        csc as &(dyn scx_format::shard_source::ColumnShardSource + Sync);
-                    let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
-                        .map_err(|e| {
-                            AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}"))
-                        })?;
-                    return pdex_ref_gpu_chunked_v3_csc(
-                        &dev,
-                        n_obs,
-                        n_vars,
-                        chunk_size,
-                        gene_names,
-                        groups,
-                        group_names,
-                        reference,
-                        mode,
-                        epsilon,
-                        &mut gpu_csc_src,
-                    );
-                }
+        match exec_info.route {
+            AccelRoute::GpuCscV3 => {
+                // The planner only emits GpuCscV3 when csc_available, which
+                // here means csc_reader.is_some(); this guard is defensive
+                // and returns a recoverable error rather than panicking.
+                let csc = csc_reader.ok_or_else(|| {
+                    AccelError::LinAlg(
+                        "pdex_ref_gpu_streaming: planner returned GpuCscV3 but no csc_reader"
+                            .to_string(),
+                    )
+                })?;
+                let csc_source = csc as &(dyn scx_format::shard_source::ColumnShardSource + Sync);
+                let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}")))?;
+                pdex_ref_gpu_chunked_v3_csc(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    &mut gpu_csc_src,
+                )
+            }
+            AccelRoute::GpuCsrV3 => {
                 let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
                     .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-                return pdex_ref_gpu_chunked_v3_csr(
+                pdex_ref_gpu_chunked_v3_csr(
                     &dev,
                     n_obs,
                     n_vars,
@@ -340,13 +365,12 @@ pub fn pdex_ref_gpu_streaming(
                     mode,
                     epsilon,
                     &mut shard_src,
-                );
+                )
             }
-
-            let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-            if de_v2_enabled() {
-                return pdex_ref_gpu_chunked_v2(
+            AccelRoute::GpuCsrV2 => {
+                let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+                pdex_ref_gpu_chunked_v2(
                     &dev,
                     n_obs,
                     n_vars,
@@ -358,24 +382,32 @@ pub fn pdex_ref_gpu_streaming(
                     mode,
                     epsilon,
                     &mut shard_src,
-                );
+                )
             }
-            pdex_ref_gpu_chunked(
-                &dev,
-                n_obs,
-                n_vars,
-                chunk_size,
-                gene_names,
-                groups,
-                group_names,
-                reference,
-                mode,
-                epsilon,
-                |dev, dense, c0, sz| {
-                    populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
-                },
-            )
-        })(),
+            AccelRoute::GpuCsrV1 => {
+                let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+                pdex_ref_gpu_chunked(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    |dev, dense, c0, sz| {
+                        populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+                    },
+                )
+            }
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_streaming: planner returned unreachable route {}",
+                other.as_str()
+            ))),
+        },
         exec_info,
     )
 }
@@ -587,44 +619,43 @@ pub fn pdex_ref_gpu_lazy(
         DeviceRequest::Gpu,
         InputLayout::LazyCsr,
         true,
+        true,
         de_v2_enabled(),
         de_v3_enabled(),
         false,
     );
     exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route. LazyCsr has no CSC capability,
+    // so it can only plan to a GpuCsr{V1,V2,V3} route.
     finish_pdex(
-        (|| {
-            if de_v3_enabled() {
-                return pdex_ref_gpu_chunked_v3_csr(
-                    &dev,
-                    n_obs,
-                    n_vars,
-                    chunk_size,
-                    gene_names,
-                    groups,
-                    group_names,
-                    reference,
-                    mode,
-                    epsilon,
-                    &mut shard_src,
-                );
-            }
-            if de_v2_enabled() {
-                return pdex_ref_gpu_chunked_v2(
-                    &dev,
-                    n_obs,
-                    n_vars,
-                    chunk_size,
-                    gene_names,
-                    groups,
-                    group_names,
-                    reference,
-                    mode,
-                    epsilon,
-                    &mut shard_src,
-                );
-            }
-            pdex_ref_gpu_chunked(
+        match exec_info.route {
+            AccelRoute::GpuCsrV3 => pdex_ref_gpu_chunked_v3_csr(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV2 => pdex_ref_gpu_chunked_v2(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV1 => pdex_ref_gpu_chunked(
                 &dev,
                 n_obs,
                 n_vars,
@@ -638,8 +669,12 @@ pub fn pdex_ref_gpu_lazy(
                 |dev, dense, c0, sz| {
                     populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
                 },
-            )
-        })(),
+            ),
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_lazy: planner returned unreachable route {} for LazyCsr",
+                other.as_str()
+            ))),
+        },
         exec_info,
     )
 }

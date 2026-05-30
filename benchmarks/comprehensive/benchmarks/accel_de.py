@@ -66,7 +66,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -248,19 +247,26 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
 
 
 def _propagate_route(src_adata: Any, dst_adata: Any) -> None:
-    """Copy the accelerator route metadata that pyscx wrote to ``src_adata.uns``
-    onto ``dst_adata.uns`` so the runner (which only holds ``dst_adata``) can
+    """Merge the accelerator route metadata that pyscx wrote to ``src_adata.uns``
+    into ``dst_adata.uns`` so the runner (which only holds ``dst_adata``) can
     read it. Used when the GPU impl runs DE on an internally-opened SCX-backed
-    AnnData distinct from the adata the runner passed in."""
+    AnnData distinct from the adata the runner passed in.
+
+    Merges per-op (mirroring the Rust ``write_accel_route`` semantics) rather
+    than overwriting, so route entries from other ops on ``dst_adata`` survive,
+    and re-assigns the dict so it works on any ``uns`` backing."""
     try:
         accel = src_adata.uns.get("scx_accel")
     except Exception:
         accel = None
-    if accel is not None:
-        try:
-            dst_adata.uns["scx_accel"] = accel
-        except Exception:
-            pass
+    if not accel:
+        return
+    try:
+        merged = dict(dst_adata.uns.get("scx_accel", {}) or {})
+        merged.update(accel)
+        dst_adata.uns["scx_accel"] = merged
+    except Exception:
+        pass
 
 
 def _extract_route(adata: Any, op: str) -> str | None:
@@ -629,12 +635,17 @@ def run(
                 # Numeric gate signal for the GPU pdex_ref triple. Always
                 # emitted (so the absolute-floor gate never sees a missing
                 # metric) and only 0.0 on a *silent fallback*: we built a CSC
-                # sidecar fixture and enabled v3, yet a non-CSC route ran. When
-                # CSC-direct wasn't expected (v3 off, or no CSC fixture) the
-                # signal is 1.0 = "not applicable / OK".
-                v3_enabled = os.environ.get("SCX_GPU_DE_V3", "") in ("1", "true", "TRUE")
+                # sidecar fixture and v3 ran, yet a non-CSC route was recorded.
+                # When CSC-direct wasn't expected (v3 off, or no CSC fixture)
+                # the signal is 1.0 = "not applicable / OK".
+                #
+                # v3 intent is read back from the recorded route itself — both
+                # v3 routes (`gpu_csc_v3` / `gpu_csr_v3`) are emitted *only*
+                # when `SCX_GPU_DE_V3` was on — rather than re-parsing the env
+                # var, so this can't drift from pyscx's own flag handling.
                 csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
-                expecting_csc = v3_enabled and csc_fixture
+                v3_route = route in ("gpu_csc_v3", "gpu_csr_v3")
+                expecting_csc = csc_fixture and v3_route
                 extras["de_route_csc_direct"] = (
                     1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
                 )

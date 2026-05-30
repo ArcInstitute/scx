@@ -146,6 +146,7 @@ fn run_rank_genes_groups_inner(
     rankby_abs: bool,
     tie_correct: bool,
     prefer_format: &str,
+    device: &str,
     gpu_device_id: Option<usize>,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
     let numpy = py.import("numpy")?;
@@ -261,9 +262,13 @@ fn run_rank_genes_groups_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsc;
-                    r.exec_info.csc_available = Some(true);
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsc,
+                        false, // no GPU CSC kernel
+                        true,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -293,9 +298,13 @@ fn run_rank_genes_groups_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsc;
-                    r.exec_info.csc_available = Some(true);
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsc,
+                        false, // no GPU CSC kernel
+                        true,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -348,8 +357,13 @@ fn run_rank_genes_groups_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsr;
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsr,
+                        true,
+                        false,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?,
@@ -459,9 +473,13 @@ fn run_rank_genes_groups_inner(
                         )
                     })
                     .map(|mut r| {
-                        r.exec_info.route = scx_accel::AccelRoute::CpuCsr;
-                        r.exec_info.csc_available = Some(false);
-                        r.exec_info.chunk_size = Some(chunk_size);
+                        r.exec_info = super::route::cpu_exec_info(
+                            device,
+                            scx_accel::InputLayout::CsrHost,
+                            true,
+                            false,
+                            Some(chunk_size),
+                        );
                         r
                     })
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
@@ -514,8 +532,13 @@ fn run_rank_genes_groups_inner(
                         )
                     })
                     .map(|mut r| {
-                        r.exec_info.route = scx_accel::AccelRoute::CpuDense;
-                        r.exec_info.csc_available = Some(false);
+                        r.exec_info = super::route::cpu_exec_info(
+                            device,
+                            scx_accel::InputLayout::DenseHost,
+                            true,
+                            false,
+                            None,
+                        );
                         r
                     })
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
@@ -677,6 +700,7 @@ pub fn rank_genes_groups(
                 rankby_abs,
                 tie_correct,
                 prefer_format,
+                device,
                 gpu_device_id,
             ) {
                 Ok((result, _unique)) => {
@@ -725,6 +749,7 @@ pub fn rank_genes_groups(
         rankby_abs,
         tie_correct,
         prefer_format,
+        device,
         gpu_device_id,
     )?;
 
@@ -733,16 +758,13 @@ pub fn rank_genes_groups(
 
     // Record the accelerator execution route: both inside the scanpy-style
     // rank_genes_groups dict (as `scx_accel_route`) and under the unified
-    // adata.uns["scx_accel"]["rank_genes_groups"] lookup.
-    let info = super::route::finalize_exec_info(
-        result.exec_info.clone(),
-        device,
-        super::route::gpu_available(),
-    );
+    // adata.uns["scx_accel"]["rank_genes_groups"] lookup. `result.exec_info`
+    // is already complete (route + reason) — set by the single planner on both
+    // the CPU dispatch sites and inside scx-accel for GPU routes.
     if let Ok(rgg) = adata.getattr("uns")?.get_item("rank_genes_groups") {
-        rgg.set_item("scx_accel_route", info.route.as_str())?;
+        rgg.set_item("scx_accel_route", result.exec_info.route.as_str())?;
     }
-    super::route::write_accel_route(py, adata, "rank_genes_groups", &info)?;
+    super::route::write_accel_route(py, adata, "rank_genes_groups", &result.exec_info)?;
 
     Ok(py.None())
 }
@@ -1003,17 +1025,14 @@ pub fn rank_genes_groups_df(
         rankby_abs,
         tie_correct,
         "csr",
+        device,
         gpu_device_id,
     )?;
 
     // Record the accelerator execution route on adata.uns; the returned
-    // polars DataFrame carries no metadata of its own.
-    let info = super::route::finalize_exec_info(
-        result.exec_info.clone(),
-        device,
-        super::route::gpu_available(),
-    );
-    super::route::write_accel_route(py, adata, "rank_genes_groups_df", &info)?;
+    // polars DataFrame carries no metadata of its own. `result.exec_info` is
+    // already complete (route + reason) from the single planner.
+    super::route::write_accel_route(py, adata, "rank_genes_groups_df", &result.exec_info)?;
 
     let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;
     Ok(df.unbind())
@@ -1129,6 +1148,7 @@ fn run_pdex_ref_inner(
     epsilon: f64,
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
+    device: &str,
     gpu_device_id: Option<usize>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = py.import("numpy")?;
@@ -1187,9 +1207,13 @@ fn run_pdex_ref_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsc;
-                    r.exec_info.csc_available = Some(true);
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsc,
+                        false, // no GPU CSC kernel
+                        true,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
@@ -1217,9 +1241,13 @@ fn run_pdex_ref_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsc;
-                    r.exec_info.csc_available = Some(true);
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsc,
+                        false, // no GPU CSC kernel
+                        true,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
@@ -1275,8 +1303,13 @@ fn run_pdex_ref_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsr;
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::BackedCsr,
+                        true,
+                        false,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
@@ -1369,9 +1402,13 @@ fn run_pdex_ref_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuCsr;
-                    r.exec_info.csc_available = Some(false);
-                    r.exec_info.chunk_size = Some(chunk_size);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::CsrHost,
+                        true,
+                        false,
+                        Some(chunk_size),
+                    );
                     r
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string())),
@@ -1420,8 +1457,13 @@ fn run_pdex_ref_inner(
                     )
                 })
                 .map(|mut r| {
-                    r.exec_info.route = scx_accel::AccelRoute::CpuDense;
-                    r.exec_info.csc_available = Some(false);
+                    r.exec_info = super::route::cpu_exec_info(
+                        device,
+                        scx_accel::InputLayout::DenseHost,
+                        true,
+                        false,
+                        None,
+                    );
                     r
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string())),
@@ -1612,15 +1654,13 @@ pub fn pdex_ref(
         epsilon,
         gene_chunk_size,
         prefer_format,
+        device,
         gpu_device_id,
     )?;
     // Record the accelerator execution route on adata.uns["scx_accel"]["pdex_ref"].
-    let info = super::route::finalize_exec_info(
-        result.exec_info.clone(),
-        device,
-        super::route::gpu_available(),
-    );
-    super::route::write_accel_route(py, adata, "pdex_ref", &info)?;
+    // `result.exec_info` is already complete (route + reason) from the single
+    // planner — CPU sites via `cpu_exec_info`, GPU routes inside scx-accel.
+    super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
     let df = pdex_ref_result_to_dataframe(py, &result)?;
     Ok(df.unbind())
 }
