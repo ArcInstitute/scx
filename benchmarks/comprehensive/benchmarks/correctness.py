@@ -29,6 +29,12 @@ from benchmarks.comprehensive.results import BenchmarkResult  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
+
+
 def _run_suite_with_gc(label: str, runner, dataset_name: str) -> list:
     """Run one validator and force a GC sweep before returning.
 
@@ -87,7 +93,7 @@ def run(
     SCX file from the source h5ad.
     """
     # Only run once per dataset — use scx_auto as the trigger
-    if format_variant.key != "scx_auto":
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
 
     from benchmarks.comprehensive.scripts import (

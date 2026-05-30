@@ -29,7 +29,10 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
-_SCX_TRIGGER_KEY = "scx_auto"
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 
 def _gsutil_rm_trees(urls: list[str]) -> None:
@@ -60,7 +63,7 @@ def run(
     Returns ``None`` for non-SCX formats (mirrors ``fragment_ops.py``) so
     the orchestrator silently skips those triples.
     """
-    if format_variant.key != _SCX_TRIGGER_KEY:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
     if provider != "gcs":
         raise ValueError(

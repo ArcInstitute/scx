@@ -40,7 +40,7 @@ from benchmarks.comprehensive.scripts.validation_helpers import csr_equal  # noq
 logger = logging.getLogger(__name__)
 
 
-_VALID_FORMATS = frozenset({
+SUPPORTED_FORMATS: frozenset[str] = frozenset({
     "scx_auto",
     "scx_none",
     "scx_scx1",
@@ -48,6 +48,9 @@ _VALID_FORMATS = frozenset({
     "scx_lz4",
     "scx_pcodec",
 })
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 
 def _normalize_csr(X: Any):
@@ -89,7 +92,7 @@ def run(
     orchestrator's ``_NO_CONVERSION`` table does not need editing — this
     benchmark *requires* the pre-converted file).
     """
-    if format_variant.key not in _VALID_FORMATS:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
 
     if converted_path is None or not Path(converted_path).exists():

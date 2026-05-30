@@ -394,3 +394,80 @@ def test_bench_format_compatible_helper():
     assert _bench_format_compatible("read_full", "accel_pca__scx_auto") is False
     assert _bench_format_compatible("read_full", "bench_csc__pca_csr") is False
 
+
+def test_bench_format_compatible_consults_supported_formats():
+    """Static-guarded benches expose ``SUPPORTED_FORMATS`` and are filtered
+    accordingly at cohort-build time."""
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _bench_format_compatible,
+        _bench_supported_formats,
+    )
+
+    # cloud_push only accepts scx_auto
+    assert _bench_supported_formats("cloud_push") == frozenset({"scx_auto"})
+    assert _bench_format_compatible("cloud_push", "scx_auto") is True
+    assert _bench_format_compatible("cloud_push", "h5ad_gzip") is False
+    assert _bench_format_compatible("cloud_push", "zarr_zstd") is False
+
+    # roundtrip accepts the 6 SCX codec variants
+    rt = _bench_supported_formats("roundtrip")
+    assert rt == frozenset({
+        "scx_auto", "scx_none", "scx_scx1", "scx_zstd", "scx_lz4", "scx_pcodec",
+    })
+    assert _bench_format_compatible("roundtrip", "scx_zstd") is True
+    assert _bench_format_compatible("roundtrip", "h5ad_gzip") is False
+
+    # correctness + cell_eval_parity_perf are also scx_auto-only
+    assert _bench_format_compatible("correctness", "scx_auto") is True
+    assert _bench_format_compatible("correctness", "h5ad_lzf") is False
+    assert _bench_format_compatible("cell_eval_parity_perf", "scx_auto") is True
+    assert _bench_format_compatible("cell_eval_parity_perf", "tiledb_soma") is False
+
+
+def test_unrestricted_bench_accepts_all_formats():
+    """Benches without ``SUPPORTED_FORMATS`` fall through to "any format"
+    (subject to the accel/CSC pairing rules)."""
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _bench_format_compatible,
+        _bench_supported_formats,
+    )
+
+    # read_full has no static guard
+    assert _bench_supported_formats("read_full") is None
+    assert _bench_format_compatible("read_full", "scx_auto") is True
+    assert _bench_format_compatible("read_full", "h5ad_none") is True
+    assert _bench_format_compatible("read_full", "tiledb_soma") is True
+    assert _bench_format_compatible("read_full", "zarr_zstd") is True
+
+
+def test_supported_formats_filters_cohort_grouping(isolated_work_dir):
+    """The orchestrator must not submit cloud_push/h5ad_none — the static
+    guard says cloud_push only runs on scx_auto, so the cohort builder
+    should never even try the incompatible combination."""
+    _FakeAutoExecutor.reset()
+    _install_fake_submitit()
+
+    _run_main_with_argv([
+        "--datasets", "pbmc3k",
+        "--formats", "scx_auto", "h5ad_none",
+        "--benchmarks", "cloud_push", "read_full",
+        "--skip-smoke",
+    ])
+
+    bench_subs = [
+        s for s in _FakeAutoExecutor.submissions
+        if s["fn_name"] == "_run_benchmark"
+    ]
+    by_label = {
+        (s["fn_args"][0], s["fn_args"][1], s["fn_args"][2]): s
+        for s in bench_subs
+    }
+
+    # cloud_push only submits for scx_auto.
+    assert ("cloud_push", "pbmc3k", "scx_auto") in by_label
+    assert ("cloud_push", "pbmc3k", "h5ad_none") not in by_label
+
+    # read_full has no static guard — submits for both.
+    assert ("read_full", "pbmc3k", "scx_auto") in by_label
+    assert ("read_full", "pbmc3k", "h5ad_none") in by_label
+

@@ -46,6 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib
 import logging
 import sys
@@ -352,15 +353,40 @@ def _triple_compatible(bench_name: str, ds_name: str, format_key: str) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=None)
+def _bench_supported_formats(bench_name: str) -> frozenset[str] | None:
+    """Return the bench module's declared format allow-list, or None for "all".
+
+    Reads the module-level ``SUPPORTED_FORMATS`` attribute that each
+    static-guarded bench exposes (e.g. ``cloud_push``, ``correctness``,
+    ``roundtrip``). Benches without the attribute return ``None`` —
+    "no per-bench restriction beyond the accel/CSC pairing rules". Cached
+    so the import cost is paid once per bench name across the whole
+    cohort-grouping pass.
+    """
+    try:
+        mod = importlib.import_module(
+            f"benchmarks.comprehensive.benchmarks.{bench_name}"
+        )
+    except ImportError:
+        return None
+    val = getattr(mod, "SUPPORTED_FORMATS", None)
+    return val if val is None else frozenset(val)
+
+
 def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
     """Check benchmark–format pairing beyond multimodal compatibility.
 
-    Accel benchmarks (accel_*) only pair with their own format variants
-    (e.g., accel_pca pairs with accel_pca__scx_auto). Similarly,
-    bench_csc_dispatch only pairs with bench_csc__* formats.
-    Non-accel benchmarks skip accel_* and bench_csc__* format keys.
-
-    This mirrors the inline filtering at run_parallel.py Phase B.
+    Two layered checks:
+    1. Accel benchmarks (accel_*) only pair with their own format variants
+       (e.g. accel_pca pairs with accel_pca__scx_auto). Similarly,
+       bench_csc_dispatch only pairs with bench_csc__* formats. Non-accel
+       benchmarks skip accel_* and bench_csc__* format keys.
+    2. Static-guarded benches (e.g. ``cloud_push``, ``correctness``)
+       expose a module-level ``SUPPORTED_FORMATS`` frozenset and only
+       accept format keys in that set. Filtering at cohort-build time
+       prevents the silent ``return None`` path in each bench from
+       producing phantom ``missing_result`` entries in ``watch.py``.
     """
     is_accel = bench_name.startswith("accel_") or bench_name == "bench_csc_dispatch"
     fmt_is_accel = format_key.startswith("accel_") or format_key.startswith("bench_csc__")
@@ -370,6 +396,10 @@ def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
             return format_key.startswith("bench_csc__")
         return format_key.startswith(f"{bench_name}__")
     elif fmt_is_accel:
+        return False
+
+    allowed = _bench_supported_formats(bench_name)
+    if allowed is not None and format_key not in allowed:
         return False
     return True
 

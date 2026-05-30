@@ -34,7 +34,10 @@ logger = logging.getLogger(__name__)
 
 # Fragment-ops is only implemented for SCX. ``scx_auto`` is chosen as the
 # single trigger so we don't re-measure for every codec variant.
-_SCX_TRIGGER_KEY = "scx_auto"
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Mirrors the runtime
+guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 # Number of random cell indices to mark deleted. Capped by n_obs at runtime.
 _DELETE_N = 10_000
@@ -259,7 +262,7 @@ def run(
     the competitor formats. Returns ``None`` for every other variant so
     those SLURM jobs exit cleanly without writing spurious results.
     """
-    if format_variant.key != _SCX_TRIGGER_KEY:
+    if format_variant.key not in SUPPORTED_FORMATS:
         return None
 
     if converted_path is None or not Path(converted_path).exists():
