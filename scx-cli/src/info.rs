@@ -7,7 +7,6 @@ use scx_format::catalog::FullCatalog;
 use scx_format::modality::ModalityType;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
 pub fn run_info(
     path: &Path,
@@ -62,27 +61,10 @@ pub fn run_info(
         );
     }
 
-    // Value encoding: read from first CSR shard header
-    let csr_shards = catalog.shards(SectionType::CsrShard);
-    let value_enc_name = if let Some(first_shard) = csr_shards.first() {
-        let bytes = reader.section_bytes(first_shard)?;
-        if bytes.len() >= SHARD_HEADER_SIZE {
-            let sh =
-                ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;
-            match ValueEncoding::from_u8(sh.value_encoding) {
-                Some(ValueEncoding::Uint8) => "uint8",
-                Some(ValueEncoding::Uint16) => "uint16",
-                Some(ValueEncoding::Uint32) => "uint32",
-                Some(ValueEncoding::Float32) => "float32",
-                Some(ValueEncoding::Float16) => "float16",
-                None => "unknown",
-            }
-        } else {
-            "n/a"
-        }
-    } else {
-        "n/a"
-    };
+    // Value encoding: summarize across ALL CSR shards (it is chosen
+    // per shard, so a file can legitimately mix widths — e.g. a subset
+    // whose first shard is uint16 but later shards hold uint32 values).
+    let value_enc_name = summarize_csr_value_encoding(&reader)?;
 
     // Line 3: value encoding and shard target
     println!(
@@ -242,6 +224,52 @@ pub fn run_info(
     }
 
     Ok(())
+}
+
+/// Human-readable name for a raw `value_encoding` header byte.
+fn value_encoding_name(byte: u8) -> &'static str {
+    match ValueEncoding::from_u8(byte) {
+        Some(ValueEncoding::Uint8) => "uint8",
+        Some(ValueEncoding::Uint16) => "uint16",
+        Some(ValueEncoding::Uint32) => "uint32",
+        Some(ValueEncoding::Float32) => "float32",
+        Some(ValueEncoding::Float16) => "float16",
+        None => "unknown",
+    }
+}
+
+/// Summarize the value encoding across **all** CSR shards.
+///
+/// Value encoding is chosen per shard, so a file can mix widths (e.g. a
+/// subset whose early shards are `uint16` but later shards hold `uint32`
+/// values). Returns the single name when uniform, `mixed (a, b)` when shards
+/// differ (names in ascending width order), or `n/a` when there are no CSR
+/// shards.
+fn summarize_csr_value_encoding(reader: &ScxReader) -> Result<String, Box<dyn std::error::Error>> {
+    let csr_shards = reader.catalog().shards(SectionType::CsrShard);
+    if csr_shards.is_empty() {
+        return Ok("n/a".to_string());
+    }
+
+    // Distinct encoding bytes, sorted ascending (= enum width order:
+    // u8, u16, u32, f32, f16).
+    let mut encs: Vec<u8> = csr_shards
+        .iter()
+        .map(|e| reader.read_shard_header(e).map(|h| h.value_encoding))
+        .collect::<Result<Vec<_>, _>>()?;
+    encs.sort_unstable();
+    encs.dedup();
+
+    Ok(match encs.as_slice() {
+        [one] => value_encoding_name(*one).to_string(),
+        many => format!(
+            "mixed ({})",
+            many.iter()
+                .map(|&b| value_encoding_name(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
 }
 
 /// Print all info as JSON.
@@ -610,5 +638,70 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{sample_header, sample_obs, sample_var, write_test_file};
+    use scx_format::writer::ScxWriter;
+
+    /// Write a 2-shard file whose shards use different value encodings:
+    /// shard 0 `Uint16`, shard 1 `Uint32` (holds 66279, > u16 max).
+    fn write_mixed_encoding_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("mixed_enc.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(4, 5)).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+
+        let s0 = ValueEncoding::Uint16
+            .encode_f32_batch(&[300.0, 400.0, 500.0, 600.0])
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &s0,
+                CodecId::None,
+                ValueEncoding::Uint16,
+                0,
+            )
+            .unwrap();
+
+        let s1 = ValueEncoding::Uint32
+            .encode_f32_batch(&[66279.0, 5.0, 7.0, 8.0])
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &s1,
+                CodecId::None,
+                ValueEncoding::Uint32,
+                2,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_summarize_value_encoding_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = ScxReader::open(write_mixed_encoding_file(&dir)).unwrap();
+        assert_eq!(
+            summarize_csr_value_encoding(&reader).unwrap(),
+            "mixed (uint16, uint32)"
+        );
+    }
+
+    #[test]
+    fn test_summarize_value_encoding_uniform() {
+        let dir = tempfile::tempdir().unwrap();
+        // write_test_file writes a single uint8 shard (values < 256).
+        let reader = ScxReader::open(write_test_file(&dir, 6, 5)).unwrap();
+        assert_eq!(summarize_csr_value_encoding(&reader).unwrap(), "uint8");
     }
 }
