@@ -48,13 +48,17 @@ class _FakeAutoExecutor:
     instances: list["_FakeAutoExecutor"] = []
     submissions: list[dict] = []
 
-    def __init__(self, folder: str) -> None:
+    def __init__(self, folder: str, **kwargs) -> None:
         self.folder = folder
         self._params: dict = {}
         self._next_id = 1000 + len(_FakeAutoExecutor.instances) * 1000
         _FakeAutoExecutor.instances.append(self)
 
     def update_parameters(self, **kwargs) -> None:
+        # NOTE: This replaces self._params entirely, which differs from
+        # real submitit (which merges). This is a pre-existing test
+        # limitation and is acceptable since the production code always
+        # passes all relevant fields on every call.
         self._params = dict(kwargs)
 
     def submit(self, fn, *args, **kwargs):
@@ -67,8 +71,37 @@ class _FakeAutoExecutor:
             "fn_name": getattr(fn, "__name__", repr(fn)),
             "fn_args": args,
             "params": dict(self._params),
+            "is_array_task": False,
         })
         return job
+
+    def map_array(self, fn, *arg_sequences):
+        """Mock Slurm Job Array submissions by fanning tasks out.
+
+        Generates task IDs in the native '<ArrayJobID>_<TaskID>' format
+        and records each task with is_array_task=True for manifest parity.
+        """
+        jobs = []
+        n_tasks = len(arg_sequences[0])
+        array_jid = str(self._next_id)
+
+        for idx in range(n_tasks):
+            task_jid = f"{array_jid}_{idx}"
+            task_args = [seq[idx] for seq in arg_sequences]
+            job = _FakeJob(task_jid, folder=self.folder)
+
+            _FakeAutoExecutor.submissions.append({
+                "folder": self.folder,
+                "job_id": task_jid,
+                "fn_name": getattr(fn, "__name__", repr(fn)),
+                "fn_args": task_args,
+                "params": dict(self._params),
+                "is_array_task": True,
+            })
+            jobs.append(job)
+
+        self._next_id += 1
+        return jobs
 
     @classmethod
     def reset(cls) -> None:
@@ -241,7 +274,8 @@ def test_phase_a_does_not_block_phase_b(isolated_work_dir):
 
 
 def test_run_manifest_records_dependency(isolated_work_dir, tmp_path):
-    """run_manifest.json should carry each bench job's dependency jobid."""
+    """run_manifest.json should carry each bench job's dependency jobid
+    and is_array_task flag."""
     _FakeAutoExecutor.reset()
     _install_fake_submitit()
 
@@ -264,3 +298,107 @@ def test_run_manifest_records_dependency(isolated_work_dir, tmp_path):
     assert by_label["read_full/pbmc3k/h5ad_none"]["dependency"] is None
     assert by_label["write/pbmc3k/scx_auto"]["dependency"] is None
     assert by_label["write/pbmc3k/h5ad_none"]["dependency"] is None
+
+    # All benchmark entries must have is_array_task=True (Phase B uses map_array).
+    for label, entry in by_label.items():
+        assert entry.get("is_array_task") is True, (
+            f"{label} missing is_array_task=True: {entry}"
+        )
+
+
+def test_no_conversion_benchmarks_have_no_dependency(isolated_work_dir):
+    """write and parallel_write_scaling must NOT have afterok dependencies,
+    while read_full on the same (dataset, format) must have one."""
+    _FakeAutoExecutor.reset()
+    _install_fake_submitit()
+
+    _run_main_with_argv([
+        "--datasets", "pbmc3k",
+        "--formats", "scx_auto",
+        "--benchmarks", "read_full", "write",
+        "--skip-smoke",
+    ])
+
+    subs = _FakeAutoExecutor.submissions
+    bench_subs = [s for s in subs if s["fn_name"] == "_run_benchmark"]
+
+    # Build lookup: (bench_name, dataset, format) -> submission
+    by_label = {(s["fn_args"][0], s["fn_args"][1], s["fn_args"][2]): s for s in bench_subs}
+
+    # write/pbmc3k/scx_auto: _NO_CONVERSION → no dependency
+    w = by_label[("write", "pbmc3k", "scx_auto")]
+    extra = w["params"].get("slurm_additional_parameters") or {}
+    assert "dependency" not in extra, (
+        f"write should have no dependency but has: {w['params']}"
+    )
+
+    # read_full/pbmc3k/scx_auto: needs conversion → has afterok dependency
+    rf = by_label[("read_full", "pbmc3k", "scx_auto")]
+    rf_extra = rf["params"].get("slurm_additional_parameters") or {}
+    assert "dependency" in rf_extra, (
+        f"read_full should have afterok dependency but doesn't: {rf['params']}"
+    )
+
+
+def test_manifest_records_is_array_task(isolated_work_dir):
+    """All benchmark entries in run_manifest.json must include is_array_task=True."""
+    _FakeAutoExecutor.reset()
+    _install_fake_submitit()
+
+    rp = _run_main_with_argv([
+        "--datasets", "pbmc3k",
+        "--formats", "scx_auto",
+        "--benchmarks", "read_full",
+        "--skip-smoke",
+    ])
+
+    manifest_path = rp.LOGS_DIR / "run_manifest.json"
+    assert manifest_path.exists()
+
+    import json
+    manifest = json.loads(manifest_path.read_text())
+
+    for entry in manifest["submitted"]:
+        assert entry.get("is_array_task") is True, (
+            f"Entry {entry['label']} missing is_array_task=True"
+        )
+
+    # Also verify the mock recorded is_array_task correctly
+    bench_subs = [
+        s for s in _FakeAutoExecutor.submissions
+        if s["fn_name"] == "_run_benchmark"
+    ]
+    assert all(s["is_array_task"] is True for s in bench_subs), (
+        "All bench submissions should be array tasks"
+    )
+    conv_subs = [
+        s for s in _FakeAutoExecutor.submissions
+        if s["fn_name"] == "_run_conversion"
+    ]
+    assert all(s["is_array_task"] is False for s in conv_subs), (
+        "All conversion submissions should NOT be array tasks"
+    )
+
+
+def test_bench_format_compatible_helper():
+    """_bench_format_compatible correctly enforces accel/CSC pairing rules."""
+    # Import directly to test the helper
+    from benchmarks.comprehensive.scripts.run_parallel import _bench_format_compatible
+
+    # accel_pca only pairs with accel_pca__* formats
+    assert _bench_format_compatible("accel_pca", "accel_pca__scx_auto") is True
+    assert _bench_format_compatible("accel_pca", "accel_pca__pyscx_cpu_auto") is True
+    assert _bench_format_compatible("accel_pca", "accel_knn__scx_auto") is False
+    assert _bench_format_compatible("accel_pca", "scx_auto") is False
+    assert _bench_format_compatible("accel_pca", "h5ad_none") is False
+
+    # bench_csc_dispatch only pairs with bench_csc__* formats
+    assert _bench_format_compatible("bench_csc_dispatch", "bench_csc__pca_csr") is True
+    assert _bench_format_compatible("bench_csc_dispatch", "scx_auto") is False
+
+    # Non-accel benchmarks skip accel and bench_csc formats
+    assert _bench_format_compatible("read_full", "scx_auto") is True
+    assert _bench_format_compatible("read_full", "h5ad_none") is True
+    assert _bench_format_compatible("read_full", "accel_pca__scx_auto") is False
+    assert _bench_format_compatible("read_full", "bench_csc__pca_csr") is False
+

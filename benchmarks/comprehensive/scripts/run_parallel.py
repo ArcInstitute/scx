@@ -351,6 +351,92 @@ def _triple_compatible(bench_name: str, ds_name: str, format_key: str) -> bool:
         return False
     return True
 
+
+def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
+    """Check benchmark–format pairing beyond multimodal compatibility.
+
+    Accel benchmarks (accel_*) only pair with their own format variants
+    (e.g., accel_pca pairs with accel_pca__scx_auto). Similarly,
+    bench_csc_dispatch only pairs with bench_csc__* formats.
+    Non-accel benchmarks skip accel_* and bench_csc__* format keys.
+
+    This mirrors the inline filtering at run_parallel.py Phase B.
+    """
+    is_accel = bench_name.startswith("accel_") or bench_name == "bench_csc_dispatch"
+    fmt_is_accel = format_key.startswith("accel_") or format_key.startswith("bench_csc__")
+
+    if is_accel:
+        if bench_name == "bench_csc_dispatch":
+            return format_key.startswith("bench_csc__")
+        return format_key.startswith(f"{bench_name}__")
+    elif fmt_is_accel:
+        return False
+    return True
+
+
+def _build_cohort_key(
+    args, ds_name: str, fmt_key: str, bench_name: str
+) -> tuple[str, str, str, str, bool]:
+    """Build a resource-cohort key for array grouping.
+
+    Returns (dataset, format_key, partition, gres, needs_conversion).
+    All benchmarks sharing the same key can safely coexist in one SLURM array.
+
+    Note: conda_env and slurm_setup are pure functions of format_key
+    (via _env_for_format / _slurm_setup_cmds), so they are fully
+    determined by the key without being explicitly included.
+    """
+    params = _per_job_slurm_params(
+        args, ds_name, fmt_key, bench_name, is_conversion=False
+    )
+    needs_conv = bench_name not in _NO_CONVERSION
+    return (
+        ds_name,
+        fmt_key,
+        params["slurm_partition"],
+        params.get("slurm_gres", ""),
+        needs_conv,
+    )
+
+
+def _determine_cohort_resources(
+    args, cohort_key: tuple, benchmarks: list[str]
+) -> dict:
+    """Compute the SLURM resource envelope for a cohort's array.
+
+    Since all benchmarks in the cohort already share the same partition,
+    gres, and conda env (by construction), we only need max(mem, time).
+    Returns a dict suitable for passing to executor.update_parameters().
+    """
+    ds_name, fmt_key, partition, gres, needs_conv = cohort_key
+    max_mem = 0
+    max_time = 0
+
+    for bench in benchmarks:
+        params = _per_job_slurm_params(
+            args, ds_name, fmt_key, bench, is_conversion=False
+        )
+        max_mem = max(max_mem, params["mem_gb"])
+        max_time = max(max_time, params["timeout_min"])
+
+    return {
+        "mem_gb": max_mem,
+        "timeout_min": max_time,
+        "slurm_partition": partition,
+        "cpus_per_task": args.cpus,
+        # Explicitly set gres to prevent carry-over from prior
+        # executor.update_parameters() calls (see §5 note on merge semantics).
+        "slurm_gres": gres if gres else "",
+        # slurm_setup is a pure function of format_key via _env_for_format
+        "slurm_setup": _slurm_setup_cmds(_env_for_format(fmt_key)),
+    }
+
+
+_TERMINAL_FAILURE_STATES = {
+    "CANCELLED", "TIMEOUT", "NODE_FAIL", "FAILED", "OUT_OF_MEMORY", "PREEMPTED",
+}
+
+
 LOGS_DIR = PROJECT_ROOT / "benchmarks" / "comprehensive" / "logs" / "submitit"
 
 
@@ -937,10 +1023,65 @@ def main() -> None:
                 if path.exists():
                     conversion_paths[(ds_name, fmt.key)] = str(path)
 
-    # --- Phase B: Benchmark jobs ---
+    # --- Phase B: Benchmark jobs (Resource-Cohort Arrays) ---
+    #
+    # Design: instead of one ``executor.submit(...)`` per (benchmark, dataset,
+    # format) triple, we group triples into *resource cohorts* keyed by
+    # ``(dataset, format_key, partition, gres, needs_conversion)`` and submit
+    # each cohort as a single SLURM Job Array via
+    # ``executor.map_array(...)``. SLURM requires every task in an array to
+    # share identical resource parameters, so the 5-tuple guarantees:
+    #   - GPU and CPU benchmarks auto-separate (different ``partition`` and
+    #     ``gres``) — e.g. ``ml_loader`` on ``scx_auto`` goes to the GPU
+    #     partition while ``read_full`` on the same key stays on CPU.
+    #   - High-memory benchmarks promoted to ``cpu_high_mem`` by
+    #     ``partition_for_memory`` get their own cohort.
+    #   - ``_NO_CONVERSION`` benchmarks (write, parallel_write_scaling,
+    #     cell_eval_parity_perf) skip the ``afterok`` dependency by sitting
+    #     in cohorts with ``needs_conversion=False``.
+    #   - Accel/CSC pairing rules (an ``accel_pca`` benchmark only with
+    #     ``accel_pca__*`` formats; ``bench_csc_dispatch`` only with
+    #     ``bench_csc__*`` formats) are enforced by
+    #     ``_bench_format_compatible`` before grouping.
+    #
+    # QOS handling: SLURM counts each array task individually against
+    # ``QOSMaxSubmitJobPerUserLimit`` (~500 on Chimera ``cpu_preemptible``).
+    # Native throttling is via ``slurm_array_parallelism`` per cohort, but we
+    # also block on ``_wait_under_pending_cap(450)`` before each
+    # ``map_array`` call and retry up to 3× with 60s drains on a QOS error,
+    # to absorb races between the squeue poll and SLURM's internal counter.
+    #
+    # Full rationale: BENCHMARKING-SUBMIT-FIX.md §4–5.
     logger.info("=" * 60)
-    logger.info("Phase B: Submitting benchmark jobs")
+    logger.info("Phase B: Grouping benchmarks into resource cohorts")
     logger.info("=" * 60)
+
+    # Build a format lookup so cohort submission can resolve runner/params
+    # from format_key without re-iterating the formats list.
+    formats_by_key: dict[str, FormatVariant] = {f.key: f for f in formats}
+
+    # ── Phase B.1: Group benchmarks into resource cohorts ──────────────
+    # Each cohort key is (dataset, format_key, partition, gres, needs_conversion).
+    # All benchmarks sharing the same key can safely coexist in one SLURM array.
+    cohorts: dict[tuple, list[str]] = {}
+    for bench_name in benchmarks:
+        for ds_name in datasets:
+            for fmt in formats:
+                # Accel/CSC pairing rules
+                if not _bench_format_compatible(bench_name, fmt.key):
+                    continue
+                # Multimodal compatibility
+                if not _triple_compatible(bench_name, ds_name, fmt.key):
+                    continue
+                key = _build_cohort_key(args, ds_name, fmt.key, bench_name)
+                cohorts.setdefault(key, []).append(bench_name)
+
+    logger.info(
+        "Grouped %d benchmarks into %d resource cohorts",
+        sum(len(v) for v in cohorts.values()), len(cohorts),
+    )
+
+    # ── Phase B.2: Submit each cohort as a SLURM Job Array ────────────
 
     # See companion comment on the convert executor above re: why
     # `slurm_python="python"` is necessary for per-job env routing.
@@ -955,129 +1096,171 @@ def main() -> None:
     bench_jobs: list[tuple[str, submitit.Job, tuple[str, str] | None]] = []
     dep_jobid_for_label: dict[str, str | None] = {}
 
-    for bench_name in benchmarks:
-        for ds_name in datasets:
-            n_runs = n_runs_for_dataset(ds_name)
-            for fmt in formats:
-                # Accelerator benchmarks are self-contained: each
-                # `accel_X` module owns its own set of variants
-                # (`accel_X__<impl>`). Pairing `accel_pca` with an
-                # `accel_knn__*` format — or with any non-accel format —
-                # schedules a cell whose `run()` returns None (waste).
-                # Skip those pairings at the launcher level.
-                if bench_name.startswith("accel_"):
-                    if not fmt.key.startswith(f"{bench_name}__"):
-                        continue
-                elif bench_name == "bench_csc_dispatch":
-                    # `bench_csc_dispatch` exposes its variants as
-                    # `bench_csc__<op>_<csr|csc>` (Phase L.3); same
-                    # self-contained-pairing rule applies.
-                    if not fmt.key.startswith("bench_csc__"):
-                        continue
-                elif fmt.key.startswith("accel_") or fmt.key.startswith("bench_csc__"):
-                    # Non-accel benchmarks (read_full, etc.) don't pair
-                    # with accel / CSC dispatch variants either.
-                    continue
+    for cohort_key, group_benches in cohorts.items():
+        ds_name, fmt_key, partition, gres, needs_conv = cohort_key
 
-                # Multimodal pairings: multimodal benchmarks only run
-                # on multimodal datasets + multimodal formats; the
-                # inverse holds for single-modality benchmarks.
-                if not _triple_compatible(bench_name, ds_name, fmt.key):
-                    continue
+        # --- Resource envelope for this cohort ---
+        array_params = _determine_cohort_resources(args, cohort_key, group_benches)
 
-                key = (ds_name, fmt.key)
-                label = f"{bench_name}/{ds_name}/{fmt.key}"
+        # --- Build executor kwargs ---
+        update_kwargs: dict[str, Any] = dict(array_params)
 
-                # Decide the conversion source and the SLURM dependency.
-                # Three states: (a) bench needs no conversion → no dep,
-                # path is None; (b) conversion was submitted this run →
-                # afterok dep on its job_id, path is the deterministic
-                # on-disk target (visible after the conv job lands);
-                # (c) converted file already on disk → no dep.
-                dep_jobid: str | None = None
-                if bench_name in _NO_CONVERSION:
-                    conv_path = None
-                elif key in conv_jobs:
-                    # Short-circuit: if the convert job is already in
-                    # a terminal failure state, don't submit dependent
-                    # bench jobs. They'd just queue as
-                    # `DependencyNeverSatisfied`, eat throttle slots
-                    # for hours (each one counts toward Chimera's
-                    # QOSMaxSubmitJobPerUserLimit), and ultimately
-                    # cancel — wasted scheduler churn for zero
-                    # signal. ``state()`` is a lightweight squeue
-                    # query; submitit caches it. Treat anything in
-                    # FAILED / CANCELLED / TIMEOUT / NODE_FAIL as a
-                    # terminal failure.
-                    conv_state = ""
-                    try:
-                        conv_state = conv_jobs[key].state or ""
-                    except Exception:
-                        # Best-effort lookup; on transient squeue
-                        # failures fall through to normal submission.
-                        conv_state = ""
-                    # See the result-loop fast-fail for the rationale —
-                    # match the FIRST whitespace-/+-delimited token so
-                    # rich slurm states like "CANCELLED by 10024" or
-                    # "CANCELLED+0:0" land correctly.
-                    conv_head = (
-                        conv_state.replace("+", " ").split()[0].upper()
-                        if conv_state else ""
-                    )
-                    if conv_head in {"FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED"}:
-                        logger.warning(
-                            "  SKIP %s: upstream convert %s already %s",
-                            label, conv_jobs[key].job_id, conv_state,
-                        )
-                        continue
-                    dep_jobid = conv_jobs[key].job_id
-                    conv_path = str(DATASETS[ds_name].path_for_format(fmt.key))
-                elif args.dry_run and key in dry_run_conv_keys:
-                    # In --dry-run we never actually submit Phase A,
-                    # so use a placeholder jobid to surface the would-be
-                    # afterok edge in the per-cell log.
-                    dep_jobid = "<conv-pending>"
-                    conv_path = str(DATASETS[ds_name].path_for_format(fmt.key))
-                else:
-                    conv_path = conversion_paths.get(key)
-                    if conv_path is None:
-                        logger.warning("  SKIP %s: no converted file", label)
-                        continue
+        # --- Conversion dependency (only for cohorts that need it) ---
+        dep_jobid: str | None = None
+        if needs_conv and (ds_name, fmt_key) in conv_jobs:
+            conv_job = conv_jobs[(ds_name, fmt_key)]
+            # Short-circuit if upstream conversion already entered a terminal
+            # failure state (matches the historical check)
+            head_state = _job_terminal_head(conv_job)
+            if head_state in _TERMINAL_FAILURE_STATES:
+                logger.warning(
+                    "Skipping cohort %s/%s — upstream conversion %s is %s",
+                    ds_name, fmt_key, conv_job.job_id, head_state,
+                )
+                continue
+            dep_jobid = conv_job.job_id
+            update_kwargs["slurm_additional_parameters"] = {
+                "dependency": f"afterok:{dep_jobid}"
+            }
+        elif needs_conv and args.dry_run and (ds_name, fmt_key) in dry_run_conv_keys:
+            dep_jobid = "<conv-pending>"
+            update_kwargs["slurm_additional_parameters"] = {}
+        else:
+            # Explicitly clear to prevent merge carry-over from previous cohort
+            update_kwargs["slurm_additional_parameters"] = {}
 
-                params = _per_job_slurm_params(args, ds_name, fmt.key, bench_name)
+        # --- Array parallelism (native SLURM throttle) ---
+        if args.max_pending_jobs > 0:
+            # Distribute the budget across cohorts, with a floor of 3
+            update_kwargs["slurm_array_parallelism"] = max(
+                3, args.max_pending_jobs // max(len(cohorts), 1)
+            )
 
-                if args.dry_run:
-                    dep_str = f" deps=afterok:{dep_jobid}" if dep_jobid else ""
-                    logger.info(
-                        "  [DRY RUN] Would run: %s [%dG, %s]%s",
-                        label, params["mem_gb"], params["slurm_partition"], dep_str,
-                    )
-                    continue
+        # --- Construct parallel argument lists for map_array ---
+        # These must match _run_benchmark's 8-parameter signature exactly:
+        #   (bench_name, dataset_name, format_key, format_runner,
+        #    format_params, n_runs, cold_cache, converted_path_str)
+        bench_names: list[str] = []
+        dataset_names: list[str] = []
+        format_keys: list[str] = []
+        format_runners: list[str] = []
+        format_params_list: list[dict] = []
+        n_runs_list: list[int] = []
+        cold_caches: list[bool] = []
+        converted_path_strs: list[str | None] = []
 
-                update_kwargs: dict[str, Any] = dict(params)
-                if dep_jobid is not None:
-                    extra = update_kwargs.get("slurm_additional_parameters", {}) or {}
-                    extra = {**extra, "dependency": f"afterok:{dep_jobid}"}
-                    update_kwargs["slurm_additional_parameters"] = extra
-                # Throttle: same QOS-cap respect as the convert loop.
-                _wait_under_pending_cap(args.max_pending_jobs, kind="bench")
-                executor.update_parameters(**update_kwargs)
-                job = executor.submit(
+        fmt_obj = formats_by_key[fmt_key]
+        for bench_name in group_benches:
+            bench_names.append(bench_name)
+            dataset_names.append(ds_name)
+            format_keys.append(fmt_key)
+            format_runners.append(fmt_obj.runner)
+            format_params_list.append(fmt_obj.params)
+            n_runs_list.append(n_runs_for_dataset(ds_name))
+            cold_caches.append(args.cold_cache)
+
+            # Resolve converted file path
+            conv_key = (ds_name, fmt_key)
+            if not needs_conv:
+                conv_path: str | None = None
+            elif conv_key in conversion_paths:
+                conv_path = conversion_paths[conv_key]
+            elif conv_key in conv_jobs or (args.dry_run and conv_key in dry_run_conv_keys):
+                conv_path = str(DATASETS[ds_name].path_for_format(fmt_key))
+            else:
+                conv_path = None
+            converted_path_strs.append(conv_path)
+
+        # Skip cohorts where non-_NO_CONVERSION benchmarks have no source.
+        # If ``not dep_jobid`` is true here, the cohort has neither a real
+        # conversion jobid nor the ``<conv-pending>`` dry-run placeholder.
+        if needs_conv and not dep_jobid:
+            # No conversion job and not in conversion_paths — check if we
+            # can actually run these benchmarks
+            if all(p is None for p in converted_path_strs):
+                logger.warning(
+                    "  SKIP cohort %s/%s: no converted file available",
+                    ds_name, fmt_key,
+                )
+                continue
+
+        # --- Dry-run: print plan without submitting ---
+        if args.dry_run:
+            logger.info(
+                "DRY-RUN cohort %s/%s/%s gres=%s conv=%s: %d tasks, "
+                "mem=%dGB time=%dmin",
+                ds_name, fmt_key, partition, gres or "none",
+                "dep" if dep_jobid else ("no-conv" if not needs_conv else "exists"),
+                len(group_benches), array_params["mem_gb"],
+                array_params["timeout_min"],
+            )
+            for bn in group_benches:
+                logger.info("  task: %s/%s/%s", bn, ds_name, fmt_key)
+            continue
+
+        # --- QOS-aware throttle: block until squeue is below cap ---
+        # Always throttle, even when max_pending_jobs is not set. The
+        # default cap (450) stays safely under Chimera's
+        # QOSMaxSubmitJobPerUserLimit of 512 on cpu_preemptible.
+        # Each map_array call counts as N individual array tasks against
+        # the QOS limit, so we must include the upcoming cohort's size.
+        tasks_in_cohort = len(group_benches)
+        effective_cap = args.max_pending_jobs if args.max_pending_jobs > 0 else 450
+        _wait_under_pending_cap(effective_cap, kind="bench")
+
+        executor.update_parameters(**update_kwargs)
+
+        # --- Submit the cohort as a single SLURM Job Array ---
+        # Retry once on QOSMaxSubmitJobPerUserLimit — the squeue poll in
+        # _wait_under_pending_cap can race with SLURM's internal counter
+        # (array tasks still being registered).
+        _QOS_RETRY_MAX = 3
+        for _attempt in range(_QOS_RETRY_MAX):
+            try:
+                task_jobs = executor.map_array(
                     _run_benchmark,
-                    bench_name, ds_name, fmt.key, fmt.runner, fmt.params,
-                    n_runs, args.cold_cache, conv_path,
+                    bench_names,
+                    dataset_names,
+                    format_keys,
+                    format_runners,
+                    format_params_list,
+                    n_runs_list,
+                    cold_caches,
+                    converted_path_strs,
                 )
-                bench_jobs.append((label, job, key if dep_jobid is not None else None))
-                dep_jobid_for_label[label] = dep_jobid
-                dep_str = f" deps=afterok:{dep_jobid}" if dep_jobid else ""
-                logger.info(
-                    "  Submitted: %s [%dG, %s]%s -> job %s",
-                    label, params["mem_gb"], params["slurm_partition"], dep_str, job.job_id,
-                )
+                break  # success
+            except Exception as exc:
+                if "QOSMaxSubmitJobPerUserLimit" in str(exc):
+                    if _attempt < _QOS_RETRY_MAX - 1:
+                        logger.warning(
+                            "QOS limit hit submitting cohort %s/%s "
+                            "(attempt %d/%d); waiting 60s for drain...",
+                            ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                        )
+                        time.sleep(60)
+                        _cancel_dep_never_satisfied()
+                        _wait_under_pending_cap(effective_cap, kind="bench")
+                        continue
+                raise  # re-raise non-QOS errors or final attempt
 
-    # Emit run_manifest.json — an authoritative list of submitted triples so
-    # watch.py can detect missing-result failures even when submitit itself
-    # exits cleanly (Phase I.6).
+        # Record jobs for the wait loop and manifest
+        for bench_name, job in zip(group_benches, task_jobs):
+            label = f"{bench_name}/{ds_name}/{fmt_key}"
+            conv_key_val = (ds_name, fmt_key) if dep_jobid else None
+            bench_jobs.append((label, job, conv_key_val))
+            dep_jobid_for_label[label] = dep_jobid
+
+        logger.info(
+            "  Submitted cohort %s/%s/%s: %d tasks, mem=%dGB, "
+            "time=%dmin%s -> array %s",
+            ds_name, fmt_key, partition, tasks_in_cohort,
+            array_params["mem_gb"], array_params["timeout_min"],
+            f" deps=afterok:{dep_jobid}" if dep_jobid else "",
+            task_jobs[0].job_id.rsplit("_", 1)[0] if task_jobs else "?",
+        )
+
+    # ── Write manifest (single JSON dump, matching existing pattern) ──
+
     if not args.dry_run and bench_jobs:
         manifest_path = LOGS_DIR / "run_manifest.json"
         manifest = {
@@ -1089,6 +1272,7 @@ def main() -> None:
                     "job_id": job.job_id,
                     "submitit_folder": str(job.paths.folder),
                     "dependency": dep_jobid_for_label.get(label),
+                    "is_array_task": True,  # All Phase B jobs are now array tasks
                 }
                 for label, job, _conv_key in bench_jobs
             ],
@@ -1098,35 +1282,23 @@ def main() -> None:
         logger.info("Run manifest: %s", manifest_path)
 
     if args.dry_run:
-        # Mirror the pairing filter from the Phase-B loop so dry-run
-        # counts match what an actual submission would produce.
-        def _pairs_ok(b: str, fk: str) -> bool:
-            if b.startswith("accel_"):
-                return fk.startswith(f"{b}__")
-            if b == "bench_csc_dispatch":
-                return fk.startswith("bench_csc__")
-            return not (fk.startswith("accel_") or fk.startswith("bench_csc__"))
-
         n_conv = sum(
             1 for ds in datasets for fmt in formats
             if not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite
         )
-        n_bench = sum(
-            1 for b in benchmarks for ds in datasets for fmt in formats
-            if _pairs_ok(b, fmt.key)
-        )
+        n_bench = sum(len(v) for v in cohorts.values())
         n_dep = sum(
-            1 for b in benchmarks for ds in datasets for fmt in formats
-            if _pairs_ok(b, fmt.key)
-            and b not in _NO_CONVERSION
+            len(v) for k, v in cohorts.items()
+            if k[4]  # needs_conversion
             and (
-                not DATASETS[ds].path_for_format(fmt.key).exists() or args.overwrite
+                not DATASETS[k[0]].path_for_format(k[1]).exists() or args.overwrite
             )
         )
         logger.info(
             "DRY RUN: would submit %d conversion + %d benchmark "
-            "(%d benchmark→conversion afterok edges) = %d total SLURM jobs",
-            n_conv, n_bench, n_dep, n_conv + n_bench,
+            "(%d benchmark→conversion afterok edges) across %d cohort arrays "
+            "= %d total SLURM jobs (arrays + individual conversions)",
+            n_conv, n_bench, n_dep, len(cohorts), n_conv + len(cohorts),
         )
         return
 

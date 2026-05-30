@@ -55,7 +55,7 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | Crate | Role | Key modules |
 |-------|------|-------------|
 | **scx-codec** | Compression codecs (standalone, no I/O) | `rice`, `forbp`, `delta_golomb`, `bitstream`, `dispatch` |
-| **scx-sparse** | CSR matrix type with scipy-compatible dtypes | `csr` (`ScxCsr`), `convert` (CSR ↔ dense) |
+| **scx-sparse** | CSR/CSC matrix types with scipy-compatible dtypes | `csr` (`ScxCsr`), `csc` (`ScxCsc`), `transpose` (streaming CSR→CSC), `convert` (CSR ↔ dense) |
 | **scx-format** | File layout, reading, and writing | `header`, `catalog`, `shard`, `reader`, `writer`, `codec_select`, `provenance`, `deletion_vectors` |
 | **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
@@ -103,6 +103,7 @@ catalog for O(1) random access to any component.
 │   var metadata        (Arrow IPC, single or sharded) │
 │   predicate indexes                                  │
 │   X/csr/000000..N-1   (CSR shards — expression data) │
+│   X_csc_shard_0..M-1  (CSC sidecar — optional)       │
 │   layers, obsm, obsp, uns, provenance                │
 │   deletion vectors    (optional, Roaring Bitmap)     │
 ├───────────────────────────────────────────────────-──┤
@@ -113,6 +114,7 @@ catalog for O(1) random access to any component.
 **Key design properties:**
 - **Single file** — easy to copy, stage, and manage
 - **CSR-native** — row-major sparse storage matches 60-80% of scRNA-seq access patterns
+- **CSC sidecar** — optional column-major view for gene-centric analytics (DE, HVG, per-gene QC)
 - **Sharded** — expression matrix is split into shards of ~10K cells each, enabling parallel I/O and selective reads
 - **Immutable fragments** — sections are never overwritten; appends write new data at EOF and update the catalog pointer atomically
 - **Dual catalog** — root catalog (fixed position) for fast open; full catalog (at EOF) for random access
@@ -161,6 +163,199 @@ The file header stores a default `codec_id`, but each shard header may **overrid
 Auto-codec selection (`scx-format/src/codec_select.rs`) samples up to 10K non-zero
 values per shard: integer data uses the median heuristic to choose Scx1 vs Zstd,
 float data routes to Pcodec. LZ4+shuffle is available via `codec="lz4"` but not auto-selected.
+
+---
+
+## CSC Sidecar Architecture
+
+The CSC (Compressed Sparse Column) sidecar is an **optional, additive column-major
+view** of the same expression matrix data that the primary CSR shards hold. CSR
+shards stay on disk unchanged — the CSC shards add roughly the same compressed
+bytes (same nnz, just laid out column-major; codec compression ratios are similar
+under Scx1 / Zstd / Pcodec).
+
+### Design rationale
+
+SCX's primary storage is CSR — optimized for row-major (cell-centric) access
+patterns: PCA, ML training, per-cell QC, cell subsetting. But several key
+analysis operations are inherently **column-major** (gene-centric):
+
+| Operation | Why CSC helps |
+|-----------|---------------|
+| Differential expression (small gene subsets) | Reads each gene's column as a single CSC slab instead of decoding every CSR row and projecting |
+| Highly variable genes (single-batch seurat_v3) | Single-pass per-column accumulators with no O(n_vars) row-wise scratch |
+| Per-gene QC metrics | Gene-axis aggregations route through CSC |
+| Filtered pseudobulk | Only the requested gene columns are decoded |
+
+Without a CSC sidecar, these operations must decode every CSR shard and project
+out columns — wasting I/O proportional to the full matrix rather than the
+queried gene set.
+
+Operations that are row-axis-only (PCA, full-pass HVG, per-cell QC, ML
+training) should **not** use CSC. Both PCA methods (covariance and randomized
+SVD) explicitly reject `prefer_format="csc"` on the pyscx side.
+
+### On-disk format
+
+CSC shards reuse the **exact same 76-byte shard header** as CSR shards
+(see [format.md §4](format.md#4-csr-shard-internal-layout)). The structural
+layout is identical — header + encoded `indptr` / `indices` / `values` +
+block index. The column-major semantics live entirely in field interpretation:
+
+| Header field | CSR semantics | CSC semantics |
+|---|---|---|
+| `shard_type` | `0` | `1` (authoritative) |
+| `n_major` | rows in this shard | **columns** in this shard |
+| `n_minor` | columns in full matrix | **rows** in full matrix (`n_obs`) |
+| `global_offset` | first row index | first **column** index |
+| `indptr` (len `n_major + 1`) | row-pointer | **column-pointer** |
+| `indices` (len `nnz`) | column indices | **global row** indices (NOT shard-local) |
+
+The catalog's `section_type = CscShard (5)` is the authoritative discriminator;
+the in-shard `shard_type` byte exists for self-contained shard validation
+(e.g. exploded `.scxd` files). Catalog `ShardStats.row_start` / `row_end`
+fields are reused for the **major-axis** range (i.e. `col_start..col_end`
+for CSC); the accessors `ShardStats::major_start()` / `major_end()` handle
+the dispatch. See [format.md §4.1](format.md#41-csc-shard-internal-layout)
+for the full field-level spec.
+
+### Multi-shard column layout
+
+CSC sidecars are split by column range (default: 5000 columns per shard via
+`--csc-cols-per-shard`). Each shard covers a contiguous half-open
+`[col_start, col_end)` range, non-overlapping and sorted by `col_start`:
+
+```
+n_vars = 36000, --csc-cols-per-shard 5000
+                       ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬───┐
+CSC shards (8 total):  │ 0..5K│5..10K│10..15│15..20│20..25│25..30│30..35│..36│
+                       └──────┴──────┴──────┴──────┴──────┴──────┴──────┴───┘
+```
+
+Two reasons to split by column range rather than emitting one giant shard:
+
+1. **Column-range pushdown.** `BackedCscIndex::shards_for_col_range` binary-searches
+   the sorted ranges and skips non-overlapping shards entirely. With 5000 cols/shard
+   on a 36K-gene matrix, a single-gene DE query touches 1 shard out of 8.
+2. **Bounded transpose memory.** The streaming CSR→CSC transpose chunks by column
+   range, so peak memory during `build-csc` scales with
+   `csc_cols_per_shard × n_obs × 8 bytes` rather than the full matrix.
+
+Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
+
+### Key types and data flow
+
+```
+                   CREATION                                    CONSUMPTION
+ ─────────────────────────────────────────   ──────────────────────────────────────
+
+ scx-sparse/src/transpose.rs                scx-format/src/backed.rs
+ ┌──────────────────────────────────┐        ┌─────────────────────────────────┐
+ │ streaming_csr_to_csc_iter_with   │        │ BackedCscIndex                  │
+ │ _cap()                           │        │   shard_ranges: Vec<(col_start, │
+ │   - iterates CSR shards          │        │     col_end, sorted_idx)>       │
+ │   - yields CscArrays per col     │        │   shards_for_col_range(lo,hi)   │
+ │     chunk (memory-bounded)       │        │     → Vec<usize>  (binary srch) │
+ └────────────┬─────────────────────┘        └────────────┬────────────────────┘
+              │                                           │
+              ▼                                           ▼
+ scx-format/src/writer.rs                   ┌─────────────────────────────────┐
+ ┌──────────────────────────────────┐        │ BackedCscReader                 │
+ │ ScxWriter::write_csc_shard()    │        │   reader: ScxReader             │
+ │   section_type = CscShard(5)    │        │   index:  BackedCscIndex        │
+ │   codec, value_encoding per     │        │   cache:  LRU<usize, ScxCsc>    │
+ │   shard                         │        │                                 │
+ └──────────────────────────────────┘        │   read_csc_columns(col_range)   │
+                                            │   read_csc_columns_subset(cols) │
+                                            │   read_shard_cached(idx)        │
+                                            └────────────┬────────────────────┘
+                                                         │
+                                                         │ impl ColumnShardSource
+                                                         ▼
+                                            scx-accel/src/csc/
+                                            ┌─────────────────────────────────┐
+                                            │ wilcoxon_rank_sum_streaming_csc │
+                                            │ streaming_mean_var_csc          │
+                                            │ pdex_ref_streaming_csc          │
+                                            │ pseudobulk_aggregate_csc        │
+                                            │                                 │
+                                            │ All generic over                │
+                                            │   S: ColumnShardSource          │
+                                            └─────────────────────────────────┘
+```
+
+**`BackedCscIndex`** (`scx-format/src/backed.rs`): A sorted vector of
+`(col_start, col_end, sorted_shard_idx)` ranges built from the catalog at
+construction time. Provides O(log n) column lookups via `partition_point`:
+`shard_for_col(col)` for single-column lookups and
+`shards_for_col_range(c_lo, c_hi)` for range queries.
+
+**`BackedCscReader`** (`scx-format/src/backed.rs`): The primary CSC consumer.
+Wraps an `ScxReader` + `BackedCscIndex` + a count-only LRU cache for decoded
+`ScxCsc` shards (simpler than the CSR reader's byte-budgeted / singleflight
+cache — CSC analytical workloads access shards in column-range order with
+limited reuse). Key method: `read_csc_columns(col_range)` skips non-overlapping
+shards, `col_slice`s partial-overlap shards post-decode, and concatenates
+results. Implements `ColumnShardSource`.
+
+**`ColumnShardSource`** (`scx-format/src/shard_source.rs`): The trait that
+abstracts CSC access. Both `BackedCscReader` (raw on-disk) and pyscx's
+`LazyShardSource` (transform-aware) implement it. All `scx-accel` CSC kernels
+are generic over this trait — no concrete type dependency.
+
+**`PreferFormat` + `require_csc()`** (`scx-accel/src/csc/dispatch.rs`):
+Explicit opt-in dispatch. There is intentionally no `Auto` variant — every
+CSC dispatch is explicit at the call site. Callers pass `prefer_format="csc"`
+through pyscx kwargs; `require_csc()` either returns the `ColumnShardSource`
+or a clean error explaining why CSC is unavailable.
+
+### Creation pipeline
+
+CSC sidecars are created by a streaming CSR→CSC transpose in
+`scx-sparse/src/transpose.rs`:
+
+1. All CSR shards for the matrix are decoded (or read from the existing file).
+2. `streaming_csr_to_csc_iter_with_cap()` iterates column chunks bounded by
+   `min(memory_budget, csc_cols_per_shard)` — each `next()` call transposes a
+   `[col_start, col_end)` slice across all CSR shards.
+3. Each yielded `CscArrays` is written via `ScxWriter::write_csc_shard()` as
+   `section_type = CscShard(5)` with independent per-shard codec selection.
+
+Entry points:
+
+| Entry point | When |
+|-------------|------|
+| `scx build-csc` | Post-hoc addition to an existing file |
+| `scx convert --csc=always` | During h5ad/h5mu → SCX conversion |
+| `pyscx.from_anndata(csc="always")` | During Python-side conversion |
+| `--rebuild-csc` on mutating ops | Re-emit after append/compact/merge/subset |
+
+Typical throughput: ~10–20 seconds for `build-csc` on a 1M-cell × 30K-gene
+file (single core, dominated by codec encoding).
+
+### Multimodal support
+
+`BackedCscReader::for_modality(reader, modality_id, cache_shards)` scopes the
+CSC index and LRU cache to a specific modality, filtering by
+`(SectionType::CscShard, modality_id)`. Each modality gets its own cache to
+avoid thrashing under interleaved access (e.g. totalVI touching RNA + ADT in
+the same step). `BackedCscReader::for_layer()` similarly scopes to a layer's
+CSC sidecar.
+
+### Mutating ops and CSC lifecycle
+
+Mutating operations (`append`, `compact`, `merge`, `subset`) change the row
+layout or column index space, making existing CSC `indices` arrays reference
+stale rows/columns. Each op therefore **drops the CSC sidecar by default**
+with a `log::warn!` message. Pass `--rebuild-csc` to re-emit the sidecar
+against the post-op output.
+
+`scx upgrade` is the exception — it preserves CSC sidecars by re-emitting
+them through `catalog.csc_shards_sorted()` into the new file.
+
+See [sharding.md § CSC sharding](sharding.md#csc-sharding) for the
+detailed design rationale and [format.md §4.1](format.md#41-csc-shard-internal-layout)
+for the full on-disk specification.
 
 ---
 

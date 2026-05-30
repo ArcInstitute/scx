@@ -85,14 +85,29 @@ def _result_exists(label: str) -> bool:
     return (RAW_RESULTS_DIR / f"{bench}__{fmt}__{dataset}.json").exists()
 
 
-def _state_from_submitit(folder: Path, job_id: str) -> tuple[str, str]:
+def _state_from_submitit(
+    folder: Path, job_id: str, *, is_array_task: bool = False
+) -> tuple[str, str]:
     """Inspect submitit's per-job folder for completion markers.
 
-    Submitit writes `<jid>_0_result.pkl` on success, `<jid>_0_log.err` on
-    failure / in-progress. Returns (state, error_tail).
+    Submitit always names per-task files ``<slurm_job_id>_<task_idx>_*``
+    where ``task_idx`` is the index inside the submitit "job" (always 0 for
+    single-process benchmarks). This is true for **both** individual jobs
+    (``2306028_0_result.pkl``) and SLURM array tasks
+    (``2374101_0_0_result.pkl`` for array ``2374101`` task ``0``). The
+    ``is_array_task`` keyword is accepted for backwards-compat with the
+    manifest but the suffix is always ``_0`` — see the on-disk evidence in
+    ``logs/submitit/bench/``.
+
+    Args:
+        folder: submitit output directory.
+        job_id: SLURM job ID (e.g. ``"2306028"`` or ``"2374101_0"``).
+        is_array_task: Vestigial — accepted from the manifest, ignored here.
     """
+    del is_array_task  # see docstring — always append "_0" regardless
     if not folder.is_dir():
         return "missing_folder", ""
+
     result_pkl = folder / f"{job_id}_0_result.pkl"
     log_err = folder / f"{job_id}_0_log.err"
     log_out = folder / f"{job_id}_0_log.out"
@@ -118,7 +133,12 @@ def build_snapshot() -> WatchSnapshot | None:
         label = entry["label"]
         job_id = str(entry["job_id"])
         folder = Path(entry["submitit_folder"])
-        state, err = _state_from_submitit(folder, job_id)
+        # Pass is_array_task from manifest to resolve correct pickle paths
+        state, err = _state_from_submitit(
+            folder,
+            job_id,
+            is_array_task=entry.get("is_array_task", False),
+        )
         if state == "completed" and not _result_exists(label):
             # Submitit thinks it's done but no JSON landed — flag it.
             state = "missing_result"
