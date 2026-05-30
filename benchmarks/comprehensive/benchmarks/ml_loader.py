@@ -103,6 +103,15 @@ except ImportError:
 
 _SCX_KEYS = {"scx_auto", "scx_scx1", "scx_zstd", "scx_lz4", "scx_none", "scx_pcodec"}
 
+SUPPORTED_FORMATS: frozenset[str] = frozenset(
+    _SCX_KEYS | {"h5ad_none", "h5ad_gzip", "tiledb_soma", "slaf"}
+)
+"""Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
+incompatible (bench, format) cells never get submitted. Derived from
+``_resolve_loader`` (the canonical static dict) — any change here must
+match the keys that ``_resolve_loader`` recognises. The runtime guard
+in ``run()`` still catches direct invocation."""
+
 _SCENARIOS: list[tuple[str, bool, bool]] = [
     # (name, hvg, normalize)
     ("raw", False, False),

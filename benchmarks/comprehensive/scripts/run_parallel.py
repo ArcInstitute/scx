@@ -68,6 +68,7 @@ from benchmarks.comprehensive.config import (  # noqa: E402
 )
 from benchmarks.comprehensive.convert import convert_dataset_format  # noqa: E402
 from benchmarks.comprehensive.results import BenchmarkResult, write_result  # noqa: E402
+from benchmarks.comprehensive.runners import make_runner  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -374,19 +375,63 @@ def _bench_supported_formats(bench_name: str) -> frozenset[str] | None:
     return val if val is None else frozenset(val)
 
 
+@functools.lru_cache(maxsize=None)
+def _bench_required_capabilities(bench_name: str) -> frozenset[str]:
+    """Return the bench module's declared ``REQUIRED_CAPABILITIES``, or empty.
+
+    Mirrors :func:`_bench_supported_formats` — bench modules expose
+    runner-capability requirements next to their runtime guards so the
+    constraint is owned by the bench, not duplicated in the orchestrator.
+    Cached for the same reason.
+    """
+    try:
+        mod = importlib.import_module(
+            f"benchmarks.comprehensive.benchmarks.{bench_name}"
+        )
+    except ImportError:
+        return frozenset()
+    val = getattr(mod, "REQUIRED_CAPABILITIES", None)
+    return frozenset(val) if val else frozenset()
+
+
+@functools.lru_cache(maxsize=None)
+def _runner_capabilities(format_key: str) -> frozenset[str]:
+    """Resolve the runner's capability set for ``format_key``.
+
+    Reads ``runner.capabilities`` after a cheap, side-effect-free
+    ``make_runner(fmt)`` instantiation — no file I/O, no cloud calls.
+    Cached so each format key pays one instantiation across the whole
+    cohort-grouping pass. Returns an empty frozenset if the format is
+    unknown or the runner constructor raises (defensive — old YAML
+    configs in CI may name retired formats).
+    """
+    fmt = next((f for f in ALL_FORMATS if f.key == format_key), None)
+    if fmt is None:
+        return frozenset()
+    try:
+        return frozenset(make_runner(fmt).capabilities)
+    except Exception:
+        return frozenset()
+
+
 def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
     """Check benchmark–format pairing beyond multimodal compatibility.
 
-    Two layered checks:
+    Three layered checks:
     1. Accel benchmarks (accel_*) only pair with their own format variants
        (e.g. accel_pca pairs with accel_pca__scx_auto). Similarly,
        bench_csc_dispatch only pairs with bench_csc__* formats. Non-accel
        benchmarks skip accel_* and bench_csc__* format keys.
     2. Static-guarded benches (e.g. ``cloud_push``, ``correctness``)
        expose a module-level ``SUPPORTED_FORMATS`` frozenset and only
-       accept format keys in that set. Filtering at cohort-build time
-       prevents the silent ``return None`` path in each bench from
-       producing phantom ``missing_result`` entries in ``watch.py``.
+       accept format keys in that set.
+    3. Capability-guarded benches (e.g. ``cloud_read``, ``ml_loader``)
+       expose ``REQUIRED_CAPABILITIES`` and only accept formats whose
+       runner declares all of those capabilities.
+
+    Filtering at cohort-build time prevents the silent ``return None``
+    path in each bench from producing phantom ``missing_result`` entries
+    in ``watch.py``.
     """
     is_accel = bench_name.startswith("accel_") or bench_name == "bench_csc_dispatch"
     fmt_is_accel = format_key.startswith("accel_") or format_key.startswith("bench_csc__")
@@ -400,6 +445,10 @@ def _bench_format_compatible(bench_name: str, format_key: str) -> bool:
 
     allowed = _bench_supported_formats(bench_name)
     if allowed is not None and format_key not in allowed:
+        return False
+
+    required = _bench_required_capabilities(bench_name)
+    if required and not required.issubset(_runner_capabilities(format_key)):
         return False
     return True
 
@@ -1083,7 +1132,12 @@ def main() -> None:
     # and a 3× / 60s retry around ``map_array`` to absorb races between the
     # squeue poll and SLURM's internal counter.
     #
-    # Full rationale: BENCHMARKING-SUBMIT-FIX.md §4–5.
+    # The two constraints driving this design: (a) SLURM requires every
+    # task in a job array to share identical resource parameters, so the
+    # 5-tuple cohort key (dataset, format_key, partition, gres,
+    # needs_conversion) is the finest grouping that preserves uniformity;
+    # (b) ``QOSMaxSubmitJobPerUserLimit`` counts each array task
+    # individually, so the per-task throttle still applies.
     logger.info("=" * 60)
     logger.info("Phase B: Grouping benchmarks into resource cohorts")
     logger.info("=" * 60)

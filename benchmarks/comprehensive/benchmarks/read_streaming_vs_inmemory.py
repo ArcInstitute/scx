@@ -45,6 +45,12 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"backed_mode"})
+"""Runner-capability requirement — read by ``run_parallel.py``'s cohort
+builder so incompatible (bench, format) cells never get submitted. Mirrors
+the runtime guard at the top of ``run()`` (defense-in-depth for direct
+invocation)."""
+
 
 def run(
     dataset: DatasetConfig,

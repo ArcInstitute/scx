@@ -46,6 +46,7 @@ class SlafRunner(FormatRunner):
         "cloud_read",
         "cloud_subset",
         "cloud_filtered",
+        "cloud_metadata",
     })
 
     @property

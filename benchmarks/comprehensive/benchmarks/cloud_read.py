@@ -39,6 +39,12 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"cloud_read"})
+"""Runner-capability requirement — read by ``run_parallel.py``'s cohort
+builder so incompatible (bench, format) cells never get submitted. Mirrors
+the runtime guard at the top of ``run()`` (defense-in-depth for direct
+invocation)."""
+
 # Skip full csr_equal above this row count — materialising both matrices
 # at census-tier scale doubles peak RSS during verification. Above the
 # threshold we fall back to row-sum equality (cheap, catches layout /

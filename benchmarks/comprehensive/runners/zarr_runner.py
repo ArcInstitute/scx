@@ -60,9 +60,9 @@ class ZarrRunner(FormatRunner):
         self.level = level
         self.backed = backed
         self.capabilities = (
-            frozenset({"cloud_read", "cloud_subset", "backed_mode"})
+            frozenset({"cloud_read", "cloud_subset", "backed_mode", "cloud_metadata"})
             if backed
-            else frozenset({"cloud_read", "cloud_subset"})
+            else frozenset({"cloud_read", "cloud_subset", "cloud_metadata"})
         )
 
     # ------------------------------------------------------------------

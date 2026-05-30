@@ -46,6 +46,12 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"cloud_filtered"})
+"""Runner-capability requirement — read by ``run_parallel.py``'s cohort
+builder so incompatible (bench, format) cells never get submitted. Mirrors
+the runtime guard at the top of ``run()`` (defense-in-depth for direct
+invocation)."""
+
 
 def _obs_columns(dataset: DatasetConfig) -> set[str]:
     """Return the obs column set for a dataset without loading X.

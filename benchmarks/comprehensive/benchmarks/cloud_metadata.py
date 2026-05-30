@@ -35,6 +35,12 @@ from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
 
+REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"cloud_metadata"})
+"""Runner-capability requirement — read by ``run_parallel.py``'s cohort
+builder so incompatible (bench, format) cells never get submitted. Mirrors
+the runtime guard at the top of ``run()`` (defense-in-depth for direct
+invocation)."""
+
 
 def run(
     dataset: DatasetConfig,
@@ -50,13 +56,13 @@ def run(
         )
 
     runner = make_runner(format_variant)
-    open_metadata = getattr(runner, "read_cloud_metadata", None)
-    if open_metadata is None:
+    if "cloud_metadata" not in runner.capabilities:
         logger.info(
-            "Skipping cloud_metadata for %s — runner has no read_cloud_metadata",
+            "Skipping cloud_metadata for %s — runner does not declare cloud_metadata",
             format_variant.key,
         )
         return None
+    open_metadata = runner.read_cloud_metadata
 
     if converted_path is None or not Path(converted_path).exists():
         raise FileNotFoundError(

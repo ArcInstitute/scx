@@ -471,3 +471,54 @@ def test_supported_formats_filters_cohort_grouping(isolated_work_dir):
     assert ("read_full", "pbmc3k", "scx_auto") in by_label
     assert ("read_full", "pbmc3k", "h5ad_none") in by_label
 
+
+def test_runner_capabilities_helper():
+    """``_runner_capabilities`` resolves the runner's static (or instance-
+    time) capability set without I/O. Verifies both happy paths and the
+    defensive ``frozenset()`` fallback for unknown formats."""
+    from benchmarks.comprehensive.scripts.run_parallel import _runner_capabilities
+
+    scx_caps = _runner_capabilities("scx_auto")
+    assert "cloud_read" in scx_caps
+    assert "cloud_filtered" in scx_caps
+    assert "cloud_metadata" in scx_caps
+    assert "backed_mode" in scx_caps
+
+    h5ad_caps = _runner_capabilities("h5ad_gzip")
+    assert "cloud_read" not in h5ad_caps
+    assert "backed_mode" not in h5ad_caps
+
+    # Unknown format → empty set (defensive — don't crash cohort grouping).
+    assert _runner_capabilities("definitely_not_a_format") == frozenset()
+
+
+def test_required_capabilities_filters_cohort_grouping(isolated_work_dir):
+    """The orchestrator must not submit cloud_read on h5ad_none — h5ad_runner
+    doesn't declare the ``cloud_read`` capability."""
+    _FakeAutoExecutor.reset()
+    _install_fake_submitit()
+
+    _run_main_with_argv([
+        "--datasets", "pbmc3k",
+        "--formats", "scx_auto", "h5ad_none",
+        "--benchmarks", "cloud_read", "read_full",
+        "--skip-smoke",
+    ])
+
+    bench_subs = [
+        s for s in _FakeAutoExecutor.submissions
+        if s["fn_name"] == "_run_benchmark"
+    ]
+    by_label = {
+        (s["fn_args"][0], s["fn_args"][1], s["fn_args"][2]): s
+        for s in bench_subs
+    }
+
+    # scx_runner declares cloud_read; h5ad_runner does not.
+    assert ("cloud_read", "pbmc3k", "scx_auto") in by_label
+    assert ("cloud_read", "pbmc3k", "h5ad_none") not in by_label
+
+    # read_full is capability-unrestricted.
+    assert ("read_full", "pbmc3k", "scx_auto") in by_label
+    assert ("read_full", "pbmc3k", "h5ad_none") in by_label
+
