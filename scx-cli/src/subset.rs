@@ -123,7 +123,14 @@ pub fn run_subset(
         n_output_cells, in_header.n_obs, n_output_genes, in_header.n_vars, output_nnz,
     );
 
-    // Warn about dropped sections
+    if dry_run {
+        println!("(dry run — no output written)");
+        return Ok(());
+    }
+
+    // Warn about dropped sections. These describe what happens when the
+    // output is *written*, so they only fire on a real run — a dry run
+    // mutates nothing and must not claim otherwise.
     if !dropped_layers.is_empty() {
         eprintln!(
             "Warning: {} layer(s) dropped (layer subsetting not yet supported): {}",
@@ -149,11 +156,6 @@ pub fn run_subset(
              column-major sidecar",
             input = input.display()
         );
-    }
-
-    if dry_run {
-        println!("(dry run — no output written)");
-        return Ok(());
     }
 
     // 8. Parse codec
