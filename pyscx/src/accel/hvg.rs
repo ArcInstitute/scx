@@ -10,6 +10,48 @@ use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 
 use super::filtering::update_layers_col_projection;
+use super::util::extract_materialized_csr;
+
+/// Single-shard [`scx_format::ShardSource`] adapter over a borrowed in-memory
+/// [`scx_sparse::ScxCsr`].
+///
+/// Lets a materialized scipy/dense `adata.X` flow through the same native HVG
+/// kernels as the backed/lazy datasets — so in-memory `seurat_v3` / `seurat`
+/// gets identical numerics and the same per-batch LOESS-singularity tolerance
+/// instead of delegating to `scanpy.pp.highly_variable_genes`. Mirrors the
+/// GPU-only `ScxCsrSource` in `pca.rs`, but is non-feature-gated because the
+/// CPU HVG path needs it too. `ScxCsr` is `Send + Sync`, so this satisfies the
+/// `+ Sync` bound the GPU kernel variants require.
+struct InMemoryCsrSource<'a> {
+    csr: &'a scx_sparse::ScxCsr,
+}
+
+impl scx_format::ShardSource for InMemoryCsrSource<'_> {
+    fn n_shards(&self) -> usize {
+        1
+    }
+    fn n_obs(&self) -> usize {
+        self.csr.n_rows()
+    }
+    fn n_vars(&self) -> usize {
+        self.csr.n_cols()
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
+        if shard_idx != 0 {
+            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: 1,
+            });
+        }
+        // One clone per pass (mean/var, then clipped-sum). Acceptable for a
+        // first cut; a borrowed-slice variant (cf. `BorrowedCsrSource`) can
+        // remove it later if in-memory HVG RSS becomes a concern.
+        Ok(self.csr.clone())
+    }
+    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+        Ok(self.csr.n_rows())
+    }
+}
 
 /// Streaming highly-variable gene selection without materialization.
 ///
@@ -31,8 +73,18 @@ use super::filtering::update_layers_col_projection;
 /// emitted naming the batch index and size, and that batch is excluded from
 /// the per-batch normalised-variance ranking. Other batches proceed normally.
 ///
+/// `X` may be an `ScxBackedSparseDataset`, an `ScxLazyTransformedDataset`, or a
+/// materialized scipy/dense matrix: for `flavor` in `seurat_v3` /
+/// `seurat_v3_paper` / `seurat`, all three run the native streaming kernel (a
+/// materialized `X` is wrapped in a single-shard `ShardSource`), so in-memory
+/// `X` gets the same numerics and the same per-batch LOESS-singularity
+/// tolerance as the backed path. Only flavors the native kernel does not
+/// implement (e.g. `cell_ranger`) delegate to `scanpy.pp.highly_variable_genes`
+/// (with a one-shot UserWarning).
+///
 /// Args:
-///     adata: AnnData with X as ScxBackedSparseDataset or ScxLazyTransformedDataset
+///     adata: AnnData with X as ScxBackedSparseDataset, ScxLazyTransformedDataset,
+///         or a materialized scipy/dense matrix
 ///     n_top_genes: Number of highly variable genes to select (default: 2000)
 ///     flavor: "seurat_v3" (raw counts) or "seurat" (log-normalized) (default: "seurat_v3")
 ///     batch_key: Column in adata.obs for batch-aware HVG (default: None)
@@ -154,14 +206,12 @@ pub fn highly_variable_genes<'py>(
         let col_proj = backed_ref.col_projection_arc();
         drop(backed_ref);
 
+        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
         return hvg_on_source(
             py,
             adata,
             &x,
-            reader,
-            vec![],
-            kept,
-            col_proj,
+            &source,
             n_obs,
             n_vars,
             n_top_genes,
@@ -185,14 +235,12 @@ pub fn highly_variable_genes<'py>(
         let col_proj = lazy_ref.col_projection.clone();
         drop(lazy_ref);
 
+        let source = build_shard_source(&reader, &transforms, &kept, &col_proj, n_vars);
         return hvg_on_source(
             py,
             adata,
             &x,
-            reader,
-            transforms,
-            kept,
-            col_proj,
+            &source,
             n_obs,
             n_vars,
             n_top_genes,
@@ -205,40 +253,58 @@ pub fn highly_variable_genes<'py>(
         );
     }
 
-    // ── Fallback to scanpy ──────────────────────────────────────────────
-    // B2-2026-05-20-Tier2 option 1: scx-native HVG only runs when X (or the
-    // chosen layer) is `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`.
-    // Eager scipy/dense X delegates to scanpy and inherits scanpy's
-    // numerical fragility — most notably `seurat_v3` LOESS singularities
-    // and `cell_ranger` pd.cut bin-edge collisions on sparse Census data.
-    // Surface the silent delegation so users can opt into the scx-native
-    // path via `to_anndata(backed=True)` / keeping the source as a lazy
-    // dataset. Python's default warning filter dedupes by (message,
-    // category, location), so repeated calls only emit once per site.
+    // ── In-memory scipy/dense X: run the native kernel ──────────────────
+    // seurat_v3 / seurat_v3_paper / seurat are implemented natively, so wrap
+    // the materialized matrix in a single-shard `ShardSource` and run the same
+    // streaming kernel as the backed path. This gives in-memory X identical
+    // numerics AND the per-batch LOESS-singularity tolerance — the scanpy
+    // delegation below has none, which was the original Tier-2 crash
+    // (per-batch loess on a high-cardinality `batch_key`). Only flavors the
+    // native kernel doesn't implement (e.g. `cell_ranger`) fall through.
+    if matches!(flavor, "seurat_v3" | "seurat_v3_paper" | "seurat") {
+        let csr = extract_materialized_csr(py, &x)?;
+        let n_obs = csr.n_rows();
+        let n_vars = csr.n_cols();
+        let source = InMemoryCsrSource { csr: &csr };
+        return hvg_on_source(
+            py,
+            adata,
+            &x,
+            &source,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            flavor,
+            batch_key,
+            span,
+            subset,
+            n_bins,
+            effective_gpu_id,
+        );
+    }
+
+    // ── Fallback to scanpy (cell_ranger / unsupported flavors only) ─────
+    // seurat_v3 / seurat_v3_paper / seurat now run the scx-native kernel even
+    // on materialized scipy/dense X (above), so this path is reached only for
+    // flavors scx does not implement natively — today `cell_ranger`. Surface
+    // the delegation so the user knows scx handed off to scanpy (and inherits
+    // scanpy's pd.cut bin-edge fragility on sparse Census data). Python's
+    // default warning filter dedupes by (message, category, location), so
+    // repeated calls only emit once per site.
     let warnings = py.import("warnings")?;
     let user_warning = py.import("builtins")?.getattr("UserWarning")?;
-    // The warning fires for every silent scanpy
-    // delegation (silent-fallback observability), but the fragility
-    // paragraph below only applies to flavors that go through LOESS
-    // (seurat_v3 / seurat_v3_paper) or pd.cut (cell_ranger). Suppress
-    // it for plain `seurat`, where the recommended workaround would
-    // otherwise re-fire the same paragraph for users already on the
-    // recommended path.
     let core = format!(
-        "highly_variable_genes(flavor={flavor:?}) on scipy/dense X routes to \
-         scanpy.pp.highly_variable_genes — scx-native HVG only runs when X is \
-         an ScxBackedSparseDataset or ScxLazyTransformedDataset. To get the \
-         scx-native path, open via pyscx.open(...).to_anndata(backed=True) or \
-         keep the source as a ScxLazyTransformedDataset (e.g. immediately \
-         after pyscx.accel.normalize_total / log1p before any op materialises \
-         X)."
+        "highly_variable_genes(flavor={flavor:?}) is not implemented natively in \
+         scx and is delegated to scanpy.pp.highly_variable_genes. flavor=\"seurat_v3\", \
+         \"seurat_v3_paper\" and \"seurat\" run the scx-native streaming kernel — \
+         including on materialized scipy/dense X — and gain per-batch LOESS-singularity \
+         tolerance there."
     );
-    let fragility_tail = if matches!(flavor, "seurat_v3" | "seurat_v3_paper" | "cell_ranger") {
-        " On the scanpy path, `seurat_v3` (LOESS) and `cell_ranger` (pd.cut) \
-         can fail with singularity / bin-edge errors on data with many \
-         low-expression genes — pre-filter via \
-         pyscx.accel.filter_genes(min_cells=10) or use flavor=\"seurat\" \
-         after normalize_total + log1p."
+    let fragility_tail = if matches!(flavor, "cell_ranger") {
+        " On the scanpy path, `cell_ranger` (pd.cut) can fail with bin-edge \
+         collisions on data with many low-expression genes — pre-filter via \
+         pyscx.accel.filter_genes(min_cells=10), or use flavor=\"seurat_v3\" / \
+         \"seurat\" to stay on the scx-native path."
     } else {
         ""
     };
@@ -264,15 +330,17 @@ pub fn highly_variable_genes<'py>(
 }
 
 /// Dispatch to seurat_v3 or seurat HVG implementation.
+///
+/// Generic over any `ShardSource` so the same kernels serve the backed/lazy
+/// datasets (`LazyShardSource`) and a materialized scipy/dense `X`
+/// (`InMemoryCsrSource`). `+ Sync` is required by the GPU kernel variants;
+/// both source types satisfy it.
 #[allow(clippy::too_many_arguments)]
-fn hvg_on_source<'py>(
+fn hvg_on_source<'py, S: scx_format::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
-    reader: Arc<scx_format::BackedCsrReader>,
-    transforms: Vec<Transform>,
-    kept_to_global: Option<Arc<Vec<u64>>>,
-    col_projection: Option<Arc<Vec<u32>>>,
+    source: &S,
     n_obs: usize,
     n_vars: usize,
     n_top_genes: usize,
@@ -288,10 +356,7 @@ fn hvg_on_source<'py>(
             py,
             adata,
             x_obj,
-            reader,
-            transforms,
-            kept_to_global,
-            col_projection,
+            source,
             n_obs,
             n_vars,
             n_top_genes,
@@ -305,10 +370,7 @@ fn hvg_on_source<'py>(
             py,
             adata,
             x_obj,
-            reader,
-            transforms,
-            kept_to_global,
-            col_projection,
+            source,
             n_obs,
             n_vars,
             n_top_genes,
@@ -324,11 +386,15 @@ fn hvg_on_source<'py>(
 
 /// Emit a UserWarning when `skmisc.loess.fit()` raises on a single batch.
 ///
-/// Names the failing batch (index + cell count) and the upstream error string
-/// so the user can either drop the batch_key, switch to flavor="seurat" post-
-/// normalize, or pre-filter low-expression genes. The failing batch is then
-/// excluded from the per-batch normalised-variance ranking — semantics
-/// identical to a batch with too few non-constant genes.
+/// Names the failing batch (index + cell count) and the upstream error string.
+/// The failing batch is then excluded from the per-batch normalised-variance
+/// ranking — semantics identical to a batch with too few non-constant genes.
+///
+/// Remedies are ordered by what actually helps the per-batch case: the
+/// singularity is driven by small / near-collinear batches, so dropping or
+/// coarsening `batch_key` is the effective fix. `filter_genes(min_cells=10)`
+/// only helps the single global fit (no `batch_key`); it cannot make a tiny
+/// batch's log-mean / log-variance regression well-conditioned.
 fn emit_hvg_loess_singularity_warning(
     py: Python<'_>,
     batch_idx: usize,
@@ -341,10 +407,11 @@ fn emit_hvg_loess_singularity_warning(
          batch index {batch_idx} (n={batch_n} cells) — {err}. This batch will be \
          excluded from the per-batch HVG ranking; other batches proceed normally. \
          Common causes: very small batches, near-collinear log-mean / log-variance, \
-         or many zero-variance genes within this batch. To avoid this, either \
-         pre-filter low-expression genes via pyscx.accel.filter_genes(min_cells=10) \
-         before HVG, switch to flavor=\"seurat\" post-normalize, or drop the \
-         offending batch from batch_key."
+         or many zero-variance genes within this batch. To avoid this, prefer \
+         dropping or coarsening batch_key (a high-cardinality key such as a \
+         per-dataset id produces many tiny, singular batches); or switch to \
+         flavor=\"seurat\" post-normalize. Note pyscx.accel.filter_genes(min_cells=10) \
+         only helps the no-batch_key global fit, not the per-batch singularity."
     );
     warnings.call_method1(
         "warn",
@@ -353,62 +420,43 @@ fn emit_hvg_loess_singularity_warning(
     Ok(())
 }
 
-/// Build a LazyShardSource, optionally filtered to a batch of cells.
+/// Build a full-dataset `LazyShardSource` for the backed / lazy dispatch.
+///
+/// Per-batch filtering is handled downstream via the `cell_batch` array passed
+/// to the batched streaming kernels, so this always builds the whole-dataset
+/// source (the previous `batch_indices` branch was unused).
 fn build_shard_source(
     reader: &Arc<scx_format::BackedCsrReader>,
     transforms: &[Transform],
     kept_to_global: &Option<Arc<Vec<u64>>>,
     col_projection: &Option<Arc<Vec<u32>>>,
     n_vars: usize,
-    batch_indices: Option<&[usize]>,
 ) -> crate::lazy_transform::LazyShardSource {
     use crate::lazy_transform::LazyShardSource;
 
-    match batch_indices {
-        Some(indices) => {
-            // Compose batch indices with existing kept_to_global
-            let global_rows: Vec<u64> = match kept_to_global {
-                Some(existing) => indices.iter().map(|&i| existing[i]).collect(),
-                None => indices.iter().map(|&i| i as u64).collect(),
-            };
-            LazyShardSource::with_kept_rows(
-                Arc::clone(reader),
-                transforms.to_vec(),
-                global_rows,
-                col_projection.clone(),
-                n_vars,
-            )
-        }
-        None => {
-            // Full dataset (or existing kept_to_global).
-            // Pass None when no filtering needed — avoids allocating a full
-            // identity range and skips the deletion-vector path in read_shard.
-            let n_obs = match kept_to_global {
-                Some(ref k) => k.len(),
-                None => reader.shape().0,
-            };
-            LazyShardSource::new(
-                Arc::clone(reader),
-                transforms.to_vec(),
-                kept_to_global.as_ref().map(Arc::clone),
-                col_projection.clone(),
-                n_obs,
-                n_vars,
-            )
-        }
-    }
+    // Pass None for kept rows when no filtering is needed — avoids allocating a
+    // full identity range and skips the deletion-vector path in read_shard.
+    let n_obs = match kept_to_global {
+        Some(k) => k.len(),
+        None => reader.shape().0,
+    };
+    LazyShardSource::new(
+        Arc::clone(reader),
+        transforms.to_vec(),
+        kept_to_global.as_ref().map(Arc::clone),
+        col_projection.clone(),
+        n_obs,
+        n_vars,
+    )
 }
 
 /// seurat_v3 flavor: raw count data, loess fit, clipped variance.
 #[allow(clippy::too_many_arguments)]
-fn hvg_seurat_v3<'py>(
+fn hvg_seurat_v3<'py, S: scx_format::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
-    reader: Arc<scx_format::BackedCsrReader>,
-    transforms: Vec<Transform>,
-    kept_to_global: Option<Arc<Vec<u64>>>,
-    col_projection: Option<Arc<Vec<u32>>>,
+    source: &S,
     n_obs: usize,
     n_vars: usize,
     n_top_genes: usize,
@@ -456,14 +504,6 @@ fn hvg_seurat_v3<'py>(
     }
 
     // ── 2. Batched streaming mean/var (single pass for ALL batches + global) ──
-    let source = build_shard_source(
-        &reader,
-        &transforms,
-        &kept_to_global,
-        &col_projection,
-        n_vars,
-        None,
-    );
     // GPU path: per-batch streaming mean/var via the batched device wrapper.
     // The wrapper finalises Bessel-corrected means/variances and the global
     // accumulator on host, matching the CPU formula byte-for-byte.
@@ -471,7 +511,7 @@ fn hvg_seurat_v3<'py>(
     let batched_stats = if let Some(dev_id) = _device_id {
         py.detach(|| {
             scx_accel::streaming_mean_var_batched_with_device(
-                &source,
+                source,
                 &cell_batch,
                 n_batches_actual,
                 "gpu",
@@ -480,12 +520,12 @@ fn hvg_seurat_v3<'py>(
         })
         .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var_batched: {e}")))?
     } else {
-        py.detach(|| scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual))
+        py.detach(|| scx_accel::streaming_mean_var_batched(source, &cell_batch, n_batches_actual))
             .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?
     };
     #[cfg(not(feature = "gpu"))]
     let batched_stats = py
-        .detach(|| scx_accel::streaming_mean_var_batched(&source, &cell_batch, n_batches_actual))
+        .detach(|| scx_accel::streaming_mean_var_batched(source, &cell_batch, n_batches_actual))
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_batched: {e}")))?;
 
     let global_stats = batched_stats.global.clone();
@@ -618,7 +658,7 @@ fn hvg_seurat_v3<'py>(
     let all_clipped = if let Some(dev_id) = _device_id {
         py.detach(|| {
             scx_accel::streaming_clip_square_sum_batched_with_device(
-                &source,
+                source,
                 &cell_batch,
                 n_batches_actual,
                 &all_clip_vals,
@@ -632,7 +672,7 @@ fn hvg_seurat_v3<'py>(
     } else {
         py.detach(|| {
             scx_accel::streaming_clip_square_sum_batched(
-                &source,
+                source,
                 &cell_batch,
                 n_batches_actual,
                 &all_clip_vals,
@@ -644,7 +684,7 @@ fn hvg_seurat_v3<'py>(
     let all_clipped = py
         .detach(|| {
             scx_accel::streaming_clip_square_sum_batched(
-                &source,
+                source,
                 &cell_batch,
                 n_batches_actual,
                 &all_clip_vals,
@@ -816,14 +856,11 @@ fn hvg_seurat_v3<'py>(
 
 /// seurat flavor: log-normalized data, binned dispersion normalization.
 #[allow(clippy::too_many_arguments)]
-fn hvg_seurat<'py>(
+fn hvg_seurat<'py, S: scx_format::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
-    reader: Arc<scx_format::BackedCsrReader>,
-    transforms: Vec<Transform>,
-    kept_to_global: Option<Arc<Vec<u64>>>,
-    col_projection: Option<Arc<Vec<u32>>>,
+    source: &S,
     _n_obs: usize,
     n_vars: usize,
     n_top_genes: usize,
@@ -846,16 +883,8 @@ fn hvg_seurat<'py>(
     }
 
     // ── 1. Streaming mean/var ───────────────────────────────────────────
-    let source = build_shard_source(
-        &reader,
-        &transforms,
-        &kept_to_global,
-        &col_projection,
-        n_vars,
-        None,
-    );
     let stats = py
-        .detach(|| scx_accel::streaming_mean_var(&source))
+        .detach(|| scx_accel::streaming_mean_var(source))
         .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var: {e}")))?;
 
     // ── 2. Compute dispersion (matching scanpy's seurat flavor) ────────
@@ -998,6 +1027,13 @@ fn apply_hvg_subset(
         let var = adata.getattr("var")?;
         let filtered_var = var.getattr("loc")?.get_item(&mask_arr)?;
         adata.setattr("_var", filtered_var)?;
+    } else {
+        // In-memory scipy/dense X (the native in-memory HVG path). There is no
+        // col_projection to update — slice the AnnData in place. anndata's own
+        // `_inplace_subset_var` handles X, var, varm, and layers consistently,
+        // and preserves the result columns we just wrote to `var` (the boolean
+        // mask selects the kept rows of the already-updated frame).
+        adata.call_method1("_inplace_subset_var", (mask_arr,))?;
     }
 
     Ok(())
