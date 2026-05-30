@@ -46,7 +46,7 @@ from pathlib import Path
 from benchmarks.comprehensive.cloud_fixtures import (
     CloudIOCounters,
     ensure_cloud_fixture,
-    require_gcp_credentials,
+    ensure_gcp_credentials_or_skip,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -140,7 +140,12 @@ def run(
 
     import pyscx
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cloud_reader_vs_pull",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
     runner = make_runner(format_variant)
     cloud_url = ensure_cloud_fixture(
         dataset, format_variant, Path(converted_path), provider=provider,

@@ -28,7 +28,7 @@ from benchmarks.comprehensive.cloud_fixtures import (
     CloudIOCounters,
     cloud_path_exists,
     cloud_url_for,
-    require_gcp_credentials,
+    ensure_gcp_credentials_or_skip,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -124,7 +124,12 @@ def run(
 
     import pyscx
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cloud_large_atlas",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
     cloud_url = cloud_url_for(dataset, format_variant, provider=provider)
     if not cloud_path_exists(cloud_url):
         raise FileNotFoundError(

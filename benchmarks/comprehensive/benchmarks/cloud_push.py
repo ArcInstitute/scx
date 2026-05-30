@@ -18,7 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from benchmarks.comprehensive.cloud_fixtures import require_gcp_credentials
+from benchmarks.comprehensive.cloud_fixtures import ensure_gcp_credentials_or_skip
 from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
@@ -72,7 +72,12 @@ def run(
             f"Run conversion first (--formats scx_auto)."
         )
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cloud_push",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
 
     runner = make_runner(format_variant)
     local_path = Path(converted_path)

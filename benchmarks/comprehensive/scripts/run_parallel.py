@@ -1045,11 +1045,13 @@ def main() -> None:
     #     ``_bench_format_compatible`` before grouping.
     #
     # QOS handling: SLURM counts each array task individually against
-    # ``QOSMaxSubmitJobPerUserLimit`` (~500 on Chimera ``cpu_preemptible``).
-    # Native throttling is via ``slurm_array_parallelism`` per cohort, but we
-    # also block on ``_wait_under_pending_cap(450)`` before each
-    # ``map_array`` call and retry up to 3× with 60s drains on a QOS error,
-    # to absorb races between the squeue poll and SLURM's internal counter.
+    # ``QOSMaxSubmitJobPerUserLimit``. The documented Chimera cap is ~500 on
+    # ``cpu_preemptible``, but the May 2026 tier-xl run observed rejections
+    # at queue depth 80–110, so we throttle conservatively. Native cap is
+    # via ``slurm_array_parallelism`` per cohort, plus a pre-submit
+    # ``_wait_under_pending_cap(args.max_pending_jobs)`` block (default 75)
+    # and a 3× / 60s retry around ``map_array`` to absorb races between the
+    # squeue poll and SLURM's internal counter.
     #
     # Full rationale: BENCHMARKING-SUBMIT-FIX.md §4–5.
     logger.info("=" * 60)
@@ -1199,13 +1201,15 @@ def main() -> None:
             continue
 
         # --- QOS-aware throttle: block until squeue is below cap ---
-        # Always throttle, even when max_pending_jobs is not set. The
-        # default cap (450) stays safely under Chimera's
-        # QOSMaxSubmitJobPerUserLimit of 512 on cpu_preemptible.
-        # Each map_array call counts as N individual array tasks against
-        # the QOS limit, so we must include the upcoming cohort's size.
+        # Always throttle, even when --max-pending-jobs is explicitly
+        # zeroed; the May 2026 tier-xl run observed
+        # QOSMaxSubmitJobPerUserLimit rejections at queue depth 80–110
+        # on cpu_preemptible (the documented ~500 cap does not reflect
+        # what the scheduler actually enforces). Each map_array call
+        # counts as N individual array tasks against the QOS limit, so
+        # we include the upcoming cohort's size below.
         tasks_in_cohort = len(group_benches)
-        effective_cap = args.max_pending_jobs if args.max_pending_jobs > 0 else 450
+        effective_cap = args.max_pending_jobs if args.max_pending_jobs > 0 else 75
         _wait_under_pending_cap(effective_cap, kind="bench")
 
         executor.update_parameters(**update_kwargs)
@@ -1272,7 +1276,6 @@ def main() -> None:
                     "job_id": job.job_id,
                     "submitit_folder": str(job.paths.folder),
                     "dependency": dep_jobid_for_label.get(label),
-                    "is_array_task": True,  # All Phase B jobs are now array tasks
                 }
                 for label, job, _conv_key in bench_jobs
             ],
@@ -1522,14 +1525,17 @@ def parse_args() -> argparse.Namespace:
         help="Skip the pre-submit runner contract check (Phase I.8).",
     )
     parser.add_argument(
-        "--max-pending-jobs", type=int, default=400,
+        "--max-pending-jobs", type=int, default=75,
         help="Throttle SLURM submission to keep total queued (PD+R) "
              "jobs at or below this cap. Required on Chimera, where "
-             "QOSMaxSubmitJobPerUserLimit aborts sbatch around ~500 "
-             "active jobs per user. The launcher polls `squeue -u "
-             "$USER` between submissions and sleeps when the cap is "
-             "reached, resuming as jobs land or fail. Set to 0 to "
-             "disable throttling (legacy behaviour). Default: 400.",
+             "QOSMaxSubmitJobPerUserLimit aborts sbatch — observed "
+             "rejections at queue depth ~80–110 in May 2026 runs (the "
+             "documented ~500 limit doesn't reflect what the scheduler "
+             "actually enforces). The launcher polls `squeue -u $USER` "
+             "between submissions and sleeps when the cap is reached, "
+             "resuming as jobs land or fail; the cohort retry loop "
+             "absorbs any race-window overshoot. Set to 0 to disable "
+             "throttling (legacy behaviour). Default: 75.",
     )
 
     return parser.parse_args()

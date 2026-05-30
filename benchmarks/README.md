@@ -376,7 +376,7 @@ Parallel (run_parallel.py): Phase A conversions + Phase B cohort arrays
                             Wall time ≈ max(single slowest job)
 ```
 
-`watch.py` consumes `comprehensive/logs/submitit/run_manifest.json` to render a live status table. Submitit names per-task files `<SLURM_jobid>_<task_idx>_*` for both individual jobs (`2306028_0_result.pkl`) and array tasks (`2374101_0_0_result.pkl` for array `2374101` task `0`); `watch.py` always appends the `_0` task suffix. The manifest carries an `is_array_task` flag per entry for downstream tooling that needs to distinguish the two shapes.
+`watch.py` consumes `comprehensive/logs/submitit/run_manifest.json` to render a live status table. Submitit names per-task files `<SLURM_jobid>_<task_idx>_*` for both individual jobs (`2306028_0_result.pkl`) and array tasks (`2374101_0_0_result.pkl` for array `2374101` task `0`) — the array-task ID is part of the SLURM job ID, so `watch.py` always appends the `_0` task-index suffix uniformly.
 
 ### Usage
 

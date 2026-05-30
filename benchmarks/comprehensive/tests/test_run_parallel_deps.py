@@ -71,15 +71,14 @@ class _FakeAutoExecutor:
             "fn_name": getattr(fn, "__name__", repr(fn)),
             "fn_args": args,
             "params": dict(self._params),
-            "is_array_task": False,
         })
         return job
 
     def map_array(self, fn, *arg_sequences):
         """Mock Slurm Job Array submissions by fanning tasks out.
 
-        Generates task IDs in the native '<ArrayJobID>_<TaskID>' format
-        and records each task with is_array_task=True for manifest parity.
+        Generates task IDs in the native ``<ArrayJobID>_<TaskID>`` format
+        matching what real submitit returns for `executor.map_array(...)`.
         """
         jobs = []
         n_tasks = len(arg_sequences[0])
@@ -96,7 +95,6 @@ class _FakeAutoExecutor:
                 "fn_name": getattr(fn, "__name__", repr(fn)),
                 "fn_args": task_args,
                 "params": dict(self._params),
-                "is_array_task": True,
             })
             jobs.append(job)
 
@@ -150,6 +148,16 @@ def isolated_work_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ):
         if modname in sys.modules:
             del sys.modules[modname]
+
+    # Re-root LOGS_DIR onto tmp_path so the test never writes the
+    # production `run_manifest.json` (the manifest path is a module-level
+    # constant in run_parallel.py and isn't derived from SCX_WORK_DIR).
+    # Without this, parallel test runs and dogfooding orchestrators stomp
+    # each other.
+    import benchmarks.comprehensive.scripts.run_parallel as rp
+    logs_dir = tmp_path / "logs" / "submitit"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(rp, "LOGS_DIR", logs_dir, raising=False)
 
     return work, data
 
@@ -274,8 +282,7 @@ def test_phase_a_does_not_block_phase_b(isolated_work_dir):
 
 
 def test_run_manifest_records_dependency(isolated_work_dir, tmp_path):
-    """run_manifest.json should carry each bench job's dependency jobid
-    and is_array_task flag."""
+    """run_manifest.json should carry each bench job's dependency jobid."""
     _FakeAutoExecutor.reset()
     _install_fake_submitit()
 
@@ -298,12 +305,6 @@ def test_run_manifest_records_dependency(isolated_work_dir, tmp_path):
     assert by_label["read_full/pbmc3k/h5ad_none"]["dependency"] is None
     assert by_label["write/pbmc3k/scx_auto"]["dependency"] is None
     assert by_label["write/pbmc3k/h5ad_none"]["dependency"] is None
-
-    # All benchmark entries must have is_array_task=True (Phase B uses map_array).
-    for label, entry in by_label.items():
-        assert entry.get("is_array_task") is True, (
-            f"{label} missing is_array_task=True: {entry}"
-        )
 
 
 def test_no_conversion_benchmarks_have_no_dependency(isolated_work_dir):
@@ -340,8 +341,9 @@ def test_no_conversion_benchmarks_have_no_dependency(isolated_work_dir):
     )
 
 
-def test_manifest_records_is_array_task(isolated_work_dir):
-    """All benchmark entries in run_manifest.json must include is_array_task=True."""
+def test_manifest_records_array_task_job_ids(isolated_work_dir):
+    """run_manifest.json must carry each Phase-B job's array-task id and folder
+    so watch.py can resolve ``<jobid>_0_result.pkl`` without guessing."""
     _FakeAutoExecutor.reset()
     _install_fake_submitit()
 
@@ -358,26 +360,16 @@ def test_manifest_records_is_array_task(isolated_work_dir):
     import json
     manifest = json.loads(manifest_path.read_text())
 
+    # Required fields per entry: label, job_id, submitit_folder, dependency.
     for entry in manifest["submitted"]:
-        assert entry.get("is_array_task") is True, (
-            f"Entry {entry['label']} missing is_array_task=True"
+        assert set(entry.keys()) >= {
+            "label", "job_id", "submitit_folder", "dependency",
+        }, f"Entry missing required keys: {entry}"
+        # Phase B jobs are submitted via map_array, so job IDs use the
+        # SLURM array-task shape ``<array>_<idx>``.
+        assert "_" in entry["job_id"], (
+            f"Expected array-task id (got {entry['job_id']!r}) for {entry['label']}"
         )
-
-    # Also verify the mock recorded is_array_task correctly
-    bench_subs = [
-        s for s in _FakeAutoExecutor.submissions
-        if s["fn_name"] == "_run_benchmark"
-    ]
-    assert all(s["is_array_task"] is True for s in bench_subs), (
-        "All bench submissions should be array tasks"
-    )
-    conv_subs = [
-        s for s in _FakeAutoExecutor.submissions
-        if s["fn_name"] == "_run_conversion"
-    ]
-    assert all(s["is_array_task"] is False for s in conv_subs), (
-        "All conversion submissions should NOT be array tasks"
-    )
 
 
 def test_bench_format_compatible_helper():

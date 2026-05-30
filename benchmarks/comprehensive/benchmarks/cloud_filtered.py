@@ -27,7 +27,7 @@ from pathlib import Path
 
 from benchmarks.comprehensive.cloud_fixtures import (
     ensure_cloud_fixture,
-    require_gcp_credentials,
+    ensure_gcp_credentials_or_skip,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -135,7 +135,12 @@ def run(
             f"Run conversion first (--formats {format_variant.key})."
         )
 
-    require_gcp_credentials()
+    if not ensure_gcp_credentials_or_skip(
+        benchmark="cloud_filtered",
+        format_key=format_variant.key,
+        dataset_name=dataset.name,
+    ):
+        return None
     cloud_url = ensure_cloud_fixture(
         dataset, format_variant, Path(converted_path), provider=provider,
     )
