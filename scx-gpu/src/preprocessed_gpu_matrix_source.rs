@@ -1,5 +1,5 @@
-//! [`GpuMatrixSource`] impl that applies `normalize_total` / `log1p` on device
-//! before yielding CSR shards.
+//! [`GpuMatrixSource`] impl that applies `normalize_total` / `log1p` /
+//! `row_scale` on device before yielding CSR shards.
 //!
 //! Wraps [`GpuPreprocessedShardSource`]; CSR-only (no CSC preprocessing path
 //! exists yet) and reports the applied transforms via

@@ -1,4 +1,4 @@
-//! GPU fused preprocessing (normalize + log1p) on GPU-resident CSR.
+//! GPU fused preprocessing (normalize + log1p + row_scale) on GPU-resident CSR.
 //!
 //! Provides GPU-accelerated versions of the CPU preprocessing operations
 //! in `scx-engine/src/fused_ops.rs` and `scx-loader/src/normalize.rs`.
@@ -7,6 +7,9 @@
 //! array while leaving `indptr` and `indices` untouched. Each CUDA thread
 //! handles one CSR row, computing the row sum, applying normalization, and
 //! optionally computing log1p in a single pass over each row's nonzeros.
+//! `row_scale` (the GPU counterpart of CPU `Transform::RowScale`) multiplies
+//! each row by an explicit per-row factor and is applied last, in the
+//! canonical order `normalize → log1p → row_scale`.
 //!
 //! ## Usage
 //!
@@ -41,8 +44,9 @@ const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normal
 
 /// Dispatch fused operations on a GPU-resident CSR view (in-place).
 ///
-/// Single source of truth for the `(normalize, log1p)` kernel dispatch —
-/// all the public slice-based entry points below are thin wrappers, and
+/// Single source of truth for the `(normalize, log1p)` kernel dispatch,
+/// followed by an orthogonal `row_scale` tail (applied last) — all the public
+/// slice-based entry points below are thin wrappers, and
 /// `GpuPreprocessedShardSource` calls this directly on the slot's
 /// exact-sized views. Kernel launches go on `dev.stream()` (the compute
 /// stream); callers that need a different stream must wrap accordingly.
@@ -123,7 +127,22 @@ pub(crate) fn apply_fused_ops_inner(
     // after any normalize/log1p above have written `data`. The factor vector
     // is global (iteration row order); `row_offset` selects this shard's slice.
     if let Some((factors, row_offset)) = row_scale {
-        let row_offset_i32 = row_offset as i32;
+        // Self-contained bounds guard: the streaming source validates
+        // `factors.len() == n_obs` at construction, but the direct entry
+        // points (`gpu_row_scale` / `gpu_apply_fused_ops`) reach here with no
+        // length check. `row_scale_kernel` does an unguarded device read of
+        // `factors[row_offset + row]`, so a short slice would be an OOB read.
+        if row_offset + n_rows > factors.len() {
+            return Err(GpuError::InvalidShard(format!(
+                "row_scale factors len {} < row_offset {row_offset} + n_rows {n_rows}",
+                factors.len()
+            )));
+        }
+        let row_offset_i32: i32 = row_offset.try_into().map_err(|_| {
+            GpuError::InvalidShard(format!(
+                "row_scale row_offset {row_offset} exceeds i32::MAX"
+            ))
+        })?;
         let func = module
             .load_function("row_scale_kernel")
             .map_err(|e| GpuError::KernelLaunchFailed(format!("row_scale_kernel: {e}")))?;
