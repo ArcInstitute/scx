@@ -326,9 +326,12 @@ fn run_rank_genes_groups_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::wilcoxon_rank_sum_gpu_streaming(
+                    scx_accel::wilcoxon_rank_sum_gpu(
                         device_id,
-                        &reader,
+                        scx_accel::GpuDeShardInput::Backed {
+                            csr: &reader,
+                            csc: None,
+                        },
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -370,7 +373,8 @@ fn run_rank_genes_groups_inner(
         }
     } else {
         // ScxLazyTransformedDataset (non-CSC GPU path) — route
-        // through `wilcoxon_rank_sum_gpu_lazy` (device-resident shard
+        // through `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Lazy`
+        // (device-resident shard
         // pipeline) before falling through to the scipy/numpy paths.
         // CPU lazy without CSC keeps the scipy/numpy fallback.
         #[cfg(feature = "gpu")]
@@ -384,9 +388,9 @@ fn run_rank_genes_groups_inner(
                     drop(lazy);
                     let result = py
                         .detach(|| {
-                            scx_accel::wilcoxon_rank_sum_gpu_lazy(
+                            scx_accel::wilcoxon_rank_sum_gpu(
                                 device_id,
-                                &lazy_src,
+                                scx_accel::GpuDeShardInput::Lazy(&lazy_src),
                                 &gene_names,
                                 &groups,
                                 &unique_groups,
@@ -442,9 +446,9 @@ fn run_rank_genes_groups_inner(
                 #[cfg(feature = "gpu")]
                 Some(device_id) => py
                     .detach(|| {
-                        scx_accel::wilcoxon_rank_sum_gpu_sparse(
+                        scx_accel::wilcoxon_rank_sum_gpu(
                             device_id,
-                            &csr,
+                            scx_accel::GpuDeShardInput::Csr(&csr),
                             &gene_names,
                             &groups,
                             &unique_groups,
@@ -1273,10 +1277,12 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu_streaming(
+                    scx_accel::pdex_ref_gpu(
                         device_id,
-                        &reader,
-                        csc_reader.as_deref(),
+                        scx_accel::GpuDeShardInput::Backed {
+                            csr: &reader,
+                            csc: csc_reader.as_deref(),
+                        },
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1327,9 +1333,9 @@ fn run_pdex_ref_inner(
             drop(lazy);
             return py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu_lazy(
+                    scx_accel::pdex_ref_gpu(
                         device_id,
-                        &lazy_src,
+                        scx_accel::GpuDeShardInput::Lazy(&lazy_src),
                         &gene_names,
                         &groups,
                         &unique_groups,
@@ -1373,9 +1379,9 @@ fn run_pdex_ref_inner(
             #[cfg(feature = "gpu")]
             Some(device_id) => py
                 .detach(|| {
-                    scx_accel::pdex_ref_gpu_sparse(
+                    scx_accel::pdex_ref_gpu(
                         device_id,
-                        &csr,
+                        scx_accel::GpuDeShardInput::Csr(&csr),
                         &gene_names,
                         &groups,
                         &unique_groups,

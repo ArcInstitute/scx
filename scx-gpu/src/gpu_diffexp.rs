@@ -892,7 +892,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
             "csc_shard_pseudobulk: n_groups={n_groups} exceeds SMEM budget \
              ({} bytes at bx=64, device opt-in limit {opt_in_limit} bytes); \
              use the CSR fallback (SCX_GPU_DE_V3 still routes here through \
-             pdex_ref_gpu_streaming when CSC sidecar is absent)",
+             pdex_ref_gpu when CSC sidecar is absent)",
             required
         )));
     }

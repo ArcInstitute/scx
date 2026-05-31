@@ -63,6 +63,8 @@ pub use pseudobulk::{
     pseudobulk_aggregate_from_slices, pseudobulk_aggregate_inmemory, AggregationMethod,
     GeomMeanMode, PseudobulkResult,
 };
+#[cfg(feature = "gpu")]
+pub use route::plan_de_route_from_source;
 pub use route::{
     plan_de_route, AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout,
 };
@@ -71,9 +73,8 @@ pub use umap::{compute_umap, UmapResult};
 // GPU-accelerated variants (behind "gpu" feature)
 #[cfg(feature = "gpu")]
 pub use diffexp_gpu::{
-    pdex_ref_gpu_dense, pdex_ref_gpu_lazy, pdex_ref_gpu_sparse, pdex_ref_gpu_streaming,
-    wilcoxon_rank_sum_gpu_dense, wilcoxon_rank_sum_gpu_lazy, wilcoxon_rank_sum_gpu_sparse,
-    wilcoxon_rank_sum_gpu_streaming,
+    pdex_ref_gpu, pdex_ref_gpu_dense, wilcoxon_rank_sum_gpu, wilcoxon_rank_sum_gpu_dense,
+    GpuDeShardInput,
 };
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;

@@ -194,10 +194,10 @@ def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
     When the bench has built an SCX-backed fixture for this dataset (with a
     CSC sidecar), route through ``pyscx.open(scx_path)`` so the dataset
     arrives as a ``ScxBackedSparseDataset`` with ``backed_csc=Some(...)``.
-    That makes pyscx's dispatch route to ``pdex_ref_gpu_streaming(...,
-    csc_reader=Some(...))``, which under ``SCX_GPU_DE_V3=1`` exercises the
+    That makes pyscx's dispatch route to ``pdex_ref_gpu(GpuDeShardInput::Backed
+    { csc: Some(...), .. })``, which under ``SCX_GPU_DE_V3=1`` exercises the
     v3 CSC-direct kernels (the path we actually want to bench). The
-    in-memory scipy CSR fallback routes through ``pdex_ref_gpu_sparse`` →
+    in-memory scipy CSR fallback routes through ``pdex_ref_gpu(Csr)`` →
     v3 CSR-fallback, which is NOT the path G4.3 is trying to measure.
     """
     import pyscx
@@ -234,7 +234,7 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
         # set when the file has a CSC sidecar), we have to go through
         # `Experiment.to_anndata(backed=True)`. Without `backed=True` we
         # get a fully-materialised AnnData with a scipy CSR X, which
-        # routes through `pdex_ref_gpu_sparse` and never exercises CSC.
+        # routes through `pdex_ref_gpu(Csr)` and never exercises CSC.
         exp = pyscx.open(str(scx_path))
         return exp.to_anndata(backed=True)
     except Exception as e:
@@ -284,8 +284,8 @@ def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     Required so the GPU pdex_ref / wilcoxon impls can route through
     ``pyscx.open(scx_path)`` → ``ScxBackedSparseDataset`` with
     ``backed_csc=Some(...)``. With only the h5ad-loaded scipy CSR in
-    memory, pyscx routes to the in-memory `pdex_ref_gpu_sparse` entry
-    point which has no CSC reader, and v3 dispatch always falls back to
+    memory, pyscx routes to the in-memory `pdex_ref_gpu(Csr)` arm
+    which has no CSC reader, and v3 dispatch always falls back to
     the CSR-direct path even when SCX_GPU_DE_V3=1.
 
     Returns the path on success or None if pyscx is missing or the
@@ -539,7 +539,7 @@ def run(
         # with CSC sidecar so the GPU pdex_ref / wilcoxon impls can load
         # it via pyscx.open() and exercise the v3-CSC dispatch path. With
         # only the in-memory scipy CSR, pyscx routes to
-        # `pdex_ref_gpu_sparse` → v3-CSR fallback, which never touches
+        # `pdex_ref_gpu(Csr)` → v3-CSR fallback, which never touches
         # the new CSC kernels.
         scx_csc_path = _ensure_scx_csc_fixture(adata_for_pick, dataset.name)
         if scx_csc_path is not None:
