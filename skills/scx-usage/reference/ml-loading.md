@@ -171,6 +171,24 @@ TrainingDataset is for **training throughput** (sequential dense batches,
 normalize+log1p fused in Rust, two-level epoch shuffle). Don't drive a training
 loop off backed slicing.
 
+### Random-access loaders that read an `obsm` embedding (`embed_key`)
+
+If you drive a `DataLoader` off backed `X` *and* an obsm embedding per cell
+(`adata.obsm[embed_key][cell_indices]`), pass `obsm=[embed_key]`:
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(backed=True, obsm=["X_state"])
+emb = adata.obsm["X_state"]        # ScxBackedObsmDataset (shard-aware, dense)
+batch_emb = emb[cell_indices]      # reads only the touched obsm shards
+```
+
+Without `obsm=[...]`, `to_anndata` materialises **every** obsm key × **all**
+rows into a dense numpy dict at open time — paid per key (even unused ones) and
+**per DataLoader worker** (each re-opens the reader), which OOMs at multi-million
+cell scale. `obsm=[embed_key]` loads only the key you use and (in backed mode)
+gathers rows lazily (`O(batch)` memory, per-key LRU = `cache_shards`). See
+[Selective + lazy `obsm`](../../../docs/scanpy.md#selective--lazy-obsm-obsm).
+
 ## Troubleshooting
 - `RuntimeError: scx.TrainingDataset requires num_workers=0` — see fork-safety above.
 - `RuntimeError: Must call __iter__ before __next__` — iterate with `for batch in ds:`, don't call `next()` on the dataset directly.

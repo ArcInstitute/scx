@@ -869,12 +869,14 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::IndexPlanDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
+    m.add_class::<backed::ScxBackedObsmDataset>()?;
     m.add_class::<backed::ScxBackedMuDataset>()?;
     m.add_class::<backed::ScxBackedMuModality>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
     m.add_class::<lazy_mapping::ScxLazyPairwiseMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyVarmMapping>()?;
+    m.add_class::<lazy_mapping::ScxLazyObsmMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyLayersMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyValueIterator>()?;
     m.add_class::<lazy_mapping::ScxLazyItemIterator>()?;
@@ -927,6 +929,19 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
+    //
+    // `ScxBackedObsmDataset` is **dense**, but AnnData's `obsm`
+    // (`AxisArrays`) re-validates every value on each public `adata.obsm[key]`
+    // access via `coerce_array`, whose accepted-type allowlist for lazy dense
+    // arrays is restricted to concrete classes we cannot subclass
+    // (`h5py.Dataset` / `zarr.Array` / `dask.array`) plus the `CSRDataset` /
+    // `CSCDataset` ABCs. Registering as `CSRDataset` is the only way to let
+    // `adata.obsm[key]` return the backed row-gather dataset (so `m[idx]`
+    // gathers `O(batch)` rows) rather than raising. The dataset's
+    // `__getitem__` returns dense numpy, and it exposes `toarray` / `__array__`
+    // so array-style consumers work; CSR-only methods (`.tocsr`) are
+    // intentionally absent. See LAZY-OBSM-LOADING.md §6 and docs/scanpy.md.
+    //
     // Best-effort: if anndata isn't installed we skip silently (common on
     // stripped-down envs); but if the import succeeds and `register` raises
     // we surface the error via `log::warn!` so a user debugging why
@@ -938,6 +953,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 for cls_name in [
                     "ScxBackedSparseDataset",
                     "ScxBackedLayerDataset",
+                    "ScxBackedObsmDataset",
                     "ScxLazyTransformedDataset",
                 ] {
                     if let Err(err) = csr_dataset.call_method1("register", (m.getattr(cls_name)?,))
