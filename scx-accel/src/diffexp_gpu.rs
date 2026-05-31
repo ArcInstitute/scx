@@ -38,7 +38,43 @@ use scx_gpu::{
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
 use crate::pseudobulk::GeomMeanMode;
+use crate::route::{
+    plan_de_route, AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout,
+};
 use crate::{AccelError, Result};
+
+/// Stamp the planned execution info onto a `pdex_ref` GPU result and emit a
+/// structured route log line. The route is decided up front by
+/// [`plan_de_route`] (the single source of truth) so the stamped route always
+/// matches the kernel branch that actually ran. Replaces the old
+/// `SCX_GPU_DE_V3_TRACE` stderr trace as the primary signal (the trace
+/// survives as a debug-only fallback inside the v3 drivers).
+fn finish_pdex(result: Result<PdexRefResult>, info: AccelExecutionInfo) -> Result<PdexRefResult> {
+    log::debug!(
+        "scx-accel pdex_ref GPU route: {} (fallback: {})",
+        info.route.as_str(),
+        info.fallback_reason.as_str()
+    );
+    result.map(|mut r| {
+        r.exec_info = info;
+        r
+    })
+}
+
+/// Stamp the planned execution info onto a Wilcoxon GPU result. Wilcoxon has
+/// no v2/v3/CSC route today — every layout runs the v1 dense-chunk driver — so
+/// the route is set directly (dense → `GpuDenseV1`, CSR-derived → `GpuCsrV1`).
+fn finish_de(result: Result<DiffExpResult>, info: AccelExecutionInfo) -> Result<DiffExpResult> {
+    log::debug!(
+        "scx-accel wilcoxon GPU route: {} (fallback: {})",
+        info.route.as_str(),
+        info.fallback_reason.as_str()
+    );
+    result.map(|mut r| {
+        r.exec_info = info;
+        r
+    })
+}
 
 /// Pseudocount used by the CPU `compute_logfc` helper. Mirrors
 /// `diffexp::LOGFC_PSEUDOCOUNT` (private there).
@@ -81,20 +117,45 @@ pub fn pdex_ref_gpu_dense(
     // already owns a contiguous `[n_obs × n_vars]` f32 array, so a single
     // `memcpy_htod` per chunk is optimal. No CSR construction tax.
     let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
-    pdex_ref_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        mode,
-        epsilon,
-        |dev, dense, c0, sz| {
-            populate_dense_from_host_dense(dev, dense, &mut chunk_buf, data, n_obs, n_vars, c0, sz)
-        },
+    // Dense host input always uses the legacy single-upload v1 path — no
+    // v2/v3, never CSC. Routed through `plan_de_route` for consistency: the
+    // `DenseHost` layout always resolves to `GpuDenseV1` regardless of flags.
+    let mut exec_info = plan_de_route(
+        DeviceRequest::Gpu,
+        InputLayout::DenseHost,
+        true,
+        true,
+        de_v2_enabled(),
+        de_v3_enabled(),
+        false,
+    );
+    exec_info.chunk_size = Some(chunk_size);
+    finish_pdex(
+        pdex_ref_gpu_chunked(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            mode,
+            epsilon,
+            |dev, dense, c0, sz| {
+                populate_dense_from_host_dense(
+                    dev,
+                    dense,
+                    &mut chunk_buf,
+                    data,
+                    n_obs,
+                    n_vars,
+                    c0,
+                    sz,
+                )
+            },
+        ),
+        exec_info,
     )
 }
 
@@ -132,51 +193,71 @@ pub fn pdex_ref_gpu_sparse(
     let src = scx_gpu::InMemoryCsrShardSource::new(csr);
     let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, &src)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    if de_v3_enabled() {
-        // In-memory CSR has no CSC sidecar; always fall back to CSR-direct.
-        return pdex_ref_gpu_chunked_v3_csr(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-    if de_v2_enabled() {
-        return pdex_ref_gpu_chunked_v2(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-    pdex_ref_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        mode,
-        epsilon,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+    // In-memory CSR never carries a CSC sidecar, so v3 takes the CSR-direct
+    // fallback (NoCscSidecar). `plan_de_route` encodes the same v3 > v2 > v1
+    // precedence the dispatch below follows.
+    let mut exec_info = plan_de_route(
+        DeviceRequest::Gpu,
+        InputLayout::CsrHost,
+        true,
+        true,
+        de_v2_enabled(),
+        de_v3_enabled(),
+        false,
+    );
+    exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route — no second read of
+    // `de_v*_enabled()` — so the stamped route can never diverge from the
+    // kernel that runs. CsrHost can only plan to a GpuCsr{V1,V2,V3} route.
+    finish_pdex(
+        match exec_info.route {
+            AccelRoute::GpuCsrV3 => pdex_ref_gpu_chunked_v3_csr(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV2 => pdex_ref_gpu_chunked_v2(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV1 => pdex_ref_gpu_chunked(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                |dev, dense, c0, sz| {
+                    populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+                },
+            ),
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_sparse: planner returned unreachable route {} for CsrHost",
+                other.as_str()
+            ))),
         },
+        exec_info,
     )
 }
 
@@ -216,74 +297,118 @@ pub fn pdex_ref_gpu_streaming(
     let chunk_size = resolve_chunk_size(&dev, n_obs, gene_chunk_size, n_vars);
 
     // V3 dispatch: CSC-first if a sidecar reader was provided, else
-    // CSR-direct fallback. V3 takes precedence over V2.
-    if de_v3_enabled() {
-        if let Some(csc) = csc_reader {
-            let csc_source = csc as &(dyn scx_format::shard_source::ColumnShardSource + Sync);
-            let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}")))?;
-            return pdex_ref_gpu_chunked_v3_csc(
-                &dev,
-                n_obs,
-                n_vars,
-                chunk_size,
-                gene_names,
-                groups,
-                group_names,
-                reference,
-                mode,
-                epsilon,
-                &mut gpu_csc_src,
-            );
-        }
-        let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-        return pdex_ref_gpu_chunked_v3_csr(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-
-    let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    if de_v2_enabled() {
-        return pdex_ref_gpu_chunked_v2(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-    pdex_ref_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        mode,
-        epsilon,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+    // CSR-direct fallback. V3 takes precedence over V2. `plan_de_route`
+    // encodes the same precedence, so the stamped route matches the branch
+    // taken below: CSC sidecar present + v3 → GpuCscV3; otherwise v3 →
+    // GpuCsrV3 (NoCscSidecar); then v2 / v1.
+    let csc_available = csc_reader.is_some();
+    let mut exec_info = plan_de_route(
+        DeviceRequest::Gpu,
+        if csc_available {
+            InputLayout::BackedCsc
+        } else {
+            InputLayout::BackedCsr
         },
+        true,
+        true,
+        de_v2_enabled(),
+        de_v3_enabled(),
+        csc_available,
+    );
+    exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route. Each arm constructs its own
+    // shard source: the CSC-direct arm needs a `RawGpuCscShardSource`
+    // (`GpuCscShardSource`), the CSR arms a `RawGpuShardSource`
+    // (`GpuShardSource`) — distinct concrete types, so per-arm construction
+    // (in each arm's own scope) avoids any mutable-borrow conflict.
+    finish_pdex(
+        match exec_info.route {
+            AccelRoute::GpuCscV3 => {
+                // The planner only emits GpuCscV3 when csc_available, which
+                // here means csc_reader.is_some(); this guard is defensive
+                // and returns a recoverable error rather than panicking.
+                let csc = csc_reader.ok_or_else(|| {
+                    AccelError::LinAlg(
+                        "pdex_ref_gpu_streaming: planner returned GpuCscV3 but no csc_reader"
+                            .to_string(),
+                    )
+                })?;
+                let csc_source = csc as &(dyn scx_format::shard_source::ColumnShardSource + Sync);
+                let mut gpu_csc_src = scx_gpu::RawGpuCscShardSource::new(&dev, csc_source)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSC source init: {e}")))?;
+                pdex_ref_gpu_chunked_v3_csc(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    &mut gpu_csc_src,
+                )
+            }
+            AccelRoute::GpuCsrV3 => {
+                let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+                pdex_ref_gpu_chunked_v3_csr(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    &mut shard_src,
+                )
+            }
+            AccelRoute::GpuCsrV2 => {
+                let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+                pdex_ref_gpu_chunked_v2(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    &mut shard_src,
+                )
+            }
+            AccelRoute::GpuCsrV1 => {
+                let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
+                pdex_ref_gpu_chunked(
+                    &dev,
+                    n_obs,
+                    n_vars,
+                    chunk_size,
+                    gene_names,
+                    groups,
+                    group_names,
+                    reference,
+                    mode,
+                    epsilon,
+                    |dev, dense, c0, sz| {
+                        populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+                    },
+                )
+            }
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_streaming: planner returned unreachable route {}",
+                other.as_str()
+            ))),
+        },
+        exec_info,
     )
 }
 
@@ -313,21 +438,36 @@ pub fn wilcoxon_rank_sum_gpu_dense(
     let dev = open_device(device_id)?;
     let chunk_size = n_vars.min(default_gpu_de_gene_chunk_size(&dev, n_obs, n_obs));
     let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
-    wilcoxon_rank_sum_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        log_transformed,
-        rankby_abs,
-        tie_correct,
-        |dev, dense, c0, sz| {
-            populate_dense_from_host_dense(dev, dense, &mut chunk_buf, data, n_obs, n_vars, c0, sz)
-        },
+    // Wilcoxon has no v2/v3/CSC route — dense host runs the v1 dense path.
+    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuDenseV1, FallbackReason::None);
+    exec_info.chunk_size = Some(chunk_size);
+    finish_de(
+        wilcoxon_rank_sum_gpu_chunked(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+            |dev, dense, c0, sz| {
+                populate_dense_from_host_dense(
+                    dev,
+                    dense,
+                    &mut chunk_buf,
+                    data,
+                    n_obs,
+                    n_vars,
+                    c0,
+                    sz,
+                )
+            },
+        ),
+        exec_info,
     )
 }
 
@@ -360,21 +500,27 @@ pub fn wilcoxon_rank_sum_gpu_sparse(
     let src = scx_gpu::InMemoryCsrShardSource::new(csr);
     let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, &src)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    wilcoxon_rank_sum_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        log_transformed,
-        rankby_abs,
-        tie_correct,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
-        },
+    // Wilcoxon has no v2/v3/CSC route — CSR-derived input runs the v1 path.
+    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuCsrV1, FallbackReason::None);
+    exec_info.chunk_size = Some(chunk_size);
+    finish_de(
+        wilcoxon_rank_sum_gpu_chunked(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+            |dev, dense, c0, sz| {
+                populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+            },
+        ),
+        exec_info,
     )
 }
 
@@ -407,21 +553,27 @@ pub fn wilcoxon_rank_sum_gpu_streaming(
 
     let mut shard_src = scx_gpu::RawGpuShardSource::new(&dev, reader)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    wilcoxon_rank_sum_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        log_transformed,
-        rankby_abs,
-        tie_correct,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
-        },
+    // Wilcoxon has no v2/v3/CSC route — CSR-derived input runs the v1 path.
+    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuCsrV1, FallbackReason::None);
+    exec_info.chunk_size = Some(chunk_size);
+    finish_de(
+        wilcoxon_rank_sum_gpu_chunked(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+            |dev, dense, c0, sz| {
+                populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+            },
+        ),
+        exec_info,
     )
 }
 
@@ -460,54 +612,70 @@ pub fn pdex_ref_gpu_lazy(
 
     let mut shard_src = RawGpuShardSource::new(&dev, source)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    if de_v3_enabled() {
-        // Generic `&dyn ShardSource` doesn't expose CSC capability; v3 in
-        // the lazy path is CSR-direct fallback only. The full CSC path
-        // routes through `pdex_ref_gpu_streaming` (which has a concrete
-        // BackedCscReader available).
-        return pdex_ref_gpu_chunked_v3_csr(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-    if de_v2_enabled() {
-        return pdex_ref_gpu_chunked_v2(
-            &dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            mode,
-            epsilon,
-            &mut shard_src,
-        );
-    }
-    pdex_ref_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        mode,
-        epsilon,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+    // Generic `&dyn ShardSource` doesn't expose CSC capability, so under v3
+    // this path is always CSR-direct (NoCscSidecar). The full CSC route goes
+    // through `pdex_ref_gpu_streaming` with a concrete BackedCscReader.
+    let mut exec_info = plan_de_route(
+        DeviceRequest::Gpu,
+        InputLayout::LazyCsr,
+        true,
+        true,
+        de_v2_enabled(),
+        de_v3_enabled(),
+        false,
+    );
+    exec_info.chunk_size = Some(chunk_size);
+    // Dispatch is driven by the planned route. LazyCsr has no CSC capability,
+    // so it can only plan to a GpuCsr{V1,V2,V3} route.
+    finish_pdex(
+        match exec_info.route {
+            AccelRoute::GpuCsrV3 => pdex_ref_gpu_chunked_v3_csr(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV2 => pdex_ref_gpu_chunked_v2(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                &mut shard_src,
+            ),
+            AccelRoute::GpuCsrV1 => pdex_ref_gpu_chunked(
+                &dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                mode,
+                epsilon,
+                |dev, dense, c0, sz| {
+                    populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+                },
+            ),
+            other => Err(AccelError::LinAlg(format!(
+                "pdex_ref_gpu_lazy: planner returned unreachable route {} for LazyCsr",
+                other.as_str()
+            ))),
         },
+        exec_info,
     )
 }
 
@@ -541,21 +709,27 @@ pub fn wilcoxon_rank_sum_gpu_lazy(
 
     let mut shard_src = RawGpuShardSource::new(&dev, source)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE shard source init: {e}")))?;
-    wilcoxon_rank_sum_gpu_chunked(
-        &dev,
-        n_obs,
-        n_vars,
-        chunk_size,
-        gene_names,
-        groups,
-        group_names,
-        reference,
-        log_transformed,
-        rankby_abs,
-        tie_correct,
-        |dev, dense, c0, sz| {
-            populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
-        },
+    // Wilcoxon has no v2/v3/CSC route — CSR-derived input runs the v1 path.
+    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuCsrV1, FallbackReason::None);
+    exec_info.chunk_size = Some(chunk_size);
+    finish_de(
+        wilcoxon_rank_sum_gpu_chunked(
+            &dev,
+            n_obs,
+            n_vars,
+            chunk_size,
+            gene_names,
+            groups,
+            group_names,
+            reference,
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+            |dev, dense, c0, sz| {
+                populate_dense_from_shard_source(dev, &mut shard_src, dense, n_obs, c0, sz)
+            },
+        ),
+        exec_info,
     )
 }
 
@@ -1290,6 +1464,7 @@ where
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -1799,6 +1974,7 @@ fn pdex_ref_gpu_chunked_v2<S: GpuShardSource>(
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -2175,6 +2351,7 @@ fn pdex_ref_gpu_chunked_v3_csr<S: GpuShardSource>(
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -2491,6 +2668,7 @@ fn pdex_ref_gpu_chunked_v3_csc<S: GpuCscShardSource>(
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -3146,6 +3324,7 @@ fn assemble_chunk_diffexp_result(
         pvals,
         pvals_adj,
         logfoldchanges: logfc,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 

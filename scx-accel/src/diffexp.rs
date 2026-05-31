@@ -33,6 +33,9 @@ pub struct DiffExpResult {
     pub pvals_adj: Vec<Vec<f64>>,
     /// log2 fold-changes (group mean / reference mean). `[n_groups][n_genes]`
     pub logfoldchanges: Vec<Vec<f64>>,
+    /// Which execution route produced this result (stamped by the dispatch
+    /// entry point; `AccelRoute::Unknown` until then).
+    pub exec_info: crate::route::AccelExecutionInfo,
 }
 
 /// Per-gene test result (before sorting/grouping).
@@ -258,6 +261,7 @@ pub fn wilcoxon_rank_sum(
         pvals: result_pvals,
         pvals_adj: result_pvals_adj,
         logfoldchanges: result_logfc,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -331,7 +335,9 @@ fn wilcoxon_from_ranks(
     n_total: usize,
     tie_correction: f64,
 ) -> (f64, f64) {
-    let (_u, z, p) = wilcoxon_full_from_ranks(ranks, group_cells, n_total, tie_correction);
+    // scanpy's `rank_genes_groups` (method="wilcoxon") does NOT apply a
+    // continuity correction — keep this path uncorrected.
+    let (_u, z, p) = wilcoxon_full_from_ranks(ranks, group_cells, n_total, tie_correction, false);
     (z, p)
 }
 
@@ -342,11 +348,19 @@ fn wilcoxon_from_ranks(
 /// tie-corrected signed z-score used by the existing scanpy-parity path.
 /// All callers within this crate use one or the other; the unified helper
 /// avoids recomputing the rank sum twice when both are needed.
+///
+/// `continuity` selects the two-sided p-value convention. `pdex_ref` matches
+/// upstream `pdex` / `numba_mwu` (and scipy's `use_continuity=True` default):
+/// subtract 0.5 from `|U − μ|` before standardizing. The scanpy-parity
+/// Wilcoxon path passes `false` (scanpy applies no continuity correction).
+/// The returned signed `z` is always the *uncorrected* score (used only by the
+/// Wilcoxon path); only the p-value reflects `continuity`.
 fn wilcoxon_full_from_ranks(
     ranks: &[f64],
     group_cells: &[usize],
     n_total: usize,
     tie_correction: f64,
+    continuity: bool,
 ) -> (f64, f64, f64) {
     let n1 = group_cells.len() as f64;
     let n2 = n_total as f64 - n1;
@@ -366,8 +380,14 @@ fn wilcoxon_full_from_ranks(
         return (u1, 0.0, 1.0);
     }
 
-    let z = (u1 - mu) / sigma_sq.sqrt();
-    let p = 2.0 * normal_sf(z.abs());
+    let sigma = sigma_sq.sqrt();
+    let z = (u1 - mu) / sigma;
+    let z_p = if continuity {
+        ((u1 - mu).abs() - 0.5).max(0.0) / sigma
+    } else {
+        z.abs()
+    };
+    let p = 2.0 * normal_sf(z_p);
     (u1, z, p)
 }
 
@@ -726,6 +746,7 @@ pub fn merge_diff_exp_results(
             pvals: vec![],
             pvals_adj: vec![],
             logfoldchanges: vec![],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         });
     }
     if chunks.len() == 1 {
@@ -735,6 +756,9 @@ pub fn merge_diff_exp_results(
     // All chunks must have the same group structure.
     let group_names = chunks[0].group_names.clone();
     let n_groups = group_names.len();
+    // Carry the route metadata of the first chunk onto the merged result —
+    // every chunk shares the same dispatch route.
+    let merged_exec_info = chunks[0].exec_info.clone();
 
     let mut merged_names = Vec::with_capacity(n_groups);
     let mut merged_scores = Vec::with_capacity(n_groups);
@@ -796,6 +820,7 @@ pub fn merge_diff_exp_results(
         pvals: merged_pvals,
         pvals_adj: merged_pvals_adj,
         logfoldchanges: merged_logfc,
+        exec_info: merged_exec_info,
     })
 }
 
@@ -835,6 +860,9 @@ pub struct PdexRefResult {
     pub p_values: Vec<Vec<f64>>,
     /// Benjamini-Hochberg adjusted p-values per group across genes.
     pub fdrs: Vec<Vec<f64>>,
+    /// Which execution route produced this result (stamped by the dispatch
+    /// entry point; `AccelRoute::Unknown` until then).
+    pub exec_info: crate::route::AccelExecutionInfo,
 }
 
 /// Per-cell value transform `f(x)` applied before averaging for pdex pseudobulk.
@@ -903,7 +931,8 @@ fn pdex_gene_target_stats(
     let tc = rank_with_ties(&values_buf[..n_total], index_buf, ranks_buf);
     group_buf_indices.clear();
     group_buf_indices.extend(0..n1);
-    let (u_stat, _z, p) = wilcoxon_full_from_ranks(ranks_buf, group_buf_indices, n_total, tc);
+    // pdex_ref matches upstream pdex's continuity-corrected two-sided p-value.
+    let (u_stat, _z, p) = wilcoxon_full_from_ranks(ranks_buf, group_buf_indices, n_total, tc, true);
 
     (target_mean, log2_fc, percent_change, u_stat, p)
 }
@@ -1091,6 +1120,7 @@ pub fn pdex_ref(
         statistics,
         p_values,
         fdrs,
+        exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
 
@@ -1293,6 +1323,7 @@ pub(crate) fn empty_pdex_result(group_names: &[String], reference: usize) -> Pde
         statistics: vec![vec![]; n_test],
         p_values: vec![vec![]; n_test],
         fdrs: vec![vec![]; n_test],
+        exec_info: crate::route::AccelExecutionInfo::default(),
     }
 }
 
@@ -1608,6 +1639,7 @@ mod tests {
             pvals: vec![vec![0.001, 0.05]],
             pvals_adj: vec![vec![0.002, 0.05]],
             logfoldchanges: vec![vec![2.0, 0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let merged = merge_diff_exp_results(vec![chunk.clone()], false).unwrap();
         assert_eq!(merged.group_names, chunk.group_names);
@@ -1626,6 +1658,7 @@ mod tests {
             pvals: vec![vec![0.3]],
             pvals_adj: vec![vec![0.3]],
             logfoldchanges: vec![vec![0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
@@ -1634,6 +1667,7 @@ mod tests {
             pvals: vec![vec![0.001]],
             pvals_adj: vec![vec![0.001]],
             logfoldchanges: vec![vec![2.0]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
 
         let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();
@@ -1656,6 +1690,7 @@ mod tests {
             pvals: vec![vec![0.04]],
             pvals_adj: vec![vec![0.04]], // per-chunk BH with n=1
             logfoldchanges: vec![vec![1.0]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
@@ -1664,6 +1699,7 @@ mod tests {
             pvals: vec![vec![0.03]],
             pvals_adj: vec![vec![0.03]],
             logfoldchanges: vec![vec![0.5]],
+            exec_info: crate::route::AccelExecutionInfo::default(),
         };
 
         let merged = merge_diff_exp_results(vec![chunk1, chunk2], false).unwrap();

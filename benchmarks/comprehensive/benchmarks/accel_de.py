@@ -175,6 +175,7 @@ def _run_pyscx_wilcoxon_gpu(adata: Any, groupby: str, reference: str) -> str:
         pyscx.accel.rank_genes_groups(
             scx_adata, groupby, reference=reference, device="gpu",
         )
+        _propagate_route(scx_adata, adata)
     else:
         pyscx.accel.rank_genes_groups(
             adata, groupby, reference=reference, device="gpu",
@@ -202,9 +203,11 @@ def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
     import pyscx
     scx_adata = _as_scx_backed_if_available(adata)
     if scx_adata is not None:
-        return pyscx.accel.pdex_ref(
+        df = pyscx.accel.pdex_ref(
             scx_adata, groupby, reference=reference, device="gpu",
         )
+        _propagate_route(scx_adata, adata)
+        return df
     return pyscx.accel.pdex_ref(adata, groupby, reference=reference, device="gpu")
 
 
@@ -240,6 +243,37 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
             "falling back to in-memory AnnData (CSR path)",
             scx_path, e,
         )
+        return None
+
+
+def _propagate_route(src_adata: Any, dst_adata: Any) -> None:
+    """Merge the accelerator route metadata that pyscx wrote to ``src_adata.uns``
+    into ``dst_adata.uns`` so the runner (which only holds ``dst_adata``) can
+    read it. Used when the GPU impl runs DE on an internally-opened SCX-backed
+    AnnData distinct from the adata the runner passed in.
+
+    Merges per-op (mirroring the Rust ``write_accel_route`` semantics) rather
+    than overwriting, so route entries from other ops on ``dst_adata`` survive,
+    and re-assigns the dict so it works on any ``uns`` backing."""
+    try:
+        accel = src_adata.uns.get("scx_accel")
+    except Exception:
+        accel = None
+    if not accel:
+        return
+    try:
+        merged = dict(dst_adata.uns.get("scx_accel", {}) or {})
+        merged.update(accel)
+        dst_adata.uns["scx_accel"] = merged
+    except Exception:
+        pass
+
+
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
         return None
 
 
@@ -585,7 +619,37 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
+
+        # Record which accelerator route actually ran (read from adata.uns,
+        # written by pyscx). `gpu_dispatch_route` is a human-readable string
+        # for the coverage banner; `de_route_csc_direct` is a numeric gate
+        # signal (1.0 iff the CSC-direct GPU route ran) so the existing
+        # absolute-floor machinery in compare_against_baseline.py can fail the
+        # gate when a CSC-direct benchmark silently fell back to CSR.
+        op_key = "rank_genes_groups" if kind == "wilcoxon" else "pdex_ref"
+        route = _extract_route(a, op_key)
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu and kind == "pdex_ref":
+                # Numeric gate signal for the GPU pdex_ref triple. Always
+                # emitted (so the absolute-floor gate never sees a missing
+                # metric) and only 0.0 on a *silent fallback*: we built a CSC
+                # sidecar fixture and v3 ran, yet a non-CSC route was recorded.
+                # When CSC-direct wasn't expected (v3 off, or no CSC fixture)
+                # the signal is 1.0 = "not applicable / OK".
+                #
+                # v3 intent is read back from the recorded route itself — both
+                # v3 routes (`gpu_csc_v3` / `gpu_csr_v3`) are emitted *only*
+                # when `SCX_GPU_DE_V3` was on — rather than re-parsing the env
+                # var, so this can't drift from pyscx's own flag handling.
+                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                v3_route = route in ("gpu_csc_v3", "gpu_csr_v3")
+                expecting_csc = csc_fixture and v3_route
+                extras["de_route_csc_direct"] = (
+                    1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
+                )
+
         if requires_gpu and cpu_pvals is not None:
             try:
                 if kind == "wilcoxon":
@@ -625,4 +689,12 @@ def run(
         result.metadata["de_pval_agreement_vs_cpu"] = round(float(np.median(pval_agreements)), 6)
     if overlaps:
         result.metadata["de_top_gene_overlap_vs_cpu"] = round(float(np.median(overlaps)), 4)
+    # Surface the route at the dataset level too (route is stable across runs).
+    run_routes = [
+        r.extra.get("gpu_dispatch_route")
+        for r in result.runs
+        if r.extra.get("gpu_dispatch_route") is not None
+    ]
+    if run_routes:
+        result.metadata["gpu_dispatch_route"] = run_routes[-1]
     return result

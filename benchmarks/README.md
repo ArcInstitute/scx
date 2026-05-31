@@ -1005,6 +1005,20 @@ capture run picks it up automatically.
 > when you need accelerator gating, until the next multi-surface
 > baseline that re-includes `accel_*` is promoted as `LATEST`.
 
+**Accelerator route assertion.** The `accel_de` GPU benchmark records the
+execution route each `pdex_ref` / `rank_genes_groups` call actually took
+(read back from `adata.uns["scx_accel"]`, written by pyscx). It lands in
+`runs[].extra` as `gpu_dispatch_route` (human-readable, e.g. `gpu_csc_v3` vs
+`gpu_csr_v3`) and, for the GPU `pdex_ref` triple, as the numeric
+`de_route_csc_direct`. `thresholds.yaml` floors `de_route_csc_direct ≥ 1.0`
+for `accel_de / accel_de__pyscx_pdex_ref_gpu / pbmc3k`: the metric is `0.0`
+**only** when a CSC sidecar fixture was built *and* `SCX_GPU_DE_V3=1` *yet a
+non-CSC route ran* — i.e. a silent fallback from the intended CSC-direct path
+to CSR. That turns "benchmarked the wrong route" into a hard gate failure
+(via the existing absolute-floor machinery — no new gate code). When
+CSC-direct isn't expected (v3 off, or no CSC fixture) the metric is `1.0`, so
+non-v3 gate runs never false-fail.
+
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives
 [`benchmark_loader.py`](scripts/benchmark_loader.py), which targets the

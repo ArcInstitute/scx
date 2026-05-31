@@ -1136,6 +1136,19 @@ All accelerators that support GPU expose a `device` parameter:
 - `device="gpu"` — force GPU (raises error if unavailable)
 - `device="gpu:1"` — select a specific GPU on multi-GPU systems
 
+> **GPU is fastest only when the input layout matches the op.** For
+> `pdex_ref` the column-major CSC-direct GPU route is the high-performance
+> path, and it requires a *backed* SCX file with a CSC sidecar
+> (`pyscx.from_anndata(..., csc="always")` / `scx convert --csc=always`) plus
+> `SCX_GPU_DE_V3=1`; in-memory scipy CSR can run on GPU but may be slower than
+> CPU. (`rank_genes_groups` / Wilcoxon has a single fixed v1 GPU kernel — no
+> CSC-direct route — so it always records `gpu_csr_v1` / `gpu_dense_v1` on
+> GPU.) When comparing performance, **check the recorded route** at
+> `adata.uns["scx_accel"][<op>]["route"]` (e.g. `gpu_csc_v3` vs `gpu_csr_v3`) —
+> every DE call records which route it actually took and the `fallback_reason`
+> if it didn't take the ideal one. See
+> [docs/api.md § Accelerator route metadata](api.md#accelerator-route-metadata).
+
 ### Compatibility matrix
 
 | Op                       | CPU | GPU | Scanpy-parity kwargs                                                  | scx-only kwargs                                |

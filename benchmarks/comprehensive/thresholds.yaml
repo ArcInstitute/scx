@@ -24,6 +24,21 @@
 #       # direction is inferred from min/max; set explicitly only to disambiguate.
 
 absolute_floors:
+  # GPU pdex_ref CSC-direct route assertion. `accel_de.py` emits
+  # `de_route_csc_direct` in runs[].extra for the GPU pdex_ref triple: 1.0
+  # when the CSC-direct route ran (or wasn't expected this run), 0.0 on a
+  # *silent fallback* — i.e. a CSC sidecar fixture was built and
+  # SCX_GPU_DE_V3=1, yet a non-CSC route (gpu_csr_v3 / v1) ran. The floor
+  # turns "benchmarked the wrong route" into a hard gate failure. The metric
+  # is always present (never a missing-metric violation); a 0.0 means the
+  # planner/dispatch silently dropped off the intended CSC-direct path. See
+  # docs/performance.md § pdex_ref GPU v3-CSC and the accelerator route
+  # metadata on adata.uns["scx_accel"].
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: pbmc3k
+    metric: de_route_csc_direct
+    min: 1.0
   # Cloud push/pull throughput — migrated from the retired
   # ``benchmark_cloud.py`` hardcoded ``_median(throughputs) > 50`` gate.
   # The 50 MB/s floor is a "network path is healthy" check, not a
