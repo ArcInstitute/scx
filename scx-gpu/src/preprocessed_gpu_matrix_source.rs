@@ -1,5 +1,5 @@
-//! [`GpuMatrixSource`] impl that applies `normalize_total` / `log1p` on device
-//! before yielding CSR shards.
+//! [`GpuMatrixSource`] impl that applies `normalize_total` / `log1p` /
+//! `row_scale` on device before yielding CSR shards.
 //!
 //! Wraps [`GpuPreprocessedShardSource`]; CSR-only (no CSC preprocessing path
 //! exists yet) and reports the applied transforms via
@@ -14,30 +14,35 @@ use crate::gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet};
 use crate::gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource};
 use crate::staging::GpuCsrSlot;
 
-/// A [`GpuMatrixSource`] that applies per-row normalization and/or `log1p` on
-/// device. `CSR`-only.
+/// A [`GpuMatrixSource`] that applies per-row normalization, `log1p`, and/or
+/// per-row scaling on device. `CSR`-only.
 pub struct PreprocessedGpuMatrixSource<'a> {
     inner: GpuPreprocessedShardSource<'a>,
     // Mirrored here because `GpuPreprocessedShardSource`'s fields are private;
     // surfaced via `transforms()`.
     normalize: Option<f32>,
     log1p: bool,
+    row_scale: bool,
 }
 
 impl<'a> PreprocessedGpuMatrixSource<'a> {
     /// Construct a preprocessing source. `normalize = Some(target)` applies
     /// per-row `normalize_total` to `target`; `log1p` applies `log(1 + x)`
-    /// after any normalization.
+    /// after any normalization; `row_scale = Some(factors)` multiplies each row
+    /// by an explicit factor (applied last). `factors` is a per-row vector in
+    /// iteration row order with length == source `n_obs`.
     pub fn new(
         dev: &'a GpuDevice,
         source: &'a (dyn ShardSource + Sync),
         normalize: Option<f32>,
         log1p: bool,
+        row_scale: Option<&[f32]>,
     ) -> Result<Self, GpuError> {
         Ok(Self {
-            inner: GpuPreprocessedShardSource::new(dev, source, normalize, log1p)?,
+            inner: GpuPreprocessedShardSource::new(dev, source, normalize, log1p, row_scale)?,
             normalize,
             log1p,
+            row_scale: row_scale.is_some(),
         })
     }
 }
@@ -55,7 +60,7 @@ impl GpuMatrixSource for PreprocessedGpuMatrixSource<'_> {
         GpuTransformSpec {
             normalize: self.normalize,
             log1p: self.log1p,
-            row_scale: false,
+            row_scale: self.row_scale,
         }
     }
 
@@ -105,7 +110,7 @@ mod tests {
             n_obs: 2,
             n_vars: 3,
         };
-        let pp = PreprocessedGpuMatrixSource::new(&dev, &src, Some(1e4), true).unwrap();
+        let pp = PreprocessedGpuMatrixSource::new(&dev, &src, Some(1e4), true, None).unwrap();
         assert_eq!(pp.available_layouts(), LayoutSet::CSR);
         let t = pp.transforms();
         assert_eq!(t.normalize, Some(1e4));
@@ -113,5 +118,11 @@ mod tests {
         assert!(!t.row_scale);
         // CSC is unavailable on a preprocessing source.
         assert!(!pp.route_metadata().csc_available);
+
+        // Supplying a per-row factor vector surfaces row_scale in the spec.
+        let factors = vec![2.0f32, 0.5];
+        let pp_rs =
+            PreprocessedGpuMatrixSource::new(&dev, &src, None, false, Some(&factors)).unwrap();
+        assert!(pp_rs.transforms().row_scale);
     }
 }
