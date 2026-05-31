@@ -749,7 +749,7 @@ fn gpu_normalize_total(
 
     let dev = scx_accel::GpuDevice::new(device_id)
         .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
-    let csr = scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), false)
+    let csr = scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), false, None)
         .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
     drop(source);
 
@@ -806,9 +806,14 @@ fn gpu_log1p_dispatch(
 
             let dev = scx_accel::GpuDevice::new(device_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
-            let csr =
-                scx_accel::gpu_preprocess_to_csr(&dev, &source, Some(target_sum as f32), true)
-                    .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
+            let csr = scx_accel::gpu_preprocess_to_csr(
+                &dev,
+                &source,
+                Some(target_sum as f32),
+                true,
+                None,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
             drop(source);
 
             let scipy_csr = scx_csr_to_scipy(py, csr)?;
@@ -831,7 +836,7 @@ fn gpu_log1p_dispatch(
         let was_lazy = x.cast::<ScxLazyTransformedDataset>().is_ok();
         let dev = scx_accel::GpuDevice::new(device_id)
             .map_err(|e| PyRuntimeError::new_err(format!("GPU init failed: {e}")))?;
-        let csr = scx_accel::gpu_preprocess_to_csr(&dev, &gs.source, None, true)
+        let csr = scx_accel::gpu_preprocess_to_csr(&dev, &gs.source, None, true, None)
             .map_err(|e| PyRuntimeError::new_err(format!("gpu_preprocess_to_csr: {e}")))?;
         drop(gs);
         let scipy_csr = scx_csr_to_scipy(py, csr)?;
