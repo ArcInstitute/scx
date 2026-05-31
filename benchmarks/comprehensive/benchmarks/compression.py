@@ -76,16 +76,30 @@ def run(
     source_bytes = h5ad_path.stat().st_size
     runner = make_runner(format_variant)
 
+    # The file-size benchmark measures the canonical SCX layout: CSR shards
+    # only, no CSC sidecar. `SCX_BENCH_WITH_CSC=1` (used to exercise the GPU
+    # CSC-direct DE path) otherwise flips `with_csc=True` for *every*
+    # ScxRunner — inflating the shared converted file this benchmark measures
+    # with a column-major sidecar. Force CSR-only here, and when the knob is
+    # on, convert a fresh CSR-only file rather than trusting the (possibly
+    # CSC-equipped) shared `converted_path`.
+    force_csr_only = bool(getattr(runner, "with_csc", False))
+    if force_csr_only:
+        runner.with_csc = False
+
     log.info(
-        "Compression benchmark: dataset=%s format=%s source=%.1f MB",
+        "Compression benchmark: dataset=%s format=%s source=%.1f MB%s",
         dataset.name,
         format_variant.key,
         source_bytes / 1e6,
+        " (forcing CSR-only; SCX_BENCH_WITH_CSC ignored for size)" if force_csr_only else "",
     )
 
     # Use pre-converted file if available, otherwise convert to temp dir.
+    # A shared converted_path may carry a CSC sidecar when SCX_BENCH_WITH_CSC
+    # is set, so skip it and reconvert CSR-only in that case.
     convert_result = None
-    if converted_path is not None and Path(converted_path).exists():
+    if converted_path is not None and Path(converted_path).exists() and not force_csr_only:
         converted_bytes = runner.file_size(converted_path)
     else:
         with tempfile.TemporaryDirectory(prefix="scx_bench_comp_") as tmp:
