@@ -33,7 +33,7 @@ h5ad. **Hybrid:** query a subset, then go in-memory with standard scanpy.
 
 ## PyExperiment (returned by `pyscx.open(path)`)
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, obsm=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — convert to AnnData.
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — convert to AnnData.
   - `var_names`: gene-name list to project (column subset).
   - `obs_filter`: predicate string. **Non-backed mode** routes through the query engine (shard pushdown). **Backed mode** evaluates it with **pandas `.query()`** (richer grammar, no pushdown) and folds the matches into the dataset's row set — so the same expression can resolve via different engines depending on `backed`.
   - `layers`: layer names to load (default all).

@@ -908,7 +908,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, obsm=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)

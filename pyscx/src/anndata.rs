@@ -594,10 +594,13 @@ fn build_eager_obsm_dict(
         if let Some(kept) = kept_to_global {
             // Pre-compute positions once for all obsm entries (loop-invariant —
             // they depend only on kept and deletion vectors).
+            // `dv_mapping` (kept global rows) is built by `compute_kept_to_global`
+            // as an ascending `(0..n_obs).filter(...)` scan, so it is sorted —
+            // binary_search keeps this O(K log D) instead of O(K * D).
             let positions: Vec<i64> = match dv_kept_to_global {
                 Some(dv_mapping) => kept
                     .iter()
-                    .filter_map(|&g| dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64))
+                    .filter_map(|&g| dv_mapping.binary_search(&g).ok().map(|p| p as i64))
                     .collect(),
                 None => kept.iter().map(|&g| g as i64).collect(),
             };
@@ -1677,8 +1680,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // caller selected obsm keys (`obsm=[...]`), did not force `eager`,
     // and did not pass `obs_filter`. Under `obs_filter` we fall back to
     // the eager path (composing a pandas-query row mask with shard
-    // gather is deferred — see LAZY-OBSM-LOADING.md §6), and `obsm=None`
-    // keeps the historical eager-all behaviour.
+    // gather is deferred), and `obsm=None` keeps the historical
+    // eager-all behaviour.
     let use_backed_obsm = obsm_filter.is_some() && !eager && obs_filter.is_none();
     // `obsm_filter` restricts the loaded keys; under backed mode we only
     // need to validate them (the bridge reads each lazily).

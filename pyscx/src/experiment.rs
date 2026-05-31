@@ -401,7 +401,7 @@ impl PyExperiment {
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, obsm=None, preserve_slots=false, modality=None, eager=false, memory_budget=None))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -411,11 +411,11 @@ impl PyExperiment {
         var_names: Option<Vec<String>>,
         obs_filter: Option<&str>,
         layers: Option<Vec<String>>,
-        obsm: Option<Vec<String>>,
         preserve_slots: bool,
         modality: Option<String>,
         eager: bool,
         memory_budget: Option<Bound<'_, PyAny>>,
+        obsm: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
         if let Some(name) = modality.as_deref() {

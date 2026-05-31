@@ -1,6 +1,7 @@
 """Tests for selective + lazy + backed ``obsm`` loading in ``to_anndata``.
 
-Covers the three phases of LAZY-OBSM-LOADING.md:
+Covers the three obsm loading phases (selective eager / lazy / backed
+row-gather):
 
 - Phase 1: ``to_anndata(obsm=[...])`` selective eager loading.
 - Phase 2: ``to_anndata(obsm=[...], eager=False)`` lazy ``ScxLazyObsmMapping``.
@@ -261,3 +262,71 @@ def test_obsm_backed_with_deletions(tmp_dir):
     # Row-gather of a subset aligns with the same rows of the source.
     sub_idx = np.array([0, 5, len(keep) - 1])
     np.testing.assert_array_equal(m[sub_idx], adata.obsm["X_emb"][keep][sub_idx])
+
+
+# ---------------------------------------------------------------------------
+# Backed indexing edge cases (boolean masks)
+# ---------------------------------------------------------------------------
+
+
+def test_obsm_backed_bool_mask_full_length(multi_obsm_scx):
+    """A correctly-sized 1-D boolean mask gathers the True rows."""
+    import pyscx
+
+    path, adata = multi_obsm_scx
+    out = pyscx.open(path).to_anndata(backed=True, obsm=["X_pca"])
+    m = out.obsm["X_pca"]
+    mask = np.zeros(60, dtype=bool)
+    mask[[3, 17, 58]] = True
+    np.testing.assert_array_equal(m[mask], adata.obsm["X_pca"][mask])
+
+
+def test_obsm_backed_bool_mask_wrong_length_raises(multi_obsm_scx):
+    """A short 1-D boolean mask raises IndexError (numpy semantics) rather
+    than silently gathering only its leading rows."""
+    import pyscx
+
+    path, _ = multi_obsm_scx
+    out = pyscx.open(path).to_anndata(backed=True, obsm=["X_pca"])
+    m = out.obsm["X_pca"]
+    with pytest.raises(IndexError):
+        _ = m[np.array([True, False])]
+
+
+def test_obsm_backed_bool_mask_2d_raises(multi_obsm_scx):
+    """A 2-D boolean mask raises IndexError rather than collapsing to its
+    first nonzero coordinate."""
+    import pyscx
+
+    path, _ = multi_obsm_scx
+    out = pyscx.open(path).to_anndata(backed=True, obsm=["X_pca"])
+    m = out.obsm["X_pca"]
+    mask2d = np.zeros((60, 10), dtype=bool)
+    mask2d[0, 0] = True
+    with pytest.raises(IndexError):
+        _ = m[mask2d]
+
+
+# ---------------------------------------------------------------------------
+# Positional back-compat (obsm appended at the end of the signature)
+# ---------------------------------------------------------------------------
+
+
+def test_to_anndata_positional_preserve_slots_still_binds(multi_obsm_scx):
+    """`obsm` is appended after `memory_budget`, so a legacy positional call
+    that set `preserve_slots=True` by position must keep working.
+
+    Positional order: backed, cache_shards, var_names, obs_filter, layers,
+    preserve_slots, ...
+    """
+    import pyscx
+
+    path, adata = multi_obsm_scx
+    # preserve_slots=True passed positionally (6th positional arg).
+    out = pyscx.open(path).to_anndata(
+        False, 4, None, "cell_type == 'T cell'", None, True
+    )
+    n_t = int((adata.obs["cell_type"] == "T cell").sum())
+    assert out.n_obs == n_t
+    # preserve_slots=True keeps obsm after the filter.
+    assert "X_pca" in out.obsm

@@ -2540,9 +2540,25 @@ impl ScxBackedObsmDataset {
         // numpy array or list
         let np = py.import("numpy")?;
         let arr = np.call_method1("asarray", (row_idx,))?;
-        let dtype_str: String = arr.getattr("dtype")?.call_method0("__str__")?.extract()?;
+        // Detect boolean masks via the dtype `kind` ('b'), which is stable
+        // across numpy versions/platforms (unlike the `str(dtype)` text,
+        // which can be "bool" / "bool_" / "bool8").
+        let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 
-        if dtype_str == "bool" {
+        if kind == "b" {
+            // A boolean mask must be 1-D and exactly `shape[0]` long — match
+            // numpy's semantics rather than silently mis-selecting rows
+            // (a short mask would otherwise gather only its leading rows, and
+            // a 2-D mask would collapse to its first nonzero coordinate).
+            let ndim: usize = arr.getattr("ndim")?.extract()?;
+            let len: usize = arr.len()?;
+            if ndim != 1 || len != self.shape_val.0 {
+                return Err(PyIndexError::new_err(format!(
+                    "boolean index did not match indexed array along axis 0; \
+                     size of axis is {} but size of corresponding boolean axis is {}",
+                    self.shape_val.0, len
+                )));
+            }
             let nonzero = arr.call_method0("nonzero")?;
             let idx_tuple = nonzero.cast::<PyTuple>()?;
             let idx_arr = idx_tuple.get_item(0)?;

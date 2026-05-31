@@ -940,7 +940,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // gathers `O(batch)` rows) rather than raising. The dataset's
     // `__getitem__` returns dense numpy, and it exposes `toarray` / `__array__`
     // so array-style consumers work; CSR-only methods (`.tocsr`) are
-    // intentionally absent. See LAZY-OBSM-LOADING.md §6 and docs/scanpy.md.
+    // intentionally absent. See docs/scanpy.md.
     //
     // Best-effort: if anndata isn't installed we skip silently (common on
     // stripped-down envs); but if the import succeeds and `register` raises
