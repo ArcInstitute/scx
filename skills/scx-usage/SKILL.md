@@ -59,8 +59,11 @@ Most-used kwargs (shared across ingest entry points):
   `pyscx.open(...).query().filter_obs(...)` pushes the filter down. Without
   them, pushdown silently regresses to a full obs scan. Set these if the file
   will be queried.
-- `csc="always"` — write a column-major sidecar (needed for `prefer_format="csc"`
-  accel paths; two-pass, transient disk ~2× output).
+- `csc="off"|"auto"|"always"` — write a column-major sidecar (needed for
+  `prefer_format="csc"` accel paths + the GPU `gpu_csc_v3` DE route; two-pass,
+  transient disk ~2× output). `"auto"` builds it only when the dataset is large
+  enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
+  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
 - `memory_budget="4G"` (bare bytes or a binary-prefixed size: `K`/`M`/`G`/`T`
   or `KiB`/`MiB`/`GiB`/`TiB`, powers of 1024; decimal `KB`/`MB`/`GB`/`TB`
   rejected), `strict_uns=True`, `shard_size`. See `reference/conversion.md` for the rest

@@ -74,7 +74,10 @@ produced when you apply lazy `normalize_total`/`log1p`.
 ## pyscx.accel.* — Rust-native accelerators
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
-(default) or `"csc"` (requires a CSC sidecar from `csc="always"` at convert).
+(default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
+convert). GPU `pdex_ref` is "GPU-fast" only with a CSC sidecar (`gpu_csc_v3`
+under `SCX_GPU_DE_V3=1`); without one it falls back to `gpu_csr_v3` — confirm via
+`adata.uns["scx_accel"][op]["route"]`.
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
 - `normalize_total(adata, target_sum=10000.0)` — on backed/lazy, appends a transform; on scipy CSR delegates to `sc.pp.normalize_total`.
