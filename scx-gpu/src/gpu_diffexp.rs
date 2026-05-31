@@ -1542,11 +1542,15 @@ pub fn gpu_de_searchsorted_ranksum(
 
 /// MWU two-sided p-value via normal approximation with tie correction.
 ///
-/// Matches the CPU `wilcoxon_full_from_ranks` formula exactly (no continuity
-/// correction): `z = (U − μ)/σ`, `p = erfc(|z| / √2)`. Output is clipped to
-/// `[0, 1]`. Caller is responsible for setting p = 1.0 when either group is
-/// empty (kernel handles `n1 == 0 || n2 == 0` defensively but the chunk loop
-/// short-circuits before launch).
+/// Matches the CPU pdex_ref path
+/// `wilcoxon_full_from_ranks(.., continuity=true)`: continuity-corrected
+/// `z = max(|U − μ| − 0.5, 0)/σ`, `p = erfc(z / √2)` (upstream pdex /
+/// numba_mwu `use_continuity=True`, scipy's default). This launcher is used
+/// only by the pdex_ref GPU sequences; the Wilcoxon GPU path computes its
+/// p-value elsewhere and stays uncorrected for scanpy parity. Output is
+/// clipped to `[0, 1]`. Caller is responsible for setting p = 1.0 when either
+/// group is empty (kernel handles `n1 == 0 || n2 == 0` defensively but the
+/// chunk loop short-circuits before launch).
 pub fn gpu_de_pvalues(
     dev: &GpuDevice,
     u_stats: &CudaSlice<f64>,

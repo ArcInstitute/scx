@@ -39,7 +39,18 @@ def _normalize_frame(df: pl.DataFrame) -> pl.DataFrame:
     Within each group, both emit rows in `var_names` (== feature) order today.
     Sorting by (target, feature) makes the comparison robust to any future
     re-ordering on either side.
+
+    Column-name normalization: upstream `pdex` reports the log2 fold change in a
+    column literally named ``fold_change`` (it has no ``log2_fold_change``
+    column), whereas `pdex_ref` exposes the same value under the descriptive
+    ``log2_fold_change`` name (and additionally mirrors it to ``fold_change``
+    as a migration alias — see ``test_pdex_ref_schema_matches_pdex``). Alias
+    ``fold_change`` → ``log2_fold_change`` when the latter is absent so both
+    frames carry the canonical column and the parity check actually compares
+    fold changes rather than silently dropping the column.
     """
+    if "log2_fold_change" not in df.columns and "fold_change" in df.columns:
+        df = df.with_columns(pl.col("fold_change").alias("log2_fold_change"))
     keep = [
         "target",
         "feature",

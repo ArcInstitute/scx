@@ -335,7 +335,9 @@ fn wilcoxon_from_ranks(
     n_total: usize,
     tie_correction: f64,
 ) -> (f64, f64) {
-    let (_u, z, p) = wilcoxon_full_from_ranks(ranks, group_cells, n_total, tie_correction);
+    // scanpy's `rank_genes_groups` (method="wilcoxon") does NOT apply a
+    // continuity correction — keep this path uncorrected.
+    let (_u, z, p) = wilcoxon_full_from_ranks(ranks, group_cells, n_total, tie_correction, false);
     (z, p)
 }
 
@@ -346,11 +348,19 @@ fn wilcoxon_from_ranks(
 /// tie-corrected signed z-score used by the existing scanpy-parity path.
 /// All callers within this crate use one or the other; the unified helper
 /// avoids recomputing the rank sum twice when both are needed.
+///
+/// `continuity` selects the two-sided p-value convention. `pdex_ref` matches
+/// upstream `pdex` / `numba_mwu` (and scipy's `use_continuity=True` default):
+/// subtract 0.5 from `|U − μ|` before standardizing. The scanpy-parity
+/// Wilcoxon path passes `false` (scanpy applies no continuity correction).
+/// The returned signed `z` is always the *uncorrected* score (used only by the
+/// Wilcoxon path); only the p-value reflects `continuity`.
 fn wilcoxon_full_from_ranks(
     ranks: &[f64],
     group_cells: &[usize],
     n_total: usize,
     tie_correction: f64,
+    continuity: bool,
 ) -> (f64, f64, f64) {
     let n1 = group_cells.len() as f64;
     let n2 = n_total as f64 - n1;
@@ -370,8 +380,14 @@ fn wilcoxon_full_from_ranks(
         return (u1, 0.0, 1.0);
     }
 
-    let z = (u1 - mu) / sigma_sq.sqrt();
-    let p = 2.0 * normal_sf(z.abs());
+    let sigma = sigma_sq.sqrt();
+    let z = (u1 - mu) / sigma;
+    let z_p = if continuity {
+        ((u1 - mu).abs() - 0.5).max(0.0) / sigma
+    } else {
+        z.abs()
+    };
+    let p = 2.0 * normal_sf(z_p);
     (u1, z, p)
 }
 
@@ -915,7 +931,8 @@ fn pdex_gene_target_stats(
     let tc = rank_with_ties(&values_buf[..n_total], index_buf, ranks_buf);
     group_buf_indices.clear();
     group_buf_indices.extend(0..n1);
-    let (u_stat, _z, p) = wilcoxon_full_from_ranks(ranks_buf, group_buf_indices, n_total, tc);
+    // pdex_ref matches upstream pdex's continuity-corrected two-sided p-value.
+    let (u_stat, _z, p) = wilcoxon_full_from_ranks(ranks_buf, group_buf_indices, n_total, tc, true);
 
     (target_mean, log2_fc, percent_change, u_stat, p)
 }
