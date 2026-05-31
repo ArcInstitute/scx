@@ -279,7 +279,13 @@ pub fn plan_de_route(
 /// [`SourceRouteMetadata`](scx_gpu::SourceRouteMetadata) deliberately omits
 /// [`InputLayout`] (it lives in this crate, which depends on `scx-gpu` — the
 /// reverse would be circular), so only the construction site knows the layout.
-/// `gpu_available` is resolved via [`crate::gpu_available`].
+///
+/// `gpu_available` is resolved via [`crate::gpu_available`] (a `GpuDevice::count`
+/// probe). In normal DE dispatch this is reached only after `open_device`
+/// already succeeded, so it is expected `true`; the probe is what keeps the
+/// `other =>` "unreachable route" arm in the dispatch `match` from being dead
+/// code — if the GPU vanished between `open_device` and here, the planner
+/// stamps a CPU route and that arm reports it rather than silently mis-running.
 #[cfg(feature = "gpu")]
 pub fn plan_de_route_from_source(
     device: DeviceRequest,

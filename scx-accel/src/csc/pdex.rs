@@ -227,7 +227,7 @@ mod tests {
     // G4.3: GPU v3 CSC-direct parity vs CPU CSR baseline.
     // -----------------------------------------------------------------
     //
-    // Two tests exercise the v3 dispatch in `pdex_ref_gpu_streaming`:
+    // Two tests exercise the v3 dispatch in `pdex_ref_gpu` (Backed variant):
     //   (a) v3 CSC-direct path (CSC sidecar provided)
     //   (b) v3 CSR-direct fallback (no CSC sidecar)
     //

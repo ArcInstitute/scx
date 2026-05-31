@@ -667,8 +667,9 @@ impl GpuCsrSlot {
 /// Adapter exposing a borrowed [`ScxCsr`] as a single-shard
 /// [`scx_format::ShardSource`].
 ///
-/// Lets the in-memory-CSR GPU DE entry points (`pdex_ref_gpu_sparse`,
-/// `wilcoxon_rank_sum_gpu_sparse`) feed the refactored chunked driver,
+/// Lets the in-memory-CSR arm of the unified GPU DE entry points
+/// (`pdex_ref_gpu` / `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Csr`) feed
+/// the refactored chunked driver,
 /// which consumes any `&dyn ShardSource + Sync` through
 /// [`crate::gpu_shard_source::RawGpuShardSource`]. The driver's per-shard
 /// device-resident scatter (`gpu_de_scatter_shard_to_dense`) then

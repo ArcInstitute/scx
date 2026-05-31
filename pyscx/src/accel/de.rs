@@ -373,7 +373,8 @@ fn run_rank_genes_groups_inner(
         }
     } else {
         // ScxLazyTransformedDataset (non-CSC GPU path) — route
-        // through `wilcoxon_rank_sum_gpu_lazy` (device-resident shard
+        // through `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Lazy`
+        // (device-resident shard
         // pipeline) before falling through to the scipy/numpy paths.
         // CPU lazy without CSC keeps the scipy/numpy fallback.
         #[cfg(feature = "gpu")]

@@ -612,15 +612,16 @@ fn populate_dense_from_host_dense(
 }
 
 /// G1.8: populate `scratch.dense[..n_obs * sz]` directly from a
-/// `GpuShardSource`. Zeros the chunk's row range, then scatters each
+/// [`GpuMatrixSource`]. Zeros the chunk's row range, then scatters each
 /// shard's CSR rows (filtered to the chunk's column range) into the
 /// global dense buffer on device — no host materialise, no
 /// `gpu_de_upload_chunk` round-trip.
 ///
-/// `S: GpuShardSource` is taken by generic because the trait isn't
-/// dyn-compatible (its `for_each_gpu_shard` callback is generic). All
-/// the entry points use a concrete `RawGpuShardSource` (or a future
-/// `GpuPreprocessedShardSource`), so monomorphisation is fine.
+/// Takes `&mut dyn GpuMatrixSource` and iterates CSR shards via
+/// [`for_each_gpu_csr_shard`](GpuMatrixSource::for_each_gpu_csr_shard) — the
+/// object-safe boxed-callback form, so all v1 chunk drivers share this one
+/// populate path regardless of the concrete source (backed / in-memory / lazy,
+/// all wrapped by [`BackedGpuMatrixSource`]).
 fn populate_dense_from_shard_source(
     dev: &GpuDevice,
     source: &mut dyn GpuMatrixSource,
@@ -1442,7 +1443,7 @@ fn pdex_ref_chunk_gpu_sequence_v2(
 /// from v1.
 ///
 /// The dense-host entry point (`pdex_ref_gpu_dense`) stays on v1 — it
-/// has no shard source. Sparse / streaming / lazy entry points dispatch
+/// has no shard source. Shard-shaped inputs (via [`pdex_ref_gpu`]) dispatch
 /// to this driver when [`scx_gpu::de_v2_enabled`] returns true.
 ///
 /// Numerical contract: produces results identical to v1 within fp32
@@ -1873,10 +1874,11 @@ fn compute_pdex_means_from_sums(
 /// `gpu_de_pseudobulk_csr_direct`) in a single pass per shard. No dense
 /// scatter, no `gpu_de_pseudobulk_all_groups` call.
 ///
-/// Used when `de_v3_enabled()` is true and the input has no CSC sidecar
-/// (in-memory CSR, or backed/lazy with `has_csc() == false`).
-/// The CSC-direct equivalent [`pdex_ref_gpu_chunked_v3_csc`] is the primary
-/// v3 path when a CSC sidecar is available.
+/// Used when `de_v3_enabled()` is true and the source's
+/// [`available_layouts`](GpuMatrixSource::available_layouts) does not contain
+/// [`LayoutSet::CSC`](scx_gpu::LayoutSet) (in-memory CSR, or backed/lazy with no
+/// CSC sidecar). The CSC-direct equivalent [`pdex_ref_gpu_chunked_v3_csc`] is
+/// the primary v3 path when a CSC sidecar is available.
 #[allow(clippy::too_many_arguments)]
 fn pdex_ref_gpu_chunked_v3_csr(
     dev: &GpuDevice,
@@ -4475,11 +4477,12 @@ mod tests {
         assert_pdex_parity(&cpu, &gpu, "all_equal_values_in_group");
     }
 
-    /// `pdex_ref_gpu_lazy` / `wilcoxon_rank_sum_gpu_lazy`
-    /// match the dense (`gpu_de_upload_chunk`) reference on the same fixture.
+    /// The lazy arm of `pdex_ref_gpu` / `wilcoxon_rank_sum_gpu`
+    /// matches the dense (`gpu_de_upload_chunk`) reference on the same fixture.
     /// We feed the same `ScxCsr` through both paths: dense via
     /// `pdex_ref_gpu_dense` (legacy host upload), and lazy via
-    /// `pdex_ref_gpu_lazy(&InMemoryCsrShardSource(&csr))` (new device-resident
+    /// `pdex_ref_gpu(GpuDeShardInput::Lazy(&InMemoryCsrShardSource(&csr)))`
+    /// (new device-resident
     /// scatter). The two paths must agree bit-for-bit on the U statistic
     /// (integer-valued) and within the documented p-value / FDR
     /// tolerance.
