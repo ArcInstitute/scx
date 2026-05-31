@@ -39,7 +39,7 @@ use super::detect::{detect_matrix_format_at, MatrixFormat};
 use super::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
 use super::h5ad_read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
 use super::h5ad_stream::{open_x_streaming, read_slice_f32};
-use super::pipeline::{ConvertError, ConvertOptions};
+use super::pipeline::{ConvertError, ConvertOptions, CscPolicy};
 use super::stream::CsrShardStream;
 use super::warnings::{ConvertWarning, WarningSink};
 
@@ -486,6 +486,39 @@ pub fn h5mu_to_scx_streaming(
     }
 
     let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
+
+    // CSC sidecar policy on the streaming multimodal path. The streaming
+    // writer cannot build per-modality CSC: the non-streaming `h5mu_to_scx`
+    // does so (it holds each modality's full CSR in memory), and
+    // `rebuild_csc_inplace` is unimodal-only — running it over a multimodal
+    // file would collapse every modality into one CSC transpose. So:
+    //   - `Always` → reject; the user explicitly demanded CSC we can't honor.
+    //   - `Auto`   → warn for each modality that would have cleared the size
+    //                threshold, then proceed CSR-only (best-effort).
+    //   - `Off`    → no-op.
+    match opts.csc {
+        CscPolicy::Always => {
+            return Err(ConvertError::Other(
+                "csc='always' is not supported on the streaming h5mu path \
+                 (per-modality CSC cannot be built while streaming). Re-run with \
+                 stream=False / --stream=false to build per-modality CSC sidecars."
+                    .to_string(),
+            ));
+        }
+        CscPolicy::Auto => {
+            let would_build: Vec<String> = modality_meta
+                .iter()
+                .filter(|(_, _, mod_n_vars)| opts.csc.should_build_csc(n_obs as u64, *mod_n_vars))
+                .map(|(name, _, _)| name.clone())
+                .collect();
+            if !would_build.is_empty() {
+                sink.emit(ConvertWarning::CscSkippedStreamingMultimodal {
+                    modalities: would_build,
+                });
+            }
+        }
+        CscPolicy::Off => {}
+    }
 
     // Placeholder header. `nnz`, `n_csr_shards`, `n_modalities`, the
     // modality table offset, and codec_id are all overwritten by

@@ -556,6 +556,12 @@ fn from_10x(
 /// `"methylation"`, `"custom"`). Modalities not listed fall back
 /// to inference and trigger a `UserWarning` per modality.
 ///
+/// `csc`: the streaming path (default) cannot build per-modality CSC
+/// sidecars — `csc="always"` raises and `csc="auto"` degrades to no-CSC
+/// with a `UserWarning` when a modality would have qualified. Pass
+/// `stream=False` to build per-modality CSC via the non-streaming path
+/// (it materializes each modality's X). `csc="off"` (default) is unaffected.
+///
 /// Example:
 ///     pyscx.from_h5mu("cite_seq.h5mu", "out.scx")
 ///     pyscx.from_h5mu("multiome.h5mu", "out.scx",

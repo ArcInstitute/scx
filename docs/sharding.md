@@ -362,11 +362,21 @@ The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
   tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` and `SCX_CSC_AUTO_VARS_THRESHOLD`
   environment variables (set either to `0` to force a build on any shape).
 
-`auto` is resolved against the matrix shape at write time, so a streaming
-conversion picks it up from the X reader's reported dimensions. The
-in-memory `from_mudata` path cannot build per-modality CSC yet: there,
-`csc="always"` raises and `csc="auto"` degrades to no-CSC (use `from_h5mu`
-or `scx build-csc`).
+`auto` is resolved against the matrix shape at write time, so a (unimodal)
+streaming conversion picks it up from the X reader's reported dimensions.
+
+Multimodal (h5mu / MuData) inputs cannot build per-modality CSC while
+streaming, and `scx build-csc` is unimodal-only (it would collapse all
+modalities into one CSC transpose). So per-modality CSC is built only by
+the **non-streaming** path:
+
+- `pyscx.from_h5mu(..., stream=False)` / `scx convert --from h5mu --stream=false`
+  — honors `csc="auto"`/`"always"` per modality.
+- `pyscx.from_h5mu(..., csc=...)` with the default `stream=True`,
+  `scx convert --from h5mu` (default streaming), and the in-memory
+  `pyscx.from_mudata` all **reject** `csc="always"` and **degrade**
+  `csc="auto"` to no-CSC (the streaming h5mu path emits a `UserWarning`
+  when a modality would have qualified).
 
 ### `--csc-cols-per-shard`
 
