@@ -2717,12 +2717,28 @@ impl ScxBackedObsmDataset {
     }
 
     /// numpy `__array__` protocol so `np.asarray(m)` materialises.
-    #[pyo3(signature = (dtype=None))]
+    ///
+    /// numpy >= 2.0 passes a `copy` keyword (`True` / `False` / `None`).
+    /// A backed dataset has no in-memory buffer to alias — `to_memory`
+    /// always allocates a fresh array — so `copy=False` (which forbids
+    /// copying) cannot be honoured and raises `ValueError`, matching
+    /// numpy's array-protocol contract (and h5py's backed `__array__`).
+    /// `True` / `None` (the `np.asarray` default) return the freshly
+    /// materialised array. Accepting the kwarg keeps `np.asarray(m)` /
+    /// `np.array(m)` from emitting numpy 2.x's missing-`copy` warning.
+    #[pyo3(signature = (dtype=None, copy=None))]
     fn __array__<'py>(
         &self,
         py: Python<'py>,
         dtype: Option<Bound<'py, PyAny>>,
+        copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if copy == Some(false) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "ScxBackedObsmDataset cannot be converted to an array without \
+                 copying (copy=False); it materialises a fresh array on access",
+            ));
+        }
         let arr = self.to_memory(py)?;
         match dtype {
             Some(dt) => arr.call_method1("astype", (dt,)),

@@ -293,6 +293,23 @@ def test_obsm_backed_bool_mask_wrong_length_raises(multi_obsm_scx):
         _ = m[np.array([True, False])]
 
 
+def test_obsm_backed_array_protocol_copy(multi_obsm_scx):
+    """`__array__` accepts numpy 2.0's `copy` kwarg: asarray/array work
+    without a warning, and `copy=False` (no-copy demand) raises ValueError
+    since a backed dataset materialises a fresh array."""
+    import pyscx
+
+    path, adata = multi_obsm_scx
+    out = pyscx.open(path).to_anndata(backed=True, obsm=["X_pca"])
+    m = out.obsm["X_pca"]
+
+    np.testing.assert_array_equal(np.asarray(m), adata.obsm["X_pca"])
+    np.testing.assert_array_equal(np.array(m), adata.obsm["X_pca"])
+    # No-copy demand cannot be satisfied by a backed dataset.
+    with pytest.raises(ValueError):
+        m.__array__(copy=False)
+
+
 def test_obsm_backed_bool_mask_2d_raises(multi_obsm_scx):
     """A 2-D boolean mask raises IndexError rather than collapsing to its
     first nonzero coordinate."""
