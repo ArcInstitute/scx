@@ -271,9 +271,78 @@ pub fn plan_de_route(
     info
 }
 
+/// Convenience wrapper over [`plan_de_route`] that reads CSC capability from a
+/// [`GpuMatrixSource`](scx_gpu::GpuMatrixSource) instead of a separate
+/// `csc_available` flag.
+///
+/// `layout` stays an explicit parameter: the source's
+/// [`SourceRouteMetadata`](scx_gpu::SourceRouteMetadata) deliberately omits
+/// [`InputLayout`] (it lives in this crate, which depends on `scx-gpu` — the
+/// reverse would be circular), so only the construction site knows the layout.
+/// `gpu_available` is resolved via [`crate::gpu_available`].
+#[cfg(feature = "gpu")]
+pub fn plan_de_route_from_source(
+    device: DeviceRequest,
+    source: &dyn scx_gpu::GpuMatrixSource,
+    layout: InputLayout,
+    v2_enabled: bool,
+    v3_enabled: bool,
+) -> AccelExecutionInfo {
+    let csc_available = source.available_layouts().contains(scx_gpu::LayoutSet::CSC);
+    plan_de_route(
+        device,
+        layout,
+        crate::gpu_available(),
+        true,
+        v2_enabled,
+        v3_enabled,
+        csc_available,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `plan_de_route_from_source` reads CSC capability from the source's
+    /// `available_layouts()` (not a separate flag). Asserts only
+    /// `csc_available`, which `plan_de_route` sets unconditionally — so the
+    /// test is independent of whether the host happens to have CUDA.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn plan_from_source_reads_csc_capability() {
+        use scx_gpu::{GpuMatrixSource, LayoutSet};
+
+        struct FakeSource(LayoutSet);
+        impl GpuMatrixSource for FakeSource {
+            fn shape(&self) -> (usize, usize) {
+                (100, 50)
+            }
+            fn available_layouts(&self) -> LayoutSet {
+                self.0
+            }
+        }
+
+        let csr_only = FakeSource(LayoutSet::CSR);
+        let info = plan_de_route_from_source(
+            DeviceRequest::Gpu,
+            &csr_only,
+            InputLayout::BackedCsr,
+            false,
+            true,
+        );
+        assert_eq!(info.csc_available, Some(false));
+
+        let with_csc = FakeSource(LayoutSet::CSR | LayoutSet::CSC);
+        let info = plan_de_route_from_source(
+            DeviceRequest::Gpu,
+            &with_csc,
+            InputLayout::BackedCsc,
+            false,
+            true,
+        );
+        assert_eq!(info.csc_available, Some(true));
+    }
 
     #[test]
     fn dense_never_routes_to_csc() {

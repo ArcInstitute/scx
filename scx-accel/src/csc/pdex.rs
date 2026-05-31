@@ -286,10 +286,12 @@ mod tests {
 
         // GPU v3 CSC-direct path.
         let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
-        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu_streaming(
+        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
             0,
-            &csr_reader,
-            Some(&csc_reader),
+            crate::diffexp_gpu::GpuDeShardInput::Backed {
+                csr: &csr_reader,
+                csc: Some(&csc_reader),
+            },
             &gene_names,
             &groups,
             &group_names,
@@ -395,10 +397,12 @@ mod tests {
 
         // GPU v3 CSR-direct fallback (csc_reader = None).
         let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
-        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu_streaming(
+        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
             0,
-            &csr_reader,
-            None,
+            crate::diffexp_gpu::GpuDeShardInput::Backed {
+                csr: &csr_reader,
+                csc: None,
+            },
             &gene_names,
             &groups,
             &group_names,
