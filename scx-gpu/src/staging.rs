@@ -1,7 +1,6 @@
 //! Shard staging primitives for asynchronous host→device CSR upload.
 //!
-//! `PinnedCsrSlot` and `GpuCsrSlot` are paired grow-only buffers used by
-//! [`crate::shard_pipeline::DoubleBufferedShardLoader`] and the
+//! `PinnedCsrSlot` and `GpuCsrSlot` are paired grow-only buffers used by the
 //! `GpuShardSource` adapters (see [`crate::gpu_shard_source`]) to amortise
 //! per-shard allocation and unblock truly-async H→D copies.
 //!
@@ -28,8 +27,8 @@
 //! descriptor; growing the underlying buffers invalidates the cache.
 //!
 //! Both slot types are `!Sync` — they're designed for single-stream
-//! single-thread consumers (the main thread of `DoubleBufferedShardLoader`,
-//! one pool per device per pipeline).
+//! single-thread consumers (the main thread of `RawGpuShardSource`, one pool
+//! per device per pipeline).
 
 use std::sync::Arc;
 
@@ -210,7 +209,7 @@ impl PinnedCsrSlot {
     }
 
     /// Issue async H→D from the pinned slot into per-shard device
-    /// buffers (used by `DoubleBufferedShardLoader::for_each_shard`).
+    /// buffers (used by `RawGpuShardSource`'s streaming shard loop).
     ///
     /// `indptr_len` and `nnz` are the live shard sizes and must be ≤
     /// the destination buffer lengths.

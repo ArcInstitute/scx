@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_gpu_preprocess_to_csr_single_shard() {
-        // Exercises the single-buffered fallback in DoubleBufferedShardLoader.
+        // Exercises the single-shard fast path of `RawGpuShardSource`.
         let dev = require_gpu!();
         let n_rows = 100;
         let n_cols = 40;
