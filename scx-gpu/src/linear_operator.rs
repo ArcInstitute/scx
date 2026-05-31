@@ -11,7 +11,8 @@
 //!   `n_vars × n_vars` Gram matrix `(X − μ)ᵀ (X − μ)` (the covariance-PCA
 //!   accumulator).
 //!
-//! All routines stream shards via [`DoubleBufferedShardLoader`], reuse the
+//! All routines stream shards via [`RawGpuShardSource`] (the G3 staging path,
+//! with a cached cuSPARSE descriptor per reusable slot), reuse the
 //! existing column-major helpers from `gpu_pca.rs`, and — critically for
 //! later phases — compute the mean-correction pre-factor `mc = Vᵀ · μ` via
 //! cuBLAS `sgemv` on the GPU, avoiding the D→H round-trip at
@@ -29,8 +30,8 @@ use crate::cusparse::{
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
-use crate::shard_pipeline::DoubleBufferedShardLoader;
-use crate::sparse_dense::sparse_to_dense_gpu_into;
+use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+use crate::sparse_dense::sparse_to_dense_gpu_into_view;
 
 /// Implicit-centering sparse operator over a `&dyn ShardSource`.
 ///
@@ -125,16 +126,19 @@ impl<'a> CenteredSparseOperator<'a> {
             None
         };
 
-        let loader = DoubleBufferedShardLoader::new(self.dev, self.source)?;
+        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
         let mut global_row = 0usize;
 
-        loader.for_each_shard(|_idx, gpu_csr| {
-            let shard_rows = gpu_csr.shape.0;
+        src.for_each_gpu_shard(|_idx, slot| {
+            let shard_rows = slot.view().shape.0;
             if shard_rows == 0 {
                 return Ok(());
             }
 
-            let a_desc = gpu_csr.to_cusparse_csr(self.dev, self.dev.stream())?;
+            // Get-or-build the cached cuSPARSE descriptor for this slot's live
+            // shard (the descriptor is reused across power iterations when the
+            // slot's pointers/shape are unchanged).
+            let a_desc = slot.cached_sp_descr(self.dev, self.dev.stream())?;
 
             // V is col-major (n_vars × k); SpMM B operand stays contiguous.
             let b_view = DnMatView::contiguous(d_v, n_vars as i64, k as i64);
@@ -154,7 +158,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 self.dev.stream(),
                 self.dev,
                 Some(pool),
-                &a_desc,
+                a_desc,
                 b_view,
                 c_view,
                 1.0,
@@ -209,16 +213,16 @@ impl<'a> CenteredSparseOperator<'a> {
             .memset_zeros(d_out)
             .map_err(|e| GpuError::KernelLaunchFailed(format!("rmatmat: zero out: {e}")))?;
 
-        let loader = DoubleBufferedShardLoader::new(self.dev, self.source)?;
+        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
         let mut global_row = 0usize;
 
-        loader.for_each_shard(|_idx, gpu_csr| {
-            let shard_rows = gpu_csr.shape.0;
+        src.for_each_gpu_shard(|_idx, slot| {
+            let shard_rows = slot.view().shape.0;
             if shard_rows == 0 {
                 return Ok(());
             }
 
-            let a_desc = gpu_csr.to_cusparse_csr(self.dev, self.dev.stream())?;
+            let a_desc = slot.cached_sp_descr(self.dev, self.dev.stream())?;
 
             // Strided view into d_y: read rows [global_row, global_row +
             // shard_rows) of the (n_obs × k) col-major buffer. SpMM walks
@@ -237,7 +241,7 @@ impl<'a> CenteredSparseOperator<'a> {
                 self.dev.stream(),
                 self.dev,
                 Some(pool),
-                &a_desc,
+                a_desc,
                 b_view,
                 c_view,
                 1.0,
@@ -293,9 +297,10 @@ impl<'a> CenteredSparseOperator<'a> {
         let scratch_len = max_shard_rows.saturating_mul(n_vars);
         let mut d_dense = self.dev.alloc_zeros::<f32>(scratch_len)?;
 
-        let loader = DoubleBufferedShardLoader::new(self.dev, self.source)?;
-        loader.for_each_shard(|_idx, gpu_csr| {
-            let shard_rows = gpu_csr.shape.0;
+        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
+        src.for_each_gpu_shard(|_idx, slot| {
+            let view = slot.view();
+            let shard_rows = view.shape.0;
             if shard_rows == 0 {
                 return Ok(());
             }
@@ -309,7 +314,16 @@ impl<'a> CenteredSparseOperator<'a> {
                 .stream()
                 .memset_zeros(&mut d_dense.slice_mut(0..used))
                 .map_err(|e| GpuError::KernelLaunchFailed(format!("gram: zero scratch: {e}")))?;
-            sparse_to_dense_gpu_into(self.dev, gpu_csr, None, n_vars, &mut d_dense)?;
+            sparse_to_dense_gpu_into_view(
+                self.dev,
+                &view.indptr,
+                &view.indices,
+                &view.data,
+                shard_rows,
+                None,
+                n_vars,
+                &mut d_dense,
+            )?;
             gpu_sgemm(
                 self.cublas,
                 self.dev.stream(),
