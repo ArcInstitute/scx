@@ -52,8 +52,9 @@ fn format_scx_error(e: scx_format::ScxError) -> GpuError {
 /// with larger `n_vars` should use [`crate::gpu_randomized_pca`] instead.
 ///
 /// See module-level docs for algorithmic detail. `Sync` is required on `source`
-/// so that internal `CenteredSparseOperator` / `DoubleBufferedShardLoader`
-/// usages can borrow it across scoped worker threads.
+/// so that the internal `CenteredSparseOperator` (which streams via
+/// `RawGpuShardSource` on the G3 staging path) can borrow it across the scoped
+/// pre-decode worker thread.
 pub fn gpu_covariance_pca(
     dev: &GpuDevice,
     source: &(dyn ShardSource + Sync),
