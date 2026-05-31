@@ -24,9 +24,11 @@
 //! [`crate::gpu_shard_source::GpuShardSource`] trait. New device-resident
 //! consumers (preprocessing, scVI dataloader) should adopt
 //! [`crate::gpu_shard_source::RawGpuShardSource`] /
-//! [`crate::gpu_shard_source::GpuPreprocessedShardSource`] directly; the
-//! existing `DoubleBufferedShardLoader` callers (HVG, linear operator)
-//! continue working on the legacy path and can migrate incrementally.
+//! [`crate::gpu_shard_source::GpuPreprocessedShardSource`] directly (or the
+//! unified [`crate::gpu_matrix_source::GpuMatrixSource`] that composes them).
+//! The former HVG and linear-operator callers have been migrated off this
+//! legacy loader onto that G3 path; `DoubleBufferedShardLoader` is retained for
+//! the remaining `gpu_preprocess` test and pending full removal.
 //!
 //! ## Async H→D (deferred per-call-site migration)
 //!

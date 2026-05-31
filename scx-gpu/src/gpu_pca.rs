@@ -136,8 +136,9 @@ pub struct GpuPcaResult {
 /// 8. Embeddings = Q @ V × Σ (CPU — Q downloaded, small multiply)
 ///
 /// Steps 3-6 stream from any `ShardSource` without materializing full X.
-/// The `Sync` bound is required so that a future refactor to
-/// `DoubleBufferedShardLoader` (Phase 2+) works without signature churn.
+/// The `Sync` bound is required so the streaming `CenteredSparseOperator`
+/// (which iterates via `RawGpuShardSource` on the G3 staging path) can borrow
+/// `source` across its scoped pre-decode worker thread.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_randomized_pca(

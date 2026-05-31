@@ -10,9 +10,10 @@
 //! * [`gpu_streaming_clip_square_sum_batched`] — per-batch variant of
 //!   `gpu_streaming_clip_square_sum` with per-batch clip thresholds.
 //!
-//! All four iterate shards via [`DoubleBufferedShardLoader`] and accumulate
-//! per-gene statistics directly on-device in f64 via `atomicAdd` (compute 6.x+
-//! required, which scx-gpu already targets via `compute_70` in `build.rs`).
+//! All four iterate shards via [`BackedGpuMatrixSource`] (the unified
+//! [`GpuMatrixSource`] CSR path with G3 staging) and accumulate per-gene
+//! statistics directly on-device in f64 via `atomicAdd` (compute 6.x+ required,
+//! which scx-gpu already targets via `compute_70` in `build.rs`).
 //!
 //! These GPU kernels are accessed via the `scx_accel::*_with_device` dispatch
 //! wrappers (see `scx-accel/src/hvg.rs`) when `device = "gpu"`. The f64
@@ -25,9 +26,10 @@ use cudarc::driver::PushKernelArg;
 
 use scx_format::ShardSource;
 
+use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::shard_pipeline::DoubleBufferedShardLoader;
+use crate::gpu_matrix_source::GpuMatrixSource;
 
 /// PTX for the HVG atomicAdd kernels. Reuses the same `colmajor_ops` module
 /// (shared with PCA helpers) to avoid a second PTX load.
@@ -40,7 +42,7 @@ pub type PerBatchClipSums = Vec<(Vec<f64>, Vec<f64>)>;
 
 /// GPU equivalent of `scx_accel::streaming_mean_var`.
 ///
-/// Streams shards through [`DoubleBufferedShardLoader`], atomically
+/// Streams shards through [`BackedGpuMatrixSource`], atomically
 /// accumulating per-column `Σ x` and `Σ x²` into f64 device buffers, then
 /// computes `mean = Σ / n` and `var = (Σ² - n · mean²) / (n - 1)` on the host
 /// (O(n_vars) work). Negative variances from numerical noise are clamped to 0.
@@ -65,9 +67,10 @@ pub fn gpu_streaming_mean_var(
         .load_function("col_sum_sq_nonzeros_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("col_sum_sq_nonzeros: {e}")))?;
 
-    let loader = DoubleBufferedShardLoader::new(dev, source)?;
-    loader.for_each_shard(|_idx, gpu_csr| {
-        let nnz = gpu_csr.data.len() as i64;
+    let mut src = BackedGpuMatrixSource::new(dev, source)?;
+    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
+        let view = slot.view();
+        let nnz = view.data.len() as i64;
         if nnz == 0 {
             return Ok(());
         }
@@ -81,8 +84,8 @@ pub fn gpu_streaming_mean_var(
         unsafe {
             dev.stream()
                 .launch_builder(&func)
-                .arg(&gpu_csr.indices)
-                .arg(&gpu_csr.data)
+                .arg(&view.indices)
+                .arg(&view.data)
                 .arg(&nnz)
                 .arg(&mut d_col_sum)
                 .arg(&mut d_col_sum_sq)
@@ -139,9 +142,10 @@ pub fn gpu_streaming_clip_square_sum(
         .load_function("col_clip_sq_nonzeros_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("col_clip_sq_nonzeros: {e}")))?;
 
-    let loader = DoubleBufferedShardLoader::new(dev, source)?;
-    loader.for_each_shard(|_idx, gpu_csr| {
-        let nnz = gpu_csr.data.len() as i64;
+    let mut src = BackedGpuMatrixSource::new(dev, source)?;
+    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
+        let view = slot.view();
+        let nnz = view.data.len() as i64;
         if nnz == 0 {
             return Ok(());
         }
@@ -155,8 +159,8 @@ pub fn gpu_streaming_clip_square_sum(
         unsafe {
             dev.stream()
                 .launch_builder(&func)
-                .arg(&gpu_csr.indices)
-                .arg(&gpu_csr.data)
+                .arg(&view.indices)
+                .arg(&view.data)
                 .arg(&nnz)
                 .arg(&d_clip)
                 .arg(&mut d_batch_sum)
@@ -229,9 +233,10 @@ pub fn gpu_streaming_mean_var_batched(
     // this device buffer instead.
     let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
 
-    let loader = DoubleBufferedShardLoader::new(dev, source)?;
-    loader.for_each_shard(|_idx, gpu_csr| {
-        let shard_n_rows = gpu_csr.shape.0;
+    let mut src = BackedGpuMatrixSource::new(dev, source)?;
+    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
+        let view = slot.view();
+        let shard_n_rows = view.shape.0;
         if shard_n_rows == 0 {
             return Ok(());
         }
@@ -243,7 +248,7 @@ pub fn gpu_streaming_mean_var_batched(
         }
         let d_row_to_batch = d_cell_batch.slice(cell_offset..cell_offset + shard_n_rows);
 
-        let nnz_i64 = gpu_csr.data.len() as i64;
+        let nnz_i64 = view.data.len() as i64;
         let n_rows_i32 = shard_n_rows as i32;
         let n_vars_i32 = n_vars as i32;
         let n_batches_i32 = n_batches as i32;
@@ -264,9 +269,9 @@ pub fn gpu_streaming_mean_var_batched(
         unsafe {
             dev.stream()
                 .launch_builder(&func)
-                .arg(&gpu_csr.indptr)
-                .arg(&gpu_csr.indices)
-                .arg(&gpu_csr.data)
+                .arg(&view.indptr)
+                .arg(&view.indices)
+                .arg(&view.data)
                 .arg(&d_row_to_batch)
                 .arg(&n_rows_i32)
                 .arg(&n_vars_i32)
@@ -358,15 +363,16 @@ pub fn gpu_streaming_clip_square_sum_batched(
     // See `gpu_streaming_mean_var_batched` for rationale.
     let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
 
-    let loader = DoubleBufferedShardLoader::new(dev, source)?;
-    loader.for_each_shard(|_idx, gpu_csr| {
-        let shard_n_rows = gpu_csr.shape.0;
+    let mut src = BackedGpuMatrixSource::new(dev, source)?;
+    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
+        let view = slot.view();
+        let shard_n_rows = view.shape.0;
         if shard_n_rows == 0 {
             return Ok(());
         }
         let d_row_to_batch = d_cell_batch.slice(cell_offset..cell_offset + shard_n_rows);
 
-        let nnz_i64 = gpu_csr.data.len() as i64;
+        let nnz_i64 = view.data.len() as i64;
         let n_rows_i32 = shard_n_rows as i32;
         let n_vars_i32 = n_vars as i32;
         let n_batches_i32 = n_batches as i32;
@@ -386,9 +392,9 @@ pub fn gpu_streaming_clip_square_sum_batched(
         unsafe {
             dev.stream()
                 .launch_builder(&func)
-                .arg(&gpu_csr.indptr)
-                .arg(&gpu_csr.indices)
-                .arg(&gpu_csr.data)
+                .arg(&view.indptr)
+                .arg(&view.indices)
+                .arg(&view.data)
                 .arg(&d_row_to_batch)
                 .arg(&n_rows_i32)
                 .arg(&n_vars_i32)
