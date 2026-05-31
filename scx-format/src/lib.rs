@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod catalog_view;
 pub mod checksum;
 pub mod codec_select;
+pub mod csc_policy;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
 pub mod encoder;
@@ -45,6 +46,10 @@ pub use catalog_view::{CatalogView, CatalogViewEntry, ShardStatsLite};
 pub use checksum::{blake3_hash, blake3_truncated_64};
 pub use codec_select::{
     select_codec, select_codec_for_modality, select_codec_with_profile, CodecProfile,
+};
+pub use csc_policy::{
+    auto_obs_threshold, auto_vars_threshold, CscPolicy, AUTO_CSC_OBS_THRESHOLD,
+    AUTO_CSC_VARS_THRESHOLD,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};

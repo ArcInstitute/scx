@@ -63,6 +63,14 @@ pub enum ConvertWarning {
     /// skipped. Lifted once `QueryPipeline` grows per-modality
     /// predicate-index lookup (Phase 6 / follow-on).
     PredicateIndexSkippedMultimodal { columns: Vec<String> },
+    /// `csc='auto'` resolved to "build" for one or more modalities, but
+    /// the streaming h5mu path cannot emit per-modality CSC sidecars (only
+    /// the non-streaming `h5mu_to_scx` can, having each modality's full CSR
+    /// in memory; `rebuild_csc_inplace` is unimodal-only and would corrupt
+    /// a multimodal file). The sidecar was skipped — re-run with
+    /// `stream=False` to build it. Explicit `csc='always'` is rejected with
+    /// an error instead of being downgraded to this warning.
+    CscSkippedStreamingMultimodal { modalities: Vec<String> },
     /// Phase 5b: detection bitmap was skipped on a shard because the
     /// `--bitmap=auto` policy rejected it (density not sparse,
     /// `n_vars` exceeds the cap, or estimated bitmap size > 15 % of
@@ -146,6 +154,7 @@ impl ConvertWarning {
             Self::DuplicateCoordinatesMerged { .. } => "duplicate_coordinates_merged",
             Self::LayerSkipped { .. } => "layer_skipped",
             Self::PredicateIndexSkippedMultimodal { .. } => "predicate_index_skipped_multimodal",
+            Self::CscSkippedStreamingMultimodal { .. } => "csc_skipped_streaming_multimodal",
             Self::BitmapSkipped { .. } => "bitmap_skipped",
             Self::Hdf5NotThreadsafe => "hdf5_not_threadsafe",
             Self::ReaderThreadsDerated { .. } => "reader_threads_derated",

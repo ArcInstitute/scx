@@ -90,10 +90,13 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
 - **`codec`**: `"auto"` (default, per-shard selection by median value), `"scx1"`
   (Delta-Golomb + FOR-BP + Rice; integer-only), `"zstd"`, `"pcodec"` (best for
   float layers), `"lz4"`, `"none"`.
-- **`csc`**: `"off"` (default) or `"always"`. `"always"` writes a column-major
-  sidecar via a two-pass write (streaming CSR → in-place rebuild); transient
-  disk briefly reaches ~2× the output size. Required to use the
-  `prefer_format="csc"` accel paths and the v3-CSC GPU DE driver.
+- **`csc`**: `"off"` (default), `"auto"`, or `"always"`. `"always"`/`"auto"`
+  write a column-major sidecar via a two-pass write (streaming CSR → in-place
+  rebuild); transient disk briefly reaches ~2× the output size. `"auto"` builds
+  it only when the dataset clears the size thresholds (`n_obs ≥ 50000` **and**
+  `n_vars ≥ 5000`, env-tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
+  `SCX_CSC_AUTO_VARS_THRESHOLD` — set either to `0` to force a build). Required
+  to use the `prefer_format="csc"` accel paths and the v3-CSC GPU DE driver.
 - **`index_obs` / `index_var` / `index_preset` / `index_auto_threshold`**:
   materialize predicate indexes at write time. `index_preset` expands curated
   column lists: `"cellxgene"` (cell_type / disease / tissue / assay / donor_id /
@@ -131,7 +134,7 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
 ```
 scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
     [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N]
-    [--stream[=true|false]] [--csc off|always] [--csc-cols-per-shard N]
+    [--stream[=true|false]] [--csc off|auto|always] [--csc-cols-per-shard N]
     [--modality NAME] [--memory-budget SIZE] [--strict-uns]
     [--dense-zero-epsilon F] [--temp-dir DIR] [--modalities CSV]
     [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV]
@@ -139,7 +142,8 @@ scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
     [--bitmap off|auto|always] [--reader-threads N] [--writer-queue-depth N]
 ```
 - `--stream` (default true) bounds peak memory; supported h5ad ↔ SCX and h5mu ↔ SCX both directions.
-- On ingest, `--csc always` does the two-pass CSR-then-rebuild write.
+- On ingest, `--csc always` (or `--csc auto` over a dataset above the size
+  thresholds) does the two-pass CSR-then-rebuild write.
 - For multimodal SCX → h5ad, combine `--to h5ad --modality NAME`.
 
 Other commands:

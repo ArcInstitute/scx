@@ -1254,8 +1254,8 @@ choice locally.
 `prefer_format="csc"` requires *all* of the following; otherwise it
 raises `RuntimeError` with a message naming the missing capability:
 
-1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always")`,
-   `scx convert --csc=always`, or `scx build-csc`).
+1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
+   `scx convert --csc=always|auto`, or `scx build-csc`).
 2. The transform chain on `adata.X` contains only column-local
    operations. `Log1p` is column-local; `NormalizeTotal` and
    `RowScale` are not (per-row state). The common `normalize_total →
@@ -1292,6 +1292,35 @@ pyscx.accel.col_sums(adata.X, prefer_format="csc")  # raises RuntimeError
 For the on-disk format and sharding granularity, see
 [docs/sharding.md § CSC sharding](sharding.md#csc-sharding) and
 [docs/format.md § 4.1 CSC Shard Internal Layout](format.md#41-csc-shard-internal-layout).
+
+### GPU-supported vs GPU-fast
+
+`device="gpu"` runs a column algorithm on the GPU, but **running on the GPU
+is not the same as running fast on the GPU**. For differential expression,
+peak GPU throughput requires a *column-major* substrate so the kernel reads
+contiguous gene columns instead of decoding and projecting every row.
+
+- **`pdex_ref` is GPU-fast only with a CSC sidecar.** With a backed SCX file
+  that has a CSC sidecar and `SCX_GPU_DE_V3=1`, the dispatch takes the
+  CSC-direct route (`route == "gpu_csc_v3"`): it drops the per-chunk dense
+  intermediate and skips non-overlapping CSC shards via a column-range
+  pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
+  falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
+  *GPU-supported but not GPU-fast*.
+- **Wilcoxon (`rank_genes_groups`) has no GPU CSC route yet.** On GPU it always
+  runs `gpu_csr_v1`; `prefer_format="csc"` accelerates only the CPU path. CSC-
+  first GPU Wilcoxon is planned but not shipped.
+- **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
+  row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
+
+To make a file GPU-fast for DE, build the sidecar at conversion time:
+`pyscx.from_anndata(adata, path, csc="auto")` (built automatically once the
+dataset clears the size thresholds) or `csc="always"`, `scx convert --csc=auto`,
+or `scx build-csc` after the fact. Then **always confirm the route actually
+taken** via `adata.uns["scx_accel"][op]["route"]` before drawing performance
+conclusions — a silent CSR fallback measured as "GPU DE" is exactly the
+benchmarking trap the [route metadata](api.md#accelerator-route-metadata) exists
+to catch.
 
 ### PCA (`pyscx.accel.pca`)
 

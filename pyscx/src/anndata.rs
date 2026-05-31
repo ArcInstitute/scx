@@ -3567,7 +3567,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_always: bool,
+    csc_policy: scx_format::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
     stream: bool,
@@ -3736,7 +3736,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
         codec: explicit_codec,
-        csc: csc_always,
+        csc: csc_policy,
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget,
@@ -3960,7 +3960,7 @@ fn route_scx_backed_to_scx(
     out_path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_always: bool,
+    csc_policy: scx_format::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
     shard_size_overridden: bool,
@@ -4068,8 +4068,11 @@ fn route_scx_backed_to_scx(
     // metadata writes with shard I/O in the canonical order.
     let ov = extract_scx_overrides(py, adata, uns_format_parsed)?;
 
-    // CSC sidecar policy.
-    let csc_dropped = src_has_csc && !csc_always;
+    // CSC sidecar policy. Resolve `Auto` against the output shape so a
+    // CSC sidecar is (re)built only when the rewritten dataset is large
+    // enough to benefit.
+    let csc_build = csc_policy.should_build_csc(out_n_obs, out_n_vars);
+    let csc_dropped = src_has_csc && !csc_build;
     if csc_dropped {
         warn_csc_dropped(py);
     }
@@ -4227,7 +4230,7 @@ fn route_scx_backed_to_scx(
     writer.finish().map_err(to_pyerr)?;
 
     // Optional CSC sidecar rebuild over the just-written file.
-    if csc_always {
+    if csc_build {
         py.detach(|| {
             scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
                 .map_err(|e| e.to_string())
@@ -4254,13 +4257,15 @@ fn route_scx_lazy_to_scx(
     out_path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_always: bool,
+    csc_policy: scx_format::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
 ) -> PyResult<()> {
     let (n_obs_usize, n_vars_usize) = lazy.shape_val;
     let n_obs = n_obs_usize as u64;
     let n_vars = n_vars_usize as u64;
+    // Resolve `Auto` against the (lazy) source shape.
+    let csc_build = csc_policy.should_build_csc(n_obs, n_vars);
 
     // Default codec to the source SCX's choice when known (preserves
     // Scx1 / Pcodec / etc through the rewrite). Falls back to Zstd
@@ -4282,7 +4287,7 @@ fn route_scx_lazy_to_scx(
     // Source CSC sidecar (if any) is always invalidated by the
     // transform chain. Warn unless the user opted into a rebuild.
     let src_has_csc = lazy.backed_csc.is_some();
-    let csc_dropped = src_has_csc && !csc_always;
+    let csc_dropped = src_has_csc && !csc_build;
     if csc_dropped {
         warn_csc_dropped(py);
     }
@@ -4434,7 +4439,7 @@ fn route_scx_lazy_to_scx(
 
     writer.finish().map_err(to_pyerr)?;
 
-    if csc_always {
+    if csc_build {
         py.detach(|| {
             scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
                 .map_err(|e| e.to_string())
@@ -4892,15 +4897,8 @@ pub fn from_anndata_impl(
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "invalid csc value '{other}'; expected 'off' or 'always'"
-            )))
-        }
-    };
+    let csc_policy =
+        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = parse_uns_format(uns_format)?;
 
     // Backed AnnData → route through the streaming converter
@@ -4930,7 +4928,7 @@ pub fn from_anndata_impl(
                 path,
                 explicit_codec,
                 shard_target_rows,
-                csc_always,
+                csc_policy,
                 csc_cols_per_shard,
                 uns_format_parsed,
                 true,  // stream
@@ -4951,7 +4949,7 @@ pub fn from_anndata_impl(
         {
             let _ = (
                 explicit_codec,
-                csc_always,
+                csc_policy,
                 csc_cols_per_shard,
                 uns_format_parsed,
                 &index_obs,
@@ -4987,7 +4985,7 @@ pub fn from_anndata_impl(
             path,
             explicit_codec,
             shard_target_rows,
-            csc_always,
+            csc_policy,
             csc_cols_per_shard,
             uns_format_parsed,
             shard_size.is_some(),
@@ -5001,7 +4999,7 @@ pub fn from_anndata_impl(
             path,
             explicit_codec,
             shard_target_rows,
-            csc_always,
+            csc_policy,
             csc_cols_per_shard,
             uns_format_parsed,
         );
@@ -5013,6 +5011,10 @@ pub fn from_anndata_impl(
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;
     let n_obs = shape.0;
     let n_vars = shape.1;
+
+    // Resolve the CSC policy now that the in-memory shape is known
+    // (`Auto` compares against the size thresholds).
+    let csc_build = csc_policy.should_build_csc(n_obs, n_vars);
 
     if n_vars > u32::MAX as u64 {
         return Err(PyRuntimeError::new_err(format!(
@@ -5075,11 +5077,7 @@ pub fn from_anndata_impl(
     // costs CSR a few bytes per index when n_obs > 65535 but
     // unblocks CSC writes on large-cell datasets (`census_1m`+).
     let index_dtype: u8 = {
-        let max_axis = if csc_always {
-            n_obs.max(n_vars)
-        } else {
-            n_vars
-        };
+        let max_axis = if csc_build { n_obs.max(n_vars) } else { n_vars };
         if max_axis <= 65535 {
             0
         } else {
@@ -5565,7 +5563,7 @@ pub fn from_anndata_impl(
     // Optional CSC sidecar — streaming transpose over the in-memory
     // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
     // a `LayerCscShard` section type would need to land first).
-    if csc_always {
+    if csc_build {
         py.detach(|| -> Result<(), scx_format::ScxError> {
             write_csc_shards_from_csr(
                 &mut writer,
