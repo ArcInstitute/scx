@@ -30,7 +30,8 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use scx_format::ScxReader;
 
 use crate::anndata::{
-    coo_record_batch_to_scipy, csr_to_scipy, filter_coo_obsp_by_kept_rows, obsm_batch_to_numpy,
+    coo_record_batch_to_scipy, csr_to_scipy, filter_coo_obsp_by_kept_rows,
+    filter_obs_by_deletion_vectors, obsm_batch_to_numpy,
 };
 use crate::to_pyerr;
 
@@ -355,6 +356,215 @@ impl ScxLazyVarmMapping {
         let n_cached = state.values().filter(|v| v.is_some()).count();
         format!(
             "ScxLazyVarmMapping({} keys, {} materialized)",
+            n_keys, n_cached
+        )
+    }
+}
+
+/// Lazy mapping for `ad.obsm`. Each value is decoded to a dense numpy
+/// 2-D array on first access (mirrors the eager pre-fix behaviour at
+/// `anndata.rs:obsm_batch_to_numpy`), with the file's deletion vectors
+/// applied so rows line up with `obs` — unlike [`ScxLazyVarmMapping`],
+/// which sits on the `var` axis and needs no row filtering.
+///
+/// Unlike `obsp` / `varp` / `varm` / `layers`, `obsm` is eager by
+/// default in `to_anndata()`. This lazy bridge is only installed when
+/// the caller has explicitly opted into selective loading
+/// (`to_anndata(obsm=[...], eager=False)`), so default behaviour stays
+/// byte-identical. The `obsm_filter` passed to [`Self::new`] is the same
+/// key set used by the eager selective path.
+#[pyclass(name = "ScxLazyObsmMapping", mapping)]
+pub struct ScxLazyObsmMapping {
+    reader: Arc<ScxReader>,
+    /// `Some(_)` enables the Phase-3 backed dense row-gather mode: each
+    /// key materialises to a [`ScxBackedObsmDataset`] (shard-aware,
+    /// `O(batch)` memory) instead of a full dense numpy array.
+    backed: Option<BackedObsmConfig>,
+    state: Mutex<HashMap<String, Option<Py<PyAny>>>>,
+}
+
+/// Construction inputs for a backed (row-gather) obsm value. Each key
+/// opens its own `BackedDenseReader` over a sibling `ScxReader` (sharing
+/// the parsed catalog), so per-key LRU caches stay independent and
+/// fork-safe — mirroring the per-layer `BackedCsrReader` opens.
+pub(crate) struct BackedObsmConfig {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) cache_shards: usize,
+    pub(crate) shared_catalog: Arc<scx_format::FullCatalog>,
+    /// User-visible row i → global file row (deletion vectors). `None` =
+    /// identity. `obs_filter` composition is intentionally excluded
+    /// (the backed-obsm path falls back to eager under `obs_filter`).
+    pub(crate) kept_to_global: Option<Arc<Vec<u64>>>,
+}
+
+impl ScxLazyObsmMapping {
+    pub(crate) fn new(reader: Arc<ScxReader>, obsm_filter: Option<&[String]>) -> Self {
+        Self::new_inner(reader, obsm_filter, None)
+    }
+
+    /// Phase 3: backed dense row-gather mode. `reader` is used only for
+    /// key enumeration; each value is built from `config`.
+    pub(crate) fn new_backed(
+        reader: Arc<ScxReader>,
+        obsm_filter: Option<&[String]>,
+        config: BackedObsmConfig,
+    ) -> Self {
+        Self::new_inner(reader, obsm_filter, Some(config))
+    }
+
+    fn new_inner(
+        reader: Arc<ScxReader>,
+        obsm_filter: Option<&[String]>,
+        backed: Option<BackedObsmConfig>,
+    ) -> Self {
+        let mut keys = reader.list_obsm();
+        if let Some(filter) = obsm_filter {
+            keys.retain(|n| filter.iter().any(|f| f == n));
+        }
+        let state: HashMap<String, Option<Py<PyAny>>> =
+            keys.into_iter().map(|k| (k, None)).collect();
+        Self {
+            reader,
+            backed,
+            state: Mutex::new(state),
+        }
+    }
+
+    fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        {
+            let state = self.state.lock().unwrap();
+            match state.get(key) {
+                Some(Some(obj)) => return Ok(obj.clone_ref(py)),
+                Some(None) => {}
+                None => return Err(PyKeyError::new_err(key.to_string())),
+            }
+        }
+        let obj: Py<PyAny> = match &self.backed {
+            Some(cfg) => {
+                // Backed row-gather: open a sibling reader (shared catalog)
+                // and wrap a per-key BackedDenseReader.
+                let r =
+                    ScxReader::open_with_shared_catalog(&cfg.path, Arc::clone(&cfg.shared_catalog))
+                        .map_err(to_pyerr)?;
+                let backed = Arc::new(
+                    scx_format::BackedDenseReader::new_obsm(r, key, cfg.cache_shards)
+                        .map_err(to_pyerr)?,
+                );
+                let ds = match &cfg.kept_to_global {
+                    Some(k) => crate::backed::ScxBackedObsmDataset::from_reader_with_deletions(
+                        backed,
+                        cfg.cache_shards,
+                        key.to_string(),
+                        k.as_ref().clone(),
+                    ),
+                    None => crate::backed::ScxBackedObsmDataset::from_reader(
+                        backed,
+                        cfg.cache_shards,
+                        key.to_string(),
+                    ),
+                };
+                ds.into_pyobject(py)?.into_any().unbind()
+            }
+            None => {
+                let batch = self.reader.read_obsm(key).map_err(to_pyerr)?;
+                // Apply deletion vectors so the dense array's rows match
+                // `obs` (the eager path does the same — see
+                // `to_anndata_with_layers`).
+                let filtered = filter_obs_by_deletion_vectors(&self.reader, batch)?;
+                obsm_batch_to_numpy(py, &filtered)?.unbind()
+            }
+        };
+        let mut state = self.state.lock().unwrap();
+        // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
+        if let Some(Some(cached)) = state.get(key) {
+            return Ok(cached.clone_ref(py));
+        }
+        state.insert(key.to_string(), Some(obj.clone_ref(py)));
+        Ok(obj)
+    }
+}
+
+#[pymethods]
+impl ScxLazyObsmMapping {
+    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        self.fetch(py, key)
+    }
+
+    fn __setitem__(&self, key: String, value: Py<PyAny>) {
+        self.state.lock().unwrap().insert(key, Some(value));
+    }
+
+    fn __delitem__(&self, key: &str) -> PyResult<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.remove(key).is_none() {
+            return Err(PyKeyError::new_err(key.to_string()));
+        }
+        Ok(())
+    }
+
+    fn __contains__(&self, key: &str) -> bool {
+        self.state.lock().unwrap().contains_key(key)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let list = PyList::new(py, &keys)?;
+        let iter = list.try_iter()?;
+        Ok(iter.into_pyobject(py)?.into_any().unbind())
+    }
+
+    fn __len__(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
+
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        PyList::new(py, &keys)
+    }
+
+    fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyValueIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
+    }
+
+    fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
+        let py = slf.py();
+        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
+        Py::new(
+            py,
+            ScxLazyItemIterator {
+                parent,
+                keys: keys.into_iter(),
+            },
+        )
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        match self.fetch(py, key) {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyKeyError>(py) => {
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let state = self.state.lock().unwrap();
+        let n_keys = state.len();
+        let n_cached = state.values().filter(|v| v.is_some()).count();
+        format!(
+            "ScxLazyObsmMapping({} keys, {} materialized)",
             n_keys, n_cached
         )
     }

@@ -908,10 +908,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)
+  - `obsm`: list of obsm keys to load (default `None` = all keys, byte-identical to prior behaviour). When set, only the listed embeddings are read — dropping the per-process RAM of unused keys on the random-access dataloader path. An unknown key raises `KeyError`; `obsm=[]` loads no embeddings. Selecting keys also changes *how* obsm is materialised (see `obsm` loading modes under `eager`, below).
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
   - `modality`: select one modality of a multimodal file and
     return a backed AnnData scoped to that modality (per-modality X /
@@ -933,8 +934,34 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     not written back. Pass `eager=True` to materialise everything up
     front and detach the returned AnnData from the SCX file handle
     (use this before closing the experiment or shipping the AnnData
-    to a subprocess). `obsm` and `uns` are always eager regardless of
-    this flag.
+    to a subprocess). `uns` is always eager regardless of this flag.
+  - **`obsm` loading modes** (selected by the combination of `obsm`,
+    `backed`, `eager`, `obs_filter`):
+    - `obsm=None` (default): every obsm key is materialised eagerly as
+      a dense numpy array — byte-identical to prior behaviour.
+    - `obsm=[...]`, `eager=True`, **or** `obs_filter` set: the selected
+      keys are materialised eagerly (selective eager).
+    - `obsm=[...]`, `backed=False`, `eager=False`: obsm becomes a lazy
+      `ScxLazyObsmMapping` bridge — each selected key is decoded to a
+      dense numpy array on *first* access (`adata.obsm[key]`), so an
+      unused/late key costs nothing. Same `MutableMapping` protocol as
+      the other bridges.
+    - `obsm=[...]`, `backed=True`, `eager=False`, no `obs_filter`:
+      obsm becomes a `ScxLazyObsmMapping` whose values are
+      `ScxBackedObsmDataset` — a shard-aware **dense row-gather**
+      dataset. `m[idx]` / `m[idx_array]` decode only the touched
+      `ObsmEmbeddingShard`s (bounded per-key LRU = `cache_shards`), so
+      per-access memory is `O(batch × n_cols)` and independent of
+      `n_obs`. This is the scalable path for a single huge embedding
+      (e.g. millions of cells × thousands of dims) on the random-access
+      `embed_key` dataloader. Under `obs_filter` the backed-obsm path
+      falls back to eager obsm (composing a pandas-query row mask with
+      shard gather is deferred). Deletion vectors compose via the same
+      `kept_to_global` remap as `X`. `ScxBackedObsmDataset` is registered
+      as an `anndata.abc.CSRDataset` virtual subclass so AnnData's `obsm`
+      coercion accepts it on public `adata.obsm[key]` access — it is
+      nonetheless **dense** (`m[idx]` / `np.asarray(m)` / `m.toarray()`
+      return dense numpy; it has no `.tocsr()`).
   - `memory_budget` (default `None`, treated as 8 GiB): emits
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block

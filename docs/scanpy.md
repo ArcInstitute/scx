@@ -385,6 +385,10 @@ exp.to_anndata(
     obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
     layers=None,          # None = load all layers; pass a list to select specific layers
                           # (e.g. ["raw_counts"]), or [] to skip loading layers entirely
+    obsm=None,            # None = load all obsm keys (default); pass a list to load only
+                          # those embeddings (e.g. ["X_pca"]), or [] to skip obsm. Selecting
+                          # keys also switches obsm to a lazy / backed row-gather bridge
+                          # (see "Selective + lazy obsm" below).
     eager=False,          # False (default): obsp/varp/varm and non-backed layers are
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
@@ -425,7 +429,7 @@ The returned `anndata.AnnData` is fully populated:
 | `X` | CSR shards | `scipy.sparse.csr_matrix` (zero-copy) |
 | `obs` | Obs metadata section | pandas DataFrame |
 | `var` | Var metadata section | pandas DataFrame |
-| `obsm` | Obsm sections | dict of numpy arrays (e.g. `X_pca`, `X_umap`) |
+| `obsm` | Obsm sections | dict of numpy arrays (e.g. `X_pca`, `X_umap`); `ScxLazyObsmMapping` when `obsm=[...]` selected (see below) |
 | `varm` | Varm sections | `ScxLazyVarmMapping` (lazy) / dict of numpy arrays (`eager=True`) |
 | `obsp` | Obsp sections (COO Arrow IPC) | `ScxLazyPairwiseMapping` (lazy) / dict of `scipy.sparse.csr_matrix` (`eager=True`) |
 | `varp` | Varp sections (COO Arrow IPC) | `ScxLazyPairwiseMapping` (lazy) / dict of `scipy.sparse.csr_matrix` (`eager=True`) |
@@ -467,6 +471,58 @@ The returned `anndata.AnnData` is fully populated:
 > code that does access them pays the same one-time decode cost it
 > would have paid at construction time. Repeat accesses of the same
 > key return the cached object.
+
+#### Selective + lazy `obsm` (`obsm=[...]`)
+
+`obsm` is eager by default (it tends to be small relative to
+`obsp`/`varp`/`varm`), so `obsm=None` is byte-identical to prior
+behaviour. Passing `obsm=[...]` opts into selective loading — only the
+listed embeddings are read — and changes *how* obsm is materialised:
+
+```python
+# Selective eager: load just X_pca (and skip X_umap / X_state / …).
+adata = exp.to_anndata(obsm=["X_pca"])
+
+# Lazy (non-backed): X_pca is a ScxLazyObsmMapping — decoded to a dense
+# numpy array on first `adata.obsm["X_pca"]` access, cached thereafter.
+adata = exp.to_anndata(obsm=["X_pca"], eager=False)
+
+# Backed dense row-gather: X_pca is a ScxBackedObsmDataset. m[idx] reads
+# only the touched obsm shards (per-key LRU = cache_shards), so a single
+# huge embedding (e.g. 10M cells × 2000-d) stays O(batch) per access.
+adata = exp.to_anndata(backed=True, obsm=["X_pca"])
+emb = adata.obsm["X_pca"]          # ScxBackedObsmDataset
+batch = emb[cell_indices]          # dense (len(idx), n_cols) float array
+```
+
+| `obsm=` | `backed` | `eager` | obsm value type | When it reads |
+|---|---|---|---|---|
+| `None` | any | any | dict of dense numpy arrays | all keys, at `to_anndata()` |
+| `[...]` | any | `True` | dict of dense numpy arrays | listed keys, at `to_anndata()` |
+| `[...]` | `False` | `False` | `ScxLazyObsmMapping` → numpy | listed key, on first access |
+| `[...]` | `True` | `False` | `ScxLazyObsmMapping` → `ScxBackedObsmDataset` | only touched rows, per `m[idx]` |
+
+An unknown key raises `KeyError`; `obsm=[]` loads no embeddings.
+Deletion vectors compose with the row gather via the same
+`kept_to_global` remap as `X`. Under `obs_filter`, the backed-obsm path
+falls back to selective eager obsm (composing a pandas-query row mask
+with shard gather is deferred). This is the fix for per-worker obsm
+memory blow-up on the random-access `embed_key`=`<obsm key>` dataloader
+path — `obsm=[embed_key]` drops every unused embedding, and `backed=True`
+keeps a single huge key off the per-worker heap.
+
+> **`ScxBackedObsmDataset` is registered as `anndata.abc.CSRDataset`.**
+> AnnData's `obsm` (`AxisArrays`) re-validates every value on each public
+> `adata.obsm[key]` access and only accepts a fixed allowlist of array
+> types; the lazy dense types it allows (`h5py.Dataset` / `zarr.Array` /
+> `dask.array`) are concrete classes we can't subclass. Registering the
+> backed dataset as a `CSRDataset` virtual subclass is what lets
+> `adata.obsm[key]` return it (and `m[idx]` gather rows) rather than
+> raising. The dataset is **dense** despite the `CSRDataset` label:
+> `m[idx]` / `np.asarray(m)` / `m.toarray()` all return dense numpy. It
+> does **not** implement CSR-only methods (`.tocsr()`), so code that
+> introspects `adata.obsm[key]` as a sparse matrix will not work — treat
+> it as a backed dense array (index it, or `np.asarray` it).
 
 > **`uns` round-trip fidelity:** `from_anndata()` defaults to
 > `uns_format="tagged"`, which preserves NumPy `dtype` and `shape`,
@@ -672,8 +728,12 @@ When `backed=True`:
 
 - `X` is an `ScxBackedSparseDataset` (not a materialized CSR matrix)
 - **Layers** are wrapped in `ScxBackedLayerDataset` — also lazy
-- **obs, var, obsm, uns** are loaded eagerly (same as non-backed — these are
+- **obs, var, uns** are loaded eagerly (same as non-backed — these are
   small relative to X)
+- **obsm** is loaded eagerly by default, but `obsm=[...]` (without
+  `eager=True` / `obs_filter`) makes each selected key a lazy
+  `ScxBackedObsmDataset` row-gather dataset — see [Selective + lazy
+  `obsm`](#selective--lazy-obsm-obsm) above
 - The dataset is **read-only** (matching AnnData's `backed="r"` semantics)
 
 Each access to `adata.X[rows, cols]` decompresses only the CSR shards that

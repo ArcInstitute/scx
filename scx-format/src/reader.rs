@@ -471,6 +471,150 @@ impl ScxReader {
         self.read_arrow_ipc(entry)
     }
 
+    /// Resolve the per-shard physical layout of a row-sharded dense
+    /// mapping (e.g. `obsm/<name>`) for the backed dense row-gather
+    /// reader ([`crate::BackedDenseReader`]).
+    ///
+    /// Unlike CSR shards, `ObsmEmbeddingShard` catalog entries carry no
+    /// `stats` block, so the per-shard row ranges live only in each
+    /// shard's Arrow schema metadata (`row_start` / `n_shard_rows` /
+    /// `n_rows_total`, stamped by `writer::stamp_dense_shard_metadata`).
+    /// We read each shard's IPC **footer schema only** (no batch
+    /// deserialisation) and validate a contiguous, ordered cover with
+    /// the same invariant as [`assemble_sharded_metadata`].
+    ///
+    /// Falls back to the legacy single-section layout (`single_type`)
+    /// treated as one shard spanning `[0, num_rows)` — that path
+    /// deserialises the one batch to learn its row count.
+    pub(crate) fn dense_mapping_layout(
+        &self,
+        prefix: &str,
+        name: &str,
+        shard_type: SectionType,
+        single_type: SectionType,
+    ) -> Result<DenseMappingLayout> {
+        let shard_name_prefix = format!("{prefix}/{name}_shard_");
+        let logical = format!("{prefix}/{name}");
+
+        let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+            .full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(&shard_name_prefix))
+            .filter_map(|e| {
+                let suffix = e.name.strip_prefix(&shard_name_prefix)?;
+                let idx: u32 = suffix.parse().ok()?;
+                Some((idx, e))
+            })
+            .collect();
+
+        if !shards.is_empty() {
+            shards.sort_by_key(|(idx, _)| *idx);
+            let mut entries: Vec<DenseShardLayoutEntry> = Vec::with_capacity(shards.len());
+            let mut n_cols = 0usize;
+            let mut dtype = arrow::datatypes::DataType::Float32;
+            let mut fields: arrow::datatypes::Fields = Default::default();
+            let mut prev_n_rows_total = 0u64;
+            let mut next_expected_row_start = 0u64;
+
+            for (i, (idx, entry)) in shards.iter().enumerate() {
+                let schema = self.read_arrow_ipc_schema_physical(entry)?;
+                let hdr = parse_shard_metadata_md(&logical, schema.metadata())?;
+                let expected_idx = i as u32;
+                if hdr.shard_idx != expected_idx {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "{logical}: shard at position {i} has shard_idx={} (expected {expected_idx})",
+                        hdr.shard_idx
+                    )));
+                }
+                if i == 0 {
+                    if hdr.row_start != 0 {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: first shard has row_start={} (expected 0)",
+                            hdr.row_start
+                        )));
+                    }
+                    n_cols = schema.fields().len();
+                    if n_cols > 0 {
+                        dtype = schema.field(0).data_type().clone();
+                    }
+                    fields = schema.fields().clone();
+                    prev_n_rows_total = hdr.n_rows_total;
+                    next_expected_row_start = hdr.n_shard_rows;
+                } else {
+                    if hdr.n_rows_total < prev_n_rows_total {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i} has n_rows_total={} which contracts the prior \
+                             shard's stamp of {prev_n_rows_total}",
+                            hdr.n_rows_total
+                        )));
+                    }
+                    if hdr.row_start != next_expected_row_start {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i} has row_start={} (expected {next_expected_row_start})",
+                            hdr.row_start
+                        )));
+                    }
+                    next_expected_row_start =
+                        next_expected_row_start.saturating_add(hdr.n_shard_rows);
+                    prev_n_rows_total = hdr.n_rows_total;
+                }
+                let _ = idx;
+                entries.push(DenseShardLayoutEntry {
+                    offset: entry.offset,
+                    length: entry.length,
+                    section_type: entry.section_type,
+                    modality_id: entry.modality_id,
+                    row_start: hdr.row_start,
+                    n_shard_rows: hdr.n_shard_rows,
+                });
+            }
+            if next_expected_row_start != prev_n_rows_total {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "{logical}: shards cover {next_expected_row_start} rows but the last shard's \
+                     n_rows_total is {prev_n_rows_total}"
+                )));
+            }
+            return Ok(DenseMappingLayout {
+                entries,
+                n_rows: prev_n_rows_total,
+                n_cols,
+                dtype,
+                fields,
+            });
+        }
+
+        // Legacy single section — one batch, no shard metadata.
+        let entry = self
+            .full_catalog
+            .get(&logical)
+            .filter(|e| e.section_type == single_type)
+            .ok_or_else(|| ScxError::SectionNotFound(logical.clone()))?;
+        let batch = self.read_arrow_ipc(entry)?;
+        let n_rows = batch.num_rows() as u64;
+        let n_cols = batch.num_columns();
+        let dtype = if n_cols > 0 {
+            batch.column(0).data_type().clone()
+        } else {
+            arrow::datatypes::DataType::Float32
+        };
+        let fields = batch.schema_ref().fields().clone();
+        Ok(DenseMappingLayout {
+            entries: vec![DenseShardLayoutEntry {
+                offset: entry.offset,
+                length: entry.length,
+                section_type: entry.section_type,
+                modality_id: entry.modality_id,
+                row_start: 0,
+                n_shard_rows: n_rows,
+            }],
+            n_rows,
+            n_cols,
+            dtype,
+            fields,
+        })
+    }
+
     /// Read the obs schema. Uses the Arrow IPC footer fast path, falling
     /// back to a per-column wide-vs-narrow refinement (via
     /// [`crate::arrow_compat::downcast_large_types`]) when any column on
@@ -1660,12 +1804,49 @@ struct ObsmShardMetadata {
     n_rows_total: u64,
 }
 
+/// Physical layout of a row-sharded dense mapping, resolved by
+/// [`ScxReader::dense_mapping_layout`] and consumed by
+/// [`crate::BackedDenseReader`].
+pub(crate) struct DenseMappingLayout {
+    /// Per-shard rows, ordered by `shard_idx` (== sorted by `row_start`).
+    pub(crate) entries: Vec<DenseShardLayoutEntry>,
+    /// Total logical row count (last shard's `n_rows_total`).
+    pub(crate) n_rows: u64,
+    /// Embedding dimensionality (number of dense columns).
+    pub(crate) n_cols: usize,
+    /// Column-0 dtype, as a representative for the whole mapping.
+    pub(crate) dtype: arrow::datatypes::DataType,
+    /// Canonical column fields (per-shard schema metadata stripped) —
+    /// the row-gather output schema. Taken from the first shard.
+    pub(crate) fields: arrow::datatypes::Fields,
+}
+
+/// One shard's catalog offset + stamped row range. Mirrors the fields
+/// `BackedDenseReader` needs (no `nnz`, since dense shards aren't CSR).
+pub(crate) struct DenseShardLayoutEntry {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) section_type: SectionType,
+    pub(crate) modality_id: u8,
+    pub(crate) row_start: u64,
+    pub(crate) n_shard_rows: u64,
+}
+
 /// Pull `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total`
 /// off a sharded batch's schema metadata. Returns
 /// `ScxError::InvalidCatalog` if any field is missing or unparseable,
 /// naming the logical section so the caller can produce a useful error.
 fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardMetadata> {
-    let md = batch.schema_ref().metadata();
+    parse_shard_metadata_md(logical, batch.schema_ref().metadata())
+}
+
+/// Like [`parse_shard_metadata`] but reads from a schema metadata map
+/// directly, so the backed dense reader can pull row ranges from an
+/// Arrow IPC **footer schema** (no batch deserialisation) at open time.
+fn parse_shard_metadata_md(
+    logical: &str,
+    md: &std::collections::HashMap<String, String>,
+) -> Result<ObsmShardMetadata> {
     let get = |key: &str| -> Result<u64> {
         md.get(key)
             .ok_or_else(|| {

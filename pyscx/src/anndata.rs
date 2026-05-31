@@ -522,6 +522,114 @@ pub(crate) fn obsm_batch_to_numpy<'py>(
     df.getattr("values")
 }
 
+/// Read obsm embeddings, optionally restricted to a caller-supplied set of
+/// keys (`to_anndata(obsm=[...])`).
+///
+/// - `filter == None` → load every obsm key (byte-identical to the prior
+///   unconditional `read_all_obsm()` behaviour, including the
+///   `SectionNotFound` → empty-map fallback).
+/// - `filter == Some(keys)` → load only the listed keys. Each key is
+///   validated against [`ScxReader::list_obsm`]; an unknown key raises
+///   `KeyError` (an empty list loads no obsm). This is the selective path
+///   that drops the per-worker RAM of unused embeddings.
+pub(crate) fn read_obsm_selected(
+    reader: &ScxReader,
+    filter: Option<&[String]>,
+) -> PyResult<std::collections::HashMap<String, RecordBatch>> {
+    match filter {
+        None => match reader.read_all_obsm() {
+            Ok(map) => Ok(map),
+            Err(scx_format::ScxError::SectionNotFound(_)) => Ok(std::collections::HashMap::new()),
+            Err(e) => Err(to_pyerr(e)),
+        },
+        Some(keys) => {
+            validate_obsm_keys(reader, filter)?;
+            let mut map = std::collections::HashMap::with_capacity(keys.len());
+            for key in keys {
+                let batch = reader.read_obsm(key).map_err(to_pyerr)?;
+                map.insert(key.clone(), batch);
+            }
+            Ok(map)
+        }
+    }
+}
+
+/// Validate that every key in `filter` exists in the file's obsm catalog
+/// (a catalog-only scan via [`ScxReader::list_obsm`] — reads no shard
+/// bytes). `None` validates nothing. An unknown key raises `KeyError`.
+/// Used by the lazy obsm path to fail fast on a bad key without
+/// defeating the per-key deferral.
+pub(crate) fn validate_obsm_keys(reader: &ScxReader, filter: Option<&[String]>) -> PyResult<()> {
+    if let Some(keys) = filter {
+        let available = reader.list_obsm();
+        for key in keys {
+            if !available.iter().any(|a| a == key) {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "obsm key {key:?} not found; available obsm keys: {available:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Populate `obsm_dict` with eager dense numpy arrays for the selected
+/// obsm keys, applying deletion vectors and (when `obs_filter` is set)
+/// the obs_filter row slice. Extracted from the backed `to_anndata`
+/// path so the backed dense row-gather branch can skip it.
+#[allow(clippy::too_many_arguments)]
+fn build_eager_obsm_dict(
+    py: Python<'_>,
+    reader: &ScxReader,
+    obsm_filter: Option<&[String]>,
+    obs_filter: Option<&str>,
+    apply_deletion_vectors: bool,
+    kept_to_global: &Option<Vec<u64>>,
+    dv_kept_to_global: &Option<Vec<u64>>,
+    obsm_dict: &Bound<'_, pyo3::types::PyDict>,
+) -> PyResult<()> {
+    let obsm_map = read_obsm_selected(reader, obsm_filter)?;
+    if obs_filter.is_some() {
+        // When obs_filter is present, obsm must be sliced to match kept_to_global.
+        if let Some(kept) = kept_to_global {
+            // Pre-compute positions once for all obsm entries (loop-invariant —
+            // they depend only on kept and deletion vectors).
+            // `dv_mapping` (kept global rows) is built by `compute_kept_to_global`
+            // as an ascending `(0..n_obs).filter(...)` scan, so it is sorted —
+            // binary_search keeps this O(K log D) instead of O(K * D).
+            let positions: Vec<i64> = match dv_kept_to_global {
+                Some(dv_mapping) => kept
+                    .iter()
+                    .filter_map(|&g| dv_mapping.binary_search(&g).ok().map(|p| p as i64))
+                    .collect(),
+                None => kept.iter().map(|&g| g as i64).collect(),
+            };
+            for (name, batch) in &obsm_map {
+                let filtered = if apply_deletion_vectors {
+                    filter_obs_by_deletion_vectors(reader, batch.clone())?
+                } else {
+                    batch.clone()
+                };
+                let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+                let idx_arr = numpy::PyArray1::from_slice(py, &positions);
+                let sliced = np_arr.call_method1("__getitem__", (idx_arr,))?;
+                obsm_dict.set_item(name, sliced)?;
+            }
+        }
+    } else {
+        for (name, batch) in &obsm_map {
+            let filtered = if apply_deletion_vectors {
+                filter_obs_by_deletion_vectors(reader, batch.clone())?
+            } else {
+                batch.clone()
+            };
+            let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+            obsm_dict.set_item(name, np_arr)?;
+        }
+    }
+    Ok(())
+}
+
 /// Returns true if either axis would overflow Int32 coordinates and the
 /// COO batch must therefore use the Int64 row/col encoding ("v2 layout").
 /// For all current workloads — even atlas-scale sub-billion-cell files —
@@ -869,16 +977,19 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
 /// the AnnData constructor — matches pre-fix behaviour and detaches
 /// the returned AnnData from the SCX file handle. See
 /// [`crate::lazy_mapping`].
+#[allow(clippy::too_many_arguments)]
 fn to_anndata_with_layers<'py>(
     py: Python<'py>,
     path: &std::path::Path,
     reader: &ScxReader,
     layer_filter: Option<&[String]>,
+    obsm_filter: Option<&[String]>,
     eager: bool,
     memory_budget: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
-        PairwiseAxis, ScxLazyLayersMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
+        PairwiseAxis, ScxLazyLayersMapping, ScxLazyObsmMapping, ScxLazyPairwiseMapping,
+        ScxLazyVarmMapping,
     };
     use std::sync::Arc;
 
@@ -926,18 +1037,32 @@ fn to_anndata_with_layers<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // obsm embeddings (eager: dense numpy, filtered by deletion vectors).
-    // Kept eager because obsm tends to be small relative to obsp/varp/varm.
-    let obsm_map = match reader.read_all_obsm() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
+    // obsm embeddings.
+    //
+    // `obsm` is eager by default (it tends to be small relative to
+    // obsp/varp/varm). It only becomes a lazy bridge when the caller has
+    // explicitly opted into selective loading via `obsm=[...]` AND not
+    // forced `eager=True` — keeping default semantics byte-identical
+    // while letting the random-access dataloader path defer (and skip)
+    // per-key materialisation. See `ScxLazyObsmMapping`.
+    //
+    // `obsm_filter` restricts the loaded keys in either mode
+    // (`to_anndata(obsm=[...])`).
+    let lazy_obsm_requested = !eager && obsm_filter.is_some();
     let obsm_dict = pyo3::types::PyDict::new(py);
-    for (name, batch) in &obsm_map {
-        let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
-        let np_arr = obsm_batch_to_numpy(py, &filtered)?;
-        obsm_dict.set_item(name, np_arr)?;
+    if lazy_obsm_requested {
+        // Lazy path: validate the requested keys exist now via a
+        // catalog-only scan (no shard bytes read — preserves the
+        // deferral guarantee), then let the bridge read each on first
+        // access.
+        validate_obsm_keys(reader, obsm_filter)?;
+    } else {
+        let obsm_map = read_obsm_selected(reader, obsm_filter)?;
+        for (name, batch) in &obsm_map {
+            let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
+            let np_arr = obsm_batch_to_numpy(py, &filtered)?;
+            obsm_dict.set_item(name, np_arr)?;
+        }
     }
 
     // uns — reconstruct any `__scx_type__` envelopes back into NumPy
@@ -958,7 +1083,7 @@ fn to_anndata_with_layers<'py>(
     } else {
         !layer_names.is_empty()
     };
-    let need_lazy = has_obsp || has_varp || has_varm || has_layers;
+    let need_lazy = has_obsp || has_varp || has_varm || has_layers || lazy_obsm_requested;
 
     let obsp_kept = if has_obsp {
         compute_kept_to_global(reader)?.map(Arc::new)
@@ -989,6 +1114,10 @@ fn to_anndata_with_layers<'py>(
         .as_ref()
         .filter(|_| has_layers)
         .map(|r| ScxLazyLayersMapping::new(Arc::clone(r), layer_filter));
+    let lazy_obsm = lazy_reader
+        .as_ref()
+        .filter(|_| lazy_obsm_requested)
+        .map(|r| ScxLazyObsmMapping::new(Arc::clone(r), obsm_filter));
 
     // Build AnnData kwargs.
     let kwargs = pyo3::types::PyDict::new(py);
@@ -1046,6 +1175,13 @@ fn to_anndata_with_layers<'py>(
         if let Some(m) = lazy_layers {
             adata.setattr("_layers", m.into_pyobject(py)?)?;
         }
+        // Lazy obsm is only built when the caller opted into selective
+        // loading (`obsm=[...]`, eager=False); default behaviour keeps
+        // obsm eager. Attach via `_obsm` to bypass AnnData's axis-length
+        // validation, same as the other bridges.
+        if let Some(m) = lazy_obsm {
+            adata.setattr("_obsm", m.into_pyobject(py)?)?;
+        }
     }
 
     Ok(adata)
@@ -1072,13 +1208,14 @@ pub fn to_anndata_filtered<'py>(
     var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
+    obsm_filter: Option<&[String]>,
     preserve_slots: bool,
     eager: bool,
     memory_budget: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Fast path: no filtering → use existing implementation
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
-        return to_anndata_with_layers(py, path, reader, None, eager, memory_budget);
+        return to_anndata_with_layers(py, path, reader, None, obsm_filter, eager, memory_budget);
     }
 
     // preserve_slots=true with obs_filter: load full AnnData, then filter
@@ -1088,7 +1225,15 @@ pub fn to_anndata_filtered<'py>(
     // than lazy bridges (which AnnData iterates / validates during
     // `.copy()` anyway).
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
-        let full = to_anndata_with_layers(py, path, reader, layer_filter, true, memory_budget)?;
+        let full = to_anndata_with_layers(
+            py,
+            path,
+            reader,
+            layer_filter,
+            obsm_filter,
+            true,
+            memory_budget,
+        )?;
 
         let obs_attr = full.getattr("obs")?;
         let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
@@ -1232,7 +1377,15 @@ pub fn to_anndata_filtered<'py>(
     // validation across all aligned slots (obsp / varp / varm), which
     // would materialize through the lazy bridges anyway — doing it up
     // front avoids fragmenting the cost across implicit slicing.
-    let adata = to_anndata_with_layers(py, path, reader, layer_filter, true, memory_budget)?;
+    let adata = to_anndata_with_layers(
+        py,
+        path,
+        reader,
+        layer_filter,
+        obsm_filter,
+        true,
+        memory_budget,
+    )?;
 
     if let Some(names) = var_names {
         // Resolve via the same path as backed / query-engine: scans all string
@@ -1326,6 +1479,7 @@ pub fn to_anndata_backed<'py>(
     var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
+    obsm_filter: Option<&[String]>,
     eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     to_anndata_backed_with_options(
@@ -1335,6 +1489,7 @@ pub fn to_anndata_backed<'py>(
         var_names,
         obs_filter,
         layer_filter,
+        obsm_filter,
         true,
         eager,
     )
@@ -1356,11 +1511,14 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     var_names: Option<&[String]>,
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
+    obsm_filter: Option<&[String]>,
     apply_deletion_vectors: bool,
     eager: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
-    use crate::lazy_mapping::{PairwiseAxis, ScxLazyPairwiseMapping, ScxLazyVarmMapping};
+    use crate::lazy_mapping::{
+        PairwiseAxis, ScxLazyObsmMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
+    };
     use scx_format::BackedCsrReader;
     use std::sync::Arc;
 
@@ -1516,57 +1674,55 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         Err(e) => return Err(to_pyerr(e)),
     };
 
-    // --- obsm (eager, filtered by deletion vectors + obs_filter) ---
-    // When obs_filter is used, obsm must also be filtered to match obs rows.
-    let obsm_map = match reader.read_all_obsm() {
-        Ok(map) => map,
-        Err(scx_format::ScxError::SectionNotFound(_)) => std::collections::HashMap::new(),
-        Err(e) => return Err(to_pyerr(e)),
-    };
+    // --- obsm ---
+    //
+    // Backed dense row-gather (`ScxBackedObsmDataset`) kicks in when the
+    // caller selected obsm keys (`obsm=[...]`), did not force `eager`,
+    // and did not pass `obs_filter`. Under `obs_filter` we fall back to
+    // the eager path (composing a pandas-query row mask with shard
+    // gather is deferred), and `obsm=None` keeps the historical
+    // eager-all behaviour.
+    let use_backed_obsm = obsm_filter.is_some() && !eager && obs_filter.is_none();
+    // `obsm_filter` restricts the loaded keys; under backed mode we only
+    // need to validate them (the bridge reads each lazily).
     let obsm_dict = pyo3::types::PyDict::new(py);
-    if obs_filter.is_some() {
-        // When obs_filter is present, obsm must be sliced to match kept_to_global
-        if let Some(ref kept) = kept_to_global {
-            // Pre-compute dv_kept and positions once for all obsm entries
-            // (these are loop-invariant — they depend only on kept and deletion vectors)
-            let dv_kept = &dv_kept_to_global;
-            let positions: Vec<i64> = match &dv_kept {
-                Some(dv_mapping) => {
-                    // Find position of each kept global row in dv_mapping
-                    kept.iter()
-                        .filter_map(|&g| {
-                            dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64)
-                        })
-                        .collect()
-                }
-                None => kept.iter().map(|&g| g as i64).collect(),
-            };
-
-            for (name, batch) in &obsm_map {
-                // First filter by deletion vectors (skipped when DVs are disabled).
-                let filtered = if apply_deletion_vectors {
-                    filter_obs_by_deletion_vectors(&reader, batch.clone())?
-                } else {
-                    batch.clone()
-                };
-                let np_arr = obsm_batch_to_numpy(py, &filtered)?;
-                // Slice to the obs_filter rows using pre-computed positions
-                let idx_arr = numpy::PyArray1::from_slice(py, &positions);
-                let sliced = np_arr.call_method1("__getitem__", (idx_arr,))?;
-                obsm_dict.set_item(name, sliced)?;
-            }
-        }
+    if use_backed_obsm {
+        validate_obsm_keys(&reader, obsm_filter)?;
     } else {
-        for (name, batch) in &obsm_map {
-            let filtered = if apply_deletion_vectors {
-                filter_obs_by_deletion_vectors(&reader, batch.clone())?
-            } else {
-                batch.clone()
-            };
-            let np_arr = obsm_batch_to_numpy(py, &filtered)?;
-            obsm_dict.set_item(name, np_arr)?;
-        }
+        build_eager_obsm_dict(
+            py,
+            &reader,
+            obsm_filter,
+            obs_filter,
+            apply_deletion_vectors,
+            &kept_to_global,
+            &dv_kept_to_global,
+            &obsm_dict,
+        )?;
     }
+
+    let lazy_obsm = if use_backed_obsm {
+        let obsm_reader = Arc::new(
+            ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
+                .map_err(to_pyerr)?,
+        );
+        // obs_filter is None here, so kept_to_global == dv_kept_to_global
+        // (deletion vectors only).
+        let kept_arc = kept_to_global.as_ref().map(|k| Arc::new(k.clone()));
+        let config = crate::lazy_mapping::BackedObsmConfig {
+            path: path.to_path_buf(),
+            cache_shards,
+            shared_catalog: Arc::clone(&shared_catalog),
+            kept_to_global: kept_arc,
+        };
+        Some(ScxLazyObsmMapping::new_backed(
+            obsm_reader,
+            obsm_filter,
+            config,
+        ))
+    } else {
+        None
+    };
 
     // --- obsp / varp / varm — lazy bridges by default ---
     //
@@ -1691,6 +1847,13 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         if let Some(m) = lazy_varm {
             adata.setattr("_varm", m.into_pyobject(py)?)?;
         }
+        // Backed dense row-gather obsm (only built when obsm was
+        // selected, not eager, no obs_filter). Attach via `_obsm` to
+        // bypass AnnData's axis-length validation, like the other
+        // bridges.
+        if let Some(m) = lazy_obsm {
+            adata.setattr("_obsm", m.into_pyobject(py)?)?;
+        }
     }
 
     Ok(adata)
@@ -1740,7 +1903,7 @@ fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<u64>>> {
 /// Builds a boolean keep-mask from the deletion vectors (same logic
 /// as `read_all_csr_shards_filtered`) and applies
 /// `arrow::compute::filter_record_batch`.
-fn filter_obs_by_deletion_vectors(
+pub(crate) fn filter_obs_by_deletion_vectors(
     reader: &ScxReader,
     obs: arrow::array::RecordBatch,
 ) -> PyResult<arrow::array::RecordBatch> {

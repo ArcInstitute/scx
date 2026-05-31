@@ -220,6 +220,26 @@ impl BackedCsrIndex {
         BackedCsrIndex { shard_ranges }
     }
 
+    /// Build the index directly from pre-sorted `(row_start, row_end)`
+    /// pairs. Used by [`BackedDenseReader`], whose obsm shard catalog
+    /// entries carry no `stats` block (row ranges come from each shard's
+    /// Arrow schema metadata, not the catalog stats the `from_catalog*` /
+    /// `from_view_sorted` constructors read). The caller must pass the
+    /// ranges already sorted by `row_start`; `sorted_shard_idx` is
+    /// stamped sequentially to index the caller's sorted shard-entry list.
+    pub fn from_ranges(ranges: &[(u64, u64)]) -> Self {
+        let shard_ranges = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, &(row_start, row_end))| ShardRange {
+                row_start,
+                row_end,
+                sorted_shard_idx: i,
+            })
+            .collect();
+        BackedCsrIndex { shard_ranges }
+    }
+
     /// Number of shards in the index.
     pub fn n_shards(&self) -> usize {
         self.shard_ranges.len()
@@ -2557,6 +2577,502 @@ pub fn concatenate_csr(csrs: &[ScxCsr], n_vars: usize) -> Result<ScxCsr> {
 }
 
 // ---------------------------------------------------------------------------
+// BackedDenseReader — on-demand row-gather for dense row-sharded mappings
+// ---------------------------------------------------------------------------
+
+/// A decoded dense shard (`obsm/<name>_shard_<i>`): one Arrow
+/// `RecordBatch` of `n_cols` primitive columns (one per embedding
+/// dimension), `n_shard_rows` long. Cached as `Arc<DenseShard>`.
+struct DenseShard {
+    batch: arrow::array::RecordBatch,
+}
+
+/// Per-shard catalog row retained by [`BackedDenseReader`]. Dense analog
+/// of [`ShardEntryLite`] — no `nnz` (dense shards aren't CSR).
+#[derive(Debug, Clone, Copy)]
+struct DenseShardEntryLite {
+    offset: u64,
+    length: u64,
+    section_type: SectionType,
+    modality_id: u8,
+}
+
+impl DenseShardEntryLite {
+    fn into_transient_full_entry(self) -> FullCatalogEntry {
+        FullCatalogEntry {
+            name: String::new(),
+            offset: self.offset,
+            length: self.length,
+            section_type: self.section_type,
+            checksum: [0u8; 32],
+            modality_id: self.modality_id,
+            stats: None,
+        }
+    }
+}
+
+/// LRU cache of decoded dense shards with both a count cap and a byte
+/// cap. Dense analog of [`WeightedLruCache`]; bytes are measured exactly
+/// via `RecordBatch::get_array_memory_size()` rather than the CSR
+/// component formula.
+struct DenseLruCache {
+    inner: LruCache<usize, DenseCacheEntry>,
+    bytes_budget: usize,
+    bytes_used: usize,
+    metrics: Option<Arc<CacheMetrics>>,
+}
+
+struct DenseCacheEntry {
+    shard: Arc<DenseShard>,
+    bytes: usize,
+}
+
+impl DenseLruCache {
+    fn new(cache_shards: usize, bytes_budget: usize) -> Self {
+        let cap = NonZeroUsize::new(cache_shards).unwrap();
+        DenseLruCache {
+            inner: LruCache::new(cap),
+            bytes_budget,
+            bytes_used: 0,
+            metrics: None,
+        }
+    }
+
+    fn estimate_bytes(shard: &DenseShard) -> usize {
+        shard.batch.get_array_memory_size()
+    }
+
+    fn get(&mut self, key: &usize) -> Option<Arc<DenseShard>> {
+        self.inner.get(key).map(|e| Arc::clone(&e.shard))
+    }
+
+    fn contains(&self, key: &usize) -> bool {
+        self.inner.contains(key)
+    }
+
+    fn put_with_budget(&mut self, key: usize, shard: Arc<DenseShard>) {
+        let bytes = Self::estimate_bytes(&shard);
+        while self.bytes_used.saturating_add(bytes) > self.bytes_budget && !self.inner.is_empty() {
+            if let Some((_, evicted)) = self.inner.pop_lru() {
+                self.bytes_used = self.bytes_used.saturating_sub(evicted.bytes);
+                if let Some(m) = &self.metrics {
+                    m.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        let was_replace = self.inner.contains(&key);
+        let entry = DenseCacheEntry { shard, bytes };
+        if let Some(displaced) = self.inner.put(key, entry) {
+            self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
+            if !was_replace {
+                if let Some(m) = &self.metrics {
+                    m.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        self.bytes_used = self.bytes_used.saturating_add(bytes);
+        if let Some(m) = &self.metrics {
+            m.bytes_inserted.fetch_add(bytes as u64, Ordering::Relaxed);
+            m.peak_bytes_in_cache
+                .fetch_max(self.bytes_used as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// On-demand row-gather reader for a dense row-sharded mapping
+/// (`obsm/<name>`). The dense counterpart of [`BackedCsrReader`]:
+/// `read_row_indices` decodes only the touched `ObsmEmbeddingShard`s
+/// (bounded LRU + singleflight) and gathers the requested rows, so
+/// per-call memory is `O(batch × n_cols)` and independent of file size.
+///
+/// # Fork safety
+///
+/// Like [`BackedCsrReader`], all of `cache` / `in_flight` / `metrics`
+/// are **per-instance** — never global. A forked DataLoader worker that
+/// constructs its own `BackedDenseReader` gets fresh `Mutex`es, so the
+/// fork-deadlock contract (`pyscx/tests/test_fork_deadlock.py`) holds.
+pub struct BackedDenseReader {
+    reader: ScxReader,
+    index: BackedCsrIndex,
+    /// Logical mapping name (e.g. `"X_pca"`), used by [`Self::read_all`].
+    name: String,
+    n_rows: usize,
+    n_cols: usize,
+    dtype: arrow::datatypes::DataType,
+    /// Canonical output schema (per-shard metadata stripped).
+    schema: Arc<arrow::datatypes::Schema>,
+    /// Per-shard catalog rows, ordered by `row_start`.
+    sorted_entries: Vec<DenseShardEntryLite>,
+    cache: Option<Mutex<DenseLruCache>>,
+    in_flight: Option<Mutex<HashMap<usize, Arc<InFlightSlot>>>>,
+    metrics: Option<Arc<CacheMetrics>>,
+    prefetch_count: usize,
+}
+
+impl BackedDenseReader {
+    /// Open a backed dense reader over `obsm/<name>` with a count-only
+    /// cache cap (`cache_shards` decoded shards; 0 = no cache).
+    pub fn new_obsm(reader: ScxReader, name: &str, cache_shards: usize) -> Result<Self> {
+        Self::new_obsm_with_byte_budget(reader, name, cache_shards, usize::MAX)
+    }
+
+    /// Open a backed dense reader over `obsm/<name>` with both a count
+    /// cap and a byte cap on the decoded-shard LRU.
+    pub fn new_obsm_with_byte_budget(
+        reader: ScxReader,
+        name: &str,
+        cache_shards: usize,
+        bytes_budget: usize,
+    ) -> Result<Self> {
+        let layout = reader.dense_mapping_layout(
+            "obsm",
+            name,
+            SectionType::ObsmEmbeddingShard,
+            SectionType::ObsmEmbedding,
+        )?;
+        Ok(Self::from_layout(
+            reader,
+            name,
+            layout,
+            cache_shards,
+            bytes_budget,
+        ))
+    }
+
+    fn from_layout(
+        reader: ScxReader,
+        name: &str,
+        layout: crate::reader::DenseMappingLayout,
+        cache_shards: usize,
+        bytes_budget: usize,
+    ) -> Self {
+        let ranges: Vec<(u64, u64)> = layout
+            .entries
+            .iter()
+            .map(|e| (e.row_start, e.row_start + e.n_shard_rows))
+            .collect();
+        let index = BackedCsrIndex::from_ranges(&ranges);
+        let sorted_entries: Vec<DenseShardEntryLite> = layout
+            .entries
+            .iter()
+            .map(|e| DenseShardEntryLite {
+                offset: e.offset,
+                length: e.length,
+                section_type: e.section_type,
+                modality_id: e.modality_id,
+            })
+            .collect();
+        let schema = Arc::new(arrow::datatypes::Schema::new(layout.fields));
+        let cache = if cache_shards > 0 {
+            Some(Mutex::new(DenseLruCache::new(cache_shards, bytes_budget)))
+        } else {
+            None
+        };
+        let in_flight = if cache.is_some() {
+            Some(Mutex::new(HashMap::new()))
+        } else {
+            None
+        };
+        let prefetch_count = cache_shards.max(2);
+        BackedDenseReader {
+            reader,
+            index,
+            name: name.to_string(),
+            n_rows: layout.n_rows as usize,
+            n_cols: layout.n_cols,
+            dtype: layout.dtype,
+            schema,
+            sorted_entries,
+            cache,
+            in_flight,
+            metrics: None,
+            prefetch_count,
+        }
+    }
+
+    /// Shape of the full mapping `(n_rows, n_cols)`.
+    pub fn shape(&self) -> (usize, usize) {
+        (self.n_rows, self.n_cols)
+    }
+
+    /// Number of rows (obs).
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Embedding dimensionality.
+    pub fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    /// Representative on-disk dtype (column 0).
+    pub fn dtype(&self) -> &arrow::datatypes::DataType {
+        &self.dtype
+    }
+
+    /// Canonical output schema (per-shard metadata stripped).
+    pub fn schema(&self) -> &Arc<arrow::datatypes::Schema> {
+        &self.schema
+    }
+
+    /// Access the underlying shard index.
+    pub fn index(&self) -> &BackedCsrIndex {
+        &self.index
+    }
+
+    /// Enable cache-behaviour counters (test/diagnostic use).
+    pub fn enable_metrics(&mut self) -> Arc<CacheMetrics> {
+        let m = Arc::new(CacheMetrics::default());
+        if let Some(ref cache_mutex) = self.cache {
+            cache_mutex.lock().unwrap().metrics = Some(Arc::clone(&m));
+        }
+        self.metrics = Some(Arc::clone(&m));
+        m
+    }
+
+    /// True if `shard_idx` is currently cached.
+    pub fn cache_contains(&self, shard_idx: usize) -> bool {
+        match &self.cache {
+            Some(m) => m.lock().unwrap().contains(&shard_idx),
+            None => false,
+        }
+    }
+
+    fn shard_count(&self) -> usize {
+        self.sorted_entries.len()
+    }
+
+    /// Decode + cache one dense shard, returning a shared `Arc`. Same
+    /// singleflight contract as [`BackedCsrReader::read_shard_cached_arc`].
+    fn read_shard_cached_arc(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
+        loop {
+            if let Some(ref cache_mutex) = self.cache {
+                let mut cache = cache_mutex.lock().unwrap();
+                if let Some(cached) = cache.get(&shard_idx) {
+                    if let Some(m) = &self.metrics {
+                        m.hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(cached);
+                }
+            }
+
+            let _guard: Option<LeaderGuard> = match &self.in_flight {
+                Some(in_flight_mutex) => {
+                    let mut in_flight = in_flight_mutex.lock().unwrap();
+                    if let Some(existing) = in_flight.get(&shard_idx) {
+                        let slot = Arc::clone(existing);
+                        drop(in_flight);
+                        if let Some(m) = &self.metrics {
+                            m.duplicate_waiters.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let mut state = slot.state.lock().unwrap();
+                        while !*state {
+                            state = slot.cv.wait(state).unwrap();
+                        }
+                        drop(state);
+                        continue;
+                    }
+                    if let Some(ref cache_mutex) = self.cache {
+                        let mut cache = cache_mutex.lock().unwrap();
+                        if let Some(cached) = cache.get(&shard_idx) {
+                            if let Some(m) = &self.metrics {
+                                m.hits.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Ok(cached);
+                        }
+                    }
+                    let slot = Arc::new(InFlightSlot::new());
+                    in_flight.insert(shard_idx, Arc::clone(&slot));
+                    Some(LeaderGuard {
+                        in_flight: in_flight_mutex,
+                        slot,
+                        key: shard_idx,
+                    })
+                }
+                None => None,
+            };
+
+            if let Some(m) = &self.metrics {
+                m.misses.fetch_add(1, Ordering::Relaxed);
+            }
+
+            return self.decode_and_cache(shard_idx);
+        }
+    }
+
+    fn decode_and_cache(&self, shard_idx: usize) -> Result<Arc<DenseShard>> {
+        let lite = *self
+            .sorted_entries
+            .get(shard_idx)
+            .ok_or(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.shard_count(),
+            })?;
+        let batch = self
+            .reader
+            .read_dense_mapping_entry(&lite.into_transient_full_entry())?;
+        let shard = Arc::new(DenseShard { batch });
+
+        if let Some(ref cache_mutex) = self.cache {
+            let mut cache = cache_mutex.lock().unwrap();
+            cache.put_with_budget(shard_idx, Arc::clone(&shard));
+        }
+
+        #[cfg(unix)]
+        {
+            use memmap2::Advice;
+            let n_shards = self.shard_count();
+            let end = std::cmp::min(shard_idx + 1 + self.prefetch_count, n_shards);
+            for prefetch_idx in (shard_idx + 1)..end {
+                if let Some(entry) = self.sorted_entries.get(prefetch_idx) {
+                    let _ = self.reader.mmap_ref().advise_range(
+                        Advice::WillNeed,
+                        entry.offset as usize,
+                        entry.length as usize,
+                    );
+                }
+            }
+        }
+
+        Ok(shard)
+    }
+
+    /// Pre-decode the requested shards into the LRU (sequential — the
+    /// dense gather is bounded by the row batch, not zstd decode, so the
+    /// CSR parallel-warm machinery isn't replicated here).
+    fn warm_shards(&self, shard_indices: &[usize]) -> Result<()> {
+        if self.cache.is_none() {
+            return Ok(());
+        }
+        let mut seen: HashSet<usize> = HashSet::with_capacity(shard_indices.len());
+        for &idx in shard_indices {
+            if seen.insert(idx) {
+                self.read_shard_cached_arc(idx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Empty `(0, n_cols)` batch with the canonical schema.
+    fn empty_batch(&self) -> Result<arrow::array::RecordBatch> {
+        Ok(arrow::array::RecordBatch::new_empty(Arc::clone(
+            &self.schema,
+        )))
+    }
+
+    /// Gather `[start, end)` rows as a dense `RecordBatch`.
+    pub fn read_rows_range(&self, start: u64, end: u64) -> Result<arrow::array::RecordBatch> {
+        if start >= end {
+            return self.empty_batch();
+        }
+        let indices: Vec<u64> = (start..end).collect();
+        self.read_row_indices(&indices)
+    }
+
+    /// Gather the given global row indices as a dense `RecordBatch`, in
+    /// request order, decoding only the touched shards. Dtype-preserving.
+    ///
+    /// Errors if any requested row falls outside the mapping's row range
+    /// (the caller — `ScxBackedObsmDataset` — always passes in-range
+    /// global rows, so a miss signals a logic bug rather than a silent
+    /// drop).
+    pub fn read_row_indices(&self, indices: &[u64]) -> Result<arrow::array::RecordBatch> {
+        use arrow::array::{ArrayRef, UInt32Array};
+
+        if indices.is_empty() {
+            return self.empty_batch();
+        }
+
+        let mut sorted_pairs: Vec<(u64, usize)> =
+            indices.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+        sorted_pairs.sort_by_key(|&(r, _)| r);
+
+        let shard_indices = self
+            .index
+            .shards_for_indices(&sorted_pairs.iter().map(|&(r, _)| r).collect::<Vec<_>>());
+        self.warm_shards(&shard_indices)?;
+
+        let mut sub_batches: Vec<arrow::array::RecordBatch> =
+            Vec::with_capacity(shard_indices.len());
+        // Original request position of each output row, in concat order.
+        let mut orig_order: Vec<usize> = Vec::with_capacity(indices.len());
+
+        for &shard_idx in &shard_indices {
+            let shard = self.read_shard_cached_arc(shard_idx)?;
+            let (s_start, s_end) =
+                self.index
+                    .shard_range(shard_idx)
+                    .ok_or(ScxError::ShardIndexOutOfBounds {
+                        index: shard_idx,
+                        count: self.index.n_shards(),
+                    })?;
+
+            let mut locals: Vec<u32> = Vec::new();
+            for &(row, orig_idx) in &sorted_pairs {
+                if row >= s_start && row < s_end {
+                    locals.push((row - s_start) as u32);
+                    orig_order.push(orig_idx);
+                }
+            }
+            if locals.is_empty() {
+                continue;
+            }
+            let idx_arr = UInt32Array::from(locals);
+            let cols: Vec<ArrayRef> = shard
+                .batch
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c, &idx_arr, None))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(ScxError::Arrow)?;
+            sub_batches.push(
+                arrow::array::RecordBatch::try_new(Arc::clone(&self.schema), cols)
+                    .map_err(ScxError::Arrow)?,
+            );
+        }
+
+        if orig_order.len() != indices.len() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "obsm/{}: dense row gather resolved {} of {} requested rows; \
+                 {} fell outside the mapping's {}-row range",
+                self.name,
+                orig_order.len(),
+                indices.len(),
+                indices.len() - orig_order.len(),
+                self.n_rows,
+            )));
+        }
+
+        let concatenated = arrow::compute::concat_batches(&self.schema, sub_batches.iter())
+            .map_err(ScxError::Arrow)?;
+
+        // Reorder concat rows into request order via the inverse permutation.
+        let mut perm = vec![0u32; orig_order.len()];
+        for (concat_pos, &orig_idx) in orig_order.iter().enumerate() {
+            perm[orig_idx] = concat_pos as u32;
+        }
+        let perm_arr = UInt32Array::from(perm);
+        let final_cols: Vec<ArrayRef> = concatenated
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c, &perm_arr, None))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(ScxError::Arrow)?;
+        arrow::array::RecordBatch::try_new(Arc::clone(&self.schema), final_cols)
+            .map_err(ScxError::Arrow)
+    }
+
+    /// Read the full mapping. Delegates to [`ScxReader::read_obsm`],
+    /// which already concatenates + validates the shard cover and
+    /// preserves dtype.
+    pub fn read_all(&self) -> Result<arrow::array::RecordBatch> {
+        self.reader.read_obsm(&self.name)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2692,6 +3208,181 @@ mod tests {
         };
         let backed = BackedCsrReader::new(reader, cache_shards);
         (backed, full_csr)
+    }
+
+    // -----------------------------------------------------------------------
+    // BackedDenseReader (obsm row-gather) tests
+    // -----------------------------------------------------------------------
+
+    /// Build a dense obsm batch for global rows `start..start+n` with
+    /// `d` columns; value[r][c] = (r*d + c) as f32 (globally unique).
+    fn obsm_batch(start: usize, n: usize, d: usize) -> arrow::array::RecordBatch {
+        use arrow::array::{ArrayRef, Float32Array};
+        let fields: Vec<Field> = (0..d)
+            .map(|c| Field::new(c.to_string(), DataType::Float32, false))
+            .collect();
+        let cols: Vec<ArrayRef> = (0..d)
+            .map(|c| {
+                let vals: Vec<f32> = (start..start + n).map(|r| (r * d + c) as f32).collect();
+                Arc::new(Float32Array::from(vals)) as ArrayRef
+            })
+            .collect();
+        arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
+    }
+
+    fn obsm_cell(batch: &arrow::array::RecordBatch, row: usize, col: usize) -> f32 {
+        batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .unwrap()
+            .value(row)
+    }
+
+    /// Write a file with `n_shards` obsm shards for key `X_emb`
+    /// (`d`-dimensional) and return its path.
+    fn write_obsm_file(
+        dir: &TempDir,
+        n_obs: usize,
+        n_shards: usize,
+        d: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join("obsm.scx");
+        let header = sample_header(n_obs as u64, 4, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(4)).unwrap();
+        let rows_per_shard = n_obs / n_shards;
+        for s in 0..n_shards {
+            let start = s * rows_per_shard;
+            let shard_rows = if s == n_shards - 1 {
+                n_obs - start
+            } else {
+                rows_per_shard
+            };
+            let batch = obsm_batch(start, shard_rows, d);
+            writer
+                .write_obsm_shard(
+                    "X_emb",
+                    s as u32,
+                    start as u64,
+                    shard_rows as u64,
+                    n_obs as u64,
+                    &batch,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_backed_dense_shape_and_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_obsm_file(&dir, 100, 4, 6);
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 2).unwrap();
+        assert_eq!(backed.shape(), (100, 6));
+        assert_eq!(backed.dtype(), &DataType::Float32);
+    }
+
+    #[test]
+    fn test_backed_dense_row_gather_matches_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let n_obs = 100;
+        let d = 6;
+        let path = write_obsm_file(&dir, n_obs, 4, d);
+
+        let full = ScxReader::open(&path).unwrap().read_obsm("X_emb").unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 2).unwrap();
+
+        // Scattered, cross-shard, out-of-order, with the last row.
+        let idx: Vec<u64> = vec![5, 0, 99, 47, 23, 24, 1];
+        let got = backed.read_row_indices(&idx).unwrap();
+        assert_eq!(got.num_rows(), idx.len());
+        assert_eq!(got.num_columns(), d);
+        for (out_row, &g) in idx.iter().enumerate() {
+            for c in 0..d {
+                assert_eq!(
+                    obsm_cell(&got, out_row, c),
+                    obsm_cell(&full, g as usize, c),
+                    "row {g} col {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_backed_dense_duplicate_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_obsm_file(&dir, 50, 2, 3);
+        let full = ScxReader::open(&path).unwrap().read_obsm("X_emb").unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 4).unwrap();
+        let idx: Vec<u64> = vec![10, 10, 3, 10];
+        let got = backed.read_row_indices(&idx).unwrap();
+        assert_eq!(got.num_rows(), 4);
+        for (out_row, &g) in idx.iter().enumerate() {
+            assert_eq!(obsm_cell(&got, out_row, 0), obsm_cell(&full, g as usize, 0));
+        }
+    }
+
+    #[test]
+    fn test_backed_dense_range_and_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_obsm_file(&dir, 60, 3, 4);
+        let full = ScxReader::open(&path).unwrap().read_obsm("X_emb").unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 2).unwrap();
+
+        let rng = backed.read_rows_range(20, 25).unwrap();
+        assert_eq!(rng.num_rows(), 5);
+        for (out_row, g) in (20..25).enumerate() {
+            assert_eq!(obsm_cell(&rng, out_row, 1), obsm_cell(&full, g, 1));
+        }
+
+        let all = backed.read_all().unwrap();
+        assert_eq!(all.num_rows(), 60);
+    }
+
+    #[test]
+    fn test_backed_dense_out_of_range_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_obsm_file(&dir, 30, 2, 2);
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 2).unwrap();
+        // Row 30 is out of range (valid rows are 0..30).
+        assert!(backed.read_row_indices(&[5, 30]).is_err());
+    }
+
+    #[test]
+    fn test_backed_dense_legacy_single_section() {
+        // Legacy single-section obsm (write_obsm) is treated as one shard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.scx");
+        let n_obs = 40;
+        let d = 5;
+        let header = sample_header(n_obs as u64, 4, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(4)).unwrap();
+        writer
+            .write_obsm("X_emb", &obsm_batch(0, n_obs, d))
+            .unwrap();
+        writer.finish().unwrap();
+
+        let full = ScxReader::open(&path).unwrap().read_obsm("X_emb").unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        let backed = BackedDenseReader::new_obsm(reader, "X_emb", 0).unwrap();
+        assert_eq!(backed.shape(), (n_obs, d));
+        let idx: Vec<u64> = vec![39, 0, 17];
+        let got = backed.read_row_indices(&idx).unwrap();
+        for (out_row, &g) in idx.iter().enumerate() {
+            for c in 0..d {
+                assert_eq!(obsm_cell(&got, out_row, c), obsm_cell(&full, g as usize, c));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

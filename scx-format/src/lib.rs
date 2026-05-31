@@ -27,7 +27,7 @@ pub use arrow_compat::{
 };
 pub use backed::{
     concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
-    BackedCsrReader, CacheMetrics,
+    BackedCsrReader, BackedDenseReader, CacheMetrics,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use bitmap::{
