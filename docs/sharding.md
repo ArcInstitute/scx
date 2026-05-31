@@ -349,6 +349,25 @@ methods (covariance and randomized SVD) explicitly reject
 `prefer_format="csc"` on the pyscx side; see
 [api.md §pyscx.accel](api.md#pyscxaccel--rust-native-accelerators).
 
+### Build policy: `off` / `auto` / `always`
+
+The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
+`from_h5ad` / `from_10x`, `scx convert --csc`) is a three-state policy:
+
+- **`off`** (default) — never emit a CSC sidecar; CSR-only output.
+- **`always`** — always emit a CSC sidecar regardless of dataset size.
+- **`auto`** — emit a sidecar only when the dataset is large enough that the
+  column-axis acceleration pays for the extra write-time transpose and
+  storage: `n_obs ≥ 50000` **and** `n_vars ≥ 5000`. Both thresholds are
+  tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` and `SCX_CSC_AUTO_VARS_THRESHOLD`
+  environment variables (set either to `0` to force a build on any shape).
+
+`auto` is resolved against the matrix shape at write time, so a streaming
+conversion picks it up from the X reader's reported dimensions. The
+in-memory `from_mudata` path cannot build per-modality CSC yet: there,
+`csc="always"` raises and `csc="auto"` degrades to no-CSC (use `from_h5mu`
+or `scx build-csc`).
+
 ### `--csc-cols-per-shard`
 
 Multi-shard CSC is the default. Each emitted CSC shard covers a
@@ -404,3 +423,25 @@ existing CSC `indices` arrays would silently reference stale rows /
 columns. Each op therefore drops the CSC sidecar by default and emits
 a `log::warn!` message. Pass `--rebuild-csc` to re-emit the sidecar
 against the post-op output via `scx build-csc` + atomic rename.
+
+### CSC lifecycle
+
+The sidecar moves through four stages over a file's life:
+
+1. **Creation.** At conversion time via the `csc` policy (`auto` / `always`
+   on `pyscx.from_anndata` / `from_h5ad` / `from_10x` / `scx convert`), or
+   after the fact with `scx build-csc input.scx output.scx`. Both paths run
+   the memory-bounded streaming CSR→CSC transpose and set the `has_csc`
+   header flag.
+2. **Consumption.** Column algorithms opt into the sidecar with
+   `prefer_format="csc"` (CPU) or, for GPU `pdex_ref`, the `gpu_csc_v3`
+   route under `SCX_GPU_DE_V3=1`. `BackedCscReader` serves column-range
+   reads with shard-level pushdown. See
+   [scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
+3. **Mutation drop.** Any row/column-layout-changing op (`append`,
+   `compact`, `merge`, `subset`) drops the sidecar with a warning, because
+   its `indices` would otherwise reference stale rows/columns.
+4. **Rebuild.** Re-emit with `--rebuild-csc` on the mutating op, or run
+   `scx build-csc` against the post-op file. The rebuild reads the current
+   CSR shards, transposes, and writes a fresh CSC sidecar + updated catalog
+   to a temp file that is atomically renamed.

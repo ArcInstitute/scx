@@ -279,15 +279,8 @@ pub fn from_h5mu_impl(
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
     let explicit_codec = crate::anndata::parse_codec(codec)?;
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "invalid csc value '{other}'; expected 'off' or 'always'"
-            )));
-        }
-    };
+    let csc_policy =
+        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
@@ -321,7 +314,7 @@ pub fn from_h5mu_impl(
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
         codec: explicit_codec,
-        csc: csc_always,
+        csc: csc_policy,
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
@@ -378,16 +371,12 @@ pub fn from_mudata_impl(
     codec_per_modality: bool,
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        other => {
-            return Err(PyRuntimeError::new_err(format!(
-                "invalid csc value: {other}; use 'off' or 'always'"
-            )));
-        }
-    };
-    if csc_always {
+    let csc_policy =
+        scx_format::CscPolicy::parse(csc).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // The in-memory MuData path cannot build per-modality CSC sidecars yet.
+    // An explicit `always` request is rejected (the user asked for something
+    // we cannot honour); `auto` degrades gracefully to no-CSC.
+    if csc_policy == scx_format::CscPolicy::Always {
         return Err(PyRuntimeError::new_err(
             "from_mudata(csc='always') is a Phase D+ follow-on (auto-emit \
              per-modality CSC). Use from_mudata(csc='off') for now and run \

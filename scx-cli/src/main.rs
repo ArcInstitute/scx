@@ -63,11 +63,13 @@ enum Commands {
         /// Whether to also emit a CSC sidecar at write time.
         ///
         /// `off` (default): CSR-only output, matches existing behavior.
-        /// `always`: also emits a CSC sidecar (column-major shards).
-        /// No `auto` mode — by design, users opt in explicitly.
-        #[arg(long, default_value = "off", value_parser = ["off", "always"])]
+        /// `auto`: emit a CSC sidecar when the dataset is large enough to
+        ///   benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default; tune via
+        ///   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
+        /// `always`: always emit a CSC sidecar (column-major shards).
+        #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
         csc: String,
-        /// Columns per CSC shard when `--csc always` (default 5000).
+        /// Columns per CSC shard when a CSC sidecar is emitted (default 5000).
         ///
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
@@ -828,14 +830,12 @@ fn run_convert(
 
     // CSC mode is meaningful only on input → SCX paths. Reject silently
     // for output paths (h5ad / mtx) where the destination has no CSC
-    // concept.
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        // clap value_parser already restricts to {off, always}; this
-        // arm is defensive.
-        other => return Err(format!("invalid --csc value: {other}").into()),
-    };
+    // concept. `Auto` is resolved against the dataset shape downstream
+    // (clap's value_parser already restricts the input to off|auto|always;
+    // the parse error arm is defensive).
+    let csc_policy = convert::CscPolicy::parse(csc).map_err(|e| -> Box<dyn std::error::Error> {
+        format!("invalid --csc value: {e}").into()
+    })?;
 
     // Phase 5a: split CSV --index-obs / --index-var into Vec<String>;
     // empty / whitespace-only inputs are treated as no override. Parsed
@@ -897,7 +897,7 @@ fn run_convert(
                 output,
                 shard_size,
                 codec,
-                csc_always,
+                csc_policy,
                 csc_cols_per_shard,
             );
         }
@@ -948,7 +948,7 @@ fn run_convert(
         output,
         shard_size,
         codec,
-        csc_always,
+        csc_policy,
         csc_cols_per_shard,
         modality,
         stream,
@@ -1023,7 +1023,7 @@ fn dispatch_convert(
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
-    csc_always: bool,
+    csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
     modality: Option<&str>,
     stream: bool,
@@ -1065,7 +1065,7 @@ fn dispatch_convert(
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
         codec: explicit_codec,
-        csc: csc_always,
+        csc: csc_policy,
         csc_cols_per_shard,
         tool: "scx".into(),
         memory_budget,
@@ -1192,7 +1192,7 @@ fn dispatch_convert(
     _output: &std::path::Path,
     _shard_size: u32,
     _codec: &str,
-    _csc_always: bool,
+    _csc_policy: convert::CscPolicy,
     _csc_cols_per_shard: usize,
     _modality: Option<&str>,
     _stream: bool,
@@ -1223,7 +1223,7 @@ fn dispatch_mtx_to_scx(
     output: &std::path::Path,
     shard_size: u32,
     codec: &str,
-    csc_always: bool,
+    csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::mtx_pipeline;
@@ -1241,12 +1241,22 @@ fn dispatch_mtx_to_scx(
     pb.finish_and_clear();
 
     // MTX conversion is delegated to the standalone `scx-mtx` crate,
-    // which doesn't know about CSC. When the user opts in via
-    // `--csc always`, post-process the just-written file with the
-    // existing build-csc machinery: write to `<output>.csc.tmp`, then
-    // atomically rename onto the final path. Costs an extra read pass
-    // but adds the CSC sidecar without modifying scx-mtx.
-    if csc_always {
+    // which doesn't know about CSC. When the policy resolves to build,
+    // post-process the just-written file with the existing build-csc
+    // machinery: write to `<output>.csc.tmp`, then atomically rename onto
+    // the final path. Costs an extra read pass but adds the CSC sidecar
+    // without modifying scx-mtx. `Auto` reads back the just-written
+    // header for the shape (scx-mtx doesn't return it to the caller).
+    let build_csc = match csc_policy {
+        convert::CscPolicy::Off => false,
+        convert::CscPolicy::Always => true,
+        convert::CscPolicy::Auto => {
+            let reader = scx_format::ScxReader::open(output)?;
+            let header = reader.header();
+            csc_policy.should_build_csc(header.n_obs, header.n_vars)
+        }
+    };
+    if build_csc {
         let tmp = output.with_extension("scx.csc.tmp");
         let _ = std::fs::remove_file(&tmp);
         scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard)?;

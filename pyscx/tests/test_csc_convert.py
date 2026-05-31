@@ -59,9 +59,50 @@ def test_from_anndata_csc_always(small_adata, tmp_path):
 
 
 def test_from_anndata_csc_invalid_value(small_adata, tmp_path):
-    """`csc` only accepts 'off' or 'always'; anything else raises."""
+    """`csc` only accepts 'off' / 'auto' / 'always'; anything else raises."""
     import pyscx
 
     path = tmp_path / "bad.scx"
     with pytest.raises(ValueError, match="csc"):
-        pyscx.from_anndata(small_adata, str(path), csc="auto")
+        pyscx.from_anndata(small_adata, str(path), csc="yes")
+
+
+def _csc_available(path):
+    """True iff the file has a usable CSC sidecar. `prefer_format="csc"`
+    raises ``RuntimeError`` when no sidecar exists, succeeds otherwise."""
+    import pyscx
+
+    adata = pyscx.open(str(path)).to_anndata(backed=True)
+    try:
+        pyscx.accel.col_sums(adata.X, prefer_format="csc")
+        return True
+    except RuntimeError:
+        return False
+
+
+def test_from_anndata_csc_auto_below_threshold_skips(small_adata, tmp_path):
+    """`csc='auto'` builds no sidecar for a sub-threshold dataset
+    (20×15 is far below the 50000-obs / 5000-var defaults)."""
+    path = tmp_path / "auto_small.scx"
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(path), csc="auto")
+    assert _csc_available(path) is False
+
+
+def test_from_anndata_csc_auto_env_override_builds(small_adata, tmp_path, monkeypatch):
+    """Lowering both thresholds to 0 makes `csc='auto'` build a sidecar
+    even on the tiny fixture; densified CSC matches CSR."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+
+    path = tmp_path / "auto_forced.scx"
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(path), csc="auto", csc_cols_per_shard=5)
+    assert _csc_available(path) is True
+
+    adata = pyscx.open(str(path)).to_anndata(backed=True)
+    csr_sums = pyscx.accel.col_sums(adata.X, prefer_format="csr")
+    csc_sums = pyscx.accel.col_sums(adata.X, prefer_format="csc")
+    np.testing.assert_allclose(csr_sums, csc_sums, atol=1e-9)

@@ -60,6 +60,11 @@ pub use scx_format::MemoryBudget;
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
 pub use warnings::{ConvertWarning, WarningSink};
 
+// CSC policy re-export is ungated: the always-available MTX → SCX path
+// (no `hdf5` feature) drives it too, so it must not live behind the
+// hdf5-gated `pipeline` module.
+pub use scx_format::CscPolicy;
+
 #[cfg(feature = "hdf5")]
 pub mod pipeline;
 

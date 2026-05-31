@@ -259,12 +259,12 @@ pub fn h5mu_to_scx(
             detect_value_encoding_for_modality(&data, opts.codec, modality_type)
                 .map_err(ScxError::from)?;
 
-        // build_csc=opts.csc lets the writer emit per-modality CSC
-        // sidecars at finish() time so callers can drop the manual
-        // `write_modality_csc_shards_from_csr` invocation below once
-        // they migrate. The legacy manual path still works (and is
-        // still wired below) — auto-emit + manual would double-write,
-        // so flip one or the other.
+        // Per-modality CSC is emitted by the manual
+        // `write_modality_csc_shards_from_csr` invocation below (gated on
+        // the resolved `opts.csc` policy). The writer can alternatively
+        // auto-emit per-modality CSC at finish() time once callers
+        // migrate; auto-emit + manual would double-write, so only one is
+        // wired at a time.
         let modality_id = writer
             .add_modality(mname, modality_type, codec_id, value_encoding, false)
             .map_err(ConvertError::from)?;
@@ -293,7 +293,7 @@ pub fn h5mu_to_scx(
 
         // Optional CSC sidecar — uses the same streaming-transpose
         // helper as the h5ad pipeline, but stamped on this modality.
-        if opts.csc {
+        if opts.csc.should_build_csc(n_obs as u64, *mod_n_vars as u64) {
             write_modality_csc_shards_from_csr(
                 &mut writer,
                 modality_id,

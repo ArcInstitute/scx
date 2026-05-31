@@ -8,6 +8,8 @@
 //! - `streaming_mean_var` vs `streaming_mean_var_csc`
 //! - `streaming_clip_square_sum` vs `streaming_clip_square_sum_csc`
 //! - `wilcoxon_rank_sum_streaming` vs `wilcoxon_rank_sum_streaming_csc`
+//! - `pdex_ref_streaming` vs `pdex_ref_streaming_csc`
+//! - `pseudobulk_aggregate` vs `pseudobulk_aggregate_csc`
 //!
 //! Tolerances: f64 sums for u8 inputs are bit-equal; means/vars and
 //! clipped sums are within 1e-7 (Bessel-correction division loses a
@@ -26,11 +28,12 @@
 #![cfg(test)]
 
 use crate::csc::mean_var::{streaming_clip_square_sum_csc, streaming_mean_var_csc};
+use crate::csc::pdex::pdex_ref_streaming_csc;
 use crate::csc::test_helpers::write_csr_csc_test_file;
 use crate::csc::wilcoxon::wilcoxon_rank_sum_streaming_csc;
-use crate::diffexp::wilcoxon_rank_sum_streaming;
+use crate::diffexp::{pdex_ref_streaming, wilcoxon_rank_sum_streaming};
 use crate::hvg::{streaming_clip_square_sum, streaming_mean_var};
-use crate::pseudobulk::{pseudobulk_aggregate, AggregationMethod};
+use crate::pseudobulk::{pseudobulk_aggregate, AggregationMethod, GeomMeanMode};
 use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
 use tempfile::tempdir;
 
@@ -153,6 +156,61 @@ fn check_parity_for(
                 assert!(
                     (csr_de.pvals[g][k] - csc_de.pvals[g][k]).abs() < 1e-9,
                     "wilcoxon pval[{g}][{k}] mismatch on seed={seed}"
+                );
+            }
+        }
+    }
+
+    // pdex_ref parity (only when there are enough cells in each group).
+    // Both kernels run the same underlying pdex_ref math on a dense
+    // per-chunk buffer that the CSC kernel scatters identically to the
+    // CSR stream, so results are bit-equal up to 1e-9.
+    if n_obs >= 6 {
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let group_names = vec!["A".to_string(), "B".to_string()];
+        let groups: Vec<usize> = (0..n_obs)
+            .map(|i| if i < n_obs / 2 { 0 } else { 1 })
+            .collect();
+        let reference = 0; // group "A" is the reference
+        let csr_pdex = pdex_ref_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            n_vars.max(1),
+            GeomMeanMode::ArithRaw,
+            1.0,
+        )
+        .unwrap();
+        let csc_pdex = pdex_ref_streaming_csc(
+            &csc_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            n_vars.max(1),
+            GeomMeanMode::ArithRaw,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(csr_pdex.group_names, csc_pdex.group_names);
+        for g in 0..csr_pdex.group_names.len() {
+            for k in 0..csr_pdex.log2_fold_changes[g].len() {
+                assert!(
+                    (csr_pdex.log2_fold_changes[g][k] - csc_pdex.log2_fold_changes[g][k]).abs()
+                        < 1e-9,
+                    "pdex log2fc[{g}][{k}] mismatch on seed={seed} {n_obs}x{n_vars}: csr={} csc={}",
+                    csr_pdex.log2_fold_changes[g][k],
+                    csc_pdex.log2_fold_changes[g][k]
+                );
+                assert!(
+                    (csr_pdex.statistics[g][k] - csc_pdex.statistics[g][k]).abs() < 1e-9,
+                    "pdex statistic[{g}][{k}] mismatch on seed={seed}"
+                );
+                assert!(
+                    (csr_pdex.p_values[g][k] - csc_pdex.p_values[g][k]).abs() < 1e-9,
+                    "pdex pval[{g}][{k}] mismatch on seed={seed}"
                 );
             }
         }

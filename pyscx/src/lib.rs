@@ -165,9 +165,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///     backed = sc.read_h5ad("big.h5ad", backed="r")
 ///     pyscx.from_anndata(backed, "big.scx")
 ///
-/// `csc`: when `"always"`, also writes a CSC (column-major) sidecar.
-///   `"off"` (default) emits CSR shards only. No `"auto"` mode — CSC is
-///   opt-in by design (matches `scx convert --csc`).
+/// `csc`: `"off"` (default) emits CSR shards only; `"always"` also writes
+///   a CSC (column-major) sidecar; `"auto"` writes one when the dataset is
+///   large enough to benefit (`n_obs >= 50000` and `n_vars >= 5000` by
+///   default, tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` /
+///   `SCX_CSC_AUTO_VARS_THRESHOLD` env vars). Matches `scx convert --csc`.
 ///
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
@@ -276,10 +278,13 @@ fn from_anndata(
 /// overrides — accepting them would re-introduce the eager-materialisation
 /// OOM class this entrypoint exists to avoid.
 ///
-/// `csc="always"` performs a two-pass write: the streaming converter
-/// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
-/// the CSC sidecar over the just-written file. Peak disk briefly
-/// reaches ~2× the output size during the rebuild.
+/// `csc="always"` (or `csc="auto"` over a dataset above the size
+/// thresholds — `n_obs >= 50000` and `n_vars >= 5000` by default, tunable
+/// via `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`)
+/// performs a two-pass write: the streaming converter emits CSR shards,
+/// then `scx_ops::rebuild_csc_inplace` regenerates the CSC sidecar over the
+/// just-written file. Peak disk briefly reaches ~2× the output size during
+/// the rebuild.
 ///
 /// Source-layout handling:
 ///   * CSR-on-disk h5ad: native streaming path.
@@ -362,15 +367,8 @@ fn from_h5ad(
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "invalid csc value '{other}'; expected 'off' or 'always'"
-            )));
-        }
-    };
+    let csc_policy =
+        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
@@ -428,7 +426,7 @@ fn from_h5ad(
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
         codec: explicit_codec,
-        csc: csc_always,
+        csc: csc_policy,
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,

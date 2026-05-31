@@ -1126,7 +1126,7 @@ fn test_h5ad_to_scx_csc_always() {
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
 
     let opts = ConvertOptions {
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 4, // → ceil(10/4) = 3 CSC shards
         ..ConvertOptions::default()
     };
@@ -1178,7 +1178,7 @@ fn test_tenx_to_scx_csc_always() {
     create_test_tenx_h5(&tenx_path, n_cells, n_genes);
 
     let opts = ConvertOptions {
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5, // → ceil(12/5) = 3 CSC shards
         ..ConvertOptions::default()
     };
@@ -2081,7 +2081,7 @@ fn streaming_opts(shard_size: u32) -> ConvertOptions {
     ConvertOptions {
         shard_target_rows: shard_size,
         codec: None,
-        csc: false,
+        csc: super::pipeline::CscPolicy::Off,
         csc_cols_per_shard: 5000,
         tool: "scx".into(),
         ..ConvertOptions::default()
@@ -2341,7 +2341,7 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
     let opts = ConvertOptions {
         shard_target_rows: 16,
         codec: None,
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5,
         tool: "scx".into(),
         ..ConvertOptions::default()

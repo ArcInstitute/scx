@@ -1089,6 +1089,33 @@ between the row-major CSR path (default) and the column-major CSC sidecar
 path. See [scanpy.md § prefer_format](scanpy.md#prefer_formatcsrcsc-explicit-column-major-dispatch)
 for the full dispatch rules and requirements.
 
+##### CSC decision matrix
+
+CSC sidecars are the column-major substrate for column (gene-axis)
+algorithms. Build one at conversion time with `csc="auto"` / `csc="always"`
+(`pyscx.from_anndata` / `from_h5ad` / `from_10x`) or `scx convert --csc=auto`,
+or after the fact with `scx build-csc`. `csc="auto"` builds a sidecar only
+when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
+`n_vars ≥ 5000` by default, tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
+`SCX_CSC_AUTO_VARS_THRESHOLD`.
+
+| Op | `supports_csc` | Default format | GPU-fast with CSC | Notes |
+|----|:--:|:--:|:--:|-------|
+| `pdex_ref` | ✅ | CSR | ✅ (`gpu_csc_v3`) | CSC-direct GPU route under `SCX_GPU_DE_V3=1`; in-memory CSR falls back to `gpu_csr_v3`. |
+| `rank_genes_groups` (Wilcoxon) | ✅ | CSR | ❌ (GPU is `gpu_csr_v1`) | CPU CSC kernel via `prefer_format="csc"`; no GPU CSC route yet. |
+| `rank_genes_groups_df` | ✅ | CSR | ❌ | Same Wilcoxon engine as above. |
+| `pseudobulk_dex` | ✅ (gene subset) | CSR | N/A (CPU + pydeseq2) | CSC requires a gene subset (`gene_indices` or `col_projection`); full-gene CSC has no win. |
+| `highly_variable_genes` (seurat_v3) | ✅ (single-batch) | CSR | ❌ | CSC routes single-batch seurat_v3; multi-batch / GPU / other flavors raise on CSC. |
+| `calculate_qc_metrics` | ✅ (gene axis) | CSR | N/A | Gene-axis aggregation uses CSC; cell-axis stays CSR. |
+| `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | ✅ | CSR | N/A | Column reductions; CSC requires no row deletion vector. |
+| `pca` | ❌ (rejects CSC) | CSR | N/A | Inherently row-major; `prefer_format="csc"` raises `ValueError`. |
+| `neighbors` / `umap` / `leiden` | N/A | — | N/A | Operate on PCA embeddings / kNN graphs, not on `X`. |
+
+"GPU-fast with CSC" means the op reaches peak GPU throughput **only** with a
+backed SCX file that has a CSC sidecar — see
+[scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
+Confirm which path actually ran via the [route metadata](#accelerator-route-metadata).
+
 - `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. On GPU: cuSPARSE SpMM + cuSOLVER QR (f32).
 - `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. GPU: CAGRA (cuVS). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.

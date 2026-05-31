@@ -94,12 +94,13 @@ pub struct ConvertOptions {
     pub shard_target_rows: u32,
     /// Explicit codec override. None = auto-select based on value distribution.
     pub codec: Option<CodecId>,
-    /// When `true`, also emit a CSC sidecar at write time (multi-shard
-    /// column-major layout). The CSR shards are still written first;
-    /// CSC chunks are produced via streaming transpose over the
-    /// in-memory CSR data.
-    pub csc: bool,
-    /// Columns per CSC shard when `csc == true`. `0` disables the
+    /// CSC-sidecar generation policy (`Off` / `Auto` / `Always`). When the
+    /// policy resolves to build (always, or auto + dataset over the size
+    /// thresholds), a multi-shard column-major CSC sidecar is emitted at
+    /// write time. The CSR shards are still written first; CSC chunks are
+    /// produced via streaming transpose over the in-memory CSR data.
+    pub csc: CscPolicy,
+    /// Columns per CSC shard when a CSC sidecar is emitted. `0` disables the
     /// cap (single CSC shard, memory permitting).
     pub csc_cols_per_shard: usize,
     /// Tool name recorded in the provenance entry. Defaults to
@@ -333,13 +334,16 @@ fn build_and_write_bitmap_for_shard(
 /// `scx-convert`) can still drive bitmap generation from its in-memory
 /// write path.
 pub use scx_format::BitmapPolicy;
+/// Re-exported from [`scx_format::CscPolicy`] so callers depending only on
+/// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
+pub use scx_format::CscPolicy;
 
 impl Default for ConvertOptions {
     fn default() -> Self {
         ConvertOptions {
             shard_target_rows: 16384,
             codec: None,
-            csc: false,
+            csc: CscPolicy::Off,
             csc_cols_per_shard: 5000,
             tool: "scx".into(),
             memory_budget: None,
@@ -644,7 +648,7 @@ pub fn h5ad_to_scx(
 
     // Optional CSC sidecar — streaming transpose over the in-memory
     // CSR data, one shard per chunk.
-    if opts.csc {
+    if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
         write_csc_shards_from_csr(
             &mut writer,
             &indptr,
@@ -833,7 +837,10 @@ pub fn tenx_to_scx(
     )?;
 
     // Optional CSC sidecar — same streaming transpose as h5ad.
-    if opts.csc {
+    if opts
+        .csc
+        .should_build_csc(tenx.n_cells as u64, tenx.n_genes as u64)
+    {
         write_csc_shards_from_csr(
             &mut writer,
             &tenx.indptr,
@@ -1258,7 +1265,7 @@ pub fn h5ad_to_scx_streaming(
     // over the just-finished file. Peak disk briefly reaches ~2×
     // output size for the duration of the rebuild (writes to a
     // sibling `.rebuild_csc.tmp` and renames).
-    if opts.csc {
+    if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
         scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
