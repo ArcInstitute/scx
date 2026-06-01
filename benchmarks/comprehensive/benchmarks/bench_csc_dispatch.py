@@ -140,7 +140,12 @@ def _convert_to_csc_scx(dataset: DatasetConfig, tmpdir: Path) -> Path:
 
 
 def _open_backed(path: Path) -> Any:
-    return pyscx.open(str(path)).to_anndata(backed=True)
+    # Size the LRU shard cache to the file's shard count. The default
+    # cache_shards=4 is < tabula_sapiens_100k's 7 CSR shards, which makes the
+    # CSR pdex_ref variant re-decode every shard per gene chunk (hours-long).
+    # Caching all shards keeps the per-gene-chunk slab reads from thrashing.
+    exp = pyscx.open(str(path))
+    return exp.to_anndata(backed=True, cache_shards=max(4, exp.shard_count))
 
 
 # ---------------------------------------------------------------------------

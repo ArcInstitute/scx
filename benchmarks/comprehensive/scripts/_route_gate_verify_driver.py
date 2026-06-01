@@ -72,12 +72,12 @@ _TRIPLES = [
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csc"),
     # CSR counterpart: confirm the csr variant does NOT take a csc route.
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csr"),
-    # NOTE: bench_csc__pdex_ref_{csc,csr} on tabula are intentionally omitted
-    # here — pdex_ref's route is already gated via accel_de's
-    # `de_route_csc_direct`, and the CSR variant thrashes the BackedCsrReader
-    # cache (cache_shards=4 < n_shards=7), making this verification run hours
-    # long. That cache sizing is a separate follow-up; the thresholds.yaml
-    # floor for bench_csc__pdex_ref_csc still stands.
+    # pdex_ref on tabula — covers the live thresholds.yaml csc_dispatch floor.
+    # `_open_backed` now sizes the LRU cache to the shard count, so the CSR
+    # variant no longer re-decodes every shard per gene chunk (was hours-long
+    # at cache_shards=4 < n_shards=7); both complete in minutes.
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csc"),
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csr"),
 ]
 
 

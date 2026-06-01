@@ -154,26 +154,33 @@ def _ensure_scx_fixture(raw: Any, dataset_name: str) -> Path | None:
     never run on GPU.
 
     Cached under ``$SCX_BENCH_TMPDIR/preproc_fixtures/`` (default
-    ``/tmp/preproc_fixtures``); ``SCX_BENCH_REBUILD_CSC=1`` forces a rebuild.
+    ``/tmp/preproc_fixtures``); ``SCX_BENCH_REBUILD_FIXTURES=1`` forces a rebuild
+    (``SCX_BENCH_REBUILD_CSC=1`` is honoured as a backward-compat alias).
     Returns None if pyscx is missing or the conversion failed.
     """
     import os
     if not _HAS_PYSCX:
         return None
-    base = Path(os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", ""))
-    out_dir = base / "preproc_fixtures" if base.is_dir() else Path("/tmp/preproc_fixtures")
+    # NOTE: Path("") is PosixPath(".") and .is_dir() is True, so an unset env
+    # must be detected on the raw string before constructing the Path — else
+    # the fixture lands in the cwd instead of the /tmp fallback.
+    base_str = os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", "")
+    out_dir = Path(base_str) / "preproc_fixtures" if base_str else Path("/tmp/preproc_fixtures")
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         logger.warning("accel_preprocess: cannot create %s (%s)", out_dir, e)
         return None
     scx_path = out_dir / f"{dataset_name}.preproc.scx"
-    rebuild = os.environ.get("SCX_BENCH_REBUILD_CSC", "") in ("1", "true", "TRUE")
+    rebuild = any(
+        os.environ.get(k, "") in ("1", "true", "TRUE")
+        for k in ("SCX_BENCH_REBUILD_FIXTURES", "SCX_BENCH_REBUILD_CSC")
+    )
     if scx_path.exists() and not rebuild:
         return scx_path
-    if scx_path.exists():
-        scx_path.unlink()
     try:
+        if scx_path.exists():
+            scx_path.unlink()
         import pyscx
         pyscx.from_anndata(raw, str(scx_path))
     except Exception as e:
@@ -273,17 +280,21 @@ def run(
 
         # Record the accelerator route + a numeric gate signal for the GPU
         # variant. The GPU variant runs on a backed SCX input (see `_fresh`),
-        # so normalize_total(device="gpu") takes the GPU shard-streaming kernel
-        # and stamps route gpu_csr_v1; a cpu_* route here means dispatch
-        # silently fell back → 0.0 fails the gate. (CPU/scanpy variants record
-        # the route for visibility but don't emit the gate signal.)
-        route = _extract_route(a, "normalize_total")
-        if route is not None:
-            extras["gpu_dispatch_route"] = route
-            if requires_gpu:
-                extras["preprocess_route_gpu_correct"] = (
-                    1.0 if route.startswith("gpu_") else 0.0
-                )
+        # so both normalize_total and log1p (device="gpu") take the GPU
+        # shard-streaming kernel and stamp route gpu_csr_v1. The gate signal
+        # covers the *whole* normalize→log1p chain: a cpu_* route on either op
+        # (a silent partial fallback, e.g. log1p drops to CPU), or log1p never
+        # stamping a route at all, scores 0.0 and fails the gate. (CPU/scanpy
+        # variants record the route for visibility but don't emit the signal.)
+        route_norm = _extract_route(a, "normalize_total")
+        route_log1p = _extract_route(a, "log1p")
+        if route_norm is not None:
+            extras["gpu_dispatch_route"] = route_norm
+        if route_log1p is not None:
+            extras["gpu_dispatch_route_log1p"] = route_log1p
+        if requires_gpu and route_norm is not None:
+            both_gpu = route_norm.startswith("gpu_") and (route_log1p or "").startswith("gpu_")
+            extras["preprocess_route_gpu_correct"] = 1.0 if both_gpu else 0.0
 
         try:
             if raw.n_obs > _MAX_DIFF_SUBSAMPLE_ROWS:
