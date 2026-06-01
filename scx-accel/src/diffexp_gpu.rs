@@ -62,9 +62,9 @@ fn finish_pdex(result: Result<PdexRefResult>, info: AccelExecutionInfo) -> Resul
     })
 }
 
-/// Stamp the planned execution info onto a Wilcoxon GPU result. Wilcoxon has
-/// no v2/v3/CSC route today — every layout runs the v1 dense-chunk driver — so
-/// the route is set directly (dense → `GpuDenseV1`, CSR-derived → `GpuCsrV1`).
+/// Stamp the planned execution info onto a Wilcoxon GPU result. Shard inputs
+/// are routed by [`plan_de_route`] (CSC-direct / CSR-direct v3 under
+/// `SCX_GPU_DE_V3`, else v1); dense-host input stays on `GpuDenseV1`.
 fn finish_de(result: Result<DiffExpResult>, info: AccelExecutionInfo) -> Result<DiffExpResult> {
     log::debug!(
         "scx-accel wilcoxon GPU route: {} (fallback: {})",
@@ -421,7 +421,8 @@ pub fn wilcoxon_rank_sum_gpu_dense(
     let dev = open_device(device_id)?;
     let chunk_size = n_vars.min(default_gpu_de_gene_chunk_size(&dev, n_obs, n_obs));
     let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
-    // Wilcoxon has no v2/v3/CSC route — dense host runs the v1 dense path.
+    // Dense-host input stays on the v1 dense path (GpuDenseV1) — the dense →
+    // CSR → v3-CSR rewrite is a separate prerequisite (ACC-RUST-OPT-V2 §5.7).
     let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuDenseV1, FallbackReason::None);
     exec_info.chunk_size = Some(chunk_size);
     finish_de(
@@ -455,9 +456,11 @@ pub fn wilcoxon_rank_sum_gpu_dense(
 }
 
 /// Wilcoxon rank-sum on any shard-shaped input (in-memory CSR / SCX-backed /
-/// lazy `ShardSource`). Wilcoxon has no v2/v3/CSC route — every shard input
-/// runs the v1 dense-chunk driver (`GpuCsrV1`); any CSC sidecar on a `Backed`
-/// input is ignored. Dense input uses [`wilcoxon_rank_sum_gpu_dense`].
+/// lazy `ShardSource`). The route is decided by [`plan_de_route`] from the
+/// input layout + the source's CSC capability: a `Backed` input with a CSC
+/// sidecar reaches the CSC-direct v3 driver under `SCX_GPU_DE_V3`; otherwise
+/// the CSR-direct v3 driver (v3 on) or the v1 dense-chunk driver (v3 off).
+/// Dense input uses [`wilcoxon_rank_sum_gpu_dense`].
 #[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_gpu(
     device_id: usize,
@@ -485,6 +488,7 @@ pub fn wilcoxon_rank_sum_gpu(
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
+                InputLayout::CsrHost,
                 n_obs,
                 n_vars,
                 chunk_size,
@@ -503,6 +507,7 @@ pub fn wilcoxon_rank_sum_gpu(
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
+                InputLayout::LazyCsr,
                 n_obs,
                 n_vars,
                 chunk_size,
@@ -515,13 +520,23 @@ pub fn wilcoxon_rank_sum_gpu(
                 tie_correct,
             )
         }
-        GpuDeShardInput::Backed { csr, .. } => {
-            // Wilcoxon has no CSC path; ignore any sidecar and stage CSR.
-            let mut source = BackedGpuMatrixSource::new(&dev, csr)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+        GpuDeShardInput::Backed { csr, csc } => {
+            // Hand the CSC sidecar (when present) to the matrix source so the
+            // planner can reach the CSC-direct v3 Wilcoxon driver.
+            let layout = if csc.is_some() {
+                InputLayout::BackedCsc
+            } else {
+                InputLayout::BackedCsr
+            };
+            let mut source = match csc {
+                Some(csc) => BackedGpuMatrixSource::with_csc(&dev, csr, csc),
+                None => BackedGpuMatrixSource::new(&dev, csr),
+            }
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
+                layout,
                 n_obs,
                 n_vars,
                 chunk_size,
@@ -537,13 +552,17 @@ pub fn wilcoxon_rank_sum_gpu(
     }
 }
 
-/// Shared Wilcoxon route dispatch over a `&mut dyn GpuMatrixSource`. Always the
-/// v1 dense-chunk driver (`GpuCsrV1`); stamped directly (no planner) to match
-/// the former per-shape entry points.
+/// Shared Wilcoxon route dispatch over a `&mut dyn GpuMatrixSource`. The route
+/// is decided once by [`plan_de_route_from_source`] (reading the source's CSC
+/// capability) so the stamped route always matches the kernel that runs —
+/// identical discipline to [`pdex_ref_gpu_dispatch`]. `GpuCsrV2` has no
+/// dedicated Wilcoxon driver and falls through to the v1 dense-chunk driver
+/// alongside `GpuCsrV1`.
 #[allow(clippy::too_many_arguments)]
 fn wilcoxon_rank_sum_gpu_dispatch(
     dev: &GpuDevice,
     source: &mut dyn GpuMatrixSource,
+    layout: InputLayout,
     n_obs: usize,
     n_vars: usize,
     chunk_size: usize,
@@ -555,25 +574,67 @@ fn wilcoxon_rank_sum_gpu_dispatch(
     rankby_abs: bool,
     tie_correct: bool,
 ) -> Result<DiffExpResult> {
-    let mut exec_info = AccelExecutionInfo::new(AccelRoute::GpuCsrV1, FallbackReason::None);
+    let mut exec_info = plan_de_route_from_source(
+        DeviceRequest::Gpu,
+        source,
+        layout,
+        de_v2_enabled(),
+        de_v3_enabled(),
+    );
     exec_info.chunk_size = Some(chunk_size);
     finish_de(
-        wilcoxon_rank_sum_gpu_chunked(
-            dev,
-            n_obs,
-            n_vars,
-            chunk_size,
-            gene_names,
-            groups,
-            group_names,
-            reference,
-            log_transformed,
-            rankby_abs,
-            tie_correct,
-            |dev, dense, c0, sz| {
-                populate_dense_from_shard_source(dev, source, dense, n_obs, c0, sz)
-            },
-        ),
+        match exec_info.route {
+            AccelRoute::GpuCscV3 => wilcoxon_rank_sum_gpu_chunked_v3_csc(
+                dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+                source,
+            ),
+            AccelRoute::GpuCsrV3 => wilcoxon_rank_sum_gpu_chunked_v3_csr(
+                dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+                source,
+            ),
+            // Wilcoxon has no v2 driver; v2/v1 both run the v1 dense-chunk path.
+            AccelRoute::GpuCsrV2 | AccelRoute::GpuCsrV1 => wilcoxon_rank_sum_gpu_chunked(
+                dev,
+                n_obs,
+                n_vars,
+                chunk_size,
+                gene_names,
+                groups,
+                group_names,
+                reference,
+                log_transformed,
+                rankby_abs,
+                tie_correct,
+                |dev, dense, c0, sz| {
+                    populate_dense_from_shard_source(dev, source, dense, n_obs, c0, sz)
+                },
+            ),
+            other => Err(AccelError::LinAlg(format!(
+                "wilcoxon_rank_sum_gpu: planner returned unreachable route {} for {:?}",
+                other.as_str(),
+                layout
+            ))),
+        },
         exec_info,
     )
 }
@@ -932,6 +993,130 @@ fn wilcoxon_chunk_gpu_sequence(
         dev.stream()
             .memcpy_dtod(&u_src, &mut u_dst)
             .map_err(|e| AccelError::LinAlg(format!("stage U: {e}")))?;
+    }
+    Ok(())
+}
+
+/// v3 equivalent of [`wilcoxon_chunk_gpu_sequence`] for the CSC/CSR-direct
+/// drivers. Unlike v1 it does **not** scatter from `scratch.dense`: the pool
+/// slab (`scratch.ref_slab`, `pool_len` rows) and each test group's slab
+/// (`scratch.per_tg_pool_slabs[tg_idx]`, `n_g` rows) are pre-populated by the
+/// shard pass (CSC / CSR-direct scatter). This mirrors the relationship
+/// between [`pdex_ref_chunk_gpu_sequence_v2`] (pre-populated slabs) and the v1
+/// `pdex_ref_chunk_gpu_sequence` (scatter-from-dense), but keeps Wilcoxon's
+/// U-stat / ranksum / combined-tie statistical kernels.
+///
+/// Pre-condition: `scratch.ref_slab[..sz * pool_len]` and, for each non-empty
+/// test group, `scratch.per_tg_pool_slabs[tg_idx][..sz * n_g]` are populated;
+/// `scratch.slab_aux` / `scratch.u_or_rank` / `scratch.tie_term` /
+/// per-group slabs pre-grown by the caller. Empty test groups (`n_g == 0`)
+/// are skipped (the host post-pass synthesises NaN scores / p = 1 for them).
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_chunk_gpu_sequence_v3(
+    dev: &GpuDevice,
+    scratch: &mut scx_gpu::GpuDeChunkScratch,
+    test_groups: &[usize],
+    group_indices: &[Vec<usize>],
+    sz: usize,
+    pool_len: usize,
+    chunk_max: usize,
+    is_ref_mode: bool,
+) -> Result<()> {
+    // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
+    // is the reference group in ref-mode or all cells in 1-vs-rest; either way
+    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
+    gpu_de_block_sort(
+        dev,
+        &mut scratch.ref_slab,
+        &mut scratch.slab_aux,
+        sz,
+        pool_len,
+    )
+    .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool (wil v3): {e}")))?;
+    gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie (wil v3): {e}")))?;
+
+    // Per-test-group sequence. Each tg's slab is pre-populated; no scatter.
+    for (tg_idx, &g) in test_groups.iter().enumerate() {
+        let n_g = group_indices[g].len();
+        if n_g == 0 {
+            continue;
+        }
+
+        if is_ref_mode {
+            // U1 from ref searchsorted → scratch.u_or_rank.
+            gpu_de_searchsorted_u_stat(
+                dev,
+                &scratch.ref_slab,
+                &scratch.per_tg_pool_slabs[tg_idx],
+                &mut scratch.u_or_rank,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted U (wil v3): {e}")))?;
+            // Combined tie for ref ∪ group → scratch.tie_term (overwrites the
+            // pool tie; unused downstream in ref-mode).
+            gpu_de_block_sort(
+                dev,
+                &mut scratch.per_tg_pool_slabs[tg_idx],
+                &mut scratch.slab_aux,
+                sz,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE sort group (wil v3): {e}")))?;
+            gpu_de_combined_tie_term(
+                dev,
+                &scratch.ref_slab,
+                &scratch.per_tg_pool_slabs[tg_idx],
+                &mut scratch.tie_term,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE combined tie (wil v3): {e}")))?;
+            let tie_off = tg_idx * chunk_max;
+            let tie_src = scratch
+                .tie_term
+                .try_slice(..sz)
+                .ok_or_else(|| AccelError::LinAlg("tie_term source slice OOB (wil v3)".into()))?;
+            let mut tie_dst = scratch
+                .tie_per_group
+                .try_slice_mut(tie_off..tie_off + sz)
+                .ok_or_else(|| {
+                    AccelError::LinAlg("tie_per_group dest slice OOB (wil v3)".into())
+                })?;
+            dev.stream()
+                .memcpy_dtod(&tie_src, &mut tie_dst)
+                .map_err(|e| AccelError::LinAlg(format!("stage tie (wil v3): {e}")))?;
+        } else {
+            // Rank sum via all-searchsorted → scratch.u_or_rank. No per-tg tie
+            // work; the pool tie in scratch.tie_term is the global correction.
+            gpu_de_searchsorted_ranksum(
+                dev,
+                &scratch.ref_slab,
+                &scratch.per_tg_pool_slabs[tg_idx],
+                &mut scratch.u_or_rank,
+                sz,
+                pool_len,
+                n_g,
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE searchsorted rank (wil v3): {e}")))?;
+        }
+
+        // Stage u_or_rank → u_per_group (both modes).
+        let u_off = tg_idx * chunk_max;
+        let u_src = scratch
+            .u_or_rank
+            .try_slice(..sz)
+            .ok_or_else(|| AccelError::LinAlg("u_or_rank source slice OOB (wil v3)".into()))?;
+        let mut u_dst = scratch
+            .u_per_group
+            .try_slice_mut(u_off..u_off + sz)
+            .ok_or_else(|| AccelError::LinAlg("u_per_group dest slice OOB (wil v3)".into()))?;
+        dev.stream()
+            .memcpy_dtod(&u_src, &mut u_dst)
+            .map_err(|e| AccelError::LinAlg(format!("stage U (wil v3): {e}")))?;
     }
     Ok(())
 }
@@ -2934,6 +3119,625 @@ where
         .map_err(|e| AccelError::LinAlg(format!("GPU DE synchronize: {e}")))?;
 
     merge_diff_exp_results(chunk_results, rankby_abs)
+}
+
+// ---------------------------------------------------------------------------
+// Wilcoxon v3 (CSC-direct / CSR-direct) chunk drivers
+// ---------------------------------------------------------------------------
+
+/// Pre-built device tables + group bookkeeping shared by the v3 Wilcoxon
+/// drivers. Built once per DE call and reused across the chunk loop.
+///
+/// Two distinct cell→group/pos table sets are needed because the Wilcoxon
+/// comparison pool differs from `pdex_ref` (§C.5):
+/// - **Main tables** (`cell_to_group_dev` / `cell_to_pos_dev`): slot 0 is the
+///   reference group (ref-mode) or empty (1-vs-rest); slots `1..=n_test` are
+///   the test groups. Used for the per-test-group scatters (`group_id =
+///   tg_idx + 1`) and for the pseudobulk (which spans all `n_slots` slots,
+///   covering every cell). `slot_to_group[slot]` maps a slot back to its
+///   original group id (for reading per-group sums back).
+/// - **Pool tables** (`pool_group_dev` / `pool_pos_dev`): map every pool cell
+///   to `group_id = 0`. In ref-mode the pool is the reference group; in
+///   1-vs-rest the pool is *all* cells, which overlaps the test groups and so
+///   cannot share the main table. Used only for the `group_id = 0` pool
+///   scatter into `ref_slab`.
+struct WilcoxonV3Prep {
+    cell_to_group_dev: CudaSlice<i32>,
+    cell_to_pos_dev: CudaSlice<i32>,
+    pool_group_dev: CudaSlice<i32>,
+    pool_pos_dev: CudaSlice<i32>,
+    /// `slot_to_group[slot] = Some(original_group)` for populated slots; slot 0
+    /// is `None` in 1-vs-rest (empty), `Some(reference)` in ref-mode.
+    slot_to_group: Vec<Option<usize>>,
+    n_slots: usize,
+    pool_len: usize,
+    is_ref_mode: bool,
+    group_indices: Vec<Vec<usize>>,
+    test_groups: Vec<usize>,
+}
+
+/// Build the [`WilcoxonV3Prep`] tables for a Wilcoxon GPU v3 call.
+fn prepare_wilcoxon_v3(
+    dev: &GpuDevice,
+    n_obs: usize,
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+) -> Result<WilcoxonV3Prep> {
+    let n_groups = group_names.len();
+    let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
+    let is_ref_mode = reference.is_some();
+    let test_groups: Vec<usize> = match reference {
+        Some(r) => (0..n_groups).filter(|&g| g != r).collect(),
+        None => (0..n_groups).collect(),
+    };
+
+    // Pool permutation: reference cells (ref-mode) or all cells (1-vs-rest).
+    let pool_host: Vec<i32> = match reference {
+        Some(r) => group_indices[r].iter().map(|&c| c as i32).collect(),
+        None => (0..n_obs as i32).collect(),
+    };
+    let pool_len = pool_host.len();
+    if pool_len == 0 {
+        return Err(AccelError::InvalidInput(
+            "Wilcoxon GPU v3: empty comparison pool (reference group has zero cells)".to_string(),
+        ));
+    }
+    let pool_offsets: Vec<i32> = vec![0, checked_offset_i32(pool_len, "Wilcoxon v3 pool offsets")?];
+    let pool_group_dev = build_cell_to_group_dev(dev, &pool_host, &pool_offsets, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 alloc pool group: {e}")))?;
+    let pool_pos_dev = build_cell_to_pos_dev(dev, &pool_host, &pool_offsets, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 alloc pool pos: {e}")))?;
+
+    // Main table: slot 0 = reference (ref-mode) or empty (1-vs-rest); slots
+    // 1..=n_test = test groups, in `test_groups` order.
+    let mut all_cells_host: Vec<i32> = Vec::new();
+    let mut offsets_host: Vec<i32> = Vec::with_capacity(test_groups.len() + 2);
+    offsets_host.push(0);
+    if let Some(r) = reference {
+        all_cells_host.extend(group_indices[r].iter().map(|&c| c as i32));
+    }
+    offsets_host.push(checked_offset_i32(
+        all_cells_host.len(),
+        "Wilcoxon v3 main offsets",
+    )?);
+    for &g in &test_groups {
+        all_cells_host.extend(group_indices[g].iter().map(|&c| c as i32));
+        offsets_host.push(checked_offset_i32(
+            all_cells_host.len(),
+            "Wilcoxon v3 main offsets",
+        )?);
+    }
+    let n_slots = test_groups.len() + 1;
+    let cell_to_group_dev = build_cell_to_group_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 alloc cell_to_group: {e}")))?;
+    let cell_to_pos_dev = build_cell_to_pos_dev(dev, &all_cells_host, &offsets_host, n_obs)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 alloc cell_to_pos: {e}")))?;
+
+    let mut slot_to_group: Vec<Option<usize>> = vec![None; n_slots];
+    if let Some(r) = reference {
+        slot_to_group[0] = Some(r);
+    }
+    for (i, &g) in test_groups.iter().enumerate() {
+        slot_to_group[i + 1] = Some(g);
+    }
+
+    Ok(WilcoxonV3Prep {
+        cell_to_group_dev,
+        cell_to_pos_dev,
+        pool_group_dev,
+        pool_pos_dev,
+        slot_to_group,
+        n_slots,
+        pool_len,
+        is_ref_mode,
+        group_indices,
+        test_groups,
+    })
+}
+
+/// Zero the per-chunk ref/pool slab, each non-empty per-tg slab, and the
+/// pseudobulk sums before the shard scatter pass populates them.
+fn zero_wilcoxon_v3_slabs(
+    dev: &GpuDevice,
+    scratch: &mut scx_gpu::GpuDeChunkScratch,
+    pool_len: usize,
+    test_groups: &[usize],
+    group_indices: &[Vec<usize>],
+    n_slots: usize,
+    sz: usize,
+) -> Result<()> {
+    {
+        let mut v = scratch.ref_slab.slice_mut(..sz * pool_len);
+        dev.stream()
+            .memset_zeros(&mut v)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 memset ref_slab: {e}")))?;
+    }
+    for (tg_idx, &g) in test_groups.iter().enumerate() {
+        let n_g = group_indices[g].len();
+        if n_g == 0 {
+            continue;
+        }
+        let mut v = scratch.per_tg_pool_slabs[tg_idx].slice_mut(..sz * n_g);
+        dev.stream()
+            .memset_zeros(&mut v)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 memset tg slab: {e}")))?;
+    }
+    {
+        let mut v = scratch.sums.slice_mut(..n_slots * sz);
+        dev.stream()
+            .memset_zeros(&mut v)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 memset sums: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Core Wilcoxon v3 driver shared by the CSC-direct and CSR-direct paths. The
+/// `populate_slabs` closure is responsible for zeroing + populating
+/// `scratch.ref_slab` (the pool), each `scratch.per_tg_pool_slabs[tg_idx]`,
+/// and `scratch.sums` (per-slot raw pseudobulk sums) for the chunk
+/// `[c0, c1)` — analogous to v1's `populate_dense` but writing gene-major
+/// slabs directly instead of `scratch.dense`. The per-chunk statistical
+/// sequence + host post-pass (z / p / logFC) is identical to the v1 driver
+/// (see [`wilcoxon_rank_sum_gpu_chunked`]); the only difference is slab
+/// population.
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_rank_sum_gpu_chunked_v3<P>(
+    dev: &GpuDevice,
+    n_obs: usize,
+    n_vars: usize,
+    chunk_size: usize,
+    gene_names: &[String],
+    group_names: &[String],
+    group_indices: &[Vec<usize>],
+    test_groups: &[usize],
+    reference: Option<usize>,
+    slot_to_group: &[Option<usize>],
+    n_slots: usize,
+    pool_len: usize,
+    is_ref_mode: bool,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+    mut populate_slabs: P,
+) -> Result<DiffExpResult>
+where
+    P: FnMut(&mut scx_gpu::GpuDeChunkScratch, usize, usize, usize) -> Result<()>,
+{
+    if chunk_size == 0 {
+        return Err(AccelError::InvalidInput(
+            "gene_chunk_size must be > 0".to_string(),
+        ));
+    }
+
+    let n_groups = group_names.len();
+    let n_test = test_groups.len();
+    let n_g_max = test_groups
+        .iter()
+        .map(|&g| group_indices[g].len())
+        .max()
+        .unwrap_or(0);
+
+    let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, pool_len.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
+    scratch
+        .ensure_ref_slab_capacity(dev, pool_len.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure ref_slab: {e}")))?;
+    scratch
+        .ensure_sums_capacity(dev, n_slots.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure sums: {e}")))?;
+    scratch
+        .ensure_aux_capacity(dev, chunk_size * pool_len.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure aux: {e}")))?;
+    scratch
+        .ensure_per_group_capacity(dev, n_test.max(1))
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure per_group: {e}")))?;
+    scratch
+        .ensure_per_tg_pool_slabs_capacity(dev, n_test, n_g_max.max(1))
+        .map_err(|e| {
+            AccelError::LinAlg(format!("GPU DE Wilcoxon v3 ensure per_tg_pool_slabs: {e}"))
+        })?;
+
+    let mut chunk_results: Vec<DiffExpResult> = Vec::new();
+    let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
+    let dev_pts = dev.with_stream(pts.clone());
+
+    for c0 in (0..n_vars).step_by(chunk_size) {
+        let c1 = (c0 + chunk_size).min(n_vars);
+        let sz = c1 - c0;
+
+        // Populate ref/pool + per-tg slabs + per-slot pseudobulk sums.
+        populate_slabs(&mut scratch, c0, c1, sz)?;
+
+        // Read per-(slot, gene) raw sums → group_gene_sums[original_group][var].
+        let sums_host: Vec<f64> = {
+            let view = scratch
+                .sums
+                .try_slice(..n_slots * sz)
+                .ok_or_else(|| AccelError::LinAlg("sums slice OOB (wil v3)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh sums (wil v3): {e}")))?
+        };
+        let mut group_gene_sums: Vec<Vec<f64>> = vec![vec![0.0f64; sz]; n_groups];
+        for (slot, maybe_g) in slot_to_group.iter().enumerate().take(n_slots) {
+            if let Some(g) = *maybe_g {
+                group_gene_sums[g].copy_from_slice(&sums_host[slot * sz..slot * sz + sz]);
+            }
+        }
+
+        let chunk_max = scratch.chunk_max();
+        let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
+        wilcoxon_chunk_gpu_sequence_v3(
+            target_dev,
+            &mut scratch,
+            test_groups,
+            group_indices,
+            sz,
+            pool_len,
+            chunk_max,
+            is_ref_mode,
+        )?;
+
+        // dtoh of the pool tie (1-vs-rest only; ref-mode overwrites tie_term
+        // per tg with the combined tie and stages it into tie_per_group).
+        let pool_tie_host: Vec<f64> = if !is_ref_mode {
+            let view = scratch
+                .tie_term
+                .try_slice(..sz)
+                .ok_or_else(|| AccelError::LinAlg("tie_term pool slice OOB (wil v3)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh pool tie (wil v3): {e}")))?
+        } else {
+            Vec::new()
+        };
+
+        let u_batch_len = n_test * chunk_max;
+        let u_batch = if n_test == 0 {
+            Vec::new()
+        } else {
+            let view = scratch
+                .u_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (wil v3)".into()))?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (wil v3): {e}")))?
+        };
+        let tie_batch: Vec<f64> = if is_ref_mode && n_test > 0 {
+            let view = scratch
+                .tie_per_group
+                .try_slice(..u_batch_len)
+                .ok_or_else(|| {
+                    AccelError::LinAlg("tie_per_group batch slice OOB (wil v3)".into())
+                })?;
+            dev.stream()
+                .clone_dtoh(&view)
+                .map_err(|e| AccelError::LinAlg(format!("dtoh tie batch (wil v3): {e}")))?
+        } else {
+            Vec::new()
+        };
+
+        // Host post-pass: per-tg slice from batched dtoh, compute z + p, logFC.
+        type ChunkGroupRow = (String, Vec<String>, Vec<f64>, Vec<f64>, Vec<f64>);
+        let mut chunk_per_group: Vec<ChunkGroupRow> = Vec::with_capacity(n_test);
+        for (tg_idx, &g) in test_groups.iter().enumerate() {
+            let n_g = group_indices[g].len();
+            let group_name = group_names[g].clone();
+
+            if n_g == 0 {
+                let names = gene_names[c0..c1].to_vec();
+                chunk_per_group.push((
+                    group_name,
+                    names,
+                    vec![f64::NAN; sz],
+                    vec![1.0f64; sz],
+                    vec![f64::NAN; sz],
+                ));
+                continue;
+            }
+
+            let off = tg_idx * chunk_max;
+            let (u_host, tie_host_for_p, n1, n2) = if is_ref_mode {
+                let u_host: Vec<f64> = u_batch[off..off + sz].to_vec();
+                let combined_tie: Vec<f64> = tie_batch[off..off + sz].to_vec();
+                (u_host, combined_tie, n_g, pool_len)
+            } else {
+                let rank_host: &[f64] = &u_batch[off..off + sz];
+                let n1d = n_g as f64;
+                let u_host: Vec<f64> = rank_host
+                    .iter()
+                    .map(|&r| r - n1d * (n1d + 1.0) / 2.0)
+                    .collect();
+                (u_host, pool_tie_host.clone(), n_g, n_obs - n_g)
+            };
+
+            let (scores, pvals) =
+                compute_scores_and_pvals(&u_host, &tie_host_for_p, n1, n2, tie_correct);
+
+            let mut logfc = Vec::with_capacity(sz);
+            for (var, &s_g) in group_gene_sums[g].iter().enumerate().take(sz) {
+                let mean_g = if n_g > 0 { s_g / n_g as f64 } else { f64::NAN };
+                let mean_ref = match reference {
+                    Some(r) => {
+                        let n_r = group_indices[r].len();
+                        if n_r == 0 {
+                            f64::NAN
+                        } else {
+                            group_gene_sums[r][var] / n_r as f64
+                        }
+                    }
+                    None => {
+                        let rest_sum: f64 = (0..n_groups)
+                            .filter(|&gg| gg != g)
+                            .map(|gg| group_gene_sums[gg][var])
+                            .sum();
+                        let rest_n = n_obs - n_g;
+                        if rest_n == 0 {
+                            f64::NAN
+                        } else {
+                            rest_sum / rest_n as f64
+                        }
+                    }
+                };
+                logfc.push(compute_logfc_hostside(mean_g, mean_ref, log_transformed));
+            }
+
+            let names = gene_names[c0..c1].to_vec();
+            chunk_per_group.push((group_name, names, scores, pvals, logfc));
+        }
+
+        let chunk_de = assemble_chunk_diffexp_result(chunk_per_group, rankby_abs)
+            .ok_or_else(|| AccelError::InvalidInput("empty test_groups in chunk".into()))?;
+        chunk_results.push(chunk_de);
+    }
+
+    dev.synchronize()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 synchronize: {e}")))?;
+
+    merge_diff_exp_results(chunk_results, rankby_abs)
+}
+
+/// CSC-direct Wilcoxon rank-sum GPU driver. Populates gene-major slabs
+/// directly from CSC column shards (skipping non-overlapping shards via
+/// `for_each_gpu_csc_shard_in_range`), bypassing the v1 `[n_obs × chunk]`
+/// dense buffer. Mirrors [`pdex_ref_gpu_chunked_v3_csc`].
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
+    dev: &GpuDevice,
+    n_obs: usize,
+    n_vars: usize,
+    chunk_size: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+    source: &mut dyn GpuMatrixSource,
+) -> Result<DiffExpResult> {
+    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
+        eprintln!("[scx-accel/wilcoxon] v3 dispatch route: csc-direct (CSC sidecar present)");
+    }
+    let prep = prepare_wilcoxon_v3(dev, n_obs, groups, group_names, reference)?;
+    let WilcoxonV3Prep {
+        cell_to_group_dev,
+        cell_to_pos_dev,
+        pool_group_dev,
+        pool_pos_dev,
+        slot_to_group,
+        n_slots,
+        pool_len,
+        is_ref_mode,
+        group_indices,
+        test_groups,
+    } = prep;
+    let n_test = test_groups.len();
+
+    wilcoxon_rank_sum_gpu_chunked_v3(
+        dev,
+        n_obs,
+        n_vars,
+        chunk_size,
+        gene_names,
+        group_names,
+        &group_indices,
+        &test_groups,
+        reference,
+        &slot_to_group,
+        n_slots,
+        pool_len,
+        is_ref_mode,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+        |scratch, c0, c1, sz| {
+            zero_wilcoxon_v3_slabs(
+                dev,
+                scratch,
+                pool_len,
+                &test_groups,
+                &group_indices,
+                n_slots,
+                sz,
+            )?;
+            source
+                .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
+                    // group_id = 0 is the pool (ref cells / all cells); 1..=n_test
+                    // are the per-test-group slabs.
+                    gpu_de_scatter_csc_to_gene_major(
+                        dev,
+                        csc_view,
+                        &pool_group_dev,
+                        &pool_pos_dev,
+                        0,
+                        &mut scratch.ref_slab,
+                        c0,
+                        c1,
+                        sz,
+                        pool_len,
+                    )?;
+                    for tg_idx in 0..n_test {
+                        let n_g = group_indices[test_groups[tg_idx]].len();
+                        if n_g == 0 {
+                            continue;
+                        }
+                        gpu_de_scatter_csc_to_gene_major(
+                            dev,
+                            csc_view,
+                            &cell_to_group_dev,
+                            &cell_to_pos_dev,
+                            (tg_idx + 1) as i32,
+                            &mut scratch.per_tg_pool_slabs[tg_idx],
+                            c0,
+                            c1,
+                            sz,
+                            n_g,
+                        )?;
+                    }
+                    gpu_de_pseudobulk_csc_direct(
+                        dev,
+                        csc_view,
+                        &cell_to_group_dev,
+                        &mut scratch.sums,
+                        c0,
+                        c1,
+                        sz,
+                        n_slots,
+                        0,
+                    )?;
+                    Ok(())
+                })
+                .map_err(|e| {
+                    AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSC shard pass: {e}"))
+                })?;
+            Ok(())
+        },
+    )
+}
+
+/// CSR-direct Wilcoxon rank-sum GPU driver — the CSC-absent fallback (in-memory
+/// CSR, lazy sources). Populates gene-major slabs from CSR row shards with a
+/// running global row offset. Mirrors [`pdex_ref_gpu_chunked_v3_csr`].
+#[allow(clippy::too_many_arguments)]
+fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
+    dev: &GpuDevice,
+    n_obs: usize,
+    n_vars: usize,
+    chunk_size: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+    source: &mut dyn GpuMatrixSource,
+) -> Result<DiffExpResult> {
+    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
+        eprintln!("[scx-accel/wilcoxon] v3 dispatch route: csr-direct (no CSC sidecar)");
+    }
+    let prep = prepare_wilcoxon_v3(dev, n_obs, groups, group_names, reference)?;
+    let WilcoxonV3Prep {
+        cell_to_group_dev,
+        cell_to_pos_dev,
+        pool_group_dev,
+        pool_pos_dev,
+        slot_to_group,
+        n_slots,
+        pool_len,
+        is_ref_mode,
+        group_indices,
+        test_groups,
+    } = prep;
+    let n_test = test_groups.len();
+
+    wilcoxon_rank_sum_gpu_chunked_v3(
+        dev,
+        n_obs,
+        n_vars,
+        chunk_size,
+        gene_names,
+        group_names,
+        &group_indices,
+        &test_groups,
+        reference,
+        &slot_to_group,
+        n_slots,
+        pool_len,
+        is_ref_mode,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+        |scratch, c0, c1, sz| {
+            zero_wilcoxon_v3_slabs(
+                dev,
+                scratch,
+                pool_len,
+                &test_groups,
+                &group_indices,
+                n_slots,
+                sz,
+            )?;
+            let mut global_row = 0usize;
+            source
+                .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                    let view = slot.view();
+                    let n_rows = view.shape.0;
+                    gpu_de_scatter_csr_to_gene_major_filtered(
+                        dev,
+                        &view,
+                        &pool_group_dev,
+                        &pool_pos_dev,
+                        0,
+                        &mut scratch.ref_slab,
+                        global_row,
+                        pool_len,
+                        sz,
+                        c0,
+                        c1,
+                    )?;
+                    for tg_idx in 0..n_test {
+                        let n_g = group_indices[test_groups[tg_idx]].len();
+                        if n_g == 0 {
+                            continue;
+                        }
+                        gpu_de_scatter_csr_to_gene_major_filtered(
+                            dev,
+                            &view,
+                            &cell_to_group_dev,
+                            &cell_to_pos_dev,
+                            (tg_idx + 1) as i32,
+                            &mut scratch.per_tg_pool_slabs[tg_idx],
+                            global_row,
+                            n_g,
+                            sz,
+                            c0,
+                            c1,
+                        )?;
+                    }
+                    gpu_de_pseudobulk_csr_direct(
+                        dev,
+                        &view,
+                        &cell_to_group_dev,
+                        &mut scratch.sums,
+                        global_row,
+                        sz,
+                        c0,
+                        c1,
+                        0,
+                    )?;
+                    global_row += n_rows;
+                    Ok(())
+                })
+                .map_err(|e| {
+                    AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSR shard pass: {e}"))
+                })?;
+            Ok(())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

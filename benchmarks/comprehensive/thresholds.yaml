@@ -59,11 +59,12 @@ absolute_floors:
     metric: de_route_csc_direct
     min: 1.0
   # GPU Wilcoxon route gate. `accel_de.py` emits `wilcoxon_route_gpu_correct`
-  # for the GPU Wilcoxon triple: 1.0 when a GPU route ran (Wilcoxon has a
-  # single fixed v1 kernel — `gpu_csr_v1` / `gpu_dense_v1`), 0.0 on a silent
-  # CPU fallback. The variant is skipped on non-GPU hosts (so a recorded route
-  # always means GPU was attempted); a cpu_* route here means dispatch silently
-  # fell off the GPU path. Gated on the same tiers DE GPU runs at.
+  # for the GPU Wilcoxon triple: 1.0 when a GPU route ran (the v1 dense path
+  # `gpu_csr_v1`/`gpu_dense_v1` or a v3 route `gpu_csc_v3`/`gpu_csr_v3`), 0.0 on
+  # a silent CPU fallback. The variant is skipped on non-GPU hosts (so a
+  # recorded route always means GPU was attempted); a cpu_* route here means
+  # dispatch silently fell off the GPU path. Gated on the same tiers DE GPU
+  # runs at.
   - benchmark: accel_de
     format: accel_de__pyscx_wilcoxon_gpu
     dataset: pbmc3k
@@ -73,6 +74,25 @@ absolute_floors:
     format: accel_de__pyscx_wilcoxon_gpu
     dataset: tabula_sapiens_100k
     metric: wilcoxon_route_gpu_correct
+    min: 1.0
+
+  # GPU Wilcoxon CSC-direct route assertion, mirroring pdex_ref's
+  # `de_route_csc_direct`. `accel_de.py` emits `wilcoxon_route_csc_direct`:
+  # 1.0 when the CSC-direct v3 Wilcoxon route ran (or wasn't expected this
+  # run), 0.0 on a *silent fallback* — a CSC sidecar fixture was built and
+  # SCX_GPU_DE_V3=1, yet a non-CSC route (gpu_csr_v3 / v1) ran. Dormant until a
+  # run sets SCX_GPU_DE_V3=1 with a CSC fixture; then a silent CSC→CSR fallback
+  # fails the gate. pbmc3k is the single-shard route check;
+  # tabula_sapiens_100k exercises the multi-shard CSC-direct path.
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: pbmc3k
+    metric: wilcoxon_route_csc_direct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: tabula_sapiens_100k
+    metric: wilcoxon_route_csc_direct
     min: 1.0
 
   # CSC dispatch verification. `bench_csc_dispatch.py` emits
