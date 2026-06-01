@@ -6,10 +6,12 @@ the recorded route is the CSC-direct one — the route assertion missing from th
 device-agnostic `test_pdex_ref_gpu_parity.py`.
 
 The v3 routes are gated by `SCX_GPU_DE_V3`, read once per process via an
-`OnceLock`, so this module sets it at import time (before pyscx runs any DE) and
-is intended to run in its own process — which is how the Chimera GPU test
-harness invokes GPU test files (isolated). If the flag wasn't active in this
-process, the route assertion is skipped while the numerical parity check runs.
+`OnceLock`, so this module sets it unconditionally at import time (before pyscx
+runs any DE) and is intended to run in its own process — which is how the Chimera
+GPU test harness invokes GPU test files (isolated). The set is unconditional (not
+`setdefault`) so a stale `SCX_GPU_DE_V3=0` in the environment cannot silently
+demote the route and turn the route assertion into a no-op — proving the
+CSC-direct route is the whole point of this test (§B.10 Bg).
 
 Skipped cleanly when `pyscx.accel.gpu_available()` is `False`.
 """
@@ -18,8 +20,9 @@ from __future__ import annotations
 
 import os
 
-# Must be set before the first DE call locks in the OnceLock read.
-os.environ.setdefault("SCX_GPU_DE_V3", "1")
+# Must be set before the first DE call locks in the OnceLock read. Unconditional
+# (not setdefault) so a stale SCX_GPU_DE_V3=0 cannot mask the route assertion.
+os.environ["SCX_GPU_DE_V3"] = "1"
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
@@ -61,7 +64,11 @@ def _compare(cpu_df, gpu_df) -> None:
 
     u_cpu = cpu_df["statistic"].cast(pl.Float64).to_numpy()
     u_gpu = gpu_df["statistic"].cast(pl.Float64).to_numpy()
-    finite = np.isfinite(u_cpu) & np.isfinite(u_gpu)
+    # Assert the finite masks agree first, so a CPU-finite / GPU-NaN value (or
+    # vice versa) fails loudly instead of being silently dropped by the &-mask.
+    np.testing.assert_array_equal(np.isfinite(u_cpu), np.isfinite(u_gpu),
+                                  err_msg="U statistic finite-mask mismatch")
+    finite = np.isfinite(u_cpu)
     np.testing.assert_allclose(u_cpu[finite], u_gpu[finite], atol=1e-6, rtol=0.0,
                                err_msg="U statistic mismatch")
     for col in ("p_value", "fdr"):
@@ -90,6 +97,8 @@ def test_pdex_ref_gpu_csc_parity_vs_reference(tmp_path) -> None:
 
     _compare(cpu_df, gpu_df)
 
+    # GPU is available (module skipif) and SCX_GPU_DE_V3=1 was set unconditionally
+    # at import, so the CSC-direct route must have been taken — fail hard, never
+    # skip, otherwise this test would silently stop proving the route (§B.10 Bg).
     route = _route(gpu)
-    if route != "gpu_csc_v3":
-        pytest.skip(f"SCX_GPU_DE_V3 not active in this process (route={route!r})")
+    assert route == "gpu_csc_v3", f"expected CSC-direct route, got {route!r}"
