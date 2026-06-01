@@ -400,8 +400,11 @@ pub fn gpu_de_upload_chunk(
 /// Scatter a permutation of cells (e.g. ref or group) from the device dense
 /// chunk into a gene-major slab `[chunk_size × n_perm]`.
 ///
-/// `cell_indices_host` is uploaded internally; for repeated calls with the
-/// same permutation, consider caching the upload via a dedicated CudaSlice.
+/// `cell_indices_host` is uploaded internally. **This host→device copy makes
+/// the function illegal to call inside a CUDA graph-capture region** — it
+/// invalidates the capture (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`).
+/// Capturable callers (the DE per-chunk sequences) must pre-upload the
+/// permutation once and use [`gpu_de_scatter_gene_major_dev`] instead.
 pub fn gpu_de_scatter_gene_major(
     dev: &GpuDevice,
     dense: &CudaSlice<f32>,
@@ -413,8 +416,26 @@ pub fn gpu_de_scatter_gene_major(
     if cell_indices_host.is_empty() || chunk_size == 0 {
         return Ok(());
     }
-    let n_perm = cell_indices_host.len();
     let d_indices = dev.htod_copy(cell_indices_host)?;
+    gpu_de_scatter_gene_major_dev(dev, dense, &d_indices, slab, n_obs, chunk_size)
+}
+
+/// Device-input variant of [`gpu_de_scatter_gene_major`]: `d_indices` is a
+/// permutation already resident on device, so this does **no** host→device
+/// copy and is safe to call inside a CUDA graph-capture region. `n_perm` is
+/// taken from `d_indices.len()`.
+pub fn gpu_de_scatter_gene_major_dev(
+    dev: &GpuDevice,
+    dense: &CudaSlice<f32>,
+    d_indices: &CudaSlice<i32>,
+    slab: &mut CudaSlice<f32>,
+    n_obs: usize,
+    chunk_size: usize,
+) -> Result<(), GpuError> {
+    let n_perm = d_indices.len();
+    if n_perm == 0 || chunk_size == 0 {
+        return Ok(());
+    }
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
     let func = module
@@ -441,7 +462,7 @@ pub fn gpu_de_scatter_gene_major(
         dev.stream()
             .launch_builder(&func)
             .arg(dense)
-            .arg(&d_indices)
+            .arg(d_indices)
             .arg(slab)
             .arg(&n_obs_i32)
             .arg(&n_perm_i32)

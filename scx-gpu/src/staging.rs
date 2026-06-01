@@ -208,47 +208,6 @@ impl PinnedCsrSlot {
         Ok(())
     }
 
-    /// Issue async H→D from the pinned slot into per-shard device
-    /// buffers (used by `RawGpuShardSource`'s streaming shard loop).
-    ///
-    /// `indptr_len` and `nnz` are the live shard sizes and must be ≤
-    /// the destination buffer lengths.
-    pub fn upload_to_buffers(
-        &self,
-        stream: &Arc<CudaStream>,
-        dst_indptr: &mut CudaSlice<i64>,
-        dst_indices: &mut CudaSlice<i32>,
-        dst_data: &mut CudaSlice<f32>,
-        indptr_len: usize,
-        nnz: usize,
-    ) -> Result<(), GpuError> {
-        macro_rules! upload {
-            ($src:expr, $dst:expr, $len:expr) => {{
-                match $src {
-                    HostBuf::Pinned(p) => {
-                        let host_slice = p
-                            .as_slice()
-                            .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
-                        let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
-                            .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
-                    }
-                    HostBuf::Pageable(v) => {
-                        let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
-                            .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
-                    }
-                }
-            }};
-        }
-        upload!(&self.indptr, dst_indptr, indptr_len);
-        upload!(&self.indices, dst_indices, nnz);
-        upload!(&self.data, dst_data, nnz);
-        Ok(())
-    }
-
     /// Issue async `memcpy_htod` of the staged shard onto `stream` into the
     /// device slot. The device slot is grown to fit first.
     ///

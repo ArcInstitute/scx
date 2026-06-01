@@ -449,4 +449,101 @@ mod tests {
             }
         }
     }
+
+    /// Regression guard for the CUDA-graph-capture htod bug: the **v1** GPU
+    /// pdex path over a **backed multi-shard** reader, **multi-chunk**, with
+    /// graph capture **forced on**. Before the device-side-scatter fix, the
+    /// captured per-chunk sequence did a host→device copy of the cell
+    /// permutations (`gpu_de_scatter_gene_major`), invalidating the capture
+    /// (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`) and erroring out. No v2/v3
+    /// override → `GpuCsrV1`; `csc: None`. Must complete and match the CPU
+    /// streaming reference. (The in-memory single-shard multi-chunk tests did
+    /// not catch this — the failure needs the backed streaming path.)
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_pdex_ref_gpu_v1_backed_multichunk_graph_capture() {
+        use scx_gpu::device::GpuDevice;
+        if GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU graph-capture regression test");
+            return;
+        }
+        let n_obs = 64usize;
+        let n_vars = 20usize;
+        let cols_per_csc_shard = 7usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let dir = tempdir().unwrap();
+        let path = write_csr_csc_test_file(
+            dir.path(),
+            "pdex_gpu_v1_graph_capture",
+            n_obs,
+            n_vars,
+            &dense,
+            cols_per_csc_shard,
+        );
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let group_names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+        let reference = 0usize;
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+
+        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let cpu_res = pdex_ref_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            7, // gene_chunk_size — multi-chunk on n_vars=20 (3 chunks)
+            mode,
+            epsilon,
+        )
+        .expect("CPU streaming pdex_ref failed");
+
+        // Force graph capture ON (deterministic) with v2/v3 OFF so the captured
+        // v1 sequence runs over the backed multi-shard reader.
+        let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
+            0,
+            crate::diffexp_gpu::GpuDeShardInput::Backed {
+                csr: &csr_reader_gpu,
+                csc: None,
+            },
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            Some(7),
+            mode,
+            epsilon,
+        );
+        scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
+        let gpu_res =
+            gpu_res.expect("GPU v1 backed multi-chunk pdex_ref under graph capture failed");
+
+        assert_eq!(cpu_res.group_names, gpu_res.group_names);
+        assert_eq!(cpu_res.feature_names, gpu_res.feature_names);
+        let n_test = cpu_res.group_names.len();
+        for tg in 0..n_test {
+            for var in 0..n_vars {
+                let u_cpu = cpu_res.statistics[tg][var];
+                let u_gpu = gpu_res.statistics[tg][var];
+                if u_cpu.is_finite() && u_gpu.is_finite() {
+                    assert!(
+                        (u_cpu - u_gpu).abs() < 1e-3,
+                        "U mismatch (v1 graph) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                    );
+                }
+                let p_cpu = cpu_res.p_values[tg][var];
+                let p_gpu = gpu_res.p_values[tg][var];
+                let pdiff = (p_cpu - p_gpu).abs();
+                assert!(
+                    pdiff < 1e-6 || pdiff / p_cpu.abs().max(1e-30) < 1e-3,
+                    "p mismatch (v1 graph) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                );
+            }
+        }
+    }
 }

@@ -30,7 +30,7 @@ use scx_gpu::{
     de_v2_enabled, de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort,
     gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct,
     gpu_de_pseudobulk_csr_direct, gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major,
-    gpu_de_scatter_csr_to_gene_major_filtered, gpu_de_scatter_gene_major,
+    gpu_de_scatter_csr_to_gene_major_filtered, gpu_de_scatter_gene_major_dev,
     gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum,
     gpu_de_searchsorted_u_stat, gpu_de_tie_term, BackedGpuMatrixSource, CudaSlice, GpuDevice,
     GpuMatrixSource, GraphKey,
@@ -687,8 +687,8 @@ fn populate_dense_from_shard_source(
 fn pdex_ref_chunk_gpu_sequence(
     dev: &GpuDevice,
     scratch: &mut scx_gpu::GpuDeChunkScratch,
-    ref_idx_i32: &[i32],
-    group_idx_i32: &[Vec<i32>],
+    d_ref: &CudaSlice<i32>,
+    d_groups: &[Option<CudaSlice<i32>>],
     test_groups: &[usize],
     group_indices: &[Vec<usize>],
     sz: usize,
@@ -698,16 +698,11 @@ fn pdex_ref_chunk_gpu_sequence(
 ) -> Result<()> {
     // Ref slab + sort + tie (used as ref-side input to every per-tg
     // combined-tie call; ref output isn't dtoh-ed — it's read by the
-    // device-side combined-tie kernel directly).
-    gpu_de_scatter_gene_major(
-        dev,
-        &scratch.dense,
-        ref_idx_i32,
-        &mut scratch.ref_slab,
-        n_obs,
-        sz,
-    )
-    .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
+    // device-side combined-tie kernel directly). `d_ref` / `d_groups` are
+    // pre-uploaded device permutations: the scatter does NO host->device copy,
+    // so this whole sequence is safe to run inside a CUDA graph capture.
+    gpu_de_scatter_gene_major_dev(dev, &scratch.dense, d_ref, &mut scratch.ref_slab, n_obs, sz)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter ref: {e}")))?;
     gpu_de_block_sort(dev, &mut scratch.ref_slab, &mut scratch.slab_aux, sz, n_ref)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref: {e}")))?;
     gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, n_ref)
@@ -720,15 +715,13 @@ fn pdex_ref_chunk_gpu_sequence(
             continue;
         }
 
-        gpu_de_scatter_gene_major(
-            dev,
-            &scratch.dense,
-            &group_idx_i32[tg_idx],
-            &mut scratch.group_slab,
-            n_obs,
-            sz,
-        )
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
+        let d_g = d_groups[tg_idx].as_ref().ok_or_else(|| {
+            AccelError::LinAlg(
+                "GPU DE scatter group: missing device permutation for non-empty group".into(),
+            )
+        })?;
+        gpu_de_scatter_gene_major_dev(dev, &scratch.dense, d_g, &mut scratch.group_slab, n_obs, sz)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
 
         gpu_de_searchsorted_u_stat(
             dev,
@@ -820,8 +813,8 @@ fn pdex_ref_chunk_gpu_sequence(
 fn wilcoxon_chunk_gpu_sequence(
     dev: &GpuDevice,
     scratch: &mut scx_gpu::GpuDeChunkScratch,
-    pool_idx_i32: &[i32],
-    group_idx_i32: &[Vec<i32>],
+    d_pool: &CudaSlice<i32>,
+    d_groups: &[Option<CudaSlice<i32>>],
     test_groups: &[usize],
     group_indices: &[Vec<usize>],
     sz: usize,
@@ -833,10 +826,12 @@ fn wilcoxon_chunk_gpu_sequence(
     // Pool slab + sort + tie. The pool is the ref set in ref-mode or
     // all cells in 1-vs-rest; either way `scratch.ref_slab` holds it
     // after the scatter and `scratch.tie_term` holds its tie term.
-    gpu_de_scatter_gene_major(
+    // `d_pool` / `d_groups` are pre-uploaded device permutations (no
+    // host->device copy here), so this sequence is CUDA-graph-capturable.
+    gpu_de_scatter_gene_major_dev(
         dev,
         &scratch.dense,
-        pool_idx_i32,
+        d_pool,
         &mut scratch.ref_slab,
         n_obs,
         sz,
@@ -860,15 +855,13 @@ fn wilcoxon_chunk_gpu_sequence(
             continue;
         }
 
-        gpu_de_scatter_gene_major(
-            dev,
-            &scratch.dense,
-            &group_idx_i32[tg_idx],
-            &mut scratch.group_slab,
-            n_obs,
-            sz,
-        )
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
+        let d_g = d_groups[tg_idx].as_ref().ok_or_else(|| {
+            AccelError::LinAlg(
+                "GPU DE scatter group: missing device permutation for non-empty group".into(),
+            )
+        })?;
+        gpu_de_scatter_gene_major_dev(dev, &scratch.dense, d_g, &mut scratch.group_slab, n_obs, sz)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE scatter group: {e}")))?;
 
         if is_ref_mode {
             // U1 from ref searchsorted → scratch.u_or_rank.
@@ -1021,6 +1014,26 @@ where
         .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc offsets: {e}")))?;
     let mode_id = geom_mean_mode_id(mode);
 
+    // Pre-upload the per-(ref / test-group) cell permutations ONCE so the
+    // captured per-chunk sequence does no host->device copy — an htod inside a
+    // CUDA graph capture region invalidates the capture
+    // (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`). Empty test groups upload to
+    // `None` and are skipped by the sequence.
+    let d_ref_perm = dev
+        .htod_copy(&ref_idx_i32)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc ref perm: {e}")))?;
+    let d_group_perms: Vec<Option<CudaSlice<i32>>> = group_idx_i32
+        .iter()
+        .map(|g| {
+            if g.is_empty() {
+                Ok(None)
+            } else {
+                dev.htod_copy(g).map(Some)
+            }
+        })
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc group perm: {e}")))?;
+
     // Device-side scratch sized to max-pool-per-gene = max(n_ref, n_g_max).
     let n_pool_max = n_ref.max(n_g_max).max(1);
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
@@ -1154,8 +1167,8 @@ where
             pdex_ref_chunk_gpu_sequence(
                 target_dev,
                 &mut scratch,
-                &ref_idx_i32,
-                &group_idx_i32,
+                &d_ref_perm,
+                &d_group_perms,
                 &test_groups,
                 &group_indices,
                 sz,
@@ -1181,8 +1194,8 @@ where
                 pdex_ref_chunk_gpu_sequence(
                     &dev_pts,
                     &mut scratch,
-                    &ref_idx_i32,
-                    &group_idx_i32,
+                    &d_ref_perm,
+                    &d_group_perms,
                     &test_groups,
                     &group_indices,
                     sz,
@@ -1210,8 +1223,8 @@ where
                     pdex_ref_chunk_gpu_sequence(
                         &dev_pts,
                         &mut scratch,
-                        &ref_idx_i32,
-                        &group_idx_i32,
+                        &d_ref_perm,
+                        &d_group_perms,
                         &test_groups,
                         &group_indices,
                         sz,
@@ -2643,6 +2656,35 @@ where
         .htod_copy(&offsets_host)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc offsets: {e}")))?;
 
+    // Resolve the pool permutation once (ref group in ref-mode, all cells in
+    // 1-vs-rest) and pre-upload it + the per-test-group permutations to device
+    // ONCE, so the captured per-chunk sequence does no host->device copy — an
+    // htod inside a CUDA graph capture region invalidates the capture. Empty
+    // test groups upload to `None` and are skipped by the sequence.
+    let pool_host: &[i32] = match (&ref_idx_i32, &all_idx_i32) {
+        (Some(r), _) => r,
+        (None, Some(a)) => a,
+        (None, None) => {
+            unreachable!("wilcoxon pool: neither ref nor all-cells permutation present")
+        }
+    };
+    let pool_len = pool_host.len();
+    let is_ref_mode = reference.is_some();
+    let d_pool_perm = dev
+        .htod_copy(pool_host)
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc pool perm: {e}")))?;
+    let d_group_perms: Vec<Option<CudaSlice<i32>>> = group_idx_i32
+        .iter()
+        .map(|g| {
+            if g.is_empty() {
+                Ok(None)
+            } else {
+                dev.htod_copy(g).map(Some)
+            }
+        })
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| AccelError::LinAlg(format!("GPU DE alloc group perm: {e}")))?;
+
     // Accumulators in input gene order.
     let n_test = test_groups.len();
     let mut chunk_results: Vec<DiffExpResult> = Vec::new();
@@ -2680,17 +2722,9 @@ where
         )
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon pseudobulk: {e}")))?;
 
-        // Resolve the pool index slice + length per mode. Ref-mode
-        // uses the reference group's cells; 1-vs-rest uses all cells.
-        // Kernel parameterisation is the same in either case (the
-        // pool is the searchsorted "haystack").
-        let pool_idx_i32: &[i32] = match (&ref_idx_i32, &all_idx_i32) {
-            (Some(r), _) => r,
-            (None, Some(a)) => a,
-            (None, None) => unreachable!(),
-        };
-        let pool_len = pool_idx_i32.len();
-        let is_ref_mode = reference.is_some();
+        // `pool_len` / `is_ref_mode` / the device pool + group permutations
+        // (`d_pool_perm` / `d_group_perms`) were resolved + uploaded once
+        // before the loop (capture-safe).
 
         // G10.5: graph-aware dispatch of the per-chunk GPU sequence
         // (pool scatter+sort+tie + per-tg searchsort{_u | _ranksum} +
@@ -2708,8 +2742,8 @@ where
             wilcoxon_chunk_gpu_sequence(
                 target_dev,
                 &mut scratch,
-                pool_idx_i32,
-                &group_idx_i32,
+                &d_pool_perm,
+                &d_group_perms,
                 &test_groups,
                 &group_indices,
                 sz,
@@ -2733,8 +2767,8 @@ where
                 wilcoxon_chunk_gpu_sequence(
                     &dev_pts,
                     &mut scratch,
-                    pool_idx_i32,
-                    &group_idx_i32,
+                    &d_pool_perm,
+                    &d_group_perms,
                     &test_groups,
                     &group_indices,
                     sz,
@@ -2754,8 +2788,8 @@ where
                     wilcoxon_chunk_gpu_sequence(
                         &dev_pts,
                         &mut scratch,
-                        pool_idx_i32,
-                        &group_idx_i32,
+                        &d_pool_perm,
+                        &d_group_perms,
                         &test_groups,
                         &group_indices,
                         sz,
