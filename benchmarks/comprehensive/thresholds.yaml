@@ -80,8 +80,8 @@ absolute_floors:
   # variant's intended layout actually dispatched (a `_csc` variant ran a route
   # containing "csc", a `_csr` variant did not), 0.0 on a silent fallback
   # (require_csc() dropped to CSR because the sidecar build failed, or vice
-  # versa). pseudobulk variants are omitted (pseudobulk_dex does not stamp a
-  # route yet).
+  # versa). All five ops (qc_metrics, hvg, rank_genes_groups, pdex_ref,
+  # pseudobulk_dex) stamp a route, so every `_csc` variant is gated.
   #
   # Gated on tabula_sapiens_100k — its multi-shard CSC sidecar exercises the
   # column slab read that pbmc3k's single shard can't, and the 100k-cell
@@ -103,6 +103,11 @@ absolute_floors:
     min: 1.0
   - benchmark: bench_csc_dispatch
     format: bench_csc__pdex_ref_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__pseudobulk_csc
     dataset: tabula_sapiens_100k
     metric: csc_dispatch_correct
     min: 1.0
@@ -455,6 +460,15 @@ absolute_floors:
     dataset: pbmc3k
     metric: max_abs_diff_vs_scanpy
     max: 1.0e-3
+  # GPU preprocess route gate. The GPU variant runs normalize_total/log1p on a
+  # backed SCX input (so the GPU shard-streaming kernel engages, route
+  # gpu_csr_v1); 0.0 means it silently fell back to CPU. Skipped on non-GPU
+  # hosts. See `accel_preprocess.py` `_fresh()` / `_ensure_scx_fixture`.
+  - benchmark: accel_preprocess
+    format: accel_preprocess__pyscx_gpu
+    dataset: pbmc3k
+    metric: preprocess_route_gpu_correct
+    min: 1.0
 
   # --- accel_hvg: HVG set overlap vs scanpy seurat_v3 ---
   - benchmark: accel_hvg

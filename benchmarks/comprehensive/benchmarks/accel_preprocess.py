@@ -145,6 +145,50 @@ def _max_abs_diff(a: Any, b: Any) -> float:
     return round(float(np.max(np.abs(xa - xb))), 6)
 
 
+def _ensure_scx_fixture(raw: Any, dataset_name: str) -> Path | None:
+    """Materialise `raw` as a plain SCX file (no CSC sidecar — normalize/log1p
+    stream CSR shards) so the GPU variant can open it backed and actually hit
+    the GPU shard-streaming kernel. Without a backed input,
+    `normalize_total(device="gpu")` falls back to CPU on in-memory scipy X
+    (no GPU kernel for materialized dense/sparse), so the "GPU" variant would
+    never run on GPU.
+
+    Cached under ``$SCX_BENCH_TMPDIR/preproc_fixtures/`` (default
+    ``/tmp/preproc_fixtures``); ``SCX_BENCH_REBUILD_CSC=1`` forces a rebuild.
+    Returns None if pyscx is missing or the conversion failed.
+    """
+    import os
+    if not _HAS_PYSCX:
+        return None
+    base = Path(os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", ""))
+    out_dir = base / "preproc_fixtures" if base.is_dir() else Path("/tmp/preproc_fixtures")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("accel_preprocess: cannot create %s (%s)", out_dir, e)
+        return None
+    scx_path = out_dir / f"{dataset_name}.preproc.scx"
+    rebuild = os.environ.get("SCX_BENCH_REBUILD_CSC", "") in ("1", "true", "TRUE")
+    if scx_path.exists() and not rebuild:
+        return scx_path
+    if scx_path.exists():
+        scx_path.unlink()
+    try:
+        import pyscx
+        pyscx.from_anndata(raw, str(scx_path))
+    except Exception as e:
+        logger.warning("accel_preprocess: pyscx.from_anndata(%s) failed: %s", dataset_name, e)
+        return None
+    return scx_path
+
+
+def _open_backed(path: Path) -> Any:
+    """Open an SCX file as a backed AnnData (X is ScxBackedSparseDataset), so
+    GPU normalize/log1p take the eager shard-streaming kernel."""
+    import pyscx
+    return pyscx.open(str(path)).to_anndata(backed=True)
+
+
 def run(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -185,9 +229,22 @@ def run(
         _fixture_cache[ref_key] = ref.X.copy() if hasattr(ref.X, "copy") else ref.X
     ref_X = _fixture_cache[ref_key]
 
+    # The GPU variant must run on a backed SCX input — `normalize_total`/
+    # `log1p(device="gpu")` only engage the GPU shard-streaming kernel for
+    # ScxBackedSparseDataset / ScxLazyTransformedDataset X; on in-memory scipy
+    # X they fall back to CPU. Build a plain SCX fixture once and open it backed
+    # per iteration so the variant genuinely exercises (and can gate) the GPU
+    # route. CPU/scanpy variants stay on the in-memory `raw.copy()`.
+    gpu_scx_path = _ensure_scx_fixture(raw, dataset.name) if requires_gpu else None
+
+    def _fresh() -> Any:
+        if gpu_scx_path is not None:
+            return _open_backed(gpu_scx_path)
+        return raw.copy()
+
     # Warm-up
     for _ in range(N_WARMUP_RUNS):
-        warm = raw.copy()
+        warm = _fresh()
         impl(warm, target_sum)
         # Materialize the lazy chain for pyscx_cpu so timing reflects
         # "preprocessing complete" rather than "transform enqueued".
@@ -199,7 +256,7 @@ def run(
     diffs: list[float] = []
     for i in range(n_runs):
         gc.collect()
-        a = raw.copy()
+        a = _fresh()
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
@@ -214,18 +271,19 @@ def run(
 
         extras: dict[str, Any] = {}
 
-        # Record the accelerator route for visibility (coverage banner /
-        # provenance). NOTE: this benchmark runs on in-memory scipy X, where
-        # normalize_total(device="gpu") legitimately falls back to the CPU
-        # path (no GPU kernel for materialized scipy/dense — see
-        # pyscx.accel.normalize_total docs), so the GPU variant records a
-        # cpu_* route here BY DESIGN. We therefore surface the route string
-        # but intentionally do NOT emit a `*_route_gpu_correct` numeric gate
-        # signal — a 1.0 floor would false-fail this expected CPU fallback.
-        # The route string makes that fallback observable instead of silent.
+        # Record the accelerator route + a numeric gate signal for the GPU
+        # variant. The GPU variant runs on a backed SCX input (see `_fresh`),
+        # so normalize_total(device="gpu") takes the GPU shard-streaming kernel
+        # and stamps route gpu_csr_v1; a cpu_* route here means dispatch
+        # silently fell back → 0.0 fails the gate. (CPU/scanpy variants record
+        # the route for visibility but don't emit the gate signal.)
         route = _extract_route(a, "normalize_total")
         if route is not None:
             extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["preprocess_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
 
         try:
             if raw.n_obs > _MAX_DIFF_SUBSAMPLE_ROWS:

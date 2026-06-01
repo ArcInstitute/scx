@@ -1181,14 +1181,19 @@ Every `pyscx.accel.*` call records the execution route it actually took on `adat
 | `"rank_genes_groups_df"` | `pyscx.accel.rank_genes_groups_df` |
 | `"highly_variable_genes"` | `pyscx.accel.highly_variable_genes` |
 | `"pca"` | `pyscx.accel.pca` |
-| `"knn"` | `pyscx.accel.neighbors` |
+| `"neighbors"` | `pyscx.accel.neighbors` |
 | `"umap"` | `pyscx.accel.umap` |
 | `"leiden"` | `pyscx.accel.leiden` |
-| `"harmony"` | `pyscx.accel.harmony_integrate` |
 | `"normalize_total"` | `pyscx.accel.normalize_total` |
 | `"log1p"` | `pyscx.accel.log1p` |
+| `"calculate_qc_metrics"` | `pyscx.accel.calculate_qc_metrics` |
+| `"pseudobulk_dex"` | `pyscx.accel.pseudobulk_dex` |
 
 This is the canonical way to confirm which path ran when comparing CPU vs GPU performance — GPU is fastest only when the input layout matches the op. The CSC-direct route (`route == "gpu_csc_v3"`) requires a backed SCX file with a CSC sidecar and `SCX_GPU_DE_V3=1`; in-memory CSR inputs report `gpu_csr_v3` with `fallback_reason == "no_csc_sidecar"`. The route is decided by a single internal planner (`scx_accel::route::plan_de_route`) that also *drives* dispatch — the GPU `pdex_ref` entry points `match` on the planned route to select the kernel, and CPU dispatch calls the same planner — so the recorded value always matches the kernel that executed. (Wilcoxon GPU has a single fixed v1 kernel, so `rank_genes_groups` / `rank_genes_groups_df` always record `gpu_csr_v1` / `gpu_dense_v1` on GPU regardless of `SCX_GPU_DE_V3`; only `pdex_ref` reaches the v2/v3/CSC routes.) Route-specific benchmark gates in `thresholds.yaml` enforce correct dispatch across all GPU ops — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating). The legacy `SCX_GPU_DE_V3_TRACE` stderr trace remains only as a debug fallback.
+
+**Non-DE ops.** PCA, kNN (`neighbors`), Leiden, HVG, and preprocessing each have a single GPU route, so their metadata is the GPU-vs-CPU dispatch contract rather than a version cascade. On a GPU host they record `gpu_csr_v1` (`pca` cuSPARSE+cuBLAS, `neighbors` cuVS CAGRA, `leiden` cuGraph, `highly_variable_genes` seurat_v3 atomic-CSR), except `umap`, whose native CUDA / cuML SGD runs on a dense embedding and records `gpu_dense_v1`. When the op's GPU library is unavailable the route falls back to `cpu_csr` / `cpu_dense` with `fallback_reason="unsupported_input_layout"` (vs `no_cuda` when CUDA itself is absent, or `user_forced_cpu` for `device="cpu"`). PCA's covariance-vs-randomized choice is a math-policy detail recorded separately in `uns["pca"]["backend"]`, not in the route string.
+
+**Preprocessing caveat.** `normalize_total` / `log1p` only reach the GPU shard-streaming kernel when `adata.X` is a backed (`ScxBackedSparseDataset`) or lazy (`ScxLazyTransformedDataset`) dataset; on a materialized scipy/dense `X` they record `cpu_csr` (with `fallback_reason="unsupported_input_layout"` on a GPU host) because the eager kernel needs a shard source — open via `pyscx.open(...).to_anndata(backed=True)` to engage GPU. `calculate_qc_metrics` and `pseudobulk_dex` are CPU-only; their route reflects only the gene-axis layout (`cpu_csc` under `prefer_format="csc"`, else `cpu_csr`). `harmony_integrate` does not record route metadata yet — its dispatch detail lives in `uns["harmony"]["backend"]`.
 
 ### ScxBackedSparseDataset
 

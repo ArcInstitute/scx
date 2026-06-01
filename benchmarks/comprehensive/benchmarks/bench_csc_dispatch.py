@@ -209,29 +209,32 @@ def _run_pdex_ref(adata: Any, prefer: str) -> None:
 
 
 def _run_pseudobulk(adata: Any, prefer: str) -> None:
-    """For CSC, we project to the top 500 genes (out of 30K+) so the
-    `gene_indices` precondition is satisfied. CSR runs the full set
-    for a like-for-like comparison.
+    """Run pseudobulk DE with a replicate-bearing design so pydeseq2 has
+    residual degrees of freedom.
+
+    A single-column groupby (``[test_col]``) yields one pseudobulk sample per
+    condition level, so DESeq2 errors with "no replicates" — the variant never
+    completed on any dataset. We synthesise a binary condition (``_bench_cond``)
+    plus 4 pseudo-replicates (``_bench_rep``) and group by both, giving 8
+    samples for a 2-coefficient design. This benchmark measures CSR-vs-CSC
+    dispatch cost, not biological signal, so the synthetic design is fine.
+
+    For CSC we project to the top 500 genes so the ``gene_indices`` precondition
+    is satisfied; CSR runs the full gene set for a like-for-like comparison.
     """
-    obs_cols = list(adata.obs.columns)
-    candidates = ["perturbation", "cell_type", "leiden"]
-    test_col = next((c for c in candidates if c in obs_cols), None)
-    if test_col is None:
-        n = adata.n_obs
-        adata.obs["_bench_group"] = (np.arange(n) < n // 2).astype(str)
-        test_col = "_bench_group"
-    levels = list(adata.obs[test_col].astype(str).unique())
-    if len(levels) < 2:
-        return
-    reference = levels[0]
+    n = adata.n_obs
+    adata.obs["_bench_cond"] = (np.arange(n) < n // 2).astype(str)
+    adata.obs["_bench_rep"] = (np.arange(n) % 4).astype(str)
+    groupby = ["_bench_cond", "_bench_rep"]
+    reference = "True"  # _bench_cond levels are "True" / "False"
     if prefer == "csc":
         # 500 genes is enough to exercise the multi-shard slab read
         # without dragging the whole catalog through.
         gene_indices = list(range(min(500, adata.n_vars)))
         pyscx.accel.pseudobulk_dex(
             adata,
-            [test_col],
-            test_col,
+            groupby,
+            "_bench_cond",
             reference,
             prefer_format="csc",
             gene_indices=gene_indices,
@@ -239,8 +242,8 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
     else:
         pyscx.accel.pseudobulk_dex(
             adata,
-            [test_col],
-            test_col,
+            groupby,
+            "_bench_cond",
             reference,
             prefer_format="csr",
         )
@@ -263,8 +266,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
 # Variant key → adata.uns["scx_accel"] op key for route extraction. Ops that
 # stamp a route to `adata.uns["scx_accel"][op]["route"]` emit the numeric
 # `csc_dispatch_correct` gate signal so a silent CSC→CSR (or CSR→CSC) fallback
-# fails the gate. `pseudobulk_dex` does not stamp a route yet, so its variants
-# are omitted (the signal will appear automatically once it does).
+# fails the gate. All five ops stamp a route, so every variant is gated.
 _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__qc_metrics_csr": "calculate_qc_metrics",
     "bench_csc__qc_metrics_csc": "calculate_qc_metrics",
@@ -274,6 +276,8 @@ _VARIANT_OP_KEY: dict[str, str] = {
     "bench_csc__de_csc": "rank_genes_groups",
     "bench_csc__pdex_ref_csr": "pdex_ref",
     "bench_csc__pdex_ref_csc": "pdex_ref",
+    "bench_csc__pseudobulk_csr": "pseudobulk_dex",
+    "bench_csc__pseudobulk_csc": "pseudobulk_dex",
 }
 
 

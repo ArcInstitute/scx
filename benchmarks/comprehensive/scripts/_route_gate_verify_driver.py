@@ -43,6 +43,7 @@ _NEW_ROUTE_METRICS = {
     "umap_route_gpu_correct",
     "leiden_route_gpu_correct",
     "hvg_route_gpu_correct",
+    "preprocess_route_gpu_correct",
 }
 
 # (benchmark, dataset, format_key). pbmc3k for the single-shard route checks;
@@ -64,9 +65,19 @@ _TRIPLES = [
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__qc_metrics_csc"),
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__hvg_csc"),
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__de_csc"),
-    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csc"),
-    # CSR counterparts: confirm the csr variant does NOT take a csc route.
-    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csr"),
+    # pseudobulk needs pydeseq2, which lives in the `scx-bench` env (these
+    # keys have no `_gpu`, so the real gate routes them there). This driver
+    # runs under `scx-bench-gpu`, which lacks pydeseq2, so these two SKIP here
+    # by design — verify them on a `scx-bench` (or .venv) CPU run instead.
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csc"),
+    # CSR counterpart: confirm the csr variant does NOT take a csc route.
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csr"),
+    # NOTE: bench_csc__pdex_ref_{csc,csr} on tabula are intentionally omitted
+    # here — pdex_ref's route is already gated via accel_de's
+    # `de_route_csc_direct`, and the CSR variant thrashes the BackedCsrReader
+    # cache (cache_shards=4 < n_shards=7), making this verification run hours
+    # long. That cache sizing is a separate follow-up; the thresholds.yaml
+    # floor for bench_csc__pdex_ref_csc still stands.
 ]
 
 
