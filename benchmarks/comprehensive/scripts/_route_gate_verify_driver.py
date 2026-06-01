@@ -43,6 +43,7 @@ _NEW_ROUTE_METRICS = {
     "umap_route_gpu_correct",
     "leiden_route_gpu_correct",
     "hvg_route_gpu_correct",
+    "preprocess_route_gpu_correct",
 }
 
 # (benchmark, dataset, format_key). pbmc3k for the single-shard route checks;
@@ -64,8 +65,18 @@ _TRIPLES = [
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__qc_metrics_csc"),
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__hvg_csc"),
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__de_csc"),
+    # pseudobulk needs pydeseq2, which lives in the `scx-bench` env (these
+    # keys have no `_gpu`, so the real gate routes them there). This driver
+    # runs under `scx-bench-gpu`, which lacks pydeseq2, so these two SKIP here
+    # by design — verify them on a `scx-bench` (or .venv) CPU run instead.
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csc"),
+    # CSR counterpart: confirm the csr variant does NOT take a csc route.
+    ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pseudobulk_csr"),
+    # pdex_ref on tabula — covers the live thresholds.yaml csc_dispatch floor.
+    # `_open_backed` now sizes the LRU cache to the shard count, so the CSR
+    # variant no longer re-decodes every shard per gene chunk (was hours-long
+    # at cache_shards=4 < n_shards=7); both complete in minutes.
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csc"),
-    # CSR counterparts: confirm the csr variant does NOT take a csc route.
     ("bench_csc_dispatch", "tabula_sapiens_100k", "bench_csc__pdex_ref_csr"),
 ]
 

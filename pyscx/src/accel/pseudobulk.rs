@@ -48,6 +48,25 @@ pub fn pseudobulk_dex(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+
+    // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
+    // Pseudobulk aggregation + pydeseq2 is CPU-only; the only dispatch choice is
+    // the gene-axis layout — cpu_csc when prefer_format="csc" (reads the
+    // gene-major sidecar), cpu_csr otherwise. Stamped on the top-level adata
+    // before the stratified branch (which recurses on discarded sub_adata
+    // copies). This is the route the CSC dispatch gate asserts.
+    let pb_route = if prefer_format == "csc" {
+        scx_accel::AccelRoute::CpuCsc
+    } else {
+        scx_accel::AccelRoute::CpuCsr
+    };
+    super::route::write_accel_route(
+        py,
+        adata,
+        "pseudobulk_dex",
+        &scx_accel::AccelExecutionInfo::new(pb_route, scx_accel::FallbackReason::None),
+    )?;
+
     // --- Stratified path ---
     if let Some(ref strat_cols) = stratify_by {
         // Forbidden columns: test_col and all groupby columns.

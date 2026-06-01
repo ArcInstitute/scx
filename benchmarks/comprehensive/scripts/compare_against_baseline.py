@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import fnmatch
 import json
 import logging
 import statistics
@@ -547,6 +548,39 @@ def _triple_was_run(
     return (current_dir / "raw" / f"{benchmark}__{fmt}__{dataset}.json").exists()
 
 
+def _resolve_floor_datasets(
+    current_dir: Path, benchmark: str, fmt: str, pattern: str,
+) -> list[str]:
+    """Expand a floor spec's ``dataset`` into the concrete datasets it applies
+    to in this candidate snapshot.
+
+    A literal (non-glob) ``dataset`` returns ``[pattern]`` unchanged — the
+    caller's ``_triple_was_run`` still decides whether it ran. A glob
+    (``*`` / ``census_*`` / ``?`` / ``[...]``) expands to every dataset of this
+    ``(benchmark, format)`` whose raw JSON is present and matches the pattern,
+    so one floor entry can cover every tier a triple ran at. A glob only ever
+    matches datasets that actually ran, so a zero-match glob yields ``[]`` and
+    the floor is silently skipped — mirroring the scoped-out-triple semantics
+    in :func:`check_absolute_floors`.
+    """
+    if not any(c in pattern for c in "*?["):
+        return [pattern]
+    raw_dir = current_dir / "raw"
+    if not raw_dir.is_dir():
+        return []
+    prefix = f"{benchmark}__{fmt}__"
+    suffix = ".json"
+    matched: set[str] = set()
+    for path in raw_dir.glob("*.json"):
+        name = path.name
+        if not name.startswith(prefix):
+            continue
+        ds = name[len(prefix):-len(suffix)]
+        if fnmatch.fnmatchcase(ds, pattern):
+            matched.add(ds)
+    return sorted(matched)
+
+
 def check_absolute_floors(
     current_dir: Path,
     floors: list[dict[str, Any]],
@@ -564,35 +598,43 @@ def check_absolute_floors(
     Each spec carries a ``direction`` ("min" or "max") — for ``direction="min"``
     the observed value must be >= threshold (e.g. throughput floors); for
     ``direction="max"`` it must be <= threshold (e.g. wall-time ceilings).
+
+    A spec's ``dataset`` may be a glob (``*`` / ``census_*`` / …); it expands to
+    every dataset of that ``(benchmark, format)`` present in the snapshot (see
+    :func:`_resolve_floor_datasets`) and the floor is evaluated independently
+    per matched dataset, so one entry can cover all tiers a triple ran at.
     """
     violations: list[FloorViolation] = []
     for spec in floors:
         benchmark = spec["benchmark"]
         fmt = spec["format"]
-        dataset = spec["dataset"]
         metric = spec["metric"]
         threshold = spec["threshold"]
         direction = spec["direction"]
-        # Scoped-out triples: skip silently. Without this, narrowing
-        # the run via --formats / --benchmarks turns into ~50 spurious
-        # "missing" violations per gate report.
-        if not _triple_was_run(current_dir, benchmark, fmt, dataset):
-            continue
-        observed = _load_current_raw_metric(
-            current_dir, benchmark, fmt, dataset, metric,
-        )
-        if observed is None:
-            violated = True
-        elif direction == "min":
-            violated = observed < threshold
-        else:  # direction == "max"
-            violated = observed > threshold
-        if violated:
-            violations.append(FloorViolation(
-                benchmark=benchmark, fmt=fmt, dataset=dataset,
-                metric=metric, threshold=threshold, observed=observed,
-                direction=direction,
-            ))
+        for dataset in _resolve_floor_datasets(
+            current_dir, benchmark, fmt, spec["dataset"],
+        ):
+            # Scoped-out triples: skip silently. Without this, narrowing
+            # the run via --formats / --benchmarks turns into ~50 spurious
+            # "missing" violations per gate report. (A glob `dataset` only
+            # resolves to triples that ran, so this is a no-op there.)
+            if not _triple_was_run(current_dir, benchmark, fmt, dataset):
+                continue
+            observed = _load_current_raw_metric(
+                current_dir, benchmark, fmt, dataset, metric,
+            )
+            if observed is None:
+                violated = True
+            elif direction == "min":
+                violated = observed < threshold
+            else:  # direction == "max"
+                violated = observed > threshold
+            if violated:
+                violations.append(FloorViolation(
+                    benchmark=benchmark, fmt=fmt, dataset=dataset,
+                    metric=metric, threshold=threshold, observed=observed,
+                    direction=direction,
+                ))
     return violations
 
 

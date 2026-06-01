@@ -374,6 +374,99 @@ def test_thresholds_yaml_requires_min_or_max(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Glob / `*` dataset matching in check_absolute_floors.
+# ---------------------------------------------------------------------------
+
+
+def _write_floor_raw(
+    raw_dir: Path, benchmark: str, fmt: str, dataset: str, metric: str,
+    value: float | None,
+) -> None:
+    """Write a minimal raw result JSON carrying ``metric`` (or omitting it
+    when ``value is None``) for one (benchmark, format, dataset) triple."""
+    extra = {} if value is None else {metric: value}
+    (raw_dir / f"{benchmark}__{fmt}__{dataset}.json").write_text(
+        json.dumps({"runs": [{"extra": extra}]})
+    )
+
+
+def _min_floors_yaml(
+    tmp_path: Path, dataset: str, *, benchmark: str = "cloud_push",
+    fmt: str = "scx_auto", metric: str = "throughput_mbps", minimum: float = 50.0,
+) -> Path:
+    thresh = tmp_path / f"thresholds_{abs(hash(dataset)) % 100000}.yaml"
+    thresh.write_text(
+        "absolute_floors:\n"
+        f"  - benchmark: {benchmark}\n"
+        f"    format: {fmt}\n"
+        f'    dataset: "{dataset}"\n'
+        f"    metric: {metric}\n"
+        f"    min: {minimum}\n"
+    )
+    return thresh
+
+
+def test_floor_glob_dataset_expands_to_all_matched(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # pbmc3k satisfies the >=50 floor; tabula violates it.
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "pbmc3k", "throughput_mbps", 100.0)
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "tabula_sapiens_100k", "throughput_mbps", 10.0)
+    floors = mod._load_thresholds_yaml(_min_floors_yaml(tmp_path, "*"))
+    vios = mod.check_absolute_floors(tmp_path, floors)
+    assert [(v.dataset, v.observed) for v in vios] == [("tabula_sapiens_100k", 10.0)]
+
+
+def test_floor_glob_prefix_pattern_matches_subset(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # All three violate, but only the census_* ones should be evaluated.
+    for ds in ("census_1m", "census_500k", "pbmc3k"):
+        _write_floor_raw(raw, "cloud_push", "scx_auto", ds, "throughput_mbps", 10.0)
+    floors = mod._load_thresholds_yaml(_min_floors_yaml(tmp_path, "census_*"))
+    vios = mod.check_absolute_floors(tmp_path, floors)
+    assert sorted(v.dataset for v in vios) == ["census_1m", "census_500k"]
+
+
+def test_floor_glob_no_match_is_skipped(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # Only cloud_push ran; a glob floor on a benchmark that didn't run matches
+    # nothing and is silently skipped (scoped-out semantics).
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "pbmc3k", "throughput_mbps", 10.0)
+    floors = mod._load_thresholds_yaml(_min_floors_yaml(tmp_path, "*", benchmark="cloud_pull"))
+    assert mod.check_absolute_floors(tmp_path, floors) == []
+
+
+def test_floor_glob_missing_metric_per_dataset(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # ds_ok carries the metric (passes); ds_bad ran but omits it → observed=None
+    # must still surface as a violation under globbing.
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "ds_ok", "throughput_mbps", 100.0)
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "ds_bad", "throughput_mbps", None)
+    floors = mod._load_thresholds_yaml(_min_floors_yaml(tmp_path, "*"))
+    vios = mod.check_absolute_floors(tmp_path, floors)
+    assert [(v.dataset, v.observed) for v in vios] == [("ds_bad", None)]
+
+
+def test_floor_exact_dataset_unchanged(tmp_path: Path) -> None:
+    mod = _import_gate_module()
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    # Both violate, but an exact (non-glob) floor only evaluates its one dataset.
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "pbmc3k", "throughput_mbps", 10.0)
+    _write_floor_raw(raw, "cloud_push", "scx_auto", "tabula_sapiens_100k", "throughput_mbps", 10.0)
+    floors = mod._load_thresholds_yaml(_min_floors_yaml(tmp_path, "pbmc3k"))
+    vios = mod.check_absolute_floors(tmp_path, floors)
+    assert [v.dataset for v in vios] == ["pbmc3k"]
+
+
+# ---------------------------------------------------------------------------
 # Flakiness ledger.
 # ---------------------------------------------------------------------------
 

@@ -20,7 +20,11 @@
 #   SCX_BENCH_GPU_ENV — conda env name; defaults to scx-bench-gpu
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Under SLURM the script runs from a spooled copy, so ${BASH_SOURCE[0]} does
+# not point into the repo — prefer $SLURM_SUBMIT_DIR (the dir sbatch was
+# invoked from; submit from the repo root). Fall back to BASH_SOURCE for
+# direct (non-SLURM) execution.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 cd "$REPO_ROOT"
 mkdir -p benchmarks/comprehensive/logs
 source .env
