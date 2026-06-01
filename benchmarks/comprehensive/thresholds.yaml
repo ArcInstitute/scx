@@ -34,9 +34,22 @@ absolute_floors:
   # planner/dispatch silently dropped off the intended CSC-direct path. See
   # docs/performance.md § pdex_ref GPU v3-CSC and the accelerator route
   # metadata on adata.uns["scx_accel"].
+  #
+  # Gated on two tiers: pbmc3k (single CSC shard — the minimal route check)
+  # and tabula_sapiens_100k, which exercises the **multi-shard** CSC-direct
+  # path (multi-shard CSC iteration + range prefiltering) that pbmc3k can't
+  # reach. Both are no-ops unless a run sets SCX_GPU_DE_V3=1 with a CSC
+  # fixture; then a silent multi-shard CSC->CSR fallback at scale fails the
+  # gate. `check_absolute_floors` skips either
+  # triple silently on runs that didn't execute it.
   - benchmark: accel_de
     format: accel_de__pyscx_pdex_ref_gpu
     dataset: pbmc3k
+    metric: de_route_csc_direct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: tabula_sapiens_100k
     metric: de_route_csc_direct
     min: 1.0
   # Cloud push/pull throughput — migrated from the retired
