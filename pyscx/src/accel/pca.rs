@@ -355,6 +355,16 @@ pub fn pca(
     // records as UnsupportedInputLayout (vs NoCuda when CUDA is simply absent).
     // The covariance-vs-randomized choice is orthogonal math policy and stays in
     // adata.uns["pca"]["backend"], not the route string.
+    //
+    // INVARIANT (pre-dispatch stamp): this is safe to stamp *before* dispatch
+    // only because (a) `pca_gpu_eligible` is the *same* probe the GPU dispatch
+    // re-checks below (`gpu_device_id` is `Some` iff
+    // `cusparse_modern_abi_available()`), and (b) the GPU kernel propagates
+    // errors via `.map_err(..)?` rather than silently falling back to CPU — so
+    // the only way to reach the CPU path is one this probe already predicted.
+    // If a silent GPU→CPU runtime fallback is ever added here, switch to
+    // stamping *after* dispatch on the branch that actually ran (see umap.rs),
+    // or this gate will false-pass.
     #[cfg(feature = "gpu")]
     let pca_gpu_eligible = scx_accel::cusparse_modern_abi_available();
     #[cfg(not(feature = "gpu"))]

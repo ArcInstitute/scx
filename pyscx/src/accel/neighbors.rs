@@ -71,6 +71,15 @@ pub fn neighbors(
     // route is cuVS CAGRA, gated on the cuVS library being present; a GPU host
     // without cuVS falls back to CPU HNSW (UnsupportedInputLayout) vs NoCuda
     // when CUDA is absent.
+    //
+    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
+    // because (a) `knn_gpu_eligible` is the *same* `cuvs_available()` probe the
+    // GPU branch re-checks below — the one runtime CPU fall-through (cuVS
+    // missing) is therefore already predicted by this probe — and (b) the cuVS
+    // CAGRA build propagates errors via `.map_err(..)?` rather than silently
+    // dropping to CPU HNSW. If a silent GPU→CPU runtime fallback is ever added,
+    // stamp *after* dispatch on the branch that ran (see umap.rs) or this gate
+    // will false-pass.
     #[cfg(feature = "gpu")]
     let knn_gpu_eligible = scx_accel::cuvs_available();
     #[cfg(not(feature = "gpu"))]
