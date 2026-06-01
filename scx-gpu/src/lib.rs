@@ -89,10 +89,10 @@ pub use gpu_diffexp::{
     de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
     gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
     gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
-    gpu_de_scatter_gene_major, gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major,
-    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
-    set_de_v2_enabled_override, set_de_v3_enabled_override, GpuDeChunkScratch,
-    GPU_DE_BLOCK_SORT_CAPACITY,
+    gpu_de_scatter_gene_major, gpu_de_scatter_gene_major_dev, gpu_de_scatter_shard_to_dense,
+    gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, gpu_de_upload_chunk, set_de_v2_enabled_override, set_de_v3_enabled_override,
+    GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
