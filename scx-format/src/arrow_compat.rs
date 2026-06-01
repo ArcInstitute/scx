@@ -83,6 +83,53 @@ pub fn downcast_large_types_schema(schema: &Schema) -> Schema {
     Schema::new(new_fields).with_metadata(schema.metadata().clone())
 }
 
+/// Cast every `Dictionary(K, V)` column's key (index) type to `Int32` so that
+/// concatenating per-shard categoricals during sharded-metadata assembly cannot
+/// overflow a narrow per-shard key (`Int8`/`Int16`) once the combined vocabulary
+/// across shards exceeds that key's range. The value type `V` is preserved;
+/// non-dictionary (and already-`Int32`-keyed) columns pass through unchanged.
+///
+/// Implemented as decode→re-encode (`cast` to the value type, then `cast` to
+/// `Dictionary(Int32, V)`) — the same cast pattern `unify_dictionary_columns`
+/// relies on, robust across arrow key-type combinations. `Int32` is always wide
+/// enough: the combined pre-dedup dictionary length is bounded by the total row
+/// count, far below `i32::MAX`. Field- and schema-level metadata (notably the
+/// `pandas` index envelope) are preserved.
+pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let needs = schema.fields().iter().any(
+        |f| matches!(f.data_type(), DataType::Dictionary(k, _) if k.as_ref() != &DataType::Int32),
+    );
+    if !needs {
+        return Ok(batch.clone());
+    }
+    let mut new_fields = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        match field.data_type() {
+            DataType::Dictionary(k, value_type) if k.as_ref() != &DataType::Int32 => {
+                let values = arrow::compute::cast(col, value_type.as_ref())?;
+                let wide_dt = DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
+                new_columns.push(arrow::compute::cast(&values, &wide_dt)?);
+                new_fields.push(
+                    Field::new(field.name(), wide_dt, field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                );
+            }
+            _ => {
+                new_columns.push(col.clone());
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+    }
+    let new_schema = Schema::new(new_fields).with_metadata(schema.metadata().clone());
+    Ok(RecordBatch::try_new(
+        std::sync::Arc::new(new_schema),
+        new_columns,
+    )?)
+}
+
 /// True if `col`'s value-offsets buffer can be re-expressed as `i32`
 /// (i.e. last offset ≤ `i32::MAX`). Returns `true` for any non-wide
 /// type. Used by the downcast path to decide between narrowing and
@@ -280,6 +327,39 @@ mod tests {
         ));
         let columns: Vec<ArrayRef> = fields.into_iter().map(|(_, _, arr)| arr).collect();
         RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    #[test]
+    fn widen_dictionary_keys_promotes_int8_to_int32_preserving_values() {
+        use arrow::datatypes::Int32Type;
+        let dict: DictionaryArray<Int8Type> = vec!["a", "b", "a", "c"].into_iter().collect();
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let batch = batch_from(vec![("ct", dict_dt, Arc::new(dict))]);
+
+        let widened = widen_dictionary_keys(&batch).unwrap();
+        assert_eq!(
+            widened.schema().field(0).data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+        );
+        let got = widened
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let values = got.values().as_any().downcast_ref::<StringArray>().unwrap();
+        let keys = got.keys();
+        let decoded: Vec<&str> = (0..got.len())
+            .map(|i| values.value(keys.value(i) as usize))
+            .collect();
+        assert_eq!(decoded, vec!["a", "b", "a", "c"]);
+    }
+
+    #[test]
+    fn widen_dictionary_keys_passes_through_non_dictionary() {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["x", "y"]));
+        let batch = batch_from(vec![("s", DataType::Utf8, arr)]);
+        let out = widen_dictionary_keys(&batch).unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
     }
 
     #[test]
