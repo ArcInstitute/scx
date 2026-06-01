@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=route_gate_verify
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu,gpu_batch
 #SBATCH --gres=gpu:1
 #SBATCH --time=08:00:00
-#SBATCH --mem=128G
-#SBATCH --cpus-per-task=16
+#SBATCH --mem=56G
+#SBATCH --cpus-per-task=8
 #SBATCH --output=/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/logs/route_gate_verify.%j.out
 #SBATCH --error=/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/logs/route_gate_verify.%j.err
 
@@ -19,6 +19,10 @@ unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK 2>/dev/null || true
 
 source /home/nickyoungblut/miniforge3/etc/profile.d/conda.sh
 conda activate scx-bench-gpu
+# .env activates the dev .venv (exports VIRTUAL_ENV); maturin refuses when
+# both VIRTUAL_ENV and CONDA_PREFIX are set. Drop VIRTUAL_ENV so maturin
+# targets the active conda env (scx-bench-gpu).
+unset VIRTUAL_ENV
 
 echo "=== GPU visible ==="
 nvidia-smi -L || true

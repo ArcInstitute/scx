@@ -80,27 +80,35 @@ absolute_floors:
   # variant's intended layout actually dispatched (a `_csc` variant ran a route
   # containing "csc", a `_csr` variant did not), 0.0 on a silent fallback
   # (require_csc() dropped to CSR because the sidecar build failed, or vice
-  # versa). Gated on tabula_sapiens_100k — its multi-shard CSC sidecar exercises
-  # the column slab read that pbmc3k's single shard can't. pseudobulk variants
-  # are omitted (pseudobulk_dex does not stamp a route yet).
+  # versa). pseudobulk variants are omitted (pseudobulk_dex does not stamp a
+  # route yet).
+  #
+  # Gated on pbmc3k. The multi-shard tabula_sapiens_100k variant is a deferred
+  # floor: `bench_csc_dispatch` builds its CSC fixture with
+  # `csc_cols_per_shard=5000` and opens it via `pyscx.open(...).to_anndata(
+  # backed=True)`, which currently raises "Dictionary key bigger than the key
+  # type" while assembling the 100k-cell multi-shard CSC backed AnnData (a
+  # pre-existing backed-open edge case, separate from route stamping). A
+  # tabula floor would be vacuous (the triple always errors in setup → skipped)
+  # until that open path is fixed.
   - benchmark: bench_csc_dispatch
     format: bench_csc__qc_metrics_csc
-    dataset: tabula_sapiens_100k
+    dataset: pbmc3k
     metric: csc_dispatch_correct
     min: 1.0
   - benchmark: bench_csc_dispatch
     format: bench_csc__hvg_csc
-    dataset: tabula_sapiens_100k
+    dataset: pbmc3k
     metric: csc_dispatch_correct
     min: 1.0
   - benchmark: bench_csc_dispatch
     format: bench_csc__de_csc
-    dataset: tabula_sapiens_100k
+    dataset: pbmc3k
     metric: csc_dispatch_correct
     min: 1.0
   - benchmark: bench_csc_dispatch
     format: bench_csc__pdex_ref_csc
-    dataset: tabula_sapiens_100k
+    dataset: pbmc3k
     metric: csc_dispatch_correct
     min: 1.0
 
