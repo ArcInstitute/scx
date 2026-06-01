@@ -277,6 +277,14 @@ def _extract_route(adata: Any, op: str) -> str | None:
         return None
 
 
+def _extract_fallback(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["fallback_reason"]``, or None."""
+    try:
+        return adata.uns["scx_accel"][op]["fallback_reason"]
+    except Exception:
+        return None
+
+
 def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     """Materialise the bench's prepared adata (groupby-tagged + subset to
     top groups) as a temp SCX file with a CSC sidecar.
@@ -631,6 +639,9 @@ def run(
         route = _extract_route(a, op_key)
         if route is not None:
             extras["gpu_dispatch_route"] = route
+            fallback = _extract_fallback(a, op_key)
+            if fallback is not None:
+                extras["gpu_dispatch_fallback"] = fallback
             if requires_gpu and kind == "pdex_ref":
                 # Numeric gate signal for the GPU pdex_ref triple. Always
                 # emitted (so the absolute-floor gate never sees a missing
@@ -648,6 +659,16 @@ def run(
                 expecting_csc = csc_fixture and v3_route
                 extras["de_route_csc_direct"] = (
                     1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
+                )
+            if requires_gpu and kind == "wilcoxon":
+                # Numeric gate signal for the GPU Wilcoxon triple. Wilcoxon has
+                # a single fixed v1 GPU kernel (`gpu_csr_v1` / `gpu_dense_v1`),
+                # so the contract is simply "a GPU route ran". The variant is
+                # skipped on non-GPU hosts (see the requires_gpu guard upstream),
+                # so a recorded route always means GPU was attempted; a cpu_*
+                # route here is a silent CPU fallback → 0.0 fails the gate.
+                extras["wilcoxon_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
                 )
 
         if requires_gpu and cpu_pvals is not None:

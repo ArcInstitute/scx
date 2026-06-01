@@ -177,6 +177,19 @@ def _run_pyscx_gpu_rand_chol(adata: Any, n_comps: int, seed: int) -> str:
     return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent.
+
+    Shared by the other accel benchmark modules (kNN / UMAP / Leiden /
+    preprocess), which import it from here, to keep the route-gate signal
+    convention identical across ops.
+    """
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
+        return None
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     # key: (implementation, requires_gpu)
     "accel_pca__scanpy_cpu": (_run_scanpy_cpu, False),
@@ -346,7 +359,7 @@ def run(
         rss_after = _get_rss_mb()
 
         # Cosine similarity vs scanpy reference (top-k PCs).
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
         try:
             emb = np.asarray(t_adata.obsm["X_pca"], dtype=np.float32)
             cos = _sign_agnostic_cosine_per_pc(ref_embedding, emb)
@@ -365,6 +378,19 @@ def run(
         except Exception as e:
             logger.warning("Cosine-sim check failed for %s run %d: %s",
                            variant_key, i + 1, e)
+
+        # Record the accelerator route + a numeric gate signal for the GPU
+        # variants. GPU PCA runs the cuSPARSE+cuBLAS route (gpu_csr_v1) for any
+        # X type, including in-memory scipy; the variant is skipped on non-GPU
+        # hosts, so a cpu_* route here is a silent fallback (e.g. the cuSPARSE
+        # modern-ABI probe failed) → 0.0 fails the gate.
+        route = _extract_route(t_adata, "pca")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["pca_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
 
         result.add_run(
             wall_s=wall,

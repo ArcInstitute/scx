@@ -28,6 +28,7 @@ from typing import Any, Callable
 import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
+    _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
@@ -211,7 +212,21 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
+
+        # Record the accelerator route for visibility (coverage banner /
+        # provenance). NOTE: this benchmark runs on in-memory scipy X, where
+        # normalize_total(device="gpu") legitimately falls back to the CPU
+        # path (no GPU kernel for materialized scipy/dense — see
+        # pyscx.accel.normalize_total docs), so the GPU variant records a
+        # cpu_* route here BY DESIGN. We therefore surface the route string
+        # but intentionally do NOT emit a `*_route_gpu_correct` numeric gate
+        # signal — a 1.0 floor would false-fail this expected CPU fallback.
+        # The route string makes that fallback observable instead of silent.
+        route = _extract_route(a, "normalize_total")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+
         try:
             if raw.n_obs > _MAX_DIFF_SUBSAMPLE_ROWS:
                 rng = np.random.default_rng(RANDOM_SEED)

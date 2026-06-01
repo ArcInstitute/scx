@@ -260,6 +260,30 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__pseudobulk_csc":  (_run_pseudobulk, "csc"),
 }
 
+# Variant key → adata.uns["scx_accel"] op key for route extraction. Ops that
+# stamp a route to `adata.uns["scx_accel"][op]["route"]` emit the numeric
+# `csc_dispatch_correct` gate signal so a silent CSC→CSR (or CSR→CSC) fallback
+# fails the gate. `pseudobulk_dex` does not stamp a route yet, so its variants
+# are omitted (the signal will appear automatically once it does).
+_VARIANT_OP_KEY: dict[str, str] = {
+    "bench_csc__qc_metrics_csr": "calculate_qc_metrics",
+    "bench_csc__qc_metrics_csc": "calculate_qc_metrics",
+    "bench_csc__hvg_csr": "highly_variable_genes",
+    "bench_csc__hvg_csc": "highly_variable_genes",
+    "bench_csc__de_csr": "rank_genes_groups",
+    "bench_csc__de_csc": "rank_genes_groups",
+    "bench_csc__pdex_ref_csr": "pdex_ref",
+    "bench_csc__pdex_ref_csc": "pdex_ref",
+}
+
+
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
+        return None
+
 
 def run(
     dataset: DatasetConfig,
@@ -321,11 +345,30 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
+
+        # Verify the intended layout actually dispatched. Read the route
+        # pyscx stamped on adata.uns and assert it matches `prefer`: a `_csc`
+        # variant must run a route containing "csc"; a `_csr` variant must NOT.
+        # 0.0 catches a silent fallback (e.g. require_csc() dropped to CSR
+        # because the sidecar build failed); the absolute-floor gate fails on
+        # it. Only emitted for ops that stamp a route (see _VARIANT_OP_KEY).
+        extras: dict[str, Any] = {}
+        op_key = _VARIANT_OP_KEY.get(key)
+        if op_key is not None:
+            route = _extract_route(adata, op_key)
+            if route is not None:
+                extras["dispatch_route"] = route
+                if prefer == "csc":
+                    extras["csc_dispatch_correct"] = 1.0 if "csc" in route else 0.0
+                else:
+                    extras["csc_dispatch_correct"] = 1.0 if "csc" not in route else 0.0
+
         result.add_run(
             wall_s=wall,
             user_s=u1 - u0,
             sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs rss=%.1f MB",
