@@ -378,6 +378,7 @@ mod tests {
         let cpu = cpu_baseline(&path, &gn, &gr, &names, None, 7);
         let gpu = gpu_v3(&path, &gn, &gr, &names, None, 7, false);
         assert_de_close(&cpu, &gpu, "csr fallback 1-vs-rest");
+        assert_eq!(gpu.exec_info.route, AccelRoute::GpuCsrV3);
     }
 
     /// (4) Route metadata: CSC sidecar → GpuCscV3; none → GpuCsrV3 (v3 on).

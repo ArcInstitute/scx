@@ -37,6 +37,7 @@ from benchmarks.comprehensive.scripts.compare_against_baseline import (  # noqa:
 _NEW_ROUTE_METRICS = {
     "de_route_csc_direct",
     "wilcoxon_route_gpu_correct",
+    "wilcoxon_route_csc_direct",
     "csc_dispatch_correct",
     "pca_route_gpu_correct",
     "knn_route_gpu_correct",
