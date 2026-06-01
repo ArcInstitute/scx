@@ -661,14 +661,26 @@ def run(
                     1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
                 )
             if requires_gpu and kind == "wilcoxon":
-                # Numeric gate signal for the GPU Wilcoxon triple. Wilcoxon has
-                # a single fixed v1 GPU kernel (`gpu_csr_v1` / `gpu_dense_v1`),
-                # so the contract is simply "a GPU route ran". The variant is
-                # skipped on non-GPU hosts (see the requires_gpu guard upstream),
-                # so a recorded route always means GPU was attempted; a cpu_*
-                # route here is a silent CPU fallback → 0.0 fails the gate.
+                # Numeric gate signal for the GPU Wilcoxon triple. The variant
+                # is skipped on non-GPU hosts (see the requires_gpu guard
+                # upstream), so a recorded route always means GPU was attempted;
+                # a cpu_* route here is a silent CPU fallback → 0.0 fails the
+                # gate. Holds for both the v1 dense path and the v3 routes.
                 extras["wilcoxon_route_gpu_correct"] = (
                     1.0 if route.startswith("gpu_") else 0.0
+                )
+                # CSC-direct route assertion, mirroring pdex_ref's
+                # `de_route_csc_direct`. 1.0 when the CSC-direct v3 route ran
+                # (or wasn't expected this run); 0.0 on a *silent fallback* —
+                # a CSC sidecar fixture was built and v3 ran, yet a non-CSC
+                # route was recorded. v3 intent is read from the recorded route
+                # (both v3 routes are emitted only when SCX_GPU_DE_V3 was on),
+                # so this can't drift from pyscx's own flag handling.
+                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                v3_route = route in ("gpu_csc_v3", "gpu_csr_v3")
+                expecting_csc = csc_fixture and v3_route
+                extras["wilcoxon_route_csc_direct"] = (
+                    1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
                 )
 
         if requires_gpu and cpu_pvals is not None:

@@ -321,6 +321,13 @@ fn run_rank_genes_groups_inner(
         // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
+        // If a CSC sidecar reader exists on the dataset, hand it to the GPU
+        // streaming path so v3 (`SCX_GPU_DE_V3=1`) can dispatch to the
+        // CSC-direct Wilcoxon driver. None falls through to the v3 CSR-direct
+        // fallback (or v1 when v3 is disabled). Mirrors the pdex_ref backed
+        // path. Only bind under the gpu feature — the CPU branch takes no CSC.
+        #[cfg(feature = "gpu")]
+        let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
         drop(backed);
         match gpu_device_id {
             #[cfg(feature = "gpu")]
@@ -330,7 +337,7 @@ fn run_rank_genes_groups_inner(
                         device_id,
                         scx_accel::GpuDeShardInput::Backed {
                             csr: &reader,
-                            csc: None,
+                            csc: csc_reader.as_deref(),
                         },
                         &gene_names,
                         &groups,
