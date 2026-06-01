@@ -40,7 +40,7 @@ absolute_floors:
   # path (multi-shard CSC iteration + range prefiltering) that pbmc3k can't
   # reach. Both are no-ops unless a run sets SCX_GPU_DE_V3=1 with a CSC
   # fixture; then a silent multi-shard CSC->CSR fallback at scale fails the
-  # gate (ACC-RUST-OPT-V2 §4.3 Gap 2). `check_absolute_floors` skips either
+  # gate. `check_absolute_floors` skips either
   # triple silently on runs that didn't execute it.
   - benchmark: accel_de
     format: accel_de__pyscx_pdex_ref_gpu
