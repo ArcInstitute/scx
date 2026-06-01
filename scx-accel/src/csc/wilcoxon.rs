@@ -486,6 +486,21 @@ mod tests {
         let cpu = cpu_baseline(&path, &gn, &gr, &names, None, 7);
         let gpu = gpu_v3(&path, &gn, &gr, &names, None, 7, true);
         assert_de_close(&cpu, &gpu, "csc multi-shard");
+
+        // §B.10 criterion 4: range prefiltering decoded strictly fewer CSC
+        // shards than the no-prefilter worst case (n_csc_shards × n_chunks).
+        let n_vars = gn.len();
+        let n_chunks = n_vars.div_ceil(7); // gene_chunk_size = 7
+        let n_csc_shards = n_vars.div_ceil(4); // cols_per_csc_shard = 4
+        let decoded = gpu
+            .exec_info
+            .shards_decoded
+            .expect("shards_decoded recorded on v3 CSC route");
+        assert!(
+            decoded > 0 && decoded < n_csc_shards * n_chunks,
+            "expected prefiltered shard count in (0, {}), got {decoded}",
+            n_csc_shards * n_chunks
+        );
     }
 
     /// (9) v3 CSC-direct vs the v1 dense-chunk path on the same fixture

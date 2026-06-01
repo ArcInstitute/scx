@@ -285,6 +285,16 @@ def _extract_fallback(adata: Any, op: str) -> str | None:
         return None
 
 
+def _extract_shards_decoded(adata: Any, op: str) -> int | None:
+    """Read ``adata.uns["scx_accel"][op]["shards_decoded"]`` (CSC/CSR-direct v3
+    route telemetry), or None when absent / not tracked."""
+    try:
+        v = adata.uns["scx_accel"][op]["shards_decoded"]
+        return None if v is None else int(v)
+    except Exception:
+        return None
+
+
 def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     """Materialise the bench's prepared adata (groupby-tagged + subset to
     top groups) as a temp SCX file with a CSC sidecar.
@@ -642,6 +652,14 @@ def run(
             fallback = _extract_fallback(a, op_key)
             if fallback is not None:
                 extras["gpu_dispatch_fallback"] = fallback
+            # §B.10 crit. 1 artifact field: how many CSC/CSR shards the v3 driver
+            # decoded+uploaded across the call. On the CSC-direct route this is
+            # below n_csc_shards × n_gene_chunks (range prefiltering); deterministic
+            # validation lives in the scx-accel `csc::{pdex,wilcoxon}` multi-shard
+            # tests. Recorded here for the route-marked artifact and dashboards.
+            shards_decoded = _extract_shards_decoded(a, op_key)
+            if shards_decoded is not None:
+                extras["shards_decoded"] = float(shards_decoded)
             if requires_gpu and kind == "pdex_ref":
                 # Numeric gate signal for the GPU pdex_ref triple. Always
                 # emitted (so the absolute-floor gate never sees a missing
