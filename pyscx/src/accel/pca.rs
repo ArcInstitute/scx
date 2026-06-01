@@ -62,9 +62,9 @@ impl ShardSource for ScxCsrSource<'_> {
 ///
 /// `BorrowedCsrSource` skips the first copy by holding `&[T]` views into
 /// numpy buffers (kept alive by the [`CsrSlices`] handle held by the
-/// caller). `read_shard` is invoked exactly once by
-/// `DoubleBufferedShardLoader::for_each_shard` for a single-shard source,
-/// so `slice.to_vec()` here replaces *both* the original `extract::<Vec>`
+/// caller). `read_shard` is invoked exactly once by the GPU shard loader
+/// for a single-shard source, so `slice.to_vec()` here replaces *both* the
+/// original `extract::<Vec>`
 /// step and the `ScxCsrSource::read_shard` clone — net one memcpy per
 /// dispatch instead of two.
 #[cfg(feature = "gpu")]

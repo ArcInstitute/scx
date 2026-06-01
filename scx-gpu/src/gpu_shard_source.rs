@@ -4,8 +4,7 @@
 //! a sequence of GPU-resident CSR shards that consumers iterate over
 //! without materialising the full matrix on the host.
 //!
-//! Compared to [`crate::shard_pipeline::DoubleBufferedShardLoader`], the
-//! `GpuShardSource` abstraction:
+//! Key properties of the `GpuShardSource` abstraction:
 //!
 //! - Reuses the **same device CSR buffers** ([`crate::staging::GpuCsrSlot`])
 //!   across all shards, avoiding the per-shard `dev.alloc_zeros` round-trip.

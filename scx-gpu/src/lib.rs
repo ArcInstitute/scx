@@ -68,7 +68,6 @@ pub mod linear_operator;
 pub mod preprocessed_gpu_matrix_source;
 pub mod rice_gpu;
 pub mod shard_decode;
-pub mod shard_pipeline;
 pub mod sparse_dense;
 pub mod staging;
 
@@ -124,7 +123,6 @@ pub use linear_operator::CenteredSparseOperator;
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
-pub use shard_pipeline::DoubleBufferedShardLoader;
 pub use sparse_dense::{
     sparse_to_dense_gpu, sparse_to_dense_gpu_into, sparse_to_dense_gpu_into_view,
 };

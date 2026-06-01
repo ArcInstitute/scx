@@ -53,8 +53,8 @@ pub trait ShardSource {
     /// Maximum number of rows across all shards.
     ///
     /// Used by GPU callers to size per-shard scratch buffers up-front
-    /// (e.g., `DoubleBufferedShardLoader` pinned slots, covariance-PCA
-    /// Gram densification scratch).
+    /// (e.g., GPU pinned-slot staging, covariance-PCA Gram densification
+    /// scratch).
     ///
     /// The default implementation reads every shard once — correct but
     /// potentially expensive. Implementors with O(1) access to shard
