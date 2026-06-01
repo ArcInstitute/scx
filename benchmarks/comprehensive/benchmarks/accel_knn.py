@@ -41,6 +41,7 @@ import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
     PcaFixture,
+    _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
@@ -230,12 +231,23 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
         try:
             recalls.append(_recall_at_k(ref_conn, a.obsp["connectivities"]))
             extras["recall_vs_scanpy"] = recalls[-1]
         except Exception as e:
             logger.warning("recall-check failed for %s run %d: %s", key, i + 1, e)
+
+        # Route + GPU gate signal. GPU kNN runs cuVS CAGRA (gpu_csr_v1); the
+        # variant is skipped on non-GPU hosts, so a cpu_* route is a silent
+        # fallback (cuVS unavailable) → 0.0 fails the gate.
+        route = _extract_route(a, "neighbors")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["knn_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
 
         result.add_run(
             wall_s=wall,

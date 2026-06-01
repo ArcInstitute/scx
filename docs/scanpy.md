@@ -1322,6 +1322,15 @@ conclusions — a silent CSR fallback measured as "GPU DE" is exactly the
 benchmarking trap the [route metadata](api.md#accelerator-route-metadata) exists
 to catch.
 
+**Benchmark route gates.** The benchmark suite enforces correct GPU dispatch
+via absolute-floor gates in `thresholds.yaml`. Every `accel_*.py` GPU variant
+emits an `<op>_route_gpu_correct` signal (1.0 when a GPU route ran, 0.0 on a
+silent CPU fallback); `bench_csc_dispatch.py` emits `csc_dispatch_correct` for
+CSC-labelled variants; and `accel_de.py` emits `de_route_csc_direct` for the
+pdex_ref CSC-direct path. See
+[benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating)
+for the full gate table.
+
 ### PCA (`pyscx.accel.pca`)
 
 Two methods, auto-routed by the number of variables:

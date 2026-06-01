@@ -11,7 +11,10 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scx_accel::route::{plan_de_route, AccelExecutionInfo, DeviceRequest, InputLayout};
+use scx_accel::route::{
+    plan_de_route, plan_hvg_route, plan_simple_gpu_route, AccelExecutionInfo, AccelRoute,
+    DeviceRequest, InputLayout,
+};
 
 /// Serialise an [`AccelExecutionInfo`] into a Python dict. `Option` fields map
 /// to `None`/value.
@@ -70,6 +73,45 @@ pub(crate) fn cpu_exec_info(
     );
     info.chunk_size = chunk_size;
     info
+}
+
+/// Build the execution info for an HVG dispatch via the single planner.
+///
+/// `gpu_eligible` is `true` only for the `seurat_v3` flavor family (the one
+/// flavor with a GPU kernel) and never for the CSC-preferred path. The caller
+/// passes the resolved `device` string and the actual flavor so the recorded
+/// route matches the code that ran.
+pub(crate) fn hvg_exec_info(
+    device: &str,
+    gpu_eligible: bool,
+    prefer_csc: bool,
+) -> AccelExecutionInfo {
+    plan_hvg_route(
+        device_request(device),
+        gpu_available(),
+        gpu_eligible,
+        prefer_csc,
+    )
+}
+
+/// Build the execution info for a single-route op (PCA / kNN / UMAP / Leiden /
+/// preprocessing) via the generic planner. `gpu_eligible` reflects whether the
+/// op's GPU library was actually usable at dispatch (cuVS / cuML / cuGraph /
+/// cuSPARSE present); `gpu_route` / `cpu_route` are the op's CSR- or
+/// dense-shaped route pair.
+pub(crate) fn simple_exec_info(
+    device: &str,
+    gpu_eligible: bool,
+    gpu_route: AccelRoute,
+    cpu_route: AccelRoute,
+) -> AccelExecutionInfo {
+    plan_simple_gpu_route(
+        device_request(device),
+        gpu_available(),
+        gpu_eligible,
+        gpu_route,
+        cpu_route,
+    )
 }
 
 /// Whether a CUDA GPU is available (always `false` without the `gpu` feature).

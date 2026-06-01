@@ -66,7 +66,8 @@ pub use pseudobulk::{
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
 pub use route::{
-    plan_de_route, AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout,
+    plan_de_route, plan_hvg_route, plan_simple_gpu_route, AccelExecutionInfo, AccelRoute,
+    DeviceRequest, FallbackReason, InputLayout,
 };
 pub use umap::{compute_umap, UmapResult};
 

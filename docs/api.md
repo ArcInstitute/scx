@@ -1166,13 +1166,29 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 
 #### Accelerator route metadata
 
-Every differential-expression call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`, where `<op>` is `"pdex_ref"`, `"rank_genes_groups"`, or `"rank_genes_groups_df"`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`. The dict carries:
+Every `pyscx.accel.*` call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`. The dict carries:
 
 - `route` — the concrete path taken. One of `cpu_dense`, `cpu_csr`, `cpu_csc`, `gpu_dense_v1`, `gpu_csr_v1`, `gpu_csr_v2`, `gpu_csr_v3`, `gpu_csc_v3` (the column-major perf path), or `gpu_device_resident` (reserved).
 - `fallback_reason` — why the ideal route wasn't taken: `none`, `no_cuda`, `no_csc_sidecar`, `unsupported_dimensions`, `unsupported_input_layout`, `user_forced_cpu`, or `perf_policy`.
 - `chunk_size`, `csc_available`, `graph_replay`, `shards_decoded`, `shards_uploaded` — optional detail (`None` when not tracked).
 
-This is the canonical way to confirm which path ran when comparing CPU vs GPU performance — GPU is fastest only when the input layout matches the op. The CSC-direct route (`route == "gpu_csc_v3"`) requires a backed SCX file with a CSC sidecar and `SCX_GPU_DE_V3=1`; in-memory CSR inputs report `gpu_csr_v3` with `fallback_reason == "no_csc_sidecar"`. The route is decided by a single internal planner (`scx_accel::route::plan_de_route`) that also *drives* dispatch — the GPU `pdex_ref` entry points `match` on the planned route to select the kernel, and CPU dispatch calls the same planner — so the recorded value always matches the kernel that executed. (Wilcoxon GPU has a single fixed v1 kernel, so `rank_genes_groups` / `rank_genes_groups_df` always record `gpu_csr_v1` / `gpu_dense_v1` on GPU regardless of `SCX_GPU_DE_V3`; only `pdex_ref` reaches the v2/v3/CSC routes.) The legacy `SCX_GPU_DE_V3_TRACE` stderr trace remains only as a debug fallback.
+**Op keys:**
+
+| Op key | Covers |
+|--------|--------|
+| `"pdex_ref"` | `pyscx.accel.pdex_ref` |
+| `"rank_genes_groups"` | `pyscx.accel.rank_genes_groups` |
+| `"rank_genes_groups_df"` | `pyscx.accel.rank_genes_groups_df` |
+| `"highly_variable_genes"` | `pyscx.accel.highly_variable_genes` |
+| `"pca"` | `pyscx.accel.pca` |
+| `"knn"` | `pyscx.accel.neighbors` |
+| `"umap"` | `pyscx.accel.umap` |
+| `"leiden"` | `pyscx.accel.leiden` |
+| `"harmony"` | `pyscx.accel.harmony_integrate` |
+| `"normalize_total"` | `pyscx.accel.normalize_total` |
+| `"log1p"` | `pyscx.accel.log1p` |
+
+This is the canonical way to confirm which path ran when comparing CPU vs GPU performance — GPU is fastest only when the input layout matches the op. The CSC-direct route (`route == "gpu_csc_v3"`) requires a backed SCX file with a CSC sidecar and `SCX_GPU_DE_V3=1`; in-memory CSR inputs report `gpu_csr_v3` with `fallback_reason == "no_csc_sidecar"`. The route is decided by a single internal planner (`scx_accel::route::plan_de_route`) that also *drives* dispatch — the GPU `pdex_ref` entry points `match` on the planned route to select the kernel, and CPU dispatch calls the same planner — so the recorded value always matches the kernel that executed. (Wilcoxon GPU has a single fixed v1 kernel, so `rank_genes_groups` / `rank_genes_groups_df` always record `gpu_csr_v1` / `gpu_dense_v1` on GPU regardless of `SCX_GPU_DE_V3`; only `pdex_ref` reaches the v2/v3/CSC routes.) Route-specific benchmark gates in `thresholds.yaml` enforce correct dispatch across all GPU ops — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating). The legacy `SCX_GPU_DE_V3_TRACE` stderr trace remains only as a debug fallback.
 
 ### ScxBackedSparseDataset
 

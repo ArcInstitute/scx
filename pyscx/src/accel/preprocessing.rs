@@ -98,6 +98,27 @@ pub fn normalize_total(
     // paths leave it cleared.
     clear_gpu_normalize_marker(adata)?;
 
+    // Record the planned route. The GPU shard-streaming kernel runs only for
+    // backed / lazy X; a scipy/dense X has no GPU kernel and falls back to the
+    // CPU path (UnsupportedInputLayout on a GPU host). The CPU path itself is
+    // lazy (it wraps X), recorded as cpu_csr.
+    let np_eligible = {
+        let xp = adata.getattr("X")?;
+        xp.cast::<ScxBackedSparseDataset>().is_ok()
+            || xp.cast::<ScxLazyTransformedDataset>().is_ok()
+    };
+    super::route::write_accel_route(
+        py,
+        adata,
+        "normalize_total",
+        &super::route::simple_exec_info(
+            device,
+            np_eligible,
+            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
+
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
         return gpu_normalize_total(py, adata, target_sum, device_id, device);
@@ -209,6 +230,32 @@ pub fn normalize_total(
 pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
 
+    // Record the planned route. The GPU kernel runs when a normalize+log1p
+    // fusion marker is present (re-runs over the ORIGINAL source) or when X is
+    // still backed / lazy; a materialized scipy/dense X falls back to CPU
+    // (UnsupportedInputLayout on a GPU host). The CPU path is lazy (cpu_csr).
+    let log1p_eligible = {
+        let has_marker = !adata
+            .getattr("uns")?
+            .call_method1("get", (GPU_NORMALIZE_MARKER_KEY, py.None()))?
+            .is_none();
+        let xp = adata.getattr("X")?;
+        has_marker
+            || xp.cast::<ScxBackedSparseDataset>().is_ok()
+            || xp.cast::<ScxLazyTransformedDataset>().is_ok()
+    };
+    super::route::write_accel_route(
+        py,
+        adata,
+        "log1p",
+        &super::route::simple_exec_info(
+            device,
+            log1p_eligible,
+            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
+
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _device.gpu_id() {
         return gpu_log1p_dispatch(py, adata, device_id, device);
@@ -295,6 +342,23 @@ pub fn calculate_qc_metrics<'py>(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+
+    // Record the planned route. QC metrics have no GPU kernel; the only route
+    // choice is the gene-axis layout — cpu_csc when prefer_format="csc" (reads
+    // the gene-major sidecar), cpu_csr otherwise. This is the route the CSC
+    // dispatch gate asserts.
+    let qc_route = if prefer_format == "csc" {
+        scx_accel::AccelRoute::CpuCsc
+    } else {
+        scx_accel::AccelRoute::CpuCsr
+    };
+    super::route::write_accel_route(
+        py,
+        adata,
+        "calculate_qc_metrics",
+        &scx_accel::AccelExecutionInfo::new(qc_route, scx_accel::FallbackReason::None),
+    )?;
+
     let x = adata.getattr("X")?;
     let qc_vars = qc_vars.unwrap_or_default();
 

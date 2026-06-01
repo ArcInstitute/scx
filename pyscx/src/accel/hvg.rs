@@ -149,6 +149,13 @@ pub fn highly_variable_genes<'py>(
                  set device='cpu' (or 'auto') or use prefer_format='csr'"
             )));
         }
+        // CSC has no GPU kernel and runs CPU-only: record the cpu_csc route.
+        super::route::write_accel_route(
+            py,
+            adata,
+            "highly_variable_genes",
+            &super::route::hvg_exec_info(device, false, true),
+        )?;
         return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor);
     }
     let resolved = super::gpu::resolve_device(device)?;
@@ -183,6 +190,29 @@ pub fn highly_variable_genes<'py>(
         let _ = resolved;
         None
     };
+
+    // Record the planned route on adata.uns["scx_accel"]["highly_variable_genes"]
+    // before dispatch. Only the seurat_v3 family has a GPU kernel; "seurat" and
+    // "cell_ranger" are CPU-only (gpu_eligible=false records
+    // UnsupportedInputLayout on a GPU host rather than implying CUDA was
+    // absent). This single stamp covers the backed / lazy / in-memory native
+    // paths and the scanpy fallback — they share `device` + `flavor`.
+    //
+    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
+    // because (a) `hvg_gpu_eligible` mirrors the same flavor gate that derives
+    // `effective_gpu_id` above (GPU runs iff the flavor is seurat_v3 family and
+    // CUDA is present), and (b) the streaming seurat_v3 GPU kernel propagates
+    // errors via `.map_err(..)?` rather than silently falling back to CPU — so
+    // the recorded `gpu_csr_v1` route always reflects the code that ran. If a
+    // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
+    // the branch that ran (see umap.rs) or this gate will false-pass.
+    let hvg_gpu_eligible = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
+    super::route::write_accel_route(
+        py,
+        adata,
+        "highly_variable_genes",
+        &super::route::hvg_exec_info(device, hvg_gpu_eligible, false),
+    )?;
 
     // F3: read the source matrix from `adata.layers[layer]` when a
     // layer is named (scanpy parity); otherwise from `adata.X`. The

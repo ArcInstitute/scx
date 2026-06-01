@@ -67,6 +67,35 @@ pub fn neighbors(
     let flat = arr.call_method0("ravel")?;
     let data: Vec<f32> = flat.extract()?;
 
+    // Record the planned route on adata.uns["scx_accel"]["neighbors"]. The GPU
+    // route is cuVS CAGRA, gated on the cuVS library being present; a GPU host
+    // without cuVS falls back to CPU HNSW (UnsupportedInputLayout) vs NoCuda
+    // when CUDA is absent.
+    //
+    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
+    // because (a) `knn_gpu_eligible` is the *same* `cuvs_available()` probe the
+    // GPU branch re-checks below — the one runtime CPU fall-through (cuVS
+    // missing) is therefore already predicted by this probe — and (b) the cuVS
+    // CAGRA build propagates errors via `.map_err(..)?` rather than silently
+    // dropping to CPU HNSW. If a silent GPU→CPU runtime fallback is ever added,
+    // stamp *after* dispatch on the branch that ran (see umap.rs) or this gate
+    // will false-pass.
+    #[cfg(feature = "gpu")]
+    let knn_gpu_eligible = scx_accel::cuvs_available();
+    #[cfg(not(feature = "gpu"))]
+    let knn_gpu_eligible = false;
+    super::route::write_accel_route(
+        py,
+        adata,
+        "neighbors",
+        &super::route::simple_exec_info(
+            device,
+            knn_gpu_eligible,
+            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
+
     // GPU path
     #[cfg(feature = "gpu")]
     if let Some(device_id) = _gpu_id {
