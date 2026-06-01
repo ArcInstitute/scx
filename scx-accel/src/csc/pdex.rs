@@ -546,4 +546,119 @@ mod tests {
             }
         }
     }
+
+    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v1_backed_multichunk_graph_capture`.
+    /// `wilcoxon_chunk_gpu_sequence` had the same CUDA-graph-capture htod bug
+    /// (its `gpu_de_scatter_gene_major` calls copied the pool + per-test-group
+    /// permutations host→device inside the captured region), fixed by the same
+    /// pre-upload-once + `_dev` scatter change. Wilcoxon has no v2/v3/CSC route,
+    /// so a backed input always runs the v1 dense-chunk driver. Exercised in
+    /// **ref-mode** (`reference = Some(0)`) to cover the per-test-group
+    /// combined-tie + `tie_per_group` staging branch of the captured sequence.
+    /// Backed multi-shard + multi-chunk (`gene_chunk_size=7`, `n_vars=20`) +
+    /// graphs forced ON; must match the CPU streaming reference. (The dense
+    /// `test_wilcoxon_gpu_*_graph_vs_direct_parity` tests are single-chunk and
+    /// never trigger capture.)
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_wilcoxon_gpu_v1_backed_multichunk_graph_capture() {
+        use crate::diffexp::wilcoxon_rank_sum_streaming;
+        use scx_gpu::device::GpuDevice;
+        if GpuDevice::new(0).is_err() {
+            eprintln!("CUDA not available — skipping GPU graph-capture regression test");
+            return;
+        }
+        let n_obs = 64usize;
+        let n_vars = 20usize;
+        let cols_per_csc_shard = 7usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let dir = tempdir().unwrap();
+        let path = write_csr_csc_test_file(
+            dir.path(),
+            "wilcoxon_gpu_v1_graph_capture",
+            n_obs,
+            n_vars,
+            &dense,
+            cols_per_csc_shard,
+        );
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let group_names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+        let reference = Some(0usize);
+        let log_transformed = false;
+        let rankby_abs = false;
+        let tie_correct = true;
+
+        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let cpu_res = wilcoxon_rank_sum_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            7, // gene_chunk_size — multi-chunk on n_vars=20 (3 chunks)
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+        )
+        .expect("CPU streaming wilcoxon failed");
+
+        // Force graph capture ON over the backed multi-shard reader (Wilcoxon
+        // is always the v1 dense-chunk driver — no v2/v3/CSC override needed).
+        let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
+        let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let gpu_res = crate::diffexp_gpu::wilcoxon_rank_sum_gpu(
+            0,
+            crate::diffexp_gpu::GpuDeShardInput::Backed {
+                csr: &csr_reader_gpu,
+                csc: None,
+            },
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            Some(7),
+            log_transformed,
+            rankby_abs,
+            tie_correct,
+        );
+        scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
+        let gpu_res =
+            gpu_res.expect("GPU v1 backed multi-chunk wilcoxon under graph capture failed");
+
+        assert_eq!(cpu_res.group_names, gpu_res.group_names);
+
+        use std::collections::HashMap;
+        let group_to_map =
+            |res: &crate::diffexp::DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
+                res.names[g]
+                    .iter()
+                    .zip(res.scores[g].iter().zip(res.pvals[g].iter()))
+                    .map(|(n, (&s, &p))| (n.clone(), (s, p)))
+                    .collect()
+            };
+
+        for g in 0..cpu_res.group_names.len() {
+            let c_map = group_to_map(&cpu_res, g);
+            let gpu_map = group_to_map(&gpu_res, g);
+            for gene in &gene_names {
+                let (s_c, p_c) = c_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                let (s_g, p_g) = gpu_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+                if s_c.is_finite() && s_g.is_finite() {
+                    assert!(
+                        (s_c - s_g).abs() < 1e-3,
+                        "score mismatch (v1 graph) group={} gene={gene}: cpu={s_c}, gpu={s_g}",
+                        cpu_res.group_names[g]
+                    );
+                }
+                let pdiff = (p_c - p_g).abs();
+                assert!(
+                    pdiff < 1e-6 || pdiff / p_c.abs().max(1e-30) < 1e-3,
+                    "p mismatch (v1 graph) group={} gene={gene}: cpu={p_c}, gpu={p_g}",
+                    cpu_res.group_names[g]
+                );
+            }
+        }
+    }
 }
