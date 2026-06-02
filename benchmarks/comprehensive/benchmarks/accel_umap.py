@@ -209,7 +209,7 @@ def run(
             logger.warning("trustworthiness failed for %s run %d: %s", key, i + 1, e)
 
         # Route + GPU gate signal. GPU UMAP runs the native CUDA SGD kernel (or
-        # cuML), recorded as gpu_dense_v1; the variant is skipped on non-GPU
+        # cuML), recorded as gpu_dense; the variant is skipped on non-GPU
         # hosts, so a cpu_* route is a silent fallback → 0.0 fails the gate.
         route = _extract_route(a, "umap")
         if route is not None:

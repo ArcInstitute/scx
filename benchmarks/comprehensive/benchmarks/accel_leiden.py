@@ -201,7 +201,7 @@ def run(
         except Exception as e:
             logger.warning("ARI failed for %s run %d: %s", key, i + 1, e)
 
-        # Route + GPU gate signal. GPU Leiden runs cuGraph (gpu_csr_v1); the
+        # Route + GPU gate signal. GPU Leiden runs cuGraph (gpu_csr); the
         # variant is skipped on non-GPU hosts and there is no silent
         # cross-backend fallback (cuGraph raises if absent), so a cpu_* route
         # here would mean device resolution silently chose CPU → 0.0.

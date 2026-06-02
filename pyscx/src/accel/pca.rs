@@ -376,7 +376,7 @@ pub fn pca(
         &super::route::simple_exec_info(
             device,
             pca_gpu_eligible,
-            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;

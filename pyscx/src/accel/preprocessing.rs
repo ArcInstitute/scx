@@ -114,7 +114,7 @@ pub fn normalize_total(
         &super::route::simple_exec_info(
             device,
             np_eligible,
-            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;
@@ -251,7 +251,7 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
         &super::route::simple_exec_info(
             device,
             log1p_eligible,
-            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;

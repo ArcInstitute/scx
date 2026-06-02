@@ -483,7 +483,7 @@ absolute_floors:
     max: 1.0e-3
   # GPU preprocess route gate. The GPU variant runs normalize_total/log1p on a
   # backed SCX input (so the GPU shard-streaming kernel engages, route
-  # gpu_csr_v1); 0.0 means it silently fell back to CPU. Skipped on non-GPU
+  # gpu_csr); 0.0 means it silently fell back to CPU. Skipped on non-GPU
   # hosts. See `accel_preprocess.py` `_fresh()` / `_ensure_scx_fixture`.
   - benchmark: accel_preprocess
     format: accel_preprocess__pyscx_gpu
