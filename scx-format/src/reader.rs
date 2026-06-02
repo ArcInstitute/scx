@@ -471,6 +471,150 @@ impl ScxReader {
         self.read_arrow_ipc(entry)
     }
 
+    /// Resolve the per-shard physical layout of a row-sharded dense
+    /// mapping (e.g. `obsm/<name>`) for the backed dense row-gather
+    /// reader ([`crate::BackedDenseReader`]).
+    ///
+    /// Unlike CSR shards, `ObsmEmbeddingShard` catalog entries carry no
+    /// `stats` block, so the per-shard row ranges live only in each
+    /// shard's Arrow schema metadata (`row_start` / `n_shard_rows` /
+    /// `n_rows_total`, stamped by `writer::stamp_dense_shard_metadata`).
+    /// We read each shard's IPC **footer schema only** (no batch
+    /// deserialisation) and validate a contiguous, ordered cover with
+    /// the same invariant as [`assemble_sharded_metadata`].
+    ///
+    /// Falls back to the legacy single-section layout (`single_type`)
+    /// treated as one shard spanning `[0, num_rows)` — that path
+    /// deserialises the one batch to learn its row count.
+    pub(crate) fn dense_mapping_layout(
+        &self,
+        prefix: &str,
+        name: &str,
+        shard_type: SectionType,
+        single_type: SectionType,
+    ) -> Result<DenseMappingLayout> {
+        let shard_name_prefix = format!("{prefix}/{name}_shard_");
+        let logical = format!("{prefix}/{name}");
+
+        let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+            .full_catalog
+            .entries
+            .iter()
+            .filter(|e| e.section_type == shard_type && e.name.starts_with(&shard_name_prefix))
+            .filter_map(|e| {
+                let suffix = e.name.strip_prefix(&shard_name_prefix)?;
+                let idx: u32 = suffix.parse().ok()?;
+                Some((idx, e))
+            })
+            .collect();
+
+        if !shards.is_empty() {
+            shards.sort_by_key(|(idx, _)| *idx);
+            let mut entries: Vec<DenseShardLayoutEntry> = Vec::with_capacity(shards.len());
+            let mut n_cols = 0usize;
+            let mut dtype = arrow::datatypes::DataType::Float32;
+            let mut fields: arrow::datatypes::Fields = Default::default();
+            let mut prev_n_rows_total = 0u64;
+            let mut next_expected_row_start = 0u64;
+
+            for (i, (idx, entry)) in shards.iter().enumerate() {
+                let schema = self.read_arrow_ipc_schema_physical(entry)?;
+                let hdr = parse_shard_metadata_md(&logical, schema.metadata())?;
+                let expected_idx = i as u32;
+                if hdr.shard_idx != expected_idx {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "{logical}: shard at position {i} has shard_idx={} (expected {expected_idx})",
+                        hdr.shard_idx
+                    )));
+                }
+                if i == 0 {
+                    if hdr.row_start != 0 {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: first shard has row_start={} (expected 0)",
+                            hdr.row_start
+                        )));
+                    }
+                    n_cols = schema.fields().len();
+                    if n_cols > 0 {
+                        dtype = schema.field(0).data_type().clone();
+                    }
+                    fields = schema.fields().clone();
+                    prev_n_rows_total = hdr.n_rows_total;
+                    next_expected_row_start = hdr.n_shard_rows;
+                } else {
+                    if hdr.n_rows_total < prev_n_rows_total {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i} has n_rows_total={} which contracts the prior \
+                             shard's stamp of {prev_n_rows_total}",
+                            hdr.n_rows_total
+                        )));
+                    }
+                    if hdr.row_start != next_expected_row_start {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i} has row_start={} (expected {next_expected_row_start})",
+                            hdr.row_start
+                        )));
+                    }
+                    next_expected_row_start =
+                        next_expected_row_start.saturating_add(hdr.n_shard_rows);
+                    prev_n_rows_total = hdr.n_rows_total;
+                }
+                let _ = idx;
+                entries.push(DenseShardLayoutEntry {
+                    offset: entry.offset,
+                    length: entry.length,
+                    section_type: entry.section_type,
+                    modality_id: entry.modality_id,
+                    row_start: hdr.row_start,
+                    n_shard_rows: hdr.n_shard_rows,
+                });
+            }
+            if next_expected_row_start != prev_n_rows_total {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "{logical}: shards cover {next_expected_row_start} rows but the last shard's \
+                     n_rows_total is {prev_n_rows_total}"
+                )));
+            }
+            return Ok(DenseMappingLayout {
+                entries,
+                n_rows: prev_n_rows_total,
+                n_cols,
+                dtype,
+                fields,
+            });
+        }
+
+        // Legacy single section — one batch, no shard metadata.
+        let entry = self
+            .full_catalog
+            .get(&logical)
+            .filter(|e| e.section_type == single_type)
+            .ok_or_else(|| ScxError::SectionNotFound(logical.clone()))?;
+        let batch = self.read_arrow_ipc(entry)?;
+        let n_rows = batch.num_rows() as u64;
+        let n_cols = batch.num_columns();
+        let dtype = if n_cols > 0 {
+            batch.column(0).data_type().clone()
+        } else {
+            arrow::datatypes::DataType::Float32
+        };
+        let fields = batch.schema_ref().fields().clone();
+        Ok(DenseMappingLayout {
+            entries: vec![DenseShardLayoutEntry {
+                offset: entry.offset,
+                length: entry.length,
+                section_type: entry.section_type,
+                modality_id: entry.modality_id,
+                row_start: 0,
+                n_shard_rows: n_rows,
+            }],
+            n_rows,
+            n_cols,
+            dtype,
+            fields,
+        })
+    }
+
     /// Read the obs schema. Uses the Arrow IPC footer fast path, falling
     /// back to a per-column wide-vs-narrow refinement (via
     /// [`crate::arrow_compat::downcast_large_types`]) when any column on
@@ -1660,12 +1804,49 @@ struct ObsmShardMetadata {
     n_rows_total: u64,
 }
 
+/// Physical layout of a row-sharded dense mapping, resolved by
+/// [`ScxReader::dense_mapping_layout`] and consumed by
+/// [`crate::BackedDenseReader`].
+pub(crate) struct DenseMappingLayout {
+    /// Per-shard rows, ordered by `shard_idx` (== sorted by `row_start`).
+    pub(crate) entries: Vec<DenseShardLayoutEntry>,
+    /// Total logical row count (last shard's `n_rows_total`).
+    pub(crate) n_rows: u64,
+    /// Embedding dimensionality (number of dense columns).
+    pub(crate) n_cols: usize,
+    /// Column-0 dtype, as a representative for the whole mapping.
+    pub(crate) dtype: arrow::datatypes::DataType,
+    /// Canonical column fields (per-shard schema metadata stripped) —
+    /// the row-gather output schema. Taken from the first shard.
+    pub(crate) fields: arrow::datatypes::Fields,
+}
+
+/// One shard's catalog offset + stamped row range. Mirrors the fields
+/// `BackedDenseReader` needs (no `nnz`, since dense shards aren't CSR).
+pub(crate) struct DenseShardLayoutEntry {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) section_type: SectionType,
+    pub(crate) modality_id: u8,
+    pub(crate) row_start: u64,
+    pub(crate) n_shard_rows: u64,
+}
+
 /// Pull `shard_idx` / `row_start` / `n_shard_rows` / `n_rows_total`
 /// off a sharded batch's schema metadata. Returns
 /// `ScxError::InvalidCatalog` if any field is missing or unparseable,
 /// naming the logical section so the caller can produce a useful error.
 fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardMetadata> {
-    let md = batch.schema_ref().metadata();
+    parse_shard_metadata_md(logical, batch.schema_ref().metadata())
+}
+
+/// Like [`parse_shard_metadata`] but reads from a schema metadata map
+/// directly, so the backed dense reader can pull row ranges from an
+/// Arrow IPC **footer schema** (no batch deserialisation) at open time.
+fn parse_shard_metadata_md(
+    logical: &str,
+    md: &std::collections::HashMap<String, String>,
+) -> Result<ObsmShardMetadata> {
     let get = |key: &str| -> Result<u64> {
         md.get(key)
             .ok_or_else(|| {
@@ -1725,7 +1906,7 @@ fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardM
 /// remapped to the surviving values. Non-dictionary columns pass through
 /// untouched; the schema (and its `pandas` index metadata) is preserved.
 fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field, Schema};
     let schema = batch.schema();
     if !schema
         .fields()
@@ -1734,18 +1915,63 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
     {
         return Ok(batch.clone());
     }
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
     let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
         match field.data_type() {
             DataType::Dictionary(_, value_type) => {
+                // Decode to the plain value array (drops the per-shard,
+                // possibly-duplicated dictionary), then re-encode to a fresh
+                // unified dictionary. Encode once with a wide Int32 key to learn
+                // the deduplicated cardinality, then re-encode with the minimal
+                // signed key type that fits it so atlas-scale categoricals don't
+                // carry needlessly wide codes.
                 let values = arrow::compute::cast(col, value_type.as_ref())?;
-                new_columns.push(arrow::compute::cast(&values, field.data_type())?);
+                let wide_dt = DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
+                let wide = arrow::compute::cast(&values, &wide_dt)?;
+                let n_distinct = wide
+                    .as_any()
+                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+                    .map(|d| d.values().len())
+                    .unwrap_or(usize::MAX);
+                let key_type = min_dictionary_key_type(n_distinct);
+                let final_dt = DataType::Dictionary(Box::new(key_type), value_type.clone());
+                let encoded = if final_dt == wide_dt {
+                    wide
+                } else {
+                    arrow::compute::cast(&values, &final_dt)?
+                };
+                new_columns.push(encoded);
+                new_fields.push(
+                    Field::new(field.name(), final_dt, field.is_nullable())
+                        .with_metadata(field.metadata().clone()),
+                );
             }
-            _ => new_columns.push(col.clone()),
+            _ => {
+                new_columns.push(col.clone());
+                new_fields.push(field.as_ref().clone());
+            }
         }
     }
-    Ok(RecordBatch::try_new(schema, new_columns)?)
+    let new_schema = Schema::new(new_fields).with_metadata(schema.metadata().clone());
+    Ok(RecordBatch::try_new(Arc::new(new_schema), new_columns)?)
+}
+
+/// Smallest signed Arrow dictionary key (index) type that can address
+/// `n_distinct` values: `Int8` for ≤ `i8::MAX`, `Int16` for ≤ `i16::MAX`,
+/// else `Int32`. Keys are non-negative indices, so the signed maxima are the
+/// addressable counts. Mirrors the compact code widths anndata/pandas use for
+/// categoricals while guaranteeing no overflow.
+fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
+    use arrow::datatypes::DataType;
+    if n_distinct <= i8::MAX as usize {
+        DataType::Int8
+    } else if n_distinct <= i16::MAX as usize {
+        DataType::Int16
+    } else {
+        DataType::Int32
+    }
 }
 
 pub fn assemble_sharded_metadata(
@@ -1764,9 +1990,22 @@ pub fn assemble_sharded_metadata(
     // payload was narrow on disk. Concatenating on narrow offsets would
     // otherwise reproduce the original `Offset overflow error` once the
     // combined string payload exceeds `i32::MAX`.
+    //
+    // Also widen every categorical (dictionary) column's KEY type to Int32
+    // before concat. Per-shard categoricals are written with a key sized to
+    // each shard's *local* vocabulary (e.g. Int8 for ≤127 local categories);
+    // `concat_batches` appends the per-shard dictionaries and offsets their
+    // keys, so once the *combined* vocabulary across shards exceeds the narrow
+    // key's range the key overflows with `Dictionary key bigger than the key
+    // type`. Int32 keys can't overflow at any realistic scale (combined
+    // pre-dedup dictionary length ≤ total rows). `unify_dictionary_columns`
+    // narrows the key back to the minimal fit after deduplication.
     let batches: Vec<RecordBatch> = raw_batches
         .iter()
-        .map(|(_, b)| crate::arrow_compat::upcast_to_large_types(b))
+        .map(|(_, b)| {
+            crate::arrow_compat::upcast_to_large_types(b)
+                .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
+        })
         .collect::<Result<_>>()?;
 
     // Verify the shards form a contiguous, ordered cover by walking their
@@ -3356,7 +3595,7 @@ mod tests {
     #[test]
     fn test_assemble_unifies_duplicate_dictionary_categories() {
         use arrow::array::{Array, DictionaryArray};
-        use arrow::datatypes::Int32Type;
+        use arrow::datatypes::Int8Type;
 
         let dict_dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         let n_shards = 4u32;
@@ -3388,9 +3627,16 @@ mod tests {
         assert_eq!(merged.num_rows(), n_shards as usize);
 
         let col = merged.column(0);
+        // After unification the single surviving category fits an Int8 key —
+        // `unify_dictionary_columns` narrows to the minimal key type.
+        assert_eq!(
+            col.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            "1 distinct category should narrow to an Int8 key"
+        );
         let dict = col
             .as_any()
-            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
             .expect("gem_group should remain dictionary-encoded");
         let values = dict
             .values()
@@ -3409,6 +3655,81 @@ mod tests {
         // Every row still resolves to the single surviving category.
         for i in 0..dict.len() {
             assert_eq!(values.value(dict.keys().value(i) as usize), "batch1");
+        }
+    }
+
+    /// Regression: a categorical column whose per-shard vocabularies are
+    /// disjoint and sum to more than a narrow per-shard key can address.
+    /// Each shard here holds 50 unique categories encoded with an `Int8` key
+    /// (50 ≤ 127, the per-shard write is valid), but the union across 3 shards
+    /// is 150 distinct. Before the fix, `concat_batches` / the unify re-encode
+    /// overflowed the `Int8` key with `Dictionary key bigger than the key
+    /// type`; now the keys are widened to `Int32` before concat and narrowed
+    /// to the minimal fit (`Int16` for 150 distinct) after deduplication.
+    #[test]
+    fn test_assemble_high_cardinality_dictionary_widens_key() {
+        use arrow::array::{Array, DictionaryArray};
+        use arrow::datatypes::Int16Type;
+
+        let per_shard = 50usize;
+        let n_shards = 3u32;
+        let total = per_shard * n_shards as usize;
+        let narrow_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+
+        let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+            .map(|shard_idx| {
+                let cats: Vec<String> = (0..per_shard)
+                    .map(|j| format!("s{shard_idx}_c{j}"))
+                    .collect();
+                let strs = StringArray::from(cats.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                // Per-shard categorical with a narrow Int8 key — valid locally
+                // (50 ≤ 127) but disjoint across shards.
+                let dict =
+                    arrow::compute::cast(&(Arc::new(strs) as arrow::array::ArrayRef), &narrow_dt)
+                        .unwrap();
+                let row_start = shard_idx as usize * per_shard;
+                let metadata = std::collections::HashMap::from([
+                    ("shard_idx".to_string(), shard_idx.to_string()),
+                    ("row_start".to_string(), row_start.to_string()),
+                    ("n_shard_rows".to_string(), per_shard.to_string()),
+                    ("n_rows_total".to_string(), total.to_string()),
+                ]);
+                let schema = Arc::new(
+                    Schema::new(vec![Field::new("cell_type", narrow_dt.clone(), false)])
+                        .with_metadata(metadata),
+                );
+                let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+                (shard_idx, batch)
+            })
+            .collect();
+
+        // Pre-fix this returned `Err(Arrow("Dictionary key bigger than the key type"))`.
+        let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+        assert_eq!(merged.num_rows(), total);
+
+        let col = merged.column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            "150 distinct categories should narrow to an Int16 key"
+        );
+        let dict = col
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int16Type>>()
+            .expect("cell_type should remain dictionary-encoded");
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("dictionary values should be Utf8");
+        assert_eq!(values.len(), total, "all 150 categories must survive");
+        // Every row resolves to its original "s{shard}_c{j}" category.
+        for shard in 0..n_shards as usize {
+            for j in 0..per_shard {
+                let row = shard * per_shard + j;
+                let got = values.value(dict.keys().value(row) as usize);
+                assert_eq!(got, format!("s{shard}_c{j}"));
+            }
         }
     }
 

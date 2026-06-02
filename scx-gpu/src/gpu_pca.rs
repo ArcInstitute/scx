@@ -33,7 +33,6 @@ use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::linear_operator::CenteredSparseOperator;
-use crate::shard_decode::GpuCsr;
 
 /// PTX source for the row-major mean-correction kernel, compiled at build time.
 const MEAN_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/spmm_mean_correct.ptx"));
@@ -136,8 +135,9 @@ pub struct GpuPcaResult {
 /// 8. Embeddings = Q @ V × Σ (CPU — Q downloaded, small multiply)
 ///
 /// Steps 3-6 stream from any `ShardSource` without materializing full X.
-/// The `Sync` bound is required so that a future refactor to
-/// `DoubleBufferedShardLoader` (Phase 2+) works without signature churn.
+/// The `Sync` bound is required so the streaming `CenteredSparseOperator`
+/// (which iterates via `RawGpuShardSource` on the G3 staging path) can borrow
+/// `source` across its scoped pre-decode worker thread.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_randomized_pca(
@@ -409,23 +409,6 @@ pub fn gpu_randomized_pca(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Upload an ScxCsr to GPU as GpuCsr.
-pub(crate) fn upload_csr_to_gpu(
-    dev: &GpuDevice,
-    csr: &scx_sparse::ScxCsr,
-) -> Result<GpuCsr, GpuError> {
-    let d_indptr = dev.htod_copy(&csr.indptr)?;
-    let d_indices = dev.htod_copy(&csr.indices)?;
-    let d_data = dev.htod_copy(&csr.data)?;
-
-    Ok(GpuCsr {
-        indptr: d_indptr,
-        indices: d_indices,
-        data: d_data,
-        shape: (csr.n_rows(), csr.n_cols()),
-    })
-}
 
 /// Strided mean-correct: apply `Y[global_row + r, c] -= mc[c]` over a
 /// `(shard_rows × k)` sub-region of `Y` (which is laid out as a
@@ -745,24 +728,6 @@ mod tests {
         let mut d_y = dev.alloc_zeros::<f32>(0).unwrap();
         let d_mc = dev.alloc_zeros::<f32>(0).unwrap();
         mean_correct_gpu(&dev, &mut d_y, &d_mc, 0, 0).unwrap();
-    }
-
-    #[test]
-    fn test_upload_csr_to_gpu() {
-        let dev = require_gpu!();
-
-        let csr = scx_sparse::ScxCsr::new(
-            (3, 4),
-            vec![0, 2, 3, 5],
-            vec![0, 2, 1, 0, 3],
-            vec![1.0, 2.0, 3.0, 4.0, 5.0],
-        )
-        .unwrap();
-
-        let gpu_csr = upload_csr_to_gpu(&dev, &csr).unwrap();
-        assert_eq!(gpu_csr.shape, (3, 4));
-        assert_eq!(gpu_csr.indices.len(), 5);
-        assert_eq!(gpu_csr.indptr.len(), 4);
     }
 
     #[test]

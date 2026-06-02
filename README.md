@@ -28,6 +28,32 @@ sce <- exp$to_sce()              # SingleCellExperiment
 See [`docs/quickstart.md`](docs/quickstart.md) for a runnable end-to-end pipeline
 (install → convert → QC → normalize → HVG → PCA → neighbors → UMAP → leiden → markers).
 
+### Using with Claude Code
+
+This repo ships a **[`skills/scx-usage/`](skills/scx-usage/)** skill for agent-assisted
+work with `pyscx` and `scx-cli`. It is task-oriented (not a format spec): install
+troubleshooting, conversion recipes, backed/lazy processing, `pyscx.accel.*`, and ML
+loaders. Start at [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md); deeper
+reference lives alongside it (`reference/installation.md`, `conversion.md`,
+`processing.md`, `ml-loading.md`).
+
+Helpful when Claude Code is helping you **install pyscx** (PyPI vs source builds,
+optional extras, common rpath/HDF5/GPU failures) or **write usage code** without
+guessing API shapes and gotchas.
+
+To load it in Claude Code from a clone of this repository:
+
+```bash
+# From the repository root (where .claude-plugin/ and skills/ live)
+claude --plugin-dir .
+```
+
+The manifest at [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) registers
+the plugin as `scx-usage`. You can also symlink or copy `skills/scx-usage/` into
+[`.claude/skills/`](.claude/skills/) (project-shared) or `~/.claude/skills/` (personal)
+so it auto-loads on startup. Other coding agents in this repo are pointed at the same
+skill via [`AGENTS.md`](AGENTS.md).
+
 ## Main features
 
 - **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
@@ -539,7 +565,9 @@ pyscx.accel.pca(adata, n_comps=50, device="gpu")
 ```
 
 See [`docs/gpu-setup.md`](docs/gpu-setup.md) for troubleshooting, SLURM
-configuration, and driver compatibility details.
+configuration, and driver compatibility details. For install pitfalls and
+PyPI-vs-source guidance aimed at agents, see
+[`skills/scx-usage/reference/installation.md`](skills/scx-usage/reference/installation.md).
 
 ### Rust CLI
 
@@ -746,7 +774,7 @@ SCX is a Rust workspace with 14 crates:
 | `pyscx` | Python bindings (PyO3) |
 | `rscx` | R bindings (extendr) |
 
-For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md).
+For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
 
 ## License
 

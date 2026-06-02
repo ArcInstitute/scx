@@ -55,7 +55,11 @@ pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 /// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
 /// inner loop.
 pub struct GpuDeChunkScratch {
-    /// `[n_obs × chunk_max]` row-major dense buffer for the current chunk.
+    /// `[n_obs × chunk_max]`-capacity row-major dense buffer for the current
+    /// chunk. Allocated lazily (zero-length until first use): the v3 CSC/CSR
+    /// DE drivers populate gene-major slabs directly and never touch it, so
+    /// production runs pay no VRAM for it; only [`gpu_de_upload_chunk`] (the
+    /// primitive-parity test path) grows it on demand.
     pub dense: CudaSlice<f32>,
     /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
     /// each test group (size large enough for whichever is bigger).
@@ -72,7 +76,7 @@ pub struct GpuDeChunkScratch {
     /// `[chunk_max]` f64 p-values for one test group.
     pub p_values: CudaSlice<f64>,
     /// `[chunk_max × n_ref_max]` gene-major ref slab. G2 hoisted from a
-    /// per-chunk `dev.alloc_zeros` in `pdex_ref_gpu_chunked`. Grow-only via
+    /// per-chunk `dev.alloc_zeros` in the pdex_ref GPU driver. Grow-only via
     /// [`Self::ensure_ref_slab_capacity`].
     pub ref_slab: CudaSlice<f32>,
     /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
@@ -80,8 +84,8 @@ pub struct GpuDeChunkScratch {
     /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
     pub group_slab: CudaSlice<f32>,
     /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
-    /// from `compute_pdex_means_gpu` / `compute_group_gene_sums_gpu`. Grow-
-    /// only via [`Self::ensure_sums_capacity`].
+    /// from the per-chunk pseudobulk fold. Grow-only via
+    /// [`Self::ensure_sums_capacity`].
     pub sums: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group U / rank-sum
     /// staging buffer. G10.4 hoist: each test group's U output is
@@ -93,7 +97,7 @@ pub struct GpuDeChunkScratch {
     /// staging buffer. Same G10.4 pattern as `u_per_group`.
     pub p_per_group: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group combined-tie
-    /// staging buffer. Used by `wilcoxon_rank_sum_gpu_chunked`'s ref-
+    /// staging buffer. Used by the Wilcoxon GPU driver's ref-
     /// mode path, where each tg produces its own combined tie term that
     /// must round-trip to host for the post-pvalue computation. 1-vs-
     /// rest reuses the global pool-tie and so doesn't write here.
@@ -137,14 +141,19 @@ impl GpuDeChunkScratch {
     /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
     ///
     /// The slab grows on demand via [`Self::ensure_slab_capacity`]; the
-    /// dense buffer is fixed-size for the whole DE call.
+    /// dense buffer is allocated lazily (zero-length here, grown only by
+    /// [`gpu_de_upload_chunk`]).
     pub fn new(
         dev: &GpuDevice,
         n_obs: usize,
         chunk_max: usize,
         n_pool_max: usize,
     ) -> Result<Self, GpuError> {
-        let dense = dev.alloc_zeros::<f32>(de_alloc_elems(n_obs, chunk_max)?)?;
+        // `dense` is allocated lazily — zero-length until `gpu_de_upload_chunk`
+        // grows it. The v3 CSC/CSR DE drivers populate gene-major slabs
+        // directly and never read it, so a default DE call pays no VRAM here
+        // (was an eager `[n_obs × chunk_max]` f32 buffer, ~2 GB on 1M cells).
+        let dense = dev.alloc_zeros::<f32>(0)?;
         let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
@@ -225,7 +234,7 @@ impl GpuDeChunkScratch {
     }
 
     /// Grow `ref_slab` to hold at least `chunk_max × n_ref` f32 keys.
-    /// Called once per `pdex_ref_gpu_chunked` invocation before the chunk
+    /// Called once per pdex_ref GPU driver invocation before the chunk
     /// loop. Same grow-only `next_power_of_two` pattern as the slab.
     pub fn ensure_ref_slab_capacity(
         &mut self,
@@ -281,8 +290,8 @@ impl GpuDeChunkScratch {
     /// G10.4: grow `u_per_group` and `p_per_group` to hold at least
     /// `n_test_groups × chunk_max` f64 values each.
     ///
-    /// Called above the chunk loop in `pdex_ref_gpu_chunked` /
-    /// `wilcoxon_rank_sum_gpu_chunked` so the per-chunk dtoh fan-out
+    /// Called above the chunk loop in the pdex_ref / Wilcoxon GPU drivers
+    /// so the per-chunk dtoh fan-out
     /// (one transfer per test group) collapses into a single batched
     /// dtoh at chunk end. `memcpy_dtod` from `u_or_rank` /
     /// `p_values` into the per-group slot is `O(chunk_size)` and
@@ -389,6 +398,10 @@ pub fn gpu_de_upload_chunk(
             got: format!("n_obs={n_obs}, chunk_size={chunk_size}"),
         });
     }
+    // `dense` is lazily allocated (zero-length in `new`); grow it on demand.
+    if scratch.dense.len() < nelem {
+        scratch.dense = dev.alloc_zeros::<f32>(nelem)?;
+    }
     // CudaSlice supports a slice view via .slice(...) in cudarc 0.19.
     let mut view = scratch.dense.slice_mut(..nelem);
     dev.stream()
@@ -400,8 +413,11 @@ pub fn gpu_de_upload_chunk(
 /// Scatter a permutation of cells (e.g. ref or group) from the device dense
 /// chunk into a gene-major slab `[chunk_size × n_perm]`.
 ///
-/// `cell_indices_host` is uploaded internally; for repeated calls with the
-/// same permutation, consider caching the upload via a dedicated CudaSlice.
+/// `cell_indices_host` is uploaded internally. **This host→device copy makes
+/// the function illegal to call inside a CUDA graph-capture region** — it
+/// invalidates the capture (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`).
+/// Capturable callers (the DE per-chunk sequences) must pre-upload the
+/// permutation once and use [`gpu_de_scatter_gene_major_dev`] instead.
 pub fn gpu_de_scatter_gene_major(
     dev: &GpuDevice,
     dense: &CudaSlice<f32>,
@@ -413,8 +429,26 @@ pub fn gpu_de_scatter_gene_major(
     if cell_indices_host.is_empty() || chunk_size == 0 {
         return Ok(());
     }
-    let n_perm = cell_indices_host.len();
     let d_indices = dev.htod_copy(cell_indices_host)?;
+    gpu_de_scatter_gene_major_dev(dev, dense, &d_indices, slab, n_obs, chunk_size)
+}
+
+/// Device-input variant of [`gpu_de_scatter_gene_major`]: `d_indices` is a
+/// permutation already resident on device, so this does **no** host→device
+/// copy and is safe to call inside a CUDA graph-capture region. `n_perm` is
+/// taken from `d_indices.len()`.
+pub fn gpu_de_scatter_gene_major_dev(
+    dev: &GpuDevice,
+    dense: &CudaSlice<f32>,
+    d_indices: &CudaSlice<i32>,
+    slab: &mut CudaSlice<f32>,
+    n_obs: usize,
+    chunk_size: usize,
+) -> Result<(), GpuError> {
+    let n_perm = d_indices.len();
+    if n_perm == 0 || chunk_size == 0 {
+        return Ok(());
+    }
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
     let func = module
@@ -441,7 +475,7 @@ pub fn gpu_de_scatter_gene_major(
         dev.stream()
             .launch_builder(&func)
             .arg(dense)
-            .arg(&d_indices)
+            .arg(d_indices)
             .arg(slab)
             .arg(&n_obs_i32)
             .arg(&n_perm_i32)
@@ -892,7 +926,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
             "csc_shard_pseudobulk: n_groups={n_groups} exceeds SMEM budget \
              ({} bytes at bx=64, device opt-in limit {opt_in_limit} bytes); \
              use the CSR fallback (SCX_GPU_DE_V3 still routes here through \
-             pdex_ref_gpu_streaming when CSC sidecar is absent)",
+             pdex_ref_gpu when CSC sidecar is absent)",
             required
         )));
     }
@@ -1542,11 +1576,15 @@ pub fn gpu_de_searchsorted_ranksum(
 
 /// MWU two-sided p-value via normal approximation with tie correction.
 ///
-/// Matches the CPU `wilcoxon_full_from_ranks` formula exactly (no continuity
-/// correction): `z = (U − μ)/σ`, `p = erfc(|z| / √2)`. Output is clipped to
-/// `[0, 1]`. Caller is responsible for setting p = 1.0 when either group is
-/// empty (kernel handles `n1 == 0 || n2 == 0` defensively but the chunk loop
-/// short-circuits before launch).
+/// Matches the CPU pdex_ref path
+/// `wilcoxon_full_from_ranks(.., continuity=true)`: continuity-corrected
+/// `z = max(|U − μ| − 0.5, 0)/σ`, `p = erfc(z / √2)` (upstream pdex /
+/// numba_mwu `use_continuity=True`, scipy's default). This launcher is used
+/// only by the pdex_ref GPU sequences; the Wilcoxon GPU path computes its
+/// p-value elsewhere and stays uncorrected for scanpy parity. Output is
+/// clipped to `[0, 1]`. Caller is responsible for setting p = 1.0 when either
+/// group is empty (kernel handles `n1 == 0 || n2 == 0` defensively but the
+/// chunk loop short-circuits before launch).
 pub fn gpu_de_pvalues(
     dev: &GpuDevice,
     u_stats: &CudaSlice<f64>,
@@ -1688,111 +1726,6 @@ pub fn default_gpu_de_gene_chunk_size(dev: &GpuDevice, n_obs: usize, n_pool_max:
     let budget = (free_bytes as f64 * 0.18) as usize;
     let raw = budget.max(per_gene_bytes) / per_gene_bytes;
     ((raw / 64).max(1)) * 64
-}
-
-/// G4 v2: returns `true` when `SCX_GPU_DE_V2=1` is set. The env var is
-/// read once and cached so repeated dispatch-site checks are free.
-///
-/// In-process override via [`set_de_v2_enabled_override`] takes
-/// precedence; used by parity tests to toggle v1 vs v2 without
-/// restarting the process.
-///
-/// Default: **off**. Opt-in until the path has been bench-validated on
-/// Chimera. The opt-in default mirrors how `SCX_GPU_DE_GENE_CHUNK_SIZE`
-/// stays user-controllable.
-pub fn de_v2_enabled() -> bool {
-    if let Some(v) = de_v2_test_override::current() {
-        return v;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("SCX_GPU_DE_V2").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE")
-        )
-    })
-}
-
-mod de_v2_test_override {
-    use std::sync::{Mutex, OnceLock};
-
-    static CELL: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
-
-    fn slot() -> &'static Mutex<Option<bool>> {
-        CELL.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn current() -> Option<bool> {
-        *slot().lock().unwrap()
-    }
-
-    pub fn set(value: Option<bool>) -> Option<bool> {
-        let mut guard = slot().lock().unwrap();
-        let prev = *guard;
-        *guard = value;
-        prev
-    }
-}
-
-/// Diagnostic override for [`de_v2_enabled`] — lets parity tests flip
-/// the v1/v2 dispatch in-process. Mirrors
-/// [`crate::gpu_graph::set_cuda_graphs_enabled_override`].
-///
-/// Returns the previous override value.
-pub fn set_de_v2_enabled_override(enabled: Option<bool>) -> Option<bool> {
-    de_v2_test_override::set(enabled)
-}
-
-/// G4 v3: returns `true` when `SCX_GPU_DE_V3=1` is set. The env var is
-/// read once and cached so repeated dispatch-site checks are free.
-///
-/// In-process override via [`set_de_v3_enabled_override`] takes
-/// precedence; used by parity tests to toggle v2 vs v3 without
-/// restarting the process.
-///
-/// Takes precedence over [`de_v2_enabled`] at the dispatch sites — v3 is
-/// strictly the larger refactor (drops the dense `[n_obs × chunk_size]`
-/// materialization step entirely), so callers gate v3 first.
-///
-/// Default: **off**. Opt-in until the path has been bench-validated.
-pub fn de_v3_enabled() -> bool {
-    if let Some(v) = de_v3_test_override::current() {
-        return v;
-    }
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("SCX_GPU_DE_V3").as_deref(),
-            Ok("1") | Ok("true") | Ok("TRUE")
-        )
-    })
-}
-
-mod de_v3_test_override {
-    use std::sync::{Mutex, OnceLock};
-
-    static CELL: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
-
-    fn slot() -> &'static Mutex<Option<bool>> {
-        CELL.get_or_init(|| Mutex::new(None))
-    }
-
-    pub fn current() -> Option<bool> {
-        *slot().lock().unwrap()
-    }
-
-    pub fn set(value: Option<bool>) -> Option<bool> {
-        let mut guard = slot().lock().unwrap();
-        let prev = *guard;
-        *guard = value;
-        prev
-    }
-}
-
-/// Diagnostic override for [`de_v3_enabled`] — lets parity tests flip
-/// the v2/v3 dispatch in-process. Returns the previous override value.
-pub fn set_de_v3_enabled_override(enabled: Option<bool>) -> Option<bool> {
-    de_v3_test_override::set(enabled)
 }
 
 #[cfg(test)]
@@ -2485,7 +2418,7 @@ mod tests {
 
     /// G2 regression: `ensure_*_capacity` only allocates on initial grow and
     /// on size increase; same / smaller requests are no-ops. The chunk loops
-    /// in `pdex_ref_gpu_chunked` / `wilcoxon_rank_sum_gpu_chunked` rely on
+    /// in the pdex_ref / Wilcoxon GPU drivers rely on
     /// this so they can pre-grow once before the loop and never re-allocate
     /// per chunk.
     #[test]
@@ -2558,8 +2491,8 @@ mod tests {
     }
 
     /// `gpu_de_scatter_shard_to_dense` reproduces, on device, the dense
-    /// `[n_obs × sz]` row-major chunk that the legacy host materialise
-    /// closure built in `pdex_ref_gpu_chunked`'s streaming variant. Three
+    /// `[n_obs × sz]` row-major chunk for a given column range directly from
+    /// a CSR shard source. Three
     /// fixtures cover: (a) full column range, (b) middle column subrange,
     /// (c) an empty shard interleaved with non-empty shards.
     #[test]
@@ -2623,8 +2556,8 @@ mod tests {
         };
 
         // Reference dense `[n_obs × sz]` built on host for a given column
-        // range. Matches what `pdex_ref_gpu_chunked`'s legacy closure
-        // wrote into `chunk_dense` before `gpu_de_upload_chunk`.
+        // range. Matches what `gpu_de_scatter_shard_to_dense` writes on
+        // device.
         let host_reference = |c0: usize, c1: usize| -> Vec<f32> {
             let sz = c1 - c0;
             let mut buf = vec![0.0f32; n_obs * sz];

@@ -35,6 +35,8 @@ pub enum GpuError {
     CuVsError(String),
     #[error("library not found: {0}")]
     LibraryNotFound(String),
+    #[error("unsupported device layout: {0}")]
+    UnsupportedLayout(String),
 }
 
 pub type Result<T> = std::result::Result<T, GpuError>;

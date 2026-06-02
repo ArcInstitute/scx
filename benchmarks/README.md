@@ -1005,6 +1005,33 @@ capture run picks it up automatically.
 > when you need accelerator gating, until the next multi-surface
 > baseline that re-includes `accel_*` is promoted as `LATEST`.
 
+**Accelerator route gates.** Every GPU accelerator benchmark records the
+execution route each call actually took (read back from
+`adata.uns["scx_accel"]`, written by pyscx) and emits binary gate signals in
+`runs[].extra`. `thresholds.yaml` declares absolute floors (`min: 1.0`) on
+these signals so a silent GPU→CPU fallback or a CSC→CSR fallback becomes a
+hard gate failure via the existing absolute-floor machinery.
+
+| Gate metric | Benchmark module | What it catches |
+|------------|------------------|-----------------|
+| `de_route_csc_direct` | `accel_de` (pdex_ref GPU) | CSC sidecar + `SCX_GPU_DE_V3=1` active, yet a non-CSC route ran. Gated on `pbmc3k`, `tabula_sapiens_100k`, and `census_1m`. |
+| `wilcoxon_route_gpu_correct` | `accel_de` (Wilcoxon GPU) | `device="gpu"` requested but a `cpu_*` route ran. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `csc_dispatch_correct` | `bench_csc_dispatch` | A `_csc`-labelled variant ran a non-CSC route (or vice versa). Gated on `tabula_sapiens_100k` for `qc_metrics`, `hvg`, `de`, and `pdex_ref` CSC variants. |
+| `hvg_route_gpu_correct` | `accel_hvg` | GPU HVG dispatch silently fell back to CPU. Gated on `pbmc3k`. |
+| `pca_route_gpu_correct` | `accel_pca` | GPU PCA dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `knn_route_gpu_correct` | `accel_knn` | GPU kNN dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `umap_route_gpu_correct` | `accel_umap` | GPU UMAP dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `leiden_route_gpu_correct` | `accel_leiden` | GPU Leiden dispatch silently fell back to CPU. Gated on `pbmc3k`. |
+
+Each gate metric is `1.0` when the expected route ran (or wasn't applicable —
+e.g. no GPU host), `0.0` on a silent fallback. All GPU benchmark modules also
+emit `gpu_dispatch_route` (the stable wire identifier, e.g. `gpu_csc_v3`) and
+`gpu_dispatch_fallback` (e.g. `no_csc_sidecar`) in `runs[].extra` for
+diagnostics. Benchmark provenance (`provenance.py`) captures the route-
+affecting env vars `SCX_GPU_DE_V2`, `SCX_GPU_DE_V3`, and
+`SCX_GPU_DE_V3_TRACE` so a result can always be attributed to its dispatch
+configuration.
+
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives
 [`benchmark_loader.py`](scripts/benchmark_loader.py), which targets the

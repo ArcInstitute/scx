@@ -4,8 +4,7 @@
 //! a sequence of GPU-resident CSR shards that consumers iterate over
 //! without materialising the full matrix on the host.
 //!
-//! Compared to [`crate::shard_pipeline::DoubleBufferedShardLoader`], the
-//! `GpuShardSource` abstraction:
+//! Key properties of the `GpuShardSource` abstraction:
 //!
 //! - Reuses the **same device CSR buffers** ([`crate::staging::GpuCsrSlot`])
 //!   across all shards, avoiding the per-shard `dev.alloc_zeros` round-trip.
@@ -38,7 +37,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::safe::{CudaEvent, CudaStream};
+use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
 use scx_format::ShardSource;
 
 use crate::device::GpuDevice;
@@ -403,24 +402,44 @@ pub struct GpuPreprocessedShardSource<'a> {
     inner: RawGpuShardSource<'a>,
     normalize: Option<f32>,
     log1p: bool,
+    /// Per-row scale factors uploaded once to device, indexed in iteration row
+    /// order (length == `source.n_obs()`). `None` = no row-scale transform.
+    row_scale: Option<CudaSlice<f32>>,
 }
 
 impl<'a> GpuPreprocessedShardSource<'a> {
     /// Construct a preprocessing source. Pass `normalize = Some(target)`
     /// to apply per-row normalization to `target` total counts; `log1p`
-    /// applies `log(1 + x)` after any normalization. Pass `None` /
-    /// `false` to skip a transform; passing both `None` and `false`
-    /// reduces to a [`RawGpuShardSource`].
+    /// applies `log(1 + x)` after any normalization; `row_scale = Some(factors)`
+    /// multiplies each row by an explicit factor (applied last). `factors` is a
+    /// per-row vector in iteration row order; its length must equal the
+    /// source's `n_obs`. Pass `None` / `false` to skip a transform; passing
+    /// all of `None` / `false` / `None` reduces to a [`RawGpuShardSource`].
     pub fn new(
         dev: &'a GpuDevice,
         source: &'a (dyn ShardSource + Sync),
         normalize: Option<f32>,
         log1p: bool,
+        row_scale: Option<&[f32]>,
     ) -> Result<Self, GpuError> {
+        let row_scale = match row_scale {
+            Some(factors) => {
+                let n_obs = source.n_obs();
+                if factors.len() != n_obs {
+                    return Err(GpuError::InvalidShard(format!(
+                        "row_scale factor length {} != source n_obs {n_obs}",
+                        factors.len()
+                    )));
+                }
+                Some(dev.htod_copy(factors)?)
+            }
+            None => None,
+        };
         Ok(Self {
             inner: RawGpuShardSource::new(dev, source)?,
             normalize,
             log1p,
+            row_scale,
         })
     }
 }
@@ -444,16 +463,36 @@ impl<'a> GpuShardSource for GpuPreprocessedShardSource<'a> {
     {
         let normalize = self.normalize;
         let log1p = self.log1p;
+        // Disjoint-field borrow: `&self.row_scale` and `&mut self.inner` touch
+        // different fields, so binding it before `self.inner.run` is allowed.
+        let row_scale = self.row_scale.as_ref();
+        // Cumulative first-global-row of the current shard, advanced per shard.
+        // `run` invokes the transform only for non-empty shards in 0..n_shards
+        // order, and empty shards contribute 0 rows — so this matches the
+        // global row layout the factor vector is indexed against.
+        let mut global_row_offset = 0usize;
         self.inner.run(f, move |dev, slot| {
-            if normalize.is_none() && !log1p {
-                return Ok(());
-            }
             let n_rows = slot.shape().0;
-            // Field-level split borrow: indptr (immutable) + data (mutable)
-            // touch disjoint fields, which Rust permits through the
-            // dedicated `split_indptr_data_mut` accessor.
-            let (indptr, mut data) = slot.split_indptr_data_mut();
-            apply_fused_ops_inner(dev, &indptr, &mut data, n_rows, normalize, log1p)
+            let result = if normalize.is_none() && !log1p && row_scale.is_none() {
+                Ok(())
+            } else {
+                // Field-level split borrow: indptr (immutable) + data (mutable)
+                // touch disjoint fields, which Rust permits through the
+                // dedicated `split_indptr_data_mut` accessor.
+                let (indptr, mut data) = slot.split_indptr_data_mut();
+                let rs = row_scale.map(|fs| (fs.slice(..), global_row_offset));
+                apply_fused_ops_inner(
+                    dev,
+                    &indptr,
+                    &mut data,
+                    n_rows,
+                    normalize,
+                    log1p,
+                    rs.as_ref().map(|(v, off)| (v, *off)),
+                )
+            };
+            global_row_offset += n_rows;
+            result
         })
     }
 }
@@ -544,7 +583,8 @@ mod tests {
             n_obs: 2,
             n_vars: 3,
         };
-        let mut gpu = GpuPreprocessedShardSource::new(&dev, &src, Some(10.0f32), true).unwrap();
+        let mut gpu =
+            GpuPreprocessedShardSource::new(&dev, &src, Some(10.0f32), true, None).unwrap();
 
         let mut seen: Vec<f32> = Vec::new();
         gpu.for_each_gpu_shard(|_idx, slot| {

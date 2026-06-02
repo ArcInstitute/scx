@@ -4,7 +4,7 @@
 //! cooperative row scatter: each warp (32 threads) handles one row's
 //! non-zeros in parallel, with optional column remapping for HVG projection.
 
-use cudarc::driver::safe::{CudaSlice, LaunchConfig};
+use cudarc::driver::safe::{CudaSlice, CudaView, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
 use crate::device::GpuDevice;
@@ -84,7 +84,42 @@ pub fn sparse_to_dense_gpu_into(
     scratch: &mut CudaSlice<f32>,
 ) -> Result<(), GpuError> {
     let (n_rows, _n_cols) = gpu_csr.shape;
+    if n_rows == 0 {
+        return Ok(());
+    }
+    let nnz = gpu_csr.data.len();
+    sparse_to_dense_gpu_into_view(
+        device,
+        &gpu_csr.indptr.slice(..n_rows + 1),
+        &gpu_csr.indices.slice(..nnz),
+        &gpu_csr.data.slice(..nnz),
+        n_rows,
+        hvg_map,
+        n_output_cols,
+        scratch,
+    )
+}
 
+/// View-based variant of [`sparse_to_dense_gpu_into`].
+///
+/// Identical kernel; takes borrowed CSR component views (`indptr`,
+/// `indices`, `data`) plus an explicit `n_rows` instead of an owned
+/// [`GpuCsr`]. This is the path used by consumers that iterate a reusable
+/// [`GpuCsrSlot`](crate::staging::GpuCsrSlot) (via
+/// [`GpuMatrixSource`](crate::gpu_matrix_source::GpuMatrixSource)) rather than
+/// owning a `GpuCsr` per shard. The same buffer contract as
+/// [`sparse_to_dense_gpu_into`] applies to `scratch`.
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_to_dense_gpu_into_view(
+    device: &GpuDevice,
+    indptr: &CudaView<'_, i64>,
+    indices: &CudaView<'_, i32>,
+    data: &CudaView<'_, f32>,
+    n_rows: usize,
+    hvg_map: Option<&CudaSlice<u32>>,
+    n_output_cols: usize,
+    scratch: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
     if n_rows == 0 || n_output_cols == 0 {
         return Ok(());
     }
@@ -126,9 +161,9 @@ pub fn sparse_to_dense_gpu_into(
             device
                 .stream()
                 .launch_builder(&kernel)
-                .arg(&gpu_csr.indptr)
-                .arg(&gpu_csr.indices)
-                .arg(&gpu_csr.data)
+                .arg(indptr)
+                .arg(indices)
+                .arg(data)
                 .arg(scratch)
                 .arg(hmap)
                 .arg(&n_rows_i32)
@@ -142,9 +177,9 @@ pub fn sparse_to_dense_gpu_into(
                 device
                     .stream()
                     .launch_builder(&kernel)
-                    .arg(&gpu_csr.indptr)
-                    .arg(&gpu_csr.indices)
-                    .arg(&gpu_csr.data)
+                    .arg(indptr)
+                    .arg(indices)
+                    .arg(data)
                     .arg(scratch)
                     .arg(&null_ptr)
                     .arg(&n_rows_i32)

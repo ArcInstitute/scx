@@ -28,6 +28,7 @@ from typing import Any, Callable
 import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
+    _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
@@ -144,6 +145,57 @@ def _max_abs_diff(a: Any, b: Any) -> float:
     return round(float(np.max(np.abs(xa - xb))), 6)
 
 
+def _ensure_scx_fixture(raw: Any, dataset_name: str) -> Path | None:
+    """Materialise `raw` as a plain SCX file (no CSC sidecar — normalize/log1p
+    stream CSR shards) so the GPU variant can open it backed and actually hit
+    the GPU shard-streaming kernel. Without a backed input,
+    `normalize_total(device="gpu")` falls back to CPU on in-memory scipy X
+    (no GPU kernel for materialized dense/sparse), so the "GPU" variant would
+    never run on GPU.
+
+    Cached under ``$SCX_BENCH_TMPDIR/preproc_fixtures/`` (default
+    ``/tmp/preproc_fixtures``); ``SCX_BENCH_REBUILD_FIXTURES=1`` forces a rebuild
+    (``SCX_BENCH_REBUILD_CSC=1`` is honoured as a backward-compat alias).
+    Returns None if pyscx is missing or the conversion failed.
+    """
+    import os
+    if not _HAS_PYSCX:
+        return None
+    # NOTE: Path("") is PosixPath(".") and .is_dir() is True, so an unset env
+    # must be detected on the raw string before constructing the Path — else
+    # the fixture lands in the cwd instead of the /tmp fallback.
+    base_str = os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", "")
+    out_dir = Path(base_str) / "preproc_fixtures" if base_str else Path("/tmp/preproc_fixtures")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("accel_preprocess: cannot create %s (%s)", out_dir, e)
+        return None
+    scx_path = out_dir / f"{dataset_name}.preproc.scx"
+    rebuild = any(
+        os.environ.get(k, "") in ("1", "true", "TRUE")
+        for k in ("SCX_BENCH_REBUILD_FIXTURES", "SCX_BENCH_REBUILD_CSC")
+    )
+    if scx_path.exists() and not rebuild:
+        return scx_path
+    try:
+        if scx_path.exists():
+            scx_path.unlink()
+        import pyscx
+        pyscx.from_anndata(raw, str(scx_path))
+    except Exception as e:
+        logger.warning("accel_preprocess: pyscx.from_anndata(%s) failed: %s", dataset_name, e)
+        return None
+    return scx_path
+
+
+def _open_backed(path: Path) -> Any:
+    """Open an SCX file as a backed AnnData (X is ScxBackedSparseDataset), so
+    GPU normalize/log1p take the eager shard-streaming kernel."""
+    import pyscx
+    return pyscx.open(str(path)).to_anndata(backed=True)
+
+
 def run(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -184,9 +236,22 @@ def run(
         _fixture_cache[ref_key] = ref.X.copy() if hasattr(ref.X, "copy") else ref.X
     ref_X = _fixture_cache[ref_key]
 
+    # The GPU variant must run on a backed SCX input — `normalize_total`/
+    # `log1p(device="gpu")` only engage the GPU shard-streaming kernel for
+    # ScxBackedSparseDataset / ScxLazyTransformedDataset X; on in-memory scipy
+    # X they fall back to CPU. Build a plain SCX fixture once and open it backed
+    # per iteration so the variant genuinely exercises (and can gate) the GPU
+    # route. CPU/scanpy variants stay on the in-memory `raw.copy()`.
+    gpu_scx_path = _ensure_scx_fixture(raw, dataset.name) if requires_gpu else None
+
+    def _fresh() -> Any:
+        if gpu_scx_path is not None:
+            return _open_backed(gpu_scx_path)
+        return raw.copy()
+
     # Warm-up
     for _ in range(N_WARMUP_RUNS):
-        warm = raw.copy()
+        warm = _fresh()
         impl(warm, target_sum)
         # Materialize the lazy chain for pyscx_cpu so timing reflects
         # "preprocessing complete" rather than "transform enqueued".
@@ -198,7 +263,7 @@ def run(
     diffs: list[float] = []
     for i in range(n_runs):
         gc.collect()
-        a = raw.copy()
+        a = _fresh()
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
@@ -211,7 +276,26 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
+
+        # Record the accelerator route + a numeric gate signal for the GPU
+        # variant. The GPU variant runs on a backed SCX input (see `_fresh`),
+        # so both normalize_total and log1p (device="gpu") take the GPU
+        # shard-streaming kernel and stamp route gpu_csr. The gate signal
+        # covers the *whole* normalize→log1p chain: a cpu_* route on either op
+        # (a silent partial fallback, e.g. log1p drops to CPU), or log1p never
+        # stamping a route at all, scores 0.0 and fails the gate. (CPU/scanpy
+        # variants record the route for visibility but don't emit the signal.)
+        route_norm = _extract_route(a, "normalize_total")
+        route_log1p = _extract_route(a, "log1p")
+        if route_norm is not None:
+            extras["gpu_dispatch_route"] = route_norm
+        if route_log1p is not None:
+            extras["gpu_dispatch_route_log1p"] = route_log1p
+        if requires_gpu and route_norm is not None:
+            both_gpu = route_norm.startswith("gpu_") and (route_log1p or "").startswith("gpu_")
+            extras["preprocess_route_gpu_correct"] = 1.0 if both_gpu else 0.0
+
         try:
             if raw.n_obs > _MAX_DIFF_SUBSAMPLE_ROWS:
                 rng = np.random.default_rng(RANDOM_SEED)

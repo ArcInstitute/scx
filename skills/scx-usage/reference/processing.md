@@ -35,12 +35,13 @@ h5ad. **Hybrid:** query a subset, then go in-memory with standard scanpy.
 
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — convert to AnnData.
   - `var_names`: gene-name list to project (column subset).
-  - `obsm`: which `obsm` keys to load. `None` (default) loads all; `[]` loads none (zero obsm I/O); a list decodes only those keys (unknown key → `KeyError`). Use on read-bound loads of files carrying many dense embeddings to skip decoding the ones you don't need. With `obs_filter` and `preserve_slots=False` a non-empty selection raises `ValueError` (the query engine can't return obsm) — use `preserve_slots=True` or `backed=True`. Not supported with `modality=`.
   - `obs_filter`: predicate string. **Non-backed mode** routes through the query engine (shard pushdown). **Backed mode** evaluates it with **pandas `.query()`** (richer grammar, no pushdown) and folds the matches into the dataset's row set — so the same expression can resolve via different engines depending on `backed`.
   - `layers`: layer names to load (default all).
+  - `obsm`: obsm keys to load (default `None` = all; byte-identical to before). `obsm=[...]` loads only the listed embeddings (unknown key → `KeyError`; `[]` = none) **and** switches the obsm materialisation mode (see next bullet). Use `obsm=[embed_key]` on the random-access dataloader path to drop every unused embedding's per-worker RAM.
   - `backed=True`: `X` and layers are lazy `ScxBackedSparseDataset`.
-  - `modality`: select one modality of a multimodal file (requires `backed=True`; incompatible with `var_names`/`obs_filter`/`layers`).
-  - `eager=False`: `obsp`/`varp`/`varm` (and `layers` in non-backed mode) are lazy bridges decoded on first access; `eager=True` materializes everything and detaches from the file handle (use before closing the experiment or shipping to a subprocess). `uns` is always eager; `obsm` is eager too but honours the `obsm=` selection (so `obsm=[]` skips it).
+  - `modality`: select one modality of a multimodal file (requires `backed=True`; incompatible with `var_names`/`obs_filter`/`layers`/`obsm`).
+  - `eager=False`: `obsp`/`varp`/`varm` (and `layers` in non-backed mode) are lazy bridges decoded on first access; `eager=True` materializes everything and detaches from the file handle (use before closing the experiment or shipping to a subprocess). `uns` is always eager.
+  - **obsm modes**: `obsm=None` → all keys eager (default). `obsm=[...]` + (`eager=True` or `obs_filter`) → selected keys eager. `obsm=[...]` + `backed=False` + `eager=False` → `ScxLazyObsmMapping` (each key → dense numpy on first access). `obsm=[...]` + `backed=True` + `eager=False` + no `obs_filter` → `ScxLazyObsmMapping` of `ScxBackedObsmDataset` (shard-aware dense row-gather: `m[idx]` reads only touched obsm shards, per-key LRU = `cache_shards`; the scalable path for one huge embedding). Deletion vectors compose via `kept_to_global`.
 - `to_mudata(backed=False, cache_shards=4)` — multimodal `mudata.MuData` (eager raises on single-modality; backed wraps single-modality in a one-modality MuData).
 - `query() -> PyQueryPipeline`.
 - `mark_deleted(mask)`, `validate()`.
@@ -73,7 +74,10 @@ produced when you apply lazy `normalize_total`/`log1p`.
 ## pyscx.accel.* — Rust-native accelerators
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
-(default) or `"csc"` (requires a CSC sidecar from `csc="always"` at convert).
+(default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
+convert). GPU `pdex_ref` is "GPU-fast" only with a CSC sidecar (`gpu_csc_v3`
+under `SCX_GPU_DE_V3=1`); without one it falls back to `gpu_csr_v3` — confirm via
+`adata.uns["scx_accel"][op]["route"]`.
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
 - `normalize_total(adata, target_sum=10000.0)` — on backed/lazy, appends a transform; on scipy CSR delegates to `sc.pp.normalize_total`.

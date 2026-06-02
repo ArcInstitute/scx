@@ -1,7 +1,6 @@
 //! Shard staging primitives for asynchronous host→device CSR upload.
 //!
-//! `PinnedCsrSlot` and `GpuCsrSlot` are paired grow-only buffers used by
-//! [`crate::shard_pipeline::DoubleBufferedShardLoader`] and the
+//! `PinnedCsrSlot` and `GpuCsrSlot` are paired grow-only buffers used by the
 //! `GpuShardSource` adapters (see [`crate::gpu_shard_source`]) to amortise
 //! per-shard allocation and unblock truly-async H→D copies.
 //!
@@ -28,8 +27,8 @@
 //! descriptor; growing the underlying buffers invalidates the cache.
 //!
 //! Both slot types are `!Sync` — they're designed for single-stream
-//! single-thread consumers (the main thread of `DoubleBufferedShardLoader`,
-//! one pool per device per pipeline).
+//! single-thread consumers (the main thread of `RawGpuShardSource`, one pool
+//! per device per pipeline).
 
 use std::sync::Arc;
 
@@ -206,47 +205,6 @@ impl PinnedCsrSlot {
         self.indptr.fill_from(&csr.indptr)?;
         self.indices.fill_from(&csr.indices)?;
         self.data.fill_from(&csr.data)?;
-        Ok(())
-    }
-
-    /// Issue async H→D from the pinned slot into per-shard device
-    /// buffers (used by `DoubleBufferedShardLoader::for_each_shard`).
-    ///
-    /// `indptr_len` and `nnz` are the live shard sizes and must be ≤
-    /// the destination buffer lengths.
-    pub fn upload_to_buffers(
-        &self,
-        stream: &Arc<CudaStream>,
-        dst_indptr: &mut CudaSlice<i64>,
-        dst_indices: &mut CudaSlice<i32>,
-        dst_data: &mut CudaSlice<f32>,
-        indptr_len: usize,
-        nnz: usize,
-    ) -> Result<(), GpuError> {
-        macro_rules! upload {
-            ($src:expr, $dst:expr, $len:expr) => {{
-                match $src {
-                    HostBuf::Pinned(p) => {
-                        let host_slice = p
-                            .as_slice()
-                            .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
-                        let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
-                            .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
-                    }
-                    HostBuf::Pageable(v) => {
-                        let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
-                            .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
-                    }
-                }
-            }};
-        }
-        upload!(&self.indptr, dst_indptr, indptr_len);
-        upload!(&self.indices, dst_indices, nnz);
-        upload!(&self.data, dst_data, nnz);
         Ok(())
     }
 
@@ -667,8 +625,9 @@ impl GpuCsrSlot {
 /// Adapter exposing a borrowed [`ScxCsr`] as a single-shard
 /// [`scx_format::ShardSource`].
 ///
-/// Lets the in-memory-CSR GPU DE entry points (`pdex_ref_gpu_sparse`,
-/// `wilcoxon_rank_sum_gpu_sparse`) feed the refactored chunked driver,
+/// Lets the in-memory-CSR arm of the unified GPU DE entry points
+/// (`pdex_ref_gpu` / `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Csr`) feed
+/// the refactored chunked driver,
 /// which consumes any `&dyn ShardSource + Sync` through
 /// [`crate::gpu_shard_source::RawGpuShardSource`]. The driver's per-shard
 /// device-resident scatter (`gpu_de_scatter_shard_to_dense`) then

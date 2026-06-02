@@ -62,9 +62,9 @@ impl ShardSource for ScxCsrSource<'_> {
 ///
 /// `BorrowedCsrSource` skips the first copy by holding `&[T]` views into
 /// numpy buffers (kept alive by the [`CsrSlices`] handle held by the
-/// caller). `read_shard` is invoked exactly once by
-/// `DoubleBufferedShardLoader::for_each_shard` for a single-shard source,
-/// so `slice.to_vec()` here replaces *both* the original `extract::<Vec>`
+/// caller). `read_shard` is invoked exactly once by the GPU shard loader
+/// for a single-shard source, so `slice.to_vec()` here replaces *both* the
+/// original `extract::<Vec>`
 /// step and the `ScxCsrSource::read_shard` clone — net one memcpy per
 /// dispatch instead of two.
 #[cfg(feature = "gpu")]
@@ -348,6 +348,38 @@ pub fn pca(
 
     // Extract X from adata
     let x = adata.getattr("X")?;
+
+    // Record the planned route on adata.uns["scx_accel"]["pca"]. PCA has a
+    // single GPU route (cuSPARSE + cuBLAS) gated on the modern cuSPARSE ABI;
+    // when that probe fails the dispatch falls back to CPU, which the planner
+    // records as UnsupportedInputLayout (vs NoCuda when CUDA is simply absent).
+    // The covariance-vs-randomized choice is orthogonal math policy and stays in
+    // adata.uns["pca"]["backend"], not the route string.
+    //
+    // INVARIANT (pre-dispatch stamp): this is safe to stamp *before* dispatch
+    // only because (a) `pca_gpu_eligible` is the *same* probe the GPU dispatch
+    // re-checks below (`gpu_device_id` is `Some` iff
+    // `cusparse_modern_abi_available()`), and (b) the GPU kernel propagates
+    // errors via `.map_err(..)?` rather than silently falling back to CPU — so
+    // the only way to reach the CPU path is one this probe already predicted.
+    // If a silent GPU→CPU runtime fallback is ever added here, switch to
+    // stamping *after* dispatch on the branch that actually ran (see umap.rs),
+    // or this gate will false-pass.
+    #[cfg(feature = "gpu")]
+    let pca_gpu_eligible = scx_accel::cusparse_modern_abi_available();
+    #[cfg(not(feature = "gpu"))]
+    let pca_gpu_eligible = false;
+    super::route::write_accel_route(
+        py,
+        adata,
+        "pca",
+        &super::route::simple_exec_info(
+            device,
+            pca_gpu_eligible,
+            scx_accel::AccelRoute::GpuCsr,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
 
     // ------- GPU path -------
     // Probe libcusparse for the cuSPARSE 12.5+ ABI before dispatching, so an

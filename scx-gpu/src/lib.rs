@@ -43,6 +43,7 @@ macro_rules! require_gpu {
 #[cfg(any(test, feature = "bench"))]
 pub mod test_utils;
 
+pub mod backed_gpu_matrix_source;
 pub mod cast_gpu;
 pub mod cublas;
 pub mod curand;
@@ -57,19 +58,21 @@ pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
 pub mod gpu_knn;
+pub mod gpu_matrix_source;
 pub mod gpu_pca;
 pub mod gpu_pca_covariance;
 pub mod gpu_preprocess;
 pub mod gpu_shard_source;
 pub mod gpu_umap;
 pub mod linear_operator;
+pub mod preprocessed_gpu_matrix_source;
 pub mod rice_gpu;
 pub mod shard_decode;
-pub mod shard_pipeline;
 pub mod sparse_dense;
 pub mod staging;
 
 // Re-export primary types for convenience.
+pub use backed_gpu_matrix_source::BackedGpuMatrixSource;
 pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, CublasHandle};
 pub use curand::random_gaussian_gpu;
 pub use cusolver::{gpu_cholesky_qr2, gpu_eigh_sym, gpu_qr_q, CusolverHandle, QrMethod};
@@ -82,14 +85,13 @@ pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
 pub use gpu_diffexp::{
-    build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev, de_v2_enabled,
-    de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
+    build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev,
+    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
     gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
     gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
-    gpu_de_scatter_gene_major, gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major,
-    gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term, gpu_de_upload_chunk,
-    set_de_v2_enabled_override, set_de_v3_enabled_override, GpuDeChunkScratch,
-    GPU_DE_BLOCK_SORT_CAPACITY,
+    gpu_de_scatter_gene_major, gpu_de_scatter_gene_major_dev, gpu_de_scatter_shard_to_dense,
+    gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
@@ -108,6 +110,7 @@ pub use gpu_hvg::{
     gpu_streaming_mean_var_batched,
 };
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
+pub use gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata};
 pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
 pub use gpu_pca_covariance::gpu_covariance_pca;
 pub use gpu_preprocess::{
@@ -116,10 +119,12 @@ pub use gpu_preprocess::{
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use gpu_umap::{gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
+pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
-pub use shard_pipeline::DoubleBufferedShardLoader;
-pub use sparse_dense::{sparse_to_dense_gpu, sparse_to_dense_gpu_into};
+pub use sparse_dense::{
+    sparse_to_dense_gpu, sparse_to_dense_gpu_into, sparse_to_dense_gpu_into_view,
+};
 pub use staging::{GpuCsrShardView, GpuCsrSlot, InMemoryCsrShardSource, PinnedCsrSlot};
 
 // Re-export cudarc types used in public API signatures.

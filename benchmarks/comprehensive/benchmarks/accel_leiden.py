@@ -29,6 +29,7 @@ from typing import Any, Callable
 import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
+    _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
@@ -189,7 +190,7 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
         try:
             labels = np.asarray(
                 a.obs["leiden"].astype(str).astype("category").cat.codes.values
@@ -199,6 +200,18 @@ def run(
                 extras["ari_vs_leidenalg"] = aris[-1]
         except Exception as e:
             logger.warning("ARI failed for %s run %d: %s", key, i + 1, e)
+
+        # Route + GPU gate signal. GPU Leiden runs cuGraph (gpu_csr); the
+        # variant is skipped on non-GPU hosts and there is no silent
+        # cross-backend fallback (cuGraph raises if absent), so a cpu_* route
+        # here would mean device resolution silently chose CPU → 0.0.
+        route = _extract_route(a, "leiden")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["leiden_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),

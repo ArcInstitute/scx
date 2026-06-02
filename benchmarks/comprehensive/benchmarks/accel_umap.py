@@ -32,6 +32,7 @@ from typing import Any, Callable
 import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
+    _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
@@ -197,7 +198,7 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
         try:
             pca = np.asarray(a.obsm["X_pca"], dtype=np.float32)
             um = np.asarray(a.obsm["X_umap"], dtype=np.float32)
@@ -206,6 +207,17 @@ def run(
                 extras["trustworthiness"] = trust[-1]
         except Exception as e:
             logger.warning("trustworthiness failed for %s run %d: %s", key, i + 1, e)
+
+        # Route + GPU gate signal. GPU UMAP runs the native CUDA SGD kernel (or
+        # cuML), recorded as gpu_dense; the variant is skipped on non-GPU
+        # hosts, so a cpu_* route is a silent fallback → 0.0 fails the gate.
+        route = _extract_route(a, "umap")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["umap_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
 
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,

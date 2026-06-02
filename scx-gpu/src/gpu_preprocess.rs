@@ -1,4 +1,4 @@
-//! GPU fused preprocessing (normalize + log1p) on GPU-resident CSR.
+//! GPU fused preprocessing (normalize + log1p + row_scale) on GPU-resident CSR.
 //!
 //! Provides GPU-accelerated versions of the CPU preprocessing operations
 //! in `scx-engine/src/fused_ops.rs` and `scx-loader/src/normalize.rs`.
@@ -7,6 +7,9 @@
 //! array while leaving `indptr` and `indices` untouched. Each CUDA thread
 //! handles one CSR row, computing the row sum, applying normalization, and
 //! optionally computing log1p in a single pass over each row's nonzeros.
+//! `row_scale` (the GPU counterpart of CPU `Transform::RowScale`) multiplies
+//! each row by an explicit per-row factor and is applied last, in the
+//! canonical order `normalize → log1p → row_scale`.
 //!
 //! ## Usage
 //!
@@ -41,8 +44,9 @@ const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normal
 
 /// Dispatch fused operations on a GPU-resident CSR view (in-place).
 ///
-/// Single source of truth for the `(normalize, log1p)` kernel dispatch —
-/// all the public slice-based entry points below are thin wrappers, and
+/// Single source of truth for the `(normalize, log1p)` kernel dispatch,
+/// followed by an orthogonal `row_scale` tail (applied last) — all the public
+/// slice-based entry points below are thin wrappers, and
 /// `GpuPreprocessedShardSource` calls this directly on the slot's
 /// exact-sized views. Kernel launches go on `dev.stream()` (the compute
 /// stream); callers that need a different stream must wrap accordingly.
@@ -53,6 +57,7 @@ pub(crate) fn apply_fused_ops_inner(
     n_rows: usize,
     normalize: Option<f32>,
     log1p: bool,
+    row_scale: Option<(&CudaView<'_, f32>, usize)>,
 ) -> Result<(), GpuError> {
     if n_rows == 0 {
         return Ok(());
@@ -79,7 +84,7 @@ pub(crate) fn apply_fused_ops_inner(
                 dev.stream()
                     .launch_builder(&func)
                     .arg(indptr)
-                    .arg(data)
+                    .arg(&mut *data)
                     .arg(&n_rows_i32)
                     .arg(&target_sum)
                     .launch(cfg)
@@ -94,7 +99,7 @@ pub(crate) fn apply_fused_ops_inner(
                 dev.stream()
                     .launch_builder(&func)
                     .arg(indptr)
-                    .arg(data)
+                    .arg(&mut *data)
                     .arg(&n_rows_i32)
                     .arg(&target_sum)
                     .launch(cfg)
@@ -109,13 +114,49 @@ pub(crate) fn apply_fused_ops_inner(
                 dev.stream()
                     .launch_builder(&func)
                     .arg(indptr)
-                    .arg(data)
+                    .arg(&mut *data)
                     .arg(&n_rows_i32)
                     .launch(cfg)
             }
             .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
         }
         (None, false) => {}
+    }
+
+    // Row-scale runs LAST (canonical order normalize → log1p → row_scale),
+    // after any normalize/log1p above have written `data`. The factor vector
+    // is global (iteration row order); `row_offset` selects this shard's slice.
+    if let Some((factors, row_offset)) = row_scale {
+        // Self-contained bounds guard: the streaming source validates
+        // `factors.len() == n_obs` at construction, but the direct entry
+        // points (`gpu_row_scale` / `gpu_apply_fused_ops`) reach here with no
+        // length check. `row_scale_kernel` does an unguarded device read of
+        // `factors[row_offset + row]`, so a short slice would be an OOB read.
+        if row_offset + n_rows > factors.len() {
+            return Err(GpuError::InvalidShard(format!(
+                "row_scale factors len {} < row_offset {row_offset} + n_rows {n_rows}",
+                factors.len()
+            )));
+        }
+        let row_offset_i32: i32 = row_offset.try_into().map_err(|_| {
+            GpuError::InvalidShard(format!(
+                "row_scale row_offset {row_offset} exceeds i32::MAX"
+            ))
+        })?;
+        let func = module
+            .load_function("row_scale_kernel")
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("row_scale_kernel: {e}")))?;
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(indptr)
+                .arg(&mut *data)
+                .arg(&n_rows_i32)
+                .arg(&row_offset_i32)
+                .arg(factors)
+                .launch(cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("row_scale_kernel: {e}")))?;
     }
     Ok(())
 }
@@ -140,6 +181,7 @@ pub fn gpu_normalize_log1p(
         n_rows,
         Some(target_sum),
         true,
+        None,
     )
 }
 
@@ -160,6 +202,7 @@ pub fn gpu_normalize(
         n_rows,
         Some(target_sum),
         false,
+        None,
     )
 }
 
@@ -172,7 +215,31 @@ pub fn gpu_log1p(
 ) -> Result<(), GpuError> {
     let indptr_view = indptr.slice(..);
     let mut data_view = data.slice_mut(..);
-    apply_fused_ops_inner(dev, &indptr_view, &mut data_view, n_rows, None, true)
+    apply_fused_ops_inner(dev, &indptr_view, &mut data_view, n_rows, None, true, None)
+}
+
+/// Per-row explicit-factor scaling on a GPU-resident CSR matrix (in-place):
+/// `data[i] *= factors[row]`. `factors` must have length ≥ `n_rows` (indexed
+/// from row 0). Mirrors the CPU `Transform::RowScale` per-row multiply.
+pub fn gpu_row_scale(
+    dev: &GpuDevice,
+    indptr: &CudaSlice<i64>,
+    data: &mut CudaSlice<f32>,
+    n_rows: usize,
+    factors: &CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    let indptr_view = indptr.slice(..);
+    let mut data_view = data.slice_mut(..);
+    let factors_view = factors.slice(..);
+    apply_fused_ops_inner(
+        dev,
+        &indptr_view,
+        &mut data_view,
+        n_rows,
+        None,
+        false,
+        Some((&factors_view, 0)),
+    )
 }
 
 /// Dispatch fused operations on a GPU-resident CSR matrix (in-place).
@@ -188,10 +255,20 @@ pub fn gpu_apply_fused_ops(
     n_rows: usize,
     normalize: Option<f32>,
     log1p: bool,
+    row_scale: Option<&CudaSlice<f32>>,
 ) -> Result<(), GpuError> {
     let indptr_view = indptr.slice(..);
     let mut data_view = data.slice_mut(..);
-    apply_fused_ops_inner(dev, &indptr_view, &mut data_view, n_rows, normalize, log1p)
+    let row_scale_view = row_scale.map(|s| s.slice(..));
+    apply_fused_ops_inner(
+        dev,
+        &indptr_view,
+        &mut data_view,
+        n_rows,
+        normalize,
+        log1p,
+        row_scale_view.as_ref().map(|v| (v, 0)),
+    )
 }
 
 /// Stream a [`ShardSource`] through [`gpu_apply_fused_ops`] and return a
@@ -217,15 +294,19 @@ pub fn gpu_apply_fused_ops(
 /// * `normalize` — `Some(target_sum)` to apply per-row normalization; `None` to
 ///   skip normalization.
 /// * `log1p` — apply `log1p` elementwise after any normalization.
+/// * `row_scale` — optional per-row factor vector (in the source's iteration
+///   row order, length `n_obs`); applied last (`data *= factor`), after any
+///   normalize/log1p.
 ///
-/// When both `normalize` and `log1p` are `None`/`false`, each shard is simply
-/// downloaded and concatenated (no kernel launched). Callers can avoid that
-/// overhead by not calling this function for the no-op case.
+/// When `normalize`, `log1p`, and `row_scale` are all `None`/`false`, each
+/// shard is simply downloaded and concatenated (no kernel launched). Callers
+/// can avoid that overhead by not calling this function for the no-op case.
 pub fn gpu_preprocess_to_csr(
     dev: &GpuDevice,
     source: &(dyn ShardSource + Sync),
     normalize: Option<f32>,
     log1p: bool,
+    row_scale: Option<&[f32]>,
 ) -> Result<ScxCsr, GpuError> {
     let n_vars = source.n_vars();
     let n_shards = source.n_shards();
@@ -243,7 +324,7 @@ pub fn gpu_preprocess_to_csr(
     // needing a Mutex or post-hoc sort.
     let mut shard_csrs = Vec::<ScxCsr>::with_capacity(n_shards);
 
-    let mut gpu_source = GpuPreprocessedShardSource::new(dev, source, normalize, log1p)?;
+    let mut gpu_source = GpuPreprocessedShardSource::new(dev, source, normalize, log1p, row_scale)?;
     gpu_source.for_each_gpu_shard(|_shard_idx, slot| {
         let view = slot.view();
         let n_rows = view.shape.0;
@@ -497,7 +578,7 @@ mod tests {
         // 1. Both normalize + log1p
         let d_indptr = dev.htod_copy(&indptr).unwrap();
         let mut d_data = dev.htod_copy(&data).unwrap();
-        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data, n_rows, Some(1e4), true).unwrap();
+        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data, n_rows, Some(1e4), true, None).unwrap();
         dev.synchronize().unwrap();
         let result_both = dev.dtoh_copy(&d_data).unwrap();
 
@@ -512,7 +593,16 @@ mod tests {
 
         // 2. Normalize only
         let mut d_data2 = dev.htod_copy(&data).unwrap();
-        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data2, n_rows, Some(1.0), false).unwrap();
+        gpu_apply_fused_ops(
+            &dev,
+            &d_indptr,
+            &mut d_data2,
+            n_rows,
+            Some(1.0),
+            false,
+            None,
+        )
+        .unwrap();
         dev.synchronize().unwrap();
         let result_norm = dev.dtoh_copy(&d_data2).unwrap();
         let row0_sum: f32 = result_norm[0..2].iter().sum();
@@ -520,14 +610,14 @@ mod tests {
 
         // 3. Log1p only
         let mut d_data3 = dev.htod_copy(&data).unwrap();
-        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data3, n_rows, None, true).unwrap();
+        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data3, n_rows, None, true, None).unwrap();
         dev.synchronize().unwrap();
         let result_log = dev.dtoh_copy(&d_data3).unwrap();
         assert!((result_log[0] - 5.0f32.ln_1p()).abs() < 1e-6);
 
         // 4. No-op
         let mut d_data4 = dev.htod_copy(&data).unwrap();
-        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data4, n_rows, None, false).unwrap();
+        gpu_apply_fused_ops(&dev, &d_indptr, &mut d_data4, n_rows, None, false, None).unwrap();
         dev.synchronize().unwrap();
         let result_noop = dev.dtoh_copy(&d_data4).unwrap();
         assert_eq!(result_noop, data);
@@ -673,8 +763,8 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let result =
-            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false).expect("gpu preprocess");
+        let result = gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false, None)
+            .expect("gpu preprocess");
         assert_eq!(result.n_rows(), n_rows);
         assert_eq!(result.n_cols(), n_cols);
         assert_eq!(result.nnz(), csr.nnz());
@@ -720,7 +810,8 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let result = gpu_preprocess_to_csr(&dev, &source, None, true).expect("gpu preprocess");
+        let result =
+            gpu_preprocess_to_csr(&dev, &source, None, true, None).expect("gpu preprocess");
         assert_eq!(result.indices, csr.indices);
         assert_eq!(result.indptr, csr.indptr);
 
@@ -747,8 +838,8 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let result =
-            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), true).expect("gpu preprocess");
+        let result = gpu_preprocess_to_csr(&dev, &source, Some(target_sum), true, None)
+            .expect("gpu preprocess");
         assert_eq!(result.indices, csr.indices);
         assert_eq!(result.indptr, csr.indptr);
 
@@ -770,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_gpu_preprocess_to_csr_single_shard() {
-        // Exercises the single-buffered fallback in DoubleBufferedShardLoader.
+        // Exercises the single-shard fast path of `RawGpuShardSource`.
         let dev = require_gpu!();
         let n_rows = 100;
         let n_cols = 40;
@@ -782,8 +873,8 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let result =
-            gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false).expect("gpu preprocess");
+        let result = gpu_preprocess_to_csr(&dev, &source, Some(target_sum), false, None)
+            .expect("gpu preprocess");
         assert_eq!(result.n_rows(), n_rows);
         assert_eq!(result.n_cols(), n_cols);
         // Per-row sums should be ~1.0.
@@ -796,5 +887,122 @@ mod tests {
             let row_sum: f32 = result.data[p0..p1].iter().sum();
             assert!((row_sum - 1.0).abs() < 1e-4, "row {r} sum = {row_sum}");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // row_scale (item 3l): per-row explicit-factor scaling on device
+    // -------------------------------------------------------------------
+
+    /// CPU reference: per-row explicit-factor scale (matches `row_scale_kernel`).
+    fn cpu_row_scale(indptr: &[i64], data: &mut [f32], factors: &[f32]) {
+        let n_rows = indptr.len() - 1;
+        for row in 0..n_rows {
+            let start = indptr[row] as usize;
+            let end = indptr[row + 1] as usize;
+            let f = factors[row];
+            for v in &mut data[start..end] {
+                *v *= f;
+            }
+        }
+    }
+
+    /// Standalone `gpu_row_scale` (single matrix, in-place) vs CPU per-row
+    /// multiply. row_scale uses plain f32 multiply on both paths, so this is a
+    /// tight bound.
+    #[test]
+    fn test_gpu_row_scale_matches_cpu() {
+        let dev = require_gpu!();
+        let indptr: Vec<i64> = vec![0, 2, 5, 6];
+        let data: Vec<f32> = vec![5.0, 10.0, 1.0, 3.0, 7.0, 2.0];
+        let factors: Vec<f32> = vec![2.0, 0.5, 3.0];
+        let n_rows = 3;
+
+        let d_indptr = dev.htod_copy(&indptr).unwrap();
+        let mut d_data = dev.htod_copy(&data).unwrap();
+        let d_factors = dev.htod_copy(&factors).unwrap();
+        gpu_row_scale(&dev, &d_indptr, &mut d_data, n_rows, &d_factors).unwrap();
+        dev.synchronize().unwrap();
+        let gpu_result = dev.dtoh_copy(&d_data).unwrap();
+
+        let mut cpu_data = data.clone();
+        cpu_row_scale(&indptr, &mut cpu_data, &factors);
+
+        for i in 0..gpu_result.len() {
+            assert!(
+                (gpu_result[i] - cpu_data[i]).abs() < 1e-5,
+                "row_scale mismatch at {i}: gpu={}, cpu={}",
+                gpu_result[i],
+                cpu_data[i]
+            );
+        }
+    }
+
+    /// `gpu_preprocess_to_csr` row_scale-only over a multi-shard source — the
+    /// concatenated result must equal the source scaled per global row,
+    /// validating the per-shard `global_row_offset` accumulation.
+    #[test]
+    fn test_gpu_preprocess_to_csr_row_scale_only_multishard() {
+        let dev = require_gpu!();
+        let n_rows = 400;
+        let n_cols = 80;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 0x5EED_1234);
+        let factors: Vec<f32> = (0..n_rows).map(|r| 0.25 + (r % 16) as f32 * 0.25).collect();
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result = gpu_preprocess_to_csr(&dev, &source, None, false, Some(&factors))
+            .expect("gpu preprocess");
+
+        let mut cpu_data = csr.data.clone();
+        cpu_row_scale(&csr.indptr, &mut cpu_data, &factors);
+
+        assert_eq!(result.data.len(), cpu_data.len());
+        for i in 0..cpu_data.len() {
+            let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
+            let denom = (cpu_data[i] as f64).abs().max(1e-10);
+            assert!(diff / denom < 1e-5, "row_scale mismatch at nnz {i}");
+        }
+    }
+
+    /// Full chain normalize → log1p → row_scale on a multi-shard source vs a
+    /// CPU reference applying the transforms in the same canonical order.
+    #[test]
+    fn test_gpu_preprocess_to_csr_normalize_log1p_row_scale_multishard() {
+        let dev = require_gpu!();
+        let n_rows = 500;
+        let n_cols = 100;
+        let target_sum = 1e4f32;
+        let csr = random_pos_csr(n_rows, n_cols, 0.1, 0xBEEF_F00D);
+        let factors: Vec<f32> = (0..n_rows).map(|r| 0.5 + (r % 7) as f32 * 0.3).collect();
+        let shards = split_into_shards(&csr, 4);
+        let source = InMemorySource {
+            shards,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let result = gpu_preprocess_to_csr(&dev, &source, Some(target_sum), true, Some(&factors))
+            .expect("gpu preprocess");
+
+        // CPU reference: fused normalize+log1p, then per-row scale (global row).
+        let mut cpu_data = csr.data.clone();
+        cpu_fused_normalize_log1p(&csr.indptr, &mut cpu_data, target_sum as f64);
+        cpu_row_scale(&csr.indptr, &mut cpu_data, &factors);
+
+        assert_eq!(result.data.len(), cpu_data.len());
+        let mut max_rel = 0.0f64;
+        for i in 0..cpu_data.len() {
+            let diff = (result.data[i] as f64 - cpu_data[i] as f64).abs();
+            let denom = (cpu_data[i] as f64).abs().max(1e-10);
+            max_rel = max_rel.max(diff / denom);
+        }
+        assert!(
+            max_rel < 1e-5,
+            "max relative error = {max_rel} (threshold: 1e-5)"
+        );
     }
 }

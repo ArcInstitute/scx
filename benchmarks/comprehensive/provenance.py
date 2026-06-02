@@ -107,4 +107,9 @@ def capture_run_provenance() -> dict[str, Any]:
         "mkl_threads": os.environ.get("MKL_NUM_THREADS", ""),
         "conda_env": os.environ.get("CONDA_DEFAULT_ENV", ""),
         "pyscx_features": os.environ.get("PYSCX_FEATURES", ""),
+        # GPU DE v3 is the unconditional default since ACC-RUST-OPT-V2 §5 Phase
+        # V1b; the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` gates were removed. The
+        # recorded `gpu_dispatch_route` (e.g. gpu_csc_v3) is now the route signal.
+        # `SCX_GPU_DE_V3_TRACE` is a debug-only stderr trace, still captured.
+        "scx_gpu_de_v3_trace": os.environ.get("SCX_GPU_DE_V3_TRACE", ""),
     }

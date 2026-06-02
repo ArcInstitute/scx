@@ -165,9 +165,11 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///     backed = sc.read_h5ad("big.h5ad", backed="r")
 ///     pyscx.from_anndata(backed, "big.scx")
 ///
-/// `csc`: when `"always"`, also writes a CSC (column-major) sidecar.
-///   `"off"` (default) emits CSR shards only. No `"auto"` mode — CSC is
-///   opt-in by design (matches `scx convert --csc`).
+/// `csc`: `"off"` (default) emits CSR shards only; `"always"` also writes
+///   a CSC (column-major) sidecar; `"auto"` writes one when the dataset is
+///   large enough to benefit (`n_obs >= 50000` and `n_vars >= 5000` by
+///   default, tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` /
+///   `SCX_CSC_AUTO_VARS_THRESHOLD` env vars). Matches `scx convert --csc`.
 ///
 /// `csc_cols_per_shard`: columns per emitted CSC shard (default 5000).
 ///   Pass `0` to disable the cap (single CSC shard, memory permitting).
@@ -276,10 +278,13 @@ fn from_anndata(
 /// overrides — accepting them would re-introduce the eager-materialisation
 /// OOM class this entrypoint exists to avoid.
 ///
-/// `csc="always"` performs a two-pass write: the streaming converter
-/// emits CSR shards, then `scx_ops::rebuild_csc_inplace` regenerates
-/// the CSC sidecar over the just-written file. Peak disk briefly
-/// reaches ~2× the output size during the rebuild.
+/// `csc="always"` (or `csc="auto"` over a dataset above the size
+/// thresholds — `n_obs >= 50000` and `n_vars >= 5000` by default, tunable
+/// via `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`)
+/// performs a two-pass write: the streaming converter emits CSR shards,
+/// then `scx_ops::rebuild_csc_inplace` regenerates the CSC sidecar over the
+/// just-written file. Peak disk briefly reaches ~2× the output size during
+/// the rebuild.
 ///
 /// Source-layout handling:
 ///   * CSR-on-disk h5ad: native streaming path.
@@ -362,15 +367,8 @@ fn from_h5ad(
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
-    let csc_always = match csc {
-        "off" => false,
-        "always" => true,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "invalid csc value '{other}'; expected 'off' or 'always'"
-            )));
-        }
-    };
+    let csc_policy =
+        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
@@ -428,7 +426,7 @@ fn from_h5ad(
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
         codec: explicit_codec,
-        csc: csc_always,
+        csc: csc_policy,
         csc_cols_per_shard,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
@@ -557,6 +555,12 @@ fn from_10x(
 /// string (`"rna"`, `"protein"`, `"atac"`, `"spatial"`,
 /// `"methylation"`, `"custom"`). Modalities not listed fall back
 /// to inference and trigger a `UserWarning` per modality.
+///
+/// `csc`: the streaming path (default) cannot build per-modality CSC
+/// sidecars — `csc="always"` raises and `csc="auto"` degrades to no-CSC
+/// with a `UserWarning` when a modality would have qualified. Pass
+/// `stream=False` to build per-modality CSC via the non-streaming path
+/// (it materializes each modality's X). `csc="off"` (default) is unaffected.
 ///
 /// Example:
 ///     pyscx.from_h5mu("cite_seq.h5mu", "out.scx")
@@ -869,12 +873,14 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::IndexPlanDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
+    m.add_class::<backed::ScxBackedObsmDataset>()?;
     m.add_class::<backed::ScxBackedMuDataset>()?;
     m.add_class::<backed::ScxBackedMuModality>()?;
     m.add_class::<backed::ScxComparisonResult>()?;
     m.add_class::<lazy_transform::ScxLazyTransformedDataset>()?;
     m.add_class::<lazy_mapping::ScxLazyPairwiseMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyVarmMapping>()?;
+    m.add_class::<lazy_mapping::ScxLazyObsmMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyLayersMapping>()?;
     m.add_class::<lazy_mapping::ScxLazyValueIterator>()?;
     m.add_class::<lazy_mapping::ScxLazyItemIterator>()?;
@@ -927,6 +933,19 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register backed classes as virtual subclasses of anndata.abc.CSRDataset.
     // This makes isinstance(x, CSRDataset) return True so AnnData accepts them.
+    //
+    // `ScxBackedObsmDataset` is **dense**, but AnnData's `obsm`
+    // (`AxisArrays`) re-validates every value on each public `adata.obsm[key]`
+    // access via `coerce_array`, whose accepted-type allowlist for lazy dense
+    // arrays is restricted to concrete classes we cannot subclass
+    // (`h5py.Dataset` / `zarr.Array` / `dask.array`) plus the `CSRDataset` /
+    // `CSCDataset` ABCs. Registering as `CSRDataset` is the only way to let
+    // `adata.obsm[key]` return the backed row-gather dataset (so `m[idx]`
+    // gathers `O(batch)` rows) rather than raising. The dataset's
+    // `__getitem__` returns dense numpy, and it exposes `toarray` / `__array__`
+    // so array-style consumers work; CSR-only methods (`.tocsr`) are
+    // intentionally absent. See docs/scanpy.md.
+    //
     // Best-effort: if anndata isn't installed we skip silently (common on
     // stripped-down envs); but if the import succeeds and `register` raises
     // we surface the error via `log::warn!` so a user debugging why
@@ -938,6 +957,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
                 for cls_name in [
                     "ScxBackedSparseDataset",
                     "ScxBackedLayerDataset",
+                    "ScxBackedObsmDataset",
                     "ScxLazyTransformedDataset",
                 ] {
                     if let Err(err) = csr_dataset.call_method1("register", (m.getattr(cls_name)?,))

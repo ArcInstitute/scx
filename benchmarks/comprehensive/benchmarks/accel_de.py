@@ -175,6 +175,7 @@ def _run_pyscx_wilcoxon_gpu(adata: Any, groupby: str, reference: str) -> str:
         pyscx.accel.rank_genes_groups(
             scx_adata, groupby, reference=reference, device="gpu",
         )
+        _propagate_route(scx_adata, adata)
     else:
         pyscx.accel.rank_genes_groups(
             adata, groupby, reference=reference, device="gpu",
@@ -193,18 +194,20 @@ def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
     When the bench has built an SCX-backed fixture for this dataset (with a
     CSC sidecar), route through ``pyscx.open(scx_path)`` so the dataset
     arrives as a ``ScxBackedSparseDataset`` with ``backed_csc=Some(...)``.
-    That makes pyscx's dispatch route to ``pdex_ref_gpu_streaming(...,
-    csc_reader=Some(...))``, which under ``SCX_GPU_DE_V3=1`` exercises the
+    That makes pyscx's dispatch route to ``pdex_ref_gpu(GpuDeShardInput::Backed
+    { csc: Some(...), .. })``, which under ``SCX_GPU_DE_V3=1`` exercises the
     v3 CSC-direct kernels (the path we actually want to bench). The
-    in-memory scipy CSR fallback routes through ``pdex_ref_gpu_sparse`` →
+    in-memory scipy CSR fallback routes through ``pdex_ref_gpu(Csr)`` →
     v3 CSR-fallback, which is NOT the path G4.3 is trying to measure.
     """
     import pyscx
     scx_adata = _as_scx_backed_if_available(adata)
     if scx_adata is not None:
-        return pyscx.accel.pdex_ref(
+        df = pyscx.accel.pdex_ref(
             scx_adata, groupby, reference=reference, device="gpu",
         )
+        _propagate_route(scx_adata, adata)
+        return df
     return pyscx.accel.pdex_ref(adata, groupby, reference=reference, device="gpu")
 
 
@@ -231,7 +234,7 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
         # set when the file has a CSC sidecar), we have to go through
         # `Experiment.to_anndata(backed=True)`. Without `backed=True` we
         # get a fully-materialised AnnData with a scipy CSR X, which
-        # routes through `pdex_ref_gpu_sparse` and never exercises CSC.
+        # routes through `pdex_ref_gpu(Csr)` and never exercises CSC.
         exp = pyscx.open(str(scx_path))
         return exp.to_anndata(backed=True)
     except Exception as e:
@@ -243,6 +246,55 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
         return None
 
 
+def _propagate_route(src_adata: Any, dst_adata: Any) -> None:
+    """Merge the accelerator route metadata that pyscx wrote to ``src_adata.uns``
+    into ``dst_adata.uns`` so the runner (which only holds ``dst_adata``) can
+    read it. Used when the GPU impl runs DE on an internally-opened SCX-backed
+    AnnData distinct from the adata the runner passed in.
+
+    Merges per-op (mirroring the Rust ``write_accel_route`` semantics) rather
+    than overwriting, so route entries from other ops on ``dst_adata`` survive,
+    and re-assigns the dict so it works on any ``uns`` backing."""
+    try:
+        accel = src_adata.uns.get("scx_accel")
+    except Exception:
+        accel = None
+    if not accel:
+        return
+    try:
+        merged = dict(dst_adata.uns.get("scx_accel", {}) or {})
+        merged.update(accel)
+        dst_adata.uns["scx_accel"] = merged
+    except Exception:
+        pass
+
+
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
+        return None
+
+
+def _extract_fallback(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["fallback_reason"]``, or None."""
+    try:
+        return adata.uns["scx_accel"][op]["fallback_reason"]
+    except Exception:
+        return None
+
+
+def _extract_shards_decoded(adata: Any, op: str) -> int | None:
+    """Read ``adata.uns["scx_accel"][op]["shards_decoded"]`` (CSC/CSR-direct v3
+    route telemetry), or None when absent / not tracked."""
+    try:
+        v = adata.uns["scx_accel"][op]["shards_decoded"]
+        return None if v is None else int(v)
+    except Exception:
+        return None
+
+
 def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     """Materialise the bench's prepared adata (groupby-tagged + subset to
     top groups) as a temp SCX file with a CSC sidecar.
@@ -250,8 +302,8 @@ def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     Required so the GPU pdex_ref / wilcoxon impls can route through
     ``pyscx.open(scx_path)`` → ``ScxBackedSparseDataset`` with
     ``backed_csc=Some(...)``. With only the h5ad-loaded scipy CSR in
-    memory, pyscx routes to the in-memory `pdex_ref_gpu_sparse` entry
-    point which has no CSC reader, and v3 dispatch always falls back to
+    memory, pyscx routes to the in-memory `pdex_ref_gpu(Csr)` arm
+    which has no CSC reader, and v3 dispatch always falls back to
     the CSR-direct path even when SCX_GPU_DE_V3=1.
 
     Returns the path on success or None if pyscx is missing or the
@@ -505,7 +557,7 @@ def run(
         # with CSC sidecar so the GPU pdex_ref / wilcoxon impls can load
         # it via pyscx.open() and exercise the v3-CSC dispatch path. With
         # only the in-memory scipy CSR, pyscx routes to
-        # `pdex_ref_gpu_sparse` → v3-CSR fallback, which never touches
+        # `pdex_ref_gpu(Csr)` → v3-CSR fallback, which never touches
         # the new CSC kernels.
         scx_csc_path = _ensure_scx_csc_fixture(adata_for_pick, dataset.name)
         if scx_csc_path is not None:
@@ -585,7 +637,70 @@ def run(
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
 
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
+
+        # Record which accelerator route actually ran (read from adata.uns,
+        # written by pyscx). `gpu_dispatch_route` is a human-readable string
+        # for the coverage banner; `de_route_csc_direct` is a numeric gate
+        # signal (1.0 iff the CSC-direct GPU route ran) so the existing
+        # absolute-floor machinery in compare_against_baseline.py can fail the
+        # gate when a CSC-direct benchmark silently fell back to CSR.
+        op_key = "rank_genes_groups" if kind == "wilcoxon" else "pdex_ref"
+        route = _extract_route(a, op_key)
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            fallback = _extract_fallback(a, op_key)
+            if fallback is not None:
+                extras["gpu_dispatch_fallback"] = fallback
+            # §B.10 crit. 1 artifact field: how many CSC/CSR shards the v3 driver
+            # decoded+uploaded across the call. On the CSC-direct route this is
+            # below n_csc_shards × n_gene_chunks (range prefiltering); deterministic
+            # validation lives in the scx-accel `csc::{pdex,wilcoxon}` multi-shard
+            # tests. Recorded here for the route-marked artifact and dashboards.
+            shards_decoded = _extract_shards_decoded(a, op_key)
+            if shards_decoded is not None:
+                extras["shards_decoded"] = float(shards_decoded)
+            if requires_gpu and kind == "pdex_ref":
+                # Numeric gate signal for the GPU pdex_ref triple. Always
+                # emitted (so the absolute-floor gate never sees a missing
+                # metric) and only 0.0 on a *silent fallback*: we built a CSC
+                # sidecar fixture, yet a non-CSC route was recorded. When no CSC
+                # fixture was built the signal is 1.0 = "not applicable / OK".
+                #
+                # GPU DE v3 is the unconditional default (the SCX_GPU_DE_V3 gate
+                # was removed in Phase V1b), so a CSC fixture must dispatch
+                # gpu_csc_v3. The expectation is keyed on the fixture alone, not
+                # the recorded route — *any* non-gpu_csc_v3 route on a CSC fixture
+                # is a silent fallback this gate catches (a gpu_csr_v3 CSC→CSR
+                # drop, but also a deeper gpu_csr / cpu_* regression). The
+                # separate `*_route_gpu_correct` gate covers GPU→CPU drops.
+                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                extras["de_route_csc_direct"] = (
+                    1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
+                )
+            if requires_gpu and kind == "wilcoxon":
+                # Numeric gate signal for the GPU Wilcoxon triple. The variant
+                # is skipped on non-GPU hosts (see the requires_gpu guard
+                # upstream), so a recorded route always means GPU was attempted;
+                # a cpu_* route here is a silent CPU fallback → 0.0 fails the
+                # gate. Holds for both the v1 dense path and the v3 routes.
+                extras["wilcoxon_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
+                # CSC-direct route assertion, mirroring pdex_ref's
+                # `de_route_csc_direct`. 1.0 when the CSC-direct route ran (or no
+                # CSC fixture this run); 0.0 on a *silent fallback* — a CSC
+                # sidecar fixture was built, yet a non-gpu_csc_v3 route was
+                # recorded. GPU DE v3 is the unconditional default (Phase V1b),
+                # so a CSC fixture must dispatch gpu_csc_v3; the expectation is
+                # keyed on the fixture alone, not the recorded route, so a deeper
+                # regression out of v3 (gpu_csr_v3 / gpu_csr / cpu_*) also
+                # fails rather than scoring N/A.
+                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                extras["wilcoxon_route_csc_direct"] = (
+                    1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
+                )
+
         if requires_gpu and cpu_pvals is not None:
             try:
                 if kind == "wilcoxon":
@@ -625,4 +740,12 @@ def run(
         result.metadata["de_pval_agreement_vs_cpu"] = round(float(np.median(pval_agreements)), 6)
     if overlaps:
         result.metadata["de_top_gene_overlap_vs_cpu"] = round(float(np.median(overlaps)), 4)
+    # Surface the route at the dataset level too (route is stable across runs).
+    run_routes = [
+        r.extra.get("gpu_dispatch_route")
+        for r in result.runs
+        if r.extra.get("gpu_dispatch_route") is not None
+    ]
+    if run_routes:
+        result.metadata["gpu_dispatch_route"] = run_routes[-1]
     return result

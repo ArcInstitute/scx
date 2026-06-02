@@ -140,7 +140,12 @@ def _convert_to_csc_scx(dataset: DatasetConfig, tmpdir: Path) -> Path:
 
 
 def _open_backed(path: Path) -> Any:
-    return pyscx.open(str(path)).to_anndata(backed=True)
+    # Size the LRU shard cache to the file's shard count. The default
+    # cache_shards=4 is < tabula_sapiens_100k's 7 CSR shards, which makes the
+    # CSR pdex_ref variant re-decode every shard per gene chunk (hours-long).
+    # Caching all shards keeps the per-gene-chunk slab reads from thrashing.
+    exp = pyscx.open(str(path))
+    return exp.to_anndata(backed=True, cache_shards=max(4, exp.shard_count))
 
 
 # ---------------------------------------------------------------------------
@@ -209,29 +214,32 @@ def _run_pdex_ref(adata: Any, prefer: str) -> None:
 
 
 def _run_pseudobulk(adata: Any, prefer: str) -> None:
-    """For CSC, we project to the top 500 genes (out of 30K+) so the
-    `gene_indices` precondition is satisfied. CSR runs the full set
-    for a like-for-like comparison.
+    """Run pseudobulk DE with a replicate-bearing design so pydeseq2 has
+    residual degrees of freedom.
+
+    A single-column groupby (``[test_col]``) yields one pseudobulk sample per
+    condition level, so DESeq2 errors with "no replicates" — the variant never
+    completed on any dataset. We synthesise a binary condition (``_bench_cond``)
+    plus 4 pseudo-replicates (``_bench_rep``) and group by both, giving 8
+    samples for a 2-coefficient design. This benchmark measures CSR-vs-CSC
+    dispatch cost, not biological signal, so the synthetic design is fine.
+
+    For CSC we project to the top 500 genes so the ``gene_indices`` precondition
+    is satisfied; CSR runs the full gene set for a like-for-like comparison.
     """
-    obs_cols = list(adata.obs.columns)
-    candidates = ["perturbation", "cell_type", "leiden"]
-    test_col = next((c for c in candidates if c in obs_cols), None)
-    if test_col is None:
-        n = adata.n_obs
-        adata.obs["_bench_group"] = (np.arange(n) < n // 2).astype(str)
-        test_col = "_bench_group"
-    levels = list(adata.obs[test_col].astype(str).unique())
-    if len(levels) < 2:
-        return
-    reference = levels[0]
+    n = adata.n_obs
+    adata.obs["_bench_cond"] = (np.arange(n) < n // 2).astype(str)
+    adata.obs["_bench_rep"] = (np.arange(n) % 4).astype(str)
+    groupby = ["_bench_cond", "_bench_rep"]
+    reference = "True"  # _bench_cond levels are "True" / "False"
     if prefer == "csc":
         # 500 genes is enough to exercise the multi-shard slab read
         # without dragging the whole catalog through.
         gene_indices = list(range(min(500, adata.n_vars)))
         pyscx.accel.pseudobulk_dex(
             adata,
-            [test_col],
-            test_col,
+            groupby,
+            "_bench_cond",
             reference,
             prefer_format="csc",
             gene_indices=gene_indices,
@@ -239,8 +247,8 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
     else:
         pyscx.accel.pseudobulk_dex(
             adata,
-            [test_col],
-            test_col,
+            groupby,
+            "_bench_cond",
             reference,
             prefer_format="csr",
         )
@@ -259,6 +267,31 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[[Any, str], None], str]] = {
     "bench_csc__pseudobulk_csr":  (_run_pseudobulk, "csr"),
     "bench_csc__pseudobulk_csc":  (_run_pseudobulk, "csc"),
 }
+
+# Variant key → adata.uns["scx_accel"] op key for route extraction. Ops that
+# stamp a route to `adata.uns["scx_accel"][op]["route"]` emit the numeric
+# `csc_dispatch_correct` gate signal so a silent CSC→CSR (or CSR→CSC) fallback
+# fails the gate. All five ops stamp a route, so every variant is gated.
+_VARIANT_OP_KEY: dict[str, str] = {
+    "bench_csc__qc_metrics_csr": "calculate_qc_metrics",
+    "bench_csc__qc_metrics_csc": "calculate_qc_metrics",
+    "bench_csc__hvg_csr": "highly_variable_genes",
+    "bench_csc__hvg_csc": "highly_variable_genes",
+    "bench_csc__de_csr": "rank_genes_groups",
+    "bench_csc__de_csc": "rank_genes_groups",
+    "bench_csc__pdex_ref_csr": "pdex_ref",
+    "bench_csc__pdex_ref_csc": "pdex_ref",
+    "bench_csc__pseudobulk_csr": "pseudobulk_dex",
+    "bench_csc__pseudobulk_csc": "pseudobulk_dex",
+}
+
+
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
+        return None
 
 
 def run(
@@ -321,11 +354,30 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
+
+        # Verify the intended layout actually dispatched. Read the route
+        # pyscx stamped on adata.uns and assert it matches `prefer`: a `_csc`
+        # variant must run a route containing "csc"; a `_csr` variant must NOT.
+        # 0.0 catches a silent fallback (e.g. require_csc() dropped to CSR
+        # because the sidecar build failed); the absolute-floor gate fails on
+        # it. Only emitted for ops that stamp a route (see _VARIANT_OP_KEY).
+        extras: dict[str, Any] = {}
+        op_key = _VARIANT_OP_KEY.get(key)
+        if op_key is not None:
+            route = _extract_route(adata, op_key)
+            if route is not None:
+                extras["dispatch_route"] = route
+                if prefer == "csc":
+                    extras["csc_dispatch_correct"] = 1.0 if "csc" in route else 0.0
+                else:
+                    extras["csc_dispatch_correct"] = 1.0 if "csc" not in route else 0.0
+
         result.add_run(
             wall_s=wall,
             user_s=u1 - u0,
             sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),
+            **extras,
         )
         logger.info(
             "  %s run %d: wall=%.3fs rss=%.1f MB",

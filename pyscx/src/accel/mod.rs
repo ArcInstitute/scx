@@ -31,5 +31,6 @@ pub mod neighbors;
 pub mod pca;
 pub mod preprocessing;
 pub mod pseudobulk;
+pub mod route;
 pub mod umap;
 pub mod util;

@@ -1211,14 +1211,17 @@ extern "C" __global__ void searchsorted_ranksum_kernel(
 // ---------------------------------------------------------------------------
 // MWU p-value via normal approximation with tie correction.
 //
-// Matches `scx-accel::diffexp::wilcoxon_full_from_ranks`:
+// Matches `scx-accel::diffexp::wilcoxon_full_from_ranks(.., continuity=true)`:
 //   μ      = n1 * n2 / 2
 //   σ²     = (n1 * n2 / 12) * ((N + 1) − tc / (N * (N − 1)))   (N = n1+n2)
-//   z      = (U1 − μ) / σ
-//   p      = erfc(|z| / √2)                                    (two-sided)
+//   z      = max(|U1 − μ| − 0.5, 0) / σ                         (continuity)
+//   p      = erfc(z / √2)                                       (two-sided)
 //
-// No continuity correction (matches CPU exactly). Clips p to [0, 1] before
-// writing, mirroring pdex_ref's clamp.
+// The continuity correction (subtract 0.5 from |U1 − μ|) matches upstream pdex
+// / numba_mwu (`use_continuity=True`, scipy's default) and the CPU pdex_ref
+// path. This kernel is used ONLY by the pdex_ref GPU sequences; the Wilcoxon
+// GPU path computes its p-value elsewhere and stays uncorrected for scanpy
+// parity. Clips p to [0, 1] before writing, mirroring pdex_ref's clamp.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void pvalue_erfc_kernel(
     const double* __restrict__ u_stats,
@@ -1248,8 +1251,12 @@ extern "C" __global__ void pvalue_erfc_kernel(
         p_values[gene] = 1.0;
         return;
     }
-    double z = (u1 - mu) / sqrt(sigma_sq);
-    double p = erfc(fabs(z) * 0.7071067811865475);  // 1/√2
+    // Continuity correction: subtract 0.5 from |U1 − μ| (floored at 0) before
+    // standardizing, matching upstream pdex / scipy and the CPU pdex_ref path.
+    double dev_abs = fabs(u1 - mu) - 0.5;
+    if (dev_abs < 0.0) dev_abs = 0.0;
+    double z = dev_abs / sqrt(sigma_sq);
+    double p = erfc(z * 0.7071067811865475);  // 1/√2 (z ≥ 0 already)
     if (p < 0.0) p = 0.0;
     if (p > 1.0) p = 1.0;
     p_values[gene] = p;

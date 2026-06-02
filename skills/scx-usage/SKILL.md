@@ -1,6 +1,6 @@
 ---
 name: scx-usage
-description: How to USE scx (pyscx + scx-cli) to get real work done — converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, MultimodalTrainingDataset). Trigger when writing or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
+description: How to USE scx (pyscx + scx-cli) to get real work done — installing pyscx (PyPI vs source, optional features, common install failures), converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, MultimodalTrainingDataset). Trigger when installing, writing, or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
 ---
 
 # Using scx (pyscx + scx-cli)
@@ -16,16 +16,65 @@ cases, plus the gotchas that are easy to get wrong. For exhaustive signatures
 and edge cases, read the bundled reference files (self-contained, in this skill
 directory):
 
+- `reference/installation.md` — PyPI vs source install, optional extras, verify
+  steps, and troubleshooting (missing `.so`, HDF5, patchelf/rpath, GPU fallback,
+  venv/conda conflicts).
 - `reference/conversion.md` — every ingest/export entry point + all kwargs.
 - `reference/processing.md` — the three approaches in depth + the full `pyscx.accel.*` catalog.
 - `reference/ml-loading.md` — TrainingDataset / IndexPlanDataset / multimodal / Lightning, full constructor refs.
 
-**Environment.** pyscx is a compiled extension (`import pyscx`). The CLI binary
-is `scx`. h5ad/h5mu support is a build-time feature; if `from_h5ad` or
-`scx convert` errors about HDF5, the install lacks that feature. GPU
-(`device="gpu"`) needs a CUDA-enabled build; ops silently fall back to CPU when
-no GPU/feature is present — verify with `pyscx.accel.gpu_info()` (returns `None`
-if unavailable) or `nvidia-smi` when you expected GPU.
+---
+
+## 0. Installing pyscx
+
+**End users** — install the wheel; no Rust toolchain needed:
+
+```bash
+pip install pyscx
+python -c "import pyscx; print(pyscx.__version__)"
+```
+
+Add extras only when needed: `'pyscx[mudata]'`, `'pyscx[10x]'`, `'pyscx[gpu]'`
+(cupy only — GPU kernels need a source build). PyPI wheels bundle libhdf5 **and**
+cloud I/O (Linux x86_64, py ≥ 3.11); they do **not** include GPU.
+
+**Developers** — clone the repo and compile the extension (a bare clone does
+*not* work like `pip install`):
+
+```bash
+uv venv .venv
+uv pip install -e "./pyscx[dev]"     # includes maturin[patchelf]
+export PATH="$(pwd)/.venv/bin:$PATH"
+cd pyscx && ../.venv/bin/maturin develop --release && cd ..
+```
+
+Use the repo `.venv/` only — not system Python. Source builds need
+`libhdf5-dev` on Linux for h5ad ingest. Cloud is **not** in the default dev
+build — pass `--features cloud` when you need `open_cloud()`. Rebuild after
+branch switches or feature changes (`--features gpu`, etc.).
+
+**Sanity check after any install:**
+
+```python
+import pyscx
+import pyscx.pyscx as native
+from pyscx import accel
+print(native.__file__)             # must be a .so / .pyd
+print(accel.gpu_available())       # False is fine on CPU-only / PyPI wheels
+```
+
+**Common gotchas** (full troubleshooting in `reference/installation.md`):
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `No module named 'pyscx'` | Wheel not installed, or dev build skipped | `pip install pyscx` or run `maturin develop` |
+| `from_h5ad` → `NotImplementedError` | Built without HDF5 | PyPI: reinstall wheel; source: `libhdf5-dev` + `maturin develop` |
+| "Failed to set rpath" on every build | Missing patchelf | `uv pip install -e "./pyscx[dev]"` + `export PATH=.venv/bin:$PATH` |
+| GPU feels like CPU | PyPI wheel and/or no GPU build/device | Build from source with `--features gpu`; check `accel.gpu_info()` / `nvidia-smi` |
+| `open_cloud` missing | Source build without cloud feature | `maturin develop --features cloud` (included in PyPI wheels) |
+| maturin errors with venv + conda | Both `VIRTUAL_ENV` and `CONDA_PREFIX` set | `unset VIRTUAL_ENV` or deactivate conda before building |
+
+The CLI binary `scx` is separate from pyscx (`cargo install --features default-bin scx-cli`).
 
 ---
 
@@ -59,8 +108,11 @@ Most-used kwargs (shared across ingest entry points):
   `pyscx.open(...).query().filter_obs(...)` pushes the filter down. Without
   them, pushdown silently regresses to a full obs scan. Set these if the file
   will be queried.
-- `csc="always"` — write a column-major sidecar (needed for `prefer_format="csc"`
-  accel paths; two-pass, transient disk ~2× output).
+- `csc="off"|"auto"|"always"` — write a column-major sidecar (needed for
+  `prefer_format="csc"` accel paths + the GPU `gpu_csc_v3` DE route; two-pass,
+  transient disk ~2× output). `"auto"` builds it only when the dataset is large
+  enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
+  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
 - `memory_budget="4G"` (bare bytes or a binary-prefixed size: `K`/`M`/`G`/`T`
   or `KiB`/`MiB`/`GiB`/`TiB`, powers of 1024; decimal `KB`/`MB`/`GB`/`TB`
   rejected), `strict_uns=True`, `shard_size`. See `reference/conversion.md` for the rest
@@ -225,11 +277,11 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 ---
 
 ## Quick gotcha checklist
+- **Install:** end users → `pip install pyscx`; devs → `uv pip install -e "./pyscx[dev]"` then `maturin develop`. Rebuild after pulling Rust changes.
 - Pick the approach by *subset?* × *fits in RAM?* — `query().collect()` materializes, so a too-big subset needs `to_anndata(backed=True, obs_filter=...)`.
 - Predicate grammar differs: `query().filter_obs()` (engine + pushdown) vs backed `obs_filter=` (pandas `.query()`).
 - Convert with `index_obs=`/`--index-preset` if the file will be queried, else pushdown is a full scan.
 - `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
-- Files with many `obsm` embeddings: `to_anndata(obsm=[...])` decodes only the keys you name (`[]` = none, `None` = all) — drops decode time on read-bound loads.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.

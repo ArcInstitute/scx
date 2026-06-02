@@ -107,6 +107,14 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
 }
 
 
+def _extract_route(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["route"]
+    except Exception:
+        return None
+
+
 def _hvg_jaccard(ref_var: Any, test_var: Any) -> float:
     """Jaccard of the two HVG gene sets."""
     try:
@@ -178,13 +186,25 @@ def run(
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
-        extras: dict[str, float] = {}
+        extras: dict[str, Any] = {}
         try:
             jaccards.append(_hvg_jaccard(ref_var, a.var))
             if not np.isnan(jaccards[-1]):
                 extras["hvg_overlap_vs_scanpy"] = jaccards[-1]
         except Exception as e:
             logger.warning("HVG overlap failed for %s run %d: %s", key, i + 1, e)
+
+        # Record the accelerator route pyscx stamped, plus a numeric gate
+        # signal for the GPU variant. HVG GPU runs the seurat_v3 atomic-CSR
+        # kernel (route gpu_csr); the variant is skipped on non-GPU hosts,
+        # so a recorded cpu_* route means dispatch silently fell back → 0.0.
+        route = _extract_route(a, "highly_variable_genes")
+        if route is not None:
+            extras["gpu_dispatch_route"] = route
+            if requires_gpu:
+                extras["hvg_route_gpu_correct"] = (
+                    1.0 if route.startswith("gpu_") else 0.0
+                )
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,
             peak_rss_mb=max(rss_before, rss_after),

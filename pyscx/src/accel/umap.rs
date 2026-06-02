@@ -103,6 +103,18 @@ pub fn umap(
             Ok(result) => {
                 write_umap_to_adata(py, adata, &result)?;
                 write_umap_backend(py, adata, "scx-gpu-cuda")?;
+                // Native CUDA SGD kernel ran: record the GPU dense route.
+                super::route::write_accel_route(
+                    py,
+                    adata,
+                    "umap",
+                    &super::route::simple_exec_info(
+                        device,
+                        true,
+                        scx_accel::AccelRoute::GpuDense,
+                        scx_accel::AccelRoute::CpuDense,
+                    ),
+                )?;
                 return Ok(());
             }
             Err(e) => {
@@ -119,6 +131,18 @@ pub fn umap(
                     random_state,
                 );
                 if cuml_ok.is_ok() {
+                    // cuML UMAP ran on GPU: record the GPU dense route.
+                    super::route::write_accel_route(
+                        py,
+                        adata,
+                        "umap",
+                        &super::route::simple_exec_info(
+                            device,
+                            true,
+                            scx_accel::AccelRoute::GpuDense,
+                            scx_accel::AccelRoute::CpuDense,
+                        ),
+                    )?;
                     return Ok(());
                 }
                 // Both GPU paths failed — fall through to CPU with warning
@@ -159,6 +183,20 @@ pub fn umap(
     // Write results to adata.obsm["X_umap"]
     write_umap_to_adata(py, adata, &result)?;
     write_umap_backend(py, adata, "scx-accel-cpu")?;
+    // CPU ran (either device=cpu/no-CUDA, or both GPU paths failed at runtime).
+    // gpu_eligible=false forces the cpu_dense route with an appropriate reason
+    // (this site is reached only when CPU actually ran).
+    super::route::write_accel_route(
+        py,
+        adata,
+        "umap",
+        &super::route::simple_exec_info(
+            device,
+            false,
+            scx_accel::AccelRoute::GpuDense,
+            scx_accel::AccelRoute::CpuDense,
+        ),
+    )?;
 
     Ok(())
 }

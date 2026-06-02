@@ -208,6 +208,21 @@ fn run_rust_leiden(
     let uns = adata.getattr("uns")?;
     uns.set_item(key_added, leiden_dict)?;
 
+    // Rust-native Leiden ran on CPU (device=cpu, or auto/gpu resolved to CPU
+    // because no CUDA device was visible). gpu_eligible=false forces the
+    // cpu_csr route with an appropriate reason — this fn only runs CPU.
+    super::route::write_accel_route(
+        py,
+        adata,
+        "leiden",
+        &super::route::simple_exec_info(
+            device,
+            false,
+            scx_accel::AccelRoute::GpuCsr,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
+
     Ok(())
 }
 
@@ -370,6 +385,18 @@ fn try_cugraph_leiden(
     let exit_result = device_ctx.call_method1("__exit__", (py.None(), py.None(), py.None()));
     body_result?;
     exit_result?;
+    // cuGraph Leiden ran on GPU: record the GPU route.
+    super::route::write_accel_route(
+        py,
+        adata,
+        "leiden",
+        &super::route::simple_exec_info(
+            device,
+            true,
+            scx_accel::AccelRoute::GpuCsr,
+            scx_accel::AccelRoute::CpuCsr,
+        ),
+    )?;
     Ok(())
 }
 

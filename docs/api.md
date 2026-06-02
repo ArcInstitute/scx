@@ -912,6 +912,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)
+  - `obsm`: list of obsm keys to load (default `None` = all keys, byte-identical to prior behaviour). When set, only the listed embeddings are read — dropping the per-process RAM of unused keys on the random-access dataloader path. An unknown key raises `KeyError`; `obsm=[]` loads no embeddings. Selecting keys also changes *how* obsm is materialised (see `obsm` loading modes under `eager`, below).
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
   - `modality`: select one modality of a multimodal file and
     return a backed AnnData scoped to that modality (per-modality X /
@@ -933,25 +934,38 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     not written back. Pass `eager=True` to materialise everything up
     front and detach the returned AnnData from the SCX file handle
     (use this before closing the experiment or shipping the AnnData
-    to a subprocess). `uns` is always eager regardless of this flag;
-    `obsm` is eager too but honours the `obsm=` selection below (so
-    `obsm=[]` skips it entirely).
+    to a subprocess). `uns` is always eager regardless of this flag.
+  - **`obsm` loading modes** (selected by the combination of `obsm`,
+    `backed`, `eager`, `obs_filter`):
+    - `obsm=None` (default): every obsm key is materialised eagerly as
+      a dense numpy array — byte-identical to prior behaviour.
+    - `obsm=[...]`, `eager=True`, **or** `obs_filter` set: the selected
+      keys are materialised eagerly (selective eager).
+    - `obsm=[...]`, `backed=False`, `eager=False`: obsm becomes a lazy
+      `ScxLazyObsmMapping` bridge — each selected key is decoded to a
+      dense numpy array on *first* access (`adata.obsm[key]`), so an
+      unused/late key costs nothing. Same `MutableMapping` protocol as
+      the other bridges.
+    - `obsm=[...]`, `backed=True`, `eager=False`, no `obs_filter`:
+      obsm becomes a `ScxLazyObsmMapping` whose values are
+      `ScxBackedObsmDataset` — a shard-aware **dense row-gather**
+      dataset. `m[idx]` / `m[idx_array]` decode only the touched
+      `ObsmEmbeddingShard`s (bounded per-key LRU = `cache_shards`), so
+      per-access memory is `O(batch × n_cols)` and independent of
+      `n_obs`. This is the scalable path for a single huge embedding
+      (e.g. millions of cells × thousands of dims) on the random-access
+      `embed_key` dataloader. Under `obs_filter` the backed-obsm path
+      falls back to eager obsm (composing a pandas-query row mask with
+      shard gather is deferred). Deletion vectors compose via the same
+      `kept_to_global` remap as `X`. `ScxBackedObsmDataset` is registered
+      as an `anndata.abc.CSRDataset` virtual subclass so AnnData's `obsm`
+      coercion accepts it on public `adata.obsm[key]` access — it is
+      nonetheless **dense** (`m[idx]` / `np.asarray(m)` / `m.toarray()`
+      return dense numpy; it has no `.tocsr()`).
   - `memory_budget` (default `None`, treated as 8 GiB): emits
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block
     assembly.
-  - `obsm` (default `None`): selects which `obsm` keys to load.
-    `None` loads every key (byte-identical to prior behaviour); `[]`
-    loads none (zero obsm I/O); a list loads only those keys via
-    per-key reads, so unused dense embeddings are never decoded. An
-    unknown key raises `KeyError`. Not supported with `modality=`
-    (raises `ValueError`). Under `obs_filter` **without**
-    `preserve_slots` the query engine cannot return obsm: a non-empty
-    selection there raises `ValueError` (use `preserve_slots=True` or
-    `backed=True`), while `[]` additionally suppresses the
-    "dropped obsm" warning. Composes with `preserve_slots=True`,
-    `var_names`, and `backed=True` (selection honoured, then
-    filtered/sliced as usual).
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are
@@ -1075,13 +1089,40 @@ between the row-major CSR path (default) and the column-major CSC sidecar
 path. See [scanpy.md § prefer_format](scanpy.md#prefer_formatcsrcsc-explicit-column-major-dispatch)
 for the full dispatch rules and requirements.
 
+##### CSC decision matrix
+
+CSC sidecars are the column-major substrate for column (gene-axis)
+algorithms. Build one at conversion time with `csc="auto"` / `csc="always"`
+(`pyscx.from_anndata` / `from_h5ad` / `from_10x`) or `scx convert --csc=auto`,
+or after the fact with `scx build-csc`. `csc="auto"` builds a sidecar only
+when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
+`n_vars ≥ 5000` by default, tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
+`SCX_CSC_AUTO_VARS_THRESHOLD`.
+
+| Op | `supports_csc` | Default format | GPU-fast with CSC | Notes |
+|----|:--:|:--:|:--:|-------|
+| `pdex_ref` | ✅ | CSR | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. |
+| `rank_genes_groups` (Wilcoxon) | ✅ | CSR | ✅ (`gpu_csc_v3`) | CSC-direct GPU route by default when a CSC sidecar is present; in-memory CSR falls back to `gpu_csr_v3`. CPU CSC kernel via `prefer_format="csc"`. |
+| `rank_genes_groups_df` | ✅ | CSR | ✅ (`gpu_csc_v3`) | Same Wilcoxon engine as above. |
+| `pseudobulk_dex` | ✅ (gene subset) | CSR | N/A (CPU + pydeseq2) | CSC requires a gene subset (`gene_indices` or `col_projection`); full-gene CSC has no win. |
+| `highly_variable_genes` (seurat_v3) | ✅ (single-batch) | CSR | ❌ | CSC routes single-batch seurat_v3; multi-batch / GPU / other flavors raise on CSC. |
+| `calculate_qc_metrics` | ✅ (gene axis) | CSR | N/A | Gene-axis aggregation uses CSC; cell-axis stays CSR. |
+| `col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | ✅ | CSR | N/A | Column reductions; CSC requires no row deletion vector. |
+| `pca` | ❌ (rejects CSC) | CSR | N/A | Inherently row-major; `prefer_format="csc"` raises `ValueError`. |
+| `neighbors` / `umap` / `leiden` | N/A | — | N/A | Operate on PCA embeddings / kNN graphs, not on `X`. |
+
+"GPU-fast with CSC" means the op reaches peak GPU throughput **only** with a
+backed SCX file that has a CSC sidecar — see
+[scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
+Confirm which path actually ran via the [route metadata](#accelerator-route-metadata).
+
 - `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — Randomized SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. On GPU: cuSPARSE SpMM + cuSOLVER QR (f32).
 - `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. GPU: CAGRA (cuVS). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `pyscx.accel.umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — Spectral-init SGD UMAP. GPU: native CUDA kernel or cuML fallback. Writes `obsm["X_umap"]`.
-- `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set. `prefer_format="csc"` routes per-chunk reads through the column-major sidecar (see kwarg docs above).
+- `pyscx.accel.rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — Parallel Wilcoxon rank-sum with BH correction. Writes `uns["rank_genes_groups"]`, or returns DataFrame when `stratify_by` is set. `prefer_format="csc"` routes per-chunk reads through the column-major sidecar (see kwarg docs above). The execution route is recorded on `uns["rank_genes_groups"]["scx_accel_route"]` and `uns["scx_accel"]["rank_genes_groups"]` (see [Accelerator route metadata](#accelerator-route-metadata)).
 - `pyscx.accel.pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None)` — Streaming pseudobulk aggregation (Rust) + pydeseq2 testing. Returns DataFrame. Requires optional `pydeseq2` dependency. `prefer_format="csc"` requires a gene subset (either an explicit `gene_indices` argument or a `col_projection` already set on `adata.X`); full-gene CSC pseudobulk has no measurable speed-up.
 - `pyscx.accel.rank_genes_groups_df(adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=False, tie_correct=False) → polars.DataFrame` — Same Wilcoxon as `rank_genes_groups()` but returns a polars DataFrame in cell-eval's `DEResults` schema: `(target, feature, fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change)`. Ready to feed into `cell_eval.initialize_de_comparison()`.
-- `pyscx.accel.pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") → polars.DataFrame` — Perturbation-screen differential expression: Mann–Whitney U + pseudobulk geometric-mean log fold change vs a single reference group. Pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex) (`pyscx/tests/test_pdex_ref_parity.py`). Returns one row per (target group, gene) excluding the reference group, with columns `target`, `feature`, `target_mean`, `ref_mean`, `target_membership`, `ref_membership`, `log2_fold_change` (also exposed as `fold_change` for migration), `percent_change`, `p_value`, `statistic`, `fdr`. `is_log1p=None` auto-detects via `adata.uns["log1p"]` + a max-value heuristic; pass `True`/`False` to override. `device="auto"` picks GPU when available and falls back to CPU otherwise. **Opt-in v3-CSC path:** set `SCX_GPU_DE_V3=1` to route the GPU dispatch through a CSC-direct driver that drops the per-chunk dense intermediate and uses a CSC shard source with pipelining + per-chunk shard-range pre-filter. v3-CSC requires a CSC sidecar on the SCX file — build it with `pyscx.from_anndata(adata, path, csc="always")` or `scx convert --csc=always`. In-memory inputs (scipy CSR) under `SCX_GPU_DE_V3=1` fall back to the v3-CSR-direct path automatically. Default (no env var) keeps the v1 GPU path. Wall-time numbers and the disposition live in [`docs/performance.md` § Per-operation timing](performance.md#per-operation-timing).
+- `pyscx.accel.pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") → polars.DataFrame` — Perturbation-screen differential expression: Mann–Whitney U + pseudobulk geometric-mean log fold change vs a single reference group. Pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex) (`pyscx/tests/test_pdex_ref_parity.py`). Returns one row per (target group, gene) excluding the reference group, with columns `target`, `feature`, `target_mean`, `ref_mean`, `target_membership`, `ref_membership`, `log2_fold_change` (also exposed as `fold_change` for migration), `percent_change`, `p_value`, `statistic`, `fdr`. `is_log1p=None` auto-detects via `adata.uns["log1p"]` + a max-value heuristic; pass `True`/`False` to override. `device="auto"` picks GPU when available and falls back to CPU otherwise. **GPU v3-CSC path (default):** the GPU dispatch routes through a CSC-direct driver that drops the per-chunk dense intermediate and uses a CSC shard source with pipelining + per-chunk shard-range pre-filter. This is the default GPU DE route (the former `SCX_GPU_DE_V3` opt-in gate was removed in ACC-RUST-OPT-V2 §5 Phase V1b). CSC-direct requires a CSC sidecar on the SCX file — build it with `pyscx.from_anndata(adata, path, csc="always")` or `scx convert --csc=always`. In-memory inputs (scipy CSR) and files without a sidecar fall back to the v3-CSR-direct path automatically. The route that actually ran is recorded on `adata.uns["scx_accel"]["pdex_ref"]` (see [Accelerator route metadata](#accelerator-route-metadata)) — `gpu_csc_v3` confirms the CSC-direct path, `gpu_csr_v3` + `fallback_reason="no_csc_sidecar"` confirms the CSR fallback. Wall-time numbers and the disposition live in [`docs/performance.md` § Per-operation timing](performance.md#per-operation-timing).
 - `pyscx.accel.pseudobulk_means(adata, groupby, min_cells_per_group=1) → (ndarray, list[str])` — Group-by mean on sparse X, streaming shard-by-shard (works on backed, lazy, scipy CSR, or dense). Returns `(means[P, G] float64, sorted group names)`. Foundation for the perturbation evaluation metrics below.
 - `pyscx.accel.perturbation_metrics(adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1) → dict[str, dict[str, float]]` — Bundled bulk metrics `{pearson_delta, mse, mae, mse_delta, mae_delta}` between paired real/pred AnnData. Matches cell-eval's metrics within atol=1e-6.
 - `pyscx.accel.energy_distance(adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None) → float` — Pearson correlation of per-perturbation e-distance vectors (real vs pred). Avoids `[N, N]` distance materialization (per-row sum reduction even on the gemm path); precomputes control self-distance once; rayon-parallel across perturbations. `backend ∈ {"auto" (default), "gemm", "scalar"}` — `"auto"` picks faer-dispatched gemm for euclidean/cosine and the scalar row-by-row path for L1; `"gemm" + metric="l1"` raises `RuntimeError` (no decomposition exists). `dtype ∈ {"f32" (default), "f64"}` controls only the matmul / per-pair arithmetic precision; reductions always accumulate in `f64`. f32 + gemm matches f64 + scalar within `atol=1e-4` correlation / `atol=1e-3` per-pert.
@@ -1122,6 +1163,39 @@ for the full dispatch rules and requirements.
   > - **Order is not preserved** — `[5, 0, 10]` produces the same result as `[0, 5, 10]`
   >
   > This differs from NumPy's fancy indexing where `a[[5, 0, 10]]` returns rows in the order `[5, 0, 10]` with duplicates preserved. Use a boolean mask for unambiguous results.
+
+#### Accelerator route metadata
+
+Every `pyscx.accel.*` call records the execution route it actually took on `adata.uns["scx_accel"][<op>]`. `rank_genes_groups` additionally copies the route string to `adata.uns["rank_genes_groups"]["scx_accel_route"]`. The dict carries:
+
+- `route` — the concrete path taken. One of `cpu_dense`, `cpu_csr`, `cpu_csc`, `gpu_csr_v3`, `gpu_csc_v3` (the column-major perf path), `gpu_csr` / `gpu_dense` (non-DE GPU routes — see **Non-DE ops** below), or `gpu_device_resident` (reserved).
+- `fallback_reason` — why the ideal route wasn't taken: `none`, `no_cuda`, `no_csc_sidecar`, `unsupported_dimensions`, `unsupported_input_layout`, `user_forced_cpu`, or `perf_policy`.
+- `chunk_size`, `csc_available`, `graph_replay`, `shards_decoded`, `shards_uploaded` — optional detail (`None` when not tracked).
+
+**Op keys:**
+
+| Op key | Covers |
+|--------|--------|
+| `"pdex_ref"` | `pyscx.accel.pdex_ref` |
+| `"rank_genes_groups"` | `pyscx.accel.rank_genes_groups` |
+| `"rank_genes_groups_df"` | `pyscx.accel.rank_genes_groups_df` |
+| `"highly_variable_genes"` | `pyscx.accel.highly_variable_genes` |
+| `"pca"` | `pyscx.accel.pca` |
+| `"neighbors"` | `pyscx.accel.neighbors` |
+| `"umap"` | `pyscx.accel.umap` |
+| `"leiden"` | `pyscx.accel.leiden` |
+| `"normalize_total"` | `pyscx.accel.normalize_total` |
+| `"log1p"` | `pyscx.accel.log1p` |
+| `"calculate_qc_metrics"` | `pyscx.accel.calculate_qc_metrics` |
+| `"pseudobulk_dex"` | `pyscx.accel.pseudobulk_dex` |
+
+This is the canonical way to confirm which path ran when comparing CPU vs GPU performance — GPU is fastest only when the input layout matches the op. The CSC-direct route (`route == "gpu_csc_v3"`) requires a backed SCX file with a CSC sidecar; in-memory CSR inputs (and files without a sidecar) report `gpu_csr_v3` with `fallback_reason == "no_csc_sidecar"`. v3 is the unconditional default GPU DE route (the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in ACC-RUST-OPT-V2 §5 Phase V1b). The route is decided by a single internal planner (`scx_accel::route::plan_de_route`) that also *drives* dispatch — the GPU `pdex_ref` **and** Wilcoxon (`rank_genes_groups` / `rank_genes_groups_df`) entry points `match` on the planned route to select the kernel, and CPU dispatch calls the same planner — so the recorded value always matches the kernel that executed. Both DE ops take `gpu_csc_v3` (CSC sidecar) or `gpu_csr_v3` (otherwise) on GPU; dense-host input is densified to CSR and also records `gpu_csr_v3`. Route-specific benchmark gates in `thresholds.yaml` enforce correct dispatch across all GPU ops — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating). The legacy `SCX_GPU_DE_V3_TRACE` stderr trace remains only as a debug fallback.
+
+**Deprecated route identifiers.** The v1/v2 dense-materialization GPU DE drivers were removed in ACC-RUST-OPT-V2 §5 P4.6 (GPU DE is now always v3), and the non-DE GPU routes were renamed from the misleading `_v1` suffix to plain `gpu_csr` / `gpu_dense` in the follow-on taxonomy cleanup. So `gpu_csr_v1`, `gpu_dense_v1`, and `gpu_csr_v2` are all **historical** — they no longer appear in fresh output. Interpret them in old benchmark JSON as: `gpu_csr_v2` = legacy v2 DE; DE `gpu_dense_v1` = legacy v1-dense DE; non-DE `gpu_csr_v1` / `gpu_dense_v1` = today's `gpu_csr` / `gpu_dense`.
+
+**Non-DE ops.** PCA, kNN (`neighbors`), Leiden, HVG, and preprocessing each have a single GPU route, so their metadata is the GPU-vs-CPU dispatch contract rather than a version cascade. On a GPU host they record `gpu_csr` (`pca` cuSPARSE+cuBLAS, `neighbors` cuVS CAGRA, `leiden` cuGraph, `highly_variable_genes` seurat_v3 atomic-CSR), except `umap`, whose native CUDA / cuML SGD runs on a dense embedding and records `gpu_dense`. When the op's GPU library is unavailable the route falls back to `cpu_csr` / `cpu_dense` with `fallback_reason="unsupported_input_layout"` (vs `no_cuda` when CUDA itself is absent, or `user_forced_cpu` for `device="cpu"`). PCA's covariance-vs-randomized choice is a math-policy detail recorded separately in `uns["pca"]["backend"]`, not in the route string.
+
+**Preprocessing caveat.** `normalize_total` / `log1p` only reach the GPU shard-streaming kernel when `adata.X` is a backed (`ScxBackedSparseDataset`) or lazy (`ScxLazyTransformedDataset`) dataset; on a materialized scipy/dense `X` they record `cpu_csr` (with `fallback_reason="unsupported_input_layout"` on a GPU host) because the eager kernel needs a shard source — open via `pyscx.open(...).to_anndata(backed=True)` to engage GPU. `calculate_qc_metrics` and `pseudobulk_dex` are CPU-only; their route reflects only the gene-axis layout (`cpu_csc` under `prefer_format="csc"`, else `cpu_csr`). `harmony_integrate` does not record route metadata yet — its dispatch detail lives in `uns["harmony"]["backend"]`.
 
 ### ScxBackedSparseDataset
 

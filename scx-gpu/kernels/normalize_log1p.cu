@@ -83,3 +83,29 @@ extern "C" __global__ void log1p_kernel(
         data[i] = log1pf(data[i]);
     }
 }
+
+// Row-scale variant: multiplies each row's non-zero values by an explicit
+// per-row factor. data[i] *= factors[row_offset + row].
+//
+// Unlike normalize_kernel (which computes the factor from the row sum), the
+// factor is supplied. `factors` is a global per-row vector indexed in the
+// source's iteration row order; `row_offset` is this shard's first global
+// row, so one device factor vector serves every shard in a streamed source.
+extern "C" __global__ void row_scale_kernel(
+    const long long* __restrict__ indptr,
+    float* __restrict__ data,
+    int n_rows,
+    int row_offset,
+    const float* __restrict__ factors
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    long long start = indptr[row];
+    long long end = indptr[row + 1];
+
+    float factor = factors[row_offset + row];
+    for (long long i = start; i < end; i++) {
+        data[i] *= factor;
+    }
+}

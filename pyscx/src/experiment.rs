@@ -356,6 +356,11 @@ impl PyExperiment {
     ///     obs_filter: Optional predicate expression (e.g., "cell_type == 'T cell'")
     ///                 to filter observations. Uses predicate pushdown for shard skipping.
     ///     layers: Optional list of layer names to load. If None, all layers are loaded.
+    ///     obsm: Optional list of obsm keys to load. If None (default), all
+    ///           obsm embeddings are loaded (byte-identical to prior behaviour).
+    ///           When set, only the listed keys are read — dropping the
+    ///           per-process RAM of unused embeddings on the random-access
+    ///           dataloader path. An unknown key raises KeyError.
     ///     preserve_slots: When True together with obs_filter in non-backed mode,
     ///                     materialize obsm and layers after filtering instead of
     ///                     dropping them. Skips query-engine predicate pushdown for X
@@ -393,16 +398,6 @@ impl PyExperiment {
     ///            Has no effect when `backed=True` (backed mode is
     ///            already memory-bounded) or in the query-engine path
     ///            (`obs_filter` without `preserve_slots`).
-    ///     obsm: Optional selection of `obsm` keys to load. `None`
-    ///            (default) loads every key — byte-identical to prior
-    ///            behaviour. `[]` loads none (zero obsm I/O). A list of
-    ///            names loads only those keys via per-key reads; an
-    ///            unknown key raises `KeyError`. Not supported with
-    ///            `modality=`. Under `obs_filter` without
-    ///            `preserve_slots` the query engine cannot return obsm:
-    ///            a non-empty selection there raises `ValueError`
-    ///            (pass `preserve_slots=True` or `backed=True`), while
-    ///            `[]` suppresses the "dropped obsm" warning.
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
@@ -430,19 +425,12 @@ impl PyExperiment {
                      use to_mudata() for eager multimodal extraction",
                 ));
             }
-            if var_names.is_some() || obs_filter.is_some() || layers.is_some() {
+            if var_names.is_some() || obs_filter.is_some() || layers.is_some() || obsm.is_some() {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "to_anndata(modality=..., backed=True) does not support \
-                     var_names / obs_filter / layers; use \
+                     var_names / obs_filter / layers / obsm; use \
                      `scx subset --modality NAME --filter ...` to materialise \
                      a filtered single-modality file first",
-                ));
-            }
-            if obsm.is_some() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "to_anndata(modality=..., backed=True) does not support \
-                     selective obsm loading; open the modality and select obsm \
-                     keys in Python",
                 ));
             }
             return anndata::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
@@ -455,8 +443,8 @@ impl PyExperiment {
                 var_names.as_deref(),
                 obs_filter,
                 layers.as_deref(),
-                eager,
                 obsm.as_deref(),
+                eager,
             )
         } else {
             anndata::to_anndata_filtered(
@@ -466,10 +454,10 @@ impl PyExperiment {
                 var_names.as_deref(),
                 obs_filter,
                 layers.as_deref(),
+                obsm.as_deref(),
                 preserve_slots,
                 eager,
                 memory_budget_bytes,
-                obsm.as_deref(),
             )
         }
     }

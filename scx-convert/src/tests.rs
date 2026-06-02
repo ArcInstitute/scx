@@ -1126,7 +1126,7 @@ fn test_h5ad_to_scx_csc_always() {
     create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
 
     let opts = ConvertOptions {
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 4, // → ceil(10/4) = 3 CSC shards
         ..ConvertOptions::default()
     };
@@ -1178,7 +1178,7 @@ fn test_tenx_to_scx_csc_always() {
     create_test_tenx_h5(&tenx_path, n_cells, n_genes);
 
     let opts = ConvertOptions {
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5, // → ceil(12/5) = 3 CSC shards
         ..ConvertOptions::default()
     };
@@ -2081,7 +2081,7 @@ fn streaming_opts(shard_size: u32) -> ConvertOptions {
     ConvertOptions {
         shard_target_rows: shard_size,
         codec: None,
-        csc: false,
+        csc: super::pipeline::CscPolicy::Off,
         csc_cols_per_shard: 5000,
         tool: "scx".into(),
         ..ConvertOptions::default()
@@ -2341,7 +2341,7 @@ fn streaming_csc_always_emits_sidecar_matching_non_streaming() {
     let opts = ConvertOptions {
         shard_target_rows: 16,
         codec: None,
-        csc: true,
+        csc: super::pipeline::CscPolicy::Always,
         csc_cols_per_shard: 5,
         tool: "scx".into(),
         ..ConvertOptions::default()
@@ -3592,6 +3592,78 @@ fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
         msg.contains("zzz") && msg.contains("available"),
         "expected message to name 'zzz' and 'available'; got: {msg}"
     );
+}
+
+/// PR #155 follow-on: the streaming h5mu path cannot build per-modality
+/// CSC, so an explicit `csc='always'` must be rejected (not silently
+/// dropped) and the error must point users to the non-streaming path.
+#[test]
+fn streaming_h5mu_csc_always_rejected() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use super::pipeline::CscPolicy;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("cite.h5mu");
+    create_test_h5mu(&h5mu, 8, 30, 5);
+
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        csc: CscPolicy::Always,
+        ..ConvertOptions::default()
+    };
+    let err = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut WarningSink::log())
+        .expect_err("csc='always' must be rejected on the streaming h5mu path");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("stream=False"),
+        "error must point users to stream=False; got: {msg}"
+    );
+}
+
+/// `csc='auto'` on the streaming h5mu path degrades to CSR-only (best
+/// effort) but must emit a `CscSkippedStreamingMultimodal` warning so the
+/// drop is not silent. Both thresholds are zeroed so the tiny fixture
+/// qualifies. Env is process-global, so this test is self-contained
+/// (set → run → restore) and must not share these vars with other tests.
+#[test]
+fn streaming_h5mu_csc_auto_warns_and_skips() {
+    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use super::pipeline::CscPolicy;
+
+    std::env::set_var("SCX_CSC_AUTO_OBS_THRESHOLD", "0");
+    std::env::set_var("SCX_CSC_AUTO_VARS_THRESHOLD", "0");
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("cite.h5mu");
+    create_test_h5mu(&h5mu, 8, 30, 5);
+    let scx = dir.path().join("out.scx");
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        csc: CscPolicy::Auto,
+        ..ConvertOptions::default()
+    };
+    let mut sink = WarningSink::log();
+    let result = h5mu_to_scx_streaming(&h5mu, &scx, &opts, &mut sink);
+
+    std::env::remove_var("SCX_CSC_AUTO_OBS_THRESHOLD");
+    std::env::remove_var("SCX_CSC_AUTO_VARS_THRESHOLD");
+
+    result.expect("csc='auto' must succeed (degrades to CSR-only)");
+    assert!(
+        sink.counts()
+            .get("csc_skipped_streaming_multimodal")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "expected a csc_skipped_streaming_multimodal warning; counts: {:?}",
+        sink.counts()
+    );
+
+    // No CSC sidecar was actually written.
+    let reader = ScxReader::open(&scx).unwrap();
+    assert!(!reader.header().has_csc(), "auto must not build CSC here");
+    assert_eq!(reader.header().n_csc_shards, 0);
 }
 
 #[test]

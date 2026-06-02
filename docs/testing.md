@@ -234,6 +234,26 @@ bash benchmarks/scripts/download_datasets.sh
 
 Full results in `benchmarks/results/*.md`.
 
+### Benchmark Regression Gating
+
+`gate_candidate.py` validates a candidate commit against the baseline
+snapshot (`results/baselines/LATEST`). The gate checks two things:
+
+1. **Relative-tolerance regression** — each metric must not regress beyond
+   its per-metric tolerance versus the baseline.
+2. **Absolute-floor violations** — metrics declared in `thresholds.yaml`
+   must meet their hard bounds regardless of the baseline.
+
+Route-specific absolute floors turn silent dispatch fallbacks (GPU→CPU, CSC→CSR)
+into hard gate failures. Every GPU accelerator benchmark emits an
+`<op>_route_gpu_correct` signal (1.0 = correct route, 0.0 = silent fallback);
+`bench_csc_dispatch.py` emits `csc_dispatch_correct`; and `accel_de.py` emits
+`de_route_csc_direct` for the pdex_ref CSC-direct path. The floor entries
+cover PCA, kNN, UMAP, Leiden, HVG, DE (pdex_ref + Wilcoxon), and CSC dispatch.
+
+See [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating)
+for the full gate table and workflow.
+
 ## GPU Tests
 
 ### Running GPU Tests

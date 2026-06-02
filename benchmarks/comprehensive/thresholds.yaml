@@ -24,6 +24,115 @@
 #       # direction is inferred from min/max; set explicitly only to disambiguate.
 
 absolute_floors:
+  # GPU pdex_ref CSC-direct route assertion. `accel_de.py` emits
+  # `de_route_csc_direct` in runs[].extra for the GPU pdex_ref triple: 1.0
+  # when the CSC-direct route ran (or wasn't expected this run), 0.0 on a
+  # *silent fallback* — i.e. a CSC sidecar fixture was built, yet the
+  # CSR-direct route `gpu_csr_v3` ran. The floor
+  # turns "benchmarked the wrong route" into a hard gate failure. The metric
+  # is always present (never a missing-metric violation); a 0.0 means the
+  # planner/dispatch silently dropped off the intended CSC-direct path. See
+  # docs/performance.md § pdex_ref GPU v3-CSC and the accelerator route
+  # metadata on adata.uns["scx_accel"].
+  #
+  # Gated on three tiers: pbmc3k (single CSC shard — the minimal route check),
+  # tabula_sapiens_100k, which exercises the **multi-shard** CSC-direct path
+  # (multi-shard CSC iteration + range prefiltering) that pbmc3k can't reach,
+  # and census_1m (the largest tier with a built CSC sidecar — guards the
+  # range-prefilter path at atlas scale). All are no-ops unless a run sets
+  # SCX_GPU_DE_V3=1 with a CSC fixture; then a silent multi-shard CSC->CSR
+  # fallback at scale fails the gate. `check_absolute_floors` skips any
+  # triple silently on runs that didn't execute it.
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: pbmc3k
+    metric: de_route_csc_direct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: tabula_sapiens_100k
+    metric: de_route_csc_direct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_pdex_ref_gpu
+    dataset: census_1m
+    metric: de_route_csc_direct
+    min: 1.0
+  # GPU Wilcoxon route gate. `accel_de.py` emits `wilcoxon_route_gpu_correct`
+  # for the GPU Wilcoxon triple: 1.0 when a GPU route ran (always a v3 DE route
+  # `gpu_csc_v3`/`gpu_csr_v3` since the v1/v2 drivers were removed), 0.0
+  # on a silent CPU fallback. The variant is skipped on non-GPU hosts (so a
+  # recorded route always means GPU was attempted); a cpu_* route here means
+  # dispatch silently fell off the GPU path. Gated on the same tiers DE GPU
+  # runs at.
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: pbmc3k
+    metric: wilcoxon_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: tabula_sapiens_100k
+    metric: wilcoxon_route_gpu_correct
+    min: 1.0
+
+  # GPU Wilcoxon CSC-direct route assertion, mirroring pdex_ref's
+  # `de_route_csc_direct`. `accel_de.py` emits `wilcoxon_route_csc_direct`:
+  # 1.0 when the CSC-direct v3 Wilcoxon route ran (or wasn't expected this
+  # run), 0.0 on a *silent fallback* — a CSC sidecar fixture was built, yet the
+  # CSR-direct route `gpu_csr_v3` ran. Dormant until a run builds a CSC fixture
+  # (v3 is now the unconditional default — the SCX_GPU_DE_V3 gate was removed);
+  # then a silent CSC→CSR fallback fails the gate. pbmc3k is the
+  # single-shard route check;
+  # tabula_sapiens_100k exercises the multi-shard CSC-direct path.
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: pbmc3k
+    metric: wilcoxon_route_csc_direct
+    min: 1.0
+  - benchmark: accel_de
+    format: accel_de__pyscx_wilcoxon_gpu
+    dataset: tabula_sapiens_100k
+    metric: wilcoxon_route_csc_direct
+    min: 1.0
+
+  # CSC dispatch verification. `bench_csc_dispatch.py` emits
+  # `csc_dispatch_correct` per run for ops that stamp a route: 1.0 when the
+  # variant's intended layout actually dispatched (a `_csc` variant ran a route
+  # containing "csc", a `_csr` variant did not), 0.0 on a silent fallback
+  # (require_csc() dropped to CSR because the sidecar build failed, or vice
+  # versa). All five ops (qc_metrics, hvg, rank_genes_groups, pdex_ref,
+  # pseudobulk_dex) stamp a route, so every `_csc` variant is gated.
+  #
+  # Gated on tabula_sapiens_100k — its multi-shard CSC sidecar exercises the
+  # column slab read that pbmc3k's single shard can't, and the 100k-cell
+  # multi-shard backed-open path (sharded obs/var categorical assembly).
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__qc_metrics_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__hvg_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__de_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__pdex_ref_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+  - benchmark: bench_csc_dispatch
+    format: bench_csc__pseudobulk_csc
+    dataset: tabula_sapiens_100k
+    metric: csc_dispatch_correct
+    min: 1.0
+
   # Cloud push/pull throughput — migrated from the retired
   # ``benchmark_cloud.py`` hardcoded ``_median(throughputs) > 50`` gate.
   # The 50 MB/s floor is a "network path is healthy" check, not a
@@ -372,6 +481,15 @@ absolute_floors:
     dataset: pbmc3k
     metric: max_abs_diff_vs_scanpy
     max: 1.0e-3
+  # GPU preprocess route gate. The GPU variant runs normalize_total/log1p on a
+  # backed SCX input (so the GPU shard-streaming kernel engages, route
+  # gpu_csr); 0.0 means it silently fell back to CPU. Skipped on non-GPU
+  # hosts. See `accel_preprocess.py` `_fresh()` / `_ensure_scx_fixture`.
+  - benchmark: accel_preprocess
+    format: accel_preprocess__pyscx_gpu
+    dataset: pbmc3k
+    metric: preprocess_route_gpu_correct
+    min: 1.0
 
   # --- accel_hvg: HVG set overlap vs scanpy seurat_v3 ---
   - benchmark: accel_hvg
@@ -384,6 +502,60 @@ absolute_floors:
     dataset: pbmc3k
     metric: hvg_overlap_vs_scanpy
     min: 0.99
+
+  # --- non-DE accelerator route gates --------------------------------
+  # Each `accel_*.py` GPU variant emits `<op>_route_gpu_correct` = 1.0 when
+  # pyscx stamped a GPU route on adata.uns["scx_accel"][<op>]["route"], 0.0 on
+  # a silent CPU fallback. The GPU variants are skipped on non-GPU hosts (so a
+  # recorded route always means GPU was attempted), turning a silent
+  # GPU→CPU dispatch regression — cuSPARSE ABI mismatch (PCA), cuVS missing
+  # (kNN), native+cuML both failing (UMAP), cuGraph absent (Leiden), seurat_v3
+  # GPU kernel falling back (HVG) — into a hard gate failure. Gated on the same
+  # tiers each op already has a correctness floor at, so the triple is
+  # guaranteed to run. `accel_preprocess` is intentionally NOT route-gated: it
+  # runs on in-memory scipy X where normalize_total(device="gpu") legitimately
+  # falls back to CPU (documented), so a 1.0 floor would false-fail; that
+  # module records `gpu_dispatch_route` for visibility only.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_cov
+    dataset: pbmc3k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_cov
+    dataset: tabula_sapiens_100k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_cagra
+    dataset: pbmc3k
+    metric: knn_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_cagra
+    dataset: tabula_sapiens_100k
+    metric: knn_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu
+    dataset: pbmc3k
+    metric: umap_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu
+    dataset: tabula_sapiens_100k
+    metric: umap_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_leiden
+    format: accel_leiden__pyscx_gpu
+    dataset: pbmc3k
+    metric: leiden_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_hvg
+    format: accel_hvg__pyscx_gpu
+    dataset: pbmc3k
+    metric: hvg_route_gpu_correct
+    min: 1.0
 
   # --- ml_loader throughput floors -----------------------------------
   # Floors at 0.5x observed baseline median (0.6x on pbmc3k
