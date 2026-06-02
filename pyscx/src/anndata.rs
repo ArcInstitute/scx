@@ -876,7 +876,11 @@ pub(crate) fn filter_coo_obsp_by_kept_rows(
 ///   eager behaviour).
 /// - `Some([])` → empty result with zero obsm I/O (the loop never runs).
 /// - `Some(names)` → per-key `read_obsm`, decoding only the requested sections.
-///   An unknown key maps `ScxError::SectionNotFound` to a Python `KeyError`.
+///   Unknown keys are reported up front via the catalog (`list_obsm`) as a
+///   single Python `KeyError` listing every missing key (matches the plural
+///   shape WIRE-SHIM §3.3 specifies for the state-scx h5ad parity branch).
+///   Duplicate names are de-duplicated (first-occurrence order) so a repeated
+///   key is decoded once.
 fn load_selected_obsm(
     reader: &ScxReader,
     obsm: Option<&[String]>,
@@ -888,12 +892,30 @@ fn load_selected_obsm(
             Err(e) => Err(to_pyerr(e)),
         },
         Some(names) => {
+            // Validate every requested key against the catalog before decoding
+            // so a typo fails loudly listing all missing keys at once.
+            let available: HashSet<String> = reader.list_obsm().into_iter().collect();
+            let missing: Vec<&String> = names.iter().filter(|n| !available.contains(*n)).collect();
+            if !missing.is_empty() {
+                return Err(PyKeyError::new_err(format!(
+                    "obsm keys not found: {missing:?}"
+                )));
+            }
+
             let mut out = Vec::with_capacity(names.len());
+            let mut seen: HashSet<&String> = HashSet::with_capacity(names.len());
             for name in names {
+                if !seen.insert(name) {
+                    continue; // duplicate key — already read
+                }
                 match reader.read_obsm(name) {
                     Ok(batch) => out.push((name.clone(), batch)),
+                    // Unreachable after the up-front catalog check, but keep the
+                    // mapping defensive in case of a concurrent catalog change.
                     Err(scx_format::ScxError::SectionNotFound(_)) => {
-                        return Err(PyKeyError::new_err(format!("obsm key not found: {name}")));
+                        return Err(PyKeyError::new_err(format!(
+                            "obsm keys not found: [{name:?}]"
+                        )));
                     }
                     Err(e) => return Err(to_pyerr(e)),
                 }
@@ -1580,11 +1602,13 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             let dv_kept = &dv_kept_to_global;
             let positions: Vec<i64> = match &dv_kept {
                 Some(dv_mapping) => {
-                    // Find position of each kept global row in dv_mapping
+                    // Find position of each kept global row in dv_mapping.
+                    // `dv_kept_to_global` is sorted ascending (the construction
+                    // invariant of `compose_kept_to_global`, same as the obsp
+                    // remap at `filter_coo_obsp_by_kept_rows`), so binary_search
+                    // gives O(M·log N) instead of a linear scan per kept row.
                     kept.iter()
-                        .filter_map(|&g| {
-                            dv_mapping.iter().position(|&dv| dv == g).map(|p| p as i64)
-                        })
+                        .filter_map(|&g| dv_mapping.binary_search(&g).ok().map(|p| p as i64))
                         .collect()
                 }
                 None => kept.iter().map(|&g| g as i64).collect(),

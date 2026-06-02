@@ -933,8 +933,9 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     not written back. Pass `eager=True` to materialise everything up
     front and detach the returned AnnData from the SCX file handle
     (use this before closing the experiment or shipping the AnnData
-    to a subprocess). `obsm` and `uns` are always eager regardless of
-    this flag.
+    to a subprocess). `uns` is always eager regardless of this flag;
+    `obsm` is eager too but honours the `obsm=` selection below (so
+    `obsm=[]` skips it entirely).
   - `memory_budget` (default `None`, treated as 8 GiB): emits
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block

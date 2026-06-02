@@ -229,6 +229,7 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 - Predicate grammar differs: `query().filter_obs()` (engine + pushdown) vs backed `obs_filter=` (pandas `.query()`).
 - Convert with `index_obs=`/`--index-preset` if the file will be queried, else pushdown is a full scan.
 - `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
+- Files with many `obsm` embeddings: `to_anndata(obsm=[...])` decodes only the keys you name (`[]` = none, `None` = all) — drops decode time on read-bound loads.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.

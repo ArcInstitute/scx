@@ -83,6 +83,21 @@ def test_obsm_unknown_key_raises_keyerror(scx_path):
         exp.to_anndata(obsm=["does_not_exist"])
 
 
+def test_obsm_unknown_keys_listed_in_keyerror(scx_path):
+    # Plural message (WIRE-SHIM §3.3 shape): all missing keys reported at once.
+    exp = pyscx.open(scx_path)
+    with pytest.raises(KeyError) as excinfo:
+        exp.to_anndata(obsm=["nope_a", "X_state", "nope_b"])
+    msg = str(excinfo.value)
+    assert "nope_a" in msg and "nope_b" in msg
+
+
+def test_obsm_duplicate_keys_deduplicated(scx_path):
+    exp = pyscx.open(scx_path)
+    adata = exp.to_anndata(obsm=["X_state", "X_state"])
+    assert set(adata.obsm.keys()) == {"X_state"}
+
+
 def test_obsm_multiple_keys(scx_path):
     exp = pyscx.open(scx_path)
     adata = exp.to_anndata(obsm=["X_state", "X_mse"])
@@ -96,6 +111,32 @@ def test_obsm_selection_backed(scx_path):
     exp = pyscx.open(scx_path)
     adata = exp.to_anndata(backed=True, obsm=["X_state"])
     assert set(adata.obsm.keys()) == {"X_state"}
+
+
+def test_obsm_empty_backed(scx_path):
+    exp = pyscx.open(scx_path)
+    adata = exp.to_anndata(backed=True, obsm=[])
+    assert len(adata.obsm) == 0
+
+
+def test_obsm_selection_backed_with_filter(scx_path):
+    # Selection composes with backed obs_filter row slicing (exercises the
+    # binary-search positions path in to_anndata_backed_with_options).
+    exp = pyscx.open(scx_path)
+    adata = exp.to_anndata(
+        backed=True, obs_filter="cell_type == 'A'", obsm=["X_state"]
+    )
+    assert set(adata.obsm.keys()) == {"X_state"}
+    assert adata.n_obs == 40
+    assert adata.obsm["X_state"].shape == (40, 8)
+
+
+def test_modality_with_obsm_raises(scx_path):
+    # The modality guard rejects any obsm= (including []) before resolving the
+    # modality, so a single-modality file still triggers the ValueError.
+    exp = pyscx.open(scx_path)
+    with pytest.raises(ValueError, match="selective obsm"):
+        exp.to_anndata(modality="rna", backed=True, obsm=[])
 
 
 # --- query-engine path (obs_filter + preserve_slots=False), §3.5.1 ----------
