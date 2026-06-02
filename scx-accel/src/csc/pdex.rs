@@ -309,6 +309,20 @@ mod tests {
         assert_eq!(cpu_res.ref_membership, gpu_res.ref_membership);
         assert_eq!(cpu_res.target_memberships, gpu_res.target_memberships);
 
+        // §B.10 criterion 4: CSC range prefiltering decoded strictly fewer
+        // shards than the no-prefilter worst case (n_csc_shards × n_chunks).
+        let n_chunks = n_vars.div_ceil(7); // gene_chunk_size = 7
+        let n_csc_shards = n_vars.div_ceil(cols_per_csc_shard);
+        let decoded = gpu_res
+            .exec_info
+            .shards_decoded
+            .expect("shards_decoded recorded on v3 CSC route");
+        assert!(
+            decoded > 0 && decoded < n_csc_shards * n_chunks,
+            "expected prefiltered shard count in (0, {}), got {decoded}",
+            n_csc_shards * n_chunks
+        );
+
         let n_test = cpu_res.group_names.len();
         for tg in 0..n_test {
             for var in 0..n_vars {

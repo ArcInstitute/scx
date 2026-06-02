@@ -50,13 +50,20 @@ use crate::{AccelError, Result};
 /// matches the kernel branch that actually ran. Replaces the old
 /// `SCX_GPU_DE_V3_TRACE` stderr trace as the primary signal (the trace
 /// survives as a debug-only fallback inside the v3 drivers).
-fn finish_pdex(result: Result<PdexRefResult>, info: AccelExecutionInfo) -> Result<PdexRefResult> {
+fn finish_pdex(
+    result: Result<PdexRefResult>,
+    mut info: AccelExecutionInfo,
+) -> Result<PdexRefResult> {
     log::debug!(
         "scx-accel pdex_ref GPU route: {} (fallback: {})",
         info.route.as_str(),
         info.fallback_reason.as_str()
     );
     result.map(|mut r| {
+        // The route/fallback come from the planner; carry the driver-measured
+        // shard counts (set on the chunk driver's result) through the stamp.
+        info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
+        info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         r.exec_info = info;
         r
     })
@@ -65,13 +72,16 @@ fn finish_pdex(result: Result<PdexRefResult>, info: AccelExecutionInfo) -> Resul
 /// Stamp the planned execution info onto a Wilcoxon GPU result. Shard inputs
 /// are routed by [`plan_de_route`] (CSC-direct / CSR-direct v3 under
 /// `SCX_GPU_DE_V3`, else v1); dense-host input stays on `GpuDenseV1`.
-fn finish_de(result: Result<DiffExpResult>, info: AccelExecutionInfo) -> Result<DiffExpResult> {
+fn finish_de(result: Result<DiffExpResult>, mut info: AccelExecutionInfo) -> Result<DiffExpResult> {
     log::debug!(
         "scx-accel wilcoxon GPU route: {} (fallback: {})",
         info.route.as_str(),
         info.fallback_reason.as_str()
     );
     result.map(|mut r| {
+        // Carry the driver-measured shard counts through the planner stamp.
+        info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
+        info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         r.exec_info = info;
         r
     })
@@ -2193,6 +2203,11 @@ fn pdex_ref_gpu_chunked_v3_csr(
     let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
 
+    // CSR has no column-range prefilter — every shard is decoded for every
+    // gene chunk, so this equals n_csr_shards × n_gene_chunks (recorded for
+    // route observability symmetry with the CSC path).
+    let mut shards_decoded = 0usize;
+
     for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
@@ -2229,6 +2244,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
         let mut global_row = 0usize;
         source
             .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                shards_decoded += 1;
                 let view = slot.view();
                 let n_rows = view.shape.0;
                 // group_id = 0 is the reference; 1..=n_test are the test groups
@@ -2396,7 +2412,11 @@ fn pdex_ref_gpu_chunked_v3_csr(
         statistics,
         p_values,
         fdrs,
-        exec_info: crate::route::AccelExecutionInfo::default(),
+        exec_info: crate::route::AccelExecutionInfo {
+            shards_decoded: Some(shards_decoded),
+            shards_uploaded: Some(shards_decoded),
+            ..Default::default()
+        },
     })
 }
 
@@ -2519,6 +2539,11 @@ fn pdex_ref_gpu_chunked_v3_csc(
     let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
 
+    // Count CSC shards actually decoded+uploaded across the whole call. With
+    // range prefiltering this is < n_csc_shards × n_gene_chunks, proving
+    // non-overlapping shards were skipped (§B.10 criterion 4).
+    let mut shards_decoded = 0usize;
+
     for (chunk_idx, c0) in (0..n_vars).step_by(chunk_size).enumerate() {
         let c1 = (c0 + chunk_size).min(n_vars);
         let sz = c1 - c0;
@@ -2557,6 +2582,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
         // they're never decoded or uploaded.
         source
             .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
+                shards_decoded += 1;
                 // group_id = 0 is the reference; 1..=n_test are tg slabs.
                 gpu_de_scatter_csc_to_gene_major(
                     dev,
@@ -2713,7 +2739,11 @@ fn pdex_ref_gpu_chunked_v3_csc(
         statistics,
         p_values,
         fdrs,
-        exec_info: crate::route::AccelExecutionInfo::default(),
+        exec_info: crate::route::AccelExecutionInfo {
+            shards_decoded: Some(shards_decoded),
+            shards_uploaded: Some(shards_decoded),
+            ..Default::default()
+        },
     })
 }
 
@@ -3302,7 +3332,9 @@ fn wilcoxon_rank_sum_gpu_chunked_v3<P>(
     mut populate_slabs: P,
 ) -> Result<DiffExpResult>
 where
-    P: FnMut(&mut scx_gpu::GpuDeChunkScratch, usize, usize, usize) -> Result<()>,
+    // Returns the number of shards decoded for the chunk (for the
+    // shards_decoded route signal); the core accumulates across chunks.
+    P: FnMut(&mut scx_gpu::GpuDeChunkScratch, usize, usize, usize) -> Result<usize>,
 {
     if chunk_size == 0 {
         return Err(AccelError::InvalidInput(
@@ -3339,6 +3371,7 @@ where
         })?;
 
     let mut chunk_results: Vec<DiffExpResult> = Vec::new();
+    let mut shards_decoded = 0usize;
     let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
 
@@ -3347,7 +3380,7 @@ where
         let sz = c1 - c0;
 
         // Populate ref/pool + per-tg slabs + per-slot pseudobulk sums.
-        populate_slabs(&mut scratch, c0, c1, sz)?;
+        shards_decoded += populate_slabs(&mut scratch, c0, c1, sz)?;
 
         // Read per-(slot, gene) raw sums → group_gene_sums[original_group][var].
         let sums_host: Vec<f64> = {
@@ -3496,7 +3529,10 @@ where
     dev.synchronize()
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 synchronize: {e}")))?;
 
-    merge_diff_exp_results(chunk_results, rankby_abs)
+    let mut result = merge_diff_exp_results(chunk_results, rankby_abs)?;
+    result.exec_info.shards_decoded = Some(shards_decoded);
+    result.exec_info.shards_uploaded = Some(shards_decoded);
+    Ok(result)
 }
 
 /// CSC-direct Wilcoxon rank-sum GPU driver. Populates gene-major slabs
@@ -3563,8 +3599,10 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
                 n_slots,
                 sz,
             )?;
+            let mut shards = 0usize;
             source
                 .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
+                    shards += 1;
                     // group_id = 0 is the pool (ref cells / all cells); 1..=n_test
                     // are the per-test-group slabs.
                     gpu_de_scatter_csc_to_gene_major(
@@ -3613,7 +3651,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
                 .map_err(|e| {
                     AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSC shard pass: {e}"))
                 })?;
-            Ok(())
+            Ok(shards)
         },
     )
 }
@@ -3682,8 +3720,10 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
                 sz,
             )?;
             let mut global_row = 0usize;
+            let mut shards = 0usize;
             source
                 .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                    shards += 1;
                     let view = slot.view();
                     let n_rows = view.shape.0;
                     gpu_de_scatter_csr_to_gene_major_filtered(
@@ -3735,7 +3775,7 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
                 .map_err(|e| {
                     AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSR shard pass: {e}"))
                 })?;
-            Ok(())
+            Ok(shards)
         },
     )
 }
