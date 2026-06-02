@@ -55,7 +55,11 @@ pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 /// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
 /// inner loop.
 pub struct GpuDeChunkScratch {
-    /// `[n_obs × chunk_max]` row-major dense buffer for the current chunk.
+    /// `[n_obs × chunk_max]`-capacity row-major dense buffer for the current
+    /// chunk. Allocated lazily (zero-length until first use): the v3 CSC/CSR
+    /// DE drivers populate gene-major slabs directly and never touch it, so
+    /// production runs pay no VRAM for it; only [`gpu_de_upload_chunk`] (the
+    /// primitive-parity test path) grows it on demand.
     pub dense: CudaSlice<f32>,
     /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
     /// each test group (size large enough for whichever is bigger).
@@ -137,14 +141,19 @@ impl GpuDeChunkScratch {
     /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
     ///
     /// The slab grows on demand via [`Self::ensure_slab_capacity`]; the
-    /// dense buffer is fixed-size for the whole DE call.
+    /// dense buffer is allocated lazily (zero-length here, grown only by
+    /// [`gpu_de_upload_chunk`]).
     pub fn new(
         dev: &GpuDevice,
         n_obs: usize,
         chunk_max: usize,
         n_pool_max: usize,
     ) -> Result<Self, GpuError> {
-        let dense = dev.alloc_zeros::<f32>(de_alloc_elems(n_obs, chunk_max)?)?;
+        // `dense` is allocated lazily — zero-length until `gpu_de_upload_chunk`
+        // grows it. The v3 CSC/CSR DE drivers populate gene-major slabs
+        // directly and never read it, so a default DE call pays no VRAM here
+        // (was an eager `[n_obs × chunk_max]` f32 buffer, ~2 GB on 1M cells).
+        let dense = dev.alloc_zeros::<f32>(0)?;
         let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
@@ -388,6 +397,10 @@ pub fn gpu_de_upload_chunk(
             ),
             got: format!("n_obs={n_obs}, chunk_size={chunk_size}"),
         });
+    }
+    // `dense` is lazily allocated (zero-length in `new`); grow it on demand.
+    if scratch.dense.len() < nelem {
+        scratch.dense = dev.alloc_zeros::<f32>(nelem)?;
     }
     // CudaSlice supports a slice view via .slice(...) in cudarc 0.19.
     let mut view = scratch.dense.slice_mut(..nelem);

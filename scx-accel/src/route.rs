@@ -41,15 +41,17 @@ pub enum AccelRoute {
     CpuCsr,
     /// CPU, CSC (column-major / gene-major) input.
     CpuCsc,
-    /// GPU, dense input, legacy v1 host-upload path.
+    /// GPU, dense input. The route id for GPU UMAP (and the legacy DE
+    /// dense-host identifier — DE no longer emits it: dense-host DE now
+    /// densifies to CSR and reports [`GpuCsrV3`](AccelRoute::GpuCsrV3)).
     GpuDenseV1,
-    /// GPU, CSR input, legacy v1 dense-materialization path.
+    /// GPU, CSR input. The generic GPU CSR route id shared by PCA, kNN, Leiden,
+    /// HVG, and preprocessing. (No longer a DE route — sparse GPU DE is always
+    /// v3.)
     GpuCsrV1,
-    /// GPU, CSR input, v2 direct-scatter path (`SCX_GPU_DE_V2`).
-    GpuCsrV2,
-    /// GPU, CSR input, v3 sparse-direct path (`SCX_GPU_DE_V3`, no CSC sidecar).
+    /// GPU, CSR input, v3 sparse-direct DE path (no CSC sidecar).
     GpuCsrV3,
-    /// GPU, CSC input, v3 column-direct path (`SCX_GPU_DE_V3` + CSC sidecar).
+    /// GPU, CSC input, v3 column-direct DE path (CSC sidecar present).
     /// The perf-winning route for column algorithms.
     GpuCscV3,
     /// GPU, fully device-resident graph pipeline. Reserved for the future
@@ -67,7 +69,6 @@ impl AccelRoute {
             AccelRoute::CpuCsc => "cpu_csc",
             AccelRoute::GpuDenseV1 => "gpu_dense_v1",
             AccelRoute::GpuCsrV1 => "gpu_csr_v1",
-            AccelRoute::GpuCsrV2 => "gpu_csr_v2",
             AccelRoute::GpuCsrV3 => "gpu_csr_v3",
             AccelRoute::GpuCscV3 => "gpu_csc_v3",
             AccelRoute::GpuDeviceResident => "gpu_device_resident",
@@ -80,7 +81,6 @@ impl AccelRoute {
             self,
             AccelRoute::GpuDenseV1
                 | AccelRoute::GpuCsrV1
-                | AccelRoute::GpuCsrV2
                 | AccelRoute::GpuCsrV3
                 | AccelRoute::GpuCscV3
                 | AccelRoute::GpuDeviceResident
@@ -205,13 +205,13 @@ pub enum InputLayout {
 /// being absent: a GPU/auto request with `gpu_available && !gpu_eligible`
 /// records a CPU route with [`FallbackReason::UnsupportedInputLayout`].
 ///
-/// GPU route selection: v3 is the unconditional default for sparse inputs.
-/// CSC-direct (`GpuCscV3`) is taken when the layout carries a CSC sidecar
-/// (`BackedCsc` + `csc_available`); every other sparse layout uses `GpuCsrV3`
-/// with [`FallbackReason::NoCscSidecar`]. Dense-host stays on the legacy
-/// single-upload `GpuDenseV1` path (the dense → CSR rewrite is a separate
-/// follow-up). The former `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were
-/// removed once v3 was promoted to default (ACC-RUST-OPT-V2 §5 Phase V1b).
+/// GPU route selection: v3 is the unconditional default. CSC-direct
+/// (`GpuCscV3`) is taken when the layout carries a CSC sidecar (`BackedCsc` +
+/// `csc_available`); every other layout — including dense-host, which the entry
+/// point densifies to CSR — uses `GpuCsrV3` with
+/// [`FallbackReason::NoCscSidecar`]. The former `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3`
+/// opt-in gates were removed once v3 was promoted to default (ACC-RUST-OPT-V2
+/// §5 Phase V1b); the v1/v2 dense-materialization drivers were deleted in P4.6.
 pub fn plan_de_route(
     device: DeviceRequest,
     layout: InputLayout,
@@ -247,12 +247,9 @@ pub fn plan_de_route(
         AccelExecutionInfo::new(route, cpu_reason)
     } else {
         match layout {
-            // Dense stays on the legacy single-upload v1 path — never CSC.
-            InputLayout::DenseHost => {
-                AccelExecutionInfo::new(AccelRoute::GpuDenseV1, FallbackReason::None)
-            }
-            // Sparse inputs: CSC-direct when a sidecar is reachable, else
-            // CSR-direct. v3 is unconditional.
+            // CSC-direct when a sidecar is reachable; every other layout —
+            // including dense-host, which the entry point densifies to CSR —
+            // uses CSR-direct. v3 is unconditional.
             InputLayout::BackedCsc if csc_available => {
                 AccelExecutionInfo::new(AccelRoute::GpuCscV3, FallbackReason::None)
             }
@@ -393,9 +390,10 @@ mod tests {
 
     #[test]
     fn dense_never_routes_to_csc() {
-        // Dense host on GPU → v1 dense, never CSC, even with the csc flag on.
+        // Dense host on GPU → CSR-direct v3 (the entry point densifies to CSR),
+        // never CSC, even with the csc flag on.
         let info = plan_de_route(DeviceRequest::Gpu, InputLayout::DenseHost, true, true, true);
-        assert_eq!(info.route, AccelRoute::GpuDenseV1);
+        assert_eq!(info.route, AccelRoute::GpuCsrV3);
         assert_ne!(info.route, AccelRoute::GpuCscV3);
 
         // Dense host on CPU → cpu_dense.
