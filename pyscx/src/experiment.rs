@@ -393,10 +393,20 @@ impl PyExperiment {
     ///            Has no effect when `backed=True` (backed mode is
     ///            already memory-bounded) or in the query-engine path
     ///            (`obs_filter` without `preserve_slots`).
+    ///     obsm: Optional selection of `obsm` keys to load. `None`
+    ///            (default) loads every key — byte-identical to prior
+    ///            behaviour. `[]` loads none (zero obsm I/O). A list of
+    ///            names loads only those keys via per-key reads; an
+    ///            unknown key raises `KeyError`. Not supported with
+    ///            `modality=`. Under `obs_filter` without
+    ///            `preserve_slots` the query engine cannot return obsm:
+    ///            a non-empty selection there raises `ValueError`
+    ///            (pass `preserve_slots=True` or `backed=True`), while
+    ///            `[]` suppresses the "dropped obsm" warning.
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -410,6 +420,7 @@ impl PyExperiment {
         modality: Option<String>,
         eager: bool,
         memory_budget: Option<Bound<'_, PyAny>>,
+        obsm: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
         if let Some(name) = modality.as_deref() {
@@ -427,6 +438,13 @@ impl PyExperiment {
                      a filtered single-modality file first",
                 ));
             }
+            if obsm.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "to_anndata(modality=..., backed=True) does not support \
+                     selective obsm loading; open the modality and select obsm \
+                     keys in Python",
+                ));
+            }
             return anndata::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
         }
         if backed {
@@ -438,6 +456,7 @@ impl PyExperiment {
                 obs_filter,
                 layers.as_deref(),
                 eager,
+                obsm.as_deref(),
             )
         } else {
             anndata::to_anndata_filtered(
@@ -450,6 +469,7 @@ impl PyExperiment {
                 preserve_slots,
                 eager,
                 memory_budget_bytes,
+                obsm.as_deref(),
             )
         }
     }

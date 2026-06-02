@@ -908,7 +908,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### PyExperiment
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)
@@ -939,6 +939,18 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block
     assembly.
+  - `obsm` (default `None`): selects which `obsm` keys to load.
+    `None` loads every key (byte-identical to prior behaviour); `[]`
+    loads none (zero obsm I/O); a list loads only those keys via
+    per-key reads, so unused dense embeddings are never decoded. An
+    unknown key raises `KeyError`. Not supported with `modality=`
+    (raises `ValueError`). Under `obs_filter` **without**
+    `preserve_slots` the query engine cannot return obsm: a non-empty
+    selection there raises `ValueError` (use `preserve_slots=True` or
+    `backed=True`), while `[]` additionally suppresses the
+    "dropped obsm" warning. Composes with `preserve_slots=True`,
+    `var_names`, and `backed=True` (selection honoured, then
+    filtered/sliced as usual).
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are
