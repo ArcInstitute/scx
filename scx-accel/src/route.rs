@@ -192,12 +192,13 @@ pub enum InputLayout {
 
 /// Decide the DE execution route from the dispatch inputs.
 ///
-/// This is the **single source of truth** for the route. The GPU `pdex_ref`
-/// dispatch sites `match` on the returned [`AccelRoute`] to select the kernel,
-/// and the pyscx CPU dispatch sites stamp the returned info directly — so the
-/// recorded route always matches the code that ran, and the whole decision
-/// matrix is testable without a GPU. (Wilcoxon GPU has a single fixed v1
-/// kernel and stamps its route directly, *not* through this planner.)
+/// This is the **single source of truth** for the route. Both the GPU
+/// `pdex_ref` and Wilcoxon (`rank_genes_groups`) dispatch sites `match` on the
+/// returned [`AccelRoute`] to select the kernel (via
+/// [`plan_de_route_from_source`] in `diffexp_gpu.rs`), and the pyscx CPU
+/// dispatch sites stamp the returned info directly — so the recorded route
+/// always matches the code that ran, and the whole decision matrix is testable
+/// without a GPU.
 ///
 /// `gpu_eligible` distinguishes "the GPU has no kernel for this op+layout"
 /// (e.g. `prefer_format="csc"`, which has no GPU CSC kernel) from CUDA simply

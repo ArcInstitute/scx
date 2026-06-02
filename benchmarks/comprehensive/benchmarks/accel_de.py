@@ -669,12 +669,14 @@ def run(
                 #
                 # GPU DE v3 is the unconditional default (the SCX_GPU_DE_V3 gate
                 # was removed in Phase V1b), so a CSC fixture must dispatch
-                # gpu_csc_v3; a gpu_csr_v3 fallback there is the silent-fallback
-                # this gate catches.
+                # gpu_csc_v3. The expectation is keyed on the fixture alone, not
+                # the recorded route — *any* non-gpu_csc_v3 route on a CSC fixture
+                # is a silent fallback this gate catches (a gpu_csr_v3 CSC→CSR
+                # drop, but also a deeper gpu_csr_v1 / cpu_* regression). The
+                # separate `*_route_gpu_correct` gate covers GPU→CPU drops.
                 csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
-                expecting_csc = csc_fixture and route in ("gpu_csc_v3", "gpu_csr_v3")
                 extras["de_route_csc_direct"] = (
-                    1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
+                    1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
                 )
             if requires_gpu and kind == "wilcoxon":
                 # Numeric gate signal for the GPU Wilcoxon triple. The variant
@@ -688,13 +690,15 @@ def run(
                 # CSC-direct route assertion, mirroring pdex_ref's
                 # `de_route_csc_direct`. 1.0 when the CSC-direct route ran (or no
                 # CSC fixture this run); 0.0 on a *silent fallback* — a CSC
-                # sidecar fixture was built, yet a non-CSC route was recorded.
-                # GPU DE v3 is the unconditional default (Phase V1b), so a CSC
-                # fixture must dispatch gpu_csc_v3.
+                # sidecar fixture was built, yet a non-gpu_csc_v3 route was
+                # recorded. GPU DE v3 is the unconditional default (Phase V1b),
+                # so a CSC fixture must dispatch gpu_csc_v3; the expectation is
+                # keyed on the fixture alone, not the recorded route, so a deeper
+                # regression out of v3 (gpu_csr_v3 / gpu_csr_v1 / cpu_*) also
+                # fails rather than scoring N/A.
                 csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
-                expecting_csc = csc_fixture and route in ("gpu_csc_v3", "gpu_csr_v3")
                 extras["wilcoxon_route_csc_direct"] = (
-                    1.0 if (not expecting_csc or route == "gpu_csc_v3") else 0.0
+                    1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
                 )
 
         if requires_gpu and cpu_pvals is not None:

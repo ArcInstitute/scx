@@ -32,6 +32,7 @@ benchmarks/comprehensive/results/accel_smoke_*/
 benchmarks/comprehensive/results/tier*/
 benchmarks/comprehensive/results/g4*/
 benchmarks/comprehensive/results/v*soak_*/
+benchmarks/comprehensive/results/v3on2_*/
 benchmarks/scripts/g4*
 
 build_artifacts/
