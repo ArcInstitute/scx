@@ -134,7 +134,7 @@ impl GpuGraphMetrics {
 
 /// Shape-keyed cache of captured `cudaGraph_t`. One cache lives on each
 /// `GpuDevice`; cache entries persist across `gpu_randomized_pca` /
-/// `pdex_ref_gpu_chunked` / etc. calls on the same device, so a second
+/// GPU DE / etc. calls on the same device, so a second
 /// run with the same shape signature replays the cached graph rather than
 /// recapturing.
 ///

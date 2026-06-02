@@ -470,7 +470,7 @@ mod tests {
     /// the backed streaming path.)
     #[cfg(feature = "gpu")]
     #[test]
-    fn test_pdex_ref_gpu_v1_backed_multichunk_graph_capture() {
+    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture() {
         use scx_gpu::device::GpuDevice;
         if GpuDevice::new(0).is_err() {
             eprintln!("CUDA not available — skipping GPU graph-capture regression test");
@@ -556,7 +556,7 @@ mod tests {
         }
     }
 
-    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v1_backed_multichunk_graph_capture`.
+    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture`.
     /// The Wilcoxon GPU chunk sequence had the same CUDA-graph-capture htod bug
     /// (its scatter calls copied the pool + per-test-group permutations
     /// host→device inside the captured region), fixed by the pre-upload-once +
@@ -570,7 +570,7 @@ mod tests {
     /// never trigger capture.)
     #[cfg(feature = "gpu")]
     #[test]
-    fn test_wilcoxon_gpu_v1_backed_multichunk_graph_capture() {
+    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_graph_capture() {
         use crate::diffexp::wilcoxon_rank_sum_streaming;
         use scx_gpu::device::GpuDevice;
         if GpuDevice::new(0).is_err() {

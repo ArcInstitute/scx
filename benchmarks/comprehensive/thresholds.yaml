@@ -27,8 +27,8 @@ absolute_floors:
   # GPU pdex_ref CSC-direct route assertion. `accel_de.py` emits
   # `de_route_csc_direct` in runs[].extra for the GPU pdex_ref triple: 1.0
   # when the CSC-direct route ran (or wasn't expected this run), 0.0 on a
-  # *silent fallback* — i.e. a CSC sidecar fixture was built and
-  # SCX_GPU_DE_V3=1, yet a non-CSC route (gpu_csr_v3 / v1) ran. The floor
+  # *silent fallback* — i.e. a CSC sidecar fixture was built, yet the
+  # CSR-direct route `gpu_csr_v3` ran. The floor
   # turns "benchmarked the wrong route" into a hard gate failure. The metric
   # is always present (never a missing-metric violation); a 0.0 means the
   # planner/dispatch silently dropped off the intended CSC-direct path. See
@@ -59,9 +59,9 @@ absolute_floors:
     metric: de_route_csc_direct
     min: 1.0
   # GPU Wilcoxon route gate. `accel_de.py` emits `wilcoxon_route_gpu_correct`
-  # for the GPU Wilcoxon triple: 1.0 when a GPU route ran (the v1 dense path
-  # `gpu_csr_v1`/`gpu_dense_v1` or a v3 route `gpu_csc_v3`/`gpu_csr_v3`), 0.0 on
-  # a silent CPU fallback. The variant is skipped on non-GPU hosts (so a
+  # for the GPU Wilcoxon triple: 1.0 when a GPU route ran (always a v3 DE route
+  # `gpu_csc_v3`/`gpu_csr_v3` since the v1/v2 drivers were removed), 0.0
+  # on a silent CPU fallback. The variant is skipped on non-GPU hosts (so a
   # recorded route always means GPU was attempted); a cpu_* route here means
   # dispatch silently fell off the GPU path. Gated on the same tiers DE GPU
   # runs at.
@@ -79,10 +79,11 @@ absolute_floors:
   # GPU Wilcoxon CSC-direct route assertion, mirroring pdex_ref's
   # `de_route_csc_direct`. `accel_de.py` emits `wilcoxon_route_csc_direct`:
   # 1.0 when the CSC-direct v3 Wilcoxon route ran (or wasn't expected this
-  # run), 0.0 on a *silent fallback* — a CSC sidecar fixture was built and
-  # SCX_GPU_DE_V3=1, yet a non-CSC route (gpu_csr_v3 / v1) ran. Dormant until a
-  # run sets SCX_GPU_DE_V3=1 with a CSC fixture; then a silent CSC→CSR fallback
-  # fails the gate. pbmc3k is the single-shard route check;
+  # run), 0.0 on a *silent fallback* — a CSC sidecar fixture was built, yet the
+  # CSR-direct route `gpu_csr_v3` ran. Dormant until a run builds a CSC fixture
+  # (v3 is now the unconditional default — the SCX_GPU_DE_V3 gate was removed);
+  # then a silent CSC→CSR fallback fails the gate. pbmc3k is the
+  # single-shard route check;
   # tabula_sapiens_100k exercises the multi-shard CSC-direct path.
   - benchmark: accel_de
     format: accel_de__pyscx_wilcoxon_gpu

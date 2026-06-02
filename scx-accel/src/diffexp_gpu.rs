@@ -145,8 +145,9 @@ pub fn pdex_ref_gpu_dense(
 /// stays in `pyscx`; this captures the three shard-shaped inputs that all
 /// reduce to "a CSR shard source + an optional CSC sidecar". Dense host input
 /// is handled separately by [`pdex_ref_gpu_dense`] /
-/// [`wilcoxon_rank_sum_gpu_dense`] — it carries no shards and deliberately
-/// avoids the CSR-construction tax.
+/// [`wilcoxon_rank_sum_gpu_dense`], which densify the host buffer to an
+/// in-memory CSR and delegate here via [`GpuDeShardInput::Csr`] (the v3 CSR
+/// path); it carries no CSC sidecar.
 pub enum GpuDeShardInput<'a> {
     /// In-memory scipy-style CSR. Never carries a CSC sidecar.
     Csr(&'a scx_sparse::ScxCsr),

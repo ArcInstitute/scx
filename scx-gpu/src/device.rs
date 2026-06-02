@@ -209,7 +209,7 @@ impl GpuDevice {
     }
 
     /// Borrow the per-device CUDA Graph cache. The cache persists across
-    /// calls — a second `gpu_randomized_pca` / `pdex_ref_gpu_chunked`
+    /// calls — a second `gpu_randomized_pca` / GPU DE
     /// run with the same shape signature replays the cached graph
     /// rather than recapturing.
     pub fn graph_cache(&self) -> std::cell::RefMut<'_, GpuGraphCache> {

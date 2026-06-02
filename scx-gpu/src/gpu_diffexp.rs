@@ -76,7 +76,7 @@ pub struct GpuDeChunkScratch {
     /// `[chunk_max]` f64 p-values for one test group.
     pub p_values: CudaSlice<f64>,
     /// `[chunk_max × n_ref_max]` gene-major ref slab. G2 hoisted from a
-    /// per-chunk `dev.alloc_zeros` in `pdex_ref_gpu_chunked`. Grow-only via
+    /// per-chunk `dev.alloc_zeros` in the pdex_ref GPU driver. Grow-only via
     /// [`Self::ensure_ref_slab_capacity`].
     pub ref_slab: CudaSlice<f32>,
     /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
@@ -84,8 +84,8 @@ pub struct GpuDeChunkScratch {
     /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
     pub group_slab: CudaSlice<f32>,
     /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
-    /// from `compute_pdex_means_gpu` / `compute_group_gene_sums_gpu`. Grow-
-    /// only via [`Self::ensure_sums_capacity`].
+    /// from the per-chunk pseudobulk fold. Grow-only via
+    /// [`Self::ensure_sums_capacity`].
     pub sums: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group U / rank-sum
     /// staging buffer. G10.4 hoist: each test group's U output is
@@ -97,7 +97,7 @@ pub struct GpuDeChunkScratch {
     /// staging buffer. Same G10.4 pattern as `u_per_group`.
     pub p_per_group: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group combined-tie
-    /// staging buffer. Used by `wilcoxon_rank_sum_gpu_chunked`'s ref-
+    /// staging buffer. Used by the Wilcoxon GPU driver's ref-
     /// mode path, where each tg produces its own combined tie term that
     /// must round-trip to host for the post-pvalue computation. 1-vs-
     /// rest reuses the global pool-tie and so doesn't write here.
@@ -234,7 +234,7 @@ impl GpuDeChunkScratch {
     }
 
     /// Grow `ref_slab` to hold at least `chunk_max × n_ref` f32 keys.
-    /// Called once per `pdex_ref_gpu_chunked` invocation before the chunk
+    /// Called once per pdex_ref GPU driver invocation before the chunk
     /// loop. Same grow-only `next_power_of_two` pattern as the slab.
     pub fn ensure_ref_slab_capacity(
         &mut self,
@@ -290,8 +290,8 @@ impl GpuDeChunkScratch {
     /// G10.4: grow `u_per_group` and `p_per_group` to hold at least
     /// `n_test_groups × chunk_max` f64 values each.
     ///
-    /// Called above the chunk loop in `pdex_ref_gpu_chunked` /
-    /// `wilcoxon_rank_sum_gpu_chunked` so the per-chunk dtoh fan-out
+    /// Called above the chunk loop in the pdex_ref / Wilcoxon GPU drivers
+    /// so the per-chunk dtoh fan-out
     /// (one transfer per test group) collapses into a single batched
     /// dtoh at chunk end. `memcpy_dtod` from `u_or_rank` /
     /// `p_values` into the per-group slot is `O(chunk_size)` and
@@ -2418,7 +2418,7 @@ mod tests {
 
     /// G2 regression: `ensure_*_capacity` only allocates on initial grow and
     /// on size increase; same / smaller requests are no-ops. The chunk loops
-    /// in `pdex_ref_gpu_chunked` / `wilcoxon_rank_sum_gpu_chunked` rely on
+    /// in the pdex_ref / Wilcoxon GPU drivers rely on
     /// this so they can pre-grow once before the loop and never re-allocate
     /// per chunk.
     #[test]
@@ -2491,8 +2491,8 @@ mod tests {
     }
 
     /// `gpu_de_scatter_shard_to_dense` reproduces, on device, the dense
-    /// `[n_obs × sz]` row-major chunk that the legacy host materialise
-    /// closure built in `pdex_ref_gpu_chunked`'s streaming variant. Three
+    /// `[n_obs × sz]` row-major chunk for a given column range directly from
+    /// a CSR shard source. Three
     /// fixtures cover: (a) full column range, (b) middle column subrange,
     /// (c) an empty shard interleaved with non-empty shards.
     #[test]
@@ -2556,8 +2556,8 @@ mod tests {
         };
 
         // Reference dense `[n_obs × sz]` built on host for a given column
-        // range. Matches what `pdex_ref_gpu_chunked`'s legacy closure
-        // wrote into `chunk_dense` before `gpu_de_upload_chunk`.
+        // range. Matches what `gpu_de_scatter_shard_to_dense` writes on
+        // device.
         let host_reference = |c0: usize, c1: usize| -> Vec<f32> {
             let sz = c1 - c0;
             let mut buf = vec![0.0f32; n_obs * sz];
