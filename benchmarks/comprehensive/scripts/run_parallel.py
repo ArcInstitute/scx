@@ -707,12 +707,13 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
             )
     # Forward GCS bucket / project / region knobs from cloud_fixtures /
     # config so the worker doesn't have to re-read `.env`.
-    # `SCX_GPU_DE_V2` / `SCX_GPU_DE_V3` / `SCX_DISABLE_CUDA_GRAPHS` are
-    # GPU-runtime knobs that need to reach the bench worker; otherwise the
-    # OnceLock-cached check defaults the worker to v1 / graphs-enabled.
+    # `SCX_DISABLE_CUDA_GRAPHS` is a GPU-runtime knob that needs to reach the
+    # bench worker; otherwise the OnceLock-cached check defaults graphs on.
+    # (The `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` gates were removed once GPU DE v3
+    # became the unconditional default — ACC-RUST-OPT-V2 §5 Phase V1b.)
     for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
                 "SCX_DATA_DIR", "SCX_WORK_DIR",
-                "SCX_GPU_DE_V2", "SCX_GPU_DE_V3", "SCX_DISABLE_CUDA_GRAPHS",
+                "SCX_DISABLE_CUDA_GRAPHS",
                 "SCX_BENCH_WITH_CSC"):
         val = os.environ.get(var, "").strip()
         if val:

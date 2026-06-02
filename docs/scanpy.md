@@ -1199,11 +1199,12 @@ All accelerators that support GPU expose a `device` parameter:
 > **GPU is fastest only when the input layout matches the op.** For
 > `pdex_ref` the column-major CSC-direct GPU route is the high-performance
 > path, and it requires a *backed* SCX file with a CSC sidecar
-> (`pyscx.from_anndata(..., csc="always")` / `scx convert --csc=always`) plus
-> `SCX_GPU_DE_V3=1`; in-memory scipy CSR can run on GPU but may be slower than
-> CPU. (`rank_genes_groups` / Wilcoxon has a single fixed v1 GPU kernel — no
-> CSC-direct route — so it always records `gpu_csr_v1` / `gpu_dense_v1` on
-> GPU.) When comparing performance, **check the recorded route** at
+> (`pyscx.from_anndata(..., csc="always")` / `scx convert --csc=always`); v3
+> CSC-direct is the default GPU DE route. In-memory scipy CSR can run on GPU but
+> may be slower than CPU. (`rank_genes_groups` / Wilcoxon shares the same
+> CSC-direct (`gpu_csc_v3`) and CSR-direct (`gpu_csr_v3`) routes as `pdex_ref`;
+> dense-host input still records `gpu_dense_v1`.) When comparing performance,
+> **check the recorded route** at
 > `adata.uns["scx_accel"][<op>]["route"]` (e.g. `gpu_csc_v3` vs `gpu_csr_v3`) —
 > every DE call records which route it actually took and the `fallback_reason`
 > if it didn't take the ideal one. See
@@ -1301,7 +1302,7 @@ peak GPU throughput requires a *column-major* substrate so the kernel reads
 contiguous gene columns instead of decoding and projecting every row.
 
 - **`pdex_ref` is GPU-fast only with a CSC sidecar.** With a backed SCX file
-  that has a CSC sidecar and `SCX_GPU_DE_V3=1`, the dispatch takes the
+  that has a CSC sidecar, the dispatch takes the
   CSC-direct route (`route == "gpu_csc_v3"`): it drops the per-chunk dense
   intermediate and skips non-overlapping CSC shards via a column-range
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call

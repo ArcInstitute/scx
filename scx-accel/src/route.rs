@@ -2,11 +2,12 @@
 //!
 //! The accelerator dispatch for differential expression (and, in future, other
 //! ops) selects between many concrete code paths driven by a mix of API
-//! arguments (`device`, `prefer_format`), environment variables
-//! (`SCX_GPU_DE_V2`, `SCX_GPU_DE_V3`), input layout (dense / in-memory CSR /
+//! arguments (`device`, `prefer_format`), input layout (dense / in-memory CSR /
 //! backed CSR / backed CSC / lazy), and runtime availability (CUDA present,
-//! CSC sidecar present). Historically the *only* signal of which route ran was
-//! an ad-hoc `SCX_GPU_DE_V3_TRACE` stderr line — which made it easy to
+//! CSC sidecar present). GPU DE v3 is the unconditional default; the former
+//! `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in
+//! ACC-RUST-OPT-V2 §5 Phase V1b. Historically the *only* signal of which route
+//! ran was an ad-hoc `SCX_GPU_DE_V3_TRACE` stderr line — which made it easy to
 //! benchmark one route while believing another ran.
 //!
 //! This module makes the route an explicit, recorded artifact:
@@ -203,17 +204,18 @@ pub enum InputLayout {
 /// being absent: a GPU/auto request with `gpu_available && !gpu_eligible`
 /// records a CPU route with [`FallbackReason::UnsupportedInputLayout`].
 ///
-/// Precedence on GPU: v3 > v2 > v1 (mirrors `diffexp_gpu.rs`). CSC-direct
-/// (`GpuCscV3`) is only taken when the layout actually carries a CSC sidecar
-/// (`BackedCsc`); every other layout under v3 falls back to `GpuCsrV3` with
-/// [`FallbackReason::NoCscSidecar`]. Dense never reaches a CSC or v2/v3 route.
+/// GPU route selection: v3 is the unconditional default for sparse inputs.
+/// CSC-direct (`GpuCscV3`) is taken when the layout carries a CSC sidecar
+/// (`BackedCsc` + `csc_available`); every other sparse layout uses `GpuCsrV3`
+/// with [`FallbackReason::NoCscSidecar`]. Dense-host stays on the legacy
+/// single-upload `GpuDenseV1` path (the dense → CSR rewrite is a separate
+/// follow-up). The former `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were
+/// removed once v3 was promoted to default (ACC-RUST-OPT-V2 §5 Phase V1b).
 pub fn plan_de_route(
     device: DeviceRequest,
     layout: InputLayout,
     gpu_available: bool,
     gpu_eligible: bool,
-    v2_enabled: bool,
-    v3_enabled: bool,
     csc_available: bool,
 ) -> AccelExecutionInfo {
     // Resolve whether we actually run on GPU, and why not when we don't.
@@ -244,26 +246,16 @@ pub fn plan_de_route(
         AccelExecutionInfo::new(route, cpu_reason)
     } else {
         match layout {
-            // Dense always uses the legacy single-upload v1 path — no v2/v3,
-            // never CSC.
+            // Dense stays on the legacy single-upload v1 path — never CSC.
             InputLayout::DenseHost => {
                 AccelExecutionInfo::new(AccelRoute::GpuDenseV1, FallbackReason::None)
             }
-            _ => {
-                if v3_enabled {
-                    if layout == InputLayout::BackedCsc && csc_available {
-                        AccelExecutionInfo::new(AccelRoute::GpuCscV3, FallbackReason::None)
-                    } else {
-                        // v3 enabled but no CSC sidecar reachable for this
-                        // layout: CSR-direct fallback.
-                        AccelExecutionInfo::new(AccelRoute::GpuCsrV3, FallbackReason::NoCscSidecar)
-                    }
-                } else if v2_enabled {
-                    AccelExecutionInfo::new(AccelRoute::GpuCsrV2, FallbackReason::None)
-                } else {
-                    AccelExecutionInfo::new(AccelRoute::GpuCsrV1, FallbackReason::None)
-                }
+            // Sparse inputs: CSC-direct when a sidecar is reachable, else
+            // CSR-direct. v3 is unconditional.
+            InputLayout::BackedCsc if csc_available => {
+                AccelExecutionInfo::new(AccelRoute::GpuCscV3, FallbackReason::None)
             }
+            _ => AccelExecutionInfo::new(AccelRoute::GpuCsrV3, FallbackReason::NoCscSidecar),
         }
     };
 
@@ -361,19 +353,9 @@ pub fn plan_de_route_from_source(
     device: DeviceRequest,
     source: &dyn scx_gpu::GpuMatrixSource,
     layout: InputLayout,
-    v2_enabled: bool,
-    v3_enabled: bool,
 ) -> AccelExecutionInfo {
     let csc_available = source.available_layouts().contains(scx_gpu::LayoutSet::CSC);
-    plan_de_route(
-        device,
-        layout,
-        crate::gpu_available(),
-        true,
-        v2_enabled,
-        v3_enabled,
-        csc_available,
-    )
+    plan_de_route(device, layout, crate::gpu_available(), true, csc_available)
 }
 
 #[cfg(test)]
@@ -400,38 +382,18 @@ mod tests {
         }
 
         let csr_only = FakeSource(LayoutSet::CSR);
-        let info = plan_de_route_from_source(
-            DeviceRequest::Gpu,
-            &csr_only,
-            InputLayout::BackedCsr,
-            false,
-            true,
-        );
+        let info = plan_de_route_from_source(DeviceRequest::Gpu, &csr_only, InputLayout::BackedCsr);
         assert_eq!(info.csc_available, Some(false));
 
         let with_csc = FakeSource(LayoutSet::CSR | LayoutSet::CSC);
-        let info = plan_de_route_from_source(
-            DeviceRequest::Gpu,
-            &with_csc,
-            InputLayout::BackedCsc,
-            false,
-            true,
-        );
+        let info = plan_de_route_from_source(DeviceRequest::Gpu, &with_csc, InputLayout::BackedCsc);
         assert_eq!(info.csc_available, Some(true));
     }
 
     #[test]
     fn dense_never_routes_to_csc() {
-        // Dense host on GPU → v1 dense, never CSC, even with v3 + csc flags on.
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::DenseHost,
-            true,
-            true,
-            true,
-            true,
-            true,
-        );
+        // Dense host on GPU → v1 dense, never CSC, even with the csc flag on.
+        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::DenseHost, true, true, true);
         assert_eq!(info.route, AccelRoute::GpuDenseV1);
         assert_ne!(info.route, AccelRoute::GpuCscV3);
 
@@ -442,68 +404,40 @@ mod tests {
             true,
             true,
             false,
-            false,
-            false,
         );
         assert_eq!(info.route, AccelRoute::CpuDense);
     }
 
     #[test]
-    fn in_memory_csr_v3_is_csr_direct_not_csc() {
-        // In-memory CSR has no CSC sidecar: v3 must fall back to CSR-direct.
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::CsrHost,
-            true,
-            true,
-            false,
-            true,
-            false,
-        );
+    fn in_memory_csr_is_csr_direct_not_csc() {
+        // In-memory CSR has no CSC sidecar: v3 CSR-direct.
+        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::CsrHost, true, true, false);
         assert_eq!(info.route, AccelRoute::GpuCsrV3);
         assert_eq!(info.fallback_reason, FallbackReason::NoCscSidecar);
     }
 
     #[test]
-    fn backed_csc_with_sidecar_v3_is_csc_direct() {
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::BackedCsc,
-            true,
-            true,
-            false,
-            true,
-            true,
-        );
+    fn backed_csc_with_sidecar_is_csc_direct() {
+        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::BackedCsc, true, true, true);
         assert_eq!(info.route, AccelRoute::GpuCscV3);
         assert_eq!(info.fallback_reason, FallbackReason::None);
         assert_eq!(info.csc_available, Some(true));
     }
 
     #[test]
-    fn lazy_csr_v3_falls_back_to_csr_direct() {
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::LazyCsr,
-            true,
-            true,
-            false,
-            true,
-            false,
-        );
+    fn lazy_csr_falls_back_to_csr_direct() {
+        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::LazyCsr, true, true, false);
         assert_eq!(info.route, AccelRoute::GpuCsrV3);
         assert_eq!(info.fallback_reason, FallbackReason::NoCscSidecar);
     }
 
     #[test]
-    fn backed_csr_v3_without_csc_falls_back() {
-        // Even a backed CSR reader under v3: no CSC sidecar → CSR-direct.
+    fn backed_csr_without_csc_falls_back() {
+        // A backed CSR reader with no CSC sidecar → CSR-direct.
         let info = plan_de_route(
             DeviceRequest::Gpu,
             InputLayout::BackedCsr,
             true,
-            true,
-            false,
             true,
             false,
         );
@@ -513,15 +447,7 @@ mod tests {
 
     #[test]
     fn forced_cpu_records_user_forced() {
-        let info = plan_de_route(
-            DeviceRequest::Cpu,
-            InputLayout::BackedCsr,
-            true,
-            true,
-            false,
-            true,
-            true,
-        );
+        let info = plan_de_route(DeviceRequest::Cpu, InputLayout::BackedCsr, true, true, true);
         assert_eq!(info.route, AccelRoute::CpuCsr);
         assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
     }
@@ -531,8 +457,6 @@ mod tests {
         let info = plan_de_route(
             DeviceRequest::Auto,
             InputLayout::BackedCsc,
-            false,
-            true,
             false,
             true,
             true,
@@ -554,9 +478,7 @@ mod tests {
                 InputLayout::BackedCsc,
                 true,  // gpu_available
                 false, // gpu_eligible — no GPU CSC kernel
-                false,
-                true,
-                true,
+                true,  // csc_available
             );
             assert!(!info.route.is_gpu());
             assert_eq!(info.route, AccelRoute::CpuCsc);
@@ -566,42 +488,19 @@ mod tests {
     }
 
     #[test]
-    fn version_precedence_v3_beats_v2_beats_v1() {
-        // v3 + v2 both on → v3 wins.
+    fn sparse_gpu_is_unconditionally_v3() {
+        // After the V1b default-flip the planner has no v2/v1 GPU route for
+        // sparse inputs: CSC sidecar → CSC-direct, otherwise CSR-direct.
+        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::BackedCsc, true, true, true);
+        assert_eq!(info.route, AccelRoute::GpuCscV3);
         let info = plan_de_route(
             DeviceRequest::Gpu,
             InputLayout::BackedCsr,
-            true,
-            true,
             true,
             true,
             false,
         );
         assert_eq!(info.route, AccelRoute::GpuCsrV3);
-
-        // v2 only → v2.
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::BackedCsr,
-            true,
-            true,
-            true,
-            false,
-            false,
-        );
-        assert_eq!(info.route, AccelRoute::GpuCsrV2);
-
-        // neither → v1.
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::BackedCsr,
-            true,
-            true,
-            false,
-            false,
-            false,
-        );
-        assert_eq!(info.route, AccelRoute::GpuCsrV1);
     }
 
     #[test]

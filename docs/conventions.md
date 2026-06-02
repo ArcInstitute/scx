@@ -77,17 +77,16 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   testing delegated to `pydeseq2`.
 - **Execution route is computed once and *drives* dispatch.** The single
   planner `scx_accel::route::plan_de_route` is the source of truth for the
-  `pdex_ref` route + fallback reason. The GPU `pdex_ref` entry points `match`
-  on the planned `AccelRoute` to pick the kernel (the env flags
-  `SCX_GPU_DE_V2`/`V3` are read only when calling the planner, never re-checked
-  at dispatch), and the pyscx CPU dispatch calls `plan_de_route` too — so the
-  recorded route can never diverge from the code that ran. `gpu_eligible`
-  models "GPU present but this op+layout has no GPU kernel" (e.g.
+  `pdex_ref` *and* `rank_genes_groups` (Wilcoxon) route + fallback reason. Both
+  ops' GPU entry points `match` on the planned `AccelRoute` to pick the kernel,
+  and the pyscx CPU dispatch calls `plan_de_route` too — so the recorded route
+  can never diverge from the code that ran. v3 is the unconditional default GPU
+  DE route (the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in
+  ACC-RUST-OPT-V2 §5 Phase V1b): `BackedCsc` + a CSC sidecar → `GpuCscV3`, every
+  other sparse layout → `GpuCsrV3`; dense-host stays on `GpuDenseV1`.
+  `gpu_eligible` models "GPU present but this op+layout has no GPU kernel" (e.g.
   `prefer_format="csc"`), recording `UnsupportedInputLayout` rather than
-  implying CUDA was missing. **Exception:** Wilcoxon GPU has a single fixed v1
-  kernel, so its entry points stamp `GpuDenseV1`/`GpuCsrV1` directly — do *not*
-  route Wilcoxon through `plan_de_route` (it would wrongly report a v3 route
-  under `SCX_GPU_DE_V3=1`). New planner-driven GPU routes MUST register an
+  implying CUDA was missing. New planner-driven GPU routes MUST register an
   `AccelRoute` variant and a dispatch arm — no silent fallbacks. The route
   surfaces to Python on `adata.uns["scx_accel"]`, and any performance claim
   must cite the recorded route. `SCX_GPU_DE_V3_TRACE` is a debug-only fallback,
