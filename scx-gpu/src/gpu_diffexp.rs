@@ -55,7 +55,11 @@ pub const GPU_DE_BLOCK_SORT_CAPACITY: usize = 8192;
 /// `gpu_pca::GpuPcaScratch` hoists allocations out of the power-iteration
 /// inner loop.
 pub struct GpuDeChunkScratch {
-    /// `[n_obs × chunk_max]` row-major dense buffer for the current chunk.
+    /// `[n_obs × chunk_max]`-capacity row-major dense buffer for the current
+    /// chunk. Allocated lazily (zero-length until first use): the v3 CSC/CSR
+    /// DE drivers populate gene-major slabs directly and never touch it, so
+    /// production runs pay no VRAM for it; only [`gpu_de_upload_chunk`] (the
+    /// primitive-parity test path) grows it on demand.
     pub dense: CudaSlice<f32>,
     /// `[chunk_max × n_pool_max]` gene-major slab; reused for ref then for
     /// each test group (size large enough for whichever is bigger).
@@ -72,7 +76,7 @@ pub struct GpuDeChunkScratch {
     /// `[chunk_max]` f64 p-values for one test group.
     pub p_values: CudaSlice<f64>,
     /// `[chunk_max × n_ref_max]` gene-major ref slab. G2 hoisted from a
-    /// per-chunk `dev.alloc_zeros` in `pdex_ref_gpu_chunked`. Grow-only via
+    /// per-chunk `dev.alloc_zeros` in the pdex_ref GPU driver. Grow-only via
     /// [`Self::ensure_ref_slab_capacity`].
     pub ref_slab: CudaSlice<f32>,
     /// `[chunk_max × n_group_max]` gene-major group slab. G2 hoisted from
@@ -80,8 +84,8 @@ pub struct GpuDeChunkScratch {
     /// chunk loops. Grow-only via [`Self::ensure_group_slab_capacity`].
     pub group_slab: CudaSlice<f32>,
     /// `[n_groups_max × chunk_max]` f64 pseudobulk sums buffer. G2 hoisted
-    /// from `compute_pdex_means_gpu` / `compute_group_gene_sums_gpu`. Grow-
-    /// only via [`Self::ensure_sums_capacity`].
+    /// from the per-chunk pseudobulk fold. Grow-only via
+    /// [`Self::ensure_sums_capacity`].
     pub sums: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group U / rank-sum
     /// staging buffer. G10.4 hoist: each test group's U output is
@@ -93,7 +97,7 @@ pub struct GpuDeChunkScratch {
     /// staging buffer. Same G10.4 pattern as `u_per_group`.
     pub p_per_group: CudaSlice<f64>,
     /// `[n_test_groups_max × chunk_max]` f64 per-test-group combined-tie
-    /// staging buffer. Used by `wilcoxon_rank_sum_gpu_chunked`'s ref-
+    /// staging buffer. Used by the Wilcoxon GPU driver's ref-
     /// mode path, where each tg produces its own combined tie term that
     /// must round-trip to host for the post-pvalue computation. 1-vs-
     /// rest reuses the global pool-tie and so doesn't write here.
@@ -137,14 +141,19 @@ impl GpuDeChunkScratch {
     /// genes per chunk, and an initial pool capacity of `n_pool_max` cells.
     ///
     /// The slab grows on demand via [`Self::ensure_slab_capacity`]; the
-    /// dense buffer is fixed-size for the whole DE call.
+    /// dense buffer is allocated lazily (zero-length here, grown only by
+    /// [`gpu_de_upload_chunk`]).
     pub fn new(
         dev: &GpuDevice,
         n_obs: usize,
         chunk_max: usize,
         n_pool_max: usize,
     ) -> Result<Self, GpuError> {
-        let dense = dev.alloc_zeros::<f32>(de_alloc_elems(n_obs, chunk_max)?)?;
+        // `dense` is allocated lazily — zero-length until `gpu_de_upload_chunk`
+        // grows it. The v3 CSC/CSR DE drivers populate gene-major slabs
+        // directly and never read it, so a default DE call pays no VRAM here
+        // (was an eager `[n_obs × chunk_max]` f32 buffer, ~2 GB on 1M cells).
+        let dense = dev.alloc_zeros::<f32>(0)?;
         let slab = dev.alloc_zeros::<f32>(de_alloc_elems(chunk_max, n_pool_max)?)?;
         // slab_aux is allocated lazily — empty until the first call that hits
         // the multi-tile sort path. Allocating a zero-length CudaSlice is
@@ -225,7 +234,7 @@ impl GpuDeChunkScratch {
     }
 
     /// Grow `ref_slab` to hold at least `chunk_max × n_ref` f32 keys.
-    /// Called once per `pdex_ref_gpu_chunked` invocation before the chunk
+    /// Called once per pdex_ref GPU driver invocation before the chunk
     /// loop. Same grow-only `next_power_of_two` pattern as the slab.
     pub fn ensure_ref_slab_capacity(
         &mut self,
@@ -281,8 +290,8 @@ impl GpuDeChunkScratch {
     /// G10.4: grow `u_per_group` and `p_per_group` to hold at least
     /// `n_test_groups × chunk_max` f64 values each.
     ///
-    /// Called above the chunk loop in `pdex_ref_gpu_chunked` /
-    /// `wilcoxon_rank_sum_gpu_chunked` so the per-chunk dtoh fan-out
+    /// Called above the chunk loop in the pdex_ref / Wilcoxon GPU drivers
+    /// so the per-chunk dtoh fan-out
     /// (one transfer per test group) collapses into a single batched
     /// dtoh at chunk end. `memcpy_dtod` from `u_or_rank` /
     /// `p_values` into the per-group slot is `O(chunk_size)` and
@@ -388,6 +397,10 @@ pub fn gpu_de_upload_chunk(
             ),
             got: format!("n_obs={n_obs}, chunk_size={chunk_size}"),
         });
+    }
+    // `dense` is lazily allocated (zero-length in `new`); grow it on demand.
+    if scratch.dense.len() < nelem {
+        scratch.dense = dev.alloc_zeros::<f32>(nelem)?;
     }
     // CudaSlice supports a slice view via .slice(...) in cudarc 0.19.
     let mut view = scratch.dense.slice_mut(..nelem);
@@ -2405,7 +2418,7 @@ mod tests {
 
     /// G2 regression: `ensure_*_capacity` only allocates on initial grow and
     /// on size increase; same / smaller requests are no-ops. The chunk loops
-    /// in `pdex_ref_gpu_chunked` / `wilcoxon_rank_sum_gpu_chunked` rely on
+    /// in the pdex_ref / Wilcoxon GPU drivers rely on
     /// this so they can pre-grow once before the loop and never re-allocate
     /// per chunk.
     #[test]
@@ -2478,8 +2491,8 @@ mod tests {
     }
 
     /// `gpu_de_scatter_shard_to_dense` reproduces, on device, the dense
-    /// `[n_obs × sz]` row-major chunk that the legacy host materialise
-    /// closure built in `pdex_ref_gpu_chunked`'s streaming variant. Three
+    /// `[n_obs × sz]` row-major chunk for a given column range directly from
+    /// a CSR shard source. Three
     /// fixtures cover: (a) full column range, (b) middle column subrange,
     /// (c) an empty shard interleaved with non-empty shards.
     #[test]
@@ -2543,8 +2556,8 @@ mod tests {
         };
 
         // Reference dense `[n_obs × sz]` built on host for a given column
-        // range. Matches what `pdex_ref_gpu_chunked`'s legacy closure
-        // wrote into `chunk_dense` before `gpu_de_upload_chunk`.
+        // range. Matches what `gpu_de_scatter_shard_to_dense` writes on
+        // device.
         let host_reference = |c0: usize, c1: usize| -> Vec<f32> {
             let sz = c1 - c0;
             let mut buf = vec![0.0f32; n_obs * sz];

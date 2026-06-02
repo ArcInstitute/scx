@@ -459,18 +459,18 @@ mod tests {
         }
     }
 
-    /// Regression guard for the CUDA-graph-capture htod bug: the **v1** GPU
-    /// pdex path over a **backed multi-shard** reader, **multi-chunk**, with
-    /// graph capture **forced on**. Before the device-side-scatter fix, the
-    /// captured per-chunk sequence did a host→device copy of the cell
-    /// permutations (`gpu_de_scatter_gene_major`), invalidating the capture
-    /// (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`) and erroring out. No v2/v3
-    /// override → `GpuCsrV1`; `csc: None`. Must complete and match the CPU
-    /// streaming reference. (The in-memory single-shard multi-chunk tests did
-    /// not catch this — the failure needs the backed streaming path.)
+    /// Regression guard for the CUDA-graph-capture htod bug: the GPU pdex path
+    /// over a **backed multi-shard** reader (no CSC sidecar → CSR-direct
+    /// `gpu_csr_v3`), **multi-chunk**, with graph capture **forced on**. Before
+    /// the device-side-scatter fix, the captured per-chunk sequence did a
+    /// host→device copy of the cell permutations, invalidating the capture
+    /// (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`) and erroring out. `csc: None`.
+    /// Must complete and match the CPU streaming reference. (The in-memory
+    /// single-shard multi-chunk tests did not catch this — the failure needs
+    /// the backed streaming path.)
     #[cfg(feature = "gpu")]
     #[test]
-    fn test_pdex_ref_gpu_v1_backed_multichunk_graph_capture() {
+    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture() {
         use scx_gpu::device::GpuDevice;
         if GpuDevice::new(0).is_err() {
             eprintln!("CUDA not available — skipping GPU graph-capture regression test");
@@ -510,8 +510,8 @@ mod tests {
         )
         .expect("CPU streaming pdex_ref failed");
 
-        // Force graph capture ON (deterministic) with v2/v3 OFF so the captured
-        // v1 sequence runs over the backed multi-shard reader.
+        // Force graph capture ON (deterministic) so the captured CSR-direct v3
+        // sequence runs over the backed multi-shard reader.
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
         let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
@@ -556,12 +556,12 @@ mod tests {
         }
     }
 
-    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v1_backed_multichunk_graph_capture`.
-    /// `wilcoxon_chunk_gpu_sequence` had the same CUDA-graph-capture htod bug
-    /// (its `gpu_de_scatter_gene_major` calls copied the pool + per-test-group
-    /// permutations host→device inside the captured region), fixed by the same
-    /// pre-upload-once + `_dev` scatter change. Wilcoxon has no v2/v3/CSC route,
-    /// so a backed input always runs the v1 dense-chunk driver. Exercised in
+    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture`.
+    /// The Wilcoxon GPU chunk sequence had the same CUDA-graph-capture htod bug
+    /// (its scatter calls copied the pool + per-test-group permutations
+    /// host→device inside the captured region), fixed by the pre-upload-once +
+    /// device-side scatter change. A backed input with no CSC sidecar runs the
+    /// CSR-direct `gpu_csr_v3` driver. Exercised in
     /// **ref-mode** (`reference = Some(0)`) to cover the per-test-group
     /// combined-tie + `tie_per_group` staging branch of the captured sequence.
     /// Backed multi-shard + multi-chunk (`gene_chunk_size=7`, `n_vars=20`) +
@@ -570,7 +570,7 @@ mod tests {
     /// never trigger capture.)
     #[cfg(feature = "gpu")]
     #[test]
-    fn test_wilcoxon_gpu_v1_backed_multichunk_graph_capture() {
+    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_graph_capture() {
         use crate::diffexp::wilcoxon_rank_sum_streaming;
         use scx_gpu::device::GpuDevice;
         if GpuDevice::new(0).is_err() {

@@ -1203,7 +1203,7 @@ All accelerators that support GPU expose a `device` parameter:
 > CSC-direct is the default GPU DE route. In-memory scipy CSR can run on GPU but
 > may be slower than CPU. (`rank_genes_groups` / Wilcoxon shares the same
 > CSC-direct (`gpu_csc_v3`) and CSR-direct (`gpu_csr_v3`) routes as `pdex_ref`;
-> dense-host input still records `gpu_dense_v1`.) When comparing performance,
+> dense-host input is densified to CSR and also records `gpu_csr_v3`.) When comparing performance,
 > **check the recorded route** at
 > `adata.uns["scx_accel"][<op>]["route"]` (e.g. `gpu_csc_v3` vs `gpu_csr_v3`) —
 > every DE call records which route it actually took and the `fallback_reason`
@@ -1308,9 +1308,10 @@ contiguous gene columns instead of decoding and projecting every row.
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
   falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
   *GPU-supported but not GPU-fast*.
-- **Wilcoxon (`rank_genes_groups`) has no GPU CSC route yet.** On GPU it always
-  runs `gpu_csr_v1`; `prefer_format="csc"` accelerates only the CPU path. CSC-
-  first GPU Wilcoxon is planned but not shipped.
+- **Wilcoxon (`rank_genes_groups`) takes the same v3 routes as `pdex_ref`.** With a
+  CSC sidecar it runs CSC-direct (`gpu_csc_v3`); without one it runs CSR-direct
+  (`gpu_csr_v3`, `fallback_reason == "no_csc_sidecar"`) — GPU-supported but not
+  GPU-fast. So a CSC sidecar makes Wilcoxon GPU-fast too.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
 
