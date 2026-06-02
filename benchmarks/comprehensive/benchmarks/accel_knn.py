@@ -238,7 +238,7 @@ def run(
         except Exception as e:
             logger.warning("recall-check failed for %s run %d: %s", key, i + 1, e)
 
-        # Route + GPU gate signal. GPU kNN runs cuVS CAGRA (gpu_csr_v1); the
+        # Route + GPU gate signal. GPU kNN runs cuVS CAGRA (gpu_csr); the
         # variant is skipped on non-GPU hosts, so a cpu_* route is a silent
         # fallback (cuVS unavailable) → 0.0 fails the gate.
         route = _extract_route(a, "neighbors")

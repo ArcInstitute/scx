@@ -196,7 +196,7 @@ def run(
 
         # Record the accelerator route pyscx stamped, plus a numeric gate
         # signal for the GPU variant. HVG GPU runs the seurat_v3 atomic-CSR
-        # kernel (route gpu_csr_v1); the variant is skipped on non-GPU hosts,
+        # kernel (route gpu_csr); the variant is skipped on non-GPU hosts,
         # so a recorded cpu_* route means dispatch silently fell back → 0.0.
         route = _extract_route(a, "highly_variable_genes")
         if route is not None:

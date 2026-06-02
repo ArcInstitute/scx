@@ -218,7 +218,7 @@ fn run_rust_leiden(
         &super::route::simple_exec_info(
             device,
             false,
-            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;
@@ -393,7 +393,7 @@ fn try_cugraph_leiden(
         &super::route::simple_exec_info(
             device,
             true,
-            scx_accel::AccelRoute::GpuCsrV1,
+            scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;

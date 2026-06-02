@@ -83,7 +83,8 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   can never diverge from the code that ran. v3 is the unconditional default GPU
   DE route (the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in
   ACC-RUST-OPT-V2 §5 Phase V1b): `BackedCsc` + a CSC sidecar → `GpuCscV3`, every
-  other sparse layout → `GpuCsrV3`; dense-host stays on `GpuDenseV1`.
+  other layout (including dense-host, which densifies to CSR) → `GpuCsrV3`. The
+  non-DE GPU ops stamp the generic `GpuCsr` / `GpuDense` routes.
   `gpu_eligible` models "GPU present but this op+layout has no GPU kernel" (e.g.
   `prefer_format="csc"`), recording `UnsupportedInputLayout` rather than
   implying CUDA was missing. New planner-driven GPU routes MUST register an

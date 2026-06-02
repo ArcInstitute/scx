@@ -281,7 +281,7 @@ def run(
         # Record the accelerator route + a numeric gate signal for the GPU
         # variant. The GPU variant runs on a backed SCX input (see `_fresh`),
         # so both normalize_total and log1p (device="gpu") take the GPU
-        # shard-streaming kernel and stamp route gpu_csr_v1. The gate signal
+        # shard-streaming kernel and stamp route gpu_csr. The gate signal
         # covers the *whole* normalize→log1p chain: a cpu_* route on either op
         # (a silent partial fallback, e.g. log1p drops to CPU), or log1p never
         # stamping a route at all, scores 0.0 and fails the gate. (CPU/scanpy

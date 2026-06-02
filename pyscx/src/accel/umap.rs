@@ -111,7 +111,7 @@ pub fn umap(
                     &super::route::simple_exec_info(
                         device,
                         true,
-                        scx_accel::AccelRoute::GpuDenseV1,
+                        scx_accel::AccelRoute::GpuDense,
                         scx_accel::AccelRoute::CpuDense,
                     ),
                 )?;
@@ -139,7 +139,7 @@ pub fn umap(
                         &super::route::simple_exec_info(
                             device,
                             true,
-                            scx_accel::AccelRoute::GpuDenseV1,
+                            scx_accel::AccelRoute::GpuDense,
                             scx_accel::AccelRoute::CpuDense,
                         ),
                     )?;
@@ -193,7 +193,7 @@ pub fn umap(
         &super::route::simple_exec_info(
             device,
             false,
-            scx_accel::AccelRoute::GpuDenseV1,
+            scx_accel::AccelRoute::GpuDense,
             scx_accel::AccelRoute::CpuDense,
         ),
     )?;

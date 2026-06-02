@@ -1,7 +1,7 @@
 """§4.7 — route-affecting env vars are captured in result provenance.
 
 `capture_run_provenance` records `SCX_GPU_DE_V2` / `SCX_GPU_DE_V3` /
-`SCX_GPU_DE_V3_TRACE` so a benchmarked route (e.g. `gpu_csr_v1`) can be
+`SCX_GPU_DE_V3_TRACE` so a benchmarked route (e.g. `gpu_csr`) can be
 disambiguated after the fact — was v3 off, or on but fell back to CSR? The
 values are embedded under `result.system["provenance"]` and serialized into
 every raw result JSON, so the gate / dashboard can attribute a route without
