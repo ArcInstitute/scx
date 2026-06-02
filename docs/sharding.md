@@ -444,8 +444,9 @@ The sidecar moves through four stages over a file's life:
    the memory-bounded streaming CSR→CSC transpose and set the `has_csc`
    header flag.
 2. **Consumption.** Column algorithms opt into the sidecar with
-   `prefer_format="csc"` (CPU) or, for GPU `pdex_ref`, the `gpu_csc_v3`
-   route under `SCX_GPU_DE_V3=1`. `BackedCscReader` serves column-range
+   `prefer_format="csc"` (CPU) or, for GPU `pdex_ref` / `rank_genes_groups`,
+   the `gpu_csc_v3` route (the default GPU DE route when a CSC sidecar is
+   present). `BackedCscReader` serves column-range
    reads with shard-level pushdown. See
    [scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
 3. **Mutation drop.** Any row/column-layout-changing op (`append`,

@@ -231,11 +231,10 @@ mod tests {
     //   (a) v3 CSC-direct path (CSC sidecar provided)
     //   (b) v3 CSR-direct fallback (no CSC sidecar)
     //
-    // Both flip `set_de_v3_enabled_override(Some(true))` so the env var
-    // doesn't need to be set when running the test suite. Tolerance is
-    // fp32-tight on U statistic / means since the v3 kernels use f64
-    // atomicAdd (CSR fallback) or f64 shared-mem tree-reduce (CSC) for
-    // the pseudobulk fold — same precision as `gpu_de_pseudobulk_all_groups`.
+    // v3 is the unconditional default since the V1b flip, so no override is
+    // needed. Tolerance is fp32-tight on U statistic / means since the v3
+    // kernels use f64 atomicAdd (CSR fallback) or f64 shared-mem tree-reduce
+    // (CSC) for the pseudobulk fold — same precision as `gpu_de_pseudobulk_all_groups`.
     //
     // Skips via `require_gpu_or_skip!()` if no CUDA device is available
     // (the test binary still links; the test just returns).
@@ -284,8 +283,7 @@ mod tests {
         )
         .expect("CPU streaming pdex_ref failed");
 
-        // GPU v3 CSC-direct path.
-        let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
+        // GPU v3 CSC-direct path (v3 is the unconditional default).
         let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
             0,
             crate::diffexp_gpu::GpuDeShardInput::Backed {
@@ -299,9 +297,8 @@ mod tests {
             Some(7),
             mode,
             epsilon,
-        );
-        scx_gpu::set_de_v3_enabled_override(prev_override);
-        let gpu_res = gpu_res.expect("GPU v3 CSC streaming pdex_ref failed");
+        )
+        .expect("GPU v3 CSC streaming pdex_ref failed");
 
         // Structural equality.
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
@@ -409,8 +406,7 @@ mod tests {
         )
         .expect("CPU streaming pdex_ref failed");
 
-        // GPU v3 CSR-direct fallback (csc_reader = None).
-        let prev_override = scx_gpu::set_de_v3_enabled_override(Some(true));
+        // GPU v3 CSR-direct fallback (csc_reader = None; v3 is the default).
         let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
             0,
             crate::diffexp_gpu::GpuDeShardInput::Backed {
@@ -424,9 +420,8 @@ mod tests {
             Some(7),
             mode,
             epsilon,
-        );
-        scx_gpu::set_de_v3_enabled_override(prev_override);
-        let gpu_res = gpu_res.expect("GPU v3 CSR-fallback streaming pdex_ref failed");
+        )
+        .expect("GPU v3 CSR-fallback streaming pdex_ref failed");
 
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
         assert_eq!(cpu_res.feature_names, gpu_res.feature_names);

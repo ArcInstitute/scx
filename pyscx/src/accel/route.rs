@@ -53,8 +53,7 @@ pub(crate) fn device_request(device: &str) -> DeviceRequest {
 /// `gpu_eligible` is `false` for layouts the GPU has no kernel for (e.g.
 /// `prefer_format="csc"` → no GPU CSC kernel), so a `device="auto"`/`"gpu"`
 /// request on a GPU host records `FallbackReason::UnsupportedInputLayout`
-/// rather than implying CUDA was absent. `v2`/`v3` are irrelevant on CPU and
-/// passed `false` (the planner's CPU branch ignores them).
+/// rather than implying CUDA was absent.
 pub(crate) fn cpu_exec_info(
     device: &str,
     layout: InputLayout,
@@ -67,8 +66,6 @@ pub(crate) fn cpu_exec_info(
         layout,
         gpu_available(),
         gpu_eligible,
-        false,
-        false,
         csc_available,
     );
     info.chunk_size = chunk_size;

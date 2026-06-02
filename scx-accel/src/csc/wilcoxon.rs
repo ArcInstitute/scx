@@ -300,8 +300,8 @@ mod tests {
         } else {
             None
         };
-        let prev = scx_gpu::set_de_v3_enabled_override(Some(true));
-        let res = wilcoxon_rank_sum_gpu(
+        // v3 is the unconditional default since the V1b flip — no override.
+        wilcoxon_rank_sum_gpu(
             0,
             GpuDeShardInput::Backed {
                 csr: &csr_reader,
@@ -315,9 +315,8 @@ mod tests {
             false,
             false,
             true,
-        );
-        scx_gpu::set_de_v3_enabled_override(prev);
-        res.expect("GPU v3 Wilcoxon failed")
+        )
+        .expect("GPU v3 Wilcoxon failed")
     }
 
     #[cfg(feature = "gpu")]
@@ -503,38 +502,8 @@ mod tests {
         );
     }
 
-    /// (9) v3 CSC-direct vs the v1 dense-chunk path on the same fixture
-    /// (CUDA-graph parity is N/A for v3 — it does no capture).
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn wilcoxon_gpu_v3_csc_matches_v1() {
-        if no_gpu() {
-            return;
-        }
-        let dir = tempdir().unwrap();
-        let (path, gn, gr, names) = three_group_fixture(dir.path(), "wil_v3_vs_v1", 7);
-        // v1: v3 override OFF → GpuCsrV1 dense-chunk driver.
-        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
-        let prev = scx_gpu::set_de_v3_enabled_override(Some(false));
-        let v1 = wilcoxon_rank_sum_gpu(
-            0,
-            GpuDeShardInput::Backed {
-                csr: &csr_reader,
-                csc: None,
-            },
-            &gn,
-            &gr,
-            &names,
-            None,
-            Some(7),
-            false,
-            false,
-            true,
-        );
-        scx_gpu::set_de_v3_enabled_override(prev);
-        let v1 = v1.expect("GPU v1 Wilcoxon failed");
-        assert_eq!(v1.exec_info.route, AccelRoute::GpuCsrV1);
-        let v3 = gpu_v3(&path, &gn, &gr, &names, None, 7, true);
-        assert_de_close(&v1, &v3, "v3 csc vs v1");
-    }
+    // (Former test (9) "v3 CSC-direct vs v1 dense-chunk" was removed with the
+    // V1b default-flip: v1 is no longer reachable through `plan_de_route`, so it
+    // cannot be selected in-process for an A/B comparison. v3-vs-CPU parity
+    // across modes/edge-cases is covered by the tests above.)
 }

@@ -27,13 +27,12 @@
 use scx_format::ShardSource;
 use scx_gpu::{
     build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev, cuda_graphs_enabled,
-    de_v2_enabled, de_v3_enabled, default_gpu_de_gene_chunk_size, gpu_de_block_sort,
-    gpu_de_combined_tie_term, gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct,
-    gpu_de_pseudobulk_csr_direct, gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major,
-    gpu_de_scatter_csr_to_gene_major_filtered, gpu_de_scatter_gene_major_dev,
-    gpu_de_scatter_shard_to_dense, gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum,
-    gpu_de_searchsorted_u_stat, gpu_de_tie_term, BackedGpuMatrixSource, CudaSlice, GpuDevice,
-    GpuMatrixSource, GraphKey,
+    default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
+    gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct,
+    gpu_de_pvalues, gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
+    gpu_de_scatter_gene_major_dev, gpu_de_scatter_shard_to_dense,
+    gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
+    gpu_de_tie_term, BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource, GraphKey,
 };
 
 use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -130,14 +129,12 @@ pub fn pdex_ref_gpu_dense(
     let mut chunk_buf = vec![0.0f32; n_obs * chunk_size];
     // Dense host input always uses the legacy single-upload v1 path — no
     // v2/v3, never CSC. Routed through `plan_de_route` for consistency: the
-    // `DenseHost` layout always resolves to `GpuDenseV1` regardless of flags.
+    // `DenseHost` layout always resolves to `GpuDenseV1`.
     let mut exec_info = plan_de_route(
         DeviceRequest::Gpu,
         InputLayout::DenseHost,
         true,
         true,
-        de_v2_enabled(),
-        de_v3_enabled(),
         false,
     );
     exec_info.chunk_size = Some(chunk_size);
@@ -331,13 +328,7 @@ fn pdex_ref_gpu_dispatch(
     mode: GeomMeanMode,
     epsilon: f64,
 ) -> Result<PdexRefResult> {
-    let mut exec_info = plan_de_route_from_source(
-        DeviceRequest::Gpu,
-        source,
-        layout,
-        de_v2_enabled(),
-        de_v3_enabled(),
-    );
+    let mut exec_info = plan_de_route_from_source(DeviceRequest::Gpu, source, layout);
     exec_info.chunk_size = Some(chunk_size);
     finish_pdex(
         match exec_info.route {
@@ -584,13 +575,7 @@ fn wilcoxon_rank_sum_gpu_dispatch(
     rankby_abs: bool,
     tie_correct: bool,
 ) -> Result<DiffExpResult> {
-    let mut exec_info = plan_de_route_from_source(
-        DeviceRequest::Gpu,
-        source,
-        layout,
-        de_v2_enabled(),
-        de_v3_enabled(),
-    );
+    let mut exec_info = plan_de_route_from_source(DeviceRequest::Gpu, source, layout);
     exec_info.chunk_size = Some(chunk_size);
     finish_de(
         match exec_info.route {
@@ -1535,8 +1520,8 @@ where
 ///
 /// Same numerical contract as v1 — produces identical U / p / tie values
 /// from the same input data; the only change is HOW the slabs got
-/// populated. Parity is tested via
-/// `test_pdex_ref_gpu_v2_vs_v1_parity`.
+/// populated. (The v2-vs-v1 parity test was removed with the V1b
+/// default-flip, after which the planner no longer reaches this driver.)
 ///
 /// Empty test groups (`n_g == 0`) are skipped — those rows in the
 /// per-group U / p slabs are LEFT UNINITIALIZED; the caller handles the
@@ -1651,13 +1636,14 @@ fn pdex_ref_chunk_gpu_sequence_v2(
 /// from v1.
 ///
 /// The dense-host entry point (`pdex_ref_gpu_dense`) stays on v1 — it
-/// has no shard source. Shard-shaped inputs (via [`pdex_ref_gpu`]) dispatch
-/// to this driver when [`scx_gpu::de_v2_enabled`] returns true.
+/// has no shard source. Retained as dead code only: since the V1b default-flip
+/// the planner no longer returns `GpuCsrV2`, so this driver is unreachable
+/// pending its deletion in the v1/v2 removal phase.
 ///
 /// Numerical contract: produces results identical to v1 within fp32
 /// tolerance (the only differences come from kernel-launch ordering of
-/// scatters, not from any algorithmic change). Parity verified by
-/// `test_pdex_ref_gpu_v2_vs_v1_parity`.
+/// scatters, not from any algorithmic change). The v2-vs-v1 parity test was
+/// removed with the V1b default-flip (this driver is now unreachable).
 #[allow(clippy::too_many_arguments)]
 fn pdex_ref_gpu_chunked_v2(
     dev: &GpuDevice,
@@ -2082,7 +2068,7 @@ fn compute_pdex_means_from_sums(
 /// `gpu_de_pseudobulk_csr_direct`) in a single pass per shard. No dense
 /// scatter, no `gpu_de_pseudobulk_all_groups` call.
 ///
-/// Used when `de_v3_enabled()` is true and the source's
+/// Used when the source's
 /// [`available_layouts`](GpuMatrixSource::available_layouts) does not contain
 /// [`LayoutSet::CSC`](scx_gpu::LayoutSet) (in-memory CSR, or backed/lazy with no
 /// CSC sidecar). The CSC-direct equivalent [`pdex_ref_gpu_chunked_v3_csc`] is
@@ -4486,147 +4472,6 @@ mod tests {
                     "ref_mean mismatch gene={var}: direct={r_d}, graph={r_g}"
                 );
             }
-        }
-    }
-
-    /// G4 v2: streaming-rank-test path must produce results identical to
-    /// the v1 (dense → gene-major scatter) path on the same input.
-    ///
-    /// The two paths run the same downstream kernels (sort + searchsort
-    /// + combined-tie + pvalues + pseudobulk); they differ only in HOW
-    /// the per-gene slabs get populated:
-    /// - v1 materializes a `[n_obs × chunk_size]` dense slab, then
-    ///   `gpu_de_scatter_gene_major` does a permuted gather per (ref +
-    ///   per-tg).
-    /// - v2 pre-zeros each slab and scatters CSR shard rows directly
-    ///   into it via the new `csr_shard_to_gene_major_kernel`.
-    ///
-    /// Outputs should match within fp32 tolerance — the only divergence
-    /// source is the slab population order, which feeds into a
-    /// deterministic sort + integer-valued U computation. p-values match
-    /// to the same tolerance as the v1 graph-vs-direct parity test.
-    ///
-    /// Uses `set_de_v2_enabled_override` to flip the v1/v2 dispatch
-    /// in-process so both branches run in the same test invocation.
-    /// Requires the sparse entry point (v1 dense entry point doesn't
-    /// route through v2 — only shard-source entries do).
-    #[test]
-    fn test_pdex_ref_gpu_v2_vs_v1_parity() {
-        let _ = require_gpu_or_skip!();
-
-        // Same sparse fixture shape as the multi-chunk regression test:
-        // 80 cells × 200 genes, ~10% density forces multi-chunk + non-empty
-        // groups so v2 exercises both per-tg slabs and the captured DE
-        // sequence.
-        let n_obs = 80usize;
-        let n_vars = 200usize;
-        let groups: Vec<usize> = (0..n_obs).map(|i| i / 40).collect();
-        let group_names = vec!["ref".to_string(), "test".to_string()];
-        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g_{i}")).collect();
-
-        let mut data = vec![0.0f32; n_obs * n_vars];
-        let mut state: u64 = 0xBEEFCAFEBABE;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 33) as u32
-        };
-        for cell in 0..n_obs {
-            for gene in 0..n_vars {
-                if (next() % 10) == 0 {
-                    data[cell * n_vars + gene] = (next() % 6) as f32;
-                }
-            }
-        }
-        let mut indptr: Vec<i64> = Vec::with_capacity(n_obs + 1);
-        let mut indices: Vec<i32> = Vec::new();
-        let mut sparse_data: Vec<f32> = Vec::new();
-        indptr.push(0);
-        for cell in 0..n_obs {
-            for gene in 0..n_vars {
-                let v = data[cell * n_vars + gene];
-                if v != 0.0 {
-                    indices.push(gene as i32);
-                    sparse_data.push(v);
-                }
-            }
-            indptr.push(indices.len() as i64);
-        }
-        let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, sparse_data);
-
-        let mode = GeomMeanMode::ArithRaw;
-        let epsilon = 1e-6;
-
-        // v1 path (default).
-        let prev = scx_gpu::set_de_v2_enabled_override(Some(false));
-        let v1 = pdex_ref_gpu(
-            0,
-            GpuDeShardInput::Csr(&csr),
-            &gene_names,
-            &groups,
-            &group_names,
-            0,
-            Some(64),
-            mode,
-            epsilon,
-        )
-        .expect("v1 pdex_ref_gpu (Csr) failed");
-
-        // v2 path (streaming rank-test).
-        scx_gpu::set_de_v2_enabled_override(Some(true));
-        let v2 = pdex_ref_gpu(
-            0,
-            GpuDeShardInput::Csr(&csr),
-            &gene_names,
-            &groups,
-            &group_names,
-            0,
-            Some(64),
-            mode,
-            epsilon,
-        )
-        .expect("v2 pdex_ref_gpu (Csr) failed");
-
-        scx_gpu::set_de_v2_enabled_override(prev);
-
-        assert_eq!(v1.group_names, v2.group_names);
-        assert_eq!(v1.feature_names, v2.feature_names);
-        assert_eq!(v1.ref_means.len(), v2.ref_means.len());
-        assert_eq!(v1.statistics.len(), v2.statistics.len());
-
-        for tg in 0..v1.group_names.len() {
-            assert_eq!(v1.statistics[tg].len(), v2.statistics[tg].len());
-            for var in 0..n_vars {
-                let u_a = v1.statistics[tg][var];
-                let u_b = v2.statistics[tg][var];
-                if u_a.is_finite() && u_b.is_finite() {
-                    assert!(
-                        (u_a - u_b).abs() < 1e-6,
-                        "U mismatch tg={tg} gene={var}: v1={u_a}, v2={u_b}"
-                    );
-                }
-                let p_a = v1.p_values[tg][var];
-                let p_b = v2.p_values[tg][var];
-                assert!(
-                    (p_a - p_b).abs() < 1e-9 || (p_a - p_b).abs() / p_a.abs().max(1e-12) < 1e-6,
-                    "p-value mismatch tg={tg} gene={var}: v1={p_a}, v2={p_b}"
-                );
-                let tm_a = v1.target_means[tg][var];
-                let tm_b = v2.target_means[tg][var];
-                assert!(
-                    (tm_a - tm_b).abs() < 1e-6 || (tm_a - tm_b).abs() / tm_a.abs().max(1e-9) < 1e-6,
-                    "target_mean mismatch tg={tg} gene={var}: v1={tm_a}, v2={tm_b}"
-                );
-            }
-        }
-        for var in 0..n_vars {
-            let r_a = v1.ref_means[var];
-            let r_b = v2.ref_means[var];
-            assert!(
-                (r_a - r_b).abs() < 1e-6 || (r_a - r_b).abs() / r_a.abs().max(1e-9) < 1e-6,
-                "ref_mean mismatch gene={var}: v1={r_a}, v2={r_b}"
-            );
         }
     }
 
