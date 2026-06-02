@@ -380,7 +380,7 @@ def run(
                            variant_key, i + 1, e)
 
         # Record the accelerator route + a numeric gate signal for the GPU
-        # variants. GPU PCA runs the cuSPARSE+cuBLAS route (gpu_csr_v1) for any
+        # variants. GPU PCA runs the cuSPARSE+cuBLAS route (gpu_csr) for any
         # X type, including in-memory scipy; the variant is skipped on non-GPU
         # hosts, so a cpu_* route here is a silent fallback (e.g. the cuSPARSE
         # modern-ABI probe failed) → 0.0 fails the gate.

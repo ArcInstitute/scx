@@ -203,7 +203,7 @@ pub fn highly_variable_genes<'py>(
     // `effective_gpu_id` above (GPU runs iff the flavor is seurat_v3 family and
     // CUDA is present), and (b) the streaming seurat_v3 GPU kernel propagates
     // errors via `.map_err(..)?` rather than silently falling back to CPU — so
-    // the recorded `gpu_csr_v1` route always reflects the code that ran. If a
+    // the recorded `gpu_csr` route always reflects the code that ran. If a
     // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
     // the branch that ran (see umap.rs) or this gate will false-pass.
     let hvg_gpu_eligible = matches!(flavor, "seurat_v3" | "seurat_v3_paper");

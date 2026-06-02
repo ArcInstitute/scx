@@ -41,14 +41,15 @@ pub enum AccelRoute {
     CpuCsr,
     /// CPU, CSC (column-major / gene-major) input.
     CpuCsc,
-    /// GPU, dense input. The route id for GPU UMAP (and the legacy DE
-    /// dense-host identifier — DE no longer emits it: dense-host DE now
-    /// densifies to CSR and reports [`GpuCsrV3`](AccelRoute::GpuCsrV3)).
-    GpuDenseV1,
-    /// GPU, CSR input. The generic GPU CSR route id shared by PCA, kNN, Leiden,
-    /// HVG, and preprocessing. (No longer a DE route — sparse GPU DE is always
-    /// v3.)
-    GpuCsrV1,
+    /// GPU, dense input. The route id for GPU UMAP (its native CUDA / cuML SGD
+    /// runs on a dense embedding). Not a DE route — dense-host DE densifies to
+    /// CSR and reports [`GpuCsrV3`](AccelRoute::GpuCsrV3).
+    GpuDense,
+    /// GPU, CSR input. The generic single-kernel GPU CSR route id shared by the
+    /// non-DE ops: PCA, kNN, Leiden, HVG, and preprocessing. Not a DE route —
+    /// sparse GPU DE is always v3 ([`GpuCsrV3`](AccelRoute::GpuCsrV3) /
+    /// [`GpuCscV3`](AccelRoute::GpuCscV3)).
+    GpuCsr,
     /// GPU, CSR input, v3 sparse-direct DE path (no CSC sidecar).
     GpuCsrV3,
     /// GPU, CSC input, v3 column-direct DE path (CSC sidecar present).
@@ -67,8 +68,8 @@ impl AccelRoute {
             AccelRoute::CpuDense => "cpu_dense",
             AccelRoute::CpuCsr => "cpu_csr",
             AccelRoute::CpuCsc => "cpu_csc",
-            AccelRoute::GpuDenseV1 => "gpu_dense_v1",
-            AccelRoute::GpuCsrV1 => "gpu_csr_v1",
+            AccelRoute::GpuDense => "gpu_dense",
+            AccelRoute::GpuCsr => "gpu_csr",
             AccelRoute::GpuCsrV3 => "gpu_csr_v3",
             AccelRoute::GpuCscV3 => "gpu_csc_v3",
             AccelRoute::GpuDeviceResident => "gpu_device_resident",
@@ -79,8 +80,8 @@ impl AccelRoute {
     pub fn is_gpu(self) -> bool {
         matches!(
             self,
-            AccelRoute::GpuDenseV1
-                | AccelRoute::GpuCsrV1
+            AccelRoute::GpuDense
+                | AccelRoute::GpuCsr
                 | AccelRoute::GpuCsrV3
                 | AccelRoute::GpuCscV3
                 | AccelRoute::GpuDeviceResident
@@ -264,7 +265,7 @@ pub fn plan_de_route(
 /// Decide the highly-variable-genes (HVG) execution route.
 ///
 /// HVG has a single GPU kernel: the `seurat_v3` atomic-CSR reduction, recorded
-/// as [`AccelRoute::GpuCsrV1`] (the wire id is honest — HVG GPU is a CSR atomic
+/// as [`AccelRoute::GpuCsr`] (the wire id is honest — HVG GPU is a CSR atomic
 /// kernel; the gate only tests [`AccelRoute::is_gpu`]). The CPU path is
 /// [`AccelRoute::CpuCsr`], or [`AccelRoute::CpuCsc`] when the caller prefers the
 /// gene-major sidecar (`prefer_csc`), which has no GPU kernel.
@@ -293,7 +294,7 @@ pub fn plan_hvg_route(
         device,
         gpu_available,
         gpu_eligible,
-        AccelRoute::GpuCsrV1,
+        AccelRoute::GpuCsr,
         cpu_route,
     )
 }
@@ -303,8 +304,8 @@ pub fn plan_hvg_route(
 ///
 /// Unlike DE/HVG there is no version cascade — the op has exactly one GPU route
 /// (`gpu_route`) and one CPU route (`cpu_route`), supplied by the caller because
-/// they differ by op (CSR-shaped input → `GpuCsrV1`/`CpuCsr`; dense embedding →
-/// `GpuDenseV1`/`CpuDense`). `gpu_eligible` distinguishes a missing GPU library
+/// they differ by op (CSR-shaped input → `GpuCsr`/`CpuCsr`; dense embedding →
+/// `GpuDense`/`CpuDense`). `gpu_eligible` distinguishes a missing GPU library
 /// (cuVS / cuML / cuGraph / cuSPARSE absent → CPU fallback with
 /// [`FallbackReason::UnsupportedInputLayout`]) from CUDA simply being absent
 /// ([`FallbackReason::NoCuda`]). A forced-CPU request records
@@ -513,10 +514,10 @@ mod tests {
     // --- HVG planner (plan_hvg_route) ---
 
     #[test]
-    fn hvg_gpu_seurat_v3_is_gpu_csr_v1() {
+    fn hvg_gpu_seurat_v3_is_gpu_csr() {
         // seurat_v3 on a GPU host → the atomic-CSR GPU kernel.
         let info = plan_hvg_route(DeviceRequest::Gpu, true, true, false);
-        assert_eq!(info.route, AccelRoute::GpuCsrV1);
+        assert_eq!(info.route, AccelRoute::GpuCsr);
         assert_eq!(info.fallback_reason, FallbackReason::None);
         assert!(info.route.is_gpu());
     }
@@ -561,10 +562,10 @@ mod tests {
             DeviceRequest::Auto,
             true,
             true,
-            AccelRoute::GpuCsrV1,
+            AccelRoute::GpuCsr,
             AccelRoute::CpuCsr,
         );
-        assert_eq!(info.route, AccelRoute::GpuCsrV1);
+        assert_eq!(info.route, AccelRoute::GpuCsr);
         assert_eq!(info.fallback_reason, FallbackReason::None);
     }
 
@@ -575,7 +576,7 @@ mod tests {
             DeviceRequest::Gpu,
             true,
             false,
-            AccelRoute::GpuDenseV1,
+            AccelRoute::GpuDense,
             AccelRoute::CpuDense,
         );
         assert_eq!(info.route, AccelRoute::CpuDense);
@@ -588,7 +589,7 @@ mod tests {
             DeviceRequest::Auto,
             false,
             true,
-            AccelRoute::GpuCsrV1,
+            AccelRoute::GpuCsr,
             AccelRoute::CpuCsr,
         );
         assert_eq!(info.route, AccelRoute::CpuCsr);
@@ -601,7 +602,7 @@ mod tests {
             DeviceRequest::Cpu,
             true,
             true,
-            AccelRoute::GpuCsrV1,
+            AccelRoute::GpuCsr,
             AccelRoute::CpuCsr,
         );
         assert_eq!(info.route, AccelRoute::CpuCsr);
