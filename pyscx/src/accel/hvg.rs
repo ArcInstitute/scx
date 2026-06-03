@@ -53,6 +53,18 @@ impl scx_format::ShardSource for InMemoryCsrSource<'_> {
     }
 }
 
+/// Whether `x` is a backed SCX dataset that exposes a usable CSC sidecar
+/// (the same capability gate as `ScxBackedSparseDataset::as_column_source`:
+/// a CSC sidecar is present and no row deletion vector is active). Used to
+/// auto-route single-batch seurat_v3 GPU HVG to the column-major reduce.
+fn backed_x_has_csc_sidecar(x: &Bound<'_, PyAny>) -> bool {
+    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
+        backed.borrow().as_column_source().is_some()
+    } else {
+        false
+    }
+}
+
 /// Streaming highly-variable gene selection without materialization.
 ///
 /// Computes HVG statistics shard-by-shard via the `ShardSource` abstraction,
@@ -97,8 +109,13 @@ impl scx_format::ShardSource for InMemoryCsrSource<'_> {
 ///         mean/var and clipped-sum passes use the column-major sidecar
 ///         instead of the row-major shards. Requires the file to have a
 ///         CSC sidecar (`from_anndata(csc="always")`). Single-batch
-///         seurat_v3 only — multi-batch and seurat flavor raise on
-///         CSC. Mutually exclusive with `device != "cpu"`.
+///         seurat_v3 only — multi-batch and seurat flavor raise on CSC.
+///         With `device="gpu"` the CSC sidecar runs the column-major
+///         reduce kernel (route `gpu_csc_v3`, no `atomicAdd` contention);
+///         on CPU it runs the CSC reduce (route `cpu_csc`). Note: even
+///         under the default `prefer_format="csr"`, a single-batch
+///         seurat_v3 GPU run on a backed dataset that has a CSC sidecar
+///         auto-routes to `gpu_csc_v3` (mirrors GPU DE).
 ///     layer: Read counts from `adata.layers[layer]` instead of
 ///         `adata.X`. Mirrors `scanpy.pp.highly_variable_genes(layer=)`
 ///         and is the canonical way to compute `flavor="seurat_v3"`
@@ -127,36 +144,56 @@ pub fn highly_variable_genes<'py>(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+    let seurat_v3_family = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
+    let single_batch = batch_key.is_none();
+
     if prefer_format == "csc" {
-        // CSC HVG only handles single-batch seurat_v3 on CPU. Reject
-        // mismatched configurations with a clear message rather than
-        // silently falling back, since the user has explicitly opted in.
-        if batch_key.is_some() {
+        // Explicit CSC: single-batch seurat_v3 only. Reject mismatched
+        // configurations with a clear message rather than silently falling
+        // back, since the user has explicitly opted in.
+        if !single_batch {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' for HVG only supports single-batch mode; \
                  pass batch_key=None or use prefer_format='csr'",
             ));
         }
-        if !matches!(flavor, "seurat_v3" | "seurat_v3_paper") {
+        if !seurat_v3_family {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' for HVG only supports flavor='seurat_v3' \
                  (or 'seurat_v3_paper'); use prefer_format='csr' for 'seurat'",
             ));
         }
-        if device != "cpu" && device != "auto" {
-            return Err(PyRuntimeError::new_err(format!(
-                "prefer_format='csc' for HVG is mutually exclusive with device={device:?}; \
-                 set device='cpu' (or 'auto') or use prefer_format='csr'"
-            )));
+        // The CSC sidecar lives on `adata.X`, not on arbitrary layers — the CSC
+        // dispatch (`hvg_seurat_v3_csc`) reads `adata.X` unconditionally. Reject
+        // `layer=` rather than silently computing on X (mirrors the `layer.is_none()`
+        // gate on the CSR auto-detect path).
+        if layer.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' for HVG reads adata.X only and does not support \
+                 layer=; pass layer=None or use prefer_format='csr'",
+            ));
         }
-        // CSC has no GPU kernel and runs CPU-only: record the cpu_csc route.
+        // GPU CSC reduce when a GPU is requested and available, else CPU CSC.
+        // The GPU CSC reduce kernel lifts the previous "csc is cpu-only"
+        // restriction; an explicit device="gpu" with no GPU still errors via
+        // resolve_device (consistent with the CSR path).
+        #[cfg(feature = "gpu")]
+        let csc_device_id: Option<usize> = super::gpu::resolve_device(device)?.gpu_id();
+        #[cfg(not(feature = "gpu"))]
+        let csc_device_id: Option<usize> = {
+            // Validate the device string even without GPU support.
+            let _ = super::gpu::resolve_device(device)?;
+            None
+        };
+        // Route: gpu_csc_v3 (GPU reduce) or cpu_csc — the planner reads
+        // gpu_available() internally, so a no-GPU host records cpu_csc.
         super::route::write_accel_route(
             py,
             adata,
             "highly_variable_genes",
-            &super::route::hvg_exec_info(device, false, true),
+            &super::route::hvg_exec_info(device, seurat_v3_family, true),
         )?;
-        return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor);
+        return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor, csc_device_id);
     }
     let resolved = super::gpu::resolve_device(device)?;
     // GPU path is supported for any seurat_v3 / seurat_v3_paper config
@@ -191,29 +228,6 @@ pub fn highly_variable_genes<'py>(
         None
     };
 
-    // Record the planned route on adata.uns["scx_accel"]["highly_variable_genes"]
-    // before dispatch. Only the seurat_v3 family has a GPU kernel; "seurat" and
-    // "cell_ranger" are CPU-only (gpu_eligible=false records
-    // UnsupportedInputLayout on a GPU host rather than implying CUDA was
-    // absent). This single stamp covers the backed / lazy / in-memory native
-    // paths and the scanpy fallback — they share `device` + `flavor`.
-    //
-    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
-    // because (a) `hvg_gpu_eligible` mirrors the same flavor gate that derives
-    // `effective_gpu_id` above (GPU runs iff the flavor is seurat_v3 family and
-    // CUDA is present), and (b) the streaming seurat_v3 GPU kernel propagates
-    // errors via `.map_err(..)?` rather than silently falling back to CPU — so
-    // the recorded `gpu_csr` route always reflects the code that ran. If a
-    // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
-    // the branch that ran (see umap.rs) or this gate will false-pass.
-    let hvg_gpu_eligible = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
-    super::route::write_accel_route(
-        py,
-        adata,
-        "highly_variable_genes",
-        &super::route::hvg_exec_info(device, hvg_gpu_eligible, false),
-    )?;
-
     // F3: read the source matrix from `adata.layers[layer]` when a
     // layer is named (scanpy parity); otherwise from `adata.X`. The
     // downstream dispatch on `ScxBackedSparseDataset` /
@@ -225,6 +239,60 @@ pub fn highly_variable_genes<'py>(
         Some(name) => adata.getattr("layers")?.get_item(name)?,
         None => adata.getattr("X")?,
     };
+
+    // Auto-detect CSC, mirroring DE's gpu_csc_v3 default: a single-batch
+    // seurat_v3 GPU run on a backed dataset that exposes a CSC sidecar uses
+    // the column-major reduce (route gpu_csc_v3) even under the default
+    // prefer_format="csr". Restricted to `layer is None` (the sidecar lives
+    // on adata.X, not on arbitrary layers) and to a GPU run
+    // (`effective_gpu_id.is_some()`) — we do not silently switch the CPU
+    // default from CSR to CSC. `backed_x_has_csc_sidecar` mirrors the
+    // `as_column_source` capability gate.
+    if effective_gpu_id.is_some()
+        && single_batch
+        && seurat_v3_family
+        && layer.is_none()
+        && backed_x_has_csc_sidecar(&x)
+    {
+        super::route::write_accel_route(
+            py,
+            adata,
+            "highly_variable_genes",
+            &super::route::hvg_exec_info(device, true, true),
+        )?;
+        return hvg_seurat_v3_csc(
+            py,
+            adata,
+            n_top_genes,
+            span,
+            subset,
+            flavor,
+            effective_gpu_id,
+        );
+    }
+
+    // Record the planned CSR route on
+    // adata.uns["scx_accel"]["highly_variable_genes"] before dispatch. Only
+    // the seurat_v3 family has a GPU kernel; "seurat" and "cell_ranger" are
+    // CPU-only (gpu_eligible=false records UnsupportedInputLayout on a GPU
+    // host rather than implying CUDA was absent). This single stamp covers the
+    // backed / lazy / in-memory native paths and the scanpy fallback — they
+    // share `device` + `flavor`.
+    //
+    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
+    // because (a) `seurat_v3_family` mirrors the same flavor gate that derives
+    // `effective_gpu_id` above (GPU runs iff the flavor is seurat_v3 family and
+    // CUDA is present), and (b) the streaming seurat_v3 GPU kernel propagates
+    // errors via `.map_err(..)?` rather than silently falling back to CPU — so
+    // the recorded `gpu_csr` route always reflects the code that ran. If a
+    // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
+    // the branch that ran (see umap.rs) or this gate will false-pass.
+    super::route::write_accel_route(
+        py,
+        adata,
+        "highly_variable_genes",
+        &super::route::hvg_exec_info(device, seurat_v3_family, false),
+    )?;
 
     // ── Try SCX backed dataset ──────────────────────────────────────────
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
@@ -1069,14 +1137,175 @@ fn apply_hvg_subset(
     Ok(())
 }
 
-/// Single-batch seurat_v3 HVG via the CSC dispatch.
+/// Loess fit on (log10 mean, log10 var) for non-constant genes — the
+/// seurat_v3 dispersion regression. Returns per-gene `estimat_var`
+/// (log10 fitted variance); constant genes and the too-few-points case
+/// stay 0.0. Shared by the backed and lazy CSC pipelines.
+fn csc_loess_estimat_var(
+    py: Python<'_>,
+    means: &[f64],
+    variances: &[f64],
+    span: f64,
+) -> PyResult<Vec<f64>> {
+    let n_vars = means.len();
+    let mut estimat_var = vec![0.0f64; n_vars];
+    let not_const: Vec<bool> = variances.iter().map(|&v| v > 0.0).collect();
+    let x_vals: Vec<f64> = means
+        .iter()
+        .zip(not_const.iter())
+        .filter(|(_, &nc)| nc)
+        .map(|(&m, _)| m.max(1e-300).log10())
+        .collect();
+    let y_vals: Vec<f64> = variances
+        .iter()
+        .zip(not_const.iter())
+        .filter(|(_, &nc)| nc)
+        .map(|(&v, _)| v.max(1e-300).log10())
+        .collect();
+
+    if x_vals.len() >= 3 {
+        let x_arr = numpy::PyArray::from_vec(py, x_vals);
+        let y_arr = numpy::PyArray::from_vec(py, y_vals);
+        let loess_mod = py.import("skmisc.loess")?;
+        let loess_cls = loess_mod.getattr("loess")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("span", span)?;
+        kwargs.set_item("degree", 2)?;
+        let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
+        model.call_method0("fit")?;
+        let fitted: Vec<f64> = model
+            .getattr("outputs")?
+            .getattr("fitted_values")?
+            .extract()?;
+        let mut fi = 0;
+        for (j, &nc) in not_const.iter().enumerate() {
+            if nc {
+                estimat_var[j] = fitted[fi];
+                fi += 1;
+            }
+        }
+    }
+    Ok(estimat_var)
+}
+
+/// clip_val per gene = `reg_std * sqrt(n) + mean` (seurat_v3).
+fn csc_clip_val(means: &[f64], estimat_var: &[f64], n_obs: usize) -> Vec<f64> {
+    let sqrt_n = (n_obs as f64).sqrt();
+    means
+        .iter()
+        .zip(estimat_var.iter())
+        .map(|(&mean, &ev)| 10.0f64.powf(ev).sqrt() * sqrt_n + mean)
+        .collect()
+}
+
+/// Steps 5–8 of single-batch seurat_v3: normalized variance, rank, write
+/// `adata.var`, optional subset. Shared by the backed and lazy CSC paths.
+#[allow(clippy::too_many_arguments)]
+fn csc_finish_seurat_v3(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    x_obj: &Bound<'_, PyAny>,
+    n_obs: usize,
+    n_vars: usize,
+    means: Vec<f64>,
+    variances: Vec<f64>,
+    estimat_var: Vec<f64>,
+    bcs: Vec<f64>,
+    sbcs: Vec<f64>,
+    n_top_genes: usize,
+    subset: bool,
+) -> PyResult<()> {
+    let n_f = n_obs as f64;
+    let denom_n = (n_f - 1.0).max(1.0);
+    let mut norm_gene_var = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        let reg_std_sq = 10.0f64.powf(estimat_var[j]);
+        if reg_std_sq > 0.0 {
+            norm_gene_var[j] = (1.0 / (denom_n * reg_std_sq))
+                * (n_f * means[j] * means[j] + sbcs[j] - 2.0 * bcs[j] * means[j]);
+        }
+    }
+
+    // Single-batch ranking: sort by normalized variance desc.
+    let mut indices: Vec<usize> = (0..n_vars).collect();
+    indices.sort_by(|&a, &b| {
+        norm_gene_var[b]
+            .partial_cmp(&norm_gene_var[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut hvg_mask = vec![false; n_vars];
+    let mut ranks = vec![f64::NAN; n_vars];
+    for (r, &g) in indices.iter().enumerate().take(n_top_genes.min(n_vars)) {
+        hvg_mask[g] = true;
+        ranks[g] = r as f64;
+    }
+
+    // Write to adata.var (matches CSR seurat_v3 schema).
+    let var = adata.getattr("var")?;
+    var.set_item(
+        "highly_variable",
+        numpy::PyArray::from_vec(py, hvg_mask.clone()),
+    )?;
+    var.set_item("means", numpy::PyArray::from_vec(py, means))?;
+    var.set_item("variances", numpy::PyArray::from_vec(py, variances))?;
+    var.set_item(
+        "variances_norm",
+        numpy::PyArray::from_vec(py, norm_gene_var),
+    )?;
+    var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
+
+    if subset {
+        apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
+    }
+    Ok(())
+}
+
+/// Device-dispatched per-column mean/var on a `Sync` CSC source: GPU CSC
+/// reduce when `device_id` is `Some` (no `atomicAdd`), else CPU CSC.
+#[cfg(feature = "gpu")]
+fn csc_mean_var_dispatch<S: scx_format::ColumnShardSource + Sync>(
+    py: Python<'_>,
+    source: &S,
+    device_id: Option<usize>,
+) -> PyResult<scx_accel::HvgStats> {
+    match device_id {
+        Some(id) => py
+            .detach(|| scx_accel::streaming_mean_var_csc_with_device(source, "gpu", id))
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_mean_var_csc: {e}"))),
+        None => scx_accel::streaming_mean_var_csc(source)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}"))),
+    }
+}
+
+/// Device-dispatched per-column clipped sums on a `Sync` CSC source.
+#[cfg(feature = "gpu")]
+fn csc_clip_dispatch<S: scx_format::ColumnShardSource + Sync>(
+    py: Python<'_>,
+    source: &S,
+    clip_val: &[f64],
+    device_id: Option<usize>,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    match device_id {
+        Some(id) => {
+            py.detach(|| {
+                scx_accel::streaming_clip_square_sum_csc_with_device(source, clip_val, "gpu", id)
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("gpu streaming_clip_square_sum_csc: {e}")))
+        }
+        None => scx_accel::streaming_clip_square_sum_csc(source, clip_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}"))),
+    }
+}
+
+/// Single-batch seurat_v3 HVG via the CSC sidecar.
 ///
-/// Same numerics as `hvg_seurat_v3` for the single-batch case, but
-/// pulls per-column mean/var and clipped sums from `ColumnShardSource`
-/// instead of the CSR-side `streaming_mean_var_batched`. The loess fit
-/// (Python `skmisc.loess`), ranking, and result-writing logic are
-/// identical to the CSR path — duplicated rather than abstracted to
-/// keep the CSR side untouched.
+/// Same numerics as `hvg_seurat_v3` for the single-batch case, but pulls
+/// per-column mean/var and clipped sums from the gene-major
+/// `ColumnShardSource`. With `device_id = Some(gid)` the two reduction
+/// passes run the GPU CSC reduce kernels (one block per gene, no
+/// `atomicAdd`) — route `gpu_csc_v3`; `None` runs the CPU CSC kernels.
+/// GPU CSC reduce is **backed-only** (raw counts): the lazy-transformed
+/// branch always runs CPU since its `&dyn` source is not `Sync`.
 fn hvg_seurat_v3_csc(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -1084,144 +1313,75 @@ fn hvg_seurat_v3_csc(
     span: f64,
     subset: bool,
     flavor: &str,
+    device_id: Option<usize>,
 ) -> PyResult<()> {
     use scx_format::ColumnShardSource;
+    let _ = flavor; // single-batch: seurat_v3 / seurat_v3_paper share ordering.
 
     let x = adata.getattr("X")?;
 
-    // Helper closure that runs the entire CSC seurat_v3 pipeline against
-    // a `&dyn ColumnShardSource`. Used by both the backed and lazy
-    // branches below to share the kernel invocations and the post-
-    // processing (loess, ranking, var-writing).
-    let run_pipeline = |source: &dyn ColumnShardSource, x_obj: &Bound<'_, PyAny>| -> PyResult<()> {
-        let n_obs = source.n_obs();
-        let n_vars = source.n_vars();
-
-        // ── 1. Single-pass per-column mean / var ────────────────────
-        // Note: `&dyn ColumnShardSource` is not `Send`, so this Rust call
-        // runs with the GIL held. Wrapping requires monomorphizing on the
-        // concrete reader type (BackedCscReader / LazyShardSource).
-        let stats = scx_accel::streaming_mean_var_csc(source)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?;
-
-        // ── 2. Loess fit on (log10 mean, log10 var) for non-constant
-        //       genes — identical to the CSR seurat_v3 fit.
-        let mut estimat_var = vec![0.0f64; n_vars];
-        let not_const: Vec<bool> = stats.variances.iter().map(|&v| v > 0.0).collect();
-        let x_vals: Vec<f64> = stats
-            .means
-            .iter()
-            .zip(not_const.iter())
-            .filter(|(_, &nc)| nc)
-            .map(|(&m, _)| m.max(1e-300).log10())
-            .collect();
-        let y_vals: Vec<f64> = stats
-            .variances
-            .iter()
-            .zip(not_const.iter())
-            .filter(|(_, &nc)| nc)
-            .map(|(&v, _)| v.max(1e-300).log10())
-            .collect();
-
-        if x_vals.len() >= 3 {
-            let x_arr = numpy::PyArray::from_vec(py, x_vals);
-            let y_arr = numpy::PyArray::from_vec(py, y_vals);
-            let loess_mod = py.import("skmisc.loess")?;
-            let loess_cls = loess_mod.getattr("loess")?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("span", span)?;
-            kwargs.set_item("degree", 2)?;
-            let model = loess_cls.call((x_arr, y_arr), Some(&kwargs))?;
-            model.call_method0("fit")?;
-            let fitted: Vec<f64> = model
-                .getattr("outputs")?
-                .getattr("fitted_values")?
-                .extract()?;
-            let mut fi = 0;
-            for (j, &nc) in not_const.iter().enumerate() {
-                if nc {
-                    estimat_var[j] = fitted[fi];
-                    fi += 1;
-                }
-            }
-        }
-
-        // ── 3. clip_val per gene — `reg_std * sqrt(n) + mean`.
-        let mut clip_val = vec![0.0f64; n_vars];
-        let n_f = n_obs as f64;
-        let sqrt_n = n_f.sqrt();
-        for j in 0..n_vars {
-            let reg_std = 10.0f64.powf(estimat_var[j]).sqrt();
-            clip_val[j] = reg_std * sqrt_n + stats.means[j];
-        }
-
-        // ── 4. Single-pass per-column clipped sum / sum_sq.
-        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(source, &clip_val)
-            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
-
-        // ── 5. Compute normalized variance per gene.
-        let denom_n = (n_f - 1.0).max(1.0);
-        let mut norm_gene_var = vec![0.0f64; n_vars];
-        for j in 0..n_vars {
-            let reg_std_sq = 10.0f64.powf(estimat_var[j]);
-            if reg_std_sq > 0.0 {
-                norm_gene_var[j] = (1.0 / (denom_n * reg_std_sq))
-                    * (n_f * stats.means[j] * stats.means[j] + sbcs[j]
-                        - 2.0 * bcs[j] * stats.means[j]);
-            }
-        }
-
-        // ── 6. Single-batch ranking: sort by normalized variance desc.
-        //       (Multi-batch logic is unreachable here — gated upstream.)
-        let mut indices: Vec<usize> = (0..n_vars).collect();
-        indices.sort_by(|&a, &b| {
-            norm_gene_var[b]
-                .partial_cmp(&norm_gene_var[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut hvg_mask = vec![false; n_vars];
-        let mut ranks = vec![f64::NAN; n_vars];
-        for (r, &g) in indices.iter().enumerate().take(n_top_genes.min(n_vars)) {
-            hvg_mask[g] = true;
-            ranks[g] = r as f64;
-        }
-        let _ = flavor; // single-batch path: seurat_v3 / seurat_v3_paper share ordering.
-
-        // ── 7. Write to adata.var (matches CSR seurat_v3 schema).
-        let var = adata.getattr("var")?;
-        var.set_item(
-            "highly_variable",
-            numpy::PyArray::from_vec(py, hvg_mask.clone()),
-        )?;
-        var.set_item("means", numpy::PyArray::from_vec(py, stats.means))?;
-        var.set_item("variances", numpy::PyArray::from_vec(py, stats.variances))?;
-        var.set_item(
-            "variances_norm",
-            numpy::PyArray::from_vec(py, norm_gene_var),
-        )?;
-        var.set_item("highly_variable_rank", numpy::PyArray::from_vec(py, ranks))?;
-
-        // ── 8. Optionally subset adata to HVG.
-        if subset {
-            apply_hvg_subset(py, adata, x_obj, &hvg_mask)?;
-        }
-        Ok(())
-    };
-
-    // Dispatch: backed yields a borrowed `&dyn`, lazy yields an owned
-    // `LazyShardSource` (we then borrow from it).
+    // ── Backed dataset: concrete `Arc<BackedCscReader>` (Send + Sync), so
+    //    the GPU CSC reduce path (which decodes on a worker thread) is
+    //    reachable. Mirror the same capability gate as `as_column_source`. ──
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let backed_ref = backed.borrow();
-        let source = backed_ref.as_column_source().ok_or_else(|| {
-            PyRuntimeError::new_err(
-                "CSC requested but unavailable: file has no CSC sidecar, \
-                 or a row deletion vector is active. Re-import with \
-                 `csc=\"always\"` or pass `prefer_format='csr'`.",
-            )
-        })?;
-        return run_pipeline(source, &x);
+        if backed_ref.kept_to_global.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "CSC requested but unavailable: a row deletion vector is active. \
+                 Pass `prefer_format='csr'`.",
+            ));
+        }
+        let csc_reader = backed_ref
+            .backed_csc
+            .as_ref()
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "CSC requested but unavailable: file has no CSC sidecar. \
+                     Re-import with `csc=\"always\"` or pass `prefer_format='csr'`.",
+                )
+            })?
+            .clone();
+        drop(backed_ref);
+
+        let n_obs = csc_reader.n_obs();
+        let n_vars = csc_reader.n_vars();
+
+        #[cfg(feature = "gpu")]
+        let stats = csc_mean_var_dispatch(py, csc_reader.as_ref(), device_id)?;
+        #[cfg(not(feature = "gpu"))]
+        let stats = {
+            let _ = device_id;
+            scx_accel::streaming_mean_var_csc(csc_reader.as_ref())
+                .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?
+        };
+
+        let estimat_var = csc_loess_estimat_var(py, &stats.means, &stats.variances, span)?;
+        let clip_val = csc_clip_val(&stats.means, &estimat_var, n_obs);
+
+        #[cfg(feature = "gpu")]
+        let (bcs, sbcs) = csc_clip_dispatch(py, csc_reader.as_ref(), &clip_val, device_id)?;
+        #[cfg(not(feature = "gpu"))]
+        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(csc_reader.as_ref(), &clip_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
+
+        return csc_finish_seurat_v3(
+            py,
+            adata,
+            &x,
+            n_obs,
+            n_vars,
+            stats.means,
+            stats.variances,
+            estimat_var,
+            bcs,
+            sbcs,
+            n_top_genes,
+            subset,
+        );
     }
 
+    // ── Lazy-transformed dataset: CPU CSC only (the `&dyn` column source is
+    //    not `Sync`, and GPU CSC reduce is a raw-counts / backed feature). ──
     if let Ok(lazy) = x.cast::<ScxLazyTransformedDataset>() {
         let lazy_ref = lazy.borrow();
         let lazy_src = lazy_ref.as_column_source().ok_or_else(|| {
@@ -1232,7 +1392,28 @@ fn hvg_seurat_v3_csc(
                  is active. Pass `prefer_format='csr'` to use the CSR path.",
             )
         })?;
-        return run_pipeline(&lazy_src, &x);
+        let n_obs = lazy_src.n_obs();
+        let n_vars = lazy_src.n_vars();
+        let stats = scx_accel::streaming_mean_var_csc(&lazy_src)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_mean_var_csc: {e}")))?;
+        let estimat_var = csc_loess_estimat_var(py, &stats.means, &stats.variances, span)?;
+        let clip_val = csc_clip_val(&stats.means, &estimat_var, n_obs);
+        let (bcs, sbcs) = scx_accel::streaming_clip_square_sum_csc(&lazy_src, &clip_val)
+            .map_err(|e| PyRuntimeError::new_err(format!("streaming_clip_square_sum_csc: {e}")))?;
+        return csc_finish_seurat_v3(
+            py,
+            adata,
+            &x,
+            n_obs,
+            n_vars,
+            stats.means,
+            stats.variances,
+            estimat_var,
+            bcs,
+            sbcs,
+            n_top_genes,
+            subset,
+        );
     }
 
     Err(PyRuntimeError::new_err(
