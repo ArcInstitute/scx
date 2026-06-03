@@ -163,6 +163,16 @@ pub fn highly_variable_genes<'py>(
                  (or 'seurat_v3_paper'); use prefer_format='csr' for 'seurat'",
             ));
         }
+        // The CSC sidecar lives on `adata.X`, not on arbitrary layers — the CSC
+        // dispatch (`hvg_seurat_v3_csc`) reads `adata.X` unconditionally. Reject
+        // `layer=` rather than silently computing on X (mirrors the `layer.is_none()`
+        // gate on the CSR auto-detect path).
+        if layer.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' for HVG reads adata.X only and does not support \
+                 layer=; pass layer=None or use prefer_format='csr'",
+            ));
+        }
         // GPU CSC reduce when a GPU is requested and available, else CPU CSC.
         // The GPU CSC reduce kernel lifts the previous "csc is cpu-only"
         // restriction; an explicit device="gpu" with no GPU still errors via

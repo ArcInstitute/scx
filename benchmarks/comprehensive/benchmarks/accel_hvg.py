@@ -214,12 +214,37 @@ def run(
         _fixture_cache[ref_key] = ref.var.copy()
     ref_var = _fixture_cache[ref_key]
 
+    # Resolve the GPU timing target once, outside the timed loop, so the
+    # one-time `pyscx.open` + `to_anndata(backed=True)` construction is excluded
+    # from the measured HVG wall time (apples-to-apples with the in-memory CSR
+    # variant). Safe to reuse across warmup + all timed runs: HVG with
+    # `subset=False` does not mutate X, and re-writing the var HVG columns is
+    # idempotent. `None` → in-memory path via `impl()` — this also covers a
+    # failed open, which then correctly trips `hvg_route_csc_direct` (the CSC
+    # reduce never ran).
+    gpu_backed = None
+    if requires_gpu and scx_csc_path is not None:
+        try:
+            import pyscx
+            gpu_backed = pyscx.open(str(scx_csc_path)).to_anndata(backed=True)
+        except Exception as e:
+            logger.warning(
+                "accel_hvg: failed to open SCX-with-CSC fixture %s (%s); "
+                "GPU variant falls back to in-memory CSR path",
+                scx_csc_path, e,
+            )
+            gpu_backed = None
+
     for _ in range(N_WARMUP_RUNS):
-        warm = raw.copy()
-        if scx_csc_path is not None:
-            warm.uns["_bench_scx_with_csc_path"] = str(scx_csc_path)
-        impl(warm, n_top_genes)
-        del warm
+        if gpu_backed is not None:
+            import pyscx
+            pyscx.accel.highly_variable_genes(
+                gpu_backed, n_top_genes=n_top_genes, flavor="seurat_v3", device="gpu",
+            )
+        else:
+            warm = raw.copy()
+            impl(warm, n_top_genes)
+            del warm
         gc.collect()
 
     backend = ""
@@ -227,13 +252,28 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = raw.copy()
-        if scx_csc_path is not None:
-            a.uns["_bench_scx_with_csc_path"] = str(scx_csc_path)
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        backend = impl(a, n_top_genes)
-        wall = time.perf_counter() - t0
+        if gpu_backed is not None:
+            # Time only the HVG call on the pre-opened backed dataset; the
+            # one-time open already happened above.
+            import pyscx
+            pyscx.accel.highly_variable_genes(
+                gpu_backed, n_top_genes=n_top_genes, flavor="seurat_v3", device="gpu",
+            )
+            wall = time.perf_counter() - t0
+            backend = "pyscx-gpu"
+            # Teardown outside the timed region: surface the route + HVG var
+            # columns on `a` for the route gate and the Jaccard overlap below.
+            # Gene order is identical (the CSC fixture was built from `raw`).
+            _propagate_route(gpu_backed, a)
+            for col in _HVG_VAR_COLS:
+                if col in gpu_backed.var.columns:
+                    a.var[col] = gpu_backed.var[col].to_numpy()
+        else:
+            backend = impl(a, n_top_genes)
+            wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
         extras: dict[str, Any] = {}
@@ -260,7 +300,7 @@ def run(
                 extras["hvg_route_gpu_correct"] = (
                     1.0 if route.startswith("gpu_") else 0.0
                 )
-                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                csc_fixture = scx_csc_path is not None
                 extras["hvg_route_csc_direct"] = (
                     1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
                 )
