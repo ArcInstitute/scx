@@ -140,7 +140,8 @@ the file until `scx compact`).
 
 ```
 catalog_version: u16             (1 = legacy single-modality, 2 = multimodal,
-                                  3 = sharded obs / var metadata supported)
+                                  3 = sharded obs / var metadata supported,
+                                  4 = CSC-sidecar freshness counters)
 manifest_sequence: u64           (matches header)
 prev_catalog_offset: u64         (0 if first)
 n_obs: u64                       (observable cells after deletions)
@@ -156,6 +157,8 @@ For each entry:
   modality_id: u8                (v2 only; 0 = global, ≥ 1 = named modality)
   stats_length: u16
   stats: [u8; stats_length]      (per-section stats, format below)
+data_generation: u64             (v4 only; CSR-data generation, bumped by append/compact/merge)
+csc_build_generation: u64        (v4 only; generation the CSC sidecar was built against)
 catalog_checksum: [u8; 32]       (BLAKE3 of all preceding catalog bytes)
 ```
 
@@ -164,6 +167,19 @@ The `modality_id` field is added between the per-entry checksum and
 1000-shard file). v1 catalogs do not carry the field; the v2 reader
 materialises every v1 entry with `modality_id = 0` (global) when
 opening a v1 file.
+
+v4 appends two `u64` generation counters (`data_generation`,
+`csc_build_generation`) between the entry list and the catalog checksum.
+The append is additive and inside the checksummed payload, so older
+readers parse the entries, ignore the trailing 16 bytes, and the checksum
+still validates. The bytes are emitted only when a counter is non-zero, so
+legacy / zero-counter files stay byte-identical at their v2/v3 declared
+version. The counters are a CSC-sidecar freshness guard: CSR-mutating
+writers bump `data_generation`, and only a CSC (re)build advances
+`csc_build_generation` to match. A sidecar is fresh iff
+`csc_build_generation == data_generation`; a reader rejects a present
+sidecar whose counters disagree (v1–v3 files default both to `0`, so
+`0 == 0` reads as fresh and legacy sidecars are never rejected).
 
 ### `section_type` enum
 

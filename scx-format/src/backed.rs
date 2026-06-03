@@ -2158,6 +2158,28 @@ impl BackedCscIndex {
 /// reader's heavier machinery isn't a fit yet. If benchmarks later show
 /// contention on the same shard from multiple threads, the singleflight
 /// pattern can be ported over.
+/// Reject a CSC sidecar that was built against an earlier generation of
+/// the CSR data (the freshness guard introduced with `catalog_version`
+/// v4). A sidecar is fresh iff `csc_build_generation == data_generation`;
+/// CSR-mutating writers bump `data_generation`, and only a CSC (re)build
+/// advances `csc_build_generation` to match.
+///
+/// The check is skipped when `csc_entries` is empty (no sidecar to
+/// validate) and is a no-op for v1–v3 files (both counters default to
+/// `0`, so `0 == 0`), so existing valid sidecars are never rejected.
+fn check_csc_sidecar_fresh(catalog: &FullCatalog, csc_entries: &[FullCatalogEntry]) -> Result<()> {
+    if csc_entries.is_empty() {
+        return Ok(());
+    }
+    if catalog.csc_build_generation != catalog.data_generation {
+        return Err(ScxError::StaleCscSidecar {
+            built_generation: catalog.csc_build_generation,
+            data_generation: catalog.data_generation,
+        });
+    }
+    Ok(())
+}
+
 pub struct BackedCscReader {
     reader: ScxReader,
     index: BackedCscIndex,
@@ -2246,6 +2268,7 @@ impl BackedCscReader {
             .into_iter()
             .cloned()
             .collect();
+        check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
         let cache = if cache_shards > 0 {
             Some(Mutex::new(CscCache::new(cache_shards)))
         } else {
@@ -2284,6 +2307,7 @@ impl BackedCscReader {
             .into_iter()
             .cloned()
             .collect();
+        check_csc_sidecar_fresh(reader.catalog(), &sorted_entries)?;
         let cache = if cache_shards > 0 {
             Some(Mutex::new(CscCache::new(cache_shards)))
         } else {
@@ -4120,6 +4144,68 @@ mod tests {
         }
         writer.finish().unwrap();
         (path, dense)
+    }
+
+    /// A freshly-written CSC file stamps matching generations
+    /// (`data_generation == csc_build_generation`), so the backed CSC
+    /// reader opens it without a staleness error.
+    #[test]
+    fn freshly_written_csc_has_matching_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = write_csc_test_file(&dir, 12, 10, 3);
+        let reader = ScxReader::open(&path).unwrap();
+        // Writer default data_generation = 1; `write_csc_shard` stamps
+        // csc_build_generation = 1 via the `write_shard_inner` chokepoint.
+        assert_eq!(reader.catalog().data_generation, 1);
+        assert_eq!(reader.catalog().csc_build_generation, 1);
+        assert!(BackedCscReader::new(reader, 0).is_ok());
+    }
+
+    /// Unit-test the freshness guard directly: matched generations pass;
+    /// a build generation behind the data generation is rejected; an
+    /// empty sidecar list and legacy (0/0) files are never rejected.
+    #[test]
+    fn csc_freshness_guard_logic() {
+        let csc_entry = FullCatalogEntry {
+            name: "X_csc_shard_0".to_string(),
+            offset: 4352,
+            length: 100,
+            section_type: SectionType::CscShard,
+            checksum: [0u8; 32],
+            modality_id: 0,
+            stats: None,
+        };
+        let mut cat = FullCatalog {
+            catalog_version: 4,
+            manifest_sequence: 0,
+            prev_catalog_offset: 0,
+            n_obs: 10,
+            entries: vec![csc_entry.clone()],
+            data_generation: 3,
+            csc_build_generation: 3,
+        };
+
+        // Fresh: matched generations with a sidecar present.
+        assert!(check_csc_sidecar_fresh(&cat, &[csc_entry.clone()]).is_ok());
+
+        // Stale: the sidecar was built one generation behind the data.
+        cat.csc_build_generation = 2;
+        let err = check_csc_sidecar_fresh(&cat, &[csc_entry.clone()]).unwrap_err();
+        assert!(matches!(
+            err,
+            ScxError::StaleCscSidecar {
+                built_generation: 2,
+                data_generation: 3,
+            }
+        ));
+
+        // No sidecar entries → nothing to validate even on a mismatch.
+        assert!(check_csc_sidecar_fresh(&cat, &[]).is_ok());
+
+        // Legacy file (both counters default to 0) → treated as fresh.
+        cat.data_generation = 0;
+        cat.csc_build_generation = 0;
+        assert!(check_csc_sidecar_fresh(&cat, &[csc_entry]).is_ok());
     }
 
     #[test]

@@ -216,7 +216,18 @@ pub fn merge_with_options(
         reserved: [0u8; 112],
     };
 
-    let mut writer = ScxWriter::new(output_path, out_header)?;
+    // Merge produces new CSR shards from multiple inputs and drops every
+    // CSC sidecar. Bump past the max input generation so the merged file's
+    // generation strictly exceeds any source; `csc_build_generation`
+    // defaults to 0 (no CSC emitted).
+    let merged_data_generation = readers
+        .iter()
+        .map(|r| r.catalog().data_generation)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut writer =
+        ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
 
     // ---------------------------------------------------------------
     // Phase 2: streaming obs across all inputs.
@@ -661,7 +672,16 @@ fn merge_multimodal(
         reserved: [0u8; 112],
     };
 
-    let mut writer = ScxWriter::new(output_path, out_header)?;
+    // As with single-modality merge: new CSR shards, CSC dropped — bump
+    // past the max input generation.
+    let merged_data_generation = readers
+        .iter()
+        .map(|r| r.catalog().data_generation)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut writer =
+        ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
 
     // Validate global obs schema across all inputs before any output
     // bytes are written. Mirrors the single-modality call site.

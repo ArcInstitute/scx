@@ -81,6 +81,8 @@ fn arb_catalog() -> impl Strategy<Value = FullCatalog> {
                 prev_catalog_offset,
                 n_obs,
                 entries,
+                data_generation: 0,
+                csc_build_generation: 0,
             },
         )
 }
@@ -139,6 +141,8 @@ proptest! {
                 modality_id,
                 stats: None,
             }],
+            data_generation: 0,
+            csc_build_generation: 0,
         };
 
         let mut buf = Vec::new();

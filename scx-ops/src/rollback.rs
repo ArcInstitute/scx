@@ -147,8 +147,14 @@ fn read_catalog_at(file: &mut (impl Read + Seek), offset: u64) -> Result<(FullCa
         entries_size += 2 + name_len + fixed_after_name + 2 + stats_len;
     }
 
-    // Step 3: Now read the entire catalog in one go (header + entries + checksum)
-    let total_catalog_len = CATALOG_HEADER_SIZE + entries_size + TRAILING_CHECKSUM;
+    // Step 3: Now read the entire catalog in one go (header + entries +
+    // optional v4 generation counters + checksum). v4 catalogs append two
+    // u64 generation counters (`data_generation`, `csc_build_generation`)
+    // between the entry list and the trailing checksum — 16 bytes that the
+    // entry scan above does not cover.
+    let trailing_generation_bytes: usize = if catalog_version >= 4 { 16 } else { 0 };
+    let total_catalog_len =
+        CATALOG_HEADER_SIZE + entries_size + trailing_generation_bytes + TRAILING_CHECKSUM;
     if offset + total_catalog_len as u64 > file_len {
         return Err(OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,

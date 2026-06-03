@@ -4,6 +4,7 @@
 // row-level filtering within shards. This is level 2 of the two-level pushdown
 // strategy (docs/api.md (Query engine, optimizations)).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 
@@ -1371,6 +1372,34 @@ pub fn index_preset_columns(name: &str) -> Option<IndexPreset> {
             var_columns: vec!["feature_name", "feature_type"],
         }),
         _ => None,
+    }
+}
+
+/// Whether a named index preset implies a CSC sidecar should be built
+/// when the caller did not explicitly pass a `csc` policy.
+///
+/// The accel-ready presets — `training` and `perturbseq` — drive
+/// column/DE-heavy workloads (pseudobulk, `pdex_ref`, `rank_genes_groups`)
+/// whose primary substrate is the column-major CSC sidecar, so selecting
+/// one of those presets upgrades an *unset* `csc` to `auto`. `cellxgene`
+/// is query/browse-oriented and does not imply CSC. An explicit `--csc`
+/// value (including `off`) always wins over this default.
+pub fn preset_implies_csc_auto(name: &str) -> bool {
+    matches!(name, "training" | "perturbseq")
+}
+
+/// Resolve the effective CSC policy string for a conversion entry point.
+///
+/// An explicit `csc` always wins; when unset (`None`), an accel-ready
+/// `index_preset` (`training` / `perturbseq`) upgrades the default to
+/// `"auto"`, otherwise the default is `"off"`. Shared by the `scx convert`
+/// CLI and the pyscx conversion entry points so the two front-ends cannot
+/// drift.
+pub fn resolve_csc_policy<'a>(csc: Option<&'a str>, index_preset: Option<&str>) -> Cow<'a, str> {
+    match csc {
+        Some(v) => Cow::Borrowed(v),
+        None if index_preset.is_some_and(preset_implies_csc_auto) => Cow::Borrowed("auto"),
+        None => Cow::Borrowed("off"),
     }
 }
 
@@ -3417,6 +3446,31 @@ mod tests {
             assert!(!p.obs_columns.is_empty());
         }
         assert!(index_preset_columns("unknown").is_none());
+    }
+
+    #[test]
+    fn accel_ready_presets_imply_csc_auto() {
+        // DE/pseudobulk-heavy presets imply a CSC sidecar.
+        assert!(preset_implies_csc_auto("training"));
+        assert!(preset_implies_csc_auto("perturbseq"));
+        // Query/browse-oriented and unknown presets do not.
+        assert!(!preset_implies_csc_auto("cellxgene"));
+        assert!(!preset_implies_csc_auto("unknown"));
+    }
+
+    #[test]
+    fn resolve_csc_policy_explicit_wins_else_preset_default() {
+        // An explicit value always wins, including "off" over an
+        // accel-ready preset.
+        assert_eq!(resolve_csc_policy(Some("off"), Some("training")), "off");
+        assert_eq!(resolve_csc_policy(Some("always"), None), "always");
+        // Unset + accel-ready preset upgrades to "auto".
+        assert_eq!(resolve_csc_policy(None, Some("training")), "auto");
+        assert_eq!(resolve_csc_policy(None, Some("perturbseq")), "auto");
+        // Unset + query-oriented / unknown / no preset stays "off".
+        assert_eq!(resolve_csc_policy(None, Some("cellxgene")), "off");
+        assert_eq!(resolve_csc_policy(None, Some("unknown")), "off");
+        assert_eq!(resolve_csc_policy(None, None), "off");
     }
 
     #[test]

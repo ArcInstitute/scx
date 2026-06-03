@@ -67,8 +67,12 @@ enum Commands {
         ///   benefit (n_obs ≥ 50000 and n_vars ≥ 5000 by default; tune via
         ///   `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`).
         /// `always`: always emit a CSC sidecar (column-major shards).
-        #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
-        csc: String,
+        ///
+        /// When omitted, an accel-ready `--index-preset` (`training` /
+        /// `perturbseq`) upgrades the default to `auto`; otherwise the
+        /// default is `off`. An explicit value here always wins.
+        #[arg(long, value_parser = ["off", "auto", "always"])]
+        csc: Option<String>,
         /// Columns per CSC shard when a CSC sidecar is emitted (default 5000).
         ///
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
@@ -579,31 +583,39 @@ fn main() {
             bitmap,
             reader_threads,
             writer_queue_depth,
-        } => run_convert(
-            &input,
-            &output,
-            from.as_deref(),
-            to.as_deref(),
-            shard_size,
-            &codec,
-            &csc,
-            csc_cols_per_shard,
-            modality.as_deref(),
-            stream,
-            memory_budget.as_deref(),
-            strict_uns,
-            dense_zero_epsilon,
-            temp_dir,
-            modalities.as_deref(),
-            modality_types.as_deref(),
-            index_obs.as_deref(),
-            index_var.as_deref(),
-            index_preset,
-            index_auto_threshold,
-            &bitmap,
-            reader_threads,
-            writer_queue_depth,
-        ),
+        } => {
+            // Resolve the CSC policy: an explicit `--csc` always wins;
+            // otherwise an accel-ready `--index-preset` upgrades the
+            // default to `auto` (column substrate for DE/pseudobulk).
+            // Shared with pyscx via `scx_engine::index::resolve_csc_policy`.
+            let csc =
+                scx_engine::index::resolve_csc_policy(csc.as_deref(), index_preset.as_deref());
+            run_convert(
+                &input,
+                &output,
+                from.as_deref(),
+                to.as_deref(),
+                shard_size,
+                &codec,
+                &csc,
+                csc_cols_per_shard,
+                modality.as_deref(),
+                stream,
+                memory_budget.as_deref(),
+                strict_uns,
+                dense_zero_epsilon,
+                temp_dir,
+                modalities.as_deref(),
+                modality_types.as_deref(),
+                index_obs.as_deref(),
+                index_var.as_deref(),
+                index_preset,
+                index_auto_threshold,
+                &bitmap,
+                reader_threads,
+                writer_queue_depth,
+            )
+        }
         Commands::Info {
             file,
             json,
