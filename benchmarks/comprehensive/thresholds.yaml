@@ -556,6 +556,17 @@ absolute_floors:
     dataset: pbmc3k
     metric: hvg_route_gpu_correct
     min: 1.0
+  # CSC-direct HVG: when the bench builds an SCX-with-CSC fixture, single-batch
+  # seurat_v3 GPU HVG must auto-route to the column-major reduce (gpu_csc_v3),
+  # not the CSR-atomic gpu_csr path. `accel_hvg.py` emits `hvg_route_csc_direct`
+  # = 1.0 when the CSC-direct route ran (or no CSC fixture was built — vacuous,
+  # mirroring `de_route_csc_direct`), 0.0 when a CSC fixture was built yet a
+  # non-gpu_csc_v3 route ran (a silent CSC→CSR dispatch regression).
+  - benchmark: accel_hvg
+    format: accel_hvg__pyscx_gpu
+    dataset: pbmc3k
+    metric: hvg_route_csc_direct
+    min: 1.0
 
   # --- ml_loader throughput floors -----------------------------------
   # Floors at 0.5x observed baseline median (0.6x on pbmc3k

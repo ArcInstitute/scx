@@ -75,19 +75,21 @@ pub(crate) fn cpu_exec_info(
 /// Build the execution info for an HVG dispatch via the single planner.
 ///
 /// `gpu_eligible` is `true` only for the `seurat_v3` flavor family (the one
-/// flavor with a GPU kernel) and never for the CSC-preferred path. The caller
-/// passes the resolved `device` string and the actual flavor so the recorded
-/// route matches the code that ran.
+/// flavor with a GPU kernel). `csc_available` is `true` when a CSC sidecar is
+/// reachable for a single-batch run, routing GPU to the column-major reduce
+/// (`gpu_csc_v3`) and CPU to `cpu_csc`. The caller passes the resolved `device`
+/// string and the actual flavor/layout so the recorded route matches the code
+/// that ran.
 pub(crate) fn hvg_exec_info(
     device: &str,
     gpu_eligible: bool,
-    prefer_csc: bool,
+    csc_available: bool,
 ) -> AccelExecutionInfo {
     plan_hvg_route(
         device_request(device),
         gpu_available(),
         gpu_eligible,
-        prefer_csc,
+        csc_available,
     )
 }
 

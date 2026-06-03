@@ -34,6 +34,15 @@ from benchmarks.comprehensive.benchmarks.accel_pca import (
     _get_rss_mb,
 )
 from benchmarks.comprehensive.benchmarks.accel_preprocess import _load_raw
+
+# Reuse DE's SCX-with-CSC fixture machinery so the GPU HVG variant exercises
+# the column-major CSC reduce route (gpu_csc_v3) on a backed dataset rather
+# than the in-memory CSR-atomic path. Shared verbatim to avoid divergence.
+from benchmarks.comprehensive.benchmarks.accel_de import (
+    _as_scx_backed_if_available,
+    _ensure_scx_csc_fixture,
+    _propagate_route,
+)
 from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
@@ -92,11 +101,38 @@ def _run_pyscx_cpu(adata: Any, n_top: int) -> str:
     return "pyscx-cpu"
 
 
+# HVG result columns copied from the backed adata (where the kernel wrote
+# them) back to the runner's in-memory adata so the Jaccard overlap below
+# still sees them. Gene order is identical (same dataset, preserved through
+# from_anndata → to_anndata(backed=True)).
+_HVG_VAR_COLS = (
+    "highly_variable",
+    "means",
+    "variances",
+    "variances_norm",
+    "highly_variable_rank",
+)
+
+
 def _run_pyscx_gpu(adata: Any, n_top: int) -> str:
     import pyscx
+
+    # When the bench built an SCX fixture with a CSC sidecar for this dataset,
+    # run on the backed dataset so single-batch seurat_v3 GPU HVG auto-routes
+    # to the column-major reduce (gpu_csc_v3). Otherwise run in-memory (the
+    # CSR-atomic gpu_csr path). Mirrors accel_de's pdex_ref GPU dispatch.
+    scx_adata = _as_scx_backed_if_available(adata)
+    target = scx_adata if scx_adata is not None else adata
     pyscx.accel.highly_variable_genes(
-        adata, n_top_genes=n_top, flavor="seurat_v3", device="gpu",
+        target, n_top_genes=n_top, flavor="seurat_v3", device="gpu",
     )
+    if scx_adata is not None:
+        _propagate_route(scx_adata, adata)
+        # Copy the HVG var columns back so run()'s Jaccard (on adata.var) and
+        # any downstream readers see them.
+        for col in _HVG_VAR_COLS:
+            if col in scx_adata.var.columns:
+                adata.var[col] = scx_adata.var[col].to_numpy()
     return "pyscx-gpu"
 
 
@@ -146,6 +182,15 @@ def run(
 
     raw = _load_raw(dataset)
 
+    # For the GPU variant, build an SCX-with-CSC fixture so single-batch
+    # seurat_v3 GPU HVG auto-routes to the column-major reduce (gpu_csc_v3).
+    # `None` (pyscx missing or conversion failed) falls back to the in-memory
+    # CSR-atomic gpu_csr path. The path is stashed on each per-run adata's uns
+    # so `_run_pyscx_gpu` → `_as_scx_backed_if_available` can pick it up.
+    scx_csc_path = (
+        _ensure_scx_csc_fixture(raw, dataset.name) if requires_gpu and _HAS_PYSCX else None
+    )
+
     result = BenchmarkResult(
         benchmark="accel_hvg",
         format=key,
@@ -157,6 +202,7 @@ def run(
             "n_obs": raw.n_obs,
             "n_vars": raw.n_vars,
             "random_seed": RANDOM_SEED,
+            "scx_csc_fixture": bool(scx_csc_path),
         },
     )
 
@@ -170,6 +216,8 @@ def run(
 
     for _ in range(N_WARMUP_RUNS):
         warm = raw.copy()
+        if scx_csc_path is not None:
+            warm.uns["_bench_scx_with_csc_path"] = str(scx_csc_path)
         impl(warm, n_top_genes)
         del warm
         gc.collect()
@@ -179,6 +227,8 @@ def run(
     for i in range(n_runs):
         gc.collect()
         a = raw.copy()
+        if scx_csc_path is not None:
+            a.uns["_bench_scx_with_csc_path"] = str(scx_csc_path)
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
@@ -194,16 +244,25 @@ def run(
         except Exception as e:
             logger.warning("HVG overlap failed for %s run %d: %s", key, i + 1, e)
 
-        # Record the accelerator route pyscx stamped, plus a numeric gate
-        # signal for the GPU variant. HVG GPU runs the seurat_v3 atomic-CSR
-        # kernel (route gpu_csr); the variant is skipped on non-GPU hosts,
-        # so a recorded cpu_* route means dispatch silently fell back → 0.0.
+        # Record the accelerator route pyscx stamped, plus numeric gate
+        # signals for the GPU variant. The GPU variant is skipped on non-GPU
+        # hosts, so a recorded cpu_* route means dispatch silently fell back.
+        #   - hvg_route_gpu_correct: 1.0 iff a GPU route ran (gpu_csr or
+        #     gpu_csc_v3), 0.0 on a silent CPU fallback.
+        #   - hvg_route_csc_direct: when a CSC fixture was built, asserts the
+        #     column-major reduce actually dispatched (route == gpu_csc_v3);
+        #     1.0 when no CSC fixture was built (vacuous, mirrors DE's
+        #     de_route_csc_direct), so it never false-fails on a non-CSC host.
         route = _extract_route(a, "highly_variable_genes")
         if route is not None:
             extras["gpu_dispatch_route"] = route
             if requires_gpu:
                 extras["hvg_route_gpu_correct"] = (
                     1.0 if route.startswith("gpu_") else 0.0
+                )
+                csc_fixture = bool(a.uns.get("_bench_scx_with_csc_path"))
+                extras["hvg_route_csc_direct"] = (
+                    1.0 if (not csc_fixture or route == "gpu_csc_v3") else 0.0
                 )
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,

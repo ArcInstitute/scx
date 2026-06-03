@@ -325,3 +325,115 @@ extern "C" __global__ void col_clip_sq_nonzeros_batched_kernel(
         atomicAdd(&sq_batch_sum_per_batch[row_base + c], vc * vc);
     }
 }
+
+// ---------------------------------------------------------------------------
+// CSC-reduce HVG column statistics (one block per column, no cross-column
+// atomics). Column-major sidecar: each gene's nonzeros are contiguous in
+// `data[col_indptr[c] .. col_indptr[c+1]]`, so a single thread block owns one
+// column, reduces its nonzeros in shared memory, and writes one value per
+// accumulator. Shards cover disjoint global column ranges and each column is
+// owned by exactly one block, so the writes are plain stores (`=`), never
+// atomics — eliminating the hot-gene `atomicAdd` contention of the CSR path.
+// Single-batch only (rows are ignored); multi-batch HVG stays on CSR.
+// ---------------------------------------------------------------------------
+
+// Block-reduce two doubles (sum, sum_sq) across `blockDim.x` threads using a
+// warp-shuffle pass followed by a shared-memory pass over the warp partials.
+// Caps at 1024 threads (32 warps). Returns the totals in lane 0 of warp 0;
+// other threads receive undefined values.
+__device__ __forceinline__ void block_reduce_sum_sumsq(
+    double& sum, double& sum_sq
+) {
+    // Warp-level reduction.
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum    += __shfl_down_sync(0xffffffff, sum, offset);
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    __shared__ double warp_sum[32];
+    __shared__ double warp_sum_sq[32];
+    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) {
+        warp_sum[warp_id] = sum;
+        warp_sum_sq[warp_id] = sum_sq;
+    }
+    __syncthreads();
+    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+    if (warp_id == 0) {
+        sum    = (threadIdx.x < (unsigned int)n_warps) ? warp_sum[threadIdx.x]    : 0.0;
+        sum_sq = (threadIdx.x < (unsigned int)n_warps) ? warp_sum_sq[threadIdx.x] : 0.0;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            sum    += __shfl_down_sync(0xffffffff, sum, offset);
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        }
+    }
+}
+
+// Per-column Σx and Σx² on a CSC shard. One block per local column.
+//
+// col_indptr: [n_cols_in_shard + 1] CSC offsets (i64)
+// data:       [nnz] f32 values
+// col_start:  global column id of local column 0 (shard offset)
+// col_sum, col_sum_sq: [n_vars] f64 accumulators (written, not accumulated)
+extern "C" __global__ void csc_col_mean_sq_reduce_kernel(
+    const long long* __restrict__ col_indptr,
+    const float* __restrict__ data,
+    int n_cols_in_shard,
+    int col_start,
+    int n_vars,
+    double* __restrict__ col_sum,
+    double* __restrict__ col_sum_sq
+) {
+    int local_col = blockIdx.x;
+    if (local_col >= n_cols_in_shard) return;
+    int global_col = col_start + local_col;
+    if (global_col < 0 || global_col >= n_vars) return;
+
+    long long s = col_indptr[local_col];
+    long long e = col_indptr[local_col + 1];
+    double sum = 0.0, sum_sq = 0.0;
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
+        double v = (double)data[i];
+        sum += v;
+        sum_sq += v * v;
+    }
+    block_reduce_sum_sumsq(sum, sum_sq);
+    if (threadIdx.x == 0) {
+        col_sum[global_col] = sum;
+        col_sum_sq[global_col] = sum_sq;
+    }
+}
+
+// Per-column clipped Σ min(x, clip[c]) and Σ min(x, clip[c])² on a CSC shard.
+// One block per local column. `clip_val` is indexed by global column id.
+extern "C" __global__ void csc_col_clip_sq_reduce_kernel(
+    const long long* __restrict__ col_indptr,
+    const float* __restrict__ data,
+    int n_cols_in_shard,
+    int col_start,
+    int n_vars,
+    const double* __restrict__ clip_val,
+    double* __restrict__ clipped_sum,
+    double* __restrict__ clipped_sum_sq
+) {
+    int local_col = blockIdx.x;
+    if (local_col >= n_cols_in_shard) return;
+    int global_col = col_start + local_col;
+    if (global_col < 0 || global_col >= n_vars) return;
+
+    double cv = clip_val[global_col];
+    long long s = col_indptr[local_col];
+    long long e = col_indptr[local_col + 1];
+    double sum = 0.0, sum_sq = 0.0;
+    for (long long i = s + threadIdx.x; i < e; i += blockDim.x) {
+        double v = (double)data[i];
+        double vc = v > cv ? cv : v;
+        sum += vc;
+        sum_sq += vc * vc;
+    }
+    block_reduce_sum_sumsq(sum, sum_sq);
+    if (threadIdx.x == 0) {
+        clipped_sum[global_col] = sum;
+        clipped_sum_sq[global_col] = sum_sq;
+    }
+}

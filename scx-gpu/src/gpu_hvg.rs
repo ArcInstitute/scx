@@ -24,11 +24,12 @@
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
-use scx_format::ShardSource;
+use scx_format::{ColumnShardSource, ShardSource};
 
 use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_csc_shard_source::{GpuCscShardSource, RawGpuCscShardSource};
 use crate::gpu_matrix_source::GpuMatrixSource;
 
 /// PTX for the HVG atomicAdd kernels. Reuses the same `colmajor_ops` module
@@ -175,6 +176,155 @@ pub fn gpu_streaming_clip_square_sum(
     let batch_sum: Vec<f64> = dev.dtoh_copy(&d_batch_sum)?;
     let sq_batch_sum: Vec<f64> = dev.dtoh_copy(&d_sq_batch_sum)?;
     Ok((batch_sum, sq_batch_sum))
+}
+
+/// CSC-reduce equivalent of [`gpu_streaming_mean_var`].
+///
+/// Reads the gene-major CSC sidecar instead of the row-major CSR shards.
+/// Each gene's nonzeros are contiguous on a CSC column, so the kernel
+/// assigns **one block per column**, reduces that column's nonzeros in
+/// shared memory, and writes a single `Σ x` / `Σ x²` per gene — no
+/// cross-column `atomicAdd`, eliminating the hot-gene contention of the
+/// CSR atomic path. Single-batch only (rows are ignored); the host
+/// finalisation (`mean = Σ / n`, Bessel-corrected variance) matches the
+/// CSR path exactly.
+///
+/// Returns `(means, variances)`, both f64 vectors of length `n_vars`.
+pub fn gpu_streaming_mean_var_csc(
+    dev: &GpuDevice,
+    source: &(dyn ColumnShardSource + Sync),
+) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+    let n_vars = source.n_vars();
+    let n_obs = source.n_obs();
+    if n_obs == 0 || n_vars == 0 {
+        return Ok((vec![0.0; n_vars], vec![0.0; n_vars]));
+    }
+
+    let mut d_col_sum = dev.alloc_zeros::<f64>(n_vars)?;
+    let mut d_col_sum_sq = dev.alloc_zeros::<f64>(n_vars)?;
+
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("csc_col_mean_sq_reduce_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_mean_sq_reduce: {e}")))?;
+
+    let n_vars_i32 = n_vars as i32;
+    let mut gpu = RawGpuCscShardSource::new(dev, source)?;
+    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
+        let n_cols = view.n_cols();
+        if n_cols == 0 {
+            return Ok(());
+        }
+        let n_cols_i32 = n_cols as i32;
+        let col_start_i32 = view.col_start as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_cols as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(&view.col_indptr)
+                .arg(&view.data)
+                .arg(&n_cols_i32)
+                .arg(&col_start_i32)
+                .arg(&n_vars_i32)
+                .arg(&mut d_col_sum)
+                .arg(&mut d_col_sum_sq)
+                .launch(cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_mean_sq_reduce: {e}")))?;
+        Ok(())
+    })?;
+
+    dev.synchronize()?;
+    let col_sum: Vec<f64> = dev.dtoh_copy(&d_col_sum)?;
+    let col_sum_sq: Vec<f64> = dev.dtoh_copy(&d_col_sum_sq)?;
+
+    let n = n_obs as f64;
+    let denom = (n - 1.0).max(1.0);
+    let mut means = vec![0.0f64; n_vars];
+    let mut variances = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        let mean = col_sum[j] / n;
+        means[j] = mean;
+        let var = (col_sum_sq[j] - n * mean * mean) / denom;
+        variances[j] = if var < 0.0 { 0.0 } else { var };
+    }
+    Ok((means, variances))
+}
+
+/// CSC-reduce equivalent of [`gpu_streaming_clip_square_sum`].
+///
+/// One block per gene reduces `Σ min(x, clip_val[c])` and
+/// `Σ min(x, clip_val[c])²` over the column's contiguous nonzeros, writing
+/// a single value per accumulator (no `atomicAdd`). `clip_val.len()` must
+/// equal `source.n_vars()`.
+///
+/// Returns `(clipped_sum, clipped_sum_sq)` — both f64 vectors of length
+/// `n_vars`.
+pub fn gpu_streaming_clip_square_sum_csc(
+    dev: &GpuDevice,
+    source: &(dyn ColumnShardSource + Sync),
+    clip_val: &[f64],
+) -> Result<(Vec<f64>, Vec<f64>), GpuError> {
+    let n_vars = source.n_vars();
+    if clip_val.len() != n_vars {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("clip_val.len() == n_vars = {n_vars}"),
+            got: format!("clip_val.len() = {}", clip_val.len()),
+        });
+    }
+    let n_obs = source.n_obs();
+    if n_obs == 0 || n_vars == 0 {
+        return Ok((vec![0.0; n_vars], vec![0.0; n_vars]));
+    }
+
+    let mut d_clipped_sum = dev.alloc_zeros::<f64>(n_vars)?;
+    let mut d_clipped_sum_sq = dev.alloc_zeros::<f64>(n_vars)?;
+    let d_clip: CudaSlice<f64> = dev.htod_copy(clip_val)?;
+
+    let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
+    let func = module
+        .load_function("csc_col_clip_sq_reduce_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_clip_sq_reduce: {e}")))?;
+
+    let n_vars_i32 = n_vars as i32;
+    let mut gpu = RawGpuCscShardSource::new(dev, source)?;
+    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
+        let n_cols = view.n_cols();
+        if n_cols == 0 {
+            return Ok(());
+        }
+        let n_cols_i32 = n_cols as i32;
+        let col_start_i32 = view.col_start as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_cols as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(&view.col_indptr)
+                .arg(&view.data)
+                .arg(&n_cols_i32)
+                .arg(&col_start_i32)
+                .arg(&n_vars_i32)
+                .arg(&d_clip)
+                .arg(&mut d_clipped_sum)
+                .arg(&mut d_clipped_sum_sq)
+                .launch(cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_clip_sq_reduce: {e}")))?;
+        Ok(())
+    })?;
+
+    dev.synchronize()?;
+    let clipped_sum: Vec<f64> = dev.dtoh_copy(&d_clipped_sum)?;
+    let clipped_sum_sq: Vec<f64> = dev.dtoh_copy(&d_clipped_sum_sq)?;
+    Ok((clipped_sum, clipped_sum_sq))
 }
 
 /// GPU equivalent of `scx_accel::streaming_mean_var_batched`.
@@ -428,7 +578,7 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use scx_sparse::ScxCsr;
+    use scx_sparse::{ScxCsc, ScxCsr};
 
     struct InMemorySource {
         shards: Vec<ScxCsr>,
@@ -794,5 +944,220 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── CSC reduce tests (one-block-per-column, no atomics) ─────────────
+
+    /// In-memory [`ColumnShardSource`]: one `ScxCsc` per shard, each covering a
+    /// contiguous global column range. Mirrors the fixture in
+    /// `gpu_csc_shard_source.rs` tests; `read_csc_columns` is unused because the
+    /// HVG reduce path only calls `read_csc_shard` + `csc_shard_col_range`.
+    struct InMemCscSource {
+        shards: Vec<ScxCsc>,
+        ranges: Vec<(u32, u32)>,
+        n_obs: usize,
+        n_vars: usize,
+    }
+
+    impl scx_format::ColumnShardSource for InMemCscSource {
+        fn n_csc_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_csc_shard(&self, i: usize) -> scx_format::Result<ScxCsc> {
+            Ok(self.shards[i].clone())
+        }
+        fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> scx_format::Result<ScxCsc> {
+            unimplemented!("HVG CSC reduce only calls read_csc_shard")
+        }
+        fn csc_shard_col_range(&self, i: usize) -> Option<(u32, u32)> {
+            self.ranges.get(i).copied()
+        }
+    }
+
+    /// Dense `n_rows × n_cols` matrix (0.0 where absent) with positive values.
+    fn build_dense(n_rows: usize, n_cols: usize, density: f64, seed: u64) -> Vec<Vec<f64>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut dense = vec![vec![0.0f64; n_cols]; n_rows];
+        for row in dense.iter_mut() {
+            for v in row.iter_mut() {
+                if rng.gen_bool(density) {
+                    *v = rng.gen_range(0.5..20.5);
+                }
+            }
+        }
+        dense
+    }
+
+    /// Column-shard the dense matrix into `n_shards` contiguous column ranges
+    /// (CSC, global row ids), so shards after the first have a non-zero
+    /// `col_start` — exercising the kernel's `col_start + local_col` mapping.
+    fn dense_to_csc_shards(dense: &[Vec<f64>], n_cols: usize, n_shards: usize) -> InMemCscSource {
+        let n_rows = dense.len();
+        let cols_per = n_cols.div_ceil(n_shards.max(1));
+        let mut shards = Vec::new();
+        let mut ranges = Vec::new();
+        let mut cs = 0usize;
+        while cs < n_cols {
+            let ce = (cs + cols_per).min(n_cols);
+            let mut indptr = vec![0i64];
+            let mut row_indices: Vec<i32> = Vec::new();
+            let mut data: Vec<f32> = Vec::new();
+            for c in cs..ce {
+                for (r, drow) in dense.iter().enumerate() {
+                    if drow[c] != 0.0 {
+                        row_indices.push(r as i32);
+                        data.push(drow[c] as f32);
+                    }
+                }
+                indptr.push(row_indices.len() as i64);
+            }
+            shards.push(ScxCsc::new_unchecked(
+                (n_rows, ce - cs),
+                indptr,
+                row_indices,
+                data,
+            ));
+            ranges.push((cs as u32, ce as u32));
+            cs = ce;
+        }
+        InMemCscSource {
+            shards,
+            ranges,
+            n_obs: n_rows,
+            n_vars: n_cols,
+        }
+    }
+
+    fn cpu_mean_var_dense(dense: &[Vec<f64>], n_cols: usize) -> (Vec<f64>, Vec<f64>) {
+        let n = dense.len() as f64;
+        let denom = (n - 1.0).max(1.0);
+        let mut means = vec![0.0; n_cols];
+        let mut vars = vec![0.0; n_cols];
+        for (c, (mean, var)) in means.iter_mut().zip(vars.iter_mut()).enumerate() {
+            let (mut s, mut sq) = (0.0f64, 0.0f64);
+            for drow in dense {
+                s += drow[c];
+                sq += drow[c] * drow[c];
+            }
+            *mean = s / n;
+            *var = ((sq - n * *mean * *mean) / denom).max(0.0);
+        }
+        (means, vars)
+    }
+
+    fn cpu_clip_dense(dense: &[Vec<f64>], n_cols: usize, clip: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let mut s = vec![0.0; n_cols];
+        let mut sq = vec![0.0; n_cols];
+        for c in 0..n_cols {
+            for drow in dense {
+                if drow[c] != 0.0 {
+                    let vc = drow[c].min(clip[c]);
+                    s[c] += vc;
+                    sq[c] += vc * vc;
+                }
+            }
+        }
+        (s, sq)
+    }
+
+    #[test]
+    fn test_gpu_streaming_mean_var_csc_matches_cpu() {
+        let dev = require_gpu!();
+        let (n_rows, n_cols) = (400usize, 90usize);
+        let dense = build_dense(n_rows, n_cols, 0.15, 123);
+        let src = dense_to_csc_shards(&dense, n_cols, 4); // multi-shard
+        let (gm, gv) = gpu_streaming_mean_var_csc(&dev, &src).expect("gpu csc mean/var");
+        let (cm, cv) = cpu_mean_var_dense(&dense, n_cols);
+        for j in 0..n_cols {
+            let dm = (gm[j] - cm[j]).abs() / cm[j].abs().max(1e-10);
+            let dv = (gv[j] - cv[j]).abs() / cv[j].abs().max(1e-10);
+            assert!(dm < 1e-5, "mean col {j}: gpu={} cpu={}", gm[j], cm[j]);
+            assert!(dv < 1e-5, "var col {j}: gpu={} cpu={}", gv[j], cv[j]);
+        }
+    }
+
+    #[test]
+    fn test_gpu_streaming_clip_square_sum_csc_matches_cpu() {
+        let dev = require_gpu!();
+        let (n_rows, n_cols) = (400usize, 90usize);
+        let dense = build_dense(n_rows, n_cols, 0.15, 321);
+        let src = dense_to_csc_shards(&dense, n_cols, 4);
+        let clip: Vec<f64> = (0..n_cols).map(|j| 1.0 + 0.05 * (j as f64)).collect();
+        let (gs, gsq) = gpu_streaming_clip_square_sum_csc(&dev, &src, &clip).expect("gpu csc clip");
+        let (cs, csq) = cpu_clip_dense(&dense, n_cols, &clip);
+        for j in 0..n_cols {
+            assert!(
+                (gs[j] - cs[j]).abs() / cs[j].abs().max(1e-10) < 1e-5,
+                "clip sum col {j}: gpu={} cpu={}",
+                gs[j],
+                cs[j]
+            );
+            assert!(
+                (gsq[j] - csq[j]).abs() / csq[j].abs().max(1e-10) < 1e-5,
+                "clip sumsq col {j}: gpu={} cpu={}",
+                gsq[j],
+                csq[j]
+            );
+        }
+    }
+
+    #[test]
+    fn test_gpu_streaming_mean_var_csc_empty() {
+        let dev = require_gpu!();
+        let src = InMemCscSource {
+            shards: vec![ScxCsc::new_unchecked((0, 5), vec![0; 6], vec![], vec![])],
+            ranges: vec![(0, 5)],
+            n_obs: 0,
+            n_vars: 5,
+        };
+        let (m, v) = gpu_streaming_mean_var_csc(&dev, &src).unwrap();
+        assert_eq!(m, vec![0.0; 5]);
+        assert_eq!(v, vec![0.0; 5]);
+    }
+
+    #[test]
+    fn test_gpu_streaming_csc_hot_gene_and_all_zero() {
+        // A hot gene (col 0 nonzero in every row) and an all-zero gene (col 1
+        // empty) in a single shard. Proves the one-block-per-column reduce
+        // matches CPU with no atomic contention, and empty columns yield 0.
+        let dev = require_gpu!();
+        let n_rows = 1000usize;
+        let n_cols = 4usize;
+        let mut dense = vec![vec![0.0f64; n_cols]; n_rows];
+        for (r, row) in dense.iter_mut().enumerate() {
+            row[0] = (r % 7) as f64 + 1.0; // hot column, all nonzero
+                                           // col 1 stays all-zero
+            if r % 3 == 0 {
+                row[2] = 2.0;
+            }
+            if r % 5 == 0 {
+                row[3] = 5.0;
+            }
+        }
+        let src = dense_to_csc_shards(&dense, n_cols, 1);
+        let (gm, gv) = gpu_streaming_mean_var_csc(&dev, &src).unwrap();
+        let (cm, cv) = cpu_mean_var_dense(&dense, n_cols);
+        for j in 0..n_cols {
+            assert!(
+                (gm[j] - cm[j]).abs() / cm[j].abs().max(1e-10) < 1e-5,
+                "mean col {j}: gpu={} cpu={}",
+                gm[j],
+                cm[j]
+            );
+            assert!(
+                (gv[j] - cv[j]).abs() / cv[j].abs().max(1e-10) < 1e-5,
+                "var col {j}: gpu={} cpu={}",
+                gv[j],
+                cv[j]
+            );
+        }
+        assert_eq!(gm[1], 0.0, "all-zero gene mean");
+        assert_eq!(gv[1], 0.0, "all-zero gene var");
     }
 }

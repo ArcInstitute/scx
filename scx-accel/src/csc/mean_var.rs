@@ -126,6 +126,54 @@ pub fn streaming_clip_square_sum_csc<S: ColumnShardSource + ?Sized>(
     Ok((clipped_sum, clipped_sum_sq))
 }
 
+// ---------------------------------------------------------------------------
+// Device-dispatched CSC wrappers (CPU default, GPU behind feature = "gpu").
+// Mirror the CSR `streaming_*_with_device` wrappers in `crate::hvg`. The GPU
+// path runs the one-block-per-column CSC reduce kernel (no `atomicAdd`); it
+// requires `S: Sync` because the device source pipelines decode on a scoped
+// worker thread. Falls back to the CPU CSC kernel on GPU-init failure.
+// ---------------------------------------------------------------------------
+
+/// Device-dispatched [`streaming_mean_var_csc`].
+#[cfg(feature = "gpu")]
+pub fn streaming_mean_var_csc_with_device<S: ColumnShardSource + Sync>(
+    source: &S,
+    device: &str,
+    device_id: usize,
+) -> Result<HvgStats> {
+    if device != "gpu" {
+        return streaming_mean_var_csc(source);
+    }
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
+        Ok(d) => d,
+        Err(_) => return streaming_mean_var_csc(source),
+    };
+    let (means, variances) = scx_gpu::gpu_streaming_mean_var_csc(&dev, source).map_err(|e| {
+        crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var_csc failed: {e}"))
+    })?;
+    Ok(HvgStats { means, variances })
+}
+
+/// Device-dispatched [`streaming_clip_square_sum_csc`].
+#[cfg(feature = "gpu")]
+pub fn streaming_clip_square_sum_csc_with_device<S: ColumnShardSource + Sync>(
+    source: &S,
+    clip_val: &[f64],
+    device: &str,
+    device_id: usize,
+) -> Result<(Vec<f64>, Vec<f64>)> {
+    if device != "gpu" {
+        return streaming_clip_square_sum_csc(source, clip_val);
+    }
+    let dev = match scx_gpu::GpuDevice::new(device_id) {
+        Ok(d) => d,
+        Err(_) => return streaming_clip_square_sum_csc(source, clip_val),
+    };
+    scx_gpu::gpu_streaming_clip_square_sum_csc(&dev, source, clip_val).map_err(|e| {
+        crate::error::AccelError::LinAlg(format!("gpu_streaming_clip_square_sum_csc failed: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +181,31 @@ mod tests {
     use crate::hvg::{streaming_clip_square_sum, streaming_mean_var};
     use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
     use tempfile::tempdir;
+
+    /// The `device="cpu"` arm of the GPU dispatch wrappers must be identical
+    /// to the plain CPU CSC kernels (no GPU touched). Runs on any host built
+    /// with `--features gpu`; the GPU arm is covered by the scx-gpu harness.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn streaming_csc_with_device_cpu_matches_cpu() {
+        let dir = tempdir().unwrap();
+        let (n_obs, n_vars) = (10usize, 8usize);
+        let dense = deterministic_dense(n_obs, n_vars);
+        let path = write_csr_csc_test_file(dir.path(), "dev", n_obs, n_vars, &dense, 3);
+        let reader = BackedCscReader::new(ScxReader::open(&path).unwrap(), 0).unwrap();
+
+        let base = streaming_mean_var_csc(&reader).unwrap();
+        let dev = streaming_mean_var_csc_with_device(&reader, "cpu", 0).unwrap();
+        assert_eq!(base.means, dev.means);
+        assert_eq!(base.variances, dev.variances);
+
+        let clip = vec![5.0_f64; n_vars];
+        let (bs, bsq) = streaming_clip_square_sum_csc(&reader, &clip).unwrap();
+        let (ds, dsq) =
+            streaming_clip_square_sum_csc_with_device(&reader, &clip, "cpu", 0).unwrap();
+        assert_eq!(bs, ds);
+        assert_eq!(bsq, dsq);
+    }
 
     #[test]
     fn streaming_mean_var_csc_matches_csr() {

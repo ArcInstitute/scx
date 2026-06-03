@@ -264,39 +264,53 @@ pub fn plan_de_route(
 
 /// Decide the highly-variable-genes (HVG) execution route.
 ///
-/// HVG has a single GPU kernel: the `seurat_v3` atomic-CSR reduction, recorded
-/// as [`AccelRoute::GpuCsr`] (the wire id is honest — HVG GPU is a CSR atomic
-/// kernel; the gate only tests [`AccelRoute::is_gpu`]). The CPU path is
-/// [`AccelRoute::CpuCsr`], or [`AccelRoute::CpuCsc`] when the caller prefers the
-/// gene-major sidecar (`prefer_csc`), which has no GPU kernel.
+/// HVG has two GPU kernels, mirroring the DE CSC-direct convention:
+///
+/// * [`AccelRoute::GpuCscV3`] — the column-major CSC reduce (one block per
+///   gene, no `atomicAdd` contention), taken when a CSC sidecar is reachable
+///   (`csc_available`). Single-batch `seurat_v3` only.
+/// * [`AccelRoute::GpuCsr`] — the `seurat_v3` atomic-CSR reduction, taken when
+///   no sidecar is present.
+///
+/// The CPU path is [`AccelRoute::CpuCsr`], or [`AccelRoute::CpuCsc`] when a
+/// gene-major sidecar is used (`csc_available`).
 ///
 /// `gpu_eligible` is `false` for non-`seurat_v3` flavors (`seurat` /
-/// `cell_ranger`) and for the CSC-preferred path; a GPU/auto request that is
-/// not eligible records [`FallbackReason::UnsupportedInputLayout`] (CUDA is
-/// present, but there is no GPU kernel for this flavor/layout) rather than
-/// [`FallbackReason::NoCuda`]. Mirrors the resolution shape of [`plan_de_route`]
-/// so the decision matrix is unit-testable without a GPU.
-///
-/// A future CSC-reduce GPU HVG kernel (section D) should reuse
-/// [`AccelRoute::GpuCscV3`], matching the DE CSC-direct convention.
+/// `cell_ranger`); a GPU/auto request that is not eligible records
+/// [`FallbackReason::UnsupportedInputLayout`] (CUDA is present, but there is no
+/// GPU kernel for this flavor) rather than [`FallbackReason::NoCuda`]. Mirrors
+/// the resolution shape of [`plan_de_route`] so the decision matrix is
+/// unit-testable without a GPU. The caller supplies
+/// `csc_available = sidecar_reachable && single_batch` (the flavor gate already
+/// lives in `gpu_eligible`), keeping this planner pure.
 pub fn plan_hvg_route(
     device: DeviceRequest,
     gpu_available: bool,
     gpu_eligible: bool,
-    prefer_csc: bool,
+    csc_available: bool,
 ) -> AccelExecutionInfo {
-    let cpu_route = if prefer_csc {
+    let cpu_route = if csc_available {
         AccelRoute::CpuCsc
     } else {
         AccelRoute::CpuCsr
     };
-    plan_simple_gpu_route(
-        device,
-        gpu_available,
-        gpu_eligible,
-        AccelRoute::GpuCsr,
-        cpu_route,
-    )
+    let (route, reason) = match device {
+        DeviceRequest::Cpu => (cpu_route, FallbackReason::UserForcedCpu),
+        DeviceRequest::Gpu | DeviceRequest::Auto => {
+            if !gpu_available {
+                (cpu_route, FallbackReason::NoCuda)
+            } else if !gpu_eligible {
+                (cpu_route, FallbackReason::UnsupportedInputLayout)
+            } else if csc_available {
+                (AccelRoute::GpuCscV3, FallbackReason::None)
+            } else {
+                (AccelRoute::GpuCsr, FallbackReason::None)
+            }
+        }
+    };
+    let mut info = AccelExecutionInfo::new(route, reason);
+    info.csc_available = Some(csc_available);
+    info
 }
 
 /// Decide the route for a single-route accelerator op (PCA / kNN / UMAP /
@@ -547,11 +561,31 @@ mod tests {
     }
 
     #[test]
-    fn hvg_csc_is_cpu_csc() {
-        // prefer_format="csc": no GPU CSC HVG kernel → CPU CSC route.
+    fn hvg_csc_ineligible_flavor_is_cpu_csc() {
+        // A CSC sidecar is present but the flavor has no GPU kernel
+        // (gpu_eligible=false): run CPU CSC, record the layout reason.
         let info = plan_hvg_route(DeviceRequest::Auto, true, false, true);
         assert_eq!(info.route, AccelRoute::CpuCsc);
         assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
+        assert_eq!(info.csc_available, Some(true));
+    }
+
+    #[test]
+    fn hvg_gpu_csc_sidecar_is_gpu_csc_v3() {
+        // seurat_v3 on a GPU host with a reachable CSC sidecar → the
+        // column-major CSC reduce route (mirrors DE's gpu_csc_v3).
+        let info = plan_hvg_route(DeviceRequest::Gpu, true, true, true);
+        assert_eq!(info.route, AccelRoute::GpuCscV3);
+        assert_eq!(info.fallback_reason, FallbackReason::None);
+        assert!(info.route.is_gpu());
+        assert_eq!(info.csc_available, Some(true));
+    }
+
+    #[test]
+    fn hvg_cpu_forced_with_sidecar_is_cpu_csc() {
+        let info = plan_hvg_route(DeviceRequest::Cpu, true, true, true);
+        assert_eq!(info.route, AccelRoute::CpuCsc);
+        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
     }
 
     // --- Generic single-route planner (plan_simple_gpu_route) ---
