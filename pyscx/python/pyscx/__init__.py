@@ -156,9 +156,12 @@ def from_h5ad(path, out, **kwargs):
             (integer-only), "zstd", "pcodec" (best for float layers),
             "lz4", "none".
         shard_size: Rows per CSR X shard. None uses the default.
-        csc: "off" (default) or "always". "always" adds a column-major
+        csc: "off", "auto", or "always". "always" adds a column-major
             sidecar via a two-pass CSR-then-rebuild write (transient disk
             ~2x the output); required for prefer_format="csc" accel paths.
+            When omitted, an accel-ready index_preset ("training" /
+            "perturbseq") upgrades the default to "auto"; otherwise "off".
+            An explicit value always wins.
         csc_cols_per_shard: Columns per CSC shard when csc="always"
             (default 5000); 0 = single CSC shard.
         uns_format: "tagged" (default) wraps NumPy/pandas containers in
@@ -282,7 +285,11 @@ def from_h5mu(path, out, **kwargs):
         out: Destination SCX file (str or os.PathLike).
         codec: Per-shard codec (see pyscx.from_h5ad). None auto-selects.
         shard_size: Rows per CSR X shard. None uses the default.
-        csc: "off" (default) or "always" (column-major sidecar).
+        csc: "off", "auto", or "always" (column-major sidecar). When
+            omitted, an accel-ready index_preset ("training" / "perturbseq")
+            upgrades the default to "auto"; otherwise "off". An explicit
+            value always wins. (Streaming h5mu cannot build per-modality
+            CSC: "auto" degrades to no-CSC with a warning.)
         csc_cols_per_shard: Columns per CSC shard when csc="always"
             (default 5000).
         stream: Stream the conversion (default True).

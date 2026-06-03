@@ -197,7 +197,7 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
 ///   conversion).
 #[pyfunction]
 #[pyo3(signature = (
-    adata, path, codec=None, shard_size=None, in_place=false, csc="off",
+    adata, path, codec=None, shard_size=None, in_place=false, csc=None,
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
@@ -210,7 +210,7 @@ fn from_anndata(
     codec: Option<&str>,
     shard_size: Option<u32>,
     in_place: bool,
-    csc: &str,
+    csc: Option<&str>,
     csc_cols_per_shard: usize,
     uns_format: &str,
     index_obs: Option<Vec<String>>,
@@ -222,6 +222,7 @@ fn from_anndata(
     force_legacy_metadata: bool,
 ) -> PyResult<()> {
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     anndata::from_anndata_impl(
         py,
         adata,
@@ -229,7 +230,7 @@ fn from_anndata(
         codec,
         shard_size,
         in_place,
-        csc,
+        &csc,
         csc_cols_per_shard,
         uns_format,
         index_obs.unwrap_or_default(),
@@ -333,7 +334,7 @@ fn from_anndata(
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
-    path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
+    path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000,
     uns_format="tagged", stream=true, strict_uns=false, dense_zero_epsilon=0.0,
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
@@ -347,7 +348,7 @@ fn from_h5ad(
     out: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
-    csc: &str,
+    csc: Option<&str>,
     csc_cols_per_shard: usize,
     uns_format: &str,
     stream: bool,
@@ -367,8 +368,9 @@ fn from_h5ad(
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
-        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        scx_format::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
@@ -570,7 +572,7 @@ fn from_10x(
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
-    path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000,
+    path, out, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000,
     stream=true, strict_uns=false, memory_budget=None, temp_dir=None,
     modalities=None, modality_types=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
@@ -583,7 +585,7 @@ fn from_h5mu(
     out: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
-    csc: &str,
+    csc: Option<&str>,
     csc_cols_per_shard: usize,
     stream: bool,
     strict_uns: bool,
@@ -599,13 +601,14 @@ fn from_h5mu(
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
 ) -> PyResult<()> {
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     mudata::from_h5mu_impl(
         py,
         path,
         out,
         codec,
         shard_size,
-        csc,
+        &csc,
         csc_cols_per_shard,
         stream,
         strict_uns,

@@ -129,6 +129,14 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         Vec::new()
     };
 
+    // Delete masks rows via a deletion-vector bitmap; it does NOT rewrite
+    // the CSR shards, and it carries any CSC sidecar forward unchanged. The
+    // sidecar therefore still matches the CSR content it was built from, so
+    // preserve both generations (no bump) to keep the freshness invariant
+    // `csc_build_generation == data_generation` intact.
+    let src_data_generation = catalog.data_generation;
+    let src_csc_build_generation = catalog.csc_build_generation;
+
     let mut new_entries: Vec<FullCatalogEntry> = catalog
         .entries
         .into_iter()
@@ -192,6 +200,8 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
         prev_catalog_offset: old_catalog_offset,
         n_obs: header.n_obs,
         entries: new_entries,
+        data_generation: src_data_generation,
+        csc_build_generation: src_csc_build_generation,
     };
 
     // Write new catalog at current EOF

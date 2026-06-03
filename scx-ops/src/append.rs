@@ -1492,6 +1492,12 @@ fn finalize_append(
         prev_catalog_offset: prep.old_catalog_offset,
         n_obs: new_n_obs,
         entries: new_entries,
+        // Append mutates the CSR data (new rows), so bump the data
+        // generation. The CSC sidecar is always dropped above, so the
+        // build generation resets to 0; any surviving CSC entry would now
+        // mismatch and be rejected by the reader.
+        data_generation: prep.old_catalog.data_generation + 1,
+        csc_build_generation: 0,
     };
 
     let (modality_table_offset, modality_table_length) =

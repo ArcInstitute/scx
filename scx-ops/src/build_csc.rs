@@ -128,7 +128,13 @@ pub fn run_build_csc(
 
     // 11. Create writer and write metadata
     pb.set_message("Writing output file...");
-    let mut writer = ScxWriter::new(output, out_header)?;
+    // build-csc does NOT change the CSR data — it only adds the column-major
+    // sidecar. Preserve the source data generation (no bump) so the freshly
+    // emitted CSC sidecar reads as fresh: `write_shard_inner` records
+    // `csc_build_generation = data_generation` for each CSC shard written,
+    // yielding `csc_build_generation == data_generation`.
+    let mut writer =
+        ScxWriter::new(output, out_header)?.with_data_generation(reader.catalog().data_generation);
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 

@@ -83,6 +83,8 @@ fn make_catalog(n_shards: usize) -> FullCatalog {
         prev_catalog_offset: 0,
         n_obs: (n_shards as u64) * 16_384,
         entries,
+        data_generation: 0,
+        csc_build_generation: 0,
     }
 }
 

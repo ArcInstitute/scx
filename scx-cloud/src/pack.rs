@@ -164,6 +164,10 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
         prev_catalog_offset: original_catalog.prev_catalog_offset,
         n_obs: original_catalog.n_obs,
         entries: new_entries,
+        // Repack does not change CSR or CSC content — preserve both
+        // generations so the freshness invariant survives the round-trip.
+        data_generation: original_catalog.data_generation,
+        csc_build_generation: original_catalog.csc_build_generation,
     };
     let mut new_catalog_bytes = Vec::new();
     new_full_catalog.write_to(&mut new_catalog_bytes)?;

@@ -218,6 +218,10 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         prev_catalog_offset: full_catalog.prev_catalog_offset,
         n_obs: full_catalog.n_obs,
         entries: new_entries,
+        // Optimize reorders sections without changing CSR/CSC content —
+        // preserve both generations.
+        data_generation: full_catalog.data_generation,
+        csc_build_generation: full_catalog.csc_build_generation,
     };
     let mut new_catalog_bytes = Vec::new();
     new_full_catalog.write_to(&mut new_catalog_bytes)?;
