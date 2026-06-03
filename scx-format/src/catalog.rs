@@ -614,10 +614,11 @@ pub struct FullCatalogEntry {
 /// field docs on [`FullCatalog`]. The append is purely additive — older
 /// readers parse the entry list, ignore the trailing 16 bytes, and the
 /// checksum still validates over the whole payload (the extra bytes are
-/// inside the checksummed region). New readers read the counters only
-/// when `catalog_version >= 4` and ≥16 payload bytes remain, defaulting
-/// both to `0` otherwise. A `0 == 0` match means "fresh", so v1–v3 files
-/// (which lack the counters) are never treated as stale.
+/// inside the checksummed region). New readers read the counters when
+/// `catalog_version >= 4`; v1–v3 catalogs lack the fields and default both
+/// to `0` (a truncated v4 catalog missing the bytes is corrupt and surfaces
+/// as a read error). A `0 == 0` match means "fresh", so v1–v3 files (which
+/// lack the counters) are never treated as stale.
 pub const CURRENT_CATALOG_VERSION: u16 = 4;
 
 #[derive(Debug, Clone)]
@@ -628,9 +629,11 @@ pub struct FullCatalog {
     pub n_obs: u64,
     pub entries: Vec<FullCatalogEntry>,
     /// Monotonic identity of the CSR X data (v4+). Bumped by every
-    /// CSR-content-mutating writer (`append`/`compact`/`merge`/`subset`);
+    /// in-place CSR-content-mutating writer (`append`/`compact`/`merge`);
     /// **not** bumped by CSC-only rewrites (`build-csc`/`--rebuild-csc`).
-    /// `0` on v1–v3 catalogs (the field was absent).
+    /// `subset` writes a brand-new file at the default generation (1)
+    /// rather than bumping a source. `0` on v1–v3 catalogs (the field was
+    /// absent).
     pub data_generation: u64,
     /// The `data_generation` value the current CSC sidecar was built
     /// against (v4+), or `0` when there is no sidecar. A sidecar is fresh

@@ -587,13 +587,9 @@ fn main() {
             // Resolve the CSC policy: an explicit `--csc` always wins;
             // otherwise an accel-ready `--index-preset` upgrades the
             // default to `auto` (column substrate for DE/pseudobulk).
-            let csc = csc.unwrap_or_else(|| {
-                match index_preset.as_deref() {
-                    Some(p) if scx_engine::index::preset_implies_csc_auto(p) => "auto",
-                    _ => "off",
-                }
-                .to_string()
-            });
+            // Shared with pyscx via `scx_engine::index::resolve_csc_policy`.
+            let csc =
+                scx_engine::index::resolve_csc_policy(csc.as_deref(), index_preset.as_deref());
             run_convert(
                 &input,
                 &output,

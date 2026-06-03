@@ -22,23 +22,6 @@ use experiment::PyExperiment;
 use query::{PyQueryPipeline, PyQueryResult};
 use scx_format::ScxError;
 
-/// Resolve the CSC policy string for a conversion entry point.
-///
-/// An explicit `csc` value always wins. When unset (`None`), an
-/// accel-ready `index_preset` (`training` / `perturbseq`) upgrades the
-/// default to `"auto"` so the column-major substrate is built for the
-/// DE/pseudobulk workloads those presets imply; otherwise the default is
-/// `"off"`. Mirrors the `scx convert` CLI behavior.
-pub(crate) fn resolve_csc_policy(csc: Option<&str>, index_preset: Option<&str>) -> String {
-    match csc {
-        Some(v) => v.to_string(),
-        None => match index_preset {
-            Some(p) if scx_engine::index::preset_implies_csc_auto(p) => "auto".to_string(),
-            _ => "off".to_string(),
-        },
-    }
-}
-
 /// Convert an ScxError into the most appropriate Python exception.
 ///
 /// User-input format errors → ValueError; missing files → FileNotFoundError;
@@ -239,7 +222,7 @@ fn from_anndata(
     force_legacy_metadata: bool,
 ) -> PyResult<()> {
     let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
-    let csc = resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     anndata::from_anndata_impl(
         py,
         adata,
@@ -385,7 +368,7 @@ fn from_h5ad(
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let explicit_codec = anndata::parse_codec(codec)?;
-    let csc = resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
         scx_format::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
@@ -618,7 +601,7 @@ fn from_h5mu(
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
 ) -> PyResult<()> {
-    let csc = resolve_csc_policy(csc, index_preset.as_deref());
+    let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     mudata::from_h5mu_impl(
         py,
         path,
