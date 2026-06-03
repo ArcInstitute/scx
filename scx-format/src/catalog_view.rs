@@ -494,6 +494,8 @@ mod tests {
             prev_catalog_offset: 0,
             n_obs,
             entries,
+            data_generation: 0,
+            csc_build_generation: 0,
         }
     }
 

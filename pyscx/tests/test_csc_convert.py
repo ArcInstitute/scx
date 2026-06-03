@@ -106,3 +106,52 @@ def test_from_anndata_csc_auto_env_override_builds(small_adata, tmp_path, monkey
     csr_sums = pyscx.accel.col_sums(adata.X, prefer_format="csr")
     csc_sums = pyscx.accel.col_sums(adata.X, prefer_format="csc")
     np.testing.assert_allclose(csr_sums, csc_sums, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.3: an accel-ready index_preset implies csc="auto" when the caller
+# did not pass an explicit `csc`. An explicit value always wins.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("preset", ["training", "perturbseq"])
+def test_index_preset_implies_csc_auto(small_adata, tmp_path, monkeypatch, preset):
+    """An accel-ready preset with no explicit `csc` upgrades to "auto".
+    With the thresholds lowered to 0, that builds a sidecar on the tiny
+    fixture."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+
+    path = tmp_path / f"preset_{preset}.scx"
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(path), index_preset=preset, csc_cols_per_shard=5)
+    assert _csc_available(path) is True
+
+
+def test_index_preset_cellxgene_does_not_imply_csc(small_adata, tmp_path, monkeypatch):
+    """The query-oriented `cellxgene` preset does NOT imply csc="auto" —
+    no sidecar even with the thresholds at 0."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+
+    path = tmp_path / "preset_cellxgene.scx"
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(path), index_preset="cellxgene", csc_cols_per_shard=5)
+    assert _csc_available(path) is False
+
+
+def test_explicit_csc_off_overrides_preset(small_adata, tmp_path, monkeypatch):
+    """An explicit `csc="off"` wins over an accel-ready preset's implied
+    "auto" — the user's explicit choice is honored."""
+    monkeypatch.setenv("SCX_CSC_AUTO_OBS_THRESHOLD", "0")
+    monkeypatch.setenv("SCX_CSC_AUTO_VARS_THRESHOLD", "0")
+
+    path = tmp_path / "preset_explicit_off.scx"
+    import pyscx
+
+    pyscx.from_anndata(
+        small_adata, str(path), index_preset="training", csc="off", csc_cols_per_shard=5
+    )
+    assert _csc_available(path) is False

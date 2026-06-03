@@ -605,6 +605,8 @@ mod tests {
                 .max()
                 .unwrap_or(0),
             entries,
+            data_generation: 0,
+            csc_build_generation: 0,
         }
     }
 

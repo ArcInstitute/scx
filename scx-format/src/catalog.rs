@@ -607,7 +607,18 @@ pub struct FullCatalogEntry {
 /// silent partial read. New readers branching on `catalog_version >= 3`
 /// can short-circuit to the sharded paths without re-scanning the
 /// catalog.
-pub const CURRENT_CATALOG_VERSION: u16 = 3;
+///
+/// v4 appends two `u64` generation counters (`data_generation`,
+/// `csc_build_generation`) immediately after the entry list, before the
+/// trailing checksum. They are a CSC-sidecar freshness guard: see the
+/// field docs on [`FullCatalog`]. The append is purely additive — older
+/// readers parse the entry list, ignore the trailing 16 bytes, and the
+/// checksum still validates over the whole payload (the extra bytes are
+/// inside the checksummed region). New readers read the counters only
+/// when `catalog_version >= 4` and ≥16 payload bytes remain, defaulting
+/// both to `0` otherwise. A `0 == 0` match means "fresh", so v1–v3 files
+/// (which lack the counters) are never treated as stale.
+pub const CURRENT_CATALOG_VERSION: u16 = 4;
 
 #[derive(Debug, Clone)]
 pub struct FullCatalog {
@@ -616,6 +627,16 @@ pub struct FullCatalog {
     pub prev_catalog_offset: u64,
     pub n_obs: u64,
     pub entries: Vec<FullCatalogEntry>,
+    /// Monotonic identity of the CSR X data (v4+). Bumped by every
+    /// CSR-content-mutating writer (`append`/`compact`/`merge`/`subset`);
+    /// **not** bumped by CSC-only rewrites (`build-csc`/`--rebuild-csc`).
+    /// `0` on v1–v3 catalogs (the field was absent).
+    pub data_generation: u64,
+    /// The `data_generation` value the current CSC sidecar was built
+    /// against (v4+), or `0` when there is no sidecar. A sidecar is fresh
+    /// iff `csc_build_generation == data_generation`; readers reject a
+    /// mismatch (see [`crate::backed::BackedCscReader`]). `0` on v1–v3.
+    pub csc_build_generation: u64,
 }
 
 impl FullCatalog {
@@ -630,8 +651,20 @@ impl FullCatalog {
     /// This closes the symmetry break that broke `pyscx.pull` of any cloud
     /// `.scxd` directory whose source `.scx` was written before the v2 stats
     /// layout shipped (2026-05-10 tier-full gate run #2).
+    ///
+    /// The two v4 generation counters ride in 16 trailing bytes after the
+    /// entry list. The declared `catalog_version` is upgraded to 4 only
+    /// when a non-zero counter is carried; a fully-zero pair (the common
+    /// no-CSC / legacy case) keeps the declared version at its v2+ floor
+    /// and emits **no** trailing bytes, so existing zero-counter files are
+    /// byte-identical to before. v4 catalogs carry the 16 bytes; v<4 do
+    /// not — `read_from` keys the trailing read strictly on
+    /// `catalog_version >= 4`.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
-        let catalog_version = std::cmp::max(self.catalog_version, 2);
+        let mut catalog_version = std::cmp::max(self.catalog_version, 2);
+        if self.data_generation != 0 || self.csc_build_generation != 0 {
+            catalog_version = std::cmp::max(catalog_version, 4);
+        }
 
         let mut buf = Vec::new();
 
@@ -668,6 +701,13 @@ impl FullCatalog {
                     buf.write_u16::<LittleEndian>(0)?;
                 }
             }
+        }
+
+        // v4 trailing generation counters (only when declared v4 — i.e.
+        // a counter is non-zero). Inside the checksummed payload.
+        if catalog_version >= 4 {
+            buf.write_u64::<LittleEndian>(self.data_generation)?;
+            buf.write_u64::<LittleEndian>(self.csc_build_generation)?;
         }
 
         // Compute checksum of everything above and append
@@ -828,12 +868,25 @@ impl FullCatalog {
             entries.push(entry);
         }
 
+        // v4 trailing generation counters. Present only when the catalog
+        // declares v4; v1–v3 catalogs default both to 0 (a `0 == 0`
+        // freshness match, so legacy CSC sidecars are never rejected).
+        let (data_generation, csc_build_generation) = if catalog_version >= 4 {
+            let data_generation = cur.read_u64::<LittleEndian>()?;
+            let csc_build_generation = cur.read_u64::<LittleEndian>()?;
+            (data_generation, csc_build_generation)
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             catalog_version,
             manifest_sequence,
             prev_catalog_offset,
             n_obs,
             entries,
+            data_generation,
+            csc_build_generation,
         })
     }
 
@@ -1659,6 +1712,8 @@ mod tests {
                 sample_full_entry("provenance", SectionType::Provenance, false),
                 sample_full_entry("uns", SectionType::UnsBlob, false),
             ],
+            data_generation: 0,
+            csc_build_generation: 0,
         }
     }
 
@@ -1717,6 +1772,8 @@ mod tests {
             prev_catalog_offset: 0,
             n_obs: 0,
             entries: vec![],
+            data_generation: 0,
+            csc_build_generation: 0,
         };
 
         let mut buf = Vec::new();
@@ -1845,6 +1902,8 @@ mod tests {
             prev_catalog_offset: 0,
             n_obs: 1000,
             entries,
+            data_generation: 0,
+            csc_build_generation: 0,
         };
 
         // Whole range: all 4 CSC shards in sorted order.
@@ -1914,6 +1973,8 @@ mod tests {
                 sample_full_entry("obs", SectionType::ObsMetadata, false),
                 sample_full_entry("X_shard_0", SectionType::CsrShard, true),
             ],
+            data_generation: 0,
+            csc_build_generation: 0,
         };
 
         let mut buf = Vec::new();
@@ -1937,6 +1998,71 @@ mod tests {
         assert_eq!(parsed.catalog_version, 2);
         assert_eq!(parsed.n_obs, v1.n_obs);
         assert_eq!(parsed.entries.len(), v1.entries.len());
+    }
+
+    /// v4 generation counters round-trip when non-zero, and the on-disk
+    /// catalog declares v4 so the trailing fields are read back.
+    #[test]
+    fn catalog_v4_generation_round_trip() {
+        let mut cat = sample_full_catalog();
+        cat.catalog_version = 2; // start below v4; the counters force the upgrade
+        cat.data_generation = 7;
+        cat.csc_build_generation = 5;
+
+        let mut buf = Vec::new();
+        cat.write_to(&mut buf).unwrap();
+
+        // A non-zero counter upgrades the declared version to 4 on disk.
+        let on_disk_version = u16::from_le_bytes([buf[0], buf[1]]);
+        assert_eq!(on_disk_version, 4, "non-zero generation must stamp v4");
+
+        let total_len = buf.len();
+        let parsed = FullCatalog::read_from(&mut Cursor::new(&buf), total_len, true).unwrap();
+        assert_eq!(parsed.catalog_version, 4);
+        assert_eq!(parsed.data_generation, 7);
+        assert_eq!(parsed.csc_build_generation, 5);
+        // Checksum still validates with the trailing fields inside the payload.
+    }
+
+    /// Zero counters emit no trailing bytes and keep the v2 declared
+    /// version — existing zero-counter files stay byte-identical, and a
+    /// reader defaults both counters to 0.
+    #[test]
+    fn catalog_zero_generation_stays_v2_no_trailing() {
+        let mut with_zero = sample_full_catalog();
+        with_zero.catalog_version = 2;
+        with_zero.data_generation = 0;
+        with_zero.csc_build_generation = 0;
+        let mut buf_zero = Vec::new();
+        with_zero.write_to(&mut buf_zero).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([buf_zero[0], buf_zero[1]]),
+            2,
+            "zero counters must not bump the declared version"
+        );
+
+        // Compare against the same catalog re-serialised: byte length must
+        // not grow by the 16 trailing bytes (none are written).
+        let parsed =
+            FullCatalog::read_from(&mut Cursor::new(&buf_zero), buf_zero.len(), true).unwrap();
+        assert_eq!(parsed.data_generation, 0);
+        assert_eq!(parsed.csc_build_generation, 0);
+        assert_eq!(parsed.catalog_version, 2);
+    }
+
+    /// A v2/v3-shaped catalog (no trailing generation bytes) reads back
+    /// with both counters defaulted to 0 — the legacy-file path.
+    #[test]
+    fn catalog_pre_v4_defaults_generation_to_zero() {
+        let mut cat = sample_full_catalog();
+        cat.catalog_version = 2;
+        // counters left at 0 → no trailing bytes written.
+        let mut buf = Vec::new();
+        cat.write_to(&mut buf).unwrap();
+
+        let parsed = FullCatalog::read_from(&mut Cursor::new(&buf), buf.len(), true).unwrap();
+        assert_eq!(parsed.data_generation, 0);
+        assert_eq!(parsed.csc_build_generation, 0);
     }
 
     // -----------------------------------------------------------------------

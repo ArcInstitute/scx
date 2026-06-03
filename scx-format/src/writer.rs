@@ -104,6 +104,17 @@ pub struct ScxWriter {
     /// assembly. The resulting CSC presence is recorded in the
     /// `ModalityFlags::HAS_CSC` bit on disk.
     modality_build_csc: Vec<bool>,
+    /// CSR-data generation counter stamped into the output catalog
+    /// (`FullCatalog::data_generation`). Defaults to `1` for a fresh
+    /// write; CSR-mutating ops set it to `source + 1` via
+    /// [`Self::with_data_generation`] so a later read can detect a CSC
+    /// sidecar built against an earlier generation.
+    data_generation: u64,
+    /// The `data_generation` a CSC sidecar was built against, set by
+    /// `finish()` when it auto-emits CSC (and left `None` otherwise so
+    /// the catalog records `0`). Stamped into
+    /// `FullCatalog::csc_build_generation`.
+    csc_build_generation: Option<u64>,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -259,7 +270,21 @@ impl ScxWriter {
             current_modality_id: 0,
             modalities: Vec::new(),
             modality_build_csc: Vec::new(),
+            data_generation: 1,
+            csc_build_generation: None,
         })
+    }
+
+    /// Override the CSR-data generation stamped into the output catalog.
+    ///
+    /// Defaults to `1` for a fresh write. CSR-mutating ops (`compact`,
+    /// `merge`, `subset`) call this with `source + 1`; CSC-only rewrites
+    /// (`build-csc`) call it with the *unchanged* source generation so the
+    /// freshly-emitted sidecar reads as fresh
+    /// (`csc_build_generation == data_generation`).
+    pub fn with_data_generation(mut self, data_generation: u64) -> Self {
+        self.data_generation = data_generation;
+        self
     }
 
     /// Adopt an already-open file mid-write so that section-emit methods
@@ -326,6 +351,11 @@ impl ScxWriter {
             current_modality_id: 0,
             modalities: Vec::new(),
             modality_build_csc: Vec::new(),
+            // Adopted writers (append in-place) never call `finish()`;
+            // the caller stamps the catalog generations itself. Defaults
+            // here are inert.
+            data_generation: 1,
+            csc_build_generation: None,
         })
     }
 
@@ -867,6 +897,20 @@ impl ScxWriter {
         name: &str,
         section_type: SectionType,
     ) -> Result<()> {
+        // Any CSC sidecar shard (X or layer, single- or multi-modality)
+        // funnels through here, so this is the one place to record that
+        // the sidecar was built against the current `data_generation`.
+        // `finish()` stamps it into `FullCatalog::csc_build_generation`;
+        // the reader rejects a sidecar whose recorded generation does not
+        // match `data_generation` (staleness guard). Mutating ops that
+        // drop CSC never reach this branch, so the field stays `0`.
+        if matches!(
+            section_type,
+            SectionType::CscShard | SectionType::LayerCscShard
+        ) {
+            self.csc_build_generation = Some(self.data_generation);
+        }
+
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -1823,6 +1867,9 @@ impl ScxWriter {
                 )?;
             }
         }
+        // `csc_build_generation` is recorded inside `write_shard_inner`
+        // for every CSC shard emitted above (single chokepoint), so no
+        // explicit stamp is needed here.
         Ok(())
     }
 
@@ -1960,6 +2007,11 @@ impl ScxWriter {
             prev_catalog_offset: 0,
             n_obs: self.header.n_obs,
             entries: self.entries.clone(),
+            data_generation: self.data_generation,
+            // `auto_emit_csc_for_marked_modalities` sets this to
+            // `Some(data_generation)` when it emits a sidecar; absent a
+            // sidecar it stays `None` → recorded as `0`.
+            csc_build_generation: self.csc_build_generation.unwrap_or(0),
         };
         let mut catalog_buf = Vec::new();
         full_catalog.write_to(&mut catalog_buf)?;

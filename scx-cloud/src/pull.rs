@@ -538,6 +538,10 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         prev_catalog_offset: original_catalog.prev_catalog_offset,
         n_obs: original_catalog.n_obs,
         entries: new_entries,
+        // Pull copies sections without changing CSR/CSC content — preserve
+        // both generations.
+        data_generation: original_catalog.data_generation,
+        csc_build_generation: original_catalog.csc_build_generation,
     };
     let mut new_catalog_bytes = Vec::new();
     new_full_catalog.write_to(&mut new_catalog_bytes)?;
@@ -1271,6 +1275,10 @@ pub async fn pull_filtered(
         prev_catalog_offset: 0,
         n_obs: shard_total_rows,
         entries: new_entries,
+        // Filtered pull changes the row set and drops CSC file-wide, so
+        // bump the data generation; the output emits no CSC sidecar.
+        data_generation: original_catalog.data_generation + 1,
+        csc_build_generation: 0,
     };
     let mut new_catalog_bytes = Vec::new();
     new_full_catalog.write_to(&mut new_catalog_bytes)?;

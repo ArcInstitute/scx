@@ -2100,6 +2100,66 @@ fn test_append_drops_csc_from_input() {
     assert_eq!(csr.shape.0, 10);
 }
 
+/// End-to-end CSC freshness lifecycle: a fresh CSC file is fresh
+/// (`data_generation == csc_build_generation`); append bumps the data
+/// generation and drops CSC; `build-csc` preserves that bumped generation
+/// and rebuilds a matching sidecar, so the rebuilt file opens fresh via
+/// `BackedCscReader`.
+#[test]
+fn test_csc_generation_lifecycle_append_then_rebuild() {
+    use scx_format::backed::BackedCscReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_csc_test_file(&dir, "csc_gen.scx", 6, 8, 4);
+
+    // Fresh file: matched generations, backed CSC reader opens.
+    {
+        let r = ScxReader::open(&path).unwrap();
+        let cat = r.catalog();
+        assert_eq!(cat.data_generation, cat.csc_build_generation);
+        let gen0 = cat.data_generation;
+        assert!(BackedCscReader::new(r, 0).is_ok());
+
+        // Append bumps the data generation and drops CSC.
+        let new_obs = sample_obs(4);
+        let (indptr, indices, values) = sample_shard_data(4, 8);
+        scx_ops::append(
+            &path,
+            &new_obs,
+            &indptr,
+            &indices,
+            &values,
+            ValueEncoding::Uint8,
+            &AppendOptions::default(),
+        )
+        .unwrap();
+
+        let r2 = ScxReader::open(&path).unwrap();
+        assert!(!r2.header().has_csc());
+        assert_eq!(
+            r2.catalog().data_generation,
+            gen0 + 1,
+            "append must bump data_generation"
+        );
+        assert_eq!(r2.catalog().csc_build_generation, 0);
+    }
+
+    // build-csc preserves the (bumped) data generation and rebuilds a
+    // fresh sidecar matching it.
+    let rebuilt = dir.path().join("csc_gen_rebuilt.scx");
+    scx_ops::run_build_csc(&path, &rebuilt, "4G", false, 4).unwrap();
+
+    let r3 = ScxReader::open(&rebuilt).unwrap();
+    assert!(r3.header().has_csc());
+    let cat3 = r3.catalog();
+    assert_eq!(
+        cat3.data_generation, cat3.csc_build_generation,
+        "rebuilt sidecar must match the current data generation"
+    );
+    // The rebuilt file opens via the backed CSC reader (not stale).
+    assert!(BackedCscReader::new(r3, 0).is_ok());
+}
+
 #[test]
 fn test_compact_drops_csc_from_input() {
     let dir = tempfile::tempdir().unwrap();

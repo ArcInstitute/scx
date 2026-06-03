@@ -1374,6 +1374,19 @@ pub fn index_preset_columns(name: &str) -> Option<IndexPreset> {
     }
 }
 
+/// Whether a named index preset implies a CSC sidecar should be built
+/// when the caller did not explicitly pass a `csc` policy.
+///
+/// The accel-ready presets — `training` and `perturbseq` — drive
+/// column/DE-heavy workloads (pseudobulk, `pdex_ref`, `rank_genes_groups`)
+/// whose primary substrate is the column-major CSC sidecar, so selecting
+/// one of those presets upgrades an *unset* `csc` to `auto`. `cellxgene`
+/// is query/browse-oriented and does not imply CSC. An explicit `--csc`
+/// value (including `off`) always wins over this default.
+pub fn preset_implies_csc_auto(name: &str) -> bool {
+    matches!(name, "training" | "perturbseq")
+}
+
 /// Build a predicate index for a metadata RecordBatch (obs or var) and
 /// return the serialized bytes ready to pass to
 /// `ScxWriter::write_obs_predicate_index` /
@@ -3417,6 +3430,16 @@ mod tests {
             assert!(!p.obs_columns.is_empty());
         }
         assert!(index_preset_columns("unknown").is_none());
+    }
+
+    #[test]
+    fn accel_ready_presets_imply_csc_auto() {
+        // DE/pseudobulk-heavy presets imply a CSC sidecar.
+        assert!(preset_implies_csc_auto("training"));
+        assert!(preset_implies_csc_auto("perturbseq"));
+        // Query/browse-oriented and unknown presets do not.
+        assert!(!preset_implies_csc_auto("cellxgene"));
+        assert!(!preset_implies_csc_auto("unknown"));
     }
 
     #[test]

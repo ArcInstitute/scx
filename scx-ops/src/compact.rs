@@ -202,7 +202,11 @@ pub fn compact_with_index_options(
     // Copy obsm flag if present
     let has_obsm = in_header.has_obsm();
 
-    let mut writer = ScxWriter::new(output_path, out_header)?;
+    // Compact rewrites the CSR shards (re-sharding / row filtering) and
+    // drops the CSC sidecar, so bump the data generation. `csc_build_generation`
+    // defaults to 0 (no CSC emitted); any stale sidecar would mismatch.
+    let mut writer = ScxWriter::new(output_path, out_header)?
+        .with_data_generation(reader.catalog().data_generation + 1);
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,
@@ -886,7 +890,10 @@ fn compact_multimodal(
         reserved: [0u8; 112],
     };
 
-    let mut writer = ScxWriter::new(output_path, out_header)?;
+    // Multimodal compact drops every CSC sidecar (rebuilt on demand), so
+    // bump the data generation; the new file emits no CSC here.
+    let mut writer = ScxWriter::new(output_path, out_header)?
+        .with_data_generation(reader.catalog().data_generation + 1);
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,

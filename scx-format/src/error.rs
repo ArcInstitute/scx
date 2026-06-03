@@ -42,6 +42,16 @@ pub enum ScxError {
     #[error("invalid catalog: {0}")]
     InvalidCatalog(String),
 
+    #[error(
+        "stale CSC sidecar: built against data generation {built_generation} but the file is \
+         now at data generation {data_generation}; the column-major sidecar no longer matches \
+         the CSR data — rebuild it with `scx build-csc` (or `--rebuild-csc`)"
+    )]
+    StaleCscSidecar {
+        built_generation: u64,
+        data_generation: u64,
+    },
+
     #[error("block n_rows {0} exceeds u16::MAX (65535)")]
     BlockRowsOverflow(u32),
 
