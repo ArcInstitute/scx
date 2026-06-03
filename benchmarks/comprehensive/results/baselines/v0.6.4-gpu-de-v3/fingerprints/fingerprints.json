@@ -1,33 +1,33 @@
 {
   "schema_version": 1,
   "environment": {
-    "hostname": "GPU3694",
+    "hostname": "GPU104C",
     "os": "Linux 5.15.0-176-generic",
-    "python_version": "3.13.13",
-    "numpy_version": "2.2.6",
-    "git_sha": "3f72ec5012231f620c31c4b0693af96e3c83ccc1",
+    "python_version": "3.13.3",
+    "numpy_version": "2.4.4",
+    "git_sha": "e833e15ee451f68a38c5667b4f49a3582d6dd7d6",
     "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
     "rayon_num_threads": "1",
     "pinned_seed": 42,
     "pinned_threads": 1,
     "blake3_available": false,
     "pyscx_version": "0.6.2",
-    "scanpy_version": "1.12.1",
-    "anndata_version": "0.12.16",
-    "scipy_version": "1.16.3",
+    "scanpy_version": "1.12",
+    "anndata_version": "0.12.10",
+    "scipy_version": "1.17.1",
     "dataset_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc3k.h5ad"
   },
   "timings_seconds": {
-    "pca": 1.79588384879753,
-    "neighbors": 1.1006328868679702,
-    "umap": 0.06139322463423014,
-    "leiden": 3.4271051730029285,
-    "harmony": 0.11157082300633192,
-    "lisi": 0.20789103815332055
+    "pca": 0.7158962213434279,
+    "neighbors": 0.9900716762058437,
+    "umap": 1.241931448224932,
+    "leiden": 0.08309945091605186,
+    "harmony": 0.32330152532085776,
+    "lisi": 0.20642835274338722
   },
   "fingerprints": {
     "pca": {
-      "hash": "sha256:1c883d81756c409edf303be6c77ce8a3cde4686faf33a0509fc8f44fe32c3af1",
+      "hash": "sha256:0eb1ec618687987d04bfdb787c275002334141d8b6edfe7d94c6d7519ae4032f",
       "shape": [
         2700,
         20
@@ -36,7 +36,7 @@
       "nbytes": 216000
     },
     "pca_variance_ratio": {
-      "hash": "sha256:d25b2181127c3ed1ca1cef4e31999dc089e04a93c0fee6fe58f5a329ba883dbf",
+      "hash": "sha256:702839d3f4b1a8404dcf782b5d2d972539b0fafd98a862b6764d890eb54ab46e",
       "shape": [
         20
       ],
@@ -44,7 +44,7 @@
       "nbytes": 160
     },
     "neighbors_distances": {
-      "hash": "sha256:64e5d781e6143ce80345a3d487a80c4f7f74ed70dc810e96cb3bac65f347b170",
+      "hash": "sha256:00e560e33d1b3757801391d66cacc242aa8ba0bf66a876192789ba0367e55091",
       "shape": [
         2700,
         2700
@@ -53,7 +53,7 @@
       "nbytes": 58320000
     },
     "neighbors_connectivities": {
-      "hash": "sha256:ce7fdd985010db419550c876b6b20a79c9430e29337109ce56ad9b6a04d9c53b",
+      "hash": "sha256:a4c999d30866ec3746f4fd19cf4964305e1ac6feb579eb2bcff4694078eac51c",
       "shape": [
         2700,
         2700
@@ -62,7 +62,7 @@
       "nbytes": 58320000
     },
     "umap": {
-      "hash": "sha256:d51fb5d14df9f0710e8720af714a71e0a224dbe6bbc6b09f6a2fb85c7513967d",
+      "hash": "sha256:9fa21b3981850830f25edfa0e18b46af19a7030de9216bc4a4713cdc76da85cd",
       "shape": [
         2700,
         2
@@ -71,7 +71,7 @@
       "nbytes": 21600
     },
     "leiden": {
-      "hash": "sha256:4462bb0c4dcd1dc2d0e4bf0c698e9ca037c0c8059b96aa7238cd3038ebfafb3b",
+      "hash": "sha256:c0b400790cb6fbd0dbb71120609d8c58194c88a7aa1fe740758aa7b6c14dd3e4",
       "shape": [
         2700
       ],
@@ -79,7 +79,7 @@
       "nbytes": 10800
     },
     "harmony": {
-      "hash": "sha256:c5e34b19a3461c16f13d76bb46bc401fed01028de0dda53018c7598cbcd6a163",
+      "hash": "sha256:016142259af4a32f1a8d49617a17f940607e6e641de21dd0cc94c6be865ae6af",
       "shape": [
         2700,
         20
@@ -88,7 +88,7 @@
       "nbytes": 216000
     },
     "lisi": {
-      "hash": "sha256:233d5bb02e085a50b9a0ffe8dcc1f93fb4ebb4676e4be9a392ae766310596eba",
+      "hash": "sha256:8cf8c349cdff30409c358e3094681d2a16cbb32868a638f366d4058216c3ca4b",
       "shape": [
         2700
       ],
