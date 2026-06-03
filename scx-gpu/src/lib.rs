@@ -106,8 +106,9 @@ pub use gpu_harmony::{
     gpu_harmony_softmax_penalty, gpu_harmony_z_sum,
 };
 pub use gpu_hvg::{
-    gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched, gpu_streaming_mean_var,
-    gpu_streaming_mean_var_batched,
+    gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched,
+    gpu_streaming_clip_square_sum_csc, gpu_streaming_mean_var, gpu_streaming_mean_var_batched,
+    gpu_streaming_mean_var_csc,
 };
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
 pub use gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata};

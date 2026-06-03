@@ -83,3 +83,21 @@ def test_layer_default_none_still_uses_X():
     accel.highly_variable_genes(adata, n_top_genes=10, flavor="seurat_v3")
     assert "highly_variable" in adata.var.columns
     assert int(adata.var["highly_variable"].sum()) == 10
+
+
+def test_prefer_csc_with_layer_raises():
+    """`prefer_format="csc"` reads adata.X only (the CSC sidecar lives on X,
+    not arbitrary layers). Combining it with `layer=` must error rather than
+    silently computing on X. The rejection fires before device resolution, so
+    it runs without a GPU."""
+    from pyscx import accel
+    adata = _make_counts_adata()
+    adata.layers["counts"] = adata.X.copy()
+    with pytest.raises(Exception, match="does not support layer"):
+        accel.highly_variable_genes(
+            adata,
+            n_top_genes=10,
+            flavor="seurat_v3",
+            prefer_format="csc",
+            layer="counts",
+        )
