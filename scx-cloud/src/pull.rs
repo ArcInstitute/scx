@@ -264,7 +264,7 @@ fn backoff_delay(cfg: &RetryConfig, attempt: usize) -> Duration {
 /// with backoff; final exhaustion surfaces as
 /// [`CloudError::DownloadFailed`]. Permanent errors short-circuit to
 /// [`CloudError::ObjectStore`] without retry.
-async fn get_with_retry(
+pub(crate) async fn get_with_retry(
     backend: &dyn ObjectStore,
     path: &ObjPath,
     cfg: &RetryConfig,
@@ -282,7 +282,62 @@ async fn get_with_retry(
             Ok(Ok(bytes)) => return Ok(bytes),
             Ok(Err(e)) => {
                 if attempt < cfg.max_retries && is_retryable(&e) {
+                    // NOT a dead store: when a transient retry is later followed
+                    // by a timeout, the Timeout terminal error surfaces this as
+                    // `last_error` (see test get_with_retry_timeout_surfaces_last_transient).
                     last_msg = Some(format!("{e}"));
+                    attempt += 1;
+                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
+                    continue;
+                }
+                if attempt >= cfg.max_retries && is_retryable(&e) {
+                    return Err(CloudError::DownloadFailed {
+                        retries: attempt,
+                        message: format!("{path}: {e}"),
+                    });
+                }
+                return Err(CloudError::ObjectStore(e));
+            }
+            Err(_) => {
+                if attempt < cfg.max_retries {
+                    last_msg = Some(format!("timeout after {:?}", started.elapsed()));
+                    attempt += 1;
+                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
+                    continue;
+                }
+                return Err(CloudError::Timeout {
+                    duration: cfg.request_timeout,
+                    path: path.to_string(),
+                    last_error: last_msg,
+                });
+            }
+        }
+    }
+}
+
+/// Issue a single cloud range `GET` with timeout + retry/backoff applied.
+///
+/// Range-read analogue of [`get_with_retry`], used by the cloud query path
+/// (`CloudReader::read_section` / `read_section_for_entry`) so selective
+/// reads inherit the same SCX-level deadline and retry budget that `pull`
+/// has (LC1) — a single stalled shard GET no longer hangs the parallel
+/// decode without a deadline.
+pub(crate) async fn get_range_with_retry(
+    backend: &dyn ObjectStore,
+    path: &ObjPath,
+    range: std::ops::Range<u64>,
+    cfg: &RetryConfig,
+) -> Result<bytes::Bytes> {
+    let mut attempt: usize = 0;
+    let mut last_msg: Option<String> = None;
+    loop {
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(cfg.request_timeout, backend.get_range(path, range.clone())).await;
+        match outcome {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(e)) => {
+                if attempt < cfg.max_retries && is_retryable(&e) {
                     attempt += 1;
                     tokio::time::sleep(backoff_delay(cfg, attempt)).await;
                     continue;
@@ -2554,6 +2609,64 @@ mod tests {
         let path = ObjPath::from("file.bin");
         let bytes = get_with_retry(&store, &path, &cfg).await.unwrap();
         assert_eq!(&*bytes, b"hello");
+    }
+
+    // LC1: the cloud query path's range reads get the same retry budget as
+    // pull. A transient failure is retried to success.
+    #[tokio::test]
+    async fn get_range_with_retry_retries_transient_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let store = FaultyStore::new(
+            inner,
+            vec![FaultMode::TransientError, FaultMode::TransientError],
+        );
+        let cfg = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_secs(10),
+        };
+        let path = ObjPath::from("file.bin");
+        let bytes = get_range_with_retry(&store, &path, 0..5, &cfg)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, b"hello");
+        assert_eq!(store.get_attempts.load(AtomicOrdering::Relaxed), 3);
+    }
+
+    // LC1: a range read that always times out surfaces CloudError::Timeout
+    // rather than hanging the parallel decode without a deadline.
+    #[tokio::test]
+    async fn get_range_with_retry_enforces_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        // Sleep beyond the timeout on every attempt (1 initial + 1 retry).
+        let store = FaultyStore::new(
+            inner,
+            vec![
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+                FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
+            ],
+        );
+        let cfg = RetryConfig {
+            max_retries: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_millis(50),
+        };
+        let path = ObjPath::from("file.bin");
+        let err = get_range_with_retry(&store, &path, 0..5, &cfg)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CloudError::Timeout { .. }),
+            "expected Timeout, got {err}"
+        );
     }
 
     // ─── Patch 11 § P2 #44 — hash-while-write equivalence ────────────

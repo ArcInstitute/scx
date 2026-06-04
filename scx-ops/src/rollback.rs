@@ -178,8 +178,9 @@ fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicabl
 ) -> Result<()> {
     let (catalog, catalog_len) = read_catalog_at(file, catalog_offset)?;
 
-    // Count CSR shards and compute stats from the target catalog
+    // Count CSR/CSC shards and compute stats from the target catalog
     let mut n_csr_shards = 0u32;
+    let mut n_csc_shards = 0u32;
     let mut total_nnz = 0u64;
     let mut has_dv = false;
 
@@ -190,6 +191,12 @@ fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicabl
                 if let Some(ref stats) = entry.stats {
                     total_nnz += stats.nnz;
                 }
+            }
+            // OE1: the CSC sidecar shard count and HAS_CSC flag must be
+            // resynced too, or rolling back across a CSC add/remove leaves
+            // the header pointing at absent shards (or vice versa).
+            SectionType::CscShard => {
+                n_csc_shards += 1;
             }
             SectionType::DeletionVectors => {
                 has_dv = true;
@@ -205,11 +212,17 @@ fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicabl
     header.prev_catalog_offset = catalog.prev_catalog_offset;
     header.n_obs = catalog.n_obs;
     header.n_csr_shards = n_csr_shards;
+    header.n_csc_shards = n_csc_shards;
     header.nnz = total_nnz;
     if has_dv {
         header.set_deletion_vectors();
     } else {
         header.flags &= !(1 << 5);
+    }
+    if n_csc_shards > 0 {
+        header.set_csc();
+    } else {
+        header.clear_csc();
     }
 
     // Clear front catalog — it references offsets from a cloud-optimized layout

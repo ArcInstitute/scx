@@ -29,7 +29,7 @@ use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityInfo, ModalityTable};
 use crate::provenance::Provenance;
 use crate::section::SectionType;
-use crate::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use crate::shard::ShardHeader;
 use crate::RootCatalog;
 
 /// Memory-mapped reader for SCX files.
@@ -2655,7 +2655,9 @@ impl ScxReader {
     /// `read_shard_from_entry`.
     pub fn read_shard_header(&self, entry: &FullCatalogEntry) -> Result<ShardHeader> {
         let section = self.section_bytes(entry)?;
-        ShardHeader::read_from(&mut Cursor::new(&section[..SHARD_HEADER_SIZE]))
+        ShardHeader::read_from(&mut Cursor::new(crate::shard_decode::shard_header_slice(
+            section,
+        )?))
     }
 
     /// Read raw shard bytes (header + compressed payload) without decoding.
@@ -3006,6 +3008,7 @@ mod tests {
     use super::*;
     use crate::header::{CURRENT_FORMAT_VERSION, MAGIC};
     use crate::provenance::ProvenanceEntry;
+    use crate::shard::SHARD_HEADER_SIZE;
     use crate::writer::ScxWriter;
     use arrow::array::{Float32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};

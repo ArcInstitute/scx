@@ -23,10 +23,6 @@ pub enum LoaderError {
     #[error("channel error: {0}")]
     ChannelError(String),
 
-    /// `next_batch()` called before `start_epoch()`.
-    #[error("next_batch() called before start_epoch()")]
-    EpochNotStarted,
-
     /// Pipeline stage panicked or exited unexpectedly.
     #[error("pipeline shutdown error: {0}")]
     ShutdownError(String),

@@ -173,6 +173,19 @@ fn read_sparse_matrix(
             n_vars,
         ))
     } else {
+        // C1: a CSC matrix misdetected as CSR has indptr length n_vars+1, not
+        // n_obs+1, which would index out of bounds in drop_explicit_zeros (a
+        // panic when n_vars < n_obs) or silently transpose. Reject it with a
+        // clear error instead.
+        if indptr.len() != n_obs + 1 {
+            return Err(ConvertError::Other(format!(
+                "CSR matrix '{group_name}' has indptr length {} but expected n_obs+1 = {} \
+                 (shape [{n_obs}, {n_vars}]); this is likely a CSC matrix missing its \
+                 encoding-type attribute",
+                indptr.len(),
+                n_obs + 1
+            )));
+        }
         Ok(drop_explicit_zeros(indptr, indices, data, n_obs, n_vars))
     }
 }

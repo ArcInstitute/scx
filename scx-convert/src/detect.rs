@@ -18,6 +18,19 @@ pub enum MatrixFormat {
     Dense,
 }
 
+/// Read a sparse group's `shape` attribute as `(n_obs, n_vars)`.
+///
+/// Returns `None` if the attribute is missing or not a length-2 vector, so
+/// callers fall back to their default classification rather than aborting.
+fn read_shape_attr(group: &hdf5::Group) -> Option<(usize, usize)> {
+    let shape = group.attr("shape").ok()?.read_1d::<i64>().ok()?;
+    if shape.len() == 2 {
+        Some((shape[0] as usize, shape[1] as usize))
+    } else {
+        None
+    }
+}
+
 /// Detect whether an HDF5 file is h5ad or 10x format.
 pub fn detect_input_format(file: &hdf5::File) -> Result<InputFormat, ConvertError> {
     // h5ad files have an "obs" group at the root
@@ -76,6 +89,36 @@ pub fn detect_matrix_format_at(
         }
         // Fallback: check for sparse structure
         if group.dataset("indptr").is_ok() && group.dataset("indices").is_ok() {
+            // A CSC group has indptr+indices too, so "both present ⇒ CSR" is
+            // wrong (C1). Disambiguate from the `shape` attribute and indptr
+            // length: CSR has indptr.len() == n_obs+1, CSC has n_vars+1. Only
+            // decide when the shape is non-square (n_obs != n_vars) and exactly
+            // one interpretation fits; otherwise fall through to the CSR
+            // default with the inferred-encoding warning.
+            let indptr_len = group
+                .dataset("indptr")
+                .ok()
+                .map(|d| d.shape().iter().product::<usize>());
+            if let (Some(indptr_len), Some((n_obs, n_vars))) = (indptr_len, read_shape_attr(&group))
+            {
+                let fits_csr = indptr_len == n_obs + 1;
+                let fits_csc = indptr_len == n_vars + 1;
+                if fits_csc && !fits_csr {
+                    sink.emit(ConvertWarning::InferredEncoding {
+                        path: path.to_string(),
+                        inferred: "csc_matrix (indptr length == n_vars+1)".into(),
+                    });
+                    return Ok(MatrixFormat::Csc);
+                }
+                if fits_csr && !fits_csc {
+                    sink.emit(ConvertWarning::InferredEncoding {
+                        path: path.to_string(),
+                        inferred: "csr_matrix (indptr length == n_obs+1)".into(),
+                    });
+                    return Ok(MatrixFormat::Csr);
+                }
+                // Square or neither-fits: ambiguous, fall through to CSR default.
+            }
             sink.emit(ConvertWarning::InferredEncoding {
                 path: path.to_string(),
                 inferred: "csr_matrix (indptr+indices present)".into(),

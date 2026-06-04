@@ -9,16 +9,17 @@ use std::io::Cursor;
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 use crate::dispatch::CodecError;
 use crate::median::floor_median_u64;
+use crate::rice::MAX_RICE_K;
 
 /// Compute the Rice parameter k from the median of delta values.
 ///
-/// `k = clamp(floor(log2(0.6931 * median)), 0, 15)`.
+/// `k = clamp(floor(log2(0.6931 * median)), 0, MAX_RICE_K)`.
 fn compute_k(median: u64) -> u8 {
     if median == 0 {
         return 0;
     }
     let raw = (std::f64::consts::LN_2 * median as f64).log2().floor() as i32;
-    raw.clamp(0, 15) as u8
+    raw.clamp(0, MAX_RICE_K as i32) as u8
 }
 
 /// Encode an indptr array using Delta-Golomb-Rice coding.
@@ -112,8 +113,14 @@ pub fn delta_golomb_decode(
         return Err(BitStreamError);
     }
 
-    // Read k byte
+    // Read k byte. `k` is encoded in a 4-bit field at write time, so any
+    // value above MAX_RICE_K is a corrupt/hostile stream; reject it before
+    // shifting (`q << k` with k >= 64 is UB-shaped — masks in release, panics
+    // in debug). `read_bits` would also reject k > 64, but bound it here.
     let k = data[8];
+    if k > MAX_RICE_K {
+        return Err(BitStreamError);
+    }
 
     // Decode deltas from bitstream
     let mut reader = BitReader::new(&data[9..]);
@@ -122,9 +129,14 @@ pub fn delta_golomb_decode(
     for _ in 0..n_deltas {
         let q = reader.read_unary()?;
         let r = if k > 0 { reader.read_bits(k)? } else { 0 };
-        let delta = (q << k) | r;
+        // checked_shl/checked_add: a long unary run or a near-u64::MAX prefix
+        // sum must surface as a decode error, not wrap silently in release.
+        let delta = q
+            .checked_shl(k as u32)
+            .map(|qk| qk | r)
+            .ok_or(BitStreamError)?;
         let prev = *indptr.last().unwrap();
-        indptr.push(prev + delta);
+        indptr.push(prev.checked_add(delta).ok_or(BitStreamError)?);
     }
 
     Ok(indptr)
@@ -255,5 +267,28 @@ mod tests {
     fn decode_truncated_data() {
         let result = delta_golomb_decode(&[0x00, 0x01, 0x02], 5);
         assert!(result.is_err());
+    }
+
+    // F2: a k byte above MAX_RICE_K is a corrupt stream — reject before
+    // the `q << k` shift (which would be UB-shaped for k >= 64) rather
+    // than panic/wrap.
+    #[test]
+    fn decode_rejects_oversized_k() {
+        let mut data = vec![0u8; 8]; // first value = 0
+        data.push(64); // k = 64 (invalid; > MAX_RICE_K)
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(delta_golomb_decode(&data, 2).is_err());
+    }
+
+    // F2: prefix-sum overflow on a hostile delta must surface as a decode
+    // error, not wrap silently in release.
+    #[test]
+    fn decode_rejects_prefix_sum_overflow() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&u64::MAX.to_le_bytes()); // first value = u64::MAX
+        data.push(0); // k = 0 → delta == unary quotient
+        data.push(0x01); // unary: one 1-bit then 0 → q = 1, so delta = 1
+                         // prev (u64::MAX) + delta (1) overflows.
+        assert!(delta_golomb_decode(&data, 2).is_err());
     }
 }
