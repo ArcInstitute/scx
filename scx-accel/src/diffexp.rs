@@ -914,9 +914,13 @@ pub struct PdexRefResult {
     pub target_memberships: Vec<usize>,
     /// Cell count for the reference group.
     pub ref_membership: usize,
-    /// `log2((target_mean + epsilon) / (ref_mean + epsilon))`.
+    /// `log2((target_mean + epsilon) / (ref_mean + epsilon))`. With the default
+    /// `epsilon == 0` this is intentionally ±inf for genes undetected in the
+    /// reference (`ref_mean == 0`), matching upstream pdex.
     pub log2_fold_changes: Vec<Vec<f64>>,
-    /// `(target_mean - ref_mean) / (ref_mean + epsilon)`.
+    /// `(target_mean - ref_mean) / (ref_mean + epsilon)`, with the denominator
+    /// floored to an internal pseudocount in the degenerate
+    /// `ref_mean + epsilon == 0` case so the value stays finite (ACC4).
     pub percent_changes: Vec<Vec<f64>>,
     /// Mann-Whitney U statistic for the test group vs the reference.
     pub statistics: Vec<Vec<f64>>,
@@ -974,8 +978,26 @@ fn pdex_gene_target_stats(
         pdex_post(mode, s / n1 as f64)
     };
 
+    // `log2_fc` keeps pdex parity: with the default `epsilon == 0` and a
+    // reference-undetected gene (`ref_mean == 0`) it is intentionally ±inf
+    // (`log2(target/0)`), matching upstream pdex. `percent_change` carries no
+    // upstream-parity constraint, so its denominator is floored with an
+    // internal pseudocount when it would otherwise be exactly zero — keeping it
+    // finite instead of dividing by zero (ACC4: the default `epsilon == 0` path
+    // previously emitted ±inf/NaN whenever a gene was undetected in the
+    // reference). Both `ref_mean` and `epsilon` are non-negative, so the
+    // denominator is only floored in the degenerate `ref_mean + epsilon == 0`
+    // case.
     let log2_fc = ((target_mean + epsilon) / (ref_mean + epsilon)).log2();
-    let percent_change = (target_mean - ref_mean) / (ref_mean + epsilon);
+    let pct_denom = {
+        let d = ref_mean + epsilon;
+        if d != 0.0 {
+            d
+        } else {
+            LOGFC_PSEUDOCOUNT
+        }
+    };
+    let percent_change = (target_mean - ref_mean) / pct_denom;
 
     if n1 == 0 || n2 == 0 {
         return (target_mean, log2_fc, percent_change, f64::NAN, 1.0);
@@ -2508,6 +2530,70 @@ mod tests {
                 assert!((0.0..=1.0).contains(&fdr));
                 assert!(fdr + 1e-12 >= p, "FDR must be >= raw p");
             }
+        }
+    }
+
+    #[test]
+    fn test_pdex_ref_undetected_gene_percent_change_finite() {
+        // ACC4: gene 0 is undetected in the reference group (all zeros) but
+        // expressed in the test groups, with the default epsilon == 0. The
+        // percent_change denominator would be exactly zero — the floor keeps it
+        // finite. log2_fc stays pdex-compatible (±inf is the documented
+        // behavior there).
+        let n_obs = 30;
+        let n_vars = 2;
+        let third = n_obs / 3;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        let mut groups = vec![0usize; n_obs];
+        for cell in 0..n_obs {
+            let g = if cell < third {
+                0
+            } else if cell < 2 * third {
+                1
+            } else {
+                2
+            };
+            groups[cell] = g;
+            // Gene 0: zero in the reference (g == 0), positive in test groups.
+            data[cell * n_vars] = if g == 0 { 0.0 } else { 5.0 };
+            // Gene 1: expressed everywhere (keeps a finite control column).
+            data[cell * n_vars + 1] = 1.0 + g as f32;
+        }
+        let group_names = vec!["ref".to_string(), "ta".to_string(), "tb".to_string()];
+        let gene_names = vec!["g0".to_string(), "g1".to_string()];
+
+        let result = pdex_ref(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            0,
+            GeomMeanMode::ArithRaw,
+            0.0, // default epsilon — the ACC4 trigger
+        )
+        .unwrap();
+
+        // Reference is undetected for gene 0.
+        assert_eq!(result.ref_means[0], 0.0);
+        for tg in 0..2 {
+            // percent_change must be finite for every gene/group despite the
+            // zero reference mean (this is the ACC4 fix).
+            for gene in 0..n_vars {
+                assert!(
+                    result.percent_changes[tg][gene].is_finite(),
+                    "percent_change must be finite (tg={tg} gene={gene}), got {}",
+                    result.percent_changes[tg][gene]
+                );
+            }
+            // The undetected-reference gene has a strictly positive, finite
+            // percent_change (target > 0 over the floored denominator).
+            assert!(result.percent_changes[tg][0] > 0.0);
+            // log2_fc for the undetected-reference gene is +inf by design
+            // (log2(target / 0)); the control gene stays finite.
+            assert!(result.log2_fold_changes[tg][0].is_infinite());
+            assert!(result.log2_fold_changes[tg][1].is_finite());
         }
     }
 

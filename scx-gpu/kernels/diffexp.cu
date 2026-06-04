@@ -21,6 +21,17 @@
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <math_constants.h>  // CUDART_INF_F
+#include <cassert>
+
+// The hand-rolled shared-memory tree reductions below (`for (s = nthr >> 1;
+// s > 0; s >>= 1)`) assume a power-of-two block size; a non-pow2 block drops
+// the odd top partial and silently under-counts. Every launch site uses pow2
+// blocks (128/64/32 are hardcoded), so the bug is latent — this guard turns a
+// future non-pow2 launch into a device-side trap instead of a silently wrong
+// statistic (finding ACC2). Asserted once per affected kernel after `nthr` is
+// set. (The cub::BlockReduce / cub::BlockRadixSort paths are non-pow2-safe and
+// need no guard.)
+#define SCX_ASSERT_POW2_BLOCK() assert((blockDim.x & (blockDim.x - 1)) == 0)
 
 // Block-sort tunables (must be compile-time constants for cub::BlockRadixSort).
 #define BLOCK_THREADS 1024
@@ -258,6 +269,7 @@ extern "C" __global__ void pseudobulk_all_groups_kernel(
 
     int tid  = threadIdx.x;
     int nthr = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
     double local_sum = 0.0;
     for (int i = start + tid; i < end; i += nthr) {
         int cell = all_group_cells[i];
@@ -315,6 +327,7 @@ extern "C" __global__ void csc_shard_pseudobulk_kernel(
     extern __shared__ double sdata[];
     int tid  = threadIdx.x;
     int nthr = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
     for (int g = 0; g < n_groups; g++) {
         sdata[(long long)g * nthr + tid] = 0.0;
     }
@@ -1128,6 +1141,7 @@ extern "C" __global__ void searchsorted_u_stat_kernel(
 
     int tid   = threadIdx.x;
     int nthr  = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
     double local = 0.0;
 
     for (int i = tid; i < n_g; i += nthr) {
@@ -1188,6 +1202,7 @@ extern "C" __global__ void searchsorted_ranksum_kernel(
 
     int tid  = threadIdx.x;
     int nthr = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
     double local = 0.0;
 
     for (int i = tid; i < n_g; i += nthr) {

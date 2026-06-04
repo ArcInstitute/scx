@@ -17,26 +17,103 @@ pub struct HvgStats {
     pub variances: Vec<f64>,
 }
 
+/// Reject non-finite values at the HVG accelerator boundary.
+///
+/// NaN/Inf cannot be summarised into a meaningful mean/variance and would
+/// silently poison HVG selection. This is the HVG analogue of the DE boundary
+/// check ([`crate::diffexp`]'s `ensure_finite_de_input`): finiteness is a
+/// contract at the accelerator entry, validated where the streaming pass
+/// already touches every nonzero — not at file ingest. (The GPU HVG path does
+/// not yet enforce this on-device; tracked as a follow-on alongside the
+/// deterministic device reduction.)
+fn ensure_finite_hvg_data(data: &[f32]) -> Result<()> {
+    if let Some(pos) = data.iter().position(|v| !v.is_finite()) {
+        return Err(crate::error::AccelError::InvalidInput(format!(
+            "HVG input contains a non-finite value ({}) at nonzero index {pos}; \
+             highly-variable-gene selection requires finite input — filter/QC NaN \
+             and Inf before computing variance",
+            data[pos]
+        )));
+    }
+    Ok(())
+}
+
+/// Welford update: fold one observed value `v` into the running
+/// `(count, mean, M2)` triple for a single column.
+///
+/// The triple tracks only the *nonzero* entries seen; the implicit zeros of a
+/// sparse column are merged once at finalize via [`welford_finalize_with_zeros`].
+/// Welford never forms `Σx²`, so it avoids the catastrophic cancellation of the
+/// `Σx² − n·mean²` form on near-constant genes.
+#[inline]
+fn welford_update(count: &mut f64, mean: &mut f64, m2: &mut f64, v: f64) {
+    *count += 1.0;
+    let delta = v - *mean;
+    *mean += delta / *count;
+    let delta2 = v - *mean;
+    *m2 += delta * delta2;
+}
+
+/// Chan parallel-merge of moment triple `other` into `acc` (both `(n, mean, M2)`).
+///
+/// Exact and order-stable — the cancellation-safe generalisation of "raw moments
+/// are additive". Used to pool per-batch nonzero moments into a global triple
+/// and to fold an implicit-zero block into a nonzero block.
+#[inline]
+fn welford_merge(acc: &mut (f64, f64, f64), other: (f64, f64, f64)) {
+    let (n_a, mean_a, m2_a) = *acc;
+    let (n_b, mean_b, m2_b) = other;
+    let n = n_a + n_b;
+    if n == 0.0 {
+        return;
+    }
+    let delta = mean_b - mean_a;
+    let mean = mean_a + delta * n_b / n;
+    let m2 = m2_a + m2_b + delta * delta * n_a * n_b / n;
+    *acc = (n, mean, m2);
+}
+
+/// Finalize `(mean, variance)` for a column whose nonzero entries are summarised
+/// by the Welford triple `(nnz, mean_nz, m2_nz)`, folding in `n_total - nnz`
+/// implicit zeros via a single Chan merge with a zero block.
+///
+/// Bessel-corrected (ddof=1, matching scanpy `correction=1`); variance clamped
+/// to ≥ 0 (numerical noise can produce a tiny negative).
+#[inline]
+fn welford_finalize_with_zeros(nnz: f64, mean_nz: f64, m2_nz: f64, n_total: f64) -> (f64, f64) {
+    if n_total <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut acc = (nnz, mean_nz, m2_nz);
+    welford_merge(&mut acc, (n_total - nnz, 0.0, 0.0));
+    let (_, mean, m2) = acc;
+    let denom = (n_total - 1.0).max(1.0);
+    let var = (m2 / denom).max(0.0);
+    (mean, var)
+}
+
 /// Single-pass streaming mean and variance per column.
 ///
-/// Accumulates per-column sum and sum-of-squares in f64, then computes:
-///   mean = sum / n
-///   var  = (sum_sq - n * mean²) / (n - 1)   (Bessel's correction, ddof=1)
+/// Accumulates a per-column Welford moment triple `(count, mean, M2)` over the
+/// nonzero entries, then folds in each column's implicit zeros once at finalize
+/// to produce:
+///   mean = Σx / n
+///   var  = M2 / (n - 1)   (Bessel's correction, ddof=1)
 ///
 /// This matches scanpy's `correction=1` parameter in `mean_var()`.
-/// Memory: O(n_vars) for two accumulator vectors.
+/// Memory: O(n_vars) for three accumulator vectors.
 ///
 /// # Numerical stability
 ///
-/// The two-pass sum-of-squares formula (`sum_sq - n * mean^2`) can suffer from
-/// catastrophic cancellation when values are large relative to the variance.
-/// Accumulating f32 sparse values into f64 provides sufficient headroom for
-/// typical scRNA-seq data (counts 0-100, up to ~10M cells). Negative variances
-/// from numerical noise are clamped to zero.
-///
-/// If this is ever needed for data with much larger magnitudes or tighter
-/// variance, Welford's online algorithm would provide better numerical
-/// stability at the cost of a branch per nonzero element.
+/// Welford's online algorithm never forms `Σx²`, so it avoids the catastrophic
+/// cancellation of the `Σx² − n·mean²` form on near-constant genes — the class
+/// that could flip HVG membership at a cutoff (finding ACC6). The CPU path is
+/// also deterministic: shards stream in index order and nonzeros accumulate
+/// sequentially in f64, so the result is bit-stable across runs. (The GPU CSR
+/// accumulation is *not* yet order-stable — see
+/// [`scx_gpu::gpu_streaming_mean_var`]; the device-side deterministic reduction
+/// is a tracked follow-on.) The cost is one division per nonzero versus the raw
+/// `Σx`/`Σx²` accumulation.
 ///
 /// Returns zero means and zero variances when `n_obs == 0`.
 pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
@@ -51,33 +128,27 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
         });
     }
 
-    let mut col_sum = vec![0.0f64; n_vars];
-    let mut col_sum_sq = vec![0.0f64; n_vars];
+    // Per-column Welford state over nonzeros; implicit zeros folded at finalize.
+    let mut count = vec![0.0f64; n_vars];
+    let mut mean = vec![0.0f64; n_vars];
+    let mut m2 = vec![0.0f64; n_vars];
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
-            let v = val as f64;
-            col_sum[c] += v;
-            col_sum_sq[c] += v * v;
+            welford_update(&mut count[c], &mut mean[c], &mut m2[c], val as f64);
         }
     }
 
     let n = n_obs as f64;
-    let denom = (n - 1.0).max(1.0); // avoid division by zero for n <= 1
     let mut means = vec![0.0f64; n_vars];
     let mut variances = vec![0.0f64; n_vars];
-
     for j in 0..n_vars {
-        let mean = col_sum[j] / n;
-        means[j] = mean;
-        // Var = (sum_sq - n * mean^2) / (n - 1)
-        variances[j] = (col_sum_sq[j] - n * mean * mean) / denom;
-        // Clamp to zero (numerical noise can produce tiny negatives)
-        if variances[j] < 0.0 {
-            variances[j] = 0.0;
-        }
+        let (mu, var) = welford_finalize_with_zeros(count[j], mean[j], m2[j], n);
+        means[j] = mu;
+        variances[j] = var;
     }
 
     Ok(HvgStats { means, variances })
@@ -128,9 +199,10 @@ pub struct BatchedHvgStats {
 
 /// Single-pass streaming mean and variance per column **for multiple batches**.
 ///
-/// Iterates through all shards once, accumulating per-batch sum and sum-of-squares
-/// in f64. Also derives global statistics from the per-batch accumulators (no
-/// extra pass needed). This reduces multi-batch HVG from 1 + 2N passes to 2 total.
+/// Iterates through all shards once, accumulating a per-batch, per-column
+/// Welford moment triple `(count, mean, M2)` over nonzeros. Also derives global
+/// statistics from the per-batch accumulators (no extra pass needed). This
+/// reduces multi-batch HVG from 1 + 2N passes to 2 total.
 ///
 /// `cell_batch` maps each visible cell (in shard-iteration order) to a batch index.
 /// Use `-1` for cells that should be excluded from all batches.
@@ -143,13 +215,16 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
 ) -> Result<BatchedHvgStats> {
     let n_vars = source.n_vars();
 
-    let mut batch_sum = vec![vec![0.0f64; n_vars]; n_batches];
-    let mut batch_sum_sq = vec![vec![0.0f64; n_vars]; n_batches];
+    // Per-batch, per-column Welford state over nonzeros.
+    let mut count = vec![vec![0.0f64; n_vars]; n_batches];
+    let mut mean = vec![vec![0.0f64; n_vars]; n_batches];
+    let mut m2 = vec![vec![0.0f64; n_vars]; n_batches];
     let mut batch_count = vec![0usize; n_batches];
 
     let mut cell_offset = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         let n_rows = csr.n_rows();
 
         for row in 0..n_rows {
@@ -166,50 +241,51 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
             for j in start..end {
                 let c = csr.indices[j] as usize;
                 let v = csr.data[j] as f64;
-                batch_sum[b][c] += v;
-                batch_sum_sq[b][c] += v * v;
+                welford_update(&mut count[b][c], &mut mean[b][c], &mut m2[b][c], v);
             }
         }
         cell_offset += n_rows;
     }
 
-    // Compute per-batch means and variances.
+    // Compute per-batch means and variances (fold each batch's implicit zeros).
     let mut per_batch = Vec::with_capacity(n_batches);
     for b in 0..n_batches {
         let n = batch_count[b] as f64;
         let mut means = vec![0.0f64; n_vars];
         let mut variances = vec![0.0f64; n_vars];
         if batch_count[b] > 0 {
-            let denom = (n - 1.0).max(1.0);
             for j in 0..n_vars {
-                let mean = batch_sum[b][j] / n;
-                means[j] = mean;
-                variances[j] = ((batch_sum_sq[b][j] - n * mean * mean) / denom).max(0.0);
+                let (mu, var) = welford_finalize_with_zeros(count[b][j], mean[b][j], m2[b][j], n);
+                means[j] = mu;
+                variances[j] = var;
             }
         }
         per_batch.push(HvgStats { means, variances });
     }
 
-    // Derive global stats from per-batch accumulators (no second pass over the
-    // data). This is exact, not an approximation: raw moments are additive, so
-    // the global Σx and Σx² are simply the sums of the per-batch Σx / Σx², and
-    // the global mean/variance computed from them equal the pooled (single-pass
-    // over all cells) result exactly. It does, however, inherit the same
-    // near-constant-gene catastrophic-cancellation sensitivity as the
-    // `Σx² − n·mean²` variance path (see `streaming_mean_var_with_device`
-    // accuracy caveat); the per-batch partial sums do not worsen it.
+    // Derive global stats from the per-batch accumulators (no second pass over
+    // the data). This is exact, not an approximation, and is the cancellation-
+    // safe form of the additive-moment invariant (ACC12): merging the per-batch
+    // nonzero Welford triples `(count, mean, M2)` via Chan's parallel merge —
+    // then folding in the global implicit zeros — yields exactly the pooled
+    // (single-pass over all cells) result, without ever forming `Σx²`. The old
+    // path summed per-batch `Σx`/`Σx²`, which was equally exact in real numbers
+    // but inherited the near-constant-gene cancellation; the Welford merge does
+    // not.
     let total_n: usize = batch_count.iter().sum();
-    let total_f = total_n as f64;
     let mut global_means = vec![0.0f64; n_vars];
     let mut global_variances = vec![0.0f64; n_vars];
     if total_n > 0 {
-        let denom = (total_f - 1.0).max(1.0);
+        let total_f = total_n as f64;
         for j in 0..n_vars {
-            let global_sum: f64 = batch_sum.iter().map(|bs| bs[j]).sum();
-            let global_sum_sq: f64 = batch_sum_sq.iter().map(|bs| bs[j]).sum();
-            let mean = global_sum / total_f;
-            global_means[j] = mean;
-            global_variances[j] = ((global_sum_sq - total_f * mean * mean) / denom).max(0.0);
+            let mut acc = (0.0f64, 0.0f64, 0.0f64);
+            for b in 0..n_batches {
+                welford_merge(&mut acc, (count[b][j], mean[b][j], m2[b][j]));
+            }
+            let (nnz, mean_nz, m2_nz) = acc;
+            let (mu, var) = welford_finalize_with_zeros(nnz, mean_nz, m2_nz, total_f);
+            global_means[j] = mu;
+            global_variances[j] = var;
         }
     }
 
@@ -346,8 +422,12 @@ pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
 ///
 /// Forwards to the CPU implementation for `device = "cpu"`; for `device = "gpu"`
 /// drives [`scx_gpu::gpu_streaming_mean_var_batched`] and finalises the
-/// per-batch and global Bessel-corrected statistics on the host (identical
-/// formula to the CPU function — see lines 176-207 above).
+/// per-batch and global Bessel-corrected statistics on the host. The GPU kernel
+/// accumulates raw `Σx`/`Σx²` moments, so the host finalisation here uses the
+/// `Σx² − n·mean²` form rather than the Welford merge the CPU path now uses
+/// (`streaming_mean_var_batched`). The two agree to round-off on genes with
+/// real variance; they can diverge on near-constant genes (ACC6) until the
+/// device path emits Welford `(count, mean, M2)` moments — a tracked follow-on.
 ///
 /// Falls back to the CPU implementation if GPU initialization fails.
 #[cfg(feature = "gpu")]
@@ -390,7 +470,8 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
         per_batch.push(HvgStats { means, variances });
     }
 
-    // Derive global stats from per-batch accumulators — matches the CPU path.
+    // Derive global stats from per-batch raw moments (GPU emits Σx/Σx²; the
+    // host finalises with the Σx²−n·mean² form, see the fn-level note re ACC6).
     let total_n: usize = batch_counts.iter().sum();
     let total_f = total_n as f64;
     let mut global_means = vec![0.0f64; n_vars];
@@ -520,6 +601,68 @@ mod tests {
         for (got, exp) in stats.variances.iter().zip(expected_vars.iter()) {
             assert!((got - exp).abs() < 1e-10, "var: got {got}, expected {exp}");
         }
+    }
+
+    #[test]
+    fn test_streaming_mean_var_rejects_non_finite() {
+        // 3.2: finiteness is a contract at the HVG accelerator entry. A NaN in
+        // the working set is rejected, not silently summarised into garbage.
+        let shard = ScxCsr::new_unchecked(
+            (2, 2),
+            vec![0, 2, 3],
+            vec![0, 1, 0],
+            vec![1.0, f32::NAN, 2.0],
+        );
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_mean_var(&source).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AccelError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // The batched entry enforces the same contract.
+        let shard =
+            ScxCsr::new_unchecked((2, 2), vec![0, 1, 2], vec![0, 1], vec![f32::INFINITY, 2.0]);
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_mean_var_batched(&source, &[0, 0], 1).unwrap_err();
+        assert!(matches!(err, crate::error::AccelError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_streaming_mean_var_near_constant_gene_stable() {
+        // ACC6: the Welford path stays accurate on a near-constant gene with a
+        // large offset, where the `Σx² − n·mean²` form loses precision because
+        // mean² (≈ 1.6e13) dwarfs the true variance (≈ 1.33). Values are
+        // integers < 2^24, so they are exact in f32 and the true variance is
+        // unambiguous.
+        let off = 4.0e6f32;
+        let shard = ScxCsr::new_unchecked(
+            (4, 1),
+            vec![0, 1, 2, 3, 4],
+            vec![0, 0, 0, 0],
+            vec![off, off + 2.0, off, off + 2.0],
+        );
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 4,
+            n_vars: 1,
+        };
+        let stats = streaming_mean_var(&source).unwrap();
+        // mean = 1e8 + 1; deviations ±1; var = (1+1+1+1)/3 = 4/3.
+        assert!((stats.means[0] - (off as f64 + 1.0)).abs() < 1e-3);
+        assert!(
+            (stats.variances[0] - 4.0 / 3.0).abs() < 1e-6,
+            "near-constant variance should be ~1.333, got {}",
+            stats.variances[0]
+        );
     }
 
     #[test]
