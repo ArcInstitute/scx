@@ -95,6 +95,7 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
             log_transformed,
             rankby_abs,
             tie_correct,
+            chunk_start,
         )?;
         all_chunk_results.push(chunk_result);
     }

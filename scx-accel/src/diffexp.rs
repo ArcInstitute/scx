@@ -25,6 +25,11 @@ pub struct DiffExpResult {
     pub group_names: Vec<String>,
     /// Gene names sorted by score for each group. `[n_groups][n_genes]`
     pub names: Vec<Vec<String>>,
+    /// Global var index per gene, parallel to `names`. `[n_groups][n_genes]`.
+    /// Carried solely to give the merge/sort a stable, scanpy-aligned tiebreak
+    /// (ascending var index on equal scores) that is identical across chunk
+    /// sizes and backends; not surfaced to Python.
+    pub gene_indices: Vec<Vec<usize>>,
     /// Z-scores (signed). `[n_groups][n_genes]`
     pub scores: Vec<Vec<f64>>,
     /// Raw p-values (two-sided). `[n_groups][n_genes]`
@@ -41,10 +46,39 @@ pub struct DiffExpResult {
 /// Per-gene test result (before sorting/grouping).
 #[derive(Debug, Clone)]
 struct GeneTestResult {
-    gene_idx: usize,
-    score: f64, // z-statistic (signed)
-    pval: f64,  // two-sided p-value
-    logfc: f64, // log2 fold-change
+    gene_idx: usize,   // local index into the (chunk's) `gene_names` slice
+    global_idx: usize, // global var index (tiebreak key + emitted `gene_indices`)
+    score: f64,        // z-statistic (signed)
+    pval: f64,         // two-sided p-value
+    logfc: f64,        // log2 fold-change
+}
+
+/// Shared DE-ranking comparator used by every ranking site (single-chunk,
+/// chunked merge, GPU chunk assembly) so gene order is identical across chunk
+/// sizes and backends.
+///
+/// Sorts by descending score (or `|score|` when `rankby_abs`); ties break by
+/// ascending global var index (matching scanpy's stable argsort). NaN scores
+/// sort **last** deterministically (their key is treated as `-inf`).
+pub(crate) fn de_rank_cmp(
+    a_score: f64,
+    a_idx: usize,
+    b_score: f64,
+    b_idx: usize,
+    rankby_abs: bool,
+) -> std::cmp::Ordering {
+    let key = |s: f64| {
+        let k = if rankby_abs { s.abs() } else { s };
+        if k.is_nan() {
+            f64::NEG_INFINITY // NaN sorts last (descending)
+        } else {
+            k
+        }
+    };
+    key(b_score)
+        .partial_cmp(&key(a_score))
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a_idx.cmp(&b_idx))
 }
 
 /// Run Wilcoxon rank-sum DE, 1-vs-rest or vs a specific reference group.
@@ -59,6 +93,9 @@ struct GeneTestResult {
 /// * `group_names` — Unique group names, length `n_groups`.
 /// * `reference` — If `Some(idx)`, compare every other group against group `idx`.
 ///   If `None`, 1-vs-rest.
+/// * `gene_index_base` — Global var index of `gene_names[0]`. Chunk drivers pass
+///   the chunk start so emitted `gene_indices` (and the tiebreak) are global;
+///   single-chunk / dense callers pass `0`.
 #[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum(
     data: &[f32],
@@ -71,6 +108,7 @@ pub fn wilcoxon_rank_sum(
     log_transformed: bool,
     rankby_abs: bool,
     tie_correct: bool,
+    gene_index_base: usize,
 ) -> Result<DiffExpResult> {
     let n_groups = group_names.len();
     if data.len() != n_obs * n_vars {
@@ -208,6 +246,7 @@ pub fn wilcoxon_rank_sum(
 
     // Transpose: gene_group_results[var][tg_idx] -> per-group sorted gene lists.
     let mut result_names = Vec::with_capacity(n_test_groups);
+    let mut result_gene_indices = Vec::with_capacity(n_test_groups);
     let mut result_scores = Vec::with_capacity(n_test_groups);
     let mut result_pvals = Vec::with_capacity(n_test_groups);
     let mut result_pvals_adj = Vec::with_capacity(n_test_groups);
@@ -220,6 +259,7 @@ pub fn wilcoxon_rank_sum(
                 let (score, pval, logfc) = gene_group_results[var_idx][tg_idx];
                 GeneTestResult {
                     gene_idx: var_idx,
+                    global_idx: gene_index_base + var_idx,
                     score,
                     pval,
                     logfc,
@@ -227,19 +267,14 @@ pub fn wilcoxon_rank_sum(
             })
             .collect();
 
-        sorted.sort_by(|a, b| {
-            let a_key = if rankby_abs { a.score.abs() } else { a.score };
-            let b_key = if rankby_abs { b.score.abs() } else { b.score };
-            b_key
-                .partial_cmp(&a_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.gene_idx.cmp(&b.gene_idx))
-        });
+        sorted
+            .sort_by(|a, b| de_rank_cmp(a.score, a.global_idx, b.score, b.global_idx, rankby_abs));
 
         let names: Vec<String> = sorted
             .iter()
             .map(|r| gene_names[r.gene_idx].clone())
             .collect();
+        let gene_indices: Vec<usize> = sorted.iter().map(|r| r.global_idx).collect();
         let scores: Vec<f64> = sorted.iter().map(|r| r.score).collect();
         let pvals: Vec<f64> = sorted.iter().map(|r| r.pval).collect();
         let logfc: Vec<f64> = sorted.iter().map(|r| r.logfc).collect();
@@ -247,6 +282,7 @@ pub fn wilcoxon_rank_sum(
         let pvals_adj = benjamini_hochberg(&pvals);
 
         result_names.push(names);
+        result_gene_indices.push(gene_indices);
         result_scores.push(scores);
         result_pvals.push(pvals);
         result_pvals_adj.push(pvals_adj);
@@ -257,6 +293,7 @@ pub fn wilcoxon_rank_sum(
     Ok(DiffExpResult {
         group_names: result_group_names,
         names: result_names,
+        gene_indices: result_gene_indices,
         scores: result_scores,
         pvals: result_pvals,
         pvals_adj: result_pvals_adj,
@@ -634,6 +671,7 @@ pub fn wilcoxon_rank_sum_streaming(
             log_transformed,
             rankby_abs,
             tie_correct,
+            chunk_start,
         )?;
         all_chunk_results.push(chunk_result);
     }
@@ -717,6 +755,7 @@ pub fn wilcoxon_rank_sum_sparse(
             log_transformed,
             rankby_abs,
             tie_correct,
+            chunk_start,
         )?;
         all_chunk_results.push(chunk_result);
     }
@@ -742,6 +781,7 @@ pub fn merge_diff_exp_results(
         return Ok(DiffExpResult {
             group_names: vec![],
             names: vec![],
+            gene_indices: vec![],
             scores: vec![],
             pvals: vec![],
             pvals_adj: vec![],
@@ -761,6 +801,7 @@ pub fn merge_diff_exp_results(
     let merged_exec_info = chunks[0].exec_info.clone();
 
     let mut merged_names = Vec::with_capacity(n_groups);
+    let mut merged_gene_indices = Vec::with_capacity(n_groups);
     let mut merged_scores = Vec::with_capacity(n_groups);
     let mut merged_pvals = Vec::with_capacity(n_groups);
     let mut merged_pvals_adj = Vec::with_capacity(n_groups);
@@ -768,7 +809,8 @@ pub fn merge_diff_exp_results(
 
     for group_name in &group_names {
         // Collect all genes for this group across chunks.
-        let mut gene_entries: Vec<(String, f64, f64, f64)> = Vec::new();
+        // Tuple: (name, score, pval, logfc, global_gene_idx).
+        let mut gene_entries: Vec<(String, f64, f64, f64, usize)> = Vec::new();
 
         for chunk in &chunks {
             // Find the position of this group in the chunk's results.
@@ -785,28 +827,26 @@ pub fn merge_diff_exp_results(
                     chunk.scores[chunk_g_pos][i],
                     chunk.pvals[chunk_g_pos][i],
                     chunk.logfoldchanges[chunk_g_pos][i],
+                    chunk.gene_indices[chunk_g_pos][i],
                 ));
             }
         }
 
-        // Sort by signed score descending (default) or |score| descending (rankby_abs).
-        gene_entries.sort_by(|a, b| {
-            let a_key = if rankby_abs { a.1.abs() } else { a.1 };
-            let b_key = if rankby_abs { b.1.abs() } else { b.1 };
-            b_key
-                .partial_cmp(&a_key)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Sort via the shared comparator: descending score (or |score|), ties
+        // broken by ascending global var index, NaN scores last.
+        gene_entries.sort_by(|a, b| de_rank_cmp(a.1, a.4, b.1, b.4, rankby_abs));
 
         let names: Vec<String> = gene_entries.iter().map(|e| e.0.clone()).collect();
         let scores: Vec<f64> = gene_entries.iter().map(|e| e.1).collect();
         let pvals: Vec<f64> = gene_entries.iter().map(|e| e.2).collect();
         let logfc: Vec<f64> = gene_entries.iter().map(|e| e.3).collect();
+        let gene_indices: Vec<usize> = gene_entries.iter().map(|e| e.4).collect();
 
         // Global BH correction across ALL genes.
         let pvals_adj = benjamini_hochberg(&pvals);
 
         merged_names.push(names);
+        merged_gene_indices.push(gene_indices);
         merged_scores.push(scores);
         merged_pvals.push(pvals);
         merged_pvals_adj.push(pvals_adj);
@@ -816,6 +856,7 @@ pub fn merge_diff_exp_results(
     Ok(DiffExpResult {
         group_names,
         names: merged_names,
+        gene_indices: merged_gene_indices,
         scores: merged_scores,
         pvals: merged_pvals,
         pvals_adj: merged_pvals_adj,
@@ -1457,6 +1498,7 @@ mod tests {
             false,
             true,  // rankby_abs=true to test absolute sort (original test expectation)
             false, // tie_correct=false (match scanpy default)
+            0,
         )
         .unwrap();
 
@@ -1534,6 +1576,7 @@ mod tests {
             false,
             false,
             false,
+            0,
         )
         .unwrap();
 
@@ -1582,6 +1625,7 @@ mod tests {
             true,
             false,
             false,
+            0,
         )
         .unwrap();
 
@@ -1597,6 +1641,7 @@ mod tests {
             false,
             false,
             false,
+            0,
         )
         .unwrap();
 
@@ -1635,6 +1680,7 @@ mod tests {
         let chunk = DiffExpResult {
             group_names: vec!["A".to_string()],
             names: vec![vec!["g1".to_string(), "g2".to_string()]],
+            gene_indices: vec![vec![0, 1]],
             scores: vec![vec![3.0, 1.0]],
             pvals: vec![vec![0.001, 0.05]],
             pvals_adj: vec![vec![0.002, 0.05]],
@@ -1654,6 +1700,7 @@ mod tests {
         let chunk1 = DiffExpResult {
             group_names: vec!["G".to_string()],
             names: vec![vec!["gene_a".to_string()]],
+            gene_indices: vec![vec![0]],
             scores: vec![vec![1.0]],
             pvals: vec![vec![0.3]],
             pvals_adj: vec![vec![0.3]],
@@ -1663,6 +1710,7 @@ mod tests {
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
             names: vec![vec!["gene_b".to_string()]],
+            gene_indices: vec![vec![1]],
             scores: vec![vec![3.0]],
             pvals: vec![vec![0.001]],
             pvals_adj: vec![vec![0.001]],
@@ -1686,6 +1734,7 @@ mod tests {
         let chunk1 = DiffExpResult {
             group_names: vec!["G".to_string()],
             names: vec![vec!["gene_a".to_string()]],
+            gene_indices: vec![vec![0]],
             scores: vec![vec![2.0]],
             pvals: vec![vec![0.04]],
             pvals_adj: vec![vec![0.04]], // per-chunk BH with n=1
@@ -1695,6 +1744,7 @@ mod tests {
         let chunk2 = DiffExpResult {
             group_names: vec!["G".to_string()],
             names: vec![vec!["gene_b".to_string()]],
+            gene_indices: vec![vec![1]],
             scores: vec![vec![1.0]],
             pvals: vec![vec![0.03]],
             pvals_adj: vec![vec![0.03]],
@@ -1749,6 +1799,7 @@ mod tests {
             false,
             false,
             false,
+            0,
         )
         .unwrap();
 
@@ -1809,6 +1860,194 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── DE ranking determinism (ACC1) ──────────────────────────────────────
+
+    #[test]
+    fn test_de_rank_cmp_orders_and_tiebreaks() {
+        use std::cmp::Ordering;
+        // Higher signed score ranks first (descending).
+        assert_eq!(de_rank_cmp(3.0, 0, 1.0, 1, false), Ordering::Less);
+        assert_eq!(de_rank_cmp(1.0, 0, 3.0, 1, false), Ordering::Greater);
+        // Equal finite scores break by ascending global index.
+        assert_eq!(de_rank_cmp(2.0, 5, 2.0, 9, false), Ordering::Less);
+        assert_eq!(de_rank_cmp(2.0, 9, 2.0, 5, false), Ordering::Greater);
+        // rankby_abs: a large-magnitude negative score outranks a small positive.
+        assert_eq!(de_rank_cmp(-5.0, 0, 1.0, 1, true), Ordering::Less);
+        assert_eq!(de_rank_cmp(-5.0, 0, 1.0, 1, false), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_de_rank_cmp_nan_sorts_last() {
+        use std::cmp::Ordering;
+        // Any finite score outranks NaN (NaN sorts last).
+        assert_eq!(de_rank_cmp(f64::NAN, 0, -10.0, 1, false), Ordering::Greater);
+        assert_eq!(de_rank_cmp(-10.0, 1, f64::NAN, 0, false), Ordering::Less);
+        // Two NaN scores tie on the value and break by ascending index — a
+        // strict total order even for empty-group (all-NaN) genes.
+        assert_eq!(de_rank_cmp(f64::NAN, 2, f64::NAN, 7, false), Ordering::Less);
+        assert_eq!(
+            de_rank_cmp(f64::NAN, 7, f64::NAN, 2, false),
+            Ordering::Greater
+        );
+        // Same holds under rankby_abs (NaN.abs() is still NaN).
+        assert_eq!(de_rank_cmp(f64::NAN, 2, f64::NAN, 7, true), Ordering::Less);
+    }
+
+    /// Build a dense [n_obs × n_vars] f32 fixture (row-major) with a mix of
+    /// signal genes, constant genes (score 0.0 → finite ties), and a third
+    /// group with no cells (its genes all score NaN). `groups` labels cells
+    /// 0 and 1 only; group 2 is declared but empty.
+    fn tie_fixture() -> (Vec<f32>, usize, usize, Vec<String>, Vec<usize>, Vec<String>) {
+        let n_obs = 16;
+        let n_vars = 6;
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        for r in 0..n_obs {
+            let in_g0 = r < 8;
+            // gene 0: strong signal up in group 0.
+            data[r * n_vars] = if in_g0 { 10.0 + r as f32 } else { 1.0 };
+            // gene 1: constant 5.0 everywhere → tie-corrected score 0.0.
+            data[r * n_vars + 1] = 5.0;
+            // gene 2: all zero → constant → score 0.0.
+            // (left at 0.0)
+            // gene 3: strong signal up in group 1.
+            data[r * n_vars + 3] = if in_g0 { 1.0 } else { 10.0 + (r - 8) as f32 };
+            // gene 4: constant 2.0 → score 0.0.
+            data[r * n_vars + 4] = 2.0;
+            // gene 5: constant 7.0 → score 0.0.
+            data[r * n_vars + 5] = 7.0;
+        }
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|r| usize::from(r >= 8)).collect();
+        // Declare a third group with no member cells → empty-group NaN path.
+        let group_names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        (data, n_obs, n_vars, gene_names, groups, group_names)
+    }
+
+    fn csr_from_dense(data: &[f32], n_obs: usize, n_vars: usize) -> scx_sparse::ScxCsr {
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut vals = Vec::new();
+        for r in 0..n_obs {
+            for c in 0..n_vars {
+                let v = data[r * n_vars + c];
+                if v != 0.0 {
+                    indices.push(c as i32);
+                    vals.push(v);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr, indices, vals)
+    }
+
+    #[test]
+    fn test_ranking_deterministic_across_chunk_sizes() {
+        // Same data, single-chunk vs chunked at several gene_chunk_sizes, must
+        // produce byte-identical `names` ordering for every group — the ACC1
+        // multi-chunk-merge determinism guarantee. tie_correct=true so the
+        // constant genes land on an exact 0.0 tie that exercises the tiebreak.
+        let (data, n_obs, n_vars, gene_names, groups, group_names) = tie_fixture();
+
+        let single = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
+
+        let csr = csr_from_dense(&data, n_obs, n_vars);
+        for chunk in [1usize, 2, 3, 5, n_vars] {
+            let chunked = wilcoxon_rank_sum_sparse(
+                &csr,
+                &gene_names,
+                &groups,
+                &group_names,
+                None,
+                chunk,
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                single.group_names, chunked.group_names,
+                "group order differs at chunk={chunk}"
+            );
+            for g in 0..single.group_names.len() {
+                assert_eq!(
+                    single.names[g], chunked.names[g],
+                    "name order differs in group {} at chunk={chunk}",
+                    single.group_names[g],
+                );
+                assert_eq!(
+                    single.gene_indices[g], chunked.gene_indices[g],
+                    "gene_indices differ in group {} at chunk={chunk}",
+                    single.group_names[g],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_finite_ties_and_nan_group_ordered_by_index() {
+        // Finite-score ties break by ascending var index; an empty group's
+        // all-NaN genes sort last among themselves in ascending index order.
+        let (data, n_obs, n_vars, gene_names, groups, group_names) = tie_fixture();
+        let res = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            true,
+            0,
+        )
+        .unwrap();
+
+        // Group "C" (index 2) has no cells → every gene scores NaN, so the
+        // ranking is purely the ascending-index tiebreak = original gene order.
+        let c_pos = res.group_names.iter().position(|n| n == "C").unwrap();
+        assert!(
+            res.scores[c_pos].iter().all(|s| s.is_nan()),
+            "empty group should score all-NaN"
+        );
+        assert_eq!(
+            res.gene_indices[c_pos],
+            (0..n_vars).collect::<Vec<_>>(),
+            "all-NaN genes must be ascending-index ordered"
+        );
+        assert_eq!(res.names[c_pos], gene_names);
+
+        // Group "A": the three constant genes (1, 4, 5) and the all-zero gene
+        // (2) all tie at score 0.0; among that tie group the var indices must
+        // be ascending. Verify the subsequence of tied genes is sorted.
+        let a_pos = res.group_names.iter().position(|n| n == "A").unwrap();
+        let tied_idx: Vec<usize> = res.scores[a_pos]
+            .iter()
+            .zip(&res.gene_indices[a_pos])
+            .filter(|(s, _)| s.abs() < 1e-12)
+            .map(|(_, &i)| i)
+            .collect();
+        let mut sorted = tied_idx.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            tied_idx, sorted,
+            "tied genes must be ascending-index ordered"
+        );
     }
 
     // ── Multi-shard streaming + cache regression coverage ───────────────────

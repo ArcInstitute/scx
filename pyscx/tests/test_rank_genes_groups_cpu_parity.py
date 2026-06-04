@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 import anndata as ad
+import pandas as pd
 import scipy.sparse as sp
 
 import pyscx
@@ -128,3 +129,86 @@ def test_rank_genes_groups_cpu_unsorted_scipy_csr_matches_sorted():
         "ensure_csr(in_place=False) mutated caller's CSR — "
         "has_sorted_indices flipped to True after rank_genes_groups"
     )
+
+
+def _tie_adata() -> ad.AnnData:
+    """40 cells × 8 genes, two groups. Genes 1/3/5/6 are constant (so their
+    tie-corrected Wilcoxon score collapses to an exact 0.0 tie); genes
+    0/2/4/7 carry real per-group signal. Used to pin tie-break ordering.
+    """
+    n_obs, n_vars = 40, 8
+    rng = np.random.default_rng(0)
+    X = np.zeros((n_obs, n_vars), dtype=np.float32)
+    in_g0 = np.arange(n_obs) < 20
+    # Signal genes: separable between the two groups.
+    X[in_g0, 0] = 10.0 + rng.random(20)
+    X[~in_g0, 0] = 1.0
+    X[in_g0, 2] = 1.0
+    X[~in_g0, 2] = 9.0 + rng.random(20)
+    X[in_g0, 4] = 8.0 + rng.random(20)
+    X[~in_g0, 4] = 2.0
+    X[in_g0, 7] = 2.0
+    X[~in_g0, 7] = 7.0 + rng.random(20)
+    # Constant genes → exact score ties.
+    X[:, 1] = 5.0
+    X[:, 3] = 0.0
+    X[:, 5] = 3.0
+    X[:, 6] = 7.0
+    obs = {"target": ["g0" if i < 20 else "g1" for i in range(n_obs)]}
+    var_names = [f"gene_{i}" for i in range(n_vars)]
+    a = ad.AnnData(
+        X=sp.csr_matrix(X),
+        obs=pd.DataFrame(obs, index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=var_names),
+    )
+    return a
+
+
+def test_rank_genes_groups_cpu_tie_order_is_ascending_var_index():
+    """On equal scores, scx breaks ties by ascending var (gene) index —
+    matching scanpy's stable argsort. With `tie_correct=True` the constant
+    genes share an exact 0.0 score, so their relative order must follow
+    `adata.var_names` position. Also pins chunk-size determinism: the
+    single-chunk and gene-chunked CPU paths must produce identical orders.
+    """
+    adata = _tie_adata()
+    var_index = {name: i for i, name in enumerate(adata.var_names)}
+
+    a_full = adata.copy()
+    a_chunked = adata.copy()
+    pyscx.accel.rank_genes_groups(
+        a_full, "target", reference="rest", tie_correct=True, device="cpu"
+    )
+    pyscx.accel.rank_genes_groups(
+        a_chunked,
+        "target",
+        reference="rest",
+        tie_correct=True,
+        gene_chunk_size=2,
+        device="cpu",
+    )
+
+    rgg_full = a_full.uns["rank_genes_groups"]
+    rgg_chunked = a_chunked.uns["rank_genes_groups"]
+    groups = list(rgg_full["names"].dtype.names)
+
+    for g in groups:
+        names_full = [str(n) for n in rgg_full["names"][g]]
+        names_chunked = [str(n) for n in rgg_chunked["names"][g]]
+        # Chunk-size invariance: identical ranking regardless of chunking.
+        assert names_full == names_chunked, (
+            f"group {g}: name order differs between single-chunk and "
+            f"gene_chunk_size=2:\n  full={names_full}\n  chunked={names_chunked}"
+        )
+
+        # Among tied genes (score ≈ 0.0), var index must be strictly ascending.
+        scores = rgg_full["scores"][g]
+        tied = [
+            var_index[str(n)]
+            for n, s in zip(rgg_full["names"][g], scores)
+            if abs(float(s)) < 1e-9
+        ]
+        assert tied == sorted(tied), (
+            f"group {g}: tied genes not in ascending var-index order: {tied}"
+        )
+        assert len(tied) >= 2, f"group {g}: fixture lost its score ties"
