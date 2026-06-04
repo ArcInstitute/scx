@@ -7,7 +7,7 @@
 //!   1. GET `_catalog.bin` + `_header.bin`
 //!   2. Parse catalog → know all sections
 //!   3. Open output file, write header placeholder
-//!   4. Download sections (parallel async) → reorder buffer → sequential write
+//!   4. Download sections (ordered bounded pipeline) → sequential write
 //!   5. Write full catalog + front catalog + root catalog + header
 //!   6. fsync + atomic rename
 
@@ -180,12 +180,10 @@ pub(crate) async fn get_range_with_retry(
 
 /// Options for the pull operation.
 pub struct PullOptions {
-    /// Number of parallel download tasks (default: 8). This bounds the
-    /// number of in-flight downloads, but NOT the reorder buffer: a
-    /// low-index straggler can stall sequential writes, so the BTreeMap
-    /// reorder buffer can hold up to N completed-but-unwritten sections in
-    /// the worst case. Peak memory is therefore bounded by the total number
-    /// of matching sections, not `parallelism`.
+    /// Number of parallel download tasks (default: 8). Downloads run through
+    /// an ordered bounded pipeline (`stream::buffered`), so this bounds both
+    /// in-flight downloads *and* completed-but-unwritten sections: peak memory
+    /// is `parallelism × max_section_size` (LC2).
     pub parallelism: usize,
     /// Produce cloud-ready output with front catalog (default: true).
     pub cloud_ready: bool,
@@ -458,12 +456,10 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     //    Order: header → root catalog → front catalog region (cloud_ready)
     //         → sections (downloaded in parallel, written in order)
     //         → full catalog at EOF.
-    //    Sections are streamed in via the same reorder window the
-    //    pre-restructure code used: in-flight downloads are bounded by
-    //    `parallelism`, but the BTreeMap reorder buffer can hold up to N
-    //    completed-but-unwritten sections in the worst case (a low-index
-    //    straggler stalls `next_write_idx`), so peak memory is bounded by
-    //    the total number of matching sections, not `parallelism`.
+    //    Sections stream in through an ordered bounded pipeline
+    //    (`stream::buffered`): downloads run up to `parallelism` at a time and
+    //    are yielded in write order, so each is written as it arrives. Peak
+    //    memory is bounded by `parallelism × max_section_size` (LC2).
     let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
     let mut writer = HashingWriter::new(BufWriter::new(raw_file));
 
@@ -500,25 +496,27 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Ordered bounded pipeline (LC2): `buffered` runs up to `parallelism`
+    // downloads concurrently but yields results in input (= write) order, so
+    // each section is written as it arrives — no reorder buffer, and peak
+    // memory is bounded by `parallelism × max_section_size` as documented.
     let download_stream =
-        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+        futures::stream::iter(download_tasks.into_iter().map(|(_idx, filename)| {
             let path = make_path(&filename);
             let backend_ref = &backend;
             async move {
                 let result = get_with_retry(backend_ref.as_ref(), &path).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+                Ok::<Vec<u8>, CloudError>(result.to_vec())
             }
         }))
-        .buffer_unordered(parallelism);
+        .buffered(parallelism);
 
     futures::pin_mut!(download_stream);
 
-    let mut next_write_idx: usize = 0;
-    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     let mut write_offset = prefix_end;
-
+    let mut idx: usize = 0;
     while let Some(result) = download_stream.next().await {
-        let (idx, data) = result?;
+        let data = result?;
         let declared = ordered_entries[idx].length;
         if data.len() as u64 != declared {
             return Err(CloudError::InvalidSectionLength {
@@ -528,25 +526,23 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
             });
         }
         total_bytes_downloaded += data.len() as u64;
-        reorder_buf.insert(idx, data);
 
-        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
-            let target_offset = section_offsets[next_write_idx];
-            let pad = (target_offset - write_offset) as usize;
-            if pad > 0 {
-                writer.write_all(&ZEROS[..pad])?;
-                write_offset = target_offset;
-            }
-            debug_assert_eq!(write_offset, target_offset);
-            writer.write_all(&section_data)?;
-            write_offset += section_data.len() as u64;
-            next_write_idx += 1;
+        let target_offset = section_offsets[idx];
+        let pad = (target_offset - write_offset) as usize;
+        if pad > 0 {
+            writer.write_all(&ZEROS[..pad])?;
+            write_offset = target_offset;
         }
+        debug_assert_eq!(write_offset, target_offset);
+        writer.write_all(&data)?;
+        write_offset += data.len() as u64;
+        idx += 1;
     }
 
-    assert!(
-        reorder_buf.is_empty() && next_write_idx == ordered_entries.len(),
-        "reorder buffer not fully drained after download stream completed"
+    assert_eq!(
+        idx,
+        ordered_entries.len(),
+        "download stream yielded fewer sections than expected"
     );
 
     // Pad to align with full_catalog_offset_new, then write the full catalog.
@@ -965,10 +961,10 @@ pub async fn pull_filtered(
         write_offset += filtered_obs_bytes.len() as u64;
     }
 
-    // 8. Stream section downloads through buffer_unordered → reorder → disk.
-    //    Entries are pre-sorted into write order so the reorder window
-    //    drains sequentially. Download concurrency is capped at `parallelism`;
-    //    peak memory is bounded by `parallelism × max_section_size`.
+    // 8. Stream section downloads through an ordered bounded pipeline (LC2):
+    //    `buffered` caps concurrency at `parallelism` while yielding results in
+    //    write order, so each section is written as it arrives — no reorder
+    //    buffer, peak memory bounded by `parallelism × max_section_size`.
     let download_tasks: Vec<(usize, String)> = streamable_entries
         .iter()
         .enumerate()
@@ -981,86 +977,80 @@ pub async fn pull_filtered(
         .collect::<Result<Vec<_>>>()?;
 
     let filtered_dl_stream =
-        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+        futures::stream::iter(download_tasks.into_iter().map(|(_idx, filename)| {
             let path = make_path(&filename);
             let backend_ref = &backend;
             async move {
                 let result = get_with_retry(backend_ref.as_ref(), &path).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+                Ok::<Vec<u8>, CloudError>(result.to_vec())
             }
         }))
-        .buffer_unordered(parallelism);
+        .buffered(parallelism);
 
     futures::pin_mut!(filtered_dl_stream);
 
-    let mut next_write_idx: usize = 0;
-    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     let mut new_row_offset: u64 = 0;
+    let mut idx: usize = 0;
 
     while let Some(result) = filtered_dl_stream.next().await {
-        let (idx, data) = result?;
-        total_bytes_downloaded += data.len() as u64;
-        reorder_buf.insert(idx, data);
+        let section_data = result?;
+        total_bytes_downloaded += section_data.len() as u64;
+        let entry = streamable_entries[idx];
 
-        // Flush all contiguously available sections starting from
-        // `next_write_idx`.
-        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
-            let entry = streamable_entries[next_write_idx];
+        // Pad to 8-byte alignment
+        let aligned = align_to_8(write_offset);
+        let pad = (aligned - write_offset) as usize;
+        if pad > 0 {
+            writer.write_all(&ZEROS[..pad])?;
+            write_offset = aligned;
+        }
 
-            // Pad to 8-byte alignment
-            let aligned = align_to_8(write_offset);
-            let pad = (aligned - write_offset) as usize;
-            if pad > 0 {
-                writer.write_all(&ZEROS[..pad])?;
-                write_offset = aligned;
-            }
+        let new_offset = write_offset;
+        writer.write_all(&section_data)?;
+        write_offset += section_data.len() as u64;
 
-            let new_offset = write_offset;
-            writer.write_all(&section_data)?;
-            write_offset += section_data.len() as u64;
-
-            let new_stats = if entry.section_type == SectionType::CsrShard {
-                if let Some(old_stats) = &entry.stats {
-                    let shard_rows = old_stats.row_end - old_stats.row_start;
-                    let ns = scx_format::catalog::ShardStats {
-                        row_start: new_row_offset,
-                        row_end: new_row_offset + shard_rows,
-                        col_start: old_stats.col_start,
-                        col_end: old_stats.col_end,
-                        nnz: old_stats.nnz,
-                        value_min: old_stats.value_min,
-                        value_max: old_stats.value_max,
-                        value_sum: old_stats.value_sum,
-                        n_indexed_columns: old_stats.n_indexed_columns,
-                        column_stats: old_stats.column_stats.clone(),
-                    };
-                    new_row_offset += shard_rows;
-                    Some(ns)
-                } else {
-                    entry.stats.clone()
-                }
+        let new_stats = if entry.section_type == SectionType::CsrShard {
+            if let Some(old_stats) = &entry.stats {
+                let shard_rows = old_stats.row_end - old_stats.row_start;
+                let ns = scx_format::catalog::ShardStats {
+                    row_start: new_row_offset,
+                    row_end: new_row_offset + shard_rows,
+                    col_start: old_stats.col_start,
+                    col_end: old_stats.col_end,
+                    nnz: old_stats.nnz,
+                    value_min: old_stats.value_min,
+                    value_max: old_stats.value_max,
+                    value_sum: old_stats.value_sum,
+                    n_indexed_columns: old_stats.n_indexed_columns,
+                    column_stats: old_stats.column_stats.clone(),
+                };
+                new_row_offset += shard_rows;
+                Some(ns)
             } else {
                 entry.stats.clone()
-            };
+            }
+        } else {
+            entry.stats.clone()
+        };
 
-            new_entries.push(FullCatalogEntry {
-                name: entry.name.clone(),
-                offset: new_offset,
-                length: section_data.len() as u64,
-                section_type: entry.section_type,
-                checksum: entry.checksum,
-                modality_id: entry.modality_id,
-                stats: new_stats,
-            });
+        new_entries.push(FullCatalogEntry {
+            name: entry.name.clone(),
+            offset: new_offset,
+            length: section_data.len() as u64,
+            section_type: entry.section_type,
+            checksum: entry.checksum,
+            modality_id: entry.modality_id,
+            stats: new_stats,
+        });
 
-            next_write_idx += 1;
-        }
+        idx += 1;
     }
 
     // Sanity: all streamable sections must have been written.
-    assert!(
-        reorder_buf.is_empty() && next_write_idx == streamable_entries.len(),
-        "reorder buffer not fully drained after filtered download stream completed"
+    assert_eq!(
+        idx,
+        streamable_entries.len(),
+        "filtered download stream yielded fewer sections than expected"
     );
 
     // Phase G.1c: re-emit the ModalityTable section at EOF before
@@ -1932,10 +1922,11 @@ mod tests {
 
     // ===== Patch 5 tests =====
 
-    /// Verify the streaming reorder window drains completely and
-    /// produces correct output across multiple parallelism values.
+    /// Verify the ordered bounded download pipeline (LC2) produces
+    /// byte-identical output regardless of parallelism — `buffered` yields in
+    /// write order, so write offsets/padding are deterministic.
     #[tokio::test]
-    async fn test_pull_buffer_unordered_matches_sequential() {
+    async fn test_pull_buffered_matches_sequential() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_file(&dir, 200, 60);
         let exploded_dir = dir.path().join("exploded_stream.scxd");
@@ -1975,6 +1966,15 @@ mod tests {
         assert_eq!(csr_seq.indptr, csr_par.indptr);
         assert_eq!(csr_seq.indices, csr_par.indices);
         assert_eq!(csr_seq.data, csr_par.data);
+
+        // LC2: ordered pipeline ⇒ the on-disk files are byte-identical, not
+        // merely semantically equal.
+        let bytes_seq = std::fs::read(&out_seq).unwrap();
+        let bytes_par = std::fs::read(&out_par).unwrap();
+        assert_eq!(
+            bytes_seq, bytes_par,
+            "parallelism must not change the on-disk byte layout"
+        );
     }
 
     /// Verify that the streaming reorder window does NOT buffer all
