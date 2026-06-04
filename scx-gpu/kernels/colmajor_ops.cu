@@ -174,6 +174,15 @@ extern "C" __global__ void scale_columns_kernel(
 //
 // Thread-per-nonzero, using atomicAdd on f64 (requires compute 6.x+).
 //
+// DETERMINISM (finding ACC6): the cross-block f64 atomicAdd makes the per-column
+// summation order nondeterministic, so the resulting Σx/Σx² can differ at the
+// last bits run-to-run and vs the CPU path. With the host-side Σx²−n·mean²
+// finalisation this can flip near-constant-gene HVG membership at a cutoff. The
+// CSC reduction (csc_col_mean_sq_reduce_kernel, one block per column, no
+// cross-block atomics) is deterministic; prefer it when reproducibility matters.
+// A deterministic CSR reduction emitting Welford (count, mean, M2) moments is a
+// tracked follow-on.
+//
 // total threads = nnz
 extern "C" __global__ void col_sum_sq_nonzeros_kernel(
     const int* __restrict__ indices,

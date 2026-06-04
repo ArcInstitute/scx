@@ -11,6 +11,16 @@
 // All kernels assume row/col indexing described above; callers must respect
 // the contract or they will silently corrupt the computation.
 
+#include <cassert>
+
+// The shared-memory tree reductions in this file (`for (s = bsize >> 1; s > 0;
+// s >>= 1)`) assume a power-of-two block size: a non-pow2 block drops the odd
+// top partial and silently under-counts the reduction. Every launch site uses
+// pow2 blocks (callers double from 32), so the bug is latent — this guard turns
+// a future non-pow2 launch into a device-side trap instead of a silent wrong
+// result (finding ACC2). Asserted once per affected kernel after `bsize` is set.
+#define SCX_ASSERT_POW2_BLOCK() assert((blockDim.x & (blockDim.x - 1)) == 0)
+
 // ──────────────────────────────────────────────────────────────────────
 // Kernel 1 — Pairwise cosine distance (cell-tiled).
 //
@@ -112,6 +122,7 @@ extern "C" __global__ void harmony_softmax_penalty_kernel(
     extern __shared__ float smem[];          // size blockDim.x floats
     int tid = threadIdx.x;
     int bsize = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
 
     // Pass 1: compute the log-weight l[k] = -dist[k,i]/sigma[k] + sum_c theta_c * log_ratio_c
     // and its per-block max for numerical stabilization.
@@ -229,6 +240,7 @@ extern "C" __global__ void harmony_softmax_kernel(
     extern __shared__ float smem[];
     int tid = threadIdx.x;
     int bsize = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
 
     // Pass 1: l[k] = -dist/sigma; per-block max for numerical stability.
     float local_max = -INFINITY;
@@ -313,6 +325,7 @@ extern "C" __global__ void harmony_block_softmax_penalty_kernel(
     extern __shared__ float smem[];
     int tid = threadIdx.x;
     int bsize = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
 
     // Pass 1: l[k] = -dist/sigma + Σ_c θ_c * log(ratio_c); per-block max.
     float local_max = -INFINITY;
@@ -501,6 +514,7 @@ extern "C" __global__ void harmony_obj_kmeans_entropy_kernel(
     extern __shared__ float smem[];
     int tid = threadIdx.x;
     int bsize = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
 
     float local = 0.0f;
     for (int k = tid; k < K; k += bsize) {

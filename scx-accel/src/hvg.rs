@@ -17,6 +17,26 @@ pub struct HvgStats {
     pub variances: Vec<f64>,
 }
 
+/// Reject non-finite values at the HVG accelerator boundary.
+///
+/// NaN/Inf cannot be summarised into a meaningful mean/variance and would
+/// silently poison HVG selection. This is the HVG analogue of the DE boundary
+/// check ([`crate::diffexp`]'s `ensure_finite_de_input`): finiteness is a
+/// contract at the accelerator entry, validated where the streaming pass
+/// already touches every nonzero — not at file ingest. (The GPU HVG path does
+/// not yet enforce this on-device; tracked as a follow-on.)
+fn ensure_finite_hvg_data(data: &[f32]) -> Result<()> {
+    if let Some(pos) = data.iter().position(|v| !v.is_finite()) {
+        return Err(crate::error::AccelError::InvalidInput(format!(
+            "HVG input contains a non-finite value ({}) at nonzero index {pos}; \
+             highly-variable-gene selection requires finite input — filter/QC NaN \
+             and Inf before computing variance",
+            data[pos]
+        )));
+    }
+    Ok(())
+}
+
 /// Single-pass streaming mean and variance per column.
 ///
 /// Accumulates per-column sum and sum-of-squares in f64, then computes:
@@ -56,6 +76,7 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
             let v = val as f64;
@@ -91,6 +112,11 @@ pub fn streaming_mean_var<S: ShardSource>(source: &S) -> Result<HvgStats> {
 /// Returns `(batch_counts_sum, squared_batch_counts_sum)` — both `Vec<f64>` of
 /// length `n_vars`.
 ///
+/// Rejects non-finite input (NaN/Inf) at the accelerator boundary via
+/// [`ensure_finite_hvg_data`], mirroring [`streaming_mean_var`]: a NaN clips to
+/// `clip_val[c]` (Rust's `f64::min` returns the non-NaN operand) and would
+/// silently poison the clipped sums otherwise.
+///
 /// Memory: O(n_vars).
 pub fn streaming_clip_square_sum<S: ShardSource>(
     source: &S,
@@ -104,6 +130,7 @@ pub fn streaming_clip_square_sum<S: ShardSource>(
 
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
             let c = col as usize;
             let v = (val as f64).min(clip_val[c]);
@@ -150,6 +177,7 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
     let mut cell_offset = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         let n_rows = csr.n_rows();
 
         for row in 0..n_rows {
@@ -230,6 +258,9 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
 ///
 /// `clip_vals[batch][gene]` is the clip threshold for each batch/gene pair.
 ///
+/// Rejects non-finite input (NaN/Inf) at the accelerator boundary via
+/// [`ensure_finite_hvg_data`], mirroring [`streaming_mean_var_batched`].
+///
 /// Memory: O(n_vars * n_batches).
 pub fn streaming_clip_square_sum_batched<S: ShardSource>(
     source: &S,
@@ -246,6 +277,7 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
     let mut cell_offset = 0usize;
     for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
+        ensure_finite_hvg_data(&csr.data)?;
         let n_rows = csr.n_rows();
 
         for row in 0..n_rows {
@@ -523,6 +555,39 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_mean_var_rejects_non_finite() {
+        // 3.2: finiteness is a contract at the HVG accelerator entry. A NaN/Inf
+        // in the working set is rejected, not silently summarised into garbage.
+        let shard = ScxCsr::new_unchecked(
+            (2, 2),
+            vec![0, 2, 3],
+            vec![0, 1, 0],
+            vec![1.0, f32::NAN, 2.0],
+        );
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_mean_var(&source).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AccelError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // The batched entry enforces the same contract.
+        let shard =
+            ScxCsr::new_unchecked((2, 2), vec![0, 1, 2], vec![0, 1], vec![f32::INFINITY, 2.0]);
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_mean_var_batched(&source, &[0, 0], 1).unwrap_err();
+        assert!(matches!(err, crate::error::AccelError::InvalidInput(_)));
+    }
+
+    #[test]
     fn test_streaming_clip_square_sum() {
         let source = make_test_source();
         // clip_val = [2.0, 3.0, 4.0] per column
@@ -541,6 +606,42 @@ mod tests {
         assert!((sbcs[0] - 5.0).abs() < 1e-10);
         assert!((sbcs[1] - 13.0).abs() < 1e-10);
         assert!((sbcs[2] - 25.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_streaming_clip_square_sum_rejects_non_finite() {
+        // 3.2: the clipped-sum (seurat_v3 second pass) helpers enforce the same
+        // finiteness contract as the mean/var entries. Without it a NaN clips to
+        // clip_val (Rust's f64::min returns the non-NaN operand) and silently
+        // poisons the clipped sums.
+        let shard = ScxCsr::new_unchecked(
+            (2, 2),
+            vec![0, 2, 3],
+            vec![0, 1, 0],
+            vec![1.0, f32::NAN, 2.0],
+        );
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_clip_square_sum(&source, &[10.0, 10.0]).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AccelError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // The batched entry enforces the same contract (Inf case).
+        let shard =
+            ScxCsr::new_unchecked((2, 2), vec![0, 1, 2], vec![0, 1], vec![f32::INFINITY, 2.0]);
+        let source = InMemorySource {
+            shards: vec![shard],
+            n_obs: 2,
+            n_vars: 2,
+        };
+        let err = streaming_clip_square_sum_batched(&source, &[0, 0], 1, &[vec![10.0, 10.0]])
+            .unwrap_err();
+        assert!(matches!(err, crate::error::AccelError::InvalidInput(_)));
     }
 
     #[test]
