@@ -98,6 +98,50 @@ pub fn run_query(
         pipeline = pipeline.with_log1p();
     }
 
+    // Count-only fast path (CLI2): plan + mask without decoding X. `count()`
+    // ignores `limit` entirely, so `--count --limit` reports the true matched
+    // count rather than `min(matched, limit)` (CLI6).
+    if count {
+        let c = pipeline.count()?;
+        let candidate_shards = c.total_shards - c.skipped_shards;
+        eprintln!(
+            "Pushdown: {}/{} shards eliminated by catalog stats (Level 1); \
+             {} of {} candidate-shard rows matched (Level 2 index/row-eval)",
+            c.skipped_shards, c.total_shards, c.matched_rows, c.candidate_shard_rows,
+        );
+        if explain {
+            eprintln!("Query plan (explain):");
+            eprintln!("  source: {source}");
+            eprintln!("  obs filter: {filter}");
+            eprintln!("  total shards: {}", c.total_shards);
+            eprintln!(
+                "  Level 1 (catalog-stats) eliminated: {}/{}",
+                c.skipped_shards, c.total_shards
+            );
+            eprintln!(
+                "  Level 2 candidate shards: {}, candidate rows: {}",
+                candidate_shards, c.candidate_shard_rows
+            );
+            eprintln!("  matched rows: {}", c.matched_rows);
+            if let Some(line) = format_level2_eliminations(c.candidate_shard_rows, c.matched_rows) {
+                eprintln!("{line}");
+            }
+        }
+        if json {
+            let json_out = serde_json::json!({
+                "count": c.matched_rows,
+                "skipped_shards": c.skipped_shards,
+                "total_shards": c.total_shards,
+                "candidate_shard_rows": c.candidate_shard_rows,
+                "matched_rows": c.matched_rows,
+            });
+            println!("{}", serde_json::to_string_pretty(&json_out)?);
+        } else {
+            println!("{}", c.matched_rows);
+        }
+        return Ok(());
+    }
+
     if let Some(n) = limit {
         pipeline = pipeline.limit(n);
     }
@@ -159,22 +203,6 @@ pub fn run_query(
         if result.matched_rows != n_cells {
             eprintln!("  returned rows (post-limit): {n_cells}");
         }
-    }
-
-    if count {
-        if json {
-            let json_out = serde_json::json!({
-                "count": n_cells,
-                "skipped_shards": result.skipped_shards,
-                "total_shards": result.total_shards,
-                "candidate_shard_rows": result.candidate_shard_rows,
-                "matched_rows": result.matched_rows,
-            });
-            println!("{}", serde_json::to_string_pretty(&json_out)?);
-        } else {
-            println!("{}", n_cells);
-        }
-        return Ok(());
     }
 
     if let Some(out_path) = output {

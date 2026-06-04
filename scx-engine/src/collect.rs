@@ -162,24 +162,48 @@ pub fn filter_csr_rows(
 // F2. Pipeline execution
 // ============================================================================
 
-/// Execute a QueryPipeline and return the query result.
-///
-/// This is the main entry point called by `QueryPipeline::collect()`.
-/// Execution steps (from docs/api.md (Query engine)):
-///  1. Build plan (catalog-level pruning)
-///  2. Read obs metadata
-///  3. Evaluate obs predicates → boolean mask
-///  4. Apply deletion vectors to mask
-///  5. Map cells to shards
-///  6. Handle var predicates + gene projection
-///  7. Parallel shard decode with optional projection
-///  8. Assemble CSR from per-shard results
-///  9. Apply fused normalize+log1p
-/// 10. Apply limit
-/// 11. Filter obs/var metadata
-/// 12. Return QueryResult
-pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
-    let plan = build_plan(&pipeline)?;
+// Query execution is split into two halves (CLI2): `plan_and_mask` does the
+// cheap work — (1) build plan / catalog-level pruning, (2) read obs metadata,
+// (3) evaluate obs predicates → boolean mask, (4) apply deletion vectors,
+// (5) map cells to shards / build keep masks, (6) var predicates + gene
+// projection — without decoding any X shard. `materialize` does the expensive
+// rest — (7) parallel shard decode, (8) assemble CSR, (9) fused normalize+log1p,
+// (10) apply limit, (11) filter obs/var, (12) return QueryResult. `execute`
+// runs both; `count` runs only the first and returns the match count.
+
+/// Per-shard row range + local keep mask produced by `plan_and_mask`.
+struct ShardInfo {
+    shard_idx: usize,
+    row_start: u64,
+    #[allow(dead_code)] // retained for debugging and future use
+    row_end: u64,
+    local_keep_mask: Vec<bool>,
+}
+
+/// Result of the cheap planning + masking half of a query (CLI2): catalog
+/// shard elimination, obs/var predicate evaluation, per-shard row-keep masks,
+/// and gene projection — everything computable **without decoding any X
+/// shard**. Consumed by [`materialize`] (full result) or summarised by
+/// [`count`] (matched-row count only).
+struct PlanAndMask {
+    plan: ExecutionPlan,
+    obs_batch: RecordBatch,
+    var_batch: RecordBatch,
+    shard_infos: Vec<ShardInfo>,
+    effective_gene_indices: Option<Vec<u32>>,
+    n_output_cols: usize,
+    skipped_shards: usize,
+    total_shards: usize,
+    candidate_shard_rows: usize,
+    /// Pre-limit Level-2 match count = Σ `local_keep_mask` trues. Equals
+    /// `csr.n_rows()` after materialisation, but needs no decode.
+    matched_rows: usize,
+}
+
+/// Cheap half of query execution: catalog pruning + obs/var predicate
+/// evaluation + per-shard row-keep masks + gene projection. No X-shard decode.
+fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
+    let plan = build_plan(pipeline)?;
     let reader = pipeline.reader();
     let n_vars = reader.header().n_vars as usize;
 
@@ -239,17 +263,6 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 5: Map matching cells to shards
     // Build per-shard keep masks (local row indices)
     let sorted_shards = reader.catalog().shards_sorted();
-    let _candidate_set: std::collections::HashSet<usize> =
-        plan.candidate_shards.iter().map(|c| c.shard_idx).collect();
-
-    // Build shard row ranges from stats
-    struct ShardInfo {
-        shard_idx: usize,
-        row_start: u64,
-        #[allow(dead_code)] // retained for debugging and future use
-        row_end: u64,
-        local_keep_mask: Vec<bool>,
-    }
 
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
     for sc in &plan.candidate_shards {
@@ -326,6 +339,64 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
         .as_ref()
         .map_or(n_vars, |gi| gi.len());
 
+    // Pre-limit Level-2 match count, computed from the keep masks alone — no
+    // X decode required (CLI2/CLI6). Equals `csr.n_rows()` post-materialise.
+    let matched_rows: usize = shard_infos
+        .iter()
+        .map(|si| si.local_keep_mask.iter().filter(|&&k| k).count())
+        .sum();
+
+    Ok(PlanAndMask {
+        plan,
+        obs_batch,
+        var_batch,
+        shard_infos,
+        effective_gene_indices,
+        n_output_cols,
+        skipped_shards,
+        total_shards,
+        candidate_shard_rows,
+        matched_rows,
+    })
+}
+
+/// Execute a query, materialising the full [`QueryResult`].
+pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
+    let pm = plan_and_mask(&pipeline)?;
+    materialize(&pipeline, pm)
+}
+
+/// Count matching rows without decoding `X` (CLI2). Ignores `limit` entirely,
+/// so `--count --limit` cannot misreport (CLI6).
+pub fn count(pipeline: &QueryPipeline) -> Result<crate::pipeline::CountResult> {
+    let pm = plan_and_mask(pipeline)?;
+    Ok(crate::pipeline::CountResult {
+        matched_rows: pm.matched_rows,
+        skipped_shards: pm.skipped_shards,
+        total_shards: pm.total_shards,
+        candidate_shard_rows: pm.candidate_shard_rows,
+    })
+}
+
+/// Expensive half of query execution: decode matching shards, assemble the CSR
+/// matrix, apply fused ops + limit, and filter obs/var metadata to the result.
+fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult> {
+    let PlanAndMask {
+        plan,
+        obs_batch,
+        var_batch,
+        shard_infos,
+        effective_gene_indices,
+        n_output_cols,
+        skipped_shards,
+        total_shards,
+        candidate_shard_rows,
+        matched_rows,
+    } = pm;
+
+    let reader = pipeline.reader();
+    let sorted_shards = reader.catalog().shards_sorted();
+
     // Step 7: Parallel shard decode with optional projection
     // Each shard produces (indptr, indices, data) filtered to matching rows
     let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shard_infos
@@ -384,10 +455,11 @@ pub fn execute(pipeline: QueryPipeline) -> Result<QueryResult> {
     // Step 9: Apply fused normalize+log1p
     apply_fused_ops(&mut csr, plan.normalize, plan.log1p);
 
-    // Capture the pre-limit Level-2 match
-    // count so the CLI's pushdown / --explain output isn't confused by
-    // `--limit N` (which truncates `csr` below).
-    let matched_rows = csr.n_rows();
+    // `matched_rows` (pre-limit Level-2 count) was computed in `plan_and_mask`
+    // from the keep masks and equals `csr.n_rows()` here. Asserting their
+    // equality keeps the mask-only `count()` path honest against the decode
+    // path without re-deriving it.
+    debug_assert_eq!(matched_rows, csr.n_rows());
 
     // Step 10: Apply limit
     if let Some(limit) = plan.limit {
@@ -747,6 +819,67 @@ mod tests {
         assert_eq!(result.obs.num_rows(), 6);
         // No truncation occurred — matched_rows must equal returned rows.
         assert_eq!(result.matched_rows, result.x.n_rows());
+    }
+
+    #[test]
+    fn count_matches_collect_matched_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 5);
+        // No predicate: every cell matches.
+        let c = QueryPipeline::open(&path).unwrap().count().unwrap();
+        assert_eq!(c.matched_rows, 12);
+        let result = QueryPipeline::open(&path).unwrap().collect().unwrap();
+        assert_eq!(c.matched_rows, result.matched_rows);
+        assert_eq!(c.total_shards, result.total_shards);
+        assert_eq!(c.skipped_shards, result.skipped_shards);
+        assert_eq!(c.candidate_shard_rows, result.candidate_shard_rows);
+    }
+
+    #[test]
+    fn count_with_predicate_matches_collect() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 5);
+        // count() and collect().matched_rows must agree for the same predicate,
+        // even though count() never decodes X.
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap();
+        let c = pipeline.count().unwrap();
+        let result = pipeline.collect().unwrap();
+        assert_eq!(c.matched_rows, result.matched_rows);
+        assert_eq!(c.matched_rows, result.x.n_rows());
+    }
+
+    #[test]
+    fn count_ignores_limit() {
+        // CLI6: count() reports the true match count regardless of `limit`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 5);
+        let no_limit = QueryPipeline::open(&path).unwrap().count().unwrap();
+        let with_limit = QueryPipeline::open(&path)
+            .unwrap()
+            .limit(3)
+            .count()
+            .unwrap();
+        assert_eq!(no_limit.matched_rows, 12);
+        assert_eq!(
+            with_limit.matched_rows, no_limit.matched_rows,
+            "limit must not change the counted match total"
+        );
+    }
+
+    #[test]
+    fn count_empty_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 5);
+        let c = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_id == 'nonexistent'")
+            .unwrap()
+            .count()
+            .unwrap();
+        assert_eq!(c.matched_rows, 0);
     }
 
     #[test]

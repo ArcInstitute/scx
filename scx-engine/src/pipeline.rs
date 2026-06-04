@@ -45,6 +45,23 @@ pub struct QueryResult {
     pub matched_rows: usize,
 }
 
+/// Result of a count-only query ([`QueryPipeline::count`]): the matched-row
+/// count plus pushdown statistics, computed **without decoding the X matrix**
+/// (CLI2) and **without applying `limit`** (CLI6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountResult {
+    /// Number of rows matching the obs predicate (Level 2). This is the true
+    /// match count — `limit` is never applied on the count path.
+    pub matched_rows: usize,
+    /// Number of shards skipped by Level 1 (catalog-stats) pushdown.
+    pub skipped_shards: usize,
+    /// Total number of shards in the file.
+    pub total_shards: usize,
+    /// Sum of rows in candidate shards that survived Level 1 pushdown, before
+    /// Level 2 narrowing.
+    pub candidate_shard_rows: usize,
+}
+
 impl std::fmt::Debug for QueryResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryResult")
@@ -182,6 +199,17 @@ impl QueryPipeline {
     /// pipeline: pushdown → decode → projection → filter → fused ops.
     pub fn collect(self) -> Result<QueryResult> {
         crate::collect::execute(self)
+    }
+
+    /// Count matching rows without decoding the X matrix (CLI2).
+    ///
+    /// Runs only the planning + masking half (`pushdown → obs/var predicate
+    /// evaluation → row-keep masks`); no CSR shard payload is decoded and no
+    /// fused transform runs. `limit` is **not** applied — the returned count is
+    /// the true Level-2 match count, so `--count --limit` cannot misreport
+    /// (CLI6). Takes `&self` so the same pipeline can still be `collect`ed.
+    pub fn count(&self) -> Result<CountResult> {
+        crate::collect::count(self)
     }
 
     // -- Accessors for testing and collect.rs --

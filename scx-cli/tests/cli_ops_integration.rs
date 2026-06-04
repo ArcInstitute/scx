@@ -367,6 +367,38 @@ fn test_query_count() {
     assert_eq!(stdout.trim(), "4");
 }
 
+// CLI6 regression: `--count` reports the true match count and is NOT capped
+// by `--limit` (which is output-only). Previously `--count --limit 1` printed
+// `min(matched, 1) = 1`.
+#[test]
+fn test_query_count_ignores_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "query_count_limit.scx", 12, 10);
+
+    let output = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "cell_type == 'T cell'",
+            "--count",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query --count --limit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "4",
+        "--count must report the true match count regardless of --limit"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Query --count --json
 // ---------------------------------------------------------------------------
