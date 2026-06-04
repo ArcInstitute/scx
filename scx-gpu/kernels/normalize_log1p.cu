@@ -31,6 +31,8 @@ extern "C" __global__ void normalize_log1p_kernel(
     for (long long i = start; i < end; i++) {
         sum += data[i];
     }
+    // Correct: an all-zero/net-zero row stays zero (scale undefined, log1p(0)=0).
+    // One thread per row here, so the return is trivially uniform.
     if (sum == 0.0f) return;
 
     // Normalize + log1p
@@ -200,6 +202,10 @@ __device__ __forceinline__ void normalize_warp_row(
     float sum = warp_reduce_sum(partial);
     // Broadcast the lane-0 total to all lanes.
     sum = __shfl_sync(0xffffffff, sum, 0);
+    // Correct: an all-zero/net-zero row stays zero (scale undefined, log1p(0)=0).
+    // Warp-uniform because it follows the collective reduce + broadcast — every
+    // lane sees the same `sum`. MUST stay after the reduction/broadcast or the
+    // divergent return would deadlock the warp-cooperative __shfl_sync.
     if (sum == 0.0f) return;
 
     float scale = target_sum / sum;
@@ -247,6 +253,10 @@ __device__ __forceinline__ void normalize_block_row(
         partial += data[i];
     }
     float sum = block_reduce_sum(partial);
+    // Correct: an all-zero/net-zero row stays zero (scale undefined, log1p(0)=0).
+    // Block-uniform because it follows the collective reduce — every thread sees
+    // the same `sum`. MUST stay after the reduction or the divergent return
+    // would deadlock the __syncthreads inside block_reduce_sum.
     if (sum == 0.0f) return;
 
     float scale = target_sum / sum;

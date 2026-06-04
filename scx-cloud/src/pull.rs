@@ -314,10 +314,12 @@ async fn get_with_retry(
 
 /// Options for the pull operation.
 pub struct PullOptions {
-    /// Number of parallel download tasks (default: 8). Also bounds the
-    /// reorder window: at most `parallelism` completed-but-out-of-order
-    /// sections are held in memory while waiting for the next sequential
-    /// write.
+    /// Number of parallel download tasks (default: 8). This bounds the
+    /// number of in-flight downloads, but NOT the reorder buffer: a
+    /// low-index straggler can stall sequential writes, so the BTreeMap
+    /// reorder buffer can hold up to N completed-but-unwritten sections in
+    /// the worst case. Peak memory is therefore bounded by the total number
+    /// of matching sections, not `parallelism`.
     pub parallelism: usize,
     /// Produce cloud-ready output with front catalog (default: true).
     pub cloud_ready: bool,
@@ -591,8 +593,11 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     //         → sections (downloaded in parallel, written in order)
     //         → full catalog at EOF.
     //    Sections are streamed in via the same reorder window the
-    //    pre-restructure code used, so peak memory is still bounded by
-    //    `parallelism × max_section_size`.
+    //    pre-restructure code used: in-flight downloads are bounded by
+    //    `parallelism`, but the BTreeMap reorder buffer can hold up to N
+    //    completed-but-unwritten sections in the worst case (a low-index
+    //    straggler stalls `next_write_idx`), so peak memory is bounded by
+    //    the total number of matching sections, not `parallelism`.
     let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
     let mut writer = HashingWriter::new(BufWriter::new(raw_file));
 

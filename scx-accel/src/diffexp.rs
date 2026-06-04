@@ -325,6 +325,16 @@ fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
 /// `tie_correction` is `Σ (t³ - t)` over tie groups, used in the variance
 /// formula for the Wilcoxon test. Shared across all group comparisons for
 /// the same gene, since ties are a property of the value distribution.
+///
+/// # Precondition
+///
+/// `values` MUST be NaN-free. This contract is enforced **only** by a
+/// `debug_assert!` below; in release builds it is unchecked and the function
+/// relies on upstream QC having removed NaNs. If a NaN does slip through in a
+/// release build, the `partial_cmp` fallback orders it as `Ordering::Equal`,
+/// so it is placed arbitrarily in the sort and produces meaningless ranks (and
+/// a garbage p-value downstream) rather than panicking. Callers must guarantee
+/// finite input.
 fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f64>) -> f64 {
     // NaN values would be silently ordered as `Equal` by the fallback below,
     // producing a meaningless rank and a garbage p-value downstream. In debug

@@ -24,7 +24,7 @@ pub struct ShardHeader {
     pub shard_format_version: u8,
     /// Shard type (0=CSR, 1=CSC)
     pub shard_type: u8,
-    /// Codec ID (0=None, 1=Scx1, 2=Zstd) — overrides file header
+    /// Codec ID (0=None, 1=Scx1, 2=Zstd, 3=Lz4Shuffle, 4=Pcodec) — overrides file header
     pub codec_id: u8,
     /// Value encoding (0=u8, 1=u16, 2=u32, 3=f32, 4=f16)
     pub value_encoding: u8,

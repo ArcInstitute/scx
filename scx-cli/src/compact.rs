@@ -91,17 +91,30 @@ pub fn run_compact(
         0.0
     };
 
+    // Display-only: `reduction` is negative when the output grew, so label
+    // the printed percentage by sign and report the absolute value.
+    let (pct, label) = if after_size < before_size {
+        (reduction, "reduction")
+    } else if after_size > before_size {
+        (-reduction, "increase")
+    } else {
+        (0.0, "unchanged")
+    };
     println!(
-        "Compacted {} -> {} ({} -> {}, {:.1}% reduction)",
+        "Compacted {} -> {} ({} -> {}, {:.1}% {})",
         input.display(),
         output.display(),
         human_size(before_size),
         human_size(after_size),
-        reduction,
+        pct,
+        label,
     );
 
     // Re-emit the CSC sidecar against the compacted output.
     if rebuild_csc {
+        // Fixed 4 GiB transpose memory budget for the post-op CSC rebuild;
+        // not overridable here. `scx build-csc --memory-limit` is the
+        // configurable counterpart.
         scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }

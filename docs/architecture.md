@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 14 crates (including `scx-integration-tests`). Dependencies flow bottom-up:
+The workspace contains 14 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐

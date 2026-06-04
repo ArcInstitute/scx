@@ -1191,18 +1191,13 @@ fn read_obsm_entry(obsm_group: &hdf5::Group, name: &str) -> Result<RecordBatch, 
 
 /// Describes a dense obsm/varm dataset without reading any value bytes.
 /// Returned by [`list_dense_mapping_shapes`] so the pipeline can pre-plan
-/// the per-key shard schedule from h5py metadata only.
-///
-/// `n_cols` is unused by the current pipeline (the per-shard read in
-/// [`read_dense_mapping_shard`] re-derives it from the dataset shape)
-/// but is carried here so callers wanting to budget total memory ahead
-/// of time can do so without a second hdf5 open.
+/// the per-key shard schedule from h5py metadata only. The per-shard
+/// read in [`read_dense_mapping_shard`] re-derives the column count from
+/// the dataset shape, so only the row count is carried here.
 #[derive(Debug, Clone)]
 pub struct DenseMappingInfo {
     pub name: String,
     pub n_rows: usize,
-    #[allow(dead_code)]
-    pub n_cols: usize,
 }
 
 /// Walk `<group_path>` in `file` and return each member's name + shape.
@@ -1230,7 +1225,6 @@ pub fn list_dense_mapping_shapes(
         result.push(DenseMappingInfo {
             name: name.clone(),
             n_rows: shape[0],
-            n_cols: shape[1],
         });
     }
     Ok(result)

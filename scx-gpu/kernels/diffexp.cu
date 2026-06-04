@@ -4,7 +4,8 @@
 // per-gene block radix sort (CUB), batched warp-cooperative searchsorted,
 // merge-walk combined tie term, and on-device normal-tail p-value via erfc.
 // Mirrors the CPU formulae in `scx-accel/src/diffexp.rs`:
-//   * U1 = Σ_i (n_ref_less(x_i) + 0.5 · n_ref_equal(x_i))      // ref vs group
+//   * U1 = Σ_i (n_ref_less(x_i) + 0.5 · n_ref_equal(x_i))      // group's U:
+//     for each group value x_i, count ref values it exceeds (+½ per tie)
 //   * Tie correction = Σ_v (c_v^3 − c_v) over distinct values v with count c_v
 //   * z = (U1 − μ) / σ;   σ² = (n1·n2/12) · ((N+1) − tc / (N·(N−1)))
 //   * p = erfc(|z| / √2)                                       // two-sided
@@ -456,6 +457,13 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
 // `merge_pass_per_gene_kernel` (tiled bottom-up merge sort).
 //
 // Grid: 1D (chunk_size). Block: BLOCK_THREADS.
+//
+// Precondition: input MUST be finite. The kernel pads with +INF and sorts on
+// the raw IEEE-754 bit pattern (cub::BlockRadixSort), so a NaN — whose bit
+// pattern lies above +INF / outside the normal ordering — would land at the
+// wrong position and corrupt the downstream U statistic and tie counts.
+// Callers must guarantee finite input (the CPU side enforces this with a
+// debug assert in `rank_with_ties`).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void block_radix_sort_per_gene_kernel(
     float* __restrict__ slab,
@@ -1091,7 +1099,9 @@ extern "C" __global__ void combined_tie_term_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Batched searchsorted U1: U1 = Σ_i (n_ref_less(x_i) + 0.5 · n_ref_equal(x_i))
+// Batched searchsorted U1 (the group's Mann-Whitney U): for each group value
+// x_i, count the ref values it exceeds (+½ per tie):
+//   U1 = Σ_i (n_ref_less(x_i) + 0.5 · n_ref_equal(x_i))
 // for x_i in group_slab[gene, :] against sorted_ref[gene, :].
 //
 // One block per gene; threads stride over the group cells, partial sums are

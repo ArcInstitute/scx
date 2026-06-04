@@ -66,7 +66,7 @@ pub struct FileHeader {
     pub n_csc_shards: u32,
     /// Target rows per shard
     pub shard_target_rows: u32,
-    /// Codec ID (0=None, 1=Scx1, 2=Zstd)
+    /// Codec ID (0=None, 1=Scx1, 2=Zstd, 3=Lz4Shuffle, 4=Pcodec)
     pub codec_id: u8,
     /// Index dtype (0=u16, 1=u32)
     pub index_dtype: u8,

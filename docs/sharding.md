@@ -13,9 +13,9 @@ indptr/indices/values arrays, and block index.
 ```
 Expression matrix (n_obs × n_vars)
 ┌─────────────────────────────┐
-│  rows 0 – 9999              │ → CSR Shard 0
-│  rows 10000 – 19999         │ → CSR Shard 1
-│  rows 20000 – 29999         │ → CSR Shard 2
+│  rows 0 – 16383             │ → CSR Shard 0
+│  rows 16384 – 32767         │ → CSR Shard 1
+│  rows 32768 – 49151         │ → CSR Shard 2
 │  ...                        │ → ...
 │  rows K – n_obs             │ → CSR Shard N-1
 └─────────────────────────────┘
@@ -29,9 +29,7 @@ bitsets** that power predicate pushdown.
 
 | Context | Default rows per shard |
 |---------|------------------------|
-| CLI (`scx convert`, `scx append`, `scx subset`) | **10,000** |
-| Python (`pyscx.from_anndata`, `pyscx.append`, etc.) | **16,384** |
-| R (`rscx::scx_from_seurat`, `rscx::scx_from_sce`) | **16,384** |
+| All entry points (CLI, Python, R) | **16,384** (`DEFAULT_SHARD_TARGET_ROWS`) |
 
 > [!TIP]
 > The default is a good starting point for most datasets. Smaller shards
@@ -41,14 +39,14 @@ bitsets** that power predicate pushdown.
 
 ### Shard sizing guidelines
 
-At 5% density with 30K genes, a 10K-row shard contains ~15M non-zero values and
-compresses to ~30–60 MB. Key considerations:
+At 5% density with 30K genes, a 16,384-row shard contains ~24M non-zero values and
+compresses to ~50–100 MB. Key considerations:
 
 - **Query engine**: Smaller shards → more granular predicate pushdown → fewer cells
   read for selective queries. Diminishing returns below ~1,000 rows.
 - **Training loader**: The triple-buffered pipeline (see [architecture.md §Training Data Loader](architecture.md#training-data-loader-scx-loader)) reads full shards
   sequentially. Very small shards add per-shard overhead; very large shards delay
-  shuffling. The default of 10K–16K rows is a good balance.
+  shuffling. The default of 16,384 rows is a good balance.
 - **Cloud access**: The exploded `.scxd` layout stores each shard as a separate
   object. Shard coalescing (merging adjacent range reads) works best when shards
   are large enough to amortize per-request latency (~30–100 MB).
@@ -60,7 +58,7 @@ compresses to ~30–60 MB. Key considerations:
 ### Setting shard size during conversion
 
 ```bash
-# Convert h5ad → SCX with 10,000 rows per shard (default)
+# Convert h5ad → SCX with 16,384 rows per shard (default)
 scx convert experiment.h5ad experiment.scx
 
 # Use a custom shard size
