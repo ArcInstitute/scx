@@ -7,7 +7,7 @@
 //!   1. GET `_catalog.bin` + `_header.bin`
 //!   2. Parse catalog → know all sections
 //!   3. Open output file, write header placeholder
-//!   4. Download sections (parallel async) → reorder buffer → sequential write
+//!   4. Download sections (ordered bounded pipeline) → sequential write
 //!   5. Write full catalog + front catalog + root catalog + header
 //!   6. fsync + atomic rename
 
@@ -139,242 +139,51 @@ fn cleanup_stale_tmp_files(dest: &Path) {
     }
 }
 
-/// Retry policy applied to every individual cloud `GET` issued by `pull` /
-/// `pull_filtered`.
+// Cloud read resilience — `RetryConfig`, `is_retryable`, `backoff_delay`, and
+// the `RetryingStore` decorator — now lives in `crate::retry`, the single
+// timeout/retry implementation installed once at the backend boundary (LC1).
+// The decorator (built into the backend by `create_backend`) applies the
+// per-request deadline + classified retry/backoff, so the helpers below no
+// longer loop: they issue one read through the (already-retrying) store and
+// map a terminal `object_store::Error` back into the rich `CloudError`.
+pub use crate::retry::RetryConfig;
+
+/// Fetch a whole object through the backend, mapping errors to [`CloudError`].
 ///
-/// The retry layer wraps each request in a [`tokio::time::timeout`] and
-/// retries application-classified transient failures with exponential
-/// backoff + jitter. It composes with `object_store`'s own internal
-/// retries: each outer attempt may itself absorb a few HTTP-level retries
-/// inside `object_store`, so the effective number of underlying HTTP
-/// attempts is roughly `max_retries × object_store_max_retries`. Defaults
-/// (3 outer × ~3 inner) are tuned to bound the worst case at ~9 attempts.
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Number of retry attempts on top of the first try. Total attempts
-    /// = `max_retries + 1`. Default 3.
-    pub max_retries: usize,
-    /// Initial backoff delay before retry attempt 1. Default 500 ms.
-    pub base_delay: Duration,
-    /// Cap on backoff delay; the exponential schedule is clamped here.
-    /// Default 30 s.
-    pub max_delay: Duration,
-    /// Jitter amplitude as a fraction of the computed delay (e.g. 0.1
-    /// means ±10%). Default 0.1.
-    pub jitter_factor: f64,
-    /// Per-request hard wall-clock timeout. A timed-out request is
-    /// retried subject to `max_retries`; final exhaustion surfaces as
-    /// [`CloudError::Timeout`]. Default 120 s.
-    pub request_timeout: Duration,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            base_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(30),
-            jitter_factor: 0.1,
-            request_timeout: Duration::from_secs(120),
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Retry policy that disables both outer retries and timeout
-    /// enforcement. Use in tests or for fail-fast call sites.
-    pub fn disabled() -> Self {
-        Self {
-            max_retries: 0,
-            base_delay: Duration::from_millis(0),
-            max_delay: Duration::from_millis(0),
-            jitter_factor: 0.0,
-            request_timeout: Duration::from_secs(60 * 60 * 24),
-        }
-    }
-}
-
-/// Classify an `object_store::Error` as retryable (transient) or
-/// permanent. Conservative: only the explicit transient signals from
-/// `object_store` plus our own heuristic substring matches against
-/// throttle / 5xx / connection-reset wording are considered retryable.
-fn is_retryable(err: &object_store::Error) -> bool {
-    use object_store::Error;
-    match err {
-        // Definite permanent failures.
-        Error::NotFound { .. } | Error::AlreadyExists { .. } | Error::NotModified { .. } => false,
-        // `object_store` has internal classification — when in doubt
-        // (Generic, JoinError, etc.) we treat the error as retryable so
-        // the outer layer gets a chance.
-        _ => {
-            let msg = format!("{err}");
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("timed out")
-                || lower.contains("timeout")
-                || lower.contains("connection reset")
-                || lower.contains("connection refused")
-                || lower.contains("connection closed")
-                || lower.contains("broken pipe")
-                || lower.contains("rate limit")
-                || lower.contains("throttle")
-                || lower.contains("throttled")
-                || lower.contains("503")
-                || lower.contains("502")
-                || lower.contains("500")
-                || lower.contains("504")
-                || lower.contains("server error")
-                || lower.contains("temporarily unavailable")
-                || matches!(
-                    err,
-                    Error::Generic { .. }
-                        | Error::JoinError { .. }
-                        | Error::UnknownConfigurationKey { .. }
-                )
-        }
-    }
-}
-
-/// Compute the exponential-backoff delay for a given attempt number.
-///
-/// Delay grows as `base * 2^(attempt-1)`, clamped to `max_delay`, then
-/// multiplied by `1 ± jitter_factor` sampled uniformly from
-/// `rand::thread_rng()`. Concurrent clients sampling independently is
-/// what actually breaks thundering-herd retry spikes — the prior
-/// `Instant::now().elapsed()` LCG seed collapsed to a constant on every
-/// call and is fixed here.
-fn backoff_delay(cfg: &RetryConfig, attempt: usize) -> Duration {
-    let exp = (attempt as u32).saturating_sub(1).min(20);
-    let raw = cfg.base_delay.saturating_mul(1u32 << exp);
-    let bounded = std::cmp::min(raw, cfg.max_delay);
-    let jitter = if cfg.jitter_factor > 0.0 {
-        use rand::Rng;
-        rand::thread_rng().gen_range(-cfg.jitter_factor..=cfg.jitter_factor)
-    } else {
-        0.0
-    };
-    let nanos = bounded.as_nanos() as f64 * (1.0 + jitter);
-    let nanos = nanos.max(0.0) as u64;
-    Duration::from_nanos(nanos)
-}
-
-/// Issue a single cloud `GET` with timeout + retry/backoff applied.
-///
-/// On timeout, retries up to `cfg.max_retries`; final exhaustion surfaces
-/// as [`CloudError::Timeout`]. On retryable `object_store` errors, retries
-/// with backoff; final exhaustion surfaces as
-/// [`CloudError::DownloadFailed`]. Permanent errors short-circuit to
-/// [`CloudError::ObjectStore`] without retry.
+/// Retry/backoff/timeout are applied by the [`crate::retry::RetryingStore`]
+/// the backend is wrapped in; this helper only translates a terminal failure
+/// (a boxed [`crate::retry::RetryError`]) back into
+/// [`CloudError::Timeout`] / [`CloudError::DownloadFailed`].
 pub(crate) async fn get_with_retry(
     backend: &dyn ObjectStore,
     path: &ObjPath,
-    cfg: &RetryConfig,
 ) -> Result<bytes::Bytes> {
-    let mut attempt: usize = 0;
-    let mut last_msg: Option<String> = None;
-    loop {
-        let started = Instant::now();
-        let outcome = tokio::time::timeout(cfg.request_timeout, async {
-            let got = backend.get(path).await?;
-            got.bytes().await
-        })
-        .await;
-        match outcome {
-            Ok(Ok(bytes)) => return Ok(bytes),
-            Ok(Err(e)) => {
-                if attempt < cfg.max_retries && is_retryable(&e) {
-                    // NOT a dead store: when a transient retry is later followed
-                    // by a timeout, the Timeout terminal error surfaces this as
-                    // `last_error` (see test get_with_retry_timeout_surfaces_last_transient).
-                    last_msg = Some(format!("{e}"));
-                    attempt += 1;
-                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
-                    continue;
-                }
-                if attempt >= cfg.max_retries && is_retryable(&e) {
-                    return Err(CloudError::DownloadFailed {
-                        retries: attempt,
-                        message: format!("{path}: {e}"),
-                    });
-                }
-                return Err(CloudError::ObjectStore(e));
-            }
-            Err(_) => {
-                if attempt < cfg.max_retries {
-                    last_msg = Some(format!("timeout after {:?}", started.elapsed()));
-                    attempt += 1;
-                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
-                    continue;
-                }
-                return Err(CloudError::Timeout {
-                    duration: cfg.request_timeout,
-                    path: path.to_string(),
-                    last_error: last_msg,
-                });
-            }
-        }
+    match backend.get(path).await {
+        Ok(got) => got.bytes().await.map_err(CloudError::ObjectStore),
+        Err(e) => Err(CloudError::from_store_error(e, path)),
     }
 }
 
-/// Issue a single cloud range `GET` with timeout + retry/backoff applied.
-///
 /// Range-read analogue of [`get_with_retry`], used by the cloud query path
-/// (`CloudReader::read_section` / `read_section_for_entry`) so selective
-/// reads inherit the same SCX-level deadline and retry budget that `pull`
-/// has (LC1) — a single stalled shard GET no longer hangs the parallel
-/// decode without a deadline.
+/// (`CloudReader::read_section` / `read_section_for_entry`). Resilience is
+/// provided by the wrapped store; this maps terminal errors to [`CloudError`].
 pub(crate) async fn get_range_with_retry(
     backend: &dyn ObjectStore,
     path: &ObjPath,
     range: std::ops::Range<u64>,
-    cfg: &RetryConfig,
 ) -> Result<bytes::Bytes> {
-    let mut attempt: usize = 0;
-    let mut last_msg: Option<String> = None;
-    loop {
-        let started = Instant::now();
-        let outcome =
-            tokio::time::timeout(cfg.request_timeout, backend.get_range(path, range.clone())).await;
-        match outcome {
-            Ok(Ok(bytes)) => return Ok(bytes),
-            Ok(Err(e)) => {
-                if attempt < cfg.max_retries && is_retryable(&e) {
-                    attempt += 1;
-                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
-                    continue;
-                }
-                if attempt >= cfg.max_retries && is_retryable(&e) {
-                    return Err(CloudError::DownloadFailed {
-                        retries: attempt,
-                        message: format!("{path}: {e}"),
-                    });
-                }
-                return Err(CloudError::ObjectStore(e));
-            }
-            Err(_) => {
-                if attempt < cfg.max_retries {
-                    last_msg = Some(format!("timeout after {:?}", started.elapsed()));
-                    attempt += 1;
-                    tokio::time::sleep(backoff_delay(cfg, attempt)).await;
-                    continue;
-                }
-                return Err(CloudError::Timeout {
-                    duration: cfg.request_timeout,
-                    path: path.to_string(),
-                    last_error: last_msg,
-                });
-            }
-        }
-    }
+    backend
+        .get_range(path, range)
+        .await
+        .map_err(|e| CloudError::from_store_error(e, path))
 }
 
 /// Options for the pull operation.
 pub struct PullOptions {
-    /// Number of parallel download tasks (default: 8). This bounds the
-    /// number of in-flight downloads, but NOT the reorder buffer: a
-    /// low-index straggler can stall sequential writes, so the BTreeMap
-    /// reorder buffer can hold up to N completed-but-unwritten sections in
-    /// the worst case. Peak memory is therefore bounded by the total number
-    /// of matching sections, not `parallelism`.
+    /// Number of parallel download tasks (default: 8). Downloads run through
+    /// an ordered bounded pipeline (`stream::buffered`), so this bounds both
+    /// in-flight downloads *and* completed-but-unwritten sections: peak memory
+    /// is `parallelism × max_section_size` (LC2).
     pub parallelism: usize,
     /// Produce cloud-ready output with front catalog (default: true).
     pub cloud_ready: bool,
@@ -432,7 +241,8 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
-    let backend = crate::backend::create_backend(&location).await?;
+    let backend =
+        crate::backend::create_backend_with_retry(&location, options.retry_config.clone()).await?;
 
     // Determine the prefix for object paths
     let prefix = match &location {
@@ -470,14 +280,13 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
 
     // 2. Download _catalog.bin and _header.bin
     let catalog_path = make_path("_catalog.bin");
-    let catalog_data =
-        get_with_retry(backend.as_ref(), &catalog_path, &options.retry_config).await?;
+    let catalog_data = get_with_retry(backend.as_ref(), &catalog_path).await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
         FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
-    let header_data = get_with_retry(backend.as_ref(), &header_path, &options.retry_config).await?;
+    let header_data = get_with_retry(backend.as_ref(), &header_path).await?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;
 
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
@@ -647,12 +456,10 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     //    Order: header → root catalog → front catalog region (cloud_ready)
     //         → sections (downloaded in parallel, written in order)
     //         → full catalog at EOF.
-    //    Sections are streamed in via the same reorder window the
-    //    pre-restructure code used: in-flight downloads are bounded by
-    //    `parallelism`, but the BTreeMap reorder buffer can hold up to N
-    //    completed-but-unwritten sections in the worst case (a low-index
-    //    straggler stalls `next_write_idx`), so peak memory is bounded by
-    //    the total number of matching sections, not `parallelism`.
+    //    Sections stream in through an ordered bounded pipeline
+    //    (`stream::buffered`): downloads run up to `parallelism` at a time and
+    //    are yielded in write order, so each is written as it arrives. Peak
+    //    memory is bounded by `parallelism × max_section_size` (LC2).
     let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
     let mut writer = HashingWriter::new(BufWriter::new(raw_file));
 
@@ -689,26 +496,27 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let retry_cfg = &options.retry_config;
+    // Ordered bounded pipeline (LC2): `buffered` runs up to `parallelism`
+    // downloads concurrently but yields results in input (= write) order, so
+    // each section is written as it arrives — no reorder buffer, and peak
+    // memory is bounded by `parallelism × max_section_size` as documented.
     let download_stream =
-        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+        futures::stream::iter(download_tasks.into_iter().map(|(_idx, filename)| {
             let path = make_path(&filename);
             let backend_ref = &backend;
             async move {
-                let result = get_with_retry(backend_ref.as_ref(), &path, retry_cfg).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+                let result = get_with_retry(backend_ref.as_ref(), &path).await?;
+                Ok::<Vec<u8>, CloudError>(result.to_vec())
             }
         }))
-        .buffer_unordered(parallelism);
+        .buffered(parallelism);
 
     futures::pin_mut!(download_stream);
 
-    let mut next_write_idx: usize = 0;
-    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     let mut write_offset = prefix_end;
-
+    let mut idx: usize = 0;
     while let Some(result) = download_stream.next().await {
-        let (idx, data) = result?;
+        let data = result?;
         let declared = ordered_entries[idx].length;
         if data.len() as u64 != declared {
             return Err(CloudError::InvalidSectionLength {
@@ -718,25 +526,23 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
             });
         }
         total_bytes_downloaded += data.len() as u64;
-        reorder_buf.insert(idx, data);
 
-        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
-            let target_offset = section_offsets[next_write_idx];
-            let pad = (target_offset - write_offset) as usize;
-            if pad > 0 {
-                writer.write_all(&ZEROS[..pad])?;
-                write_offset = target_offset;
-            }
-            debug_assert_eq!(write_offset, target_offset);
-            writer.write_all(&section_data)?;
-            write_offset += section_data.len() as u64;
-            next_write_idx += 1;
+        let target_offset = section_offsets[idx];
+        let pad = (target_offset - write_offset) as usize;
+        if pad > 0 {
+            writer.write_all(&ZEROS[..pad])?;
+            write_offset = target_offset;
         }
+        debug_assert_eq!(write_offset, target_offset);
+        writer.write_all(&data)?;
+        write_offset += data.len() as u64;
+        idx += 1;
     }
 
-    assert!(
-        reorder_buf.is_empty() && next_write_idx == ordered_entries.len(),
-        "reorder buffer not fully drained after download stream completed"
+    assert_eq!(
+        idx,
+        ordered_entries.len(),
+        "download stream yielded fewer sections than expected"
     );
 
     // Pad to align with full_catalog_offset_new, then write the full catalog.
@@ -927,20 +733,20 @@ pub async fn pull_filtered(
 
     // 1. Parse location and create backend
     let location = crate::backend::parse_location(source)?;
-    let backend = crate::backend::create_backend(&location).await?;
+    let backend =
+        crate::backend::create_backend_with_retry(&location, options.retry_config.clone()).await?;
 
     let make_path = build_path_fn(&location);
 
     // 2. Download _catalog.bin and _header.bin
     let catalog_path = make_path("_catalog.bin");
-    let catalog_data =
-        get_with_retry(backend.as_ref(), &catalog_path, &options.retry_config).await?;
+    let catalog_data = get_with_retry(backend.as_ref(), &catalog_path).await?;
     let catalog_bytes = catalog_data.to_vec();
     let original_catalog =
         FullCatalog::read_from(&mut Cursor::new(&catalog_bytes), catalog_bytes.len(), true)?;
 
     let header_path = make_path("_header.bin");
-    let header_data = get_with_retry(backend.as_ref(), &header_path, &options.retry_config).await?;
+    let header_data = get_with_retry(backend.as_ref(), &header_path).await?;
     let header = FileHeader::read_from(&mut Cursor::new(&header_data))?;
 
     let mut total_bytes_downloaded = (catalog_bytes.len() + header_data.len()) as u64;
@@ -949,7 +755,7 @@ pub async fn pull_filtered(
     let obs_path_str = section_name_to_path("obs", SectionType::ObsMetadata)
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     let obs_obj_path = make_path(&obs_path_str);
-    let obs_data = get_with_retry(backend.as_ref(), &obs_obj_path, &options.retry_config).await?;
+    let obs_data = get_with_retry(backend.as_ref(), &obs_obj_path).await?;
     total_bytes_downloaded += obs_data.len() as u64;
     let obs_bytes = obs_data.to_vec();
 
@@ -1108,7 +914,7 @@ pub async fn pull_filtered(
         let rel_path = section_name_to_path(&mt_entry.name, mt_entry.section_type)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         let path = make_path(&rel_path);
-        let data = get_with_retry(backend.as_ref(), &path, &options.retry_config).await?;
+        let data = get_with_retry(backend.as_ref(), &path).await?;
         total_bytes_downloaded += data.len() as u64;
         Some(data.to_vec())
     } else {
@@ -1155,10 +961,10 @@ pub async fn pull_filtered(
         write_offset += filtered_obs_bytes.len() as u64;
     }
 
-    // 8. Stream section downloads through buffer_unordered → reorder → disk.
-    //    Entries are pre-sorted into write order so the reorder window
-    //    drains sequentially. Download concurrency is capped at `parallelism`;
-    //    peak memory is bounded by `parallelism × max_section_size`.
+    // 8. Stream section downloads through an ordered bounded pipeline (LC2):
+    //    `buffered` caps concurrency at `parallelism` while yielding results in
+    //    write order, so each section is written as it arrives — no reorder
+    //    buffer, peak memory bounded by `parallelism × max_section_size`.
     let download_tasks: Vec<(usize, String)> = streamable_entries
         .iter()
         .enumerate()
@@ -1170,88 +976,81 @@ pub async fn pull_filtered(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let retry_cfg = &options.retry_config;
     let filtered_dl_stream =
-        futures::stream::iter(download_tasks.into_iter().map(|(idx, filename)| {
+        futures::stream::iter(download_tasks.into_iter().map(|(_idx, filename)| {
             let path = make_path(&filename);
             let backend_ref = &backend;
             async move {
-                let result = get_with_retry(backend_ref.as_ref(), &path, retry_cfg).await?;
-                Ok::<(usize, Vec<u8>), CloudError>((idx, result.to_vec()))
+                let result = get_with_retry(backend_ref.as_ref(), &path).await?;
+                Ok::<Vec<u8>, CloudError>(result.to_vec())
             }
         }))
-        .buffer_unordered(parallelism);
+        .buffered(parallelism);
 
     futures::pin_mut!(filtered_dl_stream);
 
-    let mut next_write_idx: usize = 0;
-    let mut reorder_buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
     let mut new_row_offset: u64 = 0;
+    let mut idx: usize = 0;
 
     while let Some(result) = filtered_dl_stream.next().await {
-        let (idx, data) = result?;
-        total_bytes_downloaded += data.len() as u64;
-        reorder_buf.insert(idx, data);
+        let section_data = result?;
+        total_bytes_downloaded += section_data.len() as u64;
+        let entry = streamable_entries[idx];
 
-        // Flush all contiguously available sections starting from
-        // `next_write_idx`.
-        while let Some(section_data) = reorder_buf.remove(&next_write_idx) {
-            let entry = streamable_entries[next_write_idx];
+        // Pad to 8-byte alignment
+        let aligned = align_to_8(write_offset);
+        let pad = (aligned - write_offset) as usize;
+        if pad > 0 {
+            writer.write_all(&ZEROS[..pad])?;
+            write_offset = aligned;
+        }
 
-            // Pad to 8-byte alignment
-            let aligned = align_to_8(write_offset);
-            let pad = (aligned - write_offset) as usize;
-            if pad > 0 {
-                writer.write_all(&ZEROS[..pad])?;
-                write_offset = aligned;
-            }
+        let new_offset = write_offset;
+        writer.write_all(&section_data)?;
+        write_offset += section_data.len() as u64;
 
-            let new_offset = write_offset;
-            writer.write_all(&section_data)?;
-            write_offset += section_data.len() as u64;
-
-            let new_stats = if entry.section_type == SectionType::CsrShard {
-                if let Some(old_stats) = &entry.stats {
-                    let shard_rows = old_stats.row_end - old_stats.row_start;
-                    let ns = scx_format::catalog::ShardStats {
-                        row_start: new_row_offset,
-                        row_end: new_row_offset + shard_rows,
-                        col_start: old_stats.col_start,
-                        col_end: old_stats.col_end,
-                        nnz: old_stats.nnz,
-                        value_min: old_stats.value_min,
-                        value_max: old_stats.value_max,
-                        value_sum: old_stats.value_sum,
-                        n_indexed_columns: old_stats.n_indexed_columns,
-                        column_stats: old_stats.column_stats.clone(),
-                    };
-                    new_row_offset += shard_rows;
-                    Some(ns)
-                } else {
-                    entry.stats.clone()
-                }
+        let new_stats = if entry.section_type == SectionType::CsrShard {
+            if let Some(old_stats) = &entry.stats {
+                let shard_rows = old_stats.row_end - old_stats.row_start;
+                let ns = scx_format::catalog::ShardStats {
+                    row_start: new_row_offset,
+                    row_end: new_row_offset + shard_rows,
+                    col_start: old_stats.col_start,
+                    col_end: old_stats.col_end,
+                    nnz: old_stats.nnz,
+                    value_min: old_stats.value_min,
+                    value_max: old_stats.value_max,
+                    value_sum: old_stats.value_sum,
+                    n_indexed_columns: old_stats.n_indexed_columns,
+                    column_stats: old_stats.column_stats.clone(),
+                };
+                new_row_offset += shard_rows;
+                Some(ns)
             } else {
                 entry.stats.clone()
-            };
+            }
+        } else {
+            entry.stats.clone()
+        };
 
-            new_entries.push(FullCatalogEntry {
-                name: entry.name.clone(),
-                offset: new_offset,
-                length: section_data.len() as u64,
-                section_type: entry.section_type,
-                checksum: entry.checksum,
-                modality_id: entry.modality_id,
-                stats: new_stats,
-            });
+        new_entries.push(FullCatalogEntry {
+            name: entry.name.clone(),
+            offset: new_offset,
+            length: section_data.len() as u64,
+            section_type: entry.section_type,
+            checksum: entry.checksum,
+            modality_id: entry.modality_id,
+            stats: new_stats,
+        });
 
-            next_write_idx += 1;
-        }
+        idx += 1;
     }
 
     // Sanity: all streamable sections must have been written.
-    assert!(
-        reorder_buf.is_empty() && next_write_idx == streamable_entries.len(),
-        "reorder buffer not fully drained after filtered download stream completed"
+    assert_eq!(
+        idx,
+        streamable_entries.len(),
+        "filtered download stream yielded fewer sections than expected"
     );
 
     // Phase G.1c: re-emit the ModalityTable section at EOF before
@@ -2123,10 +1922,11 @@ mod tests {
 
     // ===== Patch 5 tests =====
 
-    /// Verify the streaming reorder window drains completely and
-    /// produces correct output across multiple parallelism values.
+    /// Verify the ordered bounded download pipeline (LC2) produces
+    /// byte-identical output regardless of parallelism — `buffered` yields in
+    /// write order, so write offsets/padding are deterministic.
     #[tokio::test]
-    async fn test_pull_buffer_unordered_matches_sequential() {
+    async fn test_pull_buffered_matches_sequential() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_file(&dir, 200, 60);
         let exploded_dir = dir.path().join("exploded_stream.scxd");
@@ -2166,6 +1966,15 @@ mod tests {
         assert_eq!(csr_seq.indptr, csr_par.indptr);
         assert_eq!(csr_seq.indices, csr_par.indices);
         assert_eq!(csr_seq.data, csr_par.data);
+
+        // LC2: ordered pipeline ⇒ the on-disk files are byte-identical, not
+        // merely semantically equal.
+        let bytes_seq = std::fs::read(&out_seq).unwrap();
+        let bytes_par = std::fs::read(&out_par).unwrap();
+        assert_eq!(
+            bytes_seq, bytes_par,
+            "parallelism must not change the on-disk byte layout"
+        );
     }
 
     /// Verify that the streaming reorder window does NOT buffer all
@@ -2351,6 +2160,7 @@ mod tests {
     // `LocalFileSystem` and intercepts `get_opts` to inject failures
     // before each delegating call.
 
+    use crate::retry::{backoff_delay, is_retryable, RetryingStore};
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use object_store::local::LocalFileSystem;
@@ -2527,10 +2337,10 @@ mod tests {
         std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
         let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
         // Two transient failures, then success on the third call.
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![FaultMode::TransientError, FaultMode::TransientError],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 3,
             base_delay: Duration::from_millis(1),
@@ -2538,11 +2348,12 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_secs(10),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let bytes: Bytes = get_with_retry(&store, &path, &cfg).await.unwrap();
+        let bytes: Bytes = get_with_retry(&store, &path).await.unwrap();
         assert_eq!(&*bytes, b"hello world");
         assert_eq!(
-            store.get_attempts.load(AtomicOrdering::Relaxed),
+            faulty.get_attempts.load(AtomicOrdering::Relaxed),
             3,
             "should have hit the backend exactly 3 times (2 fail + 1 success)"
         );
@@ -2555,7 +2366,7 @@ mod tests {
         let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
         // 4 transient failures, budget allows max_retries=2 → total 3
         // attempts, all fail.
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![
                 FaultMode::TransientError,
@@ -2563,7 +2374,7 @@ mod tests {
                 FaultMode::TransientError,
                 FaultMode::TransientError,
             ],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 2,
             base_delay: Duration::from_millis(1),
@@ -2571,8 +2382,9 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_secs(10),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        let err = get_with_retry(&store, &path).await.unwrap_err();
         match err {
             CloudError::DownloadFailed { retries, message } => {
                 assert_eq!(retries, 2);
@@ -2584,7 +2396,7 @@ mod tests {
             other => panic!("expected DownloadFailed, got {other}"),
         }
         // 1 initial + 2 retries = 3 backend hits.
-        assert_eq!(store.get_attempts.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(faulty.get_attempts.load(AtomicOrdering::Relaxed), 3);
     }
 
     #[tokio::test]
@@ -2595,10 +2407,10 @@ mod tests {
         // Backend sleeps 200 ms; request_timeout is 50 ms → first
         // attempt times out, second sleep schedule is empty so the
         // retry succeeds.
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![FaultMode::SleepBeyondTimeout(Duration::from_millis(200))],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 2,
             base_delay: Duration::from_millis(1),
@@ -2606,8 +2418,9 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_millis(50),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let bytes = get_with_retry(&store, &path, &cfg).await.unwrap();
+        let bytes = get_with_retry(&store, &path).await.unwrap();
         assert_eq!(&*bytes, b"hello");
     }
 
@@ -2618,10 +2431,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
         let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![FaultMode::TransientError, FaultMode::TransientError],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 3,
             base_delay: Duration::from_millis(1),
@@ -2629,12 +2442,11 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_secs(10),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let bytes = get_range_with_retry(&store, &path, 0..5, &cfg)
-            .await
-            .unwrap();
+        let bytes = get_range_with_retry(&store, &path, 0..5).await.unwrap();
         assert_eq!(&*bytes, b"hello");
-        assert_eq!(store.get_attempts.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(faulty.get_attempts.load(AtomicOrdering::Relaxed), 3);
     }
 
     // LC1: a range read that always times out surfaces CloudError::Timeout
@@ -2645,13 +2457,13 @@ mod tests {
         std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
         let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
         // Sleep beyond the timeout on every attempt (1 initial + 1 retry).
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![
                 FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
                 FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
             ],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 1,
             base_delay: Duration::from_millis(1),
@@ -2659,10 +2471,9 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_millis(50),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let err = get_range_with_retry(&store, &path, 0..5, &cfg)
-            .await
-            .unwrap_err();
+        let err = get_range_with_retry(&store, &path, 0..5).await.unwrap_err();
         assert!(
             matches!(err, CloudError::Timeout { .. }),
             "expected Timeout, got {err}"
@@ -2722,13 +2533,13 @@ mod tests {
         std::fs::write(dir.path().join("file.bin"), b"hello").unwrap();
         let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
         // Every attempt sleeps longer than the per-request timeout.
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![
                 FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
                 FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
             ],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 1,
             base_delay: Duration::from_millis(1),
@@ -2736,8 +2547,9 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_millis(50),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        let err = get_with_retry(&store, &path).await.unwrap_err();
         match err {
             CloudError::Timeout { path: p, .. } => assert!(p.contains("file.bin")),
             other => panic!("expected Timeout, got {other}"),
@@ -2756,13 +2568,13 @@ mod tests {
         // First call: synthetic 503 (retryable). Second call: sleep
         // past the timeout. Budget allows only one retry, so the
         // second attempt's timeout exhausts it.
-        let store = FaultyStore::new(
+        let faulty = Arc::new(FaultyStore::new(
             inner,
             vec![
                 FaultMode::TransientError,
                 FaultMode::SleepBeyondTimeout(Duration::from_millis(200)),
             ],
-        );
+        ));
         let cfg = RetryConfig {
             max_retries: 1,
             base_delay: Duration::from_millis(1),
@@ -2770,8 +2582,9 @@ mod tests {
             jitter_factor: 0.0,
             request_timeout: Duration::from_millis(50),
         };
+        let store = RetryingStore::new(faulty.clone(), cfg);
         let path = ObjPath::from("file.bin");
-        let err = get_with_retry(&store, &path, &cfg).await.unwrap_err();
+        let err = get_with_retry(&store, &path).await.unwrap_err();
         match err {
             CloudError::Timeout {
                 last_error: Some(msg),
@@ -2788,5 +2601,39 @@ mod tests {
             } => panic!("expected last_error to carry prior 503 message, got None"),
             other => panic!("expected Timeout, got {other}"),
         }
+    }
+
+    /// LC1: the raw `backend.get` calls in `open_cloud` (catalog/header
+    /// detection, packed front/EOF catalog reads) inherit the decorator's
+    /// retry budget without going through the `get_with_retry` helper —
+    /// proving resilience is installed at the backend boundary, not per call
+    /// site. Drives `ObjectStore::get` directly on the wrapped store.
+    #[tokio::test]
+    async fn retrying_store_inherited_by_raw_get() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.bin"), b"hello world").unwrap();
+        let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let faulty = Arc::new(FaultyStore::new(
+            inner,
+            vec![FaultMode::TransientError, FaultMode::TransientError],
+        ));
+        let cfg = RetryConfig {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter_factor: 0.0,
+            request_timeout: Duration::from_secs(10),
+        };
+        let store = RetryingStore::new(faulty.clone(), cfg);
+        let path = ObjPath::from("file.bin");
+        // No `get_with_retry` helper — call the store API directly.
+        let got = ObjectStore::get(&store, &path).await.unwrap();
+        let bytes = got.bytes().await.unwrap();
+        assert_eq!(&*bytes, b"hello world");
+        assert_eq!(
+            faulty.get_attempts.load(AtomicOrdering::Relaxed),
+            3,
+            "raw get must inherit the decorator's retry budget (2 fail + 1 success)"
+        );
     }
 }

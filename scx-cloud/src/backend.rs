@@ -4,11 +4,14 @@
 //! Authentication relies on `object_store`'s built-in credential chains
 //! (env vars, instance metadata, service accounts).
 
+use std::sync::Arc;
+
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use url::Url;
 
 use crate::error::{CloudError, Result};
+use crate::retry::{RetryConfig, RetryingStore};
 
 /// Parsed cloud or local location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,37 +78,63 @@ pub fn parse_location(url: &str) -> Result<CloudLocation> {
     }
 }
 
-/// Create an [`ObjectStore`] backend from a [`CloudLocation`].
+/// Create an [`ObjectStore`] backend from a [`CloudLocation`] with the default
+/// [`RetryConfig`].
+///
+/// See [`create_backend_with_retry`] for the resilience contract.
+pub async fn create_backend(location: &CloudLocation) -> Result<Box<dyn ObjectStore>> {
+    create_backend_with_retry(location, RetryConfig::default()).await
+}
+
+/// Create an [`ObjectStore`] backend wrapped in the [`RetryingStore`] decorator
+/// so every consumer inherits one identical per-request deadline + retry budget
+/// (finding LC1).
+///
+/// `object_store`'s own inner retry is disabled (`max_retries: 0`) so
+/// [`RetryingStore`] is the *sole* retry authority — there is no
+/// `outer × inner` attempt compounding; the effective attempt count is exactly
+/// `cfg.max_retries + 1`.
 ///
 /// Uses default credential chains:
 /// - **GCS**: `GOOGLE_APPLICATION_CREDENTIALS` env var, or instance metadata on GCE/GKE
 /// - **S3**: `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, or instance profile on EC2
 /// - **Azure**: `AZURE_STORAGE_ACCOUNT`/`AZURE_STORAGE_KEY`, or managed identity
-pub async fn create_backend(location: &CloudLocation) -> Result<Box<dyn ObjectStore>> {
-    match location {
+pub async fn create_backend_with_retry(
+    location: &CloudLocation,
+    cfg: RetryConfig,
+) -> Result<Box<dyn ObjectStore>> {
+    // Disable object_store's internal retry so the RetryingStore decorator is
+    // the single retry authority (avoids outer × inner compounding).
+    let inner_no_retry = object_store::RetryConfig {
+        max_retries: 0,
+        ..Default::default()
+    };
+    let inner: Arc<dyn ObjectStore> = match location {
         CloudLocation::Gcs { bucket, .. } => {
             let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_bucket_name(bucket)
+                .with_retry(inner_no_retry)
                 .build()?;
-            Ok(Box::new(store))
+            Arc::new(store)
         }
         CloudLocation::S3 { bucket, .. } => {
             let store = object_store::aws::AmazonS3Builder::from_env()
                 .with_bucket_name(bucket)
+                .with_retry(inner_no_retry)
                 .build()?;
-            Ok(Box::new(store))
+            Arc::new(store)
         }
         CloudLocation::Azure { container, .. } => {
-            let mut builder =
-                object_store::azure::MicrosoftAzureBuilder::new().with_container_name(container);
+            let mut builder = object_store::azure::MicrosoftAzureBuilder::new()
+                .with_container_name(container)
+                .with_retry(inner_no_retry);
             if let Ok(account) = std::env::var("AZURE_STORAGE_ACCOUNT") {
                 builder = builder.with_account(account);
             }
             if let Ok(key) = std::env::var("AZURE_STORAGE_KEY") {
                 builder = builder.with_access_key(key);
             }
-            let store = builder.build()?;
-            Ok(Box::new(store))
+            Arc::new(builder.build()?)
         }
         CloudLocation::Local(path) => {
             let root = if path.is_file() {
@@ -113,10 +142,10 @@ pub async fn create_backend(location: &CloudLocation) -> Result<Box<dyn ObjectSt
             } else {
                 path.as_path()
             };
-            let store = LocalFileSystem::new_with_prefix(root)?;
-            Ok(Box::new(store))
+            Arc::new(LocalFileSystem::new_with_prefix(root)?)
         }
-    }
+    };
+    Ok(Box::new(RetryingStore::new(inner, cfg)))
 }
 
 #[cfg(test)]

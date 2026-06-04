@@ -7,9 +7,10 @@ pub mod explode;
 pub mod pack;
 pub mod pull;
 pub mod push;
+pub mod retry;
 pub mod section_reader;
 
-pub use backend::{create_backend, parse_location, CloudLocation};
+pub use backend::{create_backend, create_backend_with_retry, parse_location, CloudLocation};
 pub use cloud_optimize::cloud_optimize;
 pub use cloud_reader::{open_cloud, CloudReader};
 pub use coalesce::coalesce_ranges;

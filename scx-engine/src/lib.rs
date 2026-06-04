@@ -21,7 +21,7 @@ pub use index::{
     BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult, IndexPreset,
     ObsPredicateIndexBuilder, PredicateIndex, PredicateIndexBuildOptions, SkipReason,
 };
-pub use pipeline::{NormalizeConfig, QueryPipeline, QueryResult};
+pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var};
 pub use pushdown::{

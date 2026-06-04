@@ -401,10 +401,9 @@ enum Commands {
         /// Apply log1p transformation
         #[arg(long)]
         log1p: bool,
-        /// Limit number of returned cells. This caps output rows and
-        /// therefore also caps the plain-text `--count` value, which prints
-        /// `min(matched, limit)`. For the true match count when `--limit`
-        /// is set, use `--json` and read the `matched_rows` field.
+        /// Limit number of returned cells (output-only). Caps the rows
+        /// written/returned; it does NOT affect `--count`, which always
+        /// reports the true number of matching cells.
         #[arg(long)]
         limit: Option<usize>,
         /// JSON output (for --count)
