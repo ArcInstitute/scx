@@ -70,4 +70,43 @@ pub enum CloudError {
     },
 }
 
+impl CloudError {
+    /// Map an `object_store::Error` returned by a read into the richest
+    /// matching [`CloudError`].
+    ///
+    /// The [`crate::retry::RetryingStore`] decorator encodes terminal retry
+    /// failures as an `object_store::Error::Generic` whose boxed `source` is a
+    /// [`crate::retry::RetryError`]; this downcasts it back into
+    /// [`CloudError::Timeout`] / [`CloudError::DownloadFailed`] so callers see
+    /// the same structured errors the old per-helper retry loops produced.
+    /// Any other error passes through as [`CloudError::ObjectStore`].
+    pub(crate) fn from_store_error(
+        err: object_store::Error,
+        _path: &object_store::path::Path,
+    ) -> Self {
+        if let object_store::Error::Generic { source, .. } = &err {
+            if let Some(re) = source.downcast_ref::<crate::retry::RetryError>() {
+                return match re {
+                    crate::retry::RetryError::Timeout {
+                        path,
+                        duration,
+                        last_error,
+                    } => CloudError::Timeout {
+                        duration: *duration,
+                        path: path.clone(),
+                        last_error: last_error.clone(),
+                    },
+                    crate::retry::RetryError::DownloadFailed { retries, message } => {
+                        CloudError::DownloadFailed {
+                            retries: *retries,
+                            message: message.clone(),
+                        }
+                    }
+                };
+            }
+        }
+        CloudError::ObjectStore(err)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CloudError>;

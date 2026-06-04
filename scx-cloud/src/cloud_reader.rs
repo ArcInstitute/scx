@@ -56,11 +56,6 @@ pub struct CloudReader {
     /// query and are not cached.
     obs_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
     var_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
-    /// Per-request timeout + retry policy applied to every section read,
-    /// mirroring the resilience `pull` already has (LC1). A configurable
-    /// `CloudQueryOptions` to override this is a deferred follow-on; today
-    /// it is always the default.
-    retry_config: crate::pull::RetryConfig,
 }
 
 impl CloudReader {
@@ -154,12 +149,7 @@ impl CloudReader {
                         CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
                     })?;
                 let obj_path = make_path(&rel_path);
-                let data = crate::pull::get_with_retry(
-                    self.backend.as_ref(),
-                    &obj_path,
-                    &self.retry_config,
-                )
-                .await?;
+                let data = crate::pull::get_with_retry(self.backend.as_ref(), &obj_path).await?;
                 Ok(data.to_vec())
             }
             ReaderLayout::Packed(file_path) => {
@@ -174,7 +164,6 @@ impl CloudReader {
                     self.backend.as_ref(),
                     file_path,
                     entry.offset..end,
-                    &self.retry_config,
                 )
                 .await?;
                 Ok(data.to_vec())
@@ -291,12 +280,7 @@ impl CloudReader {
                         CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
                     })?;
                 let obj_path = make_path(&rel_path);
-                let data = crate::pull::get_with_retry(
-                    self.backend.as_ref(),
-                    &obj_path,
-                    &self.retry_config,
-                )
-                .await?;
+                let data = crate::pull::get_with_retry(self.backend.as_ref(), &obj_path).await?;
                 Ok(data.to_vec())
             }
             ReaderLayout::Packed(file_path) => {
@@ -311,7 +295,6 @@ impl CloudReader {
                     self.backend.as_ref(),
                     file_path,
                     entry.offset..end,
-                    &self.retry_config,
                 )
                 .await?;
                 Ok(data.to_vec())
@@ -468,7 +451,6 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 catalog,
                 obs_bytes_cache: tokio::sync::OnceCell::new(),
                 var_bytes_cache: tokio::sync::OnceCell::new(),
-                retry_config: crate::pull::RetryConfig::default(),
             })
         }
         Err(e) => {
@@ -541,7 +523,6 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     catalog,
                     obs_bytes_cache: tokio::sync::OnceCell::new(),
                     var_bytes_cache: tokio::sync::OnceCell::new(),
-                    retry_config: crate::pull::RetryConfig::default(),
                 })
             } else {
                 // Not cloud-ready: read full catalog at EOF
@@ -569,7 +550,6 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     catalog,
                     obs_bytes_cache: tokio::sync::OnceCell::new(),
                     var_bytes_cache: tokio::sync::OnceCell::new(),
-                    retry_config: crate::pull::RetryConfig::default(),
                 })
             }
         }
