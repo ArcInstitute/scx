@@ -1874,7 +1874,7 @@ where
             chunk_per_group.push((group_name, names, scores, pvals, logfc));
         }
 
-        let chunk_de = assemble_chunk_diffexp_result(chunk_per_group, rankby_abs)
+        let chunk_de = assemble_chunk_diffexp_result(chunk_per_group, rankby_abs, c0)
             .ok_or_else(|| AccelError::InvalidInput("empty test_groups in chunk".into()))?;
         chunk_results.push(chunk_de);
     }
@@ -2232,40 +2232,40 @@ fn compute_scores_and_pvals(
 fn assemble_chunk_diffexp_result(
     chunk_per_group: Vec<(String, Vec<String>, Vec<f64>, Vec<f64>, Vec<f64>)>,
     rankby_abs: bool,
+    gene_index_base: usize,
 ) -> Option<DiffExpResult> {
     if chunk_per_group.is_empty() {
         return None;
     }
     let mut group_names = Vec::with_capacity(chunk_per_group.len());
     let mut names = Vec::with_capacity(chunk_per_group.len());
+    let mut gene_indices = Vec::with_capacity(chunk_per_group.len());
     let mut scores = Vec::with_capacity(chunk_per_group.len());
     let mut pvals = Vec::with_capacity(chunk_per_group.len());
     let mut pvals_adj = Vec::with_capacity(chunk_per_group.len());
     let mut logfc = Vec::with_capacity(chunk_per_group.len());
 
     for (gn, mut g_names, g_scores, g_pvals, g_logfc) in chunk_per_group {
-        // Per-group sort by score descending (matches wilcoxon_rank_sum).
+        // Per-group sort via the shared comparator (matches wilcoxon_rank_sum):
+        // the in-chunk position `i` maps to the global var index
+        // `gene_index_base + i`, so ties break on the global index and NaN
+        // scores sort last — identical to the CPU paths.
         let n = g_scores.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
-            let ka = if rankby_abs {
-                g_scores[a].abs()
-            } else {
-                g_scores[a]
-            };
-            let kb = if rankby_abs {
-                g_scores[b].abs()
-            } else {
-                g_scores[b]
-            };
-            kb.partial_cmp(&ka)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
+            crate::diffexp::de_rank_cmp(
+                g_scores[a],
+                gene_index_base + a,
+                g_scores[b],
+                gene_index_base + b,
+                rankby_abs,
+            )
         });
         let sorted_names: Vec<String> = order
             .iter()
             .map(|&i| std::mem::take(&mut g_names[i]))
             .collect();
+        let sorted_indices: Vec<usize> = order.iter().map(|&i| gene_index_base + i).collect();
         let sorted_scores: Vec<f64> = order.iter().map(|&i| g_scores[i]).collect();
         let sorted_pvals: Vec<f64> = order.iter().map(|&i| g_pvals[i]).collect();
         let sorted_logfc: Vec<f64> = order.iter().map(|&i| g_logfc[i]).collect();
@@ -2273,6 +2273,7 @@ fn assemble_chunk_diffexp_result(
 
         group_names.push(gn);
         names.push(sorted_names);
+        gene_indices.push(sorted_indices);
         scores.push(sorted_scores);
         pvals.push(sorted_pvals);
         pvals_adj.push(bh);
@@ -2282,6 +2283,7 @@ fn assemble_chunk_diffexp_result(
     Some(DiffExpResult {
         group_names,
         names,
+        gene_indices,
         scores,
         pvals,
         pvals_adj,
@@ -2746,6 +2748,7 @@ mod tests {
             false, // not log-transformed
             false, // rankby_abs
             true,  // tie_correct
+            0,     // gene_index_base
         )
         .expect("CPU wilcoxon failed");
 

@@ -540,6 +540,7 @@ fn run_rank_genes_groups_inner(
                             log_transformed,
                             rankby_abs,
                             tie_correct,
+                            0,
                         )
                     })
                     .map(|mut r| {
