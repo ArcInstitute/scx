@@ -16,43 +16,8 @@ use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
-use crate::shard::{ShardHeader, SHARD_HEADER_SIZE};
-
-/// Bounds-checked extraction of `section[off..off + len]`.
-///
-/// Shard-header offset/length fields are read raw from untrusted bytes
-/// (the catalog BLAKE3 authenticates catalog bytes, *not* shard payloads),
-/// so a corrupt or hostile shard can point a region past the section.
-/// Return [`ScxError::SectionOutOfBounds`] rather than panicking on the
-/// slice. The `ValidatedSection` newtype is the long-term home for this
-/// (Phase 1); this keeps the four call-sites uniform in the interim.
-pub(crate) fn checked_subslice(section: &[u8], off: u32, len: u32) -> Result<&[u8]> {
-    let start = off as usize;
-    let end = (off as u64).checked_add(len as u64);
-    match end {
-        Some(end) if end <= section.len() as u64 => Ok(&section[start..end as usize]),
-        _ => Err(ScxError::SectionOutOfBounds {
-            offset: off as u64,
-            length: len as u64,
-            file_size: section.len(),
-        }),
-    }
-}
-
-/// Bounds-checked slice of the fixed-size shard header prefix.
-///
-/// A section shorter than [`SHARD_HEADER_SIZE`] would panic the raw
-/// `&section[..SHARD_HEADER_SIZE]` slice; reject it as out-of-bounds.
-pub(crate) fn shard_header_slice(section: &[u8]) -> Result<&[u8]> {
-    if section.len() < SHARD_HEADER_SIZE {
-        return Err(ScxError::SectionOutOfBounds {
-            offset: 0,
-            length: SHARD_HEADER_SIZE as u64,
-            file_size: section.len(),
-        });
-    }
-    Ok(&section[..SHARD_HEADER_SIZE])
-}
+use crate::shard::ShardHeader;
+use crate::validated_section::ValidatedSection;
 
 /// Decode a single CSR shard from its on-disk bytes.
 ///
@@ -74,7 +39,8 @@ pub fn decode_shard_bytes(
     verify_checksum: bool,
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
     // Parse shard header
-    let sh = ShardHeader::read_from(&mut Cursor::new(shard_header_slice(section)?))?;
+    let vs = ValidatedSection::new(section);
+    let sh = ShardHeader::read_from(&mut Cursor::new(vs.header()?))?;
 
     // v2 strict shard_type validation: a v2 catalog must not carry
     // CSC entries with shard_type != 1. v1 catalogs preserve the
@@ -85,11 +51,10 @@ pub fn decode_shard_bytes(
     }
 
     // Extract encoded byte slices (bounds-checked against the untrusted header)
-    let indptr_bytes = checked_subslice(section, sh.indptr_rel_offset, sh.indptr_length)?;
-    let indices_bytes = checked_subslice(section, sh.indices_rel_offset, sh.indices_length)?;
-    let values_bytes = checked_subslice(section, sh.values_rel_offset, sh.values_length)?;
-    let block_index_bytes =
-        checked_subslice(section, sh.block_index_rel_offset, sh.block_index_length)?;
+    let indptr_bytes = vs.subslice(sh.indptr_rel_offset, sh.indptr_length)?;
+    let indices_bytes = vs.subslice(sh.indices_rel_offset, sh.indices_length)?;
+    let values_bytes = vs.subslice(sh.values_rel_offset, sh.values_length)?;
+    let block_index_bytes = vs.subslice(sh.block_index_rel_offset, sh.block_index_length)?;
 
     if verify_checksum {
         let mut shard_hasher = blake3::Hasher::new();
@@ -143,13 +108,14 @@ pub fn decode_shard_indptr_bytes(
     entry: &FullCatalogEntry,
     catalog_version: u16,
 ) -> Result<Vec<i64>> {
-    let sh = ShardHeader::read_from(&mut Cursor::new(shard_header_slice(section)?))?;
+    let vs = ValidatedSection::new(section);
+    let sh = ShardHeader::read_from(&mut Cursor::new(vs.header()?))?;
 
     if catalog_version >= 2 {
         sh.validate_csc_strict(entry.section_type)?;
     }
 
-    let indptr_bytes = checked_subslice(section, sh.indptr_rel_offset, sh.indptr_length)?;
+    let indptr_bytes = vs.subslice(sh.indptr_rel_offset, sh.indptr_length)?;
 
     let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
 
@@ -161,7 +127,7 @@ pub fn decode_shard_indptr_bytes(
 mod tests {
     use super::*;
     use crate::catalog::FullCatalogEntry;
-    use crate::shard::{ShardHeader, SHARD_MAGIC};
+    use crate::shard::{ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
     use crate::SectionType;
 
     fn dummy_entry() -> FullCatalogEntry {
@@ -224,21 +190,5 @@ mod tests {
             matches!(err, ScxError::SectionOutOfBounds { .. }),
             "expected SectionOutOfBounds, got {err:?}"
         );
-    }
-
-    #[test]
-    fn checked_subslice_bounds() {
-        let buf = vec![0u8; 100];
-        assert!(checked_subslice(&buf, 0, 100).is_ok());
-        assert!(checked_subslice(&buf, 50, 50).is_ok());
-        assert!(matches!(
-            checked_subslice(&buf, 50, 51),
-            Err(ScxError::SectionOutOfBounds { .. })
-        ));
-        // offset + length overflow must not wrap to a small in-bounds value.
-        assert!(matches!(
-            checked_subslice(&buf, u32::MAX, u32::MAX),
-            Err(ScxError::SectionOutOfBounds { .. })
-        ));
     }
 }

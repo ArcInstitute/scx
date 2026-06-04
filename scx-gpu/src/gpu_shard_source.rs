@@ -45,34 +45,49 @@ use crate::error::GpuError;
 use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
 
-/// Debug-only check: each row's column indices are strictly increasing.
+/// Release-active validation of a CSR shard at the host-side GPU DE staging
+/// boundary. Returns [`GpuError::InvalidShard`] rather than relying on a
+/// `debug_assert!` that vanishes in release builds (findings ACC3 + ACC11 /
+/// the always-on-boundary-validation policy).
 ///
-/// The GPU CSR-to-dense scatter (`gpu_de_scatter_shard_to_dense`) writes
-/// `dense[row, col - c0] = data[e]` with one thread per nonzero, so a
-/// duplicate `(row, col)` pair races on the same output cell and the
-/// winner is nondeterministic. SCX canonicalisation sorts but does not
-/// dedup column indices, so we enforce the invariant at the host-side
-/// staging boundary in debug builds. The function body is gated by
-/// `#[cfg(debug_assertions)]` so release builds pay no cost.
-fn check_no_duplicate_columns(_csr: &scx_sparse::ScxCsr) {
-    #[cfg(debug_assertions)]
-    {
-        let csr = _csr;
-        for r in 0..csr.n_rows() {
-            let s = csr.indptr[r] as usize;
-            let e = csr.indptr[r + 1] as usize;
-            for w in csr.indices[s..e].windows(2) {
-                debug_assert!(
-                    w[0] < w[1],
-                    "ScxCsr row {r} has unsorted or duplicate column indices: \
-                     {} >= {} — GPU shard scatter requires strictly-increasing \
-                     per-row indices for deterministic output",
-                    w[0],
-                    w[1]
-                );
+/// Two invariants the GPU DE kernels require but cannot themselves enforce:
+///
+/// 1. **Strictly-increasing per-row columns (ACC3).** The CSR-to-dense scatter
+///    (`csr_shard_to_dense_chunk_kernel`) writes `dense[row, col - c0] =
+///    data[e]` with one thread per nonzero, so a duplicate `(row, col)` pair
+///    races on the same output cell and the winning value is nondeterministic.
+///    SCX canonicalisation sorts but does not dedup columns.
+///
+/// 2. **Finite values (ACC11).** `block_radix_sort_per_gene_kernel` pads with
+///    `+INF` and sorts on the raw IEEE-754 bit pattern, so a NaN lands at the
+///    wrong position and corrupts the U statistic and tie counts.
+///
+/// O(nnz) — negligible beside the H2D copy and the per-gene device sort. Run
+/// once per shard for every GPU DE consumer (the `for_each_gpu_shard` driver
+/// calls it before staging).
+fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
+    for r in 0..csr.n_rows() {
+        let s = csr.indptr[r] as usize;
+        let e = csr.indptr[r + 1] as usize;
+        for w in csr.indices[s..e].windows(2) {
+            if w[0] >= w[1] {
+                return Err(GpuError::InvalidShard(format!(
+                    "ScxCsr row {r} has unsorted or duplicate column indices ({} >= {}): \
+                     GPU shard scatter requires strictly-increasing per-row indices for \
+                     deterministic output",
+                    w[0], w[1]
+                )));
             }
         }
     }
+    if let Some(pos) = csr.data.iter().position(|v| !v.is_finite()) {
+        return Err(GpuError::InvalidShard(format!(
+            "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: GPU DE ranking \
+             requires finite input (NaN corrupts the radix sort; sanitise/QC before DE)",
+            csr.data[pos]
+        )));
+    }
+    Ok(())
 }
 
 /// Sequence of GPU-resident CSR shards.
@@ -241,7 +256,7 @@ impl<'a> RawGpuShardSource<'a> {
             if csr.n_rows() == 0 {
                 return Ok(());
             }
-            check_no_duplicate_columns(&csr);
+            validate_shard_for_gpu_de(&csr)?;
             self.pinned[0].stage(&csr)?;
             self.pinned[0].upload_to(
                 self.dev.stream(),
@@ -307,7 +322,7 @@ impl<'a> RawGpuShardSource<'a> {
                         .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
                 }
 
-                check_no_duplicate_columns(&csr);
+                validate_shard_for_gpu_de(&csr)?;
                 pinned[pinned_idx].stage(&csr)?;
                 pinned[pinned_idx].upload_to(
                     copy_stream,
@@ -534,6 +549,39 @@ mod tests {
             indptr.push(indices.len() as i64);
         }
         ScxCsr::new_unchecked((rows, n_vars), indptr, indices, data)
+    }
+
+    /// ACC3: a row with non-increasing (here duplicate) column indices is
+    /// rejected with `InvalidShard` — always-on, not a debug_assert. Pure
+    /// CPU; needs no GPU device.
+    #[test]
+    fn validate_rejects_duplicate_columns() {
+        // 1 row, columns [1, 1] — a duplicate the GPU scatter would race on.
+        let csr = ScxCsr::new_unchecked((1, 4), vec![0i64, 2], vec![1i32, 1], vec![1.0f32, 2.0]);
+        let err = validate_shard_for_gpu_de(&csr).unwrap_err();
+        assert!(
+            matches!(err, GpuError::InvalidShard(_)),
+            "expected InvalidShard, got {err:?}"
+        );
+    }
+
+    /// ACC11: a non-finite value is rejected with `InvalidShard` — always-on,
+    /// not a debug_assert. Pure CPU; needs no GPU device.
+    #[test]
+    fn validate_rejects_non_finite_values() {
+        let csr =
+            ScxCsr::new_unchecked((1, 4), vec![0i64, 2], vec![0i32, 2], vec![1.0f32, f32::NAN]);
+        let err = validate_shard_for_gpu_de(&csr).unwrap_err();
+        assert!(
+            matches!(err, GpuError::InvalidShard(_)),
+            "expected InvalidShard, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_clean_shard() {
+        let csr = make_csr(8, 4, 1.0);
+        assert!(validate_shard_for_gpu_de(&csr).is_ok());
     }
 
     /// Raw source yields the staged shard verbatim (slot.view returns

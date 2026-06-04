@@ -133,6 +133,56 @@ fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
     );
 }
 
+/// Correctness guards at trust boundaries must be **always-on validation**,
+/// not `debug_assert!`/`#[cfg(debug_assertions)]` (which vanish in release and
+/// let the code "silently produce wrong numbers" — review Abstraction 11). This
+/// guard bans the `debug_assert!` macro family in the decode / scatter / rank
+/// hot-path files. A genuinely-internal invariant (not an untrusted-input
+/// boundary) may stay debug-only if it carries a `debug-assert-ok:`
+/// justification on the line above or the same line (the policy's "documented
+/// justification" escape hatch).
+#[test]
+fn no_debug_assert_in_hot_paths() {
+    // (crate dir, source file relative to `<crate>/src`)
+    const HOT_PATHS: &[(&str, &str)] = &[
+        ("scx-format", "shard_decode.rs"),
+        ("scx-codec", "bitstream.rs"),
+        ("scx-codec", "rice.rs"),
+        ("scx-codec", "delta_golomb.rs"),
+        ("scx-gpu", "gpu_shard_source.rs"),
+        ("scx-accel", "diffexp.rs"),
+    ];
+    let root = workspace_root();
+    let mut offenders = Vec::new();
+    for (crate_dir, file) in HOT_PATHS {
+        let path = root.join(crate_dir).join("src").join(file);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("hot-path file {} unreadable: {e}", path.display()));
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let is_macro_call = line.contains("debug_assert!(")
+                || line.contains("debug_assert_eq!(")
+                || line.contains("debug_assert_ne!(");
+            if !is_macro_call {
+                continue;
+            }
+            let justified = line.contains("debug-assert-ok:")
+                || (i > 0 && lines[i - 1].contains("debug-assert-ok:"));
+            if !justified {
+                offenders.push(format!("{}:{}", path.display(), i + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "decode/scatter/rank hot paths must use always-on validation (return an error at the \
+         trust boundary), not debug_assert! (which is compiled out in release). Convert these, \
+         or add a `debug-assert-ok:` justification if the assert is a genuinely-internal \
+         invariant:\n{}",
+        offenders.join("\n")
+    );
+}
+
 /// Extract the quoted members from a workspace `Cargo.toml`'s
 /// `members = [ ... ]` array (single- or multi-line).
 fn parse_members(cargo_toml: &str) -> BTreeSet<String> {

@@ -26,6 +26,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_decode_shard"
+path = "fuzz_targets/fuzz_decode_shard.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_catalog"
 path = "fuzz_targets/fuzz_catalog.rs"
 test = false

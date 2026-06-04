@@ -252,22 +252,30 @@ impl<'a> BitReader<'a> {
     }
 
     /// Advance to the next byte boundary. If already aligned, this is a no-op.
+    ///
+    /// Derives the target from the single source of truth ([`position`]) and
+    /// seeks the buffer there, rather than maintaining two ways to advance
+    /// (a buffer shift vs. a buffer clear) that could disagree. The previous
+    /// implementation's "discard buffer" branch (when the byte boundary lay
+    /// beyond the buffered bits) landed at `byte_pos * 8` — which is generally
+    /// *not* the intended next boundary — silently mis-seeking the stream
+    /// (finding F4). Seeking from the absolute position is correct for both
+    /// the in-buffer and end-of-stream cases.
+    ///
+    /// [`position`]: Self::position
     pub fn align_to_byte(&mut self) {
         let pos = self.position();
-        let remainder = pos % 8;
-        if remainder > 0 {
-            let skip = 8 - remainder;
-            if skip as u8 <= self.bits_left {
-                self.bit_buf >>= skip;
-                self.bits_left -= skip as u8;
-            } else {
-                // Need more data — discard buffer and advance byte_pos
-                self.bit_buf = 0;
-                self.bits_left = 0;
-                // byte_pos is already past the buffered data, so position()
-                // is at a byte boundary after clearing the buffer
-            }
+        if pos.is_multiple_of(8) {
+            return;
         }
+        // Next byte boundary at or after the current bit position.
+        self.byte_pos = pos.div_ceil(8);
+        self.bit_buf = 0;
+        self.bits_left = 0;
+        self.refill();
+        // After refill, position() == target_byte * 8: refill loads `loaded`
+        // bytes, so byte_pos == target + loaded and bits_left == loaded * 8,
+        // hence position() == (target + loaded) * 8 - loaded * 8 == target * 8.
     }
 }
 
@@ -472,6 +480,46 @@ mod tests {
         assert_eq!(reader.position(), 6);
         reader.read_bits(2).unwrap();
         assert_eq!(reader.position(), 8);
+    }
+
+    /// F4: aligning from a mid-byte position must land on the *next* byte
+    /// boundary and leave the next whole byte readable.
+    #[test]
+    fn align_to_byte_seeks_to_next_boundary() {
+        let data = vec![0x12, 0x34, 0x56];
+        let mut reader = BitReader::new(&data);
+        reader.read_bits(11).unwrap(); // pos 11, partway through the 2nd byte
+        reader.align_to_byte();
+        assert_eq!(reader.position(), 16);
+        assert_eq!(reader.read_bits(8).unwrap(), 0x56);
+    }
+
+    #[test]
+    fn align_to_byte_is_noop_when_aligned() {
+        let data = vec![0xAA, 0xBB];
+        let mut reader = BitReader::new(&data);
+        reader.read_bits(8).unwrap();
+        let before = reader.position();
+        reader.align_to_byte();
+        assert_eq!(reader.position(), before);
+        assert_eq!(reader.position() % 8, 0);
+    }
+
+    /// F4 (the previously-buggy branch): when the next byte boundary lies
+    /// beyond the buffered bits (end of a short stream), align must still be
+    /// byte-aligned and never move backwards — the old "discard buffer" path
+    /// landed at `byte_pos * 8`, mis-seeking the stream.
+    #[test]
+    fn align_to_byte_end_of_stream_is_byte_aligned_and_monotonic() {
+        let data = vec![0x99];
+        let mut reader = BitReader::new(&data);
+        reader.read_bits(3).unwrap(); // pos 3
+        let before = reader.position();
+        reader.align_to_byte();
+        let after = reader.position();
+        assert_eq!(after % 8, 0);
+        assert!(after >= before, "align must not move backwards");
+        assert_eq!(after, 8);
     }
 
     #[test]
