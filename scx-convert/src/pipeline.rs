@@ -2044,40 +2044,21 @@ fn write_csr_shards(
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
-        // Slice indptr for this shard
+        // Slice indptr for this shard, then validate + rebase + cast
+        // through the shared scx-sparse helper. C6: this eager site
+        // previously did a manual `v >= base` check that skipped the
+        // column-bound check (`indices < n_vars`); `rebase_csr_shard`
+        // runs the full `validate_csr_arrays`.
         let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        // Validate indptr values are non-negative and >= base (finding 8.6).
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Slice indices and data
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
-        })?;
-        // Validate indices are non-negative before casting to u32 (finding 8.5).
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(shard_indptr_slice, indices.len().min(data.len()))
+                .map_err(|e| ConvertError::Other(format!("X shard validation failed: {e}")))?;
+        let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
+            shard_indptr_slice,
+            &indices[nnz_start..nnz_end],
+            n_vars as u64,
+        )
+        .map_err(|e| ConvertError::Other(format!("X shard validation failed: {e}")))?;
         let shard_data = &data[nnz_start..nnz_end];
 
         // Pre-encode so the bitmap auto-policy can compare against the
@@ -2454,7 +2435,7 @@ fn write_layer_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
@@ -2467,38 +2448,25 @@ fn write_layer_shards(
     while row_start < n_obs {
         let row_end = (row_start + shard_target_rows).min(n_obs);
 
+        // Validate + rebase + cast through the shared scx-sparse helper
+        // (C6: adds the column-bound check this eager site previously
+        // skipped).
         let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        // Validate indptr values are non-negative and >= base (finding 8.6).
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(shard_indptr_slice, indices.len().min(data.len()))
+                .map_err(|e| {
+                    ConvertError::Other(format!(
+                        "layer '{layer_name}' shard validation failed: {e}"
+                    ))
+                })?;
+        let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
+            shard_indptr_slice,
+            &indices[nnz_start..nnz_end],
+            n_vars as u64,
+        )
+        .map_err(|e| {
+            ConvertError::Other(format!("layer '{layer_name}' shard validation failed: {e}"))
         })?;
-        // Validate indices are non-negative before casting to u32 (finding 8.5).
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let shard_data = &data[nnz_start..nnz_end];
         let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
 

@@ -175,17 +175,10 @@ impl XStreamReader {
         let row_end = (row_start + target_rows).min(self.n_obs);
         let n_rows = row_end - row_start;
 
-        let base = self.indptr[row_start];
-        let end_val = self.indptr[row_end];
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(end_val)
-            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
-        if nnz_end < nnz_start {
-            return Err(ConvertError::Other(format!(
-                "indptr non-monotonic across shard: base={base}, end={end_val}"
-            )));
-        }
+        let indptr_slice = &self.indptr[row_start..=row_end];
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices_ds.shape()[0])
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         // Read the indices / data slices. Empty shards (nnz_start ==
         // nnz_end) skip the hdf5 read entirely — `read_slice_1d` on
@@ -199,26 +192,12 @@ impl XStreamReader {
             (i, v)
         };
 
-        // Validate the on-disk i64 indptr slice + i32 indices before
-        // any dtype coercion. Phase 2 hoisted this helper into
-        // scx-sparse; both this streaming reader and the in-memory
-        // pyscx path share it.
-        scx_sparse::validate_csr_arrays(
-            &self.indptr[row_start..=row_end],
-            &shard_indices_i32,
-            self.n_vars as u64,
-        )
-        .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
-
-        // Rebase the shard-local indptr to start at 0. Validation
-        // above guarantees monotonicity, so `(v - base)` is non-
-        // negative and `as u64` is lossless.
-        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows + 1);
-        for &v in &self.indptr[row_start..=row_end] {
-            shard_indptr.push((v - base) as u64);
-        }
-
-        let shard_indices: Vec<u32> = shard_indices_i32.into_iter().map(|v| v as u32).collect();
+        // Validate (monotonic indptr + column bound) + rebase + cast
+        // through the shared scx-sparse helper. Both this streaming
+        // reader and the eager pipeline path share it.
+        let (shard_indptr, shard_indices) =
+            scx_sparse::rebase_csr_shard(indptr_slice, &shard_indices_i32, self.n_vars as u64)
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         self.cursor = row_end;
         Ok(CsrShardSlice {
@@ -251,17 +230,10 @@ impl XStreamReader {
         let row_start_usize = row_start as usize;
         let row_end = row_start_usize + n_rows as usize;
 
-        let base = self.indptr[row_start_usize];
-        let end_val = self.indptr[row_end];
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(end_val)
-            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
-        if nnz_end < nnz_start {
-            return Err(ConvertError::Other(format!(
-                "indptr non-monotonic across shard: base={base}, end={end_val}"
-            )));
-        }
+        let indptr_slice = &self.indptr[row_start_usize..=row_end];
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices_ds.shape()[0])
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         let (shard_indices_i32, shard_values) = if nnz_start == nnz_end {
             (Vec::<i32>::new(), Vec::<f32>::new())
@@ -271,18 +243,10 @@ impl XStreamReader {
             (i, v)
         };
 
-        scx_sparse::validate_csr_arrays(
-            &self.indptr[row_start_usize..=row_end],
-            &shard_indices_i32,
-            self.n_vars as u64,
-        )
-        .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
-
-        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows as usize + 1);
-        for &v in &self.indptr[row_start_usize..=row_end] {
-            shard_indptr.push((v - base) as u64);
-        }
-        let shard_indices: Vec<u32> = shard_indices_i32.into_iter().map(|v| v as u32).collect();
+        // Validate + rebase + cast through the shared scx-sparse helper.
+        let (shard_indptr, shard_indices) =
+            scx_sparse::rebase_csr_shard(indptr_slice, &shard_indices_i32, self.n_vars as u64)
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         let n_cols = u32::try_from(self.n_vars)
             .map_err(|_| ConvertError::Other(format!("n_vars {} exceeds u32::MAX", self.n_vars)))?;

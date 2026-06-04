@@ -101,23 +101,25 @@ pub fn detect_matrix_format_at(
                 .map(|d| d.shape().iter().product::<usize>());
             if let (Some(indptr_len), Some((n_obs, n_vars))) = (indptr_len, read_shape_attr(&group))
             {
-                let fits_csr = indptr_len == n_obs + 1;
-                let fits_csc = indptr_len == n_vars + 1;
-                if fits_csc && !fits_csr {
-                    sink.emit(ConvertWarning::InferredEncoding {
-                        path: path.to_string(),
-                        inferred: "csc_matrix (indptr length == n_vars+1)".into(),
-                    });
-                    return Ok(MatrixFormat::Csc);
+                // Detection scans no indices, so `max_index` is None.
+                match scx_sparse::validate_sparse_layout((n_obs, n_vars), indptr_len, None) {
+                    scx_sparse::SparseLayout::Csc => {
+                        sink.emit(ConvertWarning::InferredEncoding {
+                            path: path.to_string(),
+                            inferred: "csc_matrix (indptr length == n_vars+1)".into(),
+                        });
+                        return Ok(MatrixFormat::Csc);
+                    }
+                    scx_sparse::SparseLayout::Csr => {
+                        sink.emit(ConvertWarning::InferredEncoding {
+                            path: path.to_string(),
+                            inferred: "csr_matrix (indptr length == n_obs+1)".into(),
+                        });
+                        return Ok(MatrixFormat::Csr);
+                    }
+                    // Square or neither-fits: ambiguous, fall through to CSR default.
+                    scx_sparse::SparseLayout::Ambiguous => {}
                 }
-                if fits_csr && !fits_csc {
-                    sink.emit(ConvertWarning::InferredEncoding {
-                        path: path.to_string(),
-                        inferred: "csr_matrix (indptr length == n_obs+1)".into(),
-                    });
-                    return Ok(MatrixFormat::Csr);
-                }
-                // Square or neither-fits: ambiguous, fall through to CSR default.
             }
             sink.emit(ConvertWarning::InferredEncoding {
                 path: path.to_string(),

@@ -169,21 +169,21 @@ impl MaterializedCsrStream {
         let row_start_usize = row_start as usize;
         let row_end = row_start_usize + n_rows as usize;
 
-        let base = self.indptr[row_start_usize];
-        let end_val = self.indptr[row_end];
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(end_val)
-            .map_err(|_| ConvertError::Other(format!("negative indptr end {end_val}")))?;
-
-        let mut shard_indptr: Vec<u64> = Vec::with_capacity(n_rows as usize + 1);
-        for &v in &self.indptr[row_start_usize..=row_end] {
-            shard_indptr.push((v - base) as u64);
-        }
-        let shard_indices: Vec<u32> = self.indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| v as u32)
-            .collect();
+        // C5: this materialized-CSR reader previously sliced
+        // `indices`/`data` with no monotonicity guard (a reversed range
+        // would underflow-wrap) and skipped `validate_csr_arrays`
+        // entirely. Route it through the same shared helpers as the
+        // other four ingest sites.
+        let indptr_slice = &self.indptr[row_start_usize..=row_end];
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices.len().min(self.data.len()))
+                .map_err(|e| ConvertError::Other(format!("CSR shard validation failed: {e}")))?;
+        let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
+            indptr_slice,
+            &self.indices[nnz_start..nnz_end],
+            self.n_vars,
+        )
+        .map_err(|e| ConvertError::Other(format!("CSR shard validation failed: {e}")))?;
         let shard_values: Vec<f32> = self.data[nnz_start..nnz_end].to_vec();
 
         Ok(StreamedCsrShard {
@@ -430,7 +430,7 @@ impl CscToCsrExternalTransposer {
         // produces zero records and zero duplicates.
         if !records.is_empty() {
             records.sort_unstable_by_key(|r| (r.0, r.1));
-            let dup_count = coalesce_duplicates(&mut records);
+            let dup_count = scx_sparse::coalesce_sorted_coo(&mut records);
             self.pending_duplicates = self.pending_duplicates.saturating_add(dup_count);
         }
         self.current_records = records;
@@ -570,54 +570,7 @@ fn read_bucket(path: &PathBuf) -> Result<Vec<(u64, u32, f32)>, ConvertError> {
     Ok(out)
 }
 
-/// Sum entries that share the same `(row, col)` coordinate. The
-/// input must be sorted by `(row, col)`. Returns the number of
-/// duplicate pairs that were merged (i.e. `dup_count == 0` means no
-/// duplicates).
-///
-/// Resulting `0.0` values stay in the vector — `drop_explicit_zeros_inplace`
-/// (applied downstream by `streaming_writer_coordinator`) removes them.
-fn coalesce_duplicates(records: &mut Vec<(u64, u32, f32)>) -> u64 {
-    if records.is_empty() {
-        return 0;
-    }
-    let mut dup_count: u64 = 0;
-    let mut write = 0usize;
-    for read in 1..records.len() {
-        let (r, c, v) = records[read];
-        let (pr, pc, pv) = records[write];
-        if r == pr && c == pc {
-            // Merge into the previous slot.
-            records[write] = (pr, pc, pv + v);
-            dup_count += 1;
-        } else {
-            write += 1;
-            records[write] = (r, c, v);
-        }
-    }
-    records.truncate(write + 1);
-    dup_count
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coalesce_no_duplicates() {
-        let mut v = vec![(0u64, 0u32, 1.0f32), (0, 1, 2.0), (1, 0, 3.0)];
-        let n = coalesce_duplicates(&mut v);
-        assert_eq!(n, 0);
-        assert_eq!(v.len(), 3);
-    }
-
-    #[test]
-    fn coalesce_sums_duplicates() {
-        let mut v = vec![(0u64, 0u32, 1.0f32), (0, 0, 2.5), (0, 0, 0.5), (1, 0, 3.0)];
-        let n = coalesce_duplicates(&mut v);
-        assert_eq!(n, 2);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0], (0, 0, 4.0));
-        assert_eq!(v[1], (1, 0, 3.0));
-    }
-}
+// The `(row, col)` dedup-sum was hoisted to
+// `scx_sparse::coalesce_sorted_coo` (Phase 2) so the MTX reader and
+// this external transposer share one implementation of the "sum
+// duplicates" rule; its unit tests live alongside it in scx-sparse.

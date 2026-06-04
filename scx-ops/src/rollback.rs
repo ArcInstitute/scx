@@ -7,7 +7,6 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt};
 use scx_format::catalog::{FullCatalog, RootCatalog, RootCatalogEntry};
 use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::section::SectionType;
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -178,52 +177,20 @@ fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicabl
 ) -> Result<()> {
     let (catalog, catalog_len) = read_catalog_at(file, catalog_offset)?;
 
-    // Count CSR/CSC shards and compute stats from the target catalog
-    let mut n_csr_shards = 0u32;
-    let mut n_csc_shards = 0u32;
-    let mut total_nnz = 0u64;
-    let mut has_dv = false;
-
-    for entry in &catalog.entries {
-        match entry.section_type {
-            SectionType::CsrShard => {
-                n_csr_shards += 1;
-                if let Some(ref stats) = entry.stats {
-                    total_nnz += stats.nnz;
-                }
-            }
-            // OE1: the CSC sidecar shard count and HAS_CSC flag must be
-            // resynced too, or rolling back across a CSC add/remove leaves
-            // the header pointing at absent shards (or vice versa).
-            SectionType::CscShard => {
-                n_csc_shards += 1;
-            }
-            SectionType::DeletionVectors => {
-                has_dv = true;
-            }
-            _ => {}
-        }
-    }
-
     // Update header
     header.full_catalog_offset = catalog_offset;
     header.full_catalog_length = catalog_len;
     header.manifest_sequence = catalog.manifest_sequence;
     header.prev_catalog_offset = catalog.prev_catalog_offset;
     header.n_obs = catalog.n_obs;
-    header.n_csr_shards = n_csr_shards;
-    header.n_csc_shards = n_csc_shards;
-    header.nnz = total_nnz;
-    if has_dv {
-        header.set_deletion_vectors();
-    } else {
-        header.flags &= !(1 << 5);
-    }
-    if n_csc_shards > 0 {
-        header.set_csc();
-    } else {
-        header.clear_csc();
-    }
+    // OE1 (structural): re-derive every shard counter and section flag
+    // the writer owns (n_csr/n_csc/nnz + CSC/obsm/obsp/bitmap/DV) from
+    // the target catalog through the single source of truth shared with
+    // the writer-finalize path, so rolling back across an add or remove
+    // of *any* of those section types can't leave the header
+    // inconsistent. The previous hand-rolled loop only handled
+    // CSR/CSC/DV and left obsm/obsp/bitmap flags stale.
+    header.sync_from_catalog(&catalog);
 
     // Clear front catalog — it references offsets from a cloud-optimized layout
     // that may not match the catalog we're rolling back to. (Finding 4.8)
