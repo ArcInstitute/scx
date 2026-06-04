@@ -509,6 +509,60 @@ fn test_merge_three_files() {
     assert_eq!(last.input_checksums.len(), 3);
 }
 
+// OE2: a corrupt uns section must propagate as an error through merge, not be
+// silently swallowed and conflated with "no uns section".
+#[test]
+fn test_merge_propagates_corrupt_uns() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Input with a valid uns section we will corrupt on disk.
+    let path1 = dir.path().join("corrupt_uns.scx");
+    {
+        let header = sample_header(4, 10);
+        let mut w = ScxWriter::new(&path1, header).unwrap();
+        w.write_obs(&sample_obs(4)).unwrap();
+        w.write_var(&sample_var(10)).unwrap();
+        let (ip, ix, v) = sample_shard_data(4, 10);
+        w.write_csr_shard(&ip, &ix, &v, CodecId::None, ValueEncoding::Uint8, 0)
+            .unwrap();
+        w.write_uns(&serde_json::json!({"method": "test"})).unwrap();
+        w.finish().unwrap();
+    }
+    let path2 = write_test_file(&dir, "valid.scx", 4, 10, 1);
+
+    // Locate the uns section payload and overwrite it (same length) with
+    // bytes that are neither valid JSON nor a valid compressed frame, so
+    // read_uns fails to parse rather than reporting absence.
+    let (off, len) = {
+        let reader = ScxReader::open(&path1).unwrap();
+        let e = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.name == "uns")
+            .expect("uns entry present");
+        (e.offset, e.length as usize)
+    };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path1)
+            .unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&vec![b'{'; len]).unwrap();
+        f.flush().unwrap();
+    }
+
+    let output = dir.path().join("merged_corrupt.scx");
+    let result = scx_ops::merge(&[path1.as_path(), path2.as_path()], &output);
+    assert!(
+        result.is_err(),
+        "merge should propagate corrupt uns, not swallow it as 'no uns'"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Flock test
 // ---------------------------------------------------------------------------
@@ -2158,6 +2212,53 @@ fn test_csc_generation_lifecycle_append_then_rebuild() {
     );
     // The rebuilt file opens via the backed CSC reader (not stale).
     assert!(BackedCscReader::new(r3, 0).is_ok());
+}
+
+// OE1: rolling back an append that dropped the CSC sidecar must resync the
+// CSC shard count and HAS_CSC flag from the restored catalog — not leave the
+// header advertising absent shards or clear while shards are present.
+#[test]
+fn test_rollback_restores_csc_count_and_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_csc_test_file(&dir, "csc_rollback.scx", 6, 8, 4);
+
+    // Fresh file: CSC sidecar present (2 shards: 8 vars / 4 cols-per-shard).
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.header().has_csc());
+    let original_n_csc = reader.header().n_csc_shards;
+    assert_eq!(original_n_csc, 2);
+    drop(reader);
+
+    // Append drops the CSC sidecar and clears the flag.
+    let new_obs = sample_obs(4);
+    let (indptr, indices, values) = sample_shard_data(4, 8);
+    scx_ops::append(
+        &path,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &AppendOptions::default(),
+    )
+    .unwrap();
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(!reader.header().has_csc());
+    assert_eq!(reader.header().n_csc_shards, 0);
+    drop(reader);
+
+    // Rollback must restore the CSC count and flag from the prior catalog.
+    scx_ops::rollback(&path).unwrap();
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.header().has_csc(),
+        "rollback should restore the HAS_CSC flag"
+    );
+    assert_eq!(
+        reader.header().n_csc_shards,
+        original_n_csc,
+        "rollback should restore the CSC shard count"
+    );
 }
 
 #[test]

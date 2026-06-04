@@ -121,7 +121,7 @@ pub fn pdex_ref_gpu_dense(
     )?;
 
     // Dense host input is densified into an in-memory CSR and routed through the
-    // shared v3 CSR path (ACC-RUST-OPT-V2 §5.7). The transient CSR carries no CSC
+    // shared v3 CSR path. The transient CSR carries no CSC
     // sidecar, so the planner records `gpu_csr_v3` with `NoCscSidecar`. Dense-host
     // DE is the rarest GPU DE input, so the one-time O(n_obs × n_vars) densify→CSR
     // cost is negligible versus the DE compute.
@@ -366,7 +366,7 @@ pub fn wilcoxon_rank_sum_gpu_dense(
     )?;
 
     // Dense host input is densified into an in-memory CSR and routed through the
-    // shared v3 CSR path (ACC-RUST-OPT-V2 §5.7), reporting `gpu_csr_v3` with
+    // shared v3 CSR path, reporting `gpu_csr_v3` with
     // `NoCscSidecar` — identical discipline to `pdex_ref_gpu_dense`.
     let csr = scx_sparse::dense_to_csr(data, n_obs, n_vars)
         .map_err(|e| AccelError::LinAlg(format!("dense→CSR for GPU DE: {e}")))?;

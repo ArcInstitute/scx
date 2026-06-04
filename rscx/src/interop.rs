@@ -12,6 +12,72 @@ use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
 
+/// Canonical index-column names, in priority order. The engine emits
+/// `__index_level_0__` for an unnamed pandas index (pyarrow convention);
+/// `_index` is anndata's on-disk name; the rest are defensive fallbacks.
+const INDEX_COLUMN_NAMES: &[&str] = &[
+    "__index_level_0__",
+    "_index",
+    "index",
+    "obs_names",
+    "var_names",
+];
+
+/// Position of the canonical index column in `batch`, if any.
+fn index_column_pos(batch: &RecordBatch) -> Option<usize> {
+    let schema = batch.schema();
+    INDEX_COLUMN_NAMES.iter().find_map(|&want| {
+        schema
+            .fields()
+            .iter()
+            .position(|f| f.name().as_str() == want)
+    })
+}
+
+/// Extract a string-typed (`Utf8`/`LargeUtf8`) Arrow column as owned
+/// `String`s (nulls → empty string). Returns `None` for non-string columns,
+/// so callers fall back to synthetic names.
+fn array_to_strings(col: &dyn Array) -> Option<Vec<String>> {
+    match col.data_type() {
+        DataType::Utf8 => {
+            let a = col.as_string::<i32>();
+            Some(
+                (0..a.len())
+                    .map(|i| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        DataType::LargeUtf8 => {
+            let a = col.as_string::<i64>();
+            Some(
+                (0..a.len())
+                    .map(|i| {
+                        if a.is_null(i) {
+                            String::new()
+                        } else {
+                            a.value(i).to_string()
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The canonical index column's values as `String`s, if the batch carries
+/// one and it is string-typed (barcodes for obs, gene IDs for var).
+fn index_column_strings(batch: &RecordBatch) -> Option<Vec<String>> {
+    let pos = index_column_pos(batch)?;
+    array_to_strings(batch.column(pos))
+}
+
 /// Convert an Arrow RecordBatch to an R data.frame.
 ///
 /// Column type mapping:
@@ -27,10 +93,25 @@ pub fn record_batch_to_dataframe(batch: &RecordBatch) -> Result<Robj> {
     let schema = batch.schema();
     let n_cols = schema.fields().len();
 
-    // Build a named list of R vectors, one per column
+    // B1: the canonical index column (barcodes / gene IDs) becomes
+    // row.names rather than an ordinary column — but only when it is
+    // string-typed and we can actually use it; otherwise leave it as a
+    // regular column and fall back to synthetic row names so no data is lost.
+    let row_names: Option<Vec<String>> =
+        index_column_pos(batch).and_then(|pos| array_to_strings(batch.column(pos)));
+    let skip_idx = if row_names.is_some() {
+        index_column_pos(batch)
+    } else {
+        None
+    };
+
+    // Build a named list of R vectors, one per retained column
     let mut columns: Vec<(&str, Robj)> = Vec::with_capacity(n_cols);
 
     for (i, field) in schema.fields().iter().enumerate() {
+        if Some(i) == skip_idx {
+            continue;
+        }
         let col = batch.column(i);
         let name = field.name().as_str();
         let robj = arrow_column_to_robj(col, field.data_type())?;
@@ -42,6 +123,16 @@ pub fn record_batch_to_dataframe(batch: &RecordBatch) -> Result<Robj> {
     // Set class to "data.frame" and row.names
     let n_rows = batch.num_rows() as i32;
     let robj: Robj = list.into();
+
+    // Preserve the index column as row.names so name-based joins and
+    // Seurat's rowname-alignment work, instead of overwriting it with a
+    // synthetic 1..N sequence.
+    if let Some(names) = row_names {
+        return R!(
+            "{ x <- {{robj}}; class(x) <- 'data.frame'; attr(x, 'row.names') <- {{names}}; x }"
+        )
+        .map_err(|e| Error::Other(format!("data.frame construction failed: {}", e)));
+    }
 
     // Use R to construct a proper data.frame with row.names
     R!("{ x <- {{robj}}; class(x) <- 'data.frame'; attr(x, 'row.names') <- seq_len({{n_rows}}); x }")
@@ -295,6 +386,20 @@ pub fn csr_to_dgcmatrix(csr: &ScxCsr) -> Result<Robj> {
 
 use scx_engine::pipeline::QueryResult;
 
+/// Set a cells×genes dgCMatrix's `Dimnames` from the obs/var index columns
+/// (rows = cell barcodes, cols = gene IDs) so the resulting Seurat/SCE object
+/// carries real names (B1). When either index is missing, the matrix is
+/// returned unchanged (Dimnames stays NULL, the prior behaviour).
+fn set_dgc_dimnames(dgc: Robj, obs: &RecordBatch, var: &RecordBatch) -> Result<Robj> {
+    match (index_column_strings(obs), index_column_strings(var)) {
+        (Some(cells), Some(genes)) => {
+            R!("{ m <- {{dgc}}; dimnames(m) <- list({{cells}}, {{genes}}); m }")
+                .map_err(|e| Error::Other(format!("setting dgCMatrix dimnames failed: {}", e)))
+        }
+        _ => Ok(dgc),
+    }
+}
+
 /// Create a Seurat v5 object from SCX query results.
 ///
 /// ScxCsr → dgCMatrix (CSR→CSC, cells × genes) → t(dgCMatrix) (genes × cells).
@@ -309,6 +414,7 @@ use scx_engine::pipeline::QueryResult;
 /// Requires: Seurat >= 5.0.0 (listed in Suggests)
 pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
     let dgc = csr_to_dgcmatrix(&result.x)?;
+    let dgc = set_dgc_dimnames(dgc, &result.obs, &result.var)?;
     let obs_df = record_batch_to_dataframe(&result.obs)?;
     let var_df = record_batch_to_dataframe(&result.var)?;
 
@@ -334,6 +440,7 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
 /// Requires: SingleCellExperiment (listed in Suggests)
 pub fn to_sce(result: &QueryResult) -> Result<Robj> {
     let dgc = csr_to_dgcmatrix(&result.x)?;
+    let dgc = set_dgc_dimnames(dgc, &result.obs, &result.var)?;
     let obs_df = record_batch_to_dataframe(&result.obs)?;
     let var_df = record_batch_to_dataframe(&result.var)?;
 

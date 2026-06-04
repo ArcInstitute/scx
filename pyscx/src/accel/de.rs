@@ -322,10 +322,10 @@ fn run_rank_genes_groups_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
         // If a CSC sidecar reader exists on the dataset, hand it to the GPU
-        // streaming path so v3 (`SCX_GPU_DE_V3=1`) can dispatch to the
+        // streaming path so the default v3 route can dispatch to the
         // CSC-direct Wilcoxon driver. None falls through to the v3 CSR-direct
-        // fallback (or v1 when v3 is disabled). Mirrors the pdex_ref backed
-        // path. Only bind under the gpu feature — the CPU branch takes no CSC.
+        // fallback. Mirrors the pdex_ref backed path. Only bind under the gpu
+        // feature — the CPU branch takes no CSC.
         #[cfg(feature = "gpu")]
         let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
         drop(backed);
@@ -1274,10 +1274,10 @@ fn run_pdex_ref_inner(
         let chunk_size = gene_chunk_size.unwrap_or(500);
         let reader = std::sync::Arc::clone(&backed.backed);
         // G4.3: if a CSC sidecar reader exists on the dataset, hand it to
-        // the GPU streaming path so v3 (`SCX_GPU_DE_V3=1`) can dispatch to
+        // the GPU streaming path so the default v3 route can dispatch to
         // the CSC-direct driver. None falls through to the v3 CSR-direct
-        // fallback (or v2 / v1 when v3 is disabled). Only bind under the
-        // gpu feature — the CPU branch doesn't take a CSC reader.
+        // fallback. Only bind under the gpu feature — the CPU branch doesn't
+        // take a CSC reader.
         #[cfg(feature = "gpu")]
         let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
         drop(backed);
@@ -1608,8 +1608,8 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// ``adata.uns["scx_accel"]["pdex_ref"]`` (keys: ``route``,
 /// ``fallback_reason``, ``chunk_size``, ``csc_available``, ...). The
 /// CSC-direct GPU route (``route == "gpu_csc_v3"``) requires a backed SCX file
-/// with a CSC sidecar and ``SCX_GPU_DE_V3=1``; in-memory CSR inputs fall back
-/// to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
+/// with a CSC sidecar (v3 is the default GPU DE route); in-memory CSR inputs
+/// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
 #[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto"))]

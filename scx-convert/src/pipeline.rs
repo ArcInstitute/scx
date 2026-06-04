@@ -707,6 +707,24 @@ pub fn h5ad_to_scx(
 
     if let Ok(layers) = read_layers(&file) {
         for (layer_name, (l_indptr, l_indices, l_data, l_nobs, l_nvars)) in &layers {
+            // C2: validate the layer's shape against X, matching the streaming
+            // path. A layer whose row/column count disagrees with /X would
+            // otherwise produce an SCX file whose layer dimensions silently
+            // diverge from the primary matrix.
+            if *l_nobs != n_obs {
+                sink.emit(ConvertWarning::LayerSkipped {
+                    name: layer_name.clone(),
+                    reason: format!("n_obs {l_nobs} does not match X n_obs {n_obs}"),
+                });
+                continue;
+            }
+            if *l_nvars != n_vars {
+                sink.emit(ConvertWarning::LayerSkipped {
+                    name: layer_name.clone(),
+                    reason: format!("n_vars {l_nvars} does not match X n_vars {n_vars}"),
+                });
+                continue;
+            }
             let (l_enc, l_codec) =
                 detect_value_encoding(l_data, opts.codec).map_err(ScxError::from)?;
             let l_index_dtype: u8 = if *l_nvars <= 65535 { 0 } else { 1 };

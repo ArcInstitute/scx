@@ -506,6 +506,149 @@ fn test_csc_x() {
     assert_eq!(csc_csr.data, csr_csr.data);
 }
 
+// C1: a CSC group lacking the encoding-type attribute, with n_vars < n_obs,
+// must be classified CSC (indptr.len() == n_vars+1) rather than misdetected as
+// CSR (which would panic/corrupt downstream). Detection-only and full-convert.
+#[test]
+fn test_csc_without_encoding_type_detected_by_indptr_len() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("csc_no_enc.h5ad");
+
+    let n_obs = 8usize;
+    let n_vars = 3usize; // n_vars < n_obs is the panic-prone case
+
+    // Build CSR arrays, then transpose to CSC for on-disk storage.
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for row in 0..n_obs {
+        let col = row % n_vars;
+        indices.push(col as i32);
+        data.push((row + 1) as f32);
+        indptr.push(data.len() as i64);
+    }
+    let (csc_indptr, csc_indices, csc_data) = csr_to_csc(&indptr, &indices, &data, n_obs, n_vars);
+    assert_eq!(csc_indptr.len(), n_vars + 1);
+
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        // obs group so the file reads as h5ad; no X encoding-type attr.
+        file.create_group("obs").unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([csc_indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&csc_indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([csc_indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&csc_indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([csc_data.len()])
+            .create("data")
+            .unwrap()
+            .write(&csc_data)
+            .unwrap();
+        let shape = [n_obs as i64, n_vars as i64];
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&shape)
+            .unwrap();
+    }
+
+    let file = hdf5::File::open(&path).unwrap();
+    let fmt = detect_matrix_format(&file, &mut WarningSink::log()).unwrap();
+    assert_eq!(
+        fmt,
+        MatrixFormat::Csc,
+        "CSC group without encoding-type must be detected via indptr length"
+    );
+}
+
+// C2: the eager (stream=false) ingest path must validate each layer's shape
+// against X, matching the streaming path. A layer whose n_obs disagrees with
+// /X is skipped with a LayerSkipped warning rather than written with diverging
+// dimensions.
+#[test]
+fn test_eager_skips_layer_with_mismatched_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layer_mismatch.h5ad");
+    let scx = dir.path().join("layer_mismatch.scx");
+
+    let n_obs = 10usize;
+    let n_vars = 8usize;
+    create_test_h5ad(&path, n_obs, n_vars, "csr", false);
+
+    // Add a layer whose row count (7) disagrees with X (10).
+    {
+        let file = hdf5::File::open_rw(&path).unwrap();
+        let layers = file.create_group("layers").unwrap();
+        let bad = layers.create_group("mismatch").unwrap();
+        let l_obs = 7usize;
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data = Vec::new();
+        for r in 0..l_obs {
+            indices.push((r % n_vars) as i32);
+            data.push((r + 1) as f32);
+            indptr.push(data.len() as i64);
+        }
+        bad.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        bad.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        bad.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        bad.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        bad.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[l_obs as i64, n_vars as i64])
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&path, &scx, &opts, &mut sink).unwrap();
+
+    assert!(
+        sink.counts().get("layer_skipped").copied().unwrap_or(0) >= 1,
+        "eager convert should skip the shape-mismatched layer with a warning"
+    );
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let layer_shards = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::LayerCsrShard)
+        .count();
+    assert_eq!(layer_shards, 0, "mismatched layer must not be written");
+}
+
 #[test]
 fn test_uns_skip_non_serializable() {
     let dir = tempfile::tempdir().unwrap();

@@ -1749,8 +1749,19 @@ fn combine_uns_for_merge(
     // hand off to the per-input combiner. Splitting the read step out
     // lets the per-modality multimodal path reuse the same policy
     // logic with `read_uns_for(modality_id)`.
-    let per_input: Vec<Option<serde_json::Value>> =
-        readers.iter().map(|r| r.read_uns().ok()).collect();
+    // OE2: distinguish genuine absence from corruption. `.ok()` would
+    // collapse SectionNotFound, byte/checksum failure, and JSON-parse error
+    // all to `None`, silently dropping corrupt uns (or, under RequireEqual,
+    // misreporting it as "input has no uns section"). Only a missing section
+    // is `None`; any other read error propagates.
+    let mut per_input: Vec<Option<serde_json::Value>> = Vec::with_capacity(readers.len());
+    for r in readers {
+        match r.read_uns() {
+            Ok(v) => per_input.push(Some(v)),
+            Err(scx_format::ScxError::SectionNotFound(_)) => per_input.push(None),
+            Err(e) => return Err(e.into()),
+        }
+    }
     combine_uns_per_input(&per_input, policy, conflicts_warned)
 }
 

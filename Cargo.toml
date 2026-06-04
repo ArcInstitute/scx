@@ -9,6 +9,18 @@ members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "s
 default-members = ["scx-format", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "pyscx", "tests/scx-integration-tests"]
 resolver = "2"
 
+# Keep overflow checks on for the codec crate even in release/bench. Decode is
+# not arithmetic-bound, so the cost is negligible, and it turns every latent
+# integer wrap on a corrupt/hostile shard into a hard panic-under-test rather
+# than silent corruption (pairs with the checked_shl/checked_add + MAX_RICE_K
+# parse-boundary guards in delta_golomb/rice). Per-package overrides must live
+# at the workspace root; a [profile.*] block in scx-codec/Cargo.toml is ignored.
+[profile.release.package.scx-codec]
+overflow-checks = true
+
+[profile.bench.package.scx-codec]
+overflow-checks = true
+
 [workspace.package]
 license = "MIT"
 authors = ["Nick Youngblut <nick.youngblut@arcinstitute.org>"]

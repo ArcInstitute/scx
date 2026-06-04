@@ -51,13 +51,17 @@ impl ShardShuffler {
     /// `shard_group_size`. The last group may be smaller.
     ///
     /// Increments `self.epoch` after generating groups.
+    ///
+    /// LC7: production uses [`shuffle_epoch_sorted`](Self::shuffle_epoch_sorted);
+    /// this unsorted variant is test-only.
+    #[cfg(test)]
     pub fn shuffle_epoch(&mut self) -> Vec<Vec<usize>> {
         self.shuffle_epoch_inner()
     }
 
     /// Generate offset-sorted shard groups for this epoch.
     ///
-    /// Like [`shuffle_epoch`], randomly permutes shard indices and groups them,
+    /// Like the unsorted shuffle, randomly permutes shard indices and groups them,
     /// but then sorts shards within each group by file offset (ascending) and
     /// sorts the groups themselves by minimum offset. This converts random I/O
     /// into a mostly-sequential scan while preserving stochastic group

@@ -261,17 +261,32 @@ fn parse_mtx_file(
         )));
     }
 
-    // Sort COO entries in-place by (row, col), then build CSR directly
+    // Sort COO entries in-place by (row, col), then build CSR directly.
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
     let mut indptr = vec![0i64; n_rows + 1];
     let mut indices = Vec::with_capacity(nnz);
     let mut data = Vec::with_capacity(nnz);
 
-    for &(row, col, val) in &entries {
-        indptr[row + 1] += 1;
-        indices.push(col as i32);
-        data.push(val);
+    // Coalesce duplicate coordinates by summing their values (the
+    // MatrixMarket "sum duplicates" rule) in one linear pass over the
+    // sorted run, dropping any coordinate whose summed value is zero.
+    // Without this, downstream `ScxCsc::new` rejects the duplicate row
+    // indices a later `build-csc`/`--rebuild-csc` would produce.
+    let mut i = 0;
+    while i < entries.len() {
+        let (row, col, mut sum) = entries[i];
+        let mut j = i + 1;
+        while j < entries.len() && entries[j].0 == row && entries[j].1 == col {
+            sum += entries[j].2;
+            j += 1;
+        }
+        if sum != 0.0 {
+            indptr[row + 1] += 1;
+            indices.push(col as i32);
+            data.push(sum);
+        }
+        i = j;
     }
 
     // Cumulative sum for indptr
@@ -382,6 +397,32 @@ mod tests {
         assert_eq!(indptr, vec![0, 2, 3, 5]);
         assert_eq!(indices, vec![1, 3, 0, 1, 2]);
         assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    // CLI1: duplicate coordinates must be summed (MatrixMarket rule), and a
+    // pair that sums to zero must be dropped, so the CSR carries one entry per
+    // (row, col).
+    #[test]
+    fn test_parse_mtx_sums_duplicate_coords() {
+        let mtx_content = "\
+%%MatrixMarket matrix coordinate real general
+2 2 5
+1 1 1.0
+1 1 2.0
+1 2 5.0
+2 1 4.0
+2 1 -4.0
+";
+        let bound = mtx_content.len();
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
+        let (indptr, indices, data, n_rows, n_cols) = parse_mtx_file(reader, bound).unwrap();
+
+        assert_eq!(n_rows, 2);
+        assert_eq!(n_cols, 2);
+        // (0,0) summed to 3.0; (0,1) = 5.0; (1,0) summed to 0.0 → dropped.
+        assert_eq!(indptr, vec![0, 2, 2]);
+        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(data, vec![3.0, 5.0]);
     }
 
     #[test]

@@ -14,15 +14,21 @@ use crate::median::floor_median_u32;
 /// Default block size for Rice coding of values.
 pub const B_VAL: usize = 256;
 
+/// Maximum Rice parameter `k`, single source of truth for the clamp in
+/// `compute_k` and the decode-side parse-boundary rejection in both this
+/// module and `delta_golomb`. `k` is encoded in a 4-bit field, so values
+/// above 15 are unrepresentable and indicate a corrupt/hostile stream.
+pub const MAX_RICE_K: u8 = 15;
+
 /// Compute the Rice parameter k from the median of shifted values.
 ///
-/// `k = clamp(floor(log2(0.6931 * median)), 0, 15)`.
+/// `k = clamp(floor(log2(0.6931 * median)), 0, MAX_RICE_K)`.
 fn compute_k(median: u32) -> u8 {
     if median == 0 {
         return 0;
     }
     let raw = (std::f64::consts::LN_2 * median as f64).log2().floor() as i32;
-    raw.clamp(0, 15) as u8
+    raw.clamp(0, MAX_RICE_K as i32) as u8
 }
 
 /// Encode non-zero count values using blocked Rice coding.
@@ -92,14 +98,24 @@ pub fn rice_decode(
         let k = block_header & 0x0F;
 
         for _ in 0..block_len {
-            let q = reader.read_unary()? as u32;
-            let r = if k > 0 {
-                reader.read_bits(k)? as u32
-            } else {
-                0
-            };
-            let shifted = (q << k) | r;
-            output.push(shifted + 1);
+            // Keep the unary quotient as u64: casting to u32 first would
+            // silently truncate a long (hostile) unary run before the shift.
+            let q = reader.read_unary()?;
+            let r = if k > 0 { reader.read_bits(k)? } else { 0 };
+            // `(q << k) | r`, then `+1`, all range-checked against u32 so a
+            // crafted stream returns MalformedInput rather than wrapping in
+            // release (overflow-checks are off there without the profile flag).
+            let value = q
+                .checked_shl(k as u32)
+                .map(|qk| qk | r)
+                .and_then(|shifted| shifted.checked_add(1))
+                .filter(|&v| v <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    CodecError::MalformedInput(
+                        "Rice value overflows u32 (corrupt stream)".to_string(),
+                    )
+                })?;
+            output.push(value as u32);
         }
 
         // Align to byte boundary
@@ -301,5 +317,23 @@ mod tests {
     fn rice_encode_rejects_single_zero() {
         let result = rice_encode(&[0], B_VAL);
         assert!(result.is_err());
+    }
+
+    // F2: a decoded value that overflows u32 (here `(q << k) + 1` with a
+    // crafted quotient) must return MalformedInput rather than wrapping.
+    #[test]
+    fn rice_decode_rejects_u32_overflow() {
+        let mut w = BitWriter::new();
+        w.write_bits(MAX_RICE_K as u64, 8); // block header: k = 15
+                                            // q = 2^17 → (q << 15) = 2^32 > u32::MAX, so value overflows u32.
+        w.write_unary(1u64 << 17);
+        w.write_bits(0, MAX_RICE_K); // r bits (k = 15)
+        w.pad_to_byte();
+        let data = w.flush();
+        let result = rice_decode(&data, 1, B_VAL);
+        assert!(
+            matches!(result, Err(CodecError::MalformedInput(_))),
+            "expected MalformedInput, got {result:?}"
+        );
     }
 }

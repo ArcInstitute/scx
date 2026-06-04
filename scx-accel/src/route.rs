@@ -5,8 +5,8 @@
 //! arguments (`device`, `prefer_format`), input layout (dense / in-memory CSR /
 //! backed CSR / backed CSC / lazy), and runtime availability (CUDA present,
 //! CSC sidecar present). GPU DE v3 is the unconditional default; the former
-//! `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in
-//! ACC-RUST-OPT-V2 §5 Phase V1b. Historically the *only* signal of which route
+//! `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed when v3 was
+//! promoted to default. Historically the *only* signal of which route
 //! ran was an ad-hoc `SCX_GPU_DE_V3_TRACE` stderr line — which made it easy to
 //! benchmark one route while believing another ran.
 //!
@@ -211,8 +211,8 @@ pub enum InputLayout {
 /// `csc_available`); every other layout — including dense-host, which the entry
 /// point densifies to CSR — uses `GpuCsrV3` with
 /// [`FallbackReason::NoCscSidecar`]. The former `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3`
-/// opt-in gates were removed once v3 was promoted to default (ACC-RUST-OPT-V2
-/// §5 Phase V1b); the v1/v2 dense-materialization drivers were deleted in P4.6.
+/// opt-in gates were removed once v3 was promoted to default; the v1/v2
+/// dense-materialization drivers were deleted alongside them.
 pub fn plan_de_route(
     device: DeviceRequest,
     layout: InputLayout,
