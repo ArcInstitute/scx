@@ -42,6 +42,16 @@ pub enum ScxError {
     #[error("invalid catalog: {0}")]
     InvalidCatalog(String),
 
+    #[error("unsupported {section} version: found {found}, expected {expected}")]
+    UnsupportedSectionVersion {
+        section: &'static str,
+        found: u16,
+        expected: u16,
+    },
+
+    #[error("bitmap shard gene_id {gene_id} out of range (n_vars = {n_vars})")]
+    BitmapGeneIdOutOfRange { gene_id: u32, n_vars: u32 },
+
     #[error(
         "stale CSC sidecar: built against data generation {built_generation} but the file is \
          now at data generation {data_generation}; the column-major sidecar no longer matches \

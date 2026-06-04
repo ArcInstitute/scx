@@ -14,6 +14,7 @@ use std::io::{Read, Write};
 
 use crate::checksum::blake3_hash;
 use crate::error::{Result, ScxError};
+use crate::versioned::VersionedSection;
 
 /// Magic bytes identifying a `ModalityTable` section payload.
 pub const MODALITY_TABLE_MAGIC: [u8; 4] = *b"MTBL";
@@ -190,6 +191,11 @@ pub struct ModalityTable {
     pub entries: Vec<ModalityInfo>,
 }
 
+impl VersionedSection for ModalityTable {
+    const SECTION_NAME: &'static str = "ModalityTable";
+    const CURRENT_VERSION: u16 = MODALITY_TABLE_VERSION;
+}
+
 impl ModalityTable {
     /// Convenience constructor.
     pub fn new(entries: Vec<ModalityInfo>) -> Self {
@@ -338,11 +344,7 @@ impl ModalityTable {
         }
 
         let version = cur.read_u16::<LittleEndian>()?;
-        if version != MODALITY_TABLE_VERSION {
-            return Err(ScxError::InvalidCatalog(format!(
-                "unsupported ModalityTable version: {version}"
-            )));
-        }
+        Self::check_version(version)?;
 
         let n_modalities = cur.read_u16::<LittleEndian>()? as usize;
         if n_modalities > MAX_MODALITIES as usize {
@@ -425,6 +427,15 @@ impl ModalityTable {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn check_version_rejects_future() {
+        assert!(matches!(
+            ModalityTable::check_version(MODALITY_TABLE_VERSION + 1),
+            Err(ScxError::UnsupportedSectionVersion { .. })
+        ));
+        assert!(ModalityTable::check_version(MODALITY_TABLE_VERSION).is_ok());
+    }
 
     fn sample_info(name: &str, mtype: ModalityType, n_vars: u64) -> ModalityInfo {
         ModalityInfo {

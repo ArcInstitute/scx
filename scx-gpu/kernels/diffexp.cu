@@ -72,8 +72,9 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 // (no duplicates). Threads write `dense[...] = data[e]` in parallel, so
 // duplicate `(row, col)` entries race and the winning value is
 // nondeterministic. The Rust wrapper enforces this via
-// `check_no_duplicate_columns` at the host-side staging boundary in
-// debug builds.
+// `validate_shard_for_gpu_de` at the host-side staging boundary as a
+// release-active check (returns `GpuError::InvalidShard`), not a
+// debug_assert.
 //
 // `indptr` is 64-bit (matches Rust `i64` and CSR-shard nnz ≥ 2^31);
 // `global_row_offset` is 64-bit so atlases with n_obs > 2^31 don't
@@ -462,8 +463,9 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
 // the raw IEEE-754 bit pattern (cub::BlockRadixSort), so a NaN — whose bit
 // pattern lies above +INF / outside the normal ordering — would land at the
 // wrong position and corrupt the downstream U statistic and tie counts.
-// Callers must guarantee finite input (the CPU side enforces this with a
-// debug assert in `rank_with_ties`).
+// Callers must guarantee finite input: `validate_shard_for_gpu_de` enforces it
+// release-active at the host-side staging boundary (`GpuError::InvalidShard`),
+// and the CPU DE entry point rejects non-finite input symmetrically.
 // ---------------------------------------------------------------------------
 extern "C" __global__ void block_radix_sort_per_gene_kernel(
     float* __restrict__ slab,

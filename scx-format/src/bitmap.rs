@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use crate::error::{validate_allocation, Result, ScxError};
+use crate::versioned::VersionedSection;
 
 /// Detection-bitmap generation policy. Mirrors the
 /// `--bitmap off|auto|always` CLI flag and the `bitmap="..."` pyscx
@@ -91,6 +92,11 @@ pub struct BitmapShard {
     pub genes: BTreeMap<u32, RoaringBitmap>,
 }
 
+impl VersionedSection for BitmapShard {
+    const SECTION_NAME: &'static str = "bitmap shard";
+    const CURRENT_VERSION: u16 = BITMAP_SHARD_VERSION;
+}
+
 impl BitmapShard {
     /// Build a `BitmapShard` from a sorted CSR shard. `indptr.len() ==
     /// n_rows + 1` and `indices[indptr[r]..indptr[r+1]]` lists the
@@ -142,7 +148,13 @@ impl BitmapShard {
     pub fn per_gene_counts(&self) -> Vec<u64> {
         let mut out = vec![0u64; self.n_vars as usize];
         for (&gene_id, bm) in &self.genes {
-            out[gene_id as usize] = bm.len();
+            // Defensive: `read_from` rejects out-of-range gene_ids, so this
+            // never drops a hit for a well-parsed shard. The `get_mut` keeps
+            // a directly-constructed shard with a stray key from panicking
+            // (F3 — the index used to be an unchecked `out[gene_id as usize]`).
+            if let Some(slot) = out.get_mut(gene_id as usize) {
+                *slot = bm.len();
+            }
         }
         out
     }
@@ -227,14 +239,7 @@ impl BitmapShard {
             )));
         }
         let version = r.read_u16::<LittleEndian>()?;
-        if version != BITMAP_SHARD_VERSION {
-            return Err(ScxError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported bitmap shard version {version}; expected {BITMAP_SHARD_VERSION}"
-                ),
-            )));
-        }
+        Self::check_version(version)?;
         let orientation = r.read_u8()?;
         if orientation != BITMAP_ORIENTATION_GENE_TO_ROWS {
             return Err(ScxError::Io(std::io::Error::new(
@@ -268,6 +273,13 @@ impl BitmapShard {
             } else {
                 r.read_u32::<LittleEndian>()?
             };
+            // Semantic-range check (F3): a gene_id >= n_vars would index out of
+            // bounds in `per_gene_counts`. The section checksum is advisory
+            // (the catalog hash authenticates bytes, not semantic ranges), so
+            // reject it here rather than panicking downstream.
+            if gene_id >= n_vars {
+                return Err(ScxError::BitmapGeneIdOutOfRange { gene_id, n_vars });
+            }
             let bitmap_len = r.read_u32::<LittleEndian>()? as usize;
             validate_allocation(bitmap_len, section_len)?;
             let mut bitmap_bytes = vec![0u8; bitmap_len];
@@ -387,6 +399,65 @@ mod tests {
         let buf = vec![0u8; 32]; // less than 60-byte minimum
         let err = BitmapShard::read_from(&mut Cursor::new(&buf), buf.len()).unwrap_err();
         assert!(format!("{err}").contains("too small"));
+    }
+
+    /// A shard with `index_dtype = 0` (u16 gene_id) holding a key.
+    fn shard_with_gene_key(gene_id: u32, n_vars: u32) -> BitmapShard {
+        let mut genes = BTreeMap::new();
+        let mut bm = RoaringBitmap::new();
+        bm.insert(0);
+        genes.insert(gene_id, bm);
+        BitmapShard {
+            version: BITMAP_SHARD_VERSION,
+            orientation: BITMAP_ORIENTATION_GENE_TO_ROWS,
+            index_dtype: 0,
+            row_start: 0,
+            n_rows: 1,
+            n_vars,
+            genes,
+        }
+    }
+
+    /// F3: a `gene_id >= n_vars` on the wire must be rejected at parse time,
+    /// not indexed out of bounds in `per_gene_counts`.
+    #[test]
+    fn read_rejects_gene_id_out_of_range() {
+        let shard = shard_with_gene_key(10, 4);
+        let mut buf = Vec::new();
+        shard.write_to(&mut buf).unwrap();
+        let err = BitmapShard::read_from(&mut Cursor::new(&buf), buf.len()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ScxError::BitmapGeneIdOutOfRange {
+                    gene_id: 10,
+                    n_vars: 4
+                }
+            ),
+            "expected BitmapGeneIdOutOfRange, got {err:?}"
+        );
+    }
+
+    /// F3 defensive: a directly-constructed shard with a stray out-of-range
+    /// key must not panic `per_gene_counts` (the index used to be unchecked).
+    #[test]
+    fn per_gene_counts_tolerates_out_of_range_key() {
+        let shard = shard_with_gene_key(10, 4);
+        let counts = shard.per_gene_counts();
+        assert_eq!(counts.len(), 4);
+        assert!(counts.iter().all(|&c| c == 0));
+    }
+
+    /// The version gate rejects an unknown (future) version and accepts the
+    /// current one (the uniform `VersionedSection` contract).
+    #[test]
+    fn check_version_rejects_future() {
+        use crate::versioned::VersionedSection;
+        assert!(matches!(
+            BitmapShard::check_version(BITMAP_SHARD_VERSION + 1),
+            Err(ScxError::UnsupportedSectionVersion { .. })
+        ));
+        assert!(BitmapShard::check_version(BITMAP_SHARD_VERSION).is_ok());
     }
 
     #[test]

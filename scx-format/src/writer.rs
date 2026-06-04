@@ -1899,25 +1899,12 @@ impl ScxWriter {
         let mut section = vec![0u8; entry.length as usize];
         file.read_exact(&mut section)?;
 
-        let sh = ShardHeader::read_from(&mut Cursor::new(
-            crate::shard_decode::shard_header_slice(&section)?,
-        ))?;
+        let vs = crate::validated_section::ValidatedSection::new(&section);
+        let sh = ShardHeader::read_from(&mut Cursor::new(vs.header()?))?;
 
-        let indptr_bytes = crate::shard_decode::checked_subslice(
-            &section,
-            sh.indptr_rel_offset,
-            sh.indptr_length,
-        )?;
-        let indices_bytes = crate::shard_decode::checked_subslice(
-            &section,
-            sh.indices_rel_offset,
-            sh.indices_length,
-        )?;
-        let values_bytes = crate::shard_decode::checked_subslice(
-            &section,
-            sh.values_rel_offset,
-            sh.values_length,
-        )?;
+        let indptr_bytes = vs.subslice(sh.indptr_rel_offset, sh.indptr_length)?;
+        let indices_bytes = vs.subslice(sh.indices_rel_offset, sh.indices_length)?;
+        let values_bytes = vs.subslice(sh.values_rel_offset, sh.values_length)?;
 
         let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
         let value_encoding = ValueEncoding::from_u8(sh.value_encoding)

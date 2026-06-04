@@ -512,7 +512,7 @@ fn encode_scx1(
     let indices_bytes = forbp_encode(indices, &row_lengths, index_dtype_u16)?;
 
     // values → reinterpret to u32, then Rice encode
-    let values_u32 = raw_bytes_to_u32(values, value_encoding);
+    let values_u32 = raw_bytes_to_u32(values, value_encoding)?;
     let values_bytes = rice_encode(&values_u32, B_VAL)?;
 
     Ok(EncodedShard {
@@ -907,24 +907,39 @@ fn le_bytes_to_indices(
 // ---------------------------------------------------------------------------
 
 /// Reinterpret raw LE value bytes as `Vec<u32>` according to `ValueEncoding`.
-fn raw_bytes_to_u32(data: &[u8], encoding: ValueEncoding) -> Vec<u32> {
+///
+/// `data` is a writer-side buffer sized `n_values × width`, so a ragged tail
+/// (length not a multiple of the element width) is an invariant violation, not
+/// expected input. Use `chunks_exact` and reject the remainder with
+/// [`CodecError::MalformedInput`] rather than silently dropping the partial
+/// element the way a `while let Ok(read_…)` loop did (finding F8 — the
+/// always-on form of the raggedness guard).
+fn raw_bytes_to_u32(data: &[u8], encoding: ValueEncoding) -> Result<Vec<u32>, CodecError> {
     match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&b| b as u32).collect(),
+        ValueEncoding::Uint8 => Ok(data.iter().map(|&b| b as u32).collect()),
         ValueEncoding::Uint16 => {
-            let mut cursor = Cursor::new(data);
-            let mut out = Vec::with_capacity(data.len() / 2);
-            while let Ok(v) = cursor.read_u16::<LittleEndian>() {
-                out.push(v as u32);
+            let chunks = data.chunks_exact(2);
+            if !chunks.remainder().is_empty() {
+                return Err(CodecError::MalformedInput(format!(
+                    "Uint16 value buffer length {} is not a multiple of 2",
+                    data.len()
+                )));
             }
-            out
+            Ok(chunks
+                .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
+                .collect())
         }
         ValueEncoding::Uint32 => {
-            let mut cursor = Cursor::new(data);
-            let mut out = Vec::with_capacity(data.len() / 4);
-            while let Ok(v) = cursor.read_u32::<LittleEndian>() {
-                out.push(v);
+            let chunks = data.chunks_exact(4);
+            if !chunks.remainder().is_empty() {
+                return Err(CodecError::MalformedInput(format!(
+                    "Uint32 value buffer length {} is not a multiple of 4",
+                    data.len()
+                )));
             }
-            out
+            Ok(chunks
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
         }
         ValueEncoding::Float32 | ValueEncoding::Float16 => {
             unreachable!("raw_bytes_to_u32 called with float encoding")
@@ -981,6 +996,30 @@ fn u32_to_raw_bytes(data: &[u32], encoding: ValueEncoding) -> Result<Vec<u8>, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F8: a value buffer whose length is not a multiple of the element width
+    /// is rejected, not silently truncated to drop the partial element.
+    #[test]
+    fn raw_bytes_to_u32_rejects_ragged_input() {
+        // 3 bytes is not a multiple of 2 (Uint16) or 4 (Uint32).
+        assert!(matches!(
+            raw_bytes_to_u32(&[1, 2, 3], ValueEncoding::Uint16),
+            Err(CodecError::MalformedInput(_))
+        ));
+        assert!(matches!(
+            raw_bytes_to_u32(&[1, 2, 3], ValueEncoding::Uint32),
+            Err(CodecError::MalformedInput(_))
+        ));
+        // Exact multiples decode fine.
+        assert_eq!(
+            raw_bytes_to_u32(&[1, 0, 2, 0], ValueEncoding::Uint16).unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            raw_bytes_to_u32(&[5, 0, 0, 0], ValueEncoding::Uint32).unwrap(),
+            vec![5]
+        );
+    }
 
     /// Build a small CSR matrix for testing.
     /// 3 rows, varying nnz:

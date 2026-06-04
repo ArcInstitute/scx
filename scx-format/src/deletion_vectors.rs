@@ -9,6 +9,11 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use crate::error::Result;
+use crate::versioned::VersionedSection;
+
+/// On-disk version of the deletion-vectors section. Increment only when an
+/// existing field changes shape.
+pub const DV_VERSION: u8 = 1;
 
 /// Per-shard deletion bitmap — retained as a convenience struct for call
 /// sites that construct deletions eagerly (tests, pack/unpack helpers).
@@ -41,11 +46,16 @@ pub struct DeletionVectors {
     pub shards: BTreeMap<u32, RoaringBitmap>,
 }
 
+impl VersionedSection for DeletionVectors {
+    const SECTION_NAME: &'static str = "deletion vectors";
+    const CURRENT_VERSION: u16 = DV_VERSION as u16;
+}
+
 impl DeletionVectors {
     /// Create an empty DeletionVectors.
     pub fn new() -> Self {
         Self {
-            dv_version: 1,
+            dv_version: DV_VERSION,
             shards: BTreeMap::new(),
         }
     }
@@ -76,6 +86,9 @@ impl DeletionVectors {
     /// malformed `u32` from requesting a multi-GB allocation.
     pub fn read_from<R: Read>(r: &mut R, section_len: usize) -> Result<Self> {
         let dv_version = r.read_u8()?;
+        // Version gate (F5): previously read-and-ignored, so a future v2
+        // layout would have been silently misparsed.
+        Self::check_version(dv_version as u16)?;
         let n_shards = r.read_u32::<LittleEndian>()? as usize;
 
         // Minimum bytes per shard entry: 4 (shard_id) + 4 (bitmap_len) = 8.
@@ -160,6 +173,31 @@ impl Default for DeletionVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F5: an unknown `dv_version` on the wire must be rejected (it used to be
+    /// read and ignored, so a future v2 layout would have been misparsed).
+    #[test]
+    fn read_rejects_unknown_version() {
+        let mut dv = DeletionVectors::new();
+        dv.dv_version = DV_VERSION + 1;
+        let mut buf = Vec::new();
+        dv.write_to(&mut buf).unwrap();
+        let err =
+            DeletionVectors::read_from(&mut std::io::Cursor::new(&buf), buf.len()).unwrap_err();
+        assert!(
+            matches!(err, crate::ScxError::UnsupportedSectionVersion { .. }),
+            "expected UnsupportedSectionVersion, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_version_rejects_future() {
+        assert!(matches!(
+            DeletionVectors::check_version(DV_VERSION as u16 + 1),
+            Err(crate::ScxError::UnsupportedSectionVersion { .. })
+        ));
+        assert!(DeletionVectors::check_version(DV_VERSION as u16).is_ok());
+    }
 
     #[test]
     fn round_trip() {

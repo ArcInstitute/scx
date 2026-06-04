@@ -2655,9 +2655,8 @@ impl ScxReader {
     /// `read_shard_from_entry`.
     pub fn read_shard_header(&self, entry: &FullCatalogEntry) -> Result<ShardHeader> {
         let section = self.section_bytes(entry)?;
-        ShardHeader::read_from(&mut Cursor::new(crate::shard_decode::shard_header_slice(
-            section,
-        )?))
+        let vs = crate::validated_section::ValidatedSection::new(section);
+        ShardHeader::read_from(&mut Cursor::new(vs.header()?))
     }
 
     /// Read raw shard bytes (header + compressed payload) without decoding.

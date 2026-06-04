@@ -132,6 +132,8 @@ pub fn wilcoxon_rank_sum(
             n_obs
         )));
     }
+    // Finiteness is a contract at the DE accelerator boundary (ACC10).
+    ensure_finite_de_input(data)?;
 
     // Pre-compute cell indices per group.
     let mut group_indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
@@ -319,6 +321,25 @@ fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
     }
 }
 
+/// Reject non-finite input at the DE accelerator boundary (ACC10).
+///
+/// NaN/Inf cannot be ranked meaningfully — a NaN sorts arbitrarily and poisons
+/// the Wilcoxon U statistic and p-value. This is an always-on check (the cost
+/// is one pass over a matrix the ranking already streams), replacing the
+/// per-gene `debug_assert!` that vanished in release builds. Every dense DE
+/// entry point calls it; the sparse/streaming variants inherit it by
+/// delegating to the dense kernels per gene chunk.
+fn ensure_finite_de_input(data: &[f32]) -> Result<()> {
+    if let Some(pos) = data.iter().position(|v| !v.is_finite()) {
+        return Err(crate::AccelError::InvalidInput(format!(
+            "data contains a non-finite value ({}) at index {pos}; differential expression \
+             requires finite input — filter/QC NaN and Inf before ranking",
+            data[pos]
+        )));
+    }
+    Ok(())
+}
+
 /// Rank values with mid-rank tie handling. Returns `(ranks, tie_correction)`.
 ///
 /// `ranks[i]` is the 1-based mid-rank for `values[i]`.
@@ -328,32 +349,18 @@ fn compute_logfc(mean_group: f64, mean_ref: f64, log_transformed: bool) -> f64 {
 ///
 /// # Precondition
 ///
-/// `values` MUST be NaN-free. This contract is enforced **only** by a
-/// `debug_assert!` below; in release builds it is unchecked and the function
-/// relies on upstream QC having removed NaNs. If a NaN does slip through in a
-/// release build, the `partial_cmp` fallback orders it as `Ordering::Equal`,
-/// so it is placed arbitrarily in the sort and produces meaningless ranks (and
-/// a garbage p-value downstream) rather than panicking. Callers must guarantee
-/// finite input.
+/// `values` MUST be finite. Finiteness is enforced once, always-on, at the DE
+/// accelerator entry boundary (`wilcoxon_rank_sum` rejects non-finite input
+/// with `AccelError::InvalidInput`), so this function can assume it. The sort
+/// uses [`f64::total_cmp`] rather than `partial_cmp`, giving a deterministic
+/// total order even if a NaN somehow reached here — defence in depth, never the
+/// primary guard (a stray NaN still yields a meaningless rank, just a stable
+/// one) (finding ACC10).
 fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f64>) -> f64 {
-    // NaN values would be silently ordered as `Equal` by the fallback below,
-    // producing a meaningless rank and a garbage p-value downstream. In debug
-    // builds, assert that the caller pre-sanitised the input; in release,
-    // upstream filters (QC) should have removed NaNs before we get here —
-    // if one slips through we still produce a deterministic (if wrong)
-    // result rather than panicking.
-    debug_assert!(
-        !values.iter().any(|v| v.is_nan()),
-        "rank_with_ties received NaN input — filter NaNs before ranking"
-    );
     let n = values.len();
     index_buf.clear();
     index_buf.extend(0..n);
-    index_buf.sort_unstable_by(|&a, &b| {
-        values[a]
-            .partial_cmp(&values[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    index_buf.sort_unstable_by(|&a, &b| values[a].total_cmp(&values[b]));
 
     ranks.resize(n, 0.0);
     let mut tie_correction = 0.0f64;
@@ -1051,6 +1058,8 @@ pub fn pdex_ref(
             "epsilon must be non-negative and finite (got {epsilon})"
         )));
     }
+    // Finiteness is a contract at the DE accelerator boundary (ACC10).
+    ensure_finite_de_input(data)?;
 
     // Bucket cell indices by group. Cells with `group >= n_groups` are
     // silently dropped (matches pdex's NaN/empty-string handling, which the
@@ -1388,6 +1397,10 @@ pub(crate) fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResul
     // The first chunk already initialised the membership counts.
     acc.feature_names.extend(chunk.feature_names);
     acc.ref_means.extend(chunk.ref_means);
+    // Internal pdex chunk-merge invariant (both buffers are produced by this
+    // crate with one entry per target group), not a decode/scatter/rank guard
+    // on untrusted input.
+    // debug-assert-ok: internal invariant, not an untrusted-input boundary.
     debug_assert_eq!(acc.target_means.len(), chunk.target_means.len());
     for tg in 0..acc.target_means.len() {
         acc.target_means[tg].extend(&chunk.target_means[tg]);
@@ -1474,6 +1487,37 @@ mod tests {
         assert!(
             p < 0.001,
             "p should be very small for separated groups, got {p}"
+        );
+    }
+
+    /// ACC10: a non-finite value in the input matrix is rejected at the DE
+    /// boundary rather than silently producing garbage ranks.
+    #[test]
+    fn test_wilcoxon_rejects_non_finite_input() {
+        let n_obs = 4;
+        let n_vars = 2;
+        let mut data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        data[5] = f32::NAN;
+        let groups = vec![0usize, 0, 1, 1];
+        let gene_names = vec!["g0".to_string(), "g1".to_string()];
+        let group_names = vec!["A".to_string(), "B".to_string()];
+        let err = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::AccelError::InvalidInput(_)),
+            "expected InvalidInput for NaN data, got {err:?}"
         );
     }
 

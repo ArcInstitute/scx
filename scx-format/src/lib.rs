@@ -20,6 +20,8 @@ pub mod section;
 pub mod shard;
 pub mod shard_decode;
 pub mod shard_source;
+pub(crate) mod validated_section;
+pub mod versioned;
 pub mod writer;
 
 pub use arrow_compat::{
@@ -70,6 +72,7 @@ pub use shard::{
 };
 pub use shard_decode::decode_shard_bytes;
 pub use shard_source::{ColumnShardSource, ShardSource};
+pub use versioned::VersionedSection;
 pub use writer::{
     chmod_to_umask, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile, MajorAxis,
     PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
