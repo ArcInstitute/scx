@@ -1,6 +1,6 @@
 [package]
 name = "scx-format"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "File layout, header, catalog, and shard I/O for SCX format"
 license.workspace = true
