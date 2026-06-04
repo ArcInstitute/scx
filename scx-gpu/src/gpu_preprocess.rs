@@ -4,12 +4,16 @@
 //! in `scx-engine/src/fused_ops.rs` and `scx-loader/src/normalize.rs`.
 //!
 //! The kernels operate in-place on [`GpuCsr`] data, modifying the `data`
-//! array while leaving `indptr` and `indices` untouched. Each CUDA thread
-//! handles one CSR row, computing the row sum, applying normalization, and
-//! optionally computing log1p in a single pass over each row's nonzeros.
-//! `row_scale` (the GPU counterpart of CPU `Transform::RowScale`) multiplies
-//! each row by an explicit per-row factor and is applied last, in the
-//! canonical order `normalize → log1p → row_scale`.
+//! array while leaving `indptr` and `indices` untouched. The `normalize`
+//! (and fused `normalize+log1p`) row reduction is dispatched across three
+//! granularity tiers selected by mean row density (see [`choose_row_tier`]):
+//! one thread per row (sparse rows), one warp per row (warp-shuffle reduce),
+//! or one block per row (shared-memory reduce, very dense rows). `log1p`
+//! alone is elementwise and row-independent, so it runs one thread per
+//! nonzero (grid-strided, `indptr`-free). `row_scale` (the GPU counterpart of
+//! CPU `Transform::RowScale`) multiplies each row by an explicit per-row
+//! factor on the thread-per-row kernel and is applied last, in the canonical
+//! order `normalize → log1p → row_scale`.
 //!
 //! ## Usage
 //!

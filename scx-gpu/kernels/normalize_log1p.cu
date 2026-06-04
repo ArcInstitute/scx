@@ -153,6 +153,11 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
 // total is returned to EVERY thread (broadcast), so callers can use the scale
 // without a second sync. Mirrors `block_reduce_sum_sumsq` in colmajor_ops.cu.
 __device__ __forceinline__ float block_reduce_sum(float v) {
+    // warp_partial holds one float per warp; with warpSize == 32 that caps the
+    // block at 32 warps = 1024 threads, and the final warp-shuffle pass over
+    // the partials likewise assumes n_warps <= 32. Callers launch 256-thread
+    // blocks today; this guards against a future caller exceeding the bound.
+    assert(blockDim.x <= 1024 && "block_reduce_sum: block size must be <= 1024 threads");
     __shared__ float warp_partial[32];
     __shared__ float block_total;
     int lane = threadIdx.x % warpSize;
