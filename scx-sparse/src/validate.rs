@@ -8,6 +8,67 @@ use crate::csr::CsrError;
 
 const INSERTION_THRESHOLD: usize = 32;
 
+/// The storage orientation a sparse matrix's on-disk arrays imply,
+/// as classified by [`validate_sparse_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseLayout {
+    /// indptr length matches `n_obs + 1` (and not `n_vars + 1`): row-major.
+    Csr,
+    /// indptr length matches `n_vars + 1` (and not `n_obs + 1`): column-major.
+    Csc,
+    /// The orientation can't be decided from the indptr length alone:
+    /// either the matrix is square (`n_obs == n_vars`, so both lengths
+    /// fit) or the indptr length fits neither (corrupt / unexpected
+    /// layout). The caller must consult the `encoding-type` attribute
+    /// or a documented default and/or reject the input.
+    Ambiguous,
+}
+
+/// Classify a sparse matrix's storage orientation from its declared
+/// `shape = (n_obs, n_vars)`, on-disk `indptr` length, and (optionally)
+/// the largest index value present in `indices`.
+///
+/// An h5ad group missing its `encoding-type` attribute carries no
+/// orientation marker, yet a CSC group has `indptr` + `indices` just
+/// like CSR. Misclassifying a CSC matrix as CSR panics (the
+/// `n_vars + 1`-length indptr indexes out of bounds) or silently
+/// transposes the data (review finding C1). This is the single rule
+/// shared by h5ad format detection and the eager/streaming X readers
+/// so all three agree.
+///
+/// When `max_index` is provided (the readers know it; detection does
+/// not scan for it), an orientation that would place an index past its
+/// implied minor dimension is downgraded to [`SparseLayout::Ambiguous`]
+/// rather than committed to — a CSR's column indices must be `< n_vars`
+/// and a CSC's row indices `< n_obs`.
+pub fn validate_sparse_layout(
+    shape: (usize, usize),
+    indptr_len: usize,
+    max_index: Option<i64>,
+) -> SparseLayout {
+    let (n_obs, n_vars) = shape;
+    let fits_csr = indptr_len == n_obs.saturating_add(1);
+    let fits_csc = indptr_len == n_vars.saturating_add(1);
+    match (fits_csr, fits_csc) {
+        (true, false) => {
+            if max_index.is_some_and(|m| m >= n_vars as i64) {
+                SparseLayout::Ambiguous
+            } else {
+                SparseLayout::Csr
+            }
+        }
+        (false, true) => {
+            if max_index.is_some_and(|m| m >= n_obs as i64) {
+                SparseLayout::Ambiguous
+            } else {
+                SparseLayout::Csc
+            }
+        }
+        // Both fit (square) or neither fits (corrupt): undecidable here.
+        _ => SparseLayout::Ambiguous,
+    }
+}
+
 /// Validate the shape invariants of a CSR triplet:
 /// - `indptr[0] >= 0`,
 /// - indptr monotonically non-decreasing,
@@ -40,6 +101,66 @@ pub fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> Resu
         }
     }
     Ok(())
+}
+
+/// Compute the `[start, end)` nnz range a CSR shard occupies, from
+/// its shard-local indptr slice (`indptr[row_start..=row_end]`, length
+/// `n_rows + 1`). Used to slice the `indices` / `data` arrays (in
+/// memory or from disk) before rebasing.
+///
+/// Guards the non-negative base and `end >= start` monotonicity at the
+/// endpoints so a reversed range can't silently produce an
+/// underflowed slice (the bug behind review finding C5). Full
+/// per-element validation happens in [`rebase_csr_shard`].
+pub fn shard_nnz_bounds(indptr_slice: &[i64]) -> Result<(usize, usize), CsrError> {
+    let base = indptr_slice.first().copied().unwrap_or(0);
+    let end = indptr_slice.last().copied().unwrap_or(0);
+    if base < 0 {
+        return Err(CsrError::IndptrNegative {
+            value: base,
+            position: 0,
+        });
+    }
+    if end < base {
+        return Err(CsrError::IndptrNotMonotonic {
+            index: indptr_slice.len().saturating_sub(1),
+        });
+    }
+    Ok((base as usize, end as usize))
+}
+
+/// Rebase a shard-local CSR slice into a standalone shard: validate
+/// (monotonic indptr + column bound `indices < n_vars` via
+/// [`validate_csr_arrays`]), rebase the indptr so it starts at 0, and
+/// cast widths (indptr → `u64`, indices → `u32`).
+///
+/// `indptr_slice` is `indptr[row_start..=row_end]` (length `n_rows +
+/// 1`, values still relative to the file-wide nnz origin);
+/// `shard_indices` is the `i32` indices already sliced to this shard's
+/// nnz range (see [`shard_nnz_bounds`]). The caller slices `data`
+/// itself with the same range, because some callers read `data` lazily
+/// from disk and never hold the whole array.
+///
+/// Single source of truth for the per-shard rebase performed by every
+/// ingest path (the two eager `pipeline.rs` sites, the two streaming
+/// `h5ad_stream.rs` readers, and the materialized-CSC
+/// `csc_stream.rs` reader). Folding them here closed review findings
+/// C5 (missing monotonicity guard) and C6 (the eager sites previously
+/// skipped the column-bound check).
+pub fn rebase_csr_shard(
+    indptr_slice: &[i64],
+    shard_indices: &[i32],
+    n_vars: u64,
+) -> Result<(Vec<u64>, Vec<u32>), CsrError> {
+    validate_csr_arrays(indptr_slice, shard_indices, n_vars)?;
+    // `validate_csr_arrays` guarantees `indptr_slice[0] >= 0` and
+    // monotonic non-decreasing, so `base` is non-negative and every
+    // `v - base` is non-negative — the `as u64` cast is lossless.
+    let base = indptr_slice.first().copied().unwrap_or(0);
+    let indptr: Vec<u64> = indptr_slice.iter().map(|&v| (v - base) as u64).collect();
+    // Indices are validated into `[0, n_vars)`, so `as u32` is lossless.
+    let indices: Vec<u32> = shard_indices.iter().map(|&v| v as u32).collect();
+    Ok((indptr, indices))
 }
 
 /// Sort each row's `(indices, values)` pairs by column index, in
@@ -129,6 +250,103 @@ pub fn drop_explicit_zeros_inplace(
     }
     indices.truncate(write as usize);
     values.truncate(write as usize);
+}
+
+/// Sum the values of entries that share the same `(row, col)`
+/// coordinate (the MatrixMarket / scipy `sum_duplicates()` rule).
+/// `records` must already be sorted by `(row, col)`. Returns the
+/// number of duplicate pairs that were merged (`0` means no
+/// duplicates). Resulting `0.0` values are left in place — callers
+/// drop them downstream (`drop_explicit_zeros_inplace` for CSR
+/// arrays, the MTX/CSC builders' own zero-skip).
+///
+/// Single source of truth for the "sum duplicates" rule across the
+/// untrusted COO ingest paths (the MTX reader and the external-memory
+/// CSC→CSR transposer), closing the duplicated implementations behind
+/// review finding CLI1. Generic over the coordinate types so both
+/// `(usize, usize, f32)` (MTX) and `(u64, u32, f32)` (CSC transpose)
+/// callers share it.
+pub fn coalesce_sorted_coo<R, C>(records: &mut Vec<(R, C, f32)>) -> u64
+where
+    R: Copy + PartialEq,
+    C: Copy + PartialEq,
+{
+    if records.is_empty() {
+        return 0;
+    }
+    let mut dup_count: u64 = 0;
+    let mut write = 0usize;
+    for read in 1..records.len() {
+        let (r, c, v) = records[read];
+        let (pr, pc, pv) = records[write];
+        if r == pr && c == pc {
+            // Merge into the previous slot.
+            records[write] = (pr, pc, pv + v);
+            dup_count += 1;
+        } else {
+            write += 1;
+            records[write] = (r, c, v);
+        }
+    }
+    records.truncate(write + 1);
+    dup_count
+}
+
+/// Sum adjacent entries that share a column index within each row.
+/// Rows must already be sorted by column (see
+/// [`sort_csr_rows_in_place`]); `indptr[0]` must be 0. Rewrites
+/// `indptr` and compacts `indices` / `values` in a single forward
+/// pass. Resulting `0.0` values are left for
+/// [`drop_explicit_zeros_inplace`] to remove.
+#[allow(clippy::ptr_arg)]
+fn dedup_sum_sorted_rows(indptr: &mut [u64], indices: &mut Vec<u32>, values: &mut Vec<f32>) {
+    debug_assert!(
+        !indptr.is_empty() && indptr[0] == 0,
+        "indptr must be non-empty and start at 0"
+    );
+    let n_rows = indptr.len().saturating_sub(1);
+    let mut write: usize = 0;
+    let mut next_start: usize = 0;
+    for row in 0..n_rows {
+        let start = next_start;
+        let end = indptr[row + 1] as usize;
+        next_start = end;
+        let mut k = start;
+        while k < end {
+            let col = indices[k];
+            let mut sum = values[k];
+            let mut j = k + 1;
+            while j < end && indices[j] == col {
+                sum += values[j];
+                j += 1;
+            }
+            indices[write] = col;
+            values[write] = sum;
+            write += 1;
+            k = j;
+        }
+        indptr[row + 1] = write as u64;
+    }
+    indices.truncate(write);
+    values.truncate(write);
+}
+
+/// Canonicalize a CSR matrix in place for *untrusted* ingest sources
+/// (MatrixMarket per review finding CLI1; the messy-h5ad CSC→CSR
+/// transpose): sort each row by column index, sum entries that share a
+/// `(row, col)` coordinate, and drop the resulting explicit zeros.
+/// `indptr[0]` must be 0.
+///
+/// Idempotent on already-canonical input, but **do not** call it on
+/// SCX→SCX shard rewrites — it would needlessly re-sort and re-scan
+/// canonical shards and regress streaming-write throughput. Hot
+/// per-shard rebases use [`rebase_csr_shard`] (validation only, no
+/// sort/dedup) instead.
+#[allow(clippy::ptr_arg)]
+pub fn canonicalize_csr(indptr: &mut Vec<u64>, indices: &mut Vec<u32>, values: &mut Vec<f32>) {
+    sort_csr_rows_in_place(indptr, indices, values);
+    dedup_sum_sorted_rows(indptr, indices, values);
+    drop_explicit_zeros_inplace(indptr, indices, values);
 }
 
 #[cfg(test)]
@@ -337,5 +555,155 @@ mod tests {
         assert_eq!(hot_indptr, ref_indptr);
         assert_eq!(hot_indices, ref_indices);
         assert_eq!(hot_values, ref_values);
+    }
+
+    // ---- shard_nnz_bounds (C5) ----
+
+    #[test]
+    fn shard_nnz_bounds_basic() {
+        // Shard-local slice with a non-zero base.
+        assert_eq!(shard_nnz_bounds(&[17i64, 19, 22]).unwrap(), (17, 22));
+    }
+
+    #[test]
+    fn shard_nnz_bounds_rejects_reversed_range() {
+        // C5: a reversed endpoint range must error, not underflow-wrap
+        // into a giant slice.
+        let err = shard_nnz_bounds(&[22i64, 19, 17]).unwrap_err();
+        assert!(matches!(err, CsrError::IndptrNotMonotonic { .. }));
+    }
+
+    #[test]
+    fn shard_nnz_bounds_rejects_negative_base() {
+        let err = shard_nnz_bounds(&[-1i64, 3]).unwrap_err();
+        assert!(matches!(err, CsrError::IndptrNegative { .. }));
+    }
+
+    // ---- rebase_csr_shard (C6) ----
+
+    #[test]
+    fn rebase_csr_shard_rebases_and_casts() {
+        // Shard-local indptr starting at 17; indices already sliced.
+        let indptr_slice = [17i64, 19, 22];
+        let shard_indices = [0i32, 3, 1, 2, 4];
+        let (indptr, indices) = rebase_csr_shard(&indptr_slice, &shard_indices, 5).unwrap();
+        assert_eq!(indptr, vec![0u64, 2, 5]);
+        assert_eq!(indices, vec![0u32, 3, 1, 2, 4]);
+    }
+
+    #[test]
+    fn rebase_csr_shard_rejects_out_of_range_column() {
+        // C6: the column-bound check the eager sites previously skipped.
+        let indptr_slice = [0i64, 2];
+        let shard_indices = [0i32, 9];
+        let err = rebase_csr_shard(&indptr_slice, &shard_indices, 5).unwrap_err();
+        assert!(matches!(err, CsrError::IndexOutOfRange { index: 9, .. }));
+    }
+
+    #[test]
+    fn rebase_csr_shard_rejects_non_monotonic() {
+        let indptr_slice = [0i64, 3, 2];
+        let shard_indices = [0i32, 1, 2];
+        let err = rebase_csr_shard(&indptr_slice, &shard_indices, 5).unwrap_err();
+        assert!(matches!(err, CsrError::IndptrNotMonotonic { .. }));
+    }
+
+    // ---- coalesce_sorted_coo (CLI1) ----
+
+    #[test]
+    fn coalesce_sorted_coo_no_duplicates() {
+        let mut v = vec![(0u64, 0u32, 1.0f32), (0, 1, 2.0), (1, 0, 3.0)];
+        assert_eq!(coalesce_sorted_coo(&mut v), 0);
+        assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn coalesce_sorted_coo_sums_duplicates() {
+        let mut v = vec![(0u64, 0u32, 1.0f32), (0, 0, 2.5), (0, 0, 0.5), (1, 0, 3.0)];
+        assert_eq!(coalesce_sorted_coo(&mut v), 2);
+        assert_eq!(v, vec![(0, 0, 4.0), (1, 0, 3.0)]);
+    }
+
+    #[test]
+    fn coalesce_sorted_coo_generic_usize_coords() {
+        // The MTX reader's `(usize, usize, f32)` coordinate type.
+        let mut v = vec![(0usize, 2usize, 1.0f32), (0, 2, 4.0), (3, 1, 2.0)];
+        assert_eq!(coalesce_sorted_coo(&mut v), 1);
+        assert_eq!(v, vec![(0, 2, 5.0), (3, 1, 2.0)]);
+    }
+
+    // ---- canonicalize_csr ----
+
+    #[test]
+    fn canonicalize_csr_sorts_dedups_and_drops_zeros() {
+        // Row 0: unsorted with a duplicate column 2 (3.0 + (-3.0) = 0 → dropped)
+        //        and an explicit zero at column 1.
+        // Row 1: sorted, one duplicate column 0 (1.0 + 2.0 = 3.0).
+        let mut indptr = vec![0u64, 4, 7];
+        let mut indices = vec![2u32, 0, 1, 2, 0, 0, 4];
+        let mut values = vec![3.0f32, 5.0, 0.0, -3.0, 1.0, 2.0, 7.0];
+        canonicalize_csr(&mut indptr, &mut indices, &mut values);
+        // Row 0: col 0 = 5.0 (col 1 zero dropped, col 2 summed to 0 dropped).
+        // Row 1: col 0 = 3.0, col 4 = 7.0.
+        assert_eq!(indptr, vec![0u64, 1, 3]);
+        assert_eq!(indices, vec![0u32, 0, 4]);
+        assert_eq!(values, vec![5.0f32, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn canonicalize_csr_idempotent_on_canonical_input() {
+        let mut indptr = vec![0u64, 2, 3];
+        let mut indices = vec![0u32, 2, 1];
+        let mut values = vec![1.0f32, 2.0, 3.0];
+        canonicalize_csr(&mut indptr, &mut indices, &mut values);
+        assert_eq!(indptr, vec![0u64, 2, 3]);
+        assert_eq!(indices, vec![0u32, 2, 1]);
+        assert_eq!(values, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    // ---- validate_sparse_layout (C1) ----
+
+    #[test]
+    fn validate_sparse_layout_non_square() {
+        // shape (100 obs, 50 vars): CSR indptr len 101, CSC indptr len 51.
+        assert_eq!(
+            validate_sparse_layout((100, 50), 101, None),
+            SparseLayout::Csr
+        );
+        assert_eq!(
+            validate_sparse_layout((100, 50), 51, None),
+            SparseLayout::Csc
+        );
+    }
+
+    #[test]
+    fn validate_sparse_layout_square_is_ambiguous() {
+        assert_eq!(
+            validate_sparse_layout((64, 64), 65, None),
+            SparseLayout::Ambiguous
+        );
+    }
+
+    #[test]
+    fn validate_sparse_layout_corrupt_length_is_ambiguous() {
+        // Fits neither n_obs+1 nor n_vars+1.
+        assert_eq!(
+            validate_sparse_layout((100, 50), 7, None),
+            SparseLayout::Ambiguous
+        );
+    }
+
+    #[test]
+    fn validate_sparse_layout_max_index_downgrades_impossible_csr() {
+        // Length says CSR, but a column index >= n_vars can't be CSR.
+        assert_eq!(
+            validate_sparse_layout((100, 50), 101, Some(50)),
+            SparseLayout::Ambiguous
+        );
+        // In-range max index keeps the CSR classification.
+        assert_eq!(
+            validate_sparse_layout((100, 50), 101, Some(49)),
+            SparseLayout::Csr
+        );
     }
 }

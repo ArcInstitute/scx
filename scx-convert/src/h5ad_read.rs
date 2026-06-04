@@ -162,26 +162,39 @@ fn read_sparse_matrix(
     let data = read_f32_dataset(&data_ds)?;
 
     if is_csc {
-        // CSC shape is [n_obs, n_vars] but indptr length = n_vars + 1
+        // CSC shape is [n_obs, n_vars] but indptr length = n_vars + 1.
+        // The transpose output is row-major and column-sorted; canonicalize
+        // it through the shared scx-sparse entry point so a messy source CSC
+        // (duplicate row indices within a column → duplicate columns within a
+        // row) is summed, not passed through, and explicit zeros are dropped.
+        // The i64/i32 → u64/u32 casts are lossless (a valid CSR has
+        // non-negative indptr and `0 <= col < n_vars`).
         let (csr_indptr, csr_indices, csr_data) =
             csc_to_csr(&indptr, &indices, &data, n_obs, n_vars)?;
-        Ok(drop_explicit_zeros(
-            csr_indptr,
-            csr_indices,
-            csr_data,
-            n_obs,
-            n_vars,
-        ))
+        let mut u_indptr: Vec<u64> = csr_indptr.iter().map(|&v| v as u64).collect();
+        let mut u_indices: Vec<u32> = csr_indices.iter().map(|&v| v as u32).collect();
+        let mut u_data = csr_data;
+        scx_sparse::canonicalize_csr(&mut u_indptr, &mut u_indices, &mut u_data);
+        let csr_indptr: Vec<i64> = u_indptr.iter().map(|&v| v as i64).collect();
+        let csr_indices: Vec<i32> = u_indices.iter().map(|&v| v as i32).collect();
+        Ok((csr_indptr, csr_indices, u_data, n_obs, n_vars))
     } else {
         // C1: a CSC matrix misdetected as CSR has indptr length n_vars+1, not
         // n_obs+1, which would index out of bounds in drop_explicit_zeros (a
-        // panic when n_vars < n_obs) or silently transpose. Reject it with a
-        // clear error instead.
+        // panic when n_vars < n_obs) or silently transpose. The shared
+        // classifier refines the diagnostic; the gate is the CSR length
+        // invariant (square matrices satisfy n_obs+1 and are valid here).
         if indptr.len() != n_obs + 1 {
+            let hint = if scx_sparse::validate_sparse_layout((n_obs, n_vars), indptr.len(), None)
+                == scx_sparse::SparseLayout::Csc
+            {
+                "this is a CSC matrix missing its encoding-type attribute"
+            } else {
+                "unexpected indptr length for the declared shape"
+            };
             return Err(ConvertError::Other(format!(
                 "CSR matrix '{group_name}' has indptr length {} but expected n_obs+1 = {} \
-                 (shape [{n_obs}, {n_vars}]); this is likely a CSC matrix missing its \
-                 encoding-type attribute",
+                 (shape [{n_obs}, {n_vars}]); {hint}",
                 indptr.len(),
                 n_obs + 1
             )));

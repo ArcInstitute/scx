@@ -261,32 +261,26 @@ fn parse_mtx_file(
         )));
     }
 
-    // Sort COO entries in-place by (row, col), then build CSR directly.
+    // Sort COO entries by (row, col), then coalesce duplicate
+    // coordinates by summing their values (the MatrixMarket "sum
+    // duplicates" rule) through the shared scx-sparse helper — the one
+    // implementation also used by the CSC→CSR external transposer.
+    // Without the dedup, downstream `ScxCsc::new` rejects the duplicate
+    // row indices a later `build-csc`/`--rebuild-csc` would produce.
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    scx_sparse::coalesce_sorted_coo(&mut entries);
 
+    // Build CSR directly from the deduplicated, sorted run, dropping
+    // any coordinate whose summed value is zero.
     let mut indptr = vec![0i64; n_rows + 1];
-    let mut indices = Vec::with_capacity(nnz);
-    let mut data = Vec::with_capacity(nnz);
-
-    // Coalesce duplicate coordinates by summing their values (the
-    // MatrixMarket "sum duplicates" rule) in one linear pass over the
-    // sorted run, dropping any coordinate whose summed value is zero.
-    // Without this, downstream `ScxCsc::new` rejects the duplicate row
-    // indices a later `build-csc`/`--rebuild-csc` would produce.
-    let mut i = 0;
-    while i < entries.len() {
-        let (row, col, mut sum) = entries[i];
-        let mut j = i + 1;
-        while j < entries.len() && entries[j].0 == row && entries[j].1 == col {
-            sum += entries[j].2;
-            j += 1;
-        }
-        if sum != 0.0 {
+    let mut indices = Vec::with_capacity(entries.len());
+    let mut data = Vec::with_capacity(entries.len());
+    for &(row, col, val) in &entries {
+        if val != 0.0 {
             indptr[row + 1] += 1;
             indices.push(col as i32);
-            data.push(sum);
+            data.push(val);
         }
-        i = j;
     }
 
     // Cumulative sum for indptr

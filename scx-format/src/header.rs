@@ -331,6 +331,11 @@ impl FileHeader {
         self.flags |= 1 << 1;
     }
 
+    /// Clear the bitmap flag (bit 1).
+    pub fn clear_bitmap(&mut self) {
+        self.flags &= !(1 << 1);
+    }
+
     /// Returns true if the obsm flag (bit 2) is set.
     pub fn has_obsm(&self) -> bool {
         self.flags & (1 << 2) != 0
@@ -339,6 +344,11 @@ impl FileHeader {
     /// Set the obsm flag (bit 2).
     pub fn set_obsm(&mut self) {
         self.flags |= 1 << 2;
+    }
+
+    /// Clear the obsm flag (bit 2).
+    pub fn clear_obsm(&mut self) {
+        self.flags &= !(1 << 2);
     }
 
     /// Returns true if the obsp flag (bit 3) is set.
@@ -351,6 +361,11 @@ impl FileHeader {
         self.flags |= 1 << 3;
     }
 
+    /// Clear the obsp flag (bit 3).
+    pub fn clear_obsp(&mut self) {
+        self.flags &= !(1 << 3);
+    }
+
     /// Returns true if the deletion vectors flag (bit 5) is set.
     pub fn has_deletion_vectors(&self) -> bool {
         self.flags & (1 << 5) != 0
@@ -359,6 +374,11 @@ impl FileHeader {
     /// Set the deletion vectors flag (bit 5).
     pub fn set_deletion_vectors(&mut self) {
         self.flags |= 1 << 5;
+    }
+
+    /// Clear the deletion vectors flag (bit 5).
+    pub fn clear_deletion_vectors(&mut self) {
+        self.flags &= !(1 << 5);
     }
 
     /// Returns true if the has_front_catalog flag (bit 6) is set.
@@ -392,11 +412,90 @@ impl FileHeader {
     pub fn clear_modalities(&mut self) {
         self.flags &= !(1 << 7);
     }
+
+    /// Re-derive every shard counter and section-presence flag this
+    /// header owns from `catalog` — the single source of truth shared
+    /// by the writer-finalize path and `scx_ops::rollback`, so a new
+    /// shard section type can't be accounted for in one place and
+    /// missed in the other (review finding OE1 / abstraction 3).
+    ///
+    /// Owns `n_csr_shards`, `n_csc_shards`, `nnz`, and the CSC / obsm /
+    /// obsp / bitmap / deletion-vector flag bits. Each flag is set when
+    /// the corresponding section(s) are present and cleared when
+    /// absent, so rolling a header back across an add **or** a remove
+    /// lands in the correct state. Leaves every other field — shape,
+    /// catalog offsets, modality routing, the front-catalog flag —
+    /// untouched.
+    ///
+    /// `nnz` counts only `CsrShard` entries (CSC shards mirror the same
+    /// values in a different layout; layer shards are a separate
+    /// matrix), matching the writer's `total_nnz` accumulator. The
+    /// derivation mirrors the writer exactly, including its quirk that
+    /// a single-section `ObspEmbedding` does **not** set `has_obsp`
+    /// (only the sharded `ObspEmbeddingShard` / `ObspCsrShard` variants
+    /// do).
+    pub fn sync_from_catalog(&mut self, catalog: &crate::catalog::FullCatalog) {
+        use crate::section::SectionType;
+
+        let mut n_csr_shards = 0u32;
+        let mut n_csc_shards = 0u32;
+        let mut nnz = 0u64;
+        let mut has_obsm = false;
+        let mut has_obsp = false;
+        let mut has_bitmap = false;
+        let mut has_dv = false;
+
+        for entry in &catalog.entries {
+            match entry.section_type {
+                SectionType::CsrShard => {
+                    n_csr_shards += 1;
+                    nnz += entry.stats.as_ref().map(|s| s.nnz).unwrap_or(0);
+                }
+                SectionType::CscShard => n_csc_shards += 1,
+                SectionType::ObsmEmbedding | SectionType::ObsmEmbeddingShard => has_obsm = true,
+                SectionType::ObspEmbeddingShard | SectionType::ObspCsrShard => has_obsp = true,
+                SectionType::BitmapShard => has_bitmap = true,
+                SectionType::DeletionVectors => has_dv = true,
+                _ => {}
+            }
+        }
+
+        self.n_csr_shards = n_csr_shards;
+        self.n_csc_shards = n_csc_shards;
+        self.nnz = nnz;
+
+        if n_csc_shards > 0 {
+            self.set_csc();
+        } else {
+            self.clear_csc();
+        }
+        if has_obsm {
+            self.set_obsm();
+        } else {
+            self.clear_obsm();
+        }
+        if has_obsp {
+            self.set_obsp();
+        } else {
+            self.clear_obsp();
+        }
+        if has_bitmap {
+            self.set_bitmap();
+        } else {
+            self.clear_bitmap();
+        }
+        if has_dv {
+            self.set_deletion_vectors();
+        } else {
+            self.clear_deletion_vectors();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{FullCatalog, FullCatalogEntry, ShardStats, CURRENT_CATALOG_VERSION};
     use std::io::Cursor;
 
     fn sample_header() -> FileHeader {
@@ -429,6 +528,110 @@ mod tests {
             modality_table_length: 0,
             reserved: [0u8; 112],
         }
+    }
+
+    fn catalog_entry(stype: crate::section::SectionType, nnz: Option<u64>) -> FullCatalogEntry {
+        FullCatalogEntry {
+            name: "s".to_string(),
+            offset: 4352,
+            length: 1,
+            section_type: stype,
+            checksum: [0u8; 32],
+            modality_id: 0,
+            stats: nnz.map(|n| ShardStats {
+                row_start: 0,
+                row_end: 1,
+                col_start: 0,
+                col_end: 1,
+                nnz: n,
+                value_min: 0,
+                value_max: 0,
+                value_sum: 0,
+                n_indexed_columns: 0,
+                column_stats: vec![],
+            }),
+        }
+    }
+
+    fn catalog_with(entries: Vec<FullCatalogEntry>) -> FullCatalog {
+        FullCatalog {
+            catalog_version: CURRENT_CATALOG_VERSION,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            n_obs: 1,
+            entries,
+            data_generation: 0,
+            csc_build_generation: 0,
+        }
+    }
+
+    /// OE1: `sync_from_catalog` derives counters and every owned flag
+    /// from the catalog, including the CSC / obsm / obsp / bitmap / DV
+    /// flags the old hand-rolled rollback loop ignored.
+    #[test]
+    fn sync_from_catalog_sets_counters_and_flags() {
+        use crate::section::SectionType;
+        let catalog = catalog_with(vec![
+            catalog_entry(SectionType::CsrShard, Some(7)),
+            catalog_entry(SectionType::CsrShard, Some(11)),
+            catalog_entry(SectionType::CscShard, None),
+            catalog_entry(SectionType::ObsmEmbeddingShard, None),
+            catalog_entry(SectionType::ObspCsrShard, None),
+            catalog_entry(SectionType::BitmapShard, Some(0)),
+            catalog_entry(SectionType::DeletionVectors, None),
+        ]);
+        let mut header = sample_header();
+        header.flags = 0;
+        header.sync_from_catalog(&catalog);
+
+        assert_eq!(header.n_csr_shards, 2);
+        assert_eq!(header.n_csc_shards, 1);
+        assert_eq!(header.nnz, 18); // 7 + 11; CSC and bitmap excluded
+        assert!(header.has_csc());
+        assert!(header.has_obsm());
+        assert!(header.has_obsp());
+        assert!(header.has_bitmap());
+        assert!(header.has_deletion_vectors());
+    }
+
+    /// OE1: rolling back across a *removal* must clear the flags too.
+    /// An empty (X-only) catalog clears CSC/obsm/obsp/bitmap/DV.
+    #[test]
+    fn sync_from_catalog_clears_absent_flags() {
+        use crate::section::SectionType;
+        let mut header = sample_header();
+        // Pretend the live header had everything set.
+        header.set_csc();
+        header.set_obsm();
+        header.set_obsp();
+        header.set_bitmap();
+        header.set_deletion_vectors();
+
+        let catalog = catalog_with(vec![catalog_entry(SectionType::CsrShard, Some(3))]);
+        header.sync_from_catalog(&catalog);
+
+        assert_eq!(header.n_csr_shards, 1);
+        assert_eq!(header.n_csc_shards, 0);
+        assert_eq!(header.nnz, 3);
+        assert!(!header.has_csc());
+        assert!(!header.has_obsm());
+        assert!(!header.has_obsp());
+        assert!(!header.has_bitmap());
+        assert!(!header.has_deletion_vectors());
+    }
+
+    /// OE1 quirk parity: a single-section `ObspEmbedding` does not set
+    /// `has_obsp` (mirrors the writer), while `ObspEmbeddingShard` does.
+    #[test]
+    fn sync_from_catalog_obsp_embedding_does_not_set_flag() {
+        use crate::section::SectionType;
+        let mut header = sample_header();
+        header.flags = 0;
+        header.sync_from_catalog(&catalog_with(vec![catalog_entry(
+            SectionType::ObspEmbedding,
+            None,
+        )]));
+        assert!(!header.has_obsp());
     }
 
     #[test]

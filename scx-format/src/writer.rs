@@ -2065,25 +2065,15 @@ impl ScxWriter {
         self.header.root_catalog_length = root_catalog_length;
         self.header.full_catalog_offset = full_catalog_offset;
         self.header.full_catalog_length = full_catalog_length;
-        self.header.n_csr_shards = self.csr_shard_count;
-        self.header.n_csc_shards = self.csc_shard_count;
-        self.header.nnz = self.total_nnz;
+        // Derive n_csr/n_csc/nnz + the CSC/obsm/obsp/bitmap/DV flags
+        // from the catalog through the single source of truth shared
+        // with `scx_ops::rollback` (abstraction 3 / OE1). Byte-identical
+        // to the previous hand-rolled accumulators: `n_csr_shards` /
+        // `n_csc_shards` count the same section types, `nnz` sums the
+        // CsrShard `stats.nnz` (== each shard's `*indptr.last()`), and
+        // each flag is presence-derived exactly as before.
+        self.header.sync_from_catalog(&full_catalog);
         self.header.file_checksum = 0;
-        if self.csc_shard_count > 0 {
-            self.header.set_csc();
-        }
-        if self.has_obsm {
-            self.header.set_obsm();
-        }
-        if self.has_obsp {
-            self.header.set_obsp();
-        }
-        // Phase 5b: header `has_bitmap` flag is set if ≥1 bitmap shard
-        // landed (unimodal or any modality).
-        #[cfg(feature = "deletion-vectors")]
-        if self.bitmap_shard_count > 0 || self.modality_bitmap_counts.iter().any(|&n| n > 0) {
-            self.header.set_bitmap();
-        }
 
         // 4. Compute file checksum: hash header + root catalog from memory,
         //    re-read only section bytes from file, hash full catalog from memory.
