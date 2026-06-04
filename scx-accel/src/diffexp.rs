@@ -26,7 +26,7 @@ pub struct DiffExpResult {
     /// Gene names sorted by score for each group. `[n_groups][n_genes]`
     pub names: Vec<Vec<String>>,
     /// Global var index per gene, parallel to `names`. `[n_groups][n_genes]`.
-    /// Carried solely to give the merge/sort a stable, scanpy-aligned tiebreak
+    /// Carried solely to give the merge/sort a deterministic tiebreak
     /// (ascending var index on equal scores) that is identical across chunk
     /// sizes and backends; not surfaced to Python.
     pub gene_indices: Vec<Vec<usize>>,
@@ -58,8 +58,14 @@ struct GeneTestResult {
 /// sizes and backends.
 ///
 /// Sorts by descending score (or `|score|` when `rankby_abs`); ties break by
-/// ascending global var index (matching scanpy's stable argsort). NaN scores
-/// sort **last** deterministically (their key is treated as `-inf`).
+/// ascending global var index, giving a strict total order. NaN scores sort
+/// **last** deterministically (their key is treated as `-inf`).
+///
+/// The index tiebreak is a determinism choice, not a scanpy parity target:
+/// scanpy ranks via `np.argsort(...)[::-1]` (unstable quicksort, then
+/// reversed), so its order among equal scores is incidental and not stable.
+/// Tied genes carry identical score/pval/logfc, so name-keyed consumers are
+/// unaffected — only the order of otherwise-interchangeable rows is pinned.
 pub(crate) fn de_rank_cmp(
     a_score: f64,
     a_idx: usize,
