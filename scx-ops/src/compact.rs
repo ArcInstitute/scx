@@ -104,13 +104,16 @@ pub fn compact_with_index_options(
         .map(|m| m.iter().filter(|&&k| k).count())
         .unwrap_or(n_obs);
 
-    // Stream obs shard-by-shard only when reshaping AND the input is already
-    // sharded. Legacy single-section obs (`obs_metadata_shard_count() == 0`)
-    // has no per-shard reader, and `reshape_obs == false` writes a single
-    // section that needs the full batch anyway — both fall through to the
-    // eager (materialising) path. This avoids the atlas-scale `read_obs()`
-    // OOM the sharded layout was designed to remove.
-    let stream_obs = reshape_obs && reader.obs_metadata_shard_count() > 0;
+    // Stream obs shard-by-shard whenever the input is already sharded. This
+    // preserves the row-sharded layout on output AND bounds peak memory to one
+    // shard — a sharded input must NOT collapse back to a single legacy section
+    // (the atlas-scale `read_obs()` OOM the sharded layout was designed to
+    // remove). Legacy single-section obs (`obs_metadata_shard_count() == 0`)
+    // has no per-shard reader, so it falls through to the eager (materialising)
+    // path: `reshape_obs == true` reshapes the materialised batch into shards
+    // (the legacy → sharded migration), `reshape_obs == false` re-emits a
+    // single section.
+    let stream_obs = reader.obs_metadata_shard_count() > 0;
     if reshape_obs && !stream_obs {
         log::warn!(
             "compact --reshape-obs on legacy single-section obs in {input}: \
@@ -495,6 +498,17 @@ pub fn compact_with_index_options(
     } else {
         Vec::new()
     };
+    // Record the actually-indexed columns in provenance (mirrors the convert
+    // path) so the compact record carries an audit trail of which predicate
+    // indexes were (re)built.
+    let mut params = serde_json::json!({ "reshape_obs": reshape_obs });
+    if let Some(ref result) = index_result {
+        params["predicate_index"] = serde_json::json!({
+            "obs_columns": result.obs_indexed_columns,
+            "var_columns": result.var_indexed_columns,
+            "preset": index_options.index_preset,
+        });
+    }
     prov_entries.push(ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -502,7 +516,7 @@ pub fn compact_with_index_options(
             .as_secs() as i64,
         action: "compact".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: format!("{{\"reshape_obs\":{reshape_obs}}}"),
+        params_json: params.to_string(),
         input_checksums: vec![],
     });
     writer.write_provenance(prov_entries)?;
@@ -805,10 +819,10 @@ fn compact_multimodal(
     let new_n_obs = total_kept;
 
     // Global obs is shared across modalities, so the same streaming gate as
-    // the single-modality path applies: stream shard-by-shard only when
-    // reshaping an already-sharded obs. Multimodal compact builds no
-    // predicate index, so there is no second (index) pass.
-    let stream_obs = reshape_obs && reader.obs_metadata_shard_count() > 0;
+    // the single-modality path applies: stream shard-by-shard whenever the
+    // input is already sharded (preserve the layout, bound memory). Multimodal
+    // compact builds no predicate index, so there is no second (index) pass.
+    let stream_obs = reader.obs_metadata_shard_count() > 0;
     if reshape_obs && !stream_obs {
         log::warn!(
             "compact --reshape-obs on legacy single-section obs in {input}: \

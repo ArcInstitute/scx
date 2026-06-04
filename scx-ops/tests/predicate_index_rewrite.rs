@@ -576,3 +576,184 @@ fn merge_with_missing_forced_column_does_not_create_output() {
         "merged output must NOT be on disk after upfront validation failure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MERGE-INDEX-OBS-DROPPED.md — Bug 3 (compact preserves sharded obs layout)
+// + provenance audit trail for the rebuilt predicate indexes (Bugs 1 & 2).
+// ---------------------------------------------------------------------------
+
+/// Write a single-modality test file whose obs metadata is row-sharded
+/// (`ObsMetadataShard` sections) across `n_obs_shards` shards — the v0.6.x
+/// default layout. Mirrors `write_test_file` but uses `write_obs_shard`
+/// instead of `write_obs`.
+fn write_sharded_test_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    perturbation: &str,
+    n_obs_shards: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let obs = obs_with_categories(n_obs, perturbation);
+    let total = n_obs as u64;
+    let chunk = (n_obs + n_obs_shards - 1) / n_obs_shards.max(1);
+    let chunk = chunk.max(1);
+    let (mut shard_idx, mut row_start) = (0u32, 0usize);
+    while row_start < n_obs {
+        let take = chunk.min(n_obs - row_start);
+        let slice = obs.slice(row_start, take); // zero-copy
+        writer
+            .write_obs_shard(shard_idx, row_start as u64, take as u64, total, &slice)
+            .unwrap();
+        shard_idx += 1;
+        row_start += take;
+    }
+
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Bug 3: compacting a sharded-obs input with the default kwargs
+/// (`reshape_obs=false`, no `index_obs`) must PRESERVE the row-sharded layout —
+/// it must not collapse N `ObsMetadataShard` sections into one legacy
+/// `ObsMetadata` section (the atlas-scale OOM path).
+#[test]
+fn compact_preserves_sharded_obs_layout() {
+    let dir = TempDir::new().unwrap();
+    let input = write_sharded_test_file(&dir, "src.scx", 64, 16, "DRUG_A", 2);
+
+    let in_reader = ScxReader::open(&input).unwrap();
+    assert_eq!(
+        in_reader.obs_metadata_shard_count(),
+        2,
+        "fixture precondition: input obs must be row-sharded"
+    );
+    drop(in_reader);
+
+    let out = dir.path().join("compacted.scx");
+    // Default compact: reshape_obs=false, no predicate index requested.
+    scx_ops::compact(&input, &out).unwrap();
+
+    let out_reader = ScxReader::open(&out).unwrap();
+    assert!(
+        out_reader.obs_metadata_shard_count() > 0,
+        "compact must preserve the sharded obs layout (Bug 3), got {} shards",
+        out_reader.obs_metadata_shard_count()
+    );
+}
+
+/// Inverse direction (documented `--reshape-obs` behaviour): a legacy
+/// single-section obs input migrates to a sharded layout when
+/// `reshape_obs=true`.
+#[test]
+fn compact_reshape_obs_migrates_legacy_to_sharded() {
+    let dir = TempDir::new().unwrap();
+    let input = write_test_file(&dir, "legacy.scx", 64, 16, "DRUG_A");
+
+    let in_reader = ScxReader::open(&input).unwrap();
+    assert_eq!(
+        in_reader.obs_metadata_shard_count(),
+        0,
+        "fixture precondition: input obs must be legacy single-section"
+    );
+    drop(in_reader);
+
+    let out = dir.path().join("resharded.scx");
+    let sentinel = ConversionPredicateIndexOptions {
+        index_obs: Vec::new(),
+        index_var: Vec::new(),
+        index_preset: None,
+        index_auto_threshold: 0,
+    };
+    scx_ops::compact_with_index_options(&input, &out, &sentinel, true).unwrap();
+
+    let out_reader = ScxReader::open(&out).unwrap();
+    assert!(
+        out_reader.obs_metadata_shard_count() > 0,
+        "reshape_obs=true must migrate legacy obs → sharded layout"
+    );
+}
+
+/// Helper: assert the last provenance record on `path` has `action == action`
+/// and that its `params_json.predicate_index.obs_columns` contains `column`.
+fn assert_provenance_indexes_obs(path: &std::path::Path, action: &str, column: &str) {
+    let reader = ScxReader::open(path).unwrap();
+    let prov = reader.read_provenance().unwrap();
+    let last = prov
+        .operations
+        .last()
+        .unwrap_or_else(|| panic!("expected at least one provenance record"));
+    assert_eq!(last.action, action, "last provenance record action");
+    let v: serde_json::Value = serde_json::from_str(&last.params_json)
+        .unwrap_or_else(|e| panic!("params_json must be valid JSON: {e} ({})", last.params_json));
+    let cols = v["predicate_index"]["obs_columns"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "{action} provenance must carry predicate_index.obs_columns; got {}",
+                last.params_json
+            )
+        });
+    let names: Vec<&str> = cols.iter().filter_map(|c| c.as_str()).collect();
+    assert!(
+        names.contains(&column),
+        "{action} provenance must record indexed obs column '{column}'; got {names:?}"
+    );
+}
+
+/// Bug 1: the merge provenance record must record the rebuilt predicate-index
+/// columns in `params_json` (the "NO index field in params_json" report).
+#[test]
+fn merge_provenance_records_predicate_index() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 64, 16, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 64, 16, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+
+    scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &forced_obs_pert_options(),
+    )
+    .unwrap();
+
+    assert_provenance_indexes_obs(&out, "merge", "perturbation");
+}
+
+/// Bug 2: the compact provenance record must record the rebuilt
+/// predicate-index columns in `params_json`.
+#[test]
+fn compact_provenance_records_predicate_index() {
+    let dir = TempDir::new().unwrap();
+    let input = write_test_file(&dir, "src.scx", 64, 16, "DRUG_A");
+    let out = dir.path().join("compacted.scx");
+
+    scx_ops::compact_with_index_options(&input, &out, &forced_obs_pert_options(), false).unwrap();
+
+    assert_provenance_indexes_obs(&out, "compact", "perturbation");
+}

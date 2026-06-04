@@ -10,8 +10,9 @@ For the full scanpy integration story, see [docs/scanpy.md](scanpy.md).
 ## Install
 
 ```bash
-# Python bindings
-uv pip install pyscx
+# Python bindings — download wheel from GitHub Releases:
+# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
+uv pip install ./pyscx-<version>-<python>-<abi>-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 
 # CLI (one-shot, end-user)
 cargo install --features default-bin scx-cli

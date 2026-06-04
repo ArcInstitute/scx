@@ -1,6 +1,6 @@
 ---
 name: scx-usage
-description: How to USE scx (pyscx + scx-cli) to get real work done — installing pyscx (PyPI vs source, optional features, common install failures), converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, MultimodalTrainingDataset). Trigger when installing, writing, or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
+description: How to USE scx (pyscx + scx-cli) to get real work done — installing pyscx (GitHub Release wheels vs source, optional features, common install failures), converting data into/out of SCX (h5ad/h5mu/10x/mtx), processing single-cell data (in-memory / backed-lazy / query pipeline, the pyscx.accel.* accelerators), and ML data loading (TrainingDataset, IndexPlanDataset, MultimodalTrainingDataset). Trigger when installing, writing, or debugging pyscx/scx-cli code for conversion, preprocessing/QC/clustering, or training loaders.
 ---
 
 # Using scx (pyscx + scx-cli)
@@ -16,7 +16,7 @@ cases, plus the gotchas that are easy to get wrong. For exhaustive signatures
 and edge cases, read the bundled reference files (self-contained, in this skill
 directory):
 
-- `reference/installation.md` — PyPI vs source install, optional extras, verify
+- `reference/installation.md` — GitHub Release wheels vs source install, optional extras, verify
   steps, and troubleshooting (missing `.so`, HDF5, patchelf/rpath, GPU fallback,
   venv/conda conflicts).
 - `reference/conversion.md` — every ingest/export entry point + all kwargs.
@@ -30,13 +30,16 @@ directory):
 **End users** — install the wheel; no Rust toolchain needed:
 
 ```bash
-pip install pyscx
+# Download the wheel for your Python version from GitHub Releases:
+# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
+pip install ./pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
-Add extras only when needed: `'pyscx[mudata]'`, `'pyscx[10x]'`, `'pyscx[gpu]'`
-(cupy only — GPU kernels need a source build). PyPI wheels bundle libhdf5 **and**
-cloud I/O (Linux x86_64, py ≥ 3.11); they do **not** include GPU.
+Add extras only when needed: `'./pyscx-*.whl[mudata]'`, `'./pyscx-*.whl[10x]'`,
+`'./pyscx-*.whl[gpu]'` (cupy only — GPU kernels need a source build). Pre-built
+wheels bundle libhdf5 **and** cloud I/O (Linux x86_64, py ≥ 3.11); they do **not**
+include GPU.
 
 **Developers** — clone the repo and compile the extension (a bare clone does
 *not* work like `pip install`):
@@ -60,18 +63,18 @@ import pyscx
 import pyscx.pyscx as native
 from pyscx import accel
 print(native.__file__)             # must be a .so / .pyd
-print(accel.gpu_available())       # False is fine on CPU-only / PyPI wheels
+print(accel.gpu_available())       # False is fine on CPU-only / pre-built wheels
 ```
 
 **Common gotchas** (full troubleshooting in `reference/installation.md`):
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `No module named 'pyscx'` | Wheel not installed, or dev build skipped | `pip install pyscx` or run `maturin develop` |
-| `from_h5ad` → `NotImplementedError` | Built without HDF5 | PyPI: reinstall wheel; source: `libhdf5-dev` + `maturin develop` |
+| `No module named 'pyscx'` | Wheel not installed, or dev build skipped | `pip install ./pyscx-*.whl` or run `maturin develop` |
+| `from_h5ad` → `NotImplementedError` | Built without HDF5 | Pre-built wheel: reinstall from GitHub Releases; source: `libhdf5-dev` + `maturin develop` |
 | "Failed to set rpath" on every build | Missing patchelf | `uv pip install -e "./pyscx[dev]"` + `export PATH=.venv/bin:$PATH` |
-| GPU feels like CPU | PyPI wheel and/or no GPU build/device | Build from source with `--features gpu`; check `accel.gpu_info()` / `nvidia-smi` |
-| `open_cloud` missing | Source build without cloud feature | `maturin develop --features cloud` (included in PyPI wheels) |
+| GPU feels like CPU | Pre-built wheel and/or no GPU build/device | Build from source with `--features gpu`; check `accel.gpu_info()` / `nvidia-smi` |
+| `open_cloud` missing | Source build without cloud feature | `maturin develop --features cloud` (included in pre-built wheels) |
 | maturin errors with venv + conda | Both `VIRTUAL_ENV` and `CONDA_PREFIX` set | `unset VIRTUAL_ENV` or deactivate conda before building |
 
 The CLI binary `scx` is separate from pyscx (`cargo install --features default-bin scx-cli`).
@@ -277,7 +280,7 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 ---
 
 ## Quick gotcha checklist
-- **Install:** end users → `pip install pyscx`; devs → `uv pip install -e "./pyscx[dev]"` then `maturin develop`. Rebuild after pulling Rust changes.
+- **Install:** end users → `pip install ./pyscx-*.whl` (from GitHub Releases); devs → `uv pip install -e "./pyscx[dev]"` then `maturin develop`. Rebuild after pulling Rust changes.
 - Pick the approach by *subset?* × *fits in RAM?* — `query().collect()` materializes, so a too-big subset needs `to_anndata(backed=True, obs_filter=...)`.
 - Predicate grammar differs: `query().filter_obs()` (engine + pushdown) vs backed `obs_filter=` (pandas `.query()`).
 - Convert with `index_obs=`/`--index-preset` if the file will be queried, else pushdown is a full scan.

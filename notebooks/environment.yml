@@ -26,5 +26,6 @@ dependencies:
       # Requires a Rust toolchain (rustup) and the pyscx source tree at `../pyscx`:
       #     cd pyscx && maturin develop --release
       # When publishing this env to another machine, replace the line below
-      # with `pyscx>=0.1` once wheels are distributed on PyPI.
+      # with a wheel downloaded from GitHub Releases:
+      # https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
       - maturin>=1.5

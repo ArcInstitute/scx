@@ -10,24 +10,31 @@ pain comes from mixing up **end-user** vs **developer** installs, missing
 
 | Who | What you want | How |
 |---|---|---|
-| **End user** | Use pyscx on data you already have | `pip install pyscx` (or `uv pip install pyscx`) |
+| **End user** | Use pyscx on data you already have | Download `.whl` from [GitHub Releases](https://github.com/ArcInstitute/scx/releases) (pyscx-v* tags), then `pip install ./pyscx-*.whl` |
 | **Developer** | Hack on the Rust/Python repo | Clone + `maturin develop` from `pyscx/` |
 
-Do **not** assume a git checkout works like `pip install pyscx`. A fresh clone
+Do **not** assume a git checkout works like a wheel install. A fresh clone
 has no compiled extension until you run `maturin develop`.
 
 ---
 
-## End user: PyPI wheel
+## End user: pre-built wheel from GitHub Releases
+
+pyscx is **not** published on PyPI. The `pypi.org/project/pyscx/` package is
+**unrelated**. Pre-built wheels are attached to GitHub Releases tagged `pyscx-v*`
+at <https://github.com/ArcInstitute/scx/releases>. Wheels are Linux x86_64 only,
+Python 3.11–3.14.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or: . .venv/bin/activate
-pip install pyscx
+# Download the wheel for your Python version from GitHub Releases:
+# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
+pip install ./pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
-**What published wheels include** (see `.github/workflows/pyscx-release.yml`):
+**What pre-built wheels include** (see `.github/workflows/pyscx-release.yml`):
 
 - **hdf5-static** — libhdf5 bundled; `from_h5ad` / `to_h5ad` / `from_h5mu` /
   `to_h5mu` work without system HDF5 libraries.
@@ -40,13 +47,13 @@ python -c "import pyscx; print(pyscx.__version__)"
 **Optional Python extras** (install only what you need):
 
 ```bash
-pip install 'pyscx[cloud]'      # boto3, google-cloud-storage, azure-storage-blob
-pip install 'pyscx[gpu]'        # cupy-cuda12x (Linux); needs a GPU-enabled build
-pip install 'pyscx[mudata]'     # in-memory MuData round-trip (from_mudata / to_mudata)
-pip install 'pyscx[10x]'        # from_10x (pulls scanpy)
-pip install 'pyscx[eval]'       # polars for pyscx.eval helpers
-pip install 'pyscx[scvi]'       # scvi-tools integration helpers
-pip install 'pyscx[cloud,gpu]'  # combine as needed
+pip install './pyscx-*.whl[cloud]'      # boto3, google-cloud-storage, azure-storage-blob
+pip install './pyscx-*.whl[gpu]'        # cupy-cuda12x (Linux); needs a GPU-enabled build
+pip install './pyscx-*.whl[mudata]'     # in-memory MuData round-trip (from_mudata / to_mudata)
+pip install './pyscx-*.whl[10x]'        # from_10x (pulls scanpy)
+pip install './pyscx-*.whl[eval]'       # polars for pyscx.eval helpers
+pip install './pyscx-*.whl[scvi]'       # scvi-tools integration helpers
+pip install './pyscx-*.whl[cloud,gpu]'  # combine as needed
 ```
 
 Notes on extras:
@@ -55,7 +62,7 @@ Notes on extras:
   Cloud credentials for `open_cloud()` still come from the usual env vars /
   instance metadata (`docs/cloud.md`) — SCX does not ship custom auth code.
 - **`[gpu]`** installs CuPy but **does not** magically enable GPU kernels.
-  PyPI wheels are CPU-only; you still need a source build with
+  Pre-built wheels are CPU-only; you still need a source build with
   `maturin develop --features gpu`.
 - **`[mudata]`** is for in-memory `mudata.MuData` objects (`from_mudata`,
   `Experiment.to_mudata()`). File-based h5mu ingest/export (`from_h5mu`,
@@ -107,7 +114,7 @@ sudo apt-get install -y libhdf5-dev
 ```
 
 Default `[tool.maturin] features` is `["pyo3/extension-module", "hdf5"]`, so a
-normal `maturin develop` enables the h5ad/h5mu entry points. PyPI wheels use
+normal `maturin develop` enables the h5ad/h5mu entry points. Pre-built wheels use
 `hdf5-static` instead (no system lib needed).
 
 **Feature builds from source:**
@@ -122,7 +129,7 @@ cd pyscx
     --features pyo3/extension-module                        # no hdf5 (from_h5ad raises)
 ```
 
-Cloud is compiled into PyPI wheels but **not** into the default dev build —
+Cloud is compiled into pre-built wheels but **not** into the default dev build —
 source installs that need `open_cloud()` must pass `--features cloud`.
 
 GPU builds need a CUDA toolkit (≥ 12.0) and a compatible driver. For kNN/Leiden
@@ -166,7 +173,7 @@ print(adata.shape)
 
 ### `ModuleNotFoundError: No module named 'pyscx'`
 
-- End user: run `pip install pyscx` in the env you actually use (`which python`).
+- End user: download the wheel from [GitHub Releases](https://github.com/ArcInstitute/scx/releases) and run `pip install ./pyscx-*.whl` in the env you actually use (`which python`).
 - Developer: you skipped `maturin develop`. Run it from `pyscx/` and retry.
 - Wrong platform: there are no macOS/Windows pyscx wheels today — build from
   source on those platforms.
@@ -182,7 +189,7 @@ print(adata.shape)
 
 Your build lacks HDF5 support.
 
-- **PyPI:** reinstall the wheel (`pip install --force-reinstall pyscx`).
+- **Pre-built wheel:** reinstall from [GitHub Releases](https://github.com/ArcInstitute/scx/releases) (`pip install --force-reinstall ./pyscx-*.whl`).
 - **Source:** install `libhdf5-dev`, then `maturin develop` (default features).
 - **Intentional no-hdf5 build:** use the `scx` CLI or open existing `.scx`
   files instead of `from_h5ad`.
@@ -190,7 +197,7 @@ Your build lacks HDF5 support.
 ### `AttributeError: module 'pyscx' has no attribute 'open_cloud'`
 
 Built without the cloud Rust feature. On source installs run
-`maturin develop --features cloud`. PyPI wheels include cloud by default.
+`maturin develop --features cloud`. Pre-built wheels include cloud by default.
 
 ### "Failed to set rpath for libpyscx.so"
 
@@ -219,7 +226,7 @@ unset VIRTUAL_ENV    # when using conda for the build
 
 ### GPU ops feel slow / `gpu_available()` is False
 
-- **PyPI wheel:** GPU kernels are not shipped — rebuild from source with
+- **Pre-built wheel:** GPU kernels are not shipped — rebuild from source with
   `maturin develop --release --features gpu`.
 - **Source without GPU feature:** same rebuild with `--features gpu`.
 - **GPU build but no CUDA device:** ops **silently fall back to CPU**. Check
@@ -229,16 +236,16 @@ unset VIRTUAL_ENV    # when using conda for the build
 - Pin `device="cpu"` on Leiden when label stability matters — GPU Leiden
   differs from `leidenalg` by design.
 
-### Missing APIs after `pip install pyscx`
+### Missing APIs after installing the pre-built wheel
 
 | Need | Install |
 |---|---|
-| h5ad / h5mu file I/O | Base PyPI wheel (hdf5-static) |
+| h5ad / h5mu file I/O | Base pre-built wheel (hdf5-static) |
 | Cloud URLs (`open_cloud`) | Base wheel (cloud compiled in); `[cloud]` for Python SDK extras |
-| In-memory MuData (`from_mudata`, `to_mudata`) | `pip install 'pyscx[mudata]'` |
-| 10x HDF5 (`from_10x`) | `pip install 'pyscx[10x]'` (scanpy) |
-| GPU accelerators | Source build with `--features gpu` + `pip install 'pyscx[gpu]'` (cupy) |
-| cell-eval parity helpers | `pip install 'pyscx[eval]'` (polars) |
+| In-memory MuData (`from_mudata`, `to_mudata`) | `pip install './pyscx-*.whl[mudata]'` |
+| 10x HDF5 (`from_10x`) | `pip install './pyscx-*.whl[10x]'` (scanpy) |
+| GPU accelerators | Source build with `--features gpu` + `pip install './pyscx-*.whl[gpu]'` (cupy) |
+| cell-eval parity helpers | `pip install './pyscx-*.whl[eval]'` (polars) |
 
 ### Dependency version conflicts
 
