@@ -141,5 +141,79 @@ def pca(
 ) -> None: ...
 
 
+# ---------------------------------------------------------------------------
+# Graph / embedding / integration ops
+# ---------------------------------------------------------------------------
+
+
+def neighbors(
+    adata: Any,
+    n_neighbors: int = 15,
+    use_rep: str = "X_pca",
+    random_state: int = 0,
+    ef_construction: int = 200,
+    ef_search: int = 200,
+    device: str = "auto",
+) -> None: ...
+
+
+def umap(
+    adata: Any,
+    n_components: int = 2,
+    n_epochs: int = 200,
+    min_dist: float = 0.1,
+    spread: float = 1.0,
+    negative_sample_rate: int = 5,
+    learning_rate: float = 1.0,
+    random_state: int = 0,
+    device: str = "auto",
+) -> None: ...
+
+
+def leiden(
+    adata: Any,
+    resolution: float = 1.0,
+    key_added: str = "leiden",
+    random_state: int = 0,
+    n_iterations: int = 2,
+    device: str = "auto",
+    parallel: bool = False,
+    theta: float = 1.0,
+) -> None: ...
+
+
+def harmony_integrate(
+    adata: Any,
+    key: Any,
+    *,
+    basis: str = "X_pca",
+    adjusted_basis: str | None = None,
+    n_clusters: int | None = None,
+    theta: Any | None = None,
+    sigma: float = 0.1,
+    lamb: Any | None = None,
+    alpha: float = 0.2,
+    max_iter: int = 10,
+    max_iter_kmeans: int = 4,
+    epsilon_harmony: float = 1e-2,
+    epsilon_kmeans: float = 1e-3,
+    block_size: float = 0.05,
+    batch_prop_cutoff: float = 1e-5,
+    tau: float = 0.0,
+    random_state: int = 0,
+    device: str = "auto",
+) -> None: ...
+
+
+def compute_lisi(
+    adata: Any,
+    key: str,
+    *,
+    basis: str = "X_pca",
+    perplexity: float = 30.0,
+    n_neighbors: int | None = None,
+) -> Any: ...
+
+
 # Catch-all for the rest of `pyscx.accel.*`.
 def __getattr__(name: str) -> Any: ...

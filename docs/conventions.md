@@ -81,8 +81,8 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   ops' GPU entry points `match` on the planned `AccelRoute` to pick the kernel,
   and the pyscx CPU dispatch calls `plan_de_route` too — so the recorded route
   can never diverge from the code that ran. v3 is the unconditional default GPU
-  DE route (the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed in
-  ACC-RUST-OPT-V2 §5 Phase V1b): `BackedCsc` + a CSC sidecar → `GpuCscV3`, every
+  DE route (the `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` opt-in gates were removed when v3
+  became the default): `BackedCsc` + a CSC sidecar → `GpuCscV3`, every
   other layout (including dense-host, which densifies to CSR) → `GpuCsrV3`. The
   non-DE GPU ops stamp the generic `GpuCsr` / `GpuDense` routes.
   `gpu_eligible` models "GPU present but this op+layout has no GPU kernel" (e.g.

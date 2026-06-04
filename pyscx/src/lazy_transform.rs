@@ -891,6 +891,10 @@ impl ScxLazyTransformedDataset {
         if let Some(row_factors) =
             crate::backed::try_extract_row_factors(py, other, self.shape_val.0)?
         {
+            // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
+            // 0 drops the row to empty) — this matches scanpy `normalize_total`,
+            // where empty rows stay empty, NOT raw scipy float division (which
+            // would yield inf/nan for a nonzero numerator over a zero divisor).
             let inv_factors: Vec<f64> = row_factors
                 .iter()
                 .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })

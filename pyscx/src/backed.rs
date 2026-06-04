@@ -489,6 +489,10 @@ impl ScxBackedSparseDataset {
         // `axis_mul_or_truediv(..., op=truediv)` takes for normalize_total
         // when the numba CSR path isn't available.
         if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+            // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
+            // 0 drops the row to empty) — this matches scanpy `normalize_total`,
+            // where empty rows stay empty, NOT raw scipy float division (which
+            // would yield inf/nan for a nonzero numerator over a zero divisor).
             let inv_factors: Vec<f64> = row_factors
                 .iter()
                 .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
@@ -1994,7 +1998,10 @@ impl ScxComparisonResult {
                         .backed
                         .total_nnz()
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    Ok((total as i64).into_pyobject(py)?.into_any())
+                    // Return a numpy int64 scalar (not a bare Python int) so this
+                    // shortcut matches the materialized fallback's scalar type.
+                    let np = py.import("numpy")?;
+                    np.call_method1("int64", (total as i64,))
                 }
                 Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
             }

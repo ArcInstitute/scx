@@ -945,9 +945,14 @@ pub struct StreamingOverrides {
 /// memory is bounded by `shard_target_rows × n_vars × density × ~16
 /// bytes` plus the always-resident indptr (`(n_obs + 1) × 8 bytes`).
 ///
-/// The pipeline is currently sequential: one shard read → sort →
-/// drop-zeros → encode → write per iteration. A concurrent encoder
-/// pool is a planned follow-on if benchmarks show I/O starvation.
+/// Shard processing dispatches through
+/// [`run_streaming_writer_coordinator`], which fans the per-shard read →
+/// sort → drop-zeros → encode work out across a rayon worker pool and
+/// reassembles output in shard order via a bounded crossbeam reorder
+/// buffer (output is byte-identical to the sequential path). It falls
+/// back to the sequential coordinator when libhdf5 is not built
+/// threadsafe (gated by an `H5is_library_threadsafe` probe), when the
+/// reader can't do row-range reads, or when `reader_threads <= 1`.
 ///
 /// `opts.csc == true` runs a post-`finish()`
 /// [`scx_ops::rebuild_csc_inplace`] pass over the just-written file;

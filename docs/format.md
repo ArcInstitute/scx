@@ -65,7 +65,7 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | `nnz` | `u64` | Total non-zeros (sums per-modality nnz on v2) |
 | `n_csr_shards` | `u32` | |
 | `n_csc_shards` | `u32` | 0 if CSC not present |
-| `shard_target_rows` | `u32` | Cells per CSR shard; default 10,000 |
+| `shard_target_rows` | `u32` | Cells per CSR shard; default 16,384 (`DEFAULT_SHARD_TARGET_ROWS`) |
 | `codec_id` | `u8` | Default codec (§codec.md). Per-shard override allowed. |
 | `index_dtype` | `u8` | 0 = u16 indices, 1 = u32. Set once per file. |
 | `endian` | `u8` | 0 = little (required), 1 = big (rejected) |
@@ -317,13 +317,13 @@ For each block:
 ```
 
 `row_start: u32` here is correct because it addresses rows within a shard
-(max `shard_target_rows`, typically 10,000). The *full* catalog's shard
+(max `shard_target_rows`, typically 16,384). The *full* catalog's shard
 statistics use `u64` because they address global rows (billions of cells).
 
 ### Shard sizing defaults
 
-Default 10,000 cells per CSR shard. At 5% density × 30K genes → ~15M non-zeros
-per shard → ~30–60 MB compressed. Rationale and tradeoffs are in
+Default 16,384 cells per CSR shard (`DEFAULT_SHARD_TARGET_ROWS`). At 5% density × 30K
+genes → ~24M non-zeros per shard → ~50–100 MB compressed. Rationale and tradeoffs are in
 [docs/sharding.md](sharding.md).
 
 ## 4.1 CSC Shard Internal Layout
