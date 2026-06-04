@@ -1086,7 +1086,9 @@ fn validate_var_identity(
 /// Compare two var `RecordBatch`es for identity. Returns `None` when
 /// they are identical for the purposes of merge (column names, dtypes,
 /// row count, and per-column content all match), or a human-readable
-/// description of the first observed difference.
+/// description of the first observed difference. Because per-column
+/// content is compared element-wise (positionally), this also enforces
+/// that the two batches share the same row/gene order.
 fn var_diff(a: &RecordBatch, b: &RecordBatch) -> Option<String> {
     if a.num_rows() != b.num_rows() {
         return Some(format!(

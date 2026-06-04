@@ -466,9 +466,10 @@ fn from_h5ad(
 /// Convert a 10x HDF5 file to SCX via scanpy.
 ///
 /// Reads the 10x file with scanpy.read_10x_h5(), then writes via from_anndata.
-/// `in_place` mirrors the `from_anndata()` parameter; it has no observable
-/// effect because the AnnData object returned by scanpy is freshly
-/// constructed and has no other reference.
+///
+/// `in_place` has no observable effect (scanpy returns a fresh AnnData with no
+/// other reference) and is retained only for API compatibility with
+/// `from_anndata()`.
 ///
 /// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
 /// — see those docs.

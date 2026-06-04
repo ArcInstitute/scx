@@ -12,7 +12,7 @@ use crate::median::floor_median_u64;
 
 /// Compute the Rice parameter k from the median of delta values.
 ///
-/// `k = max(0, floor(log2(0.6931 * median)))`, clamped to 0–15.
+/// `k = clamp(floor(log2(0.6931 * median)), 0, 15)`.
 fn compute_k(median: u64) -> u8 {
     if median == 0 {
         return 0;

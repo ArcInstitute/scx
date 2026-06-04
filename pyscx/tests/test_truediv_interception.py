@@ -10,7 +10,9 @@ Test coverage:
 2. Values match materialized reference (X / row_factors)
 3. Handles 1D arrays, (n,1) column vectors, (1,n) row vectors
 4. Non-row-factor shapes (e.g., scalar, 2D matrix) fall back to materialization
-5. Division by zero → zero (same as scipy behavior)
+5. Zero divisor leaves the row unscaled — matches scanpy normalize_total
+   (empty rows stay empty), NOT raw scipy float division (which would yield
+   inf/nan)
 6. Chaining: lazy.__truediv__() appends RowScale transform
 7. Chaining with normalize_total → truediv preserves lazy chain
 """

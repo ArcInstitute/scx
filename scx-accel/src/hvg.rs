@@ -190,7 +190,14 @@ pub fn streaming_mean_var_batched<S: ShardSource>(
         per_batch.push(HvgStats { means, variances });
     }
 
-    // Derive global stats from per-batch accumulators (no extra pass).
+    // Derive global stats from per-batch accumulators (no second pass over the
+    // data). This is exact, not an approximation: raw moments are additive, so
+    // the global Σx and Σx² are simply the sums of the per-batch Σx / Σx², and
+    // the global mean/variance computed from them equal the pooled (single-pass
+    // over all cells) result exactly. It does, however, inherit the same
+    // near-constant-gene catastrophic-cancellation sensitivity as the
+    // `Σx² − n·mean²` variance path (see `streaming_mean_var_with_device`
+    // accuracy caveat); the per-batch partial sums do not worsen it.
     let total_n: usize = batch_count.iter().sum();
     let total_f = total_n as f64;
     let mut global_means = vec![0.0f64; n_vars];
@@ -275,6 +282,16 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource>(
 /// accumulates per-column `Σ x` and `Σ x²` directly on-device via atomicAdd,
 /// producing results that agree with the CPU path to ~1e-5 relative error on
 /// typical scRNA-seq densities.
+///
+/// **Accuracy caveat (near-constant genes):** the ~1e-5 relative tolerance
+/// holds only for genes with non-negligible variance. For near-constant genes
+/// the relative error is effectively unbounded: the catastrophic-cancellation
+/// `Σx² − n·mean²` form (see [`streaming_mean_var`] § Numerical stability)
+/// combined with the GPU CSR path's nondeterministic-order f64 `atomicAdd`
+/// reduction means the computed variance — and therefore the outcome of the
+/// `< 0 → 0` clamp — can differ between runs and between GPU and CPU. At an HVG
+/// dispersion/variance cutoff this can flip HVG membership for such genes. Pin
+/// `device = "cpu"` if deterministic near-constant-gene behaviour is required.
 ///
 /// Only available with `feature = "gpu"`.
 ///

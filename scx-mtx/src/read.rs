@@ -128,9 +128,13 @@ fn open_maybe_gzipped(path: &Path) -> Result<Box<dyn BufRead>, MtxError> {
 /// `max_nnz_bound` is an upper bound on the number of triplets we
 /// accept, derived by the caller from the on-disk file size. The
 /// minimum ASCII triplet is "1 1 1\n" = 6 bytes, so for an
-/// uncompressed file the tight bound is `file_size / 6`. This
-/// replaces an earlier hard-coded 2 billion cap that incorrectly
-/// rejected atlas-scale inputs (>50M cells routinely exceed 2B nnz).
+/// uncompressed file the tight bound is `file_size / 6`. The bound only
+/// guards the up-front allocation reservation; it does not lift the
+/// practical ceiling on `nnz`, which is dominated by the in-memory
+/// model: the parser holds the full COO triplet buffer
+/// (`Vec<(usize, usize, f32)>`) and then the full CSR arrays
+/// simultaneously, so resident memory is roughly 32 B per nnz. A
+/// 2B-nnz matrix would need ~64 GB resident regardless of any cap.
 #[allow(clippy::type_complexity)]
 fn parse_mtx_file(
     reader: Box<dyn BufRead>,

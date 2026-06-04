@@ -218,6 +218,9 @@ enum Commands {
         /// Rebuild the CSC sidecar after appending (drops + re-emits via
         /// `scx build-csc`). Without this flag, append drops the CSC
         /// sidecar with a warning — the row layout no longer matches.
+        /// The rebuild uses a fixed 4 GiB transpose memory budget (not
+        /// configurable here; use `scx build-csc --memory-limit` for an
+        /// adjustable budget).
         #[arg(long)]
         rebuild_csc: bool,
         /// Maximum columns per emitted CSC shard when `--rebuild-csc` is
@@ -270,6 +273,9 @@ enum Commands {
         /// re-emits via `scx build-csc`). Without this flag, compact
         /// drops the CSC sidecar with a warning — the row layout no
         /// longer matches after deletion-vector application.
+        /// The rebuild uses a fixed 4 GiB transpose memory budget (not
+        /// configurable here; use `scx build-csc --memory-limit` for an
+        /// adjustable budget).
         #[arg(long)]
         rebuild_csc: bool,
         /// Maximum columns per emitted CSC shard when `--rebuild-csc`
@@ -321,6 +327,9 @@ enum Commands {
         /// Rebuild the CSC sidecar on the merged output (drops +
         /// re-emits via `scx build-csc`). Without this flag, merge
         /// drops any input CSC sidecars with a warning.
+        /// The rebuild uses a fixed 4 GiB transpose memory budget (not
+        /// configurable here; use `scx build-csc --memory-limit` for an
+        /// adjustable budget).
         #[arg(long)]
         rebuild_csc: bool,
         /// Maximum columns per emitted CSC shard when `--rebuild-csc`
@@ -392,7 +401,10 @@ enum Commands {
         /// Apply log1p transformation
         #[arg(long)]
         log1p: bool,
-        /// Limit number of returned cells
+        /// Limit number of returned cells. This caps output rows and
+        /// therefore also caps the plain-text `--count` value, which prints
+        /// `min(matched, limit)`. For the true match count when `--limit`
+        /// is set, use `--json` and read the `matched_rows` field.
         #[arg(long)]
         limit: Option<usize>,
         /// JSON output (for --count)
@@ -532,6 +544,9 @@ enum Commands {
         /// re-emits via `scx build-csc` against the projected CSR).
         /// Without this flag, subset drops any input CSC sidecar
         /// with a warning — the row/column index space changes.
+        /// The rebuild uses a fixed 4 GiB transpose memory budget (not
+        /// configurable here; use `scx build-csc --memory-limit` for an
+        /// adjustable budget).
         #[arg(long)]
         rebuild_csc: bool,
         /// Maximum columns per emitted CSC shard when `--rebuild-csc`
