@@ -59,10 +59,11 @@ pub type PerBatchClipSums = Vec<(Vec<f64>, Vec<f64>)>;
 /// form — can flip the `var < 0 → 0` clamp and thus HVG membership at a cutoff.
 /// The deterministic alternatives are [`gpu_streaming_mean_var_csc`] (one block
 /// per column, no cross-block atomics) and the CPU
-/// `scx_accel::streaming_mean_var` (sequential Welford). Making *this* CSR path
-/// deterministic — a per-block-partials + tree-merge reduction emitting Welford
-/// `(count, mean, M2)` moments — is a tracked follow-on; prefer the CSC route
-/// when a CSC sidecar is available and reproducibility matters.
+/// `scx_accel::streaming_mean_var` (sequential, fixed-order f64 accumulation).
+/// Making *this* CSR path deterministic — a per-block-partials + tree-merge
+/// reduction (optionally emitting Welford `(count, mean, M2)` moments) — is a
+/// tracked follow-on; prefer the CSC route when a CSC sidecar is available and
+/// reproducibility matters.
 pub fn gpu_streaming_mean_var(
     dev: &GpuDevice,
     source: &(dyn ShardSource + Sync),
