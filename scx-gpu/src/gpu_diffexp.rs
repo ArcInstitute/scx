@@ -506,8 +506,9 @@ pub fn gpu_de_scatter_gene_major_dev(
 /// Each row's column indices must be strictly increasing — duplicates yield
 /// nondeterministic dense values because multiple GPU threads race on the
 /// same output cell. SCX canonicalisation sorts but does not dedup, so
-/// upstream callers must enforce this. `RawGpuShardSource` checks this in
-/// debug builds via `check_no_duplicate_columns` before staging each shard.
+/// upstream callers must enforce this. `RawGpuShardSource` checks this as a
+/// release-active guard via `validate_shard_for_gpu_de` before staging each
+/// shard.
 pub fn gpu_de_scatter_shard_to_dense(
     dev: &GpuDevice,
     view: &GpuCsrShardView<'_>,
@@ -596,7 +597,7 @@ pub fn gpu_de_scatter_shard_to_dense(
 /// Same invariant as [`gpu_de_scatter_shard_to_dense`]. Duplicates would
 /// race between threads writing the same `slab[gene_local, pool_pos]`.
 /// SCX canonicalisation enforces this; `RawGpuShardSource` checks via
-/// `check_no_duplicate_columns` in debug builds.
+/// `validate_shard_for_gpu_de` as a release-active guard.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_de_scatter_shard_to_gene_major(
     dev: &GpuDevice,

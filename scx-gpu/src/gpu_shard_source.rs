@@ -829,37 +829,4 @@ mod tests {
             }
         }
     }
-
-    /// `check_no_duplicate_columns` accepts a canonical CSR with strictly
-    /// increasing per-row column indices. No panic, no GPU required.
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_check_no_duplicate_columns_accepts_canonical_csr() {
-        // 2 rows, 5 cols, each row strictly increasing.
-        let csr = ScxCsr::new_unchecked(
-            (2, 5),
-            vec![0i64, 3, 5],
-            vec![0i32, 2, 4, 1, 3],
-            vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
-        );
-        check_no_duplicate_columns(&csr);
-    }
-
-    /// `check_no_duplicate_columns` panics in debug builds on an
-    /// intra-row duplicate column index. Catches the foot-gun before the
-    /// CSR is staged to GPU, where parallel writes would race
-    /// nondeterministically.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "unsorted or duplicate column indices")]
-    fn test_check_no_duplicate_columns_panics_on_duplicate() {
-        // Row 0: [0, 3, 3] — duplicate column 3.
-        let csr = ScxCsr::new_unchecked(
-            (1, 5),
-            vec![0i64, 3],
-            vec![0i32, 3, 3],
-            vec![1.0f32, 2.0, 3.0],
-        );
-        check_no_duplicate_columns(&csr);
-    }
 }
