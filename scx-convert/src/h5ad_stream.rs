@@ -176,8 +176,9 @@ impl XStreamReader {
         let n_rows = row_end - row_start;
 
         let indptr_slice = &self.indptr[row_start..=row_end];
-        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(indptr_slice)
-            .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices_ds.shape()[0])
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         // Read the indices / data slices. Empty shards (nnz_start ==
         // nnz_end) skip the hdf5 read entirely — `read_slice_1d` on
@@ -230,8 +231,9 @@ impl XStreamReader {
         let row_end = row_start_usize + n_rows as usize;
 
         let indptr_slice = &self.indptr[row_start_usize..=row_end];
-        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(indptr_slice)
-            .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices_ds.shape()[0])
+                .map_err(|e| ConvertError::Other(format!("shard validation failed: {e}")))?;
 
         let (shard_indices_i32, shard_values) = if nnz_start == nnz_end {
             (Vec::<i32>::new(), Vec::<f32>::new())

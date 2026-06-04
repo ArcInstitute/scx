@@ -175,8 +175,9 @@ impl MaterializedCsrStream {
         // entirely. Route it through the same shared helpers as the
         // other four ingest sites.
         let indptr_slice = &self.indptr[row_start_usize..=row_end];
-        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(indptr_slice)
-            .map_err(|e| ConvertError::Other(format!("CSR shard validation failed: {e}")))?;
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(indptr_slice, self.indices.len().min(self.data.len()))
+                .map_err(|e| ConvertError::Other(format!("CSR shard validation failed: {e}")))?;
         let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
             indptr_slice,
             &self.indices[nnz_start..nnz_end],

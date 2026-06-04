@@ -21,6 +21,9 @@ pub enum CsrError {
     #[error("nnz mismatch: indptr[last]={indptr_nnz}, indices.len()={actual_nnz}")]
     NnzMismatch { indptr_nnz: i64, actual_nnz: usize },
 
+    #[error("nnz range end {nnz_end} exceeds backing array length {backing_len}")]
+    NnzOutOfRange { nnz_end: usize, backing_len: usize },
+
     #[error("index {index} out of range [0, {n_cols}) at position {position}")]
     IndexOutOfRange {
         index: i32,

@@ -110,9 +110,18 @@ pub fn validate_csr_arrays(indptr: &[i64], indices: &[i32], n_vars: u64) -> Resu
 ///
 /// Guards the non-negative base and `end >= start` monotonicity at the
 /// endpoints so a reversed range can't silently produce an
-/// underflowed slice (the bug behind review finding C5). Full
-/// per-element validation happens in [`rebase_csr_shard`].
-pub fn shard_nnz_bounds(indptr_slice: &[i64]) -> Result<(usize, usize), CsrError> {
+/// underflowed slice (the bug behind review finding C5). Also guards
+/// the upper bound: `end` must not exceed `backing_len` (the length of
+/// the `indices` / `data` array the returned range slices into), so a
+/// corrupt indptr whose last value overruns the backing array returns
+/// a clean [`CsrError::NnzOutOfRange`] instead of panicking at the
+/// slice. In-memory callers pass `indices.len().min(data.len())`;
+/// streaming callers pass the on-disk dataset length. Full per-element
+/// validation happens in [`rebase_csr_shard`].
+pub fn shard_nnz_bounds(
+    indptr_slice: &[i64],
+    backing_len: usize,
+) -> Result<(usize, usize), CsrError> {
     let base = indptr_slice.first().copied().unwrap_or(0);
     let end = indptr_slice.last().copied().unwrap_or(0);
     if base < 0 {
@@ -126,7 +135,14 @@ pub fn shard_nnz_bounds(indptr_slice: &[i64]) -> Result<(usize, usize), CsrError
             index: indptr_slice.len().saturating_sub(1),
         });
     }
-    Ok((base as usize, end as usize))
+    let end_usize = end as usize;
+    if end_usize > backing_len {
+        return Err(CsrError::NnzOutOfRange {
+            nnz_end: end_usize,
+            backing_len,
+        });
+    }
+    Ok((base as usize, end_usize))
 }
 
 /// Rebase a shard-local CSR slice into a standalone shard: validate
@@ -561,22 +577,36 @@ mod tests {
 
     #[test]
     fn shard_nnz_bounds_basic() {
-        // Shard-local slice with a non-zero base.
-        assert_eq!(shard_nnz_bounds(&[17i64, 19, 22]).unwrap(), (17, 22));
+        // Shard-local slice with a non-zero base. `backing_len` >= end.
+        assert_eq!(shard_nnz_bounds(&[17i64, 19, 22], 22).unwrap(), (17, 22));
     }
 
     #[test]
     fn shard_nnz_bounds_rejects_reversed_range() {
         // C5: a reversed endpoint range must error, not underflow-wrap
         // into a giant slice.
-        let err = shard_nnz_bounds(&[22i64, 19, 17]).unwrap_err();
+        let err = shard_nnz_bounds(&[22i64, 19, 17], 22).unwrap_err();
         assert!(matches!(err, CsrError::IndptrNotMonotonic { .. }));
     }
 
     #[test]
     fn shard_nnz_bounds_rejects_negative_base() {
-        let err = shard_nnz_bounds(&[-1i64, 3]).unwrap_err();
+        let err = shard_nnz_bounds(&[-1i64, 3], 3).unwrap_err();
         assert!(matches!(err, CsrError::IndptrNegative { .. }));
+    }
+
+    #[test]
+    fn shard_nnz_bounds_rejects_overrun() {
+        // A corrupt indptr whose last value overruns the backing array
+        // must error cleanly rather than panic at the downstream slice.
+        let err = shard_nnz_bounds(&[0i64, 5], 3).unwrap_err();
+        assert!(matches!(
+            err,
+            CsrError::NnzOutOfRange {
+                nnz_end: 5,
+                backing_len: 3
+            }
+        ));
     }
 
     // ---- rebase_csr_shard (C6) ----

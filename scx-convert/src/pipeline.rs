@@ -2050,8 +2050,9 @@ fn write_csr_shards(
         // column-bound check (`indices < n_vars`); `rebase_csr_shard`
         // runs the full `validate_csr_arrays`.
         let shard_indptr_slice = &indptr[row_start..=row_end];
-        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(shard_indptr_slice)
-            .map_err(|e| ConvertError::Other(format!("X shard validation failed: {e}")))?;
+        let (nnz_start, nnz_end) =
+            scx_sparse::shard_nnz_bounds(shard_indptr_slice, indices.len().min(data.len()))
+                .map_err(|e| ConvertError::Other(format!("X shard validation failed: {e}")))?;
         let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
             shard_indptr_slice,
             &indices[nnz_start..nnz_end],
@@ -2452,9 +2453,12 @@ fn write_layer_shards(
         // skipped).
         let shard_indptr_slice = &indptr[row_start..=row_end];
         let (nnz_start, nnz_end) =
-            scx_sparse::shard_nnz_bounds(shard_indptr_slice).map_err(|e| {
-                ConvertError::Other(format!("layer '{layer_name}' shard validation failed: {e}"))
-            })?;
+            scx_sparse::shard_nnz_bounds(shard_indptr_slice, indices.len().min(data.len()))
+                .map_err(|e| {
+                    ConvertError::Other(format!(
+                        "layer '{layer_name}' shard validation failed: {e}"
+                    ))
+                })?;
         let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
             shard_indptr_slice,
             &indices[nnz_start..nnz_end],
