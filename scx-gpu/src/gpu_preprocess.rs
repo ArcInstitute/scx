@@ -42,6 +42,48 @@ use crate::gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource};
 /// PTX source for the normalize+log1p kernels, compiled at build time.
 const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normalize_log1p.ptx"));
 
+/// Granularity for the `normalize` / `normalize+log1p` row reduction.
+///
+/// All three tiers compute the *same* per-row normalization — the choice is
+/// purely a performance trade-off, so a coarse selector is correctness-safe.
+/// `Thread` is the original one-thread-per-row kernel (best for very sparse
+/// rows). `Warp` puts one warp on each row (32-wide shuffle reduction). `Block`
+/// puts one block on each row (shared-memory reduction) for very dense rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowTier {
+    Thread,
+    Warp,
+    Block,
+}
+
+/// Rows with mean nnz at or below this use one thread per row — a warp would
+/// leave most of its 32 lanes idle.
+const TIER_THREAD_MAX_MEAN_NNZ: usize = 8;
+/// Rows with mean nnz at or above this use one block per row — a single warp's
+/// 32 lanes would each loop too many times.
+const TIER_BLOCK_MIN_MEAN_NNZ: usize = 512;
+
+/// Pick a row-reduction tier from the *mean* row density (`nnz / n_rows`).
+///
+/// Uses the shard mean rather than per-row nnz: it needs no host `indptr` (only
+/// `n_rows` and `data.len()`, both already in hand), and since the tier is
+/// correctness-neutral the coarse mean is sufficient for the roughly uniform
+/// per-cell nnz of scRNA-seq data. A future refinement could bucket rows
+/// individually for shards with heavy intra-shard density skew.
+pub(crate) fn choose_row_tier(n_rows: usize, nnz: usize) -> RowTier {
+    if n_rows == 0 {
+        return RowTier::Thread;
+    }
+    let mean = nnz / n_rows;
+    if mean <= TIER_THREAD_MAX_MEAN_NNZ {
+        RowTier::Thread
+    } else if mean >= TIER_BLOCK_MIN_MEAN_NNZ {
+        RowTier::Block
+    } else {
+        RowTier::Warp
+    }
+}
+
 /// Dispatch fused operations on a GPU-resident CSR view (in-place).
 ///
 /// Single source of truth for the `(normalize, log1p)` kernel dispatch,
@@ -50,6 +92,10 @@ const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normal
 /// `GpuPreprocessedShardSource` calls this directly on the slot's
 /// exact-sized views. Kernel launches go on `dev.stream()` (the compute
 /// stream); callers that need a different stream must wrap accordingly.
+///
+/// The `normalize` reduction granularity is auto-selected from the shard's mean
+/// row density via [`choose_row_tier`]; [`apply_fused_ops_with_tier`] takes an
+/// explicit tier (used by tests to force a kernel on a small matrix).
 pub(crate) fn apply_fused_ops_inner(
     dev: &GpuDevice,
     indptr: &CudaView<'_, i64>,
@@ -59,14 +105,32 @@ pub(crate) fn apply_fused_ops_inner(
     log1p: bool,
     row_scale: Option<(&CudaView<'_, f32>, usize)>,
 ) -> Result<(), GpuError> {
+    let tier = choose_row_tier(n_rows, data.len());
+    apply_fused_ops_with_tier(dev, indptr, data, n_rows, normalize, log1p, row_scale, tier)
+}
+
+/// [`apply_fused_ops_inner`] with an explicit normalize-reduction [`RowTier`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_fused_ops_with_tier(
+    dev: &GpuDevice,
+    indptr: &CudaView<'_, i64>,
+    data: &mut CudaViewMut<'_, f32>,
+    n_rows: usize,
+    normalize: Option<f32>,
+    log1p: bool,
+    row_scale: Option<(&CudaView<'_, f32>, usize)>,
+    tier: RowTier,
+) -> Result<(), GpuError> {
     if n_rows == 0 {
         return Ok(());
     }
 
     let module = dev.load_module_cached(NORMALIZE_LOG1P_PTX)?;
     let n_rows_i32 = n_rows as i32;
+    let nnz = data.len();
     let threads: u32 = 256;
     let blocks = (n_rows as u32).div_ceil(threads);
+    // Thread-per-row config — also used by the row_scale tail below.
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),
@@ -74,12 +138,52 @@ pub(crate) fn apply_fused_ops_inner(
     };
 
     match (normalize, log1p) {
-        (Some(target_sum), true) => {
+        (Some(target_sum), do_log1p) => {
+            // Select the kernel + launch geometry by tier. All three variants
+            // share the same argument list (indptr, data, n_rows, target_sum).
+            let (func_name, norm_cfg) = match tier {
+                RowTier::Thread => (
+                    if do_log1p {
+                        "normalize_log1p_kernel"
+                    } else {
+                        "normalize_kernel"
+                    },
+                    cfg,
+                ),
+                RowTier::Warp => {
+                    // One warp per row: 256 threads = 8 warps per block.
+                    let warps_per_block = threads / 32;
+                    let warp_blocks = (n_rows as u32).div_ceil(warps_per_block);
+                    (
+                        if do_log1p {
+                            "normalize_log1p_warp_kernel"
+                        } else {
+                            "normalize_warp_kernel"
+                        },
+                        LaunchConfig {
+                            grid_dim: (warp_blocks, 1, 1),
+                            block_dim: (threads, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                    )
+                }
+                RowTier::Block => (
+                    if do_log1p {
+                        "normalize_log1p_block_kernel"
+                    } else {
+                        "normalize_block_kernel"
+                    },
+                    // One block per row.
+                    LaunchConfig {
+                        grid_dim: (n_rows as u32, 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                ),
+            };
             let func = module
-                .load_function("normalize_log1p_kernel")
-                .map_err(|e| {
-                    GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}"))
-                })?;
+                .load_function(func_name)
+                .map_err(|e| GpuError::KernelLaunchFailed(format!("{func_name}: {e}")))?;
             unsafe {
                 dev.stream()
                     .launch_builder(&func)
@@ -87,38 +191,31 @@ pub(crate) fn apply_fused_ops_inner(
                     .arg(&mut *data)
                     .arg(&n_rows_i32)
                     .arg(&target_sum)
-                    .launch(cfg)
+                    .launch(norm_cfg)
             }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_log1p_kernel: {e}")))?;
-        }
-        (Some(target_sum), false) => {
-            let func = module
-                .load_function("normalize_kernel")
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
-            unsafe {
-                dev.stream()
-                    .launch_builder(&func)
-                    .arg(indptr)
-                    .arg(&mut *data)
-                    .arg(&n_rows_i32)
-                    .arg(&target_sum)
-                    .launch(cfg)
-            }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("normalize_kernel: {e}")))?;
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("{func_name}: {e}")))?;
         }
         (None, true) => {
+            // log1p is elementwise and row-independent: one thread per nonzero,
+            // grid-strided. No reduction, so the row tier doesn't apply.
+            let nnz_i64 = nnz as i64;
+            let log1p_blocks = (nnz as u32).div_ceil(threads).max(1);
+            let log1p_cfg = LaunchConfig {
+                grid_dim: (log1p_blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let func = module
-                .load_function("log1p_kernel")
-                .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
+                .load_function("log1p_nnz_kernel")
+                .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_nnz_kernel: {e}")))?;
             unsafe {
                 dev.stream()
                     .launch_builder(&func)
-                    .arg(indptr)
                     .arg(&mut *data)
-                    .arg(&n_rows_i32)
-                    .launch(cfg)
+                    .arg(&nnz_i64)
+                    .launch(log1p_cfg)
             }
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_kernel: {e}")))?;
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("log1p_nnz_kernel: {e}")))?;
         }
         (None, false) => {}
     }
@@ -1004,5 +1101,256 @@ mod tests {
             max_rel < 1e-5,
             "max relative error = {max_rel} (threshold: 1e-5)"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 2.1 — nonzero-parallel kernels: tier selection + parity
+    // -------------------------------------------------------------------
+
+    /// The tier selector is pure and correctness-neutral; verify its
+    /// mean-density boundaries without a GPU.
+    #[test]
+    fn test_choose_row_tier_boundaries() {
+        // Empty / degenerate.
+        assert_eq!(choose_row_tier(0, 0), RowTier::Thread);
+        // mean == 0 (all-empty rows) → Thread.
+        assert_eq!(choose_row_tier(100, 0), RowTier::Thread);
+        // mean exactly at the thread ceiling → Thread.
+        assert_eq!(
+            choose_row_tier(10, 10 * TIER_THREAD_MAX_MEAN_NNZ),
+            RowTier::Thread
+        );
+        // Just above the thread ceiling → Warp.
+        assert_eq!(
+            choose_row_tier(10, 10 * (TIER_THREAD_MAX_MEAN_NNZ + 1)),
+            RowTier::Warp
+        );
+        // Mid-range → Warp.
+        assert_eq!(choose_row_tier(1000, 1000 * 64), RowTier::Warp);
+        // Just below the block floor → Warp.
+        assert_eq!(
+            choose_row_tier(10, 10 * (TIER_BLOCK_MIN_MEAN_NNZ - 1)),
+            RowTier::Warp
+        );
+        // At/above the block floor → Block.
+        assert_eq!(
+            choose_row_tier(10, 10 * TIER_BLOCK_MIN_MEAN_NNZ),
+            RowTier::Block
+        );
+        assert_eq!(choose_row_tier(10, 10 * 4096), RowTier::Block);
+    }
+
+    /// Build a CSR (`indptr`, `data`) with an explicit per-row nnz. `indices`
+    /// are irrelevant to the normalize/log1p kernels (they only touch
+    /// `indptr` + `data`), so they're omitted.
+    fn csr_with_row_nnz(row_nnz: &[usize], seed: u64) -> (Vec<i64>, Vec<f32>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut indptr = vec![0i64];
+        let mut data = Vec::new();
+        for &k in row_nnz {
+            for _ in 0..k {
+                data.push(rng.gen_range(0.5..20.5));
+            }
+            indptr.push(data.len() as i64);
+        }
+        (indptr, data)
+    }
+
+    /// Run `normalize` (optionally fused with log1p) through a forced tier and
+    /// return the transformed `data`.
+    fn run_normalize_tier(
+        dev: &GpuDevice,
+        indptr: &[i64],
+        data: &[f32],
+        n_rows: usize,
+        target_sum: f32,
+        do_log1p: bool,
+        tier: RowTier,
+    ) -> Vec<f32> {
+        let d_indptr = dev.htod_copy(indptr).unwrap();
+        let mut d_data = dev.htod_copy(data).unwrap();
+        {
+            let iv = d_indptr.slice(..);
+            let mut dv = d_data.slice_mut(..);
+            apply_fused_ops_with_tier(
+                dev,
+                &iv,
+                &mut dv,
+                n_rows,
+                Some(target_sum),
+                do_log1p,
+                None,
+                tier,
+            )
+            .unwrap();
+        }
+        dev.synchronize().unwrap();
+        dev.dtoh_copy(&d_data).unwrap()
+    }
+
+    /// Every tier (Thread / Warp / Block) must match the CPU reference on the
+    /// same input, including empty and single-nonzero rows. Forced tiers let us
+    /// exercise the warp/block kernels on a small deterministic matrix.
+    #[test]
+    fn test_gpu_normalize_tiers_match_cpu() {
+        let dev = require_gpu!();
+        // Mix of empty, tiny, medium, and dense rows.
+        let row_nnz = [0usize, 1, 5, 33, 64, 200, 1, 0, 129];
+        let n_rows = row_nnz.len();
+        let (indptr, data) = csr_with_row_nnz(&row_nnz, 0xA11CE);
+        let target_sum = 1e4f32;
+
+        let mut cpu = data.clone();
+        cpu_normalize(&indptr, &mut cpu, target_sum as f64);
+
+        for tier in [RowTier::Thread, RowTier::Warp, RowTier::Block] {
+            let gpu = run_normalize_tier(&dev, &indptr, &data, n_rows, target_sum, false, tier);
+            let mut max_rel = 0.0f64;
+            for i in 0..cpu.len() {
+                let diff = (gpu[i] as f64 - cpu[i] as f64).abs();
+                let denom = (cpu[i] as f64).abs().max(1e-10);
+                max_rel = max_rel.max(diff / denom);
+            }
+            // f32-accumulation bound: the Thread tier sums a row's nonzeros
+            // sequentially in f32, whose drift vs the f64 CPU reference grows
+            // with row nnz (~nnz·2^-24, here ~1e-5 for the 200-nnz row). The
+            // warp/block tiers tree-reduce and stay tighter. A real logic error
+            // would yield O(1) diffs, not 5e-5.
+            assert!(
+                max_rel < 5e-5,
+                "normalize tier {tier:?} max rel err = {max_rel}"
+            );
+        }
+    }
+
+    /// Same, for the fused normalize+log1p kernels (f32 vs f64 → 1e-4).
+    #[test]
+    fn test_gpu_normalize_log1p_tiers_match_cpu() {
+        let dev = require_gpu!();
+        let row_nnz = [0usize, 1, 7, 50, 64, 300, 2, 0, 257];
+        let n_rows = row_nnz.len();
+        let (indptr, data) = csr_with_row_nnz(&row_nnz, 0xBEE5);
+        let target_sum = 1e4f32;
+
+        let mut cpu = data.clone();
+        cpu_fused_normalize_log1p(&indptr, &mut cpu, target_sum as f64);
+
+        for tier in [RowTier::Thread, RowTier::Warp, RowTier::Block] {
+            let gpu = run_normalize_tier(&dev, &indptr, &data, n_rows, target_sum, true, tier);
+            let mut max_rel = 0.0f64;
+            for i in 0..cpu.len() {
+                let diff = (gpu[i] as f64 - cpu[i] as f64).abs();
+                let denom = (cpu[i] as f64).abs().max(1e-10);
+                max_rel = max_rel.max(diff / denom);
+            }
+            assert!(
+                max_rel < 1e-4,
+                "normalize_log1p tier {tier:?} max rel err = {max_rel}"
+            );
+        }
+    }
+
+    /// Heavy intra-shard skew (a few very dense rows among many sparse/empty)
+    /// stresses the cooperative reductions' empty/zero-sum guards and the
+    /// strided write loops. Both nonzero-parallel tiers must still match CPU.
+    #[test]
+    fn test_gpu_normalize_skewed_rows() {
+        let dev = require_gpu!();
+        let mut row_nnz = vec![0usize; 200];
+        for r in (0..200).step_by(3) {
+            row_nnz[r] = 2;
+        }
+        row_nnz[50] = 800;
+        row_nnz[123] = 1500;
+        let n_rows = row_nnz.len();
+        let (indptr, data) = csr_with_row_nnz(&row_nnz, 0x5EED_BEEF);
+        let target_sum = 1e4f32;
+
+        let mut cpu = data.clone();
+        cpu_normalize(&indptr, &mut cpu, target_sum as f64);
+
+        for tier in [RowTier::Warp, RowTier::Block] {
+            let gpu = run_normalize_tier(&dev, &indptr, &data, n_rows, target_sum, false, tier);
+            for i in 0..cpu.len() {
+                let diff = (gpu[i] as f64 - cpu[i] as f64).abs();
+                let denom = (cpu[i] as f64).abs().max(1e-10);
+                assert!(
+                    diff / denom < 1e-5,
+                    "skewed tier {tier:?} mismatch at nnz {i}"
+                );
+            }
+        }
+    }
+
+    /// Auto-dispatch (`gpu_normalize` → `choose_row_tier`) must land in the
+    /// expected tier for the warp- and block-density regimes and match CPU.
+    #[test]
+    fn test_gpu_normalize_auto_dispatch_warp_and_block() {
+        let dev = require_gpu!();
+        let target_sum = 1e4f32;
+
+        // Warp regime: 256 rows × mean ~64 nnz.
+        let warp_nnz = vec![64usize; 256];
+        assert_eq!(
+            choose_row_tier(256, 256 * 64),
+            RowTier::Warp,
+            "expected warp regime"
+        );
+        // Block regime: 64 rows × mean ~600 nnz.
+        let block_nnz = vec![600usize; 64];
+        assert_eq!(
+            choose_row_tier(64, 64 * 600),
+            RowTier::Block,
+            "expected block regime"
+        );
+
+        for (label, row_nnz, n_rows) in
+            [("warp", warp_nnz, 256usize), ("block", block_nnz, 64usize)]
+        {
+            let (indptr, data) = csr_with_row_nnz(&row_nnz, 0xD15A);
+            let d_indptr = dev.htod_copy(&indptr).unwrap();
+            let mut d_data = dev.htod_copy(&data).unwrap();
+            gpu_normalize(&dev, &d_indptr, &mut d_data, n_rows, target_sum).unwrap();
+            dev.synchronize().unwrap();
+            let gpu = dev.dtoh_copy(&d_data).unwrap();
+
+            let mut cpu = data.clone();
+            cpu_normalize(&indptr, &mut cpu, target_sum as f64);
+            let mut max_rel = 0.0f64;
+            for i in 0..cpu.len() {
+                let diff = (gpu[i] as f64 - cpu[i] as f64).abs();
+                let denom = (cpu[i] as f64).abs().max(1e-10);
+                max_rel = max_rel.max(diff / denom);
+            }
+            assert!(max_rel < 1e-5, "auto {label} max rel err = {max_rel}");
+        }
+    }
+
+    /// The log1p-only path now launches the one-thread-per-nonzero kernel.
+    /// Exercise it on a larger matrix (the small `test_gpu_log1p_only` above
+    /// already covers it through the unchanged public API).
+    #[test]
+    fn test_gpu_log1p_nnz_large() {
+        let dev = require_gpu!();
+        let row_nnz = vec![37usize; 1000];
+        let n_rows = row_nnz.len();
+        let (indptr, data) = csr_with_row_nnz(&row_nnz, 0x106_1A6E);
+
+        let d_indptr = dev.htod_copy(&indptr).unwrap();
+        let mut d_data = dev.htod_copy(&data).unwrap();
+        gpu_log1p(&dev, &d_indptr, &mut d_data, n_rows).unwrap();
+        dev.synchronize().unwrap();
+        let gpu = dev.dtoh_copy(&d_data).unwrap();
+
+        let mut cpu = data.clone();
+        cpu_log1p(&indptr, &mut cpu);
+        for i in 0..cpu.len() {
+            assert!(
+                (gpu[i] - cpu[i]).abs() < 1e-6,
+                "log1p_nnz mismatch at {i}: gpu={}, cpu={}",
+                gpu[i],
+                cpu[i]
+            );
+        }
     }
 }
