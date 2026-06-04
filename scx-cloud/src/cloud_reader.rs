@@ -56,6 +56,14 @@ pub struct CloudReader {
     /// query and are not cached.
     obs_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
     var_bytes_cache: tokio::sync::OnceCell<Vec<u8>>,
+    /// Logical-level caches for the assembled obs/var `RecordBatch` (LC4).
+    /// On atlas-scale sharded files, `read_obs`/`read_var` would otherwise
+    /// re-fetch and re-assemble every `ObsMetadataShard`/`VarMetadataShard`
+    /// section on each call (and `read_*_schema` fetch `shard_0` separately).
+    /// Caching the assembled batch makes obs/var single-assembly per reader,
+    /// and lets the schema derive from it without a redundant GET.
+    obs_assembled: tokio::sync::OnceCell<RecordBatch>,
+    var_assembled: tokio::sync::OnceCell<RecordBatch>,
 }
 
 impl CloudReader {
@@ -183,6 +191,14 @@ impl CloudReader {
     /// canonical narrow `Utf8` / `Binary` types regardless of the
     /// on-disk encoding.
     pub async fn read_obs(&self) -> Result<RecordBatch> {
+        self.obs_assembled
+            .get_or_try_init(|| self.load_obs())
+            .await
+            .cloned()
+    }
+
+    /// Assemble the obs batch (uncached). See [`Self::read_obs`].
+    async fn load_obs(&self) -> Result<RecordBatch> {
         if self.obs_metadata_shard_count() > 0 {
             return self
                 .read_sharded_metadata(
@@ -199,8 +215,17 @@ impl CloudReader {
     }
 
     /// Read var metadata as an Arrow RecordBatch. Mirror of
-    /// [`Self::read_obs`] for the var axis — same dual-layout handling.
+    /// [`Self::read_obs`] for the var axis — same dual-layout handling and
+    /// per-axis assembled-batch caching (LC4).
     pub async fn read_var(&self) -> Result<RecordBatch> {
+        self.var_assembled
+            .get_or_try_init(|| self.load_var())
+            .await
+            .cloned()
+    }
+
+    /// Assemble the var batch (uncached). See [`Self::read_var`].
+    async fn load_var(&self) -> Result<RecordBatch> {
         if self.var_metadata_shard_count() > 0 {
             return self
                 .read_sharded_metadata(
@@ -302,29 +327,20 @@ impl CloudReader {
         }
     }
 
-    /// Read the obs schema without materialising the full RecordBatch.
+    /// Read the obs schema.
     ///
-    /// Decodes only the Arrow IPC footer. On sharded files the schema is
-    /// read from `obs_metadata/shard_0` (every shard shares one schema),
-    /// mirroring `ScxReader::read_obs_schema`.
+    /// Derives the schema from the assembled obs batch (LC4): the batch is
+    /// cached in a `OnceCell`, so a subsequent `read_obs` is free and there is
+    /// no separate `shard_0` / `obs` schema GET. The assembled batch is the
+    /// authoritative schema (post upcast→concat→downcast), matching what
+    /// `read_obs` returns.
     pub async fn read_obs_schema(&self) -> Result<Schema> {
-        let data = if self.obs_metadata_shard_count() > 0 {
-            self.read_section("obs_metadata/shard_0").await?
-        } else {
-            self.read_metadata_section("obs").await?
-        };
-        decode_arrow_ipc_schema(&data)
+        Ok(self.read_obs().await?.schema().as_ref().clone())
     }
 
-    /// Read the var schema without materialising the full RecordBatch.
-    /// Mirror of [`Self::read_obs_schema`].
+    /// Read the var schema. Mirror of [`Self::read_obs_schema`].
     pub async fn read_var_schema(&self) -> Result<Schema> {
-        let data = if self.var_metadata_shard_count() > 0 {
-            self.read_section("var_metadata/shard_0").await?
-        } else {
-            self.read_metadata_section("var").await?
-        };
-        decode_arrow_ipc_schema(&data)
+        Ok(self.read_var().await?.schema().as_ref().clone())
     }
 
     /// Raw bytes of the obs predicate index section, if present.
@@ -403,15 +419,6 @@ fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
-fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<Schema> {
-    let cursor = Cursor::new(bytes);
-    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
-        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    Ok(scx_format::downcast_large_types_schema(
-        reader.schema().as_ref(),
-    ))
-}
-
 /// Open an SCX file or directory from cloud/local storage.
 ///
 /// Detects the layout automatically:
@@ -451,6 +458,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 catalog,
                 obs_bytes_cache: tokio::sync::OnceCell::new(),
                 var_bytes_cache: tokio::sync::OnceCell::new(),
+                obs_assembled: tokio::sync::OnceCell::new(),
+                var_assembled: tokio::sync::OnceCell::new(),
             })
         }
         Err(e) => {
@@ -523,6 +532,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     catalog,
                     obs_bytes_cache: tokio::sync::OnceCell::new(),
                     var_bytes_cache: tokio::sync::OnceCell::new(),
+                    obs_assembled: tokio::sync::OnceCell::new(),
+                    var_assembled: tokio::sync::OnceCell::new(),
                 })
             } else {
                 // Not cloud-ready: read full catalog at EOF
@@ -550,6 +561,8 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     catalog,
                     obs_bytes_cache: tokio::sync::OnceCell::new(),
                     var_bytes_cache: tokio::sync::OnceCell::new(),
+                    obs_assembled: tokio::sync::OnceCell::new(),
+                    var_assembled: tokio::sync::OnceCell::new(),
                 })
             }
         }
@@ -872,7 +885,7 @@ mod tests {
         assert_eq!(gene_id.value(0), "gene_0");
         assert_eq!(gene_id.value(n_vars - 1), format!("gene_{}", n_vars - 1));
 
-        // Schema reads must not require materialising the full batch.
+        // Schema is derived from the (cached) assembled batch (LC4).
         let obs_schema = reader.read_obs_schema().await.unwrap();
         assert!(obs_schema.field_with_name("cell_type").is_ok());
         let var_schema = reader.read_var_schema().await.unwrap();
@@ -908,5 +921,41 @@ mod tests {
 
         let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
         assert_sharded_reads(&reader, 100, 50).await;
+    }
+
+    /// LC4: the assembled obs/var batch is cached in a `OnceCell`, so repeated
+    /// reads return identical data without re-fetching/re-assembling the
+    /// shards (the `get_or_try_init` closure runs at most once per axis), and
+    /// `read_*_schema` derives from the cached batch rather than a separate
+    /// `shard_0` GET.
+    #[tokio::test]
+    async fn read_obs_var_assembled_batches_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+
+        // Schema first (derives from — and populates — the cached batch),
+        // then two batch reads: all three must agree.
+        let obs_schema = reader.read_obs_schema().await.unwrap();
+        let obs1 = reader.read_obs().await.unwrap();
+        let obs2 = reader.read_obs().await.unwrap();
+        assert_eq!(
+            obs1, obs2,
+            "repeated read_obs must return identical batches"
+        );
+        assert_eq!(
+            &obs_schema,
+            obs1.schema().as_ref(),
+            "read_obs_schema must equal the assembled batch schema"
+        );
+
+        let var_schema = reader.read_var_schema().await.unwrap();
+        let var1 = reader.read_var().await.unwrap();
+        let var2 = reader.read_var().await.unwrap();
+        assert_eq!(
+            var1, var2,
+            "repeated read_var must return identical batches"
+        );
+        assert_eq!(&var_schema, var1.schema().as_ref());
     }
 }
