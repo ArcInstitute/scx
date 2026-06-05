@@ -279,22 +279,32 @@ where
         .map(|i| values.value(i).to_string())
         .collect();
 
-    // Extract codes (1-based for R factors, NA for nulls)
+    // Extract codes (1-based for R factors, NA for nulls).
+    // B7: bounds-check each key against the emitted levels. A key outside
+    // `0..levels.len()` (e.g. from a sliced/non-canonical dictionary) would
+    // otherwise render as a silent `<NA>` or index past the levels vector —
+    // error explicitly instead.
+    let levels_len = levels.len();
     let keys = dict_arr.keys();
     let codes: Vec<Option<i32>> = (0..keys.len())
-        .map(|i| {
+        .map(|i| -> Result<Option<i32>> {
             if dict_arr.is_null(i) {
-                None
+                Ok(None)
             } else {
-                // Arrow indices are 0-based, R factor codes are 1-based
+                // Arrow indices are 0-based, R factor codes are 1-based.
                 let key_val = keys.as_primitive::<K>().value(i);
-                match key_val.try_into() {
-                    Ok(v) => Some(v + 1), // 0-based → 1-based
-                    Err(_) => None,
+                let idx: i32 = key_val.try_into().map_err(|_| {
+                    Error::Other(format!("dictionary key at row {i} does not fit in i32"))
+                })?;
+                if idx < 0 || (idx as usize) >= levels_len {
+                    return Err(Error::Other(format!(
+                        "dictionary key {idx} at row {i} is out of range for {levels_len} levels"
+                    )));
                 }
+                Ok(Some(idx + 1)) // 0-based → 1-based
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     // Build factor in R: integer vector with "levels" and "class" attributes
     let levels_robj: Robj = levels.into_robj();

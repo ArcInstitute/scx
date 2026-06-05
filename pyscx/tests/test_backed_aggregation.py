@@ -60,6 +60,20 @@ def test_var_no_axis(adata_backed, adata_non_backed):
     np.testing.assert_allclose(backed_var, numpy_var, rtol=1e-5)
 
 
+# --- getnnz dtype parity (B5) ---
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_getnnz_dtype_is_int32(adata_backed, adata_non_backed, axis):
+    """getnnz returns a uniform int32 for both axes (was uint32 on axis=0,
+    int64 on axis=1). scipy's own getnnz dtype is platform-inconsistent
+    across axes, so we pin our output to int32 and check value parity."""
+    backed_nnz = adata_backed.X.getnnz(axis=axis)
+    scipy_nnz = adata_non_backed.X.getnnz(axis=axis)
+    assert backed_nnz.dtype == np.int32
+    np.testing.assert_array_equal(backed_nnz, scipy_nnz)
+
+
 # --- Max tests ---
 
 

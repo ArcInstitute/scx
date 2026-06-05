@@ -92,7 +92,13 @@ impl ScxLazyPairwiseMapping {
     /// Convert the lazy mapping into a plain `dict` by materializing
     /// every key. Used by the `eager=True` `to_anndata()` path.
     pub(crate) fn materialize_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let dict = PyDict::new(py);
         for key in keys {
             let value = self.fetch(py, &key)?;
@@ -103,7 +109,7 @@ impl ScxLazyPairwiseMapping {
 
     fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match state.get(key) {
                 Some(Some(obj)) => return Ok(obj.clone_ref(py)),
                 Some(None) => {}
@@ -123,7 +129,7 @@ impl ScxLazyPairwiseMapping {
             _ => coo_record_batch_to_scipy(py, &batch)?,
         };
         let obj: Py<PyAny> = bound.unbind();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Re-check: a concurrent fetch may have populated the slot while
         // we were decoding. Return whatever's already there so callers
         // converge on the same Py<PyAny> identity (the `a is b` invariant
@@ -143,11 +149,14 @@ impl ScxLazyPairwiseMapping {
     }
 
     fn __setitem__(&self, key: String, value: Py<PyAny>) {
-        self.state.lock().unwrap().insert(key, Some(value));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(value));
     }
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.remove(key).is_none() {
             return Err(PyKeyError::new_err(key.to_string()));
         }
@@ -155,28 +164,49 @@ impl ScxLazyPairwiseMapping {
     }
 
     fn __contains__(&self, key: &str) -> bool {
-        self.state.lock().unwrap().contains_key(key)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
         Ok(iter.into_pyobject(py)?.into_any().unbind())
     }
 
     fn __len__(&self) -> usize {
-        self.state.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         PyList::new(py, &keys)
     }
 
     fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -189,7 +219,13 @@ impl ScxLazyPairwiseMapping {
 
     fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -212,7 +248,7 @@ impl ScxLazyPairwiseMapping {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let n_keys = state.len();
         let n_cached = state.values().filter(|v| v.is_some()).count();
         format!(
@@ -244,7 +280,13 @@ impl ScxLazyVarmMapping {
     }
 
     pub(crate) fn materialize_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let dict = PyDict::new(py);
         for key in keys {
             let value = self.fetch(py, &key)?;
@@ -255,7 +297,7 @@ impl ScxLazyVarmMapping {
 
     fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match state.get(key) {
                 Some(Some(obj)) => return Ok(obj.clone_ref(py)),
                 Some(None) => {}
@@ -265,7 +307,7 @@ impl ScxLazyVarmMapping {
         let batch = self.reader.read_varm(key).map_err(to_pyerr)?;
         let bound = obsm_batch_to_numpy(py, &batch)?;
         let obj: Py<PyAny> = bound.unbind();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
             return Ok(cached.clone_ref(py));
@@ -282,11 +324,14 @@ impl ScxLazyVarmMapping {
     }
 
     fn __setitem__(&self, key: String, value: Py<PyAny>) {
-        self.state.lock().unwrap().insert(key, Some(value));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(value));
     }
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.remove(key).is_none() {
             return Err(PyKeyError::new_err(key.to_string()));
         }
@@ -294,28 +339,49 @@ impl ScxLazyVarmMapping {
     }
 
     fn __contains__(&self, key: &str) -> bool {
-        self.state.lock().unwrap().contains_key(key)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
         Ok(iter.into_pyobject(py)?.into_any().unbind())
     }
 
     fn __len__(&self) -> usize {
-        self.state.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         PyList::new(py, &keys)
     }
 
     fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -328,7 +394,13 @@ impl ScxLazyVarmMapping {
 
     fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -351,7 +423,7 @@ impl ScxLazyVarmMapping {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let n_keys = state.len();
         let n_cached = state.values().filter(|v| v.is_some()).count();
         format!(
@@ -432,7 +504,7 @@ impl ScxLazyObsmMapping {
 
     fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match state.get(key) {
                 Some(Some(obj)) => return Ok(obj.clone_ref(py)),
                 Some(None) => {}
@@ -474,7 +546,7 @@ impl ScxLazyObsmMapping {
                 obsm_batch_to_numpy(py, &filtered)?.unbind()
             }
         };
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
             return Ok(cached.clone_ref(py));
@@ -491,11 +563,14 @@ impl ScxLazyObsmMapping {
     }
 
     fn __setitem__(&self, key: String, value: Py<PyAny>) {
-        self.state.lock().unwrap().insert(key, Some(value));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(value));
     }
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.remove(key).is_none() {
             return Err(PyKeyError::new_err(key.to_string()));
         }
@@ -503,28 +578,49 @@ impl ScxLazyObsmMapping {
     }
 
     fn __contains__(&self, key: &str) -> bool {
-        self.state.lock().unwrap().contains_key(key)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
         Ok(iter.into_pyobject(py)?.into_any().unbind())
     }
 
     fn __len__(&self) -> usize {
-        self.state.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         PyList::new(py, &keys)
     }
 
     fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -537,7 +633,13 @@ impl ScxLazyObsmMapping {
 
     fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -560,7 +662,7 @@ impl ScxLazyObsmMapping {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let n_keys = state.len();
         let n_cached = state.values().filter(|v| v.is_some()).count();
         format!(
@@ -600,7 +702,13 @@ impl ScxLazyLayersMapping {
     }
 
     pub(crate) fn materialize_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let dict = PyDict::new(py);
         for key in keys {
             let value = self.fetch(py, &key)?;
@@ -611,7 +719,7 @@ impl ScxLazyLayersMapping {
 
     fn fetch(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match state.get(key) {
                 Some(Some(obj)) => return Ok(obj.clone_ref(py)),
                 Some(None) => {}
@@ -621,7 +729,7 @@ impl ScxLazyLayersMapping {
         let csr = self.reader.read_layer_filtered(key).map_err(to_pyerr)?;
         let bound = csr_to_scipy(py, csr)?;
         let obj: Py<PyAny> = bound.unbind();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // See `ScxLazyPairwiseMapping::fetch` for the double-check rationale.
         if let Some(Some(cached)) = state.get(key) {
             return Ok(cached.clone_ref(py));
@@ -638,11 +746,14 @@ impl ScxLazyLayersMapping {
     }
 
     fn __setitem__(&self, key: String, value: Py<PyAny>) {
-        self.state.lock().unwrap().insert(key, Some(value));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, Some(value));
     }
 
     fn __delitem__(&self, key: &str) -> PyResult<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.remove(key).is_none() {
             return Err(PyKeyError::new_err(key.to_string()));
         }
@@ -650,28 +761,49 @@ impl ScxLazyLayersMapping {
     }
 
     fn __contains__(&self, key: &str) -> bool {
-        self.state.lock().unwrap().contains_key(key)
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
     }
 
     fn __iter__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let list = PyList::new(py, &keys)?;
         let iter = list.try_iter()?;
         Ok(iter.into_pyobject(py)?.into_any().unbind())
     }
 
     fn __len__(&self) -> usize {
-        self.state.lock().unwrap().len()
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let keys: Vec<String> = self.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         PyList::new(py, &keys)
     }
 
     fn values(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyValueIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -684,7 +816,13 @@ impl ScxLazyLayersMapping {
 
     fn items(slf: PyRef<'_, Self>) -> PyResult<Py<ScxLazyItemIterator>> {
         let py = slf.py();
-        let keys: Vec<String> = slf.state.lock().unwrap().keys().cloned().collect();
+        let keys: Vec<String> = slf
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         let parent: Py<PyAny> = slf.into_pyobject(py)?.into_any().unbind();
         Py::new(
             py,
@@ -707,7 +845,7 @@ impl ScxLazyLayersMapping {
     }
 
     fn __repr__(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let n_keys = state.len();
         let n_cached = state.values().filter(|v| v.is_some()).count();
         format!(

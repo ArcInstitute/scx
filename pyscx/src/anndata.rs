@@ -512,11 +512,86 @@ pub(crate) fn csr_to_scipy<'py>(
     scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
 }
 
+/// Build a numpy 2-D array directly from a RecordBatch of homogeneous numeric
+/// float columns (B4). Returns `None` (→ caller falls back to the pandas path)
+/// when the batch is empty, heterogeneous, non-float, or contains nulls.
+///
+/// This avoids the RecordBatch → pyarrow Table → pandas DataFrame → `.values`
+/// round-trip for the common dense-float obsm/varm case, including the f32→f64
+/// upcast that `.values` can introduce (breaking the f32 zero-copy contract).
+fn record_batch_to_numpy2d<'py>(
+    py: Python<'py>,
+    batch: &RecordBatch,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    use arrow::array::{Array, Float32Array, Float64Array};
+    use arrow::datatypes::DataType;
+
+    let n_rows = batch.num_rows();
+    let n_cols = batch.num_columns();
+    if n_cols == 0 {
+        return Ok(None);
+    }
+    let dt = batch.schema().field(0).data_type().clone();
+    let homogeneous = batch.schema().fields().iter().all(|f| f.data_type() == &dt);
+    if !homogeneous {
+        return Ok(None);
+    }
+    // Nulls would read as a default value via `.value()`; defer those to pandas.
+    if batch.columns().iter().any(|c| c.null_count() > 0) {
+        return Ok(None);
+    }
+
+    match dt {
+        DataType::Float32 => {
+            let Some(cols) = (0..n_cols)
+                .map(|c| batch.column(c).as_any().downcast_ref::<Float32Array>())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let mut flat: Vec<f32> = Vec::with_capacity(n_rows * n_cols);
+            for r in 0..n_rows {
+                for col in &cols {
+                    flat.push(col.value(r));
+                }
+            }
+            let arr = PyArray1::from_vec(py, flat)
+                .into_any()
+                .call_method1("reshape", ((n_rows, n_cols),))?;
+            Ok(Some(arr))
+        }
+        DataType::Float64 => {
+            let Some(cols) = (0..n_cols)
+                .map(|c| batch.column(c).as_any().downcast_ref::<Float64Array>())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let mut flat: Vec<f64> = Vec::with_capacity(n_rows * n_cols);
+            for r in 0..n_rows {
+                for col in &cols {
+                    flat.push(col.value(r));
+                }
+            }
+            let arr = PyArray1::from_vec(py, flat)
+                .into_any()
+                .call_method1("reshape", ((n_rows, n_cols),))?;
+            Ok(Some(arr))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Convert an Arrow RecordBatch (obsm/varm) to a numpy 2D array.
 pub(crate) fn obsm_batch_to_numpy<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // Fast path: dense homogeneous float columns → numpy 2-D directly.
+    if let Some(arr) = record_batch_to_numpy2d(py, batch)? {
+        return Ok(arr);
+    }
+    // Fallback: heterogeneous / non-numeric → pyarrow + pandas.
     let table = record_batch_to_pyarrow(py, batch)?;
     let df = pyarrow_table_to_pandas(&table)?;
     df.getattr("values")

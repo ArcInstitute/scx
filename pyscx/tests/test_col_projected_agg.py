@@ -445,3 +445,35 @@ def test_qc_metrics_with_gene_subset(backed_projected_data):
         adata_full.obs["pct_counts_mt"].values,
         rtol=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# B6: projected row / scalar variance (streaming, no materialization fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_col_var_axis1_projected(backed_projected_data, col_subset):
+    """Row var (axis=1) with projection matches the materialized subset, via
+    the streaming row-stats reducer (no to_memory fallback)."""
+    import pyscx
+
+    backed_x = pyscx.open(backed_projected_data).to_anndata(backed=True).X
+    full_x = pyscx.open(backed_projected_data).to_anndata().X.toarray()
+    backed_x.set_col_projection([int(c) for c in col_subset])
+
+    projected_var = np.asarray(backed_x.var(axis=1)).flatten()
+    expected_var = full_x[:, col_subset].var(axis=1)
+    np.testing.assert_allclose(projected_var, expected_var, rtol=1e-5)
+
+
+def test_var_scalar_projected(backed_projected_data, col_subset):
+    """Scalar var (axis=None) with projection matches the materialized subset."""
+    import pyscx
+
+    backed_x = pyscx.open(backed_projected_data).to_anndata(backed=True).X
+    full_x = pyscx.open(backed_projected_data).to_anndata().X.toarray()
+    backed_x.set_col_projection([int(c) for c in col_subset])
+
+    projected_var = float(np.asarray(backed_x.var()))
+    expected_var = float(full_x[:, col_subset].var())
+    np.testing.assert_allclose(projected_var, expected_var, rtol=1e-5)

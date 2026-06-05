@@ -114,16 +114,22 @@ class TestBackedTruedivInterception:
 
         np.testing.assert_allclose(mat, ref, rtol=1e-5)
 
-    def test_row_vector_returns_lazy(self, scx_file):
-        """Dividing by (1, n_obs) row vector should return a lazy wrapper."""
+    def test_row_vector_not_intercepted(self, scx_file):
+        """A (1, n_obs) row vector is NOT a per-row scale (B3).
+
+        Only `(n_obs,)` and `(n_obs, 1)` are unambiguously row-oriented. A
+        `(1, n_obs)` operand is a per-column broadcast in numpy/scipy
+        semantics; with a non-square matrix (n_obs != n_vars) it is not
+        broadcastable, so it falls through to scipy and raises — rather than
+        being silently mis-applied as a transposed RowScale.
+        """
         path, X_ref = scx_file
         adata = pyscx.open(path).to_anndata(backed=True)
         n_obs = X_ref.shape[0]
 
         factors = np.random.default_rng(2).uniform(0.5, 2.0, size=(1, n_obs))
-        result = adata.X / factors
-
-        assert isinstance(result, pyscx.ScxLazyTransformedDataset)
+        with pytest.raises(ValueError, match="inconsistent shapes"):
+            adata.X / factors
 
     def test_scalar_falls_back(self, scx_file):
         """Dividing by a scalar should fall back to materialization (not lazy)."""
@@ -314,3 +320,34 @@ class TestAggregationAfterTruediv:
             lazy_nnz, ref_nnz,
             err_msg="NNZ should be preserved after truediv"
         )
+
+
+class TestSquareMatrixAmbiguity:
+    """B3: on a square matrix (n_obs == n_vars) a bare length-n operand is
+    orientation-ambiguous and must NOT be silently folded into a per-row
+    RowScale."""
+
+    def test_square_matrix_per_gene_not_row_intercepted(self):
+        path, X = _make_test_scx(n_obs=40, n_vars=40, seed=11)
+        adata = pyscx.open(path).to_anndata(backed=True)
+        n = X.shape[0]
+        v = np.random.default_rng(3).uniform(0.5, 2.0, size=n)
+
+        result = adata.X / v
+        # Ambiguous square case is not intercepted as a lazy row scale.
+        assert not isinstance(result, pyscx.ScxLazyTransformedDataset)
+        # Falls through to scipy per-gene (per-column) semantics.
+        got = result.toarray() if sp.issparse(result) else np.asarray(result)
+        expected = X.toarray() / v
+        np.testing.assert_allclose(got, expected, rtol=1e-5)
+
+    def test_square_matrix_column_vector_still_row_scale(self):
+        """An explicit (n, 1) column vector is unambiguously per-row even when
+        the matrix is square, so it is still intercepted lazily."""
+        path, X = _make_test_scx(n_obs=40, n_vars=40, seed=12)
+        adata = pyscx.open(path).to_anndata(backed=True)
+        n = X.shape[0]
+        v = np.random.default_rng(4).uniform(0.5, 2.0, size=(n, 1))
+
+        result = adata.X / v
+        assert isinstance(result, pyscx.ScxLazyTransformedDataset)

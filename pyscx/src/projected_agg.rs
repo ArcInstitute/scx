@@ -266,6 +266,51 @@ pub fn row_nnz_and_sums_projected(
     Ok((counts, sums))
 }
 
+/// Per-row sum and sum-of-squares over a column subset, computed in a single
+/// shard pass (B6). Row and scalar variance over the projected columns derive
+/// from these without materializing the projected submatrix, replacing the
+/// previous `to_memory()` fallback. (Projected per-row nnz is served by
+/// [`row_nnz_projected`].)
+///
+/// Variance over the projected columns (implicit zeros included, denominator
+/// `n_proj = col_indices.len()`):
+///   `var[i] = sumsq[i] / n_proj - (sum[i] / n_proj)^2`.
+pub struct ProjectedRowStats {
+    pub sums: Vec<f64>,
+    pub sumsq: Vec<f64>,
+}
+
+pub fn row_stats_projected(
+    reader: &BackedCsrReader,
+    col_indices: &[u32],
+) -> Result<ProjectedRowStats> {
+    let n_obs = reader.shape().0;
+    let mut sums = vec![0.0f64; n_obs];
+    let mut sumsq = vec![0.0f64; n_obs];
+    let mut global_row = 0usize;
+
+    for shard_idx in 0..reader.index().n_shards() {
+        let csr = reader.read_shard_uncached(shard_idx)?;
+        let projected = project_csr(&csr, col_indices);
+        for row in 0..projected.n_rows() {
+            let s = projected.indptr[row] as usize;
+            let e = projected.indptr[row + 1] as usize;
+            let g = global_row + row;
+            let mut sm = 0.0f64;
+            let mut sq = 0.0f64;
+            for &v in &projected.data[s..e] {
+                let v = v as f64;
+                sm += v;
+                sq += v * v;
+            }
+            sums[g] = sm;
+            sumsq[g] = sq;
+        }
+        global_row += csr.n_rows();
+    }
+    Ok(ProjectedRowStats { sums, sumsq })
+}
+
 // ---------------------------------------------------------------------------
 // Masked + projected aggregation (deletion vector + column subset)
 // ---------------------------------------------------------------------------

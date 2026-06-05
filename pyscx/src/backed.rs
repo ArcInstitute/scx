@@ -323,15 +323,17 @@ impl ScxBackedSparseDataset {
     fn to_memory<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // When deletion vectors are present, we need to filter the full matrix
         // using the kept_to_global mapping rather than returning all rows.
-        let csr = if let Some(ref kept) = self.kept_to_global {
-            self.backed
-                .read_row_indices(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            self.backed
-                .read_all()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        };
+        // B2: decode the full matrix off the GIL; build the scipy array after.
+        let csr = detached(py, || {
+            if let Some(ref kept) = self.kept_to_global {
+                self.backed
+                    .read_row_indices(kept)
+                    .map_err(|e| e.to_string())
+            } else {
+                self.backed.read_all().map_err(|e| e.to_string())
+            }
+        })
+        .map_err(PyRuntimeError::new_err)?;
         let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
@@ -450,7 +452,9 @@ impl ScxBackedSparseDataset {
         // Try to extract a per-row scaling vector.  If the multiplier is
         // a 1D or column array with length == n_obs, express as lazy
         // RowScale transform — mirroring __truediv__ (which inverts).
-        if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+        if let Some(row_factors) =
+            try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
+        {
             let global_factors = expand_to_global(
                 row_factors,
                 self.kept_to_global.as_ref().map(|v| v.as_slice()),
@@ -488,7 +492,9 @@ impl ScxBackedSparseDataset {
         // matrix materialization.  This is the code path scanpy's
         // `axis_mul_or_truediv(..., op=truediv)` takes for normalize_total
         // when the numba CSR path isn't available.
-        if let Some(row_factors) = try_extract_row_factors(py, other, self.shape_val.0)? {
+        if let Some(row_factors) =
+            try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
+        {
             // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
             // 0 drops the row to empty) — this matches scanpy `normalize_total`,
             // where empty rows stay empty, NOT raw scipy float division (which
@@ -562,36 +568,16 @@ impl ScxBackedSparseDataset {
     fn sum<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let sums = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        projected_agg::col_sums_masked_projected(&self.backed, kept, cols)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => projected_agg::col_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_sums_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                // B2: release the GIL for the heavy shard decode + reduction.
+                let sums = detached(py, || self.col_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let arr = numpy::PyArray::from_vec(py, sums);
                 // Return as (1, n_vars) matrix to match scipy convention
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
-                // Row sums
-                let all_sums = if let Some(ref cols) = self.col_projection {
-                    projected_agg::row_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_sums = detached(py, || self.row_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 // Apply deletion vector remapping if present
                 let filtered = self.filter_row_results(&all_sums);
                 let arr = numpy::PyArray::from_vec(py, filtered);
@@ -600,14 +586,8 @@ impl ScxBackedSparseDataset {
             }
             None => {
                 // Total sum — use row sums + filter for correctness with deletions
-                let all_sums = if let Some(ref cols) = self.col_projection {
-                    projected_agg::row_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_sums = detached(py, || self.row_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 Ok(total.into_pyobject(py)?.into_any())
@@ -622,36 +602,16 @@ impl ScxBackedSparseDataset {
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let sums = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        projected_agg::col_sums_masked_projected(&self.backed, kept, cols)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => projected_agg::col_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_sums_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                let sums = detached(py, || self.col_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let n = self.shape_val.0 as f64;
                 let means: Vec<f64> = sums.iter().map(|&s| s / n).collect();
                 let arr = numpy::PyArray::from_vec(py, means);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
-                let all_sums = if let Some(ref cols) = self.col_projection {
-                    projected_agg::row_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_sums = detached(py, || self.row_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let filtered = self.filter_row_results(&all_sums);
                 let n = self.shape_val.1 as f64;
                 let means: Vec<f64> = filtered.iter().map(|&s| s / n).collect();
@@ -659,14 +619,8 @@ impl ScxBackedSparseDataset {
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                let all_sums = if let Some(ref cols) = self.col_projection {
-                    projected_agg::row_sums_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_sums()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_sums = detached(py, || self.row_sums_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 let n = (self.shape_val.0 as f64) * (self.shape_val.1 as f64);
@@ -685,92 +639,83 @@ impl ScxBackedSparseDataset {
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let var = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        projected_agg::col_var_masked_projected(&self.backed, kept, cols)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => {
-                        let n_obs = self.backed.shape().0;
-                        projected_agg::col_var_projected(&self.backed, cols, n_obs)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_var_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_var()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                // B2: heavy decode + per-column two-pass variance off the GIL.
+                let var = detached(py, || self.col_var_raw()).map_err(PyRuntimeError::new_err)?;
                 let arr = numpy::PyArray::from_vec(py, var);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
-                // Row var — column projection doesn't affect the two-pass per-row
-                // algorithm since each row's variance is independent. But with
-                // col_projection we must compute it from projected data.
-                if self.col_projection.is_some() {
-                    // Materialize projected subset for axis=1 var since
-                    // row_var on projected data requires a custom streaming
-                    // implementation — use to_memory fallback for now.
-                    let mat = self.to_memory(py)?;
-                    let np = py.import("numpy")?;
-                    let mean = mat.call_method1("mean", (1i32,))?;
-                    let mean_sq = mat
-                        .call_method1("power", (2,))?
-                        .call_method1("mean", (1i32,))?;
-                    return np
-                        .call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?));
-                }
-                let all_var = self
-                    .backed
-                    .row_var()
+                // Row var — each row's variance is independent.
+                if let Some(ref cols) = self.col_projection {
+                    // B6: stream per-row sum/sumsq over the projected columns in
+                    // one pass and derive variance, instead of materializing the
+                    // projected submatrix via to_memory().
+                    let n_proj = cols.len() as f64;
+                    let stats = detached(py, || {
+                        projected_agg::row_stats_projected(&self.backed, cols)
+                    })
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let sums = self.filter_row_results(&stats.sums);
+                    let sumsq = self.filter_row_results(&stats.sumsq);
+                    let var: Vec<f64> = sums
+                        .iter()
+                        .zip(&sumsq)
+                        .map(|(&s, &sq)| {
+                            if n_proj == 0.0 {
+                                0.0
+                            } else {
+                                let mean = s / n_proj;
+                                (sq / n_proj - mean * mean).max(0.0)
+                            }
+                        })
+                        .collect();
+                    let arr = numpy::PyArray::from_vec(py, var);
+                    return arr.call_method1("reshape", ((self.shape_val.0, 1i32),));
+                }
+                let all_var = detached(py, || self.backed.row_var().map_err(|e| e.to_string()))
+                    .map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_var);
                 let arr = numpy::PyArray::from_vec(py, filtered);
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                if self.col_projection.is_some() {
-                    // For scalar variance with col_projection, compute from
-                    // projected column sums and column var.
-                    let mat = self.to_memory(py)?;
-                    let np = py.import("numpy")?;
-                    let mean = mat.call_method0("mean")?;
-                    let mean_sq = mat.call_method1("power", (2,))?.call_method0("mean")?;
-                    return np
-                        .call_method1("subtract", (&mean_sq, &mean.call_method1("power", (2,))?));
+                if let Some(ref cols) = self.col_projection {
+                    // B6: scalar variance over projected columns from the same
+                    // one-pass row stats (no materialization).
+                    let n_proj = cols.len();
+                    let stats = detached(py, || {
+                        projected_agg::row_stats_projected(&self.backed, cols)
+                    })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let sums = self.filter_row_results(&stats.sums);
+                    let sumsq = self.filter_row_results(&stats.sumsq);
+                    let n_total = (sums.len() as f64) * (n_proj as f64);
+                    if n_total == 0.0 {
+                        return Ok(0.0f64.into_pyobject(py)?.into_any());
+                    }
+                    let mean = sums.iter().sum::<f64>() / n_total;
+                    let variance = (sumsq.iter().sum::<f64>() / n_total - mean * mean).max(0.0);
+                    return Ok(variance.into_pyobject(py)?.into_any());
                 }
-                // Total scalar variance via Var(X) = E[X²] - (E[X])²
-                // Both sums are computed shard-by-shard without materialization.
+                // Total scalar variance via Var(X) = E[X²] - (E[X])².
+                // Both reductions stream shard-by-shard, off the GIL.
                 let n_obs = self.shape_val.0;
                 let n_vars = self.shape_val.1;
                 let n_total = (n_obs as f64) * (n_vars as f64);
                 if n_total == 0.0 {
                     return Ok(0.0f64.into_pyobject(py)?.into_any());
                 }
-
-                // E[X] = total_sum / n_total
-                let all_sums = self
-                    .backed
-                    .row_sums()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let filtered_sums = self.filter_row_results(&all_sums);
-                let total_sum: f64 = filtered_sums.iter().sum();
-                let mean = total_sum / n_total;
-
-                // E[X²] = total_sum_sq / n_total
-                let all_sq = self
-                    .backed
-                    .row_sum_of_squares()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let filtered_sq = self.filter_row_results(&all_sq);
-                let total_sq: f64 = filtered_sq.iter().sum();
-                let mean_sq = total_sq / n_total;
-
-                // Var = E[X²] - (E[X])²
+                let (all_sums, all_sq) = detached(py, || {
+                    let s = self.backed.row_sums().map_err(|e| e.to_string())?;
+                    let sq = self
+                        .backed
+                        .row_sum_of_squares()
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>((s, sq))
+                })
+                .map_err(PyRuntimeError::new_err)?;
+                let mean = self.filter_row_results(&all_sums).iter().sum::<f64>() / n_total;
+                let mean_sq = self.filter_row_results(&all_sq).iter().sum::<f64>() / n_total;
                 let variance = mean_sq - mean * mean;
                 Ok(variance.into_pyobject(py)?.into_any())
             }
@@ -784,39 +729,18 @@ impl ScxBackedSparseDataset {
     fn getnnz<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let counts = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => projected_agg::col_nnz_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, Some(kept)) => {
-                        // Masked version returns Vec<f64>, convert to Vec<u32>
-                        let f_counts = self
-                            .backed
-                            .col_nnz_masked(kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        f_counts.iter().map(|&v| v as u32).collect::<Vec<u32>>()
-                    }
-                    (None, None) => self
-                        .backed
-                        .col_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
-                Ok(numpy::PyArray::from_vec(py, counts).into_any())
+                let counts = detached(py, || self.col_nnz_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // B5: scipy `getnnz` returns int32 for both axes — emit int32
+                // here too (was uint32) so dtype is uniform across axes.
+                Ok(nnz_to_numpy(py, counts.into_iter().map(|c| c as i64)).into_any())
             }
             Some(1) => {
-                let all_nnz = if let Some(ref cols) = self.col_projection {
-                    projected_agg::row_nnz_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                } else {
-                    self.backed
-                        .row_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                };
+                let all_nnz = detached(py, || self.row_nnz_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let filtered = self.filter_row_results(&all_nnz);
-                Ok(numpy::PyArray::from_vec(py, filtered).into_any())
+                // B5: int32 to match axis=0 and scipy (was int64).
+                Ok(nnz_to_numpy(py, filtered).into_any())
             }
             None => match (&self.col_projection, &self.kept_to_global) {
                 (Some(cols), Some(kept)) => {
@@ -964,65 +888,26 @@ impl ScxBackedSparseDataset {
     fn max<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let maxes = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        let n_kept = kept.len();
-                        projected_agg::col_max_masked_projected(&self.backed, kept, cols, n_kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => {
-                        let n_obs = self.backed.shape().0;
-                        projected_agg::col_max_projected(&self.backed, cols, n_obs)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_max_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_max()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                let maxes = detached(py, || self.col_max_raw()).map_err(PyRuntimeError::new_err)?;
                 let arr = numpy::PyArray::from_vec(py, maxes);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
                 if self.col_projection.is_some() {
                     // Row max on projected subset — fall back to to_memory
+                    // (whose decode is itself off the GIL).
                     let mat = self.to_memory(py)?;
                     return mat.call_method1("max", (1i32,));
                 }
-                let all_max = self
-                    .backed
-                    .row_max()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let all_max = detached(py, || self.backed.row_max().map_err(|e| e.to_string()))
+                    .map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_max);
                 let arr = numpy::PyArray::from_vec(py, filtered);
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
                 // Scalar max — compute from column maxes
-                let maxes = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        let n_kept = kept.len();
-                        projected_agg::col_max_masked_projected(&self.backed, kept, cols, n_kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => {
-                        let n_obs = self.backed.shape().0;
-                        projected_agg::col_max_projected(&self.backed, cols, n_obs)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_max_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_max()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                let maxes = detached(py, || self.col_max_raw()).map_err(PyRuntimeError::new_err)?;
                 let total_max = maxes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 Ok(total_max.into_pyobject(py)?.into_any())
             }
@@ -1038,64 +923,25 @@ impl ScxBackedSparseDataset {
     fn min<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let mins = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        let n_kept = kept.len();
-                        projected_agg::col_min_masked_projected(&self.backed, kept, cols, n_kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => {
-                        let n_obs = self.backed.shape().0;
-                        projected_agg::col_min_projected(&self.backed, cols, n_obs)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_min_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_min()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                let mins = detached(py, || self.col_min_raw()).map_err(PyRuntimeError::new_err)?;
                 let arr = numpy::PyArray::from_vec(py, mins);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
                 if self.col_projection.is_some() {
                     // Row min on projected subset — fall back to to_memory
+                    // (whose decode is itself off the GIL).
                     let mat = self.to_memory(py)?;
                     return mat.call_method1("min", (1i32,));
                 }
-                let all_min = self
-                    .backed
-                    .row_min()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let all_min = detached(py, || self.backed.row_min().map_err(|e| e.to_string()))
+                    .map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_min);
                 let arr = numpy::PyArray::from_vec(py, filtered);
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                let mins = match (&self.col_projection, &self.kept_to_global) {
-                    (Some(cols), Some(kept)) => {
-                        let n_kept = kept.len();
-                        projected_agg::col_min_masked_projected(&self.backed, kept, cols, n_kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (Some(cols), None) => {
-                        let n_obs = self.backed.shape().0;
-                        projected_agg::col_min_projected(&self.backed, cols, n_obs)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                    }
-                    (None, Some(kept)) => self
-                        .backed
-                        .col_min_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                    (None, None) => self
-                        .backed
-                        .col_min()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                };
+                let mins = detached(py, || self.col_min_raw()).map_err(PyRuntimeError::new_err)?;
                 let total_min = mins.iter().cloned().fold(f64::INFINITY, f64::min);
                 Ok(total_min.into_pyobject(py)?.into_any())
             }
@@ -1113,6 +959,116 @@ impl ScxBackedSparseDataset {
         match &self.kept_to_global {
             Some(mapping) => mapping.iter().map(|&g| all_values[g as usize]).collect(),
             None => all_values.to_vec(),
+        }
+    }
+
+    // B2: pure-Rust aggregation kernels factored out of the `#[pymethods]`
+    // entry points so the heavy shard decode can run under `detached(py, ..)`
+    // (GIL released). Each routes the projection/mask combination to the right
+    // backend call and unifies the (differing) backend error types to `String`
+    // — the closure passed to `detached` must not construct a `PyErr`.
+
+    /// Column sums (`axis=0`), honoring column projection and row keep-mask.
+    fn col_sums_raw(&self) -> Result<Vec<f64>, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_sums_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => {
+                projected_agg::col_sums_projected(&self.backed, cols).map_err(|e| e.to_string())
+            }
+            (None, Some(kept)) => self.backed.col_sums_masked(kept).map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_sums().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Per-row sums (`axis=1` / total), honoring column projection. Deletion
+    /// remapping is applied by the caller via `filter_row_results`.
+    fn row_sums_raw(&self) -> Result<Vec<f64>, String> {
+        if let Some(ref cols) = self.col_projection {
+            projected_agg::row_sums_projected(&self.backed, cols).map_err(|e| e.to_string())
+        } else {
+            self.backed.row_sums().map_err(|e| e.to_string())
+        }
+    }
+
+    /// Column nnz counts (`axis=0`), honoring column projection and keep-mask.
+    fn col_nnz_raw(&self) -> Result<Vec<u32>, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => {
+                projected_agg::col_nnz_projected(&self.backed, cols).map_err(|e| e.to_string())
+            }
+            (None, Some(kept)) => self
+                .backed
+                .col_nnz_masked(kept)
+                .map(|f| f.iter().map(|&v| v as u32).collect())
+                .map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_nnz().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Per-row nnz counts (`axis=1`), honoring column projection.
+    fn row_nnz_raw(&self) -> Result<Vec<i64>, String> {
+        if let Some(ref cols) = self.col_projection {
+            projected_agg::row_nnz_projected(&self.backed, cols).map_err(|e| e.to_string())
+        } else {
+            self.backed.row_nnz().map_err(|e| e.to_string())
+        }
+    }
+
+    /// Column variance (`axis=0`), honoring column projection and keep-mask.
+    fn col_var_raw(&self) -> Result<Vec<f64>, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_var_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => {
+                let n_obs = self.backed.shape().0;
+                projected_agg::col_var_projected(&self.backed, cols, n_obs)
+                    .map_err(|e| e.to_string())
+            }
+            (None, Some(kept)) => self.backed.col_var_masked(kept).map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_var().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Column maxima (`axis=0`), honoring column projection and keep-mask.
+    fn col_max_raw(&self) -> Result<Vec<f64>, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_max_masked_projected(&self.backed, kept, cols, kept.len())
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => {
+                let n_obs = self.backed.shape().0;
+                projected_agg::col_max_projected(&self.backed, cols, n_obs)
+                    .map_err(|e| e.to_string())
+            }
+            (None, Some(kept)) => self.backed.col_max_masked(kept).map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_max().map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Column minima (`axis=0`), honoring column projection and keep-mask.
+    fn col_min_raw(&self) -> Result<Vec<f64>, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                projected_agg::col_min_masked_projected(&self.backed, kept, cols, kept.len())
+                    .map_err(|e| e.to_string())
+            }
+            (Some(cols), None) => {
+                let n_obs = self.backed.shape().0;
+                projected_agg::col_min_projected(&self.backed, cols, n_obs)
+                    .map_err(|e| e.to_string())
+            }
+            (None, Some(kept)) => self.backed.col_min_masked(kept).map_err(|e| e.to_string()),
+            (None, None) => self.backed.col_min().map_err(|e| e.to_string()),
         }
     }
 
@@ -1967,16 +1923,23 @@ impl ScxComparisonResult {
             // (UMI counts) is exactly the number of entries > 0.
             match axis {
                 Some(0) => {
-                    let counts = if let Some(ref kept) = self.kept_to_global {
-                        let f_counts = self
-                            .backed
+                    // B5: emit int64 (was uint32) so both axes of this `.sum()`
+                    // shortcut agree with each other and with the materialized
+                    // `(X>0).sum(axis)` fallback (scipy sums bools to int64).
+                    let counts: Vec<i64> = if let Some(ref kept) = self.kept_to_global {
+                        self.backed
                             .col_nnz_masked(kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        f_counts.iter().map(|&v| v as u32).collect::<Vec<u32>>()
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                            .iter()
+                            .map(|&v| v as i64)
+                            .collect()
                     } else {
                         self.backed
                             .col_nnz()
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                            .iter()
+                            .map(|&v| v as i64)
+                            .collect()
                     };
                     let arr = numpy::PyArray::from_vec(py, counts);
                     arr.call_method1("reshape", ((1i32, self.shape_val.1),))
@@ -2097,21 +2060,57 @@ impl ScxComparisonResult {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Try to extract a float64 vector from a numpy array or scipy matrix.
+/// Run a pure-Rust closure with the GIL released (B2). Thin standardizing
+/// wrapper over [`Python::detach`] for the backed-data aggregation
+/// convention: `let raw = detached(py, || reader_op())?; build_numpy(py, raw)`.
+/// Every backed/lazy `#[pymethods]` entry point that does shard I/O + decode +
+/// aggregation should run that pure-Rust work through here so a multi-GB
+/// reduction never blocks other Python threads (e.g. a training-loader
+/// consumer). The closure must not touch Python (no `py`, no `PyErr`); map the
+/// Rust error to a `PyErr` after it returns.
+pub(crate) fn detached<T, E, F>(py: Python<'_>, f: F) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E> + Send,
+    T: Send,
+    E: Send,
+{
+    py.detach(f)
+}
+
+/// Build an `int32` numpy array of nnz counts. scipy's `getnnz` returns
+/// `int32` for both axes, so this is the single source for every
+/// nnz-producing path (axis 0/1, masked, projected, comparison) — keeping
+/// the dtype uniform and matching scipy. B5.
+pub(crate) fn nnz_to_numpy<'py, I: IntoIterator<Item = i64>>(
+    py: Python<'py>,
+    counts: I,
+) -> Bound<'py, numpy::PyArray1<i32>> {
+    let v: Vec<i32> = counts.into_iter().map(|c| c as i32).collect();
+    numpy::PyArray::from_vec(py, v)
+}
+
+/// Try to extract a per-row (length `n_obs`) float64 scale vector from a numpy
+/// array or scipy matrix, for the row-scaling fast path of `__mul__` /
+/// `__truediv__`.
 ///
-/// This handles the shapes scanpy's `axis_mul_or_truediv` produces when
-/// performing row-wise normalization:
-///   - `(n_obs,)`     — 1D array from `np.ravel(row_sums)`
-///   - `(n_obs, 1)`   — column vector
-///   - `(1, n_obs)`   — row vector (transposed)
+/// B3: interception keys off the **pre-ravel** shape and only accepts
+/// *unambiguously* row-oriented operands:
+///   - `(n_obs,)`     — 1D row factors (`np.ravel(row_sums)`)
+///   - `(n_obs, 1)`   — explicit column vector
 ///
-/// Returns `Ok(Some(vec))` if extraction succeeds and length == `n_obs`,
-/// returns `Ok(None)` if the shape doesn't match (triggers materialization fallback),
-/// returns `Err` only on actual Python errors.
+/// A `(1, n)` row vector is a per-*column* broadcast, not a row factor, so it
+/// is no longer intercepted. And on a square matrix (`n_obs == n_vars`) a bare
+/// 1-D operand of that length is ambiguous (could be a genuine per-gene
+/// vector), so it returns `None` → the caller materializes (always correct).
+///
+/// Returns `Ok(Some(vec))` on an unambiguous row factor of length `n_obs`,
+/// `Ok(None)` to fall through to materialization, `Err` only on real Python
+/// errors.
 pub(crate) fn try_extract_row_factors(
     py: Python<'_>,
     other: &Bound<'_, PyAny>,
     n_obs: usize,
+    n_vars: usize,
 ) -> PyResult<Option<Vec<f64>>> {
     let np = py.import("numpy")?;
 
@@ -2120,6 +2119,24 @@ pub(crate) fn try_extract_row_factors(
         Ok(a) => a,
         Err(_) => return Ok(None),
     };
+
+    // Inspect the pre-ravel shape to disambiguate orientation.
+    let shape: Vec<usize> = match arr.getattr("shape").and_then(|s| s.extract()) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let is_row_oriented = match shape.as_slice() {
+        // 1-D length n_obs: row factor, unless the matrix is square (then the
+        // operand could equally be a per-gene vector — ambiguous, materialize).
+        [len] => *len == n_obs && n_obs != n_vars,
+        // Explicit column vector: unambiguously per-row regardless of squareness.
+        [rows, 1] => *rows == n_obs,
+        // (1, n) row vectors and everything else are not row factors.
+        _ => false,
+    };
+    if !is_row_oriented {
+        return Ok(None);
+    }
 
     // Flatten to 1D
     let flat = match arr.call_method0("ravel") {
@@ -2289,7 +2306,7 @@ impl ScxBackedMuDataset {
     fn obs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Fast path: cached obs already constructed.
         {
-            let guard = self.cached_obs.lock().expect("cached_obs poisoned");
+            let guard = self.cached_obs.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref obj) = *guard {
                 return Ok(obj.clone_ref(py));
             }
@@ -2302,7 +2319,7 @@ impl ScxBackedMuDataset {
         let table = crate::anndata::record_batch_to_pyarrow(py, &batch)?;
         let df = crate::anndata::pyarrow_table_to_pandas(&table)?;
         let obj: Py<PyAny> = df.unbind();
-        let mut guard = self.cached_obs.lock().expect("cached_obs poisoned");
+        let mut guard = self.cached_obs.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(obj.clone_ref(py));
         Ok(obj)
     }
