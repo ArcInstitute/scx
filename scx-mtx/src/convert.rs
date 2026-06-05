@@ -100,16 +100,10 @@ pub fn mtx_to_scx(
 }
 
 fn parse_codec_str(s: &str) -> Result<Option<CodecId>, MtxError> {
-    match s {
-        "auto" => Ok(None),
-        "none" => Ok(Some(CodecId::None)),
-        "scx1" => Ok(Some(CodecId::Scx1)),
-        "zstd" => Ok(Some(CodecId::Zstd)),
-        other => Err(MtxError::InvalidCodec(format!(
-            "Unknown codec: '{}'. Use auto, none, scx1, or zstd.",
-            other
-        ))),
-    }
+    // Delegate to the single-source CLI codec vocabulary in scx-codec so this
+    // path accepts the same set as the rest of the CLI (previously omitted
+    // lz4/pcodec).
+    CodecId::parse_cli(s).map_err(MtxError::InvalidCodec)
 }
 
 use scx_codec::value_encoding::{

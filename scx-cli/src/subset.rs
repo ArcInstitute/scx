@@ -159,21 +159,7 @@ pub fn run_subset(
     }
 
     // 8. Parse codec
-    let explicit_codec = match codec {
-        "auto" => None,
-        "none" => Some(scx_codec::CodecId::None),
-        "scx1" => Some(scx_codec::CodecId::Scx1),
-        "zstd" => Some(scx_codec::CodecId::Zstd),
-        "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
-        "pcodec" => Some(scx_codec::CodecId::Pcodec),
-        other => {
-            return Err(format!(
-                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
-                other
-            )
-            .into())
-        }
-    };
+    let explicit_codec = scx_codec::CodecId::parse_cli(codec)?;
 
     // 9. Write output SCX file
     let output = output.unwrap();
@@ -430,20 +416,7 @@ fn extract_modality(
     let n_obs = reader.header().n_obs;
     let n_vars = info.n_vars;
 
-    let explicit_codec = match codec {
-        "auto" => None,
-        "none" => Some(scx_codec::CodecId::None),
-        "scx1" => Some(scx_codec::CodecId::Scx1),
-        "zstd" => Some(scx_codec::CodecId::Zstd),
-        "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
-        "pcodec" => Some(scx_codec::CodecId::Pcodec),
-        other => {
-            return Err(format!(
-                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
-            )
-            .into());
-        }
-    };
+    let explicit_codec = scx_codec::CodecId::parse_cli(codec)?;
     let modality_type = info.modality_type;
 
     let csr = reader.read_all_csr_shards_for(modality_id)?;
@@ -688,20 +661,7 @@ fn extract_modality_with_filter(
         return Ok(());
     }
 
-    let explicit_codec = match codec {
-        "auto" => None,
-        "none" => Some(scx_codec::CodecId::None),
-        "scx1" => Some(scx_codec::CodecId::Scx1),
-        "zstd" => Some(scx_codec::CodecId::Zstd),
-        "lz4" => Some(scx_codec::CodecId::Lz4Shuffle),
-        "pcodec" => Some(scx_codec::CodecId::Pcodec),
-        other => {
-            return Err(format!(
-                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
-            )
-            .into())
-        }
-    };
+    let explicit_codec = scx_codec::CodecId::parse_cli(codec)?;
 
     let output = output.unwrap();
     let n_obs_out = projected_csr.n_rows() as u64;
