@@ -284,9 +284,15 @@ fn tokenize(expr: &str) -> Result<Vec<Token>> {
             continue;
         }
 
+        let reason = if chars[i] == '=' {
+            // A lone '=' is the classic "assignment vs equality" slip.
+            "unexpected character: '=' (use '==' for equality)".to_string()
+        } else {
+            format!("unexpected character: '{}'", chars[i])
+        };
         return Err(EngineError::PredicateParseError {
             expr: expr.to_string(),
-            reason: format!("unexpected character: '{}'", chars[i]),
+            reason,
         });
     }
 
@@ -1288,6 +1294,21 @@ mod tests {
         let schema = test_schema();
         let err = parse_predicate("cell_type ==", &schema, "obs").unwrap_err();
         assert!(matches!(err, EngineError::PredicateParseError { .. }));
+    }
+
+    #[test]
+    fn parse_lone_equals_hints_double_equals() {
+        let schema = test_schema();
+        let err = parse_predicate("cell_type = 'T cell'", &schema, "obs").unwrap_err();
+        match err {
+            EngineError::PredicateParseError { reason, .. } => {
+                assert!(
+                    reason.contains("use '=='"),
+                    "lone '=' should hint at '==', got: {reason}"
+                );
+            }
+            other => panic!("expected PredicateParseError, got {other:?}"),
+        }
     }
 
     #[test]

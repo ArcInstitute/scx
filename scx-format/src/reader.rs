@@ -100,8 +100,23 @@ impl ScxReader {
     }
 
     fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let path = path.as_ref();
+        // Echo the offending path in the error — a bare "No such file or
+        // directory (os error 2)" forces the caller to guess which file failed.
+        let file = File::open(path).map_err(|e| {
+            ScxError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot open '{}': {}", path.display(), e),
+            ))
+        })?;
+        let mmap = unsafe {
+            Mmap::map(&file).map_err(|e| {
+                ScxError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("cannot mmap '{}': {}", path.display(), e),
+                ))
+            })?
+        };
 
         // Start with Normal advice (kernel default heuristic). Access-pattern-
         // specific hints (Sequential, WillNeed, DontNeed) are issued at each
@@ -3012,6 +3027,19 @@ mod tests {
     use arrow::array::{Float32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn open_missing_file_error_includes_path() {
+        let missing = "/nonexistent/scx-user/does_not_exist_xyz.scx";
+        let msg = match ScxReader::open_unchecked(missing) {
+            Ok(_) => panic!("expected open of a nonexistent path to fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains(missing),
+            "open error should echo the offending path, got: {msg}"
+        );
+    }
 
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
