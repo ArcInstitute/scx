@@ -331,6 +331,32 @@ impl IndexedCsrShardStream for XStreamReader {
     fn read_range(&self, row_start: u64, n_rows: u32) -> Result<StreamedCsrShard, ConvertError> {
         self.read_range_inner(row_start, n_rows)
     }
+
+    /// C7: exact per-worker working set from the resident `indptr` — the
+    /// largest nnz of any `shard_target_rows`-row window — instead of the
+    /// density-ceiling default that under-estimates dense-stored-as-CSR
+    /// inputs and over-spawns workers into OOM. No I/O: `indptr` is loaded
+    /// eagerly at open.
+    fn per_worker_bytes(
+        &self,
+        shard_target_rows: u32,
+        _modality_type: scx_format::modality::ModalityType,
+    ) -> u64 {
+        let n_obs = self.indptr.len().saturating_sub(1);
+        if n_obs == 0 {
+            return 1;
+        }
+        let t = (shard_target_rows.max(1) as usize).min(n_obs);
+        let mut max_nnz: u64 = 0;
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + t).min(n_obs);
+            let nnz = self.indptr[end].saturating_sub(self.indptr[start]).max(0) as u64;
+            max_nnz = max_nnz.max(nnz);
+            start = end;
+        }
+        crate::stream::shard_working_set_bytes(max_nnz, t as u64)
+    }
 }
 
 /// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.

@@ -8,6 +8,18 @@ use scx_format::modality::ModalityType;
 
 use super::pipeline::ConvertError;
 
+/// Working-set bytes for processing one CSR shard of `nnz` non-zeros over
+/// `n_rows` rows: the decoded `i32` indices + `f32` values (8 B/nnz) plus an
+/// equal scratch allowance for the rebuild/encode buffers, plus the
+/// shard-local `u64` indptr. Single source shared by the ingest worker-derate
+/// (`IndexedCsrShardStream::per_worker_bytes`) and the export-side
+/// `per_shard_export_bytes`, so the two budgets can't drift.
+pub(crate) fn shard_working_set_bytes(nnz: u64, n_rows: u64) -> u64 {
+    let payload = nnz.saturating_mul(8);
+    let indptr = n_rows.saturating_add(1).saturating_mul(8);
+    payload.saturating_mul(2).saturating_add(indptr).max(1)
+}
+
 /// Major axis of the source matrix. Streaming readers always emit
 /// CSR shards downstream; `Column` only appears as a marker on
 /// readers that perform an internal column-major → row-major
@@ -105,14 +117,18 @@ pub trait IndexedCsrShardStream: Send + Sync {
         None
     }
 
-    /// Conservative per-worker working-set estimate in bytes used
-    /// by the memory-budget derate in the parallel-coordinator
-    /// dispatcher. Default impl assumes the sparsified output is
-    /// the binding bound and picks density by modality
-    /// (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
-    /// (`i32` indices + `f32` values + amortised `indptr`). Dense
-    /// readers override this to size the dense slab buffer
-    /// instead.
+    /// Per-worker working-set estimate in bytes used by the
+    /// memory-budget derate in the parallel-coordinator dispatcher.
+    ///
+    /// The default impl is a density-based **ceiling**, not an exact
+    /// figure: it assumes the sparsified output binds and picks density
+    /// by modality (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
+    /// (`i32` indices + `f32` values + amortised `indptr`). It is only a
+    /// fallback for readers that cannot cheaply know their nnz — a
+    /// dense-stored-as-CSR matrix would *under*-estimate here. Readers
+    /// with a resident `indptr` (CSR h5ad) override this to derive the
+    /// exact max-shard nnz via [`shard_working_set_bytes`]; dense readers
+    /// override it to size the dense slab buffer instead.
     fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
         let density_den: u64 = match modality_type {
             ModalityType::Atac => crate::pipeline::PARALLEL_DENSITY_ATAC_DEN,
