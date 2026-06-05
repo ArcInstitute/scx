@@ -688,6 +688,84 @@ fn test_uns_skip_non_serializable() {
     assert_eq!(uns["count"], 42);
 }
 
+// C3/C4 export: 2-D numeric `uns` arrays and 1-D boolean arrays must
+// round-trip through h5ad → scx → h5ad. Before the writer fix they were
+// silently dropped on export (the `write_uns_value` Array arm only handled
+// 1-D i64/f64/string). Note: f32 input widens to f64 on round-trip (the read
+// path coerces Float → f64), so the matrix here is authored as f64.
+#[test]
+fn test_uns_2d_and_bool_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("uns_nd.h5ad");
+    let scx_path = dir.path().join("uns_nd.scx");
+    let h5ad_out = dir.path().join("uns_nd_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    let colors =
+        ndarray::Array2::<f64>::from_shape_vec((2, 3), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap();
+    let contrasts = ndarray::Array2::<i64>::from_shape_vec((2, 2), vec![1, -2, 3, -4]).unwrap();
+    let mask2d =
+        ndarray::Array2::<bool>::from_shape_vec((2, 2), vec![true, false, false, true]).unwrap();
+    let flags: Vec<bool> = vec![true, false, true, true];
+
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        uns.new_dataset::<f64>()
+            .shape([2, 3])
+            .create("colors")
+            .unwrap()
+            .write(&colors)
+            .unwrap();
+        uns.new_dataset::<i64>()
+            .shape([2, 2])
+            .create("contrasts")
+            .unwrap()
+            .write(&contrasts)
+            .unwrap();
+        uns.new_dataset::<bool>()
+            .shape([2, 2])
+            .create("mask2d")
+            .unwrap()
+            .write(&mask2d)
+            .unwrap();
+        uns.new_dataset::<bool>()
+            .shape([4])
+            .create("flags")
+            .unwrap()
+            .write(&flags)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+
+    let out_colors = uns.dataset("colors").unwrap().read_2d::<f64>().unwrap();
+    assert_eq!(
+        out_colors, colors,
+        "2-D float uns dropped/garbled on export"
+    );
+
+    let out_contrasts = uns.dataset("contrasts").unwrap().read_2d::<i64>().unwrap();
+    assert_eq!(out_contrasts, contrasts, "2-D int uns dropped/garbled");
+
+    let out_mask = uns.dataset("mask2d").unwrap().read_2d::<bool>().unwrap();
+    assert_eq!(out_mask, mask2d, "2-D bool uns dropped/garbled");
+
+    let out_flags: Vec<bool> = uns
+        .dataset("flags")
+        .unwrap()
+        .read_1d::<bool>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(out_flags, flags, "1-D bool uns dropped on export");
+}
+
 #[test]
 fn test_categorical_columns() {
     let dir = tempfile::tempdir().unwrap();
