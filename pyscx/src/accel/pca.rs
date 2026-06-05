@@ -22,8 +22,8 @@ use super::util::{extract_csr_slices, CsrSlices};
 /// `ScxCsr`. Parallels the CPU-path's `*_inmemory` entry points by presenting
 /// the whole CSR as a single shard to the streaming GPU code.
 #[cfg(feature = "gpu")]
-struct ScxCsrSource<'a> {
-    csr: &'a scx_sparse::ScxCsr,
+pub(crate) struct ScxCsrSource<'a> {
+    pub(crate) csr: &'a scx_sparse::ScxCsr,
 }
 
 #[cfg(feature = "gpu")]
@@ -68,11 +68,11 @@ impl ShardSource for ScxCsrSource<'_> {
 /// step and the `ScxCsrSource::read_shard` clone — net one memcpy per
 /// dispatch instead of two.
 #[cfg(feature = "gpu")]
-struct BorrowedCsrSource<'a> {
-    indptr: &'a [i64],
-    indices: &'a [i32],
-    data: &'a [f32],
-    shape: (usize, usize),
+pub(crate) struct BorrowedCsrSource<'a> {
+    pub(crate) indptr: &'a [i64],
+    pub(crate) indices: &'a [i32],
+    pub(crate) data: &'a [f32],
+    pub(crate) shape: (usize, usize),
 }
 
 #[cfg(feature = "gpu")]
@@ -113,7 +113,7 @@ impl ShardSource for BorrowedCsrSource<'_> {
 /// Returns `Ok(None)` if `X` cannot be presented as a scipy CSR (e.g. a type
 /// scipy refuses to convert); callers fall through to the owned-`Vec` path.
 #[cfg(feature = "gpu")]
-fn try_extract_borrowed_csr<'py>(
+pub(super) fn try_extract_borrowed_csr<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
 ) -> PyResult<Option<(CsrSlices<'py>, (usize, usize))>> {
@@ -134,7 +134,7 @@ fn try_extract_borrowed_csr<'py>(
 /// the covariance path when `n_vars <= GPU_COVARIANCE_PCA_THRESHOLD` and the
 /// randomized path otherwise.
 #[cfg(feature = "gpu")]
-fn resolve_gpu_method(method: &str, n_vars: usize) -> PyResult<&'static str> {
+pub(crate) fn resolve_gpu_method(method: &str, n_vars: usize) -> PyResult<&'static str> {
     match method {
         "auto" => {
             if n_vars <= scx_accel::GPU_COVARIANCE_PCA_THRESHOLD {
@@ -154,7 +154,7 @@ fn resolve_gpu_method(method: &str, n_vars: usize) -> PyResult<&'static str> {
 /// Parse a `qr_method` string into a [`scx_gpu::QrMethod`]. Both values are
 /// valid now (Phase 4 wired up CholeskyQR2 behind `"cholesky"`).
 #[cfg(feature = "gpu")]
-fn parse_qr_method(qr_method: &str) -> PyResult<scx_accel::QrMethod> {
+pub(crate) fn parse_qr_method(qr_method: &str) -> PyResult<scx_accel::QrMethod> {
     match qr_method {
         "householder" => Ok(scx_accel::QrMethod::Householder),
         "cholesky" => Ok(scx_accel::QrMethod::Cholesky),
@@ -259,7 +259,7 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
 /// The PCA dispatcher then falls through to the CPU path instead of letting
 /// cudarc's lazy `dlsym` panic deep in an FFI call.
 #[cfg(feature = "gpu")]
-fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResult<()> {
+pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResult<()> {
     let warnings = py.import("warnings")?;
     warnings.call_method1(
         "warn",
@@ -567,7 +567,7 @@ pub fn pca(
 }
 
 /// Write PCA results to AnnData slots matching scanpy's format.
-fn write_pca_to_adata(
+pub(crate) fn write_pca_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::PcaResult,

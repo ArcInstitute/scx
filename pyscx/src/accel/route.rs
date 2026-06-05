@@ -153,3 +153,27 @@ pub(crate) fn write_accel_route(
     scx_accel.set_item(op, exec_info_to_pydict(py, info)?)?;
     Ok(())
 }
+
+/// Copy an already-stamped op's route dict from `uns["scx_accel"][from_op]` to
+/// `uns["scx_accel"][to_op]`. Used by fused entries (e.g. `pca_neighbors`) whose
+/// summary route should mirror what an underlying sequential op actually
+/// recorded, rather than re-synthesizing one. No-op if `from_op` is absent.
+pub(crate) fn copy_accel_route(
+    adata: &Bound<'_, PyAny>,
+    from_op: &str,
+    to_op: &str,
+) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+    let Some(scx_accel) = uns
+        .call_method1("get", ("scx_accel",))
+        .ok()
+        .filter(|o| !o.is_none())
+        .and_then(|o| o.cast_into::<PyDict>().ok())
+    else {
+        return Ok(());
+    };
+    if let Some(route) = scx_accel.get_item(from_op)? {
+        scx_accel.set_item(to_op, route)?;
+    }
+    Ok(())
+}

@@ -1220,6 +1220,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `prefer_format`            |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
+| `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
 | `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
@@ -1416,6 +1417,47 @@ via a faer matmul + per-row partial top-k sort; `ef_construction` /
 f32 Gram matrix (~100 MB at the threshold) — keep this in mind if
 calling at the boundary on memory-constrained hosts.
 On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
+
+### Fused PCA → kNN (`pyscx.accel.pca_neighbors`)
+
+Runs PCA then the kNN graph in a single call. On a GPU host with cuSPARSE 12.5+
+and cuVS available, the PCA embedding is kept **resident on the GPU** and fed
+straight into CAGRA — eliminating the `obsm["X_pca"]` GPU→host→GPU round-trip
+that calling `pca` then `neighbors` separately incurs (~240 MB of host traffic
+at 1M cells × 60 PCs). Output is identical to the two sequential calls; it
+writes every slot they do (`obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`,
+`obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`).
+
+```python
+# One call instead of pca(...) + neighbors(...).
+pyscx.accel.pca_neighbors(adata, n_comps=50, n_neighbors=15, device="gpu")
+
+# When the fully fused path runs, all three are stamped "gpu_device_resident":
+#   adata.uns["scx_accel"]["pca"]["route"]
+#   adata.uns["scx_accel"]["neighbors"]["route"]
+#   adata.uns["scx_accel"]["pca_neighbors"]["route"]
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_comps` | 50 | Number of principal components |
+| `n_neighbors` | 15 | Number of nearest neighbors |
+| `zero_center` | `True` | Mean-center before PCA |
+| `random_state` | 0 | Random seed |
+| `n_oversamples` / `n_power_iterations` | 10 / 2 | Randomized-PCA accuracy knobs |
+| `method` | `"auto"` | PCA method: `"auto"`, `"covariance"`, `"randomized"` |
+| `qr_method` | `"householder"` | Randomized-PCA QR: `"householder"` or `"cholesky"` |
+| `use_rep` | `"X_pca"` | obsm key the `neighbors` step reads. A non-default value always runs the sequential path — the fused path runs kNN on the freshly-computed PCA embedding, so honoring `obsm[use_rep]` requires the standalone `neighbors`. |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
+| `prefer_format` | `"csr"` | Only `"csr"` is supported (PCA's SpMM path is row-major) |
+
+Fallback: when the device-resident path is unavailable — no GPU, a libcusparse
+older than cuSPARSE 12.5, or cuVS missing — `pca_neighbors` transparently runs
+the standalone `pca` then `neighbors` (each with its own normal routing and
+warnings), and the `pca_neighbors` route records the non-device-resident result
+(e.g. `cpu_csr`). The fuzzy-graph (connectivity) step runs on the CPU in both
+cases. Accepts the same `X` inputs as `pca` (backed SCX, lazy transform, or a
+materialized scipy/dense matrix).
 
 ### UMAP (`pyscx.accel.umap`)
 

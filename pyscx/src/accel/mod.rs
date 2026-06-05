@@ -22,6 +22,7 @@ pub mod col_aggs;
 pub mod de;
 pub mod eval_metrics;
 pub mod filtering;
+pub mod fused;
 pub mod gpu;
 pub mod harmony;
 pub mod hvg;

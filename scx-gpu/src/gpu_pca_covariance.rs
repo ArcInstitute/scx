@@ -26,12 +26,13 @@ use cudarc::driver::PushKernelArg;
 
 use scx_format::{total_variance_from_col_sq, ShardSource};
 
-use crate::cublas::{gpu_sgemm, CublasHandle};
+use crate::cublas::{gpu_sgemm, gpu_transpose_f32, CublasHandle};
 use crate::cusolver::{gpu_eigh_sym, CusolverHandle};
 use crate::cusparse::CusparseHandle;
 use crate::device::GpuDevice;
+use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
-use crate::gpu_pca::GpuPcaResult;
+use crate::gpu_pca::{GpuPcaDeviceResult, GpuPcaResult};
 use crate::linear_operator::CenteredSparseOperator;
 
 // Reuse the existing column-major PTX module — it already hosts
@@ -45,22 +46,31 @@ fn format_scx_error(e: scx_format::ScxError) -> GpuError {
     GpuError::InvalidShard(format!("SCX read error: {e}"))
 }
 
-/// GPU-accelerated covariance PCA.
-///
-/// Streams shards twice — once to build the Gram matrix, once to project the
-/// embeddings. Designed for `n_vars <= 8000` (HVG-selected data); callers
-/// with larger `n_vars` should use [`crate::gpu_randomized_pca`] instead.
-///
-/// See module-level docs for algorithmic detail. `Sync` is required on `source`
-/// so that the internal `CenteredSparseOperator` (which streams via
-/// `RawGpuShardSource` on the G3 staging path) can borrow it across the scoped
-/// pre-decode worker thread.
-pub fn gpu_covariance_pca(
+/// Internal output of the shared covariance-PCA core: the embedding kept
+/// **col-major** on the device plus the host-side loadings/variance. The two
+/// public entry points ([`gpu_covariance_pca`], [`gpu_covariance_pca_device`])
+/// differ only in how they finalize `d_embeddings`.
+struct CovariancePcaCore {
+    /// Embedding `U·Σ`, col-major `(n_obs × n_components)`, owned device buffer.
+    d_embeddings: CudaSlice<f32>,
+    components: Vec<f32>,
+    variance_explained: Vec<f64>,
+    variance_ratio: Vec<f64>,
+    mean: Option<Vec<f64>>,
+    n_components: usize,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+/// Shared covariance-PCA core: streams shards twice (Gram, then projection) and
+/// returns the embedding `U·Σ` **col-major on the device** plus host-side
+/// loadings/variance. See module docs for the algorithm.
+fn covariance_pca_core(
     dev: &GpuDevice,
     source: &(dyn ShardSource + Sync),
     n_components: usize,
     zero_center: bool,
-) -> Result<GpuPcaResult, GpuError> {
+) -> Result<CovariancePcaCore, GpuError> {
     let (n_obs, n_vars) = source.shape();
 
     if n_components == 0 || n_obs == 0 || n_vars == 0 {
@@ -153,18 +163,10 @@ pub fn gpu_covariance_pca(
     }
     dev.synchronize()?;
 
-    // Step 7: D→H copy results.
-    let embeddings_colmajor = dev.dtoh_copy(&d_embeddings)?;
+    // Step 7: D→H copy the small loadings/eigenvalues (the large embedding
+    // stays on the device — see the wrappers below).
     let v_topk_host = dev.dtoh_copy(&d_v_topk)?;
     let eigvals_topk = dev.dtoh_copy(&d_eigvals_topk)?;
-
-    // Embeddings: col-major (n_obs × n_components) → row-major for AnnData.
-    let mut embeddings = vec![0.0f32; n_obs * n_components];
-    for j in 0..n_components {
-        for i in 0..n_obs {
-            embeddings[i * n_components + j] = embeddings_colmajor[j * n_obs + i];
-        }
-    }
 
     // Components: V is col-major (n_vars × n_components); transpose to
     // row-major (n_components × n_vars) — the `GpuPcaResult` convention.
@@ -190,12 +192,115 @@ pub fn gpu_covariance_pca(
         vec![0.0; n_components]
     };
 
+    Ok(CovariancePcaCore {
+        d_embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean: means,
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+/// GPU-accelerated covariance PCA returning a host [`GpuPcaResult`].
+///
+/// Streams shards twice — once to build the Gram matrix, once to project the
+/// embeddings. Designed for `n_vars <= 8000` (HVG-selected data); callers
+/// with larger `n_vars` should use [`crate::gpu_randomized_pca`] instead.
+///
+/// See module-level docs for algorithmic detail. `Sync` is required on `source`
+/// so that the internal `CenteredSparseOperator` (which streams via
+/// `RawGpuShardSource` on the G3 staging path) can borrow it across the scoped
+/// pre-decode worker thread.
+pub fn gpu_covariance_pca(
+    dev: &GpuDevice,
+    source: &(dyn ShardSource + Sync),
+    n_components: usize,
+    zero_center: bool,
+) -> Result<GpuPcaResult, GpuError> {
+    let core = covariance_pca_core(dev, source, n_components, zero_center)?;
+    let CovariancePcaCore {
+        d_embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    } = core;
+
+    // Embeddings: col-major (n_obs × n_components) → row-major for AnnData.
+    let embeddings_colmajor = dev.dtoh_copy(&d_embeddings)?;
+    let mut embeddings = vec![0.0f32; n_obs * n_components];
+    for j in 0..n_components {
+        for i in 0..n_obs {
+            embeddings[i * n_components + j] = embeddings_colmajor[j * n_obs + i];
+        }
+    }
+
     Ok(GpuPcaResult {
         embeddings,
         components,
         variance_explained,
         variance_ratio,
-        mean: means,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+/// GPU-accelerated covariance PCA returning a **device-resident** embedding
+/// ([`GpuPcaDeviceResult`]) — V3 plan Phase 2.3.
+///
+/// Identical to [`gpu_covariance_pca`] except the embedding stays on the GPU:
+/// the col-major `U·Σ` is transposed in place (via [`gpu_transpose_f32`]) into a
+/// row-major [`DeviceEmbedding`] ready to feed into `gpu_knn_cagra_device`.
+pub fn gpu_covariance_pca_device(
+    dev: &GpuDevice,
+    source: &(dyn ShardSource + Sync),
+    n_components: usize,
+    zero_center: bool,
+) -> Result<GpuPcaDeviceResult, GpuError> {
+    let core = covariance_pca_core(dev, source, n_components, zero_center)?;
+    let CovariancePcaCore {
+        d_embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    } = core;
+
+    // Transpose col-major (n_obs × n_components) → row-major on the device.
+    // A fresh cuBLAS handle is intentional: the core's handle was scoped to its
+    // own stream usage and already dropped, so the transpose needs its own.
+    let cublas = CublasHandle::new()?;
+    // `d_embeddings` and `d_rowmajor` are both live across the transpose, so
+    // peak GPU memory transiently holds ~2× the embedding (~480 MB at 1M × 60 f32).
+    let mut d_rowmajor = dev.alloc_zeros::<f32>(n_obs * n_components)?;
+    gpu_transpose_f32(
+        &cublas,
+        dev.stream(),
+        &d_embeddings,
+        &mut d_rowmajor,
+        n_obs,
+        n_components,
+    )?;
+    dev.synchronize()?;
+    let embeddings = DeviceEmbedding::new(d_rowmajor, n_obs, n_components)?;
+
+    Ok(GpuPcaDeviceResult {
+        embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
         n_components,
         n_obs,
         n_vars,

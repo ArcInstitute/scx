@@ -33,6 +33,7 @@ use std::sync::OnceLock;
 use cudarc::driver::safe::{DevicePtr, DevicePtrMut};
 
 use crate::device::GpuDevice;
+use crate::device_resident::{DeviceEmbedding, DeviceKnnGraph};
 use crate::error::GpuError;
 
 // ---------------------------------------------------------------------------
@@ -599,6 +600,39 @@ pub fn gpu_knn_cagra(
             got: format!("{}", data.len()),
         });
     }
+
+    // Upload the host embedding once, then run the device-resident core and
+    // download + post-process. Output is byte-identical to running CAGRA
+    // inline (the post-process lives in `DeviceKnnGraph::to_host`).
+    let d_data = dev.htod_copy(data)?;
+    let embedding = DeviceEmbedding::new(d_data, n_obs, n_dims)?;
+    let graph = gpu_knn_cagra_device(dev, &embedding, n_neighbors)?;
+    graph.to_host(dev)
+}
+
+/// GPU kNN via cuVS CAGRA, **device-resident** input and output (V3 plan
+/// Phase 2.3).
+///
+/// Reads `embedding` (a row-major `(n_obs × n_dims)` [`DeviceEmbedding`], e.g.
+/// from `gpu_randomized_pca_device`) directly as the CAGRA dataset — no host
+/// upload — and returns a [`DeviceKnnGraph`] holding the raw `u32` neighbor
+/// indices + L2-squared distances **on the GPU** (no download, no self-filter).
+/// The fused PCA → kNN path uses this to keep the embedding resident across the
+/// handoff; call [`DeviceKnnGraph::to_host`] to materialize the host
+/// [`GpuKnnResult`].
+///
+/// # Errors
+///
+/// * `GpuError::LibraryNotFound` — cuVS not installed
+/// * `GpuError::CuVsError` — bad `n_neighbors`, or CAGRA build/search failed
+/// * `GpuError::OutOfMemory` — GPU memory exhausted
+pub fn gpu_knn_cagra_device(
+    dev: &GpuDevice,
+    embedding: &DeviceEmbedding,
+    n_neighbors: usize,
+) -> Result<DeviceKnnGraph, GpuError> {
+    let (n_obs, n_dims) = embedding.shape();
+
     if n_neighbors == 0 || n_neighbors > n_obs {
         return Err(GpuError::CuVsError(format!(
             "n_neighbors ({n_neighbors}) must be in [1, n_obs ({n_obs})]"
@@ -627,8 +661,9 @@ pub fn gpu_knn_cagra(
     // addresses the right device's memory on multi-GPU hosts.
     let device_ordinal = dev.context().ordinal() as i32;
 
-    // Upload data to GPU
-    let d_data = dev.htod_copy(data)?;
+    // The CAGRA dataset reads directly from the device-resident embedding —
+    // no host round-trip.
+    let d_data = embedding.data();
 
     // Allocate output buffers on GPU
     // CAGRA returns u32 indices — we search k+1 to filter self-hits
@@ -806,47 +841,10 @@ pub fn gpu_knn_cagra(
         }
     } // SyncOnDrop guards dropped here
 
-    // Synchronize and download results
-    dev.synchronize()?;
-    let neighbors_u32 = dev.dtoh_copy(&d_neighbors)?;
-    let distances_f32 = dev.dtoh_copy(&d_distances)?;
-
-    // Post-process: convert u32→i64, filter self-hits, take Euclidean distance (sqrt)
-    // CAGRA returns L2 squared distances — take sqrt for Euclidean distance
-    let mut indices = Vec::with_capacity(n_obs * n_neighbors);
-    let mut distances = Vec::with_capacity(n_obs * n_neighbors);
-
-    for i in 0..n_obs {
-        let row_start = i * search_k;
-        let mut count = 0;
-        for j in 0..search_k {
-            if count >= n_neighbors {
-                break;
-            }
-            let neighbor_idx = neighbors_u32[row_start + j] as usize;
-            if neighbor_idx == i {
-                // Skip self
-                continue;
-            }
-            indices.push(neighbor_idx as i64);
-            // sqrt for Euclidean distance
-            distances.push(distances_f32[row_start + j].sqrt());
-            count += 1;
-        }
-        // Pad if we didn't find enough neighbors (shouldn't happen normally)
-        while count < n_neighbors {
-            indices.push(i as i64);
-            distances.push(0.0);
-            count += 1;
-        }
-    }
-
-    Ok(GpuKnnResult {
-        indices,
-        distances,
-        n_obs,
-        n_neighbors,
-    })
+    // Return the raw CAGRA output device-resident. The self-hit filter, u32→i64
+    // conversion, and sqrt (L2² → Euclidean) live in `DeviceKnnGraph::to_host`,
+    // which also synchronizes the stream before downloading.
+    DeviceKnnGraph::new(d_neighbors, d_distances, n_obs, search_k, n_neighbors)
 }
 
 // ---------------------------------------------------------------------------
@@ -927,6 +925,76 @@ mod tests {
                 same_cluster >= 4,
                 "point {i} has only {same_cluster}/{n_neighbors} neighbors in same cluster"
             );
+        }
+    }
+
+    /// `gpu_knn_cagra_device` (device-resident input/output) must produce the
+    /// exact same host `GpuKnnResult` as `gpu_knn_cagra` on the same data — the
+    /// host wrapper is just `htod_copy → device core → to_host`.
+    #[test]
+    fn test_gpu_knn_cagra_device_matches_host() {
+        let dev = match GpuDevice::new(0) {
+            Ok(dev) => dev,
+            Err(_) => {
+                eprintln!("CUDA not available — skipping GPU kNN device-parity test");
+                return;
+            }
+        };
+        if !cuvs_available() {
+            eprintln!("cuVS not available — skipping GPU kNN device-parity test");
+            return;
+        }
+
+        let n_per_cluster = 25;
+        let n_obs = n_per_cluster * 2;
+        let n_dims = 3;
+        let n_neighbors = 5;
+
+        let mut data = Vec::with_capacity(n_obs * n_dims);
+        for i in 0..n_per_cluster {
+            data.push(0.1 * (i as f32));
+            data.push(0.1 * ((i % 5) as f32));
+            data.push(0.05 * (i as f32));
+        }
+        for i in 0..n_per_cluster {
+            data.push(10.0 + 0.1 * (i as f32));
+            data.push(10.0 + 0.1 * ((i % 5) as f32));
+            data.push(10.0 + 0.05 * (i as f32));
+        }
+
+        // Host path (htod_copy → device core → to_host).
+        let host = gpu_knn_cagra(&dev, &data, n_obs, n_dims, n_neighbors).unwrap();
+
+        // Device path: upload → DeviceEmbedding → device core → to_host.
+        let d_data = dev.htod_copy(&data).unwrap();
+        let embedding = DeviceEmbedding::new(d_data, n_obs, n_dims).unwrap();
+        let graph = gpu_knn_cagra_device(&dev, &embedding, n_neighbors).unwrap();
+        assert_eq!(graph.n_obs(), n_obs);
+        assert_eq!(graph.n_neighbors(), n_neighbors);
+        assert_eq!(graph.search_k(), (n_neighbors + 1).min(n_obs));
+        let dev_result = graph.to_host(&dev).unwrap();
+
+        // The two paths run two *independent* CAGRA builds. CAGRA may break ties
+        // between equidistant neighbors in a different order across runs, so we
+        // compare per-row neighbor *sets* (order-independent) and sorted
+        // per-row distances (within f32 tol) rather than exact element order. A
+        // genuinely broken device path would scramble the sets entirely.
+        for i in 0..n_obs {
+            let lo = i * n_neighbors;
+            let hi = lo + n_neighbors;
+            let mut h_idx = host.indices[lo..hi].to_vec();
+            let mut d_idx = dev_result.indices[lo..hi].to_vec();
+            h_idx.sort_unstable();
+            d_idx.sort_unstable();
+            assert_eq!(h_idx, d_idx, "row {i}: neighbor sets differ");
+
+            let mut h_dist = host.distances[lo..hi].to_vec();
+            let mut d_dist = dev_result.distances[lo..hi].to_vec();
+            h_dist.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            d_dist.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for (a, b) in h_dist.iter().zip(d_dist.iter()) {
+                assert!((a - b).abs() <= 1e-4, "row {i}: distance {a} vs {b}");
+            }
         }
     }
 
