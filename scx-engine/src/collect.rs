@@ -196,7 +196,10 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     let reader = pipeline.reader();
     let n_vars = reader.header().n_vars as usize;
 
-    let total_shards = reader.catalog().shards_sorted().len();
+    // Sorted CSR-shard view, computed once and reused across this function
+    // (was recomputed — filter+sort+alloc — ≥4× per query). OE6.
+    let sorted_shards = reader.catalog().shards_sorted();
+    let total_shards = sorted_shards.len();
     let skipped_shards = total_shards - plan.candidate_shards.len();
 
     // Sum of rows in candidate shards (post Level 1
@@ -204,12 +207,11 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     // narrowing). Lets the CLI report "{matched_rows} of {candidate_rows}
     // candidate-shard rows matched" so users can see Level 2 is doing
     // work even when Level 1 skipped zero shards.
-    let sorted_shards_for_rows = reader.catalog().shards_sorted();
     let candidate_shard_rows: usize = plan
         .candidate_shards
         .iter()
         .filter_map(|sc| {
-            sorted_shards_for_rows[sc.shard_idx]
+            sorted_shards[sc.shard_idx]
                 .stats
                 .as_ref()
                 .map(|s| (s.row_end - s.row_start) as usize)
@@ -234,7 +236,6 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
 
     // Step 4: Apply deletion vectors — exclude deleted cells
     if let Some(ref dv) = plan.deletion_vectors {
-        let sorted_shards = reader.catalog().shards_sorted();
         for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
             if let Some(ref stats) = shard_entry.stats {
                 if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
@@ -251,8 +252,6 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
 
     // Step 5: Map matching cells to shards
     // Build per-shard keep masks (local row indices)
-    let sorted_shards = reader.catalog().shards_sorted();
-
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
     for sc in &plan.candidate_shards {
         let entry = sorted_shards[sc.shard_idx];

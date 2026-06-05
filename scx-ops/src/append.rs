@@ -1718,11 +1718,15 @@ pub(crate) fn unify_dict_columns(
 
     for (i, field) in schema.fields().iter().enumerate() {
         let col = batch.column(i);
-        if let DataType::Dictionary(_, value_type) = field.data_type() {
+        if matches!(field.data_type(), DataType::Dictionary(_, _)) {
+            // OE8: single-source the Dictionary(_, V) → V extraction through
+            // `effective_type` so this cast path and the append-time schema
+            // check can't drift on how they strip the dictionary.
+            let value_type = effective_type(field.data_type());
             let cast_col = arrow::compute::cast(col, value_type)?;
             new_fields.push(arrow::datatypes::Field::new(
                 field.name(),
-                value_type.as_ref().clone(),
+                value_type.clone(),
                 field.is_nullable(),
             ));
             new_columns.push(cast_col);
