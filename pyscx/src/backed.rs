@@ -742,36 +742,13 @@ impl ScxBackedSparseDataset {
                 // B5: int32 to match axis=0 and scipy (was int64).
                 Ok(nnz_to_numpy(py, filtered).into_any())
             }
-            None => match (&self.col_projection, &self.kept_to_global) {
-                (Some(cols), Some(kept)) => {
-                    let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
-                    Ok((total as usize).into_pyobject(py)?.into_any())
-                }
-                (Some(cols), None) => {
-                    let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
-                    Ok((total as usize).into_pyobject(py)?.into_any())
-                }
-                (None, Some(kept)) => {
-                    // Sum row NNZ for kept rows only
-                    let all_nnz = self
-                        .backed
-                        .row_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: i64 = kept.iter().map(|&g| all_nnz[g as usize]).sum();
-                    Ok((total as usize).into_pyobject(py)?.into_any())
-                }
-                (None, None) => {
-                    let total = self
-                        .backed
-                        .total_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    Ok(total.into_pyobject(py)?.into_any())
-                }
-            },
+            None => {
+                // B2: scalar total nnz — run the (potentially heavy, for the
+                // masked/projected arms) shard decode + reduction off the GIL.
+                let total = detached(py, || self.total_nnz_raw())
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                Ok(total.into_pyobject(py)?.into_any())
+            }
             Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
         }
     }
@@ -1018,6 +995,31 @@ impl ScxBackedSparseDataset {
             projected_agg::row_nnz_projected(&self.backed, cols).map_err(|e| e.to_string())
         } else {
             self.backed.row_nnz().map_err(|e| e.to_string())
+        }
+    }
+
+    /// Scalar total nnz (`getnnz(axis=None)`), honoring column projection and
+    /// keep-mask. The masked/projected arms decode shards, so this runs through
+    /// `detached` at the call site like the per-axis kernels.
+    fn total_nnz_raw(&self) -> Result<usize, String> {
+        match (&self.col_projection, &self.kept_to_global) {
+            (Some(cols), Some(kept)) => {
+                let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
+                    .map_err(|e| e.to_string())?;
+                Ok(nnz.iter().map(|&v| v as u64).sum::<u64>() as usize)
+            }
+            (Some(cols), None) => {
+                let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
+                    .map_err(|e| e.to_string())?;
+                Ok(nnz.iter().map(|&v| v as u64).sum::<u64>() as usize)
+            }
+            (None, Some(kept)) => {
+                // Sum row NNZ for kept rows only.
+                let all_nnz = self.backed.row_nnz().map_err(|e| e.to_string())?;
+                let total: i64 = kept.iter().map(|&g| all_nnz[g as usize]).sum();
+                Ok(total as usize)
+            }
+            (None, None) => self.backed.total_nnz().map_err(|e| e.to_string()),
         }
     }
 
@@ -1926,29 +1928,28 @@ impl ScxComparisonResult {
                     // B5: emit int64 (was uint32) so both axes of this `.sum()`
                     // shortcut agree with each other and with the materialized
                     // `(X>0).sum(axis)` fallback (scipy sums bools to int64).
-                    let counts: Vec<i64> = if let Some(ref kept) = self.kept_to_global {
-                        self.backed
-                            .col_nnz_masked(kept)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                            .iter()
-                            .map(|&v| v as i64)
-                            .collect()
-                    } else {
-                        self.backed
-                            .col_nnz()
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                            .iter()
-                            .map(|&v| v as i64)
-                            .collect()
-                    };
+                    // B2: decode the column nnz off the GIL.
+                    let counts: Vec<i64> = detached(py, || {
+                        let raw = match &self.kept_to_global {
+                            Some(kept) => self
+                                .backed
+                                .col_nnz_masked(kept)
+                                .map(|v| v.into_iter().map(|c| c as i64).collect::<Vec<i64>>()),
+                            None => self
+                                .backed
+                                .col_nnz()
+                                .map(|v| v.into_iter().map(|c| c as i64).collect::<Vec<i64>>()),
+                        };
+                        raw.map_err(|e| e.to_string())
+                    })
+                    .map_err(PyRuntimeError::new_err)?;
                     let arr = numpy::PyArray::from_vec(py, counts);
                     arr.call_method1("reshape", ((1i32, self.shape_val.1),))
                 }
                 Some(1) => {
-                    let all_nnz = self
-                        .backed
-                        .row_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    // B2: decode row nnz off the GIL; keep-mask filter is cheap.
+                    let all_nnz = detached(py, || self.backed.row_nnz().map_err(|e| e.to_string()))
+                        .map_err(PyRuntimeError::new_err)?;
                     let filtered = match &self.kept_to_global {
                         Some(mapping) => mapping.iter().map(|&g| all_nnz[g as usize]).collect(),
                         None => all_nnz,
@@ -1957,10 +1958,8 @@ impl ScxComparisonResult {
                     arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
                 }
                 None => {
-                    let total = self
-                        .backed
-                        .total_nnz()
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let total = detached(py, || self.backed.total_nnz().map_err(|e| e.to_string()))
+                        .map_err(PyRuntimeError::new_err)?;
                     // Return a numpy int64 scalar (not a bare Python int) so this
                     // shortcut matches the materialized fallback's scalar type.
                     let np = py.import("numpy")?;
@@ -2085,7 +2084,20 @@ pub(crate) fn nnz_to_numpy<'py, I: IntoIterator<Item = i64>>(
     py: Python<'py>,
     counts: I,
 ) -> Bound<'py, numpy::PyArray1<i32>> {
-    let v: Vec<i32> = counts.into_iter().map(|c| c as i32).collect();
+    let v: Vec<i32> = counts
+        .into_iter()
+        .map(|c| {
+            // scipy's getnnz is itself int32, so this matches the contract; but a
+            // per-row/col count above i32::MAX (only reachable on a pathological
+            // ~2.1B-nnz axis) would wrap silently. Surface it in debug builds and
+            // saturate in release rather than emit a negative count.
+            debug_assert!(
+                c <= i32::MAX as i64,
+                "nnz count {c} exceeds i32::MAX; getnnz output would overflow"
+            );
+            c.min(i32::MAX as i64) as i32
+        })
+        .collect();
     numpy::PyArray::from_vec(py, v)
 }
 
