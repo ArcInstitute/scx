@@ -139,20 +139,9 @@ pub fn run_append(
     }
 
     // Resolve codec.
-    let codec_selection = match codec {
-        "auto" => CodecSelection::Auto,
-        "none" => CodecSelection::Explicit(CodecId::None),
-        "scx1" => CodecSelection::Explicit(CodecId::Scx1),
-        "zstd" => CodecSelection::Explicit(CodecId::Zstd),
-        "lz4" => CodecSelection::Explicit(CodecId::Lz4Shuffle),
-        "pcodec" => CodecSelection::Explicit(CodecId::Pcodec),
-        other => {
-            return Err(format!(
-                "unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
-                other
-            )
-            .into())
-        }
+    let codec_selection = match CodecId::parse_cli(codec)? {
+        None => CodecSelection::Auto,
+        Some(c) => CodecSelection::Explicit(c),
     };
 
     // Drop the target reader before scx_ops::append_from_reader acquires

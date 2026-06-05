@@ -979,7 +979,7 @@ fn merge_multimodal(
             .map(|r| r.read_uns_for(modality_id).ok())
             .collect();
         if let Some(combined) =
-            combine_uns_per_input(&per_input, options.uns_policy, &mut uns_conflicts_warned)?
+            combine_uns_per_input(per_input, options.uns_policy, &mut uns_conflicts_warned)?
         {
             writer.write_uns_for(modality_id, &combined)?;
         }
@@ -1780,7 +1780,7 @@ fn combine_uns_for_merge(
             Err(e) => return Err(e.into()),
         }
     }
-    combine_uns_per_input(&per_input, policy, conflicts_warned)
+    combine_uns_per_input(per_input, policy, conflicts_warned)
 }
 
 /// Lower-level uns merge: combine an already-collected
@@ -1789,70 +1789,87 @@ fn combine_uns_for_merge(
 /// merge path for each modality's uns. `None` entries represent
 /// inputs that had no uns section.
 fn combine_uns_per_input(
-    per_input: &[Option<serde_json::Value>],
+    per_input: Vec<Option<serde_json::Value>>,
     policy: crate::merge_options::UnsPolicy,
     conflicts_warned: &mut usize,
 ) -> Result<Option<serde_json::Value>> {
     use crate::merge_options::UnsPolicy;
 
     // Pull out the first non-None as the canonical body for `First` /
-    // `Summary`; bail early when no input has uns.
+    // `Summary`; bail early when no input has uns. OE10: `per_input` is
+    // consumed by value so the chosen canonical payload is moved out rather
+    // than deep-cloned (these uns blobs can be large).
     let first_present = per_input.iter().position(|v| v.is_some());
     let Some(first_idx) = first_present else {
         return Ok(None);
     };
 
+    /// Move the `Some(value)` at `idx` out of an owned vec.
+    fn take_canonical(per_input: Vec<Option<serde_json::Value>>, idx: usize) -> serde_json::Value {
+        per_input
+            .into_iter()
+            .nth(idx)
+            .expect("first_present index in bounds")
+            .expect("first_present index points at Some")
+    }
+
     match policy {
         UnsPolicy::First => {
             // Warn on any input whose uns differs from the chosen one
             // so silent data loss is at least visible in logs.
-            let canonical = per_input[first_idx].as_ref().unwrap().clone();
-            for (i, other) in per_input.iter().enumerate() {
-                if i == first_idx {
-                    continue;
-                }
-                if let Some(o) = other {
-                    if o != &canonical {
-                        *conflicts_warned += 1;
-                        log::warn!(
-                            "merge: input {i}'s uns differs from input {first_idx}; \
-                             dropping under uns_policy=first"
-                        );
+            {
+                let canonical = per_input[first_idx].as_ref().unwrap();
+                for (i, other) in per_input.iter().enumerate() {
+                    if i == first_idx {
+                        continue;
+                    }
+                    if let Some(o) = other {
+                        if o != canonical {
+                            *conflicts_warned += 1;
+                            log::warn!(
+                                "merge: input {i}'s uns differs from input {first_idx}; \
+                                 dropping under uns_policy=first"
+                            );
+                        }
                     }
                 }
             }
-            Ok(Some(canonical))
+            Ok(Some(take_canonical(per_input, first_idx)))
         }
         UnsPolicy::RequireEqual => {
-            let canonical = per_input[first_idx].as_ref().unwrap();
-            for (i, other) in per_input.iter().enumerate() {
-                if i == first_idx {
-                    continue;
-                }
-                if let Some(o) = other {
-                    if o != canonical {
+            {
+                let canonical = per_input[first_idx].as_ref().unwrap();
+                for (i, other) in per_input.iter().enumerate() {
+                    if i == first_idx {
+                        continue;
+                    }
+                    if let Some(o) = other {
+                        if o != canonical {
+                            return Err(OpsError::UnsConflict {
+                                policy: "require-equal",
+                                detail: format!(
+                                    "input {first_idx} vs input {i}: uns differs (see input \
+                                     files for full payload)"
+                                ),
+                            });
+                        }
+                    } else {
                         return Err(OpsError::UnsConflict {
                             policy: "require-equal",
                             detail: format!(
-                                "input {first_idx} vs input {i}: uns differs (see input \
-                                 files for full payload)"
+                                "input {i} has no uns section but input {first_idx} does"
                             ),
                         });
                     }
-                } else {
-                    return Err(OpsError::UnsConflict {
-                        policy: "require-equal",
-                        detail: format!("input {i} has no uns section but input {first_idx} does"),
-                    });
                 }
             }
-            Ok(Some(canonical.clone()))
+            Ok(Some(take_canonical(per_input, first_idx)))
         }
         UnsPolicy::Namespace => {
             let mut obj = serde_json::Map::new();
-            for (i, v) in per_input.iter().enumerate() {
+            for (i, v) in per_input.into_iter().enumerate() {
                 if let Some(payload) = v {
-                    obj.insert(format!("input_{i}"), payload.clone());
+                    obj.insert(format!("input_{i}"), payload);
                 }
             }
             if obj.is_empty() {
@@ -1862,33 +1879,36 @@ fn combine_uns_per_input(
             }
         }
         UnsPolicy::Summary => {
-            let canonical = per_input[first_idx].as_ref().unwrap();
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
-            for (i, other) in per_input.iter().enumerate() {
-                if i == first_idx {
-                    continue;
-                }
-                match other {
-                    Some(o) if o != canonical => {
-                        *conflicts_warned += 1;
-                        conflicts.push(serde_json::json!({
-                            "input": i,
-                            "status": "differs",
-                        }));
+            {
+                let canonical = per_input[first_idx].as_ref().unwrap();
+                for (i, other) in per_input.iter().enumerate() {
+                    if i == first_idx {
+                        continue;
                     }
-                    None => {
-                        conflicts.push(serde_json::json!({
-                            "input": i,
-                            "status": "missing",
-                        }));
+                    match other {
+                        Some(o) if o != canonical => {
+                            *conflicts_warned += 1;
+                            conflicts.push(serde_json::json!({
+                                "input": i,
+                                "status": "differs",
+                            }));
+                        }
+                        None => {
+                            conflicts.push(serde_json::json!({
+                                "input": i,
+                                "status": "missing",
+                            }));
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+            let canonical = take_canonical(per_input, first_idx);
             if conflicts.is_empty() {
-                Ok(Some(canonical.clone()))
+                Ok(Some(canonical))
             } else {
-                let mut payload = match canonical.clone() {
+                let mut payload = match canonical {
                     serde_json::Value::Object(m) => m,
                     other => {
                         let mut wrapper = serde_json::Map::new();

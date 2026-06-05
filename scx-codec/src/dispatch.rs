@@ -42,6 +42,37 @@ impl CodecId {
             _ => None,
         }
     }
+
+    /// Parse a CLI/codec selection string. `"auto"` → `None` (the writer
+    /// auto-selects per shard); every other accepted token maps to an
+    /// explicit codec. This is the single source of truth for the CLI codec
+    /// vocabulary — all command-line entry points delegate here so the
+    /// accepted set can't drift between subcommands.
+    pub fn parse_cli(s: &str) -> Result<Option<CodecId>, String> {
+        match s {
+            "auto" => Ok(None),
+            "none" => Ok(Some(CodecId::None)),
+            "scx1" => Ok(Some(CodecId::Scx1)),
+            "zstd" => Ok(Some(CodecId::Zstd)),
+            "lz4" => Ok(Some(CodecId::Lz4Shuffle)),
+            "pcodec" => Ok(Some(CodecId::Pcodec)),
+            other => Err(format!(
+                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
+            )),
+        }
+    }
+
+    /// Human-readable codec name for display (e.g. `scx info`). The single
+    /// source of truth for codec id → name rendering.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            CodecId::None => "none",
+            CodecId::Scx1 => "scx1",
+            CodecId::Zstd => "zstd",
+            CodecId::Lz4Shuffle => "lz4+shuffle",
+            CodecId::Pcodec => "pcodec",
+        }
+    }
 }
 
 /// Caller-supplied codec choice for write operations that emit shards.
@@ -1382,5 +1413,34 @@ mod tests {
         let result = zstd_decode_bounded(&compressed, 1000);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn test_codec_id_parse_cli() {
+        assert_eq!(CodecId::parse_cli("auto").unwrap(), None);
+        assert_eq!(CodecId::parse_cli("none").unwrap(), Some(CodecId::None));
+        assert_eq!(CodecId::parse_cli("scx1").unwrap(), Some(CodecId::Scx1));
+        assert_eq!(CodecId::parse_cli("zstd").unwrap(), Some(CodecId::Zstd));
+        assert_eq!(
+            CodecId::parse_cli("lz4").unwrap(),
+            Some(CodecId::Lz4Shuffle)
+        );
+        assert_eq!(CodecId::parse_cli("pcodec").unwrap(), Some(CodecId::Pcodec));
+        assert!(CodecId::parse_cli("gzip").is_err());
+    }
+
+    #[test]
+    fn test_codec_id_display_name() {
+        assert_eq!(CodecId::None.display_name(), "none");
+        assert_eq!(CodecId::Scx1.display_name(), "scx1");
+        assert_eq!(CodecId::Zstd.display_name(), "zstd");
+        assert_eq!(CodecId::Lz4Shuffle.display_name(), "lz4+shuffle");
+        assert_eq!(CodecId::Pcodec.display_name(), "pcodec");
+        // Every explicit CLI codec parses back to a value whose display name
+        // is stable (round-trip guard so the two maps can't drift).
+        for s in ["none", "scx1", "zstd", "pcodec"] {
+            let c = CodecId::parse_cli(s).unwrap().unwrap();
+            assert_eq!(c.display_name(), s);
+        }
     }
 }

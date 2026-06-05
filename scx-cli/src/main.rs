@@ -9,6 +9,7 @@ mod compact;
 mod index_warnings;
 use scx_convert as convert;
 mod delete;
+mod format;
 mod info;
 mod merge;
 mod query;
@@ -1072,21 +1073,7 @@ fn dispatch_convert(
     use scx_codec::CodecId;
     let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
-    let explicit_codec = match codec {
-        "auto" => None,
-        "none" => Some(CodecId::None),
-        "scx1" => Some(CodecId::Scx1),
-        "zstd" => Some(CodecId::Zstd),
-        "lz4" => Some(CodecId::Lz4Shuffle),
-        "pcodec" => Some(CodecId::Pcodec),
-        other => {
-            return Err(format!(
-                "Unknown codec: '{}'. Use auto, none, scx1, zstd, lz4, or pcodec.",
-                other
-            )
-            .into())
-        }
-    };
+    let explicit_codec = CodecId::parse_cli(codec)?;
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,

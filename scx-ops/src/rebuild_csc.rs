@@ -26,14 +26,20 @@ pub fn rebuild_csc_inplace(
     tmp_name.push(".rebuild_csc.tmp");
     let tmp_path = target.with_file_name(tmp_name);
 
-    if tmp_path.exists() {
-        std::fs::remove_file(&tmp_path)?;
+    // `run_build_csc` reads `target` and writes the CSR + new CSC sidecar into
+    // `tmp_path` (via its own temp→fsync→rename, overwriting any stale temp),
+    // then we swap into place. OE7: a cleanup guard removes the partial temp on
+    // any failure so a failed rebuild never leaks a stray `*.rebuild_csc.tmp`;
+    // this also drops the previous `exists()`-then-`remove_file` TOCTOU.
+    let build_and_swap = || -> Result<(), Box<dyn std::error::Error>> {
+        build_csc::run_build_csc(target, &tmp_path, memory_limit, false, csc_cols_per_shard)?;
+        std::fs::rename(&tmp_path, target)?;
+        Ok(())
+    };
+    if let Err(e) = build_and_swap() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
-
-    // `run_build_csc` reads `target`, writes the CSR + new CSC sidecar
-    // into `tmp_path`. Then we swap into place.
-    build_csc::run_build_csc(target, &tmp_path, memory_limit, false, csc_cols_per_shard)?;
-    std::fs::rename(&tmp_path, target)?;
 
     log::info!(
         "rebuild-csc: restored CSC sidecar on {target}",

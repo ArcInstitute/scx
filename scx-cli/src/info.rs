@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 
+use crate::format::human_size;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::catalog::FullCatalog;
 use scx_format::modality::ModalityType;
@@ -31,14 +32,7 @@ pub fn run_info(
     );
 
     // Codec name
-    let codec_name = match CodecId::from_u8(header.codec_id) {
-        Some(CodecId::None) => "none",
-        Some(CodecId::Scx1) => "scx1",
-        Some(CodecId::Zstd) => "zstd",
-        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
-        Some(CodecId::Pcodec) => "pcodec",
-        None => "unknown",
-    };
+    let codec_name = codec_id_name(header.codec_id);
 
     // Index dtype
     let index_dtype = match header.index_dtype {
@@ -278,14 +272,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
     let catalog = reader.catalog();
     let file_size = std::fs::metadata(path)?.len();
 
-    let codec_name = match CodecId::from_u8(header.codec_id) {
-        Some(CodecId::None) => "none",
-        Some(CodecId::Scx1) => "scx1",
-        Some(CodecId::Zstd) => "zstd",
-        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
-        Some(CodecId::Pcodec) => "pcodec",
-        None => "unknown",
-    };
+    let codec_name = codec_id_name(header.codec_id);
 
     let mut sections = Vec::new();
     for entry in &catalog.entries {
@@ -603,14 +590,9 @@ fn modality_type_name(t: ModalityType) -> &'static str {
 }
 
 fn codec_id_name(id: u8) -> &'static str {
-    match CodecId::from_u8(id) {
-        Some(CodecId::None) => "none",
-        Some(CodecId::Scx1) => "scx1",
-        Some(CodecId::Zstd) => "zstd",
-        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
-        Some(CodecId::Pcodec) => "pcodec",
-        None => "unknown",
-    }
+    CodecId::from_u8(id)
+        .map(|c| c.display_name())
+        .unwrap_or("unknown")
 }
 
 fn fmt_num(n: u64) -> String {
@@ -623,22 +605,6 @@ fn fmt_num(n: u64) -> String {
         result.push(ch);
     }
     result.chars().rev().collect()
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 #[cfg(test)]

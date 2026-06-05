@@ -240,10 +240,9 @@ pub async fn io_stage(
                 });
             }
 
-            let profile_inner = std::env::var("SCX_LOADER_PROFILE")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false);
-            if profile_inner {
+            // `profile` (read once via `profiling_enabled()` at pipeline scope)
+            // is captured by copy into this `move` closure — no per-group env read.
+            if profile {
                 let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
                 eprintln!(
                     "[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)",

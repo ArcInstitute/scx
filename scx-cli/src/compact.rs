@@ -5,6 +5,7 @@ use std::path::Path;
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_engine::ConversionPredicateIndexOptions;
 
+use crate::format::human_size;
 use crate::index_warnings::emit_index_summary;
 
 #[allow(clippy::too_many_arguments)]
@@ -120,20 +121,4 @@ pub fn run_compact(
     }
 
     Ok(())
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }
