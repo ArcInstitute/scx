@@ -272,14 +272,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
     let catalog = reader.catalog();
     let file_size = std::fs::metadata(path)?.len();
 
-    let codec_name = match CodecId::from_u8(header.codec_id) {
-        Some(CodecId::None) => "none",
-        Some(CodecId::Scx1) => "scx1",
-        Some(CodecId::Zstd) => "zstd",
-        Some(CodecId::Lz4Shuffle) => "lz4+shuffle",
-        Some(CodecId::Pcodec) => "pcodec",
-        None => "unknown",
-    };
+    let codec_name = codec_id_name(header.codec_id);
 
     let mut sections = Vec::new();
     for entry in &catalog.entries {
