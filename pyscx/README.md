@@ -88,9 +88,11 @@ Always use the shared `uv` venv at `../.venv/` — do not mix in system
 `pip`. See [docs/development.md](../docs/development.md) for the full
 build matrix (CPU-only, HDF5, cloud, GPU, Python, R).
 
-**Wheels** (when published) ship the `hdf5-static` feature so libhdf5 is
-bundled — no system library required. The `cloud` and `gpu` extras
-remain opt-in (`pip install 'pyscx[cloud,gpu]'`).
+**Pre-built wheels** (published to [GitHub Releases](https://github.com/ArcInstitute/scx/releases))
+ship the `hdf5-static` feature so libhdf5 is bundled — no system library
+required. The `cloud` and `gpu` extras remain opt-in — attach them to the
+resolved wheel filename (`pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"`; a
+quoted `*` glob reaches pip verbatim and fails).
 
 ### Feature flags
 

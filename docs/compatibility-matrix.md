@@ -11,7 +11,7 @@ For native-side build flags (CPU / cloud / GPU / HDF5) see
 
 ## Supported version bounds (declared in `pyproject.toml`)
 
-These bounds are what `pip install pyscx` will resolve against. The
+These bounds are what installing the pre-built pyscx wheel will resolve against. The
 upper caps reflect the last release that has been smoke-tested locally;
 the lower caps reflect the oldest version we are willing to support.
 

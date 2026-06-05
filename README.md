@@ -37,7 +37,7 @@ loaders. Start at [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md); deep
 reference lives alongside it (`reference/installation.md`, `conversion.md`,
 `processing.md`, `ml-loading.md`).
 
-Helpful when Claude Code is helping you **install pyscx** (PyPI vs source builds,
+Helpful when Claude Code is helping you **install pyscx** (GitHub Release wheels vs source builds,
 optional extras, common rpath/HDF5/GPU failures) or **write usage code** without
 guessing API shapes and gotchas.
 
@@ -566,7 +566,7 @@ pyscx.accel.pca(adata, n_comps=50, device="gpu")
 
 See [`docs/gpu-setup.md`](docs/gpu-setup.md) for troubleshooting, SLURM
 configuration, and driver compatibility details. For install pitfalls and
-PyPI-vs-source guidance aimed at agents, see
+GitHub-Release-wheel-vs-source guidance aimed at agents, see
 [`skills/scx-usage/reference/installation.md`](skills/scx-usage/reference/installation.md).
 
 ### Rust CLI

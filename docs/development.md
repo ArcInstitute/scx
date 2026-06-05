@@ -251,7 +251,7 @@ compiles without CUDA installed. This ensures that:
 
 All feature flags are opt-in, with one exception: `pyscx/hdf5` is in the
 default `[tool.maturin] features` set so a bare `maturin develop`
-matches the published PyPI wheel. Opt out with
+matches the published pre-built wheel. Opt out with
 `maturin develop --no-default-features --features pyo3/extension-module`.
 
 | Crate | Feature | What it enables |

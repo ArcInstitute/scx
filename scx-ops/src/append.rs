@@ -1373,6 +1373,22 @@ fn finalize_append(
         } else {
             Vec::new()
         };
+        // Stamp the convert-on-append payload shape so downstream tools can
+        // tell that obs is now sharded. Append doesn't expose the merge-side
+        // policy switches (var identity, uns policy) — there's only one input,
+        // so they have no meaning here. Record the actually-indexed columns
+        // (mirrors the convert/merge/compact paths) for the audit trail.
+        let mut params = serde_json::json!({
+            "n_new_rows": n_new_rows,
+            "obs_layout": "ObsMetadataShard",
+        });
+        if let Some(ref result) = index_result {
+            params["predicate_index"] = serde_json::json!({
+                "obs_columns": result.obs_indexed_columns,
+                "var_columns": result.var_indexed_columns,
+                "preset": index_options.index_preset,
+            });
+        }
         entries.push(ProvenanceEntry {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1380,14 +1396,7 @@ fn finalize_append(
                 .as_secs() as i64,
             action: "append".to_string(),
             tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-            // Stamp the convert-on-append payload shape so downstream
-            // tools can tell that obs is now sharded. Append doesn't
-            // expose the merge-side policy switches (var identity,
-            // uns policy) — there's only one input, so they have no
-            // meaning here.
-            params_json: format!(
-                "{{\"n_new_rows\":{n_new_rows},\"obs_layout\":\"ObsMetadataShard\"}}",
-            ),
+            params_json: params.to_string(),
             input_checksums: vec![],
         });
         entries

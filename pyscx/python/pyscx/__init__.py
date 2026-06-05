@@ -79,7 +79,7 @@ def _require_hdf5(fn_name):
         raise NotImplementedError(
             f"pyscx.{fn_name} requires the `hdf5` feature; rebuild via "
             "`cd pyscx && maturin develop --features hdf5` or install "
-            "the prebuilt wheel from PyPI (bundles libhdf5)."
+            "the prebuilt wheel from GitHub Releases (bundles libhdf5)."
         )
 
 

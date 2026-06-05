@@ -544,6 +544,24 @@ pub fn merge_with_options(
             all_prov_entries.extend(prov.operations);
         }
     }
+    // Record the actually-indexed columns in provenance (mirrors the convert
+    // path at `scx-convert/src/pipeline.rs`) so the merge record carries an
+    // audit trail of which predicate indexes were rebuilt — closes the
+    // "NO index field in params_json" gap reported against atlas merges.
+    let mut params = serde_json::json!({
+        "n_inputs": input_paths.len(),
+        "assume_identical_var": options.assume_identical_var,
+        "assume_identical_obs": options.assume_identical_obs,
+        "uns_policy": options.uns_policy.as_str(),
+        "uns_conflicts_warned": uns_conflicts_warned,
+    });
+    if let Some(ref result) = index_result {
+        params["predicate_index"] = serde_json::json!({
+            "obs_columns": result.obs_indexed_columns,
+            "var_columns": result.var_indexed_columns,
+            "preset": options.index_options.index_preset,
+        });
+    }
     all_prov_entries.push(ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -551,15 +569,7 @@ pub fn merge_with_options(
             .as_secs() as i64,
         action: "merge".to_string(),
         tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
-        params_json: format!(
-            "{{\"n_inputs\":{},\"assume_identical_var\":{},\"assume_identical_obs\":{},\
-             \"uns_policy\":\"{}\",\"uns_conflicts_warned\":{}}}",
-            input_paths.len(),
-            options.assume_identical_var,
-            options.assume_identical_obs,
-            options.uns_policy.as_str(),
-            uns_conflicts_warned,
-        ),
+        params_json: params.to_string(),
         input_checksums: readers
             .iter()
             .map(|r| {
