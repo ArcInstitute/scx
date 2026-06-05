@@ -689,10 +689,7 @@ fn write_one_shard_to_prealloc(
 ///   the encoded shard size, which is ≤ the decoded payload).
 fn per_shard_export_bytes(stats: &ShardStats) -> u64 {
     let n_rows = stats.row_end.saturating_sub(stats.row_start);
-    let payload = stats.nnz.saturating_mul(8);
-    let indptr = n_rows.saturating_add(1).saturating_mul(8);
-    let scratch = payload;
-    payload.saturating_add(indptr).saturating_add(scratch)
+    crate::stream::shard_working_set_bytes(stats.nnz, n_rows)
 }
 
 /// Test seam — exposes the per-shard export budget estimate so the

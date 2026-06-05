@@ -1473,39 +1473,45 @@ fn append_shard_to_column(
             ..
         } => {
             let (local_codes, local_values) = dict_local_codes_and_string_values(array, name)?;
-            // Build local→global remap (extends `dict` / `cat_order`
-            // for any value not seen before).
-            let mut remap: Vec<i32> = Vec::with_capacity(local_values.len());
-            for v in local_values {
-                let g = match dict.get(&v) {
-                    Some(&g) => g,
+            // C10: intern only the dictionary values actually referenced by
+            // `kept_local` rows, so categories present only in
+            // deletion-dropped rows don't enter the global vocabulary. The
+            // local→global map is filled lazily as kept codes are visited.
+            let mut local_to_global: Vec<Option<i32>> = vec![None; local_values.len()];
+            let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
+            for &i in kept_local {
+                let lc = local_codes[i];
+                if lc < 0 {
+                    kept_codes.push(-1);
+                    continue;
+                }
+                let lc_idx = lc as usize;
+                let g = match local_to_global[lc_idx] {
+                    Some(g) => g,
                     None => {
-                        // Cap at i32::MAX. Practical categorical
-                        // cardinalities (cell_type, donor_id) stay
-                        // well below this; saturating is defensive.
-                        let g: i32 = cat_order.len().try_into().map_err(|_| {
-                            ConvertError::Other(format!(
-                                "column '{name}': categorical cardinality exceeds i32::MAX"
-                            ))
-                        })?;
-                        dict.insert(v.clone(), g);
-                        cat_order.push(v);
+                        let v = &local_values[lc_idx];
+                        let g = match dict.get(v) {
+                            Some(&g) => g,
+                            None => {
+                                // Cap at i32::MAX. Practical categorical
+                                // cardinalities (cell_type, donor_id) stay
+                                // well below this; saturating is defensive.
+                                let g: i32 = cat_order.len().try_into().map_err(|_| {
+                                    ConvertError::Other(format!(
+                                        "column '{name}': categorical cardinality exceeds i32::MAX"
+                                    ))
+                                })?;
+                                dict.insert(v.clone(), g);
+                                cat_order.push(v.clone());
+                                g
+                            }
+                        };
+                        local_to_global[lc_idx] = Some(g);
                         g
                     }
                 };
-                remap.push(g);
+                kept_codes.push(g);
             }
-            let kept_codes: Vec<i32> = kept_local
-                .iter()
-                .map(|&i| {
-                    let lc = local_codes[i];
-                    if lc < 0 {
-                        -1
-                    } else {
-                        remap[lc as usize]
-                    }
-                })
-                .collect();
             codes_ds.write_slice(
                 ArrayView1::from(kept_codes.as_slice()),
                 ndarray::s![*offset..*offset + kept_codes.len()],
@@ -1750,11 +1756,27 @@ fn write_uns_value(
                 .write_scalar(b)?;
         }
         serde_json::Value::Array(arr) => {
-            // Try as array of numbers
-            if arr.iter().all(|v| v.is_i64()) {
+            // 2-D numeric arrays (e.g. color/contrast matrices) — mirror the
+            // nested-JSON shape produced by `read_uns_entry`'s 2-D arm so they
+            // round-trip rather than being silently dropped. Ragged / empty /
+            // non-numeric nested arrays fall through to the no-op skip (a true
+            // HDF5 round-trip is always rectangular, so ragged only arises from
+            // synthetic JSON).
+            if !arr.is_empty() && arr.iter().all(|v| v.is_array()) {
+                write_uns_2d_array(group, name, arr)?;
+            } else if arr.iter().all(|v| v.is_i64()) {
                 let data: Vec<i64> = arr.iter().filter_map(|v| v.as_i64()).collect();
                 group
                     .new_dataset::<i64>()
+                    .shape([data.len()])
+                    .create(name)?
+                    .write(&data)?;
+            } else if !arr.is_empty() && arr.iter().all(|v| v.is_u64()) {
+                // Unsigned values above i64::MAX (C3): keep them exact instead
+                // of coercing to f64 via the `is_number` arm below.
+                let data: Vec<u64> = arr.iter().filter_map(|v| v.as_u64()).collect();
+                group
+                    .new_dataset::<u64>()
                     .shape([data.len()])
                     .create(name)?
                     .write(&data)?;
@@ -1762,6 +1784,15 @@ fn write_uns_value(
                 let data: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                 group
                     .new_dataset::<f64>()
+                    .shape([data.len()])
+                    .create(name)?
+                    .write(&data)?;
+            } else if !arr.is_empty() && arr.iter().all(|v| v.is_boolean()) {
+                // 1-D boolean (C3): the scalar bool arm above confirms the
+                // `bool` H5Type; without this arm bool vectors are dropped.
+                let data: Vec<bool> = arr.iter().filter_map(|v| v.as_bool()).collect();
+                group
+                    .new_dataset::<bool>()
                     .shape([data.len()])
                     .create(name)?
                     .write(&data)?;
@@ -1781,5 +1812,64 @@ fn write_uns_value(
         }
         serde_json::Value::Null => {}
     }
+    Ok(())
+}
+
+/// Write a 2-D numeric `uns` array (nested JSON `[[..],[..]]`) as a rectangular
+/// HDF5 dataset, mirroring the dtype set of `read_uns_entry`'s 2-D arm
+/// (Integer/Unsigned/Float/Boolean). Ragged, empty, or non-numeric inputs are
+/// skipped (no-op) rather than errored, matching the lenient behavior of the
+/// surrounding scalar/1-D arms. The caller guarantees every element is an array.
+fn write_uns_2d_array(
+    group: &hdf5::Group,
+    name: &str,
+    arr: &[serde_json::Value],
+) -> Result<(), ConvertError> {
+    let rows: Vec<&Vec<serde_json::Value>> = arr.iter().filter_map(|v| v.as_array()).collect();
+    let n_rows = rows.len();
+    let n_cols = rows[0].len();
+    // Rectangular and non-degenerate, else skip.
+    if n_cols == 0 || rows.iter().any(|r| r.len() != n_cols) {
+        return Ok(());
+    }
+    let cells = || rows.iter().flat_map(|r| r.iter());
+
+    // Detect element dtype over all cells, mirroring the read-path ordering:
+    // i64 first (catches negatives + small ints), then u64 (large unsigned),
+    // then f64, then bool. Anything else (mixed / non-numeric) is skipped.
+    if cells().all(|v| v.is_i64()) {
+        let flat: Vec<i64> = cells().filter_map(|v| v.as_i64()).collect();
+        write_2d_dataset::<i64>(group, name, n_rows, n_cols, flat)
+    } else if cells().all(|v| v.is_u64()) {
+        let flat: Vec<u64> = cells().filter_map(|v| v.as_u64()).collect();
+        write_2d_dataset::<u64>(group, name, n_rows, n_cols, flat)
+    } else if cells().all(|v| v.is_number()) {
+        let flat: Vec<f64> = cells().filter_map(|v| v.as_f64()).collect();
+        write_2d_dataset::<f64>(group, name, n_rows, n_cols, flat)
+    } else if cells().all(|v| v.is_boolean()) {
+        let flat: Vec<bool> = cells().filter_map(|v| v.as_bool()).collect();
+        write_2d_dataset::<bool>(group, name, n_rows, n_cols, flat)
+    } else {
+        Ok(())
+    }
+}
+
+/// Create and write a rectangular `n_rows × n_cols` HDF5 dataset from a
+/// row-major flattened buffer. Shared by the `write_uns_2d_array` type arms;
+/// mirrors the `ndarray::Array2::from_shape_vec` idiom in `write_obsm_entry`.
+fn write_2d_dataset<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    n_rows: usize,
+    n_cols: usize,
+    flat: Vec<T>,
+) -> Result<(), ConvertError> {
+    let nd = ndarray::Array2::from_shape_vec((n_rows, n_cols), flat)
+        .map_err(|e| ConvertError::Other(format!("ndarray shape error: {e}")))?;
+    group
+        .new_dataset::<T>()
+        .shape([n_rows, n_cols])
+        .create(name)?
+        .write(&nd)?;
     Ok(())
 }

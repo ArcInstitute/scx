@@ -139,7 +139,10 @@ pub fn streaming_csr_to_csc(
 
     let mut col_start = 0usize;
     while col_start < n_cols {
-        let col_end = (col_start + chunk_cols).min(n_cols);
+        // CLI9: saturating add — `chunk_cols` is `usize::MAX` (the "all
+        // columns in one pass" sentinel) for the empty / unbounded case, so a
+        // plain `col_start + chunk_cols` would overflow-panic in debug.
+        let col_end = col_start.saturating_add(chunk_cols).min(n_cols);
         let chunk_n_cols = col_end - col_start;
 
         let chunk = transpose_column_chunk(shards, n_rows_total, col_start, col_end);
@@ -226,7 +229,8 @@ impl<'a> Iterator for CscShardIterator<'a> {
         }
 
         let col_start = self.current_col;
-        let col_end = (col_start + self.chunk_cols).min(self.n_cols);
+        // CLI9: saturating add against the `usize::MAX` chunk_cols sentinel.
+        let col_end = col_start.saturating_add(self.chunk_cols).min(self.n_cols);
 
         let chunk = transpose_column_chunk(self.shards, self.n_rows_total, col_start, col_end);
         self.current_col = col_end;
@@ -544,6 +548,36 @@ mod tests {
         let shard_b = dense_to_csr(&[1.0, 2.0, 3.0], 1, 3);
         let err = streaming_csr_to_csc(&[shard_a, shard_b], 2, 2, 1_000_000).unwrap_err();
         assert!(matches!(err, TransposeError::ShapeMismatch { .. }));
+    }
+
+    // CLI9: an empty matrix (0 rows) makes compute_chunk_cols return the
+    // usize::MAX "all columns" sentinel; the col_end computation must not
+    // overflow-panic. Transposing a 0×3 matrix yields an empty CSC.
+    #[test]
+    fn test_transpose_empty_matrix_no_overflow() {
+        let csc = streaming_csr_to_csc(&[], 0, 3, 1_000_000).unwrap();
+        assert_eq!(csc.indptr, vec![0i64; 4]);
+        assert!(csc.indices.is_empty());
+        assert!(csc.data.is_empty());
+    }
+
+    // CLI9: a memory budget that admits exactly one column per pass still
+    // transposes correctly (multiple single-column passes).
+    #[test]
+    fn test_transpose_single_column_budget() {
+        // 2×3 matrix; 2 rows × 12 = 24 bytes/col → budget 24 → 1 col/pass.
+        let shard = dense_to_csr(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0], 2, 3);
+        let csc = streaming_csr_to_csc(&[shard], 2, 3, 24).unwrap();
+        let reference = streaming_csr_to_csc(
+            &[dense_to_csr(&[1.0, 0.0, 2.0, 0.0, 3.0, 0.0], 2, 3)],
+            2,
+            3,
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(csc.indptr, reference.indptr);
+        assert_eq!(csc.indices, reference.indices);
+        assert_eq!(csc.data, reference.data);
     }
 
     #[test]

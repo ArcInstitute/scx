@@ -21,6 +21,7 @@ pub fn run_subset(
     codec: &str,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Pure modality extraction (no filter / no genes). The output is a
     // single-modality v2 file containing just the chosen modality's
@@ -51,6 +52,7 @@ pub fn run_subset(
             codec,
             rebuild_csc,
             csc_cols_per_shard,
+            csc_memory_limit,
         );
     }
 
@@ -177,10 +179,7 @@ pub fn run_subset(
 
     // Re-emit the CSC sidecar against the projected output.
     if rebuild_csc {
-        // Fixed 4 GiB transpose memory budget for the post-op CSC rebuild;
-        // not overridable here. `scx build-csc --memory-limit` is the
-        // configurable counterpart.
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
@@ -521,6 +520,7 @@ fn extract_modality_with_filter(
     codec: &str,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
 
@@ -742,10 +742,7 @@ fn extract_modality_with_filter(
     println!("Wrote {}", output.display());
 
     if rebuild_csc {
-        // Fixed 4 GiB transpose memory budget for the post-op CSC rebuild;
-        // not overridable here. `scx build-csc --memory-limit` is the
-        // configurable counterpart.
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
     Ok(())
@@ -895,6 +892,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -923,6 +921,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -951,6 +950,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -977,6 +977,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
         // Should succeed without writing any file
@@ -999,6 +1000,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1022,6 +1024,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1047,6 +1050,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -1073,6 +1077,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
@@ -1138,6 +1143,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -1312,6 +1318,7 @@ mod tests {
             "none",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -1343,6 +1350,7 @@ mod tests {
             "none",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -1377,6 +1385,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .unwrap();
 
@@ -1503,6 +1512,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .expect("subset must succeed (pre-fix this returned `out of range for uint16`)");
 
@@ -1548,6 +1558,7 @@ mod tests {
             "auto",
             false,
             5000,
+            "4G",
         )
         .expect("0-row subset must not panic or error");
 

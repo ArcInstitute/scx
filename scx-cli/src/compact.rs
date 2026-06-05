@@ -15,6 +15,7 @@ pub fn run_compact(
     force: bool,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
@@ -113,10 +114,7 @@ pub fn run_compact(
 
     // Re-emit the CSC sidecar against the compacted output.
     if rebuild_csc {
-        // Fixed 4 GiB transpose memory budget for the post-op CSC rebuild;
-        // not overridable here. `scx build-csc --memory-limit` is the
-        // configurable counterpart.
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

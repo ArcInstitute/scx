@@ -183,6 +183,19 @@ fn parse_mtx_file(
         )));
     }
 
+    // CLI7: the optional 5th token is the symmetry qualifier
+    // (general | symmetric | skew-symmetric | hermitian). Only `general`
+    // stores every entry; for the others the reader would silently load
+    // just the stored triangle. Reject non-`general` rather than misread.
+    if let Some(&symmetry) = tokens.get(4) {
+        if symmetry != "general" {
+            return Err(MtxError::Parse(format!(
+                "MTX symmetry '{symmetry}' is not supported (only 'general'); \
+                 a {symmetry} matrix stores only one triangle"
+            )));
+        }
+    }
+
     // Skip comment lines (start with %)
     let mut size_line = String::new();
     for line_result in lines.by_ref() {
@@ -417,6 +430,24 @@ mod tests {
         assert_eq!(indptr, vec![0, 2, 2]);
         assert_eq!(indices, vec![0, 1]);
         assert_eq!(data, vec![3.0, 5.0]);
+    }
+
+    // CLI7: a non-`general` symmetry qualifier must be rejected rather than
+    // silently read as if only the stored triangle existed.
+    #[test]
+    fn test_parse_mtx_rejects_symmetric() {
+        let mtx_content = "\
+%%MatrixMarket matrix coordinate real symmetric
+2 2 1
+1 1 1.0
+";
+        let bound = mtx_content.len();
+        let reader: Box<dyn BufRead> = Box::new(BufReader::new(Cursor::new(mtx_content)));
+        let err = parse_mtx_file(reader, bound).unwrap_err();
+        assert!(
+            matches!(err, MtxError::Parse(ref m) if m.contains("symmetric")),
+            "expected symmetry rejection, got: {err:?}"
+        );
     }
 
     #[test]

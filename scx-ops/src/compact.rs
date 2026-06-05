@@ -548,6 +548,39 @@ fn obsp_coords_as_i64(batch: &arrow::array::RecordBatch, name: &str) -> Result<V
     }
 }
 
+/// Flexible accessor for an obsp/varp COO `data` column. Mirrors
+/// [`obsp_coords_as_i64`] for the value array: accepts both `Float32` and
+/// `Float64` (legal in AnnData — e.g. `Float64` distance matrices) and
+/// preserves null slots. Returns the per-row values (`None` = null), the
+/// source `DataType`, and the field's nullability so the output can be
+/// rebuilt without losing dtype or nullability.
+#[allow(clippy::type_complexity)]
+fn obsp_data_as_f64(
+    batch: &arrow::array::RecordBatch,
+) -> Result<(Vec<Option<f64>>, arrow::datatypes::DataType, bool)> {
+    use arrow::array::{Array, Float32Array, Float64Array};
+    let idx = batch.schema().index_of("data").map_err(|_| {
+        crate::error::OpsError::InvalidInput("obsp COO column `data` is missing".to_string())
+    })?;
+    let nullable = batch.schema().field(idx).is_nullable();
+    let col = batch.column(idx);
+    if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+        let v = (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i) as f64))
+            .collect();
+        Ok((v, arrow::datatypes::DataType::Float32, nullable))
+    } else if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        let v = (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+            .collect();
+        Ok((v, arrow::datatypes::DataType::Float64, nullable))
+    } else {
+        Err(crate::error::OpsError::InvalidInput(
+            "obsp COO column `data` is neither Float32 nor Float64".to_string(),
+        ))
+    }
+}
+
 /// Remap an obsp COO `RecordBatch` (obs×obs) through the obs keep-mask.
 ///
 /// Drops entries whose `row` OR `col` references a deleted obs and renumbers
@@ -562,7 +595,7 @@ fn filter_obsp_coo(
     batch: &arrow::array::RecordBatch,
     keep_mask: &[bool],
 ) -> Result<arrow::array::RecordBatch> {
-    use arrow::array::{Float32Array, Int32Array, Int64Array};
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field};
 
     // old obs index -> new obs index (or -1 if the obs was deleted).
@@ -578,18 +611,11 @@ fn filter_obsp_coo(
 
     let rows = obsp_coords_as_i64(batch, "row")?;
     let cols = obsp_coords_as_i64(batch, "col")?;
-    let data = batch
-        .column_by_name("data")
-        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
-        .ok_or_else(|| {
-            crate::error::OpsError::InvalidInput(
-                "obsp COO column `data` is missing or not Float32".to_string(),
-            )
-        })?;
+    let (data, data_type, data_nullable) = obsp_data_as_f64(batch)?;
 
     let mut out_rows: Vec<i64> = Vec::new();
     let mut out_cols: Vec<i64> = Vec::new();
-    let mut out_data: Vec<f32> = Vec::new();
+    let mut out_data: Vec<Option<f64>> = Vec::new();
     for i in 0..batch.num_rows() {
         let r = usize::try_from(rows[i]).ok();
         let c = usize::try_from(cols[i]).ok();
@@ -602,8 +628,19 @@ fn filter_obsp_coo(
         };
         out_rows.push(nr);
         out_cols.push(nc);
-        out_data.push(data.value(i));
+        out_data.push(data[i]);
     }
+
+    // Preserve the input `data` dtype (Float32/Float64) and nullability.
+    let data_arr: std::sync::Arc<dyn arrow::array::Array> = match data_type {
+        DataType::Float64 => std::sync::Arc::new(Float64Array::from(out_data)),
+        _ => std::sync::Arc::new(Float32Array::from(
+            out_data
+                .into_iter()
+                .map(|v| v.map(|x| x as f32))
+                .collect::<Vec<Option<f32>>>(),
+        )),
+    };
 
     // Choose the output coordinate width from the compacted dimension: keep
     // Int64 when the surviving axis still exceeds i32::MAX, otherwise narrow
@@ -642,17 +679,13 @@ fn filter_obsp_coo(
         vec![
             Field::new("row", coord_type.clone(), false),
             Field::new("col", coord_type, false),
-            Field::new("data", DataType::Float32, false),
+            Field::new("data", data_type, data_nullable),
         ],
         metadata,
     ));
     Ok(arrow::array::RecordBatch::try_new(
         schema,
-        vec![
-            row_arr,
-            col_arr,
-            std::sync::Arc::new(Float32Array::from(out_data)),
-        ],
+        vec![row_arr, col_arr, data_arr],
     )?)
 }
 

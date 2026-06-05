@@ -1519,8 +1519,19 @@ fn read_uns_entry(
                     let data: Vec<i64> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
                 }
+                // C3: anndata stores uint/bool uns vectors too — the scalar arm
+                // already handles these types, so the 1-D arm must as well or
+                // they get dropped (lenient) / abort (strict_uns).
+                TypeDescriptor::Unsigned(_) => {
+                    let data: Vec<u64> = ds.read_1d()?.to_vec();
+                    Ok(serde_json::json!(data))
+                }
                 TypeDescriptor::Float(_) => {
                     let data: Vec<f64> = ds.read_1d()?.to_vec();
+                    Ok(serde_json::json!(data))
+                }
+                TypeDescriptor::Boolean => {
+                    let data: Vec<bool> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
                 }
                 TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii => {
@@ -1530,6 +1541,52 @@ fn read_uns_entry(
                 }
                 _ => Err(ConvertError::Other(format!(
                     "unsupported uns array type: {desc:?}"
+                ))),
+            };
+        }
+
+        // C4: 2-D numeric arrays (e.g. color/contrast matrices) round-trip as
+        // nested JSON arrays. Higher ranks and non-numeric 2-D arrays fall
+        // through to the error → skip/warn (lenient) or abort (strict_uns) path.
+        if shape.len() == 2 {
+            // Row-major nested JSON arrays (`[[..], [..]]`). Built from the
+            // concrete element type so `serde_json::json!` resolves Serialize
+            // through serde_json itself (scx-convert has no direct `serde` dep).
+            return match desc {
+                TypeDescriptor::Integer(_) => {
+                    let rows: Vec<Vec<i64>> = ds
+                        .read_2d::<i64>()?
+                        .outer_iter()
+                        .map(|r| r.to_vec())
+                        .collect();
+                    Ok(serde_json::json!(rows))
+                }
+                TypeDescriptor::Unsigned(_) => {
+                    let rows: Vec<Vec<u64>> = ds
+                        .read_2d::<u64>()?
+                        .outer_iter()
+                        .map(|r| r.to_vec())
+                        .collect();
+                    Ok(serde_json::json!(rows))
+                }
+                TypeDescriptor::Float(_) => {
+                    let rows: Vec<Vec<f64>> = ds
+                        .read_2d::<f64>()?
+                        .outer_iter()
+                        .map(|r| r.to_vec())
+                        .collect();
+                    Ok(serde_json::json!(rows))
+                }
+                TypeDescriptor::Boolean => {
+                    let rows: Vec<Vec<bool>> = ds
+                        .read_2d::<bool>()?
+                        .outer_iter()
+                        .map(|r| r.to_vec())
+                        .collect();
+                    Ok(serde_json::json!(rows))
+                }
+                _ => Err(ConvertError::Other(format!(
+                    "unsupported 2-D uns array type: {desc:?}"
                 ))),
             };
         }
