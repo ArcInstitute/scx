@@ -291,6 +291,15 @@ shard's worth of metadata during the merge/append/ingest hot path and
 avoids Arrow IPC's 2 GB narrow-offset ceiling for string columns at atlas
 scale.
 
+Obs/var **metadata** sharding is decided independently of X sharding and
+applies only to the paths listed above. The streaming h5ad / MTX convert
+path — `pyscx.from_h5ad`, `pyscx.from_mtx`, and `scx convert` — always
+writes a single-section `obs_metadata` / `var_metadata`, regardless of
+`n_obs` (the X matrix is still row-sharded at `shard_target_rows`). To
+obtain sharded metadata from an h5ad source, either ingest with
+`pyscx.from_anndata`, or migrate an existing single-section file with
+`pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`).
+
 Each shard covers rows `[row_start, row_start + n_shard_rows)` of the
 logical metadata table and carries schema metadata (`shard_idx`,
 `row_start`, `n_shard_rows`, `n_rows_total`). Readers reassemble shards
