@@ -851,7 +851,7 @@ impl ScxLazyTransformedDataset {
         // Try to express as a lazy RowScale (multiply by per-row factor).
         // This intercepts scanpy's axis_mul_or_truediv path.
         if let Some(row_factors) =
-            crate::backed::try_extract_row_factors(py, other, self.shape_val.0)?
+            crate::backed::try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
         {
             let global_factors = crate::backed::expand_to_global(
                 row_factors,
@@ -889,7 +889,7 @@ impl ScxLazyTransformedDataset {
         // Try to express as a lazy RowScale (multiply by 1/factor).
         // This intercepts scanpy's axis_mul_or_truediv path.
         if let Some(row_factors) =
-            crate::backed::try_extract_row_factors(py, other, self.shape_val.0)?
+            crate::backed::try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
         {
             // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
             // 0 drops the row to empty) — this matches scanpy `normalize_total`,

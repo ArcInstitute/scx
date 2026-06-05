@@ -65,6 +65,19 @@ def test_obsm_none_loads_all(multi_obsm_scx):
     assert set(out.obsm.keys()) == {"X_pca", "X_umap"}
 
 
+def test_obsm_preserves_float32_dtype(multi_obsm_scx):
+    """B4: dense f32 obsm round-trips as float32 (the old pandas .values path
+    could upcast to float64), built directly from the Arrow float columns."""
+    import pyscx
+
+    path, adata = multi_obsm_scx
+    out = pyscx.open(path).to_anndata()
+    for key in ("X_pca", "X_umap"):
+        arr = np.asarray(out.obsm[key])
+        assert arr.dtype == np.float32, f"{key}: {arr.dtype}"
+        np.testing.assert_array_equal(arr, adata.obsm[key])
+
+
 def test_obsm_selective_loads_only_listed(multi_obsm_scx):
     """obsm=["X_pca"] loads only that key; values match the full load."""
     import pyscx

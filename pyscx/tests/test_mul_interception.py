@@ -122,17 +122,22 @@ class TestLazyMulInterception:
 
         np.testing.assert_allclose(mat_lazy, ref, rtol=1e-4)
 
-    def test_row_vector_returns_lazy(self, scx_file):
-        """Multiplying lazy dataset by (1, n_obs) row vector should stay lazy."""
+    def test_row_vector_not_intercepted(self, scx_file):
+        """A (1, n_obs) row vector is NOT a per-row scale (B3).
+
+        Only `(n_obs,)` and `(n_obs, 1)` are unambiguously row-oriented. A
+        `(1, n_obs)` operand is no longer intercepted as a transposed RowScale;
+        it falls through to scipy, where `*` is matrix multiplication and the
+        non-conformable shape raises rather than being silently mis-applied.
+        """
         path, X_ref = scx_file
         adata = pyscx.open(path).to_anndata(backed=True)
         n_obs = X_ref.shape[0]
 
         pyscx.accel.normalize_total(adata, target_sum=1e4)
         factors = np.random.default_rng(2).uniform(0.5, 2.0, size=(1, n_obs))
-        result = adata.X * factors
-
-        assert isinstance(result, pyscx.ScxLazyTransformedDataset)
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            adata.X * factors
 
     def test_scalar_falls_back(self, scx_file):
         """Multiplying lazy dataset by scalar should materialize."""

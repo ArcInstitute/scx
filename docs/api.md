@@ -1241,6 +1241,8 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 **Arithmetic:**
 - `__truediv__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(1/factors)` (lazy). Otherwise materializes.
 - `__mul__(other)` — If `other` is a per-row vector, returns `ScxLazyTransformedDataset` with `RowScale(factors)` (lazy). Otherwise materializes.
+
+  *Per-row vector* means an **unambiguously row-oriented** operand: a 1-D `(n_obs,)` array or an explicit `(n_obs, 1)` column vector. A `(1, n_obs)` row vector is treated as a per-*column* broadcast (numpy/scipy semantics), **not** intercepted as a transposed row scale — on a non-square matrix it falls through to scipy and raises a shape error rather than being silently mis-applied. On a **square** matrix (`n_obs == n_vars`) a bare 1-D `(n,)` operand is orientation-ambiguous (could be per-gene), so it is not intercepted and instead materializes; pass an explicit `(n_obs, 1)` column vector to force the lazy row-scale path. scanpy's `normalize_total` reshapes its row factors to `(n_obs, 1)`, so that path stays lazy.
 - `__add__(other)` — Materializes and adds.
 - `__sub__(other)` — Materializes and subtracts.
 - `__matmul__(other)` — Matrix multiply (materializes).
@@ -1308,6 +1310,8 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 **Arithmetic:**
 - `__truediv__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
 - `__mul__(other)` — If `other` is a per-row vector, appends `RowScale` transform (lazy). Otherwise materializes.
+
+  *Per-row vector* is defined identically to `ScxBackedSparseDataset` above: `(n_obs,)` or `(n_obs, 1)` are intercepted lazily; `(1, n_obs)` and ambiguous square-matrix `(n,)` operands fall through to materialization.
 - `__add__(other)` — Materializes and adds.
 - `__sub__(other)` — Materializes and subtracts.
 - `__matmul__(other)` — Matrix multiply (materializes).
