@@ -1,6 +1,6 @@
 [package]
 name = "scx-engine"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2021"
 description = "Lazy query engine for SCX files"
 license.workspace = true
