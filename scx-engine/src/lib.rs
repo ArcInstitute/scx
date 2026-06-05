@@ -15,11 +15,12 @@ pub use fused_ops::{
     streaming_save_layer, PreprocessConfig,
 };
 pub use index::{
-    build_and_write_conversion_predicate_indexes,
+    apply_obs_shard_column_stats, build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, build_indexes,
-    build_obs_predicate_index_bytes, build_var_predicate_index_bytes, index_preset_columns,
-    BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult, IndexPreset,
-    ObsPredicateIndexBuilder, PredicateIndex, PredicateIndexBuildOptions, SkipReason,
+    build_obs_predicate_index_bytes, build_var_predicate_index_bytes, derive_shard_column_stats,
+    index_preset_columns, BuildOutcome, ConversionPredicateIndexOptions,
+    ConversionPredicateIndexResult, IndexPreset, ObsPredicateIndexBuilder, PredicateIndex,
+    PredicateIndexBuildOptions, SkipReason,
 };
 pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};

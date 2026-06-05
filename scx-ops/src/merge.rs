@@ -502,6 +502,14 @@ pub fn merge_with_options(
         )?;
         if let Some(bytes) = obs_bytes {
             writer.write_obs_predicate_index(&bytes)?;
+            // Populate per-shard catalog column stats so query-time shard
+            // skipping works on the merged output. `output_shard_row_ranges`
+            // is the CSR-shard space the index was built against.
+            scx_engine::apply_obs_shard_column_stats(
+                &mut writer,
+                &bytes,
+                output_shard_row_ranges.len(),
+            )?;
         }
         // var stays on the batch-mode builder — var rarely overflows
         // and the streaming path doesn't help small-axis predicate

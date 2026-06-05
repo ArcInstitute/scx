@@ -1519,6 +1519,21 @@ mod streaming_tests {
         let mut w = ScxWriter::new(&output, test_header(n as u64)).unwrap();
         write_obs_shards_streaming(&reader, &mut w, None, n).unwrap();
         w.write_var(&var).unwrap();
+        // One CSR shard spanning all rows so the catalog CSR-shard count
+        // matches `output_shard_row_ranges` for the per-shard column-stats
+        // pass that runs inside the streaming index build.
+        let indptr: Vec<u64> = (0..=n as u64).collect();
+        let indices: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+        let values: Vec<u8> = vec![1u8; n];
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
 
         let opts = ConversionPredicateIndexOptions {
             index_obs: vec!["cluster".to_string()],

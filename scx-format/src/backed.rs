@@ -4186,11 +4186,11 @@ mod tests {
         };
 
         // Fresh: matched generations with a sidecar present.
-        assert!(check_csc_sidecar_fresh(&cat, &[csc_entry.clone()]).is_ok());
+        assert!(check_csc_sidecar_fresh(&cat, std::slice::from_ref(&csc_entry)).is_ok());
 
         // Stale: the sidecar was built one generation behind the data.
         cat.csc_build_generation = 2;
-        let err = check_csc_sidecar_fresh(&cat, &[csc_entry.clone()]).unwrap_err();
+        let err = check_csc_sidecar_fresh(&cat, std::slice::from_ref(&csc_entry)).unwrap_err();
         assert!(matches!(
             err,
             ScxError::StaleCscSidecar {

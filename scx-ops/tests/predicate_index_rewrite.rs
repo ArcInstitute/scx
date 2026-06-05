@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
-use scx_engine::ConversionPredicateIndexOptions;
+use scx_engine::{ConversionPredicateIndexOptions, QueryPipeline};
 use scx_format::header::{FileHeader, MAGIC};
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
@@ -146,6 +146,39 @@ fn write_test_file(
             params_json: "{}".to_string(),
             input_checksums: vec![],
         }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Like `write_test_file` but stamps a custom `shard_target_rows` in the
+/// header so downstream `compact` re-sharding produces multiple output shards.
+fn write_test_file_with_target(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    perturbation: &str,
+    shard_target_rows: u32,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let mut header = sample_header(n_obs as u64, n_vars as u64);
+    header.shard_target_rows = shard_target_rows;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs(&obs_with_categories(n_obs, perturbation))
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
         .unwrap();
     writer.finish().unwrap();
     path
@@ -756,4 +789,113 @@ fn compact_provenance_records_predicate_index() {
     scx_ops::compact_with_index_options(&input, &out, &forced_obs_pert_options(), false).unwrap();
 
     assert_provenance_indexes_obs(&out, "compact", "perturbation");
+}
+
+// ---------------------------------------------------------------------------
+// Predicate pushdown: per-shard column stats let `filter_obs` skip shards.
+// Each input contributes one CSR shard whose `perturbation` value is unique
+// to that file, so a merged/compacted file has per-shard stats that exclude
+// the shards of the other file.
+// ---------------------------------------------------------------------------
+
+/// `merge_with_index_options` output supports query-time shard skipping.
+#[test]
+fn merge_output_enables_shard_skipping() {
+    let dir = TempDir::new().unwrap();
+    let a = write_test_file(&dir, "a.scx", 64, 16, "DRUG_A");
+    let b = write_test_file(&dir, "b.scx", 64, 16, "DRUG_B");
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &forced_obs_pert_options(),
+    )
+    .unwrap();
+
+    let r = QueryPipeline::open(&out)
+        .unwrap()
+        .filter_obs("perturbation == 'DRUG_A'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(r.total_shards, 2, "two inputs → two CSR shards");
+    assert_eq!(
+        r.skipped_shards, 1,
+        "DRUG_B's shard must be skipped when filtering DRUG_A"
+    );
+    assert_eq!(r.matched_rows, 64, "only DRUG_A's 64 rows match");
+}
+
+/// `compact_with_index_options` output supports query-time shard skipping.
+#[test]
+fn compact_output_enables_shard_skipping() {
+    let dir = TempDir::new().unwrap();
+    // Small shard target so compact re-sharding keeps ≥2 shards (each still
+    // single-perturbation) rather than collapsing both inputs into one shard.
+    let a = write_test_file_with_target(&dir, "a.scx", 64, 16, "DRUG_A", 32);
+    let b = write_test_file_with_target(&dir, "b.scx", 64, 16, "DRUG_B", 32);
+    let merged = dir.path().join("merged.scx");
+    scx_ops::merge_with_index_options(
+        &[a.as_path(), b.as_path()],
+        &merged,
+        &forced_obs_pert_options(),
+    )
+    .unwrap();
+
+    let compacted = dir.path().join("compacted.scx");
+    scx_ops::compact_with_index_options(&merged, &compacted, &forced_obs_pert_options(), false)
+        .unwrap();
+
+    let r = QueryPipeline::open(&compacted)
+        .unwrap()
+        .filter_obs("perturbation == 'DRUG_B'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert!(r.total_shards >= 1);
+    assert!(
+        r.skipped_shards >= 1,
+        "DRUG_A's shard must be skipped when filtering DRUG_B (got {}/{})",
+        r.skipped_shards,
+        r.total_shards
+    );
+    assert_eq!(r.matched_rows, 64);
+}
+
+/// `append_from_reader_with_index_options` rebuilds per-shard stats across the
+/// pre-existing + newly-appended CSR shards, so the appended file supports
+/// shard skipping (Phase 2 — append's bespoke catalog assembly).
+#[test]
+fn append_output_enables_shard_skipping() {
+    let dir = TempDir::new().unwrap();
+    let target = write_test_file(&dir, "target.scx", 32, 16, "DRUG_A");
+    let source = write_test_file(&dir, "source.scx", 32, 16, "DRUG_B");
+    let source_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader_with_index_options(
+        &target,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+        &forced_obs_pert_options(),
+    )
+    .unwrap();
+
+    // After append: shard 0 == old DRUG_A rows, shard 1 == appended DRUG_B
+    // rows. Filtering DRUG_B must skip the old (DRUG_A) shard.
+    let r = QueryPipeline::open(&target)
+        .unwrap()
+        .filter_obs("perturbation == 'DRUG_B'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(r.total_shards, 2, "old shard + one appended shard");
+    assert_eq!(
+        r.skipped_shards, 1,
+        "the pre-existing DRUG_A shard is skipped"
+    );
+    assert_eq!(r.matched_rows, 32, "only the appended DRUG_B rows match");
 }

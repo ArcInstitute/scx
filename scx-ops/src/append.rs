@@ -1267,6 +1267,11 @@ fn finalize_append(
     }
 
     let drop_old_predicate_indexes = rebuild_index;
+    // Per-shard column stats derived from the rebuilt obs index, applied to the
+    // assembled catalog entries (old + new CSR shards) further below — append
+    // does not write CSR shards through a fresh `ScxWriter`, so the writer's
+    // bulk setter can't reach them.
+    let mut per_shard_obs_stats: Option<Vec<Vec<scx_format::catalog::ColumnStat>>> = None;
     let index_result = if let Some(builder) = obs_index_builder {
         // Per-output-shard `(row_start, row_end)` for the full obs:
         // existing CSR shards (modality_id == 0) sorted by row_start,
@@ -1296,6 +1301,15 @@ fn finalize_append(
             .map_err(OpsError::Engine)?;
         if let Some(bytes) = obs_bytes {
             writer.write_obs_predicate_index(&bytes)?;
+            // Derive the per-shard CategoryBitset / MinMax stats now (the index
+            // shard_id space == `shard_row_ranges` order). They're applied to
+            // the assembled catalog entries below.
+            let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
+                .map_err(OpsError::Engine)?;
+            per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
+                &index,
+                shard_row_ranges.len(),
+            ));
         }
         let preset_var = match index_options.index_preset.as_deref() {
             Some(name) => scx_engine::index_preset_columns(name)
@@ -1493,6 +1507,14 @@ fn finalize_append(
         modality_id: 0,
         stats: None,
     });
+
+    // Apply the per-shard column stats to the assembled catalog so query-time
+    // shard skipping works across both pre-existing and freshly-appended CSR
+    // shards. `assign_csr_shard_column_stats` addresses modality-0 CSR shards by
+    // `row_start` order, matching the `shard_row_ranges` the index was built on.
+    if let Some(per_shard) = per_shard_obs_stats {
+        scx_format::assign_csr_shard_column_stats(&mut new_entries, per_shard)?;
+    }
 
     let new_manifest_sequence = prep.header.manifest_sequence + 1;
     let new_catalog = FullCatalog {

@@ -87,6 +87,9 @@ pub enum ScxError {
     #[error("column_stats count {0} exceeds u8::MAX (255)")]
     ColumnStatsOverflow(usize),
 
+    #[error("per-shard column_stats count {got} != CSR shard count {expected}")]
+    ColumnStatsShardCountMismatch { got: usize, expected: usize },
+
     #[error(
         "invalid shard_type byte {got} for section_type {section_type:#x} (expected {expected})"
     )]
