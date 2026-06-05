@@ -391,7 +391,7 @@ fn build_knn_exact(
 ///
 /// Returns (indptr, indices, data) for an (n_obs × n_obs) sparse matrix
 /// where entry (i, j) = distance from point i to neighbor j.
-fn build_knn_csr(
+pub(crate) fn build_knn_csr(
     knn_indices: &[usize],
     knn_distances: &[f64],
     n_obs: usize,
@@ -425,7 +425,7 @@ fn build_knn_csr(
 ///     conn(i,j) = μ(i,j) + μ(j,i) - μ(i,j) * μ(j,i)
 ///
 /// Returns CSR triplets (indptr, indices, data) for the symmetrized connectivity matrix.
-fn compute_connectivities(
+pub(crate) fn compute_connectivities(
     knn_indices: &[usize],
     knn_distances: &[f64],
     n_obs: usize,

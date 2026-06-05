@@ -147,7 +147,7 @@ pub fn neighbors(
 }
 
 /// Write kNN results to AnnData slots matching scanpy's format.
-fn write_neighbors_to_adata(
+pub(crate) fn write_neighbors_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::KnnResult,

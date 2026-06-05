@@ -900,6 +900,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_gpu(&accel_module)?;
     register_dim_reduction(&accel_module)?;
     register_neighbors(&accel_module)?;
+    register_fused(&accel_module)?;
     register_clustering(&accel_module)?;
     register_de(&accel_module)?;
     register_pseudobulk(&accel_module)?;
@@ -1014,6 +1015,11 @@ fn register_dim_reduction(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_neighbors(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::neighbors::neighbors, m)?)?;
+    Ok(())
+}
+
+fn register_fused(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::fused::pca_neighbors, m)?)?;
     Ok(())
 }
 

@@ -15,6 +15,8 @@ pub mod diffexp;
 pub mod diffexp_gpu;
 pub mod error;
 pub mod eval_metrics;
+#[cfg(feature = "gpu")]
+pub mod fused;
 pub mod harmony;
 pub mod hvg;
 pub mod leiden;
@@ -79,6 +81,8 @@ pub use diffexp_gpu::{
     pdex_ref_gpu, pdex_ref_gpu_dense, wilcoxon_rank_sum_gpu, wilcoxon_rank_sum_gpu_dense,
     GpuDeShardInput,
 };
+#[cfg(feature = "gpu")]
+pub use fused::pca_then_knn_gpu;
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]

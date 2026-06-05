@@ -136,6 +136,63 @@ pub fn gpu_sgemm(
     Ok(())
 }
 
+/// Transpose a column-major `(n_rows × n_cols)` matrix into a row-major
+/// `(n_rows × n_cols)` matrix (device → device), via `cublasSgeam`.
+///
+/// A row-major `(n_rows × n_cols)` buffer is bit-identical to a column-major
+/// `(n_cols × n_rows)` buffer, so this computes `C = Aᵀ` where `A` is the
+/// col-major source `(n_rows × n_cols, lda = n_rows)` and `C` is col-major
+/// `(n_cols × n_rows, ldc = n_cols)`. The result `dst` therefore reads back as
+/// the row-major source.
+///
+/// Used by the device-returning PCA path to turn the col-major embedding `d_u`
+/// into a row-major [`crate::DeviceEmbedding`] without a host round-trip.
+/// `src` and `dst` must both have length `n_rows * n_cols` and must not alias.
+pub fn gpu_transpose_f32(
+    handle: &CublasHandle,
+    stream: &Arc<CudaStream>,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f32>,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<(), GpuError> {
+    handle.set_stream(stream)?;
+
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    // C (col-major) is (m × n) = (n_cols × n_rows). op(A) = Aᵀ supplies it.
+    let m = n_cols as i32;
+    let n = n_rows as i32;
+    let lda = n_rows as i32; // A col-major (n_rows × n_cols)
+    let ldb = n_cols as i32; // B unused (beta = 0) but must be a valid leading dim
+    let ldc = n_cols as i32; // C col-major (n_cols × n_rows)
+
+    let (src_ptr, _gs) = src.device_ptr(stream);
+    let (dst_ptr, _gd) = dst.device_ptr_mut(stream);
+
+    unsafe {
+        cbs::cublasSgeam(
+            handle.raw(),
+            cbs::cublasOperation_t::CUBLAS_OP_T,
+            cbs::cublasOperation_t::CUBLAS_OP_N,
+            m,
+            n,
+            &alpha as *const f32,
+            src_ptr as *const f32,
+            lda,
+            &beta as *const f32,
+            // B is ignored because beta = 0; reuse src as a valid pointer.
+            src_ptr as *const f32,
+            ldb,
+            dst_ptr as *mut f32,
+            ldc,
+        )
+        .result()
+        .map_err(|e| GpuError::CuBlasError(format!("cublasSgeam (transpose): {e:?}")))?;
+    }
+    Ok(())
+}
+
 /// Single-precision matrix–vector multiply: `y = α · op(A) · x + β · y`.
 ///
 /// `A` is col-major with backing shape `(m, n)` and `lda = m`. When `trans == N`,

@@ -50,6 +50,7 @@ pub mod curand;
 pub mod cusolver;
 pub mod cusparse;
 pub mod device;
+pub mod device_resident;
 pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_csc_shard_source;
@@ -73,7 +74,7 @@ pub mod staging;
 
 // Re-export primary types for convenience.
 pub use backed_gpu_matrix_source::BackedGpuMatrixSource;
-pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, CublasHandle};
+pub use cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, gpu_strsm, gpu_transpose_f32, CublasHandle};
 pub use curand::random_gaussian_gpu;
 pub use cusolver::{gpu_cholesky_qr2, gpu_eigh_sym, gpu_qr_q, CusolverHandle, QrMethod};
 pub use cusparse::{
@@ -81,6 +82,7 @@ pub use cusparse::{
     CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
 pub use device::GpuDevice;
+pub use device_resident::{DeviceEmbedding, DeviceFuzzyGraph, DeviceKnnGraph};
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
@@ -110,10 +112,13 @@ pub use gpu_hvg::{
     gpu_streaming_clip_square_sum_csc, gpu_streaming_mean_var, gpu_streaming_mean_var_batched,
     gpu_streaming_mean_var_csc,
 };
-pub use gpu_knn::{cuvs_available, gpu_knn_cagra, GpuKnnResult};
+pub use gpu_knn::{cuvs_available, gpu_knn_cagra, gpu_knn_cagra_device, GpuKnnResult};
 pub use gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata};
-pub use gpu_pca::{gpu_randomized_pca, mean_correct_gpu, GpuPcaResult};
-pub use gpu_pca_covariance::gpu_covariance_pca;
+pub use gpu_pca::{
+    gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
+    GpuPcaResult,
+};
+pub use gpu_pca_covariance::{gpu_covariance_pca, gpu_covariance_pca_device};
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };

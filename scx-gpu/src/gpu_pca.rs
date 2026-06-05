@@ -26,11 +26,12 @@ use faer::Mat;
 use scx_format::total_variance_from_col_sq;
 use scx_format::ShardSource;
 
-use crate::cublas::{gpu_sgemm, CublasHandle};
+use crate::cublas::{gpu_sgemm, gpu_transpose_f32, CublasHandle};
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
 use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle};
 use crate::device::GpuDevice;
+use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
 use crate::linear_operator::CenteredSparseOperator;
 
@@ -118,10 +119,56 @@ pub struct GpuPcaResult {
     pub n_vars: usize,
 }
 
-/// GPU-accelerated randomized PCA.
+/// Result of GPU randomized PCA with the embedding kept **device-resident**
+/// (V3 plan Phase 2.3).
 ///
-/// Streams data shard-by-shard from `source`, performing SpMM on GPU via
-/// cuSPARSE, QR via cuSOLVER, and the final SVD on CPU via `faer`.
+/// Identical to [`GpuPcaResult`] except `embeddings` is a [`DeviceEmbedding`]
+/// (row-major `(n_obs × n_components)` on the GPU) instead of a host `Vec<f32>`.
+/// The small loadings/variance arrays stay on the host (they are already
+/// computed there via the CPU SVD of `B`). The fused PCA → kNN path feeds this
+/// embedding straight into CAGRA without a GPU→host→GPU round-trip.
+pub struct GpuPcaDeviceResult {
+    /// Cell embeddings, device-resident, row-major `(n_obs × n_components)`.
+    pub embeddings: DeviceEmbedding,
+    /// Principal components (loadings): row-major `(n_components × n_vars)` on host.
+    pub components: Vec<f32>,
+    /// Variance explained by each component (f64 for precision).
+    pub variance_explained: Vec<f64>,
+    /// Ratio of variance explained (each / total).
+    pub variance_ratio: Vec<f64>,
+    /// Column means used for centering (None if `zero_center=false`).
+    pub mean: Option<Vec<f64>>,
+    /// Number of components.
+    pub n_components: usize,
+    /// Number of observations.
+    pub n_obs: usize,
+    /// Number of variables.
+    pub n_vars: usize,
+}
+
+/// Internal output of the shared randomized-PCA core: the scaled embedding kept
+/// **col-major** on the device (`scratch`-independent owned buffer) plus the
+/// host-side loadings/variance. The two public entry points differ only in how
+/// they finalize `d_u`: [`gpu_randomized_pca`] transposes it to a host
+/// row-major `Vec<f32>`; [`gpu_randomized_pca_device`] transposes it to a
+/// row-major [`DeviceEmbedding`] on the GPU.
+struct RandomizedPcaCore {
+    /// Embedding `U·Σ`, col-major `(n_obs × n_components)`, owned device buffer.
+    d_u: CudaSlice<f32>,
+    components: Vec<f32>,
+    variance_explained: Vec<f64>,
+    variance_ratio: Vec<f64>,
+    mean: Option<Vec<f64>>,
+    n_components: usize,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+/// Shared randomized-PCA core: runs the full streaming SpMM / QR / SVD pipeline
+/// and returns the scaled embedding `U·Σ` **col-major on the device** plus the
+/// host-side loadings/variance. Both public entry points
+/// ([`gpu_randomized_pca`], [`gpu_randomized_pca_device`]) wrap this and differ
+/// only in how they finalize `d_u`.
 ///
 /// # Algorithm (matching scx-accel CPU version)
 ///
@@ -132,7 +179,7 @@ pub struct GpuPcaResult {
 /// 5. Power iteration: B = X^T @ Q, Q_B = qr(B), Y = X @ Q_B, Q = qr(Y)
 /// 6. B = X^T @ Q (streaming GPU SpMM transpose)
 /// 7. SVD of B (small matrix, CPU faer in f64) → Û, Σ, V^T
-/// 8. Embeddings = Q @ V × Σ (CPU — Q downloaded, small multiply)
+/// 8. Embeddings = Q @ V × Σ (GPU cuBLAS sgemm + column scaling) — kept on GPU
 ///
 /// Steps 3-6 stream from any `ShardSource` without materializing full X.
 /// The `Sync` bound is required so the streaming `CenteredSparseOperator`
@@ -140,7 +187,7 @@ pub struct GpuPcaResult {
 /// `source` across its scoped pre-decode worker thread.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_randomized_pca(
+fn randomized_pca_core(
     dev: &GpuDevice,
     source: &(dyn ShardSource + Sync),
     n_components: usize,
@@ -149,7 +196,7 @@ pub fn gpu_randomized_pca(
     zero_center: bool,
     seed: u64,
     qr_method: QrMethod,
-) -> Result<GpuPcaResult, GpuError> {
+) -> Result<RandomizedPcaCore, GpuError> {
     let (n_obs, n_vars) = source.shape();
 
     // Validate inputs
@@ -352,20 +399,11 @@ pub fn gpu_randomized_pca(
         cbs::cublasOperation_t::CUBLAS_OP_N,
         cbs::cublasOperation_t::CUBLAS_OP_N,
     )?;
-    // U[:, j] *= σ[j] — one kernel launch, broadcast column scaling.
+    // U[:, j] *= σ[j] — one kernel launch, broadcast column scaling. `d_u` now
+    // holds the scaled embedding U·Σ, col-major (n_obs × n_components), and is
+    // returned device-resident; the wrappers below decide host vs device
+    // finalization.
     gpu_scale_columns(dev, &mut d_u, &d_sigma, n_obs, n_components)?;
-
-    // Single D→H copy of the final embedding, col-major (n_obs × n_components).
-    dev.synchronize()?;
-    let u_host_colmajor = dev.dtoh_copy(&d_u)?;
-
-    // Transpose col-major → row-major for the scanpy-compatible layout.
-    let mut embeddings = vec![0.0f32; n_obs * n_components];
-    for pc in 0..n_components {
-        for i in 0..n_obs {
-            embeddings[i * n_components + pc] = u_host_colmajor[pc * n_obs + i];
-        }
-    }
 
     // Components: rows of U_hat^T → (n_components × n_vars).
     // U_hat is already on host (from the CPU SVD of B — B is small, so this
@@ -394,12 +432,141 @@ pub fn gpu_randomized_pca(
         vec![0.0; n_components]
     };
 
+    Ok(RandomizedPcaCore {
+        d_u,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean: means,
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+/// GPU-accelerated randomized PCA returning a host [`GpuPcaResult`].
+///
+/// Thin wrapper over [`randomized_pca_core`] that downloads the col-major
+/// embedding once and transposes it to the scanpy-compatible row-major
+/// `(n_obs × n_components)` layout. Behaviour and output are unchanged from
+/// before the device-residency refactor.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_randomized_pca(
+    dev: &GpuDevice,
+    source: &(dyn ShardSource + Sync),
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+    qr_method: QrMethod,
+) -> Result<GpuPcaResult, GpuError> {
+    let core = randomized_pca_core(
+        dev,
+        source,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+        qr_method,
+    )?;
+    let RandomizedPcaCore {
+        d_u,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    } = core;
+
+    // Single D→H copy of the final embedding, col-major (n_obs × n_components).
+    dev.synchronize()?;
+    let u_host_colmajor = dev.dtoh_copy(&d_u)?;
+
+    // Transpose col-major → row-major for the scanpy-compatible layout.
+    let mut embeddings = vec![0.0f32; n_obs * n_components];
+    for pc in 0..n_components {
+        for i in 0..n_obs {
+            embeddings[i * n_components + pc] = u_host_colmajor[pc * n_obs + i];
+        }
+    }
+
     Ok(GpuPcaResult {
         embeddings,
         components,
         variance_explained,
         variance_ratio,
-        mean: means,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    })
+}
+
+/// GPU-accelerated randomized PCA returning a **device-resident** embedding
+/// ([`GpuPcaDeviceResult`]) — V3 plan Phase 2.3.
+///
+/// Identical to [`gpu_randomized_pca`] except the embedding never touches the
+/// host: the col-major `U·Σ` is transposed in place on the GPU (via
+/// [`gpu_transpose_f32`]) into a row-major [`DeviceEmbedding`], ready to feed
+/// straight into `gpu_knn_cagra_device` as the CAGRA dataset. The small
+/// loadings/variance arrays remain on the host (already produced by the CPU
+/// SVD).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_randomized_pca_device(
+    dev: &GpuDevice,
+    source: &(dyn ShardSource + Sync),
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+    qr_method: QrMethod,
+) -> Result<GpuPcaDeviceResult, GpuError> {
+    let core = randomized_pca_core(
+        dev,
+        source,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+        qr_method,
+    )?;
+    let RandomizedPcaCore {
+        d_u,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
+        n_components,
+        n_obs,
+        n_vars,
+    } = core;
+
+    // Transpose col-major (n_obs × n_components) → row-major on the device.
+    let cublas_handle = CublasHandle::new()?;
+    let mut d_rowmajor = dev.alloc_zeros::<f32>(n_obs * n_components)?;
+    gpu_transpose_f32(
+        &cublas_handle,
+        dev.stream(),
+        &d_u,
+        &mut d_rowmajor,
+        n_obs,
+        n_components,
+    )?;
+    dev.synchronize()?;
+    let embeddings = DeviceEmbedding::new(d_rowmajor, n_obs, n_components)?;
+
+    Ok(GpuPcaDeviceResult {
+        embeddings,
+        components,
+        variance_explained,
+        variance_ratio,
+        mean,
         n_components,
         n_obs,
         n_vars,
@@ -1042,6 +1209,139 @@ mod tests {
             assert!(
                 diff < 1e-3,
                 "variance_ratio[{j}] diff = {diff} between cholesky and householder"
+            );
+        }
+    }
+
+    /// The device-resident PCA entry (`gpu_randomized_pca_device`) must produce
+    /// the same result as the host entry (`gpu_randomized_pca`): both share the
+    /// `randomized_pca_core` pipeline (same seed → same `d_u`) and differ only
+    /// in finalizing the embedding (host transpose vs device `cublasSgeam`
+    /// transpose). The downloaded device embedding must therefore match the
+    /// host embedding element-for-element, and the loadings/variance are shared.
+    #[test]
+    fn test_gpu_randomized_pca_device_matches_host() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use scx_format::ShardSource;
+        use scx_sparse::ScxCsr;
+
+        let dev = require_gpu!();
+
+        struct InMemorySource {
+            shards: Vec<ScxCsr>,
+            n_obs: usize,
+            n_vars: usize,
+        }
+        impl ShardSource for InMemorySource {
+            fn n_shards(&self) -> usize {
+                self.shards.len()
+            }
+            fn n_obs(&self) -> usize {
+                self.n_obs
+            }
+            fn n_vars(&self) -> usize {
+                self.n_vars
+            }
+            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+                Ok(self.shards[i].clone())
+            }
+        }
+
+        let n_rows = 400;
+        let n_cols = 60;
+        let k = 12;
+        let mut rng = StdRng::seed_from_u64(99);
+        let mut indptr: Vec<i64> = vec![0];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for _ in 0..n_rows {
+            for c in 0..n_cols {
+                if rng.gen_bool(0.1) {
+                    indices.push(c as i32);
+                    data.push(rng.gen_range(-1.0..1.0));
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        let csr = ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data);
+        // Two shards to exercise the streaming path.
+        let mid = n_rows / 2;
+        let p_mid = csr.indptr[mid] as usize;
+        let shard0 = ScxCsr::new_unchecked(
+            (mid, n_cols),
+            csr.indptr[0..=mid].to_vec(),
+            csr.indices[0..p_mid].to_vec(),
+            csr.data[0..p_mid].to_vec(),
+        );
+        let shard1 = ScxCsr::new_unchecked(
+            (n_rows - mid, n_cols),
+            csr.indptr[mid..=n_rows]
+                .iter()
+                .map(|&p| p - csr.indptr[mid])
+                .collect(),
+            csr.indices[p_mid..].to_vec(),
+            csr.data[p_mid..].to_vec(),
+        );
+        let source = InMemorySource {
+            shards: vec![shard0, shard1],
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let host =
+            gpu_randomized_pca(&dev, &source, k, 10, 2, true, 7, QrMethod::Householder).unwrap();
+        let dev_res =
+            gpu_randomized_pca_device(&dev, &source, k, 10, 2, true, 7, QrMethod::Householder)
+                .unwrap();
+
+        // Shapes.
+        assert_eq!(dev_res.n_obs, n_rows);
+        assert_eq!(dev_res.n_components, k);
+        assert_eq!(dev_res.embeddings.shape(), (n_rows, k));
+        assert_eq!(dev_res.components.len(), host.components.len());
+
+        // The host and device entries are *separate* randomized-PCA runs (the
+        // public API has no shared-core hook), so GPU SpMM/QR run-to-run
+        // nondeterminism makes them differ at f32 noise level (~1e-6). A tight
+        // tolerance still catches a genuinely wrong device transpose (which
+        // would be O(1) off) while tolerating that noise.
+        for (a, b) in dev_res.components.iter().zip(host.components.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-3,
+                "device components {a} vs host {b} differ beyond tol"
+            );
+        }
+        for (a, b) in dev_res
+            .variance_explained
+            .iter()
+            .zip(host.variance_explained.iter())
+        {
+            assert!(
+                (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                "variance_explained {a} vs {b} differ beyond tol"
+            );
+        }
+        for (a, b) in dev_res
+            .variance_ratio
+            .iter()
+            .zip(host.variance_ratio.iter())
+        {
+            assert!(
+                (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                "variance_ratio {a} vs {b} differ beyond tol"
+            );
+        }
+
+        // Device embedding downloads to the same row-major values as the host
+        // path: the device `cublasSgeam` transpose is value-preserving, so the
+        // two agree up to the same run-to-run GPU noise.
+        let dev_emb = dev_res.embeddings.to_host(&dev).unwrap();
+        assert_eq!(dev_emb.len(), host.embeddings.len());
+        for (a, b) in dev_emb.iter().zip(host.embeddings.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                "device embedding {a} vs host {b} differ beyond tol"
             );
         }
     }
