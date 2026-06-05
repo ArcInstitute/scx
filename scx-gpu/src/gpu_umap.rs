@@ -41,6 +41,11 @@ use crate::gpu_graph::{
 
 const UMAP_SGD_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/umap_sgd.ptx"));
 
+/// Compiled PTX for the device edge-list + sampling-schedule prep kernels
+/// (produced by build.rs from kernels/umap_edges.cu). Consumed by
+/// [`gpu_umap_from_device_graph`].
+const UMAP_EDGES_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/umap_edges.ptx"));
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -178,23 +183,266 @@ pub fn gpu_umap_native(
     // Convert scheduling arrays to f32 for GPU (f64 precision not needed
     // for epoch scheduling — the comparison is epoch_of_next_sample <= epoch).
     let epochs_per_sample_f32: Vec<f32> = epochs_per_sample.iter().map(|&x| x as f32).collect();
-    let epoch_of_next_sample_f32: Vec<f32> = epochs_per_sample
-        .clone()
-        .iter()
-        .map(|&x| x as f32)
-        .collect();
+    let epoch_of_next_sample_f32: Vec<f32> = epochs_per_sample_f32.clone();
     let d_epochs_per_sample = dev.htod_copy(&epochs_per_sample_f32)?;
     let mut d_epoch_of_next_sample = dev.htod_copy(&epoch_of_next_sample_f32)?;
 
-    // --- Load UMAP SGD kernel ---
+    // --- SGD optimization loop (shared with gpu_umap_from_device_graph) ---
+    run_umap_sgd_device(
+        dev,
+        &mut d_embedding,
+        &d_head,
+        &d_tail,
+        &mut d_epoch_of_next_sample,
+        &d_epochs_per_sample,
+        n_edges,
+        n_obs,
+        n_components,
+        a,
+        b,
+        learning_rate,
+        negative_sample_rate,
+        seed,
+        n_epochs,
+        &embedding_f32,
+        &epoch_of_next_sample_f32,
+    )?;
+
+    // --- Download result ---
+    dev.synchronize()?;
+    let embedding = dev.dtoh_copy(&d_embedding)?;
+
+    Ok(GpuUmapResult {
+        embedding,
+        n_obs,
+        n_components,
+    })
+}
+
+/// Compute a UMAP embedding from a **device-resident** fuzzy graph
+/// ([`DeviceFuzzyGraph`]), the device-residency entry point for the fused
+/// PCA → kNN → UMAP pipeline (V3 plan Phase 2.4).
+///
+/// Unlike [`gpu_umap_native`], the connectivity CSR never round-trips through
+/// the host: the SGD edge list (`head`/`tail`) and per-edge sampling schedule
+/// are built on-device from `graph` (via `kernels/umap_edges.cu`), and only the
+/// final coordinates are downloaded.
+///
+/// # Arguments
+///
+/// * `graph` — device-resident symmetric connectivity CSR (values in `[0, 1]`).
+/// * `init_coords` — optional host init (`n_obs × n_components`, f32, row-major).
+///   `None` → small-Gaussian random init (matches [`gpu_umap_native`]). The
+///   fused path passes a host spectral init computed from the one connectivity
+///   download it already performs for `obsp`.
+///
+/// Other arguments mirror [`gpu_umap_native`].
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_umap_from_device_graph(
+    dev: &GpuDevice,
+    graph: &crate::device_resident::DeviceFuzzyGraph,
+    n_components: usize,
+    n_epochs: usize,
+    min_dist: f32,
+    spread: f32,
+    negative_sample_rate: usize,
+    learning_rate: f32,
+    seed: u64,
+    init_coords: Option<&[f32]>,
+) -> Result<GpuUmapResult, GpuError> {
+    let n_obs = graph.n_obs();
+    let n_edges = graph.nnz();
+
+    if n_obs == 0 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_obs > 0".to_string(),
+            got: "0".to_string(),
+        });
+    }
+    if n_components == 0 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_components > 0".to_string(),
+            got: "0".to_string(),
+        });
+    }
+    if n_epochs == 0 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_epochs > 0".to_string(),
+            got: "0".to_string(),
+        });
+    }
+
+    // --- CPU-side: find a, b parameters (tiny). ---
+    let (a, b) = find_ab_params(spread as f64, min_dist as f64);
+    let (a, b) = (a as f32, b as f32);
+
+    // --- Initialize embedding (host init or random). ---
+    let embedding_f32: Vec<f32> = match init_coords {
+        Some(coords) => {
+            if coords.len() != n_obs * n_components {
+                return Err(GpuError::ShapeMismatch {
+                    expected: format!(
+                        "init_coords length = n_obs × n_components = {}",
+                        n_obs * n_components
+                    ),
+                    got: format!("{}", coords.len()),
+                });
+            }
+            coords.to_vec()
+        }
+        None => random_init_f32(n_obs, n_components, seed),
+    };
+    let mut d_embedding = dev.htod_copy(&embedding_f32)?;
+
+    // --- Build the SGD edge list + sampling schedule on-device from `graph`. ---
+    let edges_module = dev.load_module_cached(UMAP_EDGES_PTX)?;
+    let n_obs_i32 = n_obs as i32;
+    let n_edges_i32 = n_edges as i32;
+
+    // head[e] = source row of edge e (CSR row expansion); tail = CSR columns.
+    let mut d_head = dev.alloc_zeros::<i32>(n_edges)?;
+    {
+        let func = edges_module
+            .load_function("umap_expand_head_kernel")
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("load umap_expand_head: {e}")))?;
+        let threads = 256u32;
+        let grid = (n_obs as u32).div_ceil(threads);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(graph.indptr())
+                .arg(&n_obs_i32)
+                .arg(&mut d_head)
+                .launch(cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("umap_expand_head_kernel: {e}")))?;
+    }
+    // tail = the CSR column indices themselves (already i32, device-resident).
+    let d_tail = graph.indices();
+
+    // Per-edge sampling schedule: max-weight reduction → epochs_per_sample.
+    let edge_threads = 256u32;
+    let edge_grid = (n_edges as u32).div_ceil(edge_threads);
+    let edge_cfg = LaunchConfig {
+        grid_dim: (edge_grid, 1, 1),
+        block_dim: (edge_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut d_max = dev.alloc_zeros::<f32>(1)?;
+    {
+        let func = edges_module
+            .load_function("umap_max_weight_kernel")
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("load umap_max_weight: {e}")))?;
+        // Cap the reduction grid so the shared-mem atomic stays bounded.
+        let red_grid = edge_grid.min(1024);
+        let red_cfg = LaunchConfig {
+            grid_dim: (red_grid, 1, 1),
+            block_dim: (edge_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(graph.data())
+                .arg(&n_edges_i32)
+                .arg(&mut d_max)
+                .launch(red_cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("umap_max_weight_kernel: {e}")))?;
+    }
+    let n_epochs_i32 = n_epochs as i32;
+    let mut d_epochs_per_sample = dev.alloc_zeros::<f32>(n_edges)?;
+    let mut d_epoch_of_next_sample = dev.alloc_zeros::<f32>(n_edges)?;
+    {
+        let func = edges_module
+            .load_function("umap_epochs_kernel")
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("load umap_epochs: {e}")))?;
+        unsafe {
+            dev.stream()
+                .launch_builder(&func)
+                .arg(graph.data())
+                .arg(&d_max)
+                .arg(&n_edges_i32)
+                .arg(&n_epochs_i32)
+                .arg(&mut d_epochs_per_sample)
+                .arg(&mut d_epoch_of_next_sample)
+                .launch(edge_cfg)
+        }
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("umap_epochs_kernel: {e}")))?;
+    }
+
+    // Host reset baselines for the graph-capture fallback path: the embedding
+    // init and the initial epoch_of_next_sample (== epochs_per_sample).
+    dev.synchronize()?;
+    let reset_epoch_of_next_sample = dev.dtoh_copy(&d_epochs_per_sample)?;
+
+    // --- SGD optimization loop (shared with gpu_umap_native). ---
+    run_umap_sgd_device(
+        dev,
+        &mut d_embedding,
+        &d_head,
+        d_tail,
+        &mut d_epoch_of_next_sample,
+        &d_epochs_per_sample,
+        n_edges,
+        n_obs,
+        n_components,
+        a,
+        b,
+        learning_rate,
+        negative_sample_rate,
+        seed,
+        n_epochs,
+        &embedding_f32,
+        &reset_epoch_of_next_sample,
+    )?;
+
+    dev.synchronize()?;
+    let embedding = dev.dtoh_copy(&d_embedding)?;
+
+    Ok(GpuUmapResult {
+        embedding,
+        n_obs,
+        n_components,
+    })
+}
+
+/// Run the UMAP SGD optimization on already-uploaded device buffers, shared by
+/// [`gpu_umap_native`] (host-built graph) and [`gpu_umap_from_device_graph`]
+/// (device-built graph). Loads the SGD kernel, runs the graph-capture path, and
+/// on capture failure resets `d_embedding` / `d_epoch_of_next_sample` from the
+/// supplied host baselines before the direct fallback loop.
+#[allow(clippy::too_many_arguments)]
+fn run_umap_sgd_device(
+    dev: &GpuDevice,
+    d_embedding: &mut cudarc::driver::safe::CudaSlice<f32>,
+    d_head: &cudarc::driver::safe::CudaSlice<i32>,
+    d_tail: &cudarc::driver::safe::CudaSlice<i32>,
+    d_epoch_of_next_sample: &mut cudarc::driver::safe::CudaSlice<f32>,
+    d_epochs_per_sample: &cudarc::driver::safe::CudaSlice<f32>,
+    n_edges: usize,
+    n_obs: usize,
+    n_components: usize,
+    a: f32,
+    b: f32,
+    learning_rate: f32,
+    negative_sample_rate: usize,
+    seed: u64,
+    n_epochs: usize,
+    reset_embedding: &[f32],
+    reset_epoch_of_next_sample: &[f32],
+) -> Result<(), GpuError> {
     let module = dev.load_module_cached(UMAP_SGD_PTX)?;
     let func = module
         .load_function("umap_sgd_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load umap_sgd_kernel: {e}")))?;
 
-    // --- SGD optimization loop ---
     let n_obs_i32 = n_obs as i32;
-    let n_edges_i32 = n_edges as i32;
     let n_components_i32 = n_components as i32;
     let neg_rate_i32 = negative_sample_rate as i32;
 
@@ -204,10 +452,10 @@ pub fn gpu_umap_native(
     // this supports ~549 billion edges — far beyond any real dataset.
     if n_edges > u32::MAX as usize {
         return Err(GpuError::KernelLaunchFailed(format!(
-            "UMAP edge count {} exceeds u32::MAX",
-            n_edges
+            "UMAP edge count {n_edges} exceeds u32::MAX"
         )));
     }
+    let n_edges_i32 = n_edges as i32;
     let grid_size = (n_edges as u32).div_ceil(block_size);
     let cfg = LaunchConfig {
         grid_dim: (grid_size, 1, 1),
@@ -215,24 +463,19 @@ pub fn gpu_umap_native(
         shared_mem_bytes: 0,
     };
 
-    // Graph-replay path. The SGD loop is a single
-    // `umap_sgd_kernel` per epoch; capturing it once and replaying with
-    // per-epoch `alpha` / `epoch_i32` updates via
-    // `cuGraphExecKernelNodeSetParams_v2` amortizes the per-launch
-    // dispatch cost across all `n_epochs` iterations. Falls back to
-    // the per-epoch launch loop on capture failure or
-    // `SCX_DISABLE_CUDA_GRAPHS=1`. The fallback path is functionally
-    // identical to the pre-G10.3 implementation.
+    // Graph-replay path: capture one `umap_sgd_kernel` launch and replay it
+    // with per-epoch `alpha` / `epoch` updates. Falls back to the per-epoch
+    // launch loop on capture failure or `SCX_DISABLE_CUDA_GRAPHS=1`.
     let graph_outcome = if cuda_graphs_enabled() {
         run_sgd_loop_with_graph(
             dev,
             &func,
             cfg,
-            &mut d_embedding,
-            &d_head,
-            &d_tail,
-            &mut d_epoch_of_next_sample,
-            &d_epochs_per_sample,
+            d_embedding,
+            d_head,
+            d_tail,
+            d_epoch_of_next_sample,
+            d_epochs_per_sample,
             n_edges_i32,
             n_obs_i32,
             n_components_i32,
@@ -248,27 +491,17 @@ pub fn gpu_umap_native(
     };
 
     if graph_outcome.is_err() {
-        // Graph path may have applied a partial epoch range before
-        // failing (one or more successful graph.launch() calls before
-        // an error), leaving d_embedding and d_epoch_of_next_sample
-        // mutated. Drain any in-flight work on the per-thread stream
-        // (the error path in run_sgd_loop_with_graph returns before
-        // its terminating pts.synchronize), then re-upload the
-        // originals so the direct loop's 0..n_epochs schedule starts
-        // from the same baseline as a cold dispatch.
-        //
-        // `context().synchronize()` (cuCtxSynchronize) waits on ALL
-        // streams in the context — necessary because kernels ran on
-        // per_thread_stream, which dev.synchronize() (the legacy
-        // default stream) does not cover.
+        // Partial graph replays may have mutated d_embedding /
+        // d_epoch_of_next_sample. Drain all streams, then re-upload the host
+        // baselines so the direct loop starts from a cold-dispatch state.
         dev.context()
             .synchronize()
             .map_err(|e| GpuError::CudaError(format!("ctx sync before fallback reset: {e}")))?;
         dev.stream()
-            .memcpy_htod(&embedding_f32, &mut d_embedding)
+            .memcpy_htod(reset_embedding, d_embedding)
             .map_err(|e| GpuError::CudaError(format!("reset d_embedding before fallback: {e}")))?;
         dev.stream()
-            .memcpy_htod(&epoch_of_next_sample_f32, &mut d_epoch_of_next_sample)
+            .memcpy_htod(reset_epoch_of_next_sample, d_epoch_of_next_sample)
             .map_err(|e| {
                 GpuError::CudaError(format!("reset d_epoch_of_next_sample before fallback: {e}"))
             })?;
@@ -276,11 +509,11 @@ pub fn gpu_umap_native(
             dev,
             &func,
             cfg,
-            &mut d_embedding,
-            &d_head,
-            &d_tail,
-            &mut d_epoch_of_next_sample,
-            &d_epochs_per_sample,
+            d_embedding,
+            d_head,
+            d_tail,
+            d_epoch_of_next_sample,
+            d_epochs_per_sample,
             n_edges_i32,
             n_obs_i32,
             n_components_i32,
@@ -293,15 +526,7 @@ pub fn gpu_umap_native(
         )?;
     }
 
-    // --- Download result ---
-    dev.synchronize()?;
-    let embedding = dev.dtoh_copy(&d_embedding)?;
-
-    Ok(GpuUmapResult {
-        embedding,
-        n_obs,
-        n_components,
-    })
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -947,6 +1172,81 @@ mod tests {
              embedding_f32 / epoch_of_next_sample_f32 via memcpy_htod \
              before falling back to run_sgd_loop_direct) is not landing — \
              the direct loop is running on already-mutated buffers."
+        );
+    }
+
+    /// Phase 2.4: `gpu_umap_from_device_graph` (device-built edge list +
+    /// schedule from a `DeviceFuzzyGraph`) must produce an embedding
+    /// consistent with `gpu_umap_native` (host-built edges) on the *same*
+    /// connectivity graph — within the irreducible atomicAdd-race floor. Both
+    /// paths share the SGD core and the same random init (deterministic from
+    /// `seed`), so any gross divergence indicates a bug in the device edge /
+    /// schedule construction.
+    #[test]
+    fn test_gpu_umap_from_device_graph_matches_native() {
+        let dev = require_gpu!();
+        let (indptr, indices, data, n_obs) = test_graph();
+        let n_comp = 2;
+        let n_epochs = 50;
+
+        // Disable graph capture so both paths take the deterministic direct
+        // loop, isolating device-edge-construction differences from
+        // per-thread-stream race jitter.
+        let prev = crate::gpu_graph::set_cuda_graphs_enabled_override(Some(false));
+
+        // Two native runs → atomic-race floor.
+        let native_a = gpu_umap_native(
+            &dev, &indptr, &indices, &data, n_obs, n_comp, n_epochs, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .unwrap();
+        let native_b = gpu_umap_native(
+            &dev, &indptr, &indices, &data, n_obs, n_comp, n_epochs, 0.1, 1.0, 5, 1.0, 42, None,
+        )
+        .unwrap();
+
+        // Device-graph path on the same connectivity CSR.
+        let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let d_indptr = dev.htod_copy(&indptr).unwrap();
+        let d_indices = dev.htod_copy(&indices).unwrap();
+        let d_data = dev.htod_copy(&data_f32).unwrap();
+        let graph = crate::device_resident::DeviceFuzzyGraph::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            n_obs,
+            indices.len(),
+        )
+        .unwrap();
+        let dev_res =
+            gpu_umap_from_device_graph(&dev, &graph, n_comp, n_epochs, 0.1, 1.0, 5, 1.0, 42, None)
+                .unwrap();
+
+        crate::gpu_graph::set_cuda_graphs_enabled_override(prev);
+
+        assert_eq!(dev_res.embedding.len(), native_a.embedding.len());
+        for &v in &dev_res.embedding {
+            assert!(v.is_finite(), "device-graph embedding NaN/Inf: {v}");
+        }
+
+        let rmse = |xs: &[f32], ys: &[f32]| -> f32 {
+            let s: f64 = xs
+                .iter()
+                .zip(ys.iter())
+                .map(|(x, y)| (x - y) as f64)
+                .map(|d| d * d)
+                .sum();
+            (s / xs.len() as f64).sqrt() as f32
+        };
+        let floor = rmse(&native_a.embedding, &native_b.embedding);
+        let dev_vs_native = rmse(&dev_res.embedding, &native_a.embedding);
+        eprintln!(
+            "device-graph umap parity: native_vs_native={floor:.4}, dev_vs_native={dev_vs_native:.4}"
+        );
+        let allowed = (floor * 2.0).max(0.5);
+        assert!(
+            dev_vs_native <= allowed,
+            "device-graph RMSE {dev_vs_native:.4} exceeds 2× native floor {floor:.4} + 0.5 \
+             = {allowed:.4} — device edge-list / schedule construction likely differs from host"
         );
     }
 

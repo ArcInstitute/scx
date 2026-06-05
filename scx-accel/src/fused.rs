@@ -15,6 +15,7 @@ use scx_format::ShardSource;
 use crate::error::{AccelError, Result};
 use crate::neighbors::{build_knn_csr, compute_connectivities, KnnResult};
 use crate::pca::PcaResult;
+use crate::umap::{random_init, spectral_init, UmapResult};
 
 /// Run GPU PCA then GPU CAGRA kNN with the embedding kept **device-resident**
 /// between the two stages.
@@ -123,6 +124,157 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
     };
 
     Ok((pca, knn))
+}
+
+/// Run GPU PCA → CAGRA kNN → fuzzy graph → UMAP with the embedding **and** the
+/// connectivity graph kept device-resident across the whole chain (V3 Phase 2.4).
+///
+/// Extends [`pca_then_knn_gpu`] with the device fuzzy-simplicial-set kernel
+/// ([`scx_gpu::gpu_fuzzy_simplicial_set_device`]) and device-resident UMAP
+/// ([`scx_gpu::gpu_umap_from_device_graph`]): the symmetrized connectivity CSR
+/// is built on-device (replacing the host `compute_connectivities`) and feeds
+/// UMAP directly, so the graph is downloaded **once** — for the returned
+/// `obsp` matrices and the host spectral init — rather than symmetrized on the
+/// CPU and re-uploaded for SGD.
+///
+/// Returns `(PcaResult, KnnResult, UmapResult)`. The `KnnResult` carries the
+/// device-built connectivities (`conn_*`) and the raw kNN distance CSR
+/// (`dist_*`); UMAP is seeded by a host spectral init computed from those
+/// connectivities (random fallback for tiny inputs).
+#[allow(clippy::too_many_arguments)]
+pub fn pca_then_knn_umap_gpu<S: ShardSource + Sync>(
+    device_id: usize,
+    source: &S,
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+    qr_method: scx_gpu::QrMethod,
+    use_covariance: bool,
+    n_neighbors: usize,
+    umap_n_components: usize,
+    n_epochs: usize,
+    min_dist: f64,
+    spread: f64,
+    negative_sample_rate: usize,
+    umap_learning_rate: f64,
+    umap_seed: u64,
+) -> Result<(PcaResult, KnnResult, UmapResult)> {
+    let dev = scx_gpu::GpuDevice::new(device_id)
+        .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
+
+    // Stage 1: GPU PCA → device-resident embedding.
+    let pca_dev = if use_covariance {
+        scx_gpu::gpu_covariance_pca_device(&dev, source, n_components, zero_center)
+    } else {
+        scx_gpu::gpu_randomized_pca_device(
+            &dev,
+            source,
+            n_components,
+            n_oversamples,
+            n_power_iterations,
+            zero_center,
+            seed,
+            qr_method,
+        )
+    }
+    .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
+
+    let n_obs = pca_dev.n_obs;
+    if n_neighbors == 0 || n_neighbors > n_obs {
+        return Err(AccelError::InvalidInput(format!(
+            "n_neighbors ({n_neighbors}) must be in [1, n_obs ({n_obs})]"
+        )));
+    }
+
+    // Stage 2: CAGRA kNN reads the embedding directly off the device.
+    let knn_dev = scx_gpu::gpu_knn_cagra_device(&dev, &pca_dev.embeddings, n_neighbors)
+        .map_err(|e| AccelError::InvalidInput(format!("GPU kNN (CAGRA): {e}")))?;
+
+    // Stage 3: device fuzzy simplicial set (replaces host compute_connectivities).
+    let fuzzy = scx_gpu::gpu_fuzzy_simplicial_set_device(&dev, &knn_dev, n_neighbors)
+        .map_err(|e| AccelError::InvalidInput(format!("GPU fuzzy graph: {e}")))?;
+
+    // Stage 4: single download — raw kNN (for indices/distances + dist CSR) and
+    // the symmetric connectivities (for obsp + spectral init).
+    let gpu_knn = knn_dev
+        .to_host(&dev)
+        .map_err(|e| AccelError::InvalidInput(format!("GPU kNN download: {e}")))?;
+    let (conn_indptr, conn_indices, conn_data_f32) = fuzzy
+        .to_host(&dev)
+        .map_err(|e| AccelError::InvalidInput(format!("fuzzy graph download: {e}")))?;
+    let conn_data: Vec<f64> = conn_data_f32.iter().map(|&v| v as f64).collect();
+
+    let indices: Vec<usize> = gpu_knn.indices.iter().map(|&idx| idx as usize).collect();
+    let distances: Vec<f64> = gpu_knn.distances.iter().map(|&d| d as f64).collect();
+    let (dist_indptr, dist_indices, dist_data) =
+        build_knn_csr(&indices, &distances, n_obs, n_neighbors);
+    let knn = KnnResult {
+        indices,
+        distances,
+        conn_indptr,
+        conn_indices,
+        conn_data,
+        dist_indptr,
+        dist_indices,
+        dist_data,
+        n_neighbors,
+        n_obs,
+    };
+
+    // Stage 5: host spectral init from the connectivities (random fallback).
+    let init_f64 = spectral_init(
+        &knn.conn_indptr,
+        &knn.conn_indices,
+        &knn.conn_data,
+        n_obs,
+        umap_n_components,
+        umap_seed,
+    )
+    .unwrap_or_else(|_| random_init(n_obs, umap_n_components, umap_seed));
+    let init_f32: Vec<f32> = init_f64.iter().map(|&v| v as f32).collect();
+
+    // Stage 6: device UMAP consumes the device fuzzy graph (no re-upload); only
+    // the final coordinates are downloaded.
+    let gpu_umap = scx_gpu::gpu_umap_from_device_graph(
+        &dev,
+        &fuzzy,
+        umap_n_components,
+        n_epochs,
+        min_dist as f32,
+        spread as f32,
+        negative_sample_rate,
+        umap_learning_rate as f32,
+        umap_seed,
+        Some(&init_f32),
+    )
+    .map_err(|e| AccelError::InvalidInput(format!("GPU UMAP: {e}")))?;
+    let umap = UmapResult {
+        embeddings: gpu_umap.embedding.iter().map(|&v| v as f64).collect(),
+        n_obs,
+        n_components: umap_n_components,
+    };
+
+    // Stage 7: PcaResult — download the embedding once (for obsm["X_pca"]).
+    let emb_f32 = pca_dev
+        .embeddings
+        .to_host(&dev)
+        .map_err(|e| AccelError::LinAlg(format!("PCA embedding download: {e}")))?;
+    let embeddings: Vec<f64> = emb_f32.iter().map(|&v| v as f64).collect();
+    let components: Vec<f64> = pca_dev.components.iter().map(|&v| v as f64).collect();
+    let pca = PcaResult {
+        embeddings,
+        components,
+        variance_explained: pca_dev.variance_explained,
+        variance_ratio: pca_dev.variance_ratio,
+        mean: pca_dev.mean,
+        n_components: pca_dev.n_components,
+        n_obs: pca_dev.n_obs,
+        n_vars: pca_dev.n_vars,
+    };
+
+    Ok((pca, knn, umap))
 }
 
 #[cfg(test)]
@@ -268,6 +420,94 @@ mod tests {
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b, "row {i}: fused vs ref neighbor sets differ");
+        }
+    }
+
+    /// The fused `pca_then_knn_umap_gpu` must produce a `PcaResult` / `KnnResult`
+    /// consistent with `pca_then_knn_gpu` (same device PCA + CAGRA), and a valid
+    /// `UmapResult` (correct shape, all finite) seeded by the device fuzzy graph.
+    #[test]
+    fn test_pca_then_knn_umap_gpu_matches_sequential() {
+        if !crate::gpu_available() || !crate::cuvs_available() {
+            eprintln!("GPU + cuVS not available — skipping fused PCA→kNN→UMAP test");
+            return;
+        }
+
+        let n_rows = 400;
+        let n_cols = 60;
+        let k = 12;
+        let n_neighbors = 10;
+        let umap_comps = 2;
+        let source = random_two_shard_source(n_rows, n_cols, 11);
+
+        let (pca, knn, umap) = pca_then_knn_umap_gpu(
+            0,
+            &source,
+            k,
+            10,
+            2,
+            true,
+            11,
+            scx_gpu::QrMethod::Householder,
+            false, // randomized PCA
+            n_neighbors,
+            umap_comps,
+            50,  // n_epochs (low for test speed)
+            0.1, // min_dist
+            1.0, // spread
+            5,   // negative_sample_rate
+            1.0, // umap_learning_rate
+            11,  // umap_seed
+        )
+        .unwrap();
+
+        // PCA parity vs a separate device randomized-PCA run (f32 noise tol).
+        let pca_ref = crate::randomized_pca_gpu(
+            0,
+            &source,
+            k,
+            10,
+            2,
+            true,
+            11,
+            scx_gpu::QrMethod::Householder,
+        )
+        .unwrap();
+        assert_eq!(pca.embeddings.len(), pca_ref.embeddings.len());
+        for (a, b) in pca.embeddings.iter().zip(pca_ref.embeddings.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                "fused PCA {a} vs ref {b}"
+            );
+        }
+
+        // kNN handoff: neighbor sets match CAGRA on the fused run's own embedding.
+        let fused_emb_f32: Vec<f32> = pca.embeddings.iter().map(|&v| v as f32).collect();
+        let knn_ref =
+            crate::build_knn_graph_gpu(0, &fused_emb_f32, n_rows, k, n_neighbors).unwrap();
+        for i in 0..n_rows {
+            let lo = i * n_neighbors;
+            let hi = lo + n_neighbors;
+            let mut a = knn.indices[lo..hi].to_vec();
+            let mut b = knn_ref.indices[lo..hi].to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "row {i}: fused vs ref neighbor sets differ");
+        }
+
+        // Connectivities are present and symmetric in shape.
+        assert_eq!(knn.conn_indptr.len(), n_rows + 1);
+        assert!(
+            *knn.conn_indptr.last().unwrap() > 0,
+            "device fuzzy graph produced no edges"
+        );
+
+        // UMAP embedding: correct shape, all finite.
+        assert_eq!(umap.n_obs, n_rows);
+        assert_eq!(umap.n_components, umap_comps);
+        assert_eq!(umap.embeddings.len(), n_rows * umap_comps);
+        for &v in &umap.embeddings {
+            assert!(v.is_finite(), "UMAP embedding value not finite: {v}");
         }
     }
 }

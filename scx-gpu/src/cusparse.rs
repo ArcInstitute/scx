@@ -717,6 +717,119 @@ pub fn spmm_csr_transpose_view(
     )
 }
 
+/// Device CSR triplet `(indptr, indices, data)` returned by [`csr_transpose`].
+pub type DeviceCsrTriplet = (CudaSlice<i32>, CudaSlice<i32>, CudaSlice<f32>);
+
+/// Transpose a CSR matrix `M` (`n_rows × n_cols`, `i32` indptr/indices, `f32`
+/// values) into `T = Mᵀ` in CSR form on the device.
+///
+/// Implemented via `cusparseCsr2cscEx2`: the CSC of `M` is, by definition, the
+/// CSR of `Mᵀ` — `cscColPtr` becomes `Tᵀ`'s row pointers, `cscRowInd` its
+/// column indices, `cscVal` its values. cuSPARSE owns the counting / scatter /
+/// per-row sort, so hub columns (high in-degree) are handled without a custom
+/// imbalanced sort, and the output rows are **column-sorted** — exactly what
+/// the fuzzy-graph merge kernels require.
+///
+/// Returns `(t_indptr [n_cols + 1], t_indices [nnz], t_data [nnz])`. All index
+/// buffers are `i32`; `nnz` must fit in `i32` (always true for kNN graphs:
+/// `n_obs × n_neighbors`).
+#[allow(clippy::too_many_arguments)]
+pub fn csr_transpose(
+    handle: &CusparseHandle,
+    dev: &GpuDevice,
+    stream: &Arc<CudaStream>,
+    m_indptr: &CudaSlice<i32>,
+    m_indices: &CudaSlice<i32>,
+    m_data: &CudaSlice<f32>,
+    n_rows: usize,
+    n_cols: usize,
+    nnz: usize,
+) -> Result<DeviceCsrTriplet, GpuError> {
+    handle.set_stream(stream)?;
+
+    let mut t_indptr = dev.alloc_zeros::<i32>(n_cols + 1)?;
+    let mut t_indices = dev.alloc_zeros::<i32>(nnz)?;
+    let mut t_data = dev.alloc_zeros::<f32>(nnz)?;
+
+    // Scope the `device_ptr` SyncOnDrop guards so they release before the
+    // output buffers are moved into the returned tuple.
+    {
+        let (m_rp, _g1) = m_indptr.device_ptr(stream);
+        let (m_ci, _g2) = m_indices.device_ptr(stream);
+        let (m_v, _g3) = m_data.device_ptr(stream);
+        let (t_cp, _g4) = t_indptr.device_ptr_mut(stream);
+        let (t_ri, _g5) = t_indices.device_ptr_mut(stream);
+        let (t_v, _g6) = t_data.device_ptr_mut(stream);
+
+        let val_type = cudaDataType::CUDA_R_32F;
+        let action = csp::cusparseAction_t::CUSPARSE_ACTION_NUMERIC;
+        let base = cusparseIndexBase_t::CUSPARSE_INDEX_BASE_ZERO;
+        let alg = csp::cusparseCsr2CscAlg_t::CUSPARSE_CSR2CSC_ALG_DEFAULT;
+
+        let mut buf_size: usize = 0;
+        unsafe {
+            csp::cusparseCsr2cscEx2_bufferSize(
+                handle.raw(),
+                n_rows as i32,
+                n_cols as i32,
+                nnz as i32,
+                m_v as *const core::ffi::c_void,
+                m_rp as *const i32,
+                m_ci as *const i32,
+                t_v as *mut core::ffi::c_void,
+                t_cp as *mut i32,
+                t_ri as *mut i32,
+                val_type,
+                action,
+                base,
+                alg,
+                &mut buf_size as *mut usize,
+            )
+            .result()
+            .map_err(|e| {
+                GpuError::CuSparseError(format!("cusparseCsr2cscEx2_bufferSize: {e:?}"))
+            })?;
+        }
+
+        let workspace = if buf_size > 0 {
+            Some(dev.alloc_zeros::<u8>(buf_size)?)
+        } else {
+            None
+        };
+        let ws_ptr = match &workspace {
+            Some(ws) => {
+                let (p, _g) = ws.device_ptr(stream);
+                p as *mut core::ffi::c_void
+            }
+            None => std::ptr::null_mut(),
+        };
+
+        unsafe {
+            csp::cusparseCsr2cscEx2(
+                handle.raw(),
+                n_rows as i32,
+                n_cols as i32,
+                nnz as i32,
+                m_v as *const core::ffi::c_void,
+                m_rp as *const i32,
+                m_ci as *const i32,
+                t_v as *mut core::ffi::c_void,
+                t_cp as *mut i32,
+                t_ri as *mut i32,
+                val_type,
+                action,
+                base,
+                alg,
+                ws_ptr,
+            )
+            .result()
+            .map_err(|e| GpuError::CuSparseError(format!("cusparseCsr2cscEx2: {e:?}")))?;
+        }
+    }
+
+    Ok((t_indptr, t_indices, t_data))
+}
+
 /// Raw device pointers for cupy `__cuda_array_interface__` interop.
 ///
 /// All pointers are `u64` (CUDA device pointers). The consumer is responsible

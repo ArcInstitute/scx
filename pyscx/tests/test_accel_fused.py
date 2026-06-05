@@ -283,6 +283,140 @@ class TestPcaNeighborsGpu:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Fused PCA → kNN → UMAP (V3 Phase 2.4)
+# ---------------------------------------------------------------------------
+
+
+class TestPcaNeighborsUmapCpu:
+    def test_writes_all_slots(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=15, n_components=2, device="cpu"
+        )
+
+        assert "X_pca" in adata.obsm
+        assert "distances" in adata.obsp
+        assert "connectivities" in adata.obsp
+        assert "neighbors" in adata.uns
+        assert "X_umap" in adata.obsm
+        assert adata.obsm["X_pca"].shape == (100, 10)
+        assert adata.obsm["X_umap"].shape == (100, 2)
+        assert np.isfinite(adata.obsm["X_umap"]).all()
+
+    def test_matches_sequential(self, synthetic_adata):
+        """Fused CPU path == sequential pca + neighbors + umap (PCA + graph)."""
+        import pyscx
+
+        fused = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            fused, n_comps=10, n_neighbors=15, n_components=2, device="cpu", random_state=0
+        )
+
+        seq = synthetic_adata.copy()
+        pyscx.accel.pca(seq, n_comps=10, device="cpu", random_state=0)
+        pyscx.accel.neighbors(seq, n_neighbors=15, device="cpu", random_state=0)
+        pyscx.accel.umap(seq, n_components=2, device="cpu", random_state=0)
+
+        np.testing.assert_allclose(
+            fused.obsm["X_pca"], seq.obsm["X_pca"], rtol=1e-5, atol=1e-5
+        )
+        assert (fused.obsp["connectivities"] != seq.obsp["connectivities"]).nnz == 0
+        # UMAP is the same deterministic CPU SGD at a matched seed.
+        np.testing.assert_allclose(
+            fused.obsm["X_umap"], seq.obsm["X_umap"], rtol=1e-4, atol=1e-4
+        )
+
+    def test_route_metadata_cpu(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=8, n_neighbors=10, n_components=2, device="cpu"
+        )
+
+        accel = adata.uns["scx_accel"]
+        assert accel["pca"]["route"] == "cpu_csr"
+        assert accel["neighbors"]["route"] == "cpu_csr"
+        # The umap stage stamps the dense CPU route; the summary mirrors it.
+        assert accel["umap"]["route"] == "cpu_dense"
+        assert accel["pca_neighbors_umap"]["route"] == "cpu_dense"
+
+    def test_invalid_args(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        with pytest.raises(ValueError):
+            pyscx.accel.pca_neighbors_umap(adata, method="bogus", device="cpu")
+        with pytest.raises(ValueError):
+            pyscx.accel.pca_neighbors_umap(adata, qr_method="bogus", device="cpu")
+        with pytest.raises(ValueError):
+            pyscx.accel.pca_neighbors_umap(adata, prefer_format="csc", device="cpu")
+
+
+@cuvs_only
+class TestPcaNeighborsUmapGpu:
+    def test_route_metadata_device_resident(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=15, n_components=2, device="gpu"
+        )
+
+        accel = adata.uns["scx_accel"]
+        assert accel["pca"]["route"] == "gpu_device_resident"
+        assert accel["neighbors"]["route"] == "gpu_device_resident"
+        assert accel["umap"]["route"] == "gpu_device_resident"
+        assert accel["pca_neighbors_umap"]["route"] == "gpu_device_resident"
+        assert adata.uns["neighbors"]["params"]["method"] == "cagra"
+
+    def test_matches_sequential_gpu(self, synthetic_adata):
+        """Fused GPU PCA matches a separate GPU PCA run; UMAP is valid.
+
+        UMAP is stochastic on the GPU (atomicAdd races), so only PCA parity is
+        asserted exactly-ish; the UMAP embedding is checked for correct shape and
+        finiteness (a broken device fuzzy graph / UMAP handoff would NaN or crash).
+        """
+        import pyscx
+
+        fused = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            fused, n_comps=20, n_neighbors=15, n_components=2, device="gpu", random_state=0
+        )
+
+        seq = synthetic_adata.copy()
+        pyscx.accel.pca(seq, n_comps=20, device="gpu", random_state=0)
+        np.testing.assert_allclose(
+            fused.obsm["X_pca"], seq.obsm["X_pca"], rtol=1e-3, atol=1e-3
+        )
+
+        assert "connectivities" in fused.obsp
+        assert fused.obsp["connectivities"].nnz > 0
+        assert fused.obsm["X_umap"].shape == (100, 2)
+        assert np.isfinite(fused.obsm["X_umap"]).all()
+
+    def test_backed_input(self, pca_adata):
+        """Fused PCA→kNN→UMAP works on a backed SCX `X` (streaming source)."""
+        import pyscx
+
+        scx_path, _ = pca_adata
+        adata = pyscx.open(scx_path).to_anndata(backed=True)
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=15, n_components=2, device="gpu"
+        )
+
+        assert adata.obsm["X_pca"].shape[1] == 10
+        assert adata.obsm["X_umap"].shape == (adata.n_obs, 2)
+        assert np.isfinite(adata.obsm["X_umap"]).all()
+        assert (
+            adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
+            == "gpu_device_resident"
+        )
+
+
 @gpu_no_cuvs
 class TestPcaNeighborsPartialFallback:
     def test_route_reflects_partial_gpu(self, synthetic_adata):

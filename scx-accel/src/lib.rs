@@ -82,7 +82,7 @@ pub use diffexp_gpu::{
     GpuDeShardInput,
 };
 #[cfg(feature = "gpu")]
-pub use fused::pca_then_knn_gpu;
+pub use fused::{pca_then_knn_gpu, pca_then_knn_umap_gpu};
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]

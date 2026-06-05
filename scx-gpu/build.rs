@@ -80,7 +80,10 @@ fn main() {
         }
     }
 
-    // Re-run build if any kernel file changes
+    // Re-run build if any kernel file changes — and watch the directory itself
+    // so newly added `.cu` files trigger a rebuild (per-file watches alone
+    // never fire for a file that didn't exist on the previous run).
+    println!("cargo:rerun-if-changed=kernels");
     for cu_file in &cu_files {
         println!("cargo:rerun-if-changed={}", cu_file.display());
     }
