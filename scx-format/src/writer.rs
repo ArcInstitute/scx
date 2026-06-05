@@ -1304,6 +1304,26 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Attach per-shard column statistics to every CSR shard at once.
+    ///
+    /// `per_shard[k]` is the `Vec<ColumnStat>` for the k-th CSR shard in
+    /// `FullCatalog::csr_shards_sorted` order (sorted by `row_start`). This is
+    /// the same `shard_id` space the obs predicate index is built against
+    /// (`shard_row_ranges` index == catalog CSR-shard sorted position), so the
+    /// per-shard `CategoryBitset` / `MinMax` stats derived from that index line
+    /// up with the shards `prune_shards_by_catalog_with_dict` iterates at query
+    /// time. Unlike [`Self::set_shard_column_stats`] (which only touches the
+    /// last-written entry) this addresses shards by position, in a single sort
+    /// pass — O(n log n) rather than O(n²) on atlas-scale shard counts.
+    ///
+    /// `per_shard.len()` must equal the number of CSR shards written so far.
+    pub fn set_csr_shard_column_stats_bulk(
+        &mut self,
+        per_shard: Vec<Vec<crate::catalog::ColumnStat>>,
+    ) -> Result<()> {
+        assign_csr_shard_column_stats(&mut self.entries, per_shard)
+    }
+
     // -----------------------------------------------------------------------
     // Phase B: per-modality writer API
     // -----------------------------------------------------------------------
@@ -2407,6 +2427,52 @@ pub enum MajorAxis {
     Col,
 }
 
+/// Attach per-shard column statistics to the modality-0 CSR shard entries in
+/// `entries`, addressing them by `csr_shards_sorted` position.
+///
+/// `per_shard[k]` is the `Vec<ColumnStat>` for the k-th modality-0 CSR shard in
+/// `row_start` order — the same `shard_id` space an obs predicate index is
+/// built against (`shard_row_ranges` index == catalog CSR-shard sorted
+/// position). Shared by [`ScxWriter::set_csr_shard_column_stats_bulk`] (on the
+/// writer's own entries) and `scx-ops::append` (on its assembled catalog
+/// entries, which include both pre-existing and freshly-appended CSR shards).
+///
+/// `per_shard.len()` must equal the number of modality-0 CSR shard entries;
+/// returns [`ScxError::ColumnStatsShardCountMismatch`] otherwise.
+pub fn assign_csr_shard_column_stats(
+    entries: &mut [FullCatalogEntry],
+    per_shard: Vec<Vec<crate::catalog::ColumnStat>>,
+) -> Result<()> {
+    let mut shard_entry_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+        .map(|(i, _)| i)
+        .collect();
+    if per_shard.len() != shard_entry_indices.len() {
+        return Err(ScxError::ColumnStatsShardCountMismatch {
+            got: per_shard.len(),
+            expected: shard_entry_indices.len(),
+        });
+    }
+    shard_entry_indices.sort_by_key(|&i| {
+        entries[i]
+            .stats
+            .as_ref()
+            .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
+    });
+    for (column_stats, &entry_idx) in per_shard.into_iter().zip(shard_entry_indices.iter()) {
+        if column_stats.len() > u8::MAX as usize {
+            return Err(ScxError::ColumnStatsOverflow(column_stats.len()));
+        }
+        if let Some(ref mut stats) = entries[entry_idx].stats {
+            stats.n_indexed_columns = column_stats.len() as u8;
+            stats.column_stats = column_stats;
+        }
+    }
+    Ok(())
+}
+
 /// Compute shard statistics from raw value bytes.
 ///
 /// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and
@@ -2565,6 +2631,110 @@ mod tests {
         let indices = vec![1u32, 3, 0, 2, 4, 2];
         let values: Vec<u8> = vec![5, 10, 1, 3, 7, 2]; // u8 encoding
         (indptr, indices, values)
+    }
+
+    /// `set_csr_shard_column_stats_bulk` assigns each `Vec<ColumnStat>` to the
+    /// CSR shard at the matching `csr_shards_sorted` position (by row_start),
+    /// regardless of the order shards were written, and the stats round-trip
+    /// through the catalog.
+    #[test]
+    fn bulk_csr_shard_column_stats_assigns_by_sorted_position() {
+        use crate::catalog::{column_name_hash, ColumnStat};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bulk.scx");
+        let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let (indptr, indices, values) = sample_shard_data();
+        // Write shard covering rows 3..6 first, then 0..3 — so write order
+        // differs from sorted (row_start) order.
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                3,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let hash = column_name_hash("cell_type");
+        // per_shard[0] is for the row_start==0 shard; per_shard[1] for row_start==3.
+        writer
+            .set_csr_shard_column_stats_bulk(vec![
+                vec![ColumnStat::CategoryBitset {
+                    column_name_hash: hash,
+                    bitset: vec![0b0000_0001],
+                }],
+                vec![ColumnStat::CategoryBitset {
+                    column_name_hash: hash,
+                    bitset: vec![0b0000_0010],
+                }],
+            ])
+            .unwrap();
+        writer.finish().unwrap();
+
+        let reader = crate::ScxReader::open(&path).unwrap();
+        let sorted = reader.catalog().csr_shards_sorted();
+        assert_eq!(sorted.len(), 2);
+        // Sorted by row_start: index 0 == rows 0..3, index 1 == rows 3..6.
+        let stats0 = sorted[0].stats.as_ref().unwrap();
+        let stats1 = sorted[1].stats.as_ref().unwrap();
+        assert_eq!(stats0.row_start, 0);
+        assert_eq!(stats1.row_start, 3);
+        match &stats0.column_stats[0] {
+            ColumnStat::CategoryBitset { bitset, .. } => assert_eq!(bitset, &vec![0b0000_0001]),
+            other => panic!("unexpected stat: {other:?}"),
+        }
+        match &stats1.column_stats[0] {
+            ColumnStat::CategoryBitset { bitset, .. } => assert_eq!(bitset, &vec![0b0000_0010]),
+            other => panic!("unexpected stat: {other:?}"),
+        }
+    }
+
+    /// Wrong per-shard length is rejected (guards against shard_id/range
+    /// misalignment — the bug class that left pushdown non-functional).
+    #[test]
+    fn bulk_csr_shard_column_stats_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bulk_bad.scx");
+        let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let (indptr, indices, values) = sample_shard_data();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        // One CSR shard but two stat vecs.
+        let err = writer
+            .set_csr_shard_column_stats_bulk(vec![vec![], vec![]])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ScxError::ColumnStatsShardCountMismatch {
+                got: 2,
+                expected: 1
+            }
+        ));
     }
 
     /// Round-trip the `adopt_in_place` / `into_in_place_parts` pair: start

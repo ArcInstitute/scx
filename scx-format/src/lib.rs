@@ -74,8 +74,8 @@ pub use shard_decode::decode_shard_bytes;
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use versioned::VersionedSection;
 pub use writer::{
-    chmod_to_umask, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile, MajorAxis,
-    PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
+    assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,
+    make_sibling_tempfile, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
 };
 
 /// Default number of rows per CSR shard when callers don't override it.
