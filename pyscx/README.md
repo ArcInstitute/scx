@@ -90,8 +90,9 @@ build matrix (CPU-only, HDF5, cloud, GPU, Python, R).
 
 **Pre-built wheels** (published to [GitHub Releases](https://github.com/ArcInstitute/scx/releases))
 ship the `hdf5-static` feature so libhdf5 is bundled — no system library
-required. The `cloud` and `gpu` extras remain opt-in
-(`pip install './pyscx-*.whl[cloud,gpu]'`).
+required. The `cloud` and `gpu` extras remain opt-in — attach them to the
+resolved wheel filename (`pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"`; a
+quoted `*` glob reaches pip verbatim and fails).
 
 ### Feature flags
 

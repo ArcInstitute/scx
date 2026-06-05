@@ -44,17 +44,25 @@ python -c "import pyscx; print(pyscx.__version__)"
 - **Not included** — GPU acceleration. For `device="gpu"` you must build from
   source with `--features gpu` (see below).
 
-**Optional Python extras** (install only what you need):
+**Optional Python extras** (install only what you need). Extras must attach to
+the **resolved** wheel filename — `pip` does not expand globs, and quoting a
+`*` pattern (needed so the shell leaves `[extra]` alone) blocks shell expansion
+too, so `'./pyscx-*.whl[cloud]'` reaches pip verbatim and fails. Wrap the glob
+in `$(ls ...)` so the shell resolves it to a single filename before appending
+the extra (assumes exactly one matching wheel in the directory):
 
 ```bash
-pip install './pyscx-*.whl[cloud]'      # boto3, google-cloud-storage, azure-storage-blob
-pip install './pyscx-*.whl[gpu]'        # cupy-cuda12x (Linux); needs a GPU-enabled build
-pip install './pyscx-*.whl[mudata]'     # in-memory MuData round-trip (from_mudata / to_mudata)
-pip install './pyscx-*.whl[10x]'        # from_10x (pulls scanpy)
-pip install './pyscx-*.whl[eval]'       # polars for pyscx.eval helpers
-pip install './pyscx-*.whl[scvi]'       # scvi-tools integration helpers
-pip install './pyscx-*.whl[cloud,gpu]'  # combine as needed
+pip install "$(ls ./pyscx-*.whl)[cloud]"      # boto3, google-cloud-storage, azure-storage-blob
+pip install "$(ls ./pyscx-*.whl)[gpu]"        # cupy-cuda12x (Linux); needs a GPU-enabled build
+pip install "$(ls ./pyscx-*.whl)[mudata]"     # in-memory MuData round-trip (from_mudata / to_mudata)
+pip install "$(ls ./pyscx-*.whl)[10x]"        # from_10x (pulls scanpy)
+pip install "$(ls ./pyscx-*.whl)[eval]"       # polars for pyscx.eval helpers
+pip install "$(ls ./pyscx-*.whl)[scvi]"       # scvi-tools integration helpers
+pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"  # combine as needed
 ```
+
+Or just spell out the full filename, e.g.
+`pip install './pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'`.
 
 Notes on extras:
 
@@ -242,10 +250,10 @@ unset VIRTUAL_ENV    # when using conda for the build
 |---|---|
 | h5ad / h5mu file I/O | Base pre-built wheel (hdf5-static) |
 | Cloud URLs (`open_cloud`) | Base wheel (cloud compiled in); `[cloud]` for Python SDK extras |
-| In-memory MuData (`from_mudata`, `to_mudata`) | `pip install './pyscx-*.whl[mudata]'` |
-| 10x HDF5 (`from_10x`) | `pip install './pyscx-*.whl[10x]'` (scanpy) |
-| GPU accelerators | Source build with `--features gpu` + `pip install './pyscx-*.whl[gpu]'` (cupy) |
-| cell-eval parity helpers | `pip install './pyscx-*.whl[eval]'` (polars) |
+| In-memory MuData (`from_mudata`, `to_mudata`) | `pip install "$(ls ./pyscx-*.whl)[mudata]"` |
+| 10x HDF5 (`from_10x`) | `pip install "$(ls ./pyscx-*.whl)[10x]"` (scanpy) |
+| GPU accelerators | Source build with `--features gpu` + `pip install "$(ls ./pyscx-*.whl)[gpu]"` (cupy) |
+| cell-eval parity helpers | `pip install "$(ls ./pyscx-*.whl)[eval]"` (polars) |
 
 ### Dependency version conflicts
 

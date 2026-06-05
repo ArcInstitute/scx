@@ -36,10 +36,11 @@ pip install ./pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
-Add extras only when needed: `'./pyscx-*.whl[mudata]'`, `'./pyscx-*.whl[10x]'`,
-`'./pyscx-*.whl[gpu]'` (cupy only — GPU kernels need a source build). Pre-built
-wheels bundle libhdf5 **and** cloud I/O (Linux x86_64, py ≥ 3.11); they do **not**
-include GPU.
+Add extras only when needed — attach them to the resolved wheel filename via
+`pip install "$(ls ./pyscx-*.whl)[mudata]"` (a quoted `*` glob reaches pip
+verbatim and fails); e.g. `[mudata]`, `[10x]`, `[gpu]` (cupy only — GPU kernels
+need a source build). Pre-built wheels bundle libhdf5 **and** cloud I/O (Linux
+x86_64, py ≥ 3.11); they do **not** include GPU.
 
 **Developers** — clone the repo and compile the extension (a bare clone does
 *not* work like `pip install`):
