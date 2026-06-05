@@ -18,6 +18,7 @@ pub fn run_append(
     shard_size: NonZeroU32,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
+    csc_memory_limit: &str,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
@@ -203,10 +204,7 @@ pub fn run_append(
 
     // Re-emit the CSC sidecar that scx_ops::append dropped.
     if rebuild_csc {
-        // Fixed 4 GiB transpose memory budget for the post-op CSC rebuild;
-        // not overridable here. `scx build-csc --memory-limit` is the
-        // configurable counterpart.
-        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, "4G")?;
+        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, csc_memory_limit)?;
         println!("Rebuilt CSC sidecar on {}", target.display());
     }
 
