@@ -2290,6 +2290,12 @@ fn streaming_impl(
 /// exact convention `pushdown::can_exclude_shard` checks
 /// (`values.binary_search` → bit `i`). For each numeric column we fold the B+
 /// tree leaf entries into a per-shard [`ColumnStat::MinMax`].
+///
+/// Precondition: every `shard_id` recorded in the index lies in `0..n_shards`
+/// (the index is built against exactly `n_shards` `shard_row_ranges`). An
+/// out-of-range id signals an index/catalog shard-space misalignment, which
+/// would silently mis-place "value present" bits and risk incorrect shard
+/// skipping; it trips a `debug_assert` and is otherwise dropped defensively.
 pub fn derive_shard_column_stats(
     index: &PredicateIndex,
     n_shards: usize,
@@ -2306,6 +2312,11 @@ pub fn derive_shard_column_stats(
                 for (bit, entry) in cat.entries.iter().enumerate() {
                     for range in &entry.shard_ranges {
                         let shard = range.shard_id as usize;
+                        debug_assert!(
+                            shard < n_shards,
+                            "categorical shard_id {shard} >= n_shards {n_shards} — \
+                             index/catalog shard-space misalignment"
+                        );
                         if shard < n_shards {
                             bitsets[shard][bit / 8] |= 1 << (bit % 8);
                         }
@@ -2324,6 +2335,11 @@ pub fn derive_shard_column_stats(
                 for page in &num.leaf_pages {
                     for entry in &page.entries {
                         let shard = entry.shard_id as usize;
+                        debug_assert!(
+                            shard < n_shards,
+                            "numeric shard_id {shard} >= n_shards {n_shards} — \
+                             index/catalog shard-space misalignment"
+                        );
                         if shard < n_shards {
                             let slot =
                                 minmax[shard].get_or_insert((entry.min_value, entry.max_value));

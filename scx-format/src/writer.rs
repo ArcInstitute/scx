@@ -2439,6 +2439,11 @@ pub enum MajorAxis {
 ///
 /// `per_shard.len()` must equal the number of modality-0 CSR shard entries;
 /// returns [`ScxError::ColumnStatsShardCountMismatch`] otherwise.
+///
+/// Precondition: every modality-0 CSR shard entry must carry `Some(stats)`. The
+/// by-position mapping relies on sorting those entries by `major_start`; an entry
+/// with `stats == None` sorts to the end (`u64::MAX`) and has its stats dropped,
+/// either of which would silently misalign the mapping. Trips a `debug_assert`.
 pub fn assign_csr_shard_column_stats(
     entries: &mut [FullCatalogEntry],
     per_shard: Vec<Vec<crate::catalog::ColumnStat>>,
@@ -2465,6 +2470,10 @@ pub fn assign_csr_shard_column_stats(
         if column_stats.len() > u8::MAX as usize {
             return Err(ScxError::ColumnStatsOverflow(column_stats.len()));
         }
+        debug_assert!(
+            entries[entry_idx].stats.is_some(),
+            "CSR shard entry missing stats — by-position column-stats mapping would misalign"
+        );
         if let Some(ref mut stats) = entries[entry_idx].stats {
             stats.n_indexed_columns = column_stats.len() as u8;
             stats.column_stats = column_stats;
