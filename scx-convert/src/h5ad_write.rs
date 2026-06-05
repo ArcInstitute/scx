@@ -1473,39 +1473,45 @@ fn append_shard_to_column(
             ..
         } => {
             let (local_codes, local_values) = dict_local_codes_and_string_values(array, name)?;
-            // Build local→global remap (extends `dict` / `cat_order`
-            // for any value not seen before).
-            let mut remap: Vec<i32> = Vec::with_capacity(local_values.len());
-            for v in local_values {
-                let g = match dict.get(&v) {
-                    Some(&g) => g,
+            // C10: intern only the dictionary values actually referenced by
+            // `kept_local` rows, so categories present only in
+            // deletion-dropped rows don't enter the global vocabulary. The
+            // local→global map is filled lazily as kept codes are visited.
+            let mut local_to_global: Vec<Option<i32>> = vec![None; local_values.len()];
+            let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
+            for &i in &kept_local {
+                let lc = local_codes[i];
+                if lc < 0 {
+                    kept_codes.push(-1);
+                    continue;
+                }
+                let lc_idx = lc as usize;
+                let g = match local_to_global[lc_idx] {
+                    Some(g) => g,
                     None => {
-                        // Cap at i32::MAX. Practical categorical
-                        // cardinalities (cell_type, donor_id) stay
-                        // well below this; saturating is defensive.
-                        let g: i32 = cat_order.len().try_into().map_err(|_| {
-                            ConvertError::Other(format!(
-                                "column '{name}': categorical cardinality exceeds i32::MAX"
-                            ))
-                        })?;
-                        dict.insert(v.clone(), g);
-                        cat_order.push(v);
+                        let v = &local_values[lc_idx];
+                        let g = match dict.get(v) {
+                            Some(&g) => g,
+                            None => {
+                                // Cap at i32::MAX. Practical categorical
+                                // cardinalities (cell_type, donor_id) stay
+                                // well below this; saturating is defensive.
+                                let g: i32 = cat_order.len().try_into().map_err(|_| {
+                                    ConvertError::Other(format!(
+                                        "column '{name}': categorical cardinality exceeds i32::MAX"
+                                    ))
+                                })?;
+                                dict.insert(v.clone(), g);
+                                cat_order.push(v.clone());
+                                g
+                            }
+                        };
+                        local_to_global[lc_idx] = Some(g);
                         g
                     }
                 };
-                remap.push(g);
+                kept_codes.push(g);
             }
-            let kept_codes: Vec<i32> = kept_local
-                .iter()
-                .map(|&i| {
-                    let lc = local_codes[i];
-                    if lc < 0 {
-                        -1
-                    } else {
-                        remap[lc as usize]
-                    }
-                })
-                .collect();
             codes_ds.write_slice(
                 ArrayView1::from(kept_codes.as_slice()),
                 ndarray::s![*offset..*offset + kept_codes.len()],
