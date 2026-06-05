@@ -1479,7 +1479,7 @@ fn append_shard_to_column(
             // local→global map is filled lazily as kept codes are visited.
             let mut local_to_global: Vec<Option<i32>> = vec![None; local_values.len()];
             let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
-            for &i in &kept_local {
+            for &i in kept_local {
                 let lc = local_codes[i];
                 if lc < 0 {
                     kept_codes.push(-1);

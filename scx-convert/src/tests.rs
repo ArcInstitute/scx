@@ -5067,11 +5067,14 @@ fn parallel_memory_budget_derates_workers() {
     create_test_h5ad(&h5ad, 80, 17, "csr", false);
     let scx = dir.path().join("out.scx");
 
-    // 16 rows × 17 vars × 4 / 5 = 217 bytes per worker. Budget = 500
-    // → grants at most 2 workers; requested = 8 → derate fires.
+    // C7: per-worker bytes are now nnz-exact (derived from the resident
+    // indptr), not a density estimate. Each aligned 16-row window of this
+    // fixture holds 40 nnz (rows alternate 2/3 nnz), so per-worker working set
+    // = 16 B/nnz × 40 + 8 × (16 + 1) = 776 bytes. Budget = 1600 → grants
+    // floor(1600 / 776) = 2 workers; requested = 8 → derate fires.
     let mut opts = streaming_opts(16);
     opts.reader_threads = Some(8);
-    opts.memory_budget = Some(500);
+    opts.memory_budget = Some(1600);
 
     // Capture warnings to assert ReaderThreadsDerated emitted.
     use std::sync::{Arc, Mutex};
