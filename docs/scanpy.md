@@ -1447,7 +1447,7 @@ pyscx.accel.pca_neighbors(adata, n_comps=50, n_neighbors=15, device="gpu")
 | `n_oversamples` / `n_power_iterations` | 10 / 2 | Randomized-PCA accuracy knobs |
 | `method` | `"auto"` | PCA method: `"auto"`, `"covariance"`, `"randomized"` |
 | `qr_method` | `"householder"` | Randomized-PCA QR: `"householder"` or `"cholesky"` |
-| `use_rep` | `"X_pca"` | obsm key the fallback `neighbors` step reads |
+| `use_rep` | `"X_pca"` | obsm key the `neighbors` step reads. A non-default value always runs the sequential path — the fused path runs kNN on the freshly-computed PCA embedding, so honoring `obsm[use_rep]` requires the standalone `neighbors`. |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 | `prefer_format` | `"csr"` | Only `"csr"` is supported (PCA's SpMM path is row-major) |
 

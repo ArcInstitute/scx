@@ -156,6 +156,23 @@ pub fn gpu_transpose_f32(
     n_rows: usize,
     n_cols: usize,
 ) -> Result<(), GpuError> {
+    // Guard against a mis-sized caller before issuing a raw device-pointer SpMM
+    // (cublasSgeam reads/writes exactly `n_rows * n_cols` elements off each
+    // pointer; a short buffer would be an out-of-bounds device access).
+    let expected_len = n_rows * n_cols;
+    if src.len() != expected_len {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("src length = n_rows × n_cols = {expected_len}"),
+            got: format!("{}", src.len()),
+        });
+    }
+    if dst.len() != expected_len {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("dst length = n_rows × n_cols = {expected_len}"),
+            got: format!("{}", dst.len()),
+        });
+    }
+
     handle.set_stream(stream)?;
 
     let alpha: f32 = 1.0;

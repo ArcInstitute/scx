@@ -548,7 +548,11 @@ pub fn gpu_randomized_pca_device(
     } = core;
 
     // Transpose col-major (n_obs × n_components) → row-major on the device.
+    // A fresh cuBLAS handle is intentional: the core's handle was scoped to its
+    // own stream usage and already dropped, so the transpose needs its own.
     let cublas_handle = CublasHandle::new()?;
+    // `d_u` and `d_rowmajor` are both live across the transpose, so peak GPU
+    // memory transiently holds ~2× the embedding (~480 MB at 1M × 60 f32).
     let mut d_rowmajor = dev.alloc_zeros::<f32>(n_obs * n_components)?;
     gpu_transpose_f32(
         &cublas_handle,
@@ -1301,11 +1305,11 @@ mod tests {
         assert_eq!(dev_res.embeddings.shape(), (n_rows, k));
         assert_eq!(dev_res.components.len(), host.components.len());
 
-        // The host and device entries are *separate* randomized-PCA runs (the
-        // public API has no shared-core hook), so GPU SpMM/QR run-to-run
-        // nondeterminism makes them differ at f32 noise level (~1e-6). A tight
-        // tolerance still catches a genuinely wrong device transpose (which
-        // would be O(1) off) while tolerating that noise.
+        // The host and device entries share `randomized_pca_core` but each call
+        // runs it *separately* (there is no single-call hook returning both), so
+        // GPU SpMM/QR run-to-run nondeterminism makes them differ at f32 noise
+        // level (~1e-6). A tight tolerance still catches a genuinely wrong device
+        // transpose (which would be O(1) off) while tolerating that noise.
         for (a, b) in dev_res.components.iter().zip(host.components.iter()) {
             assert!(
                 (a - b).abs() <= 1e-3,

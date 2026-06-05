@@ -52,6 +52,15 @@ cuvs_only = pytest.mark.skipif(
     reason="cuVS CAGRA not available — skipping fused device-resident GPU tests",
 )
 
+# Inverse gate: a GPU is present but cuVS is NOT — the partial-fallback case
+# (GPU PCA + CPU HNSW kNN). Skips on CPU-only hosts AND on hosts where cuVS is
+# installed, so it is a no-op in most environments; it exists to assert the
+# route metadata is accurate when only the kNN stage falls back.
+gpu_no_cuvs = pytest.mark.skipif(
+    not (_gpu_available() and not _cuvs_available()),
+    reason="needs a GPU host WITHOUT cuVS — skipping partial-fallback route test",
+)
+
 
 @pytest.fixture
 def pca_adata(synthetic_adata, scx_from_adata):
@@ -199,3 +208,97 @@ class TestPcaNeighborsGpu:
         assert adata.obsm["X_pca"].shape[1] == 10
         assert "connectivities" in adata.obsp
         assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
+
+    def test_lazy_transform_input(self, pca_adata):
+        """Fused path works on a lazy `ScxLazyTransformedDataset` `X`.
+
+        Exercises the `ScxLazyTransformedDataset` dispatch branch in fused.rs.
+        The CPU-device normalize/log1p setup keeps `X` lazy (a GPU-device
+        normalize would eager-materialize), so the fused GPU entry consumes the
+        lazy shard source directly.
+        """
+        import pyscx
+
+        scx_path, _ = pca_adata
+        adata = pyscx.open(scx_path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata, target_sum=1e4, device="cpu")
+        pyscx.accel.log1p(adata, device="cpu")
+        assert type(adata.X).__name__ == "ScxLazyTransformedDataset"
+
+        pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
+
+        assert adata.obsm["X_pca"].shape[1] == 10
+        assert "connectivities" in adata.obsp
+        assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
+
+    @pytest.mark.parametrize("method", ["covariance", "randomized", "auto"])
+    def test_pca_method_routes(self, synthetic_adata, method):
+        """Both device PCA cores feed the fused handoff.
+
+        `synthetic_adata` has n_vars=50 ≤ GPU_COVARIANCE_PCA_THRESHOLD, so
+        `method="auto"` resolves to covariance; `"covariance"` exercises
+        `gpu_covariance_pca_device` and `"randomized"` exercises
+        `gpu_randomized_pca_device`. All must keep the device-resident route.
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors(
+            adata, n_comps=10, n_neighbors=15, device="gpu", method=method
+        )
+
+        assert adata.obsm["X_pca"].shape == (100, 10)
+        assert "connectivities" in adata.obsp
+        assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
+
+    def test_non_default_use_rep_falls_back_to_sequential(self, synthetic_adata):
+        """A non-default `use_rep` must NOT take the fused device-resident path.
+
+        The fused path always runs kNN on the freshly-computed PCA embedding, so
+        honoring `obsm[use_rep]` requires the sequential path. Regression guard
+        for the silently-wrong-result bug: with `use_rep != "X_pca"` the route
+        must not be `gpu_device_resident`, and the recorded kNN representation
+        must be the one requested.
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        # Provide the custom representation the sequential neighbors() will read.
+        adata.obsm["X_custom"] = np.ascontiguousarray(
+            adata.obsm["X_pca"], dtype=np.float32
+        )
+
+        pyscx.accel.pca_neighbors(
+            adata, n_comps=10, n_neighbors=15, device="gpu", use_rep="X_custom"
+        )
+
+        assert adata.uns["scx_accel"]["pca_neighbors"]["route"] != "gpu_device_resident"
+        assert adata.uns["neighbors"]["params"]["use_rep"] == "X_custom"
+        assert "connectivities" in adata.obsp
+
+
+# ---------------------------------------------------------------------------
+# Partial fallback: GPU present, cuVS absent (GPU PCA + CPU HNSW kNN).
+# Skips unless the host has a GPU but no cuVS — a no-op in most environments.
+# ---------------------------------------------------------------------------
+
+
+@gpu_no_cuvs
+class TestPcaNeighborsPartialFallback:
+    def test_route_reflects_partial_gpu(self, synthetic_adata):
+        """When only kNN falls back, the summary must mirror the kNN route.
+
+        GPU PCA still runs (`pca` → `gpu_csr`) but kNN runs on CPU HNSW
+        (`neighbors` → `cpu_csr`). The `pca_neighbors` summary must report the
+        actual `neighbors` route (`cpu_csr`), not a synthesized full-CPU run.
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        with pytest.warns(UserWarning, match="cuVS not found"):
+            pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
+
+        accel = adata.uns["scx_accel"]
+        assert accel["pca"]["route"] == "gpu_csr"
+        assert accel["neighbors"]["route"] == "cpu_csr"
+        assert accel["pca_neighbors"]["route"] == "cpu_csr"

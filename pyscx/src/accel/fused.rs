@@ -54,7 +54,10 @@ use scx_format::ShardSource;
 ///     device: "auto" (default), "cpu", "gpu", or "gpu:N".
 ///     method: "auto" (default), "covariance", or "randomized".
 ///     qr_method: "householder" (default) or "cholesky".
-///     use_rep: obsm key the (fallback) neighbors step reads (default "X_pca").
+///     use_rep: obsm key the neighbors step reads (default "X_pca"). The fused
+///         device-resident path runs kNN on the freshly-computed PCA embedding,
+///         so a non-default `use_rep` always takes the sequential path (which
+///         reads `obsm[use_rep]`).
 ///     prefer_format: only "csr" is supported (PCA is row-major).
 #[pyfunction]
 #[pyo3(signature = (adata, n_comps=50, n_neighbors=15, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", use_rep="X_pca", prefer_format="csr"))]
@@ -94,24 +97,24 @@ pub fn pca_neighbors(
         )));
     }
 
-    // The fully device-resident path needs both the modern cuSPARSE ABI (PCA)
-    // and cuVS (CAGRA kNN).
-    #[cfg(feature = "gpu")]
-    let fused_eligible = scx_accel::cusparse_modern_abi_available() && scx_accel::cuvs_available();
-    #[cfg(not(feature = "gpu"))]
-    let fused_eligible = false;
-
     // ---- Fully fused device-resident GPU path ----
+    // Gated on `use_rep == "X_pca"`: the fused path always feeds kNN the
+    // freshly-computed PCA embedding, whereas the sequential `neighbors` reads
+    // `obsm[use_rep]`. A non-default `use_rep` therefore must take the
+    // sequential path (which honors `obsm[use_rep]`) — otherwise we'd compute
+    // the graph from the new PCA embedding while claiming we used `use_rep`. So
+    // a non-default `use_rep` falls straight through to the sequential delegate
+    // below (no fused-specific cuSPARSE/cuVS warnings — `pca()` emits its own).
     #[cfg(feature = "gpu")]
-    if let Some(device_id) = match _device.gpu_id() {
-        Some(id) if scx_accel::cusparse_modern_abi_available() => Some(id),
-        Some(_) => {
+    if let Some(device_id) = match (_device.gpu_id(), use_rep == "X_pca") {
+        (Some(id), true) if scx_accel::cusparse_modern_abi_available() => Some(id),
+        (Some(_), true) => {
             // libcusparse too old — warn and let the fallback (which may still
             // use GPU PCA via its own probe) handle it.
             emit_cusparse_abi_warning(py, device)?;
             None
         }
-        None => None,
+        _ => None,
     } {
         if scx_accel::cuvs_available() {
             let qr = parse_qr_method(qr_method)?;
@@ -216,12 +219,15 @@ pub fn pca_neighbors(
             let warnings = py.import("warnings")?;
             warnings.call_method1(
                 "warn",
-                (format!(
-                    "pca_neighbors(device={device:?}): cuVS not found — the fused \
-                     device-resident path is unavailable; falling back to sequential \
-                     pca + neighbors (CPU HNSW). Install cuVS: conda install -c rapidsai \
-                     -c conda-forge libcuvs"
-                ),),
+                (
+                    format!(
+                        "pca_neighbors(device={device:?}): cuVS not found — the fused \
+                         device-resident path is unavailable; falling back to sequential \
+                         pca + neighbors (CPU HNSW). Install cuVS: conda install -c rapidsai \
+                         -c conda-forge libcuvs"
+                    ),
+                    py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                ),
             )?;
         }
     }
@@ -252,15 +258,13 @@ pub fn pca_neighbors(
         device,
     )?;
 
-    // Summary route on pca_neighbors: device-resident only if the fused path
-    // ran (it returned above when it did), so this records the non-fused reality.
-    let info = super::route::simple_exec_info(
-        device,
-        fused_eligible,
-        scx_accel::AccelRoute::GpuDeviceResident,
-        scx_accel::AccelRoute::CpuCsr,
-    );
-    super::route::write_accel_route(py, adata, "pca_neighbors", &info)?;
+    // Summary route on pca_neighbors: the fused path returned above when it
+    // ran, so we got here only on the sequential fallback. Mirror the actual
+    // route the `neighbors` stage recorded (the stage whose GPU-vs-CPU outcome
+    // determines whether fusion happened) rather than synthesizing a summary —
+    // this stays accurate when GPU PCA ran but kNN fell back to CPU HNSW (cuVS
+    // missing), where a synthesized `cpu_csr` would wrongly imply a full-CPU run.
+    super::route::copy_accel_route(adata, "neighbors", "pca_neighbors")?;
 
     Ok(())
 }

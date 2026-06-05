@@ -278,7 +278,11 @@ pub fn gpu_covariance_pca_device(
     } = core;
 
     // Transpose col-major (n_obs × n_components) → row-major on the device.
+    // A fresh cuBLAS handle is intentional: the core's handle was scoped to its
+    // own stream usage and already dropped, so the transpose needs its own.
     let cublas = CublasHandle::new()?;
+    // `d_embeddings` and `d_rowmajor` are both live across the transpose, so
+    // peak GPU memory transiently holds ~2× the embedding (~480 MB at 1M × 60 f32).
     let mut d_rowmajor = dev.alloc_zeros::<f32>(n_obs * n_components)?;
     gpu_transpose_f32(
         &cublas,
