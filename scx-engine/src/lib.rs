@@ -26,7 +26,7 @@ pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult};
 pub use predicate::{evaluate, parse_predicate, Predicate, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var};
 pub use pushdown::{
-    prune_rows_by_index, prune_shards_by_catalog, prune_shards_by_catalog_with_dict,
-    CategoryDictionaries, ShardCandidate,
+    prune_shards_by_catalog, prune_shards_by_catalog_with_dict, CategoryDictionaries,
+    ShardCandidate,
 };
 pub use reader::{BoxedSectionReader, SectionReader};
