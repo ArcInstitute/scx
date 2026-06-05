@@ -1468,6 +1468,12 @@ pub fn read_uns(
     Ok(serde_json::Value::Object(map))
 }
 
+/// Convert a 2-D array into a row-major nested JSON array (`[[..], [..]]`).
+fn array2_to_json<T: serde::Serialize + Clone>(arr: ndarray::Array2<T>) -> serde_json::Value {
+    let rows: Vec<Vec<T>> = arr.outer_iter().map(|row| row.to_vec()).collect();
+    serde_json::json!(rows)
+}
+
 fn read_uns_entry(
     group: &hdf5::Group,
     name: &str,
@@ -1519,8 +1525,19 @@ fn read_uns_entry(
                     let data: Vec<i64> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
                 }
+                // C3: anndata stores uint/bool uns vectors too — the scalar arm
+                // already handles these types, so the 1-D arm must as well or
+                // they get dropped (lenient) / abort (strict_uns).
+                TypeDescriptor::Unsigned(_) => {
+                    let data: Vec<u64> = ds.read_1d()?.to_vec();
+                    Ok(serde_json::json!(data))
+                }
                 TypeDescriptor::Float(_) => {
                     let data: Vec<f64> = ds.read_1d()?.to_vec();
+                    Ok(serde_json::json!(data))
+                }
+                TypeDescriptor::Boolean => {
+                    let data: Vec<bool> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
                 }
                 TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii => {
@@ -1530,6 +1547,21 @@ fn read_uns_entry(
                 }
                 _ => Err(ConvertError::Other(format!(
                     "unsupported uns array type: {desc:?}"
+                ))),
+            };
+        }
+
+        // C4: 2-D numeric arrays (e.g. color/contrast matrices) round-trip as
+        // nested JSON arrays. Higher ranks and non-numeric 2-D arrays fall
+        // through to the error → skip/warn (lenient) or abort (strict_uns) path.
+        if shape.len() == 2 {
+            return match desc {
+                TypeDescriptor::Integer(_) => Ok(array2_to_json(ds.read_2d::<i64>()?)),
+                TypeDescriptor::Unsigned(_) => Ok(array2_to_json(ds.read_2d::<u64>()?)),
+                TypeDescriptor::Float(_) => Ok(array2_to_json(ds.read_2d::<f64>()?)),
+                TypeDescriptor::Boolean => Ok(array2_to_json(ds.read_2d::<bool>()?)),
+                _ => Err(ConvertError::Other(format!(
+                    "unsupported 2-D uns array type: {desc:?}"
                 ))),
             };
         }
