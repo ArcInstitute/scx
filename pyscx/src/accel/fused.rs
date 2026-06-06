@@ -335,9 +335,18 @@ pub fn pca_neighbors_umap(
 
     // ---- Fully fused device-resident GPU path (gated on use_rep == "X_pca"). ----
     #[cfg(feature = "gpu")]
+    // The fused fuzzy-graph kernel caps `n_neighbors` at `FUZZY_MAX_K` (256);
+    // for larger `k` we fall through to the sequential path (which has no such
+    // cap) rather than hard-erroring. Route the size-cap case through `_ => None`
+    // so it does not also emit a spurious cuSPARSE-ABI warning.
     if let Some(device_id) = match (_device.gpu_id(), use_rep == "X_pca") {
-        (Some(id), true) if scx_accel::cusparse_modern_abi_available() => Some(id),
-        (Some(_), true) => {
+        (Some(id), true)
+            if n_neighbors <= scx_accel::FUZZY_MAX_K
+                && scx_accel::cusparse_modern_abi_available() =>
+        {
+            Some(id)
+        }
+        (Some(_), true) if n_neighbors <= scx_accel::FUZZY_MAX_K => {
             emit_cusparse_abi_warning(py, device)?;
             None
         }
@@ -686,6 +695,10 @@ fn fused_umap_dispatch_unwind_safe<S: ShardSource + Sync>(
     ),
     scx_accel::AccelError,
 > {
+    // `random_state` intentionally seeds both the PCA and UMAP stages — the
+    // fused `pca_neighbors_umap` entry exposes a single `random_state` kwarg
+    // (matching the standalone path), so independent PCA/UMAP seeds are not
+    // surfaced here even though the underlying fn takes them separately.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         scx_accel::pca_then_knn_umap_gpu(
             device_id,
@@ -694,7 +707,7 @@ fn fused_umap_dispatch_unwind_safe<S: ShardSource + Sync>(
             n_oversamples,
             n_power_iterations,
             zero_center,
-            random_state,
+            random_state, // PCA seed
             qr,
             use_covariance,
             n_neighbors,
@@ -704,7 +717,7 @@ fn fused_umap_dispatch_unwind_safe<S: ShardSource + Sync>(
             umap.spread,
             umap.negative_sample_rate,
             umap.umap_learning_rate,
-            random_state,
+            random_state, // UMAP seed (same value by design)
         )
     }))
     .unwrap_or_else(|panic_payload| {

@@ -292,6 +292,20 @@ pub fn gpu_umap_from_device_graph(
         }
         None => random_init_f32(n_obs, n_components, seed),
     };
+
+    // An empty fuzzy graph (all isolated nodes) is degenerate but valid: SGD has
+    // no edges to optimize, so it would leave the init embedding unchanged.
+    // Return it directly — the edge-list / schedule kernels below would otherwise
+    // launch with a zero-sized grid (`n_edges.div_ceil(...) == 0`), which is an
+    // invalid CUDA launch.
+    if n_edges == 0 {
+        return Ok(GpuUmapResult {
+            embedding: embedding_f32,
+            n_obs,
+            n_components,
+        });
+    }
+
     let mut d_embedding = dev.htod_copy(&embedding_f32)?;
 
     // --- Build the SGD edge list + sampling schedule on-device from `graph`. ---
@@ -1248,6 +1262,34 @@ mod tests {
             "device-graph RMSE {dev_vs_native:.4} exceeds 2× native floor {floor:.4} + 0.5 \
              = {allowed:.4} — device edge-list / schedule construction likely differs from host"
         );
+    }
+
+    #[test]
+    fn test_gpu_umap_from_device_graph_empty_graph() {
+        // An all-isolated fuzzy graph (nnz == 0) has no edges to optimize. The
+        // device-graph path must return the init embedding unchanged rather than
+        // launching the edge-list / schedule kernels with a zero-sized grid
+        // (`n_edges.div_ceil(...) == 0`), which is an invalid CUDA launch.
+        let dev = require_gpu!();
+        let n_obs = 8usize;
+        let n_comp = 2usize;
+
+        let indptr = vec![0i64; n_obs + 1]; // every row empty → nnz == 0
+        let d_indptr = dev.htod_copy(&indptr).unwrap();
+        let d_indices = dev.htod_copy(&Vec::<i32>::new()).unwrap();
+        let d_data = dev.htod_copy(&Vec::<f32>::new()).unwrap();
+        let graph =
+            crate::device_resident::DeviceFuzzyGraph::new(d_indptr, d_indices, d_data, n_obs, 0)
+                .unwrap();
+
+        let init: Vec<f32> = (0..n_obs * n_comp).map(|i| i as f32 * 0.1).collect();
+        let res =
+            gpu_umap_from_device_graph(&dev, &graph, n_comp, 50, 0.1, 1.0, 5, 1.0, 42, Some(&init))
+                .unwrap();
+
+        assert_eq!(res.embedding.len(), n_obs * n_comp);
+        // No edges → SGD is a no-op → the init embedding is returned verbatim.
+        assert_eq!(res.embedding, init);
     }
 
     #[test]

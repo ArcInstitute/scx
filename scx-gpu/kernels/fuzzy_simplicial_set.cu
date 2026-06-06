@@ -42,6 +42,10 @@ extern "C" __global__ void fuzzy_membership_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_obs) return;
 
+    // Per-thread (per-row) scratch is always FUZZY_MAX_K-sized, not k-sized —
+    // ~2 KB/thread of local memory regardless of the actual n_neighbors. The
+    // column sort below (step 4) is an O(k²) insertion sort, fine for the
+    // typical small k; the host caps k at FUZZY_MAX_K before launch.
     int cols[FUZZY_MAX_K];
     float vals[FUZZY_MAX_K]; // distances first, then overwritten with memberships
 

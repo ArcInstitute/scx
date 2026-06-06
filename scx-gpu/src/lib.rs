@@ -96,7 +96,7 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
-pub use gpu_fuzzy::gpu_fuzzy_simplicial_set_device;
+pub use gpu_fuzzy::{gpu_fuzzy_simplicial_set_device, FUZZY_MAX_K};
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
     read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,

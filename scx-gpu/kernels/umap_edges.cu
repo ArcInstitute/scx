@@ -6,6 +6,17 @@
 // host helpers `scx_sparse::umap_math::compute_epochs_per_sample` and the CSR→
 // edge-list expansion previously done on the CPU in `gpu_umap_native`.
 
+#include <cassert>
+
+// The hand-rolled shared-memory tree reduction in `umap_max_weight_kernel`
+// (`for (s = blockDim.x >> 1; s > 0; s >>= 1)`) assumes a power-of-two block
+// size; a non-pow2 block drops the odd top partial and silently under-counts
+// the max weight. The only launch site hardcodes block=256 (pow2), so the bug
+// is latent — this guard turns a future non-pow2 launch into a device-side trap
+// instead of a silently wrong sampling schedule (mirrors the #182 fix in
+// diffexp.cu / harmony.cu).
+#define SCX_ASSERT_POW2_BLOCK() assert((blockDim.x & (blockDim.x - 1)) == 0)
+
 // Expand CSR row pointers into a per-edge head (source) index: thread per row
 // writes its row index into every edge slot in [indptr[i], indptr[i+1]).
 // The tail (destination) array is the CSR column-index buffer itself.
@@ -43,6 +54,7 @@ extern "C" __global__ void umap_max_weight_kernel(
     int nnz,
     float* __restrict__ out_max)     // [1], pre-zeroed
 {
+    SCX_ASSERT_POW2_BLOCK();
     __shared__ float sdata[256];
     int tid = threadIdx.x;
     float local = 0.0f;

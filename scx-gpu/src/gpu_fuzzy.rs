@@ -32,7 +32,11 @@ use crate::error::GpuError;
 const FUZZY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fuzzy_simplicial_set.ptx"));
 
 /// Must match `FUZZY_MAX_K` in `kernels/fuzzy_simplicial_set.cu`.
-const FUZZY_MAX_K: usize = 256;
+///
+/// Public so the fused pyscx path can gate on `n_neighbors <= FUZZY_MAX_K` and
+/// fall back to the sequential `pca → neighbors → umap` path for larger `k`
+/// rather than hard-erroring inside `gpu_fuzzy_simplicial_set_device`.
+pub const FUZZY_MAX_K: usize = 256;
 
 /// Build a device-resident UMAP fuzzy simplicial set from a raw kNN graph.
 ///

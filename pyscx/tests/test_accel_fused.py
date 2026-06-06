@@ -416,6 +416,37 @@ class TestPcaNeighborsUmapGpu:
             == "gpu_device_resident"
         )
 
+    def test_large_n_neighbors_falls_back_to_sequential(self):
+        """n_neighbors > FUZZY_MAX_K (256) exceeds the fused fuzzy-graph kernel's
+        per-row scratch cap. The fused device-resident path must be bypassed and
+        the call fall back to sequential pca → neighbors → umap, not hard-error.
+
+        The sequential GPU kNN handles k=300 because CAGRA's itopk_size is raised
+        to cover search_k (the cuVS default of 64 would otherwise fail for k>=64).
+        """
+        import anndata
+        import pyscx
+
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = 400, 50
+        dense = rng.integers(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+        dense[rng.random((n_obs, n_vars)) > 0.3] = 0
+        adata = anndata.AnnData(X=sp.csr_matrix(dense))
+
+        # Must not raise despite n_neighbors > 256.
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=300, n_components=2, device="gpu"
+        )
+
+        # The fully fused route is skipped for k > 256; the summary mirrors the
+        # sequential umap stage (not "gpu_device_resident").
+        assert (
+            adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
+            != "gpu_device_resident"
+        )
+        assert adata.obsm["X_umap"].shape == (n_obs, 2)
+        assert np.isfinite(adata.obsm["X_umap"]).all()
+
 
 @gpu_no_cuvs
 class TestPcaNeighborsPartialFallback:
