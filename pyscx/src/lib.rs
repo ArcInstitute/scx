@@ -1020,6 +1020,7 @@ fn register_neighbors(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_fused(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::fused::pca_neighbors, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::fused::pca_neighbors_umap, m)?)?;
     Ok(())
 }
 

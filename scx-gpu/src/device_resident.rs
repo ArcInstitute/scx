@@ -213,11 +213,12 @@ impl DeviceKnnGraph {
 /// A device-resident fuzzy simplicial set (UMAP connectivities) as a CSR matrix
 /// on the GPU.
 ///
-/// **Forward declaration for Phase 2.4** — defined here per task 2.2 so the
-/// type vocabulary is stable, but no producer exists yet. Today the fuzzy graph
-/// is built on the host by `scx_accel::neighbors::compute_connectivities`;
-/// Phase 2.4 will add a CUDA fuzzy-simplicial-set kernel that emits this type
-/// directly from a [`DeviceKnnGraph`], and UMAP will consume it.
+/// Produced by [`crate::gpu_fuzzy_simplicial_set_device`] (Phase 2.4): a CUDA
+/// fuzzy-simplicial-set kernel emits this type directly from a
+/// [`DeviceKnnGraph`], symmetrized via cuSPARSE transpose + a two-pointer merge,
+/// equivalent to running `scx_accel::neighbors::compute_connectivities` on the
+/// host. Consumed by [`crate::gpu_umap_from_device_graph`], which builds the SGD
+/// edge list on-device so the connectivity buffers never round-trip the host.
 ///
 /// Layout matches the host CSR connectivity convention: `indptr` length
 /// `n_obs + 1` (`i64`), `indices` / `data` length `nnz` (`i32` / `f32`),

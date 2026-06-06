@@ -82,7 +82,7 @@ pub use diffexp_gpu::{
     GpuDeShardInput,
 };
 #[cfg(feature = "gpu")]
-pub use fused::pca_then_knn_gpu;
+pub use fused::{pca_then_knn_gpu, pca_then_knn_umap_gpu};
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]
@@ -100,6 +100,7 @@ pub use pca::{
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{
     cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, QrMethod,
+    FUZZY_MAX_K,
 };
 #[cfg(feature = "gpu")]
 pub use umap::compute_umap_gpu;

@@ -24,7 +24,7 @@ use scx_sparse::umap_math;
 pub use umap_math::{compute_epochs_per_sample, find_ab_params};
 
 /// Random initialization (f64) — delegates to `scx_sparse::umap_math::random_init_f64`.
-fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
+pub(crate) fn random_init(n_obs: usize, n_components: usize, seed: u64) -> Vec<f64> {
     umap_math::random_init_f64(n_obs, n_components, seed)
 }
 
@@ -260,7 +260,7 @@ pub fn compute_umap(
 ///
 /// Computes the 2 (or n_components) smallest non-trivial eigenvectors of
 /// D^{-1/2} A D^{-1/2} using power iteration with deflation.
-fn spectral_init(
+pub(crate) fn spectral_init(
     indptr: &[i64],
     indices: &[i32],
     data: &[f64],

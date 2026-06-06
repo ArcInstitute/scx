@@ -754,6 +754,17 @@ pub fn gpu_knn_cagra_device(
         destroy_fn: cuvs.search_params_destroy,
     };
 
+    // CAGRA requires `itopk_size >= search_k` (and a multiple of 32); the cuVS
+    // default is 64, so leaving it unset silently fails for `search_k > 64`
+    // (i.e. n_neighbors >= 64). Raise it to cover the request while keeping the
+    // default 64 floor — the common small-k path is unchanged, and only the
+    // previously-broken large-k path is affected. cuVS single-CTA caps itopk at
+    // 1024; beyond that we let cuVS surface its own error.
+    let itopk_size = search_k.next_multiple_of(32).max(64);
+    unsafe {
+        (*search_params_ptr).itopk_size = itopk_size;
+    }
+
     // Build DLManagedTensors for queries (= dataset, self-query) and outputs
     // Queries tensor — same data as dataset
     let mut queries_shape: Vec<i64> = vec![n_obs as i64, n_dims as i64];
@@ -925,6 +936,45 @@ mod tests {
                 same_cluster >= 4,
                 "point {i} has only {same_cluster}/{n_neighbors} neighbors in same cluster"
             );
+        }
+    }
+
+    /// Regression: `n_neighbors >= 64` requires raising CAGRA's `itopk_size`
+    /// above the cuVS default of 64 (`itopk_size >= search_k`). Before that fix
+    /// this hard-errored in `cuvsCagraSearch`.
+    #[test]
+    fn test_gpu_knn_cagra_large_k() {
+        let dev = match GpuDevice::new(0) {
+            Ok(dev) => dev,
+            Err(_) => {
+                eprintln!("CUDA not available — skipping GPU kNN large-k test");
+                return;
+            }
+        };
+        if !cuvs_available() {
+            eprintln!("cuVS not available — skipping GPU kNN large-k test");
+            return;
+        }
+
+        // n_neighbors (80) well above the default itopk_size (64).
+        let n_obs = 400usize;
+        let n_dims = 8usize;
+        let n_neighbors = 80usize;
+        let mut data = Vec::with_capacity(n_obs * n_dims);
+        for i in 0..n_obs {
+            for d in 0..n_dims {
+                data.push(0.01 * ((i * n_dims + d) % 97) as f32);
+            }
+        }
+
+        let result = gpu_knn_cagra(&dev, &data, n_obs, n_dims, n_neighbors).unwrap();
+        assert_eq!(result.n_neighbors, n_neighbors);
+        assert_eq!(result.indices.len(), n_obs * n_neighbors);
+        for &idx in &result.indices {
+            assert!(idx >= 0 && (idx as usize) < n_obs, "invalid index: {idx}");
+        }
+        for &dist in &result.distances {
+            assert!(dist >= 0.0 && dist.is_finite(), "bad distance: {dist}");
         }
     }
 

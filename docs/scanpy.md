@@ -1221,6 +1221,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `prefer_format`            |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
+| `pca_neighbors_umap`     | ✓   | ✓   | (PCA + neighbors + UMAP kwargs, see below)                            | `device`, `method`, `qr_method`, `prefer_format` |
 | `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
@@ -1458,6 +1459,39 @@ warnings), and the `pca_neighbors` route records the non-device-resident result
 (e.g. `cpu_csr`). The fuzzy-graph (connectivity) step runs on the CPU in both
 cases. Accepts the same `X` inputs as `pca` (backed SCX, lazy transform, or a
 materialized scipy/dense matrix).
+
+### Fused PCA → kNN → UMAP (`pyscx.accel.pca_neighbors_umap`)
+
+Extends the fused path through the embedding (V3 Phase 2.4). On a GPU host with
+cuSPARSE 12.5+ and cuVS, PCA → CAGRA kNN → **fuzzy simplicial set** → UMAP all
+stay device-resident: the symmetrized connectivity graph is built on the GPU
+(replacing the host `compute_connectivities` symmetrization) and fed straight
+into the UMAP SGD without a host round-trip. The connectivity graph is
+downloaded **once** — for `obsp["connectivities"]` and the host spectral init —
+rather than symmetrized on the CPU and re-uploaded for SGD. Writes every slot
+`pca` + `neighbors` + `umap` do, including `obsm["X_umap"]`.
+
+```python
+# One call instead of pca(...) + neighbors(...) + umap(...).
+pyscx.accel.pca_neighbors_umap(adata, n_comps=50, n_neighbors=15,
+                               n_components=2, device="gpu")
+
+# When the fully fused path runs, all four are stamped "gpu_device_resident":
+#   adata.uns["scx_accel"]["pca"|"neighbors"|"umap"|"pca_neighbors_umap"]["route"]
+```
+
+Takes the [`pca_neighbors`](#fused-pca--knn-pyscxaccelpca_neighbors) parameters
+plus the UMAP knobs: `n_components` (output dims, default 2), `n_epochs`
+(default 200), `min_dist` (default 0.1), `spread` (default 1.0),
+`negative_sample_rate` (default 5), `umap_learning_rate` (default 1.0).
+
+Fallback: when the device-resident path is unavailable (no GPU, libcusparse <
+12.5, or cuVS missing), it transparently runs the standalone `pca` → `neighbors`
+→ `umap` (each with its own routing/warnings) and the `pca_neighbors_umap` route
+mirrors the `umap` stage's recorded route. GPU UMAP is non-deterministic
+(intentional atomicAdd races, matching cuML), so the embedding differs run-to-run
+but preserves cluster structure — pin `device="cpu"` for reproducible
+coordinates.
 
 ### UMAP (`pyscx.accel.umap`)
 

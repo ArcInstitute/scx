@@ -55,6 +55,7 @@ pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_csc_shard_source;
 pub mod gpu_diffexp;
+pub mod gpu_fuzzy;
 pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
@@ -95,6 +96,7 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
+pub use gpu_fuzzy::{gpu_fuzzy_simplicial_set_device, FUZZY_MAX_K};
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
     read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,
@@ -123,7 +125,7 @@ pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
-pub use gpu_umap::{gpu_umap_native, GpuUmapResult};
+pub use gpu_umap::{gpu_umap_from_device_graph, gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use rice_gpu::rice_decode_gpu;

@@ -202,7 +202,11 @@ pub fn umap(
 }
 
 /// Write UMAP backend metadata to adata.uns["umap"].
-fn write_umap_backend(py: Python<'_>, adata: &Bound<'_, PyAny>, backend: &str) -> PyResult<()> {
+pub(crate) fn write_umap_backend(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    backend: &str,
+) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
     let umap_dict = PyDict::new(py);
     umap_dict.set_item("backend", backend)?;
@@ -264,7 +268,7 @@ fn try_cuml_umap(
 }
 
 /// Write UMAP results to adata.obsm["X_umap"].
-fn write_umap_to_adata(
+pub(crate) fn write_umap_to_adata(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     result: &scx_accel::UmapResult,
