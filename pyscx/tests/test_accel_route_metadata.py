@@ -76,3 +76,23 @@ def test_scx_accel_dict_accumulates_ops():
     pyscx.accel.rank_genes_groups(adata, GROUPBY, reference="rest", device="cpu")
     assert "pdex_ref" in adata.uns["scx_accel"]
     assert "rank_genes_groups" in adata.uns["scx_accel"]
+
+
+def test_pca_cpu_route_omits_tuning_metadata():
+    """Task 2.5: on the CPU route, the math-mode / SpMM-policy / graph-replay
+    fields are recorded as None (they are GPU-only knobs)."""
+    adata = _make_adata()
+    adata.X = sp.csr_matrix(adata.X)
+    pyscx.accel.pca(adata, n_comps=5, device="cpu")
+    info = _route(adata, "pca")
+    assert info["route"] == "cpu_csr"
+    assert info["math_mode"] is None
+    assert info["spmm_policy"] is None
+    assert info["graph_replay"] is None
+
+
+def test_pca_rejects_invalid_spmm_policy():
+    """Task 2.5: spmm_policy is validated on every device path."""
+    adata = _make_adata()
+    with pytest.raises(ValueError, match="spmm_policy"):
+        pyscx.accel.pca(adata, n_comps=5, device="cpu", spmm_policy="bogus")

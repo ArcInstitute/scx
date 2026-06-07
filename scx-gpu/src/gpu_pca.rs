@@ -34,6 +34,7 @@ use crate::device::GpuDevice;
 use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
 use crate::linear_operator::CenteredSparseOperator;
+use crate::math_policy::GpuPcaTuning;
 
 /// PTX source for the row-major mean-correction kernel, compiled at build time.
 const MEAN_CORRECT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/spmm_mean_correct.ptx"));
@@ -117,6 +118,9 @@ pub struct GpuPcaResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
+    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5):
+    /// `true` only on the device-resident capture path.
+    pub graph_replayed: bool,
 }
 
 /// Result of GPU randomized PCA with the embedding kept **device-resident**
@@ -144,6 +148,8 @@ pub struct GpuPcaDeviceResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
+    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
+    pub graph_replayed: bool,
 }
 
 /// Internal output of the shared randomized-PCA core: the scaled embedding kept
@@ -162,6 +168,10 @@ struct RandomizedPcaCore {
     n_components: usize,
     n_obs: usize,
     n_vars: usize,
+    /// Whether a captured CUDA graph was replayed in the power loop (Task 2.5).
+    /// `true` only on the device-resident capture path; `false` for the
+    /// streaming or direct-resident paths.
+    graph_replayed: bool,
 }
 
 /// Shared randomized-PCA core: runs the full streaming SpMM / QR / SVD pipeline
@@ -196,6 +206,7 @@ fn randomized_pca_core(
     zero_center: bool,
     seed: u64,
     qr_method: QrMethod,
+    tuning: GpuPcaTuning,
 ) -> Result<RandomizedPcaCore, GpuError> {
     let (n_obs, n_vars) = source.shape();
 
@@ -235,6 +246,10 @@ fn randomized_pca_core(
     let cusparse_handle = CusparseHandle::new()?;
     let cusolver_handle = CusolverHandle::new()?;
     let cublas_handle = CublasHandle::new()?;
+    // Task 2.5: apply the requested math mode to every cuBLAS GEMM/GEMV/GER in
+    // this PCA run (sticky on the handle). StrictFp32 (default) preserves the
+    // pre-2.5 fp32 numerics; AllowTf32 trades mantissa precision for speed.
+    cublas_handle.set_math_mode(tuning.math_mode)?;
 
     // Step 1: Compute column means and sum-of-squares (CPU-side, 1 pass)
     let (means, col_sum_sq) = source
@@ -270,72 +285,105 @@ fn randomized_pca_core(
         d_means.as_ref(),
     );
 
-    // Step 3: Y = (X − μ) · Ω with mean correction. Writes directly into
-    // scratch.d_y; gpu_qr_q consumes it in place and returns the Q factor.
-    op.matmat_pooled(&d_omega, &mut scratch.d_y, k, &mut pool)?;
+    // Task 2.5: when the full matrix fits device memory, run the power loop on
+    // a single device-resident CSR (one upload, two SpMM/iter, optional CUDA-
+    // graph capture) instead of the streaming operator that re-decodes and
+    // re-uploads the whole matrix on every matmat/rmatmat. Falls back to the
+    // streaming path (below) when it won't fit VRAM. `try_build_resident_csr`
+    // drains `source` once; the streaming `op` is only used on the fallback.
+    //
+    // Ensure the means upload + Ω generation (issued on the default stream
+    // above) are complete before the resident loop, which may run on the
+    // per-thread capture stream (no auto cross-stream sync there).
+    dev.synchronize()?;
+    let resident = crate::gpu_pca_resident::try_build_resident_csr(dev, source, k)?;
+    let graph_replayed = if let Some(gpu_csr) = resident {
+        crate::gpu_pca_resident::run_resident_power_loop(
+            dev,
+            &gpu_csr,
+            &mut scratch,
+            &d_omega,
+            d_means.as_ref(),
+            &cusparse_handle,
+            &cublas_handle,
+            &cusolver_handle,
+            qr_method,
+            n_obs,
+            n_vars,
+            k,
+            n_power_iterations,
+            tuning,
+        )?
+    } else {
+        // Streaming fallback: the matrix does not fit device memory. The
+        // pre-2.5 streaming operator re-decodes + re-uploads the whole matrix
+        // on each matmat / rmatmat. No CUDA-graph capture on this path.
+        op.matmat_pooled(&d_omega, &mut scratch.d_y, k, &mut pool)?;
 
-    // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
-    // Both backends use `gpu_qr_q`'s swap-and-return pattern: the input
-    // buffer is left as a zero-length dummy and Q is returned in a new
-    // CudaSlice. To keep `scratch.d_y` / `scratch.d_z` alive across the
-    // power loop (avoiding a per-iter re-allocation of the n_obs × k
-    // forward output and n_vars × k transpose output), this closure
-    // swaps the returned Q back into the scratch field and returns the
-    // empty dummy for drop. The caller then reads Q from the scratch
-    // slot. Net cost: two `std::mem::swap`s per QR call (no allocations).
-    let qr_into =
-        |scratch_slot: &mut CudaSlice<f32>, rows: usize, cols: usize| -> Result<(), GpuError> {
-            let mut q = match qr_method {
-                QrMethod::Householder => gpu_qr_q(
-                    &cusolver_handle,
-                    dev.stream(),
-                    dev,
-                    scratch_slot,
-                    rows,
-                    cols,
-                )?,
-                QrMethod::Cholesky => gpu_cholesky_qr2(
-                    &cublas_handle,
-                    &cusolver_handle,
-                    dev,
-                    scratch_slot,
-                    rows,
-                    cols,
-                )?,
-            };
-            // After gpu_qr_q's internal swap, `scratch_slot` holds the empty
-            // dummy and `q` owns the n_obs * k buffer of Q. Swap so the
-            // scratch field reclaims the Q buffer.
-            debug_assert_eq!(
-                scratch_slot.len(),
-                0,
-                "QR backend must leave its input as a zero-length dummy via \
+        // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
+        // Both backends use `gpu_qr_q`'s swap-and-return pattern: the input
+        // buffer is left as a zero-length dummy and Q is returned in a new
+        // CudaSlice. To keep `scratch.d_y` / `scratch.d_z` alive across the
+        // power loop (avoiding a per-iter re-allocation of the n_obs × k
+        // forward output and n_vars × k transpose output), this closure
+        // swaps the returned Q back into the scratch field and returns the
+        // empty dummy for drop. The caller then reads Q from the scratch
+        // slot. Net cost: two `std::mem::swap`s per QR call (no allocations).
+        let qr_into =
+            |scratch_slot: &mut CudaSlice<f32>, rows: usize, cols: usize| -> Result<(), GpuError> {
+                let mut q = match qr_method {
+                    QrMethod::Householder => gpu_qr_q(
+                        &cusolver_handle,
+                        dev.stream(),
+                        dev,
+                        scratch_slot,
+                        rows,
+                        cols,
+                    )?,
+                    QrMethod::Cholesky => gpu_cholesky_qr2(
+                        &cublas_handle,
+                        &cusolver_handle,
+                        dev,
+                        scratch_slot,
+                        rows,
+                        cols,
+                    )?,
+                };
+                // After gpu_qr_q's internal swap, `scratch_slot` holds the empty
+                // dummy and `q` owns the n_obs * k buffer of Q. Swap so the
+                // scratch field reclaims the Q buffer.
+                debug_assert_eq!(
+                    scratch_slot.len(),
+                    0,
+                    "QR backend must leave its input as a zero-length dummy via \
                  std::mem::swap; see cusolver::gpu_qr_q / gpu_cholesky_qr2 \
                  for the contract",
-            );
-            std::mem::swap(scratch_slot, &mut q);
-            // `q` (now the empty dummy) drops here.
-            Ok(())
-        };
+                );
+                std::mem::swap(scratch_slot, &mut q);
+                // `q` (now the empty dummy) drops here.
+                Ok(())
+            };
 
-    // Step 4: scratch.d_y ← qr(scratch.d_y); Q now lives in scratch.d_y.
-    qr_into(&mut scratch.d_y, n_obs, k)?;
-
-    // Step 5: Power iterations. Each iter does:
-    //   B = (X − μ)ᵀ · Q   →  scratch.d_z   (Q lives in scratch.d_y)
-    //   Q_B = qr(scratch.d_z)                (Q_B now in scratch.d_z)
-    //   Y = (X − μ) · Q_B  →  scratch.d_y   (overwrites Q)
-    //   Q = qr(scratch.d_y)                  (new Q in scratch.d_y)
-    for _ in 0..n_power_iterations {
-        op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
-        qr_into(&mut scratch.d_z, n_vars, k)?;
-
-        op.matmat_pooled(&scratch.d_z, &mut scratch.d_y, k, &mut pool)?;
+        // Step 4: scratch.d_y ← qr(scratch.d_y); Q now lives in scratch.d_y.
         qr_into(&mut scratch.d_y, n_obs, k)?;
-    }
 
-    // Step 6: B = (X − μ)ᵀ · Q  (final, n_vars × k) — written into scratch.d_z
-    op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+        // Step 5: Power iterations. Each iter does:
+        //   B = (X − μ)ᵀ · Q   →  scratch.d_z   (Q lives in scratch.d_y)
+        //   Q_B = qr(scratch.d_z)                (Q_B now in scratch.d_z)
+        //   Y = (X − μ) · Q_B  →  scratch.d_y   (overwrites Q)
+        //   Q = qr(scratch.d_y)                  (new Q in scratch.d_y)
+        for _ in 0..n_power_iterations {
+            op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+            qr_into(&mut scratch.d_z, n_vars, k)?;
+
+            op.matmat_pooled(&scratch.d_z, &mut scratch.d_y, k, &mut pool)?;
+            qr_into(&mut scratch.d_y, n_obs, k)?;
+        }
+
+        // Step 6: B = (X − μ)ᵀ · Q  (final, n_vars × k) — written into scratch.d_z
+        op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+        false
+    };
     let d_b_final = &scratch.d_z;
 
     // Step 7: Download B to host, SVD via faer (f64 for accuracy)
@@ -441,6 +489,7 @@ fn randomized_pca_core(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed,
     })
 }
 
@@ -460,6 +509,7 @@ pub fn gpu_randomized_pca(
     zero_center: bool,
     seed: u64,
     qr_method: QrMethod,
+    tuning: GpuPcaTuning,
 ) -> Result<GpuPcaResult, GpuError> {
     let core = randomized_pca_core(
         dev,
@@ -470,6 +520,7 @@ pub fn gpu_randomized_pca(
         zero_center,
         seed,
         qr_method,
+        tuning,
     )?;
     let RandomizedPcaCore {
         d_u,
@@ -480,6 +531,7 @@ pub fn gpu_randomized_pca(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed,
     } = core;
 
     // Single D→H copy of the final embedding, col-major (n_obs × n_components).
@@ -503,6 +555,7 @@ pub fn gpu_randomized_pca(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed,
     })
 }
 
@@ -525,6 +578,7 @@ pub fn gpu_randomized_pca_device(
     zero_center: bool,
     seed: u64,
     qr_method: QrMethod,
+    tuning: GpuPcaTuning,
 ) -> Result<GpuPcaDeviceResult, GpuError> {
     let core = randomized_pca_core(
         dev,
@@ -535,6 +589,7 @@ pub fn gpu_randomized_pca_device(
         zero_center,
         seed,
         qr_method,
+        tuning,
     )?;
     let RandomizedPcaCore {
         d_u,
@@ -545,6 +600,7 @@ pub fn gpu_randomized_pca_device(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed,
     } = core;
 
     // Transpose col-major (n_obs × n_components) → row-major on the device.
@@ -574,6 +630,7 @@ pub fn gpu_randomized_pca_device(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed,
     })
 }
 
@@ -653,8 +710,26 @@ pub(crate) fn gpu_column_sums(
     k: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
     let mut out = dev.alloc_zeros::<f32>(k)?;
+    gpu_column_sums_into(dev, x, &mut out, m, k)?;
+    Ok(out)
+}
+
+/// [`gpu_column_sums`] writing into a caller-provided `out` (length `k`)
+/// instead of allocating. Required inside CUDA-graph capture (Task 2.5), where
+/// device allocations are forbidden — the resident PCA transpose segment
+/// pre-allocates the column-sum buffer once and reuses it across replays.
+///
+/// `out` must be zeroed by the caller if the kernel does not fully overwrite
+/// it; `column_sum_kernel` writes every `out[j]`, so no pre-zero is needed.
+pub(crate) fn gpu_column_sums_into(
+    dev: &GpuDevice,
+    x: &CudaSlice<f32>, // (m × k) col-major
+    out: &mut CudaSlice<f32>,
+    m: usize,
+    k: usize,
+) -> Result<(), GpuError> {
     if m == 0 || k == 0 {
-        return Ok(out);
+        return Ok(());
     }
 
     let module = dev.load_module_cached(COLMAJOR_OPS_PTX)?;
@@ -681,14 +756,14 @@ pub(crate) fn gpu_column_sums(
         dev.stream()
             .launch_builder(&func)
             .arg(x)
-            .arg(&mut out)
+            .arg(out)
             .arg(&m_i32)
             .arg(&k_i32)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("column_sum: {e}")))?;
 
-    Ok(out)
+    Ok(())
 }
 
 /// Outer product subtraction on GPU: Z[v, j] -= mu[v] * sum_q[j].
@@ -1065,8 +1140,18 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let gpu_rand =
-            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::default()).unwrap();
+        let gpu_rand = gpu_randomized_pca(
+            &dev,
+            &source,
+            k,
+            10,
+            4,
+            true,
+            42,
+            QrMethod::default(),
+            crate::math_policy::GpuPcaTuning::default(),
+        )
+        .unwrap();
         let gpu_cov = gpu_covariance_pca(&dev, &source, k, true).unwrap();
 
         // Loadings must agree (sign-agnostic) with the covariance reference.
@@ -1197,9 +1282,30 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let hh =
-            gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Householder).unwrap();
-        let ch = gpu_randomized_pca(&dev, &source, k, 10, 4, true, 42, QrMethod::Cholesky).unwrap();
+        let hh = gpu_randomized_pca(
+            &dev,
+            &source,
+            k,
+            10,
+            4,
+            true,
+            42,
+            QrMethod::Householder,
+            crate::math_policy::GpuPcaTuning::default(),
+        )
+        .unwrap();
+        let ch = gpu_randomized_pca(
+            &dev,
+            &source,
+            k,
+            10,
+            4,
+            true,
+            42,
+            QrMethod::Cholesky,
+            crate::math_policy::GpuPcaTuning::default(),
+        )
+        .unwrap();
 
         let cos = row_abs_cosine(&ch.components, &hh.components, k, n_cols);
         assert!(
@@ -1293,11 +1399,30 @@ mod tests {
             n_vars: n_cols,
         };
 
-        let host =
-            gpu_randomized_pca(&dev, &source, k, 10, 2, true, 7, QrMethod::Householder).unwrap();
-        let dev_res =
-            gpu_randomized_pca_device(&dev, &source, k, 10, 2, true, 7, QrMethod::Householder)
-                .unwrap();
+        let host = gpu_randomized_pca(
+            &dev,
+            &source,
+            k,
+            10,
+            2,
+            true,
+            7,
+            QrMethod::Householder,
+            crate::math_policy::GpuPcaTuning::default(),
+        )
+        .unwrap();
+        let dev_res = gpu_randomized_pca_device(
+            &dev,
+            &source,
+            k,
+            10,
+            2,
+            true,
+            7,
+            QrMethod::Householder,
+            crate::math_policy::GpuPcaTuning::default(),
+        )
+        .unwrap();
 
         // Shapes.
         assert_eq!(dev_res.n_obs, n_rows);

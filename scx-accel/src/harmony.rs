@@ -1555,29 +1555,29 @@ mod gpu_impl {
         }
     }
 
-    /// Sum `obj_cell` (length N) and `cross_kgb` (length K·B) on CPU
-    /// after a tiny `dtoh` and return the Harmony objective.
+    /// Reduce `obj_cell` (length N) and `cross_kgb` (length K·B) to two f64
+    /// scalars **on-device** (Task 2.6) and return the Harmony objective.
     ///
-    /// Per-iter cost: `(N + K·B) · 4 bytes` PCIe + a sequential
-    /// f32→f64 sum on host. At N=1 M, K=100, B=100 that's ~4 MB /
-    /// 0.1 ms PCIe + 1 ms host sum — negligible compared to the iter's
-    /// GPU work. f32 partials promoted to f64 during accumulation;
-    /// f32 mantissa is sufficient for the per-cell entries
-    /// (R in [0, 1], dist in [0, 4]).
+    /// Previously this did a full `(N + K·B)`-element D→H copy followed by a
+    /// host f64 sum. The device reduction (`gpu_harmony_reduce_objective`)
+    /// accumulates in f64 on the GPU and downloads only 2 scalars per iter,
+    /// removing the per-iteration `(N + K·B) · 4 bytes` PCIe traffic (≈4 MB at
+    /// N=1 M, K=B=100). f64 accumulation preserves the prior host-f64 result
+    /// within floating-point reassociation.
     fn compute_objective_gpu(
         dev: &GpuDevice,
         d_obj_cell: &CudaSlice<f32>,
         d_cross_kgb: &CudaSlice<f32>,
         n: usize,
     ) -> Result<f64> {
-        let obj_cell = dev
-            .dtoh_copy(d_obj_cell)
-            .map_err(|e| AccelError::LinAlg(format!("download obj_cell: {e}")))?;
-        let cross_kgb = dev
-            .dtoh_copy(d_cross_kgb)
-            .map_err(|e| AccelError::LinAlg(format!("download cross_kgb: {e}")))?;
-        let kmeans_entropy: f64 = obj_cell.iter().map(|&v| v as f64).sum();
-        let cross: f64 = cross_kgb.iter().map(|&v| v as f64).sum();
+        let (kmeans_entropy, cross) = scx_gpu::gpu_harmony_reduce_objective(
+            dev,
+            d_obj_cell,
+            d_obj_cell.len(),
+            d_cross_kgb,
+            d_cross_kgb.len(),
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU objective reduce: {e}")))?;
         let norm = 2000.0 / n as f64;
         Ok((kmeans_entropy + cross) * norm)
     }
@@ -1818,6 +1818,45 @@ mod gpu_impl {
         let mut d_r_row = dev
             .alloc_zeros::<f32>(n)
             .map_err(|e| AccelError::LinAlg(format!("alloc R-row scratch: {e}")))?;
+
+        // Task 2.6: pre-upload the global per-batch cell membership ONCE — it
+        // is fixed for the whole run. `all_cells` concatenates each global
+        // batch's cell indices in canonical (covariate, level) order;
+        // `batch_start[gb]..batch_start[gb+1]` delimits batch `gb`. The
+        // correction loop gathers each cluster's kept-batch cells from this
+        // device buffer via `memcpy_dtod` instead of rebuilding `cells_concat`
+        // on the host and re-uploading it per cluster (O(N) host work + PCIe
+        // every cluster × outer-iter → one upload total).
+        let mut all_cells: Vec<i32> = Vec::new();
+        let mut batch_start: Vec<i32> = Vec::with_capacity(b + 1);
+        batch_start.push(0);
+        for gb in 0..b {
+            let (ci, lvl) = state.gb_to_cov_level(gb);
+            let cells = &state.batch_index[ci][lvl];
+            all_cells.extend(cells.iter().map(|&i| i as i32));
+            batch_start.push(all_cells.len() as i32);
+        }
+        let all_cells_total = all_cells.len();
+        let d_all_cells = dev
+            .htod_copy(&all_cells)
+            .map_err(|e| AccelError::LinAlg(format!("upload global cell membership: {e}")))?;
+
+        // Task 2.6: persistent correction scratch hoisted out of the
+        // per-cluster K-loop. `b` (total batch levels) upper-bounds any
+        // cluster's kept-batch count `b_prime`. Each is sized once and reused;
+        // the z-sum / correction kernels only touch the valid `b_prime`-prefix.
+        let mut d_z_sum_scratch = dev
+            .alloc_zeros::<f32>((b * d).max(1))
+            .map_err(|e| AccelError::LinAlg(format!("alloc z_sum scratch: {e}")))?;
+        let mut d_w_scratch = dev
+            .alloc_zeros::<f32>((b * d).max(1))
+            .map_err(|e| AccelError::LinAlg(format!("alloc W scratch: {e}")))?;
+        let mut d_cells_concat_scratch = dev
+            .alloc_zeros::<i32>(all_cells_total.max(1))
+            .map_err(|e| AccelError::LinAlg(format!("alloc cells_concat scratch: {e}")))?;
+        let mut d_offsets_scratch = dev
+            .alloc_zeros::<i32>(b + 1)
+            .map_err(|e| AccelError::LinAlg(format!("alloc batch_offsets scratch: {e}")))?;
 
         // Per-sub-iter shuffled cell order (CPU shuffle, GPU consumes
         // contiguous block ranges). Allocated once at full size N.
@@ -2190,21 +2229,46 @@ mod gpu_impl {
                     full_matrix_inverse(&cov, size)?
                 };
 
-                // Build flat cells_concat + batch_offsets covering all
-                // kept batches (including empty ones, which contribute
-                // zero-length offset spans). The same arrays drive both
-                // the GPU z-sum reduction below and the grouped
-                // correction kernel afterwards.
-                let mut cells_concat: Vec<i32> = Vec::with_capacity(n);
+                // Task 2.6: gather this cluster's kept-batch cells from the
+                // pre-uploaded global membership (`d_all_cells`) into the
+                // reused `d_cells_concat_scratch` via on-device `memcpy_dtod`,
+                // and build only the tiny `batch_offsets` (length b_prime+1) on
+                // host. Empty kept batches contribute zero-length spans, exactly
+                // as the previous host rebuild did. Replaces the per-cluster
+                // O(N) host concatenation + full `cells_concat` H→D upload.
                 let mut batch_offsets: Vec<i32> = Vec::with_capacity(b_prime + 1);
                 batch_offsets.push(0);
+                let mut off: usize = 0;
                 for &gb in &kept {
-                    let (ci, lvl) = state.gb_to_cov_level(gb);
-                    let cells = &state.batch_index[ci][lvl];
-                    cells_concat.extend(cells.iter().map(|&i| i as i32));
-                    batch_offsets.push(cells_concat.len() as i32);
+                    let gstart = batch_start[gb] as usize;
+                    let gend = batch_start[gb + 1] as usize;
+                    let len = gend - gstart;
+                    if len > 0 {
+                        let src = d_all_cells
+                            .try_slice(gstart..gend)
+                            .ok_or_else(|| AccelError::LinAlg("d_all_cells slice oob".into()))?;
+                        let mut dst = d_cells_concat_scratch
+                            .try_slice_mut(off..off + len)
+                            .ok_or_else(|| {
+                                AccelError::LinAlg("cells_concat scratch slice oob".into())
+                            })?;
+                        dev.stream()
+                            .memcpy_dtod(&src, &mut dst)
+                            .map_err(|e| AccelError::LinAlg(format!("gather kept cells: {e}")))?;
+                    }
+                    off += len;
+                    batch_offsets.push(off as i32);
                 }
-                let n_kept_total = cells_concat.len();
+                let n_kept_total = off;
+                // Upload the tiny offsets into the reused scratch prefix.
+                {
+                    let mut off_dst = d_offsets_scratch
+                        .try_slice_mut(0..batch_offsets.len())
+                        .ok_or_else(|| AccelError::LinAlg("offsets scratch slice oob".into()))?;
+                    dev.stream()
+                        .memcpy_htod(&batch_offsets, &mut off_dst)
+                        .map_err(|e| AccelError::LinAlg(format!("upload batch_offsets: {e}")))?;
+                }
 
                 // R[k, :] is already on device — slice d_r[ku*n..(ku+1)*n]
                 // and memcpy_dtod into the hoisted d_r_row scratch.
@@ -2215,36 +2279,37 @@ mod gpu_impl {
                 dev.stream()
                     .memcpy_dtod(&r_view, &mut d_r_row)
                     .map_err(|e| AccelError::LinAlg(format!("memcpy R row: {e}")))?;
-                let d_cells_concat = dev
-                    .htod_copy(&cells_concat)
-                    .map_err(|e| AccelError::LinAlg(format!("upload cells_concat: {e}")))?;
-                let d_offsets = dev
-                    .htod_copy(&batch_offsets)
-                    .map_err(|e| AccelError::LinAlg(format!("upload batch_offsets: {e}")))?;
 
                 // GPU z-sum: z_sum[j, t] = Σ_{i in batch j} R[k,i] · Z_orig[t,i].
-                // Replaces the CPU triple-nested loop that was
-                // O(K · N · d) sequential per-cluster work. f32 result
-                // is downloaded and promoted to f64 for the
-                // (small) regression solve below.
-                let mut d_z_sum = dev
-                    .alloc_zeros::<f32>(b_prime * d)
-                    .map_err(|e| AccelError::LinAlg(format!("alloc z_sum: {e}")))?;
+                // Writes into the reused `d_z_sum_scratch` (only the b_prime×d
+                // prefix; the kernel overwrites every touched slot). f32 result
+                // is downloaded and promoted to f64 for the regression solve.
                 gpu_harmony_z_sum(
                     &dev,
                     &d_r_row,
                     &d_z_orig,
-                    &d_cells_concat,
-                    &d_offsets,
-                    &mut d_z_sum,
+                    &d_cells_concat_scratch,
+                    &d_offsets_scratch,
+                    &mut d_z_sum_scratch,
                     b_prime,
                     d,
                     n,
                 )
                 .map_err(|e| AccelError::LinAlg(format!("GPU z-sum: {e}")))?;
-                let z_sum_f32 = dev
-                    .dtoh_copy(&d_z_sum)
-                    .map_err(|e| AccelError::LinAlg(format!("download z_sum: {e}")))?;
+                // Download only the valid b_prime×d prefix of the reused scratch
+                // (not the full b×d capacity).
+                let z_sum_f32 = {
+                    let view = d_z_sum_scratch
+                        .try_slice(0..b_prime * d)
+                        .ok_or_else(|| AccelError::LinAlg("z_sum scratch slice oob".into()))?;
+                    let mut host = vec![0f32; b_prime * d];
+                    dev.stream()
+                        .memcpy_dtoh(&view, &mut host)
+                        .map_err(|e| AccelError::LinAlg(format!("download z_sum: {e}")))?;
+                    dev.synchronize()
+                        .map_err(|e| AccelError::LinAlg(format!("sync z_sum: {e}")))?;
+                    host
+                };
                 let z_sum: Vec<f64> = z_sum_f32.iter().map(|&v| v as f64).collect();
                 let mut z_sum_all = vec![0f64; d];
                 for j in 0..b_prime {
@@ -2294,16 +2359,22 @@ mod gpu_impl {
                     // All kept batches are empty — nothing to scatter.
                     continue;
                 }
-                let d_w = dev
-                    .htod_copy(&w_flat)
-                    .map_err(|e| AccelError::LinAlg(format!("upload W: {e}")))?;
+                // Upload W into the reused scratch prefix (Task 2.6).
+                {
+                    let mut w_dst = d_w_scratch
+                        .try_slice_mut(0..w_flat.len())
+                        .ok_or_else(|| AccelError::LinAlg("W scratch slice oob".into()))?;
+                    dev.stream()
+                        .memcpy_htod(&w_flat, &mut w_dst)
+                        .map_err(|e| AccelError::LinAlg(format!("upload W: {e}")))?;
+                }
                 gpu_harmony_correction_grouped(
                     &dev,
                     &mut d_z_corr,
                     &d_r_row,
-                    &d_w,
-                    &d_cells_concat,
-                    &d_offsets,
+                    &d_w_scratch,
+                    &d_cells_concat_scratch,
+                    &d_offsets_scratch,
                     b_prime,
                     n_kept_total,
                     d,

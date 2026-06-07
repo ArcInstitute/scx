@@ -63,10 +63,12 @@ pub mod gpu_knn;
 pub mod gpu_matrix_source;
 pub mod gpu_pca;
 pub mod gpu_pca_covariance;
+pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
 pub mod gpu_shard_source;
 pub mod gpu_umap;
 pub mod linear_operator;
+pub mod math_policy;
 pub mod preprocessed_gpu_matrix_source;
 pub mod rice_gpu;
 pub mod shard_decode;
@@ -106,8 +108,8 @@ pub use gpu_harmony::{
     gpu_harmony_block_oe_update, gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction, gpu_harmony_correction_grouped, gpu_harmony_distances,
     gpu_harmony_distances_gemm, gpu_harmony_l2_normalize_cols, gpu_harmony_memory_bytes,
-    gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy, gpu_harmony_softmax,
-    gpu_harmony_softmax_penalty, gpu_harmony_z_sum,
+    gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy, gpu_harmony_reduce_objective,
+    gpu_harmony_softmax, gpu_harmony_softmax_penalty, gpu_harmony_z_sum,
 };
 pub use gpu_hvg::{
     gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched,
@@ -127,6 +129,7 @@ pub use gpu_preprocess::{
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use gpu_umap::{gpu_umap_from_device_graph, gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
+pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};

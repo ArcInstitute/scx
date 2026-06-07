@@ -138,6 +138,7 @@ pub fn pca_neighbors(
                     method,
                     n_neighbors,
                     use_rep,
+                    device,
                 )?;
                 true
             } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
@@ -156,6 +157,7 @@ pub fn pca_neighbors(
                     method,
                     n_neighbors,
                     use_rep,
+                    device,
                 )?;
                 true
             } else if let Some((slices, shape)) = try_extract_borrowed_csr(py, &x)? {
@@ -179,6 +181,7 @@ pub fn pca_neighbors(
                     method,
                     n_neighbors,
                     use_rep,
+                    device,
                 )?;
                 true
             } else {
@@ -198,21 +201,14 @@ pub fn pca_neighbors(
                     method,
                     n_neighbors,
                     use_rep,
+                    device,
                 )?;
                 true
             };
 
             if ran {
-                // Stamp the device-resident route on both ops + the fused summary.
-                let info = super::route::simple_exec_info(
-                    device,
-                    true,
-                    scx_accel::AccelRoute::GpuDeviceResident,
-                    scx_accel::AccelRoute::CpuCsr,
-                );
-                super::route::write_accel_route(py, adata, "pca", &info)?;
-                super::route::write_accel_route(py, adata, "neighbors", &info)?;
-                super::route::write_accel_route(py, adata, "pca_neighbors", &info)?;
+                // Routes (pca / neighbors / pca_neighbors) were stamped inside
+                // `run_fused_gpu` with the Task 2.5 PCA metadata.
                 return Ok(());
             }
         } else {
@@ -248,6 +244,9 @@ pub fn pca_neighbors(
         method,
         qr_method,
         prefer_format,
+        // Task 2.5 tuning knobs: the fused entry points keep PCA defaults.
+        false,     // allow_tf32
+        "default", // spmm_policy
     )?;
     super::neighbors::neighbors(
         py,
@@ -382,6 +381,7 @@ pub fn pca_neighbors_umap(
                     n_neighbors,
                     use_rep,
                     &umap_params,
+                    device,
                 )?;
                 true
             } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
@@ -401,6 +401,7 @@ pub fn pca_neighbors_umap(
                     n_neighbors,
                     use_rep,
                     &umap_params,
+                    device,
                 )?;
                 true
             } else if let Some((slices, shape)) = try_extract_borrowed_csr(py, &x)? {
@@ -425,6 +426,7 @@ pub fn pca_neighbors_umap(
                     n_neighbors,
                     use_rep,
                     &umap_params,
+                    device,
                 )?;
                 true
             } else {
@@ -445,21 +447,14 @@ pub fn pca_neighbors_umap(
                     n_neighbors,
                     use_rep,
                     &umap_params,
+                    device,
                 )?;
                 true
             };
 
             if ran {
-                let info = super::route::simple_exec_info(
-                    device,
-                    true,
-                    scx_accel::AccelRoute::GpuDeviceResident,
-                    scx_accel::AccelRoute::CpuCsr,
-                );
-                super::route::write_accel_route(py, adata, "pca", &info)?;
-                super::route::write_accel_route(py, adata, "neighbors", &info)?;
-                super::route::write_accel_route(py, adata, "umap", &info)?;
-                super::route::write_accel_route(py, adata, "pca_neighbors_umap", &info)?;
+                // Routes (pca / neighbors / umap / pca_neighbors_umap) were
+                // stamped inside `run_fused_gpu_umap` with the Task 2.5 metadata.
                 return Ok(());
             }
         } else {
@@ -492,6 +487,9 @@ pub fn pca_neighbors_umap(
         method,
         qr_method,
         prefer_format,
+        // Task 2.5 tuning knobs: the fused entry points keep PCA defaults.
+        false,     // allow_tf32
+        "default", // spmm_policy
     )?;
     super::neighbors::neighbors(
         py,
@@ -552,6 +550,7 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     method: &str,
     n_neighbors: usize,
     use_rep: &str,
+    device: &str,
 ) -> PyResult<()> {
     let n_vars = source.n_vars();
     let use_covariance = resolve_gpu_method(method, n_vars)? == "covariance";
@@ -572,6 +571,50 @@ fn run_fused_gpu<S: ShardSource + Sync>(
 
     write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse")?;
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
+    // Stamp the device-resident route on pca / neighbors / pca_neighbors,
+    // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
+    // result, and the math-mode / SpMM-policy knobs only when the randomized
+    // path (which consumes them) ran — covariance records neither.
+    stamp_fused_route(
+        py,
+        adata,
+        device,
+        &["pca", "neighbors", "pca_neighbors"],
+        pca_res.graph_replayed,
+        use_covariance,
+    )
+}
+
+/// Stamp the fused `gpu_device_resident` route on each `op`, attaching the
+/// Task 2.5 PCA metadata. The fused entry points use the default tuning
+/// (strict-fp32 + heuristic SpMM); `math_mode` / `spmm_policy` are recorded only
+/// for the randomized path (the covariance path runs no SpMM and does not thread
+/// the math mode, matching the standalone `pca` entry's honesty).
+#[cfg(feature = "gpu")]
+fn stamp_fused_route(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    device: &str,
+    ops: &[&str],
+    graph_replayed: Option<bool>,
+    use_covariance: bool,
+) -> PyResult<()> {
+    let mut info = super::route::simple_exec_info(
+        device,
+        true,
+        scx_accel::AccelRoute::GpuDeviceResident,
+        scx_accel::AccelRoute::CpuCsr,
+    );
+    if info.route.is_gpu() {
+        info.graph_replay = graph_replayed;
+        if !use_covariance {
+            info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
+            info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
+        }
+    }
+    for op in ops {
+        super::route::write_accel_route(py, adata, op, &info)?;
+    }
     Ok(())
 }
 
@@ -605,6 +648,10 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
             qr,
             use_covariance,
             n_neighbors,
+            // Task 2.5: the fused pyscx entry points do not expose the math-mode /
+            // SpMM-policy knobs; use the strict-fp32 + heuristic-default tuning
+            // (residency + capture still engage automatically).
+            scx_accel::GpuPcaTuning::default(),
         )
     }))
     .unwrap_or_else(|panic_payload| {
@@ -645,6 +692,7 @@ fn run_fused_gpu_umap<S: ShardSource + Sync>(
     n_neighbors: usize,
     use_rep: &str,
     umap: &UmapFusedParams,
+    device: &str,
 ) -> PyResult<()> {
     let n_vars = source.n_vars();
     let use_covariance = resolve_gpu_method(method, n_vars)? == "covariance";
@@ -668,7 +716,16 @@ fn run_fused_gpu_umap<S: ShardSource + Sync>(
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
     write_umap_to_adata(py, adata, &umap_res)?;
     write_umap_backend(py, adata, "scx-gpu-cuda")?;
-    Ok(())
+    // Stamp the device-resident route on all four ops with the Task 2.5 PCA
+    // metadata (finding 5), same policy as the non-UMAP fused path.
+    stamp_fused_route(
+        py,
+        adata,
+        device,
+        &["pca", "neighbors", "umap", "pca_neighbors_umap"],
+        pca_res.graph_replayed,
+        use_covariance,
+    )
 }
 
 /// `catch_unwind` wrapper around [`scx_accel::pca_then_knn_umap_gpu`], mirroring
@@ -718,6 +775,8 @@ fn fused_umap_dispatch_unwind_safe<S: ShardSource + Sync>(
             umap.negative_sample_rate,
             umap.umap_learning_rate,
             random_state, // UMAP seed (same value by design)
+            // Task 2.5: fused entry uses strict-fp32 + heuristic-default tuning.
+            scx_accel::GpuPcaTuning::default(),
         )
     }))
     .unwrap_or_else(|panic_payload| {

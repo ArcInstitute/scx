@@ -250,6 +250,8 @@ pub fn gpu_covariance_pca(
         n_components,
         n_obs,
         n_vars,
+        // Covariance PCA does not run the resident power loop / capture path.
+        graph_replayed: false,
     })
 }
 
@@ -304,6 +306,8 @@ pub fn gpu_covariance_pca_device(
         n_components,
         n_obs,
         n_vars,
+        // Covariance PCA does not run the resident power loop / capture path.
+        graph_replayed: false,
     })
 }
 
@@ -634,6 +638,7 @@ mod tests {
             true,
             123,
             crate::cusolver::QrMethod::default(),
+            crate::math_policy::GpuPcaTuning::default(),
         )
         .unwrap();
 

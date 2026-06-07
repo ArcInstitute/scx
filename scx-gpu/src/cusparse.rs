@@ -509,6 +509,7 @@ fn spmm_impl_view(
     c: DnMatViewMut<'_>,
     alpha: f32,
     beta: f32,
+    alg: csp::cusparseSpMMAlg_t,
 ) -> Result<(), GpuError> {
     // Bind cuSPARSE handle to our CUDA stream
     handle.set_stream(stream)?;
@@ -527,7 +528,6 @@ fn spmm_impl_view(
 
     let alpha_ptr = &alpha as *const f32 as *const core::ffi::c_void;
     let beta_ptr = &beta as *const f32 as *const core::ffi::c_void;
-    let alg = csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT;
 
     // Query workspace buffer size
     let mut buf_size: usize = 0;
@@ -645,7 +645,17 @@ fn spmm_impl(
         ld: c_rows,
     };
     spmm_impl_view(
-        handle, stream, dev, None, op_a, a, b_view, c_view, alpha, beta,
+        handle,
+        stream,
+        dev,
+        None,
+        op_a,
+        a,
+        b_view,
+        c_view,
+        alpha,
+        beta,
+        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
     )
 }
 
@@ -671,6 +681,36 @@ pub fn spmm_csr_view(
     alpha: f32,
     beta: f32,
 ) -> Result<(), GpuError> {
+    spmm_csr_view_with_alg(
+        handle,
+        stream,
+        dev,
+        pool,
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
+    )
+}
+
+/// [`spmm_csr_view`] with an explicit cuSPARSE algorithm (Task 2.5). The PCA
+/// power loop passes the algorithm resolved from its [`SpmmAlgPolicy`](crate::math_policy::SpmmAlgPolicy);
+/// `CUSPARSE_SPMM_CSR_ALG2` is required inside CUDA-graph capture.
+#[allow(clippy::too_many_arguments)]
+pub fn spmm_csr_view_with_alg(
+    handle: &CusparseHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    pool: Option<&mut CuSparseWorkspacePool>,
+    a: &CusparseSpMatDescr,
+    b: DnMatView<'_>,
+    c: DnMatViewMut<'_>,
+    alpha: f32,
+    beta: f32,
+    alg: csp::cusparseSpMMAlg_t,
+) -> Result<(), GpuError> {
     spmm_impl_view(
         handle,
         stream,
@@ -682,6 +722,7 @@ pub fn spmm_csr_view(
         c,
         alpha,
         beta,
+        alg,
     )
 }
 
@@ -703,6 +744,34 @@ pub fn spmm_csr_transpose_view(
     alpha: f32,
     beta: f32,
 ) -> Result<(), GpuError> {
+    spmm_csr_transpose_view_with_alg(
+        handle,
+        stream,
+        dev,
+        pool,
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        csp::cusparseSpMMAlg_t::CUSPARSE_SPMM_ALG_DEFAULT,
+    )
+}
+
+/// [`spmm_csr_transpose_view`] with an explicit cuSPARSE algorithm (Task 2.5).
+#[allow(clippy::too_many_arguments)]
+pub fn spmm_csr_transpose_view_with_alg(
+    handle: &CusparseHandle,
+    stream: &Arc<CudaStream>,
+    dev: &GpuDevice,
+    pool: Option<&mut CuSparseWorkspacePool>,
+    a: &CusparseSpMatDescr,
+    b: DnMatView<'_>,
+    c: DnMatViewMut<'_>,
+    alpha: f32,
+    beta: f32,
+    alg: csp::cusparseSpMMAlg_t,
+) -> Result<(), GpuError> {
     spmm_impl_view(
         handle,
         stream,
@@ -714,6 +783,7 @@ pub fn spmm_csr_transpose_view(
         c,
         alpha,
         beta,
+        alg,
     )
 }
 

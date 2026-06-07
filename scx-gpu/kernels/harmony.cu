@@ -535,6 +535,44 @@ extern "C" __global__ void harmony_obj_kmeans_entropy_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Kernel 2h — f32 array → f64 scalar sum (Task 2.6).
+//
+// Reduces `in[0..n]` to a single f64, accumulated with `atomicAdd(out, .)`
+// across blocks. The caller must zero `*out` before launch and must launch
+// with a power-of-two block size (the shared-mem tree reduction assumes it).
+// Double accumulation matches the host f64 sum the GPU Harmony objective
+// previously did after a full N + K·B element D→H copy; this kernel collapses
+// that to a 1-element download instead.
+//
+// Grid: any (grid-stride over n). Block: pow2 (e.g. 256). Shared mem:
+// blockDim.x * sizeof(double).
+// ──────────────────────────────────────────────────────────────────────
+extern "C" __global__ void harmony_reduce_sum_kernel(
+    const float* __restrict__ in,
+    long long n,
+    double* __restrict__ out
+) {
+    extern __shared__ double dsmem[];
+    int tid = threadIdx.x;
+    int bsize = blockDim.x;
+    SCX_ASSERT_POW2_BLOCK();
+
+    double local = 0.0;
+    for (long long i = (long long)blockIdx.x * bsize + tid;
+         i < n;
+         i += (long long)bsize * gridDim.x) {
+        local += (double)in[i];
+    }
+    dsmem[tid] = local;
+    __syncthreads();
+    for (int s = bsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) dsmem[tid] += dsmem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(out, dsmem[0]);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Kernel 2g — Per-(k, gb) cross-entropy objective contribution.
 //
 // cross_kgb[k, gb] = sigma[k] * O[k, gb] * theta[gb] * log((O+E+1)/(2E+1))
