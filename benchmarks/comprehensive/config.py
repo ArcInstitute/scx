@@ -664,6 +664,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_pipeline import (
+            accel_pipeline_variants,
+        )
+        out.extend(accel_pipeline_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.accel_de import (
             accel_de_variants,
         )
@@ -948,6 +955,13 @@ def estimate_memory_gb(
         # buffer is `n_obs × gene_chunk_size`; HVG keeps loess working
         # arrays. Size roughly like accel_hvg.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "accel_pipeline":
+        # End-to-end PCA→kNN→UMAP: holds the preprocessed AnnData + scanpy
+        # reference embedding/connectivities + per-run copies, plus the PCA
+        # sparse/GPU buffers and the kNN/UMAP graphs simultaneously (the union
+        # of accel_pca + accel_knn + accel_umap working sets). Size like the
+        # PCA/DE chunked-buffer tier.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("accel_umap", "accel_leiden"):
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
         # 1M cells.
@@ -1073,6 +1087,12 @@ def estimate_time_minutes(
         "accel_leiden":           90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
+        # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark runs all
+        # three stages back-to-back per variant (the CPU reference is the
+        # slowest), so budget ≈ accel_pca + accel_knn + accel_umap (30+60+120)
+        # rather than the 15-min fall-through, which would time out the
+        # `pyscx_cpu` variant on the larger tiers.
+        "accel_pipeline":        210,
         # PR G1 — pdex_ref + Wilcoxon rank_genes_groups. Per-variant
         # work is bounded by the rank-test + sort × n_genes inner loop;
         # the GPU path's BlockRadixSort caps the per-gene pool at 8192

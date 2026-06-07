@@ -965,9 +965,10 @@ performance currently under regression governance:
 | **Cell-eval / arc-bench parity perf** | `cell_eval_parity_perf` |
 | **Cloud (GCP) — push, pull, read, metadata, query, large-atlas, cost model** | `cloud_push`, `cloud_pull`, `cloud_read`, `cloud_metadata`, `cloud_filtered`, `cloud_reader_vs_pull`, `cost_model`, `cloud_large_atlas` |
 | **Analysis accelerators (CPU + GPU)** | `accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg` |
+| **End-to-end residency pipeline (CPU + GPU + rapids-singlecell)** | `accel_pipeline` |
 | **Multimodal — h5mu compression and training-loader throughput** | `multimodal_compression`, `multimodal_training` |
 
-That is 29 benchmarks across 12 distinct domains, each expanded across the
+That is 30 benchmarks across 13 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
 plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
@@ -1022,6 +1023,7 @@ hard gate failure via the existing absolute-floor machinery.
 | `knn_route_gpu_correct` | `accel_knn` | GPU kNN dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `umap_route_gpu_correct` | `accel_umap` | GPU UMAP dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `leiden_route_gpu_correct` | `accel_leiden` | GPU Leiden dispatch silently fell back to CPU. Gated on `pbmc3k`. |
+| `pipeline_route_gpu_correct` | `accel_pipeline` (device-resident variant) | The fused PCA→kNN→UMAP path silently dropped off the `gpu_device_resident` route (cuVS missing, cuSPARSE ABI mismatch, `n_neighbors > FUZZY_MAX_K`, non-default `use_rep`). Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 
 Each gate metric is `1.0` when the expected route ran (or wasn't applicable —
 e.g. no GPU host), `0.0` on a silent fallback. All GPU benchmark modules also
@@ -1031,6 +1033,33 @@ diagnostics. Benchmark provenance (`provenance.py`) captures the route-
 affecting env vars `SCX_GPU_DE_V2`, `SCX_GPU_DE_V3`, and
 `SCX_GPU_DE_V3_TRACE` so a result can always be attributed to its dispatch
 configuration.
+
+**End-to-end residency benchmark (`accel_pipeline`).** The per-op accel
+benchmarks above time one stage at a time; `accel_pipeline` times the whole
+`PCA → kNN → UMAP` chain to measure the device-residency win (V3 Phase 2). Four
+variants run on the same preprocessed fixture:
+
+| Variant | Path |
+|---|---|
+| `accel_pipeline__pyscx_cpu` | sequential CPU pca → neighbors → umap (reference) |
+| `accel_pipeline__pyscx_gpu_resident` | fused `pyscx.accel.pca_neighbors_umap` — the embedding/kNN/fuzzy graph stay on the GPU between stages |
+| `accel_pipeline__pyscx_gpu_hostboundary` | three separate GPU calls, each round-tripping its result through host memory |
+| `accel_pipeline__rapids_singlecell_gpu` | `rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap` — the leading GPU-scanpy competitor |
+
+The resident-vs-host-boundary delta on `pipeline_wall_s` quantifies the
+residency speedup; the `rapids_singlecell_gpu` variant places it against a real
+GPU competitor rather than only a CPU strawman. Per-stage correctness
+(`pca_subspace_cos_min`, `knn_recall_vs_scanpy`, `umap_trustworthiness`) is held
+to the same floors as the standalone `accel_pca`/`accel_knn`/`accel_umap` gates,
+and `pipeline_route_gpu_correct` gates the device-resident route (above).
+
+The `rapids_singlecell_gpu` variant needs `cuml` + `rapids-singlecell` in the
+`scx-bench-gpu` conda env (added to `envs/scx-bench-gpu.yml`; rebuild with
+`conda env update -f envs/scx-bench-gpu.yml`). On a host without
+rapids-singlecell installed, that variant records a typed
+`no_rapids_singlecell` stub and the SCX variants still run — so it is
+informational this release (no absolute floor); the broader per-op
+rapids-singlecell competitor matrix is tracked separately (V3 task 2.9).
 
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives

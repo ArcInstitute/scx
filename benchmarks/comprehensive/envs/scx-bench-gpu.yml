@@ -79,6 +79,10 @@ dependencies:
   - cuda-version=12.6
   - cuvs>=25.10,<26.04
   - cugraph>=25.10,<26.04
+  # cuML — required by rapids-singlecell (the GPU-scanpy competitor used by
+  # the accel_pipeline residency benchmark, V3 task 2.7). Pinned to the same
+  # RAPIDS band as cuvs/cugraph so the solver keeps one coherent RAPIDS build.
+  - cuml>=25.10,<26.04
 
   # PyTorch with CUDA (for GPU ML loader benchmarks). Use conda-forge's
   # `cuda126` builds — the official pytorch channel's `pytorch-cuda`
@@ -91,3 +95,23 @@ dependencies:
     - submitit>=1.5.0
     - tiledbsoma>=2.3.0
     - tiledbsoma-ml>=0.1.0
+    # rapids-singlecell — the GPU-scanpy competitor for the accel_pipeline
+    # residency benchmark (V3 task 2.7) — is installed *manually*, NOT pinned
+    # here, because of a build/version coupling with RAPIDS:
+    #   * rapids-singlecell >= 0.12 (the band matching cuML 25/26) ships
+    #     compiled CUDA kernels built with `-arch=native`. That requires a
+    #     *visible GPU at build time* so nvcc resolves the real arch (sm_90 on
+    #     H100); building on a GPU-less login/worker node defaults to an old
+    #     arch where `atomicAdd(double)` is unavailable and the wheel fails.
+    #   * rapids-singlecell < 0.12 is pure-Python but targets the older cuML API
+    #     (`cuml.manifold.simpl_set`) removed in cuML 25/26 (this env: 26.02).
+    # Auto-pinning either band would make `conda env update` fail or install a
+    # broken import, so the benchmark instead *gracefully skips* the
+    # rapids_singlecell_gpu variant (typed `no_rapids_singlecell` stub) until an
+    # operator builds it ON A GPU NODE against cuML 26.x. Working recipe (run
+    # inside an sbatch/srun GPU allocation, in this conda env, isolated from any
+    # `.venv` whose pip RAPIDS libs would shadow conda's and break cuML):
+    #     pip install --no-deps 'rapids-singlecell>=0.12'   # -arch=native -> sm_90
+    #     pip install docrep scikit-image                   # pure-Python runtime deps
+    # The SCX residency variants (cpu / gpu_resident / gpu_hostboundary) run
+    # regardless. `cuml` above is the shared RAPIDS dep rapids-singlecell needs.

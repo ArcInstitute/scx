@@ -154,6 +154,11 @@ def _capture_environment() -> dict[str, Any]:
         ("scanpy", "scanpy"),
         ("anndata", "anndata"),
         ("scipy", "scipy"),
+        # GPU competitor stack — recorded so the accel_pipeline residency
+        # head-to-head (V3 task 2.7) is traceable to a rapids-singlecell / cuML
+        # version, next to the cuVS/cuGraph fingerprints captured elsewhere.
+        ("rapids_singlecell", "rapids_singlecell"),
+        ("cuml", "cuml"),
     ]:
         try:
             mod = __import__(import_name)

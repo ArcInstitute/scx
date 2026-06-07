@@ -66,6 +66,11 @@ ALL_BENCHMARKS: list[str] = [
     "accel_leiden",
     "accel_preprocess",
     "accel_hvg",
+    # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark: the fused
+    # device-resident path vs the host-boundary path vs a CPU reference vs the
+    # rapids-singlecell GPU competitor. Variants live in
+    # `benchmarks/comprehensive/benchmarks/accel_pipeline.py`.
+    "accel_pipeline",
     # PR series G1 — pdex_ref + rank_genes_groups (Wilcoxon) CPU vs GPU.
     # Both entries gained a `device=` parameter in G1; this benchmark
     # captures CPU baseline + GPU acceleration on the same fixture so
