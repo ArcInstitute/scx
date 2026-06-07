@@ -151,6 +151,12 @@ pub struct AccelExecutionInfo {
     pub shards_decoded: Option<usize>,
     /// Number of shards uploaded to device (streaming routes), if tracked.
     pub shards_uploaded: Option<usize>,
+    /// GPU floating-point math mode for the op, if applicable (Task 2.5):
+    /// `"strict_fp32"` / `"allow_tf32"`. `None` for CPU / ops without the knob.
+    pub math_mode: Option<&'static str>,
+    /// cuSPARSE SpMM algorithm policy for the op, if applicable (Task 2.5):
+    /// `"default"` / `"deterministic"` / `"benchmark_once"`. `None` otherwise.
+    pub spmm_policy: Option<&'static str>,
 }
 
 impl AccelExecutionInfo {

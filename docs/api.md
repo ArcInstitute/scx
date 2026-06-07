@@ -1173,6 +1173,7 @@ Every `pyscx.accel.*` call records the execution route it actually took on `adat
 - `route` — the concrete path taken. One of `cpu_dense`, `cpu_csr`, `cpu_csc`, `gpu_csr_v3`, `gpu_csc_v3` (the column-major perf path), `gpu_csr` / `gpu_dense` (non-DE GPU routes — see **Non-DE ops** below), or `gpu_device_resident` (the fused PCA→kNN and PCA→kNN→UMAP paths keep the embedding — and, for the UMAP variant, the fuzzy graph — on the GPU between stages; see **Non-DE ops**).
 - `fallback_reason` — why the ideal route wasn't taken: `none`, `no_cuda`, `no_csc_sidecar`, `unsupported_dimensions`, `unsupported_input_layout`, `user_forced_cpu`, or `perf_policy`.
 - `chunk_size`, `csc_available`, `graph_replay`, `shards_decoded`, `shards_uploaded` — optional detail (`None` when not tracked).
+- `math_mode`, `spmm_policy` — GPU PCA only (Task 2.5): the cuBLAS/cuSPARSE float math mode (`strict_fp32` / `allow_tf32`) and the cuSPARSE SpMM algorithm policy (`default` / `deterministic` / `benchmark_once`) the run used. `None` on CPU / ops without these knobs. `graph_replay` is `True` only when a captured CUDA graph was replayed in the GPU PCA power loop (SpMM-segment capture is opt-in via `SCX_ENABLE_PCA_SPMM_CAPTURE` and off by default — `cusparseSpMM` is not capture-safe on current cuSPARSE; the device-resident PCA power loop runs regardless and avoids re-decoding/re-uploading the matrix each power iteration).
 
 **Op keys:**
 

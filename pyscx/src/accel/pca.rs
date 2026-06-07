@@ -164,6 +164,18 @@ pub(crate) fn parse_qr_method(qr_method: &str) -> PyResult<scx_accel::QrMethod> 
     }
 }
 
+/// Build the [`scx_accel::GpuPcaTuning`] for the GPU PCA path from the Python
+/// kwargs (Task 2.5). `spmm_policy` is pre-validated by the caller.
+#[cfg(feature = "gpu")]
+fn build_pca_tuning(allow_tf32: bool, spmm_policy: &str) -> scx_accel::GpuPcaTuning {
+    let policy = match spmm_policy {
+        "deterministic" => scx_accel::SpmmAlgPolicy::Deterministic,
+        "benchmark_once" => scx_accel::SpmmAlgPolicy::BenchmarkOnce,
+        _ => scx_accel::SpmmAlgPolicy::Default,
+    };
+    scx_accel::GpuPcaTuning::new(scx_accel::GpuMathMode::from_allow_tf32(allow_tf32), policy)
+}
+
 /// Dispatch to either `covariance_pca_gpu` or `randomized_pca_gpu` based on
 /// the resolved method. All GPU-branch call-sites funnel through this helper.
 ///
@@ -182,6 +194,7 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     random_state: u64,
     method: &str,
     qr_method: scx_accel::QrMethod,
+    tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     match method {
         "covariance" => scx_accel::covariance_pca_gpu(device_id, source, n_comps, zero_center),
@@ -194,6 +207,7 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
             zero_center,
             random_state,
             qr_method,
+            tuning,
         ),
         // Unreachable after resolve_gpu_method() normalisation.
         _ => Err(scx_accel::AccelError::LinAlg(format!(
@@ -220,6 +234,7 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
     random_state: u64,
     method: &str,
     qr_method: scx_accel::QrMethod,
+    tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gpu_pca_dispatch(
@@ -232,6 +247,7 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
             random_state,
             method,
             qr_method,
+            tuning,
         )
     }))
     .unwrap_or_else(|panic_payload| {
@@ -303,8 +319,50 @@ pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResul
 ///
 /// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
 /// producing slightly different but equally valid results. See docs/scanpy.md.
+/// Stable `&'static str` label for a validated `spmm_policy` kwarg.
+#[cfg(feature = "gpu")]
+fn spmm_policy_label(spmm_policy: &str) -> &'static str {
+    match spmm_policy {
+        "deterministic" => "deterministic",
+        "benchmark_once" => "benchmark_once",
+        _ => "default",
+    }
+}
+
+/// Stamp the PCA route + Task 2.5 tuning metadata on
+/// `adata.uns["scx_accel"]["pca"]`. Called once before dispatch (everything
+/// `None`) and re-stamped on the GPU branch after dispatch. `math_mode` /
+/// `spmm_policy` are passed `Some` only by the route that actually consumes
+/// them — the **randomized** GPU path (which runs the cuBLAS math mode and the
+/// cuSPARSE SpMM). The **covariance** path passes `None` for both (it applies no
+/// SpMM, and does not thread the math mode), so the metadata never claims a knob
+/// that wasn't used. All fields stay `None` on a CPU route regardless.
+#[allow(clippy::too_many_arguments)]
+fn stamp_pca_route(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    device: &str,
+    gpu_eligible: bool,
+    math_mode: Option<&'static str>,
+    spmm_policy: Option<&'static str>,
+    graph_replay: Option<bool>,
+) -> PyResult<()> {
+    let mut info = super::route::simple_exec_info(
+        device,
+        gpu_eligible,
+        scx_accel::AccelRoute::GpuCsr,
+        scx_accel::AccelRoute::CpuCsr,
+    );
+    if info.route.is_gpu() {
+        info.math_mode = math_mode;
+        info.spmm_policy = spmm_policy;
+        info.graph_replay = graph_replay;
+    }
+    super::route::write_accel_route(py, adata, "pca", &info)
+}
+
 #[pyfunction]
-#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr"))]
+#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr", allow_tf32=false, spmm_policy="default"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pca(
     py: Python<'_>,
@@ -318,6 +376,12 @@ pub fn pca(
     method: &str,
     qr_method: &str,
     prefer_format: &str,
+    // Task 2.5 GPU tuning knobs. `allow_tf32` enables cuBLAS/cuSPARSE TF32
+    // tensor-op math (faster, reduced-precision — validate by subspace, not
+    // bitwise). `spmm_policy` selects the cuSPARSE SpMM algorithm policy. Both
+    // are no-ops on the CPU path (recorded on `uns["scx_accel"]["pca"]`).
+    allow_tf32: bool,
+    spmm_policy: &str,
 ) -> PyResult<()> {
     let _device = resolve_device(device)?;
     // Validate user args even on CPU path — catches typos regardless of device.
@@ -331,6 +395,16 @@ pub fn pca(
             "Invalid qr_method={qr_method:?}; expected 'householder' or 'cholesky'"
         )));
     }
+    if !matches!(spmm_policy, "default" | "deterministic" | "benchmark_once") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid spmm_policy={spmm_policy:?}; expected 'default', 'deterministic', \
+             or 'benchmark_once'"
+        )));
+    }
+    // `allow_tf32` is consumed only on the GPU PCA path; silence the unused-var
+    // lint on CPU-only builds (validation above still runs for `spmm_policy`).
+    #[cfg(not(feature = "gpu"))]
+    let _ = allow_tf32;
     // CSC dispatch is intentionally not implemented for PCA: the
     // covariance build (`X^T @ X`) and randomized SpMM both consume
     // shards in row-major order, where CSC offers no measurable
@@ -369,17 +443,10 @@ pub fn pca(
     let pca_gpu_eligible = scx_accel::cusparse_modern_abi_available();
     #[cfg(not(feature = "gpu"))]
     let pca_gpu_eligible = false;
-    super::route::write_accel_route(
-        py,
-        adata,
-        "pca",
-        &super::route::simple_exec_info(
-            device,
-            pca_gpu_eligible,
-            scx_accel::AccelRoute::GpuCsr,
-            scx_accel::AccelRoute::CpuCsr,
-        ),
-    )?;
+    // Pre-dispatch stamp records the route only; the tuning knobs + graph_replay
+    // are filled by the per-branch re-stamp after GPU dispatch (and only for the
+    // randomized route that actually uses them).
+    stamp_pca_route(py, adata, device, pca_gpu_eligible, None, None, None)?;
 
     // ------- GPU path -------
     // Probe libcusparse for the cuSPARSE 12.5+ ABI before dispatching, so an
@@ -398,6 +465,31 @@ pub fn pca(
     #[cfg(feature = "gpu")]
     if let Some(device_id) = gpu_device_id {
         let qr = parse_qr_method(qr_method)?;
+        let tuning = build_pca_tuning(allow_tf32, spmm_policy);
+        // Task 2.5 metadata labels — recorded only for the randomized route that
+        // actually consumes them (see the per-branch re-stamp below).
+        let math_mode_label = if allow_tf32 {
+            "allow_tf32"
+        } else {
+            "strict_fp32"
+        };
+        let spmm_policy_lbl = spmm_policy_label(spmm_policy);
+        // Re-stamp the route after dispatch. `math_mode` / `spmm_policy` are
+        // recorded only for the randomized route that actually consumes them
+        // (covariance passes `None`); `stamp_pca_route` itself drops every knob
+        // on a non-GPU route.
+        let stamp = |graph_replayed: Option<bool>, m: &str| -> PyResult<()> {
+            let is_rand = m == "randomized";
+            stamp_pca_route(
+                py,
+                adata,
+                device,
+                pca_gpu_eligible,
+                is_rand.then_some(math_mode_label),
+                is_rand.then_some(spmm_policy_lbl),
+                graph_replayed,
+            )
+        };
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             let reader = &*backed.backed;
@@ -413,8 +505,10 @@ pub fn pca(
                 random_state,
                 m,
                 qr,
+                tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -433,8 +527,10 @@ pub fn pca(
                 random_state,
                 m,
                 qr,
+                tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -462,8 +558,10 @@ pub fn pca(
                 random_state,
                 m,
                 qr,
+                tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -483,8 +581,10 @@ pub fn pca(
             random_state,
             m,
             qr,
+            tuning,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
+        stamp(result.graph_replayed, m)?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
         return Ok(());
     }

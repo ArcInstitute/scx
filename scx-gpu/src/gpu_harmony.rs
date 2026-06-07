@@ -641,6 +641,64 @@ pub fn gpu_harmony_obj_kmeans_entropy(
     Ok(())
 }
 
+/// Sum `obj_cell` (length `n`) and `cross_kgb` (length `k_b`) into two f64
+/// scalars **on-device** (Task 2.6), returning `(sum_obj_cell, sum_cross_kgb)`.
+///
+/// Replaces the previous host f64 reduction over a full `(N + K·B)`-element
+/// D→H copy in `compute_objective_gpu` with a 2-element download. Accumulates
+/// in f64 inside the kernel so the result matches the prior host f64 sum within
+/// floating-point reassociation. Uses a power-of-two block (256) as the tree
+/// reduction requires.
+pub fn gpu_harmony_reduce_objective(
+    dev: &GpuDevice,
+    obj_cell: &CudaSlice<f32>,
+    n: usize,
+    cross_kgb: &CudaSlice<f32>,
+    k_b: usize,
+) -> Result<(f64, f64), GpuError> {
+    let module = dev.load_module_cached(HARMONY_PTX)?;
+    let func = module
+        .load_function("harmony_reduce_sum_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_reduce_sum: {e}")))?;
+
+    // out[0] = Σ obj_cell, out[1] = Σ cross_kgb. Zeroed before the
+    // atomicAdd-accumulating launches.
+    let mut d_out = dev.alloc_zeros::<f64>(2)?;
+
+    const THREADS: u32 = 256;
+    let mut reduce_into =
+        |src: &CudaSlice<f32>, len: usize, out_idx: usize| -> Result<(), GpuError> {
+            if len == 0 {
+                return Ok(());
+            }
+            let blocks = (len as u32).div_ceil(THREADS).clamp(1, 1024);
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: THREADS * std::mem::size_of::<f64>() as u32,
+            };
+            let n_ll = len as i64;
+            let mut out_view = d_out.slice_mut(out_idx..out_idx + 1);
+            unsafe {
+                dev.stream()
+                    .launch_builder(&func)
+                    .arg(src)
+                    .arg(&n_ll)
+                    .arg(&mut out_view)
+                    .launch(cfg)
+            }
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("harmony_reduce_sum: {e}")))?;
+            Ok(())
+        };
+
+    reduce_into(obj_cell, n, 0)?;
+    reduce_into(cross_kgb, k_b, 1)?;
+
+    dev.synchronize()?;
+    let h = dev.dtoh_copy(&d_out)?;
+    Ok((h[0], h[1]))
+}
+
 /// Per-(k, gb) cross-entropy objective contribution.
 ///
 /// Writes `cross[k, gb] = σ[k] · O[k, gb] · θ[gb] · log((O+E+1) /
@@ -1429,5 +1487,41 @@ mod tests {
             }
             assert!((s - 1.0).abs() < 1e-4, "col {i} sum = {s}");
         }
+    }
+
+    /// Task 2.6: the device objective reduction sums `obj_cell` (N) and
+    /// `cross_kgb` (K·B) into two f64 scalars matching a host f64 sum.
+    /// Exercises a non-trivial length (> one block) and an empty-array edge.
+    #[test]
+    fn test_reduce_objective_matches_host() {
+        let dev = require_gpu!();
+        let n = 5000usize; // > block size, forces the grid-stride + atomicAdd
+        let k_b = 777usize;
+        let obj: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) * 0.25 - 1.0).collect();
+        let cross: Vec<f32> = (0..k_b).map(|i| ((i % 7) as f32) * 0.5).collect();
+
+        let host_obj: f64 = obj.iter().map(|&v| v as f64).sum();
+        let host_cross: f64 = cross.iter().map(|&v| v as f64).sum();
+
+        let d_obj = dev.htod_copy(&obj).unwrap();
+        let d_cross = dev.htod_copy(&cross).unwrap();
+        let (sum_obj, sum_cross) =
+            gpu_harmony_reduce_objective(&dev, &d_obj, n, &d_cross, k_b).unwrap();
+
+        // f64 device accumulation vs host f64 sum — agree to a tight tol
+        // (only reassociation differs).
+        assert!(
+            (sum_obj - host_obj).abs() <= 1e-6 * host_obj.abs().max(1.0),
+            "obj sum: gpu {sum_obj} vs host {host_obj}"
+        );
+        assert!(
+            (sum_cross - host_cross).abs() <= 1e-6 * host_cross.abs().max(1.0),
+            "cross sum: gpu {sum_cross} vs host {host_cross}"
+        );
+
+        // Empty arrays reduce to zero without launching.
+        let empty = dev.alloc_zeros::<f32>(0).unwrap();
+        let (z0, z1) = gpu_harmony_reduce_objective(&dev, &empty, 0, &empty, 0).unwrap();
+        assert_eq!((z0, z1), (0.0, 0.0));
     }
 }

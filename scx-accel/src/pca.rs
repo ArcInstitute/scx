@@ -57,6 +57,10 @@ pub struct PcaResult {
     pub n_obs: usize,
     /// Number of variables.
     pub n_vars: usize,
+    /// Whether a captured CUDA graph was replayed in the GPU power loop
+    /// (Task 2.5). `None` on CPU paths; `Some(true)` only when the device-
+    /// resident capture path ran and replayed a graph.
+    pub graph_replayed: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +854,7 @@ fn build_pca_result(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed: None,
     })
 }
 
@@ -1019,6 +1024,7 @@ pub fn covariance_pca<S: ShardSource>(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed: None,
     })
 }
 
@@ -1143,6 +1149,7 @@ pub fn covariance_pca_inmemory(
         n_components,
         n_obs,
         n_vars,
+        graph_replayed: None,
     })
 }
 
@@ -1189,6 +1196,7 @@ pub fn covariance_pca_gpu<S: ShardSource + Sync>(
         n_components: gpu_result.n_components,
         n_obs: gpu_result.n_obs,
         n_vars: gpu_result.n_vars,
+        graph_replayed: Some(gpu_result.graph_replayed),
     })
 }
 
@@ -1235,6 +1243,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
     zero_center: bool,
     seed: u64,
     qr_method: scx_gpu::QrMethod,
+    tuning: scx_gpu::GpuPcaTuning,
 ) -> Result<PcaResult> {
     let dev = scx_gpu::GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
@@ -1248,6 +1257,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
         zero_center,
         seed,
         qr_method,
+        tuning,
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
 
@@ -1266,6 +1276,7 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
         n_components: gpu_result.n_components,
         n_obs: gpu_result.n_obs,
         n_vars: gpu_result.n_vars,
+        graph_replayed: Some(gpu_result.graph_replayed),
     })
 }
 

@@ -48,6 +48,7 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
     qr_method: scx_gpu::QrMethod,
     use_covariance: bool,
     n_neighbors: usize,
+    tuning: scx_gpu::GpuPcaTuning,
 ) -> Result<(PcaResult, KnnResult)> {
     let dev = scx_gpu::GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
@@ -65,6 +66,7 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
             zero_center,
             seed,
             qr_method,
+            tuning,
         )
     }
     .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
@@ -121,6 +123,7 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
         n_components: pca_dev.n_components,
         n_obs: pca_dev.n_obs,
         n_vars: pca_dev.n_vars,
+        graph_replayed: Some(pca_dev.graph_replayed),
     };
 
     Ok((pca, knn))
@@ -160,6 +163,7 @@ pub fn pca_then_knn_umap_gpu<S: ShardSource + Sync>(
     negative_sample_rate: usize,
     umap_learning_rate: f64,
     umap_seed: u64,
+    tuning: scx_gpu::GpuPcaTuning,
 ) -> Result<(PcaResult, KnnResult, UmapResult)> {
     let dev = scx_gpu::GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
@@ -177,6 +181,7 @@ pub fn pca_then_knn_umap_gpu<S: ShardSource + Sync>(
             zero_center,
             seed,
             qr_method,
+            tuning,
         )
     }
     .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
@@ -272,6 +277,7 @@ pub fn pca_then_knn_umap_gpu<S: ShardSource + Sync>(
         n_components: pca_dev.n_components,
         n_obs: pca_dev.n_obs,
         n_vars: pca_dev.n_vars,
+        graph_replayed: Some(pca_dev.graph_replayed),
     };
 
     Ok((pca, knn, umap))
@@ -372,6 +378,7 @@ mod tests {
             scx_gpu::QrMethod::Householder,
             false, // randomized
             n_neighbors,
+            scx_gpu::GpuPcaTuning::default(),
         )
         .unwrap();
 
@@ -387,6 +394,7 @@ mod tests {
             true,
             7,
             scx_gpu::QrMethod::Householder,
+            scx_gpu::GpuPcaTuning::default(),
         )
         .unwrap();
         assert_eq!(pca.embeddings.len(), pca_ref.embeddings.len());
@@ -458,6 +466,7 @@ mod tests {
             5,   // negative_sample_rate
             1.0, // umap_learning_rate
             11,  // umap_seed
+            scx_gpu::GpuPcaTuning::default(),
         )
         .unwrap();
 
@@ -471,6 +480,7 @@ mod tests {
             true,
             11,
             scx_gpu::QrMethod::Householder,
+            scx_gpu::GpuPcaTuning::default(),
         )
         .unwrap();
         assert_eq!(pca.embeddings.len(), pca_ref.embeddings.len());

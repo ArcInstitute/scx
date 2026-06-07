@@ -30,6 +30,8 @@ pub(crate) fn exec_info_to_pydict<'py>(
     d.set_item("csc_available", info.csc_available)?;
     d.set_item("shards_decoded", info.shards_decoded)?;
     d.set_item("shards_uploaded", info.shards_uploaded)?;
+    d.set_item("math_mode", info.math_mode)?;
+    d.set_item("spmm_policy", info.spmm_policy)?;
     Ok(d)
 }
 

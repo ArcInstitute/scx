@@ -46,6 +46,23 @@ impl CublasHandle {
         self.raw
     }
 
+    /// Set the cuBLAS math mode (Task 2.5).
+    ///
+    /// Sticky on the handle until changed: applies to every subsequent GEMM /
+    /// GEMV / GER on this handle. [`GpuMathMode::StrictFp32`] maps to
+    /// `CUBLAS_PEDANTIC_MATH` — *not* `CUBLAS_DEFAULT_MATH`, which NVIDIA
+    /// documents as free to use Tensor Cores (incl. TF32) for some routines;
+    /// only the pedantic mode actually guarantees the "strict fp32" label.
+    /// [`GpuMathMode::AllowTf32`] maps to `CUBLAS_TF32_TENSOR_OP_MATH`. See
+    /// [`crate::math_policy::GpuMathMode`] for the rationale.
+    pub fn set_math_mode(&self, mode: crate::math_policy::GpuMathMode) -> Result<(), GpuError> {
+        unsafe {
+            cbs::cublasSetMathMode(self.raw, mode.to_cublas())
+                .result()
+                .map_err(|e| GpuError::CuBlasError(format!("cublasSetMathMode: {e:?}")))
+        }
+    }
+
     /// Bind this handle to the given CUDA stream.
     ///
     /// All subsequent cuBLAS operations using this handle execute on `stream`.

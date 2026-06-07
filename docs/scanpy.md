@@ -1218,7 +1218,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
-| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `prefer_format`            |
+| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32`, `spmm_policy` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
 | `pca_neighbors_umap`     | ✓   | ✓   | (PCA + neighbors + UMAP kwargs, see below)                            | `device`, `method`, `qr_method`, `prefer_format` |
