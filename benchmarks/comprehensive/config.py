@@ -1087,6 +1087,12 @@ def estimate_time_minutes(
         "accel_leiden":           90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
+        # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark runs all
+        # three stages back-to-back per variant (the CPU reference is the
+        # slowest), so budget ≈ accel_pca + accel_knn + accel_umap (30+60+120)
+        # rather than the 15-min fall-through, which would time out the
+        # `pyscx_cpu` variant on the larger tiers.
+        "accel_pipeline":        210,
         # PR G1 — pdex_ref + Wilcoxon rank_genes_groups. Per-variant
         # work is bounded by the rank-test + sort × n_genes inner loop;
         # the GPU path's BlockRadixSort caps the per-gene pool at 8192

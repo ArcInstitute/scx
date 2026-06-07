@@ -596,6 +596,10 @@ absolute_floors:
   # method="auto" on the 2000-HVG fixture routes PCA through the exact
   # covariance path, so the strict 0.90 subspace floor applies (headroom under
   # the 0.95 standalone covariance floor for end-to-end f32 drift).
+  # Gated on both pbmc3k and tabula_sapiens_100k — symmetric with the
+  # pipeline_route_gpu_correct gate above and the standalone per-op route
+  # gates (pca/knn/umap_route_gpu_correct), so a correctness regression at
+  # scale can't slip through while only the dispatch route is gated.
   - benchmark: accel_pipeline
     format: accel_pipeline__pyscx_gpu_resident
     dataset: pbmc3k
@@ -609,6 +613,21 @@ absolute_floors:
   - benchmark: accel_pipeline
     format: accel_pipeline__pyscx_gpu_resident
     dataset: pbmc3k
+    metric: umap_trustworthiness
+    min: 0.90
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: tabula_sapiens_100k
+    metric: pca_subspace_cos_min
+    min: 0.90
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: tabula_sapiens_100k
+    metric: knn_recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: tabula_sapiens_100k
     metric: umap_trustworthiness
     min: 0.90
 

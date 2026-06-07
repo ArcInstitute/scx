@@ -358,12 +358,15 @@ def run(
             peak_rss_mb=max(rss_before, rss_after),
             **extras,
         )
+        # Read this run's metrics from `extras` (nan if the check failed this
+        # run) — not from the cross-run accumulators, whose `[-1]` would
+        # mislabel a prior run's value as the current run's on a failure.
         logger.info(
             "  %s run %d: wall=%.3fs  rss=%.1fMB  subspace=%.4f recall=%.3f trust=%.3f",
             key, i + 1, wall, max(rss_before, rss_after),
-            sub_min_runs[-1] if sub_min_runs else float("nan"),
-            recall_runs[-1] if recall_runs else float("nan"),
-            trust_runs[-1] if trust_runs else float("nan"),
+            extras.get("pca_subspace_cos_min", float("nan")),
+            extras.get("knn_recall_vs_scanpy", float("nan")),
+            extras.get("umap_trustworthiness", float("nan")),
         )
         del a
         gc.collect()
