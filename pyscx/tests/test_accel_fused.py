@@ -251,6 +251,46 @@ class TestPcaNeighborsGpu:
         assert "connectivities" in adata.obsp
         assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
 
+    def test_fused_randomized_records_tuning_metadata(self, synthetic_adata):
+        """The fused device-resident path must propagate the PCA tuning knobs
+        (V3 task 2.5) onto the stamped route, exactly as standalone `pca()` does.
+
+        For the randomized core, `stamp_fused_route` records the math-mode and
+        SpMM-policy defaults and the graph-replay flag (capture is off by
+        default → `graph_replay` is False, never the missing key).
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors(
+            adata, n_comps=10, n_neighbors=15, device="gpu", method="randomized"
+        )
+
+        pca = adata.uns["scx_accel"]["pca"]
+        assert pca["route"] == "gpu_device_resident"
+        assert pca["math_mode"] == "strict_fp32"
+        assert pca["spmm_policy"] == "default"
+        # graph_replay is a present key (bool), not absent.
+        assert "graph_replay" in pca
+        assert pca["graph_replay"] in (True, False)
+
+    def test_fused_covariance_omits_tuning_metadata(self, synthetic_adata):
+        """The covariance core ignores the SpMM/math knobs, so the fused route
+        must leave `math_mode` / `spmm_policy` as None — mirroring the standalone
+        `pca()` covariance behaviour (`test_pca_cpu_route_omits_tuning_metadata`).
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors(
+            adata, n_comps=10, n_neighbors=15, device="gpu", method="covariance"
+        )
+
+        pca = adata.uns["scx_accel"]["pca"]
+        assert pca["route"] == "gpu_device_resident"
+        assert pca["math_mode"] is None
+        assert pca["spmm_policy"] is None
+
     def test_non_default_use_rep_falls_back_to_sequential(self, synthetic_adata):
         """A non-default `use_rep` must NOT take the fused device-resident path.
 
@@ -372,6 +412,24 @@ class TestPcaNeighborsUmapGpu:
         assert accel["umap"]["route"] == "gpu_device_resident"
         assert accel["pca_neighbors_umap"]["route"] == "gpu_device_resident"
         assert adata.uns["neighbors"]["params"]["method"] == "cagra"
+
+    def test_fused_randomized_records_tuning_metadata(self, synthetic_adata):
+        """PCA tuning metadata (V3 task 2.5) propagates through the fused
+        PCA→kNN→UMAP path's `pca` route too — same `stamp_fused_route` seam.
+        """
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=15, n_components=2,
+            device="gpu", method="randomized",
+        )
+
+        pca = adata.uns["scx_accel"]["pca"]
+        assert pca["route"] == "gpu_device_resident"
+        assert pca["math_mode"] == "strict_fp32"
+        assert pca["spmm_policy"] == "default"
+        assert pca["graph_replay"] in (True, False)
 
     def test_matches_sequential_gpu(self, synthetic_adata):
         """Fused GPU PCA matches a separate GPU PCA run; UMAP is valid.

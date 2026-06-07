@@ -568,6 +568,50 @@ absolute_floors:
     metric: hvg_route_csc_direct
     min: 1.0
 
+  # --- accel_pipeline: device-resident PCA→kNN→UMAP route gate --------
+  # The fused `pyscx.accel.pca_neighbors_umap` path keeps the PCA embedding →
+  # kNN graph → fuzzy graph on the GPU between stages (the DeviceEmbedding /
+  # DeviceKnnGraph / DeviceFuzzyGraph handoffs from V3 tasks 2.3/2.4). This
+  # realizes the `device_resident_route_correct` gate deferred from 2.4:
+  # `accel_pipeline.py` emits `pipeline_route_gpu_correct` for the
+  # `pyscx_gpu_resident` variant = 1.0 iff pca / neighbors / umap **and** the
+  # pca_neighbors_umap summary all stamped `gpu_device_resident`, 0.0 on any
+  # silent host-boundary fallback (cuVS missing, cuSPARSE ABI mismatch,
+  # n_neighbors > FUZZY_MAX_K, use_rep != X_pca). The variant is skipped on
+  # non-GPU hosts, so a recorded 0.0 is always a real dispatch regression.
+  # Gated on the same tiers the per-op route gates run at.
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: pbmc3k
+    metric: pipeline_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: tabula_sapiens_100k
+    metric: pipeline_route_gpu_correct
+    min: 1.0
+  # Per-stage correctness of the fused resident pipeline, reusing the same
+  # accuracy bars as the standalone accel_pca (covariance) / accel_knn /
+  # accel_umap floors — the fused path must not silently degrade any stage.
+  # method="auto" on the 2000-HVG fixture routes PCA through the exact
+  # covariance path, so the strict 0.90 subspace floor applies (headroom under
+  # the 0.95 standalone covariance floor for end-to-end f32 drift).
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: pbmc3k
+    metric: pca_subspace_cos_min
+    min: 0.90
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: pbmc3k
+    metric: knn_recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_pipeline
+    format: accel_pipeline__pyscx_gpu_resident
+    dataset: pbmc3k
+    metric: umap_trustworthiness
+    min: 0.90
+
   # --- ml_loader throughput floors -----------------------------------
   # Floors at 0.5x observed baseline median (0.6x on pbmc3k
   # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).

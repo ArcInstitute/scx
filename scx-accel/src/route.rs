@@ -527,6 +527,13 @@ mod tests {
     fn route_strings_are_stable() {
         assert_eq!(AccelRoute::GpuCscV3.as_str(), "gpu_csc_v3");
         assert_eq!(AccelRoute::CpuCsr.as_str(), "cpu_csr");
+        // The fused device-resident pipeline route string is a wire contract:
+        // the accel_pipeline residency benchmark's `pipeline_route_gpu_correct`
+        // gate (V3 task 2.7) matches on exactly this value.
+        assert_eq!(
+            AccelRoute::GpuDeviceResident.as_str(),
+            "gpu_device_resident"
+        );
         assert_eq!(FallbackReason::NoCscSidecar.as_str(), "no_csc_sidecar");
         assert_eq!(FallbackReason::None.as_str(), "none");
     }

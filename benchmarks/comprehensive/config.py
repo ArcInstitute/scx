@@ -664,6 +664,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_pipeline import (
+            accel_pipeline_variants,
+        )
+        out.extend(accel_pipeline_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.accel_de import (
             accel_de_variants,
         )
@@ -947,6 +954,13 @@ def estimate_memory_gb(
         # being run (qc / hvg / de / pseudobulk). DE chunked dense
         # buffer is `n_obs × gene_chunk_size`; HVG keeps loess working
         # arrays. Size roughly like accel_hvg.
+        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "accel_pipeline":
+        # End-to-end PCA→kNN→UMAP: holds the preprocessed AnnData + scanpy
+        # reference embedding/connectivities + per-run copies, plus the PCA
+        # sparse/GPU buffers and the kNN/UMAP graphs simultaneously (the union
+        # of accel_pca + accel_knn + accel_umap working sets). Size like the
+        # PCA/DE chunked-buffer tier.
         peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("accel_umap", "accel_leiden"):
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
