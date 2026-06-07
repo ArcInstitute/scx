@@ -595,6 +595,23 @@ QueryPipeline::open("file.scx")?
 - Two-level predicate pushdown: catalog shard pruning + index row pruning
 - Fused normalize+log1p in single CSR row scan
 - Parallel shard processing via rayon
+- **Bounded obs memory on row-sharded files.** `filter_obs` / `count`
+  evaluate obs predicates one metadata shard at a time into an `n_obs`
+  boolean mask rather than concatenating every obs shard into RAM, and
+  skip decoding obs shards that don't overlap a surviving CSR shard (when
+  per-shard catalog row-range stats are present — written going forward,
+  so existing atlas files still get the memory bound but not the I/O
+  skip). Peak obs memory is ~`(rayon width × one shard) + n_obs` bytes,
+  not the full obs table. This bound applies **only to the query engine
+  path**: other `read_obs()` callers (`compact` / `merge` / streaming
+  export / CLI `subset` / `to_anndata`) still assemble the full obs table
+  and remain unbounded on atlas-scale sharded files.
+- **Filtered-obs categorical semantics.** A `filter_obs(...).collect()`
+  result's categorical (`Dictionary<_, Utf8>`) obs columns carry only the
+  categories present in the surviving rows, not the full parent
+  dictionary — standard AnnData/pandas behavior. Downstream code that
+  compares `.cat.categories` against the source file (e.g. plotting that
+  assumes a fixed palette) should re-derive categories from the result.
 
 ## scx-loader — Training Data Loader
 
