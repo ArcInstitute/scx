@@ -1,6 +1,6 @@
 [package]
 name = "scx-cloud"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2021"
 description = "Cloud operations for SCX: pull, push, explode, pack, cloud-optimize"
 license.workspace = true
