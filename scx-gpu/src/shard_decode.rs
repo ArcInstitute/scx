@@ -17,6 +17,7 @@ use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::forbp_gpu::forbp_decode_gpu;
+use crate::profile::{self, CodecClass};
 use crate::rice_gpu::rice_decode_gpu;
 
 /// GPU-resident CSR matrix.
@@ -159,19 +160,32 @@ fn decode_scx1_gpu(
     }
 
     // indptr: Delta-Golomb on CPU → Vec<u64> → Vec<i64> → upload
+    let t_host = profile::start();
     let indptr_u64 =
         delta_golomb_decode(indptr_bytes, n_rows + 1).map_err(scx_codec::CodecError::from)?;
     let indptr_i64: Vec<i64> = indptr_u64.into_iter().map(|v| v as i64).collect();
+    profile::record_host_decode_since(CodecClass::Scx1, t_host);
+
+    let t_htod = profile::start();
     let d_indptr = dev.htod_copy(&indptr_i64)?;
+    profile::record_htod_since(CodecClass::Scx1, t_htod, indptr_i64.len() * 8);
 
     // indices: FOR-BP on GPU → on-device u32→i32 cast (no host round-trip)
+    // values:  Rice on GPU → on-device u32→f32 cast (no host round-trip)
+    // Both decode GPU-side; the bucket covers the bitstream upload + kernels.
+    let t_gpu = profile::start();
     let (d_indices_u32, _row_lengths) =
         forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
     let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
-    // values: Rice on GPU → on-device u32→f32 cast (no host round-trip)
     let d_values_u32 = rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?;
     let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
+    if t_gpu.is_some() {
+        // Synchronize so the elapsed time reflects completed device work, not
+        // just async launch latency. Only paid when profiling is enabled.
+        dev.synchronize()?;
+    }
+    profile::record_gpu_decode_since(t_gpu);
 
     Ok(GpuCsr {
         indptr: d_indptr,
@@ -200,6 +214,7 @@ fn decode_cpu_fallback(
         indices_bytes,
         values_bytes,
     };
+    let t_host = profile::start();
     let (indptr, indices, data) = scx_codec::decode_shard_scipy(
         &encoded,
         codec_id,
@@ -208,10 +223,14 @@ fn decode_cpu_fallback(
         nnz,
         index_dtype_u16,
     )?;
+    profile::record_host_decode_since(CodecClass::Generic, t_host);
 
+    let t_htod = profile::start();
     let d_indptr = dev.htod_copy(&indptr)?;
     let d_indices = dev.htod_copy(&indices)?;
     let d_data = dev.htod_copy(&data)?;
+    let htod_bytes = indptr.len() * 8 + indices.len() * 4 + data.len() * 4;
+    profile::record_htod_since(CodecClass::Generic, t_htod, htod_bytes);
 
     Ok(GpuCsr {
         indptr: d_indptr,

@@ -173,6 +173,54 @@ apptainer build scx-gpu.sif docker://rapidsai/base:24.12-cuda12.2-py3.12
 apptainer exec --nv scx-gpu.sif python -c "import pyscx; print(pyscx.accel.gpu_available())"
 ```
 
+## rapids-singlecell analysis backend (GPU compute layer)
+
+SCX's native GPU accelerators (PCA, kNN, UMAP, Leiden, HVG, preprocessing, DE)
+work with the conda/CUDA setup above and **do not** require RAPIDS. Separately,
+SCX can route `device="gpu"` analysis ops to
+[rapids-singlecell](https://rapids-singlecell.readthedocs.io/) as a GPU *compute
+layer* (the destination of the ACC-RUST-OPT-V4 transition). This backend is an
+**optional, detected runtime dependency**, not a hard requirement:
+
+- When rapids-singlecell **is** importable, supported GPU-analysis ops route to
+  it; SCX hands it a GPU-resident matrix so there is no host round-trip.
+- When it is **absent**, those ops fall back to CPU with a one-shot diagnostic
+  naming this install path and `fallback_reason="no_rapids"`. SCX still imports
+  and runs (CPU + native streaming + the ML loader) with rapids absent.
+
+The lightweight native GPU bits (cudarc + cuVS-C: loader, streaming, the cuPy
+device handoff) ship under `pyscx[gpu]` with **no** RAPIDS dependency.
+
+### Install
+
+A dedicated, slimmer environment spec is published at
+[`benchmarks/comprehensive/envs/scx-gpu-analysis.yml`](../benchmarks/comprehensive/envs/scx-gpu-analysis.yml):
+
+```bash
+conda env create -f benchmarks/comprehensive/envs/scx-gpu-analysis.yml
+conda activate scx-gpu-analysis
+cd pyscx && maturin develop --release --features gpu && cd ..
+```
+
+rapids-singlecell itself is **not** pinned in that spec and must be installed
+**manually on a GPU node**, because it cannot be resolved reproducibly by conda
+or a pip extra (it is CUDA-arch + RAPIDS-version coupled; `>=0.12` ships CUDA
+kernels built with `-arch=native`, which needs a GPU visible at build time so
+nvcc resolves `sm_90` on H100):
+
+```bash
+# Inside an sbatch/srun GPU allocation, in the scx-gpu-analysis env,
+# isolated from any .venv whose pip RAPIDS libs would shadow conda's:
+pip install --no-deps 'rapids-singlecell>=0.12'
+pip install docrep scikit-image
+```
+
+**Packaging verdict (Phase 0.3):** the `-arch=native` GPU-node build is the
+practical ceiling today — a fully reproducible conda/wheel resolution of
+rapids-singlecell is not available, so SCX treats it as a detected runtime
+dependency with a documented manual install rather than declaring a brittle hard
+extra. The rapids-absent path is exercised by a dedicated CI lane.
+
 ## SLURM / HPC configuration
 
 On HPC clusters, GPU nodes typically require module loads or conda activation

@@ -1300,6 +1300,23 @@ impl ScxReader {
         self.read_shard_from_entry(shards[shard_idx])
     }
 
+    /// Read the raw bytes (76-byte header + encoded payload) of a single CSR
+    /// shard for the given modality, by 0-based index in catalog order.
+    ///
+    /// Mirrors [`Self::read_csr_shard_for`] but skips decoding — the returned
+    /// slice (borrowed from the mmap) can be fed directly to a GPU-side shard
+    /// decoder such as `scx_gpu::decode_shard_gpu`.
+    pub fn read_raw_csr_shard_bytes_for(&self, modality_id: u8, shard_idx: usize) -> Result<&[u8]> {
+        let shards = self.full_catalog.csr_shards_for_modality(modality_id);
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.read_raw_shard_bytes(shards[shard_idx])
+    }
+
     /// Indptr-only variant of [`Self::read_csr_shard_for`]. Decodes only
     /// the row-pointer region; cheap path for callers that need just
     /// per-row nnz counts.
