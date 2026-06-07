@@ -1908,6 +1908,17 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
         "accel_preprocess": "max_abs_diff_vs_scanpy",
         "accel_hvg": "hvg_overlap_vs_scanpy",
     }
+    # Polarity marker for the "Metric" column. Most accel parity metrics are
+    # higher-is-better (cosine / recall / trustworthiness / overlap / ARI), but
+    # preprocess's `max_abs_diff_vs_scanpy` is an error term (lower-is-better).
+    # Annotate the metric name so the side-by-side SCX/rapids values in one
+    # column aren't read with the wrong polarity.
+    lower_is_better = {"max_abs_diff_vs_scanpy"}
+
+    def _fmt_metric_name(key: str) -> str:
+        if not key:
+            return "—"
+        return f"{key} (↓)" if key in lower_is_better else f"{key} (↑)"
 
     def _metric(row: Any, key: str) -> Any:
         if row.runs:
@@ -1936,8 +1947,16 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
         rapids = impls.get("rapids_singlecell_gpu")
         if rapids is None:
             continue
-        # Pick the representative SCX GPU impl (covariance PCA matches the
-        # post-HVG covariance route; other ops have a single GPU impl).
+        # Pick the representative SCX GPU impl. Prefer covariance PCA
+        # (`pyscx_gpu_cov`) — it matches the post-HVG (~2000-var) covariance
+        # route the 2.7/2.9 pipeline measures; the randomized variants are the
+        # >8000-var path and aren't apples-to-apples here. Every other op has a
+        # single GPU impl, so the fallback rarely fires. When it does (e.g. a
+        # capture with only randomized PCA), `sorted(...)` makes the choice
+        # deterministic (alphabetical: `rand_chol` before `rand_hh`) rather than
+        # dict-order-dependent. If an `accel_pca__pyscx_gpu_auto` variant is ever
+        # added, revisit this selection so the comparison baseline doesn't move
+        # silently.
         scx = (
             impls.get("pyscx_gpu_cov")
             or next(
@@ -1956,7 +1975,7 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
             op_labels.get(bench, bench), SHORT_NAMES.get(ds, ds),
             _fmt_time(scx_t), _fmt_time(rap_t),
             f"{ratio:.2f}x" if ratio else "—",
-            mkey or "—", _fmt_metric(_metric(scx, mkey)),
+            _fmt_metric_name(mkey), _fmt_metric(_metric(scx, mkey)),
             _fmt_metric(_metric(rapids, mkey)),
         ])
 

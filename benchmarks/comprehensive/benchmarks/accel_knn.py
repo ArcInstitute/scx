@@ -55,16 +55,9 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
+from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _has_rapids_singlecell() -> bool:
-    try:
-        import rapids_singlecell  # noqa: F401
-        return True
-    except Exception:
-        return False
 
 _HAS_PYSCX = False
 _HAS_PYSCX_GPU = False
@@ -206,7 +199,7 @@ def run(
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
         return None
-    if key == "accel_knn__rapids_singlecell_gpu" and not _has_rapids_singlecell():
+    if key == "accel_knn__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
         write_missing_result(
             benchmark="accel_knn", format_key=key, dataset=dataset.name,
             missing_reason="no_rapids_singlecell",

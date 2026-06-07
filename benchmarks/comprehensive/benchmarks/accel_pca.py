@@ -105,14 +105,6 @@ def accel_pca_variants() -> list[FormatVariant]:
     ]
 
 
-def _has_rapids_singlecell() -> bool:
-    try:
-        import rapids_singlecell  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
 # Backwards-compat re-exports — earlier accel_* modules import these names
 # directly from accel_pca. Point them at AcceleratorRunner instead of the
 # removed module-level helpers. The aliases can be removed once every
@@ -319,7 +311,7 @@ def run(
     if requires_gpu and not _HAS_PYSCX_GPU:
         logger.warning("GPU not available — skipping %s", variant_key)
         return None
-    if variant_key == "accel_pca__rapids_singlecell_gpu" and not _has_rapids_singlecell():
+    if variant_key == "accel_pca__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
         logger.warning("rapids-singlecell not installed — recording stub for %s", variant_key)
         write_missing_result(
             benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
