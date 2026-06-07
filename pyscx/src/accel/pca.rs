@@ -474,6 +474,22 @@ pub fn pca(
             "strict_fp32"
         };
         let spmm_policy_lbl = spmm_policy_label(spmm_policy);
+        // Re-stamp the route after dispatch. `math_mode` / `spmm_policy` are
+        // recorded only for the randomized route that actually consumes them
+        // (covariance passes `None`); `stamp_pca_route` itself drops every knob
+        // on a non-GPU route.
+        let stamp = |graph_replayed: Option<bool>, m: &str| -> PyResult<()> {
+            let is_rand = m == "randomized";
+            stamp_pca_route(
+                py,
+                adata,
+                device,
+                pca_gpu_eligible,
+                is_rand.then_some(math_mode_label),
+                is_rand.then_some(spmm_policy_lbl),
+                graph_replayed,
+            )
+        };
 
         if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             let reader = &*backed.backed;
@@ -492,23 +508,7 @@ pub fn pca(
                 tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp_pca_route(
-                py,
-                adata,
-                device,
-                pca_gpu_eligible,
-                if m == "randomized" {
-                    Some(math_mode_label)
-                } else {
-                    None
-                },
-                if m == "randomized" {
-                    Some(spmm_policy_lbl)
-                } else {
-                    None
-                },
-                result.graph_replayed,
-            )?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -530,23 +530,7 @@ pub fn pca(
                 tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp_pca_route(
-                py,
-                adata,
-                device,
-                pca_gpu_eligible,
-                if m == "randomized" {
-                    Some(math_mode_label)
-                } else {
-                    None
-                },
-                if m == "randomized" {
-                    Some(spmm_policy_lbl)
-                } else {
-                    None
-                },
-                result.graph_replayed,
-            )?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -577,23 +561,7 @@ pub fn pca(
                 tuning,
             )
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp_pca_route(
-                py,
-                adata,
-                device,
-                pca_gpu_eligible,
-                if m == "randomized" {
-                    Some(math_mode_label)
-                } else {
-                    None
-                },
-                if m == "randomized" {
-                    Some(spmm_policy_lbl)
-                } else {
-                    None
-                },
-                result.graph_replayed,
-            )?;
+            stamp(result.graph_replayed, m)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
             return Ok(());
         }
@@ -616,23 +584,7 @@ pub fn pca(
             tuning,
         )
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-        stamp_pca_route(
-            py,
-            adata,
-            device,
-            pca_gpu_eligible,
-            if m == "randomized" {
-                Some(math_mode_label)
-            } else {
-                None
-            },
-            if m == "randomized" {
-                Some(spmm_policy_lbl)
-            } else {
-                None
-            },
-            result.graph_replayed,
-        )?;
+        stamp(result.graph_replayed, m)?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse")?;
         return Ok(());
     }
