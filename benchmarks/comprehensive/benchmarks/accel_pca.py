@@ -60,7 +60,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 from benchmarks.comprehensive.runners.accel_runner import (
     AcceleratorRunner,
@@ -95,6 +95,11 @@ def accel_pca_variants() -> list[FormatVariant]:
         FormatVariant(
             name="pyscx PCA (GPU randomized, Cholesky)",
             key="accel_pca__pyscx_gpu_rand_chol",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="rapids-singlecell PCA (GPU)",
+            key="accel_pca__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
         ),
     ]
@@ -177,6 +182,19 @@ def _run_pyscx_gpu_rand_chol(adata: Any, n_comps: int, seed: int) -> str:
     return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
+def _run_rapids_singlecell(adata: Any, n_comps: int, seed: int) -> str:
+    """rapids-singlecell GPU competitor (V3 task 2.9): the same PCA stage on
+    the GPU-scanpy stack. `convert_all=True` round-trips obsm so X_pca returns
+    to host for the subspace-cosine correctness check.
+    """
+    import rapids_singlecell as rsc
+
+    rsc.get.anndata_to_GPU(adata, convert_all=True)
+    rsc.pp.pca(adata, n_comps=n_comps, random_state=seed)
+    rsc.get.anndata_to_CPU(adata, convert_all=True)
+    return "rapids-singlecell-gpu"
+
+
 def _extract_route(adata: Any, op: str) -> str | None:
     """Read ``adata.uns["scx_accel"][op]["route"]``, or None if absent.
 
@@ -197,6 +215,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_pca__pyscx_gpu_cov": (_run_pyscx_gpu_cov, True),
     "accel_pca__pyscx_gpu_rand_hh": (_run_pyscx_gpu_rand_hh, True),
     "accel_pca__pyscx_gpu_rand_chol": (_run_pyscx_gpu_rand_chol, True),
+    "accel_pca__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
 
 
@@ -291,6 +310,14 @@ def run(
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
         logger.warning("GPU not available — skipping %s", variant_key)
+        return None
+    if variant_key == "accel_pca__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
+        logger.warning("rapids-singlecell not installed — recording stub for %s", variant_key)
+        write_missing_result(
+            benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
+            missing_reason="no_rapids_singlecell",
+            notes="rapids-singlecell import failed; install into scx-bench-gpu",
+        )
         return None
 
     fixture = _load_preprocessed(dataset, n_comps=n_comps)

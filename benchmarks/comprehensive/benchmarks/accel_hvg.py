@@ -50,7 +50,8 @@ from benchmarks.comprehensive.config import (
     QUERY_N_HVGS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
+from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,11 @@ def accel_hvg_variants() -> list[FormatVariant]:
         FormatVariant(
             name="pyscx HVG (GPU seurat_v3)",
             key="accel_hvg__pyscx_gpu", category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="rapids-singlecell HVG (GPU seurat_v3)",
+            key="accel_hvg__rapids_singlecell_gpu",
+            category="accel", runner="accel_runner",
         ),
     ]
 
@@ -136,10 +142,23 @@ def _run_pyscx_gpu(adata: Any, n_top: int) -> str:
     return "pyscx-gpu"
 
 
+def _run_rapids_singlecell(adata: Any, n_top: int) -> str:
+    """rapids-singlecell GPU competitor (V3 task 2.9): seurat_v3 HVG on raw
+    counts via the GPU-scanpy stack, in-memory. Writes var["highly_variable"]
+    for the Jaccard-overlap check."""
+    import rapids_singlecell as rsc
+
+    rsc.get.anndata_to_GPU(adata)
+    rsc.pp.highly_variable_genes(adata, n_top_genes=n_top, flavor="seurat_v3")
+    rsc.get.anndata_to_CPU(adata)
+    return "rapids-singlecell-gpu"
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_hvg__scanpy_cpu": (_run_scanpy, False),
     "accel_hvg__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_hvg__pyscx_gpu": (_run_pyscx_gpu, True),
+    "accel_hvg__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
 
 
@@ -179,6 +198,13 @@ def run(
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
         return None
+    if key == "accel_hvg__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
+        write_missing_result(
+            benchmark="accel_hvg", format_key=key, dataset=dataset.name,
+            missing_reason="no_rapids_singlecell",
+            notes="rapids-singlecell import failed; install into scx-bench-gpu",
+        )
+        return None
 
     raw = _load_raw(dataset)
 
@@ -187,8 +213,13 @@ def run(
     # `None` (pyscx missing or conversion failed) falls back to the in-memory
     # CSR-atomic gpu_csr path. The path is stashed on each per-run adata's uns
     # so `_run_pyscx_gpu` → `_as_scx_backed_if_available` can pick it up.
+    # Only the pyscx GPU variant runs on a backed SCX-with-CSC fixture (to hit
+    # the gpu_csc_v3 column-major reduce). The rapids competitor consumes an
+    # in-memory AnnData, so it stays on raw.copy() via the impl() path.
     scx_csc_path = (
-        _ensure_scx_csc_fixture(raw, dataset.name) if requires_gpu and _HAS_PYSCX else None
+        _ensure_scx_csc_fixture(raw, dataset.name)
+        if requires_gpu and _HAS_PYSCX and "pyscx" in key
+        else None
     )
 
     result = BenchmarkResult(

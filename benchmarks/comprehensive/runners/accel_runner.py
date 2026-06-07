@@ -63,6 +63,7 @@ class AcceleratorRunner:
         self._cache: dict[tuple, Any] = {}
         self._has_pyscx: bool | None = None
         self._has_gpu: bool | None = None
+        self._has_rapids_singlecell: bool | None = None
 
     @classmethod
     def instance(cls) -> "AcceleratorRunner":
@@ -103,6 +104,23 @@ class AcceleratorRunner:
                 except Exception:
                     self._has_gpu = False
         return self._has_gpu
+
+    def has_rapids_singlecell(self) -> bool:
+        """True iff `rapids_singlecell` imports cleanly (V3 task 2.9).
+
+        The GPU-scanpy competitor probe, cached once per process (the
+        per-op `accel_*__rapids_singlecell_gpu` variants share one worker).
+        Catches a broad `Exception`, not just `ImportError`: importing
+        rapids-singlecell can fail with a CUDA-init `RuntimeError` on a
+        host without a usable GPU, which is still "not usable" here.
+        """
+        if self._has_rapids_singlecell is None:
+            try:
+                import rapids_singlecell  # noqa: F401
+                self._has_rapids_singlecell = True
+            except Exception:
+                self._has_rapids_singlecell = False
+        return self._has_rapids_singlecell
 
     # ------------------------------------------------------------------
     # Fixtures — cached per (dataset, config) key

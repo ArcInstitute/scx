@@ -45,7 +45,8 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
+from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,11 @@ def accel_leiden_variants() -> list[FormatVariant]:
             name="pyscx Leiden (cuGraph GPU)", key="accel_leiden__pyscx_gpu",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="rapids-singlecell Leiden (GPU)",
+            key="accel_leiden__rapids_singlecell_gpu",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -100,10 +106,25 @@ def _run_pyscx_gpu(adata: Any, seed: int) -> str:
     return adata.uns.get("leiden", {}).get("backend", "cugraph-or-scx")
 
 
+def _run_rapids_singlecell(adata: Any, seed: int) -> str:
+    """rapids-singlecell GPU competitor (V3 task 2.9). Runs cuGraph Leiden on
+    the precomputed scanpy neighbors graph (GPU-resident via `convert_all=True`);
+    writes obs["leiden"] for the ARI check. ARI vs leidenalg is informational
+    (cuGraph label divergence — same documented behaviour as SCX GPU Leiden).
+    """
+    import rapids_singlecell as rsc
+
+    rsc.get.anndata_to_GPU(adata, convert_all=True)
+    rsc.tl.leiden(adata, random_state=seed)
+    rsc.get.anndata_to_CPU(adata, convert_all=True)
+    return "rapids-singlecell-gpu"
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_leiden__leidenalg_cpu": (_run_leidenalg, False),
     "accel_leiden__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_leiden__pyscx_gpu": (_run_pyscx_gpu, True),
+    "accel_leiden__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
 
 
@@ -132,6 +153,13 @@ def run(
     if key.startswith("accel_leiden__pyscx") and not _HAS_PYSCX:
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
+        return None
+    if key == "accel_leiden__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
+        write_missing_result(
+            benchmark="accel_leiden", format_key=key, dataset=dataset.name,
+            missing_reason="no_rapids_singlecell",
+            notes="rapids-singlecell import failed; install into scx-bench-gpu",
+        )
         return None
 
     fixture = _load_preprocessed(dataset, n_comps=n_comps)

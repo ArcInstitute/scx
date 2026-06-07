@@ -631,6 +631,39 @@ absolute_floors:
     metric: umap_trustworthiness
     min: 0.90
 
+  # --- rapids-singlecell competitor correctness (V3 task 2.9) --------
+  # The per-op rapids-singlecell GPU variants are the head-to-head speed
+  # competitor (the wall-time ratio is surfaced in the accel report, not gated
+  # — rapids version drift must not fail the build). But rapids IS held to the
+  # SAME accuracy bar as SCX's own GPU variants: it reuses the identical
+  # `vs_scanpy` correctness metrics, so a rapids variant that silently computes
+  # the wrong thing fails here. Mirrors the SCX-GPU floors (pca subspace, knn
+  # recall, umap trustworthiness, hvg overlap) at the pbmc3k tier. No floor on
+  # `accel_leiden__rapids` ARI (cuGraph label divergence — same documented
+  # behaviour SCX's GPU Leiden has) or on `accel_preprocess__rapids` (preprocess
+  # is not accuracy-gated for SCX either). `check_absolute_floors` skips these
+  # silently until a rapids capture runs.
+  - benchmark: accel_pca
+    format: accel_pca__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.90
+  - benchmark: accel_knn
+    format: accel_knn__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_umap
+    format: accel_umap__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: trustworthiness
+    min: 0.90
+  - benchmark: accel_hvg
+    format: accel_hvg__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: hvg_overlap_vs_scanpy
+    min: 0.90
+
   # --- ml_loader throughput floors -----------------------------------
   # Floors at 0.5x observed baseline median (0.6x on pbmc3k
   # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).

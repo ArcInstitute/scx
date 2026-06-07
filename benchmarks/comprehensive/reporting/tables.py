@@ -1880,6 +1880,116 @@ def accelerator_parity_table() -> TableBlock | TextBlock:
                       caption="Accelerator parity — SCX vs baseline (CPU)")
 
 
+def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
+    """SCX GPU vs rapids-singlecell GPU head-to-head, per (operation, dataset).
+
+    The V3 task 2.9 competitive comparison: for each accel op, join the SCX-GPU
+    row and the ``rapids_singlecell_gpu`` row from the same dataset and show the
+    wall-time ratio (SCX / rapids; >1 means rapids is faster) alongside each
+    side's accuracy metric. The ratio is *surfaced here* (not gated — rapids
+    version drift must not fail the build); correctness is gated separately.
+    The per-op split localizes the end-to-end pipeline gap (2.7) to a stage.
+    """
+    store = get_store()
+    accel_benchmarks = [
+        "accel_pca", "accel_knn", "accel_umap", "accel_leiden",
+        "accel_preprocess", "accel_hvg",
+    ]
+    op_labels = {
+        "accel_pca": "PCA", "accel_knn": "kNN", "accel_umap": "UMAP",
+        "accel_leiden": "Leiden", "accel_preprocess": "Preprocess",
+        "accel_hvg": "HVG",
+    }
+    parity_keys = {
+        "accel_pca": "subspace_cos_min",
+        "accel_knn": "recall_vs_scanpy",
+        "accel_umap": "trustworthiness",
+        "accel_leiden": "ari_vs_leidenalg",
+        "accel_preprocess": "max_abs_diff_vs_scanpy",
+        "accel_hvg": "hvg_overlap_vs_scanpy",
+    }
+    # Polarity marker for the "Metric" column. Most accel parity metrics are
+    # higher-is-better (cosine / recall / trustworthiness / overlap / ARI), but
+    # preprocess's `max_abs_diff_vs_scanpy` is an error term (lower-is-better).
+    # Annotate the metric name so the side-by-side SCX/rapids values in one
+    # column aren't read with the wrong polarity.
+    lower_is_better = {"max_abs_diff_vs_scanpy"}
+
+    def _fmt_metric_name(key: str) -> str:
+        if not key:
+            return "—"
+        return f"{key} (↓)" if key in lower_is_better else f"{key} (↑)"
+
+    def _metric(row: Any, key: str) -> Any:
+        if row.runs:
+            v = row.runs[0].get("extra", {}).get(key)
+            if v is not None:
+                return v
+        return row.metadata.get(key)
+
+    def _fmt_metric(v: Any) -> str:
+        if v is None:
+            return "—"
+        if isinstance(v, float):
+            return f"{v:.4f}" if abs(v) < 100 else f"{v:.1f}"
+        return str(v)
+
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for bench in accel_benchmarks:
+        for row in store.by_benchmark(bench):
+            impl_short = row.format.replace(f"{bench}__", "")
+            by_key.setdefault((bench, row.dataset), {})[impl_short] = row
+
+    headers = ["Operation", "Dataset", "SCX GPU time", "rapids time",
+               "SCX/rapids", "Metric", "SCX", "rapids"]
+    rows: list[list[str]] = []
+    for (bench, ds), impls in sorted(by_key.items()):
+        rapids = impls.get("rapids_singlecell_gpu")
+        if rapids is None:
+            continue
+        # Pick the representative SCX GPU impl. Prefer covariance PCA
+        # (`pyscx_gpu_cov`) — it matches the post-HVG (~2000-var) covariance
+        # route the 2.7/2.9 pipeline measures; the randomized variants are the
+        # >8000-var path and aren't apples-to-apples here. Every other op has a
+        # single GPU impl, so the fallback rarely fires. When it does (e.g. a
+        # capture with only randomized PCA), `sorted(...)` makes the choice
+        # deterministic (alphabetical: `rand_chol` before `rand_hh`) rather than
+        # dict-order-dependent. If an `accel_pca__pyscx_gpu_auto` variant is ever
+        # added, revisit this selection so the comparison baseline doesn't move
+        # silently.
+        scx = (
+            impls.get("pyscx_gpu_cov")
+            or next(
+                (r for k, r in sorted(impls.items())
+                 if "pyscx_gpu" in k and "rapids" not in k),
+                None,
+            )
+        )
+        if scx is None:
+            continue
+        scx_t = scx.median_wall_s
+        rap_t = rapids.median_wall_s
+        ratio = (scx_t / rap_t) if (scx_t and rap_t) else None
+        mkey = parity_keys.get(bench, "")
+        rows.append([
+            op_labels.get(bench, bench), SHORT_NAMES.get(ds, ds),
+            _fmt_time(scx_t), _fmt_time(rap_t),
+            f"{ratio:.2f}x" if ratio else "—",
+            _fmt_metric_name(mkey), _fmt_metric(_metric(scx, mkey)),
+            _fmt_metric(_metric(rapids, mkey)),
+        ])
+
+    if not rows:
+        return TextBlock(
+            "_No rapids-singlecell comparison data — run the "
+            "`accel_*__rapids_singlecell_gpu` variants on a GPU host with "
+            "rapids-singlecell installed._"
+        )
+    return TableBlock(headers=headers, rows=rows, wide=True,
+                      caption="SCX GPU vs rapids-singlecell — wall-time ratio "
+                              "(>1 = rapids faster) + accuracy")
+
+
 def cell_eval_correctness_summary_table() -> TableBlock | TextBlock:
     """Cell-eval / arc-bench correctness summary (before performance table).
 
@@ -2352,6 +2462,7 @@ def generate_all_tables() -> dict[str, Block | list[Block]]:
         "correctness_dataset_summary": correctness_dataset_summary_table(),
         "pipeline_agreement": pipeline_agreement_table(),
         "accelerator_parity": accelerator_parity_table(),
+        "accelerator_gpu_vs_rapids": accelerator_gpu_vs_rapids_comparison_table(),
         "cell_eval_correctness": cell_eval_correctness_summary_table(),
         "cell_eval_parity_perf": cell_eval_parity_perf_table(),
         "harmony_lisi_correctness": harmony_lisi_correctness_summary_table(),

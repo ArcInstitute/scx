@@ -71,6 +71,7 @@ from benchmarks.comprehensive.config import (
     RANDOM_SEED,
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
+from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +86,6 @@ try:
         _HAS_PYSCX_GPU = False
 except ImportError:
     pass
-
-
-def _has_rapids_singlecell() -> bool:
-    try:
-        import rapids_singlecell  # noqa: F401
-        return True
-    except Exception:
-        return False
 
 
 def accel_pipeline_variants() -> list[FormatVariant]:
@@ -229,7 +222,7 @@ def run(
     if requires_gpu and not _HAS_PYSCX_GPU:
         logger.warning("GPU not available — skipping %s", key)
         return None
-    if key == "accel_pipeline__rapids_singlecell_gpu" and not _has_rapids_singlecell():
+    if key == "accel_pipeline__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
         logger.warning("rapids-singlecell not installed — recording stub for %s", key)
         write_missing_result(
             benchmark="accel_pipeline",

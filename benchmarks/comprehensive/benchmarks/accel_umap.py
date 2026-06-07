@@ -48,7 +48,8 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
+from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,11 @@ def accel_umap_variants() -> list[FormatVariant]:
             name="pyscx UMAP (GPU)", key="accel_umap__pyscx_gpu",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="rapids-singlecell UMAP (GPU)",
+            key="accel_umap__rapids_singlecell_gpu",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -100,10 +106,25 @@ def _run_pyscx_gpu(adata: Any, seed: int) -> str:
     return adata.uns.get("umap", {}).get("backend", "scx-gpu-cuda")
 
 
+def _run_rapids_singlecell(adata: Any, seed: int) -> str:
+    """rapids-singlecell GPU competitor (V3 task 2.9). Runs UMAP on the
+    precomputed scanpy neighbors graph (kept GPU-resident via
+    `convert_all=True`), isolating the UMAP stage; `X_umap` returns to host for
+    the trustworthiness check.
+    """
+    import rapids_singlecell as rsc
+
+    rsc.get.anndata_to_GPU(adata, convert_all=True)
+    rsc.tl.umap(adata, random_state=seed)
+    rsc.get.anndata_to_CPU(adata, convert_all=True)
+    return "rapids-singlecell-gpu"
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_umap__scanpy_cpu": (_run_scanpy_umap, False),
     "accel_umap__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_umap__pyscx_gpu": (_run_pyscx_gpu, True),
+    "accel_umap__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
 
 
@@ -148,6 +169,13 @@ def run(
     if key.startswith("accel_umap__pyscx") and not _HAS_PYSCX:
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
+        return None
+    if key == "accel_umap__rapids_singlecell_gpu" and not AcceleratorRunner.instance().has_rapids_singlecell():
+        write_missing_result(
+            benchmark="accel_umap", format_key=key, dataset=dataset.name,
+            missing_reason="no_rapids_singlecell",
+            notes="rapids-singlecell import failed; install into scx-bench-gpu",
+        )
         return None
 
     fixture = _load_preprocessed(dataset, n_comps=n_comps)
