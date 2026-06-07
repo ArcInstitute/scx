@@ -89,6 +89,16 @@ impl SectionReader for CloudSectionReader {
             .map_err(cloud_to_engine)
     }
 
+    fn obs_metadata_shard_count(&self) -> usize {
+        self.inner.obs_metadata_shard_count()
+    }
+
+    fn read_obs_shard(&self, shard_idx: u32) -> scx_engine::Result<RecordBatch> {
+        self.rt
+            .block_on(self.inner.read_obs_shard(shard_idx))
+            .map_err(cloud_to_engine)
+    }
+
     fn read_var(&self) -> scx_engine::Result<RecordBatch> {
         self.rt
             .block_on(self.inner.read_var())

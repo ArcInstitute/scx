@@ -214,6 +214,27 @@ impl CloudReader {
         )?)?)
     }
 
+    /// Read one obs metadata row-shard by index, decoded and narrowed to
+    /// canonical `Utf8` / `Binary` types (parity with
+    /// `ScxReader::read_obs_shard`), with the per-shard `row_start` /
+    /// `n_shard_rows` schema metadata preserved. Bounded by one shard —
+    /// does NOT assemble the full obs table, so it never re-OOMs the way
+    /// [`Self::read_obs`] can at atlas scale.
+    pub async fn read_obs_shard(&self, shard_idx: u32) -> Result<RecordBatch> {
+        let name = format!("obs_metadata/shard_{shard_idx}");
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::ObsMetadataShard && e.name == name)
+            .ok_or_else(|| CloudError::SectionNotFound(name.clone()))?;
+        let bytes = self.read_section_for_entry(entry).await?;
+        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
+            &bytes,
+            "obs_metadata",
+        )?)?)
+    }
+
     /// Read var metadata as an Arrow RecordBatch. Mirror of
     /// [`Self::read_obs`] for the var axis — same dual-layout handling and
     /// per-axis assembled-batch caching (LC4).

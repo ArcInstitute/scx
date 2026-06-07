@@ -46,6 +46,11 @@ use crate::RootCatalog;
 #[derive(Default, Debug)]
 pub struct ReaderDebugCounts {
     pub read_obs: AtomicU64,
+    /// Per-shard obs reads. The streaming query path increments this
+    /// instead of `read_obs`; tests assert `read_obs == 0` (no full
+    /// materialisation) and that this count stays bounded by the surviving
+    /// shards (I/O skip).
+    pub read_obs_shard: AtomicU64,
     pub read_layer: AtomicU64,
     pub read_layer_for: AtomicU64,
     pub read_obsm: AtomicU64,
@@ -816,6 +821,10 @@ impl ScxReader {
     /// (`shard_idx`, `row_start`, `n_shard_rows`, `n_rows_total`)
     /// preserved — callers may consult those fields directly.
     pub fn read_obs_shard(&self, shard_idx: u32) -> Result<RecordBatch> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_obs_shard
+            .fetch_add(1, Ordering::Relaxed);
         let key = format!("obs_metadata/shard_{shard_idx}");
         let entry = self
             .full_catalog
@@ -2095,6 +2104,65 @@ pub fn assemble_sharded_metadata(
     // Strip the per-shard metadata (shard_idx / row_start / n_shard_rows)
     // from the merged batch's schema. Keep n_rows_total and any
     // payload-level metadata.
+    let narrowed_schema = narrowed.schema();
+    let mut clean_metadata = narrowed_schema.metadata().clone();
+    clean_metadata.remove("shard_idx");
+    clean_metadata.remove("row_start");
+    clean_metadata.remove("n_shard_rows");
+    let clean_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        narrowed_schema.fields().clone(),
+        clean_metadata,
+    ));
+    Ok(RecordBatch::try_new(
+        clean_schema,
+        narrowed.columns().to_vec(),
+    )?)
+}
+
+/// Assemble an **arbitrary, already-row-filtered** subset of metadata
+/// shard batches into one logical batch.
+///
+/// Runs the same `upcast → widen-dict → concat → unify-dict → downcast →
+/// strip-per-shard-metadata` pipeline as [`assemble_sharded_metadata`],
+/// but WITHOUT the contiguous-cover validation and WITHOUT requiring the
+/// per-shard `shard_idx` / `row_start` stamps — the input batches are an
+/// arbitrary subset (any order, possibly empty), already filtered to the
+/// rows the caller wants. Callers are responsible for passing the batches
+/// in the final row order they want concatenated.
+///
+/// `template_schema` is only consulted when `batches` is empty, to build a
+/// correctly-typed 0-row result; pass the schema a normal read of this
+/// axis would produce (e.g. a single shard run through this same pipeline,
+/// or a prior assembled batch's schema).
+///
+/// Used by the query engine to rebuild the filtered obs metadata for a
+/// `filter_obs(...).collect()` result while only ever holding the matching
+/// rows in memory — see `scx-engine/src/collect.rs`.
+pub fn assemble_filtered_metadata(
+    template_schema: &Arc<arrow::datatypes::Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(template_schema.clone()));
+    }
+
+    // Widen exactly as `assemble_sharded_metadata` does so concat can't
+    // overflow narrow string offsets or per-shard dictionary key widths.
+    let wide: Vec<RecordBatch> = batches
+        .iter()
+        .map(|b| {
+            crate::arrow_compat::upcast_to_large_types(b)
+                .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
+        })
+        .collect::<Result<_>>()?;
+
+    let wide_schema = wide[0].schema();
+    let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;
+    let unified = unify_dictionary_columns(&concatenated)?;
+    let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
+
+    // Strip the per-shard metadata keys so the result schema matches a
+    // normal (full) read's assembled batch.
     let narrowed_schema = narrowed.schema();
     let mut clean_metadata = narrowed_schema.metadata().clone();
     clean_metadata.remove("shard_idx");

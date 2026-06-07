@@ -284,6 +284,28 @@ impl ShardStats {
         self.row_start..self.row_end
     }
 
+    /// Build stats carrying only a row range, for metadata shards
+    /// (`ObsMetadataShard` / `VarMetadataShard`). These shards have no
+    /// CSR value/nnz semantics, so the column range, nnz, value
+    /// summaries, and per-column stats are all zero/empty. The row range
+    /// lets the query engine map a metadata shard to its global rows
+    /// (and skip shards that don't overlap surviving CSR shards) without
+    /// decoding the shard payload.
+    pub fn row_range_only(row_start: u64, n_rows: u64) -> Self {
+        ShardStats {
+            row_start,
+            row_end: row_start + n_rows,
+            col_start: 0,
+            col_end: 0,
+            nnz: 0,
+            value_min: 0,
+            value_max: 0,
+            value_sum: 0,
+            n_indexed_columns: 0,
+            column_stats: Vec::new(),
+        }
+    }
+
     /// Column range. Pick this method when the entry is known to be a
     /// `CscShard`. v2 stats carry an explicit column range; v1 stats
     /// reconciled at catalog-read time have `col_start`/`col_end`
