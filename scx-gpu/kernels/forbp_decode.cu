@@ -51,7 +51,10 @@ extern "C" __global__ void forbp_decode_kernel(
                 word |= ((unsigned long long)bitstream[byte_idx + b]) << (b * 8);
             }
             word >>= bit_idx;
-            unsigned int mask = (1u << frame_bits) - 1;
+            // Guard against UB: `1u << 32` is undefined. frame_bits can be 32
+            // for u32-index shards (n_vars > 65535) whose deltas need 32 bits.
+            unsigned int mask =
+                (frame_bits >= 32) ? 0xFFFFFFFFu : ((1u << frame_bits) - 1);
             delta = (unsigned int)(word & mask);
         }
 

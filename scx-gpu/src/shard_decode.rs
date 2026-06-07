@@ -355,6 +355,112 @@ mod tests {
         assert_eq!(gpu_data, cpu_data, "data mismatch");
     }
 
+    /// Build a deterministic CSR with the given per-row nnz counts. Columns are
+    /// strictly increasing within each row (FOR-BP requires sorted indices).
+    /// Returns `(indptr, indices, values_u16)`.
+    fn build_dense_csr(row_nnzs: &[usize], n_cols: u32) -> (Vec<u64>, Vec<u32>, Vec<u16>) {
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values_u16: Vec<u16> = Vec::new();
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        for &nnz_row in row_nnzs {
+            let mut col = 0u32;
+            for _ in 0..nnz_row {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                col += (state % 4 + 1) as u32; // strictly increasing
+                assert!(col < n_cols, "test column overflow — widen n_cols");
+                indices.push(col);
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                values_u16.push((state % 7 + 1) as u16);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        (indptr, indices, values_u16)
+    }
+
+    fn assert_gpu_cpu_decode_match(
+        dev: &GpuDevice,
+        indptr: &[u64],
+        indices: &[u32],
+        values_u16: &[u16],
+        n_cols: u32,
+    ) {
+        let n_rows = indptr.len() - 1;
+        let nnz = indices.len();
+        let index_dtype_u16 = n_cols <= 65535;
+        let values_raw: Vec<u8> = values_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let shard_bytes = build_test_shard(
+            indptr,
+            indices,
+            &values_raw,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_cols,
+        );
+
+        let gpu_csr = decode_shard_gpu(dev, &shard_bytes).unwrap();
+        let gpu_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
+        let gpu_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
+        let gpu_data = dev.dtoh_copy(&gpu_csr.data).unwrap();
+
+        let header = ShardHeader::read_from(&mut Cursor::new(&shard_bytes)).unwrap();
+        let indptr_enc =
+            &shard_bytes[header.indptr_rel_offset as usize..][..header.indptr_length as usize];
+        let indices_enc =
+            &shard_bytes[header.indices_rel_offset as usize..][..header.indices_length as usize];
+        let values_enc =
+            &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
+        let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
+            indptr_enc,
+            indices_enc,
+            values_enc,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_rows,
+            nnz,
+            index_dtype_u16,
+        );
+
+        assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize));
+        assert_eq!(gpu_indptr, cpu_indptr, "indptr mismatch");
+        assert_eq!(gpu_indices, cpu_indices, "indices mismatch");
+        assert_eq!(gpu_data, cpu_data, "data mismatch");
+    }
+
+    /// Regression for the FOR-BP SIMD-layout decode bug (Phase 0.4 follow-up).
+    ///
+    /// Rows with nnz >= `scx_codec::forbp::SIMD_THRESHOLD` (128) are bit-packed
+    /// by the encoder with BitPacker4x's SIMD layout, which the sequential GPU
+    /// kernel cannot decode — `forbp_decode_gpu` must route these to the host
+    /// reference decoder. The synthetic `test_shard_decode_gpu_scx1` uses only
+    /// small rows (<=20 nnz) and never exercises this path; real data (e.g.
+    /// pbmc3k cells expressing >=128 genes) does.
+    #[test]
+    fn test_shard_decode_gpu_scx1_dense_rows_u16() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        // Mix of dense (>=128 nnz -> SIMD path), exactly-threshold, sparse, empty.
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
+    }
+
+    /// Same SIMD-layout regression for u32 column indices (n_cols > 65535), which
+    /// exercises the wider `frame_min` / `frame_bits` path on the host fallback.
+    #[test]
+    fn test_shard_decode_gpu_scx1_dense_rows_u32() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 70_000;
+        let row_nnzs = [2usize, 130, 300, 0, 512, 9, 256];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
+    }
+
     #[test]
     fn test_shard_decode_gpu_none() {
         let dev = require_gpu!();

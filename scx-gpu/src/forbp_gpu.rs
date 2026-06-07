@@ -149,6 +149,32 @@ pub fn forbp_decode_gpu(
         return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths));
     }
 
+    // The encoder bit-packs any row with nnz >= SIMD_THRESHOLD using BitPacker4x's
+    // SIMD layout (scx_codec::forbp::forbp_encode), which differs from the scalar
+    // LSB-first packing the GPU kernel below assumes. The kernel only decodes the
+    // scalar layout correctly, so when ANY row uses the SIMD path (ubiquitous in
+    // real single-cell data — cells expressing >=128 genes) we decode the indices
+    // on the host via the reference decoder (correct for both layouts) and upload.
+    // The GPU kernel fast path is retained for all-sparse-row shards.
+    if all_row_lengths
+        .iter()
+        .any(|&n| n >= scx_codec::forbp::SIMD_THRESHOLD)
+    {
+        let t_decode = crate::profile::start();
+        let (indices, row_lengths) = scx_codec::forbp::forbp_decode(data, n_rows, index_dtype_u16)
+            .map_err(|e| GpuError::InvalidShard(format!("FOR-BP host decode: {e:?}")))?;
+        crate::profile::record_host_decode_since(crate::profile::CodecClass::Scx1, t_decode);
+
+        let t_htod = crate::profile::start();
+        let d_indices = dev.htod_copy(&indices)?;
+        crate::profile::record_htod_since(
+            crate::profile::CodecClass::Scx1,
+            t_htod,
+            indices.len() * 4,
+        );
+        return Ok((d_indices, row_lengths));
+    }
+
     // Load PTX module (cached) and get kernel function
     let module = dev.load_module_cached(FORBP_PTX)?;
     let kernel = module
