@@ -48,7 +48,23 @@ pub trait SectionReader: Send + Sync {
     fn read_var_schema(&self) -> Result<Schema>;
 
     /// Obs metadata as an Arrow RecordBatch.
+    ///
+    /// **Memory cost:** on row-sharded (atlas-scale) files this decodes
+    /// and concatenates every obs metadata shard. Prefer the streaming
+    /// [`Self::obs_metadata_shard_count`] + [`Self::read_obs_shard`] pair
+    /// when you can process obs per-shard (the query engine does — see
+    /// `scx-engine/src/collect.rs`).
     fn read_obs(&self) -> Result<RecordBatch>;
+
+    /// Number of `ObsMetadataShard` sections (pure catalog scan, no I/O).
+    /// Zero on legacy single-section files.
+    fn obs_metadata_shard_count(&self) -> usize;
+
+    /// Read one obs metadata row-shard by index. Returns the per-shard
+    /// `RecordBatch` (narrow/canonical types) with its stamped
+    /// `row_start` / `n_shard_rows` schema metadata preserved. Bounded by
+    /// one shard's worth of obs, regardless of the logical obs size.
+    fn read_obs_shard(&self, shard_idx: u32) -> Result<RecordBatch>;
 
     /// Var metadata as an Arrow RecordBatch.
     fn read_var(&self) -> Result<RecordBatch>;
@@ -95,6 +111,14 @@ impl SectionReader for ScxReader {
 
     fn read_obs(&self) -> Result<RecordBatch> {
         Ok(ScxReader::read_obs(self)?)
+    }
+
+    fn obs_metadata_shard_count(&self) -> usize {
+        ScxReader::obs_metadata_shard_count(self)
+    }
+
+    fn read_obs_shard(&self, shard_idx: u32) -> Result<RecordBatch> {
+        Ok(ScxReader::read_obs_shard(self, shard_idx)?)
     }
 
     fn read_var(&self) -> Result<RecordBatch> {

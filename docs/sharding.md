@@ -158,6 +158,23 @@ adata = result.to_anndata()
 print(f"Skipped {result.skipped_shards}/{result.total_shards} shards")
 ```
 
+On row-sharded files (obs/var metadata sharding, below) the query engine
+evaluates obs predicates **one metadata shard at a time** into a bounded
+`n_obs` mask, and skips decoding obs shards that don't overlap a surviving
+CSR shard when per-shard catalog row-range stats are present. Peak obs
+memory is ~`(rayon width × one shard) + n_obs` bytes rather than the whole
+obs table, so `query().filter_obs(...).count()` / `.collect()` stay
+bounded at atlas scale (9 000+ shards). Files written before row-range
+stats existed still get the memory bound (every shard is streamed) but not
+the I/O skip; re-running `pyscx.compact` re-stamps the stats and restores
+shard skipping. This bound is **specific to the query path** — `compact`,
+`merge`, streaming export, `subset`, and `to_anndata` still assemble the
+full obs table.
+
+Filtered categorical obs columns in a `collect()` result carry only the
+categories present in the surviving rows (AnnData/pandas convention), not
+the full parent dictionary.
+
 ### Training loader (shard-level streaming)
 
 The training data loader reads shards sequentially with inter-epoch
@@ -302,11 +319,18 @@ obtain sharded metadata from an h5ad source, either ingest with
 
 Each shard covers rows `[row_start, row_start + n_shard_rows)` of the
 logical metadata table and carries schema metadata (`shard_idx`,
-`row_start`, `n_shard_rows`, `n_rows_total`). Readers reassemble shards
-transparently via the shard-aware APIs (`obs_shard_count`,
-`read_obs_shard`, `obs_shards`, `read_obs_assembled`); the legacy
-`read_obs` accessor errors on sharded files with a diagnostic directing
-callers to the shard APIs.
+`row_start`, `n_shard_rows`, `n_rows_total`). The same row range is also
+recorded in the catalog as row-range-only `ShardStats` (no nnz/value
+summary — metadata shards have no CSR semantics), so the query engine can
+map a metadata shard to its global rows, and skip decoding shards that
+don't overlap a surviving CSR shard, without reading the shard payload.
+These stats are additive (~57 B/shard, no format-version bump) and written
+by every producer (convert / merge / append / compact); files written
+before they existed are still read correctly (the query engine falls back
+to streaming every shard). Readers reassemble shards transparently via the
+shard-aware APIs (`obs_shard_count`, `read_obs_shard`, `obs_shards`,
+`read_obs_assembled`); the legacy `read_obs` accessor errors on sharded
+files with a diagnostic directing callers to the shard APIs.
 
 A file MUST NOT carry both a single-section `obs_metadata` (type 0) and
 sharded `obs_metadata_shard` (type 24) entries — the writer enforces

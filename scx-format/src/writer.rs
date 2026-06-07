@@ -531,11 +531,15 @@ impl ScxWriter {
         let stamped =
             stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
         let data = Self::write_arrow_ipc(&stamped)?;
+        // Stamp the shard's global row range into the catalog so the query
+        // engine can map this shard to its rows — and skip decoding it when
+        // it doesn't overlap any surviving CSR shard — without reading the
+        // payload. See `ShardStats::row_range_only`.
         self.write_section_bytes(
             format!("obs_metadata/shard_{shard_idx}"),
             SectionType::ObsMetadataShard,
             &data,
-            None,
+            Some(ShardStats::row_range_only(row_start, n_shard_rows)),
         )?;
         let next = match self.obs_layout {
             ObsVarLayout::Sharded(n) => n.saturating_add(1),
@@ -573,11 +577,13 @@ impl ScxWriter {
         let stamped =
             stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
         let data = Self::write_arrow_ipc(&stamped)?;
+        // Mirror of `write_obs_shard`: stamp the row range for symmetry and
+        // future var-axis pushdown.
         self.write_section_bytes(
             format!("var_metadata/shard_{shard_idx}"),
             SectionType::VarMetadataShard,
             &data,
-            None,
+            Some(ShardStats::row_range_only(row_start, n_shard_rows)),
         )?;
         let next = match self.var_layout {
             ObsVarLayout::Sharded(n) => n.saturating_add(1),
