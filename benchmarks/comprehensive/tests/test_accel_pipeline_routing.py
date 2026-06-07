@@ -97,3 +97,52 @@ def test_cpu_variant_no_gpu_gres():
     )
     # CPU variant must not request a GPU gres (would fail QOS on cpu_high_mem).
     assert params["slurm_gres"] == ""
+
+
+# ---------------------------------------------------------------------------
+# V3 task 2.9 — per-op rapids-singlecell competitor variants
+# ---------------------------------------------------------------------------
+
+# (benchmark, format_key) for each per-op rapids competitor.
+RAPIDS_PER_OP = [
+    ("accel_pca", "accel_pca__rapids_singlecell_gpu"),
+    ("accel_knn", "accel_knn__rapids_singlecell_gpu"),
+    ("accel_umap", "accel_umap__rapids_singlecell_gpu"),
+    ("accel_leiden", "accel_leiden__rapids_singlecell_gpu"),
+    ("accel_preprocess", "accel_preprocess__rapids_singlecell_gpu"),
+    ("accel_hvg", "accel_hvg__rapids_singlecell_gpu"),
+]
+
+
+def test_accel_formats_yields_per_op_rapids_variants():
+    import benchmarks.comprehensive.config as c
+
+    keys = {f.key for f in c.accel_formats()}
+    for _, key in RAPIDS_PER_OP:
+        assert key in keys, f"{key} missing from accel_formats()"
+
+
+@pytest.mark.parametrize("bench,key", RAPIDS_PER_OP)
+def test_per_op_rapids_routes_to_gpu_env(bench, key):
+    from benchmarks.comprehensive.scripts.run_parallel import _env_for_format
+
+    assert _env_for_format(key) == "scx-bench-gpu"
+
+
+@pytest.mark.parametrize("bench,key", RAPIDS_PER_OP)
+def test_per_op_rapids_gets_gpu_partition_and_gres(bench, key):
+    from benchmarks.comprehensive.scripts.run_parallel import _per_job_slurm_params
+
+    params = _per_job_slurm_params(_fake_args(), "pbmc3k", key, bench)
+    assert params["slurm_partition"] == "preemptible"
+    assert params["slurm_gres"] == "gpu:1"
+
+
+@pytest.mark.parametrize("bench,key", RAPIDS_PER_OP)
+def test_per_op_rapids_pairs_only_with_its_benchmark(bench, key):
+    from benchmarks.comprehensive.scripts.run_parallel import _bench_format_compatible
+
+    assert _bench_format_compatible(bench, key)
+    # A rapids key never pairs with a different accel benchmark.
+    other = "accel_umap" if bench != "accel_umap" else "accel_pca"
+    assert not _bench_format_compatible(other, key)

@@ -107,6 +107,22 @@ def build(store: ResultStore) -> Chapter:
         ],
     ))
 
+    # ── SCX GPU vs rapids-singlecell (V3 task 2.9) ───────────────────
+    c.sections.append(Section(
+        title="SCX GPU vs rapids-singlecell",
+        blocks=[
+            TextBlock(
+                "Head-to-head against the leading GPU-scanpy stack "
+                "(rapids-singlecell). The ratio (SCX / rapids wall time; >1 means "
+                "rapids is faster) is surfaced for competitiveness tracking — it "
+                "is not gated, since rapids version drift must not fail the "
+                "build. Correctness is held to the same accuracy bar as SCX. The "
+                "per-op split localizes the end-to-end pipeline gap to a stage."
+            ),
+            tables.accelerator_gpu_vs_rapids_comparison_table(),
+        ],
+    ))
+
     # ── CSC vs CSR dispatch (moved from operations chapter) ──────────
     c.sections.append(Section(
         title="CSC vs CSR Accelerator Dispatch",

@@ -39,9 +39,17 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     RANDOM_SEED,
 )
-from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 
 logger = logging.getLogger(__name__)
+
+
+def _has_rapids_singlecell() -> bool:
+    try:
+        import rapids_singlecell  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 # Subsample ceiling for the elementwise correctness diff. Full-matrix
 # compare on census-scale data densifies both operands into 100+ GB
@@ -78,6 +86,11 @@ def accel_preproc_variants() -> list[FormatVariant]:
         FormatVariant(
             name="pyscx normalize+log1p (GPU eager)",
             key="accel_preprocess__pyscx_gpu",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="rapids-singlecell normalize+log1p (GPU)",
+            key="accel_preprocess__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
         ),
     ]
@@ -117,10 +130,23 @@ def _run_pyscx_gpu(adata: Any, target_sum: float = 1e4) -> str:
     return "pyscx-gpu-eager-fused"
 
 
+def _run_rapids_singlecell(adata: Any, target_sum: float = 1e4) -> str:
+    """rapids-singlecell GPU competitor (V3 task 2.9): the same
+    normalize_total + log1p on the GPU-scanpy stack, in-memory (not backed)."""
+    import rapids_singlecell as rsc
+
+    rsc.get.anndata_to_GPU(adata)
+    rsc.pp.normalize_total(adata, target_sum=target_sum)
+    rsc.pp.log1p(adata)
+    rsc.get.anndata_to_CPU(adata)
+    return "rapids-singlecell-gpu"
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_preprocess__scanpy_cpu": (_run_scanpy, False),
     "accel_preprocess__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_preprocess__pyscx_gpu": (_run_pyscx_gpu, True),
+    "accel_preprocess__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
 
 
@@ -212,6 +238,13 @@ def run(
         return None
     if requires_gpu and not _HAS_PYSCX_GPU:
         return None
+    if key == "accel_preprocess__rapids_singlecell_gpu" and not _has_rapids_singlecell():
+        write_missing_result(
+            benchmark="accel_preprocess", format_key=key, dataset=dataset.name,
+            missing_reason="no_rapids_singlecell",
+            notes="rapids-singlecell import failed; install into scx-bench-gpu",
+        )
+        return None
 
     raw = _load_raw(dataset)
 
@@ -242,7 +275,15 @@ def run(
     # X they fall back to CPU. Build a plain SCX fixture once and open it backed
     # per iteration so the variant genuinely exercises (and can gate) the GPU
     # route. CPU/scanpy variants stay on the in-memory `raw.copy()`.
-    gpu_scx_path = _ensure_scx_fixture(raw, dataset.name) if requires_gpu else None
+    # Only the pyscx GPU variant runs on a backed SCX input (it needs the
+    # shard-streaming kernel). The rapids competitor consumes an in-memory
+    # AnnData (rsc.get.anndata_to_GPU can't take a ScxBackedSparseDataset), so
+    # it stays on raw.copy().
+    gpu_scx_path = (
+        _ensure_scx_fixture(raw, dataset.name)
+        if requires_gpu and "pyscx" in key
+        else None
+    )
 
     def _fresh() -> Any:
         if gpu_scx_path is not None:

@@ -1053,13 +1053,27 @@ GPU competitor rather than only a CPU strawman. Per-stage correctness
 to the same floors as the standalone `accel_pca`/`accel_knn`/`accel_umap` gates,
 and `pipeline_route_gpu_correct` gates the device-resident route (above).
 
-The `rapids_singlecell_gpu` variant needs `cuml` + `rapids-singlecell` in the
-`scx-bench-gpu` conda env (added to `envs/scx-bench-gpu.yml`; rebuild with
-`conda env update -f envs/scx-bench-gpu.yml`). On a host without
-rapids-singlecell installed, that variant records a typed
-`no_rapids_singlecell` stub and the SCX variants still run — so it is
-informational this release (no absolute floor); the broader per-op
-rapids-singlecell competitor matrix is tracked separately (V3 task 2.9).
+**Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
+the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant
+(`accel_{pca,knn,umap,leiden,preprocess,hvg}`) that runs the matching `rsc.*` op
+on the same fixture/device/dataset. Because each op is its own benchmark, the six
+side-by-side cells **localize** the end-to-end pipeline gap to a stage. The
+head-to-head wall-time ratio (SCX-GPU / rapids) is rendered in the accel report's
+**"SCX GPU vs rapids-singlecell"** table — it is *surfaced, not gated* (rapids
+version drift must not fail the build). rapids correctness IS gated: each variant
+reuses the same `vs_scanpy` accuracy metric as SCX and is held to the same floor
+(`subspace_cos_min`/`recall_vs_scanpy`/`trustworthiness`/`hvg_overlap_vs_scanpy`
+≥ 0.90 on `pbmc3k`); Leiden ARI and preprocess are informational (matching SCX's
+own coverage). DE (`rank_genes_groups`) is deferred to Phase 4.4.
+
+The rapids variants need `cuml` + `rapids-singlecell` in the `scx-bench-gpu`
+conda env. `cuml` installs via `conda env update -f envs/scx-bench-gpu.yml`;
+**rapids-singlecell ≥ 0.12 must be `pip install`ed from source on a GPU node**
+(its `-arch=native` CUDA build needs a visible GPU to resolve sm_90 — see the
+note in `envs/scx-bench-gpu.yml`), plus `pip install docrep scikit-image`. On a
+host without rapids-singlecell installed (or a non-GPU host), every rapids
+variant records a typed `no_rapids_singlecell` stub and the SCX variants still
+run — so the suite never hard-fails on the competitor's absence.
 
 **`scripts/submit_benchmarks.py` is a narrow specialty tool**, not a
 peer of `gate_candidate.py`. It exclusively drives
