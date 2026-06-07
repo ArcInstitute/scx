@@ -241,7 +241,16 @@ fn obs_shard_row_start(batch: &RecordBatch) -> Result<u64> {
         })
 }
 
-/// True if `[rs, re)` overlaps any range in `sorted` (sorted by start).
+/// True if `[rs, re)` overlaps any range in `sorted`.
+///
+/// **Precondition:** `sorted` must be **non-overlapping** and sorted by
+/// `start`. For non-overlapping ranges this also makes the `end` field
+/// monotonically non-decreasing, which is what licenses the
+/// `partition_point` on `end` below — on overlapping ranges that binary
+/// search can step past a range that actually overlaps. CSR shard row
+/// ranges (the only caller) are contiguous and disjoint, so they satisfy
+/// this. Do not reuse this helper for arbitrary, possibly-overlapping
+/// ranges without a linear scan instead.
 fn range_overlaps_any(rs: u64, re: u64, sorted: &[(u64, u64)]) -> bool {
     // Find the first range whose end is > rs, then check it starts < re.
     let i = sorted.partition_point(|(_, e)| *e <= rs);
@@ -558,6 +567,12 @@ fn materialize_filtered_obs(
     // Read each needed obs shard and take its matching local rows. For an
     // empty result, feed a single 0-row shard so the assembler produces the
     // canonical schema (avoids the cloud `read_obs_schema` full-assembly).
+    //
+    // `read_obs_shard(0)` is safe here: `materialize_filtered_obs` is only
+    // reached on the row-sharded path, where `obs_shard_ranges` is
+    // non-empty — which requires `obs_metadata_shard_count() > 0`, so shard
+    // 0 always exists. A future caller that reaches this with empty
+    // `obs_shard_ranges` would get a "section not found" error instead.
     let filtered_batches: Vec<RecordBatch> = if groups.is_empty() {
         vec![reader.read_obs_shard(0)?.slice(0, 0)]
     } else {
