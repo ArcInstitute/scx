@@ -270,11 +270,6 @@ absolute_floors:
     dataset: pbmc3k
     metric: cosine_sim_min
     min: 0.99
-  - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
-    dataset: pbmc3k
-    metric: cosine_sim_min
-    min: 0.99
   # Randomized PCA's per-PC cosine is unreliable by construction — the
   # randomized subspace iteration agrees with scanpy's subspace but
   # returns axes rotated/permuted vs the deterministic reference. The
@@ -353,18 +348,9 @@ absolute_floors:
   # under the empirical tail (pbmc3k 0.032, tabula 0.041, census_1m
   # 0.185) so randomized-SVD tail drift passes, but a true component-loss
   # regression (cos_min → 0) still fails.
-  # Covariance PCA (exact) keeps a strict `subspace_cos_min ≥ 0.95`
-  # floor — it doesn't have the randomized-tail problem.
-  - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
-    dataset: pbmc3k
-    metric: subspace_cos_min
-    min: 0.95
-  - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
-    dataset: tabula_sapiens_100k
-    metric: subspace_cos_min
-    min: 0.95
+  # (The in-VRAM covariance PCA path and its strict subspace_cos_min ≥ 0.95
+  # floors were removed in ACC-RUST-OPT-V4 Phase 3.2 — in-VRAM PCA routes to
+  # rapids-singlecell, whose subspace correctness is gated below.)
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k
@@ -425,37 +411,11 @@ absolute_floors:
     dataset: census_1m
     metric: subspace_cos_min
     min: 0.02
-  # Covariance path at census_1m — f32 GPU vs f64 CPU tail-PC drift is real
-  # but bounded; observed 0.9999+. Keep 0.90 floor for safety headroom.
-  - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
-    dataset: census_1m
-    metric: cosine_sim_min
-    min: 0.90
-
-  # --- accel_knn: recall vs scanpy ---
-  - benchmark: accel_knn
-    format: accel_knn__pyscx_gpu_cagra
-    dataset: pbmc3k
-    metric: recall_vs_scanpy
-    min: 0.90
-  - benchmark: accel_knn
-    format: accel_knn__pyscx_gpu_cagra
-    dataset: tabula_sapiens_100k
-    metric: recall_vs_scanpy
-    min: 0.90
-
-  # --- accel_umap: trustworthiness ---
-  - benchmark: accel_umap
-    format: accel_umap__pyscx_gpu
-    dataset: pbmc3k
-    metric: trustworthiness
-    min: 0.90
-  - benchmark: accel_umap
-    format: accel_umap__pyscx_gpu
-    dataset: tabula_sapiens_100k
-    metric: trustworthiness
-    min: 0.90
+  # (ACC-RUST-OPT-V4 Phase 3: the in-VRAM native covariance-PCA, in-VRAM native
+  # CAGRA kNN, and native UMAP correctness floors were removed with their paths —
+  # in-VRAM PCA / kNN / UMAP route to rapids-singlecell, gated by the rapids
+  # accuracy floors below. Native randomized PCA survives and keeps its
+  # subspace_cos_* floors above.)
 
   # --- accel_leiden: ARI vs leidenalg ---
   # First comprehensive run on pbmc3k produced ARI=0.893 for pyscx_cpu,
@@ -507,44 +467,29 @@ absolute_floors:
   # Each `accel_*.py` GPU variant emits `<op>_route_gpu_correct` = 1.0 when
   # pyscx stamped a GPU route on adata.uns["scx_accel"][<op>]["route"], 0.0 on
   # a silent CPU fallback. The GPU variants are skipped on non-GPU hosts (so a
-  # recorded route always means GPU was attempted), turning a silent
-  # GPU→CPU dispatch regression — cuSPARSE ABI mismatch (PCA), cuVS missing
-  # (kNN), native+cuML both failing (UMAP), cuGraph absent (Leiden), seurat_v3
-  # GPU kernel falling back (HVG) — into a hard gate failure. Gated on the same
-  # tiers each op already has a correctness floor at, so the triple is
-  # guaranteed to run. `accel_preprocess` is intentionally NOT route-gated: it
-  # runs on in-memory scipy X where normalize_total(device="gpu") legitimately
-  # falls back to CPU (documented), so a 1.0 floor would false-fail; that
-  # module records `gpu_dispatch_route` for visibility only.
+  # recorded route always means GPU was attempted), turning a silent GPU→CPU
+  # dispatch regression into a hard gate failure. Gated on the same tiers each
+  # op already has a correctness floor at, so the triple is guaranteed to run.
+  #
+  # ACC-RUST-OPT-V4 Phase 3 removed the in-VRAM native kNN (CAGRA) and native
+  # UMAP paths and the in-VRAM covariance PCA path; their `*_route_gpu_correct`
+  # floors are gone (in-VRAM kNN/UMAP/PCA route to rapids — gated by the rapids
+  # route floors below). The PCA native-route gate is retained on the surviving
+  # native **randomized** PCA variant (`pyscx_gpu_rand_hh`, run under
+  # SCX_FORCE_NATIVE_GPU), and the native Leiden (cuGraph) and HVG (seurat_v3)
+  # route gates are unchanged. `accel_preprocess` is intentionally NOT
+  # route-gated: it runs on in-memory scipy X where normalize_total(device="gpu")
+  # legitimately falls back to CPU (documented), so a 1.0 floor would false-fail;
+  # that module records `gpu_dispatch_route` for visibility only.
   - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
+    format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k
     metric: pca_route_gpu_correct
     min: 1.0
   - benchmark: accel_pca
-    format: accel_pca__pyscx_gpu_cov
+    format: accel_pca__pyscx_gpu_rand_hh
     dataset: tabula_sapiens_100k
     metric: pca_route_gpu_correct
-    min: 1.0
-  - benchmark: accel_knn
-    format: accel_knn__pyscx_gpu_cagra
-    dataset: pbmc3k
-    metric: knn_route_gpu_correct
-    min: 1.0
-  - benchmark: accel_knn
-    format: accel_knn__pyscx_gpu_cagra
-    dataset: tabula_sapiens_100k
-    metric: knn_route_gpu_correct
-    min: 1.0
-  - benchmark: accel_umap
-    format: accel_umap__pyscx_gpu
-    dataset: pbmc3k
-    metric: umap_route_gpu_correct
-    min: 1.0
-  - benchmark: accel_umap
-    format: accel_umap__pyscx_gpu
-    dataset: tabula_sapiens_100k
-    metric: umap_route_gpu_correct
     min: 1.0
   - benchmark: accel_leiden
     format: accel_leiden__pyscx_gpu
@@ -568,68 +513,12 @@ absolute_floors:
     metric: hvg_route_csc_direct
     min: 1.0
 
-  # --- accel_pipeline: device-resident PCA→kNN→UMAP route gate --------
-  # The fused `pyscx.accel.pca_neighbors_umap` path keeps the PCA embedding →
-  # kNN graph → fuzzy graph on the GPU between stages (the DeviceEmbedding /
-  # DeviceKnnGraph / DeviceFuzzyGraph handoffs from V3 tasks 2.3/2.4). This
-  # realizes the `device_resident_route_correct` gate deferred from 2.4:
-  # `accel_pipeline.py` emits `pipeline_route_gpu_correct` for the
-  # `pyscx_gpu_resident` variant = 1.0 iff pca / neighbors / umap **and** the
-  # pca_neighbors_umap summary all stamped `gpu_device_resident`, 0.0 on any
-  # silent host-boundary fallback (cuVS missing, cuSPARSE ABI mismatch,
-  # n_neighbors > FUZZY_MAX_K, use_rep != X_pca). The variant is skipped on
-  # non-GPU hosts, so a recorded 0.0 is always a real dispatch regression.
-  # Gated on the same tiers the per-op route gates run at.
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: pbmc3k
-    metric: pipeline_route_gpu_correct
-    min: 1.0
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: tabula_sapiens_100k
-    metric: pipeline_route_gpu_correct
-    min: 1.0
-  # Per-stage correctness of the fused resident pipeline, reusing the same
-  # accuracy bars as the standalone accel_pca (covariance) / accel_knn /
-  # accel_umap floors — the fused path must not silently degrade any stage.
-  # method="auto" on the 2000-HVG fixture routes PCA through the exact
-  # covariance path, so the strict 0.90 subspace floor applies (headroom under
-  # the 0.95 standalone covariance floor for end-to-end f32 drift).
-  # Gated on both pbmc3k and tabula_sapiens_100k — symmetric with the
-  # pipeline_route_gpu_correct gate above and the standalone per-op route
-  # gates (pca/knn/umap_route_gpu_correct), so a correctness regression at
-  # scale can't slip through while only the dispatch route is gated.
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: pbmc3k
-    metric: pca_subspace_cos_min
-    min: 0.90
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: pbmc3k
-    metric: knn_recall_vs_scanpy
-    min: 0.90
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: pbmc3k
-    metric: umap_trustworthiness
-    min: 0.90
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: tabula_sapiens_100k
-    metric: pca_subspace_cos_min
-    min: 0.90
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: tabula_sapiens_100k
-    metric: knn_recall_vs_scanpy
-    min: 0.90
-  - benchmark: accel_pipeline
-    format: accel_pipeline__pyscx_gpu_resident
-    dataset: tabula_sapiens_100k
-    metric: umap_trustworthiness
-    min: 0.90
+  # (ACC-RUST-OPT-V4 Phase 3.1 removed the device-resident fused
+  # `pca_neighbors_umap` native path — it depended on native UMAP — so the
+  # `accel_pipeline__pyscx_gpu_resident` route + per-stage correctness floors
+  # were removed with it. In-VRAM fused PCA→kNN→UMAP routes to the full
+  # rapids-singlecell pipeline, gated by `pipeline_route_rapids_correct` +
+  # per-stage rapids accuracy floors below.)
 
   # --- rapids-singlecell competitor correctness (V3 task 2.9) --------
   # The per-op rapids-singlecell GPU variants are the head-to-head speed

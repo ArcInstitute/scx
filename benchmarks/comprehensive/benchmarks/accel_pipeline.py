@@ -1,15 +1,17 @@
 """
 End-to-end PCA→kNN→UMAP residency benchmark.
 
-This is the Phase-2 *residency* benchmark (V3 task 2.7): it measures the
-device-resident fused pipeline (`pyscx.accel.pca_neighbors_umap`, which keeps the
-PCA embedding → kNN graph → fuzzy graph on the GPU between stages — the
-`DeviceEmbedding`/`DeviceKnnGraph`/`DeviceFuzzyGraph` handoffs from tasks
-2.3/2.4) **against** the current host-boundary path that round-trips every
-intermediate through host memory, a CPU reference, and the leading GPU-scanpy
-stack (rapids-singlecell).
+This benchmark measures the fused `pyscx.accel.pca_neighbors_umap` pipeline
+against a CPU reference, the host-boundary path that round-trips every
+intermediate through host memory (separate GPU calls), and the leading
+GPU-scanpy stack (rapids-singlecell).
 
-The handoff that 2.3/2.4 made device-resident is PCA→kNN→UMAP; preprocessing
+In-VRAM `device="gpu"` now routes the fused pipeline to the full rapids-singlecell
+pipeline (`rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap`); the native
+device-resident fused path (`DeviceEmbedding`/`DeviceKnnGraph`/`DeviceFuzzyGraph`
+handoffs) was removed in ACC-RUST-OPT-V4 Phase 3.1 along with native UMAP.
+
+Preprocessing
 (`normalize_total`/`log1p`/HVG) is supplied by the shared `AcceleratorRunner`
 fixture (identical to `accel_pca`/`accel_knn`/`accel_umap`) so the four variants
 are apples-to-apples on the same preprocessed matrix and only the residency of
@@ -20,7 +22,6 @@ the PCA→kNN→UMAP chain differs.
 | `format_variant.key` | Path | Device |
 |---|---|---|
 | `accel_pipeline__pyscx_cpu`            | pyscx pca → neighbors → umap (separate CPU calls) | CPU |
-| `accel_pipeline__pyscx_gpu_resident`   | fused `pyscx.accel.pca_neighbors_umap` (device-resident) | GPU |
 | `accel_pipeline__pyscx_gpu_hostboundary` | pyscx pca → neighbors → umap (separate GPU calls; host round-trip between stages) | GPU |
 | `accel_pipeline__rapids_singlecell_gpu`  | `rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap` | GPU |
 
@@ -32,7 +33,7 @@ the PCA→kNN→UMAP chain differs.
 | `pca_subspace_cos_min`   | rotation-invariant PCA subspace cosine vs scanpy CPU |
 | `knn_recall_vs_scanpy`   | neighbor-set Jaccard recall vs scanpy CPU |
 | `umap_trustworthiness`   | sklearn trustworthiness of the UMAP embedding |
-| `pipeline_route_gpu_correct` | resident variant only: 1.0 iff pca/neighbors/umap/pca_neighbors_umap all stamped `gpu_device_resident`, else 0.0 (a silent host-boundary fallback) |
+| `pipeline_route_rapids_correct` | rapids variant: 1.0 iff pca/neighbors/umap/pca_neighbors_umap all stamped `rapids_singlecell_gpu`, else 0.0 |
 | `graph_replay`/`math_mode`/`spmm_policy` | passthrough from `uns["scx_accel"]["pca"]` (visibility) |
 
 The rapids-singlecell variant is informational this PR (no route gate): it is the
@@ -97,11 +98,6 @@ def accel_pipeline_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
-            name="pyscx pipeline (GPU device-resident)",
-            key="accel_pipeline__pyscx_gpu_resident",
-            category="accel", runner="accel_runner",
-        ),
-        FormatVariant(
             name="pyscx pipeline (GPU host-boundary)",
             key="accel_pipeline__pyscx_gpu_hostboundary",
             category="accel", runner="accel_runner",
@@ -128,20 +124,6 @@ def _run_pyscx_cpu(adata: Any, n_comps: int, n_neighbors: int, seed: int) -> str
     )
     pyscx.accel.umap(adata, device="cpu", random_state=seed)
     return "scx-accel-cpu"
-
-
-def _run_pyscx_gpu_resident(
-    adata: Any, n_comps: int, n_neighbors: int, seed: int
-) -> str:
-    import pyscx
-    # Fused device-resident path: PCA embedding → kNN graph → fuzzy graph stay
-    # on the GPU between stages; only the final coordinates + connectivities
-    # come back to host.
-    pyscx.accel.pca_neighbors_umap(
-        adata, n_comps=n_comps, n_neighbors=n_neighbors,
-        device="gpu", random_state=seed,
-    )
-    return "scx-gpu-device-resident"
 
 
 def _run_pyscx_gpu_hostboundary(
@@ -180,23 +162,9 @@ def _run_rapids_singlecell(
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     # key: (implementation, requires_gpu)
     "accel_pipeline__pyscx_cpu": (_run_pyscx_cpu, False),
-    "accel_pipeline__pyscx_gpu_resident": (_run_pyscx_gpu_resident, True),
     "accel_pipeline__pyscx_gpu_hostboundary": (_run_pyscx_gpu_hostboundary, True),
     "accel_pipeline__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
 }
-
-
-def _pipeline_route_gpu_correct(adata: Any) -> float:
-    """1.0 iff the fused device-resident path stamped `gpu_device_resident` on
-    every handoff op (pca / neighbors / umap) **and** the summary key; 0.0 on
-    any silent host-boundary fallback. This realizes the device-residency
-    route gate deferred from task 2.4.
-    """
-    expected = "gpu_device_resident"
-    for op in ("pca", "neighbors", "umap", "pca_neighbors_umap"):
-        if _extract_route(adata, op) != expected:
-            return 0.0
-    return 1.0
 
 
 def _pipeline_route_rapids_correct(adata: Any) -> float:
@@ -348,12 +316,11 @@ def run(
         except Exception as e:
             logger.warning("UMAP trustworthiness failed for %s run %d: %s", key, i + 1, e)
 
-        # Route gate: only the device-resident variant asserts the fused route.
+        # Route gate: the rapids fused variant asserts the rapids route. (The
+        # native device-resident variant + its pipeline_route_gpu_correct gate
+        # were removed in ACC-RUST-OPT-V4 Phase 3.1 along with native UMAP.)
         # Passthrough the PCA tuning metadata for visibility on the GPU variants.
-        if key == "accel_pipeline__pyscx_gpu_resident":
-            extras["pipeline_route_gpu_correct"] = _pipeline_route_gpu_correct(a)
-            extras["gpu_dispatch_route"] = _extract_route(a, "pca_neighbors_umap")
-        elif is_rapids_variant(key):
+        if is_rapids_variant(key):
             extras["pipeline_route_rapids_correct"] = _pipeline_route_rapids_correct(a)
             extras["gpu_dispatch_route"] = _extract_route(a, "pca_neighbors_umap")
         try:

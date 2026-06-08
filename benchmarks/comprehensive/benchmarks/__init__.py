@@ -58,7 +58,7 @@ ALL_BENCHMARKS: list[str] = [
     # Accelerator benchmarks
     # These don't vary by file format; each accelerator module expands
     # internally into several implementation variants (one `FormatVariant`
-    # slot per impl, e.g. accel_pca__scanpy_cpu vs accel_pca__pyscx_gpu_cov).
+    # slot per impl, e.g. accel_pca__scanpy_cpu vs accel_pca__pyscx_gpu_rand_hh).
     # See `config.accel_formats()`.
     "accel_pca",
     "accel_knn",

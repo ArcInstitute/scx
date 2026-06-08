@@ -11,7 +11,6 @@ of the kNN connectivity graph, scheduled as an independent cell by
 |---|---|---|
 | `accel_knn__scanpy_cpu`       | scanpy.pp.neighbors (HNSW via `pynndescent`) | CPU |
 | `accel_knn__pyscx_cpu`        | pyscx.accel.neighbors (instant-distance HNSW) | CPU |
-| `accel_knn__pyscx_gpu_cagra`  | pyscx.accel.neighbors (cuVS CAGRA)            | GPU |
 
 ## Correctness metric
 
@@ -86,10 +85,6 @@ def accel_knn_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
-            name="pyscx neighbors (GPU CAGRA)", key="accel_knn__pyscx_gpu_cagra",
-            category="accel", runner="accel_runner",
-        ),
-        FormatVariant(
             name="rapids-singlecell neighbors (GPU)",
             key="accel_knn__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
@@ -128,14 +123,6 @@ def _run_pyscx_cpu(adata: Any, n_neighbors: int, seed: int) -> str:
     return adata.uns["neighbors"].get("backend", "scx-accel-cpu")
 
 
-def _run_pyscx_gpu_cagra(adata: Any, n_neighbors: int, seed: int) -> str:
-    import pyscx
-    pyscx.accel.neighbors(
-        adata, n_neighbors=n_neighbors, device="gpu", random_state=seed,
-    )
-    return adata.uns["neighbors"].get("backend", "scx-gpu-cagra")
-
-
 def _run_rapids_singlecell(adata: Any, n_neighbors: int, seed: int) -> str:
     """rapids-singlecell kNN route (Phase 2): drives the pyscx in-VRAM
     `device="gpu"` path, which after Phase 1 hands off to `rsc.pp.neighbors`.
@@ -161,7 +148,6 @@ def _run_pyscx_gpu_no_rapids(adata: Any, n_neighbors: int, seed: int) -> str:
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_knn__scanpy_cpu": (_run_scanpy_neighbors, False),
     "accel_knn__pyscx_cpu": (_run_pyscx_cpu, False),
-    "accel_knn__pyscx_gpu_cagra": (_run_pyscx_gpu_cagra, True),
     "accel_knn__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
     "accel_knn__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
 }
