@@ -25,9 +25,10 @@ pub type HostCsrTriplet = (Vec<i64>, Vec<i32>, Vec<f32>);
 /// A device-resident dense embedding, **row-major contiguous**
 /// `(n_obs × n_components)`.
 ///
-/// Produced by the device-returning PCA entry points
-/// (`gpu_randomized_pca_device` / `gpu_covariance_pca_device`) and consumed by
-/// `gpu_knn_cagra_device`. Row-major layout matches what CAGRA expects for its
+/// Produced by the device-returning randomized PCA entry point
+/// (`gpu_randomized_pca_device`) and consumed by `gpu_knn_cagra_device`. (The
+/// covariance device PCA entry point was removed in ACC-RUST-OPT-V4 Phase 3.2.)
+/// Row-major layout matches what CAGRA expects for its
 /// DLPack dataset tensor (strides `[n_components, 1]`) and what
 /// `obsm["X_pca"]` stores on the host, so [`Self::to_host`] needs no transpose.
 pub struct DeviceEmbedding {
@@ -207,95 +208,5 @@ impl DeviceKnnGraph {
             n_obs,
             n_neighbors,
         })
-    }
-}
-
-/// A device-resident fuzzy simplicial set (UMAP connectivities) as a CSR matrix
-/// on the GPU.
-///
-/// Produced by [`crate::gpu_fuzzy_simplicial_set_device`] (Phase 2.4): a CUDA
-/// fuzzy-simplicial-set kernel emits this type directly from a
-/// [`DeviceKnnGraph`], symmetrized via cuSPARSE transpose + a two-pointer merge,
-/// equivalent to running `scx_accel::neighbors::compute_connectivities` on the
-/// host. Consumed by [`crate::gpu_umap_from_device_graph`], which builds the SGD
-/// edge list on-device so the connectivity buffers never round-trip the host.
-///
-/// Layout matches the host CSR connectivity convention: `indptr` length
-/// `n_obs + 1` (`i64`), `indices` / `data` length `nnz` (`i32` / `f32`),
-/// symmetric, values in `[0, 1]`.
-pub struct DeviceFuzzyGraph {
-    indptr: CudaSlice<i64>,
-    indices: CudaSlice<i32>,
-    data: CudaSlice<f32>,
-    n_obs: usize,
-    nnz: usize,
-}
-
-impl DeviceFuzzyGraph {
-    /// Wrap device CSR connectivity buffers.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GpuError::ShapeMismatch`] if `indptr.len() != n_obs + 1` or the
-    /// `indices` / `data` lengths disagree with `nnz`.
-    pub fn new(
-        indptr: CudaSlice<i64>,
-        indices: CudaSlice<i32>,
-        data: CudaSlice<f32>,
-        n_obs: usize,
-        nnz: usize,
-    ) -> Result<Self, GpuError> {
-        if indptr.len() != n_obs + 1 {
-            return Err(GpuError::ShapeMismatch {
-                expected: format!("indptr length = n_obs + 1 = {}", n_obs + 1),
-                got: format!("{}", indptr.len()),
-            });
-        }
-        if indices.len() != nnz || data.len() != nnz {
-            return Err(GpuError::ShapeMismatch {
-                expected: format!("indices/data length = nnz = {nnz}"),
-                got: format!("indices={}, data={}", indices.len(), data.len()),
-            });
-        }
-        Ok(Self {
-            indptr,
-            indices,
-            data,
-            n_obs,
-            nnz,
-        })
-    }
-
-    /// Borrow the device CSR row-pointer buffer (`i64`, length `n_obs + 1`).
-    pub fn indptr(&self) -> &CudaSlice<i64> {
-        &self.indptr
-    }
-
-    /// Borrow the device CSR column-index buffer (`i32`, length `nnz`).
-    pub fn indices(&self) -> &CudaSlice<i32> {
-        &self.indices
-    }
-
-    /// Borrow the device CSR value buffer (`f32`, length `nnz`).
-    pub fn data(&self) -> &CudaSlice<f32> {
-        &self.data
-    }
-
-    /// Number of observations (rows / columns of the symmetric graph).
-    pub fn n_obs(&self) -> usize {
-        self.n_obs
-    }
-
-    /// Number of stored nonzeros.
-    pub fn nnz(&self) -> usize {
-        self.nnz
-    }
-
-    /// Download to host CSR triplets `(indptr, indices, data)`.
-    pub fn to_host(&self, dev: &GpuDevice) -> Result<HostCsrTriplet, GpuError> {
-        let indptr = dev.dtoh_copy(&self.indptr)?;
-        let indices = dev.dtoh_copy(&self.indices)?;
-        let data = dev.dtoh_copy(&self.data)?;
-        Ok((indptr, indices, data))
     }
 }

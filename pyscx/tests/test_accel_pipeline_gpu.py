@@ -75,7 +75,8 @@ def test_full_gpu_pipeline(tmp_path):
     assert "highly_variable" in adata.var
     assert adata.var["highly_variable"].sum() == 500
 
-    # 4. PCA — GPU covariance path (n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD=8000).
+    # 4. PCA — in-memory `device="gpu"` routes to rapids-singlecell (the native
+    #    in-VRAM covariance core was removed in Phase 3.2).
     pyscx.accel.pca(adata, n_comps=30, device="gpu", random_state=0)
     assert adata.obsm["X_pca"].shape == (n_obs, 30)
     assert "PCs" in adata.varm

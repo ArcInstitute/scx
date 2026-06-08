@@ -18,8 +18,6 @@ use super::pca::{
     write_pca_to_adata, BorrowedCsrSource, ScxCsrSource,
 };
 #[cfg(feature = "gpu")]
-use super::umap::{write_umap_backend, write_umap_to_adata};
-#[cfg(feature = "gpu")]
 use super::util::extract_materialized_csr;
 #[cfg(feature = "gpu")]
 use crate::backed::ScxBackedSparseDataset;
@@ -471,148 +469,6 @@ pub fn pca_neighbors_umap(
         }
     }
 
-    // ---- Fully fused device-resident GPU path (gated on use_rep == "X_pca"). ----
-    #[cfg(feature = "gpu")]
-    // The fused fuzzy-graph kernel caps `n_neighbors` at `FUZZY_MAX_K` (256);
-    // for larger `k` we fall through to the sequential path (which has no such
-    // cap) rather than hard-erroring. Route the size-cap case through `_ => None`
-    // so it does not also emit a spurious cuSPARSE-ABI warning.
-    if let Some(device_id) = match (_device.gpu_id(), use_rep == "X_pca") {
-        (Some(id), true)
-            if n_neighbors <= scx_accel::FUZZY_MAX_K
-                && scx_accel::cusparse_modern_abi_available() =>
-        {
-            Some(id)
-        }
-        (Some(_), true) if n_neighbors <= scx_accel::FUZZY_MAX_K => {
-            emit_cusparse_abi_warning(py, device)?;
-            None
-        }
-        _ => None,
-    } {
-        if scx_accel::cuvs_available() {
-            let qr = parse_qr_method(qr_method)?;
-            let x = adata.getattr("X")?;
-
-            let umap_params = UmapFusedParams {
-                n_components,
-                n_epochs,
-                min_dist,
-                spread,
-                negative_sample_rate,
-                umap_learning_rate,
-            };
-
-            let ran = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-                let reader = &*backed.backed;
-                run_fused_gpu_umap(
-                    py,
-                    adata,
-                    device_id,
-                    reader,
-                    n_comps,
-                    n_oversamples,
-                    n_power_iterations,
-                    zero_center,
-                    random_state,
-                    qr,
-                    method,
-                    n_neighbors,
-                    use_rep,
-                    &umap_params,
-                    device,
-                )?;
-                true
-            } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
-                let source = lazy.as_shard_source();
-                run_fused_gpu_umap(
-                    py,
-                    adata,
-                    device_id,
-                    &source,
-                    n_comps,
-                    n_oversamples,
-                    n_power_iterations,
-                    zero_center,
-                    random_state,
-                    qr,
-                    method,
-                    n_neighbors,
-                    use_rep,
-                    &umap_params,
-                    device,
-                )?;
-                true
-            } else if let Some((slices, shape)) = try_extract_borrowed_csr(py, &x)? {
-                let source = BorrowedCsrSource {
-                    indptr: slices.indptr(),
-                    indices: slices.indices(),
-                    data: slices.data(),
-                    shape,
-                };
-                run_fused_gpu_umap(
-                    py,
-                    adata,
-                    device_id,
-                    &source,
-                    n_comps,
-                    n_oversamples,
-                    n_power_iterations,
-                    zero_center,
-                    random_state,
-                    qr,
-                    method,
-                    n_neighbors,
-                    use_rep,
-                    &umap_params,
-                    device,
-                )?;
-                true
-            } else {
-                let csr = extract_materialized_csr(py, &x)?;
-                let source = ScxCsrSource { csr: &csr };
-                run_fused_gpu_umap(
-                    py,
-                    adata,
-                    device_id,
-                    &source,
-                    n_comps,
-                    n_oversamples,
-                    n_power_iterations,
-                    zero_center,
-                    random_state,
-                    qr,
-                    method,
-                    n_neighbors,
-                    use_rep,
-                    &umap_params,
-                    device,
-                )?;
-                true
-            };
-
-            if ran {
-                // Routes (pca / neighbors / umap / pca_neighbors_umap) were
-                // stamped inside `run_fused_gpu_umap` with the Task 2.5 metadata.
-                return Ok(());
-            }
-        } else {
-            let warnings = py.import("warnings")?;
-            warnings.call_method1(
-                "warn",
-                (
-                    format!(
-                        "pca_neighbors_umap(device={device:?}): cuVS not found — the fused \
-                         device-resident path is unavailable; falling back to sequential \
-                         pca + neighbors + umap. Install cuVS: conda install -c rapidsai \
-                         -c conda-forge libcuvs"
-                    ),
-                    py.get_type::<pyo3::exceptions::PyUserWarning>(),
-                ),
-            )?;
-        }
-    }
-
     // ---- Sequential fallback (no GPU / missing cuSPARSE 12.5 / missing cuVS). ----
     super::pca::pca(
         py,
@@ -660,17 +516,6 @@ pub fn pca_neighbors_umap(
     Ok(())
 }
 
-/// UMAP knobs threaded through the fused GPU path.
-#[cfg(feature = "gpu")]
-struct UmapFusedParams {
-    n_components: usize,
-    n_epochs: usize,
-    min_dist: f64,
-    spread: f64,
-    negative_sample_rate: usize,
-    umap_learning_rate: f64,
-}
-
 /// Run the fused GPU PCA → kNN dispatch on a single `ShardSource` and write the
 /// results into `adata`. Route stamping is done by the caller.
 #[cfg(feature = "gpu")]
@@ -692,7 +537,10 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     device: &str,
 ) -> PyResult<()> {
     let n_vars = source.n_vars();
-    let use_covariance = resolve_gpu_method(method, n_vars)? == "covariance";
+    // ACC-RUST-OPT-V4 Phase 3.2: the covariance GPU PCA path was removed;
+    // `resolve_gpu_method` validates the method string and always resolves the
+    // native fused path to randomized.
+    resolve_gpu_method(method, n_vars)?;
 
     let (pca_res, knn_res) = fused_dispatch_unwind_safe(
         device_id,
@@ -703,7 +551,6 @@ fn run_fused_gpu<S: ShardSource + Sync>(
         zero_center,
         random_state,
         qr,
-        use_covariance,
         n_neighbors,
     )
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -712,23 +559,21 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
-    // result, and the math-mode / SpMM-policy knobs only when the randomized
-    // path (which consumes them) ran — covariance records neither.
+    // result and the math-mode / SpMM-policy knobs (the randomized path consumes
+    // both — covariance, which recorded neither, was removed in Phase 3.2).
     stamp_fused_route(
         py,
         adata,
         device,
         &["pca", "neighbors", "pca_neighbors"],
         pca_res.graph_replayed,
-        use_covariance,
     )
 }
 
 /// Stamp the fused `gpu_device_resident` route on each `op`, attaching the
 /// Task 2.5 PCA metadata. The fused entry points use the default tuning
-/// (strict-fp32 + heuristic SpMM); `math_mode` / `spmm_policy` are recorded only
-/// for the randomized path (the covariance path runs no SpMM and does not thread
-/// the math mode, matching the standalone `pca` entry's honesty).
+/// (strict-fp32 + heuristic SpMM); `math_mode` / `spmm_policy` are always
+/// recorded now that the (SpMM-free) covariance path is gone.
 #[cfg(feature = "gpu")]
 fn stamp_fused_route(
     py: Python<'_>,
@@ -736,7 +581,6 @@ fn stamp_fused_route(
     device: &str,
     ops: &[&str],
     graph_replayed: Option<bool>,
-    use_covariance: bool,
 ) -> PyResult<()> {
     let mut info = super::route::simple_exec_info(
         device,
@@ -746,10 +590,8 @@ fn stamp_fused_route(
     );
     if info.route.is_gpu() {
         info.graph_replay = graph_replayed;
-        if !use_covariance {
-            info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
-            info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
-        }
+        info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
+        info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
     }
     for op in ops {
         super::route::write_accel_route(py, adata, op, &info)?;
@@ -772,7 +614,6 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
     zero_center: bool,
     random_state: u64,
     qr: scx_accel::QrMethod,
-    use_covariance: bool,
     n_neighbors: usize,
 ) -> Result<(scx_accel::PcaResult, scx_accel::KnnResult), scx_accel::AccelError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -785,7 +626,6 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
             zero_center,
             random_state,
             qr,
-            use_covariance,
             n_neighbors,
             // Task 2.5: the fused pyscx entry points do not expose the math-mode /
             // SpMM-policy knobs; use the strict-fp32 + heuristic-default tuning
@@ -805,131 +645,6 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
             .unwrap_or_else(|| "unknown panic payload".to_string());
         Err(scx_accel::AccelError::LinAlg(format!(
             "fused GPU PCA→kNN panicked: {msg}. If this mentions libcusparse / \
-             cusparse* undefined symbol, set \
-             LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH — see docs/gpu-setup.md."
-        )))
-    })
-}
-
-/// Run the fused GPU PCA → kNN → UMAP dispatch on a single `ShardSource` and
-/// write all results (`X_pca`, `obsp`, `uns["neighbors"]`, `X_umap`) into
-/// `adata`. Route stamping is done by the caller.
-#[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
-fn run_fused_gpu_umap<S: ShardSource + Sync>(
-    py: Python<'_>,
-    adata: &Bound<'_, PyAny>,
-    device_id: usize,
-    source: &S,
-    n_comps: usize,
-    n_oversamples: usize,
-    n_power_iterations: usize,
-    zero_center: bool,
-    random_state: u64,
-    qr: scx_accel::QrMethod,
-    method: &str,
-    n_neighbors: usize,
-    use_rep: &str,
-    umap: &UmapFusedParams,
-    device: &str,
-) -> PyResult<()> {
-    let n_vars = source.n_vars();
-    let use_covariance = resolve_gpu_method(method, n_vars)? == "covariance";
-
-    let (pca_res, knn_res, umap_res) = fused_umap_dispatch_unwind_safe(
-        device_id,
-        source,
-        n_comps,
-        n_oversamples,
-        n_power_iterations,
-        zero_center,
-        random_state,
-        qr,
-        use_covariance,
-        n_neighbors,
-        umap,
-    )
-    .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-
-    write_pca_to_adata(py, adata, &pca_res, "scx-gpu-cusparse")?;
-    super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
-    write_umap_to_adata(py, adata, &umap_res)?;
-    write_umap_backend(py, adata, "scx-gpu-cuda")?;
-    // Stamp the device-resident route on all four ops with the Task 2.5 PCA
-    // metadata (finding 5), same policy as the non-UMAP fused path.
-    stamp_fused_route(
-        py,
-        adata,
-        device,
-        &["pca", "neighbors", "umap", "pca_neighbors_umap"],
-        pca_res.graph_replayed,
-        use_covariance,
-    )
-}
-
-/// `catch_unwind` wrapper around [`scx_accel::pca_then_knn_umap_gpu`], mirroring
-/// [`fused_dispatch_unwind_safe`].
-#[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
-fn fused_umap_dispatch_unwind_safe<S: ShardSource + Sync>(
-    device_id: usize,
-    source: &S,
-    n_comps: usize,
-    n_oversamples: usize,
-    n_power_iterations: usize,
-    zero_center: bool,
-    random_state: u64,
-    qr: scx_accel::QrMethod,
-    use_covariance: bool,
-    n_neighbors: usize,
-    umap: &UmapFusedParams,
-) -> Result<
-    (
-        scx_accel::PcaResult,
-        scx_accel::KnnResult,
-        scx_accel::UmapResult,
-    ),
-    scx_accel::AccelError,
-> {
-    // `random_state` intentionally seeds both the PCA and UMAP stages — the
-    // fused `pca_neighbors_umap` entry exposes a single `random_state` kwarg
-    // (matching the standalone path), so independent PCA/UMAP seeds are not
-    // surfaced here even though the underlying fn takes them separately.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scx_accel::pca_then_knn_umap_gpu(
-            device_id,
-            source,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state, // PCA seed
-            qr,
-            use_covariance,
-            n_neighbors,
-            umap.n_components,
-            umap.n_epochs,
-            umap.min_dist,
-            umap.spread,
-            umap.negative_sample_rate,
-            umap.umap_learning_rate,
-            random_state, // UMAP seed (same value by design)
-            // Task 2.5: fused entry uses strict-fp32 + heuristic-default tuning.
-            scx_accel::GpuPcaTuning::default(),
-        )
-    }))
-    .unwrap_or_else(|panic_payload| {
-        let msg = panic_payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| {
-                panic_payload
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-            })
-            .unwrap_or_else(|| "unknown panic payload".to_string());
-        Err(scx_accel::AccelError::LinAlg(format!(
-            "fused GPU PCA→kNN→UMAP panicked: {msg}. If this mentions libcusparse / \
              cusparse* undefined symbol, set \
              LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH — see docs/gpu-setup.md."
         )))

@@ -82,7 +82,7 @@ pub use diffexp_gpu::{
     GpuDeShardInput,
 };
 #[cfg(feature = "gpu")]
-pub use fused::{pca_then_knn_gpu, pca_then_knn_umap_gpu};
+pub use fused::pca_then_knn_gpu;
 #[cfg(feature = "gpu")]
 pub use harmony::harmony_integrate_gpu;
 #[cfg(feature = "gpu")]
@@ -93,18 +93,13 @@ pub use hvg::{
 #[cfg(feature = "gpu")]
 pub use neighbors::{build_knn_graph_gpu, cuvs_available};
 #[cfg(feature = "gpu")]
-pub use pca::{
-    covariance_pca_gpu, gpu_available, gpu_info, randomized_pca_gpu, GpuInfo,
-    GPU_COVARIANCE_PCA_THRESHOLD,
-};
+pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
 #[cfg(feature = "gpu")]
 pub use scx_gpu::profile;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{
     cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, GpuMathMode,
-    GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat, FUZZY_MAX_K,
+    GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat,
 };
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{decode_csr_shards_to_device, decode_shard_gpu, GpuCsr, GpuCsrPointers};
-#[cfg(feature = "gpu")]
-pub use umap::compute_umap_gpu;

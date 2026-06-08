@@ -16,7 +16,6 @@ the "one job per benchmark × dataset pair" model (`AGENTS.md:21`).
 |---|---|---|---|---|
 | `accel_pca__scanpy_cpu`            | scanpy    | CPU | scanpy default (arpack)       | n/a |
 | `accel_pca__pyscx_cpu_auto`        | pyscx     | CPU | auto (covariance if n_vars≤5000) | n/a |
-| `accel_pca__pyscx_gpu_cov`         | pyscx     | GPU | covariance                    | n/a |
 | `accel_pca__pyscx_gpu_rand_hh`     | pyscx     | GPU | randomized                    | householder |
 | `accel_pca__pyscx_gpu_rand_chol`   | pyscx     | GPU | randomized                    | cholesky |
 
@@ -83,10 +82,6 @@ def accel_pca_variants() -> list[FormatVariant]:
         ),
         FormatVariant(
             name="pyscx PCA (CPU auto)", key="accel_pca__pyscx_cpu_auto",
-            category="accel", runner="accel_runner",
-        ),
-        FormatVariant(
-            name="pyscx PCA (GPU covariance)", key="accel_pca__pyscx_gpu_cov",
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
@@ -157,16 +152,6 @@ def _run_pyscx_cpu_auto(adata: Any, n_comps: int, seed: int) -> str:
 
     pyscx.accel.pca(adata, n_comps=n_comps, device="cpu", random_state=seed)
     return adata.uns["pca"].get("backend", "scx-accel-cpu")
-
-
-def _run_pyscx_gpu_cov(adata: Any, n_comps: int, seed: int) -> str:
-    import pyscx
-
-    pyscx.accel.pca(
-        adata, n_comps=n_comps, device="gpu",
-        method="covariance", random_state=seed,
-    )
-    return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
 def _run_pyscx_gpu_rand_hh(adata: Any, n_comps: int, seed: int) -> str:
@@ -331,7 +316,6 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     # key: (implementation, requires_gpu)
     "accel_pca__scanpy_cpu": (_run_scanpy_cpu, False),
     "accel_pca__pyscx_cpu_auto": (_run_pyscx_cpu_auto, False),
-    "accel_pca__pyscx_gpu_cov": (_run_pyscx_gpu_cov, True),
     "accel_pca__pyscx_gpu_rand_hh": (_run_pyscx_gpu_rand_hh, True),
     "accel_pca__pyscx_gpu_rand_chol": (_run_pyscx_gpu_rand_chol, True),
     "accel_pca__rapids_singlecell_gpu": (_run_rapids_singlecell, True),

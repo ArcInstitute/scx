@@ -324,7 +324,7 @@ def check_claim(
     # Broader: same benchmark + dataset, any format.
     # Use the manifest's actual fields rather than __-splitting the key,
     # because format strings can themselves contain "__" (e.g.
-    # "accel_pca__pyscx_gpu_cov").
+    # "accel_pca__pyscx_gpu_rand_hh").
     for rk, rdata in raw_manifests.items():
         if rdata.get("benchmark") == claim.benchmark and rdata.get("dataset") == claim.dataset:
             return True, f"backed by raw/{rk}.json (format: {rdata.get('format', '?')})"

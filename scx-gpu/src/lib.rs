@@ -56,18 +56,15 @@ pub mod forbp_gpu;
 pub mod gpu_csc_shard_source;
 pub mod gpu_csr_assemble;
 pub mod gpu_diffexp;
-pub mod gpu_fuzzy;
 pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
 pub mod gpu_knn;
 pub mod gpu_matrix_source;
 pub mod gpu_pca;
-pub mod gpu_pca_covariance;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
 pub mod gpu_shard_source;
-pub mod gpu_umap;
 pub mod linear_operator;
 pub mod math_policy;
 pub mod preprocessed_gpu_matrix_source;
@@ -87,7 +84,7 @@ pub use cusparse::{
     CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
 pub use device::GpuDevice;
-pub use device_resident::{DeviceEmbedding, DeviceFuzzyGraph, DeviceKnnGraph};
+pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
@@ -101,7 +98,6 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
-pub use gpu_fuzzy::{gpu_fuzzy_simplicial_set_device, FUZZY_MAX_K};
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
     read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,
@@ -125,12 +121,10 @@ pub use gpu_pca::{
     gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
     GpuPcaResult,
 };
-pub use gpu_pca_covariance::{gpu_covariance_pca, gpu_covariance_pca_device};
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
-pub use gpu_umap::{gpu_umap_from_device_graph, gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;

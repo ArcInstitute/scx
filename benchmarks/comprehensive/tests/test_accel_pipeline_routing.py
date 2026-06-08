@@ -8,7 +8,7 @@ Hermetic — no GPU, no datasets read, no submitit. Asserts:
     yields its four variant keys.
   * `_bench_format_compatible` pairs `accel_pipeline` with `accel_pipeline__*`
     only (and isolates it from other accel benchmarks / non-accel benches).
-  * `_env_for_format` routes the GPU variants (resident, host-boundary, rapids)
+  * `_env_for_format` routes the GPU variants (host-boundary, rapids)
     to `scx-bench-gpu` and the CPU variant to `scx-bench`.
   * `_per_job_slurm_params` routes the GPU variants to the preemptible GPU
     partition with `gpu:1`, and leaves the CPU variant off the GPU partition.
@@ -21,9 +21,11 @@ import types
 import pytest
 
 
+# The native device-resident pipeline variant (`accel_pipeline__pyscx_gpu_resident`)
+# was removed in ACC-RUST-OPT-V4 Phase 3 along with the device-resident fused
+# UMAP path; the in-VRAM pipeline now routes to rapids-singlecell.
 PIPELINE_KEYS = [
     "accel_pipeline__pyscx_cpu",
-    "accel_pipeline__pyscx_gpu_resident",
     "accel_pipeline__pyscx_gpu_hostboundary",
     "accel_pipeline__rapids_singlecell_gpu",
 ]
@@ -53,8 +55,8 @@ def test_bench_format_pairing_is_isolated():
     for k in PIPELINE_KEYS:
         assert _bench_format_compatible("accel_pipeline", k)
     # …never with another accel benchmark's variants…
-    assert not _bench_format_compatible("accel_pipeline", "accel_pca__pyscx_gpu_cov")
-    assert not _bench_format_compatible("accel_pca", "accel_pipeline__pyscx_gpu_resident")
+    assert not _bench_format_compatible("accel_pipeline", "accel_pca__pyscx_gpu_rand_hh")
+    assert not _bench_format_compatible("accel_pca", "accel_pipeline__pyscx_gpu_hostboundary")
     # …and a non-accel benchmark never sees accel_pipeline keys.
     assert not _bench_format_compatible("read_full", "accel_pipeline__pyscx_cpu")
 

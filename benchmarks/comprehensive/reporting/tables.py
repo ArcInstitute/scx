@@ -1947,23 +1947,16 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
         rapids = impls.get("rapids_singlecell_gpu")
         if rapids is None:
             continue
-        # Pick the representative SCX GPU impl. Prefer covariance PCA
-        # (`pyscx_gpu_cov`) — it matches the post-HVG (~2000-var) covariance
-        # route the 2.7/2.9 pipeline measures; the randomized variants are the
-        # >8000-var path and aren't apples-to-apples here. Every other op has a
-        # single GPU impl, so the fallback rarely fires. When it does (e.g. a
-        # capture with only randomized PCA), `sorted(...)` makes the choice
-        # deterministic (alphabetical: `rand_chol` before `rand_hh`) rather than
-        # dict-order-dependent. If an `accel_pca__pyscx_gpu_auto` variant is ever
-        # added, revisit this selection so the comparison baseline doesn't move
-        # silently.
-        scx = (
-            impls.get("pyscx_gpu_cov")
-            or next(
-                (r for k, r in sorted(impls.items())
-                 if "pyscx_gpu" in k and "rapids" not in k),
-                None,
-            )
+        # Pick the representative SCX GPU impl. The native in-VRAM covariance
+        # PCA variant (`pyscx_gpu_cov`) was removed in ACC-RUST-OPT-V4 Phase 3,
+        # so PCA's SCX-GPU representative is now the randomized variant. For PCA
+        # this resolves to `pyscx_gpu_rand_*`; every other op has a single GPU
+        # impl. `sorted(...)` makes the choice deterministic (alphabetical:
+        # `rand_chol` before `rand_hh`) rather than dict-order-dependent.
+        scx = next(
+            (r for k, r in sorted(impls.items())
+             if "pyscx_gpu" in k and "rapids" not in k),
+            None,
         )
         if scx is None:
             continue

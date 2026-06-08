@@ -4,7 +4,6 @@ Every test in this file is gated on `pyscx.accel.gpu_available()`; on a
 CPU-only host or a build without the `gpu` feature they are silently skipped.
 Covered scenarios:
 
-* GPU covariance PCA vs CPU covariance PCA (cosine ≥ 0.999, top-50)
 * GPU randomized PCA (`qr_method="householder"`) vs CPU randomized PCA at
   matched seed
 * GPU randomized PCA (`qr_method="cholesky"`) vs GPU randomized PCA
@@ -111,27 +110,13 @@ def _clustered_count_adata(
 
 
 # --------------------------------------------------------------------- #
-# 7.1.a — GPU covariance PCA vs CPU covariance PCA
+# 7.1.a — GPU covariance PCA was removed in ACC-RUST-OPT-V4 Phase 3.2.
+#   The native in-VRAM covariance core no longer exists (in-memory
+#   `device="gpu"` PCA routes to rapids-singlecell, and `resolve_gpu_method`
+#   always yields "randomized"), so there is no GPU covariance path to compare
+#   against CPU covariance — the former test_gpu_covariance_vs_cpu_covariance
+#   test was dropped. GPU randomized parity is covered below.
 # --------------------------------------------------------------------- #
-
-@gpu_only
-def test_gpu_covariance_vs_cpu_covariance_cosine():
-    """Top-50 PCs from GPU covariance PCA match CPU covariance PCA."""
-    import pyscx
-
-    adata = _random_count_adata(n_obs=1_000, n_vars=500, density=0.1, seed=1)
-    a_cpu = adata.copy()
-    a_gpu = adata.copy()
-
-    pyscx.accel.pca(a_cpu, n_comps=50, device="cpu", method="covariance",
-                    random_state=0)
-    pyscx.accel.pca(a_gpu, n_comps=50, device="gpu", method="covariance",
-                    random_state=0)
-
-    cos = _cosine_sign_agnostic(a_cpu.obsm["X_pca"], a_gpu.obsm["X_pca"])
-    # Top-50 PCs — loosen the very-trailing ones slightly; strong PCs must be tight.
-    assert (cos[:25] >= 0.999).all(), f"top-25 cosine: min={cos[:25].min():.4f}"
-    assert (cos >= 0.99).all(), f"top-50 cosine: min={cos.min():.4f}"
 
 
 # --------------------------------------------------------------------- #
@@ -139,9 +124,14 @@ def test_gpu_covariance_vs_cpu_covariance_cosine():
 # --------------------------------------------------------------------- #
 
 @gpu_only
-def test_gpu_randomized_householder_vs_cpu_randomized():
+def test_gpu_randomized_householder_vs_cpu_randomized(monkeypatch):
     """CPU vs GPU randomized PCA (Householder) on a fixture with a planted
     well-separated top-`(n_clusters-1)` subspace.
+
+    Pins `SCX_FORCE_NATIVE_GPU=1` so the GPU side exercises the **native**
+    randomized PCA (cuSPARSE+cuSOLVER) rather than rapids-singlecell — in-memory
+    `device="gpu"` PCA routes to rapids by default after Phase 1.3, and this
+    test is specifically about native CPU-vs-GPU randomized parity.
 
     The CPU path seeds a Rust `ChaCha8` RNG; the GPU path seeds cuRAND's
     XORWOW generator. Even at matched `random_state`, the two streams
@@ -160,10 +150,12 @@ def test_gpu_randomized_householder_vs_cpu_randomized():
     """
     import pyscx
 
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     n_clusters = 5
     well_separated = n_clusters - 1
-    # n_vars > GPU_COVARIANCE_PCA_THRESHOLD to force the randomized path on both
-    # sides regardless of the method="auto" routing threshold.
+    # method="randomized" on both sides. (On GPU every method resolves to
+    # randomized since Phase 3.2 removed the in-VRAM covariance core; the CPU
+    # side is pinned to randomized explicitly.)
     adata = _clustered_count_adata(
         n_obs=1_000, n_vars=9_000, n_clusters=n_clusters, density=0.03, seed=2,
     )
@@ -214,10 +206,16 @@ def test_gpu_randomized_householder_vs_cpu_randomized():
 # --------------------------------------------------------------------- #
 
 @gpu_only
-def test_gpu_cholesky_matches_householder():
-    """qr_method="cholesky" and qr_method="householder" should agree to 1e-3."""
+def test_gpu_cholesky_matches_householder(monkeypatch):
+    """qr_method="cholesky" and qr_method="householder" should agree to 1e-3.
+
+    Pins `SCX_FORCE_NATIVE_GPU=1` so both runs exercise the native cuSOLVER QR
+    step (rapids ignores `qr_method`, so without this both would route to rapids
+    and the comparison would be vacuous).
+    """
     import pyscx
 
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     adata = _random_count_adata(n_obs=800, n_vars=9_000, density=0.05, seed=3)
     a_h = adata.copy()
     a_c = adata.copy()
@@ -245,9 +243,14 @@ def test_gpu_cholesky_matches_householder():
 # --------------------------------------------------------------------- #
 
 @gpu_only
-def test_gpu_cholesky_ill_conditioned_raises():
+def test_gpu_cholesky_ill_conditioned_raises(monkeypatch):
     """CholeskyQR2 must surface a RuntimeError with 'non-SPD' on a true
     rank-deficient input — pointing the caller at `qr_method="householder"`.
+
+    Pins `SCX_FORCE_NATIVE_GPU=1`: in-memory `device="gpu"` PCA routes to
+    rapids-singlecell by default (Phase 1.3), which ignores `qr_method` and
+    never hits the native CholeskyQR2 non-SPD detection — so the native path
+    must be forced for this test to exercise it.
 
     Build a `(n_obs × n_vars)` matrix as `X = U @ V^T` with `rank(X) = 5`,
     well below `k = n_comps + n_oversamples = 30`. Then `Y = (X - μ) @ Ω` has
@@ -267,6 +270,7 @@ def test_gpu_cholesky_ill_conditioned_raises():
     import anndata
     import pyscx
 
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     rng = np.random.default_rng(7)
     n_obs, n_vars, rank = 1_000, 9_000, 5
     u = rng.standard_normal((n_obs, rank)).astype(np.float32)
@@ -296,8 +300,9 @@ def test_lazy_normalize_log1p_pca_matches_scanpy(tmp_path):
     import scanpy as sc
 
     # Reasonably-sized synthetic stand-in for pbmc3k (the real pbmc3k fixture
-    # may not exist on all machines). Dims chosen so the covariance-PCA path
-    # (n_vars ≤ GPU_COVARIANCE_PCA_THRESHOLD = 8000) is exercised.
+    # may not exist on all machines). In-memory `device="gpu"` PCA routes to
+    # rapids-singlecell (or the native randomized core under
+    # SCX_FORCE_NATIVE_GPU=1); the leading PCs must still align with scanpy.
     adata_src = _random_count_adata(n_obs=2_000, n_vars=3_000, density=0.07, seed=11)
 
     # Scanpy reference (in-memory).
@@ -372,10 +377,14 @@ def test_device_gating_cpu_build_rejects_gpu():
     not __import__("sys").platform.startswith("linux"),
     reason="ru_maxrss reporting differs by platform; only assert on Linux",
 )
-def test_gpu_pca_materialized_csr_host_spike():
+def test_gpu_pca_materialized_csr_host_spike(monkeypatch):
     """The Phase-10 borrow fast-lane must keep the host RSS spike under
     ~1.5× the input CSR's nbytes when feeding a materialised scipy CSR to
     `pyscx.accel.pca(device="gpu")`.
+
+    Pins `SCX_FORCE_NATIVE_GPU=1` — the borrow fast-lane is on the native GPU
+    PCA dispatch; in-memory `device="gpu"` would otherwise route to rapids
+    (which has its own, unrelated host-memory profile).
 
     Pre-Phase-10 the path was numpy → `extract::<Vec<T>>` (copy 1) → `ScxCsr`
     → `read_shard` clone (copy 2), which pushed peak RSS to ≈ 2× input. The
@@ -391,6 +400,7 @@ def test_gpu_pca_materialized_csr_host_spike():
 
     import pyscx
 
+    monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
     # 100K × 200 @ 10% density: small enough to run in a CI test, large
     # enough that the input dominates baseline RSS noise.
     adata = _random_count_adata(n_obs=100_000, n_vars=200, density=0.10, seed=42)

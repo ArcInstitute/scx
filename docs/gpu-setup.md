@@ -22,17 +22,19 @@ with a `device="gpu"` parameter.
 | SCX operation | CUDA Toolkit (`nvcc`) | cuVS | cuGraph |
 |---------------|----------------------|------|---------|
 | GPU PCA — randomized (cuSPARSE SpMM + cuSOLVER QR + cuBLAS) | required | — | — |
-| GPU PCA — covariance (cuSPARSE + cuSOLVER `syevd` + cuBLAS) | required | — | — |
 | GPU CholeskyQR2 (cuSOLVER `potrf` + cuBLAS `strsm`) | required | — | — |
-| GPU UMAP (native CUDA SGD kernel) | required | — | — |
 | GPU preprocessing (`normalize_total` / `log1p` / `highly_variable_genes` with `device="gpu"`) | required | — | — |
-| GPU kNN (CAGRA) | required | required | — |
+| GPU kNN — CAGRA (device-resident, fused `pca_neighbors`) | required | required | — |
 | GPU Leiden clustering | — | — | required |
 
 Operations without their required dependencies fall back to CPU automatically
-with a warning — no crashes.
+with a warning — no crashes. In-VRAM `device="gpu"` PCA, kNN, and UMAP route to
+**rapids-singlecell** (a separate runtime dependency — see the routing section
+below); the in-VRAM native covariance PCA, CAGRA kNN, and CUDA-SGD UMAP kernels
+were removed in ACC-RUST-OPT-V4 Phase 3 (CAGRA survives only inside the
+device-resident fused `pca_neighbors` path).
 
-**Note on cuBLAS:** covariance PCA, GPU-resident final-embedding
+**Note on cuBLAS:** randomized PCA, GPU-resident final-embedding
 multiply, CholeskyQR2, and preprocessing Gram correction depend on **cuBLAS**.
 `libcublas.so` ships alongside `libcusparse.so` / `libcusolver.so` inside
 every CUDA Toolkit 12.x install, so no new runtime library path or env-var
@@ -250,11 +252,13 @@ rapids (which would OOM).
 
 ### Forcing the native GPU kernels
 
-`SCX_FORCE_NATIVE_GPU=1` keeps the native SCX GPU kernels for in-VRAM ops
-instead of routing to rapids — a transition-only A/B + rollback switch (removed
-once the rapids routes are gated and the superseded native kernels are deleted).
-When rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops
-fall back to CPU (`fallback_reason="no_rapids"`) with a one-shot `UserWarning`.
+`SCX_FORCE_NATIVE_GPU=1` keeps the **surviving** native SCX GPU kernels for
+in-VRAM ops instead of routing to rapids. After the ACC-RUST-OPT-V4 Phase 3
+removals these are the streaming preprocess kernels and randomized PCA; the
+in-VRAM native UMAP, covariance PCA, and CAGRA kNN kernels were deleted (rapids
+supersedes them), so for those ops the override now falls through to CPU. When
+rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops fall
+back to CPU (`fallback_reason="no_rapids"`) with a one-shot `UserWarning`.
 
 `SCX_DISABLE_RAPIDS=1` forces that rapids-absent CPU fallback **even on a host
 where rapids is installed** — it makes the dispatcher treat rapids as

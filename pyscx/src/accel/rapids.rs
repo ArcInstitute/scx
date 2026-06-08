@@ -4,10 +4,12 @@
 //! [rapids-singlecell](https://rapids-singlecell.readthedocs.io/) — the GPU
 //! compute layer — rather than SCX's native CUDA kernels. rapids is a *detected
 //! runtime dependency* (§4.3): present → route to it; absent → route CPU with a
-//! one-shot diagnostic and `fallback_reason="no_rapids"`. The native GPU kernels
-//! stay reachable for A/B + rollback via `SCX_FORCE_NATIVE_GPU=1` (a
-//! transition-only override removed at the end of Phase 3) and for the
-//! out-of-VRAM streaming moat (backed / lazy `X`, which never routes here).
+//! one-shot diagnostic and `fallback_reason="no_rapids"`. The **surviving** native
+//! GPU paths stay reachable via `SCX_FORCE_NATIVE_GPU=1` — after Phase 3 these are
+//! the streaming preprocess kernels (also fed by the ML loader) and randomized
+//! PCA; the in-VRAM native UMAP, covariance PCA, and CAGRA kNN paths the override
+//! used to also pin were removed in Phase 3. The out-of-VRAM streaming moat
+//! (backed / lazy `X`) never routes here regardless of the override.
 //!
 //! This module is GPU-gated; callers reference it from `#[cfg(feature = "gpu")]`
 //! blocks only.
@@ -23,8 +25,10 @@ use super::gpu::{rapids_singlecell_info, ResolvedDevice};
 use super::route::write_accel_route;
 
 /// `SCX_FORCE_NATIVE_GPU` override — keep the native SCX GPU kernels instead of
-/// routing in-VRAM GPU compute to rapids-singlecell. Transition-only A/B +
-/// rollback switch (removed at the end of Phase 3).
+/// routing in-VRAM GPU compute to rapids-singlecell. After Phase 3 it pins only
+/// the surviving native paths (streaming preprocess kernels, randomized PCA);
+/// the in-VRAM UMAP / covariance-PCA / CAGRA-kNN kernels it also used to pin were
+/// removed, so for those ops it now falls through to the CPU path.
 pub(crate) fn force_native_gpu() -> bool {
     matches!(std::env::var("SCX_FORCE_NATIVE_GPU"), Ok(v) if v != "0" && !v.is_empty())
 }

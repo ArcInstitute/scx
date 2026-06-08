@@ -1,5 +1,4 @@
-//! Device-resident randomized-PCA power loop with optional CUDA-graph capture
-//! (V3 plan Task 2.5).
+//! Device-resident randomized-PCA power loop (V3 plan Task 2.5).
 //!
 //! The streaming randomized-PCA core (`gpu_pca::randomized_pca_core`) drives the
 //! power loop through [`crate::linear_operator::CenteredSparseOperator`], which
@@ -12,44 +11,22 @@
 //! 1. Drains the [`ShardSource`] **once** into a single device-resident
 //!    [`GpuCsr`] + cuSPARSE descriptor ([`try_build_resident_csr`]).
 //! 2. Runs the power loop as two plain `cusparseSpMM` calls per iteration on
-//!    that fixed descriptor — no per-iteration decode/upload.
-//! 3. Optionally **captures** each SpMM segment (forward / transpose) into a
-//!    CUDA graph and replays it across power iterations
-//!    ([`run_resident_power_loop`]), amortising kernel-launch latency.
+//!    that fixed descriptor — no per-iteration decode/upload
+//!    ([`run_resident_power_loop`]).
 //!
-//! ## Why the scratch buffers must be pointer-stable for capture
-//!
-//! A captured graph bakes in the device pointers of its kernel arguments.
-//! `cusolver::gpu_qr_q` uses a swap-and-return that hands back a **new**
-//! `CudaSlice` (the input is left as a zero-length dummy), so naively threading
-//! it through `scratch.d_y` would change that buffer's pointer every iteration
-//! and invalidate the captured forward/transpose graphs. We therefore keep
-//! `scratch.d_y` / `scratch.d_z` pointer-stable and run QR through
-//! [`qr_into_stable`], which QRs a scratch copy and copies the `Q` factor back
-//! into the original buffer.
-//!
-//! ## Stream discipline
-//!
-//! Each path runs entirely on a single stream: the direct path on the device's
-//! default stream, the capture path on the capturable per-thread stream (via a
-//! `dev.with_stream(...)` clone). Replayed graphs launch on their capture
-//! stream, and QR runs on the same stream, so segments and QR serialise without
-//! a cross-stream wait. The per-thread stream (unlike `new_stream()`) does not
-//! flip cudarc into multi-stream mode, so default-stream-allocated scratch is
-//! capture-safe (no auto-inserted `cuStreamWaitEvent`).
+//! SpMM-segment CUDA-graph capture (an opt-in `cusparseSpMM` graph replay) was
+//! removed in ACC-RUST-OPT-V4 Phase 3.4: it poisoned the CUDA context on the
+//! cuSPARSE versions tested (CUDA 12.x on H100) and was never a measured win
+//! over the direct resident path, which already delivers the residency benefit.
 //!
 //! ## Math mode / SpMM algorithm
 //!
 //! The [`GpuPcaTuning`] math mode is applied to the shared cuBLAS handle by the
-//! caller. The SpMM algorithm follows the [`SpmmAlgPolicy`]; capture forces the
-//! deterministic CSR algorithm (`CUSPARSE_SPMM_CSR_ALG2`) regardless, since the
-//! heuristic default may use atomics / size its workspace per shape.
-
-use std::sync::Arc;
+//! caller. The SpMM algorithm follows the `SpmmAlgPolicy` math policy.
 
 use cudarc::cublas::sys as cbs;
 use cudarc::cusparse::sys as csp;
-use cudarc::driver::safe::{CudaGraph, CudaSlice, CudaStream};
+use cudarc::driver::safe::CudaSlice;
 
 use scx_format::ShardSource;
 
@@ -61,28 +38,15 @@ use crate::cusparse::{
 };
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::gpu_graph::{capture_graph, cuda_graphs_enabled};
 use crate::gpu_pca::{
     gpu_column_sums_into, gpu_mean_correct_colmajor_strided, gpu_outer_sub, GpuPcaScratch,
 };
-use crate::math_policy::{GpuPcaTuning, SpmmAlgPolicy};
+use crate::math_policy::GpuPcaTuning;
 use crate::shard_decode::GpuCsr;
 
 /// VRAM headroom factor applied to the resident-CSR + scratch estimate before
 /// comparing against free device memory.
 const RESIDENT_VRAM_HEADROOM: f64 = 1.2;
-
-/// Whether to attempt SpMM-segment CUDA-graph capture (Task 2.5). Off unless
-/// `SCX_ENABLE_PCA_SPMM_CAPTURE` is `1`/`true` — capturing `cusparseSpMM` is not
-/// safe on the cuSPARSE versions tested (it poisons the CUDA context, see
-/// [`run_resident_power_loop`]). Opt-in so the path can be re-enabled when a
-/// capture-safe cuSPARSE is available, without changing the default behaviour.
-fn pca_spmm_capture_opt_in() -> bool {
-    matches!(
-        std::env::var("SCX_ENABLE_PCA_SPMM_CAPTURE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
-}
 
 /// Drain `source` into a single device-resident CSR, or return `None` when the
 /// resident matrix plus PCA dense scratch would not fit device memory (the
@@ -390,11 +354,9 @@ fn power_iter_direct(
 /// with the final `B = (X − μ)ᵀ·Q` (`n_vars × k`, col-major) — exactly the two
 /// buffers the streaming core leaves for the downstream SVD.
 ///
-/// Returns `true` when a captured CUDA graph was replayed for at least one
-/// segment, `false` when the direct (non-captured) resident path ran. Capture
-/// is attempted only when [`cuda_graphs_enabled`] and `n_power_iterations ≥ 2`
-/// (fewer iterations have nothing to replay); any capture failure falls back to
-/// the direct resident path for the rest of the call.
+/// Always returns `false` (no CUDA-graph replay): SpMM-segment capture was
+/// removed in ACC-RUST-OPT-V4 Phase 3.4. The `Result<bool, _>` shape is kept so
+/// callers can keep recording `graph_replayed` without churn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resident_power_loop(
     dev: &GpuDevice,
@@ -412,69 +374,22 @@ pub(crate) fn run_resident_power_loop(
     n_power_iterations: usize,
     tuning: GpuPcaTuning,
 ) -> Result<bool, GpuError> {
-    // SpMM-segment CUDA-graph capture is **opt-in** (`SCX_ENABLE_PCA_SPMM_CAPTURE=1`)
-    // and off by default. On the cuSPARSE versions tested (CUDA 12.x on H100),
-    // capturing `cusparseSpMM` does not merely fail to replay — it poisons the
-    // CUDA context with a sticky `CUDA_ERROR_INVALID_VALUE`, so even a direct
-    // fallback in the same context then fails. There is no safe in-context
-    // recovery once capture is attempted, so we gate the attempt entirely rather
-    // than rely on a fallback. The residency win (single upload + one SpMM per
-    // segment, no per-iteration re-decode) is delivered on the direct path
-    // regardless; the capture machinery stays in place for a future cuSPARSE
-    // that is capture-safe. The general `SCX_DISABLE_CUDA_GRAPHS` kill switch
-    // still applies (UMAP / Harmony k-means capture custom kernels, which are
-    // capture-safe).
-    let want_capture =
-        cuda_graphs_enabled() && n_power_iterations >= 2 && pca_spmm_capture_opt_in();
-
-    // Resident scratch + cuSPARSE descriptor are built on the DEFAULT stream so
-    // they remain valid for the direct path and (after `dev.synchronize()`) for
-    // the per-thread capture stream. The descriptor downcasts indptr i64→i32.
+    // SpMM-segment CUDA-graph capture was removed in ACC-RUST-OPT-V4 Phase 3.4:
+    // capturing `cusparseSpMM` poisons the CUDA context on the cuSPARSE versions
+    // tested (CUDA 12.x on H100) and was never a measured win. The residency
+    // benefit (single upload + one SpMM per segment, no per-iteration re-decode)
+    // is delivered by the direct loop below regardless.
+    //
+    // Resident scratch + cuSPARSE descriptor are built on the default stream.
+    // The descriptor downcasts indptr i64→i32.
     let mut d_mc = dev.alloc_zeros::<f32>(k)?;
     let mut d_sum_q = dev.alloc_zeros::<f32>(k)?;
     let mut pool = CuSparseWorkspacePool::new();
     let desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
     dev.synchronize()?;
 
-    if want_capture {
-        // Best-effort capture on the per-thread (capturable) stream. `cusparseSpMM`
-        // is not capturable on every cuSPARSE version — a captured-then-replayed
-        // SpMM can corrupt the stream (the failure surfaces on the next sync). So
-        // ANY error from the capture attempt (capture, replay, or sync) falls
-        // back to the clean direct redo below: capture never compromises
-        // correctness, it only ever fails to *accelerate*.
-        let pts: Arc<CudaStream> = dev.context().per_thread_stream();
-        let dev_pts = dev.with_stream(pts.clone());
-        let captured = attempt_captured_loop(
-            &dev_pts,
-            &pts,
-            cusparse,
-            cublas,
-            cusolver,
-            &desc,
-            d_means,
-            scratch,
-            d_omega,
-            &mut d_mc,
-            &mut d_sum_q,
-            &mut pool,
-            qr_method,
-            n_obs,
-            n_vars,
-            k,
-            n_power_iterations,
-        );
-        if captured.is_ok() {
-            return Ok(true);
-        }
-        // Quiesce the device before the direct redo (the failed capture may have
-        // left work queued / the per-thread stream in an error state).
-        let _ = dev.synchronize();
-    }
-
-    // Direct resident loop on the default stream — a clean recompute from Ω,
-    // honouring the requested SpMM policy. Also the sole path when capture is
-    // disabled or `n_power_iterations < 2`.
+    // Direct resident loop on the default stream — streams the CSR once, then
+    // runs the power loop as plain cusparseSpMM calls honouring the SpMM policy.
     run_direct_resident_loop(
         dev,
         cusparse,
@@ -571,159 +486,6 @@ fn run_direct_resident_loop(
     Ok(())
 }
 
-/// Attempt the capture-accelerated power loop on the per-thread stream `dev_pts`
-/// (forces the deterministic SpMM algorithm). Returns `Err` on any capture /
-/// replay / sync failure so the caller can fall back to the direct path. On
-/// success, `scratch.d_y` holds the final `Q` and `scratch.d_z` the final `B`.
-#[allow(clippy::too_many_arguments)]
-fn attempt_captured_loop(
-    dev_pts: &GpuDevice,
-    pts: &Arc<CudaStream>,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    cusolver: &CusolverHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    scratch: &mut GpuPcaScratch,
-    d_omega: &CudaSlice<f32>,
-    d_mc: &mut CudaSlice<f32>,
-    d_sum_q: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    qr_method: QrMethod,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    n_power_iterations: usize,
-) -> Result<(), GpuError> {
-    let alg = SpmmAlgPolicy::Deterministic.to_alg();
-
-    // Initial Y = (X − μ)·Ω + QR (forward warm-up), then iteration 0 directly
-    // (transpose warm-up) — all on the capture stream. The captured graphs then
-    // bake the pointer-stable scratch (transpose: d_y→d_z, forward: d_z→d_y).
-    matmat_resident(
-        dev_pts,
-        cusparse,
-        cublas,
-        desc,
-        d_means,
-        d_omega,
-        &mut scratch.d_y,
-        d_mc,
-        pool,
-        n_obs,
-        n_vars,
-        k,
-        alg,
-    )?;
-    qr_into_stable(
-        dev_pts,
-        cusolver,
-        cublas,
-        qr_method,
-        &mut scratch.d_y,
-        n_obs,
-        k,
-    )?;
-    power_iter_direct(
-        dev_pts, cusparse, cublas, cusolver, desc, d_means, scratch, d_mc, d_sum_q, pool,
-        qr_method, n_obs, n_vars, k, alg,
-    )?;
-
-    let (fwd_graph, tr_graph) = capture_resident_segments(
-        dev_pts, pts, cusparse, cublas, desc, d_means, scratch, d_mc, d_sum_q, pool, n_obs, n_vars,
-        k, alg,
-    )?;
-
-    for _ in 1..n_power_iterations {
-        tr_graph
-            .launch()
-            .map_err(|e| GpuError::CudaError(format!("resident transpose replay: {e}")))?;
-        qr_into_stable(
-            dev_pts,
-            cusolver,
-            cublas,
-            qr_method,
-            &mut scratch.d_z,
-            n_vars,
-            k,
-        )?;
-        fwd_graph
-            .launch()
-            .map_err(|e| GpuError::CudaError(format!("resident forward replay: {e}")))?;
-        qr_into_stable(
-            dev_pts,
-            cusolver,
-            cublas,
-            qr_method,
-            &mut scratch.d_y,
-            n_obs,
-            k,
-        )?;
-    }
-    // Step 6: final B = (X − μ)ᵀ·Q via the transpose graph replay.
-    tr_graph
-        .launch()
-        .map_err(|e| GpuError::CudaError(format!("resident final transpose replay: {e}")))?;
-    dev_pts.synchronize()?;
-    Ok(())
-}
-
-/// Capture the forward and transpose SpMM segments as CUDA graphs on the
-/// per-thread stream. Both segments read/write the pointer-stable
-/// `scratch.d_y` / `scratch.d_z` (transpose: d_y→d_z, forward: d_z→d_y), so the
-/// captured graphs stay valid across replays. Returns
-/// `(forward_graph, transpose_graph)`.
-#[allow(clippy::too_many_arguments)]
-fn capture_resident_segments(
-    active: &GpuDevice,
-    pts: &Arc<CudaStream>,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    scratch: &mut GpuPcaScratch,
-    d_mc: &mut CudaSlice<f32>,
-    d_sum_q: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    alg: csp::cusparseSpMMAlg_t,
-) -> Result<(CudaGraph, CudaGraph), GpuError> {
-    // Transpose graph borrows d_y (read) + d_z (write).
-    let tr_graph = {
-        let GpuPcaScratch {
-            ref d_y,
-            ref mut d_z,
-            ..
-        } = *scratch;
-        capture_graph(pts, |_s| {
-            rmatmat_resident(
-                active, cusparse, desc, d_means, d_y, d_z, d_sum_q, pool, n_obs, n_vars, k, alg,
-            )
-        })?
-        .ok_or_else(|| GpuError::CudaError("resident transpose capture produced no graph".into()))?
-    };
-
-    // Forward graph borrows d_z (read) + d_y (write).
-    let fwd_graph = {
-        let GpuPcaScratch {
-            ref mut d_y,
-            ref d_z,
-            ..
-        } = *scratch;
-        capture_graph(pts, |_s| {
-            matmat_resident(
-                active, cusparse, cublas, desc, d_means, d_z, d_y, d_mc, pool, n_obs, n_vars, k,
-                alg,
-            )
-        })?
-        .ok_or_else(|| GpuError::CudaError("resident forward capture produced no graph".into()))?
-    };
-
-    Ok((fwd_graph, tr_graph))
-}
-
 #[cfg(test)]
 mod tests {
     use crate::cusolver::QrMethod;
@@ -807,12 +569,11 @@ mod tests {
     }
 
     /// Task 2.5: PCA results must be identical in subspace whether CUDA graphs
-    /// are enabled or disabled. SpMM-segment capture is opt-in
-    /// (`SCX_ENABLE_PCA_SPMM_CAPTURE`) and off here, so both runs take the direct
-    /// resident path; this guards that toggling the graph kill switch does not
-    /// perturb the resident PCA, and that the small (fits-VRAM) input routes
-    /// through the resident path on both. Compared by |cosine| (sign-free), not
-    /// bitwise.
+    /// are enabled or disabled. SpMM-segment capture was removed in Phase 3.4, so
+    /// both runs take the direct resident path; this guards that toggling the
+    /// graph kill switch does not perturb the resident PCA, and that the small
+    /// (fits-VRAM) input routes through the resident path on both. Compared by
+    /// |cosine| (sign-free), not bitwise.
     #[test]
     fn test_resident_capture_vs_direct_subspace() {
         let dev = require_gpu!();
@@ -820,7 +581,7 @@ mod tests {
         let source = random_source(n_rows, n_cols, 4, 17);
         let tuning = GpuPcaTuning::default();
 
-        // Graphs enabled (but PCA SpMM capture is opt-in and off → direct path).
+        // Graphs enabled (PCA SpMM capture was removed in Phase 3.4 → direct path).
         set_cuda_graphs_enabled_override(Some(true));
         let captured = gpu_randomized_pca(
             &dev,

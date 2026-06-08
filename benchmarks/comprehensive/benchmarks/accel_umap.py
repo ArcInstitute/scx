@@ -11,7 +11,6 @@ before dispatching to the UMAP variant.
 |---|---|---|
 | `accel_umap__scanpy_cpu`       | scanpy.tl.umap (umap-learn) | CPU |
 | `accel_umap__pyscx_cpu`        | pyscx.accel.umap (faer SGD) | CPU |
-| `accel_umap__pyscx_gpu`        | pyscx.accel.umap (native CUDA SGD) | GPU |
 
 ## Correctness metric
 
@@ -80,10 +79,6 @@ def accel_umap_variants() -> list[FormatVariant]:
             category="accel", runner="accel_runner",
         ),
         FormatVariant(
-            name="pyscx UMAP (GPU)", key="accel_umap__pyscx_gpu",
-            category="accel", runner="accel_runner",
-        ),
-        FormatVariant(
             name="rapids-singlecell UMAP (GPU)",
             key="accel_umap__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
@@ -106,12 +101,6 @@ def _run_pyscx_cpu(adata: Any, seed: int) -> str:
     import pyscx
     pyscx.accel.umap(adata, device="cpu", random_state=seed)
     return adata.uns.get("umap", {}).get("backend", "scx-accel-cpu")
-
-
-def _run_pyscx_gpu(adata: Any, seed: int) -> str:
-    import pyscx
-    pyscx.accel.umap(adata, device="gpu", random_state=seed)
-    return adata.uns.get("umap", {}).get("backend", "scx-gpu-cuda")
 
 
 def _run_rapids_singlecell(adata: Any, seed: int) -> str:
@@ -140,7 +129,6 @@ def _run_pyscx_gpu_no_rapids(adata: Any, seed: int) -> str:
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_umap__scanpy_cpu": (_run_scanpy_umap, False),
     "accel_umap__pyscx_cpu": (_run_pyscx_cpu, False),
-    "accel_umap__pyscx_gpu": (_run_pyscx_gpu, True),
     "accel_umap__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
     "accel_umap__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
 }
