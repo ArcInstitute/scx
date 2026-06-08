@@ -241,6 +241,37 @@ pub(crate) fn upload_host_csr(
     })
 }
 
+/// Wrap an already device-resident [`scx_accel::GpuCsr`] (e.g. from
+/// `scx_accel::decode_csr_shards_to_device`) in a [`GpuCsrMatrix`] holder whose
+/// buffers a `cupyx` CSR can adopt with no copy (ACC-RUST-OPT-V4 Phase 1.2
+/// follow-up). Unlike [`upload_host_csr`], the `data`/`indices`/`indptr` are
+/// already on the device — this only records the device pointers.
+///
+/// `decode_csr_shards_to_device` synchronizes the stream before returning, so the
+/// decode/concat kernels have completed and the pointers are safe to expose; the
+/// extra sync here is a cheap belt-and-braces guard.
+#[cfg(feature = "gpu")]
+pub(crate) fn adopt_device_csr(
+    dev: scx_accel::GpuDevice,
+    csr: scx_accel::GpuCsr,
+) -> PyResult<GpuCsrMatrix> {
+    dev.synchronize()
+        .map_err(|e| PyRuntimeError::new_err(format!("GPU device-CSR synchronize: {e}")))?;
+    let (n_rows, n_cols) = csr.shape;
+    let nnz = csr.indices.len();
+    let ptrs = csr.device_pointers(dev.stream());
+    Ok(GpuCsrMatrix {
+        csr,
+        _dev: dev,
+        data_ptr: ptrs.data_ptr,
+        indices_ptr: ptrs.indices_ptr,
+        indptr_ptr: ptrs.indptr_ptr,
+        n_rows,
+        n_cols,
+        nnz,
+    })
+}
+
 /// Decode one CSR shard of an SCX file directly onto the GPU and return a
 /// [`GpuShardCsr`] whose device buffers can back a `cupyx` CSR with no copy.
 ///
