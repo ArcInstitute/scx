@@ -32,6 +32,13 @@ pub(crate) fn exec_info_to_pydict<'py>(
     d.set_item("shards_uploaded", info.shards_uploaded)?;
     d.set_item("math_mode", info.math_mode)?;
     d.set_item("spmm_policy", info.spmm_policy)?;
+    // ACC-RUST-OPT-V4 §4.4 rapids-route / device-handoff metadata.
+    d.set_item("rapids_version", info.rapids_version.as_deref())?;
+    d.set_item("cuml_version", info.cuml_version.as_deref())?;
+    d.set_item("cupy_version", info.cupy_version.as_deref())?;
+    d.set_item("transfer_mode", info.transfer_mode)?;
+    d.set_item("device_id", info.device_id)?;
+    d.set_item("bytes_uploaded", info.bytes_uploaded)?;
     Ok(d)
 }
 
@@ -110,6 +117,28 @@ pub(crate) fn simple_exec_info(
         device_request(device),
         gpu_available(),
         gpu_eligible,
+        gpu_route,
+        cpu_route,
+    )
+}
+
+/// Build the execution info for an op that can hand in-VRAM GPU compute to
+/// rapids-singlecell (ACC-RUST-OPT-V4 Phase 1) via [`plan_rapids_route`].
+/// `rapids_available` comes from the import probe, `fits_vram` from the VRAM
+/// pre-flight; `gpu_route`/`cpu_route` are the op's native fallback routes.
+#[allow(dead_code)] // first consumers land in Phase 1.3/1.4
+pub(crate) fn rapids_exec_info(
+    device: &str,
+    rapids_available: bool,
+    fits_vram: bool,
+    gpu_route: AccelRoute,
+    cpu_route: AccelRoute,
+) -> AccelExecutionInfo {
+    scx_accel::route::plan_rapids_route(
+        device_request(device),
+        gpu_available(),
+        rapids_available,
+        fits_vram,
         gpu_route,
         cpu_route,
     )

@@ -29,8 +29,10 @@ use pyo3::types::PyDict;
 #[cfg(feature = "gpu")]
 #[pyclass(unsendable, name = "CudaArrayView", module = "pyscx.accel")]
 pub struct CudaArrayView {
-    /// Keeps the owning shard (and thus the device memory) alive.
-    _parent: Py<GpuShardCsr>,
+    /// Keeps the owning holder (`GpuShardCsr` or `GpuCsrMatrix`) — and thus the
+    /// device memory the pointer references — alive. Typed as `Py<PyAny>` so one
+    /// view serves both holders.
+    _parent: Py<PyAny>,
     ptr: u64,
     len: usize,
     /// numpy typestr, e.g. "<f4" / "<i4" / "<i8".
@@ -109,7 +111,7 @@ impl GpuShardCsr {
             (b.data_ptr, b.nnz)
         };
         Ok(CudaArrayView {
-            _parent: slf.unbind(),
+            _parent: slf.into_any().unbind(),
             ptr,
             len,
             typestr: "<f4",
@@ -123,7 +125,7 @@ impl GpuShardCsr {
             (b.indices_ptr, b.nnz)
         };
         Ok(CudaArrayView {
-            _parent: slf.unbind(),
+            _parent: slf.into_any().unbind(),
             ptr,
             len,
             typestr: "<i4",
@@ -137,7 +139,7 @@ impl GpuShardCsr {
             (b.indptr_ptr, b.n_rows + 1)
         };
         Ok(CudaArrayView {
-            _parent: slf.unbind(),
+            _parent: slf.into_any().unbind(),
             ptr,
             len,
             typestr: "<i8",
@@ -150,6 +152,142 @@ impl GpuShardCsr {
             self.n_rows, self.n_cols, self.nnz
         )
     }
+}
+
+/// A whole-matrix GPU-resident CSR whose `data` / `indices` / `indptr` device
+/// buffers back a `cupyx.scipy.sparse.csr_matrix` with no host round-trip — the
+/// X of `pyscx.open(...).to_gpu_anndata()` (ACC-RUST-OPT-V4 Phase 1.2).
+///
+/// Ownership / lifetime: this holder is the **single owner** of the device
+/// allocations (`GpuCsr`). cuPy adopts the buffers through [`CudaArrayView`]s
+/// (which hold a reference back to this holder), so the device memory lives
+/// exactly as long as the returned AnnData's `X` (and its `.base` chain) — it is
+/// freed when that is garbage-collected. Chained `rsc.*` ops allocate their own
+/// outputs from cuPy's pool; they do not double-allocate or free this input.
+#[cfg(feature = "gpu")]
+#[pyclass(unsendable, name = "GpuCsrMatrix", module = "pyscx.accel")]
+pub struct GpuCsrMatrix {
+    // Drop order: `csr` (device buffers) before `_dev` (context/stream).
+    #[allow(dead_code)]
+    csr: scx_accel::GpuCsr,
+    _dev: scx_accel::GpuDevice,
+    data_ptr: u64,
+    indices_ptr: u64,
+    indptr_ptr: u64,
+    n_rows: usize,
+    n_cols: usize,
+    nnz: usize,
+}
+
+#[cfg(feature = "gpu")]
+#[pymethods]
+impl GpuCsrMatrix {
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        (self.n_rows, self.n_cols)
+    }
+
+    #[getter]
+    fn nnz(&self) -> usize {
+        self.nnz
+    }
+
+    /// `data` array (f32, length `nnz`) as a CAI view.
+    fn data(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+        let (ptr, len) = {
+            let b = slf.borrow();
+            (b.data_ptr, b.nnz)
+        };
+        Ok(CudaArrayView {
+            _parent: slf.into_any().unbind(),
+            ptr,
+            len,
+            typestr: "<f4",
+        })
+    }
+
+    /// `indices` array (i32, length `nnz`) as a CAI view.
+    fn indices(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+        let (ptr, len) = {
+            let b = slf.borrow();
+            (b.indices_ptr, b.nnz)
+        };
+        Ok(CudaArrayView {
+            _parent: slf.into_any().unbind(),
+            ptr,
+            len,
+            typestr: "<i4",
+        })
+    }
+
+    /// `indptr` array (i64, length `n_rows + 1`) as a CAI view.
+    fn indptr(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+        let (ptr, len) = {
+            let b = slf.borrow();
+            (b.indptr_ptr, b.n_rows + 1)
+        };
+        Ok(CudaArrayView {
+            _parent: slf.into_any().unbind(),
+            ptr,
+            len,
+            typestr: "<i8",
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "GpuCsrMatrix(shape=({}, {}), nnz={})",
+            self.n_rows, self.n_cols, self.nnz
+        )
+    }
+}
+
+/// Upload a host CSR (scipy layout: i64 indptr, i32 indices, f32 data) to a
+/// single device-resident [`GpuCsrMatrix`] (ACC-RUST-OPT-V4 Phase 1.2).
+///
+/// One HtoD per buffer, then a stream sync so the device pointers are safe to
+/// expose to a cuPy consumer. The caller owns the ≤VRAM pre-flight (using
+/// `dev.free_memory()`) and passes the already-opened `dev`, which this holder
+/// takes ownership of.
+#[cfg(feature = "gpu")]
+pub(crate) fn upload_host_csr(
+    dev: scx_accel::GpuDevice,
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_rows: usize,
+    n_cols: usize,
+) -> PyResult<GpuCsrMatrix> {
+    let d_indptr = dev
+        .htod_copy(indptr)
+        .map_err(|e| PyRuntimeError::new_err(format!("HtoD indptr: {e}")))?;
+    let d_indices = dev
+        .htod_copy(indices)
+        .map_err(|e| PyRuntimeError::new_err(format!("HtoD indices: {e}")))?;
+    let d_data = dev
+        .htod_copy(data)
+        .map_err(|e| PyRuntimeError::new_err(format!("HtoD data: {e}")))?;
+    let csr = scx_accel::GpuCsr {
+        indptr: d_indptr,
+        indices: d_indices,
+        data: d_data,
+        shape: (n_rows, n_cols),
+    };
+    // Synchronize so the (async) uploads complete before a cuPy consumer reads
+    // the exposed device pointers.
+    dev.synchronize()
+        .map_err(|e| PyRuntimeError::new_err(format!("GPU upload synchronize: {e}")))?;
+    let ptrs = csr.device_pointers(dev.stream());
+    Ok(GpuCsrMatrix {
+        csr,
+        _dev: dev,
+        data_ptr: ptrs.data_ptr,
+        indices_ptr: ptrs.indices_ptr,
+        indptr_ptr: ptrs.indptr_ptr,
+        n_rows,
+        n_cols,
+        nnz: indices.len(),
+    })
 }
 
 /// Decode one CSR shard of an SCX file directly onto the GPU and return a
