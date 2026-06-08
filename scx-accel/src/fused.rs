@@ -19,22 +19,20 @@ use crate::pca::PcaResult;
 /// Run GPU PCA then GPU CAGRA kNN with the embedding kept **device-resident**
 /// between the two stages.
 ///
-/// PCA is computed via the device-returning entry points
-/// ([`scx_gpu::gpu_randomized_pca_device`] / [`scx_gpu::gpu_covariance_pca_device`],
-/// selected by `use_covariance`); the resulting [`scx_gpu::DeviceEmbedding`]
-/// is handed directly to [`scx_gpu::gpu_knn_cagra_device`] as the CAGRA
-/// dataset. The kNN neighbor indices/distances are downloaded once and the
-/// fuzzy connectivities are built on the CPU (matching
-/// [`crate::build_knn_graph_gpu`]); the embedding is downloaded once for the
-/// returned [`PcaResult`].
+/// PCA is computed via the device-returning entry point
+/// ([`scx_gpu::gpu_randomized_pca_device`]); the resulting
+/// [`scx_gpu::DeviceEmbedding`] is handed directly to
+/// [`scx_gpu::gpu_knn_cagra_device`] as the CAGRA dataset. The kNN neighbor
+/// indices/distances are downloaded once and the fuzzy connectivities are built
+/// on the CPU (matching [`crate::build_knn_graph_gpu`]); the embedding is
+/// downloaded once for the returned [`PcaResult`].
 ///
 /// Returns `(PcaResult, KnnResult)` — byte-for-byte equivalent to running
-/// [`crate::randomized_pca_gpu`] (or [`crate::covariance_pca_gpu`]) followed by
-/// [`crate::build_knn_graph_gpu`] on its embedding, minus the intermediate host
-/// round-trip of the embedding.
+/// [`crate::randomized_pca_gpu`] followed by [`crate::build_knn_graph_gpu`] on
+/// its embedding, minus the intermediate host round-trip of the embedding.
 ///
-/// The fuzzy-graph step stays on the host until V3 Phase 2.4 adds the
-/// device-resident fuzzy-simplicial-set kernel.
+/// ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance PCA path, so this
+/// fused pipeline now always uses device-resident randomized PCA.
 #[allow(clippy::too_many_arguments)]
 pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
     device_id: usize,
@@ -45,29 +43,24 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
     zero_center: bool,
     seed: u64,
     qr_method: scx_gpu::QrMethod,
-    use_covariance: bool,
     n_neighbors: usize,
     tuning: scx_gpu::GpuPcaTuning,
 ) -> Result<(PcaResult, KnnResult)> {
     let dev = scx_gpu::GpuDevice::new(device_id)
         .map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))?;
 
-    // Stage 1: GPU PCA → device-resident embedding (stays on the GPU).
-    let pca_dev = if use_covariance {
-        scx_gpu::gpu_covariance_pca_device(&dev, source, n_components, zero_center)
-    } else {
-        scx_gpu::gpu_randomized_pca_device(
-            &dev,
-            source,
-            n_components,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            seed,
-            qr_method,
-            tuning,
-        )
-    }
+    // Stage 1: GPU randomized PCA → device-resident embedding (stays on the GPU).
+    let pca_dev = scx_gpu::gpu_randomized_pca_device(
+        &dev,
+        source,
+        n_components,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        seed,
+        qr_method,
+        tuning,
+    )
     .map_err(|e| AccelError::LinAlg(format!("GPU PCA failed: {e}")))?;
 
     let n_obs = pca_dev.n_obs;
@@ -221,7 +214,6 @@ mod tests {
             true,
             7,
             scx_gpu::QrMethod::Householder,
-            false, // randomized
             n_neighbors,
             scx_gpu::GpuPcaTuning::default(),
         )

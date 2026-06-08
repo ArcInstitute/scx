@@ -1013,24 +1013,16 @@ mod tests {
 
     #[test]
     fn test_gpu_randomized_pca_phase3_parity() {
-        // Phase 3.5 — after the GPU-resident-embedding refactor, verify:
+        // After the GPU-resident-embedding refactor, verify that
+        // variance_ratio is non-negative, monotone-descending by PC index, and
+        // sums to ≤ 1 + ε — this catches a σ-scaling bug in the
+        // sgemm + `gpu_scale_columns` tail.
         //
-        //   * variance_ratio is non-negative, monotone-descending by PC index,
-        //     and sums to ≤ 1 + ε — catches a σ-scaling bug in the new
-        //     sgemm + `gpu_scale_columns` tail.
-        //   * loadings match `gpu_covariance_pca` on a small fixture (cosine ≥
-        //     0.99). This cross-checks the Halko path against the dense-eigh
-        //     reference (Phase 2) on shared ground truth, substituting for the
-        //     "pre/post refactor snapshot" called out in the spec — we don't
-        //     have access to a pre-refactor binary, but Phase 2's GPU
-        //     covariance PCA is independently verified against a CPU reference
-        //     (see `gpu_pca_covariance::tests`), so it is a valid regression
-        //     oracle here.
-        //
-        // scx-gpu cannot depend on scx-accel (cycle), so CPU-vs-GPU parity
-        // against `scx_accel::randomized_pca` is deferred to the Python-side
-        // test suite (Phase 7.1).
-        use crate::gpu_pca_covariance::gpu_covariance_pca;
+        // The earlier loadings-vs-`gpu_covariance_pca` cosine oracle was dropped
+        // in ACC-RUST-OPT-V4 Phase 3.2 along with the GPU covariance path;
+        // randomized-PCA loadings are now validated against scanpy/rapids by the
+        // Python-side `subspace_cos_min` gate (cross-crate parity can't live here
+        // — scx-gpu cannot depend on scx-accel).
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         use scx_format::ShardSource;
@@ -1102,21 +1094,6 @@ mod tests {
             out
         }
 
-        fn row_abs_cosine(a: &[f32], b: &[f32], k: usize, d: usize) -> f32 {
-            assert_eq!(a.len(), k * d);
-            assert_eq!(b.len(), k * d);
-            let mut total = 0.0f32;
-            for i in 0..k {
-                let ra = &a[i * d..(i + 1) * d];
-                let rb = &b[i * d..(i + 1) * d];
-                let dot: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
-                let na: f32 = ra.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let nb: f32 = rb.iter().map(|x| x * x).sum::<f32>().sqrt();
-                total += (dot / (na * nb).max(1e-12)).abs();
-            }
-            total / k as f32
-        }
-
         let n_rows = 800;
         let n_cols = 120;
         let k = 15;
@@ -1152,14 +1129,6 @@ mod tests {
             crate::math_policy::GpuPcaTuning::default(),
         )
         .unwrap();
-        let gpu_cov = gpu_covariance_pca(&dev, &source, k, true).unwrap();
-
-        // Loadings must agree (sign-agnostic) with the covariance reference.
-        let cos = row_abs_cosine(&gpu_rand.components, &gpu_cov.components, k, n_cols);
-        assert!(
-            cos > 0.99,
-            "Phase-3 gpu_randomized_pca vs gpu_covariance_pca: cosine = {cos}"
-        );
 
         // Variance ratios: non-negative, monotone-descending within tolerance,
         // and sum ≤ 1 + ε (a σ-scaling bug would easily violate this).

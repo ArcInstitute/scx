@@ -93,10 +93,7 @@ pub use hvg::{
 #[cfg(feature = "gpu")]
 pub use neighbors::{build_knn_graph_gpu, cuvs_available};
 #[cfg(feature = "gpu")]
-pub use pca::{
-    covariance_pca_gpu, gpu_available, gpu_info, randomized_pca_gpu, GpuInfo,
-    GPU_COVARIANCE_PCA_THRESHOLD,
-};
+pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
 #[cfg(feature = "gpu")]
 pub use scx_gpu::profile;
 #[cfg(feature = "gpu")]

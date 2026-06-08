@@ -538,7 +538,10 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     device: &str,
 ) -> PyResult<()> {
     let n_vars = source.n_vars();
-    let use_covariance = resolve_gpu_method(method, n_vars)? == "covariance";
+    // ACC-RUST-OPT-V4 Phase 3.2: the covariance GPU PCA path was removed;
+    // `resolve_gpu_method` validates the method string and always resolves the
+    // native fused path to randomized.
+    resolve_gpu_method(method, n_vars)?;
 
     let (pca_res, knn_res) = fused_dispatch_unwind_safe(
         device_id,
@@ -549,7 +552,6 @@ fn run_fused_gpu<S: ShardSource + Sync>(
         zero_center,
         random_state,
         qr,
-        use_covariance,
         n_neighbors,
     )
     .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
@@ -558,23 +560,21 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     super::neighbors::write_neighbors_to_adata(py, adata, &knn_res, n_neighbors, use_rep, "cagra")?;
     // Stamp the device-resident route on pca / neighbors / pca_neighbors,
     // carrying the Task 2.5 metadata (finding 5): `graph_replay` from the PCA
-    // result, and the math-mode / SpMM-policy knobs only when the randomized
-    // path (which consumes them) ran — covariance records neither.
+    // result and the math-mode / SpMM-policy knobs (the randomized path consumes
+    // both — covariance, which recorded neither, was removed in Phase 3.2).
     stamp_fused_route(
         py,
         adata,
         device,
         &["pca", "neighbors", "pca_neighbors"],
         pca_res.graph_replayed,
-        use_covariance,
     )
 }
 
 /// Stamp the fused `gpu_device_resident` route on each `op`, attaching the
 /// Task 2.5 PCA metadata. The fused entry points use the default tuning
-/// (strict-fp32 + heuristic SpMM); `math_mode` / `spmm_policy` are recorded only
-/// for the randomized path (the covariance path runs no SpMM and does not thread
-/// the math mode, matching the standalone `pca` entry's honesty).
+/// (strict-fp32 + heuristic SpMM); `math_mode` / `spmm_policy` are always
+/// recorded now that the (SpMM-free) covariance path is gone.
 #[cfg(feature = "gpu")]
 fn stamp_fused_route(
     py: Python<'_>,
@@ -582,7 +582,6 @@ fn stamp_fused_route(
     device: &str,
     ops: &[&str],
     graph_replayed: Option<bool>,
-    use_covariance: bool,
 ) -> PyResult<()> {
     let mut info = super::route::simple_exec_info(
         device,
@@ -592,10 +591,8 @@ fn stamp_fused_route(
     );
     if info.route.is_gpu() {
         info.graph_replay = graph_replayed;
-        if !use_covariance {
-            info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
-            info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
-        }
+        info.math_mode = Some(scx_accel::GpuMathMode::default().as_str());
+        info.spmm_policy = Some(scx_accel::SpmmAlgPolicy::default().as_str());
     }
     for op in ops {
         super::route::write_accel_route(py, adata, op, &info)?;
@@ -618,7 +615,6 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
     zero_center: bool,
     random_state: u64,
     qr: scx_accel::QrMethod,
-    use_covariance: bool,
     n_neighbors: usize,
 ) -> Result<(scx_accel::PcaResult, scx_accel::KnnResult), scx_accel::AccelError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -631,7 +627,6 @@ fn fused_dispatch_unwind_safe<S: ShardSource + Sync>(
             zero_center,
             random_state,
             qr,
-            use_covariance,
             n_neighbors,
             // Task 2.5: the fused pyscx entry points do not expose the math-mode /
             // SpMM-policy knobs; use the strict-fp32 + heuristic-default tuning

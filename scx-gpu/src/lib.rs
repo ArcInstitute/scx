@@ -63,7 +63,6 @@ pub mod gpu_hvg;
 pub mod gpu_knn;
 pub mod gpu_matrix_source;
 pub mod gpu_pca;
-pub mod gpu_pca_covariance;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
 pub mod gpu_shard_source;
@@ -124,7 +123,6 @@ pub use gpu_pca::{
     gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,
     GpuPcaResult,
 };
-pub use gpu_pca_covariance::{gpu_covariance_pca, gpu_covariance_pca_device};
 pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };

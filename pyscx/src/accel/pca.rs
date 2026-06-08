@@ -128,23 +128,17 @@ pub(super) fn try_extract_borrowed_csr<'py>(
     Ok(Some((slices, shape)))
 }
 
-/// Pick the GPU PCA method: explicit user override, or auto-route by `n_vars`.
+/// Resolve the native GPU PCA method.
 ///
-/// Returns `"covariance"` or `"randomized"`. `method == "auto"` dispatches to
-/// the covariance path when `n_vars <= GPU_COVARIANCE_PCA_THRESHOLD` and the
-/// randomized path otherwise.
+/// ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance-PCA kernels: in-VRAM
+/// `device="gpu"` PCA now routes to rapids-singlecell, and the only surviving
+/// native GPU path is randomized (the streaming / device-resident moat). All
+/// accepted `method` values therefore resolve to `"randomized"` here;
+/// `method="covariance"` is still honored on the **CPU** path (`covariance_pca`).
 #[cfg(feature = "gpu")]
-pub(crate) fn resolve_gpu_method(method: &str, n_vars: usize) -> PyResult<&'static str> {
+pub(crate) fn resolve_gpu_method(method: &str, _n_vars: usize) -> PyResult<&'static str> {
     match method {
-        "auto" => {
-            if n_vars <= scx_accel::GPU_COVARIANCE_PCA_THRESHOLD {
-                Ok("covariance")
-            } else {
-                Ok("randomized")
-            }
-        }
-        "covariance" => Ok("covariance"),
-        "randomized" => Ok("randomized"),
+        "auto" | "covariance" | "randomized" => Ok("randomized"),
         other => Err(PyValueError::new_err(format!(
             "Invalid method={other:?}; expected 'auto', 'covariance', or 'randomized'"
         ))),
@@ -176,12 +170,11 @@ fn build_pca_tuning(allow_tf32: bool, spmm_policy: &str) -> scx_accel::GpuPcaTun
     scx_accel::GpuPcaTuning::new(scx_accel::GpuMathMode::from_allow_tf32(allow_tf32), policy)
 }
 
-/// Dispatch to either `covariance_pca_gpu` or `randomized_pca_gpu` based on
-/// the resolved method. All GPU-branch call-sites funnel through this helper.
-///
-/// `qr_method` is threaded to `randomized_pca_gpu` (Householder default,
-/// Cholesky opt-in) and **silently ignored** on the covariance path — the
-/// Python docstring already documents that covariance PCA has no QR step.
+/// Dispatch native GPU PCA. ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM
+/// covariance path, so `resolve_gpu_method` always yields `"randomized"` and
+/// this helper routes to `randomized_pca_gpu`. All GPU-branch call-sites funnel
+/// through here. `qr_method` selects the QR step (Householder default, Cholesky
+/// opt-in).
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_pca_dispatch<S: ShardSource + Sync>(
@@ -197,7 +190,6 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     match method {
-        "covariance" => scx_accel::covariance_pca_gpu(device_id, source, n_comps, zero_center),
         "randomized" => scx_accel::randomized_pca_gpu(
             device_id,
             source,
