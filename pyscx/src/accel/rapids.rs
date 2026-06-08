@@ -147,6 +147,25 @@ pub(crate) fn ensure_gpu_anndata(
     Ok("anndata_to_gpu")
 }
 
+/// Bring a GPU-uploaded AnnData back to host via `rsc.get.anndata_to_CPU`
+/// (`convert_all=True` so result slots — `obsm`/`obsp` as well as `X` — return
+/// to host and the device buffers are released). Called only when *we* uploaded
+/// the host `X` (`transfer_mode == "anndata_to_gpu"`); a `to_gpu_anndata`-sourced
+/// cupy `X` (`"scx_device_handoff"`) is deliberately left GPU-resident.
+pub(crate) fn restore_host_anndata(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    gpu_id: usize,
+) -> PyResult<()> {
+    let rsc_get = py.import("rapids_singlecell")?.getattr("get")?;
+    with_device(py, gpu_id, || {
+        let kw = PyDict::new(py);
+        kw.set_item("convert_all", true)?;
+        rsc_get.call_method("anndata_to_CPU", (adata,), Some(&kw))?;
+        Ok(())
+    })
+}
+
 /// Stamp `uns["scx_accel"][op]` with the rapids-singlecell route + detected
 /// rapids / cuML / cuPy versions + device id + transfer mode.
 pub(crate) fn stamp(
@@ -180,6 +199,12 @@ pub(crate) fn stamp_no_rapids(
 /// Hand an op off to rapids-singlecell: ensure `X` is on device, run `call`
 /// (which invokes the `rsc.*` function) pinned to the device, then stamp the
 /// route. `call` receives the GPU-resident `adata`.
+///
+/// Host-in → host-out contract: when `call`'s input arrived as a host AnnData
+/// (we did the upload), the results and `X` are restored to host afterwards and
+/// the device buffers freed — so `pyscx.accel.<op>(adata, device="gpu")` leaves
+/// `adata.X` host-resident, matching the native path. A `to_gpu_anndata`-sourced
+/// cupy `X` is left GPU-resident for zero-re-upload chaining.
 pub(crate) fn run(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
@@ -189,13 +214,21 @@ pub(crate) fn run(
 ) -> PyResult<()> {
     let transfer_mode = ensure_gpu_anndata(py, adata, gpu_id)?;
     with_device(py, gpu_id, || call(py, adata))?;
+    if transfer_mode == "anndata_to_gpu" {
+        restore_host_anndata(py, adata, gpu_id)?;
+    }
     stamp(py, adata, op, gpu_id, transfer_mode)
 }
 
 /// Run the fused PCA → neighbors [→ UMAP] rapids pipeline on the device AnnData
 /// and stamp every stage (ACC-RUST-OPT-V4 Phase 1.4). `umap` carries the UMAP
-/// stage params `(n_components, min_dist, spread, negative_sample_rate)` when the
-/// UMAP stage should run; `None` runs PCA → neighbors only.
+/// stage params `(n_components, min_dist, spread, negative_sample_rate, n_epochs,
+/// learning_rate)` when the UMAP stage should run; `None` runs PCA → neighbors
+/// only. `n_epochs`/`learning_rate` map to rapids' `maxiter`/`alpha`.
+///
+/// Same host-in → host-out contract as [`run`]: an uploaded host AnnData is
+/// restored to host (results + `X`) after all stages; a `to_gpu_anndata`-sourced
+/// cupy `X` is left GPU-resident.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_fused(
     py: Python<'_>,
@@ -206,7 +239,7 @@ pub(crate) fn run_fused(
     random_state: u64,
     n_neighbors: usize,
     use_rep: &str,
-    umap: Option<(usize, f64, f64, usize)>,
+    umap: Option<(usize, f64, f64, usize, usize, f64)>,
 ) -> PyResult<()> {
     let transfer_mode = ensure_gpu_anndata(py, adata, gpu_id)?;
     with_device(py, gpu_id, || {
@@ -222,17 +255,32 @@ pub(crate) fn run_fused(
         kw.set_item("random_state", random_state)?;
         rsc_fn(py, "pp", "neighbors")?.call((adata,), Some(&kw))?;
 
-        if let Some((n_components, min_dist, spread, negative_sample_rate)) = umap {
+        if let Some((
+            n_components,
+            min_dist,
+            spread,
+            negative_sample_rate,
+            n_epochs,
+            learning_rate,
+        )) = umap
+        {
             let kw = PyDict::new(py);
             kw.set_item("n_components", n_components)?;
             kw.set_item("min_dist", min_dist)?;
             kw.set_item("spread", spread)?;
             kw.set_item("negative_sample_rate", negative_sample_rate)?;
+            // rapids `rsc.tl.umap` names: n_epochs → maxiter, learning_rate → alpha.
+            kw.set_item("maxiter", n_epochs)?;
+            kw.set_item("alpha", learning_rate)?;
             kw.set_item("random_state", random_state)?;
             rsc_fn(py, "tl", "umap")?.call((adata,), Some(&kw))?;
         }
         Ok(())
     })?;
+
+    if transfer_mode == "anndata_to_gpu" {
+        restore_host_anndata(py, adata, gpu_id)?;
+    }
 
     stamp(py, adata, "pca", gpu_id, transfer_mode)?;
     stamp(py, adata, "neighbors", gpu_id, transfer_mode)?;

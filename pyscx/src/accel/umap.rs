@@ -72,6 +72,11 @@ pub fn umap(
                         kw.set_item("min_dist", min_dist)?;
                         kw.set_item("spread", spread)?;
                         kw.set_item("negative_sample_rate", negative_sample_rate)?;
+                        // rapids `rsc.tl.umap` names: n_epochs → maxiter,
+                        // learning_rate → alpha (pyscx defaults 200 / 1.0 match
+                        // the native path, so forwarding keeps the contract).
+                        kw.set_item("maxiter", n_epochs)?;
+                        kw.set_item("alpha", learning_rate)?;
                         kw.set_item("random_state", random_state)?;
                         super::rapids::rsc_fn(py, "tl", "umap")?.call((adata,), Some(&kw))?;
                         Ok(())

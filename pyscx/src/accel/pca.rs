@@ -438,6 +438,10 @@ pub fn pca(
                         kw.set_item("n_comps", n_comps)?;
                         kw.set_item("zero_center", zero_center)?;
                         kw.set_item("random_state", random_state)?;
+                        // n_oversamples / n_power_iterations / method / qr_method
+                        // are native-SVD-solver internals with no rapids analogue
+                        // (rapids picks its own svd_solver) — intentionally not
+                        // forwarded.
                         super::rapids::rsc_fn(py, "pp", "pca")?.call((adata,), Some(&kw))?;
                         Ok(())
                     })?;

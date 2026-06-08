@@ -423,7 +423,14 @@ pub fn pca_neighbors_umap(
                         random_state,
                         n_neighbors,
                         use_rep,
-                        Some((n_components, min_dist, spread, negative_sample_rate)),
+                        Some((
+                            n_components,
+                            min_dist,
+                            spread,
+                            negative_sample_rate,
+                            n_epochs,
+                            umap_learning_rate,
+                        )),
                     )?;
                     return Ok(());
                 }

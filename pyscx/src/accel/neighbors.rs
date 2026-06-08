@@ -65,6 +65,8 @@ pub fn neighbors(
                         let kw = super::rapids::kwargs(py);
                         kw.set_item("n_neighbors", n_neighbors)?;
                         kw.set_item("use_rep", use_rep)?;
+                        // ef_construction / ef_search are HNSW-specific knobs with
+                        // no rapids (cuVS) analogue — intentionally not forwarded.
                         kw.set_item("random_state", random_state)?;
                         super::rapids::rsc_fn(py, "pp", "neighbors")?.call((adata,), Some(&kw))?;
                         Ok(())

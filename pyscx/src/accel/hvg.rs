@@ -220,12 +220,28 @@ pub fn highly_variable_genes<'py>(
                             kw.set_item("batch_key", bk)?;
                         }
                         kw.set_item("span", span)?;
+                        kw.set_item("n_bins", n_bins)?;
                         // NB: rsc.pp.highly_variable_genes has no `subset` kwarg
-                        // (unlike scanpy); callers subset via adata[:, mask].
+                        // (unlike scanpy); we apply the subset post-hoc below,
+                        // exactly as the CPU/native path does.
                         super::rapids::rsc_fn(py, "pp", "highly_variable_genes")?
                             .call((adata,), Some(&kw))?;
                         Ok(())
                     })?;
+                    // `run` restored X to host (host-in → host-out); honor
+                    // `subset=True` the same way the CPU/native path does, since
+                    // rsc.pp.highly_variable_genes does not subset itself.
+                    if subset {
+                        let mask: Vec<bool> = adata
+                            .getattr("var")?
+                            .get_item("highly_variable")?
+                            .call_method0("to_numpy")?
+                            .extract::<numpy::PyReadonlyArray1<bool>>()?
+                            .as_slice()?
+                            .to_vec();
+                        let x_obj = adata.getattr("X")?;
+                        apply_hvg_subset(py, adata, &x_obj, &mask)?;
+                    }
                     return Ok(());
                 }
                 super::rapids::RapidsDecision::NoRapidsCpu => {

@@ -233,6 +233,15 @@ kernel for (`seurat`, `cell_ranger`, `pearson_residuals`,
 from `pyscx.open(...).to_gpu_anndata()` — or `anndata_to_gpu` when rapids
 uploads a host `X`).
 
+**`X` residency contract.** When the op uploads a host `X` (`anndata_to_gpu`),
+the result slots (`obsm`/`obsp`) **and** `X` are brought back to host afterwards
+and the device buffers freed — so `pyscx.accel.<op>(adata, device="gpu")` on an
+in-memory AnnData leaves `adata.X` host-resident, exactly as the native path
+does. When `X` arrives already device-resident (`scx_device_handoff`, from
+`to_gpu_anndata()`), it is **left on the GPU** so a chain of `pyscx.accel.*`
+calls runs without re-uploading — that path is the way to keep data GPU-resident
+across ops.
+
 These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
 `seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, and every
 **out-of-VRAM** path — a backed/lazy `X` (`ScxBackedSparseDataset` /
