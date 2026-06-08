@@ -247,6 +247,12 @@ once the rapids routes are gated and the superseded native kernels are deleted).
 When rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops
 fall back to CPU (`fallback_reason="no_rapids"`) with a one-shot `UserWarning`.
 
+`SCX_DISABLE_RAPIDS=1` forces that rapids-absent CPU fallback **even on a host
+where rapids is installed** — it makes the dispatcher treat rapids as
+unimportable. It exists so the no-rapids fallback contract can be exercised
+(tests / the Phase 2 benchmark gate) without uninstalling rapids; it takes
+precedence over `SCX_FORCE_NATIVE_GPU`.
+
 ## SLURM / HPC configuration
 
 On HPC clusters, GPU nodes typically require module loads or conda activation

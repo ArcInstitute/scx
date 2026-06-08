@@ -29,6 +29,15 @@ pub(crate) fn force_native_gpu() -> bool {
     matches!(std::env::var("SCX_FORCE_NATIVE_GPU"), Ok(v) if v != "0" && !v.is_empty())
 }
 
+/// `SCX_DISABLE_RAPIDS` override — treat rapids-singlecell as if it were not
+/// importable, so a GPU op takes the `no_rapids` CPU-fallback path even on a host
+/// where rapids *is* installed. Exists so the Phase 2.2 fallback gate can exercise
+/// the rapids-absent contract without uninstalling rapids; honored ahead of the
+/// `force_native` override so the fallback (not the native kernels) is what runs.
+pub(crate) fn rapids_disabled() -> bool {
+    matches!(std::env::var("SCX_DISABLE_RAPIDS"), Ok(v) if v != "0" && !v.is_empty())
+}
+
 /// How a GPU-eligible standalone op should dispatch in the in-VRAM regime.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RapidsDecision {
@@ -49,6 +58,12 @@ pub(crate) fn decide(py: Python<'_>, resolved: ResolvedDevice, op: &str) -> Rapi
         Some(i) => i,
         None => return RapidsDecision::Native, // device="cpu" → existing CPU path
     };
+    // SCX_DISABLE_RAPIDS forces the rapids-absent fallback (Phase 2.2 gate),
+    // checked before force_native so it pins the `no_rapids` CPU path.
+    if rapids_disabled() {
+        warn_no_rapids_once(py, op);
+        return RapidsDecision::NoRapidsCpu;
+    }
     if force_native_gpu() {
         return RapidsDecision::Native;
     }

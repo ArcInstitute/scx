@@ -46,8 +46,10 @@ on-the-fly: `normalize_total` + `log1p` + `highly_variable_genes`
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -100,6 +102,11 @@ def accel_pca_variants() -> list[FormatVariant]:
         FormatVariant(
             name="rapids-singlecell PCA (GPU)",
             key="accel_pca__rapids_singlecell_gpu",
+            category="accel", runner="accel_runner",
+        ),
+        FormatVariant(
+            name="pyscx PCA (GPU, rapids disabled → CPU fallback)",
+            key="accel_pca__pyscx_gpu_no_rapids",
             category="accel", runner="accel_runner",
         ),
     ]
@@ -183,16 +190,28 @@ def _run_pyscx_gpu_rand_chol(adata: Any, n_comps: int, seed: int) -> str:
 
 
 def _run_rapids_singlecell(adata: Any, n_comps: int, seed: int) -> str:
-    """rapids-singlecell GPU competitor (V3 task 2.9): the same PCA stage on
-    the GPU-scanpy stack. `convert_all=True` round-trips obsm so X_pca returns
-    to host for the subspace-cosine correctness check.
+    """rapids-singlecell PCA route (ACC-RUST-OPT-V4 Phase 2): drives the pyscx
+    in-VRAM `device="gpu"` path, which after Phase 1 hands off to
+    rapids-singlecell (`rsc.pp.pca`). This exercises + gates the real pyscx→rapids
+    handoff (not raw rsc). `anndata_to_CPU(convert_all=True)` round-trips obsm so
+    X_pca returns to host for the subspace-cosine correctness check.
     """
+    import pyscx
     import rapids_singlecell as rsc
 
-    rsc.get.anndata_to_GPU(adata, convert_all=True)
-    rsc.pp.pca(adata, n_comps=n_comps, random_state=seed)
+    pyscx.accel.pca(adata, n_comps=n_comps, device="gpu", random_state=seed)
     rsc.get.anndata_to_CPU(adata, convert_all=True)
-    return "rapids-singlecell-gpu"
+    return _extract_route(adata, "pca") or "rapids_singlecell_gpu"
+
+
+def _run_pyscx_gpu_no_rapids(adata: Any, n_comps: int, seed: int) -> str:
+    """Phase 2.2 no-rapids fallback: `device="gpu"` under SCX_DISABLE_RAPIDS=1
+    (set by the run loop) must fall back to CPU with fallback_reason="no_rapids".
+    """
+    import pyscx
+
+    pyscx.accel.pca(adata, n_comps=n_comps, device="gpu", random_state=seed)
+    return adata.uns["pca"].get("backend", "scx-accel-cpu")
 
 
 def _extract_route(adata: Any, op: str) -> str | None:
@@ -208,6 +227,106 @@ def _extract_route(adata: Any, op: str) -> str | None:
         return None
 
 
+def _extract_fallback_reason(adata: Any, op: str) -> str | None:
+    """Read ``adata.uns["scx_accel"][op]["fallback_reason"]``, or None if absent."""
+    try:
+        return adata.uns["scx_accel"][op]["fallback_reason"]
+    except Exception:
+        return None
+
+
+# --- ACC-RUST-OPT-V4 Phase 2: route-gate helpers (shared across accel_*) ------
+#
+# Phase 1 flipped the in-VRAM `device="gpu"` default to rapids-singlecell. So on
+# the scx-bench-gpu env (rapids installed) the native `pyscx_gpu_*` variants would
+# route to rapids and break the native `*_route_gpu_correct` floors. We therefore
+# (a) force the native kernels for the native variants via SCX_FORCE_NATIVE_GPU,
+# and (b) carry the rapids route gate on the `*__rapids_singlecell_gpu` variant,
+# which now drives pyscx (default → rapids) and asserts `rapids_singlecell_gpu`.
+
+def is_rapids_variant(variant_key: str) -> bool:
+    """True for the `accel_*__rapids_singlecell_gpu` variant."""
+    return variant_key.endswith("__rapids_singlecell_gpu")
+
+
+def is_no_rapids_variant(variant_key: str) -> bool:
+    """True for the Phase 2.2 `accel_*__pyscx_gpu_no_rapids` fallback variant."""
+    return variant_key.endswith("__pyscx_gpu_no_rapids")
+
+
+@contextlib.contextmanager
+def env_var(name: str, value: str):
+    """Set ``os.environ[name]=value`` for the duration, restoring the prior value."""
+    prev = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = prev
+
+
+def force_native_gpu_env():
+    """Pin the native SCX GPU kernels (not rapids) for the duration — used to
+    wrap the native `pyscx_gpu_*` variant impls so their `*_route_gpu_correct`
+    floors keep gating the native path after the Phase 1 default-flip."""
+    return env_var("SCX_FORCE_NATIVE_GPU", "1")
+
+
+def disable_rapids_env():
+    """Force the rapids-absent fallback path (Phase 2.2 no-rapids gate)."""
+    return env_var("SCX_DISABLE_RAPIDS", "1")
+
+
+def dispatch_env(variant_key: str, requires_gpu: bool):
+    """The env context a variant's impl must run under:
+    - no-rapids variant  → SCX_DISABLE_RAPIDS=1 (exercise the CPU fallback)
+    - rapids variant     → no override (default in-VRAM route → rapids)
+    - native gpu variant → SCX_FORCE_NATIVE_GPU=1 (pin native kernels)
+    - cpu variant        → nothing
+    """
+    if is_no_rapids_variant(variant_key):
+        return disable_rapids_env()
+    if requires_gpu and not is_rapids_variant(variant_key):
+        return force_native_gpu_env()
+    return contextlib.nullcontext()
+
+
+def emit_route_signal(
+    extras: dict[str, Any],
+    variant_key: str,
+    route: str | None,
+    *,
+    requires_gpu: bool,
+    gpu_metric: str,
+    rapids_metric: str,
+    fallback_reason: str | None = None,
+    no_rapids_metric: str | None = None,
+) -> None:
+    """Record `gpu_dispatch_route` + the numeric route-gate signal for the variant.
+
+    - rapids variant     → `rapids_metric` = 1.0 iff route == "rapids_singlecell_gpu"
+    - no-rapids variant  → `no_rapids_metric` = 1.0 iff route is cpu_* and
+                           fallback_reason == "no_rapids"
+    - native gpu variant → `gpu_metric` = 1.0 iff route starts with "gpu_"
+    - cpu variant        → only the human-readable `gpu_dispatch_route` is recorded
+    """
+    if route is None:
+        return
+    extras["gpu_dispatch_route"] = route
+    if is_rapids_variant(variant_key):
+        extras[rapids_metric] = 1.0 if route == "rapids_singlecell_gpu" else 0.0
+    elif is_no_rapids_variant(variant_key):
+        if no_rapids_metric is not None:
+            extras[no_rapids_metric] = (
+                1.0 if route.startswith("cpu") and fallback_reason == "no_rapids" else 0.0
+            )
+    elif requires_gpu:
+        extras[gpu_metric] = 1.0 if route.startswith("gpu_") else 0.0
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     # key: (implementation, requires_gpu)
     "accel_pca__scanpy_cpu": (_run_scanpy_cpu, False),
@@ -216,6 +335,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_pca__pyscx_gpu_rand_hh": (_run_pyscx_gpu_rand_hh, True),
     "accel_pca__pyscx_gpu_rand_chol": (_run_pyscx_gpu_rand_chol, True),
     "accel_pca__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
+    "accel_pca__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
 }
 
 
@@ -361,7 +481,8 @@ def run(
     for i in range(N_WARMUP_RUNS):
         logger.info("Warm-up run %d/%d for %s", i + 1, N_WARMUP_RUNS, variant_key)
         warm_adata = fixture.adata.copy()
-        impl(warm_adata, n_comps, RANDOM_SEED)
+        with dispatch_env(variant_key, requires_gpu):
+            impl(warm_adata, n_comps, RANDOM_SEED)
         del warm_adata
         gc.collect()
 
@@ -379,7 +500,8 @@ def run(
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
 
-        backend = impl(t_adata, n_comps, RANDOM_SEED)
+        with dispatch_env(variant_key, requires_gpu):
+            backend = impl(t_adata, n_comps, RANDOM_SEED)
 
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
@@ -411,13 +533,16 @@ def run(
         # X type, including in-memory scipy; the variant is skipped on non-GPU
         # hosts, so a cpu_* route here is a silent fallback (e.g. the cuSPARSE
         # modern-ABI probe failed) → 0.0 fails the gate.
-        route = _extract_route(t_adata, "pca")
-        if route is not None:
-            extras["gpu_dispatch_route"] = route
-            if requires_gpu:
-                extras["pca_route_gpu_correct"] = (
-                    1.0 if route.startswith("gpu_") else 0.0
-                )
+        emit_route_signal(
+            extras,
+            variant_key,
+            _extract_route(t_adata, "pca"),
+            requires_gpu=requires_gpu,
+            gpu_metric="pca_route_gpu_correct",
+            rapids_metric="pca_route_rapids_correct",
+            fallback_reason=_extract_fallback_reason(t_adata, "pca"),
+            no_rapids_metric="pca_fallback_no_rapids_correct",
+        )
 
         result.add_run(
             wall_s=wall,

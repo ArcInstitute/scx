@@ -58,6 +58,8 @@ from benchmarks.comprehensive.benchmarks.accel_pca import (
     _load_preprocessed,
     _run_scanpy_cpu,
     _subspace_principal_cosines,
+    dispatch_env,
+    is_rapids_variant,
 )
 from benchmarks.comprehensive.benchmarks.accel_knn import (
     _recall_at_k,
@@ -160,15 +162,19 @@ def _run_pyscx_gpu_hostboundary(
 def _run_rapids_singlecell(
     adata: Any, n_comps: int, n_neighbors: int, seed: int
 ) -> str:
+    """rapids-singlecell fused route (Phase 2): drives the pyscx fused
+    `pca_neighbors_umap(device="gpu")`, which after Phase 1 runs the full rapids
+    pipeline (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) and stamps
+    `rapids_singlecell_gpu` on every stage. Results return to host for the
+    correctness metrics."""
+    import pyscx
     import rapids_singlecell as rsc
-    # Move counts to GPU, run the rsc PCA→neighbors→UMAP chain, then bring the
-    # results back so the correctness metrics read the same obsm/obsp keys.
-    rsc.get.anndata_to_GPU(adata)
-    rsc.pp.pca(adata, n_comps=n_comps, random_state=seed)
-    rsc.pp.neighbors(adata, n_neighbors=n_neighbors, random_state=seed)
-    rsc.tl.umap(adata, random_state=seed)
-    rsc.get.anndata_to_CPU(adata)
-    return "rapids-singlecell-gpu"
+
+    pyscx.accel.pca_neighbors_umap(
+        adata, n_comps=n_comps, n_neighbors=n_neighbors, device="gpu", random_state=seed,
+    )
+    rsc.get.anndata_to_CPU(adata, convert_all=True)
+    return _extract_route(adata, "pca_neighbors_umap") or "rapids_singlecell_gpu"
 
 
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
@@ -189,6 +195,15 @@ def _pipeline_route_gpu_correct(adata: Any) -> float:
     expected = "gpu_device_resident"
     for op in ("pca", "neighbors", "umap", "pca_neighbors_umap"):
         if _extract_route(adata, op) != expected:
+            return 0.0
+    return 1.0
+
+
+def _pipeline_route_rapids_correct(adata: Any) -> float:
+    """1.0 iff the fused rapids pipeline stamped `rapids_singlecell_gpu` on every
+    stage (pca / neighbors / umap) and the summary key; 0.0 otherwise (Phase 2)."""
+    for op in ("pca", "neighbors", "umap", "pca_neighbors_umap"):
+        if _extract_route(adata, op) != "rapids_singlecell_gpu":
             return 0.0
     return 1.0
 
@@ -283,7 +298,8 @@ def run(
     for i in range(N_WARMUP_RUNS):
         logger.info("Warm-up run %d/%d for %s", i + 1, N_WARMUP_RUNS, key)
         warm = fixture.adata.copy()
-        impl(warm, n_comps, n_neighbors, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            impl(warm, n_comps, n_neighbors, RANDOM_SEED)
         del warm
         gc.collect()
 
@@ -300,7 +316,8 @@ def run(
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
 
-        backend = impl(a, n_comps, n_neighbors, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            backend = impl(a, n_comps, n_neighbors, RANDOM_SEED)
 
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
@@ -335,6 +352,9 @@ def run(
         # Passthrough the PCA tuning metadata for visibility on the GPU variants.
         if key == "accel_pipeline__pyscx_gpu_resident":
             extras["pipeline_route_gpu_correct"] = _pipeline_route_gpu_correct(a)
+            extras["gpu_dispatch_route"] = _extract_route(a, "pca_neighbors_umap")
+        elif is_rapids_variant(key):
+            extras["pipeline_route_rapids_correct"] = _pipeline_route_rapids_correct(a)
             extras["gpu_dispatch_route"] = _extract_route(a, "pca_neighbors_umap")
         try:
             pca_route_info = a.uns.get("scx_accel", {}).get("pca", {})
