@@ -13,7 +13,11 @@ pub const B_IDX: usize = 128;
 
 /// Minimum NNZ per row to use BitPacker4x SIMD path.
 /// BitPacker4x processes 128 values per call.
-const SIMD_THRESHOLD: usize = BitPacker4x::BLOCK_LEN;
+///
+/// Public so consumers that re-implement the bit-unpacking (e.g. the scx-gpu
+/// FOR-BP decoder) can detect rows packed with the SIMD layout — which differs
+/// from the scalar LSB-first remainder packing — and route those correctly.
+pub const SIMD_THRESHOLD: usize = BitPacker4x::BLOCK_LEN;
 
 // ---------------------------------------------------------------------------
 // LEB128 varint helpers (task 5.2)

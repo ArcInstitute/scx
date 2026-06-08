@@ -252,6 +252,117 @@ pub fn estimate_gpu_memory<'py>(
     Ok(dict.into_any().unbind())
 }
 
+/// Snapshot the GPU per-stage timing profiler (ACC-RUST-OPT-V4 Phase 0.2).
+///
+/// Returns a dict breaking GPU wall-time into decode / upload / compute
+/// buckets, or `None` when the `gpu` feature is disabled. The profiler only
+/// accumulates when the process was started with `SCX_GPU_PROFILE=1`; with the
+/// env var unset every bucket reads zero and `enabled` is `False`.
+///
+/// Bucket keys (each a sub-dict with `ms`, `count`, and — for uploads —
+/// `bytes`): `host_decode_scx1`, `host_decode_generic`, `htod_scx1`,
+/// `htod_generic`, `gpu_decode`, `compute`. The `host_decode_*` + `htod_*`
+/// buckets quantify how much of the in-VRAM gap vs rapids-singlecell is
+/// decode/upload (the Phase 4 format-work signal) rather than compute.
+///
+/// Example:
+///     pyscx.accel.gpu_profile_reset()
+///     pyscx.accel.pca(adata, device="gpu")   # run with SCX_GPU_PROFILE=1
+///     prof = pyscx.accel.gpu_profile_snapshot()
+#[pyfunction]
+pub fn gpu_profile_snapshot(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "gpu")]
+    {
+        let snap = scx_accel::profile::snapshot();
+        let stage = |s: scx_accel::StageStat| -> PyResult<Py<PyAny>> {
+            let d = PyDict::new(py);
+            d.set_item("ms", s.ns as f64 / 1.0e6)?;
+            d.set_item("count", s.count)?;
+            d.set_item("bytes", s.bytes)?;
+            Ok(d.into_any().unbind())
+        };
+        let dict = PyDict::new(py);
+        dict.set_item("enabled", snap.enabled)?;
+        dict.set_item("host_decode_scx1", stage(snap.host_decode_scx1)?)?;
+        dict.set_item("host_decode_generic", stage(snap.host_decode_generic)?)?;
+        dict.set_item("htod_scx1", stage(snap.htod_scx1)?)?;
+        dict.set_item("htod_generic", stage(snap.htod_generic)?)?;
+        dict.set_item("gpu_decode", stage(snap.gpu_decode)?)?;
+        dict.set_item("compute", stage(snap.compute)?)?;
+        Ok(dict.into_any().unbind())
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Ok(py.None())
+    }
+}
+
+/// Reset the GPU per-stage timing profiler counters to zero.
+///
+/// Call between benchmark runs so each snapshot reflects only the most recent
+/// operation. No-op when the `gpu` feature is disabled.
+#[pyfunction]
+pub fn gpu_profile_reset() -> PyResult<()> {
+    #[cfg(feature = "gpu")]
+    {
+        scx_accel::profile::reset();
+    }
+    Ok(())
+}
+
+/// rapids-singlecell + core-dep (cuML, cuPy) availability and versions.
+///
+/// rapids is a **detected runtime dependency** (ACC-RUST-OPT-V4 §4.3): SCX
+/// probes for it at dispatch and routes GPU analysis to it when present, else
+/// falls back to CPU. `available` is `true` only when all three import cleanly.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // fields consumed by the Phase 1.3/1.4 op routers
+pub(crate) struct RapidsInfo {
+    pub available: bool,
+    pub rapids_version: Option<String>,
+    pub cuml_version: Option<String>,
+    pub cupy_version: Option<String>,
+}
+
+fn module_version(py: Python<'_>, module: &str) -> Option<String> {
+    py.import(module)
+        .ok()
+        .and_then(|m| m.getattr("__version__").ok())
+        .and_then(|v| v.extract::<String>().ok())
+}
+
+/// Probe rapids-singlecell once and cache the result process-wide. The import
+/// (and the CUDA init it triggers) is paid once; a host without the stack
+/// records `available = false` with `None` versions. Tolerant of
+/// `ImportError`/CUDA-init failures (they surface as `Err`, mapped to `None`).
+///
+/// Used by the Phase 1.3/1.4 op routers via
+/// [`crate::accel::route::rapids_exec_info`].
+#[allow(dead_code)] // first consumers land in Phase 1.3/1.4
+pub(crate) fn rapids_singlecell_info(py: Python<'_>) -> RapidsInfo {
+    static INFO: std::sync::OnceLock<RapidsInfo> = std::sync::OnceLock::new();
+    INFO.get_or_init(|| {
+        let rapids_version = module_version(py, "rapids_singlecell");
+        let cuml_version = module_version(py, "cuml");
+        let cupy_version = module_version(py, "cupy");
+        RapidsInfo {
+            available: rapids_version.is_some() && cuml_version.is_some() && cupy_version.is_some(),
+            rapids_version,
+            cuml_version,
+            cupy_version,
+        }
+    })
+    .clone()
+}
+
+/// Whether cuPy is importable. cuPy (not rapids) is the hard requirement for the
+/// `to_gpu_anndata` device handoff — the returned `X` is a
+/// `cupyx.scipy.sparse.csr_matrix`. Returns the version string when present.
+#[allow(dead_code)] // consumed by the gpu-gated to_gpu_anndata (1.2)
+pub(crate) fn cupy_info(py: Python<'_>) -> Option<String> {
+    module_version(py, "cupy")
+}
+
 /// Resolution of a `device=` string to either CPU or a specific GPU index.
 ///
 /// Returned by [`resolve_device`] / [`validate_device_or_default`]. Callers

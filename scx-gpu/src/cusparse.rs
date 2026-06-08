@@ -571,6 +571,11 @@ fn spmm_impl_view(
         Ok(())
     };
 
+    // Time the SpMM execution for the Phase 0.2 GPU profiler. cuSPARSE SpMM is
+    // asynchronous, so when profiling is enabled we synchronize after launch so
+    // the recorded duration reflects completed compute; both the timer and the
+    // sync are skipped entirely on the hot path when profiling is disabled.
+    let t_compute = crate::profile::start();
     match pool {
         Some(p) => p.with_workspace(dev, stream, buf_size, run_spmm)?,
         None => {
@@ -590,6 +595,12 @@ fn spmm_impl_view(
             run_spmm(workspace_ptr)?;
         }
     }
+    if t_compute.is_some() {
+        stream
+            .synchronize()
+            .map_err(|e| GpuError::CudaError(format!("profile spmm synchronize: {e}")))?;
+    }
+    crate::profile::record_compute_since(t_compute);
 
     Ok(())
 }

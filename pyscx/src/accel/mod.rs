@@ -24,6 +24,7 @@ pub mod eval_metrics;
 pub mod filtering;
 pub mod fused;
 pub mod gpu;
+pub mod gpu_handoff;
 pub mod harmony;
 pub mod hvg;
 pub mod leiden;

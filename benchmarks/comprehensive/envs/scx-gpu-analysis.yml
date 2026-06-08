@@ -1,0 +1,83 @@
+# SCX GPU analysis backend — rapids-singlecell compute layer (ACC-RUST-OPT-V4 Phase 0.3)
+#
+# The published, user-facing install story for the rapids-singlecell GPU
+# *compute* backend that pyscx's `device="gpu"` analysis ops route to (Phase 1+).
+# Slimmer than `scx-bench-gpu.yml` (no submitit / tiledbsoma / pytorch / the full
+# benchmark stack) — this is what a downstream user installs alongside
+# `pyscx[gpu]`, not the regression harness.
+#
+# Create:    conda env create -f benchmarks/comprehensive/envs/scx-gpu-analysis.yml
+# Activate:  conda activate scx-gpu-analysis
+# Build pyscx (lightweight native GPU bits — NO RAPIDS dependency):
+#            cd pyscx && maturin develop --release --features gpu && cd ..
+# Install the RAPIDS compute layer (manual, ON A GPU NODE — see note below):
+#            pip install --no-deps 'rapids-singlecell>=0.12'
+#            pip install docrep scikit-image
+#
+# Dependency model (V4 §4.3): rapids-singlecell is a DETECTED RUNTIME dependency,
+# not a hard pip extra. pyscx imports and runs (CPU + native streaming + loader)
+# with rapids absent; GPU-analysis ops fall back to CPU with a `no_rapids`
+# diagnostic. So this env is the *supported install path*, and its absence is a
+# graceful degradation, never an import error.
+#
+# IMPORTANT — pin cuda-version to your NVIDIA driver's max CUDA version:
+#   Driver 550.x → cuda-version=12.4
+#   Driver 560.x → cuda-version=12.6   (Chimera's driver; the default here)
+# Check with: nvidia-smi (top-right "CUDA Version: 12.x").
+
+name: scx-gpu-analysis
+channels:
+  - rapidsai
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python — kept loose; the conda solver picks the version RAPIDS builds for.
+  - python>=3.11,<3.14
+
+  # Single-cell stack rapids-singlecell + pyscx operate on.
+  - anndata>=0.12
+  - scanpy>=1.12
+  - scipy>=1.15
+  - numpy>=2.0
+  - pandas>=2.2
+  - h5py>=3.14
+
+  # CPU reference / fallback analysis (rapids-absent path, and CPU accelerators).
+  - scikit-learn>=1.5
+  - scikit-misc>=0.5   # skmisc.loess — seurat_v3 HVG
+  - leidenalg>=0.10
+  - python-igraph>=0.11
+
+  # Build tooling for pyscx's native GPU bits (cudarc + cuVS-C; no RAPIDS dep).
+  - maturin>=1.5
+  - patchelf
+
+  # RAPIDS compute layer. cuda-version=12.6 matches Chimera's driver 560.x.
+  # cuvs/cugraph/cuml share one RAPIDS band (<26.04 is the last cuda12 band;
+  # 26.04+ is cuda13-only). cuML is the core dependency rapids-singlecell needs;
+  # cuvs (kNN) and cugraph (Leiden) round out the GPU op coverage.
+  - cuda-version=12.6
+  - cuml>=25.10,<26.04
+  - cuvs>=25.10,<26.04
+  - cugraph>=25.10,<26.04
+
+  - pip
+  - pip:
+    # rapids-singlecell is installed MANUALLY, ON A GPU NODE, and is NOT pinned
+    # here — the same build/version coupling documented at length in
+    # scx-bench-gpu.yml applies:
+    #   * >= 0.12 ships CUDA kernels built with `-arch=native`, so nvcc must see
+    #     a real GPU at build time (sm_90 on H100); building on a GPU-less node
+    #     defaults to an arch without atomicAdd(double) and the wheel fails.
+    #   * < 0.12 is pure-Python but targets the pre-25 cuML API removed in the
+    #     RAPIDS band above.
+    # Working recipe (inside an sbatch/srun GPU allocation, this conda env, and
+    # isolated from any .venv whose pip RAPIDS libs would shadow conda's):
+    #     pip install --no-deps 'rapids-singlecell>=0.12'
+    #     pip install docrep scikit-image
+    # Phase 0.3 verdict: the `-arch=native` GPU-node build is the practical
+    # ceiling today; conda cannot resolve rapids-singlecell reproducibly, so the
+    # detected-runtime-dep + documented manual install is the supported story.
+    - docrep
+    - scikit-image

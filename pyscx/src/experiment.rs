@@ -462,6 +462,197 @@ impl PyExperiment {
         }
     }
 
+    /// Return a **GPU-resident** AnnData whose `X` is a
+    /// `cupyx.scipy.sparse.csr_matrix` decoded onto the device (ACC-RUST-OPT-V4
+    /// Phase 1.2). This is the cheapest path from SCX-on-disk to a GPU matrix
+    /// rapids-singlecell operates on — `rsc.get.anndata_to_GPU(adata)` is a no-op
+    /// on the returned object (no host re-upload).
+    ///
+    /// **≤VRAM only.** If the matrix would not fit in free device memory this
+    /// raises (it does **not** silently OOM or fall back) — use a backed /
+    /// streaming workflow (`open(...).to_anndata(backed=True)` + `pyscx.accel.*`)
+    /// for the >VRAM regime.
+    ///
+    /// Accepts the same shaping options as `to_anndata` (`var_names`,
+    /// `obs_filter`, `layers`, `obsm`); obs/var/obsm/uns/layers are host-resident
+    /// and `X` is the GPU-resident matrix. Requires cuPy.
+    ///
+    /// Ownership: the device buffers are owned by a single SCX-side holder that
+    /// the returned AnnData keeps alive (via `X`'s `.base` chain); they are freed
+    /// when the AnnData / its `X` is garbage-collected. Chained `rsc.*` ops
+    /// allocate their own outputs from cuPy's pool.
+    ///
+    /// Example:
+    ///     adata = pyscx.open("atlas.scx").to_gpu_anndata()
+    ///     import rapids_singlecell as rsc
+    ///     rsc.pp.pca(adata)            # runs in-VRAM; no host bounce
+    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn to_gpu_anndata<'py>(
+        &self,
+        py: Python<'py>,
+        var_names: Option<Vec<String>>,
+        obs_filter: Option<&str>,
+        layers: Option<Vec<String>>,
+        obsm: Option<Vec<String>>,
+        device: &str,
+        memory_budget: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        #[cfg(feature = "gpu")]
+        {
+            use pyo3::exceptions::{PyRuntimeError, PyValueError};
+
+            // cuPy is the hard requirement — the returned X is cupyx-sparse.
+            let cupy_version = crate::accel::gpu::cupy_info(py).ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "to_gpu_anndata requires cuPy (cupyx.scipy.sparse). Install the rapids \
+                     analysis backend — see docs/gpu-setup.md.",
+                )
+            })?;
+            // Resolve to a concrete GPU ordinal; reject device="cpu".
+            let resolved = crate::accel::gpu::resolve_device(device)?;
+            let gpu_id = resolved.gpu_id().ok_or_else(|| {
+                PyValueError::new_err(
+                    "to_gpu_anndata requires a GPU device ('gpu', 'gpu:N', or 'auto' on a GPU host)",
+                )
+            })?;
+
+            // Build the CPU AnnData with the full option surface. `eager=true`
+            // detaches it from the file and materialises X as a host scipy CSR
+            // with deletions / var_names / obs_filter / obsm / layers applied.
+            let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+            let adata = anndata::to_anndata_filtered(
+                py,
+                &self.path,
+                &self.reader,
+                var_names.as_deref(),
+                obs_filter,
+                layers.as_deref(),
+                obsm.as_deref(),
+                false, // preserve_slots
+                true,  // eager
+                memory_budget_bytes,
+            )?;
+
+            // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
+            // they fit, so coerce to the GpuCsr layout (f32 data / i32 indices /
+            // i64 indptr) via astype(copy=False) — a no-op when already correct.
+            let np = py.import("numpy")?;
+            let f32_ty = np.getattr("float32")?;
+            let i32_ty = np.getattr("int32")?;
+            let i64_ty = np.getattr("int64")?;
+            let x = adata.getattr("X")?;
+            let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
+            // scipy CSR `indices` are column indices (< n_cols), so coercing them
+            // to i32 is lossless as long as n_cols fits i32; numpy astype(int32)
+            // would otherwise wrap silently. (indptr stays i64.) ≤VRAM single-cell
+            // n_cols is tiny — this only guards a pathological input.
+            if n_cols > i32::MAX as usize {
+                return Err(PyValueError::new_err(format!(
+                    "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
+                     the cupyx CSR handoff requires i32 indices."
+                )));
+            }
+            let astype =
+                |arr: Bound<'py, PyAny>, ty: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
+                    let kw = pyo3::types::PyDict::new(py);
+                    kw.set_item("copy", false)?;
+                    arr.call_method("astype", (ty,), Some(&kw))
+                };
+            let data_arr = astype(x.getattr("data")?, &f32_ty)?;
+            let indices_arr = astype(x.getattr("indices")?, &i32_ty)?;
+            let indptr_arr = astype(x.getattr("indptr")?, &i64_ty)?;
+            let data: Vec<f32> = data_arr
+                .extract::<PyReadonlyArray1<f32>>()?
+                .as_slice()?
+                .to_vec();
+            let indices: Vec<i32> = indices_arr
+                .extract::<PyReadonlyArray1<i32>>()?
+                .as_slice()?
+                .to_vec();
+            let indptr: Vec<i64> = indptr_arr
+                .extract::<PyReadonlyArray1<i64>>()?
+                .as_slice()?
+                .to_vec();
+
+            // ≤VRAM pre-flight: refuse rather than OOM.
+            let bytes_uploaded =
+                (data.len() as u64) * 4 + (indices.len() as u64) * 4 + (indptr.len() as u64) * 8;
+            let dev = scx_accel::GpuDevice::new(gpu_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("GPU device {gpu_id}: {e}")))?;
+            let (free, total) = dev
+                .free_memory()
+                .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
+            const HEADROOM: f64 = 1.2;
+            if (bytes_uploaded as f64) * HEADROOM > free as f64 {
+                return Err(PyValueError::new_err(format!(
+                    "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
+                     {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
+                     backed/streaming workflow (open(...).to_anndata(backed=True) + \
+                     pyscx.accel.*), not to_gpu_anndata.",
+                    bytes_uploaded as f64 / 1e9,
+                    indices.len(),
+                    free as f64 / 1e9,
+                    total as f64 / 1e9,
+                    gpu_id,
+                )));
+            }
+
+            // Upload to a single SCX-owned device CSR and adopt it into cuPy.
+            let holder = crate::accel::gpu_handoff::upload_host_csr(
+                dev, &indptr, &indices, &data, n_rows, n_cols,
+            )?;
+            let holder = Bound::new(py, holder)?;
+            let cupy = py.import("cupy")?;
+            let cupyx_sparse = py.import("cupyx.scipy.sparse")?;
+            let adopt = |method: &str| -> PyResult<Bound<'py, PyAny>> {
+                // cupy.asarray adopts the CAI view without copy and sets .base to
+                // it, transitively keeping `holder` (and its device memory) alive.
+                cupy.call_method1("asarray", (holder.call_method0(method)?,))
+            };
+            let data_cp = adopt("data")?;
+            let indices_cp = adopt("indices")?;
+            let indptr_cp = adopt("indptr")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("shape", (n_rows, n_cols))?;
+            kwargs.set_item("copy", false)?;
+            let gpu_x = cupyx_sparse.call_method(
+                "csr_matrix",
+                ((data_cp, indices_cp, indptr_cp),),
+                Some(&kwargs),
+            )?;
+            adata.setattr("X", gpu_x)?;
+
+            // Honest device-handoff metadata (ACC-RUST-OPT-V4 §4.4).
+            let mut info = scx_accel::route::AccelExecutionInfo::new(
+                scx_accel::route::AccelRoute::GpuCsr,
+                scx_accel::route::FallbackReason::None,
+            );
+            info.transfer_mode = Some("scx_device_handoff");
+            info.device_id = Some(gpu_id);
+            info.bytes_uploaded = Some(bytes_uploaded);
+            info.cupy_version = Some(cupy_version);
+            crate::accel::route::write_accel_route(py, &adata, "to_gpu_anndata", &info)?;
+
+            Ok(adata)
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (
+                py,
+                var_names,
+                obs_filter,
+                layers,
+                obsm,
+                device,
+                memory_budget,
+            );
+            Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "to_gpu_anndata requires pyscx built with the 'gpu' feature",
+            ))
+        }
+    }
+
     /// Validate all section checksums.
     ///
     /// Returns a list of (section_name, passed) tuples.

@@ -43,7 +43,15 @@ use scx_format::ShardSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_preprocess::apply_fused_ops_inner;
+use crate::profile::{self, CodecClass};
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
+
+/// Approximate the host→device bytes a staged CSR shard moves (data f32 +
+/// indices i32 + indptr i64). Used only for the Phase 0.2 GPU profiler.
+#[inline]
+fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
+    csr.data.len() * 4 + csr.indices.len() * 4 + (csr.n_rows() + 1) * 8
+}
 
 /// Release-active validation of a CSR shard at the host-side GPU DE staging
 /// boundary. Returns [`GpuError::InvalidShard`] rather than relying on a
@@ -249,15 +257,19 @@ impl<'a> RawGpuShardSource<'a> {
         // the caller's next host action implicitly orders against the
         // compute stream and the pinned buffer is free to reuse.
         if n_shards == 1 {
+            let t_decode = profile::start();
             let csr = self
                 .source
                 .read_shard(0)
                 .map_err(|e| GpuError::InvalidShard(format!("shard 0: {e}")))?;
+            profile::record_host_decode_since(CodecClass::Generic, t_decode);
             if csr.n_rows() == 0 {
                 return Ok(());
             }
             validate_shard_for_gpu_de(&csr)?;
+            let t_stage = profile::start();
             self.pinned[0].stage(&csr)?;
+            profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(&csr));
             self.pinned[0].upload_to(
                 self.dev.stream(),
                 &mut self.slot,
@@ -289,7 +301,9 @@ impl<'a> RawGpuShardSource<'a> {
 
             scope.spawn(move || {
                 for i in 0..n_shards {
+                    let t_decode = profile::start();
                     let out = source.read_shard(i).map(|c| (i, c));
+                    profile::record_host_decode_since(CodecClass::Generic, t_decode);
                     if tx.send(out).is_err() {
                         break;
                     }
@@ -323,7 +337,9 @@ impl<'a> RawGpuShardSource<'a> {
                 }
 
                 validate_shard_for_gpu_de(&csr)?;
+                let t_stage = profile::start();
                 pinned[pinned_idx].stage(&csr)?;
+                profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(&csr));
                 pinned[pinned_idx].upload_to(
                     copy_stream,
                     slot,

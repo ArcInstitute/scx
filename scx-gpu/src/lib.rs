@@ -70,6 +70,7 @@ pub mod gpu_umap;
 pub mod linear_operator;
 pub mod math_policy;
 pub mod preprocessed_gpu_matrix_source;
+pub mod profile;
 pub mod rice_gpu;
 pub mod shard_decode;
 pub mod sparse_dense;
@@ -131,6 +132,7 @@ pub use gpu_umap::{gpu_umap_from_device_graph, gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
+pub use profile::{ProfileSnapshot, StageStat};
 pub use rice_gpu::rice_decode_gpu;
 pub use shard_decode::{decode_shard_gpu, GpuCsr};
 pub use sparse_dense::{
