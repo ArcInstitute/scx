@@ -173,9 +173,19 @@ fn decode_scx1_gpu(
     // indices: FOR-BP on GPU → on-device u32→i32 cast (no host round-trip)
     // values:  Rice on GPU → on-device u32→f32 cast (no host round-trip)
     // Both decode GPU-side; the bucket covers the bitstream upload + kernels.
-    let t_gpu = profile::start();
-    let (d_indices_u32, _row_lengths) =
+    let t_forbp = profile::start();
+    let (d_indices_u32, _row_lengths, forbp_host_fallback) =
         forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
+    // FOR-BP self-accounts its SIMD host fallback (host_decode_scx1 + htod_scx1),
+    // so only count it toward gpu_decode when it actually ran on the GPU; on the
+    // fallback path restart the timer after it returns so gpu_decode captures only
+    // the genuine GPU work that follows (Rice decode + the two casts) and the
+    // buckets stay disjoint.
+    let t_gpu = if forbp_host_fallback {
+        profile::start()
+    } else {
+        t_forbp
+    };
     let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
     let d_values_u32 = rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?;

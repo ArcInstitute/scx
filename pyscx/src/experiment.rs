@@ -542,6 +542,17 @@ impl PyExperiment {
             let i32_ty = np.getattr("int32")?;
             let i64_ty = np.getattr("int64")?;
             let x = adata.getattr("X")?;
+            let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
+            // scipy CSR `indices` are column indices (< n_cols), so coercing them
+            // to i32 is lossless as long as n_cols fits i32; numpy astype(int32)
+            // would otherwise wrap silently. (indptr stays i64.) ≤VRAM single-cell
+            // n_cols is tiny — this only guards a pathological input.
+            if n_cols > i32::MAX as usize {
+                return Err(PyValueError::new_err(format!(
+                    "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
+                     the cupyx CSR handoff requires i32 indices."
+                )));
+            }
             let astype =
                 |arr: Bound<'py, PyAny>, ty: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
                     let kw = pyo3::types::PyDict::new(py);
@@ -563,7 +574,6 @@ impl PyExperiment {
                 .extract::<PyReadonlyArray1<i64>>()?
                 .as_slice()?
                 .to_vec();
-            let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
 
             // ≤VRAM pre-flight: refuse rather than OOM.
             let bytes_uploaded =

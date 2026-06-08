@@ -132,8 +132,13 @@ fn preparse_forbp(
 
 /// Decode FOR-BP encoded column indices on GPU.
 ///
-/// Returns `(CudaSlice<u32>, Vec<usize>)` — GPU indices and CPU row_lengths.
-/// Row lengths are returned on CPU since they're needed for CSR construction.
+/// Returns `(CudaSlice<u32>, Vec<usize>, bool)` — GPU indices, CPU row_lengths,
+/// and `took_host_fallback` (`true` when a SIMD-packed row forced the host
+/// reference decoder + HtoD instead of the GPU kernel). Row lengths are returned
+/// on CPU since they're needed for CSR construction. The `took_host_fallback`
+/// flag lets the profiler avoid double-counting the host span (which this
+/// function already records into `host_decode_scx1`/`htod_scx1`) inside the
+/// caller's `gpu_decode` bucket.
 ///
 /// Produces **bit-identical** output to `scx_codec::forbp::forbp_decode`.
 pub fn forbp_decode_gpu(
@@ -141,12 +146,12 @@ pub fn forbp_decode_gpu(
     data: &[u8],
     n_rows: usize,
     index_dtype_u16: bool,
-) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
+) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
     // CPU pre-parse all headers
     let (metas, all_row_lengths, total_nnz) = preparse_forbp(data, n_rows, index_dtype_u16)?;
 
     if total_nnz == 0 {
-        return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths));
+        return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths, false));
     }
 
     // The encoder bit-packs any row with nnz >= SIMD_THRESHOLD using BitPacker4x's
@@ -172,7 +177,7 @@ pub fn forbp_decode_gpu(
             t_htod,
             indices.len() * 4,
         );
-        return Ok((d_indices, row_lengths));
+        return Ok((d_indices, row_lengths, true));
     }
 
     // Load PTX module (cached) and get kernel function
@@ -225,7 +230,7 @@ pub fn forbp_decode_gpu(
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("forbp_decode_kernel: {e}")))?;
 
-    Ok((d_output, all_row_lengths))
+    Ok((d_output, all_row_lengths, false))
 }
 
 #[cfg(test)]
@@ -249,7 +254,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths) =
+        let (d_output, gpu_row_lengths, _took_host_fallback) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
@@ -296,7 +301,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths) =
+        let (d_output, gpu_row_lengths, _took_host_fallback) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
@@ -321,7 +326,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths) =
+        let (d_output, gpu_row_lengths, _took_host_fallback) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 

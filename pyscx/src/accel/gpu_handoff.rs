@@ -67,6 +67,79 @@ impl CudaArrayView {
     }
 }
 
+/// Shared `#[pymethods]` for the GPU CSR holder pyclasses. `GpuShardCsr` and
+/// `GpuCsrMatrix` have identical fields and identical CAI plumbing; only the
+/// `__repr__` label differs. pyo3 pyclasses cannot share a trait-based
+/// `#[pymethods]`, so factor the duplication through this macro.
+#[cfg(feature = "gpu")]
+macro_rules! impl_gpu_csr_holder_methods {
+    ($ty:ty, $label:literal) => {
+        #[pymethods]
+        impl $ty {
+            /// Matrix shape `(n_rows, n_cols)`.
+            #[getter]
+            fn shape(&self) -> (usize, usize) {
+                (self.n_rows, self.n_cols)
+            }
+
+            /// Number of stored non-zeros.
+            #[getter]
+            fn nnz(&self) -> usize {
+                self.nnz
+            }
+
+            /// `data` array (f32, length `nnz`) as a CAI view.
+            fn data(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+                let (ptr, len) = {
+                    let b = slf.borrow();
+                    (b.data_ptr, b.nnz)
+                };
+                Ok(CudaArrayView {
+                    _parent: slf.into_any().unbind(),
+                    ptr,
+                    len,
+                    typestr: "<f4",
+                })
+            }
+
+            /// `indices` array (i32, length `nnz`) as a CAI view.
+            fn indices(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+                let (ptr, len) = {
+                    let b = slf.borrow();
+                    (b.indices_ptr, b.nnz)
+                };
+                Ok(CudaArrayView {
+                    _parent: slf.into_any().unbind(),
+                    ptr,
+                    len,
+                    typestr: "<i4",
+                })
+            }
+
+            /// `indptr` array (i64, length `n_rows + 1`) as a CAI view.
+            fn indptr(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
+                let (ptr, len) = {
+                    let b = slf.borrow();
+                    (b.indptr_ptr, b.n_rows + 1)
+                };
+                Ok(CudaArrayView {
+                    _parent: slf.into_any().unbind(),
+                    ptr,
+                    len,
+                    typestr: "<i8",
+                })
+            }
+
+            fn __repr__(&self) -> String {
+                format!(
+                    concat!($label, "(shape=({}, {}), nnz={})"),
+                    self.n_rows, self.n_cols, self.nnz
+                )
+            }
+        }
+    };
+}
+
 /// A GPU-resident CSR shard whose `data` / `indices` / `indptr` device buffers
 /// can be adopted by `cupyx.scipy.sparse.csr_matrix` with no host round-trip.
 ///
@@ -90,69 +163,7 @@ pub struct GpuShardCsr {
 }
 
 #[cfg(feature = "gpu")]
-#[pymethods]
-impl GpuShardCsr {
-    /// Matrix shape `(n_rows, n_cols)`.
-    #[getter]
-    fn shape(&self) -> (usize, usize) {
-        (self.n_rows, self.n_cols)
-    }
-
-    /// Number of stored non-zeros.
-    #[getter]
-    fn nnz(&self) -> usize {
-        self.nnz
-    }
-
-    /// `data` array (f32, length `nnz`) as a CAI view.
-    fn data(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.data_ptr, b.nnz)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<f4",
-        })
-    }
-
-    /// `indices` array (i32, length `nnz`) as a CAI view.
-    fn indices(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.indices_ptr, b.nnz)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<i4",
-        })
-    }
-
-    /// `indptr` array (i64, length `n_rows + 1`) as a CAI view.
-    fn indptr(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.indptr_ptr, b.n_rows + 1)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<i8",
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "GpuShardCsr(shape=({}, {}), nnz={})",
-            self.n_rows, self.n_cols, self.nnz
-        )
-    }
-}
+impl_gpu_csr_holder_methods!(GpuShardCsr, "GpuShardCsr");
 
 /// A whole-matrix GPU-resident CSR whose `data` / `indices` / `indptr` device
 /// buffers back a `cupyx.scipy.sparse.csr_matrix` with no host round-trip — the
@@ -180,67 +191,7 @@ pub struct GpuCsrMatrix {
 }
 
 #[cfg(feature = "gpu")]
-#[pymethods]
-impl GpuCsrMatrix {
-    #[getter]
-    fn shape(&self) -> (usize, usize) {
-        (self.n_rows, self.n_cols)
-    }
-
-    #[getter]
-    fn nnz(&self) -> usize {
-        self.nnz
-    }
-
-    /// `data` array (f32, length `nnz`) as a CAI view.
-    fn data(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.data_ptr, b.nnz)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<f4",
-        })
-    }
-
-    /// `indices` array (i32, length `nnz`) as a CAI view.
-    fn indices(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.indices_ptr, b.nnz)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<i4",
-        })
-    }
-
-    /// `indptr` array (i64, length `n_rows + 1`) as a CAI view.
-    fn indptr(slf: Bound<'_, Self>) -> PyResult<CudaArrayView> {
-        let (ptr, len) = {
-            let b = slf.borrow();
-            (b.indptr_ptr, b.n_rows + 1)
-        };
-        Ok(CudaArrayView {
-            _parent: slf.into_any().unbind(),
-            ptr,
-            len,
-            typestr: "<i8",
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "GpuCsrMatrix(shape=({}, {}), nnz={})",
-            self.n_rows, self.n_cols, self.nnz
-        )
-    }
-}
+impl_gpu_csr_holder_methods!(GpuCsrMatrix, "GpuCsrMatrix");
 
 /// Upload a host CSR (scipy layout: i64 indptr, i32 indices, f32 data) to a
 /// single device-resident [`GpuCsrMatrix`] (ACC-RUST-OPT-V4 Phase 1.2).

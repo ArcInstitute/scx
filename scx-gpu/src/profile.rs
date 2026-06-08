@@ -9,9 +9,13 @@
 //! Four buckets; the decode/upload buckets are split by codec class because
 //! Scx1 decodes GPU-side (Rice/FOR-BP) while None/Zstd/Lz4Shuffle/Pcodec decode
 //! on the host and then upload:
-//! - `host_decode` — CPU-side codec decode (Delta-Golomb indptr, scipy fallback)
+//! - `host_decode` — CPU-side codec decode (Delta-Golomb indptr, scipy fallback,
+//!   and the FOR-BP SIMD-layout host fallback)
 //! - `htod`        — host→device uploads (`htod_copy`)
-//! - `gpu_decode`  — GPU-side Rice/FOR-BP decode + casts (Scx1 only)
+//! - `gpu_decode`  — GPU-side Scx1 decode only (Rice values + the two u32 casts
+//!   always; the FOR-BP indices kernel only when it ran on-GPU). When a dense row
+//!   forces the FOR-BP host fallback, that span is recorded in `host_decode`/`htod`
+//!   instead and excluded here, so the buckets stay disjoint (no double-count).
 //! - `compute`     — cuSPARSE SpMM execution (and other instrumented kernels)
 //!
 //! When disabled (the default), every hook short-circuits on a single relaxed
@@ -114,9 +118,12 @@ pub fn record_htod_since(class: CodecClass, start: Option<Instant>, bytes: usize
     }
 }
 
-/// Record a GPU-side decode region (Scx1 Rice/FOR-BP + casts). No-op if `start`
-/// was `None`. The caller must have synchronized the stream before calling so
-/// the elapsed time reflects completed device work.
+/// Record a GPU-side decode region (Scx1 Rice + casts, plus the FOR-BP indices
+/// kernel only when it ran on-GPU). No-op if `start` was `None`. The caller must
+/// have synchronized the stream before calling so the elapsed time reflects
+/// completed device work, and must exclude any FOR-BP SIMD host fallback (already
+/// recorded via [`record_host_decode_since`]/[`record_htod_since`]) so this bucket
+/// stays disjoint from the host buckets.
 #[inline]
 pub fn record_gpu_decode_since(start: Option<Instant>) {
     if let Some(t) = start {
