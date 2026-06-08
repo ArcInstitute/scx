@@ -99,7 +99,7 @@ pub use scx_gpu::profile;
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{
     cusparse_modern_abi_available, gpu_log1p, gpu_preprocess_to_csr, GpuDevice, GpuMathMode,
-    GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat, FUZZY_MAX_K,
+    GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat,
 };
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{decode_csr_shards_to_device, decode_shard_gpu, GpuCsr, GpuCsrPointers};

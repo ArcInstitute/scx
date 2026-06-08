@@ -56,7 +56,6 @@ pub mod forbp_gpu;
 pub mod gpu_csc_shard_source;
 pub mod gpu_csr_assemble;
 pub mod gpu_diffexp;
-pub mod gpu_fuzzy;
 pub mod gpu_graph;
 pub mod gpu_harmony;
 pub mod gpu_hvg;
@@ -85,7 +84,7 @@ pub use cusparse::{
     CusparseSpMatDescr, DnMatDescr, GpuCsrPointers,
 };
 pub use device::GpuDevice;
-pub use device_resident::{DeviceEmbedding, DeviceFuzzyGraph, DeviceKnnGraph};
+pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
@@ -99,7 +98,6 @@ pub use gpu_diffexp::{
     gpu_de_scatter_shard_to_gene_major, gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat,
     gpu_de_tie_term, gpu_de_upload_chunk, GpuDeChunkScratch, GPU_DE_BLOCK_SORT_CAPACITY,
 };
-pub use gpu_fuzzy::{gpu_fuzzy_simplicial_set_device, FUZZY_MAX_K};
 pub use gpu_graph::{
     capture_graph, cuda_graphs_enabled, exec_kernel_node_set_params, graph_kernel_nodes,
     read_kernel_node_params, set_cuda_graphs_enabled_override, GpuGraphCache, GpuGraphMetrics,
