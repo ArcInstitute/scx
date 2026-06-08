@@ -99,6 +99,74 @@ pub fn pca_neighbors(
         )));
     }
 
+    // ACC-RUST-OPT-V4 Phase 1.4: in-VRAM `device="gpu"` fused PCA→kNN routes to a
+    // full rapids pipeline (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X.
+    // backed/lazy X stays on the native device-resident fused path (>VRAM moat,
+    // pending Phase 0.1). Gated on the default `use_rep="X_pca"` like the native
+    // fused path.
+    #[cfg(feature = "gpu")]
+    if use_rep == "X_pca" {
+        let x_in_memory = {
+            let xp = adata.getattr("X")?;
+            xp.extract::<PyRef<ScxBackedSparseDataset>>().is_err()
+                && xp.extract::<PyRef<ScxLazyTransformedDataset>>().is_err()
+        };
+        if x_in_memory {
+            match super::rapids::decide(py, _device, "pca_neighbors") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run_fused(
+                        py,
+                        adata,
+                        gid,
+                        n_comps,
+                        zero_center,
+                        random_state,
+                        n_neighbors,
+                        use_rep,
+                        None,
+                    )?;
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    pca_neighbors(
+                        py,
+                        adata,
+                        n_comps,
+                        n_neighbors,
+                        zero_center,
+                        random_state,
+                        n_oversamples,
+                        n_power_iterations,
+                        "cpu",
+                        method,
+                        qr_method,
+                        use_rep,
+                        prefer_format,
+                    )?;
+                    super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "pca",
+                        scx_accel::AccelRoute::CpuCsr,
+                    )?;
+                    super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "neighbors",
+                        scx_accel::AccelRoute::CpuCsr,
+                    )?;
+                    return super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "pca_neighbors",
+                        scx_accel::AccelRoute::CpuCsr,
+                    );
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
+    }
+
     // ---- Fully fused device-resident GPU path ----
     // Gated on `use_rep == "X_pca"`: the fused path always feeds kNN the
     // freshly-computed PCA embedding, whereas the sequential `neighbors` reads
@@ -330,6 +398,70 @@ pub fn pca_neighbors_umap(
             "pyscx.accel.pca_neighbors_umap only supports prefer_format='csr' (got \
              {prefer_format:?}); PCA's SpMM path is row-major and CSC is not implemented."
         )));
+    }
+
+    // ACC-RUST-OPT-V4 Phase 1.4: in-VRAM `device="gpu"` fused PCA→kNN→UMAP routes
+    // to a full rapids pipeline (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on
+    // an in-memory X. This is the prerequisite for deleting native UMAP (Phase
+    // 3.1). backed/lazy X stays on the native device-resident fused path.
+    #[cfg(feature = "gpu")]
+    if use_rep == "X_pca" {
+        let x_in_memory = {
+            let xp = adata.getattr("X")?;
+            xp.extract::<PyRef<ScxBackedSparseDataset>>().is_err()
+                && xp.extract::<PyRef<ScxLazyTransformedDataset>>().is_err()
+        };
+        if x_in_memory {
+            match super::rapids::decide(py, _device, "pca_neighbors_umap") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run_fused(
+                        py,
+                        adata,
+                        gid,
+                        n_comps,
+                        zero_center,
+                        random_state,
+                        n_neighbors,
+                        use_rep,
+                        Some((n_components, min_dist, spread, negative_sample_rate)),
+                    )?;
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    pca_neighbors_umap(
+                        py,
+                        adata,
+                        n_comps,
+                        n_neighbors,
+                        n_components,
+                        n_epochs,
+                        min_dist,
+                        spread,
+                        negative_sample_rate,
+                        umap_learning_rate,
+                        zero_center,
+                        random_state,
+                        n_oversamples,
+                        n_power_iterations,
+                        "cpu",
+                        method,
+                        qr_method,
+                        use_rep,
+                        prefer_format,
+                    )?;
+                    for op in ["pca", "neighbors", "umap", "pca_neighbors_umap"] {
+                        super::rapids::stamp_no_rapids(
+                            py,
+                            adata,
+                            op,
+                            scx_accel::AccelRoute::CpuCsr,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
     }
 
     // ---- Fully fused device-resident GPU path (gated on use_rep == "X_pca"). ----

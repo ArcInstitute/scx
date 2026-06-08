@@ -177,6 +177,59 @@ pub(crate) fn run(
     stamp(py, adata, op, gpu_id, transfer_mode)
 }
 
+/// Run the fused PCA → neighbors [→ UMAP] rapids pipeline on the device AnnData
+/// and stamp every stage (ACC-RUST-OPT-V4 Phase 1.4). `umap` carries the UMAP
+/// stage params `(n_components, min_dist, spread, negative_sample_rate)` when the
+/// UMAP stage should run; `None` runs PCA → neighbors only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_fused(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    gpu_id: usize,
+    n_comps: usize,
+    zero_center: bool,
+    random_state: u64,
+    n_neighbors: usize,
+    use_rep: &str,
+    umap: Option<(usize, f64, f64, usize)>,
+) -> PyResult<()> {
+    let transfer_mode = ensure_gpu_anndata(py, adata, gpu_id)?;
+    with_device(py, gpu_id, || {
+        let kw = PyDict::new(py);
+        kw.set_item("n_comps", n_comps)?;
+        kw.set_item("zero_center", zero_center)?;
+        kw.set_item("random_state", random_state)?;
+        rsc_fn(py, "pp", "pca")?.call((adata,), Some(&kw))?;
+
+        let kw = PyDict::new(py);
+        kw.set_item("n_neighbors", n_neighbors)?;
+        kw.set_item("use_rep", use_rep)?;
+        kw.set_item("random_state", random_state)?;
+        rsc_fn(py, "pp", "neighbors")?.call((adata,), Some(&kw))?;
+
+        if let Some((n_components, min_dist, spread, negative_sample_rate)) = umap {
+            let kw = PyDict::new(py);
+            kw.set_item("n_components", n_components)?;
+            kw.set_item("min_dist", min_dist)?;
+            kw.set_item("spread", spread)?;
+            kw.set_item("negative_sample_rate", negative_sample_rate)?;
+            kw.set_item("random_state", random_state)?;
+            rsc_fn(py, "tl", "umap")?.call((adata,), Some(&kw))?;
+        }
+        Ok(())
+    })?;
+
+    stamp(py, adata, "pca", gpu_id, transfer_mode)?;
+    stamp(py, adata, "neighbors", gpu_id, transfer_mode)?;
+    if umap.is_some() {
+        stamp(py, adata, "umap", gpu_id, transfer_mode)?;
+        stamp(py, adata, "pca_neighbors_umap", gpu_id, transfer_mode)?;
+    } else {
+        stamp(py, adata, "pca_neighbors", gpu_id, transfer_mode)?;
+    }
+    Ok(())
+}
+
 /// Build a `rapids_singlecell` submodule function handle, e.g.
 /// `rsc_fn(py, "pp", "pca")`.
 pub(crate) fn rsc_fn<'py>(
