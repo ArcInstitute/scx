@@ -43,15 +43,27 @@ python benchmarks/comprehensive/scripts/compare_against_baseline.py \
 
 ## Picking a baseline
 
-Two flavours live side-by-side. **Multi-surface** baselines (the default `LATEST` target) gate format / cloud / multimodal benchmarks. **Accel-only** baselines gate the `accel_*` family — they exist because capture coverage and gate coverage on accelerators have drifted (`benchmarks/README.md` "Capture vs gate coverage" — the `accel_*` rows in `LATEST` capture cleanly but produce no gate signal against the current multi-surface baseline). PRs that touch `accel_*` should pin the accel-only baseline explicitly:
+Two flavours live side-by-side. **Accel-only** baselines gate the `accel_*`
+family; **multi-surface** baselines gate format / cloud / multimodal benchmarks.
+They exist as separate snapshots because capture coverage and gate coverage on
+accelerators have drifted (`benchmarks/README.md` "Capture vs gate coverage" —
+`accel_*` rows in a multi-surface snapshot capture cleanly but produce no gate
+signal against a multi-surface baseline, and vice-versa).
+
+**`LATEST` currently points at the accel-only baseline**
+(`v0.6.5-accel-gpu-rapids-floors`) — it is the canonical signal for the
+ACC-RUST-OPT-V4 rapids-routing work, so accel PRs gate against it by default.
+Because that snapshot carries no format/cloud/multimodal rows, **format / cloud /
+multimodal PRs must pin the latest multi-surface baseline explicitly**
+(`v0.6.2-n_counts-augmentation`) rather than relying on the default `LATEST`:
 
 ```bash
-# Format / cloud / multimodal PRs: default LATEST.
-python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel
+# Accel PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE): default LATEST.
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only
 
-# Accel PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE):
-python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
-    --baseline benchmarks/comprehensive/results/baselines/v0.4.3-g1-gpu-de
+# Format / cloud / multimodal PRs: pin the multi-surface baseline.
+python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel \
+    --baseline benchmarks/comprehensive/results/baselines/v0.6.2-n_counts-augmentation
 ```
 
 ## Versions
