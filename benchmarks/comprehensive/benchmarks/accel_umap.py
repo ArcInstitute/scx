@@ -32,11 +32,14 @@ from typing import Any, Callable
 import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
+    _extract_fallback_reason,
     _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
     _load_preprocessed,
+    dispatch_env,
+    emit_route_signal,
 )
 from benchmarks.comprehensive.benchmarks.accel_knn import (
     _ensure_pca,
@@ -85,6 +88,11 @@ def accel_umap_variants() -> list[FormatVariant]:
             key="accel_umap__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx UMAP (GPU, rapids disabled → CPU fallback)",
+            key="accel_umap__pyscx_gpu_no_rapids",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -107,17 +115,26 @@ def _run_pyscx_gpu(adata: Any, seed: int) -> str:
 
 
 def _run_rapids_singlecell(adata: Any, seed: int) -> str:
-    """rapids-singlecell GPU competitor (V3 task 2.9). Runs UMAP on the
-    precomputed scanpy neighbors graph (kept GPU-resident via
-    `convert_all=True`), isolating the UMAP stage; `X_umap` returns to host for
-    the trustworthiness check.
+    """rapids-singlecell UMAP route (Phase 2): drives the pyscx in-VRAM
+    `device="gpu"` path, which after Phase 1 hands off to `rsc.tl.umap` on the
+    precomputed neighbors graph; `X_umap` returns to host for the
+    trustworthiness check.
     """
+    import pyscx
     import rapids_singlecell as rsc
 
-    rsc.get.anndata_to_GPU(adata, convert_all=True)
-    rsc.tl.umap(adata, random_state=seed)
+    pyscx.accel.umap(adata, device="gpu", random_state=seed)
     rsc.get.anndata_to_CPU(adata, convert_all=True)
-    return "rapids-singlecell-gpu"
+    return _extract_route(adata, "umap") or "rapids_singlecell_gpu"
+
+
+def _run_pyscx_gpu_no_rapids(adata: Any, seed: int) -> str:
+    """Phase 2.2 no-rapids fallback: `device="gpu"` under SCX_DISABLE_RAPIDS=1
+    must fall back to CPU with fallback_reason="no_rapids"."""
+    import pyscx
+
+    pyscx.accel.umap(adata, device="gpu", random_state=seed)
+    return adata.uns.get("umap", {}).get("backend", "scx-accel-cpu")
 
 
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
@@ -125,6 +142,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_umap__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_umap__pyscx_gpu": (_run_pyscx_gpu, True),
     "accel_umap__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
+    "accel_umap__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
 }
 
 
@@ -208,7 +226,8 @@ def run(
     # Warm-up
     for _ in range(N_WARMUP_RUNS):
         warm = base.copy()
-        impl(warm, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            impl(warm, RANDOM_SEED)
         del warm
         gc.collect()
 
@@ -221,7 +240,8 @@ def run(
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        backend = impl(a, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            backend = impl(a, RANDOM_SEED)
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
@@ -239,13 +259,16 @@ def run(
         # Route + GPU gate signal. GPU UMAP runs the native CUDA SGD kernel (or
         # cuML), recorded as gpu_dense; the variant is skipped on non-GPU
         # hosts, so a cpu_* route is a silent fallback → 0.0 fails the gate.
-        route = _extract_route(a, "umap")
-        if route is not None:
-            extras["gpu_dispatch_route"] = route
-            if requires_gpu:
-                extras["umap_route_gpu_correct"] = (
-                    1.0 if route.startswith("gpu_") else 0.0
-                )
+        emit_route_signal(
+            extras,
+            key,
+            _extract_route(a, "umap"),
+            requires_gpu=requires_gpu,
+            gpu_metric="umap_route_gpu_correct",
+            rapids_metric="umap_route_rapids_correct",
+            fallback_reason=_extract_fallback_reason(a, "umap"),
+            no_rapids_metric="umap_fallback_no_rapids_correct",
+        )
 
         result.add_run(
             wall_s=wall, user_s=u1 - u0, sys_s=s1 - s0,

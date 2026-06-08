@@ -664,6 +664,123 @@ absolute_floors:
     metric: hvg_overlap_vs_scanpy
     min: 0.90
 
+  # --- ACC-RUST-OPT-V4 Phase 2.1: rapids ROUTE gates -----------------
+  # After Phase 1, pyscx.accel.X(device="gpu") routes in-VRAM to rapids. The
+  # `accel_*__rapids_singlecell_gpu` variants now drive pyscx (not raw rsc) and
+  # emit `<op>_route_rapids_correct` = 1.0 iff the stamped route is
+  # "rapids_singlecell_gpu", 0.0 if the handoff silently fell back. Gated on the
+  # same tiers as the native `*_route_gpu_correct` gates — which now run under
+  # SCX_FORCE_NATIVE_GPU=1 (the harness force-native wrap) so they keep
+  # protecting the surviving native >VRAM/backed kernels. HVG's rapids route is
+  # NOT floored here: its benchmarked flavor (seurat_v3) stays native by design
+  # (§4.1), and the rapids HVG flavors (seurat/cell_ranger/…) need log-normalized
+  # inputs + a separate reference — covered by the pyscx GPU verify instead.
+  # census_1m is exercised in validation but not hard-floored for these ops,
+  # mirroring the native route gates (which also stop at tabula_sapiens_100k).
+  - benchmark: accel_pca
+    format: accel_pca__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: pca_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: pca_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_knn
+    format: accel_knn__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: knn_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_knn
+    format: accel_knn__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: knn_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_umap
+    format: accel_umap__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: umap_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_umap
+    format: accel_umap__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: umap_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_preprocess
+    format: accel_preprocess__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: preprocess_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_pipeline
+    format: accel_pipeline__rapids_singlecell_gpu
+    dataset: pbmc3k
+    metric: pipeline_route_rapids_correct
+    min: 1.0
+  - benchmark: accel_pipeline
+    format: accel_pipeline__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: pipeline_route_rapids_correct
+    min: 1.0
+
+  # --- Phase 2.1: rapids correctness extended to tabula_sapiens_100k --
+  # Mirror the pbmc3k rapids accuracy floors at the medium tier (same metrics /
+  # bars as the SCX-GPU variants). Skipped silently until a tabula rapids
+  # capture runs (same convention as the pbmc3k rapids floors above).
+  - benchmark: accel_pca
+    format: accel_pca__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.90
+  - benchmark: accel_knn
+    format: accel_knn__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_umap
+    format: accel_umap__rapids_singlecell_gpu
+    dataset: tabula_sapiens_100k
+    metric: trustworthiness
+    min: 0.90
+
+  # --- Phase 2.2: no-rapids fallback gate ----------------------------
+  # `accel_*__pyscx_gpu_no_rapids` runs device="gpu" under SCX_DISABLE_RAPIDS=1,
+  # which forces the rapids-absent path: the op must fall back to CPU and stamp
+  # fallback_reason="no_rapids". `<op>_fallback_no_rapids_correct` = 1.0 iff the
+  # route is cpu_* AND fallback_reason == "no_rapids" (0.0 = the contract broke:
+  # it routed GPU/rapids anyway, or didn't record no_rapids). The CPU fallback
+  # must also stay correct, so the same accuracy floor applies. Headline ops only.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: pca_fallback_no_rapids_correct
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.90
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: knn_fallback_no_rapids_correct
+    min: 1.0
+  - benchmark: accel_knn
+    format: accel_knn__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: recall_vs_scanpy
+    min: 0.90
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: umap_fallback_no_rapids_correct
+    min: 1.0
+  - benchmark: accel_umap
+    format: accel_umap__pyscx_gpu_no_rapids
+    dataset: pbmc3k
+    metric: trustworthiness
+    min: 0.90
+
   # --- ml_loader throughput floors -----------------------------------
   # Floors at 0.5x observed baseline median (0.6x on pbmc3k
   # since N_RUNS_SMALL=5 gives a tighter median than N_RUNS_LARGE=3).

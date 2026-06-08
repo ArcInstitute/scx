@@ -221,6 +221,47 @@ rapids-singlecell is not available, so SCX treats it as a detected runtime
 dependency with a documented manual install rather than declaring a brittle hard
 extra. The rapids-absent path is exercised by a dedicated CI lane.
 
+### What routes to rapids (in-VRAM `device="gpu"`)
+
+With rapids present, in-memory (≤VRAM) `device="gpu"` ops route to rapids:
+`pca`, `neighbors`, `umap`, `normalize_total`/`log1p`, the fused
+`pca_neighbors`/`pca_neighbors_umap`, and the HVG flavors SCX has no native GPU
+kernel for (`seurat`, `cell_ranger`, `pearson_residuals`,
+`poisson_gene_selection`). The route is recorded as `rapids_singlecell_gpu` on
+`adata.uns["scx_accel"][<op>]` with the detected rapids/cuML/cuPy versions and a
+`transfer_mode` (`scx_device_handoff` when `X` is already device-resident — e.g.
+from `pyscx.open(...).to_gpu_anndata()` — or `anndata_to_gpu` when rapids
+uploads a host `X`).
+
+**`X` residency contract.** When the op uploads a host `X` (`anndata_to_gpu`),
+the result slots (`obsm`/`obsp`) **and** `X` are brought back to host afterwards
+and the device buffers freed — so `pyscx.accel.<op>(adata, device="gpu")` on an
+in-memory AnnData leaves `adata.X` host-resident, exactly as the native path
+does. When `X` arrives already device-resident (`scx_device_handoff`, from
+`to_gpu_anndata()`), it is **left on the GPU** so a chain of `pyscx.accel.*`
+calls runs without re-uploading — that path is the way to keep data GPU-resident
+across ops.
+
+These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
+`seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, and every
+**out-of-VRAM** path — a backed/lazy `X` (`ScxBackedSparseDataset` /
+`ScxLazyTransformedDataset`) always uses SCX's native streaming kernels, never
+rapids (which would OOM).
+
+### Forcing the native GPU kernels
+
+`SCX_FORCE_NATIVE_GPU=1` keeps the native SCX GPU kernels for in-VRAM ops
+instead of routing to rapids — a transition-only A/B + rollback switch (removed
+once the rapids routes are gated and the superseded native kernels are deleted).
+When rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops
+fall back to CPU (`fallback_reason="no_rapids"`) with a one-shot `UserWarning`.
+
+`SCX_DISABLE_RAPIDS=1` forces that rapids-absent CPU fallback **even on a host
+where rapids is installed** — it makes the dispatcher treat rapids as
+unimportable. It exists so the no-rapids fallback contract can be exercised
+(tests / the Phase 2 benchmark gate) without uninstalling rapids; it takes
+precedence over `SCX_FORCE_NATIVE_GPU`.
+
 ## SLURM / HPC configuration
 
 On HPC clusters, GPU nodes typically require module loads or conda activation

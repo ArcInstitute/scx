@@ -196,6 +196,79 @@ pub fn highly_variable_genes<'py>(
         return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor, csc_device_id);
     }
     let resolved = super::gpu::resolve_device(device)?;
+
+    // ACC-RUST-OPT-V4 Phase 1.3: the HVG flavors SCX has no native GPU kernel for
+    // (`seurat` / `cell_ranger` / `pearson_residuals` / `poisson_gene_selection`)
+    // route to rapids-singlecell in the in-VRAM regime. `seurat_v3` /
+    // `seurat_v3_paper` stay native (SCX wins — §4.1). Restricted to an in-memory
+    // X read from adata.X (no `layer=`).
+    #[cfg(feature = "gpu")]
+    if !seurat_v3_family && layer.is_none() {
+        let x_in_memory = {
+            let xp = adata.getattr("X")?;
+            xp.cast::<ScxBackedSparseDataset>().is_err()
+                && xp.cast::<ScxLazyTransformedDataset>().is_err()
+        };
+        if x_in_memory {
+            match super::rapids::decide(py, resolved, "highly_variable_genes") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run(py, adata, "highly_variable_genes", gid, |py, adata| {
+                        let kw = super::rapids::kwargs(py);
+                        kw.set_item("n_top_genes", n_top_genes)?;
+                        kw.set_item("flavor", flavor)?;
+                        if let Some(bk) = batch_key {
+                            kw.set_item("batch_key", bk)?;
+                        }
+                        kw.set_item("span", span)?;
+                        kw.set_item("n_bins", n_bins)?;
+                        // NB: rsc.pp.highly_variable_genes has no `subset` kwarg
+                        // (unlike scanpy); we apply the subset post-hoc below,
+                        // exactly as the CPU/native path does.
+                        super::rapids::rsc_fn(py, "pp", "highly_variable_genes")?
+                            .call((adata,), Some(&kw))?;
+                        Ok(())
+                    })?;
+                    // `run` restored X to host (host-in → host-out); honor
+                    // `subset=True` the same way the CPU/native path does, since
+                    // rsc.pp.highly_variable_genes does not subset itself.
+                    if subset {
+                        let mask: Vec<bool> = adata
+                            .getattr("var")?
+                            .get_item("highly_variable")?
+                            .call_method0("to_numpy")?
+                            .extract::<numpy::PyReadonlyArray1<bool>>()?
+                            .as_slice()?
+                            .to_vec();
+                        let x_obj = adata.getattr("X")?;
+                        apply_hvg_subset(py, adata, &x_obj, &mask)?;
+                    }
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    highly_variable_genes(
+                        py,
+                        adata,
+                        n_top_genes,
+                        flavor,
+                        batch_key,
+                        span,
+                        subset,
+                        n_bins,
+                        "cpu",
+                        prefer_format,
+                        layer,
+                    )?;
+                    return super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "highly_variable_genes",
+                        scx_accel::AccelRoute::CpuCsr,
+                    );
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
+    }
     // GPU path is supported for any seurat_v3 / seurat_v3_paper config
     // (including multi-batch via per-batch kernels). For flavor="seurat" the
     // GPU kernels don't apply — fall back to CPU with a single warning.

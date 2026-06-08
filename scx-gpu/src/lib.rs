@@ -54,6 +54,7 @@ pub mod device_resident;
 pub mod error;
 pub mod forbp_gpu;
 pub mod gpu_csc_shard_source;
+pub mod gpu_csr_assemble;
 pub mod gpu_diffexp;
 pub mod gpu_fuzzy;
 pub mod gpu_graph;
@@ -90,6 +91,7 @@ pub use device_resident::{DeviceEmbedding, DeviceFuzzyGraph, DeviceKnnGraph};
 pub use error::{GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
+pub use gpu_csr_assemble::decode_csr_shards_to_device;
 pub use gpu_diffexp::{
     build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev,
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,

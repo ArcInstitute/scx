@@ -41,12 +41,15 @@ import numpy as np
 
 from benchmarks.comprehensive.benchmarks.accel_pca import (
     PcaFixture,
+    _extract_fallback_reason,
     _extract_route,
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
     _load_preprocessed,
     _run_scanpy_cpu,
+    dispatch_env,
+    emit_route_signal,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -91,6 +94,11 @@ def accel_knn_variants() -> list[FormatVariant]:
             key="accel_knn__rapids_singlecell_gpu",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx neighbors (GPU, rapids disabled → CPU fallback)",
+            key="accel_knn__pyscx_gpu_no_rapids",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -129,16 +137,25 @@ def _run_pyscx_gpu_cagra(adata: Any, n_neighbors: int, seed: int) -> str:
 
 
 def _run_rapids_singlecell(adata: Any, n_neighbors: int, seed: int) -> str:
-    """rapids-singlecell GPU competitor (V3 task 2.9). Reads the precomputed
-    `X_pca` (kept GPU-resident via `convert_all=True`) and builds the kNN graph;
+    """rapids-singlecell kNN route (Phase 2): drives the pyscx in-VRAM
+    `device="gpu"` path, which after Phase 1 hands off to `rsc.pp.neighbors`.
     `obsp` returns to host for the recall check.
     """
+    import pyscx
     import rapids_singlecell as rsc
 
-    rsc.get.anndata_to_GPU(adata, convert_all=True)
-    rsc.pp.neighbors(adata, n_neighbors=n_neighbors, random_state=seed)
+    pyscx.accel.neighbors(adata, n_neighbors=n_neighbors, device="gpu", random_state=seed)
     rsc.get.anndata_to_CPU(adata, convert_all=True)
-    return "rapids-singlecell-gpu"
+    return _extract_route(adata, "neighbors") or "rapids_singlecell_gpu"
+
+
+def _run_pyscx_gpu_no_rapids(adata: Any, n_neighbors: int, seed: int) -> str:
+    """Phase 2.2 no-rapids fallback: `device="gpu"` under SCX_DISABLE_RAPIDS=1
+    must fall back to CPU with fallback_reason="no_rapids"."""
+    import pyscx
+
+    pyscx.accel.neighbors(adata, n_neighbors=n_neighbors, device="gpu", random_state=seed)
+    return adata.uns["neighbors"].get("backend", "scx-accel-cpu")
 
 
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
@@ -146,6 +163,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_knn__pyscx_cpu": (_run_pyscx_cpu, False),
     "accel_knn__pyscx_gpu_cagra": (_run_pyscx_gpu_cagra, True),
     "accel_knn__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
+    "accel_knn__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
 }
 
 
@@ -238,7 +256,8 @@ def run(
     for i in range(N_WARMUP_RUNS):
         warm = fixture.adata.copy()
         _ensure_pca(warm, n_comps)
-        impl(warm, n_neighbors, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            impl(warm, n_neighbors, RANDOM_SEED)
         del warm
         gc.collect()
 
@@ -253,7 +272,8 @@ def run(
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        backend = impl(a, n_neighbors, RANDOM_SEED)
+        with dispatch_env(key, requires_gpu):
+            backend = impl(a, n_neighbors, RANDOM_SEED)
         wall = time.perf_counter() - t0
         u1, s1 = _get_cpu_times()
         rss_after = _get_rss_mb()
@@ -268,13 +288,16 @@ def run(
         # Route + GPU gate signal. GPU kNN runs cuVS CAGRA (gpu_csr); the
         # variant is skipped on non-GPU hosts, so a cpu_* route is a silent
         # fallback (cuVS unavailable) → 0.0 fails the gate.
-        route = _extract_route(a, "neighbors")
-        if route is not None:
-            extras["gpu_dispatch_route"] = route
-            if requires_gpu:
-                extras["knn_route_gpu_correct"] = (
-                    1.0 if route.startswith("gpu_") else 0.0
-                )
+        emit_route_signal(
+            extras,
+            key,
+            _extract_route(a, "neighbors"),
+            requires_gpu=requires_gpu,
+            gpu_metric="knn_route_gpu_correct",
+            rapids_metric="knn_route_rapids_correct",
+            fallback_reason=_extract_fallback_reason(a, "neighbors"),
+            no_rapids_metric="knn_fallback_no_rapids_correct",
+        )
 
         result.add_run(
             wall_s=wall,

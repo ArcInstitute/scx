@@ -69,6 +69,16 @@ jobs:
           # scx-accel gpu feature — requires cudarc stubs only, no CUDA toolkit
           - flags: "-p scx-accel --features gpu"
             name: "scx-accel --features gpu"
+          # pyscx gpu feature — the rapids-absent lane (ACC-RUST-OPT-V4 §4.3).
+          # Compiles + clippy-checks the gpu-gated rapids routing on a CPU runner
+          # with neither CUDA nor rapids-singlecell present (cudarc stubs compile);
+          # the detected-dependency contract (pyscx imports + CPU/streaming/loader
+          # run with rapids absent) holds by construction, and the planner's
+          # no_rapids branch is unit-tested in `cargo test` (scx-accel route).
+          # The runtime no_rapids→CPU assertion on a GPU host without rapids is a
+          # Phase 2.2 GPU gate (needs hardware CI does not have).
+          - flags: "-p pyscx --features gpu"
+            name: "pyscx --features gpu"
           # pyscx cloud — covered by the python job; also check standalone
           - flags: "-p pyscx --features cloud"
             name: "pyscx --features cloud"

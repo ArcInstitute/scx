@@ -1055,16 +1055,41 @@ and `pipeline_route_gpu_correct` gates the device-resident route (above).
 
 **Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
 the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant
-(`accel_{pca,knn,umap,leiden,preprocess,hvg}`) that runs the matching `rsc.*` op
-on the same fixture/device/dataset. Because each op is its own benchmark, the six
-side-by-side cells **localize** the end-to-end pipeline gap to a stage. The
-head-to-head wall-time ratio (SCX-GPU / rapids) is rendered in the accel report's
-**"SCX GPU vs rapids-singlecell"** table — it is *surfaced, not gated* (rapids
-version drift must not fail the build). rapids correctness IS gated: each variant
-reuses the same `vs_scanpy` accuracy metric as SCX and is held to the same floor
+(`accel_{pca,knn,umap,leiden,preprocess,hvg}`) on the same fixture/device/dataset.
+Because each op is its own benchmark, the six side-by-side cells **localize** the
+end-to-end pipeline gap to a stage. The head-to-head wall-time ratio (SCX-GPU /
+rapids) is rendered in the accel report's **"SCX GPU vs rapids-singlecell"**
+table — it is *surfaced, not gated* (rapids version drift must not fail the
+build). rapids correctness IS gated: each variant reuses the same `vs_scanpy`
+accuracy metric as SCX and is held to the same floor
 (`subspace_cos_min`/`recall_vs_scanpy`/`trustworthiness`/`hvg_overlap_vs_scanpy`
-≥ 0.90 on `pbmc3k`); Leiden ARI and preprocess are informational (matching SCX's
-own coverage). DE (`rank_genes_groups`) is deferred to Phase 4.4.
+≥ 0.90); Leiden ARI and preprocess are informational. DE (`rank_genes_groups`) is
+deferred to Phase 4.4.
+
+**rapids route gates (ACC-RUST-OPT-V4 Phase 2).** After Phase 1, in-VRAM
+`device="gpu"` ops route to rapids-singlecell, so the `accel_*__rapids_singlecell_gpu`
+variants (pca / knn / umap / preprocess / pipeline) now **drive pyscx**
+(`pyscx.accel.X(device="gpu")`), not raw `rsc.*`, and emit
+`<op>_route_rapids_correct` = 1.0 iff the stamped route is `rapids_singlecell_gpu`
+(floored on `pbmc3k` + `tabula_sapiens_100k`). To keep the native
+`*_route_gpu_correct` floors meaningful (the surviving >VRAM/backed kernels), the
+native `pyscx_gpu_*` variants now run under `SCX_FORCE_NATIVE_GPU=1` (set by the
+harness `dispatch_env` wrapper), pinning the native route. HVG is excluded from
+the rapids route floor — its benchmarked flavor (`seurat_v3`) stays native by
+design; the rapids HVG flavors are validated by the pyscx GPU verify
+(`tasks/phase1_rapids_routes_verify.py`). A no-rapids fallback gate
+(`accel_{pca,knn,umap}__pyscx_gpu_no_rapids`, run under `SCX_DISABLE_RAPIDS=1`)
+asserts the rapids-absent path stamps `fallback_reason="no_rapids"` and stays
+correct on CPU.
+
+> **Baseline re-promotion (deferred).** The Phase 2 routing flip changes which
+> route the `pyscx_gpu`/`rapids_singlecell_gpu` accel cells record, so the accel
+> baseline must be **re-captured and re-promoted post-merge**, once Phase 1/2 are
+> on `main`: `gate_candidate.py --tier full` (on `main`, scx-bench-gpu with
+> rapids) → `promote_baseline.py --version v0.6.5-accel-gpu-rapids-floors`. Until
+> then `LATEST` stays at `v0.6.4-accel-gpu-rapids`; the new `*_route_rapids_correct`
+> / `*_fallback_no_rapids_correct` floors are absolute (baseline-independent) so
+> they gate without a re-promotion.
 
 The rapids variants need `cuml` + `rapids-singlecell` in the `scx-bench-gpu`
 conda env. `cuml` installs via `conda env update -f envs/scx-bench-gpu.yml`;

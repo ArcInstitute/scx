@@ -32,6 +32,8 @@ from benchmarks.comprehensive.benchmarks.accel_pca import (
     _fixture_cache,
     _get_cpu_times,
     _get_rss_mb,
+    dispatch_env,
+    is_rapids_variant,
 )
 from benchmarks.comprehensive.config import (
     DatasetConfig,
@@ -124,15 +126,17 @@ def _run_pyscx_gpu(adata: Any, target_sum: float = 1e4) -> str:
 
 
 def _run_rapids_singlecell(adata: Any, target_sum: float = 1e4) -> str:
-    """rapids-singlecell GPU competitor (V3 task 2.9): the same
-    normalize_total + log1p on the GPU-scanpy stack, in-memory (not backed)."""
+    """rapids-singlecell preprocess route (Phase 2): drives the pyscx in-VRAM
+    `device="gpu"` path on an in-memory X, which after Phase 1 hands
+    normalize_total + log1p to `rsc.pp.*`. (backed X stays native streaming, so
+    the rapids route is exercised on the in-memory fixture.)"""
+    import pyscx
     import rapids_singlecell as rsc
 
-    rsc.get.anndata_to_GPU(adata)
-    rsc.pp.normalize_total(adata, target_sum=target_sum)
-    rsc.pp.log1p(adata)
+    pyscx.accel.normalize_total(adata, target_sum=target_sum, device="gpu")
+    pyscx.accel.log1p(adata, device="gpu")
     rsc.get.anndata_to_CPU(adata)
-    return "rapids-singlecell-gpu"
+    return _extract_route(adata, "normalize_total") or "rapids_singlecell_gpu"
 
 
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
@@ -286,7 +290,8 @@ def run(
     # Warm-up
     for _ in range(N_WARMUP_RUNS):
         warm = _fresh()
-        impl(warm, target_sum)
+        with dispatch_env(key, requires_gpu):
+            impl(warm, target_sum)
         # Materialize the lazy chain for pyscx_cpu so timing reflects
         # "preprocessing complete" rather than "transform enqueued".
         _ = warm.X[:100]
@@ -301,7 +306,8 @@ def run(
         rss_before = _get_rss_mb()
         u0, s0 = _get_cpu_times()
         t0 = time.perf_counter()
-        backend = impl(a, target_sum)
+        with dispatch_env(key, requires_gpu):
+            backend = impl(a, target_sum)
         # Force materialization so the lazy-pyscx-CPU variant's wall time
         # reflects end-to-end (not just transform enqueue).
         if "pyscx_cpu" in key:
@@ -326,7 +332,14 @@ def run(
             extras["gpu_dispatch_route"] = route_norm
         if route_log1p is not None:
             extras["gpu_dispatch_route_log1p"] = route_log1p
-        if requires_gpu and route_norm is not None:
+        if is_rapids_variant(key) and route_norm is not None:
+            # Phase 2: both stages must hand off to rapids-singlecell.
+            both_rapids = (
+                route_norm == "rapids_singlecell_gpu"
+                and route_log1p == "rapids_singlecell_gpu"
+            )
+            extras["preprocess_route_rapids_correct"] = 1.0 if both_rapids else 0.0
+        elif requires_gpu and route_norm is not None:
             both_gpu = route_norm.startswith("gpu_") and (route_log1p or "").startswith("gpu_")
             extras["preprocess_route_gpu_correct"] = 1.0 if both_gpu else 0.0
 

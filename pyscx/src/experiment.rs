@@ -458,6 +458,7 @@ impl PyExperiment {
                 preserve_slots,
                 eager,
                 memory_budget_bytes,
+                false,
             )
         }
     }
@@ -517,91 +518,211 @@ impl PyExperiment {
                 )
             })?;
 
-            // Build the CPU AnnData with the full option surface. `eager=true`
-            // detaches it from the file and materialises X as a host scipy CSR
-            // with deletions / var_names / obs_filter / obsm / layers applied.
+            let dev = scx_accel::GpuDevice::new(gpu_id)
+                .map_err(|e| PyRuntimeError::new_err(format!("GPU device {gpu_id}: {e}")))?;
+            const HEADROOM: f64 = 1.2;
             let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
-            let adata = anndata::to_anndata_filtered(
-                py,
-                &self.path,
-                &self.reader,
-                var_names.as_deref(),
-                obs_filter,
-                layers.as_deref(),
-                obsm.as_deref(),
-                false, // preserve_slots
-                true,  // eager
-                memory_budget_bytes,
-            )?;
 
-            // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
-            // they fit, so coerce to the GpuCsr layout (f32 data / i32 indices /
-            // i64 indptr) via astype(copy=False) — a no-op when already correct.
-            let np = py.import("numpy")?;
-            let f32_ty = np.getattr("float32")?;
-            let i32_ty = np.getattr("int32")?;
-            let i64_ty = np.getattr("int64")?;
-            let x = adata.getattr("X")?;
-            let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
-            // scipy CSR `indices` are column indices (< n_cols), so coercing them
-            // to i32 is lossless as long as n_cols fits i32; numpy astype(int32)
-            // would otherwise wrap silently. (indptr stays i64.) ≤VRAM single-cell
-            // n_cols is tiny — this only guards a pathological input.
-            if n_cols > i32::MAX as usize {
-                return Err(PyValueError::new_err(format!(
-                    "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
-                     the cupyx CSR handoff requires i32 indices."
-                )));
-            }
-            let astype =
-                |arr: Bound<'py, PyAny>, ty: &Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
+            // Fast path: a full-matrix handoff with no row/column reshaping decodes
+            // X straight onto the device (no host scipy CSR, no re-upload — the
+            // decode→host→re-upload trip Phase 0.2 measured as ~92% of census_1m
+            // PCA wall). Any var_names / obs_filter / layer projection, a deletion
+            // vector, or a multimodal source falls back to the host-assemble path
+            // below — on-device filtered decode is Phase 4 format work.
+            const SCX1_CODEC_ID: u8 = 1;
+            let n_csr_shards = self.reader.csr_shard_count_for(0) as usize;
+            let fast_path = var_names.is_none()
+                && obs_filter.is_none()
+                && layers.is_none()
+                && !self.reader.is_multimodal()
+                && !self.reader.header().has_deletion_vectors()
+                && n_csr_shards > 0;
+
+            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode): (
+                Bound<'py, PyAny>,
+                crate::accel::gpu_handoff::GpuCsrMatrix,
+                usize,
+                usize,
+                u64,
+                &'static str,
+            ) = if fast_path {
+                // X-less skeleton (obs / var / obsm / uns / layers assembled eagerly;
+                // X is assigned after the device decode below).
+                let adata = anndata::to_anndata_filtered(
+                    py,
+                    &self.path,
+                    &self.reader,
+                    None,
+                    None,
+                    None,
+                    obsm.as_deref(),
+                    false, // preserve_slots
+                    true,  // eager
+                    memory_budget_bytes,
+                    true, // skip_x
+                )?;
+
+                // Raw shard bytes (borrow the reader's mmap) + a cheap header
+                // pre-scan for the VRAM gate and the honest HtoD byte count.
+                let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n_csr_shards);
+                let mut total_rows: usize = 0;
+                let mut total_nnz: usize = 0;
+                let mut host_htod_bytes: u64 = 0;
+                for i in 0..n_csr_shards {
+                    let bytes = self
+                        .reader
+                        .read_raw_csr_shard_bytes_for(0, i)
+                        .map_err(|e| PyRuntimeError::new_err(format!("read CSR shard {i}: {e}")))?;
+                    let header =
+                        scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(bytes))
+                            .map_err(|e| {
+                                PyRuntimeError::new_err(format!("shard {i} header: {e}"))
+                            })?;
+                    let rows = header.n_major as usize;
+                    let nnz = header.nnz as usize;
+                    total_rows += rows;
+                    total_nnz += nnz;
+                    // Scx1 indices/values decode on-device (no CSR re-upload). Only
+                    // host-decoded codecs (Zstd/Pcodec/LZ4/None) pay the HtoD this
+                    // follow-up exists to avoid — count those bytes so a fully-Scx1
+                    // file reports ~0 uploaded.
+                    if header.codec_id != SCX1_CODEC_ID {
+                        host_htod_bytes += (rows as u64 + 1) * 8 + (nnz as u64) * 8;
+                    }
+                    shard_refs.push(bytes);
+                }
+
+                let n_cols: usize = adata.getattr("n_vars")?.extract()?;
+                if n_cols > i32::MAX as usize {
+                    return Err(PyValueError::new_err(format!(
+                        "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
+                         the cupyx CSR handoff requires i32 indices."
+                    )));
+                }
+
+                // ≤VRAM pre-flight on the device-resident CSR size (HEADROOM covers
+                // the transient single-shard decode buffer during concat).
+                let device_bytes = (total_nnz as u64) * 8 + (total_rows as u64 + 1) * 8;
+                let (free, total) = dev
+                    .free_memory()
+                    .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
+                if (device_bytes as f64) * HEADROOM > free as f64 {
+                    return Err(PyValueError::new_err(format!(
+                        "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
+                         {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
+                         backed/streaming workflow (open(...).to_anndata(backed=True) + \
+                         pyscx.accel.*), not to_gpu_anndata.",
+                        device_bytes as f64 / 1e9,
+                        total_nnz,
+                        free as f64 / 1e9,
+                        total as f64 / 1e9,
+                        gpu_id,
+                    )));
+                }
+
+                let gpu_csr =
+                    scx_accel::decode_csr_shards_to_device(&dev, &shard_refs).map_err(|e| {
+                        PyRuntimeError::new_err(format!("GPU shard assembly failed: {e}"))
+                    })?;
+                let n_rows = gpu_csr.shape.0;
+                let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
+                (
+                    adata,
+                    holder,
+                    n_rows,
+                    n_cols,
+                    host_htod_bytes,
+                    "scx_device_handoff_streamed",
+                )
+            } else {
+                // Host-assemble fallback (filtered / projected / multimodal inputs):
+                // the full option surface via the eager path, then a single HtoD.
+                let adata = anndata::to_anndata_filtered(
+                    py,
+                    &self.path,
+                    &self.reader,
+                    var_names.as_deref(),
+                    obs_filter,
+                    layers.as_deref(),
+                    obsm.as_deref(),
+                    false, // preserve_slots
+                    true,  // eager
+                    memory_budget_bytes,
+                    false, // skip_x
+                )?;
+
+                // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
+                // they fit, so coerce to the GpuCsr layout (f32 data / i32 indices /
+                // i64 indptr) via astype(copy=False) — a no-op when already correct.
+                let np = py.import("numpy")?;
+                let f32_ty = np.getattr("float32")?;
+                let i32_ty = np.getattr("int32")?;
+                let i64_ty = np.getattr("int64")?;
+                let x = adata.getattr("X")?;
+                let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
+                if n_cols > i32::MAX as usize {
+                    return Err(PyValueError::new_err(format!(
+                        "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
+                         the cupyx CSR handoff requires i32 indices."
+                    )));
+                }
+                let astype = |arr: Bound<'py, PyAny>,
+                              ty: &Bound<'py, PyAny>|
+                 -> PyResult<Bound<'py, PyAny>> {
                     let kw = pyo3::types::PyDict::new(py);
                     kw.set_item("copy", false)?;
                     arr.call_method("astype", (ty,), Some(&kw))
                 };
-            let data_arr = astype(x.getattr("data")?, &f32_ty)?;
-            let indices_arr = astype(x.getattr("indices")?, &i32_ty)?;
-            let indptr_arr = astype(x.getattr("indptr")?, &i64_ty)?;
-            let data: Vec<f32> = data_arr
-                .extract::<PyReadonlyArray1<f32>>()?
-                .as_slice()?
-                .to_vec();
-            let indices: Vec<i32> = indices_arr
-                .extract::<PyReadonlyArray1<i32>>()?
-                .as_slice()?
-                .to_vec();
-            let indptr: Vec<i64> = indptr_arr
-                .extract::<PyReadonlyArray1<i64>>()?
-                .as_slice()?
-                .to_vec();
+                let data_arr = astype(x.getattr("data")?, &f32_ty)?;
+                let indices_arr = astype(x.getattr("indices")?, &i32_ty)?;
+                let indptr_arr = astype(x.getattr("indptr")?, &i64_ty)?;
+                let data: Vec<f32> = data_arr
+                    .extract::<PyReadonlyArray1<f32>>()?
+                    .as_slice()?
+                    .to_vec();
+                let indices: Vec<i32> = indices_arr
+                    .extract::<PyReadonlyArray1<i32>>()?
+                    .as_slice()?
+                    .to_vec();
+                let indptr: Vec<i64> = indptr_arr
+                    .extract::<PyReadonlyArray1<i64>>()?
+                    .as_slice()?
+                    .to_vec();
 
-            // ≤VRAM pre-flight: refuse rather than OOM.
-            let bytes_uploaded =
-                (data.len() as u64) * 4 + (indices.len() as u64) * 4 + (indptr.len() as u64) * 8;
-            let dev = scx_accel::GpuDevice::new(gpu_id)
-                .map_err(|e| PyRuntimeError::new_err(format!("GPU device {gpu_id}: {e}")))?;
-            let (free, total) = dev
-                .free_memory()
-                .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
-            const HEADROOM: f64 = 1.2;
-            if (bytes_uploaded as f64) * HEADROOM > free as f64 {
-                return Err(PyValueError::new_err(format!(
-                    "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
-                     {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
-                     backed/streaming workflow (open(...).to_anndata(backed=True) + \
-                     pyscx.accel.*), not to_gpu_anndata.",
-                    bytes_uploaded as f64 / 1e9,
-                    indices.len(),
-                    free as f64 / 1e9,
-                    total as f64 / 1e9,
-                    gpu_id,
-                )));
-            }
+                let bytes_uploaded = (data.len() as u64) * 4
+                    + (indices.len() as u64) * 4
+                    + (indptr.len() as u64) * 8;
+                let (free, total) = dev
+                    .free_memory()
+                    .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
+                if (bytes_uploaded as f64) * HEADROOM > free as f64 {
+                    return Err(PyValueError::new_err(format!(
+                        "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
+                         {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
+                         backed/streaming workflow (open(...).to_anndata(backed=True) + \
+                         pyscx.accel.*), not to_gpu_anndata.",
+                        bytes_uploaded as f64 / 1e9,
+                        indices.len(),
+                        free as f64 / 1e9,
+                        total as f64 / 1e9,
+                        gpu_id,
+                    )));
+                }
 
-            // Upload to a single SCX-owned device CSR and adopt it into cuPy.
-            let holder = crate::accel::gpu_handoff::upload_host_csr(
-                dev, &indptr, &indices, &data, n_rows, n_cols,
-            )?;
+                let holder = crate::accel::gpu_handoff::upload_host_csr(
+                    dev, &indptr, &indices, &data, n_rows, n_cols,
+                )?;
+                (
+                    adata,
+                    holder,
+                    n_rows,
+                    n_cols,
+                    bytes_uploaded,
+                    "scx_device_handoff",
+                )
+            };
+
+            // Adopt the device buffers into a cupyx CSR and assign as X.
             let holder = Bound::new(py, holder)?;
             let cupy = py.import("cupy")?;
             let cupyx_sparse = py.import("cupyx.scipy.sparse")?;
@@ -628,7 +749,7 @@ impl PyExperiment {
                 scx_accel::route::AccelRoute::GpuCsr,
                 scx_accel::route::FallbackReason::None,
             );
-            info.transfer_mode = Some("scx_device_handoff");
+            info.transfer_mode = Some(transfer_mode);
             info.device_id = Some(gpu_id);
             info.bytes_uploaded = Some(bytes_uploaded);
             info.cupy_version = Some(cupy_version);

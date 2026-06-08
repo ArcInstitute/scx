@@ -33,6 +33,8 @@ pub mod neighbors;
 pub mod pca;
 pub mod preprocessing;
 pub mod pseudobulk;
+#[cfg(feature = "gpu")]
+pub mod rapids;
 pub mod route;
 pub mod umap;
 pub mod util;

@@ -105,6 +105,6 @@ pub use scx_gpu::{
     GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat, FUZZY_MAX_K,
 };
 #[cfg(feature = "gpu")]
-pub use scx_gpu::{decode_shard_gpu, GpuCsr, GpuCsrPointers};
+pub use scx_gpu::{decode_csr_shards_to_device, decode_shard_gpu, GpuCsr, GpuCsrPointers};
 #[cfg(feature = "gpu")]
 pub use umap::compute_umap_gpu;

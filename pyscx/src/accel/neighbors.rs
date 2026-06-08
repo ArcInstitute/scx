@@ -48,6 +48,54 @@ pub fn neighbors(
     #[cfg(feature = "gpu")]
     let _gpu_id = _device.gpu_id();
 
+    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` kNN hands off to
+    // rapids-singlecell (`rsc.pp.neighbors`) when `X` is in memory. backed/lazy
+    // X stays on the native cuVS streaming/device-resident path.
+    #[cfg(feature = "gpu")]
+    {
+        use crate::backed::ScxBackedSparseDataset;
+        use crate::lazy_transform::ScxLazyTransformedDataset;
+        let xp = adata.getattr("X")?;
+        let x_in_memory = xp.cast::<ScxBackedSparseDataset>().is_err()
+            && xp.cast::<ScxLazyTransformedDataset>().is_err();
+        if x_in_memory {
+            match super::rapids::decide(py, _device, "neighbors") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run(py, adata, "neighbors", gid, |py, adata| {
+                        let kw = super::rapids::kwargs(py);
+                        kw.set_item("n_neighbors", n_neighbors)?;
+                        kw.set_item("use_rep", use_rep)?;
+                        // ef_construction / ef_search are HNSW-specific knobs with
+                        // no rapids (cuVS) analogue — intentionally not forwarded.
+                        kw.set_item("random_state", random_state)?;
+                        super::rapids::rsc_fn(py, "pp", "neighbors")?.call((adata,), Some(&kw))?;
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    neighbors(
+                        py,
+                        adata,
+                        n_neighbors,
+                        use_rep,
+                        random_state,
+                        ef_construction,
+                        ef_search,
+                        "cpu",
+                    )?;
+                    return super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "neighbors",
+                        scx_accel::AccelRoute::CpuCsr,
+                    );
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
+    }
+
     // Extract representation matrix from adata.obsm[use_rep]
     let obsm = adata.getattr("obsm")?;
     let rep_data = obsm.get_item(use_rep).map_err(|_| {

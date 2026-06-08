@@ -1061,6 +1061,7 @@ fn to_anndata_with_layers<'py>(
     obsm_filter: Option<&[String]>,
     eager: bool,
     memory_budget: Option<u64>,
+    skip_x: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyLayersMapping, ScxLazyObsmMapping, ScxLazyPairwiseMapping,
@@ -1087,9 +1088,19 @@ fn to_anndata_with_layers<'py>(
         )?;
     }
 
-    // X — assemble all CSR shards (with deletion vector filtering)
-    let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
-    let x = csr_to_scipy(py, csr)?;
+    // X — assemble all CSR shards (with deletion vector filtering).
+    //
+    // `skip_x` builds an X-less skeleton: obs/var define the shape and the
+    // caller assigns `adata.X` afterwards. Used by `to_gpu_anndata`'s
+    // device-resident streamed path, which decodes X straight onto the GPU
+    // instead of materialising a host scipy CSR here. obs/var/obsm/uns/layers
+    // are assembled identically either way.
+    let x = if skip_x {
+        None
+    } else {
+        let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
+        Some(csr_to_scipy(py, csr)?)
+    };
 
     // obs metadata — filter by deletion vectors if present
     let obs = match reader.read_obs() {
@@ -1196,7 +1207,9 @@ fn to_anndata_with_layers<'py>(
 
     // Build AnnData kwargs.
     let kwargs = pyo3::types::PyDict::new(py);
-    kwargs.set_item("X", x)?;
+    if let Some(x) = x {
+        kwargs.set_item("X", x)?;
+    }
     if let Some(obs) = obs {
         kwargs.set_item("obs", obs)?;
     }
@@ -1287,10 +1300,28 @@ pub fn to_anndata_filtered<'py>(
     preserve_slots: bool,
     eager: bool,
     memory_budget: Option<u64>,
+    skip_x: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // `skip_x` (the X-less skeleton for `to_gpu_anndata`) is only meaningful on
+    // the no-filter fast path — the caller guarantees no var_names / obs_filter /
+    // layer projection when it sets it (those paths reshape X and must build it).
+    debug_assert!(
+        !skip_x || (var_names.is_none() && obs_filter.is_none() && layer_filter.is_none()),
+        "skip_x requires no var_names / obs_filter / layer_filter"
+    );
+
     // Fast path: no filtering → use existing implementation
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
-        return to_anndata_with_layers(py, path, reader, None, obsm_filter, eager, memory_budget);
+        return to_anndata_with_layers(
+            py,
+            path,
+            reader,
+            None,
+            obsm_filter,
+            eager,
+            memory_budget,
+            skip_x,
+        );
     }
 
     // preserve_slots=true with obs_filter: load full AnnData, then filter
@@ -1308,6 +1339,7 @@ pub fn to_anndata_filtered<'py>(
             obsm_filter,
             true,
             memory_budget,
+            false,
         )?;
 
         let obs_attr = full.getattr("obs")?;
@@ -1460,6 +1492,7 @@ pub fn to_anndata_filtered<'py>(
         obsm_filter,
         true,
         memory_budget,
+        false,
     )?;
 
     if let Some(names) = var_names {
