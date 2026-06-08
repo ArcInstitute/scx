@@ -45,8 +45,6 @@ pub fn neighbors(
 
     // Determine effective device
     let _device = resolve_device(device)?;
-    #[cfg(feature = "gpu")]
-    let _gpu_id = _device.gpu_id();
 
     // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` kNN hands off to
     // rapids-singlecell (`rsc.pp.neighbors`) when `X` is in memory. backed/lazy
@@ -115,60 +113,27 @@ pub fn neighbors(
     let flat = arr.call_method0("ravel")?;
     let data: Vec<f32> = flat.extract()?;
 
-    // Record the planned route on adata.uns["scx_accel"]["neighbors"]. The GPU
-    // route is cuVS CAGRA, gated on the cuVS library being present; a GPU host
-    // without cuVS falls back to CPU HNSW (UnsupportedInputLayout) vs NoCuda
-    // when CUDA is absent.
+    // Record the planned route on adata.uns["scx_accel"]["neighbors"].
     //
-    // INVARIANT (pre-dispatch stamp): safe to stamp *before* dispatch only
-    // because (a) `knn_gpu_eligible` is the *same* `cuvs_available()` probe the
-    // GPU branch re-checks below — the one runtime CPU fall-through (cuVS
-    // missing) is therefore already predicted by this probe — and (b) the cuVS
-    // CAGRA build propagates errors via `.map_err(..)?` rather than silently
-    // dropping to CPU HNSW. If a silent GPU→CPU runtime fallback is ever added,
-    // stamp *after* dispatch on the branch that ran (see umap.rs) or this gate
-    // will false-pass.
-    #[cfg(feature = "gpu")]
-    let knn_gpu_eligible = scx_accel::cuvs_available();
-    #[cfg(not(feature = "gpu"))]
-    let knn_gpu_eligible = false;
+    // ACC-RUST-OPT-V4 Phase 3.3: the in-VRAM native CAGRA dispatch was removed.
+    // In-VRAM `device="gpu"` kNN routes to rapids-singlecell (intercepted above);
+    // the standalone entry now runs CPU HNSW for backed/lazy `X` and under
+    // SCX_FORCE_NATIVE_GPU. The device-resident CAGRA path survives only inside
+    // the fused `pca_neighbors` pipeline (`scx_accel::pca_then_knn_gpu`), where
+    // the PCA embedding never leaves the device. The no-rapids CPU fallback
+    // (route `cpu_*` + `fallback_reason="no_rapids"`) is stamped in the rapids
+    // interception above, so this stamp covers only the genuine CPU runs.
     super::route::write_accel_route(
         py,
         adata,
         "neighbors",
         &super::route::simple_exec_info(
             device,
-            knn_gpu_eligible,
+            false,
             scx_accel::AccelRoute::GpuCsr,
             scx_accel::AccelRoute::CpuCsr,
         ),
     )?;
-
-    // GPU path
-    #[cfg(feature = "gpu")]
-    if let Some(device_id) = _gpu_id {
-        // Check if cuVS CAGRA is available
-        if scx_accel::cuvs_available() {
-            let result = py
-                .detach(|| {
-                    scx_accel::build_knn_graph_gpu(device_id, &data, n_obs, n_vars, n_neighbors)
-                })
-                .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-
-            write_neighbors_to_adata(py, adata, &result, n_neighbors, use_rep, "cagra")?;
-            return Ok(());
-        }
-        // cuVS not available — fall through to CPU with warning
-        let warnings = py.import("warnings")?;
-        warnings.call_method1(
-            "warn",
-            (format!(
-                "neighbors(device={device:?}): cuVS library not found — falling \
-                 back to CPU HNSW (the requested GPU is ignored). Install cuVS \
-                 for GPU-accelerated kNN: conda install -c rapidsai -c conda-forge libcuvs"
-            ),),
-        )?;
-    }
 
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;
