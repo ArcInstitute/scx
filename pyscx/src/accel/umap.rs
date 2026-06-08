@@ -134,82 +134,49 @@ pub fn umap(
         .call_method1("astype", ("float64",))?
         .extract::<Vec<f64>>()?;
 
-    // GPU path
+    // GPU path. The native CUDA SGD kernel was removed in ACC-RUST-OPT-V4 Phase
+    // 3.1 (in-VRAM UMAP routes to rapids-singlecell; see the interception above).
+    // This branch is reached only for backed/lazy `X` (the >VRAM regime, which
+    // never routes to rapids) or in-memory `X` under `SCX_FORCE_NATIVE_GPU=1`;
+    // the sole on-GPU option here is the cuML fallback, otherwise CPU.
     #[cfg(feature = "gpu")]
-    if let Some(device_id) = _gpu_id {
-        // Try native CUDA SGD kernel first — release GIL for duration
-        let gpu_result = py.detach(|| {
-            scx_accel::compute_umap_gpu(
-                device_id,
-                &indptr,
-                &indices,
-                &data,
-                n_obs,
-                n_components,
-                n_epochs,
-                min_dist,
-                spread,
-                negative_sample_rate,
-                learning_rate,
-                random_state,
-            )
-        });
-        match gpu_result {
-            Ok(result) => {
-                write_umap_to_adata(py, adata, &result)?;
-                write_umap_backend(py, adata, "scx-gpu-cuda")?;
-                // Native CUDA SGD kernel ran: record the GPU dense route.
-                super::route::write_accel_route(
-                    py,
-                    adata,
-                    "umap",
-                    &super::route::simple_exec_info(
-                        device,
-                        true,
-                        scx_accel::AccelRoute::GpuDense,
-                        scx_accel::AccelRoute::CpuDense,
-                    ),
-                )?;
-                return Ok(());
-            }
-            Err(e) => {
-                // Native CUDA failed — try cuML fallback
-                let cuml_ok = try_cuml_umap(
-                    py,
-                    adata,
-                    n_components,
-                    n_epochs,
-                    min_dist,
-                    spread,
-                    negative_sample_rate,
-                    learning_rate,
-                    random_state,
-                );
-                if cuml_ok.is_ok() {
-                    // cuML UMAP ran on GPU: record the GPU dense route.
-                    super::route::write_accel_route(
-                        py,
-                        adata,
-                        "umap",
-                        &super::route::simple_exec_info(
-                            device,
-                            true,
-                            scx_accel::AccelRoute::GpuDense,
-                            scx_accel::AccelRoute::CpuDense,
-                        ),
-                    )?;
-                    return Ok(());
-                }
-                // Both GPU paths failed — fall through to CPU with warning
-                let warnings = py.import("warnings")?;
-                warnings.call_method1(
-                    "warn",
-                    (format!(
-                        "GPU UMAP failed (native: {e}; cuML not available) — falling back to CPU"
-                    ),),
-                )?;
-            }
+    if _gpu_id.is_some() {
+        let cuml_ok = try_cuml_umap(
+            py,
+            adata,
+            n_components,
+            n_epochs,
+            min_dist,
+            spread,
+            negative_sample_rate,
+            learning_rate,
+            random_state,
+        );
+        if cuml_ok.is_ok() {
+            // cuML UMAP ran on GPU: record the GPU dense route.
+            super::route::write_accel_route(
+                py,
+                adata,
+                "umap",
+                &super::route::simple_exec_info(
+                    device,
+                    true,
+                    scx_accel::AccelRoute::GpuDense,
+                    scx_accel::AccelRoute::CpuDense,
+                ),
+            )?;
+            return Ok(());
         }
+        // cuML unavailable — fall through to CPU with a warning.
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            (concat!(
+                "GPU UMAP: native CUDA UMAP was removed (in-VRAM UMAP routes to ",
+                "rapids-singlecell) and cuML is not importable — falling back to CPU. ",
+                "Install the rapids analysis backend (see docs/gpu-setup.md)."
+            ),),
+        )?;
     }
 
     // Suppress unused variable warning when gpu feature is not enabled

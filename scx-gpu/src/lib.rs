@@ -67,7 +67,6 @@ pub mod gpu_pca_covariance;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
 pub mod gpu_shard_source;
-pub mod gpu_umap;
 pub mod linear_operator;
 pub mod math_policy;
 pub mod preprocessed_gpu_matrix_source;
@@ -130,7 +129,6 @@ pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
 pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
-pub use gpu_umap::{gpu_umap_from_device_graph, gpu_umap_native, GpuUmapResult};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
