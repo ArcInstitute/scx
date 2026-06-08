@@ -13,6 +13,7 @@ use scx_codec::{CodecId, ValueEncoding};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry, ShardStats};
 use crate::checksum::blake3_hash;
+use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO};
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
@@ -141,6 +142,8 @@ pub struct PreEncodedSection {
     pub section_type: SectionType,
     /// NNZ count for this shard.
     pub nnz: u64,
+    /// Optional decode metadata sidecar for this shard.
+    pub decode_sidecar: Option<DecodeSidecar>,
 }
 
 /// Per-axis layout state used by [`ScxWriter`] to enforce that obs (and
@@ -432,6 +435,22 @@ impl ScxWriter {
         });
 
         Ok(())
+    }
+
+    fn write_decode_sidecar_for_source(
+        &mut self,
+        source_name: &str,
+        sidecar: DecodeSidecar,
+        stats: Option<ShardStats>,
+    ) -> Result<()> {
+        let mut data = Vec::with_capacity(sidecar.estimated_encoded_size());
+        sidecar.write_to(&mut data)?;
+        self.write_section_bytes(
+            format!("decode/{source_name}"),
+            SectionType::DecodeMetadataShard,
+            &data,
+            stats,
+        )
     }
 
     /// Serialize a RecordBatch to Arrow IPC file format bytes.
@@ -1090,6 +1109,27 @@ impl ScxWriter {
             nnz,
         );
 
+        // Build the decode sidecar from the encoder-produced metadata (single
+        // source of truth) — never re-derived. Only Scx1 integer CSR shards
+        // carry `scx1_decode`; CSC / non-CSR targets yield `None` inside
+        // `from_codec_metadata`.
+        let decode_sidecar = match (codec_id, &encoded.scx1_decode) {
+            (CodecId::Scx1, Some(meta)) => DecodeSidecar::from_codec_metadata(
+                meta,
+                value_encoding,
+                shard_index_dtype,
+                shard_header.n_minor,
+                row_start,
+                section_type,
+                shard_global_offset,
+                section_length,
+                section_checksum,
+            )?
+            .filter(|s| s.within_overhead_budget(DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO)),
+            _ => None,
+        };
+        let sidecar_stats = stats.clone();
+
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
             offset: shard_global_offset,
@@ -1099,6 +1139,10 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(stats),
         });
+
+        if let Some(sidecar) = decode_sidecar {
+            self.write_decode_sidecar_for_source(name, sidecar, Some(sidecar_stats))?;
+        }
 
         Ok(())
     }
@@ -1182,6 +1226,8 @@ impl ScxWriter {
 
         self.current_offset += section.section_length;
 
+        let source_name = section.name.clone();
+        let sidecar_stats = section.stats.clone();
         self.entries.push(FullCatalogEntry {
             name: section.name,
             offset: shard_global_offset,
@@ -1191,6 +1237,14 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(section.stats),
         });
+
+        if let Some(sidecar) = section.decode_sidecar {
+            self.write_decode_sidecar_for_source(
+                &source_name,
+                sidecar.with_source_offset(shard_global_offset),
+                Some(sidecar_stats),
+            )?;
+        }
 
         match section.section_type {
             SectionType::CsrShard => {
@@ -2646,6 +2700,68 @@ mod tests {
         let indices = vec![1u32, 3, 0, 2, 4, 2];
         let values: Vec<u8> = vec![5, 10, 1, 3, 7, 2]; // u8 encoding
         (indptr, indices, values)
+    }
+
+    #[test]
+    fn scx1_csr_shard_emits_valid_decode_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decode_sidecar.scx");
+        let mut header = sample_header();
+        header.n_obs = 4;
+        header.n_vars = 20_000;
+        header.codec_id = CodecId::Scx1 as u8;
+        header.index_dtype = 0;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        let nnz_per_row = 8192usize;
+        let mut indptr = Vec::with_capacity(5);
+        let mut indices = Vec::with_capacity(4 * nnz_per_row);
+        let mut values = Vec::with_capacity(4 * nnz_per_row);
+        indptr.push(0);
+        for row in 0..4 {
+            for col in 0..(nnz_per_row - 1) {
+                indices.push(col as u32);
+                values.push(1u8);
+            }
+            indices.push(19_999);
+            values.push(1u8);
+            indptr.push(((row + 1) * nnz_per_row) as u64);
+        }
+
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Scx1,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+        let sidecars: Vec<_> = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| entry.section_type == SectionType::DecodeMetadataShard)
+            .collect();
+        assert_eq!(sidecars.len(), 1);
+        reader.validate_decode_sidecar_entry(sidecars[0]).unwrap();
+
+        let csr_shards = reader.catalog().shards_sorted();
+        assert_eq!(csr_shards.len(), 1);
+        reader.validate_canonical_csr_entry(csr_shards[0]).unwrap();
+
+        let sidecar = reader.read_decode_sidecar_from_entry(sidecars[0]).unwrap();
+        assert_eq!(sidecar.n_rows, 4);
+        assert_eq!(sidecar.n_cols, 20_000);
+        assert_eq!(sidecar.nnz, indices.len() as u64);
+        assert_eq!(sidecar.rows.len(), 4);
     }
 
     /// `set_csr_shard_column_stats_bulk` assigns each `Vec<ColumnStat>` to the
@@ -4827,6 +4943,7 @@ mod tests {
             name: "X_csc_shard_0".to_string(),
             section_type: SectionType::CscShard,
             nnz: 3,
+            decode_sidecar: None,
         };
 
         writer.write_preencoded_shard(pre).unwrap();

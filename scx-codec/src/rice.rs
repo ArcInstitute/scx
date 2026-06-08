@@ -20,6 +20,22 @@ pub const B_VAL: usize = 256;
 /// above 15 are unrepresentable and indicate a corrupt/hostile stream.
 pub const MAX_RICE_K: u8 = 15;
 
+/// Per-block decode metadata produced by the actual Rice encoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiceBlockMetadata {
+    pub value_start: u64,
+    pub n_values: u16,
+    pub bit_offset: u64,
+    pub k: u8,
+}
+
+/// Encoded Rice bytes plus per-block metadata from the same encode pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiceEncodeResult {
+    pub bytes: Vec<u8>,
+    pub blocks: Vec<RiceBlockMetadata>,
+}
+
 /// Compute the Rice parameter k from the median of shifted values.
 ///
 /// `k = clamp(floor(log2(0.6931 * median)), 0, MAX_RICE_K)`.
@@ -36,19 +52,41 @@ fn compute_k(median: u32) -> u8 {
 /// All values must be >= 1 (non-zero counts). They are shifted by -1 before encoding.
 /// The output is a byte vector containing the encoded bitstream.
 pub fn rice_encode(values: &[u32], block_size: usize) -> Result<Vec<u8>, BitStreamError> {
+    Ok(rice_encode_with_metadata(values, block_size)?.bytes)
+}
+
+/// Encode non-zero count values and return the exact per-block decode metadata
+/// observed during encoding.
+pub fn rice_encode_with_metadata(
+    values: &[u32],
+    block_size: usize,
+) -> Result<RiceEncodeResult, BitStreamError> {
     if values.contains(&0) {
         return Err(BitStreamError);
     }
 
     let mut writer = BitWriter::new();
+    let mut blocks = Vec::with_capacity(values.len().div_ceil(block_size));
+    let mut value_start = 0u64;
 
     for chunk in values.chunks(block_size) {
+        if chunk.len() > u16::MAX as usize {
+            return Err(BitStreamError);
+        }
         // Shift: subtract 1 from each value
         let shifted: Vec<u32> = chunk.iter().map(|&v| v - 1).collect();
 
         // Compute Rice parameter k
         let median = floor_median_u32(&shifted);
         let k = compute_k(median);
+        let bit_offset = writer.position() as u64;
+
+        blocks.push(RiceBlockMetadata {
+            value_start,
+            n_values: chunk.len() as u16,
+            bit_offset,
+            k,
+        });
 
         // Write block header: 1 byte with k in low nibble
         writer.write_bits(k as u64, 8);
@@ -65,9 +103,77 @@ pub fn rice_encode(values: &[u32], block_size: usize) -> Result<Vec<u8>, BitStre
 
         // Pad to byte boundary after each block
         writer.pad_to_byte();
+        value_start += chunk.len() as u64;
     }
 
-    Ok(writer.flush())
+    Ok(RiceEncodeResult {
+        bytes: writer.flush(),
+        blocks,
+    })
+}
+
+/// Decode Rice-encoded values by seeking to encoder-produced block offsets.
+pub fn rice_decode_with_metadata(
+    data: &[u8],
+    blocks: &[RiceBlockMetadata],
+) -> Result<Vec<u32>, CodecError> {
+    let n_values: usize = blocks.iter().map(|b| b.n_values as usize).sum();
+    let mut output = Vec::with_capacity(n_values);
+
+    for (block_idx, block) in blocks.iter().enumerate() {
+        if block.n_values == 0 || block.k > MAX_RICE_K {
+            return Err(CodecError::MalformedInput(format!(
+                "invalid Rice metadata for block {block_idx}: n_values={}, k={}",
+                block.n_values, block.k
+            )));
+        }
+        if block.value_start != output.len() as u64 {
+            return Err(CodecError::MalformedInput(format!(
+                "Rice metadata block {block_idx} starts at value {}, expected {}",
+                block.value_start,
+                output.len()
+            )));
+        }
+        let bit_offset = usize::try_from(block.bit_offset).map_err(|_| {
+            CodecError::MalformedInput(format!(
+                "Rice metadata block {block_idx} bit offset overflows usize"
+            ))
+        })?;
+        let mut reader = BitReader::new_at(data, bit_offset)?;
+
+        let block_header = reader.read_bits(8)? as u8;
+        if block_header & 0xF0 != 0 {
+            return Err(CodecError::MalformedInput(format!(
+                "Rice block header has non-zero reserved high nibble: 0x{:02x}",
+                block_header
+            )));
+        }
+        let k = block_header & 0x0F;
+        if k != block.k {
+            return Err(CodecError::MalformedInput(format!(
+                "Rice metadata block {block_idx} k {} != encoded k {}",
+                block.k, k
+            )));
+        }
+
+        for _ in 0..block.n_values {
+            let q = reader.read_unary()?;
+            let r = if k > 0 { reader.read_bits(k)? } else { 0 };
+            let value = q
+                .checked_shl(k as u32)
+                .map(|qk| qk | r)
+                .and_then(|shifted| shifted.checked_add(1))
+                .filter(|&v| v <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    CodecError::MalformedInput(
+                        "Rice value overflows u32 (corrupt stream)".to_string(),
+                    )
+                })?;
+            output.push(value as u32);
+        }
+    }
+
+    Ok(output)
 }
 
 /// Decode Rice-encoded values.

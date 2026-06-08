@@ -52,7 +52,7 @@ cd rscx && R CMD INSTALL .
 
 14 workspace crates plus an integration-test crate; the dependency core is `scx-codec → scx-format → {scx-sparse, scx-mtx, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-accel, scx-convert} → {scx-cli, pyscx, rscx}`. Full graph and isolation rules in [docs/architecture.md § Crate Dependency Graph](docs/architecture.md#crate-dependency-graph). Feature flags: `scx-cli{hdf5,cloud}`, `scx-convert{hdf5}`, `pyscx{cloud,gpu}`, `scx-gpu{gds}`, `scx-accel{gpu}` — all opt-in.
 
-File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX\x01"`), 4096-byte root catalog at offset 256, 8-byte-aligned sections (26 types, IDs 0–25), full catalog at EOF with per-entry checksums + shard statistics. 76-byte CSR shard headers (magic `b"SCXS"`). Codecs: `None`, `Scx1` (integer only), `Pcodec` (float), `Zstd`, `Lz4Shuffle`; auto-codec routes float → `Pcodec`, and for integers selects `Scx1` (median ≤ 8) vs `Zstd` (> 8). On-disk `u64`/`u16-u32`/`u8-u32`, in-memory `i64`/`i32`/`f32` to match scipy CSR zero-copy.
+File format ([docs/format.md](docs/format.md)): 256-byte LE header (magic `b"SCX\x01"`), 4096-byte root catalog at offset 256, 8-byte-aligned sections (27 types, IDs 0–26), full catalog at EOF with per-entry checksums + shard statistics. v3 writers emit canonical row-major CSR and may add `DecodeMetadataShard` sidecars. 76-byte CSR shard headers (magic `b"SCXS"`). Codecs: `None`, `Scx1` (integer only), `Pcodec` (float), `Zstd`, `Lz4Shuffle`; auto-codec routes float → `Pcodec`, and for integers selects `Scx1` (median ≤ 8) vs `Zstd` (> 8). On-disk `u64`/`u16-u32`/`u8-u32`, in-memory `i64`/`i32`/`f32` to match scipy CSR zero-copy.
 
 ## Capabilities (summary)
 

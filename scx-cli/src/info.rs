@@ -574,7 +574,9 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
         // Section names already include the axis prefix
         // (`obs_metadata/shard_N` / `var_metadata/shard_N`), so use them
         // verbatim — `scx info` displays them grouped by axis.
-        SectionType::ObsMetadataShard | SectionType::VarMetadataShard => name.to_string(),
+        SectionType::ObsMetadataShard
+        | SectionType::VarMetadataShard
+        | SectionType::DecodeMetadataShard => name.to_string(),
     }
 }
 

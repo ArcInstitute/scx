@@ -17,6 +17,7 @@ use scx_format::{
     select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection, ProvenanceEntry,
     ScxReader, ScxWriter,
 };
+use scx_sparse::canonicalize_csr;
 
 use crate::to_pyerr;
 
@@ -262,11 +263,37 @@ fn write_csc_shards_from_csr(
     codec_id: CodecId,
     csc_cols_per_shard: usize,
 ) -> Result<(), scx_format::ScxError> {
+    let mut indptr_u64: Vec<u64> = indptr
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(scx_format::ScxError::InvalidCatalog(format!(
+                    "negative CSR indptr value {v} before CSC transpose"
+                )))
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indices_u32: Vec<u32> = indices
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(scx_format::ScxError::InvalidCatalog(format!(
+                    "negative CSR index value {v} before CSC transpose"
+                )))
+            } else {
+                Ok(v as u32)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = data.to_vec();
+    canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut values);
     let csr = scx_sparse::ScxCsr::new_unchecked(
         (n_obs, n_vars),
-        indptr.to_vec(),
-        indices.to_vec(),
-        data.to_vec(),
+        indptr_u64.iter().map(|&v| v as i64).collect(),
+        indices_u32.iter().map(|&v| v as i32).collect(),
+        values,
     );
     let shards = std::slice::from_ref(&csr);
 
@@ -3568,7 +3595,7 @@ fn parallel_encode_csr_shards(
             .par_iter()
             .map(|b| {
                 // 1. Rebase indptr for this shard
-                let shard_indptr: Vec<u64> = if csr_validated {
+                let mut shard_indptr: Vec<u64> = if csr_validated {
                     indptr_owned[b.row_start..=b.row_end]
                         .iter()
                         .map(|&v| (v - b.indptr_base) as u64)
@@ -3590,7 +3617,7 @@ fn parallel_encode_csr_shards(
                 };
 
                 // 2. Convert indices i32 → u32
-                let shard_indices: Vec<u32> = if csr_validated {
+                let mut shard_indices: Vec<u32> = if csr_validated {
                     indices_owned[b.nnz_start..b.nnz_end]
                         .iter()
                         .map(|&v| v as u32)
@@ -3608,12 +3635,14 @@ fn parallel_encode_csr_shards(
                         .collect::<Result<Vec<u32>, String>>()?
                 };
 
-                let shard_data = &data_owned[b.nnz_start..b.nnz_end];
+                let mut shard_data = data_owned[b.nnz_start..b.nnz_end].to_vec();
+                canonicalize_csr(&mut shard_indptr, &mut shard_indices, &mut shard_data);
+
                 let name = format!("{name_prefix}_shard_{}", b.shard_idx);
                 scx_format::encode_one_shard(
                     &shard_indptr,
                     &shard_indices,
-                    shard_data,
+                    &shard_data,
                     explicit_codec,
                     index_dtype,
                     n_vars,
@@ -3937,11 +3966,10 @@ fn warn_csc_dropped(py: Python<'_>) {
         .and_then(|w| w.call_method1("warn", (msg,)));
 }
 
-/// Decompose a scipy CSR matrix and invoke `f` with borrowed slices
-/// suitable for `encode_one_shard`. `indptr` and `indices` are owned
-/// `Vec`s because they require an i64→u64 / i32→u32 cast; `data` is
-/// borrowed directly from the underlying numpy buffer to avoid an
-/// f32 copy. The borrow lives only for the duration of `f`.
+/// Decompose a scipy CSR matrix, canonicalize it, and invoke `f` with
+/// slices suitable for `encode_one_shard`. `indptr`, `indices`, and
+/// `data` are owned because v3 writers must sort rows, sum duplicate
+/// coordinates, and drop explicit zeros before encoding.
 fn decompose_scipy_csr_with<F, R>(py: Python<'_>, csr: &Bound<'_, PyAny>, f: F) -> PyResult<R>
 where
     F: FnOnce(&[u64], &[u32], &[f32]) -> PyResult<R>,
@@ -3954,7 +3982,7 @@ where
     let indptr_slice = indptr
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let indptr_u64: Vec<u64> = indptr_slice
+    let mut indptr_u64: Vec<u64> = indptr_slice
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -3973,7 +4001,7 @@ where
     let indices_slice = indices
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let indices_u32: Vec<u32> = indices_slice
+    let mut indices_u32: Vec<u32> = indices_slice
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -3992,8 +4020,10 @@ where
     let data_slice = data
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mut data_vec = data_slice.to_vec();
+    canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut data_vec);
 
-    f(&indptr_u64, &indices_u32, data_slice)
+    f(&indptr_u64, &indices_u32, &data_vec)
 }
 
 /// Build a fresh `FileHeader` template for an SCX → SCX rewrite.
@@ -5353,22 +5383,22 @@ pub fn from_anndata_impl(
         let encoded_csr_size = section.section_length as usize;
         writer.write_preencoded_shard(section).map_err(to_pyerr)?;
         if !matches!(bitmap_policy, scx_format::BitmapPolicy::Off) {
-            // Build the bitmap from the original CSR slice. boundary
-            // values are bounded to the (already-validated) slice
-            // lengths; the i64→u64 / i32→u32 casts mirror the
-            // `parallel_encode_csr_shards` contract.
+            // Build the bitmap from the same canonical local CSR
+            // representation used by the encoded shard.
             let lo = boundary.row_start;
             let hi = boundary.row_end;
             let nnz_lo = boundary.nnz_start;
             let nnz_hi = boundary.nnz_end;
-            let local_indptr: Vec<u64> = indptr_slice[lo..=hi]
+            let mut local_indptr: Vec<u64> = indptr_slice[lo..=hi]
                 .iter()
                 .map(|&v| (v - boundary.indptr_base) as u64)
                 .collect();
-            let local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
+            let mut local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
                 .iter()
                 .map(|&v| v as u32)
                 .collect();
+            let mut local_data = data_slice[nnz_lo..nnz_hi].to_vec();
+            canonicalize_csr(&mut local_indptr, &mut local_indices, &mut local_data);
             let n_rows = (hi - lo) as u32;
             build_and_write_bitmap_for_shard_python(
                 py,

@@ -9,7 +9,7 @@ use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
 use scx_format::writer::{PreEncodedSection, ScxWriter};
-use scx_sparse::{drop_explicit_zeros_inplace, sort_csr_rows_in_place};
+use scx_sparse::canonicalize_csr;
 
 use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
 use super::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
@@ -1300,7 +1300,7 @@ pub fn h5ad_to_scx_streaming(
 /// time, encoding each shard through [`encode_one_shard`].
 ///
 /// Phase 0.2 seam. The initial implementation is sequential — one
-/// shard read → drop-zeros → sort → encode → write per iteration —
+/// shard read → canonicalize → encode → write per iteration —
 /// matching the behaviour of the original inline loop in
 /// `h5ad_to_scx_streaming`. Phase 8c will replace the body with a
 /// bounded shard queue plus an ordered writer stage, but the
@@ -1338,8 +1338,7 @@ pub fn streaming_writer_coordinator(
                 policy: "sum".to_string(),
             });
         }
-        drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
-        sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
+        canonicalize_csr(&mut shard.indptr, &mut shard.indices, &mut shard.values);
         let row_start = shard.row_start;
         let n_rows = shard.n_rows as u64;
         let pre = encode_one_shard(
@@ -1655,8 +1654,7 @@ fn encode_one_shard_worker(
 ) -> Result<EncodedShardOutput, ConvertError> {
     let mut shard = reader.read_range(row_start, n_rows)?;
     let duplicates_merged = shard.duplicates_merged;
-    drop_explicit_zeros_inplace(&mut shard.indptr, &mut shard.indices, &mut shard.values);
-    sort_csr_rows_in_place(&shard.indptr, &mut shard.indices, &mut shard.values);
+    canonicalize_csr(&mut shard.indptr, &mut shard.indices, &mut shard.values);
 
     let pre = encode_one_shard(
         &shard.indptr,
@@ -1975,15 +1973,40 @@ fn write_csc_shards_from_csr(
     codec_id: CodecId,
     csc_cols_per_shard: usize,
 ) -> Result<(), ConvertError> {
-    // Wrap the in-memory CSR as a single ScxCsr "shard" for the
-    // transpose iterator. Use the unchecked constructor — these
-    // arrays were just produced by validated readers, no need to
-    // re-validate.
+    // Wrap the canonical in-memory CSR as a single ScxCsr "shard"
+    // for the transpose iterator so the optional CSC sidecar mirrors
+    // the row-major shards emitted by `write_csr_shards`.
+    let mut indptr_u64: Vec<u64> = indptr
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(ConvertError::Other(format!(
+                    "negative CSR indptr value {v} before CSC transpose"
+                )))
+            } else {
+                Ok(v as u64)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indices_u32: Vec<u32> = indices
+        .iter()
+        .map(|&v| {
+            if v < 0 {
+                Err(ConvertError::Other(format!(
+                    "negative CSR index value {v} before CSC transpose"
+                )))
+            } else {
+                Ok(v as u32)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = data.to_vec();
+    canonicalize_csr(&mut indptr_u64, &mut indices_u32, &mut values);
     let csr = scx_sparse::ScxCsr::new_unchecked(
         (n_obs, n_vars),
-        indptr.to_vec(),
-        indices.to_vec(),
-        data.to_vec(),
+        indptr_u64.iter().map(|&v| v as i64).collect(),
+        indices_u32.iter().map(|&v| v as i32).collect(),
+        values,
     );
     let shards = std::slice::from_ref(&csr);
 
@@ -2059,7 +2082,10 @@ fn write_csr_shards(
             n_vars as u64,
         )
         .map_err(|e| ConvertError::Other(format!("X shard validation failed: {e}")))?;
-        let shard_data = &data[nnz_start..nnz_end];
+        let mut shard_indptr = shard_indptr;
+        let mut shard_indices = shard_indices;
+        let mut shard_data = data[nnz_start..nnz_end].to_vec();
+        canonicalize_csr(&mut shard_indptr, &mut shard_indices, &mut shard_data);
 
         // Pre-encode so the bitmap auto-policy can compare against the
         // post-codec section length (matches streaming + python in-memory
@@ -2068,7 +2094,7 @@ fn write_csr_shards(
         let pre = encode_one_shard(
             &shard_indptr,
             &shard_indices,
-            shard_data,
+            &shard_data,
             Some(codec_id),
             index_dtype,
             n_vars_u32,

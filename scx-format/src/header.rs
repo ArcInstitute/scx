@@ -16,13 +16,17 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 /// Readers accept versions 1..=CURRENT_FORMAT_VERSION.
 /// The writer stamps this value in `finish()`.
 ///
-/// v2 (current) carries three new fields between `front_catalog_length`
+/// v2 carries three new fields between `front_catalog_length`
 /// and the trailing `reserved` block: `n_modalities`,
 /// `modality_table_offset`, `modality_table_length`. v1 readers reject
 /// v2 files via the `format_version > CURRENT_FORMAT_VERSION` check;
 /// v2 readers accept both versions and stamp the new fields as zero
 /// when reading a v1 file (single-modality semantic equivalence).
-pub const CURRENT_FORMAT_VERSION: u16 = 2;
+///
+/// v3 adds the canonical CSR invariant for newly written CSR-like shards
+/// and permits `DecodeMetadataShard` sections that index Scx1 shard
+/// payloads for direct device/random-access decode.
+pub const CURRENT_FORMAT_VERSION: u16 = 3;
 
 /// Bitmask of currently-defined flag bits. Reserved bits (4 and 8..=31)
 /// must be zero per the on-disk spec; `read_from` rejects any header
@@ -36,7 +40,7 @@ pub const KNOWN_FLAGS: u32 =
 pub struct FileHeader {
     /// Magic bytes: b"SCX\x01"
     pub magic: [u8; 4],
-    /// Format version (currently 2)
+    /// Format version (currently 3)
     pub format_version: u16,
     /// Header length in bytes (always 256)
     pub header_length: u16,
@@ -117,7 +121,7 @@ impl FileHeader {
     ///   `modality_table_offset` (u64), `modality_table_length` (u64),
     ///   then a 112-byte `reserved` tail.
     ///
-    /// Writers should always emit v2 going forward
+    /// Writers should always emit the current version going forward
     /// (`format_version = CURRENT_FORMAT_VERSION`).
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_all(&self.magic)?;
@@ -151,7 +155,7 @@ impl FileHeader {
             w.write_all(&self.reserved)?;
         } else {
             // v1 layout: reserved is 132 bytes. Writers should not emit
-            // v1 going forward (CURRENT_FORMAT_VERSION = 2), but the
+            // v1 going forward (CURRENT_FORMAT_VERSION is newer), but the
             // 132-byte tail is preserved here for symmetry with the
             // legacy on-disk shape: 20 leading zero bytes (where v2
             // placed the new fields) followed by `self.reserved` (112
@@ -173,7 +177,7 @@ impl FileHeader {
     ///   to be zero (v1 writers always wrote them as zero, so any
     ///   non-zero value here indicates corruption). The new modality
     ///   fields are stamped as zero in the returned struct.
-    /// - v2: the three modality-routing fields (`n_modalities`,
+    /// - v2/v3: the three modality-routing fields (`n_modalities`,
     ///   `modality_table_offset`, `modality_table_length`) are parsed
     ///   from those 20 bytes, followed by 112 bytes of `reserved`.
     ///
@@ -712,7 +716,7 @@ mod tests {
 
     #[test]
     fn reject_bad_version() {
-        // Anything beyond CURRENT_FORMAT_VERSION (currently 2) must be
+        // Anything beyond CURRENT_FORMAT_VERSION must be
         // rejected. Version 0 is also invalid.
         let mut header = sample_header();
         header.format_version = CURRENT_FORMAT_VERSION + 1;
@@ -746,10 +750,10 @@ mod tests {
         assert_eq!(decoded.reserved, [0u8; 112]);
     }
 
-    /// v2 round-trip: write a header with non-zero modality fields,
-    /// read back, and assert all four new fields preserved.
+    /// Current-format round-trip: write a header with non-zero modality fields,
+    /// read back, and assert all modality fields are preserved.
     #[test]
-    fn v2_round_trip_modality_fields() {
+    fn current_round_trip_modality_fields() {
         let mut header = sample_header();
         header.n_modalities = 3;
         header.modality_table_offset = 0x4000;
@@ -762,7 +766,7 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let decoded = FileHeader::read_from(&mut cursor).unwrap();
-        assert_eq!(decoded.format_version, 2);
+        assert_eq!(decoded.format_version, CURRENT_FORMAT_VERSION);
         assert_eq!(decoded.n_modalities, 3);
         assert_eq!(decoded.modality_table_offset, 0x4000);
         assert_eq!(decoded.modality_table_length, 0x200);

@@ -368,10 +368,11 @@ scGPT train end-to-end on atlas-scale SCX data.
 `pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
 [docs/multimodal.md](docs/multimodal.md) for the user-facing guide
 and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
-the on-disk layout. Section ids 15 = `ModalityTable` and
-16 = `LayerCscShard` are now allocated; ids 17–31 are reserved for
-further multimodal/spatial extensions; ids 32–239 are reserved for
-future use; ids 240–255 are vendor / private. The `has_modalities`
+the on-disk layout. Section ids 15 = `ModalityTable`, 16 = `LayerCscShard`, 17–25 =
+embedding / sharded metadata extensions, and 26 = `DecodeMetadataShard`
+are now allocated; ids 27–31 are reserved for further multimodal/spatial
+extensions; ids 32–239 are reserved for future use; ids 240–255 are
+vendor / private. The `has_modalities`
 header flag (bit 7) is wired through writers and readers.
 
 ### 3.5 Quality + Polish — PARTIALLY COMPLETE
