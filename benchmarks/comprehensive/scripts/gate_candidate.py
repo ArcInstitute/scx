@@ -809,7 +809,9 @@ def _translate_probe_result(r: dict) -> list[CheckResult]:
 # ---------------------------------------------------------------------------
 
 
-def _check_worker_gpu_pyscx(env_name: str | None) -> CheckResult:
+def _check_worker_gpu_pyscx(
+    env_name: str | None, preflight_ran: bool = True
+) -> CheckResult:
     """Verify the worker GPU conda env has a pyscx built with ``--features gpu``.
 
     Background: pyscx's editable .so is shared across conda envs via the
@@ -820,10 +822,20 @@ def _check_worker_gpu_pyscx(env_name: str | None) -> CheckResult:
     after a 6h full-tier bench in this session.
 
     This check spawns a ~1s subprocess in the worker GPU env, imports
-    pyscx, and asserts ``accel.gpu_info()`` is truthy. Runs
-    unconditionally when GPU is in scope, even when ``--skip-preflight``
-    is passed (the SLURM gpu_probe is the heavier preflight piece — this
-    is the cheap local one we always want).
+    pyscx, and inspects ``accel.gpu_info()``. Runs unconditionally when GPU
+    is in scope, even when ``--skip-preflight`` is passed (the SLURM
+    gpu_probe is the heavier preflight piece — this is the cheap local one
+    we always want).
+
+    ``IMPORT_FAIL`` / ``CALL_FAIL`` (a genuinely broken gpu build) are
+    always fatal. A falsy ``accel.gpu_info()`` (``GPU_INFO_FALSY``) is
+    ambiguous — it means "no GPU on *this* host **or** built without
+    ``--features gpu``". When ``preflight_ran`` is True the SLURM gpu_probe
+    already validated the build on a real GPU node, so this is just a
+    CPU-hosted orchestrator with no local GPU → WARN. Under
+    ``--skip-preflight`` (``preflight_ran=False``) no authoritative probe
+    ran, so a falsy result must stay FAIL rather than silently let every
+    GPU benchmark skip.
 
     Returns ``CheckResult(level="ok" | "fail" | "warn")``.
     """
@@ -871,18 +883,53 @@ def _check_worker_gpu_pyscx(env_name: str | None) -> CheckResult:
             "worker_gpu_pyscx", "fail",
             f"subprocess timed out (60s) in env={env_name}",
         )
+    # Scan *all* lines for the probe's verdict prefix, not just out[-1]: stderr
+    # is concatenated after stdout, so a trailing conda/deprecation warning line
+    # would otherwise mask the real result (and re-introduce the false-fail this
+    # check is meant to avoid).
     out = (proc.stdout + proc.stderr).strip().splitlines()
-    last = out[-1] if out else ""
-    if proc.returncode == 0 and last.startswith("OK:"):
-        return CheckResult("worker_gpu_pyscx", "ok", f"env={env_name}: {last}")
+
+    def _find(prefix: str) -> str | None:
+        return next((ln for ln in out if ln.startswith(prefix)), None)
+
+    ok_line = _find("OK:")
+    if proc.returncode == 0 and ok_line:
+        return CheckResult("worker_gpu_pyscx", "ok", f"env={env_name}: {ok_line}")
+
+    # `GPU_INFO_FALSY` means pyscx imported cleanly but accel.gpu_info() was
+    # falsy — i.e. either there is no GPU on *this* (orchestrator) host, or the
+    # build is missing --features gpu. That is NOT a broken gpu build the way
+    # IMPORT_FAIL / CALL_FAIL are. When preflight ran, the SLURM gpu_probe
+    # already validated pyscx-gpu on a real GPU node, so this is just a
+    # CPU-hosted orchestrator → WARN. Under --skip-preflight no authoritative
+    # probe ran, so a falsy result stays FAIL rather than silently skipping
+    # every GPU benchmark.
+    falsy_line = _find("GPU_INFO_FALSY")
+    if falsy_line:
+        if preflight_ran:
+            return CheckResult(
+                "worker_gpu_pyscx", "warn",
+                f"env={env_name}: no GPU on orchestrator host ({falsy_line}); "
+                "the pre-flight SLURM gpu_probe is the authoritative gpu-build check",
+            )
+        return CheckResult(
+            "worker_gpu_pyscx", "fail",
+            f"env={env_name}: {falsy_line} under --skip-preflight; with no SLURM "
+            "gpu_probe this is indistinguishable from a build missing --features "
+            "gpu, which would silently skip every GPU benchmark. Drop "
+            "--skip-preflight to validate the build on a GPU node, or rebuild "
+            "with: cd pyscx && /path/to/.venv/bin/maturin develop --release "
+            "--features gpu",
+        )
 
     rebuild_hint = (
         "rebuild with: cd pyscx && "
         "/path/to/.venv/bin/maturin develop --release --features gpu"
     )
+    err_line = _find("IMPORT_FAIL") or _find("CALL_FAIL") or (out[-1] if out else "")
     return CheckResult(
         "worker_gpu_pyscx", "fail",
-        f"env={env_name}: {last or 'no output'} (rc={proc.returncode}); {rebuild_hint}",
+        f"env={env_name}: {err_line or 'no output'} (rc={proc.returncode}); {rebuild_hint}",
     )
 
 
@@ -1278,9 +1325,15 @@ def main() -> int:
         if plan.get("accel_gpu"):
             phase = "worker-gpu-sanity"
             gpu_env = _resolve_worker_gpu_env()
-            sanity = _check_worker_gpu_pyscx(gpu_env)
+            sanity = _check_worker_gpu_pyscx(
+                gpu_env, preflight_ran=not args.skip_preflight
+            )
             log = phase_logger("worker-gpu-sanity")
-            log_method = "info" if sanity.level == "ok" else sanity.level
+            # Map CheckResult levels to real logging.Logger method names
+            # ("warn"/"fail" are not logger methods → AttributeError otherwise).
+            log_method = {"ok": "info", "warn": "warning", "fail": "error"}.get(
+                sanity.level, "info"
+            )
             getattr(log, log_method)(
                 "%s [%s]: %s", sanity.name, sanity.level, sanity.msg,
             )
