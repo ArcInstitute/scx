@@ -303,11 +303,14 @@ pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResul
 ///     device: Device selection — "auto" (default), "cpu", "gpu", or
 ///         "gpu:N" to target CUDA device N on multi-GPU systems.
 ///     method: PCA method — "auto" (default), "covariance", or "randomized".
-///         "auto" chooses covariance for n_vars <= GPU_COVARIANCE_PCA_THRESHOLD
-///         (8000) on GPU, and n_vars <= COVARIANCE_PCA_THRESHOLD (5000) on CPU.
+///         On CPU, "auto" chooses covariance for n_vars <=
+///         COVARIANCE_PCA_THRESHOLD (5000), else randomized. On GPU the native
+///         in-VRAM covariance core was removed in ACC-RUST-OPT-V4 Phase 3.2, so
+///         every method resolves to randomized (in-memory `device="gpu"` routes
+///         to rapids-singlecell, which runs its own covariance/randomized PCA).
 ///     qr_method: QR algorithm for randomized PCA — "householder" (default)
-///         or "cholesky". `cholesky` selects CholeskyQR2 (Phase 4, not yet
-///         implemented). Ignored for method="covariance".
+///         or "cholesky". `cholesky` selects CholeskyQR2. Ignored for
+///         method="covariance".
 ///
 /// Note: GPU mode uses f32 precision throughout (CPU uses f64 intermediates),
 /// producing slightly different but equally valid results. See docs/scanpy.md.

@@ -18,7 +18,6 @@ use super::pca::{
     write_pca_to_adata, BorrowedCsrSource, ScxCsrSource,
 };
 #[cfg(feature = "gpu")]
-#[cfg(feature = "gpu")]
 use super::util::extract_materialized_csr;
 #[cfg(feature = "gpu")]
 use crate::backed::ScxBackedSparseDataset;

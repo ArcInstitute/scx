@@ -1,4 +1,6 @@
-//! UMAP embedding — CPU SGD + GPU CUDA kernel + cuML fallback.
+//! UMAP embedding — CPU SGD + in-VRAM rapids-singlecell (`rsc.tl.umap`) +
+//! cuML fallback. The native GPU CUDA SGD kernel was removed in
+//! ACC-RUST-OPT-V4 Phase 3.
 
 use numpy::PyArray2;
 use pyo3::exceptions::PyRuntimeError;
@@ -55,7 +57,9 @@ pub fn umap(
 
     // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` UMAP hands off to
     // rapids-singlecell (`rsc.tl.umap`) when `X` is in memory. backed/lazy X
-    // stays on the native device-resident SGD path.
+    // (and the `SCX_FORCE_NATIVE_GPU=1` in-memory case) fall through to the
+    // cuML fallback then CPU SGD — the native device-resident UMAP SGD kernel
+    // was removed in Phase 3.1.
     #[cfg(feature = "gpu")]
     {
         use crate::backed::ScxBackedSparseDataset;

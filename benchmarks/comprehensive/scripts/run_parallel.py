@@ -822,8 +822,8 @@ def _per_job_slurm_params(
     # Route accelerator benchmarks
     # to the GPU partition **only for variants that actually use the GPU**.
     # Variant naming convention: format_key ending in `_gpu` or containing
-    # `_gpu_` indicates GPU dispatch (e.g. `accel_pca__pyscx_gpu_cov`,
-    # `accel_knn__pyscx_gpu_cagra`). CPU-only variants (`accel_*__scanpy_cpu`,
+    # `_gpu_` indicates GPU dispatch (e.g. `accel_pca__pyscx_gpu_rand_hh`,
+    # `accel_pca__rapids_singlecell_gpu`). CPU-only variants (`accel_*__scanpy_cpu`,
     # `accel_*__pyscx_cpu*`, `accel_leiden__leidenalg_cpu`) flow through
     # partition_for_memory which auto-promotes to cpu_high_mem when sizing
     # exceeds the preemptible-GPU node's RAM ceiling — unblocking
@@ -916,7 +916,7 @@ def main() -> None:
     # Resolve formats
     # `accel_formats()` is lazy-loaded — pulls in the `FormatVariant` entries
     # for each `accel_*.py` module's implementation variants (PCA: scanpy_cpu,
-    # pyscx_cpu_auto, pyscx_gpu_cov, pyscx_gpu_rand_hh, pyscx_gpu_rand_chol;
+    # pyscx_cpu_auto, pyscx_gpu_rand_hh, pyscx_gpu_rand_chol, rapids_singlecell_gpu;
     # kNN / UMAP / Leiden / preprocess / HVG similarly). Included whenever
     # --include-accel is set, when --formats explicitly names an accel key,
     # or when --benchmarks names any accel_* benchmark.
@@ -963,7 +963,7 @@ def main() -> None:
         formats = list(PRIMARY_FORMATS)
 
     # --no-gpu: drop accel GPU variants. By convention accel format keys are
-    # `<bench>__<impl>_<device>[_<extra>]`, e.g. `accel_pca__pyscx_gpu_cov`.
+    # `<bench>__<impl>_<device>[_<extra>]`, e.g. `accel_pca__pyscx_gpu_rand_hh`.
     # The substring "_gpu" is unique to GPU variants — CPU keys use "_cpu" and
     # format-benchmark keys (zarr_zstd, scx_auto, …) don't include "_gpu".
     if args.no_gpu:
@@ -1613,8 +1613,8 @@ def parse_args() -> argparse.Namespace:
                              "--formats names any accel_* key.")
     parser.add_argument("--no-gpu", action="store_true",
                         help="Drop accel formats whose key matches *_gpu* "
-                             "(e.g. accel_pca__pyscx_gpu_cov, "
-                             "accel_knn__pyscx_gpu). Use on CPU-only hosts or "
+                             "(e.g. accel_pca__pyscx_gpu_rand_hh, "
+                             "accel_pca__rapids_singlecell_gpu). Use on CPU-only hosts or "
                              "when validating CPU-only changes on a GPU box. "
                              "CPU accel variants and format benchmarks are "
                              "unaffected.")

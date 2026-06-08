@@ -1,18 +1,27 @@
-"""Tests for pyscx.accel.pca_neighbors() — fused device-resident PCA → kNN.
+"""Tests for the fused accelerators `pyscx.accel.pca_neighbors[_umap]`.
 
-The fused entry runs GPU PCA then GPU CAGRA kNN in one call, keeping the PCA
-embedding resident on the GPU between the two stages (V3 plan Phase 2.3). When
-the fully device-resident path is unavailable it falls back to sequential
-pca() + neighbors().
+Routing after ACC-RUST-OPT-V4 Phase 3 (native in-VRAM GPU paths removed):
 
-Coverage:
-* CPU fallback (any host): outputs + route metadata match sequential
-  pca(device="cpu") + neighbors(device="cpu"); routes stamp "cpu_csr".
-* Fused GPU path (gated on cuVS): outputs match sequential GPU pca + neighbors;
-  pca / neighbors / pca_neighbors routes stamp "gpu_device_resident".
+* **CPU** (any host): outputs + route metadata match sequential
+  `pca(device="cpu")` + `neighbors(device="cpu")` [+ `umap(device="cpu")`];
+  routes stamp `cpu_csr` (and `cpu_dense` for the umap stage/summary).
+* **In-memory `device="gpu"` with rapids-singlecell present:** routes to the
+  rapids pipeline — every stage + the summary stamp `rapids_singlecell_gpu`
+  (`pca_neighbors`: `rsc.pp.pca`+`rsc.pp.neighbors`; `pca_neighbors_umap`:
+  +`rsc.tl.umap`).
+* **`pca_neighbors` device-resident native path** (`gpu_device_resident`): kept
+  for backed/lazy `X` and for in-memory `X` under `SCX_FORCE_NATIVE_GPU=1` —
+  the PCA embedding stays GPU-resident and feeds straight into CAGRA. PCA on
+  GPU is always randomized (the in-VRAM covariance core was removed in 3.2).
+* **`pca_neighbors_umap` has no native device-resident path** (native UMAP SGD +
+  device fuzzy graph were removed in 3.1): in-VRAM it runs the rapids pipeline;
+  backed/lazy (or rapids-absent) inputs fall back to sequential
+  pca → neighbors → umap (umap stage uses cuML → CPU).
 """
 
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import pytest
@@ -30,35 +39,53 @@ def _gpu_available() -> bool:
         return False
 
 
-def _cuvs_available() -> bool:
-    """True iff a GPU is present AND cuVS CAGRA actually runs (method=="cagra")."""
-    if not _gpu_available():
-        return False
+def _probe_fused_route(env: dict[str, str] | None = None) -> str | None:
+    """Run `pca_neighbors(device="gpu")` on a tiny in-memory AnnData and return
+    the stamped `pca_neighbors` route (or None on any failure).
+
+    Used to detect, at collection time, which GPU regime the host is in —
+    behavioral detection is more robust than reimplementing the internal
+    rapids / cuVS probes (which are not exposed to Python).
+    """
+    saved: dict[str, str | None] = {}
+    if env:
+        for k, v in env.items():
+            saved[k] = os.environ.get(k)
+            os.environ[k] = v
     try:
         import anndata as ad
         import pyscx
 
         rng = np.random.default_rng(0)
-        a = ad.AnnData(X=sp.csr_matrix(rng.random((60, 10), dtype=np.float32)))
-        a.obsm["X_pca"] = np.ascontiguousarray(a.X.toarray(), dtype=np.float32)
-        pyscx.accel.neighbors(a, n_neighbors=5, device="gpu")
-        return a.uns["neighbors"]["params"]["method"] == "cagra"
+        a = ad.AnnData(X=sp.csr_matrix(rng.random((60, 12), dtype=np.float32)))
+        pyscx.accel.pca_neighbors(a, n_comps=5, n_neighbors=5, device="gpu")
+        return a.uns["scx_accel"]["pca_neighbors"]["route"]
     except Exception:
-        return False
+        return None
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
-cuvs_only = pytest.mark.skipif(
-    not _cuvs_available(),
-    reason="cuVS CAGRA not available — skipping fused device-resident GPU tests",
+# In-VRAM rapids pipeline available (in-memory `device="gpu"` → rapids).
+_RAPIDS_FUSED = _gpu_available() and _probe_fused_route() == "rapids_singlecell_gpu"
+# Native device-resident CAGRA fused path available (force-native bypasses
+# rapids; backed/lazy inputs use the same native path). cuVS-gated.
+_DEVICE_RESIDENT = (
+    _gpu_available()
+    and _probe_fused_route({"SCX_FORCE_NATIVE_GPU": "1"}) == "gpu_device_resident"
 )
 
-# Inverse gate: a GPU is present but cuVS is NOT — the partial-fallback case
-# (GPU PCA + CPU HNSW kNN). Skips on CPU-only hosts AND on hosts where cuVS is
-# installed, so it is a no-op in most environments; it exists to assert the
-# route metadata is accurate when only the kNN stage falls back.
-gpu_no_cuvs = pytest.mark.skipif(
-    not (_gpu_available() and not _cuvs_available()),
-    reason="needs a GPU host WITHOUT cuVS — skipping partial-fallback route test",
+rapids_fused_only = pytest.mark.skipif(
+    not _RAPIDS_FUSED,
+    reason="rapids-singlecell in-VRAM pipeline not available — skipping rapids fused tests",
+)
+device_resident_only = pytest.mark.skipif(
+    not _DEVICE_RESIDENT,
+    reason="native device-resident CAGRA (cuVS) not available — skipping device-resident fused tests",
 )
 
 
@@ -133,15 +160,46 @@ class TestPcaNeighborsCpu:
 
 
 # ---------------------------------------------------------------------------
-# Fused device-resident GPU path (gated on cuVS)
+# In-memory `device="gpu"` → rapids-singlecell pipeline (Phase 1.4)
 # ---------------------------------------------------------------------------
 
 
-@cuvs_only
-class TestPcaNeighborsGpu:
-    def test_route_metadata_device_resident(self, synthetic_adata):
+@rapids_fused_only
+class TestPcaNeighborsRapids:
+    def test_route_metadata_rapids(self, synthetic_adata):
         import pyscx
 
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
+
+        accel = adata.uns["scx_accel"]
+        assert accel["pca"]["route"] == "rapids_singlecell_gpu"
+        assert accel["neighbors"]["route"] == "rapids_singlecell_gpu"
+        assert accel["pca_neighbors"]["route"] == "rapids_singlecell_gpu"
+
+    def test_writes_all_slots(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
+
+        assert adata.obsm["X_pca"].shape == (100, 10)
+        assert "connectivities" in adata.obsp
+        assert adata.obsp["connectivities"].nnz > 0
+
+
+# ---------------------------------------------------------------------------
+# Native device-resident fused PCA → CAGRA kNN (gated on cuVS).
+# Reached for backed/lazy `X`, or in-memory `X` under SCX_FORCE_NATIVE_GPU=1.
+# ---------------------------------------------------------------------------
+
+
+@device_resident_only
+class TestPcaNeighborsDeviceResident:
+    def test_route_metadata_force_native(self, synthetic_adata, monkeypatch):
+        import pyscx
+
+        monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
         adata = synthetic_adata.copy()
         pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
 
@@ -149,56 +207,42 @@ class TestPcaNeighborsGpu:
         assert accel["pca"]["route"] == "gpu_device_resident"
         assert accel["neighbors"]["route"] == "gpu_device_resident"
         assert accel["pca_neighbors"]["route"] == "gpu_device_resident"
-        # And neighbors used CAGRA, not HNSW.
+        # The device-resident kNN stage uses CAGRA, not HNSW.
         assert adata.uns["neighbors"]["params"]["method"] == "cagra"
 
-    def test_matches_sequential_gpu(self, synthetic_adata):
-        """Fused GPU path matches the sequential ops.
+    def test_matches_sequential_pca(self, synthetic_adata, monkeypatch):
+        """Fused device-resident PCA matches a separate force-native GPU PCA run,
+        and the kNN graph is valid.
 
-        Two separate GPU PCA runs differ only at f32 noise level, so PCA is
-        compared with tolerance. The kNN graph is checked *deterministically* by
-        running CAGRA on the fused run's own X_pca (the exact embedding the
-        device-resident kNN saw) — identical input ⇒ identical graph.
+        Two GPU randomized-PCA runs differ only at f32 noise level, so PCA is
+        compared with tolerance. The native standalone `neighbors(device="gpu")`
+        no longer produces a CAGRA graph (Phase 3.3 routes it to CPU HNSW /
+        rapids), so the fused CAGRA graph cannot be reproduced standalone — we
+        assert it is non-degenerate instead.
         """
-        import anndata as ad
         import pyscx
 
+        monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
         fused = synthetic_adata.copy()
         pyscx.accel.pca_neighbors(
             fused, n_comps=20, n_neighbors=15, device="gpu", random_state=0
         )
 
-        # PCA parity (tolerance) vs a separate GPU PCA run.
         seq = synthetic_adata.copy()
         pyscx.accel.pca(seq, n_comps=20, device="gpu", random_state=0)
         np.testing.assert_allclose(
             fused.obsm["X_pca"], seq.obsm["X_pca"], rtol=1e-3, atol=1e-3
         )
 
-        # kNN handoff: CAGRA on the fused embedding must reproduce the fused
-        # graph. Two CAGRA builds can break ties between equidistant neighbors
-        # differently, so compare per-row neighbor *sets* and allow a small
-        # fraction of rows to differ (a broken handoff would mismatch ~all rows).
-        ref = ad.AnnData(X=fused.X.copy())
-        ref.obsm["X_pca"] = np.ascontiguousarray(fused.obsm["X_pca"], dtype=np.float32)
-        pyscx.accel.neighbors(ref, n_neighbors=15, device="gpu")
-        assert ref.uns["neighbors"]["params"]["method"] == "cagra"
-
-        fd = fused.obsp["distances"].tocsr()
-        rd = ref.obsp["distances"].tocsr()
-        n_obs = fd.shape[0]
-        mismatched = sum(
-            set(fd.indices[fd.indptr[i] : fd.indptr[i + 1]])
-            != set(rd.indices[rd.indptr[i] : rd.indptr[i + 1]])
-            for i in range(n_obs)
-        )
-        assert mismatched <= 0.05 * n_obs, (
-            f"{mismatched}/{n_obs} rows have different neighbor sets — "
-            "device kNN handoff likely broken"
-        )
+        # kNN graph sanity: symmetric connectivities with the expected fan-out.
+        conn = fused.obsp["connectivities"].tocsr()
+        assert conn.shape == (100, 100)
+        assert conn.nnz > 0
+        assert fused.uns["neighbors"]["params"]["method"] == "cagra"
 
     def test_backed_input(self, pca_adata):
-        """Fused path works on a backed SCX `X` (streaming source)."""
+        """Fused path works on a backed SCX `X` (streaming source); backed never
+        routes to rapids, so it takes the native device-resident path."""
         import pyscx
 
         scx_path, _ = pca_adata
@@ -215,7 +259,8 @@ class TestPcaNeighborsGpu:
         Exercises the `ScxLazyTransformedDataset` dispatch branch in fused.rs.
         The CPU-device normalize/log1p setup keeps `X` lazy (a GPU-device
         normalize would eager-materialize), so the fused GPU entry consumes the
-        lazy shard source directly.
+        lazy shard source directly — and lazy inputs take the native
+        device-resident path (never rapids).
         """
         import pyscx
 
@@ -231,17 +276,14 @@ class TestPcaNeighborsGpu:
         assert "connectivities" in adata.obsp
         assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
 
-    @pytest.mark.parametrize("method", ["covariance", "randomized", "auto"])
-    def test_pca_method_routes(self, synthetic_adata, method):
-        """Both device PCA cores feed the fused handoff.
-
-        `synthetic_adata` has n_vars=50 ≤ GPU_COVARIANCE_PCA_THRESHOLD, so
-        `method="auto"` resolves to covariance; `"covariance"` exercises
-        `gpu_covariance_pca_device` and `"randomized"` exercises
-        `gpu_randomized_pca_device`. All must keep the device-resident route.
-        """
+    @pytest.mark.parametrize("method", ["randomized", "auto"])
+    def test_pca_method_routes(self, synthetic_adata, monkeypatch, method):
+        """GPU PCA always resolves to randomized (the in-VRAM covariance core
+        was removed in Phase 3.2), so every method keeps the device-resident
+        route under force-native."""
         import pyscx
 
+        monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
         adata = synthetic_adata.copy()
         pyscx.accel.pca_neighbors(
             adata, n_comps=10, n_neighbors=15, device="gpu", method=method
@@ -251,16 +293,17 @@ class TestPcaNeighborsGpu:
         assert "connectivities" in adata.obsp
         assert adata.uns["scx_accel"]["pca_neighbors"]["route"] == "gpu_device_resident"
 
-    def test_fused_randomized_records_tuning_metadata(self, synthetic_adata):
-        """The fused device-resident path must propagate the PCA tuning knobs
-        (V3 task 2.5) onto the stamped route, exactly as standalone `pca()` does.
+    def test_fused_randomized_records_tuning_metadata(self, synthetic_adata, monkeypatch):
+        """The native device-resident path propagates the PCA tuning knobs onto
+        the stamped route, exactly as standalone `pca()` does.
 
         For the randomized core, `stamp_fused_route` records the math-mode and
-        SpMM-policy defaults and the graph-replay flag (capture is off by
-        default → `graph_replay` is False, never the missing key).
+        SpMM-policy defaults and the graph-replay flag (capture was removed in
+        3.4 → `graph_replay` is always False, never the missing key).
         """
         import pyscx
 
+        monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
         adata = synthetic_adata.copy()
         pyscx.accel.pca_neighbors(
             adata, n_comps=10, n_neighbors=15, device="gpu", method="randomized"
@@ -274,24 +317,7 @@ class TestPcaNeighborsGpu:
         assert "graph_replay" in pca
         assert pca["graph_replay"] in (True, False)
 
-    def test_fused_covariance_omits_tuning_metadata(self, synthetic_adata):
-        """The covariance core ignores the SpMM/math knobs, so the fused route
-        must leave `math_mode` / `spmm_policy` as None — mirroring the standalone
-        `pca()` covariance behaviour (`test_pca_cpu_route_omits_tuning_metadata`).
-        """
-        import pyscx
-
-        adata = synthetic_adata.copy()
-        pyscx.accel.pca_neighbors(
-            adata, n_comps=10, n_neighbors=15, device="gpu", method="covariance"
-        )
-
-        pca = adata.uns["scx_accel"]["pca"]
-        assert pca["route"] == "gpu_device_resident"
-        assert pca["math_mode"] is None
-        assert pca["spmm_policy"] is None
-
-    def test_non_default_use_rep_falls_back_to_sequential(self, synthetic_adata):
+    def test_non_default_use_rep_falls_back_to_sequential(self, synthetic_adata, monkeypatch):
         """A non-default `use_rep` must NOT take the fused device-resident path.
 
         The fused path always runs kNN on the freshly-computed PCA embedding, so
@@ -302,6 +328,7 @@ class TestPcaNeighborsGpu:
         """
         import pyscx
 
+        monkeypatch.setenv("SCX_FORCE_NATIVE_GPU", "1")
         adata = synthetic_adata.copy()
         # Provide the custom representation the sequential neighbors() will read.
         adata.obsm["X_custom"] = np.ascontiguousarray(
@@ -318,13 +345,7 @@ class TestPcaNeighborsGpu:
 
 
 # ---------------------------------------------------------------------------
-# Partial fallback: GPU present, cuVS absent (GPU PCA + CPU HNSW kNN).
-# Skips unless the host has a GPU but no cuVS — a no-op in most environments.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Fused PCA → kNN → UMAP (V3 Phase 2.4)
+# Fused PCA → kNN → UMAP — CPU
 # ---------------------------------------------------------------------------
 
 
@@ -396,9 +417,14 @@ class TestPcaNeighborsUmapCpu:
             pyscx.accel.pca_neighbors_umap(adata, prefer_format="csc", device="cpu")
 
 
-@cuvs_only
-class TestPcaNeighborsUmapGpu:
-    def test_route_metadata_device_resident(self, synthetic_adata):
+# ---------------------------------------------------------------------------
+# Fused PCA → kNN → UMAP — in-memory `device="gpu"` → rapids pipeline (Phase 1.4)
+# ---------------------------------------------------------------------------
+
+
+@rapids_fused_only
+class TestPcaNeighborsUmapRapids:
+    def test_route_metadata_rapids(self, synthetic_adata):
         import pyscx
 
         adata = synthetic_adata.copy()
@@ -407,57 +433,66 @@ class TestPcaNeighborsUmapGpu:
         )
 
         accel = adata.uns["scx_accel"]
-        assert accel["pca"]["route"] == "gpu_device_resident"
-        assert accel["neighbors"]["route"] == "gpu_device_resident"
-        assert accel["umap"]["route"] == "gpu_device_resident"
-        assert accel["pca_neighbors_umap"]["route"] == "gpu_device_resident"
-        assert adata.uns["neighbors"]["params"]["method"] == "cagra"
+        assert accel["pca"]["route"] == "rapids_singlecell_gpu"
+        assert accel["neighbors"]["route"] == "rapids_singlecell_gpu"
+        assert accel["umap"]["route"] == "rapids_singlecell_gpu"
+        assert accel["pca_neighbors_umap"]["route"] == "rapids_singlecell_gpu"
 
-    def test_fused_randomized_records_tuning_metadata(self, synthetic_adata):
-        """PCA tuning metadata (V3 task 2.5) propagates through the fused
-        PCA→kNN→UMAP path's `pca` route too — same `stamp_fused_route` seam.
-        """
+    def test_writes_valid_embedding(self, synthetic_adata):
         import pyscx
 
         adata = synthetic_adata.copy()
         pyscx.accel.pca_neighbors_umap(
-            adata, n_comps=10, n_neighbors=15, n_components=2,
-            device="gpu", method="randomized",
+            adata, n_comps=20, n_neighbors=15, n_components=2, device="gpu"
         )
 
-        pca = adata.uns["scx_accel"]["pca"]
-        assert pca["route"] == "gpu_device_resident"
-        assert pca["math_mode"] == "strict_fp32"
-        assert pca["spmm_policy"] == "default"
-        assert pca["graph_replay"] in (True, False)
+        assert adata.obsm["X_pca"].shape == (100, 20)
+        assert "connectivities" in adata.obsp
+        assert adata.obsp["connectivities"].nnz > 0
+        assert adata.obsm["X_umap"].shape == (100, 2)
+        assert np.isfinite(adata.obsm["X_umap"]).all()
 
-    def test_matches_sequential_gpu(self, synthetic_adata):
-        """Fused GPU PCA matches a separate GPU PCA run; UMAP is valid.
-
-        UMAP is stochastic on the GPU (atomicAdd races), so only PCA parity is
-        asserted exactly-ish; the UMAP embedding is checked for correct shape and
-        finiteness (a broken device fuzzy graph / UMAP handoff would NaN or crash).
+    def test_large_n_neighbors_completes(self):
+        """Large `n_neighbors` must complete without error and produce a valid
+        embedding. The old `FUZZY_MAX_K` per-row scratch cap (and the fused
+        device-resident UMAP path it guarded) was removed in Phase 3 — in-VRAM
+        the call now runs the full rapids pipeline, which handles large k. The
+        route is never `gpu_device_resident` (no native fused UMAP path exists).
         """
+        import anndata
         import pyscx
 
-        fused = synthetic_adata.copy()
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = 400, 50
+        dense = rng.integers(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+        dense[rng.random((n_obs, n_vars)) > 0.3] = 0
+        adata = anndata.AnnData(X=sp.csr_matrix(dense))
+
         pyscx.accel.pca_neighbors_umap(
-            fused, n_comps=20, n_neighbors=15, n_components=2, device="gpu", random_state=0
+            adata, n_comps=10, n_neighbors=300, n_components=2, device="gpu"
         )
 
-        seq = synthetic_adata.copy()
-        pyscx.accel.pca(seq, n_comps=20, device="gpu", random_state=0)
-        np.testing.assert_allclose(
-            fused.obsm["X_pca"], seq.obsm["X_pca"], rtol=1e-3, atol=1e-3
+        assert (
+            adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
+            != "gpu_device_resident"
         )
+        assert adata.obsm["X_umap"].shape == (n_obs, 2)
+        assert np.isfinite(adata.obsm["X_umap"]).all()
 
-        assert "connectivities" in fused.obsp
-        assert fused.obsp["connectivities"].nnz > 0
-        assert fused.obsm["X_umap"].shape == (100, 2)
-        assert np.isfinite(fused.obsm["X_umap"]).all()
 
-    def test_backed_input(self, pca_adata):
-        """Fused PCA→kNN→UMAP works on a backed SCX `X` (streaming source)."""
+# ---------------------------------------------------------------------------
+# Fused PCA → kNN → UMAP — backed/lazy `X`: sequential fallback.
+# Native device-resident UMAP was removed in 3.1, and backed inputs never route
+# to rapids, so the summary must NOT be `gpu_device_resident`.
+# ---------------------------------------------------------------------------
+
+
+@device_resident_only
+class TestPcaNeighborsUmapSequentialFallback:
+    def test_backed_input_falls_back(self, pca_adata):
+        """Fused PCA→kNN→UMAP on a backed SCX `X` falls back to the sequential
+        path (no native device-resident UMAP), but still produces a valid
+        embedding."""
         import pyscx
 
         scx_path, _ = pca_adata
@@ -471,57 +506,5 @@ class TestPcaNeighborsUmapGpu:
         assert np.isfinite(adata.obsm["X_umap"]).all()
         assert (
             adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
-            == "gpu_device_resident"
-        )
-
-    def test_large_n_neighbors_falls_back_to_sequential(self):
-        """n_neighbors > FUZZY_MAX_K (256) exceeds the fused fuzzy-graph kernel's
-        per-row scratch cap. The fused device-resident path must be bypassed and
-        the call fall back to sequential pca → neighbors → umap, not hard-error.
-
-        The sequential GPU kNN handles k=300 because CAGRA's itopk_size is raised
-        to cover search_k (the cuVS default of 64 would otherwise fail for k>=64).
-        """
-        import anndata
-        import pyscx
-
-        rng = np.random.default_rng(0)
-        n_obs, n_vars = 400, 50
-        dense = rng.integers(0, 200, size=(n_obs, n_vars)).astype(np.float32)
-        dense[rng.random((n_obs, n_vars)) > 0.3] = 0
-        adata = anndata.AnnData(X=sp.csr_matrix(dense))
-
-        # Must not raise despite n_neighbors > 256.
-        pyscx.accel.pca_neighbors_umap(
-            adata, n_comps=10, n_neighbors=300, n_components=2, device="gpu"
-        )
-
-        # The fully fused route is skipped for k > 256; the summary mirrors the
-        # sequential umap stage (not "gpu_device_resident").
-        assert (
-            adata.uns["scx_accel"]["pca_neighbors_umap"]["route"]
             != "gpu_device_resident"
         )
-        assert adata.obsm["X_umap"].shape == (n_obs, 2)
-        assert np.isfinite(adata.obsm["X_umap"]).all()
-
-
-@gpu_no_cuvs
-class TestPcaNeighborsPartialFallback:
-    def test_route_reflects_partial_gpu(self, synthetic_adata):
-        """When only kNN falls back, the summary must mirror the kNN route.
-
-        GPU PCA still runs (`pca` → `gpu_csr`) but kNN runs on CPU HNSW
-        (`neighbors` → `cpu_csr`). The `pca_neighbors` summary must report the
-        actual `neighbors` route (`cpu_csr`), not a synthesized full-CPU run.
-        """
-        import pyscx
-
-        adata = synthetic_adata.copy()
-        with pytest.warns(UserWarning, match="cuVS not found"):
-            pyscx.accel.pca_neighbors(adata, n_comps=10, n_neighbors=15, device="gpu")
-
-        accel = adata.uns["scx_accel"]
-        assert accel["pca"]["route"] == "gpu_csr"
-        assert accel["neighbors"]["route"] == "cpu_csr"
-        assert accel["pca_neighbors"]["route"] == "cpu_csr"

@@ -608,7 +608,7 @@ ALL_FORMATS = PRIMARY_FORMATS + ADDITIONAL_FORMATS + MULTIMODAL_FORMATS
 # for PCA / kNN / UMAP / Leiden / preprocessing / HVG. Each registers as a
 # `FormatVariant` so the per-cell parallel launcher (`run_parallel.py`) can
 # schedule one SLURM job per (benchmark × implementation × dataset) — e.g.
-# (accel_pca, accel_pca__pyscx_gpu_cov, census_1m). Runner is `noop_runner`
+# (accel_pca, accel_pca__pyscx_gpu_rand_hh, census_1m). Runner is `noop_runner`
 # because these benchmarks don't depend on file conversion.
 # ---------------------------------------------------------------------------
 

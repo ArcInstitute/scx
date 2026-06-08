@@ -40,8 +40,10 @@ _NEW_ROUTE_METRICS = {
     "wilcoxon_route_csc_direct",
     "csc_dispatch_correct",
     "pca_route_gpu_correct",
-    "knn_route_gpu_correct",
-    "umap_route_gpu_correct",
+    # knn/umap native in-VRAM routes were removed in ACC-RUST-OPT-V4 Phase 3
+    # (in-VRAM kNN/UMAP route to rapids-singlecell); their correctness is now
+    # gated as `knn_route_rapids_correct` / `umap_route_rapids_correct` on the
+    # rapids variants, not here.
     "leiden_route_gpu_correct",
     "hvg_route_gpu_correct",
     "preprocess_route_gpu_correct",
@@ -54,12 +56,12 @@ _TRIPLES = [
     ("accel_de", "pbmc3k", "accel_de__pyscx_wilcoxon_gpu"),
     ("accel_de", "tabula_sapiens_100k", "accel_de__pyscx_pdex_ref_gpu"),
     ("accel_de", "tabula_sapiens_100k", "accel_de__pyscx_wilcoxon_gpu"),
-    ("accel_pca", "pbmc3k", "accel_pca__pyscx_gpu_cov"),
-    ("accel_pca", "tabula_sapiens_100k", "accel_pca__pyscx_gpu_cov"),
-    ("accel_knn", "pbmc3k", "accel_knn__pyscx_gpu_cagra"),
-    ("accel_knn", "tabula_sapiens_100k", "accel_knn__pyscx_gpu_cagra"),
-    ("accel_umap", "pbmc3k", "accel_umap__pyscx_gpu"),
-    ("accel_umap", "tabula_sapiens_100k", "accel_umap__pyscx_gpu"),
+    # Native in-VRAM covariance PCA / CAGRA kNN / UMAP variants were removed in
+    # ACC-RUST-OPT-V4 Phase 3. PCA's native route gate (`pca_route_gpu_correct`)
+    # now rides the surviving randomized variant; in-VRAM kNN/UMAP route to
+    # rapids and are gated as `*_route_rapids_correct` elsewhere.
+    ("accel_pca", "pbmc3k", "accel_pca__pyscx_gpu_rand_hh"),
+    ("accel_pca", "tabula_sapiens_100k", "accel_pca__pyscx_gpu_rand_hh"),
     ("accel_leiden", "pbmc3k", "accel_leiden__pyscx_gpu"),
     ("accel_hvg", "pbmc3k", "accel_hvg__pyscx_gpu"),
     ("accel_preprocess", "pbmc3k", "accel_preprocess__pyscx_gpu"),

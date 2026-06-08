@@ -970,7 +970,7 @@ performance currently under regression governance:
 
 That is 30 benchmarks across 13 distinct domains, each expanded across the
 relevant format variants (h5ad / zarr / scx / tiledb / parquet / bpcells
-plus accelerator-implementation variants like `accel_pca__pyscx_gpu_cov`)
+plus accelerator-implementation variants like `accel_pca__pyscx_gpu_rand_hh`)
 and the tier's dataset list (pbmc3k → census_10m). The canonical list
 lives in [`benchmarks/comprehensive/benchmarks/__init__.py::ALL_BENCHMARKS`](comprehensive/benchmarks/__init__.py).
 Adding a new benchmark to the suite is a one-line edit there — every
@@ -1019,11 +1019,15 @@ hard gate failure via the existing absolute-floor machinery.
 | `wilcoxon_route_gpu_correct` | `accel_de` (Wilcoxon GPU) | `device="gpu"` requested but a `cpu_*` route ran. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `csc_dispatch_correct` | `bench_csc_dispatch` | A `_csc`-labelled variant ran a non-CSC route (or vice versa). Gated on `tabula_sapiens_100k` for `qc_metrics`, `hvg`, `de`, and `pdex_ref` CSC variants. |
 | `hvg_route_gpu_correct` | `accel_hvg` | GPU HVG dispatch silently fell back to CPU. Gated on `pbmc3k`. |
-| `pca_route_gpu_correct` | `accel_pca` | GPU PCA dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
-| `knn_route_gpu_correct` | `accel_knn` | GPU kNN dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
-| `umap_route_gpu_correct` | `accel_umap` | GPU UMAP dispatch silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `pca_route_gpu_correct` | `accel_pca` (native randomized variant `pyscx_gpu_rand_hh`) | The surviving native randomized GPU PCA route silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `leiden_route_gpu_correct` | `accel_leiden` | GPU Leiden dispatch silently fell back to CPU. Gated on `pbmc3k`. |
-| `pipeline_route_gpu_correct` | `accel_pipeline` (device-resident variant) | The fused PCA→kNN→UMAP path silently dropped off the `gpu_device_resident` route (cuVS missing, cuSPARSE ABI mismatch, `n_neighbors > FUZZY_MAX_K`, non-default `use_rep`). Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+
+The native in-VRAM kNN / UMAP / fused-pipeline route gates (`knn_route_gpu_correct`,
+`umap_route_gpu_correct`, `pipeline_route_gpu_correct`) were dropped in
+ACC-RUST-OPT-V4 Phase 3 when those in-VRAM paths were removed; in-VRAM kNN / UMAP /
+pipeline now route to rapids-singlecell and are gated by `knn_route_rapids_correct`
+/ `umap_route_rapids_correct` / `pipeline_route_rapids_correct` (see the
+rapids-route section below).
 
 Each gate metric is `1.0` when the expected route ran (or wasn't applicable —
 e.g. no GPU host), `0.0` on a silent fallback. All GPU benchmark modules also
@@ -1042,16 +1046,19 @@ variants run on the same preprocessed fixture:
 | Variant | Path |
 |---|---|
 | `accel_pipeline__pyscx_cpu` | sequential CPU pca → neighbors → umap (reference) |
-| `accel_pipeline__pyscx_gpu_resident` | fused `pyscx.accel.pca_neighbors_umap` — the embedding/kNN/fuzzy graph stay on the GPU between stages |
 | `accel_pipeline__pyscx_gpu_hostboundary` | three separate GPU calls, each round-tripping its result through host memory |
 | `accel_pipeline__rapids_singlecell_gpu` | `rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap` — the leading GPU-scanpy competitor |
 
-The resident-vs-host-boundary delta on `pipeline_wall_s` quantifies the
-residency speedup; the `rapids_singlecell_gpu` variant places it against a real
-GPU competitor rather than only a CPU strawman. Per-stage correctness
-(`pca_subspace_cos_min`, `knn_recall_vs_scanpy`, `umap_trustworthiness`) is held
-to the same floors as the standalone `accel_pca`/`accel_knn`/`accel_umap` gates,
-and `pipeline_route_gpu_correct` gates the device-resident route (above).
+(The native device-resident fused variant `accel_pipeline__pyscx_gpu_resident`
+was removed in ACC-RUST-OPT-V4 Phase 3 along with the device-resident fused UMAP
+path; the in-VRAM pipeline now routes to rapids-singlecell.)
+
+The host-boundary-vs-rapids delta on `pipeline_wall_s` places SCX's GPU pipeline
+against a real GPU competitor rather than only a CPU strawman. Per-stage
+correctness (`pca_subspace_cos_min`, `knn_recall_vs_scanpy`,
+`umap_trustworthiness`) is held to the same floors as the standalone
+`accel_pca`/`accel_knn`/`accel_umap` gates, and `pipeline_route_rapids_correct`
+gates the rapids pipeline route (above).
 
 **Per-op rapids-singlecell competitor (`accel_*__rapids_singlecell_gpu`).** Beyond
 the fused pipeline, every accel op carries a `rapids_singlecell_gpu` variant
