@@ -876,6 +876,18 @@ def _check_worker_gpu_pyscx(env_name: str | None) -> CheckResult:
     if proc.returncode == 0 and last.startswith("OK:"):
         return CheckResult("worker_gpu_pyscx", "ok", f"env={env_name}: {last}")
 
+    # `GPU_INFO_FALSY` means pyscx imported cleanly but accel.gpu_info() was
+    # falsy — i.e. there is no GPU on *this* (orchestrator) host. That is NOT a
+    # broken gpu build (IMPORT_FAIL / CALL_FAIL are), and the pre-flight SLURM
+    # gpu_probe already validated pyscx-gpu on a real GPU node. Downgrade to WARN
+    # so a CPU-hosted orchestrator isn't blocked by this redundant local probe.
+    if last.startswith("GPU_INFO_FALSY"):
+        return CheckResult(
+            "worker_gpu_pyscx", "warn",
+            f"env={env_name}: no GPU on orchestrator host ({last}); "
+            "the pre-flight SLURM gpu_probe is the authoritative gpu-build check",
+        )
+
     rebuild_hint = (
         "rebuild with: cd pyscx && "
         "/path/to/.venv/bin/maturin develop --release --features gpu"
@@ -1280,7 +1292,11 @@ def main() -> int:
             gpu_env = _resolve_worker_gpu_env()
             sanity = _check_worker_gpu_pyscx(gpu_env)
             log = phase_logger("worker-gpu-sanity")
-            log_method = "info" if sanity.level == "ok" else sanity.level
+            # Map CheckResult levels to real logging.Logger method names
+            # ("warn"/"fail" are not logger methods → AttributeError otherwise).
+            log_method = {"ok": "info", "warn": "warning", "fail": "error"}.get(
+                sanity.level, "info"
+            )
             getattr(log, log_method)(
                 "%s [%s]: %s", sanity.name, sanity.level, sanity.msg,
             )
