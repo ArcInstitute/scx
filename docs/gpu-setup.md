@@ -221,6 +221,32 @@ rapids-singlecell is not available, so SCX treats it as a detected runtime
 dependency with a documented manual install rather than declaring a brittle hard
 extra. The rapids-absent path is exercised by a dedicated CI lane.
 
+### What routes to rapids (in-VRAM `device="gpu"`)
+
+With rapids present, in-memory (≤VRAM) `device="gpu"` ops route to rapids:
+`pca`, `neighbors`, `umap`, `normalize_total`/`log1p`, the fused
+`pca_neighbors`/`pca_neighbors_umap`, and the HVG flavors SCX has no native GPU
+kernel for (`seurat`, `cell_ranger`, `pearson_residuals`,
+`poisson_gene_selection`). The route is recorded as `rapids_singlecell_gpu` on
+`adata.uns["scx_accel"][<op>]` with the detected rapids/cuML/cuPy versions and a
+`transfer_mode` (`scx_device_handoff` when `X` is already device-resident — e.g.
+from `pyscx.open(...).to_gpu_anndata()` — or `anndata_to_gpu` when rapids
+uploads a host `X`).
+
+These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
+`seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, and every
+**out-of-VRAM** path — a backed/lazy `X` (`ScxBackedSparseDataset` /
+`ScxLazyTransformedDataset`) always uses SCX's native streaming kernels, never
+rapids (which would OOM).
+
+### Forcing the native GPU kernels
+
+`SCX_FORCE_NATIVE_GPU=1` keeps the native SCX GPU kernels for in-VRAM ops
+instead of routing to rapids — a transition-only A/B + rollback switch (removed
+once the rapids routes are gated and the superseded native kernels are deleted).
+When rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops
+fall back to CPU (`fallback_reason="no_rapids"`) with a one-shot `UserWarning`.
+
 ## SLURM / HPC configuration
 
 On HPC clusters, GPU nodes typically require module loads or conda activation
