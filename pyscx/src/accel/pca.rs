@@ -423,6 +423,54 @@ pub fn pca(
     // Extract X from adata
     let x = adata.getattr("X")?;
 
+    // ACC-RUST-OPT-V4 Phase 1.3: in the in-VRAM regime (X in memory, not a
+    // backed/lazy streaming source) hand `device="gpu"` PCA to rapids-singlecell.
+    // backed/lazy X stays on the native streaming path (the >VRAM moat).
+    #[cfg(feature = "gpu")]
+    {
+        let x_in_memory = x.cast::<ScxBackedSparseDataset>().is_err()
+            && x.cast::<ScxLazyTransformedDataset>().is_err();
+        if x_in_memory {
+            match super::rapids::decide(py, _device, "pca") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run(py, adata, "pca", gid, |py, adata| {
+                        let kw = super::rapids::kwargs(py);
+                        kw.set_item("n_comps", n_comps)?;
+                        kw.set_item("zero_center", zero_center)?;
+                        kw.set_item("random_state", random_state)?;
+                        super::rapids::rsc_fn(py, "pp", "pca")?.call((adata,), Some(&kw))?;
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    pca(
+                        py,
+                        adata,
+                        n_comps,
+                        zero_center,
+                        random_state,
+                        n_oversamples,
+                        n_power_iterations,
+                        "cpu",
+                        method,
+                        qr_method,
+                        prefer_format,
+                        allow_tf32,
+                        spmm_policy,
+                    )?;
+                    return super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "pca",
+                        scx_accel::route::AccelRoute::CpuCsr,
+                    );
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
+    }
+
     // Record the planned route on adata.uns["scx_accel"]["pca"]. PCA has a
     // single GPU route (cuSPARSE + cuBLAS) gated on the modern cuSPARSE ABI;
     // when that probe fails the dispatch falls back to CPU, which the planner

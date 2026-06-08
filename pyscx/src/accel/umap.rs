@@ -53,6 +53,56 @@ pub fn umap(
     #[cfg(feature = "gpu")]
     let _gpu_id = _device.gpu_id();
 
+    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` UMAP hands off to
+    // rapids-singlecell (`rsc.tl.umap`) when `X` is in memory. backed/lazy X
+    // stays on the native device-resident SGD path.
+    #[cfg(feature = "gpu")]
+    {
+        use crate::backed::ScxBackedSparseDataset;
+        use crate::lazy_transform::ScxLazyTransformedDataset;
+        let xp = adata.getattr("X")?;
+        let x_in_memory = xp.cast::<ScxBackedSparseDataset>().is_err()
+            && xp.cast::<ScxLazyTransformedDataset>().is_err();
+        if x_in_memory {
+            match super::rapids::decide(py, _device, "umap") {
+                super::rapids::RapidsDecision::Rapids(gid) => {
+                    super::rapids::run(py, adata, "umap", gid, |py, adata| {
+                        let kw = super::rapids::kwargs(py);
+                        kw.set_item("n_components", n_components)?;
+                        kw.set_item("min_dist", min_dist)?;
+                        kw.set_item("spread", spread)?;
+                        kw.set_item("negative_sample_rate", negative_sample_rate)?;
+                        kw.set_item("random_state", random_state)?;
+                        super::rapids::rsc_fn(py, "tl", "umap")?.call((adata,), Some(&kw))?;
+                        Ok(())
+                    })?;
+                    return Ok(());
+                }
+                super::rapids::RapidsDecision::NoRapidsCpu => {
+                    umap(
+                        py,
+                        adata,
+                        n_components,
+                        n_epochs,
+                        min_dist,
+                        spread,
+                        negative_sample_rate,
+                        learning_rate,
+                        random_state,
+                        "cpu",
+                    )?;
+                    return super::rapids::stamp_no_rapids(
+                        py,
+                        adata,
+                        "umap",
+                        scx_accel::AccelRoute::CpuCsr,
+                    );
+                }
+                super::rapids::RapidsDecision::Native => {}
+            }
+        }
+    }
+
     // Extract connectivities CSR from adata.obsp["connectivities"]
     let obsp = adata.getattr("obsp")?;
     let conn = obsp.get_item("connectivities").map_err(|_| {

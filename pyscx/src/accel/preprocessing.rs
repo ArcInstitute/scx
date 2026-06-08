@@ -107,6 +107,36 @@ pub fn normalize_total(
         xp.cast::<ScxBackedSparseDataset>().is_ok()
             || xp.cast::<ScxLazyTransformedDataset>().is_ok()
     };
+
+    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` preprocess on an in-memory
+    // X hands off to rapids-singlecell. backed/lazy X keeps the native streaming
+    // path (the loader/streaming kernels — §4.1).
+    #[cfg(feature = "gpu")]
+    if !np_eligible {
+        match super::rapids::decide(py, _device, "normalize_total") {
+            super::rapids::RapidsDecision::Rapids(gid) => {
+                super::rapids::run(py, adata, "normalize_total", gid, |py, adata| {
+                    let kw = super::rapids::kwargs(py);
+                    kw.set_item("target_sum", target_sum)?;
+                    super::rapids::rsc_fn(py, "pp", "normalize_total")?
+                        .call((adata,), Some(&kw))?;
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            super::rapids::RapidsDecision::NoRapidsCpu => {
+                normalize_total(py, adata, target_sum, "cpu")?;
+                return super::rapids::stamp_no_rapids(
+                    py,
+                    adata,
+                    "normalize_total",
+                    scx_accel::AccelRoute::CpuCsr,
+                );
+            }
+            super::rapids::RapidsDecision::Native => {}
+        }
+    }
+
     super::route::write_accel_route(
         py,
         adata,
@@ -244,6 +274,32 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
             || xp.cast::<ScxBackedSparseDataset>().is_ok()
             || xp.cast::<ScxLazyTransformedDataset>().is_ok()
     };
+
+    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` log1p on an in-memory X
+    // (no pending fusion marker, not backed/lazy) hands off to rapids-singlecell.
+    #[cfg(feature = "gpu")]
+    if !log1p_eligible {
+        match super::rapids::decide(py, _device, "log1p") {
+            super::rapids::RapidsDecision::Rapids(gid) => {
+                super::rapids::run(py, adata, "log1p", gid, |py, adata| {
+                    super::rapids::rsc_fn(py, "pp", "log1p")?.call1((adata,))?;
+                    Ok(())
+                })?;
+                return Ok(());
+            }
+            super::rapids::RapidsDecision::NoRapidsCpu => {
+                log1p(py, adata, "cpu")?;
+                return super::rapids::stamp_no_rapids(
+                    py,
+                    adata,
+                    "log1p",
+                    scx_accel::AccelRoute::CpuCsr,
+                );
+            }
+            super::rapids::RapidsDecision::Native => {}
+        }
+    }
+
     super::route::write_accel_route(
         py,
         adata,
