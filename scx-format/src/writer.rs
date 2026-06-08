@@ -886,6 +886,12 @@ impl ScxWriter {
     }
 
     /// Write an obsp CSR shard.
+    ///
+    /// Emits a [`SectionType::ObspCsrShard`], which `scx validate --deep`
+    /// checks against the v3 canonical-CSR invariant. The caller MUST pass
+    /// canonical CSR (per-row indices strictly increasing, duplicate
+    /// coordinates summed, explicit zeros dropped — see
+    /// [`scx_sparse::canonicalize_csr`]); this writer does not canonicalize.
     #[allow(clippy::too_many_arguments)]
     pub fn write_obsp_shard(
         &mut self,
@@ -1748,6 +1754,10 @@ impl ScxWriter {
 
     /// Per-modality `write_obsp_shard`. Section name is
     /// `obsp/{modality_name}/{name}/shard_{shard_idx}`.
+    ///
+    /// Emits a [`SectionType::ObspCsrShard`] checked by `scx validate --deep`
+    /// against the v3 canonical-CSR invariant; the caller MUST pass canonical
+    /// CSR (see [`Self::write_obsp_shard`]). This writer does not canonicalize.
     #[allow(clippy::too_many_arguments)]
     pub fn write_obsp_shard_for(
         &mut self,
@@ -2762,6 +2772,76 @@ mod tests {
         assert_eq!(sidecar.n_cols, 20_000);
         assert_eq!(sidecar.nnz, indices.len() as u64);
         assert_eq!(sidecar.rows.len(), 4);
+    }
+
+    /// The path pyscx actually uses: `encode_one_shard` → `write_preencoded_shard`.
+    /// Exercises the `source_section_offset` patching (`with_source_offset`) and the
+    /// encode-time `section_length`/`section_checksum` agreeing with the catalog entry
+    /// — the staleness guard `validate_decode_sidecar_entry` enforces.
+    #[test]
+    fn preencoded_scx1_shard_emits_valid_decode_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decode_sidecar_preencoded.scx");
+        let mut header = sample_header();
+        header.n_obs = 4;
+        header.n_vars = 20_000;
+        header.codec_id = CodecId::Scx1 as u8;
+        header.index_dtype = 0;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        let nnz_per_row = 8192usize;
+        let mut indptr = Vec::with_capacity(5);
+        let mut indices = Vec::with_capacity(4 * nnz_per_row);
+        let mut values: Vec<f32> = Vec::with_capacity(4 * nnz_per_row);
+        indptr.push(0u64);
+        for row in 0..4 {
+            for col in 0..(nnz_per_row - 1) {
+                indices.push(col as u32);
+                values.push(1.0);
+            }
+            indices.push(19_999u32);
+            values.push(1.0);
+            indptr.push(((row + 1) * nnz_per_row) as u64);
+        }
+
+        let pre = crate::encoder::encode_one_shard(
+            &indptr,
+            &indices,
+            &values,
+            Some(CodecId::Scx1),
+            0, // index_dtype: u16
+            20_000,
+            0, // global_row_offset
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+        )
+        .unwrap();
+        assert!(
+            pre.decode_sidecar.is_some(),
+            "Scx1 preencoded shard must carry a decode sidecar"
+        );
+        writer.write_preencoded_shard(pre).unwrap();
+
+        let final_path = writer.finish().unwrap();
+        let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+        let sidecars: Vec<_> = reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|entry| entry.section_type == SectionType::DecodeMetadataShard)
+            .collect();
+        assert_eq!(sidecars.len(), 1);
+        // Passes only if the patched source offset + encode-time length/checksum
+        // resolve to the written CSR shard's catalog entry.
+        reader.validate_decode_sidecar_entry(sidecars[0]).unwrap();
+
+        let csr_shards = reader.catalog().shards_sorted();
+        assert_eq!(csr_shards.len(), 1);
+        reader.validate_canonical_csr_entry(csr_shards[0]).unwrap();
     }
 
     /// `set_csr_shard_column_stats_bulk` assigns each `Vec<ColumnStat>` to the

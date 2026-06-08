@@ -59,25 +59,36 @@ pub fn run_validate(
 
     if deep {
         println!("\nDeep checks:");
-        for entry in &catalog.entries {
-            if matches!(
-                entry.section_type,
-                SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
-            ) {
-                n_checks += 1;
-                let result = reader.validate_canonical_csr_entry(entry);
-                let passed = result.is_ok();
-                let icon = if passed { "OK" } else { "FAIL" };
-                println!("[{icon}] canonical-csr {}", entry.name);
-                if verbose {
-                    if let Err(err) = &result {
-                        println!("       error: {err}");
+        // The canonical-CSR invariant is a v3 guarantee only. Pre-v3 files may
+        // legitimately carry unsorted / unsummed shards, so checking them would
+        // be a false failure — skip the canonical-CSR loop below v3. (Decode
+        // sidecars only exist in v3 files, so that loop is gated implicitly.)
+        if header.format_version >= 3 {
+            for entry in &catalog.entries {
+                if matches!(
+                    entry.section_type,
+                    SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+                ) {
+                    n_checks += 1;
+                    let result = reader.validate_canonical_csr_entry(entry);
+                    let passed = result.is_ok();
+                    let icon = if passed { "OK" } else { "FAIL" };
+                    println!("[{icon}] canonical-csr {}", entry.name);
+                    if verbose {
+                        if let Err(err) = &result {
+                            println!("       error: {err}");
+                        }
+                    }
+                    if !passed {
+                        all_passed = false;
                     }
                 }
-                if !passed {
-                    all_passed = false;
-                }
             }
+        } else {
+            println!(
+                "canonical-CSR checks skipped: file is format_version {} (< 3)",
+                header.format_version
+            );
         }
         for entry in &catalog.entries {
             if entry.section_type == SectionType::DecodeMetadataShard {

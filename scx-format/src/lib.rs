@@ -62,7 +62,9 @@ pub use decode_sidecar::{
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use encoder::encode_one_shard;
 pub use error::{validate_allocation, Result, ScxError};
-pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
+pub use header::{
+    rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
+};
 pub use mem::MemoryBudget;
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,

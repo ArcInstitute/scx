@@ -1218,7 +1218,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
-| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32`, `spmm_policy` |
+| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
 | `pca_neighbors_umap`     | ✓   | ✓   | (PCA + neighbors + UMAP kwargs, see below)                            | `device`, `method`, `qr_method`, `prefer_format` |
@@ -1339,19 +1339,19 @@ for the full gate table.
 
 Two methods, auto-routed by the number of variables:
 
-- **Covariance PCA** (CPU: n_vars ≤ 5,000; GPU: n_vars ≤ 8,000): Builds the
-  covariance matrix `X^T @ X` directly from CSR nonzeros via sparse outer
-  product accumulation (exploiting symmetry), then eigendecomposes. Exact
-  results, faster than randomized SVD for HVG-selected data. Parallel
-  accumulation via rayon thread-local matrices on CPU; GPU path streams shards
-  through `CenteredSparseOperator` (implicit mean-centering) into a dense
-  on-device Gram matrix, then `cusolverDnSsyevd`.
-- **Randomized SVD** (CPU: n_vars > 5,000; GPU: n_vars > 8,000): Streaming
-  shard-by-shard SpMM with zero-copy `MatRef::from_row_major_slice` views.
-  Skips intermediate QR on transpose results for n_power_iterations ≤ 2
-  (matching sklearn's default). GPU path uses cuSPARSE SpMM + cuSOLVER QR and
-  stays fully GPU-resident through the final embedding (cuBLAS `sgemm` +
-  broadcast-scale) — no host round-trip.
+- **Covariance PCA** (CPU: n_vars ≤ 5,000): Builds the covariance matrix
+  `X^T @ X` directly from CSR nonzeros via sparse outer product accumulation
+  (exploiting symmetry), then eigendecomposes. Exact results, faster than
+  randomized SVD for HVG-selected data. Parallel accumulation via rayon
+  thread-local matrices. CPU-only; the former native GPU covariance path
+  (`cusolverDnSsyevd`) was removed in Phase 3.2.
+- **Randomized SVD** (CPU: n_vars > 5,000): Streaming shard-by-shard SpMM
+  with zero-copy `MatRef::from_row_major_slice` views. Skips intermediate QR
+  on transpose results for n_power_iterations ≤ 2 (matching sklearn's default).
+- **GPU PCA** routes to `rapids_singlecell` (`rsc.pp.pca`) via
+  `to_gpu_anndata()`. The data is handed off as a GPU-resident AnnData with
+  `cupyx.scipy.sparse.csr_matrix` X — no host round-trip. The streaming/
+  randomized CPU PCA path (>VRAM datasets) survives natively as a fallback.
 
 Both methods work in backed mode without materializing the full matrix.
 
@@ -1377,15 +1377,15 @@ pyscx.accel.pca(adata, n_comps=50)
 | `n_power_iterations` | 2 | Power iterations for spectral accuracy (randomized SVD only) |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 | `method` | `"auto"` | `"auto"`, `"covariance"`, or `"randomized"`. `"auto"` routes by `n_vars` (covariance when small, randomized otherwise). Explicit override is useful when benchmarking or when the auto threshold doesn't fit your data. |
-| `qr_method` | `"householder"` | Randomized-path QR algorithm: `"householder"` (cuSOLVER `geqrf`/`orgqr` — always stable) or `"cholesky"` (CholeskyQR2 via `potrf` + `strsm` — ~3× faster on well-conditioned inputs). **Ignored** by the covariance path. Non-SPD failures surface as `RuntimeError` with a clear "retry with qr_method='householder'" hint. |
+| `qr_method` | `"householder"` | CPU randomized-path QR algorithm: `"householder"` (always stable) or `"cholesky"` (CholeskyQR2 — ~3× faster on well-conditioned inputs). **Ignored** by the covariance path and by the GPU rapids path. Non-SPD failures surface as `RuntimeError` with a clear "retry with qr_method='householder'" hint. |
 
 **Key advantage:** On HVG-selected data (2,000 genes), covariance PCA
 completes in 4.2s on 1M cells — 5× faster than the previous randomized
 SVD and 1.9× faster than scanpy. The method is auto-selected based on
-`n_vars`; no user configuration needed. On GPU, the pipeline uses
-cuSPARSE SpMM + cuSOLVER (QR for randomized, `syevd` for covariance) with
-cuBLAS for the Gram accumulation and post-QR multiplies. Peak memory is one
-shard plus working matrices (plus ~30 MB covariance matrix for 2K genes).
+`n_vars`; no user configuration needed. On GPU, PCA routes to
+`rapids_singlecell` (`rsc.pp.pca`) which handles method selection
+internally. Peak memory on CPU is one shard plus working matrices (plus
+~30 MB covariance matrix for 2K genes).
 
 ### kNN graph (`pyscx.accel.neighbors`)
 
@@ -1417,23 +1417,28 @@ via a faer matmul + per-row partial top-k sort; `ef_construction` /
 `n_obs × n_obs`
 f32 Gram matrix (~100 MB at the threshold) — keep this in mind if
 calling at the boundary on memory-constrained hosts.
-On GPU, uses NVIDIA CAGRA (cuVS) — benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
+On GPU, routes to `rapids_singlecell` (`rsc.pp.neighbors`) via
+`to_gpu_anndata()`. The standalone native CAGRA dispatch was removed in
+Phase 3.3; device-resident CAGRA kNN is retained only within the fused
+pipeline path. Benchmarked at 4.4× on 100K cells and 9.4× on 1M cells.
 
 ### Fused PCA → kNN (`pyscx.accel.pca_neighbors`)
 
-Runs PCA then the kNN graph in a single call. On a GPU host with cuSPARSE 12.5+
-and cuVS available, the PCA embedding is kept **resident on the GPU** and fed
-straight into CAGRA — eliminating the `obsm["X_pca"]` GPU→host→GPU round-trip
-that calling `pca` then `neighbors` separately incurs (~240 MB of host traffic
-at 1M cells × 60 PCs). Output is identical to the two sequential calls; it
-writes every slot they do (`obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`,
-`obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`).
+Runs PCA then the kNN graph in a single call. On a GPU host with
+`rapids_singlecell` available, the entire pipeline runs through
+`rsc.pp.pca` + `rsc.pp.neighbors` — data stays GPU-resident via
+`to_gpu_anndata()`, eliminating the `obsm["X_pca"]` GPU→host→GPU
+round-trip that calling `pca` then `neighbors` separately incurs (~240 MB
+of host traffic at 1M cells × 60 PCs). Output is identical to the two
+sequential calls; it writes every slot they do (`obsm["X_pca"]`,
+`varm["PCs"]`, `uns["pca"]`, `obsp["distances"]`,
+`obsp["connectivities"]`, `uns["neighbors"]`).
 
 ```python
 # One call instead of pca(...) + neighbors(...).
 pyscx.accel.pca_neighbors(adata, n_comps=50, n_neighbors=15, device="gpu")
 
-# When the fully fused path runs, all three are stamped "gpu_device_resident":
+# When the rapids fused path runs, all three are stamped "rapids_singlecell_gpu":
 #   adata.uns["scx_accel"]["pca"]["route"]
 #   adata.uns["scx_accel"]["neighbors"]["route"]
 #   adata.uns["scx_accel"]["pca_neighbors"]["route"]
@@ -1447,36 +1452,36 @@ pyscx.accel.pca_neighbors(adata, n_comps=50, n_neighbors=15, device="gpu")
 | `random_state` | 0 | Random seed |
 | `n_oversamples` / `n_power_iterations` | 10 / 2 | Randomized-PCA accuracy knobs |
 | `method` | `"auto"` | PCA method: `"auto"`, `"covariance"`, `"randomized"` |
-| `qr_method` | `"householder"` | Randomized-PCA QR: `"householder"` or `"cholesky"` |
+| `qr_method` | `"householder"` | CPU randomized-PCA QR: `"householder"` or `"cholesky"` (ignored on GPU rapids path) |
 | `use_rep` | `"X_pca"` | obsm key the `neighbors` step reads. A non-default value always runs the sequential path — the fused path runs kNN on the freshly-computed PCA embedding, so honoring `obsm[use_rep]` requires the standalone `neighbors`. |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 | `prefer_format` | `"csr"` | Only `"csr"` is supported (PCA's SpMM path is row-major) |
 
-Fallback: when the device-resident path is unavailable — no GPU, a libcusparse
-older than cuSPARSE 12.5, or cuVS missing — `pca_neighbors` transparently runs
-the standalone `pca` then `neighbors` (each with its own normal routing and
-warnings), and the `pca_neighbors` route records the non-device-resident result
-(e.g. `cpu_csr`). The fuzzy-graph (connectivity) step runs on the CPU in both
-cases. Accepts the same `X` inputs as `pca` (backed SCX, lazy transform, or a
-materialized scipy/dense matrix).
+Fallback: when `rapids_singlecell` is not importable — or the GPU is
+unavailable — `pca_neighbors` transparently runs the standalone `pca` then
+`neighbors` (each with its own normal routing and warnings), and the
+`pca_neighbors` route records the fallback reason as `no_rapids`
+(e.g. `cpu_csr`). The fuzzy-graph (connectivity) step runs on the CPU in
+the fallback path. Accepts the same `X` inputs as `pca` (backed SCX, lazy
+transform, or a materialized scipy/dense matrix).
 
 ### Fused PCA → kNN → UMAP (`pyscx.accel.pca_neighbors_umap`)
 
-Extends the fused path through the embedding (V3 Phase 2.4). On a GPU host with
-cuSPARSE 12.5+ and cuVS, PCA → CAGRA kNN → **fuzzy simplicial set** → UMAP all
-stay device-resident: the symmetrized connectivity graph is built on the GPU
-(replacing the host `compute_connectivities` symmetrization) and fed straight
-into the UMAP SGD without a host round-trip. The connectivity graph is
-downloaded **once** — for `obsp["connectivities"]` and the host spectral init —
-rather than symmetrized on the CPU and re-uploaded for SGD. Writes every slot
-`pca` + `neighbors` + `umap` do, including `obsm["X_umap"]`.
+Extends the fused path through the embedding. On a GPU host with
+`rapids_singlecell` available, the full pipeline runs through
+`rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap` — data stays
+GPU-resident via `to_gpu_anndata()` with no host round-trip. The native
+CUDA SGD UMAP kernel, fuzzy simplicial set kernel, and device-resident
+CAGRA kNN were removed in Phase 3 (3.1, 3.5, 3.3 respectively); rapids
+is now the sole GPU path. Writes every slot `pca` + `neighbors` + `umap`
+do, including `obsm["X_umap"]`.
 
 ```python
 # One call instead of pca(...) + neighbors(...) + umap(...).
 pyscx.accel.pca_neighbors_umap(adata, n_comps=50, n_neighbors=15,
                                n_components=2, device="gpu")
 
-# When the fully fused path runs, all four are stamped "gpu_device_resident":
+# When the rapids fused path runs, all four are stamped "rapids_singlecell_gpu":
 #   adata.uns["scx_accel"]["pca"|"neighbors"|"umap"|"pca_neighbors_umap"]["route"]
 ```
 
@@ -1485,18 +1490,19 @@ plus the UMAP knobs: `n_components` (output dims, default 2), `n_epochs`
 (default 200), `min_dist` (default 0.1), `spread` (default 1.0),
 `negative_sample_rate` (default 5), `umap_learning_rate` (default 1.0).
 
-Fallback: when the device-resident path is unavailable (no GPU, libcusparse <
-12.5, or cuVS missing), it transparently runs the standalone `pca` → `neighbors`
-→ `umap` (each with its own routing/warnings) and the `pca_neighbors_umap` route
-mirrors the `umap` stage's recorded route. GPU UMAP is non-deterministic
-(intentional atomicAdd races, matching cuML), so the embedding differs run-to-run
-but preserves cluster structure — pin `device="cpu"` for reproducible
-coordinates.
+Fallback: when `rapids_singlecell` is not importable (or no GPU), it
+transparently runs the standalone `pca` → `neighbors` → `umap` on CPU (each
+with its own routing/warnings) and the `pca_neighbors_umap` route records the
+fallback reason as `no_rapids`. GPU UMAP via rapids is non-deterministic, so
+the embedding differs run-to-run but preserves cluster structure — pin
+`device="cpu"` for reproducible coordinates.
 
 ### UMAP (`pyscx.accel.umap`)
 
-SGD-based UMAP embedding with spectral initialization and negative
-sampling. Takes the kNN connectivity graph as input.
+UMAP embedding with spectral initialization. On CPU, uses an SGD-based
+implementation with negative sampling. On GPU, routes to
+`rapids_singlecell` (`rsc.tl.umap`). Takes the kNN connectivity graph as
+input.
 
 ```python
 pyscx.accel.umap(adata)
@@ -1516,8 +1522,10 @@ pyscx.accel.umap(adata)
 | `random_state` | 0 | Random seed |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"` |
 
-On GPU, uses a native CUDA SGD kernel (edge-parallel with `atomicAdd`).
-Falls back to cuML UMAP if available for maximum performance.
+On GPU, routes to `rapids_singlecell` (`rsc.tl.umap`) via
+`to_gpu_anndata()`. The native CUDA SGD UMAP kernel was removed in
+Phase 3.1. Falls back to CPU if `rapids_singlecell` is not importable
+(fallback reason: `no_rapids`).
 
 ### Leiden clustering (`pyscx.accel.leiden`)
 
@@ -2137,10 +2145,9 @@ The GPU test suite (`pyscx/tests/test_accel_gpu.py`) enforces these thresholds v
 | Test | Metric | Threshold | Notes |
 |------|--------|-----------|-------|
 | GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 | Sign-invariant; GPU=f32, CPU=f64 |
-| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (CAGRA vs HNSW); exact match not expected |
-| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic due to `atomicAdd` races |
+| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (rapids vs HNSW); exact match not expected |
+| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic (rapids_singlecell GPU UMAP) |
 | GPU Leiden vs CPU Leiden | ARI | > 0.90 | Graph partitioning is inherently non-deterministic |
-| GPU SpMM vs CPU SpMM | Max relative error | < 1e-5 | Relative error (not absolute) for values near zero |
 | GPU normalize + log1p | Element-wise | rtol=1e-7 | Possible f32 rounding differences vs CPU |
 
 ### Checking which backend was used
@@ -2149,21 +2156,26 @@ All accelerators record the backend in `adata.uns`:
 
 ```python
 pyscx.accel.pca(adata, device="gpu")
-print(adata.uns["pca"]["backend"])          # "scx-gpu-cusparse"
+print(adata.uns["pca"]["backend"])          # "rapids_singlecell_gpu"
 print(adata.uns["pca"]["device"])           # "NVIDIA A100-SXM4-80GB"
 print(adata.uns["pca"]["gpu_time_ms"])      # 1234.5
 
 pyscx.accel.neighbors(adata, device="gpu")
-print(adata.uns["neighbors"]["backend"])    # "scx-gpu-cagra"
+print(adata.uns["neighbors"]["backend"])    # "rapids_singlecell_gpu"
 
 pyscx.accel.umap(adata, device="gpu")
-print(adata.uns["umap"]["backend"])         # "scx-gpu-cuda" or "cuml"
+print(adata.uns["umap"]["backend"])         # "rapids_singlecell_gpu"
 ```
 
-If cuML or cuGraph are importable at runtime, they are used as optimized
-backends for UMAP and GPU Leiden respectively. Otherwise, SCX's native CUDA
-kernels (UMAP) or the Rust-native Leiden implementation are used. The
-Leiden dispatch order is: Rust-native → GPU cuGraph → Python leidenalg.
+On GPU, PCA, kNN, and UMAP all route to `rapids_singlecell` (`rsc.pp.pca`,
+`rsc.pp.neighbors`, `rsc.tl.umap`). Preprocessing ops (`normalize_total`,
+`log1p`, `highly_variable_genes`) also route to `rsc.pp.*` on GPU. GPU
+Leiden uses cuGraph. The Leiden dispatch order is: Rust-native CPU →
+cuGraph GPU → Python leidenalg. Set `SCX_FORCE_NATIVE_GPU=1` to pin
+surviving native GPU paths (HVG `seurat_v3`, DE, Harmony, Leiden); set
+`SCX_DISABLE_RAPIDS=1` to force the rapids-absent fallback for testing.
+When rapids is unavailable, a one-shot `UserWarning` is emitted and the
+fallback reason `no_rapids` is recorded in the route metadata.
 
 ## Multithreading
 
@@ -2319,9 +2331,9 @@ sc.tl.leiden(adata_sub)  # CPU Leiden; use device="gpu" for cuGraph
 sc.pl.umap(adata_sub, color="leiden")
 
 # Check which backends were used
-print(adata_sub.uns["pca"]["backend"])       # "scx-gpu-cusparse"
-print(adata_sub.uns["neighbors"]["backend"]) # "scx-gpu-cagra"
-print(adata_sub.uns["umap"]["backend"])      # "scx-gpu-cuda"
+print(adata_sub.uns["pca"]["backend"])       # "rapids_singlecell_gpu"
+print(adata_sub.uns["neighbors"]["backend"]) # "rapids_singlecell_gpu"
+print(adata_sub.uns["umap"]["backend"])      # "rapids_singlecell_gpu"
 ```
 
 ### Differential expression

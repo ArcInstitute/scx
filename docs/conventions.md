@@ -62,6 +62,11 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   reference.
 - GDS requires local NVMe + nvidia-fs drivers + ext4/XFS filesystem;
   always falls back to the CPU path.
+- In-VRAM GPU analysis (PCA, kNN, UMAP, preprocessing) routes through
+  **rapids-singlecell** via PyO3 Python interop (`pyscx/src/accel/rapids.rs`).
+  The module performs a one-shot runtime import probe; absence triggers a
+  `no_rapids` `UserWarning` and falls back to CPU. rapids is a detected
+  runtime dependency (conda), not a build dependency or pip extra.
 
 ## Accelerators (scx-accel)
 

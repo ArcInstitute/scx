@@ -229,6 +229,68 @@ fn merge_small_inputs_emits_shards() {
     assert_eq!(donors.value(200), "donor_C");
 }
 
+/// Write a legacy input stamping an explicit `format_version` (the writer
+/// trusts the header it is given). Used to exercise the version gate.
+fn write_legacy_input_versioned(
+    path: &std::path::Path,
+    n_obs: u64,
+    donor: &str,
+    var: &RecordBatch,
+    format_version: u16,
+) {
+    let mut h = header(n_obs, 4);
+    h.format_version = format_version;
+    let mut writer = ScxWriter::new(path, h).unwrap();
+    writer
+        .write_obs(&obs_batch(0, n_obs as usize, donor))
+        .unwrap();
+    writer.write_var(var).unwrap();
+    write_zero_csr_shard(&mut writer, 0, n_obs);
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "streaming_merge_append test fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+#[test]
+fn merge_gates_v3_stamp_on_min_source_version() {
+    // Merge re-encodes shards without re-canonicalizing, so the v3 canonical
+    // claim must only be stamped when every input already guarantees it. A
+    // pre-v3 input pins the merged output below v3; all-v3 inputs yield v3.
+    let dir = tempfile::tempdir().unwrap();
+    let var = var_batch();
+
+    // Mixed v2 + v3 inputs → output stays v2 (no false canonical claim).
+    let p0 = dir.path().join("v2.scx");
+    let p1 = dir.path().join("v3.scx");
+    write_legacy_input_versioned(&p0, 50, "donor_A", &var, 2);
+    write_legacy_input_versioned(&p1, 50, "donor_B", &var, 3);
+    let mixed = dir.path().join("mixed.scx");
+    scx_ops::merge(&[p0.as_path(), p1.as_path()], &mixed).unwrap();
+    assert_eq!(
+        ScxReader::open(&mixed).unwrap().header().format_version,
+        2,
+        "a pre-v3 input must pin the merged output below v3"
+    );
+
+    // All-v3 inputs → output claims v3.
+    let p2 = dir.path().join("v3b.scx");
+    write_legacy_input_versioned(&p2, 50, "donor_C", &var, 3);
+    let all_v3 = dir.path().join("all_v3.scx");
+    scx_ops::merge(&[p1.as_path(), p2.as_path()], &all_v3).unwrap();
+    assert_eq!(
+        ScxReader::open(&all_v3).unwrap().header().format_version,
+        3,
+        "all-v3 inputs must yield a v3 merged output"
+    );
+}
+
 #[test]
 fn merge_var_mismatch_errors_by_default() {
     // Phase 2e default (assume_identical_var = false): var identity

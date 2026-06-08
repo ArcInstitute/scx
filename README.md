@@ -57,7 +57,7 @@ skill via [`AGENTS.md`](AGENTS.md).
 ## Main features
 
 - **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
-- **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The CUDA path (cuSPARSE · cuSOLVER · cuVS CAGRA · cuGraph) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
+- **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The GPU path (rapids-singlecell for PCA · kNN · UMAP · preprocessing, cuGraph for Leiden, plus native CUDA kernels for HVG · DE · Harmony) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
 - **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) runs at **~11 GB peak RSS** vs ~22 GB materialised (51% less; lazy preprocessing alone peaks at ~3.5 GB). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
 - **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
 - **Mutable without rewriting** — append new cells, mark-delete doublets, compact, merge, or roll back in milliseconds. Append writes new matrix shards in O(new cells); obs metadata is rewritten as a merged Arrow IPC covering all cells (see [docs/operations.md](docs/operations.md)). Delete is a logical mask, not a data rewrite.
@@ -260,8 +260,7 @@ print(exp.n_obs, exp.n_vars)
 ### Your analysis pipeline is too slow for atlas-scale
 
 At >1M cells, even optimized CPU code for PCA, kNN, and UMAP takes minutes.
-SCX provides GPU-accelerated analysis via CUDA — PCA through cuSPARSE SpMM +
-cuSOLVER QR, kNN through cuVS CAGRA, and UMAP through a native CUDA SGD kernel.
+SCX provides GPU-accelerated analysis via [rapids-singlecell](https://rapids-singlecell.readthedocs.io/) — PCA (`rsc.pp.pca`), kNN (`rsc.pp.neighbors`), and UMAP (`rsc.tl.umap`) run in-VRAM on the GPU, with native CUDA kernels for HVG, DE, and Harmony.
 All accessed through the same Python API with a single `device="gpu"` parameter:
 
 ```python
@@ -279,10 +278,10 @@ sc.tl.leiden(adata)  # downstream scanpy works identically
 sc.pl.umap(adata, color="leiden")
 ```
 
-SCX streams shards from disk → GPU via cuSPARSE SpMM — no full matrix
-materialization in CPU memory. This enables GPU analysis on datasets larger
-than VRAM. When no GPU is available, every operation falls back to CPU
-automatically with a warning.
+SCX provides `to_gpu_anndata()` for minimal-copy device handoff to a
+GPU-resident AnnData with `cupyx.scipy.sparse.csr_matrix` X, enabling
+full in-VRAM pipelines via rapids-singlecell. When no GPU is available,
+every operation falls back to CPU automatically with a warning.
 
 ### Your perturb-seq evaluation pipeline is slow
 
@@ -498,9 +497,9 @@ cd pyscx && ../.venv/bin/maturin develop --release --features cloud
 
 #### GPU acceleration
 
-GPU support requires the CUDA Toolkit (≥ 12.0) and, for kNN/Leiden, the
-RAPIDS libraries (cuVS, cuGraph). There are three ways to set this up —
-conda is recommended as it handles the full CUDA + RAPIDS dependency tree.
+GPU support requires the CUDA Toolkit (≥ 12.0) and rapids-singlecell
+(which brings cuML, cuGraph, and cupy). There are three ways to set this
+up — conda is recommended as it handles the full CUDA + RAPIDS dependency tree.
 
 **Option A: conda (recommended)** — resolves CUDA version matching automatically:
 
@@ -509,16 +508,16 @@ conda is recommended as it handles the full CUDA + RAPIDS dependency tree.
 conda create -n scx-gpu python=3.13
 conda activate scx-gpu
 
-# Install RAPIDS (cuVS for kNN, cuGraph for Leiden) — pin cuda-version to match your driver
+# Install rapids-singlecell + RAPIDS (cuGraph for Leiden) — pin cuda-version to match your driver
 # Run `nvidia-smi` to check your driver's max CUDA version
-conda install -c rapidsai -c conda-forge cuvs cugraph cuda-version=12.2
+conda install -c rapidsai -c conda-forge rapids-singlecell cugraph cuda-version=12.2
 
 # Install Python deps + build pyscx with GPU support
 pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
 cd pyscx && maturin develop --release --features gpu
 ```
 
-**Option B: system CUDA Toolkit** — if you only need PCA/UMAP (no cuVS kNN or cuGraph Leiden):
+**Option B: system CUDA Toolkit** — for native-only GPU ops (HVG, DE, Harmony, Leiden via cuGraph):
 
 ```bash
 # 1. Install CUDA Toolkit ≥ 12.0
@@ -538,8 +537,8 @@ uv pip install maturin numpy scipy pyarrow anndata
 cd pyscx && ../.venv/bin/maturin develop --release --features gpu
 ```
 
-This gives you GPU-accelerated PCA (cuSPARSE SpMM) and UMAP (native CUDA SGD).
-kNN and Leiden will fall back to CPU since cuVS/cuGraph are not installed.
+Without rapids-singlecell, PCA/kNN/UMAP will fall back to CPU.
+Native CUDA kernels (HVG, DE, Harmony) still run on GPU.
 
 **Option C: container** — for reproducible environments or CI:
 

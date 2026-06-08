@@ -368,13 +368,8 @@ pub fn append_from_anndata(
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-    // Detect encoding and encode values
-    let value_encoding = anndata::detect_value_encoding(data_slice);
-    let values_bytes = anndata::encode_values(data_slice, value_encoding)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
     // Convert indptr/indices to on-disk types (finding 9.2: validate non-negative).
-    let indptr: Vec<u64> = indptr_slice
+    let mut indptr: Vec<u64> = indptr_slice
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -386,7 +381,7 @@ pub fn append_from_anndata(
             }
         })
         .collect::<PyResult<Vec<u64>>>()?;
-    let indices: Vec<u32> = indices_slice
+    let mut indices: Vec<u32> = indices_slice
         .iter()
         .map(|&v| {
             if v < 0 {
@@ -396,6 +391,25 @@ pub fn append_from_anndata(
             }
         })
         .collect::<PyResult<Vec<u32>>>()?;
+
+    // Canonicalize the appended X before encoding so it upholds the v3
+    // invariant (append preserves the base file's format_version, which may be
+    // v3). Skip the f32 copy when the input is already canonical — the common
+    // case. Detect encoding + encode from the (possibly canonicalized) values.
+    let (value_encoding, values_bytes) =
+        if scx_sparse::is_canonical_csr(&indptr, &indices, data_slice) {
+            let ve = anndata::detect_value_encoding(data_slice);
+            let vb = anndata::encode_values(data_slice, ve)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            (ve, vb)
+        } else {
+            let mut data_vec = data_slice.to_vec();
+            scx_sparse::canonicalize_csr(&mut indptr, &mut indices, &mut data_vec);
+            let ve = anndata::detect_value_encoding(&data_vec);
+            let vb = anndata::encode_values(&data_vec, ve)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            (ve, vb)
+        };
 
     // Read obs from AnnData
     let obs_df = adata.getattr("obs")?;

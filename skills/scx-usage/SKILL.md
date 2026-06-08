@@ -196,6 +196,17 @@ normally. `accel.*` write to the standard AnnData slots (`obsm["X_pca"]`,
 `obsp["distances"]`/`["connectivities"]`, `obsm["X_umap"]`, `obs[leiden]`), so
 downstream scanpy is unchanged.
 
+**GPU rapids-singlecell routing:** When `rapids-singlecell` is installed
+(conda — not pip), `device="gpu"` routes PCA → `rsc.pp.pca`, kNN →
+`rsc.pp.neighbors`, UMAP → `rsc.tl.umap`, and preprocessing → `rsc.pp.*`.
+Native GPU paths survive for streaming/randomized PCA (>VRAM), HVG
+`seurat_v3`, Leiden, DE, and Harmony. If rapids is absent, GPU ops fall
+back to CPU with `FallbackReason::NoRapids`. `to_gpu_anndata()` on a
+`PyExperiment` provides a minimal-copy on-device handoff (shard decode →
+GPU → `cupyx.sparse.csr_matrix`). Env vars: `SCX_FORCE_NATIVE_GPU=1`
+pins surviving native GPU paths; `SCX_DISABLE_RAPIDS=1` forces the
+no-rapids CPU fallback for testing.
+
 ### Query pipeline (predicate pushdown → subset)
 ```python
 adata = (pyscx.open("atlas.scx").query()
@@ -289,4 +300,4 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.
-- GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` if you expected GPU.
+- GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing.

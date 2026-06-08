@@ -186,9 +186,15 @@ pub fn merge_with_options(
     // selected per-shard via select_codec(). `flags` stays 0 — merge
     // intentionally produces a clean output header rather than carrying
     // input flag state forward.
+    // Merge re-encodes shards via `encode_one_shard` (no re-canonicalization),
+    // so the v3 canonical-CSR invariant only holds if every input already
+    // guarantees it. Gate the stamp on the minimum input version (floor 1 —
+    // this is the single-modality merge).
+    let input_format_versions: Vec<u16> =
+        readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format::rewrite_output_format_version(&input_format_versions, 1),
         header_length: 256,
         flags: 0,
         n_obs: total_n_obs,
@@ -660,9 +666,13 @@ fn merge_multimodal(
 
     let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
 
+    // Gate the v3 canonical claim on the minimum input version (floor 2 —
+    // multimodal output requires v2+). See the single-modality merge above.
+    let input_format_versions: Vec<u16> =
+        readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format::rewrite_output_format_version(&input_format_versions, 2),
         header_length: 256,
         flags: 0,
         n_obs: total_n_obs,

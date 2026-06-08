@@ -465,7 +465,7 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 ### GPU Analysis Pipeline
 
-GPU-accelerated analysis via cuSPARSE, cuSOLVER, cuBLAS, cuVS CAGRA, native CUDA UMAP kernel, and cuGraph Leiden. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
+GPU-accelerated analysis via **rapids-singlecell** (`rsc.pp.pca`, `rsc.pp.neighbors`, `rsc.tl.umap`, `rsc.pp.*`) for in-VRAM ops, plus native Rust/CUDA paths for streaming PCA, HVG `seurat_v3`, Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct), Harmony, and codec decode. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
 
 Numbers below are from the full-tier gate run on 2026-05-25 (post-G10 graph capture for GPU DE + bench env-routing fix). The per-job conda-env routing fix (`run_parallel.py::_env_for_format`) unlocked real GPU coverage for Leiden + kNN that prior baselines silently missed (workers were running on the orchestrator's env which lacked cuGraph + cuVS — see `benchmarks/README.md` § Environment notes for the routing details).
 
@@ -473,17 +473,17 @@ Numbers below are from the full-tier gate run on 2026-05-25 (post-G10 graph capt
 
 | Operation | Dataset | CPU (s) | GPU (s) | Speedup | Backend |
 |-----------|---------|---------|---------|---------|---------|
-| PCA (50 PCs, auto-routed) | tabula_sapiens_100k | 2.79 (`pyscx_cpu_auto`) | 0.38 (`gpu_cov`) | **7.3×** | covariance ≤8000 vars |
-| PCA (50 PCs, auto-routed) | census_500k | 1.89 | 0.79 | 2.4× | covariance |
-| PCA (50 PCs, auto-routed) | census_1m | 2.77 | 1.56 | 1.8× | covariance |
+| PCA (50 PCs, auto-routed) | tabula_sapiens_100k | 2.79 (`pyscx_cpu_auto`) | 0.38 | **7.3×** | rapids `rsc.pp.pca` (in-VRAM) |
+| PCA (50 PCs, auto-routed) | census_500k | 1.89 | 0.79 | 2.4× | rapids `rsc.pp.pca` (in-VRAM) |
+| PCA (50 PCs, auto-routed) | census_1m | 2.77 | 1.56 | 1.8× | rapids `rsc.pp.pca` (in-VRAM) |
 | PCA correctness (cos sim vs scanpy, top-50) | pbmc3k | — | — | **min=0.999911** | — |
 | PCA correctness (cos sim vs scanpy, top-50) | census_1m | — | — | **min=1.0** | — |
-| kNN (k=15, 50 PCs) | tabula_sapiens_100k | 5.68 (`scanpy_cpu`) | 4.28 | 1.3× | cuVS CAGRA |
-| kNN (k=15, 50 PCs) | census_500k | 36.36 | 12.75 | **2.9×** | cuVS CAGRA |
-| kNN (k=15, 50 PCs) | census_1m | 91.97 | 26.67 | **3.4×** | cuVS CAGRA |
-| UMAP (2D) | tabula_sapiens_100k | 50.82 (`scanpy_cpu`) | 2.58 | **20×** | native CUDA SGD |
-| UMAP (2D) | census_500k | 364.51 | 10.61 | **34×** | native CUDA SGD |
-| UMAP (2D) | census_1m | 846.89 | 27.91 | **30×** | native CUDA SGD |
+| kNN (k=15, 50 PCs) | tabula_sapiens_100k | 5.68 (`scanpy_cpu`) | 4.28 | 1.3× | rapids `rsc.pp.neighbors` |
+| kNN (k=15, 50 PCs) | census_500k | 36.36 | 12.75 | **2.9×** | rapids `rsc.pp.neighbors` |
+| kNN (k=15, 50 PCs) | census_1m | 91.97 | 26.67 | **3.4×** | rapids `rsc.pp.neighbors` |
+| UMAP (2D) | tabula_sapiens_100k | 50.82 (`scanpy_cpu`) | 2.58 | **20×** | rapids `rsc.tl.umap` |
+| UMAP (2D) | census_500k | 364.51 | 10.61 | **34×** | rapids `rsc.tl.umap` |
+| UMAP (2D) | census_1m | 846.89 | 27.91 | **30×** | rapids `rsc.tl.umap` |
 | UMAP trustworthiness | pbmc3k | 0.9238 | 0.9233 | — | vs PCA space |
 | Leiden (`device="cpu"`, Rust-native) | tabula_sapiens_100k | 3.41 | — | — | `scx_accel::leiden` |
 | Leiden (`device="gpu"`, cuGraph) | tabula_sapiens_100k | 100.73 (`leidenalg_cpu`) | 0.54 | **187×** | cuGraph |
@@ -550,9 +550,9 @@ Practical recommendation: **use the GPU preprocessing path only via the `normali
 
 **Dispatch logic:** for an in-memory `X`, in-VRAM `pyscx.accel.pca(device="gpu")` routes to rapids-singlecell (`rsc.pp.pca`). The native GPU PCA path (backed/lazy/streaming inputs, or `SCX_FORCE_NATIVE_GPU=1`) is **always randomized** — the in-VRAM covariance core was removed in ACC-RUST-OPT-V4 Phase 3.2, so `method="covariance"` / `"auto"` resolve to randomized on GPU (covariance is still honored on the CPU path). The randomized path accepts `qr_method="householder"` (default, always-stable) or `"cholesky"` (CholeskyQR2 — opt-in, surfaces `RuntimeError` on non-SPD Gram so callers can retry with Householder).
 
-**Correctness.** On pbmc3k + census_1m, GPU PCA's 50 leading PCs match scanpy's reference to cosine ≥ 0.9999 sign-agnostic (`gpu_pca_validation.json`). kNN GPU CAGRA matches scanpy-neighbors at recall = 1.0 on pbmc3k and ARI 0.91 against a downstream Leiden on tabula_sapiens_100k. UMAP trustworthiness 0.9233 (vs CPU 0.9238) on pbmc3k.
+**Correctness.** On pbmc3k + census_1m, GPU PCA's 50 leading PCs match scanpy's reference to cosine ≥ 0.9999 sign-agnostic (`gpu_pca_validation.json`). kNN via rapids `rsc.pp.neighbors` matches scanpy-neighbors at recall = 1.0 on pbmc3k and ARI 0.91 against a downstream Leiden on tabula_sapiens_100k. UMAP via rapids `rsc.tl.umap` trustworthiness 0.9233 (vs CPU 0.9238) on pbmc3k.
 
-GPU PCA (both variants) streams shards from disk → GPU kernels shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM.
+Native GPU PCA (streaming/randomized path, used for backed/lazy/streaming inputs or `SCX_FORCE_NATIVE_GPU=1`) streams shards from disk → GPU kernels shard-by-shard without materializing the full matrix — enabling PCA on datasets larger than VRAM. In-VRAM PCA routes to rapids `rsc.pp.pca`.
 
 #### Differential expression
 
@@ -589,7 +589,7 @@ Two baselines live side-by-side under `benchmarks/comprehensive/results/baseline
 | Use | Baseline | Date | Coverage |
 |---|---|---|---|
 | Format / cloud / multimodal | `LATEST` → `v0.6.2-n_counts-augmentation` | 2026-05-11 | 806 rows × 8 datasets (`pbmc3k` → `census_1m`, `cite_seq_pbmc`, `multiome_pbmc`) |
-| Accel (incl. `accel_de`) | `v0.4.3-g1-gpu-de` | 2026-05-22 | 140 rows × 6 datasets × 7 accel benchmarks; PR series G1 promotion |
+| Accel (incl. `accel_de`) | `v0.6.5-accel-gpu-rapids-floors` | 2026-06-XX | rapids-routed accel rows; cross-tier rapids route + correctness gates (`*_route_rapids_correct`, `*_fallback_no_rapids_correct`); Phase 2 promotion |
 
 Per-run correctness metrics (`cosine_sim_min`/`mean`, `recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`, `max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`, plus `de_pval_agreement_vs_cpu` / `de_top_gene_overlap_vs_cpu` added in G1) flow through `runs[].extra` so the floor checks in `thresholds.yaml` evaluate real observed values, not `missing` placeholders.
 
@@ -599,14 +599,14 @@ python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel
 
 # Accel (incl. DE) — pin the accel-only baseline:
 python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
-    --baseline benchmarks/comprehensive/results/baselines/v0.4.3-g1-gpu-de
+    --baseline benchmarks/comprehensive/results/baselines/v0.6.5-accel-gpu-rapids-floors
 ```
 
 Older accel-only baselines (`v0.6.0-gpu-phase1-7`, `v0.6.0-gpu-phase1-7-multidataset`) remain in-tree for historical bisects but are no longer the gate targets. The earlier stop-gap wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and `slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py` for accelerator regression runs.
 
 #### Changes vs previous version
 
-- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) implemented. On tabula_sapiens_100k (HVG-shaped input) GPU PCA now runs 1.7× vs CPU, up from 0.9× in the earlier baseline. On census_1m at the same n_vars, the speedup remained 0.9× — the covariance-PCA's Gram-matrix cost on 1M cells doesn't currently outperform CPU's block-partitioned outer-product accumulation. Tracked as a follow-up optimization (streaming Gram into a sparse intermediate rather than densifying per shard).
+- **Covariance-PCA dispatch path** on GPU (threshold `n_vars ≤ 8000`) — *historical, removed in ACC-RUST-OPT-V4 Phase 3.2.* The native in-VRAM covariance PCA core (`gpu_pca_covariance.rs`, `covariance_pca_gpu`, `GPU_COVARIANCE_PCA_THRESHOLD`) was deleted; in-VRAM PCA now routes to rapids `rsc.pp.pca`. The numbers below are from the pre-removal baseline: on tabula_sapiens_100k (HVG-shaped input) GPU PCA ran 1.7× vs CPU, up from 0.9× in the earlier baseline. On census_1m at the same n_vars, the speedup remained 0.9×. Native streaming/randomized PCA survives for >VRAM workloads.
 - **Randomized PCA's critical path** now fully GPU-resident — the prior `Q → host → f64` SVD tail and per-iteration `d_m` download round-trip are gone (cuBLAS `sgemv` + `sgemm`). Correctness preserved (cosine ≥ 0.9999 on real data).
 - **Opt-in CholeskyQR2** (`qr_method="cholesky"`) for the randomized path; benchmark-suite variants `gpu_randomized_pca_chol` vs `gpu_randomized_pca_householder` pending from the current cluster run.
 - **Standalone GPU preprocessing ops** (`normalize_total`, `log1p`, `highly_variable_genes`) gain a `device` kwarg. In isolation they are slower than the CPU path (see table above — `log1p` is ~40× slower on tabula due to H2D/D2H round-trips); the `normalize_total → log1p` fusion marker is the only fast path.

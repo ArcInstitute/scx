@@ -28,6 +28,27 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 /// payloads for direct device/random-access decode.
 pub const CURRENT_FORMAT_VERSION: u16 = 3;
 
+/// Output `format_version` for an SCX→SCX operation that copies or
+/// re-encodes source shards **without** re-canonicalizing them
+/// (passthrough, merge, compact, append raw-copy). v3's canonical-CSR
+/// invariant may only be claimed when every source already guarantees it
+/// (is itself v3+); a pre-v3 source could carry unsorted indices or
+/// unsummed duplicate coordinates, so upgrading it to v3 would be a false
+/// claim that `scx validate --deep` would (correctly) reject.
+///
+/// `feature_floor` is the minimum version the output's own features
+/// require (1 = legacy single-modality, 2 = multimodal). The result is
+/// `min(sources)` clamped into `[feature_floor, CURRENT_FORMAT_VERSION]`.
+/// An empty `source_versions` (no SCX source) yields `CURRENT_FORMAT_VERSION`.
+pub fn rewrite_output_format_version(source_versions: &[u16], feature_floor: u16) -> u16 {
+    let min_source = source_versions
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(CURRENT_FORMAT_VERSION);
+    min_source.clamp(feature_floor, CURRENT_FORMAT_VERSION)
+}
+
 /// Bitmask of currently-defined flag bits. Reserved bits (4 and 8..=31)
 /// must be zero per the on-disk spec; `read_from` rejects any header
 /// whose `flags & !KNOWN_FLAGS != 0` so future writers can't sneak
@@ -712,6 +733,27 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = FileHeader::read_from(&mut cursor).unwrap_err();
         assert!(matches!(err, ScxError::UnsupportedEndian));
+    }
+
+    #[test]
+    fn rewrite_output_format_version_gates_on_min_source() {
+        // All v3 sources → claim v3.
+        assert_eq!(rewrite_output_format_version(&[3, 3], 1), 3);
+        // A pre-v3 source pins the output below v3 (no false canonical claim).
+        assert_eq!(rewrite_output_format_version(&[3, 2], 1), 2);
+        assert_eq!(rewrite_output_format_version(&[1], 1), 1);
+        // Feature floor lifts the result (multimodal needs >= 2).
+        assert_eq!(rewrite_output_format_version(&[1], 2), 2);
+        // Never exceeds CURRENT.
+        assert_eq!(
+            rewrite_output_format_version(&[CURRENT_FORMAT_VERSION + 5], 1),
+            CURRENT_FORMAT_VERSION
+        );
+        // No SCX source → CURRENT.
+        assert_eq!(
+            rewrite_output_format_version(&[], 1),
+            CURRENT_FORMAT_VERSION
+        );
     }
 
     #[test]

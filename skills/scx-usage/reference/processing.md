@@ -76,7 +76,7 @@ All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
 (default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
 convert). GPU `pdex_ref` is "GPU-fast" only with a CSC sidecar (`gpu_csc_v3`
-under `SCX_GPU_DE_V3=1`); without one it falls back to `gpu_csr_v3` — confirm via
+route, now the default); without one it falls back to `gpu_csr_v3` — confirm via
 `adata.uns["scx_accel"][op]["route"]`.
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
@@ -89,15 +89,15 @@ under `SCX_GPU_DE_V3=1`); without one it falls back to `gpu_csr_v3` — confirm 
 - `highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3", batch_key=None, span=0.3, subset=False, n_bins=20, device="auto", prefer_format="csr", layer=None)` — streaming. **seurat_v3 expects raw counts** — run before normalize/log1p or pass `layer="counts"`. Runs the scx-native kernel on backed, lazy, **and** in-memory scipy/dense `X` for `flavor` in `seurat_v3`/`seurat_v3_paper`/`seurat` (a materialized `X` is wrapped in a single-shard `ShardSource`); only `cell_ranger` delegates to scanpy. **High-cardinality `batch_key`** (e.g. CELLxGENE `dataset_id` → many <150-cell batches) makes some per-batch loess fits singular; the native path catches each, warns naming the batch, and drops it from the ranking, so HVG completes — prefer a coarser `batch_key` if many drop (`filter_genes(min_cells=10)` only helps the no-`batch_key` global fit). Writes `var["highly_variable"]`, `var["means"]`, `var["variances"]`, `var["variances_norm"]`, `var["highly_variable_rank"]`.
 
 **Dimensionality reduction / graph:**
-- `pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — randomized SVD with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. **PCA rejects CSC.**
-- `neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — CPU HNSW / GPU CAGRA. Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
-- `umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — writes `obsm["X_umap"]`.
+- `pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — in-VRAM data routes to `rsc.pp.pca` (rapids-singlecell); >VRAM data uses native randomized SVD with streaming shards. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. **PCA rejects CSC.**
+- `neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — CPU HNSW; GPU routes to `rsc.pp.neighbors` (rapids-singlecell). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
+- `umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — GPU routes to `rsc.tl.umap` (rapids-singlecell); CPU falls back to scanpy. Writes `obsm["X_umap"]`.
 - `leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto")` — reads `obsp["connectivities"]`. **Pin `device="cpu"` for label stability** (GPU Leiden diverges from `leidenalg`; documented). Writes `obs[key_added]` (categorical) + `uns["leiden"]`.
 
 **DE / perturbation:**
 - `rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — parallel Wilcoxon + BH. Writes `uns["rank_genes_groups"]` (or returns a DataFrame when `stratify_by` set).
 - `rank_genes_groups_df(...) -> polars.DataFrame` — same Wilcoxon in cell-eval's `DEResults` schema.
-- `pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") -> polars.DataFrame` — perturbation-screen DE (Mann–Whitney U + pseudobulk geometric-mean LFC vs one reference group). Set `SCX_GPU_DE_V3=1` to use the CSC-direct GPU driver (needs a CSC sidecar).
+- `pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") -> polars.DataFrame` — perturbation-screen DE (Mann–Whitney U + pseudobulk geometric-mean LFC vs one reference group). CSC-direct GPU driver (`gpu_csc_v3`) is the default when a CSC sidecar is present; without one falls back to `gpu_csr_v3`.
 - `pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None) -> DataFrame` — streaming pseudobulk + pydeseq2 (optional dep). CSC needs a gene subset.
 - `pseudobulk_means(adata, groupby, min_cells_per_group=1) -> (ndarray[P,G] f64, group_names)`.
 - `perturbation_metrics(adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1) -> dict` — `{pearson_delta, mse, mae, mse_delta, mae_delta}`.
@@ -114,7 +114,7 @@ under `SCX_GPU_DE_V3=1`); without one it falls back to `gpu_csr_v3` — confirm 
 
 **GPU helpers:**
 - `gpu_info() -> dict | None` — `{device, total_vram_gb, free_vram_gb}` or `None` if unavailable.
-- `estimate_gpu_memory(adata, operation, **kwargs) -> {required_gb, fits_in_vram}` — `operation` ∈ `"pca"` / `"knn"` / `"umap"` / `"leiden"`.
+- `estimate_gpu_memory(adata, operation, **kwargs) -> {required_gb, fits_in_vram}` — `operation` ∈ `"pca"` / `"leiden"` (kNN and UMAP route to rapids-singlecell and are no longer estimated natively).
 
 ## Streaming write-back (copy-on-write, no full materialization)
 - `pyscx.preprocess(source, target, ops, target_sum=None)` — shard-by-shard transform to a new file.

@@ -347,19 +347,54 @@ fn dedup_sum_sorted_rows(indptr: &mut [u64], indices: &mut Vec<u32>, values: &mu
     values.truncate(write);
 }
 
+/// Returns `true` iff [`canonicalize_csr`] would leave this CSR
+/// unchanged: every row's column indices are strictly increasing
+/// (already sorted **and** free of duplicate `(row, col)` coordinates —
+/// duplicates manifest as equal adjacent indices) and no stored value
+/// is an explicit zero. Read-only, `O(nnz)`, allocates nothing.
+/// `indptr[0]` is assumed to be 0.
+///
+/// Lets hot ingest paths skip the canonicalize copy/sort when the input
+/// (e.g. a scipy CSR with `has_canonical_format == True`) is already
+/// canonical — the overwhelmingly common case.
+pub fn is_canonical_csr(indptr: &[u64], indices: &[u32], values: &[f32]) -> bool {
+    let n_rows = indptr.len().saturating_sub(1);
+    for row in 0..n_rows {
+        let start = indptr[row] as usize;
+        let end = indptr[row + 1] as usize;
+        if end < start || end > indices.len() || end > values.len() {
+            return false;
+        }
+        let row_idx = &indices[start..end];
+        for w in row_idx.windows(2) {
+            if w[1] <= w[0] {
+                return false;
+            }
+        }
+        if values[start..end].contains(&0.0) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Canonicalize a CSR matrix in place for *untrusted* ingest sources
 /// (MatrixMarket per review finding CLI1; the messy-h5ad CSC→CSR
 /// transpose): sort each row by column index, sum entries that share a
 /// `(row, col)` coordinate, and drop the resulting explicit zeros.
 /// `indptr[0]` must be 0.
 ///
-/// Idempotent on already-canonical input, but **do not** call it on
-/// SCX→SCX shard rewrites — it would needlessly re-sort and re-scan
-/// canonical shards and regress streaming-write throughput. Hot
+/// Idempotent on already-canonical input (and short-circuits via
+/// [`is_canonical_csr`] in that case, skipping the per-row sort), but
+/// **do not** call it on SCX→SCX shard rewrites — it would needlessly
+/// re-scan canonical shards and regress streaming-write throughput. Hot
 /// per-shard rebases use [`rebase_csr_shard`] (validation only, no
 /// sort/dedup) instead.
 #[allow(clippy::ptr_arg)]
 pub fn canonicalize_csr(indptr: &mut Vec<u64>, indices: &mut Vec<u32>, values: &mut Vec<f32>) {
+    if is_canonical_csr(indptr, indices, values) {
+        return;
+    }
     sort_csr_rows_in_place(indptr, indices, values);
     dedup_sum_sorted_rows(indptr, indices, values);
     drop_explicit_zeros_inplace(indptr, indices, values);
@@ -689,6 +724,26 @@ mod tests {
         assert_eq!(indptr, vec![0u64, 2, 3]);
         assert_eq!(indices, vec![0u32, 2, 1]);
         assert_eq!(values, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    // ---- is_canonical_csr ----
+
+    #[test]
+    fn is_canonical_csr_accepts_canonical() {
+        let indptr = vec![0u64, 2, 3];
+        let indices = vec![0u32, 2, 1];
+        let values = vec![1.0f32, 2.0, 3.0];
+        assert!(is_canonical_csr(&indptr, &indices, &values));
+    }
+
+    #[test]
+    fn is_canonical_csr_rejects_unsorted_dup_and_zero() {
+        // Unsorted within a row.
+        assert!(!is_canonical_csr(&[0, 2], &[2, 0], &[1.0, 2.0]));
+        // Duplicate column (equal adjacent indices).
+        assert!(!is_canonical_csr(&[0, 2], &[1, 1], &[1.0, 2.0]));
+        // Explicit zero value.
+        assert!(!is_canonical_csr(&[0, 2], &[0, 1], &[1.0, 0.0]));
     }
 
     // ---- validate_sparse_layout (C1) ----
