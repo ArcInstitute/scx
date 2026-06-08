@@ -220,7 +220,8 @@ pub fn highly_variable_genes<'py>(
                             kw.set_item("batch_key", bk)?;
                         }
                         kw.set_item("span", span)?;
-                        kw.set_item("subset", subset)?;
+                        // NB: rsc.pp.highly_variable_genes has no `subset` kwarg
+                        // (unlike scanpy); callers subset via adata[:, mask].
                         super::rapids::rsc_fn(py, "pp", "highly_variable_genes")?
                             .call((adata,), Some(&kw))?;
                         Ok(())
