@@ -354,9 +354,19 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         let var_batch = reader.read_var()?;
         let (effective_gene_indices, n_output_cols) =
             resolve_gene_projection(&plan, &var_batch, n_vars)?;
+        // The empty result still needs the obs schema. On the row-sharded path
+        // `materialize_filtered_obs` derives it from a single shard (bounded);
+        // on the legacy single-section path there are NO obs shards, so we must
+        // hand `materialize` the full obs batch to take the (legacy) empty
+        // branch. Legacy files are not atlas-scale, so this read is cheap.
+        let legacy_obs = if reader.obs_metadata_shard_count() == 0 {
+            Some(reader.read_obs()?)
+        } else {
+            None
+        };
         return Ok(PlanAndMask {
             plan,
-            legacy_obs: None,
+            legacy_obs,
             obs_shard_ranges: Vec::new(),
             var_batch,
             shard_infos: Vec::new(),
