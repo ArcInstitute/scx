@@ -1,7 +1,7 @@
 {
   "fixture_name": "v1_layers_obsm_uns",
   "header": {
-    "format_version": 2,
+    "format_version": 3,
     "n_obs": 30,
     "n_vars": 20,
     "nnz": 183,

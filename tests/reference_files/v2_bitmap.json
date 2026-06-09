@@ -1,7 +1,7 @@
 {
   "fixture_name": "v2_bitmap",
   "header": {
-    "format_version": 2,
+    "format_version": 3,
     "n_obs": 40,
     "n_vars": 25,
     "nnz": 314,
