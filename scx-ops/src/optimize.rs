@@ -111,7 +111,7 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
         .collect();
     layer_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for entry in x_entries.into_iter().chain(layer_entries.into_iter()) {
+    for entry in x_entries.into_iter().chain(layer_entries) {
         let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
         let (indptr_i64, indices_i32, values) = reader.read_shard_from_entry(entry)?;
         let mut indptr: Vec<u64> = indptr_i64.iter().map(|&v| v as u64).collect();
