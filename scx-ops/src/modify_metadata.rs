@@ -240,9 +240,13 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
 
         if let Some(builder) = builder {
             // Finish over CSR shard ranges so the index's shard space matches
-            // the matrix shards. Fall back to the obs-shard ranges only if the
-            // file's CSR shards carry no stats (older files).
-            let use_csr = !csr_ranges.is_empty();
+            // the matrix shards. Fall back to the obs-shard ranges unless the
+            // CSR ranges fully cover [0, n_obs): a partial range list (some
+            // shards missing stats on older files) would misalign the index's
+            // shard space with the matrix.
+            let csr_covers_all = !csr_ranges.is_empty()
+                && csr_ranges.iter().map(|(s, e)| e - s).sum::<u64>() == prep.old_n_obs;
+            let use_csr = csr_covers_all;
             let ranges: &[(u64, u64)] = if use_csr {
                 &csr_ranges
             } else {
@@ -442,8 +446,21 @@ fn should_drop_old_entry(e: &FullCatalogEntry, patch: &MetadataPatch) -> bool {
 
 /// Match an obsm/varm catalog entry name against a replaced key. Section names
 /// are `{prefix}/{key}` (single) or `{prefix}/{key}_shard_{idx}` (sharded).
+///
+/// Uses `rfind("_shard_")` stem extraction (mirroring `merge`/`compact`) rather
+/// than a `starts_with` prefix test, so a key like `pca` does not falsely match
+/// the sharded sections of a distinct key `pca_shard` (`{prefix}/pca_shard_shard_0`).
 fn entry_matches_key(name: &str, prefix: &str, key: &str) -> bool {
-    name == format!("{prefix}/{key}") || name.starts_with(&format!("{prefix}/{key}_shard_"))
+    let Some(rest) = name.strip_prefix(&format!("{prefix}/")) else {
+        return false;
+    };
+    if rest == key {
+        return true; // single, unsharded section: {prefix}/{key}
+    }
+    match rest.rfind("_shard_") {
+        Some(pos) => &rest[..pos] == key, // {prefix}/{key}_shard_{idx}
+        None => false,
+    }
 }
 
 /// Read the existing `Provenance` operations (empty if the file has none).
@@ -492,4 +509,44 @@ fn build_params_json(patch: &MetadataPatch, obs_cols: &[String], var_cols: &[Str
         });
     }
     params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::entry_matches_key;
+
+    #[test]
+    fn entry_matches_key_single_and_sharded() {
+        // Single, unsharded section.
+        assert!(entry_matches_key("obsm/pca", "obsm", "pca"));
+        // Sharded sections of the same key.
+        assert!(entry_matches_key("obsm/pca_shard_0", "obsm", "pca"));
+        assert!(entry_matches_key("obsm/pca_shard_12", "obsm", "pca"));
+    }
+
+    #[test]
+    fn entry_matches_key_no_prefix_false_positive() {
+        // Regression: replacing key `pca` must NOT drop the sharded sections of
+        // a distinct key `pca_shard` (`obsm/pca_shard_shard_0`). The old
+        // `starts_with("obsm/pca_shard_")` test matched this by accident.
+        assert!(!entry_matches_key("obsm/pca_shard_shard_0", "obsm", "pca"));
+        // …but it IS the correct match for its own key.
+        assert!(entry_matches_key(
+            "obsm/pca_shard_shard_0",
+            "obsm",
+            "pca_shard"
+        ));
+        // The distinct single section likewise must not match.
+        assert!(!entry_matches_key("obsm/pca_shard", "obsm", "pca"));
+        // Numeric-suffix sibling key (e.g. `X_pca` vs `X_pca_2`).
+        assert!(!entry_matches_key("obsm/X_pca_2_shard_0", "obsm", "X_pca"));
+    }
+
+    #[test]
+    fn entry_matches_key_respects_axis_prefix() {
+        // A varm section never matches an obsm replacement and vice versa.
+        assert!(!entry_matches_key("varm/pca", "obsm", "pca"));
+        assert!(!entry_matches_key("varm/pca_shard_0", "obsm", "pca"));
+        assert!(entry_matches_key("varm/pca_shard_0", "varm", "pca"));
+    }
 }

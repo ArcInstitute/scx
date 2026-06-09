@@ -7,7 +7,7 @@
 // holds the two primitives shared by those ops:
 //
 //   * [`prepare_in_place`] — the lock + header/catalog/modality-table read
-//     prelude, returning the open lock alongside an [`AppendPrep`] snapshot.
+//     prelude, returning the open lock alongside an [`InPlacePrep`] snapshot.
 //   * [`commit_in_place`] — the catalog-write → fsync → root-catalog-rebuild →
 //     fsync → header-finalize atomic commit sequence.
 //
@@ -31,8 +31,8 @@ use crate::rollback::build_root_catalog_from_full;
 /// Shared state captured during the prelude of any in-place mutation: header,
 /// catalog, modality routing, and resolved per-modality `n_vars`. The exclusive
 /// `FileLock` is returned alongside this struct so helper functions can take
-/// `&mut FileLock` and `&AppendPrep` without aliasing.
-pub(crate) struct AppendPrep {
+/// `&mut FileLock` and `&InPlacePrep` without aliasing.
+pub(crate) struct InPlacePrep {
     pub(crate) header: FileHeader,
     pub(crate) header_index_dtype: u8,
     pub(crate) old_catalog: FullCatalog,
@@ -52,7 +52,7 @@ pub(crate) struct AppendPrep {
 pub(crate) fn prepare_in_place(
     target_path: &Path,
     modality_id: u8,
-) -> Result<(FileLock, AppendPrep)> {
+) -> Result<(FileLock, InPlacePrep)> {
     let mut lock = FileLock::acquire_exclusive(target_path)?;
 
     let header = {
@@ -88,14 +88,14 @@ pub(crate) fn prepare_in_place(
     if modality_id != 0 {
         let table = modality_table.as_ref().ok_or_else(|| {
             OpsError::Format(scx_format::ScxError::InvalidCatalog(format!(
-                "append: target file has no modality table but modality_id={modality_id} \
+                "in-place op: target file has no modality table but modality_id={modality_id} \
                  was requested"
             )))
         })?;
         if (modality_id as usize) > table.len() {
             return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
                 format!(
-                    "append: modality_id={modality_id} out of range (file has {} modalities)",
+                    "in-place op: modality_id={modality_id} out of range (file has {} modalities)",
                     table.len()
                 ),
             )));
@@ -136,7 +136,7 @@ pub(crate) fn prepare_in_place(
 
     Ok((
         lock,
-        AppendPrep {
+        InPlacePrep {
             header,
             header_index_dtype,
             old_catalog,

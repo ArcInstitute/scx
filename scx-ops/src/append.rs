@@ -20,7 +20,7 @@ use scx_format::writer::ScxWriter;
 
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
-use crate::in_place::{commit_in_place, prepare_in_place, AppendPrep};
+use crate::in_place::{commit_in_place, prepare_in_place, InPlacePrep};
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
@@ -524,7 +524,7 @@ pub fn append_from_reader_with_index_options(
 /// Thin wrapper over the shared [`prepare_in_place`] prelude. Append has no
 /// data-independent validation of its own today; the wrapper is kept as the
 /// named seam for any future append-specific pre-write checks.
-fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, AppendPrep)> {
+fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, InPlacePrep)> {
     prepare_in_place(target_path, modality_id)
 }
 
@@ -686,7 +686,7 @@ fn entry_nnz(entry: &FullCatalogEntry) -> u64 {
 fn write_csr_chunk(
     lock: &mut FileLock,
     write_offset: &mut u64,
-    prep: &AppendPrep,
+    prep: &InPlacePrep,
     shard_indptr: &[u64],
     shard_indices: &[u32],
     shard_values: &[u8],
@@ -820,7 +820,7 @@ fn write_csr_chunk(
 fn raw_copy_csr_shard(
     lock: &mut FileLock,
     write_offset: &mut u64,
-    prep: &AppendPrep,
+    prep: &InPlacePrep,
     source: &ScxReader,
     entry: &FullCatalogEntry,
     sh: &ShardHeader,
@@ -945,7 +945,7 @@ fn raw_copy_csr_shard(
 fn finalize_append(
     target_path: &Path,
     lock: &mut FileLock,
-    mut prep: AppendPrep,
+    mut prep: InPlacePrep,
     old_obs: &RecordBatch,
     new_obs: &RecordBatch,
     new_shard_entries: Vec<FullCatalogEntry>,
