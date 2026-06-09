@@ -777,8 +777,15 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     // `shard_infos` come from `candidate_shards`, which derive from
     // `catalog.shards_sorted()` (ascending `row_start`), so this list is
     // globally ascending and aligns row-for-row with the assembled CSR.
+    //
+    // Only the decoded prefix (`shard_infos[..decode_count]`) contributes rows
+    // to the assembled CSR; for a `limit`ed query the trailing shards were
+    // never decoded. The prefix already holds >= `limit` matches, so building
+    // over it (then truncating below) yields the same first-`limit` rows while
+    // avoiding an all-shards alloc on the low-selectivity full-scan path. With
+    // no limit `decode_count == shard_infos.len()`, so this is unchanged.
     let mut matching_global_rows: Vec<u32> = Vec::new();
-    for si in &shard_infos {
+    for si in &shard_infos[..decode_count] {
         for (local_row, &keep) in si.local_keep_mask.iter().enumerate() {
             if keep {
                 matching_global_rows.push((si.row_start as usize + local_row) as u32);
@@ -1365,6 +1372,9 @@ mod tests {
         path
     }
 
+    // Only the `debug_assertions`-gated assertions reference this, so it is
+    // dead code in release builds.
+    #[cfg(debug_assertions)]
     fn x_decode_count(pipeline: &QueryPipeline) -> u64 {
         pipeline
             .reader()
@@ -1399,6 +1409,9 @@ mod tests {
         assert_eq!(r.x.n_rows(), 1);
         assert_eq!(r.obs.num_rows(), 1);
         assert_eq!(r.matched_rows, MS_SHARDS, "pre-limit Level-2 count");
+        // The X-decode counter is only incremented under `debug_assertions`
+        // (compiled away in release), so assert it only when present.
+        #[cfg(debug_assertions)]
         assert_eq!(
             x_decode_count(&pipeline),
             1,
@@ -1421,6 +1434,8 @@ mod tests {
         let r = materialize(&pipeline, pm).unwrap();
 
         assert_eq!(r.x.n_rows(), MS_SHARDS);
+        // Debug-only counter (see `limit_pushdown_bounds_full_scan_x_decode`).
+        #[cfg(debug_assertions)]
         assert_eq!(
             x_decode_count(&pipeline),
             MS_SHARDS as u64,
@@ -1451,30 +1466,35 @@ mod tests {
         assert_eq!(r.obs.num_rows(), 0);
         assert_eq!(r.skipped_shards, MS_SHARDS);
 
-        let reader = pipeline
-            .reader()
-            .as_any()
-            .downcast_ref::<scx_format::reader::ScxReader>()
-            .unwrap();
-        let counts = reader.debug_counts();
-        use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(
-            counts.read_obs.load(Relaxed),
-            0,
-            "short-circuit must not materialise the full obs table"
-        );
-        // The full obs scan is avoided entirely. `materialize` reads at most one
-        // obs shard as the 0-row schema template for the empty result (a
-        // bounded, MB-scale read) — never the whole file. `count()` skips
-        // materialise and reads zero (asserted in the integration test).
-        assert!(
-            counts.read_obs_shard.load(Relaxed) < MS_SHARDS as u64,
-            "short-circuit must not scan all obs shards"
-        );
-        assert_eq!(
-            counts.read_shard_from_entry.load(Relaxed),
-            0,
-            "short-circuit must not decode any X shard"
-        );
+        // Read counters are only incremented under `debug_assertions` (compiled
+        // away in release), so inspect them only when present.
+        #[cfg(debug_assertions)]
+        {
+            let reader = pipeline
+                .reader()
+                .as_any()
+                .downcast_ref::<scx_format::reader::ScxReader>()
+                .unwrap();
+            let counts = reader.debug_counts();
+            use std::sync::atomic::Ordering::Relaxed;
+            assert_eq!(
+                counts.read_obs.load(Relaxed),
+                0,
+                "short-circuit must not materialise the full obs table"
+            );
+            // The full obs scan is avoided entirely. `materialize` reads at most
+            // one obs shard as the 0-row schema template for the empty result (a
+            // bounded, MB-scale read) — never the whole file. `count()` skips
+            // materialise and reads zero (asserted in the integration test).
+            assert!(
+                counts.read_obs_shard.load(Relaxed) < MS_SHARDS as u64,
+                "short-circuit must not scan all obs shards"
+            );
+            assert_eq!(
+                counts.read_shard_from_entry.load(Relaxed),
+                0,
+                "short-circuit must not decode any X shard"
+            );
+        }
     }
 }
