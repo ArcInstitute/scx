@@ -95,7 +95,7 @@ fn copy_uns(reader: &ScxReader, writer: &mut ScxWriter) -> Result<(), Box<dyn st
 }
 
 /// Copy predicate index sections from reader to writer.
-fn copy_predicate_indices(
+pub(crate) fn copy_predicate_indices(
     reader: &ScxReader,
     writer: &mut ScxWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -109,7 +109,7 @@ fn copy_predicate_indices(
 }
 
 /// Read existing provenance, append a new entry, and write to writer.
-fn append_provenance(
+pub(crate) fn append_provenance(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     action: &str,
