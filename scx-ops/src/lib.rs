@@ -6,6 +6,7 @@ pub mod delete;
 pub mod error;
 pub mod flock;
 pub mod helpers;
+mod in_place;
 pub mod merge;
 pub mod merge_options;
 pub mod predicate_index;
