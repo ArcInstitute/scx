@@ -235,8 +235,9 @@ kernel for (`seurat`, `cell_ranger`, `pearson_residuals`,
 from `pyscx.open(...).to_gpu_anndata()`, regardless of which mode that call itself
 stamped — or `anndata_to_gpu` when rapids uploads a host `X`. (`to_gpu_anndata`
 stamps its *own*, more specific transfer mode on the `to_gpu_anndata` op key —
-`scx_device_decode_gpu` for a fully-in-VRAM Scx1 sidecar decode, or
-`scx_device_handoff_streamed` when a shard host-bounces; see
+`scx_device_decode_gpu` for a fully-in-VRAM Scx1 sidecar decode (incl. dense
+≥128-nnz rows via the BitPacker4x kernel), or `scx_device_handoff_streamed`
+when a non-Scx1 / sidecar-less shard host-bounces; see
 [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).)
 
 **`X` residency contract.** When the op uploads a host `X` (`anndata_to_gpu`),
