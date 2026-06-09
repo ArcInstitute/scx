@@ -95,6 +95,7 @@ re-encode all of `X`.
 | **`obs`** | O(n_obs) | Re-sharded `ObsMetadataShard` sections. Must match the file's `n_obs`. |
 | **`var`** | O(n_vars) | Single `VarMetadata` section. Must match `n_vars`. |
 | **`obsm` / `varm`** | O(replaced matrices) | Only the named matrices are rewritten; other keys pass through. |
+| **`obsp` / `varp`** | O(1) | Not replaceable here — existing sections (`ObspEmbedding` / `VarpEmbedding` and their shards) pass through unchanged. |
 | **CSC sidecar** | **Preserved** | `data_generation` / `csc_build_generation` are left unchanged, so a pre-existing CSC sidecar stays valid — no `--rebuild-csc` needed. |
 | **Predicate indexes** | O(n_obs)/O(n_vars) when rebuilt | A predicate index over a replaced `obs`/`var` is dropped (its values are now stale); pass `--index-obs` / `--index-var` / `--index-preset` to rebuild. Untouched when only `uns`/`obsm`/`varm` change. |
 

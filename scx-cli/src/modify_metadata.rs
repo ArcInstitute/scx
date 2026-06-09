@@ -29,9 +29,11 @@ pub fn run_modify_metadata(
     modality: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(m) = modality.as_deref() {
-        if !m.trim().is_empty() {
+        let t = m.trim();
+        // `0` is the supported global modality; only non-zero is unsupported.
+        if !t.is_empty() && t != "0" {
             return Err("multimodal modify-metadata is not yet supported; \
-                        only the global modality is available today"
+                        only the global modality (0) is available today"
                 .into());
         }
     }
