@@ -9,7 +9,10 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use scx_codec::forbp::ForBpRowMetadata;
 use scx_codec::rice::RiceBlockMetadata;
-use scx_codec::{CodecId, Scx1DecodeMetadata, ValueEncoding};
+use scx_codec::{
+    decode_scx1_row_range, CodecError, CodecId, DecodedShard, EncodedShardRef, Scx1DecodeMetadata,
+    ValueEncoding,
+};
 use std::io::{Read, Write};
 
 use crate::error::{validate_allocation, Result, ScxError};
@@ -463,4 +466,107 @@ fn validate_sidecar_shape(
         )));
     }
     Ok(())
+}
+
+/// Decode a full Scx1 shard by splitting its rows into contiguous chunks and
+/// decoding each chunk independently through the sidecar offsets — rayon-parallel
+/// when the `parallel` feature is enabled, sequential otherwise. The result is
+/// byte-identical to `scx_codec::decode_shard_ref` for the same shard.
+///
+/// `chunk_rows` bounds the rows per chunk; `0` (or a shard that fits one chunk)
+/// decodes the whole shard in a single [`decode_scx1_row_range`] call.
+pub fn decode_scx1_parallel(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    metadata: &Scx1DecodeMetadata,
+    chunk_rows: usize,
+) -> std::result::Result<DecodedShard, CodecError> {
+    let n_rows = metadata.rows.len();
+    if chunk_rows == 0 || n_rows <= chunk_rows {
+        return decode_scx1_row_range(encoded, value_encoding, metadata, 0, n_rows);
+    }
+
+    // Contiguous (start, len) row chunks.
+    let chunks: Vec<(usize, usize)> = (0..n_rows)
+        .step_by(chunk_rows)
+        .map(|start| (start, chunk_rows.min(n_rows - start)))
+        .collect();
+
+    // Decode chunks independently (parallel when the feature is on); the
+    // collected order matches `chunks`, so stitching below is deterministic.
+    #[cfg(feature = "parallel")]
+    let decoded: Vec<DecodedShard> = {
+        use rayon::prelude::*;
+        chunks
+            .par_iter()
+            .map(|&(start, len)| {
+                decode_scx1_row_range(encoded, value_encoding, metadata, start, len)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    #[cfg(not(feature = "parallel"))]
+    let decoded: Vec<DecodedShard> = chunks
+        .iter()
+        .map(|&(start, len)| decode_scx1_row_range(encoded, value_encoding, metadata, start, len))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Stitch: offset each chunk's 0-based local indptr by the running nnz;
+    // concatenate indices + value bytes in chunk order.
+    let total_nnz: usize = metadata.rows.iter().map(|r| r.nnz as usize).sum();
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0u64);
+    let mut indices = Vec::with_capacity(total_nnz);
+    let mut values = Vec::with_capacity(total_nnz * value_encoding.byte_width());
+    let mut running = 0u64;
+    for (chunk_indptr, chunk_indices, chunk_values) in decoded {
+        for &p in &chunk_indptr[1..] {
+            indptr.push(running + p);
+        }
+        running += *chunk_indptr.last().unwrap_or(&0);
+        indices.extend_from_slice(&chunk_indices);
+        values.extend_from_slice(&chunk_values);
+    }
+
+    Ok((indptr, indices, values))
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use scx_codec::value_encoding::values_to_raw_bytes;
+    use scx_codec::{decode_shard_ref, encode_shard};
+
+    #[test]
+    fn decode_scx1_parallel_matches_canonical_for_all_chunkings() {
+        let row_nnz: Vec<usize> = vec![
+            0, 1, 5, 130, 0, 200, 7, 256, 257, 3, 0, 140, 511, 1, 64, 300, 0, 2, 128, 90,
+        ];
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut vals_f32: Vec<f32> = Vec::new();
+        for &m in &row_nnz {
+            for j in 0..m {
+                indices.push(j as u32);
+                vals_f32.push((1 + (j % 97)) as f32);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        let n_rows = row_nnz.len();
+        let nnz = indices.len();
+        let venc = ValueEncoding::Uint16;
+        let values = values_to_raw_bytes(&vals_f32, venc).unwrap();
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, venc, false).unwrap();
+        let meta = encoded.scx1_decode.clone().unwrap();
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        let canonical = decode_shard_ref(&r, CodecId::Scx1, venc, n_rows, nnz, false).unwrap();
+
+        for chunk_rows in [0usize, 1, 3, 7, n_rows, n_rows + 5] {
+            let got = decode_scx1_parallel(&r, venc, &meta, chunk_rows).unwrap();
+            assert_eq!(got, canonical, "parallel decode chunk_rows={chunk_rows}");
+        }
+    }
 }

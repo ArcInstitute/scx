@@ -55,8 +55,9 @@ pub use csc_policy::{
     AUTO_CSC_VARS_THRESHOLD,
 };
 pub use decode_sidecar::{
-    DecodeRowEntry, DecodeSidecar, RiceBlockEntry, DECODE_SIDECAR_KIND_SCX1_CSR,
-    DECODE_SIDECAR_MAGIC, DECODE_SIDECAR_VERSION, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO,
+    decode_scx1_parallel, DecodeRowEntry, DecodeSidecar, RiceBlockEntry,
+    DECODE_SIDECAR_KIND_SCX1_CSR, DECODE_SIDECAR_MAGIC, DECODE_SIDECAR_VERSION,
+    DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};

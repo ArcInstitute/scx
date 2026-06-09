@@ -2774,6 +2774,92 @@ mod tests {
         assert_eq!(sidecar.rows.len(), 4);
     }
 
+    /// Task 4.3: a large Scx1 shard with a decode sidecar must decode via the
+    /// parallel sidecar path byte-identically to the sequential path, and the
+    /// random-access `decode_scx1_row_range` must match the full-decode slice.
+    #[test]
+    fn parallel_sidecar_decode_matches_sequential_and_row_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parallel_decode.scx");
+        let n_rows = 4096usize; // == PARALLEL_SIDECAR_DECODE_MIN_ROWS → parallel path
+        let n_cols = 2000u32;
+        let mut header = sample_header();
+        header.n_obs = n_rows as u64;
+        header.n_vars = n_cols as u64;
+        header.codec_id = CodecId::Scx1 as u8;
+        header.index_dtype = 1; // u32 indices
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+
+        // ~256 nnz/row (Rice-block aligned + BitPacker4x ≥128) so the sidecar
+        // stays well under the 25% overhead budget and is actually emitted.
+        let nnz_per_row = 256usize;
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::with_capacity(n_rows * nnz_per_row);
+        let mut values: Vec<u8> = Vec::with_capacity(n_rows * nnz_per_row * 2);
+        for _ in 0..n_rows {
+            for col in 0..nnz_per_row {
+                indices.push(col as u32);
+                // u16 LE, non-zero (Scx1 Rice requires >= 1).
+                let v = (1 + (col % 97)) as u16;
+                values.extend_from_slice(&v.to_le_bytes());
+            }
+            indptr.push(indices.len() as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Scx1,
+                ValueEncoding::Uint16,
+                0,
+            )
+            .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+        // The sidecar must have been emitted, else the parallel branch is dead.
+        assert_eq!(
+            reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+                .count(),
+            1,
+            "decode sidecar must be emitted for this shard (else parallel path is untested)"
+        );
+
+        let csr_entry = reader.catalog().shards_sorted()[0];
+
+        // Verified (sequential) decode vs the non-verifying read (parallel
+        // sidecar path) must be byte-identical.
+        let seq = reader.read_shard_from_entry_verified(csr_entry).unwrap();
+        let par = reader.read_shard_from_entry(csr_entry).unwrap();
+        assert_eq!(seq, par, "parallel sidecar decode != sequential decode");
+
+        // Random-access row-range matches the corresponding slice of the full
+        // decode (indptr rebased).
+        let (full_indptr, full_indices, full_values) = &seq;
+        for (s, k) in [(0usize, 1usize), (1000, 257), (4095, 1), (2048, 512)] {
+            let (ri, rx, rv) = reader
+                .decode_scx1_row_range(csr_entry, s, k)
+                .unwrap()
+                .expect("sidecar present");
+            let base = full_indptr[s];
+            let expect_indptr: Vec<i64> =
+                full_indptr[s..=s + k].iter().map(|&p| p - base).collect();
+            let lo = full_indptr[s] as usize;
+            let hi = full_indptr[s + k] as usize;
+            assert_eq!(ri, expect_indptr, "row-range indptr s={s} k={k}");
+            assert_eq!(rx, full_indices[lo..hi], "row-range indices s={s} k={k}");
+            assert_eq!(rv, full_values[lo..hi], "row-range values s={s} k={k}");
+        }
+    }
+
     /// The path pyscx actually uses: `encode_one_shard` → `write_preencoded_shard`.
     /// Exercises the `source_section_offset` patching (`with_source_offset`) and the
     /// encode-time `section_length`/`section_checksum` agreeing with the catalog entry

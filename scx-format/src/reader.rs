@@ -3019,18 +3019,152 @@ impl ScxReader {
         self.read_shard_from_entry_inner(entry, true)
     }
 
+    /// Resolve + load the decode sidecar for a CSR shard `entry` (named
+    /// `decode/<name>`), returning `None` unless a matching, **fresh**, Scx1
+    /// sidecar exists. Freshness is the `(offset, length, checksum)` triple — a
+    /// stale sidecar (source rewritten) is ignored, never trusted.
+    fn scx1_sidecar_for(&self, entry: &FullCatalogEntry) -> Result<Option<DecodeSidecar>> {
+        let name = format!("decode/{}", entry.name);
+        let Some(sc_entry) = self.full_catalog.get(&name) else {
+            return Ok(None);
+        };
+        if sc_entry.section_type != SectionType::DecodeMetadataShard {
+            return Ok(None);
+        }
+        let sidecar = self.read_decode_sidecar_from_entry(sc_entry)?;
+        if sidecar.source_section_offset != entry.offset
+            || sidecar.source_section_length != entry.length
+            || sidecar.source_section_checksum != entry.checksum
+            || sidecar.codec_id != CodecId::Scx1 as u8
+        {
+            return Ok(None);
+        }
+        Ok(Some(sidecar))
+    }
+
+    /// Slice a shard section's three encoded streams into an `EncodedShardRef`
+    /// using the `ShardHeader` relative offsets (mirrors the slicing in
+    /// `validate_decode_sidecar_entry`).
+    fn encoded_ref_from_section<'a>(
+        section: &'a [u8],
+        header: &ShardHeader,
+        name: &str,
+    ) -> Result<scx_codec::EncodedShardRef<'a>> {
+        let slice = |rel: u32, len: u32, label: &str| -> Result<&'a [u8]> {
+            let start = rel as usize;
+            let end = start
+                .checked_add(len as usize)
+                .filter(|&e| e <= section.len())
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!("shard {name} {label} stream out of bounds"))
+                })?;
+            Ok(&section[start..end])
+        };
+        Ok(scx_codec::EncodedShardRef {
+            indptr_bytes: slice(header.indptr_rel_offset, header.indptr_length, "indptr")?,
+            indices_bytes: slice(header.indices_rel_offset, header.indices_length, "indices")?,
+            values_bytes: slice(header.values_rel_offset, header.values_length, "values")?,
+        })
+    }
+
+    /// Random-access decode of a contiguous row range `[row_start, row_start +
+    /// n_rows)` of a CSR shard via its decode sidecar (O(window), not O(shard)).
+    ///
+    /// Returns `Ok(None)` when the shard has no usable Scx1 sidecar (no sidecar,
+    /// stale, or a non-Scx1 codec) — callers then fall back to a full
+    /// [`read_shard_from_entry`](Self::read_shard_from_entry) + slice. The
+    /// `Some` result is byte-identical to that fallback's matching row slice.
+    pub fn decode_scx1_row_range(
+        &self,
+        entry: &FullCatalogEntry,
+        row_start: usize,
+        n_rows: usize,
+    ) -> Result<Option<scx_codec::ScipyShard>> {
+        let Some(sidecar) = self.scx1_sidecar_for(entry)? else {
+            return Ok(None);
+        };
+        let section = self.section_bytes(entry)?;
+        let header = self.read_shard_header(entry)?;
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let encoded = Self::encoded_ref_from_section(section, &header, &entry.name)?;
+        let decoded = scx_codec::decode_scx1_row_range(
+            &encoded,
+            venc,
+            &sidecar.to_scx1_metadata(),
+            row_start,
+            n_rows,
+        )
+        .map_err(|e| {
+            ScxError::InvalidCatalog(format!("sidecar row-range decode of {}: {e}", entry.name))
+        })?;
+        let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+            ScxError::InvalidCatalog(format!("sidecar row-range convert of {}: {e}", entry.name))
+        })?;
+        Ok(Some(scipy))
+    }
+
     fn read_shard_from_entry_inner(
         &self,
         entry: &FullCatalogEntry,
         verify_checksum: bool,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         let section = self.section_bytes(entry)?;
+        // Parallel sidecar-driven decode (Task 4.3): for large Scx1 shards that
+        // carry a fresh decode sidecar, decode the rows concurrently via the
+        // recorded offsets — byte-identical to the sequential path. Only on the
+        // non-verifying read path (the verifying path keeps its single-pass
+        // checksum+decode). Falls through when no sidecar / small / feature off.
+        #[cfg(feature = "parallel")]
+        if !verify_checksum {
+            if let Some(scipy) = self.try_parallel_sidecar_decode(entry, section)? {
+                return Ok(scipy);
+            }
+        }
         crate::shard_decode::decode_shard_bytes(
             section,
             entry,
             self.full_catalog.catalog_version,
             verify_checksum,
         )
+    }
+
+    /// Minimum shard rows before the parallel sidecar decode is worth its setup.
+    #[cfg(feature = "parallel")]
+    const PARALLEL_SIDECAR_DECODE_MIN_ROWS: u32 = 4096;
+
+    #[cfg(feature = "parallel")]
+    fn try_parallel_sidecar_decode(
+        &self,
+        entry: &FullCatalogEntry,
+        section: &[u8],
+    ) -> Result<Option<scx_codec::ScipyShard>> {
+        let header = self.read_shard_header(entry)?;
+        if header.n_major < Self::PARALLEL_SIDECAR_DECODE_MIN_ROWS {
+            return Ok(None);
+        }
+        let Some(sidecar) = self.scx1_sidecar_for(entry)? else {
+            return Ok(None);
+        };
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let encoded = Self::encoded_ref_from_section(section, &header, &entry.name)?;
+        let chunk_rows = (header.n_major as usize)
+            .div_ceil(rayon::current_num_threads().max(1) * 4)
+            .max(1024);
+        let decoded = crate::decode_sidecar::decode_scx1_parallel(
+            &encoded,
+            venc,
+            &sidecar.to_scx1_metadata(),
+            chunk_rows,
+        )
+        .map_err(|e| {
+            ScxError::InvalidCatalog(format!("parallel sidecar decode of {}: {e}", entry.name))
+        })?;
+        let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+            ScxError::InvalidCatalog(format!("parallel sidecar convert of {}: {e}", entry.name))
+        })?;
+        Ok(Some(scipy))
     }
 
     /// Read only the indptr (row-pointer) array of a shard, skipping

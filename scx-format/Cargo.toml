@@ -39,3 +39,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "catalog_parse"
 harness = false
+
+[[bench]]
+name = "sidecar_decode"
+harness = false
