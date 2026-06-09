@@ -2198,7 +2198,7 @@ pub(crate) fn pandas_to_record_batch(
 /// column name `"0".."N-1"`, matching the shape that
 /// `scx-convert::pipeline::read_dense_mapping_shard` emits on the
 /// streaming ingest side.
-fn numpy_or_pandas_to_record_batch(
+pub(crate) fn numpy_or_pandas_to_record_batch(
     py: Python<'_>,
     arr: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
@@ -2521,9 +2521,9 @@ pub(crate) fn uns_json_to_py<'py>(
 
 /// Convert a Python object (typically a dict supplied as `uns_override`)
 /// into a `serde_json::Value` using the existing tagged-envelope writer.
-/// Thin wrapper around [`normalize_uns_value`]. Gated on the `hdf5`
-/// feature because its sole caller (`pyscx.from_h5ad`) is h5ad-only.
-#[cfg(feature = "hdf5")]
+/// Thin wrapper around [`normalize_uns_value`]. Reachable without the
+/// `hdf5` feature so the in-place `set_uns` / `modify_metadata` bindings
+/// (`crate::ops`) can serialize a `uns` dict on any build.
 pub(crate) fn uns_py_to_json<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,

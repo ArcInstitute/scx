@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use arrow::record_batch::RecordBatch;
 
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, SkipReason};
@@ -720,4 +723,177 @@ pub fn merge(
             .detach(|| scx_ops::merge(&input_refs, &output_path))
             .map_err(ops_to_pyerr),
     }
+}
+
+// ---------------------------------------------------------------------------
+// In-place metadata replacement (set_uns / modify_metadata)
+// ---------------------------------------------------------------------------
+
+/// Convert an obs/var input (pandas `DataFrame` or pyarrow `Table`) to an
+/// Arrow `RecordBatch`. A `Table` is routed through `to_pandas()` so the
+/// shared `pandas_to_record_batch` IPC path handles both.
+fn obs_var_to_record_batch(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+    let pa = py.import("pyarrow")?;
+    let table_cls = pa.getattr("Table")?;
+    if obj.is_instance(&table_cls)? {
+        let df = obj.call_method0("to_pandas")?;
+        anndata::pandas_to_record_batch(py, &df)
+    } else {
+        anndata::pandas_to_record_batch(py, obj)
+    }
+}
+
+/// Convert a `dict[str, ndarray]` (obsm/varm) into the named dense
+/// `RecordBatch`es the Rust patch expects.
+fn dense_dict_to_batches(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    axis: &str,
+) -> PyResult<Vec<(String, RecordBatch)>> {
+    let dict = obj.cast::<PyDict>().map_err(|_| {
+        PyValueError::new_err(format!("{axis} must be a dict of {{name: ndarray}}"))
+    })?;
+    let mut out = Vec::with_capacity(dict.len());
+    for (k, v) in dict.iter() {
+        let name: String = k
+            .extract()
+            .map_err(|_| PyValueError::new_err(format!("{axis} keys must be strings")))?;
+        let batch = anndata::numpy_or_pandas_to_record_batch(py, &v)?;
+        out.push((name, batch));
+    }
+    Ok(out)
+}
+
+/// Resolve the optional `modality` kwarg to a `modality_id`. Only the
+/// global modality (`0`) is supported today; non-zero ids reach the Rust
+/// layer which returns a clear `MultimodalUnsupported` error.
+fn resolve_modality_id(modality: Option<&Bound<'_, PyAny>>) -> PyResult<u8> {
+    match modality {
+        None => Ok(0),
+        Some(m) => {
+            if let Ok(i) = m.extract::<i64>() {
+                if !(0..=255).contains(&i) {
+                    return Err(PyValueError::new_err(
+                        "modality id out of range (expected 0..=255)",
+                    ));
+                }
+                Ok(i as u8)
+            } else if m.extract::<String>().is_ok() {
+                Err(PyValueError::new_err(
+                    "named modality is not yet supported by modify_metadata; \
+                     pass an integer modality id (only 0 / global is supported today)",
+                ))
+            } else {
+                Err(PyValueError::new_err("modality must be an int or None"))
+            }
+        }
+    }
+}
+
+/// Replace the whole `uns` block of an existing `.scx` file in place,
+/// without re-encoding `X`.
+///
+/// **Replace semantics, not merge** — `uns` fully supersedes the existing
+/// block (consistent with `from_h5ad(..., uns_override=)`). The matrix
+/// (`X` / CSR / CSC shards) is never read or rewritten, so a pre-existing
+/// CSC sidecar stays valid. The change is atomic and rollback-able
+/// (`pyscx.rollback`).
+///
+/// For a shallow merge, read-modify-write::
+///
+///     adata = pyscx.open(path).to_anndata()
+///     adata.uns["descriptions"] = {...}
+///     pyscx.set_uns(path, dict(adata.uns))
+#[pyfunction]
+pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<()> {
+    let json = anndata::uns_py_to_json(py, uns, anndata::UnsFormat::Tagged)?;
+    let path_buf = PathBuf::from(path);
+    py.detach(|| scx_ops::set_uns(&path_buf, &json))
+        .map_err(ops_to_pyerr)?;
+    Ok(())
+}
+
+/// Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) of an
+/// existing `.scx` file in place, without re-encoding `X`.
+///
+/// Any omitted argument is left untouched (its sections pass through
+/// verbatim). Cost is O(size of the replaced sections); the matrix shards
+/// are never read or rewritten, so a pre-existing CSC sidecar and
+/// `data_generation` are preserved (no `--rebuild-csc` needed). One atomic
+/// commit; rollback-able via `pyscx.rollback`.
+///
+/// **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
+/// the section and `num_rows` must match the file's `n_obs` / `n_vars`
+/// (changing cell/gene count is out of scope — use `append` / `subset`).
+/// `obsm` / `varm` replace only the named matrices. Predicate indexes over a
+/// replaced `obs`/`var` are dropped unless `index_obs` / `index_var` /
+/// `index_preset` request a rebuild.
+///
+/// Args:
+///     path: target `.scx` file.
+///     uns: dict replacing the whole `uns` block.
+///     obs / var: pandas `DataFrame` (or pyarrow `Table`); `num_rows` must
+///         equal `n_obs` / `n_vars`.
+///     obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
+///     index_obs / index_var / index_preset / index_auto_threshold:
+///         predicate-index rebuild policy (only consulted when obs/var change).
+///     modality: integer modality id (only `0` / global is supported today).
+#[pyfunction]
+#[pyo3(signature = (
+    path, *, uns=None, obs=None, var=None, obsm=None, varm=None,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    modality=None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn modify_metadata(
+    py: Python<'_>,
+    path: &str,
+    uns: Option<&Bound<'_, PyAny>>,
+    obs: Option<&Bound<'_, PyAny>>,
+    var: Option<&Bound<'_, PyAny>>,
+    obsm: Option<&Bound<'_, PyAny>>,
+    varm: Option<&Bound<'_, PyAny>>,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+    modality: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let uns_json = match uns {
+        Some(u) => Some(anndata::uns_py_to_json(py, u, anndata::UnsFormat::Tagged)?),
+        None => None,
+    };
+    let obs_batch = match obs {
+        Some(o) => Some(obs_var_to_record_batch(py, o)?),
+        None => None,
+    };
+    let var_batch = match var {
+        Some(v) => Some(obs_var_to_record_batch(py, v)?),
+        None => None,
+    };
+    let obsm_batches = match obsm {
+        Some(d) => Some(dense_dict_to_batches(py, d, "obsm")?),
+        None => None,
+    };
+    let varm_batches = match varm {
+        Some(d) => Some(dense_dict_to_batches(py, d, "varm")?),
+        None => None,
+    };
+    let modality_id = resolve_modality_id(modality)?;
+    let index = build_index_options(index_obs, index_var, index_preset, index_auto_threshold)
+        .unwrap_or_default();
+
+    let patch = scx_ops::MetadataPatch {
+        uns: uns_json,
+        obs: obs_batch,
+        var: var_batch,
+        obsm: obsm_batches,
+        varm: varm_batches,
+        index,
+        modality_id,
+    };
+    let path_buf = PathBuf::from(path);
+    py.detach(|| scx_ops::modify_metadata(&path_buf, &patch))
+        .map_err(ops_to_pyerr)?;
+    Ok(())
 }
