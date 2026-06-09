@@ -722,6 +722,22 @@ pub fn decode_scx1_row_range(
             .partition_point(|b| b.value_start <= v0)
             .saturating_sub(1);
         let b1 = blocks.partition_point(|b| b.value_start < v1);
+        // A fresh-but-malformed sidecar (nonzero row nnz, yet empty or gapped
+        // `rice_blocks`) can leave an empty span (`b1 <= b0`) or a span that does
+        // not lead at `v0` (`blocks[b0].value_start > v0`). Reject it rather than
+        // panic on `covered[0]` / a `v0 - block_base` underflow: the hot
+        // `read_shard_from_entry` sidecar path reaches here without the deeper
+        // `validate_decode_sidecar_entries` coverage check, so a malformed
+        // optional `DecodeMetadataShard` must error, not abort the process. The
+        // `||` short-circuits so `blocks[b0]` is indexed only when `b1 > b0`
+        // (hence `b0 < b1 <= len`). The trailing-coverage case is caught by the
+        // `head + window_nnz > decoded.len()` check below.
+        if b1 <= b0 || blocks[b0].value_start > v0 {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx1 row-range: sidecar rice_blocks do not cover value ordinal {v0} \
+                 for rows [{row_start}, {row_end})"
+            )));
+        }
         let covered = &blocks[b0..b1];
         let block_base = covered[0].value_start;
         let rebased: Vec<RiceBlockMetadata> = covered
@@ -1535,6 +1551,54 @@ mod tests {
 
         // Out-of-range is rejected, not a panic.
         assert!(decode_scx1_row_range(&r, venc, &meta, n_rows, 1).is_err());
+    }
+
+    /// A fresh-but-malformed sidecar (nonzero row nnz, but empty or gapped
+    /// `rice_blocks`) must make `decode_scx1_row_range` return `Err`, never
+    /// panic — this path is reachable from `read_shard_from_entry` without the
+    /// deeper coverage validation.
+    #[test]
+    fn decode_scx1_row_range_rejects_malformed_rice_spans() {
+        use crate::value_encoding::values_to_raw_bytes;
+
+        // Small shard spanning >1 Rice block (300 nnz > B_VAL=256).
+        let indptr = vec![0u64, 130, 300];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut vals_f32: Vec<f32> = Vec::new();
+        for &(start, end) in &[(0usize, 130usize), (130, 300)] {
+            for j in 0..(end - start) {
+                indices.push(j as u32);
+                vals_f32.push((1 + (j % 50)) as f32);
+            }
+        }
+        let (n_rows, nnz) = (2usize, 300usize);
+        let venc = ValueEncoding::Uint16;
+        let values = values_to_raw_bytes(&vals_f32, venc).unwrap();
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, venc, false).unwrap();
+        let good = encoded.scx1_decode.clone().unwrap();
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        // Sanity: the well-formed sidecar decodes a nonzero window.
+        assert!(decode_scx1_row_range(&r, venc, &good, 0, n_rows).is_ok());
+
+        // Empty rice_blocks while rows still claim nnz > 0 → error, not panic.
+        let mut empty_blocks = good.clone();
+        empty_blocks.rice_blocks.clear();
+        assert!(decode_scx1_row_range(&r, venc, &empty_blocks, 0, n_rows).is_err());
+
+        // Gapped: drop the leading block so no block covers value ordinal 0 →
+        // error (guards the `v0 - block_base` underflow), not panic.
+        let mut gapped = good.clone();
+        assert!(
+            gapped.rice_blocks.len() >= 2,
+            "shard must span >1 Rice block"
+        );
+        gapped.rice_blocks.remove(0);
+        assert!(decode_scx1_row_range(&r, venc, &gapped, 0, n_rows).is_err());
+        let _ = nnz;
     }
 
     /// Task 6.10: Zstd + Float32 round-trips correctly.
