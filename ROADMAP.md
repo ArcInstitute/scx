@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-06-07
+**Last updated**: 2026-06-08
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -368,10 +368,11 @@ scGPT train end-to-end on atlas-scale SCX data.
 `pyscx.MultimodalTrainingDataset` and Seurat v5 / MAE via rscx. See
 [docs/multimodal.md](docs/multimodal.md) for the user-facing guide
 and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
-the on-disk layout. Section ids 15 = `ModalityTable` and
-16 = `LayerCscShard` are now allocated; ids 17–31 are reserved for
-further multimodal/spatial extensions; ids 32–239 are reserved for
-future use; ids 240–255 are vendor / private. The `has_modalities`
+the on-disk layout. Section ids 15 = `ModalityTable`, 16 = `LayerCscShard`, 17–25 =
+embedding / sharded metadata extensions, and 26 = `DecodeMetadataShard`
+are now allocated; ids 27–31 are reserved for further multimodal/spatial
+extensions; ids 32–239 are reserved for future use; ids 240–255 are
+vendor / private. The `has_modalities`
 header flag (bit 7) is wired through writers and readers.
 
 ### 3.5 Quality + Polish — PARTIALLY COMPLETE
@@ -448,13 +449,17 @@ full scverse pipeline works via AnnData from the format / codec / bridge work.
 - [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
 - [x] **Stratified DE**: per-stratum execution for both Wilcoxon and pseudobulk
 
-### 4c. GPU Accelerators — COMPLETE (benchmarked, 3/4 Go/No-Go gates pass)
-- [x] GPU SpMM for PCA (cuSPARSE + cuSOLVER QR + cuRAND)
-- [x] GPU kNN via CAGRA (cuVS) — 9.4× on 1M cells
-- [x] GPU UMAP via native CUDA SGD kernel — 7.7× on 1M cells
-- [x] GPU Leiden via cuGraph — 16× on 1M cells
-- [x] Fused GPU preprocessing (normalize+log1p)
-- [x] Graceful fallback to CPU when GPU unavailable
+### 4c. GPU Accelerators — COMPLETE (rapids-singlecell transition done)
+- [x] GPU PCA — in-VRAM routes to `rsc.pp.pca`; streaming/randomized PCA survives natively (>VRAM moat)
+- [x] GPU kNN — in-VRAM routes to `rsc.pp.neighbors`; device-resident CAGRA (cuVS) retained in fused pipeline only. Standalone native kNN CAGRA dispatch removed in Phase 3
+- [x] GPU UMAP — routes to `rsc.tl.umap`. Native CUDA SGD kernel (`umap_sgd.cu`, `umap_edges.cu`, `gpu_umap.rs`, `fuzzy_simplicial_set.cu`, `gpu_fuzzy.rs`) removed in Phase 3
+- [x] GPU Leiden via cuGraph — 16× on 1M cells (native, unchanged)
+- [x] GPU preprocessing — routes to `rsc.pp.normalize_total` / `rsc.pp.log1p`; native ML-loader + streaming kernels survive
+- [x] GPU HVG — `seurat_v3` stays native (1.2× at 1M); extra flavors route to `rsc.pp.highly_variable_genes`
+- [x] Fused GPU pipelines — `pca_neighbors_umap` and `pca_neighbors` re-pointed to full rapids pipeline
+- [x] `to_gpu_anndata()` — minimal-copy device handoff returning GPU-resident AnnData with `cupyx.scipy.sparse.csr_matrix` X
+- [x] Graceful fallback to CPU when GPU unavailable or rapids absent (`FallbackReason::NoRapids`)
+- [x] `SCX_FORCE_NATIVE_GPU=1` pins surviving native paths; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing
 
 See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/performance.md) for setup and benchmark results.
 
@@ -469,6 +474,22 @@ See [docs/gpu-setup.md](docs/gpu-setup.md) and [docs/performance.md](docs/perfor
 - [x] `pyscx.accel.filter_cells()` / `filter_genes()` — non-materializing QC filters
 - [x] `pyscx.accel.subset_obs()` — deletion vector construction from Python
 - [x] `pyscx.accel.calculate_qc_metrics()` — streaming QC metrics
+
+### 4e. Rapids-singlecell GPU Compute Transition
+
+In-VRAM GPU analysis ops now route to [rapids-singlecell](https://github.com/scverse/rapids_singlecell)
+for PCA, kNN, UMAP, preprocessing, and HVG (extra flavors). Native GPU code
+is retained only where it has a structural or >VRAM moat. rapids-singlecell
+is a detected runtime dependency (not a pip extra); install story is in
+`docs/gpu-setup.md` and `envs/scx-gpu-analysis.yml`.
+
+- ✅ **Phase 0 — Evidence**: >VRAM benchmarks, transfer/decode profiling, cuPy min-copy PoC, packaging spike
+- ✅ **Phase 1 — Routing**: rapids routes added (`AccelRoute::RapidsSinglecell`), `to_gpu_anndata()`, fused pipeline re-point, `FallbackReason::NoRapids`, `pyscx/src/accel/rapids.rs` runtime probe, one-shot `no_rapids` `UserWarning`
+- ✅ **Phase 2 — Gate**: cross-tier rapids route + correctness gates (`*_route_rapids_correct`), no-rapids fallback gates (`*_fallback_no_rapids_correct`), baseline promoted to `v0.6.5-accel-gpu-rapids-floors`
+- ✅ **Phase 3 — Removal**: deleted native UMAP (`umap_sgd.cu`, `umap_edges.cu`, `gpu_umap.rs`, `fuzzy_simplicial_set.cu`, `gpu_fuzzy.rs`), covariance PCA (`gpu_pca_covariance.rs`), standalone kNN CAGRA dispatch, PCA SpMM graph-capture (`pca_spmm_capture_opt_in`). Dead-kernel audit complete; FOR-BP kept
+- 🟨 **Phase 4 — Format sidecar** *(not yet implemented)*: decode-metadata sidecar, sorted+deduped CSR invariant, decode→device fast path
+
+**What survives natively**: streaming/randomized PCA (>VRAM moat), HVG `seurat_v3` (1.2× at 1M), Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct, structural moat), Harmony, preprocessing kernels (ML loader + streaming), device-resident CAGRA kNN (fused pipeline only), codec decode (`rice_decode.cu`, `forbp_decode.cu`), `colmajor_ops.cu`, `gpu_graph.rs`, `shard_decode.rs`.
 
 ---
 
@@ -600,7 +621,8 @@ The legacy `benchmarks/scripts/benchmark_cloud.py` shim has been deleted.
 | **3** | 7-10 | **PARTIALLY COMPLETE.** R bindings, extended CLI (`build-csc`, `subset`, `upgrade`), complete documentation. CITE-seq / Multiome / TEA-seq multimodal + Seurat v5 / MAE interop shipped, including multimodal `merge` / `compact` / `append` / `subset --filter`. Detection bitmap shipped. GDS and spatial transcriptomics R-tree remain **DEFERRED**. |
 | **4a** | 10-12 | **COMPLETE.** Full scanpy backed mode parity: native aggregation, comparison optimization, streaming preprocess, chunk iteration, selective loading. |
 | **4b** | 12-15 | **COMPLETE.** Rust-native PCA/kNN/UMAP/DE/pseudobulk accelerators (3-10× faster at scale). |
-| **4c** | 15+ | **COMPLETE (benchmarked).** GPU-accelerated PCA/kNN/UMAP/Leiden via cuSPARSE/cuVS/cuGraph. Per-op speedups: kNN 9.4×, UMAP 7.7×, Leiden 16×. 3.8× end-to-end on 1M cells. |
+| **4c** | 15+ | **COMPLETE.** GPU analysis routes to rapids-singlecell for in-VRAM PCA/kNN/UMAP/preprocess/HVG. Leiden stays cuGraph-native (16×). Native UMAP, covariance PCA, standalone kNN removed (Phase 3). Streaming/randomized PCA, HVG `seurat_v3`, DE, Harmony survive natively. `to_gpu_anndata()` for minimal-copy device handoff. |
+| **4e** | 15+ | **Phase 0–3 COMPLETE; Phase 4 in progress.** Rapids-singlecell GPU compute transition. Phases 0–3 (evidence → routing → gate → removal) done. Phase 4 (decode-metadata sidecar, sorted-CSR invariant, decode→device fast path) not yet started. |
 | **4d** | 16+ | **COMPLETE.** Eliminate materialization: lazy normalize/log1p, column-projected streaming aggregation, streaming PCA through transforms via `ShardSource` trait, non-materializing `filter_cells`/`filter_genes`. Full out-of-core pipeline from open → QC → preprocess → PCA → kNN → UMAP → Leiden with ~11 GB peak RSS at 1M cells (vs ~22 GB materialized; 51% reduction). |
 | **5** | ongoing | **COMPLETE** (S3/Azure deferred; CITE-seq multimodal depends on §3.4). Comprehensive multi-format benchmark harness validated on Chimera HPC + GCS, including SLAF parity across compression / read / selective / ML / memory, fragment-ops throughput, cloud push/pull/read/metadata/filtered-query + cost model + GCP instance matrix, on-demand regression gate with justification workflow + rolling HTML dashboard, and honest idempotent-retry contract for interrupted pulls. |
 
@@ -657,7 +679,7 @@ Key developments to monitor that affect SCX's value proposition:
 | **AnnData + Zarr v3** | zarr-python 3 (released Jan 2025) with sharding + async I/O. AnnData migration to Zarr v3 as primary backend | If AnnData-on-Zarr closes the cloud access gap, SCX's HPC advantage must be larger to justify adoption |
 | **TileDB-SOMA-ML** | Alpha → stable release. C++ acceleration. Performance improvements | If SOMA-ML achieves competitive throughput, SCX's training loader advantage narrows |
 | **BPCells** | Bitpacked on-disk sparse matrices for Seurat v5. 44M cells on a laptop. Potential Python bindings | A Python BPCells could address similar pain points without requiring a new format |
-| **rapids-singlecell** | GPU-accelerated scanpy replacements via cupy/cuml | If GPU analysis becomes mainstream via rapids, SCX's GPU path is less novel |
+| **rapids-singlecell** | GPU-accelerated scanpy replacements via cupy/cuml. SCX now routes in-VRAM PCA/kNN/UMAP/preprocess/HVG to rapids-singlecell (Phases 0–3 complete) | SCX leverages rapids as a compute backend rather than competing. Risk shifts to rapids API stability and conda packaging friction |
 | **scverse governance** | Consolidation around h5ad/Zarr. Community standards for new formats | SCX may face community resistance if it's seen as fragmenting the ecosystem |
 | **CELLxGENE Census** | 125M+ cells on TileDB-SOMA. Growing API adoption | Census standardization on SOMA creates network effects that SCX must overcome |
 | **SLAF** ([slaf-project/slaf](https://github.com/slaf-project/slaf)) | SQL-native sparse lazy format: DuckDB + Polars backend, Scanpy-compatible lazy API, PyTorch tokenizers/dataloaders for foundation models, `slafdb` on PyPI | Overlaps directly with SCX across lazy AnnData, selective queries (SQL pushdown), and ML training loader. A SQL-first approach sidesteps a binary-format learning curve; if SLAF matches SCX on throughput, the pitch shifts to "binary format + domain codec + single-file portability" |

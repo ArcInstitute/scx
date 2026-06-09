@@ -7,6 +7,7 @@ pub mod catalog_view;
 pub mod checksum;
 pub mod codec_select;
 pub mod csc_policy;
+pub mod decode_sidecar;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
 pub mod encoder;
@@ -53,11 +54,17 @@ pub use csc_policy::{
     auto_obs_threshold, auto_vars_threshold, CscPolicy, AUTO_CSC_OBS_THRESHOLD,
     AUTO_CSC_VARS_THRESHOLD,
 };
+pub use decode_sidecar::{
+    DecodeRowEntry, DecodeSidecar, RiceBlockEntry, DECODE_SIDECAR_KIND_SCX1_CSR,
+    DECODE_SIDECAR_MAGIC, DECODE_SIDECAR_VERSION, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO,
+};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use encoder::encode_one_shard;
 pub use error::{validate_allocation, Result, ScxError};
-pub use header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
+pub use header::{
+    rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
+};
 pub use mem::MemoryBudget;
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,

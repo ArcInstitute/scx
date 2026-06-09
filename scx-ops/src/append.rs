@@ -295,7 +295,17 @@ pub fn append_from_reader_with_index_options(
     source_modality_id: u8,
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
-    let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
+    let (mut lock, mut prep) = prepare_append(target_path, options.modality_id)?;
+
+    // Appended source shards are raw-copied or decoded+re-encoded without
+    // re-canonicalization, so a pre-v3 source could inject non-canonical shards
+    // into the (possibly v3) base. Gate the file's format_version on the lower
+    // of base and source — never claim v3 unless both already guarantee it.
+    let feature_floor = if prep.header.n_modalities > 0 { 2 } else { 1 };
+    prep.header.format_version = scx_format::rewrite_output_format_version(
+        &[prep.header.format_version, source.header().format_version],
+        feature_floor,
+    );
 
     // Enumerate the source's CSR shard catalog entries (already sorted by
     // row_start by `csr_shards_for_modality`).

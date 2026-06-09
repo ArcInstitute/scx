@@ -988,23 +988,18 @@ capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.6.2-n_counts-augmentation`
-> (captured 2026-05-11 from `b1629ea`, tier `full`, 806 rows across all
-> 8 datasets — `pbmc3k`, `pbmc10k`, `smartseq2`, `tabula_sapiens_100k`,
-> `census_500k`, `census_1m`, `cite_seq_pbmc_5k`, `multiome_pbmc_10k`).
+> The current `LATEST` symlink points at `v0.6.5-accel-gpu-rapids-floors`.
 > It gates **format** (`compression`, `read_full`, `read_selective`,
 > `write`, `memory`, `parallel_scaling`, `parallel_write_scaling`,
 > `roundtrip`), **cloud** (`cloud_metadata`, `cloud_read`,
 > `cloud_filtered`, `cloud_pull`, `cloud_push`, `cloud_large_atlas`,
 > `cloud_reader_vs_pull`, `cost_model`), **`ml_loader`**, **multimodal**
 > (`multimodal_compression`, `multimodal_training`), `index_plan`,
-> `fragment_ops`, and `correctness`. The remaining gap is the `accel_*`
-> family (`accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`,
-> `accel_preprocess`, `accel_hvg`) — those benchmarks capture cleanly
-> but produce no gate signal against `LATEST`. Pin
-> `--baseline benchmarks/comprehensive/results/baselines/v0.6.0-gpu-phase1-7`
-> when you need accelerator gating, until the next multi-surface
-> baseline that re-includes `accel_*` is promoted as `LATEST`.
+> `fragment_ops`, `correctness`, and the **`accel_*`** family
+> (`accel_pca`, `accel_knn`, `accel_umap`, `accel_leiden`,
+> `accel_preprocess`, `accel_hvg`) including per-op rapids-route
+> correctness floors (`*_route_rapids_correct`,
+> `*_fallback_no_rapids_correct`).
 
 **Accelerator route gates.** Every GPU accelerator benchmark records the
 execution route each call actually took (read back from
@@ -1089,14 +1084,11 @@ design; the rapids HVG flavors are validated by the pyscx GPU verify
 asserts the rapids-absent path stamps `fallback_reason="no_rapids"` and stays
 correct on CPU.
 
-> **Baseline re-promotion (deferred).** The Phase 2 routing flip changes which
-> route the `pyscx_gpu`/`rapids_singlecell_gpu` accel cells record, so the accel
-> baseline must be **re-captured and re-promoted post-merge**, once Phase 1/2 are
-> on `main`: `gate_candidate.py --tier full` (on `main`, scx-bench-gpu with
-> rapids) → `promote_baseline.py --version v0.6.5-accel-gpu-rapids-floors`. Until
-> then `LATEST` stays at `v0.6.4-accel-gpu-rapids`; the new `*_route_rapids_correct`
-> / `*_fallback_no_rapids_correct` floors are absolute (baseline-independent) so
-> they gate without a re-promotion.
+> **Baseline promoted.** `LATEST` was promoted to
+> `v0.6.5-accel-gpu-rapids-floors` after the Phase 2 routing flip merged.
+> The `*_route_rapids_correct` / `*_fallback_no_rapids_correct` floors are
+> absolute (baseline-independent) and gate alongside the relative
+> regression checks.
 
 The rapids variants need `cuml` + `rapids-singlecell` in the `scx-bench-gpu`
 conda env. `cuml` installs via `conda env update -f envs/scx-bench-gpu.yml`;
@@ -1443,7 +1435,7 @@ Run it locally before opening a PR that touches the gate.
 
 The comprehensive baseline at
 `comprehensive/results/baselines/LATEST` (currently
-`v0.6.0-gpu-phase1-7-multidataset`) covers both format-level **and**
+`v0.6.5-accel-gpu-rapids-floors`) covers both format-level **and**
 GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
 `accel_leiden`, `accel_preprocess`, `accel_hvg`) across pbmc3k,
 tabula_sapiens_100k, and census_1m. Per-run correctness metrics

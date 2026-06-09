@@ -9,6 +9,7 @@ use scx_codec::value_encoding::{detect_value_encoding, values_to_raw_bytes};
 use scx_codec::{encode_shard, CodecId, ValueEncoding};
 
 use crate::codec_select::select_codec_for_modality;
+use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO};
 use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
@@ -142,6 +143,25 @@ pub fn encode_one_shard(
         + encoded.values_bytes.len()
         + block_index_bytes.len()) as u64;
 
+    // Build the decode sidecar from the **encoder-produced** metadata (single
+    // source of truth for the bit layout) — never re-derived. Only Scx1 integer
+    // CSR shards carry `scx1_decode`.
+    let decode_sidecar = match (shard_codec, &encoded.scx1_decode) {
+        (CodecId::Scx1, Some(meta)) => DecodeSidecar::from_codec_metadata(
+            meta,
+            shard_value_encoding,
+            index_dtype,
+            n_vars,
+            global_row_offset,
+            section_type,
+            0,
+            section_length,
+            section_checksum,
+        )?
+        .filter(|s| s.within_overhead_budget(DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO)),
+        _ => None,
+    };
+
     // 10. Compute shard stats. pyscx writes row-major CSR shards
     // exclusively; CSC sidecars use a separate path.
     let stats = compute_shard_stats(
@@ -164,5 +184,6 @@ pub fn encode_one_shard(
         name,
         section_type,
         nnz,
+        decode_sidecar,
     })
 }

@@ -78,6 +78,8 @@ pub enum SectionType {
     /// [`ObsMetadataShard`] for the var axis. Section name:
     /// `var_metadata/shard_<idx>`.
     VarMetadataShard = 25,
+    /// Decode metadata sidecar for an encoded CSR-like shard.
+    DecodeMetadataShard = 26,
 }
 
 impl SectionType {
@@ -110,6 +112,7 @@ impl SectionType {
             23 => Some(Self::VarpEmbeddingShard),
             24 => Some(Self::ObsMetadataShard),
             25 => Some(Self::VarMetadataShard),
+            26 => Some(Self::DecodeMetadataShard),
             _ => None,
         }
     }
@@ -186,11 +189,15 @@ mod tests {
             SectionType::from_u8(25),
             Some(SectionType::VarMetadataShard)
         );
+        assert_eq!(
+            SectionType::from_u8(26),
+            Some(SectionType::DecodeMetadataShard)
+        );
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(26), None);
+        assert_eq!(SectionType::from_u8(27), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 

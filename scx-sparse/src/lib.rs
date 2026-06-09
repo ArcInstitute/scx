@@ -14,7 +14,7 @@ pub use transpose::{
 };
 pub use umap_math::{compute_epochs_per_sample, find_ab_params, random_init_f32, random_init_f64};
 pub use validate::{
-    canonicalize_csr, coalesce_sorted_coo, drop_explicit_zeros_inplace, rebase_csr_shard,
-    shard_nnz_bounds, sort_csr_rows_in_place, validate_csr_arrays, validate_sparse_layout,
-    SparseLayout,
+    canonicalize_csr, coalesce_sorted_coo, drop_explicit_zeros_inplace, is_canonical_csr,
+    rebase_csr_shard, shard_nnz_bounds, sort_csr_rows_in_place, validate_csr_arrays,
+    validate_sparse_layout, SparseLayout,
 };

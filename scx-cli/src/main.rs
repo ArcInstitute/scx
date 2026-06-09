@@ -193,9 +193,12 @@ enum Commands {
     Validate {
         /// SCX file to validate
         file: PathBuf,
-        /// Print checksum values
+        /// Print checksum values and deep-check errors
         #[arg(long)]
         verbose: bool,
+        /// Decode sparse shards and validate v3 canonical CSR plus decode sidecars
+        #[arg(long)]
+        deep: bool,
     },
     /// Append cells from another SCX file
     Append {
@@ -652,7 +655,11 @@ fn main() {
             json,
             history,
         } => info::run_info(&file, json, history),
-        Commands::Validate { file, verbose } => match validate::run_validate(&file, verbose) {
+        Commands::Validate {
+            file,
+            verbose,
+            deep,
+        } => match validate::run_validate(&file, verbose, deep) {
             Ok(all_passed) => {
                 if all_passed {
                     Ok(())

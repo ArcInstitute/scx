@@ -5,8 +5,13 @@ use std::io::Cursor;
 
 use crate::bitstream::BitStreamError;
 use crate::delta_golomb::{delta_golomb_decode, delta_golomb_encode};
-use crate::forbp::{forbp_decode_with_hint, forbp_encode};
-use crate::rice::{rice_decode, rice_encode, B_VAL};
+use crate::forbp::{
+    forbp_decode_with_hint, forbp_decode_with_metadata, forbp_encode_with_metadata,
+    ForBpRowMetadata,
+};
+use crate::rice::{
+    rice_decode, rice_decode_with_metadata, rice_encode_with_metadata, RiceBlockMetadata, B_VAL,
+};
 use crate::shuffle::{byte_shuffle, byte_unshuffle};
 
 // ---------------------------------------------------------------------------
@@ -176,12 +181,23 @@ impl ValueEncoding {
     }
 }
 
+/// The Scx1 decode metadata produced as a byproduct of actual encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scx1DecodeMetadata {
+    pub rows: Vec<ForBpRowMetadata>,
+    pub rice_blocks: Vec<RiceBlockMetadata>,
+}
+
 /// The encoded byte arrays for a single CSR shard (owned).
 #[derive(Debug)]
 pub struct EncodedShard {
     pub indptr_bytes: Vec<u8>,
     pub indices_bytes: Vec<u8>,
     pub values_bytes: Vec<u8>,
+    /// Present only for Scx1 integer shards. This is emitted by the encoder
+    /// that wrote the bitstreams, so decode sidecars do not re-derive codec
+    /// internals in a second crate.
+    pub scx1_decode: Option<Scx1DecodeMetadata>,
 }
 
 /// Borrowed reference to encoded shard byte arrays (zero-copy from mmap).
@@ -494,6 +510,7 @@ fn encode_none(
         indptr_bytes,
         indices_bytes,
         values_bytes: values.to_vec(),
+        scx1_decode: None,
     })
 }
 
@@ -540,17 +557,84 @@ fn encode_scx1(
 
     // indices → FOR-BP (needs row_lengths from indptr)
     let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
-    let indices_bytes = forbp_encode(indices, &row_lengths, index_dtype_u16)?;
+    let indices_encoded = forbp_encode_with_metadata(indices, &row_lengths, index_dtype_u16)?;
 
     // values → reinterpret to u32, then Rice encode
     let values_u32 = raw_bytes_to_u32(values, value_encoding)?;
-    let values_bytes = rice_encode(&values_u32, B_VAL)?;
+    let values_encoded = rice_encode_with_metadata(&values_u32, B_VAL)?;
 
     Ok(EncodedShard {
         indptr_bytes,
-        indices_bytes,
-        values_bytes,
+        indices_bytes: indices_encoded.bytes,
+        values_bytes: values_encoded.bytes,
+        scx1_decode: Some(Scx1DecodeMetadata {
+            rows: indices_encoded.rows,
+            rice_blocks: values_encoded.blocks,
+        }),
     })
+}
+
+/// Decode a Scx1 shard through encoder-produced metadata offsets.
+///
+/// The returned arrays should match [`decode_shard_ref`] for the same shard.
+/// Unlike the normal decoder, this reconstructs `indptr` from row metadata and
+/// seeks directly to per-row/per-block offset positions for indices and values.
+pub fn decode_scx1_with_metadata(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    metadata: &Scx1DecodeMetadata,
+) -> Result<DecodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+    if metadata.rows.len() != n_rows {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 metadata row count {} != n_rows {n_rows}",
+            metadata.rows.len()
+        )));
+    }
+
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0);
+    let mut covered = 0u64;
+    for (row_idx, row) in metadata.rows.iter().enumerate() {
+        if row.value_start != covered {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx1 metadata row {row_idx} value_start {} != expected {covered}",
+                row.value_start
+            )));
+        }
+        covered = covered
+            .checked_add(row.nnz as u64)
+            .ok_or_else(|| CodecError::MalformedInput("Scx1 metadata nnz overflows u64".into()))?;
+        indptr.push(covered);
+    }
+    if covered != nnz as u64 {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 metadata covers {covered} values, expected {nnz}"
+        )));
+    }
+
+    let indices = forbp_decode_with_metadata(encoded.indices_bytes, &metadata.rows)?;
+    if indices.len() != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 metadata decoded {} indices, expected {nnz}",
+            indices.len()
+        )));
+    }
+
+    let values_u32 = rice_decode_with_metadata(encoded.values_bytes, &metadata.rice_blocks)?;
+    if values_u32.len() != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 metadata decoded {} values, expected {nnz}",
+            values_u32.len()
+        )));
+    }
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
+
+    Ok((indptr, indices, values_bytes))
 }
 
 fn decode_scx1_ref(
@@ -599,6 +683,7 @@ fn encode_zstd(
         indptr_bytes,
         indices_bytes,
         values_bytes,
+        scx1_decode: None,
     })
 }
 
@@ -702,6 +787,7 @@ fn encode_lz4_shuffle(
         indptr_bytes,
         indices_bytes,
         values_bytes,
+        scx1_decode: None,
     })
 }
 
@@ -787,6 +873,7 @@ fn encode_pcodec(
         indptr_bytes,
         indices_bytes,
         values_bytes,
+        scx1_decode: None,
     })
 }
 
@@ -1195,9 +1282,72 @@ mod tests {
             indptr_bytes: vec![],
             indices_bytes: vec![],
             values_bytes: vec![],
+            scx1_decode: None,
         };
         let result = decode_shard(&encoded, CodecId::Scx1, ValueEncoding::Float32, 3, 6, false);
         assert!(matches!(result, Err(CodecError::FloatWithScx1)));
+    }
+
+    /// The encoder-emitted Scx1 decode metadata must reproduce the canonical
+    /// decode when fed to `decode_scx1_with_metadata` (parity), and a corrupted
+    /// offset must NOT reproduce it (proving the open-verify parity net catches
+    /// a bad sidecar — either an error or a divergent decode).
+    #[test]
+    fn decode_scx1_with_metadata_parity_and_detects_corruption() {
+        use crate::value_encoding::values_to_raw_bytes;
+
+        // 3 rows, strictly-increasing indices, non-zero integer values.
+        let indptr: Vec<u64> = vec![0, 2, 2, 5];
+        let indices: Vec<u32> = vec![0, 3, 1, 4, 9];
+        let vals_f32: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let (n_rows, nnz) = (3usize, 5usize);
+        let value_encoding = ValueEncoding::Uint16;
+        let values = values_to_raw_bytes(&vals_f32, value_encoding).unwrap();
+
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            value_encoding,
+            false,
+        )
+        .unwrap();
+        let meta = encoded
+            .scx1_decode
+            .clone()
+            .expect("Scx1 encode must emit decode metadata");
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        let canonical =
+            decode_shard_ref(&r, CodecId::Scx1, value_encoding, n_rows, nnz, false).unwrap();
+
+        // Parity: decode-via-offsets == canonical decode.
+        let via = decode_scx1_with_metadata(&r, value_encoding, n_rows, nnz, &meta).unwrap();
+        assert_eq!(via, canonical, "decode-via-metadata must match canonical");
+
+        // Corrupt a Rice value-block bit offset → must error or diverge.
+        let mut bad_rice = meta.clone();
+        bad_rice.rice_blocks[0].bit_offset = bad_rice.rice_blocks[0].bit_offset.wrapping_add(5);
+        let got = decode_scx1_with_metadata(&r, value_encoding, n_rows, nnz, &bad_rice);
+        assert!(
+            got.map_or(true, |d| d != canonical),
+            "corrupted Rice block offset must not reproduce the canonical decode"
+        );
+
+        // Corrupt a row's index bit offset → must error or diverge.
+        let mut bad_idx = meta.clone();
+        if let Some(row) = bad_idx.rows.iter_mut().find(|row| row.nnz > 0) {
+            row.indices_bit_offset = row.indices_bit_offset.wrapping_add(7);
+        }
+        let got = decode_scx1_with_metadata(&r, value_encoding, n_rows, nnz, &bad_idx);
+        assert!(
+            got.map_or(true, |d| d != canonical),
+            "corrupted index bit offset must not reproduce the canonical decode"
+        );
     }
 
     /// Task 6.10: Zstd + Float32 round-trips correctly.

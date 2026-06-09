@@ -2,11 +2,11 @@
   "algorithm": "blake3",
   "files": {
     "cloud_exploded_reference.scxd/X/000000.shard": "93feaffe323d28c27080520f20cd6e0b782048e13df445a14d112dbb45bdbff1",
-    "cloud_exploded_reference.scxd/_catalog.bin": "6155e353633288a892dad5aea8b5b8ec1dd97b0feb4f33d5200a638409104a63",
-    "cloud_exploded_reference.scxd/_header.bin": "b321b9f5062efe92ca9f823523763798aa6c89efe9456e6c443fcc3a8d7e7f6b",
+    "cloud_exploded_reference.scxd/_catalog.bin": "de4c637603385325dec7a121476f2ac66a9d999f5500393e42b1b6bd5e6ab308",
+    "cloud_exploded_reference.scxd/_header.bin": "bde543ed620d83c467bb1bc0c298bc9d377efaa9fe3e03157e1c1444df834042",
     "cloud_exploded_reference.scxd/obs.arrow": "794a06967214125c05018f00dbda379d97dc9928d4ded9aadd5eee4aa2c41943",
     "cloud_exploded_reference.scxd/var.arrow": "baf47006b6a5ef34084b63450296e1631e9ee4b0c6b860e83c214e68ca51661d",
-    "cloud_optimized_reference.scx": "6014413d4af2fdea0b61de4a899dc08441d6a8e165108f5cfb0b4e8afa7bfe28",
+    "cloud_optimized_reference.scx": "88992eae7c6fe160f75fe47d00d475086e7604af4d69939085143e3999fe8f7b",
     "golden_lz4shuffle_f32.scx": "eabe8a7770fe04db8b33bf72977b8a2c535952c2561fd9dd09b018a6581fba31",
     "golden_lz4shuffle_u16.scx": "0b7912694d04b3ae1bc494cb7fe9b6efdb3525a1e9d6c775088959b3f2e7c000",
     "golden_lz4shuffle_u32.scx": "85d24b445957f30e203b911a45c1bca16d0fd3c9df69501c4570467f35867cdf",
@@ -26,13 +26,13 @@
     "golden_zstd_u16.scx": "93d54468220d5df37702046ecfc9a00f308d85e6f98118a6d4d3b22718e50155",
     "golden_zstd_u32.scx": "88229a255bedc16054c312080d564671138c9148b5ef2523f66d00fa5d34ec0b",
     "golden_zstd_u8.scx": "30c215a6f68a41ce3b79741009a6de88fb9c9b34cd1a1a1ea2b0ce4fd8104aa6",
-    "v1_csc.scx": "02dd424aa84cd2b31a28f8a1da50c822447d7134deb04c40216dcc4c879147bb",
-    "v1_deletion_vectors.scx": "16481aefa7b46af1a360272d68ce310d59e9f5e2ade82765056b9ac93ace7338",
-    "v1_layers_obsm_uns.scx": "59d14eff6ff659636478ce4a20837ecba78fd0581954f2121cf214998994b4b2",
-    "v1_minimal.scx": "5fd3e7c0501770456554368260927c2f489a25589cd57c565a62f27d3fa501fb",
-    "v1_predicate_indexes.scx": "970b7cd411f806f57f2c0480ace3a82581d63f4543e9c64d3e50a4608ba29278",
-    "v2_bitmap.scx": "c45d1fbf348181cb4c74d394965ea5b3f7d28e955d191ed41523854d6b10b929",
-    "v2_multimodal_citeseq.scx": "55f5bf3e6f2acb7f800ee6ce19fe520d737490458c9e8385fc96defb697a9db8",
-    "v2_multimodal_partial_csc.scx": "fa4c91845eafabb5cd5a14dcb03a23a43683f6239bcf7d6a00db4ce9052d7d00"
+    "v1_csc.scx": "a39902aa0fa85b5dffd3a14a2e2bfc77271ca148cb8e962515ec8580a7805aab",
+    "v1_deletion_vectors.scx": "25dabbd08b4cdbbc2a29ad2b243bda9c8a15f33a4c2ec9a6b4367e6c8643b14d",
+    "v1_layers_obsm_uns.scx": "9160d0f625160ecf7a797dfc2262181b0ea4c5bf0aea2f8336699b548bada01c",
+    "v1_minimal.scx": "1a871bf0da79537bb5425e225f39aef96bababd3b03e2175f031dec561f4c79b",
+    "v1_predicate_indexes.scx": "bcc3dee4ea3504f54949bf0a2979daea9c21aaf5d923c8791f201be0a5162d30",
+    "v2_bitmap.scx": "204480087becf936ac62f08e21e0ed006124bde51c8fc37625d68d8552e1aef2",
+    "v2_multimodal_citeseq.scx": "27efe06ca885ffa3ba869cabefd136942e9b2f916c9c431109e39fbe196a28a9",
+    "v2_multimodal_partial_csc.scx": "02f6ab55dce3626818da10c0187468fdd9893c95a54c06ab1f497e7aa8ad46a1"
   }
 }

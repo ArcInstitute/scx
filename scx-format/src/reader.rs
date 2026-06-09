@@ -11,19 +11,15 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use memmap2::Mmap;
-use scx_sparse::{ScxCsc, ScxCsr};
-
-// `CodecId` / `ValueEncoding` are only referenced from the in-module
-// `#[cfg(test)]` block + the test-only `values_to_f32` helper; gating
-// the imports keeps the release build warning-clean.
-#[cfg(test)]
 use scx_codec::{CodecId, ValueEncoding};
+use scx_sparse::{ScxCsc, ScxCsr};
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::checksum::blake3_hash;
+use crate::decode_sidecar::DecodeSidecar;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityInfo, ModalityTable};
@@ -2725,6 +2721,233 @@ impl ScxReader {
         Ok(results)
     }
 
+    /// Read and parse a `DecodeMetadataShard` section.
+    pub fn read_decode_sidecar_from_entry(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<DecodeSidecar> {
+        if entry.section_type != SectionType::DecodeMetadataShard {
+            return Err(ScxError::InvalidCatalog(format!(
+                "entry {} is {:?}, not DecodeMetadataShard",
+                entry.name, entry.section_type
+            )));
+        }
+        let section = self.section_bytes(entry)?;
+        DecodeSidecar::read_from(&mut Cursor::new(section), section.len())
+    }
+
+    /// Validate one decode sidecar against its source catalog entry and shard header.
+    pub fn validate_decode_sidecar_entry(&self, entry: &FullCatalogEntry) -> Result<()> {
+        let sidecar = self.read_decode_sidecar_from_entry(entry)?;
+        if !Self::is_canonical_csr_section(sidecar.target_section_type) {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} targets non-CSR section type {:?}",
+                entry.name, sidecar.target_section_type
+            )));
+        }
+
+        let source = self
+            .full_catalog
+            .entries
+            .iter()
+            .find(|source| {
+                source.offset == sidecar.source_section_offset
+                    && source.length == sidecar.source_section_length
+                    && source.checksum == sidecar.source_section_checksum
+            })
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "decode sidecar {} references missing source section at offset {} length {}",
+                    entry.name, sidecar.source_section_offset, sidecar.source_section_length
+                ))
+            })?;
+
+        if source.section_type != sidecar.target_section_type {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} target type {:?} != source {} type {:?}",
+                entry.name, sidecar.target_section_type, source.name, source.section_type
+            )));
+        }
+        if source.modality_id != entry.modality_id {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} modality {} != source {} modality {}",
+                entry.name, entry.modality_id, source.name, source.modality_id
+            )));
+        }
+
+        let shard_header = self.read_shard_header(source)?;
+        let codec_id = CodecId::from_u8(shard_header.codec_id)
+            .ok_or(ScxError::UnknownCodec(shard_header.codec_id))?;
+        if codec_id != CodecId::Scx1 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} source {} uses codec {:?}, expected Scx1",
+                entry.name, source.name, codec_id
+            )));
+        }
+        let value_encoding = ValueEncoding::from_u8(shard_header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(shard_header.value_encoding))?;
+        if !value_encoding.is_integer() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} source {} uses non-integer value encoding {:?}",
+                entry.name, source.name, value_encoding
+            )));
+        }
+        if shard_header.codec_id != sidecar.codec_id
+            || shard_header.value_encoding != sidecar.value_encoding
+            || shard_header.index_dtype != sidecar.index_dtype
+            || shard_header.n_major != sidecar.n_rows
+            || shard_header.n_minor != sidecar.n_cols
+            || shard_header.nnz != sidecar.nnz
+            || shard_header.global_offset != sidecar.major_start
+        {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} shape/header metadata does not match source {}",
+                entry.name, source.name
+            )));
+        }
+
+        if let Some(stats) = source.stats.as_ref() {
+            let expected_end = sidecar
+                .major_start
+                .checked_add(sidecar.n_rows as u64)
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "decode sidecar {} row range overflows u64",
+                        entry.name
+                    ))
+                })?;
+            if stats.nnz != sidecar.nnz
+                || stats.major_start(source.section_type) != sidecar.major_start
+                || stats.major_end(source.section_type) != expected_end
+            {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {} stats do not match source {}",
+                    entry.name, source.name
+                )));
+            }
+        }
+
+        Self::validate_decode_sidecar_entries(&entry.name, &sidecar)?;
+
+        // Decode-parity: decode the source shard **through** the sidecar's
+        // recorded row/Rice-block offsets and assert byte-equality with the
+        // canonical decode. This is the safety net the encoder-emitted offsets
+        // depend on — a sidecar is only trustworthy if a consumer seeking to its
+        // offsets reproduces exactly what the normal decoder produces.
+        let section = self.section_bytes(source)?;
+        let slice_stream = |rel: u32, len: u32, label: &str| -> Result<&[u8]> {
+            let start = rel as usize;
+            let end = start
+                .checked_add(len as usize)
+                .filter(|&e| e <= section.len())
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "decode sidecar {} source {} {label} stream out of bounds",
+                        entry.name, source.name
+                    ))
+                })?;
+            Ok(&section[start..end])
+        };
+        let encoded_ref = scx_codec::EncodedShardRef {
+            indptr_bytes: slice_stream(
+                shard_header.indptr_rel_offset,
+                shard_header.indptr_length,
+                "indptr",
+            )?,
+            indices_bytes: slice_stream(
+                shard_header.indices_rel_offset,
+                shard_header.indices_length,
+                "indices",
+            )?,
+            values_bytes: slice_stream(
+                shard_header.values_rel_offset,
+                shard_header.values_length,
+                "values",
+            )?,
+        };
+        let n_rows = shard_header.n_major as usize;
+        let nnz = shard_header.nnz as usize;
+        let index_dtype_u16 = shard_header.index_dtype == 0;
+        let via_offsets = scx_codec::decode_scx1_with_metadata(
+            &encoded_ref,
+            value_encoding,
+            n_rows,
+            nnz,
+            &sidecar.to_scx1_metadata(),
+        )
+        .map_err(|e| {
+            ScxError::InvalidCatalog(format!(
+                "decode sidecar {} parity decode (via offsets) failed: {e}",
+                entry.name
+            ))
+        })?;
+        let canonical = scx_codec::decode_shard_ref(
+            &encoded_ref,
+            codec_id,
+            value_encoding,
+            n_rows,
+            nnz,
+            index_dtype_u16,
+        )
+        .map_err(|e| {
+            ScxError::InvalidCatalog(format!(
+                "decode sidecar {} canonical decode of source {} failed: {e}",
+                entry.name, source.name
+            ))
+        })?;
+        if via_offsets != canonical {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {} parity mismatch: decode-via-offsets != canonical decode of source {}",
+                entry.name, source.name
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validate every decode sidecar section.
+    pub fn validate_decode_sidecars(&self) -> Vec<(String, bool)> {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|entry| entry.section_type == SectionType::DecodeMetadataShard)
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    self.validate_decode_sidecar_entry(entry).is_ok(),
+                )
+            })
+            .collect()
+    }
+
+    /// Validate that a row-major sparse shard obeys the v3 canonical CSR invariant.
+    pub fn validate_canonical_csr_entry(&self, entry: &FullCatalogEntry) -> Result<()> {
+        if !Self::is_canonical_csr_section(entry.section_type) {
+            return Err(ScxError::InvalidCatalog(format!(
+                "entry {} is {:?}, not a canonical CSR shard type",
+                entry.name, entry.section_type
+            )));
+        }
+        let shard_header = self.read_shard_header(entry)?;
+        let (indptr, indices, data) = self.read_shard_from_entry_verified(entry)?;
+        Self::validate_decoded_canonical_csr(&entry.name, &shard_header, &indptr, &indices, &data)
+    }
+
+    /// Validate all row-major sparse shards against the v3 canonical CSR invariant.
+    pub fn validate_canonical_csr_shards(&self) -> Vec<(String, bool)> {
+        self.full_catalog
+            .entries
+            .iter()
+            .filter(|entry| Self::is_canonical_csr_section(entry.section_type))
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    self.validate_canonical_csr_entry(entry).is_ok(),
+                )
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -2821,6 +3044,182 @@ impl ScxReader {
             entry,
             self.full_catalog.catalog_version,
         )
+    }
+
+    fn is_canonical_csr_section(section_type: SectionType) -> bool {
+        matches!(
+            section_type,
+            SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+        )
+    }
+
+    fn validate_decode_sidecar_entries(name: &str, sidecar: &DecodeSidecar) -> Result<()> {
+        let mut expected_value_start = 0u64;
+        for (row_idx, row) in sidecar.rows.iter().enumerate() {
+            if row.value_start != expected_value_start {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} row {row_idx} value_start {} != expected {}",
+                    row.value_start, expected_value_start
+                )));
+            }
+            if row.frame_bits > 32 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} row {row_idx} frame_bits {} exceeds 32",
+                    row.frame_bits
+                )));
+            }
+            if row.index_packing > 2 || (row.nnz == 0 && row.index_packing != 0) {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} row {row_idx} has invalid index_packing {}",
+                    row.index_packing
+                )));
+            }
+            expected_value_start = expected_value_start
+                .checked_add(row.nnz as u64)
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "decode sidecar {name} row nnz sum overflows u64"
+                    ))
+                })?;
+        }
+        if expected_value_start != sidecar.nnz {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {name} row coverage {} != nnz {}",
+                expected_value_start, sidecar.nnz
+            )));
+        }
+
+        let mut expected_value_start = 0u64;
+        for (block_idx, block) in sidecar.rice_blocks.iter().enumerate() {
+            if block.value_start != expected_value_start {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} Rice block {block_idx} value_start {} != expected {}",
+                    block.value_start, expected_value_start
+                )));
+            }
+            if block.n_values == 0 || block.n_values as usize > scx_codec::rice::B_VAL {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} Rice block {block_idx} has invalid n_values {}",
+                    block.n_values
+                )));
+            }
+            if block.k > scx_codec::rice::MAX_RICE_K {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "decode sidecar {name} Rice block {block_idx} k {} exceeds {}",
+                    block.k,
+                    scx_codec::rice::MAX_RICE_K
+                )));
+            }
+            expected_value_start = expected_value_start
+                .checked_add(block.n_values as u64)
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "decode sidecar {name} Rice block coverage overflows u64"
+                    ))
+                })?;
+        }
+        if expected_value_start != sidecar.nnz {
+            return Err(ScxError::InvalidCatalog(format!(
+                "decode sidecar {name} Rice block coverage {} != nnz {}",
+                expected_value_start, sidecar.nnz
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_decoded_canonical_csr(
+        name: &str,
+        header: &ShardHeader,
+        indptr: &[i64],
+        indices: &[i32],
+        data: &[f32],
+    ) -> Result<()> {
+        let expected_indptr_len = header.n_major as usize + 1;
+        if indptr.len() != expected_indptr_len {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {name} indptr len {} != n_major + 1 {}",
+                indptr.len(),
+                expected_indptr_len
+            )));
+        }
+        if indptr.first().copied() != Some(0) {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {name} indptr must start at 0"
+            )));
+        }
+        if indices.len() != data.len() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {name} indices len {} != data len {}",
+                indices.len(),
+                data.len()
+            )));
+        }
+        if header.nnz != indices.len() as u64 {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {name} header nnz {} != decoded nnz {}",
+                header.nnz,
+                indices.len()
+            )));
+        }
+
+        for (row, window) in indptr.windows(2).enumerate() {
+            let start_raw = window[0];
+            let end_raw = window[1];
+            if start_raw < 0 || end_raw < 0 || end_raw < start_raw {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {name} invalid indptr window at row {row}: {start_raw}..{end_raw}"
+                )));
+            }
+            let start = usize::try_from(start_raw).map_err(|_| {
+                ScxError::InvalidCatalog(format!(
+                    "CSR shard {name} row {row} start overflows usize"
+                ))
+            })?;
+            let end = usize::try_from(end_raw).map_err(|_| {
+                ScxError::InvalidCatalog(format!("CSR shard {name} row {row} end overflows usize"))
+            })?;
+            if end > indices.len() {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {name} row {row} end {end} exceeds decoded nnz {}",
+                    indices.len()
+                )));
+            }
+
+            let mut prev: Option<i32> = None;
+            for pos in start..end {
+                let idx = indices[pos];
+                if idx < 0 || idx as u64 >= header.n_minor as u64 {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "CSR shard {name} row {row} index {idx} out of range [0, {})",
+                        header.n_minor
+                    )));
+                }
+                if let Some(prev_idx) = prev {
+                    if idx <= prev_idx {
+                        return Err(ScxError::InvalidCatalog(format!(
+                        "CSR shard {name} row {row} indices are not strictly increasing: {idx} after {prev_idx}"
+                    )));
+                    }
+                }
+                if data[pos] == 0.0 {
+                    return Err(ScxError::InvalidCatalog(format!(
+                        "CSR shard {name} row {row} stores explicit zero at ordinal {pos}"
+                    )));
+                }
+                prev = Some(idx);
+            }
+        }
+
+        let last = *indptr.last().unwrap_or(&-1);
+        if last < 0 || last as usize != indices.len() {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {name} indptr last {last} != decoded nnz {}",
+                indices.len()
+            )));
+        }
+
+        Ok(())
     }
 
     /// Assemble multiple shard entries into a single ScxCsr using parallel decode.

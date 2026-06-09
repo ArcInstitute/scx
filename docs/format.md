@@ -36,6 +36,7 @@ experiment.scx (single binary file)
 │ X/csr/000000 … X/csr/{N-1}    (CSR shards)                       │
 │ X/csc/…                       (optional, if has_csc)             │
 │ X/bitmap/…                    (optional, if has_bitmap)          │
+│ decode/…                      (optional decode metadata sidecars) │
 │ layers/{name}/csr/…           (additional CSR shard sets)        │
 │ obsm/{name}                   (Arrow IPC dense 2D tensors)       │
 │ obsp/{name}/csr/…             (sparse cell-cell graphs)          │
@@ -57,7 +58,7 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCX\x01"` |
-| `format_version` | `u16` | 1 (legacy) or 2 (multimodal-capable). v2 readers accept both; v1 readers reject v2. |
+| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), or 3 (canonical CSR + decode sidecars). v3 uses the v2 header byte layout; older readers reject v3 via the version check. |
 | `header_length` | `u16` | 256; reserves space for future header growth |
 | `flags` | `u32` | See flag table below |
 | `n_obs` | `u64` | Total cells (after deletions) |
@@ -79,15 +80,19 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | `file_checksum` | `u64` | BLAKE3 truncated to 64 bits |
 | `front_catalog_offset` | `u64` | 0 if `has_front_catalog` unset |
 | `front_catalog_length` | `u64` | 0 if not present |
-| `n_modalities` | `u32` | v2 only; number of named modalities (0 = single-modality / v1-shape). Capped at 255. |
-| `modality_table_offset` | `u64` | v2 only; offset of the `ModalityTable` section. 0 when `n_modalities == 0`. |
-| `modality_table_length` | `u64` | v2 only; section byte length. 0 when `n_modalities == 0`. |
+| `n_modalities` | `u32` | v2+ only; number of named modalities (0 = single-modality / v1-shape). Capped at 255. |
+| `modality_table_offset` | `u64` | v2+ only; offset of the `ModalityTable` section. 0 when `n_modalities == 0`. |
+| `modality_table_length` | `u64` | v2+ only; section byte length. 0 when `n_modalities == 0`. |
 | `reserved` | `[u8; 112]` | Zeroed. Shrunk from `[u8; 132]` in v2 to make room for the three modality fields. |
 
-v1 files have the older 132-byte `reserved` field; the v2 reader maps
-the leading 20 bytes of that block to the three new modality fields
+v1 files have the older 132-byte `reserved` field; the v2/v3 reader maps
+the leading 20 bytes of that block to the three modality fields
 when reading a `format_version = 1` header (validating that those
 bytes are zero — v1 writers always zeroed the full reserved block).
+
+v3 does not add header fields. Its breaking changes are semantic: newly
+written row-major sparse shards are canonical CSR (§4), and files may carry
+`decode_metadata_shard` sections (§4.2).
 
 ### Flags
 
@@ -211,7 +216,8 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 | 23 | `varp_embedding_shard` (Arrow IPC COO; row-shard of a `varp/<name>` pairwise sparse matrix) |
 | 24 | `obs_metadata_shard` (Arrow IPC; row-shard of the obs metadata batch — see § Sharded metadata layout below) |
 | 25 | `var_metadata_shard` (Arrow IPC; row-shard of the var metadata batch — mirror of `obs_metadata_shard`) |
-| 26–31 | Reserved for multimodal/spatial extensions |
+| 26 | `decode_metadata_shard` (optional decode metadata sidecar for a source Scx1 CSR-like shard — see §4.2) |
+| 27–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
@@ -300,6 +306,22 @@ Total: 76 bytes. Implementations MUST use exactly 76 — this matches
 > values are a hint for tools that want summary stats without touching
 > individual shards. This is how a file can mix, e.g., Scx1 raw integer
 > shards in `X` with Zstd-compressed float shards in a normalized layer.
+
+### v3 canonical CSR invariant
+
+For `format_version >= 3`, newly written row-major sparse shard sections
+(`csr_shard`, `layer_csr_shard`, and `obsp_csr_shard`) MUST be canonical CSR:
+
+- `indptr[0] == 0`, `indptr` is monotonic, and `indptr.last() == nnz`.
+- Every row stores column indices in strictly increasing order.
+- Every stored index is in `[0, n_minor)`.
+- Duplicate `(row, col)` coordinates are summed before write.
+- Explicit zero values are dropped after duplicate summation.
+
+This invariant is enforced by current writers at untrusted ingest boundaries
+(h5ad/h5mu/10x/MTX and Python AnnData inputs). Readers do not need to
+canonicalize on ordinary reads; use `scx validate --deep` to decode shards
+and check the invariant.
 
 ### Block index
 
@@ -398,6 +420,66 @@ while preserving CSC sidecars: the CSR rewrite loop calls
 `writer.write_csc_shard()` on the new file. The post-upgrade file has
 identical CSC content (byte-equal under the same codec) and a
 correctly populated `n_csc_shards` count + `has_csc` flag.
+
+## 4.2 Decode Metadata Sidecar
+
+`decode_metadata_shard` (section type 26) is optional metadata for direct
+random-access or device decode of an existing encoded shard. It does not
+duplicate matrix values. Current writers emit it only for Scx1 integer
+`csr_shard` and `layer_csr_shard` sections when the estimated sidecar size is
+no more than 25% of the source shard section length. Consumers MUST treat the
+sidecar as an optimization and fall back to normal shard decode when it is
+absent.
+
+Catalog name: `decode/<source_section_name>`. The source identity is stored in
+the payload as `(source_section_offset, source_section_length,
+source_section_checksum)`. A reader validates that tuple against the active
+catalog before trusting the sidecar. Mutating rewrites must rebuild or drop
+decode sidecars; they must not copy them blindly across changed source shards.
+
+Payload layout, little-endian:
+
+```
+magic: [u8; 4] = b"SCXD"
+version: u16 = 1
+kind: u8 = 1                       (Scx1 CSR decode metadata)
+target_section_type: u8            (currently 4 or 7)
+codec_id: u8                       (must be Scx1)
+value_encoding: u8                 (must be integer)
+index_dtype: u8                    (0 = u16, 1 = u32)
+reserved: u16 = 0
+n_rows: u32
+n_cols: u32
+nnz: u64
+major_start: u64                   (row_start for CSR-like source)
+source_section_offset: u64
+source_section_length: u64
+source_section_checksum: [u8; 32]  (full BLAKE3 catalog checksum)
+n_row_entries: u32
+n_rice_blocks: u32
+
+For each row entry:
+  nnz: u32
+  value_start: u64
+  frame_min: u32
+  frame_bits: u8
+  index_packing: u8                (0 empty, 1 scalar bitpack, 2 BitPacker4x layout)
+  reserved: u16 = 0
+  indices_bit_offset: u64          (from start of encoded indices stream)
+
+For each Rice value block:
+  value_start: u64
+  n_values: u16
+  k: u8
+  reserved: u8 = 0
+  bit_offset: u64                  (from start of encoded values stream)
+
+payload_checksum: [u8; 32]         (BLAKE3 of all preceding sidecar bytes)
+```
+
+The sidecar is valid only when row entries cover exactly `nnz` values, Rice
+blocks cover exactly `nnz` values, and all fixed metadata matches the source
+shard header and catalog stats. `scx validate --deep` checks those conditions.
 
 ## 5. Arrow IPC Metadata
 
@@ -929,7 +1011,7 @@ without breaking older files.
 
 ## 13. Multimodal Extension (Optional)
 
-v2 files can carry multiple feature spaces (CITE-seq RNA + protein, 10x
+v2+ files can carry multiple feature spaces (CITE-seq RNA + protein, 10x
 Multiome RNA + ATAC, …) in a single SCX. Cells are global; modalities
 are routed via a 1-byte `modality_id` stamped on each catalog entry,
 plus a `ModalityTable` section that names every registered modality.
@@ -938,15 +1020,15 @@ plus a `ModalityTable` section that names every registered modality.
 
 A multimodal file has:
 
-- `format_version = 2`,
+- `format_version >= 2`,
 - `has_modalities` flag set (bit 7),
 - `n_modalities ≥ 1`,
 - `modality_table_offset` / `modality_table_length` pointing at the
   `ModalityTable` section.
 
-A v2 file with `n_modalities = 0` (and the offset/length fields zero)
-is **single-modality** and decodes identically to a v1 file via the v2
-reader. Adopting v2 does not force users into multimodal.
+A v2/v3 file with `n_modalities = 0` (and the offset/length fields zero)
+is **single-modality** and decodes identically to a v1 file via the v2/v3
+reader. Adopting v2+ does not force users into multimodal.
 
 ### 13.2 ModalityTable section (id 15)
 

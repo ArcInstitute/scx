@@ -62,7 +62,7 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
-| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `pca` (covariance eigh + randomized SVD, auto-routed), `neighbors` (HNSW kNN), `umap` (SGD embedding), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native Leiden community detection), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled. |
+| **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `route` (accelerator execution planner + rapids probe), `pca` (streaming/randomized SVD, auto-routed; in-VRAM routes to `rsc.pp.pca`), `neighbors` (HNSW kNN; in-VRAM routes to `rsc.pp.neighbors`), `umap` (routes to `rsc.tl.umap`), `hvg` (streaming `seurat_v3`; extra flavors route to `rsc.pp.highly_variable_genes`), `fused` (fused `pca_neighbors_umap` / `pca_neighbors` pipelines via rapids), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native CPU + cuGraph GPU), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled; rapids-singlecell detected at runtime (not a pip extra). |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA, device-resident fused path), `gpu_harmony` (distance / softmax+penalty / L2-normalize / batched correction kernels), `gpu_preprocess` (fused normalize+log1p), `gpu_matrix_source` (unified `GpuMatrixSource` capability trait over the row-major `GpuShardSource` (CSR) and column-major `GpuCscShardSource` (CSC) device shard sources, with G3-shaped pinned-ring staging), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
@@ -81,8 +81,25 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 > `instant-distance` for HNSW kNN, `rand_chacha` for deterministic Leiden seeding,
 > and `libc` for `malloc_trim` in the Leiden optimizer.
 > With the `gpu` feature enabled, `scx-accel` gains an optional dependency on `scx-gpu`
-> for GPU-accelerated PCA (cuSPARSE SpMM + cuSOLVER QR), kNN (cuVS CAGRA), and
-> UMAP (native CUDA SGD kernel).
+> and routes GPU analysis through **rapids-singlecell** (`rsc.*`) when available:
+> PCA → `rsc.pp.pca`, kNN → `rsc.pp.neighbors`, UMAP → `rsc.tl.umap`,
+> preprocessing → `rsc.pp.*`, HVG extra flavors → `rsc.pp.highly_variable_genes`.
+> rapids-singlecell is a detected runtime dependency (conda `envs/scx-gpu-analysis.yml`);
+> `pyscx/src/accel/rapids.rs` provides a one-shot import probe and emits a
+> `no_rapids` `UserWarning` if the package is absent.
+> `SCX_FORCE_NATIVE_GPU=1` pins surviving native paths;
+> `SCX_DISABLE_RAPIDS=1` forces the no-rapids fallback for testing.
+>
+> **What survives natively** (not routed to rapids):
+> streaming / randomized PCA (>VRAM moat), HVG `seurat_v3` (1.2× at 1M),
+> Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct),
+> Harmony, preprocessing kernels (ML loader + streaming), device-resident
+> CAGRA kNN (fused pipeline only), codec decode (`rice_decode.cu`,
+> `forbp_decode.cu`), and `gpu_graph.rs` (generic graph capture).
+>
+> Native GPU UMAP (`umap_sgd.cu`, `gpu_umap.rs`), in-VRAM covariance PCA
+> (`gpu_pca_covariance.rs`), standalone kNN CAGRA dispatch, and PCA SpMM
+> graph-capture (`pca_spmm_capture_opt_in`) were removed in Phase 3.
 
 ---
 
@@ -932,40 +949,48 @@ Cell Ranger MTX conversion uses the `scx-mtx` crate (always-on, no HDF5 dependen
   PyTorch              batch["X"].to(device) → model.forward()
 ```
 
-### Analysis: SCX → GPU Accelerators
+### Analysis: SCX → GPU Accelerators (rapids-singlecell)
 
 When `device="gpu"` is set (or `device="auto"` with a CUDA GPU present),
-the analysis pipeline runs entirely on GPU:
+the analysis pipeline routes through **rapids-singlecell** for UMAP, in-VRAM
+PCA, and kNN, while streaming/randomized PCA and codec decode remain native.
 
 ```
   experiment.scx
       │
       ▼
-  BackedCsrReader      Read shard bytes from disk
-      │
+  AccelRoute planner    Detect rapids (one-shot import probe)
+      │                 → RapidsSinglecell | NativeGpu | FallbackCpu
+      │                 SCX_FORCE_NATIVE_GPU=1 pins native paths
+      │                 SCX_DISABLE_RAPIDS=1 forces no-rapids fallback
       ▼
-  GPU PCA (streaming)   For each shard:
-      │                   1. htod copy raw shard bytes
-      │                   2. decode_shard_gpu() → GpuCsr
-      │                   3. GpuCsr → CusparseSpMatDescr (zero-copy)
-      │                   4. cusparseSpMM: Y_shard += A_shard @ Ω
-      │                   5. mean_correct_kernel on Y_shard rows
-      │                 Then:
-      │                   cuSOLVER QR → Power iteration → CPU SVD → GPU GEMM
+  to_gpu_anndata()      Minimal-copy device handoff:
+      │                 PyExperiment → GPU-resident AnnData
+      │                 X as cupyx.scipy.sparse.csr_matrix
       ▼
-  GPU kNN (CAGRA)       cuVS CAGRA index build + all-queries search
-      │                 on PCA embeddings (stays on GPU)
+  GPU PCA               Two paths:
+      │                 (a) In-VRAM: rsc.pp.pca (via rapids)
+      │                 (b) Streaming/randomized (native, >VRAM moat):
+      │                     shard-streaming cuSPARSE SpMM + cuBLAS,
+      │                     auto-routed by dataset size
       ▼
-  GPU UMAP              Native CUDA SGD kernel (edge-parallel)
-      │                 or cuML fallback if available
+  GPU kNN               Two paths:
+      │                 (a) In-VRAM: rsc.pp.neighbors (via rapids)
+      │                 (b) Device-resident CAGRA (fused pipeline only)
+      ▼
+  GPU UMAP              rsc.tl.umap (via rapids-singlecell)
+      │                 Native CUDA SGD kernel removed in Phase 3
       ▼
   AnnData               dtoh copy embeddings, kNN graph, UMAP coords
                         → adata.obsm["X_pca"], obsp, obsm["X_umap"]
 ```
 
+Fused pipelines (`pca_neighbors_umap`, `pca_neighbors`) route end-to-end
+through rapids when available, minimising device↔host copies.
+
 Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices
-during PCA). kNN and UMAP operate on the (n_obs × n_components) dense
-embeddings, which are small relative to the full expression matrix.
+during streaming PCA). kNN and UMAP operate on the (n_obs × n_components)
+dense embeddings, which are small relative to the full expression matrix.
 
 ---
 

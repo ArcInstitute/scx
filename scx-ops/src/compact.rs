@@ -171,10 +171,12 @@ pub fn compact_with_index_options(
     // `has_csc` (bit 0) — the CSC sidecar is dropped explicitly above.
     let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
 
-    // Set up output header
+    // Set up output header. Compact re-shards CSR rows via `encode_one_shard`
+    // without re-canonicalizing, so it can only claim v3 if the input already
+    // guarantees the canonical invariant (floor 1 — single-modality compact).
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 1),
         header_length: 256,
         flags: out_flags,
         n_obs: new_n_obs as u64,
@@ -907,9 +909,10 @@ fn compact_multimodal(
         .max()
         .unwrap_or(0);
 
+    // Multimodal compact: gate the v3 claim on the input version (floor 2).
     let out_header = FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 2),
         header_length: 256,
         flags: out_flags,
         n_obs: new_n_obs as u64,
