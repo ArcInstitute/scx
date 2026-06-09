@@ -15,6 +15,29 @@ pub fn build_test_shard(
     value_encoding: ValueEncoding,
     n_cols: u32,
 ) -> Vec<u8> {
+    build_test_shard_with_metadata(
+        indptr,
+        indices,
+        values_raw,
+        codec_id,
+        value_encoding,
+        n_cols,
+    )
+    .0
+}
+
+/// Like [`build_test_shard`], but also returns the encoder-emitted Scx1 decode
+/// metadata ([`scx_codec::Scx1DecodeMetadata`] from `EncodedShard::scx1_decode`)
+/// so GPU sidecar-driven decode paths can be tested for byte-parity against the
+/// CPU-prescan path. The metadata is `None` for non-Scx1 codecs.
+pub fn build_test_shard_with_metadata(
+    indptr: &[u64],
+    indices: &[u32],
+    values_raw: &[u8],
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    n_cols: u32,
+) -> (Vec<u8>, Option<scx_codec::Scx1DecodeMetadata>) {
     let n_rows = (indptr.len() - 1) as u32;
     let nnz = *indptr.last().unwrap();
     let index_dtype_u16 = n_cols <= 65535;
@@ -61,5 +84,5 @@ pub fn build_test_shard(
     buf.extend_from_slice(&encoded.indptr_bytes);
     buf.extend_from_slice(&encoded.indices_bytes);
     buf.extend_from_slice(&encoded.values_bytes);
-    buf
+    (buf, encoded.scx1_decode)
 }

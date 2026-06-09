@@ -10,15 +10,15 @@ use cudarc::driver::safe::CudaSlice;
 
 use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
-use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
+use scx_codec::{CodecId, EncodedShardRef, Scx1DecodeMetadata, ValueEncoding};
 use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::forbp_gpu::forbp_decode_gpu;
+use crate::forbp_gpu::{forbp_decode_gpu, forbp_decode_gpu_with_metadata};
 use crate::profile::{self, CodecClass};
-use crate::rice_gpu::rice_decode_gpu;
+use crate::rice_gpu::{rice_decode_gpu, rice_decode_gpu_with_metadata};
 
 /// GPU-resident CSR matrix.
 ///
@@ -35,6 +35,53 @@ pub struct GpuCsr {
     pub shape: (usize, usize),
 }
 
+/// Host→device transfer accounting for a device decode, surfaced for the
+/// ACC-RUST-OPT-V4 §4.4 `transfer_mode` / `bytes_uploaded` route metadata.
+///
+/// Lets a caller distinguish a genuine in-VRAM Scx1 decode (only the tiny indptr
+/// uploaded) from a host-decode+HtoD bounce, and measures how much of a shard
+/// still falls back to the host — the evidence for whether the BitPacker4x GPU
+/// kernel (Task 4.4b) is worth building.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceDecodeStats {
+    /// A FOR-BP row used the BitPacker4x host-decode fallback (the `>= 128`-nnz
+    /// gap Task 4.4b would close). Distinct from a non-Scx1 codec shard.
+    pub any_forbp_host_fallback: bool,
+    /// Total host→device bytes: the Scx1 indptr (always uploaded), any FOR-BP
+    /// host-fallback indices, and the full payload of any non-Scx1 shard.
+    pub host_uploaded_bytes: u64,
+    /// Bytes decoded directly on the device (Scx1 indices/values that took the
+    /// GPU kernel path).
+    pub device_decoded_bytes: u64,
+    /// True iff every shard decoded its indices+values on the device (all Scx1,
+    /// no FOR-BP host-fallback) — i.e. only indptr was uploaded. Drives the
+    /// `scx_device_decode_gpu` transfer-mode stamp.
+    pub fully_device_decoded: bool,
+}
+
+impl Default for DeviceDecodeStats {
+    fn default() -> Self {
+        // `fully_device_decoded` starts `true` so aggregation can AND it down as
+        // shards are merged; a fresh single-shard stat sets it explicitly.
+        Self {
+            any_forbp_host_fallback: false,
+            host_uploaded_bytes: 0,
+            device_decoded_bytes: 0,
+            fully_device_decoded: true,
+        }
+    }
+}
+
+impl DeviceDecodeStats {
+    /// Fold a per-shard stat into a running aggregate.
+    pub fn merge(&mut self, other: &DeviceDecodeStats) {
+        self.any_forbp_host_fallback |= other.any_forbp_host_fallback;
+        self.host_uploaded_bytes += other.host_uploaded_bytes;
+        self.device_decoded_bytes += other.device_decoded_bytes;
+        self.fully_device_decoded &= other.fully_device_decoded;
+    }
+}
+
 /// Decode an entire SCX shard on GPU, producing a [`GpuCsr`].
 ///
 /// Pipeline:
@@ -47,6 +94,20 @@ pub struct GpuCsr {
 ///
 /// Produces **bit-identical** output to `scx_codec::decode_shard_scipy`.
 pub fn decode_shard_gpu(dev: &GpuDevice, shard_bytes: &[u8]) -> Result<GpuCsr, GpuError> {
+    decode_shard_gpu_with_metadata(dev, shard_bytes, None).map(|(csr, _stats)| csr)
+}
+
+/// Decode an entire SCX shard on GPU, optionally driven by a decode-metadata
+/// sidecar ([`Scx1DecodeMetadata`]) so the per-row FOR-BP / per-block Rice
+/// offsets feed the kernels directly instead of being re-derived by a CPU
+/// prescan (ACC-RUST-OPT-V4 Task 4.4a). `metadata` applies only to the Scx1
+/// path; pass `None` (or a non-Scx1 shard) to use the prescan path. Returns the
+/// [`GpuCsr`] plus [`DeviceDecodeStats`] describing the host↔device transfer.
+pub fn decode_shard_gpu_with_metadata(
+    dev: &GpuDevice,
+    shard_bytes: &[u8],
+    metadata: Option<&Scx1DecodeMetadata>,
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     // 1. Parse 76-byte shard header
     if shard_bytes.len() < SHARD_HEADER_SIZE {
         return Err(GpuError::InvalidShard(format!(
@@ -100,6 +161,7 @@ pub fn decode_shard_gpu(dev: &GpuDevice, shard_bytes: &[u8]) -> Result<GpuCsr, G
             n_rows,
             n_cols,
             nnz,
+            metadata,
         ),
         CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
             decode_cpu_fallback(
@@ -152,12 +214,15 @@ fn decode_scx1_gpu(
     n_rows: usize,
     n_cols: usize,
     nnz: usize,
-) -> Result<GpuCsr, GpuError> {
+    metadata: Option<&Scx1DecodeMetadata>,
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     if !value_encoding.is_integer() {
         return Err(GpuError::InvalidShard(
             "Scx1 codec does not support float value encodings".into(),
         ));
     }
+
+    let mut stats = DeviceDecodeStats::default();
 
     // indptr: Delta-Golomb on CPU → Vec<u64> → Vec<i64> → upload
     let t_host = profile::start();
@@ -168,14 +233,24 @@ fn decode_scx1_gpu(
 
     let t_htod = profile::start();
     let d_indptr = dev.htod_copy(&indptr_i64)?;
+    let indptr_bytes_uploaded = (indptr_i64.len() * 8) as u64;
     profile::record_htod_since(CodecClass::Scx1, t_htod, indptr_i64.len() * 8);
+    // indptr always round-trips host→device; it is the residual upload of a
+    // fully-GPU-decoded Scx1 shard (the "only the tiny indptr" of §2.5).
+    stats.host_uploaded_bytes += indptr_bytes_uploaded;
 
     // indices: FOR-BP on GPU → on-device u32→i32 cast (no host round-trip)
     // values:  Rice on GPU → on-device u32→f32 cast (no host round-trip)
     // Both decode GPU-side; the bucket covers the bitstream upload + kernels.
+    // With a sidecar, the per-row/per-block offsets feed the kernels directly
+    // and the CPU prescan is skipped (Task 4.4a).
     let t_forbp = profile::start();
-    let (d_indices_u32, _row_lengths, forbp_host_fallback) =
-        forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
+    let (d_indices_u32, _row_lengths, forbp_host_fallback) = match metadata {
+        Some(meta) => {
+            forbp_decode_gpu_with_metadata(dev, indices_bytes, &meta.rows, n_rows, index_dtype_u16)?
+        }
+        None => forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?,
+    };
     // FOR-BP self-accounts its SIMD host fallback (host_decode_scx1 + htod_scx1),
     // so only count it toward gpu_decode when it actually ran on the GPU; on the
     // fallback path restart the timer after it returns so gpu_decode captures only
@@ -186,9 +261,25 @@ fn decode_scx1_gpu(
     } else {
         t_forbp
     };
+    if forbp_host_fallback {
+        // The BitPacker4x (>=128-nnz) layout forced a host decode + HtoD of the
+        // u32 indices — the residual Task 4.4b's GPU kernel would eliminate.
+        stats.any_forbp_host_fallback = true;
+        stats.fully_device_decoded = false;
+        stats.host_uploaded_bytes += (nnz as u64) * 4;
+    } else {
+        stats.device_decoded_bytes += (nnz as u64) * 4;
+    }
     let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
-    let d_values_u32 = rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?;
+    let d_values_u32 = match metadata {
+        Some(meta) => {
+            rice_decode_gpu_with_metadata(dev, values_bytes, &meta.rice_blocks, nnz, B_VAL)?
+        }
+        None => rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?,
+    };
+    // Rice values always decode on the device.
+    stats.device_decoded_bytes += (nnz as u64) * 4;
     let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
     if t_gpu.is_some() {
         // Synchronize so the elapsed time reflects completed device work, not
@@ -197,12 +288,15 @@ fn decode_scx1_gpu(
     }
     profile::record_gpu_decode_since(t_gpu);
 
-    Ok(GpuCsr {
-        indptr: d_indptr,
-        indices: d_indices,
-        data: d_data,
-        shape: (n_rows, n_cols),
-    })
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: d_indices,
+            data: d_data,
+            shape: (n_rows, n_cols),
+        },
+        stats,
+    ))
 }
 
 /// CPU fallback decode for None and Zstd codecs, then upload to GPU.
@@ -218,7 +312,7 @@ fn decode_cpu_fallback(
     n_rows: usize,
     n_cols: usize,
     nnz: usize,
-) -> Result<GpuCsr, GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     let encoded = EncodedShardRef {
         indptr_bytes,
         indices_bytes,
@@ -242,12 +336,24 @@ fn decode_cpu_fallback(
     let htod_bytes = indptr.len() * 8 + indices.len() * 4 + data.len() * 4;
     profile::record_htod_since(CodecClass::Generic, t_htod, htod_bytes);
 
-    Ok(GpuCsr {
-        indptr: d_indptr,
-        indices: d_indices,
-        data: d_data,
-        shape: (n_rows, n_cols),
-    })
+    // Non-Scx1 codecs decode wholly on the host then upload the full CSR — never
+    // a device decode, so this never counts as `fully_device_decoded`.
+    let stats = DeviceDecodeStats {
+        any_forbp_host_fallback: false,
+        host_uploaded_bytes: htod_bytes as u64,
+        device_decoded_bytes: 0,
+        fully_device_decoded: false,
+    };
+
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: d_indices,
+            data: d_data,
+            shape: (n_rows, n_cols),
+        },
+        stats,
+    ))
 }
 
 #[cfg(test)]
@@ -469,6 +575,129 @@ mod tests {
         let row_nnzs = [2usize, 130, 300, 0, 512, 9, 256];
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
         assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
+    }
+
+    /// Decode an Scx1 shard three ways — host reference, GPU no-sidecar (CPU
+    /// prescan), and GPU sidecar-driven (Task 4.4a) — and assert all three are
+    /// byte-identical. Returns the sidecar-driven [`DeviceDecodeStats`].
+    fn assert_sidecar_decode_match(
+        dev: &GpuDevice,
+        indptr: &[u64],
+        indices: &[u32],
+        values_u16: &[u16],
+        n_cols: u32,
+    ) -> DeviceDecodeStats {
+        let n_rows = indptr.len() - 1;
+        let nnz = indices.len();
+        let index_dtype_u16 = n_cols <= 65535;
+        let values_raw: Vec<u8> = values_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let (shard_bytes, meta) = crate::test_utils::build_test_shard_with_metadata(
+            indptr,
+            indices,
+            &values_raw,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_cols,
+        );
+        let meta = meta.expect("Scx1 shard must emit decode metadata");
+
+        // Host reference.
+        let header = ShardHeader::read_from(&mut Cursor::new(&shard_bytes)).unwrap();
+        let indptr_enc =
+            &shard_bytes[header.indptr_rel_offset as usize..][..header.indptr_length as usize];
+        let indices_enc =
+            &shard_bytes[header.indices_rel_offset as usize..][..header.indices_length as usize];
+        let values_enc =
+            &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
+        let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
+            indptr_enc,
+            indices_enc,
+            values_enc,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_rows,
+            nnz,
+            index_dtype_u16,
+        );
+
+        // GPU, no sidecar (CPU prescan path) and GPU, sidecar-driven.
+        let (plain, _plain_stats) =
+            decode_shard_gpu_with_metadata(dev, &shard_bytes, None).unwrap();
+        let (sided, stats) =
+            decode_shard_gpu_with_metadata(dev, &shard_bytes, Some(&meta)).unwrap();
+
+        for (label, csr) in [("no-sidecar", &plain), ("sidecar", &sided)] {
+            let g_indptr = dev.dtoh_copy(&csr.indptr).unwrap();
+            let g_indices = dev.dtoh_copy(&csr.indices).unwrap();
+            let g_data = dev.dtoh_copy(&csr.data).unwrap();
+            assert_eq!(csr.shape, (n_rows, n_cols as usize), "{label} shape");
+            assert_eq!(g_indptr, cpu_indptr, "{label} indptr mismatch");
+            assert_eq!(g_indices, cpu_indices, "{label} indices mismatch");
+            assert_eq!(g_data, cpu_data, "{label} data mismatch");
+        }
+        stats
+    }
+
+    /// Sidecar-driven GPU decode of an all-sparse Scx1 shard (<128 nnz/row,
+    /// incl. empty rows and a partial last Rice block) is byte-identical to the
+    /// prescan path and host, and decodes entirely on the device.
+    #[test]
+    fn test_sidecar_decode_all_sparse_fully_device() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 64, 0, 100, 7, 33, 0, 120, 2, 90];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
+        assert!(
+            !stats.any_forbp_host_fallback,
+            "all-sparse must not host-fallback"
+        );
+        assert!(
+            stats.fully_device_decoded,
+            "all-sparse must fully device-decode"
+        );
+        let nnz = indices.len() as u64;
+        // Only the tiny indptr is uploaded; indices+values decode on the device.
+        assert_eq!(stats.host_uploaded_bytes, (indptr.len() as u64) * 8);
+        assert_eq!(stats.device_decoded_bytes, nnz * 8);
+    }
+
+    /// Sidecar-driven GPU decode of a mixed shard (some rows >= 128 nnz) stays
+    /// byte-identical, but FOR-BP indices still take the host-fallback (the Task
+    /// 4.4b gap) while Rice values decode on the device via the sidecar.
+    #[test]
+    fn test_sidecar_decode_mixed_dense_host_fallback() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
+        assert!(
+            stats.any_forbp_host_fallback,
+            "dense rows must host-fallback FOR-BP"
+        );
+        assert!(
+            !stats.fully_device_decoded,
+            "mixed shard is not fully device-decoded"
+        );
+        let nnz = indices.len() as u64;
+        // Only Rice values decode on device; FOR-BP indices upload from host.
+        assert_eq!(stats.device_decoded_bytes, nnz * 4, "only Rice on device");
+        assert_eq!(
+            stats.host_uploaded_bytes,
+            (indptr.len() as u64) * 8 + nnz * 4
+        );
+    }
+
+    /// u32-column (n_cols > 65535) sidecar-driven parity.
+    #[test]
+    fn test_sidecar_decode_u32_indices() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 70_000;
+        let row_nnzs = [2usize, 130, 300, 0, 512, 9, 256, 1, 64];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let _ = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
     }
 
     #[test]

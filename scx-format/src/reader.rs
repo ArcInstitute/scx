@@ -1318,6 +1318,27 @@ impl ScxReader {
         self.read_raw_shard_bytes(shards[shard_idx])
     }
 
+    /// Resolve the decode-metadata sidecar for a CSR shard by modality + 0-based
+    /// index (parallel to [`Self::read_raw_csr_shard_bytes_for`]). Returns `None`
+    /// when no fresh Scx1 sidecar exists (non-Scx1 codec, stale, or absent —
+    /// never an error). Used by the GPU device-decode handoff to drive
+    /// `scx_gpu::decode_csr_shards_to_device_with_metadata` from the
+    /// encoder-emitted offsets instead of a CPU prescan (ACC-RUST-OPT-V4 4.4a).
+    pub fn scx1_metadata_for_csr_shard(
+        &self,
+        modality_id: u8,
+        shard_idx: usize,
+    ) -> Result<Option<scx_codec::Scx1DecodeMetadata>> {
+        let shards = self.full_catalog.csr_shards_for_modality(modality_id);
+        if shard_idx >= shards.len() {
+            return Err(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: shards.len(),
+            });
+        }
+        self.scx1_metadata_for(shards[shard_idx])
+    }
+
     /// Indptr-only variant of [`Self::read_csr_shard_for`]. Decodes only
     /// the row-pointer region; cheap path for callers that need just
     /// per-row nnz counts.
@@ -3045,6 +3066,21 @@ impl ScxReader {
             return Ok(None);
         }
         Ok(Some(sidecar))
+    }
+
+    /// Resolve the codec-level [`scx_codec::Scx1DecodeMetadata`] for a CSR shard
+    /// `entry`, or `None` when no fresh Scx1 decode sidecar exists (non-Scx1
+    /// codec, stale, or absent — never an error). This is the public seam GPU
+    /// device-decode consumers (`to_gpu_anndata`) call to drive
+    /// `scx_gpu::decode_csr_shards_to_device_with_metadata` directly from the
+    /// encoder-emitted offsets instead of a CPU prescan (ACC-RUST-OPT-V4 4.4a).
+    pub fn scx1_metadata_for(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<Option<scx_codec::Scx1DecodeMetadata>> {
+        Ok(self
+            .scx1_sidecar_for(entry)?
+            .map(|sidecar| sidecar.to_scx1_metadata()))
     }
 
     /// Slice a shard section's three encoded streams into an `EncodedShardRef`

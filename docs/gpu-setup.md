@@ -231,9 +231,13 @@ With rapids present, in-memory (≤VRAM) `device="gpu"` ops route to rapids:
 kernel for (`seurat`, `cell_ranger`, `pearson_residuals`,
 `poisson_gene_selection`). The route is recorded as `rapids_singlecell_gpu` on
 `adata.uns["scx_accel"][<op>]` with the detected rapids/cuML/cuPy versions and a
-`transfer_mode` (`scx_device_handoff` when `X` is already device-resident — e.g.
-from `pyscx.open(...).to_gpu_anndata()` — or `anndata_to_gpu` when rapids
-uploads a host `X`).
+`transfer_mode`: `scx_device_handoff` when `X` is already device-resident — e.g.
+from `pyscx.open(...).to_gpu_anndata()`, regardless of which mode that call itself
+stamped — or `anndata_to_gpu` when rapids uploads a host `X`. (`to_gpu_anndata`
+stamps its *own*, more specific transfer mode on the `to_gpu_anndata` op key —
+`scx_device_decode_gpu` for a fully-in-VRAM Scx1 sidecar decode, or
+`scx_device_handoff_streamed` when a shard host-bounces; see
+[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).)
 
 **`X` residency contract.** When the op uploads a host `X` (`anndata_to_gpu`),
 the result slots (`obsm`/`obsp`) **and** `X` are brought back to host afterwards

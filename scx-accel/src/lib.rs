@@ -102,4 +102,7 @@ pub use scx_gpu::{
     GpuPcaTuning, ProfileSnapshot, QrMethod, SpmmAlgPolicy, StageStat,
 };
 #[cfg(feature = "gpu")]
-pub use scx_gpu::{decode_csr_shards_to_device, decode_shard_gpu, GpuCsr, GpuCsrPointers};
+pub use scx_gpu::{
+    decode_csr_shards_to_device, decode_csr_shards_to_device_with_metadata, decode_shard_gpu,
+    decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr, GpuCsrPointers,
+};
