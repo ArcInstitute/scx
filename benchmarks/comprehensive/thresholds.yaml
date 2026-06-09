@@ -503,6 +503,11 @@ absolute_floors:
   #   dataset: pbmc3k
   #   metric: to_gpu_anndata_decode_correct
   #   min: 1.0
+  # - benchmark: accel_to_gpu_anndata
+  #   format: accel_to_gpu_anndata__scx1_gpu
+  #   dataset: tabula_sapiens_100k
+  #   metric: to_gpu_anndata_decode_correct
+  #   min: 1.0
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k

@@ -52,6 +52,17 @@ _HAS_PYSCX_GPU = AcceleratorRunner.instance().has_gpu()
 
 _VARIANT_KEY = "accel_to_gpu_anndata__scx1_gpu"
 
+# The staged `thresholds.yaml` route/decode floors live only on pbmc3k +
+# tabula_sapiens_100k (mirroring the other accel route gates). Restricting the
+# gate to these two tiers keeps a full `--tier full --accel-only` run from
+# submitting this benchmark for census tiers, where the self-converted fixture
+# (h5ad read + `from_anndata` + host CSR reference + GPU-resident decode) is
+# costly and `estimate_memory_gb` cannot budget a shared converted fixture.
+# Atlas tiers are deferred until an in-place `scx optimize` / shared-fixture
+# path exists. Enforced at the top of `run()` (defense-in-depth for direct
+# invocation; the orchestrator has no per-dataset cohort filter).
+SUPPORTED_DATASETS: frozenset[str] = frozenset({"pbmc3k", "tabula_sapiens_100k"})
+
 
 def accel_to_gpu_anndata_variants() -> list[FormatVariant]:
     return [
@@ -80,9 +91,16 @@ def _convert_counts_to_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, i
     import pyscx
 
     adata = anndata.read_h5ad(str(dataset.h5ad_path))
-    # Keep integer counts — Scx1 codec + decode sidecars require integer X.
+    # Force the Scx1 codec rather than relying on `codec="auto"`: auto only
+    # selects Scx1 for integer X with median nonzero ≤ 8 (else Zstd), so a
+    # high-median count tier would silently land as Zstd — no decode sidecar,
+    # `transfer_mode=scx_device_handoff_streamed`, and a false route-floor
+    # failure. Explicit Scx1 pins the sidecar path for any integer-valued X
+    # (no dtype coercion needed — `from_anndata` coerces to f32 and detects
+    # integer encoding internally). Genuinely fractional X silently falls back
+    # to Zstd, which the route/decode metrics surface.
     scx_path = Path(tmpdir) / f"{dataset.name}.scx"
-    pyscx.from_anndata(adata, str(scx_path))
+    pyscx.from_anndata(adata, str(scx_path), codec="scx1")
     n_obs = int(adata.n_obs)
     n_shards = int(pyscx.open(str(scx_path)).shard_count)
     return scx_path, n_obs, n_shards
@@ -97,6 +115,21 @@ def run(
 ) -> BenchmarkResult | None:
     variant_key = format_variant.key
     if variant_key != _VARIANT_KEY:
+        return None
+    if dataset.name not in SUPPORTED_DATASETS:
+        logger.info(
+            "%s gate scoped to %s — recording stub for %s",
+            variant_key,
+            sorted(SUPPORTED_DATASETS),
+            dataset.name,
+        )
+        write_missing_result(
+            benchmark="accel_to_gpu_anndata",
+            format_key=variant_key,
+            dataset=dataset.name,
+            missing_reason="dataset_out_of_gate_scope",
+            notes="to_gpu_anndata gate scoped to pbmc3k + tabula_sapiens_100k",
+        )
         return None
     if not _HAS_PYSCX:
         logger.warning("pyscx not installed — skipping %s", variant_key)
