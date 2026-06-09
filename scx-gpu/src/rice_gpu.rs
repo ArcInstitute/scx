@@ -125,7 +125,12 @@ pub fn rice_decode_gpu_with_metadata(
         }
         // Sidecar bit_offset points at the 1-byte block header; the kernel wants
         // the byte offset of the block's data (just past that header).
-        block_offsets.push((b.bit_offset / 8 + 1) as u32);
+        let byte_off = b.bit_offset / 8 + 1;
+        block_offsets.push(u32::try_from(byte_off).map_err(|_| {
+            GpuError::InvalidShard(format!(
+                "Rice sidecar: block byte offset {byte_off} exceeds u32"
+            ))
+        })?);
         block_k.push(b.k);
     }
     rice_decode_gpu_core(dev, data, n_values, block_size, block_offsets, block_k)

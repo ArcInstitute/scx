@@ -1339,7 +1339,8 @@ for the full gate table.
 
 The device-handoff path — `pyscx.open(...).to_gpu_anndata()`, then chained
 `pyscx.accel.*` / `rsc.*` ops on the device-resident AnnData
-(`transfer_mode == "scx_device_handoff"`) — is only as fast as the cost of
+(`transfer_mode` ∈ `scx_device_decode_gpu` / `scx_device_handoff_streamed` /
+`scx_device_handoff`) — is only as fast as the cost of
 getting each shard onto the GPU. That cost is dominated by **decode**, and
 decode cost is set by the **value representation you persisted on disk**, not by
 the analysis op. So the layout choice matters as much as the device flag:
@@ -1371,8 +1372,19 @@ the analysis op. So the layout choice matters as much as the device flag:
   GPU-relevant matrix as Scx1 counts," **not** "add a sidecar to a float layer."
 
 Confirm the path actually taken via
-`adata.uns["scx_accel"][op]["transfer_mode"]` (`scx_device_handoff` = on-device,
-`anndata_to_gpu` = host re-upload), the same way you confirm `route` for DE.
+`adata.uns["scx_accel"][op]["transfer_mode"]`, the same way you confirm `route`
+for DE. `to_gpu_anndata` stamps one of:
+- `scx_device_decode_gpu` — Scx1 shards decoded **fully in VRAM** from the decode
+  sidecar; only the tiny indptr is uploaded (`bytes_uploaded` ≈ indptr). The fast
+  path you want.
+- `scx_device_handoff_streamed` — on-device, but some shard still bounced through
+  the host: a FOR-BP ≥128-nnz BitPacker4x fallback or a non-Scx1 codec (the float
+  Pcodec case above). `bytes_uploaded` is the real HtoD total.
+- `scx_device_handoff` — host-assembled CSR (filtered / projected / multimodal
+  input), or an `X` that was already device-resident on entry.
+
+(rapids ops that have to upload a host `X` instead stamp `anndata_to_gpu` — a host
+re-upload, not a `to_gpu_anndata` mode.)
 
 **rapids-singlecell does not read the decode sidecar.** The sidecar lives
 entirely on the SCX side of the handoff: it accelerates SCX's own

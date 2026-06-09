@@ -196,8 +196,18 @@ pub fn forbp_decode_gpu_with_metadata(
             frame_min: r.frame_min,
             frame_bits: r.frame_bits,
             nnz: r.nnz,
-            bit_offset: r.indices_bit_offset as u32,
-            output_offset: r.value_start as u32,
+            bit_offset: u32::try_from(r.indices_bit_offset).map_err(|_| {
+                GpuError::InvalidShard(format!(
+                    "FOR-BP sidecar: indices_bit_offset {} exceeds u32",
+                    r.indices_bit_offset
+                ))
+            })?,
+            output_offset: u32::try_from(r.value_start).map_err(|_| {
+                GpuError::InvalidShard(format!(
+                    "FOR-BP sidecar: value_start {} exceeds u32",
+                    r.value_start
+                ))
+            })?,
         });
     }
     forbp_decode_gpu_core(
