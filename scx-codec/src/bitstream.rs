@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(data, vec![0x01]);
 
         let mut reader = BitReader::new(&data);
-        assert_eq!(reader.read_bit().unwrap(), true);
+        assert!(reader.read_bit().unwrap());
     }
 
     #[test]
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(data, vec![0x00]);
 
         let mut reader = BitReader::new(&data);
-        assert_eq!(reader.read_bit().unwrap(), false);
+        assert!(!reader.read_bit().unwrap());
     }
 
     #[test]
@@ -418,7 +418,7 @@ mod tests {
         let mut reader = BitReader::new(&data);
         assert_eq!(reader.read_bits(5).unwrap(), 0b10110);
         assert_eq!(reader.read_unary().unwrap(), 3);
-        assert_eq!(reader.read_bit().unwrap(), true);
+        assert!(reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(8).unwrap(), 0xFF);
         assert_eq!(reader.read_unary().unwrap(), 0);
     }
@@ -440,7 +440,7 @@ mod tests {
 
         let mut reader = BitReader::new(&data);
         assert_eq!(reader.read_bits(7).unwrap(), 0b1010101);
-        assert_eq!(reader.read_bit().unwrap(), true);
+        assert!(reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(3).unwrap(), 0b110);
     }
 

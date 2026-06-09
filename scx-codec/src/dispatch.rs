@@ -1491,7 +1491,7 @@ mod tests {
         let row_nnz: Vec<usize> = vec![
             0, 1, 5, 130, 0, 200, 7, 256, 257, 3, 0, 140, 511, 1, 64, 300, 0, 2, 128, 90,
         ];
-        let n_cols = 4000u32;
+        let _n_cols = 4000u32;
         let mut indptr = vec![0u64];
         let mut indices: Vec<u32> = Vec::new();
         let mut vals_f32: Vec<f32> = Vec::new();
