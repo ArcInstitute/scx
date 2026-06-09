@@ -876,27 +876,30 @@ impl BackedCsrReader {
         const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
         let mut plans: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(shard_indices.len());
         let mut full_shards: Vec<usize> = Vec::new();
-        for &shard_idx in &shard_indices {
-            let (s_start, s_end) =
-                self.index
-                    .shard_range(shard_idx)
-                    .ok_or(ScxError::ShardIndexOutOfBounds {
-                        index: shard_idx,
-                        count: self.index.n_shards(),
-                    })?;
-            let local_start = (start.max(s_start) - s_start) as usize;
-            let local_end = (end.min(s_end) - s_start) as usize;
-            let window = (local_end - local_start) as u64;
-            let shard_rows = s_end - s_start;
-            let cached = self
-                .cache
-                .as_ref()
-                .is_some_and(|c| c.lock().unwrap().contains(&shard_idx));
-            let use_row_range = !cached && window * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
-            if !use_row_range {
-                full_shards.push(shard_idx);
+        // Hold the cache lock once for the whole planning pass (N→1 lock
+        // acquisitions) and drop it before `warm_shards` — `std::sync::Mutex`
+        // is non-reentrant, and the warm path re-locks the cache.
+        {
+            let cache = self.cache.as_ref().map(|c| c.lock().unwrap());
+            for &shard_idx in &shard_indices {
+                let (s_start, s_end) =
+                    self.index
+                        .shard_range(shard_idx)
+                        .ok_or(ScxError::ShardIndexOutOfBounds {
+                            index: shard_idx,
+                            count: self.index.n_shards(),
+                        })?;
+                let local_start = (start.max(s_start) - s_start) as usize;
+                let local_end = (end.min(s_end) - s_start) as usize;
+                let window = (local_end - local_start) as u64;
+                let shard_rows = s_end - s_start;
+                let cached = cache.as_ref().is_some_and(|c| c.contains(&shard_idx));
+                let use_row_range = !cached && window * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
+                if !use_row_range {
+                    full_shards.push(shard_idx);
+                }
+                plans.push((shard_idx, local_start, local_end, use_row_range));
             }
-            plans.push((shard_idx, local_start, local_end, use_row_range));
         }
 
         // Pre-decode the cold full-path shards in parallel (no-op if all cached).
@@ -931,12 +934,23 @@ impl BackedCsrReader {
         local_start: usize,
         local_end: usize,
     ) -> Result<Option<ScxCsr>> {
-        let Some(lite) = self.shard_entry(shard_idx) else {
+        // Recover the *real* catalog entry (name + checksum) for this shard.
+        // The `ShardEntryLite` table drops both, but sidecar resolution needs
+        // them — a transient entry with an empty name / zero checksum would
+        // never match `decode/<name>` nor pass the freshness guard, silently
+        // disabling the fast path. `(offset, section_type)` uniquely identifies
+        // the section.
+        let Some((offset, section_type)) = self
+            .shard_entry(shard_idx)
+            .map(|l| (l.offset, l.section_type))
+        else {
             return Ok(None);
         };
-        let entry = (*lite).into_transient_full_entry();
+        let Some(entry) = self.reader.full_entry_at_offset(offset, section_type) else {
+            return Ok(None);
+        };
         let n = local_end - local_start;
-        match self.reader.decode_scx1_row_range(&entry, local_start, n)? {
+        match self.reader.decode_scx1_row_range(entry, local_start, n)? {
             Some((indptr, indices, data)) => Ok(Some(ScxCsr::new_unchecked(
                 (n, self.n_vars),
                 indptr,
@@ -3380,12 +3394,30 @@ mod tests {
         // Small windows (< shard_rows/4 = 8) of cold shards take the row-range
         // path; assert byte-identical to the reference slice. Cover a window in
         // shard 0, a window in shard 1, and a single row.
-        for (a, b) in [(2usize, 6usize), (40, 44), (10, 11), (33, 37)] {
+        let windows = [(2usize, 6usize), (40, 44), (10, 11), (33, 37)];
+        for (a, b) in windows {
             let got = backed.read_rows(a as u64, b as u64).unwrap();
             let (eip, eix, ev) = slice_raw(&indptr, &indices, &values, a, b);
             assert_eq!(got.indptr, eip, "indptr [{a},{b})");
             assert_eq!(got.indices, eix, "indices [{a},{b})");
             assert_eq!(got.data, ev, "data [{a},{b})");
+        }
+
+        // The results above are correct via *either* path, so assert the
+        // row-range fast path was actually exercised (one decode per small
+        // window) — otherwise a silently-disabled fast path would pass too.
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::Ordering;
+            assert_eq!(
+                backed
+                    .reader
+                    .debug_counts()
+                    .decode_scx1_row_range
+                    .load(Ordering::Relaxed),
+                windows.len() as u64,
+                "each small window must take the sidecar row-range path",
+            );
         }
 
         // A large window (whole file) takes the full-decode path and must also

@@ -52,6 +52,12 @@ pub struct ReaderDebugCounts {
     /// assert it stays bounded by the prefix needed to satisfy `.limit(N)`
     /// rather than scaling with the candidate-shard count.
     pub read_shard_from_entry: AtomicU64,
+    /// Per-shard sidecar-driven row-range decodes via
+    /// [`ScxReader::decode_scx1_row_range`] that actually resolved a fresh Scx1
+    /// sidecar (the `Some` path). Backed-reader tests assert this is nonzero to
+    /// prove the row-range fast path was taken rather than silently falling
+    /// back to a full-shard decode.
+    pub decode_scx1_row_range: AtomicU64,
     pub read_layer: AtomicU64,
     pub read_layer_for: AtomicU64,
     pub read_obsm: AtomicU64,
@@ -363,6 +369,25 @@ impl ScxReader {
 
     pub fn catalog(&self) -> &FullCatalog {
         self.full_catalog.as_ref()
+    }
+
+    /// Resolve the full catalog entry for a section at byte `offset` of the
+    /// given type. The backed reader's `ShardEntryLite` table deliberately
+    /// drops the section `name` and `checksum` to shrink its per-shard
+    /// footprint, but sidecar resolution needs them (`decode/<name>` lookup +
+    /// the freshness `checksum`), so the row-range fast path recovers the real
+    /// entry through this accessor. Offsets are unique across sections, so the
+    /// `(offset, section_type)` match is unambiguous. Linear scan — callers
+    /// gate it to the small-window path where it is negligible against decode.
+    pub fn full_entry_at_offset(
+        &self,
+        offset: u64,
+        section_type: SectionType,
+    ) -> Option<&FullCatalogEntry> {
+        self.full_catalog
+            .entries
+            .iter()
+            .find(|e| e.offset == offset && e.section_type == section_type)
     }
 
     /// Clone the internal `Arc<FullCatalog>` for cheap reuse across
@@ -3142,6 +3167,10 @@ impl ScxReader {
         let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
             ScxError::InvalidCatalog(format!("sidecar row-range convert of {}: {e}", entry.name))
         })?;
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .decode_scx1_row_range
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Some(scipy))
     }
 
