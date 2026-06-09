@@ -529,7 +529,6 @@ impl PyExperiment {
             // PCA wall). Any var_names / obs_filter / layer projection, a deletion
             // vector, or a multimodal source falls back to the host-assemble path
             // below — on-device filtered decode is Phase 4 format work.
-            const SCX1_CODEC_ID: u8 = 1;
             let n_csr_shards = self.reader.csr_shard_count_for(0) as usize;
             let fast_path = var_names.is_none()
                 && obs_filter.is_none()
@@ -565,9 +564,10 @@ impl PyExperiment {
                 // Raw shard bytes (borrow the reader's mmap) + a cheap header
                 // pre-scan for the VRAM gate and the honest HtoD byte count.
                 let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n_csr_shards);
+                let mut shard_metadata: Vec<Option<scx_codec::Scx1DecodeMetadata>> =
+                    Vec::with_capacity(n_csr_shards);
                 let mut total_rows: usize = 0;
                 let mut total_nnz: usize = 0;
-                let mut host_htod_bytes: u64 = 0;
                 for i in 0..n_csr_shards {
                     let bytes = self
                         .reader
@@ -578,17 +578,17 @@ impl PyExperiment {
                             .map_err(|e| {
                                 PyRuntimeError::new_err(format!("shard {i} header: {e}"))
                             })?;
-                    let rows = header.n_major as usize;
-                    let nnz = header.nnz as usize;
-                    total_rows += rows;
-                    total_nnz += nnz;
-                    // Scx1 indices/values decode on-device (no CSR re-upload). Only
-                    // host-decoded codecs (Zstd/Pcodec/LZ4/None) pay the HtoD this
-                    // follow-up exists to avoid — count those bytes so a fully-Scx1
-                    // file reports ~0 uploaded.
-                    if header.codec_id != SCX1_CODEC_ID {
-                        host_htod_bytes += (rows as u64 + 1) * 8 + (nnz as u64) * 8;
-                    }
+                    total_rows += header.n_major as usize;
+                    total_nnz += header.nnz as usize;
+                    // Resolve the decode sidecar so Scx1 indices/values decode on the
+                    // device from the encoder-emitted offsets (no CPU prescan, no host
+                    // bounce). `None` for non-Scx1 / stale / absent — those fall back
+                    // to host decode + HtoD inside the assembler, whose returned
+                    // DeviceDecodeStats report the real uploaded byte count below.
+                    let meta = self.reader.scx1_metadata_for_csr_shard(0, i).map_err(|e| {
+                        PyRuntimeError::new_err(format!("shard {i} decode sidecar: {e}"))
+                    })?;
+                    shard_metadata.push(meta);
                     shard_refs.push(bytes);
                 }
 
@@ -620,19 +620,31 @@ impl PyExperiment {
                     )));
                 }
 
-                let gpu_csr =
-                    scx_accel::decode_csr_shards_to_device(&dev, &shard_refs).map_err(|e| {
-                        PyRuntimeError::new_err(format!("GPU shard assembly failed: {e}"))
-                    })?;
+                let (gpu_csr, decode_stats) = scx_accel::decode_csr_shards_to_device_with_metadata(
+                    &dev,
+                    &shard_refs,
+                    &shard_metadata,
+                )
+                .map_err(|e| PyRuntimeError::new_err(format!("GPU shard assembly failed: {e}")))?;
                 let n_rows = gpu_csr.shape.0;
                 let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
+                // Honest transfer mode: a genuine fully-in-VRAM Scx1 decode (only the
+                // tiny indptr uploaded) vs a path where some shard still bounced
+                // through the host — a FOR-BP >=128-nnz BitPacker4x fallback (the
+                // Task 4.4b gap) or a non-Scx1 codec. `bytes_uploaded` is the real
+                // HtoD total from the decode, not a header estimate.
+                let transfer_mode = if decode_stats.fully_device_decoded {
+                    "scx_device_decode_gpu"
+                } else {
+                    "scx_device_handoff_streamed"
+                };
                 (
                     adata,
                     holder,
                     n_rows,
                     n_cols,
-                    host_htod_bytes,
-                    "scx_device_handoff_streamed",
+                    decode_stats.host_uploaded_bytes,
+                    transfer_mode,
                 )
             } else {
                 // Host-assemble fallback (filtered / projected / multimodal inputs):

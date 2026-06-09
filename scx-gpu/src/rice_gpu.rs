@@ -87,15 +87,67 @@ pub fn rice_decode_gpu(
     if n_values == 0 {
         return dev.alloc_zeros::<u32>(0);
     }
+    // CPU pre-scan to find block byte offsets and k parameters
+    let (block_offsets, block_k) = prescan_rice_blocks(data, n_values, block_size)?;
+    rice_decode_gpu_core(dev, data, n_values, block_size, block_offsets, block_k)
+}
 
+/// Rice GPU decode driven by an encoder-emitted decode-metadata sidecar
+/// ([`scx_codec::rice::RiceBlockMetadata`]) instead of the CPU
+/// `prescan_rice_blocks` pass. The per-block `bit_offset` (to the 1-byte block
+/// header) and `k` are exactly what the kernel needs, so the full CPU scan of
+/// the bitstream (which otherwise must decode every value to find block
+/// boundaries) is skipped. Output is **bit-identical** to [`rice_decode_gpu`].
+pub fn rice_decode_gpu_with_metadata(
+    dev: &GpuDevice,
+    data: &[u8],
+    blocks: &[scx_codec::rice::RiceBlockMetadata],
+    n_values: usize,
+    block_size: usize,
+) -> Result<CudaSlice<u32>, GpuError> {
+    if n_values == 0 {
+        return dev.alloc_zeros::<u32>(0);
+    }
+    let expected = n_values.div_ceil(block_size);
+    if blocks.len() != expected {
+        return Err(GpuError::InvalidShard(format!(
+            "Rice sidecar: blocks.len() {} != expected {expected} for {n_values} values",
+            blocks.len()
+        )));
+    }
+    let mut block_offsets = Vec::with_capacity(blocks.len());
+    let mut block_k = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        if !b.bit_offset.is_multiple_of(8) {
+            return Err(GpuError::InvalidShard(
+                "Rice sidecar: block bit_offset is not byte-aligned".into(),
+            ));
+        }
+        // Sidecar bit_offset points at the 1-byte block header; the kernel wants
+        // the byte offset of the block's data (just past that header).
+        block_offsets.push((b.bit_offset / 8 + 1) as u32);
+        block_k.push(b.k);
+    }
+    rice_decode_gpu_core(dev, data, n_values, block_size, block_offsets, block_k)
+}
+
+/// Shared Rice GPU decode core: takes precomputed per-block byte offsets + k
+/// parameters (from either the CPU prescan or a decode sidecar) and launches the
+/// kernel (one thread per block).
+fn rice_decode_gpu_core(
+    dev: &GpuDevice,
+    data: &[u8],
+    n_values: usize,
+    block_size: usize,
+    block_offsets: Vec<u32>,
+    block_k: Vec<u8>,
+) -> Result<CudaSlice<u32>, GpuError> {
     // Load PTX module (cached) and get kernel function
     let module = dev.load_module_cached(RICE_PTX)?;
     let kernel = module
         .load_function("rice_decode_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("load rice_decode_kernel: {e}")))?;
 
-    // CPU pre-scan to find block byte offsets and k parameters
-    let (block_offsets, block_k) = prescan_rice_blocks(data, n_values, block_size)?;
     let n_blocks = block_offsets.len() as u32;
     let last_block_len = {
         let rem = n_values % block_size;

@@ -149,7 +149,80 @@ pub fn forbp_decode_gpu(
 ) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
     // CPU pre-parse all headers
     let (metas, all_row_lengths, total_nnz) = preparse_forbp(data, n_rows, index_dtype_u16)?;
+    forbp_decode_gpu_core(
+        dev,
+        data,
+        index_dtype_u16,
+        metas,
+        all_row_lengths,
+        total_nnz,
+    )
+}
 
+/// FOR-BP GPU decode driven by an encoder-emitted decode-metadata sidecar
+/// ([`scx_codec::forbp::ForBpRowMetadata`]) instead of the CPU `preparse_forbp`
+/// pass. The sidecar already stores exactly what the kernel needs (per-row
+/// `indices_bit_offset`, `frame_min`, `frame_bits`, `nnz`, and `value_start` =
+/// the output offset), so the full CPU scan of the bitstream is skipped.
+///
+/// `rows` must have one entry per CSR row (`rows.len() == n_rows`), including
+/// empty rows. Output is **bit-identical** to [`forbp_decode_gpu`]; the same
+/// `>= SIMD_THRESHOLD` host-fallback is retained (the GPU kernel still cannot
+/// unpack the BitPacker4x SIMD layout — that is Task 4.4b).
+pub fn forbp_decode_gpu_with_metadata(
+    dev: &GpuDevice,
+    data: &[u8],
+    rows: &[scx_codec::forbp::ForBpRowMetadata],
+    n_rows: usize,
+    index_dtype_u16: bool,
+) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
+    if rows.len() != n_rows {
+        return Err(GpuError::InvalidShard(format!(
+            "FOR-BP sidecar: rows.len() {} != n_rows {n_rows}",
+            rows.len()
+        )));
+    }
+    let mut metas = Vec::with_capacity(rows.len());
+    let mut all_row_lengths = Vec::with_capacity(rows.len());
+    let mut total_nnz: usize = 0;
+    for r in rows {
+        let nnz = r.nnz as usize;
+        all_row_lengths.push(nnz);
+        total_nnz += nnz;
+        if nnz == 0 {
+            continue;
+        }
+        metas.push(RowMeta {
+            frame_min: r.frame_min,
+            frame_bits: r.frame_bits,
+            nnz: r.nnz,
+            bit_offset: r.indices_bit_offset as u32,
+            output_offset: r.value_start as u32,
+        });
+    }
+    forbp_decode_gpu_core(
+        dev,
+        data,
+        index_dtype_u16,
+        metas,
+        all_row_lengths,
+        total_nnz,
+    )
+}
+
+/// Shared FOR-BP GPU decode core: takes the per-row metadata (from either the
+/// CPU `preparse_forbp` pass or a decode sidecar) and runs the SIMD host-fallback
+/// check + kernel launch. `index_dtype_u16`/`data`/`n_rows` are only used by the
+/// host-fallback reference decoder.
+fn forbp_decode_gpu_core(
+    dev: &GpuDevice,
+    data: &[u8],
+    index_dtype_u16: bool,
+    metas: Vec<RowMeta>,
+    all_row_lengths: Vec<usize>,
+    total_nnz: usize,
+) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
+    let n_rows = all_row_lengths.len();
     if total_nnz == 0 {
         return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths, false));
     }

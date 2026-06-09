@@ -18,11 +18,12 @@
 
 use std::io::Cursor;
 
+use scx_codec::Scx1DecodeMetadata;
 use scx_format::shard::ShardHeader;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::shard_decode::{decode_shard_gpu, GpuCsr};
+use crate::shard_decode::{decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr};
 
 /// Decode all CSR shards of a modality straight onto the device and concatenate
 /// them (in the order given, row-stacked) into a single [`GpuCsr`].
@@ -40,10 +41,38 @@ use crate::shard_decode::{decode_shard_gpu, GpuCsr};
 /// Returns [`GpuError::InvalidShard`] if `shards` is empty or shard column
 /// counts disagree, and propagates any per-shard decode / CUDA error.
 pub fn decode_csr_shards_to_device(dev: &GpuDevice, shards: &[&[u8]]) -> Result<GpuCsr, GpuError> {
+    decode_csr_shards_to_device_with_metadata(dev, shards, &[]).map(|(csr, _stats)| csr)
+}
+
+/// Like [`decode_csr_shards_to_device`], but each shard may be driven by a
+/// decode-metadata sidecar ([`Scx1DecodeMetadata`]) so the Scx1 FOR-BP / Rice
+/// offsets feed the GPU kernels directly instead of being re-derived by a CPU
+/// prescan (ACC-RUST-OPT-V4 Task 4.4a).
+///
+/// `metadata` is indexed parallel to `shards`: `metadata[i]` is the sidecar for
+/// shard `i`, or `None` to use the prescan path. An empty `metadata` slice means
+/// "no sidecars" (identical to [`decode_csr_shards_to_device`]). Output is
+/// byte-identical regardless of whether the sidecar path is taken.
+///
+/// Returns the assembled [`GpuCsr`] plus an aggregate [`DeviceDecodeStats`]
+/// (host↔device transfer accounting) the caller stamps onto the §4.4
+/// `transfer_mode` / `bytes_uploaded` route metadata.
+pub fn decode_csr_shards_to_device_with_metadata(
+    dev: &GpuDevice,
+    shards: &[&[u8]],
+    metadata: &[Option<Scx1DecodeMetadata>],
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     if shards.is_empty() {
         return Err(GpuError::InvalidShard(
             "decode_csr_shards_to_device: no CSR shards".into(),
         ));
+    }
+    if !metadata.is_empty() && metadata.len() != shards.len() {
+        return Err(GpuError::InvalidShard(format!(
+            "decode_csr_shards_to_device: metadata len {} != shards len {}",
+            metadata.len(),
+            shards.len()
+        )));
     }
 
     // 1. Pre-scan headers (cheap, no decode) → total rows / nnz + per-shard nnz.
@@ -80,9 +109,12 @@ pub fn decode_csr_shards_to_device(dev: &GpuDevice, shards: &[&[u8]]) -> Result<
     // 3. Decode each shard onto the device, dtod-copy into the combined buffer
     //    at the running nnz offset, and fold its indptr into the host array.
     let mut nnz_base: usize = 0;
+    let mut stats = DeviceDecodeStats::default();
     for (i, bytes) in shards.iter().enumerate() {
         let (rows, nnz) = per_shard[i];
-        let shard = decode_shard_gpu(dev, bytes)?;
+        let shard_meta = metadata.get(i).and_then(|m| m.as_ref());
+        let (shard, shard_stats) = decode_shard_gpu_with_metadata(dev, bytes, shard_meta)?;
+        stats.merge(&shard_stats);
         debug_assert_eq!(shard.shape.0, rows);
         debug_assert_eq!(shard.indices.len(), nnz);
 
@@ -121,17 +153,21 @@ pub fn decode_csr_shards_to_device(dev: &GpuDevice, shards: &[&[u8]]) -> Result<
     // (a cuPy CSR adopting these buffers) cannot race the still-running work.
     dev.synchronize()?;
 
-    Ok(GpuCsr {
-        indptr: combined_indptr,
-        indices: combined_indices,
-        data: combined_data,
-        shape: (total_rows, n_cols),
-    })
+    Ok((
+        GpuCsr {
+            indptr: combined_indptr,
+            indices: combined_indices,
+            data: combined_data,
+            shape: (total_rows, n_cols),
+        },
+        stats,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shard_decode::decode_shard_gpu;
     use crate::test_utils::build_test_shard;
     use scx_codec::{decode_shard_scipy, CodecId, EncodedShardRef, ValueEncoding};
 

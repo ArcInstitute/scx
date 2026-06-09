@@ -2860,6 +2860,64 @@ mod tests {
         }
     }
 
+    /// `ScxReader::scx1_metadata_for_csr_shard` resolves the encoder-emitted
+    /// decode metadata for a fresh Scx1 sidecar (the public seam the GPU
+    /// device-decode handoff, Task 4.4a, calls): one FOR-BP row entry per CSR
+    /// row, Rice blocks present, and an out-of-range index errors.
+    #[test]
+    fn scx1_metadata_for_csr_shard_resolves_fresh_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata_for.scx");
+        let n_rows = 512usize;
+        let n_cols = 2000u32;
+        let mut header = sample_header();
+        header.n_obs = n_rows as u64;
+        header.n_vars = n_cols as u64;
+        header.codec_id = CodecId::Scx1 as u8;
+        header.index_dtype = 1;
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs()).unwrap();
+        writer.write_var(&sample_var()).unwrap();
+        let nnz_per_row = 256usize;
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for _ in 0..n_rows {
+            for col in 0..nnz_per_row {
+                indices.push(col as u32);
+                let v = (1 + (col % 97)) as u16;
+                values.extend_from_slice(&v.to_le_bytes());
+            }
+            indptr.push(indices.len() as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Scx1,
+                ValueEncoding::Uint16,
+                0,
+            )
+            .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+        let meta = reader
+            .scx1_metadata_for_csr_shard(0, 0)
+            .unwrap()
+            .expect("fresh Scx1 sidecar must resolve");
+        assert_eq!(meta.rows.len(), n_rows, "one FOR-BP row entry per CSR row");
+        assert!(!meta.rice_blocks.is_empty(), "Rice blocks present");
+        // Per-row `value_start` is the running nnz prefix.
+        assert_eq!(meta.rows[0].value_start, 0);
+        assert_eq!(meta.rows[1].value_start, nnz_per_row as u64);
+
+        // Out-of-range shard index errors (not `Ok(None)`).
+        assert!(reader.scx1_metadata_for_csr_shard(0, 99).is_err());
+    }
+
     /// The path pyscx actually uses: `encode_one_shard` → `write_preencoded_shard`.
     /// Exercises the `source_section_offset` patching (`with_source_offset`) and the
     /// encode-time `section_length`/`section_checksum` agreeing with the catalog entry

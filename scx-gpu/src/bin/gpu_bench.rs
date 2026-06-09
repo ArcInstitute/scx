@@ -16,9 +16,10 @@ use serde::Serialize;
 use scx_codec::forbp::{forbp_decode, forbp_encode};
 use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
 use scx_codec::{encode_shard, CodecId, EncodedShardRef, ValueEncoding};
-use scx_gpu::test_utils::build_test_shard;
+use scx_gpu::test_utils::{build_test_shard, build_test_shard_with_metadata};
 use scx_gpu::{
-    decode_shard_gpu, forbp_decode_gpu, rice_decode_gpu, sparse_to_dense_gpu, GpuDevice,
+    decode_shard_gpu, decode_shard_gpu_with_metadata, forbp_decode_gpu, rice_decode_gpu,
+    sparse_to_dense_gpu, GpuDevice,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,28 @@ struct BenchResult {
     cpu_max_us: f64,
     gpu_min_us: f64,
     gpu_max_us: f64,
+}
+
+/// Result of the sidecar-driven decode benchmark (Task 4.4a): GPU decode with
+/// the CPU prescan vs driven by the decode sidecar, plus the host↔device
+/// transfer accounting that quantifies the remaining FOR-BP host-fallback share
+/// (the 4.4b decision input).
+#[derive(Serialize)]
+struct SidecarBenchResult {
+    benchmark: String,
+    label: String,
+    n_rows: usize,
+    nnz: usize,
+    /// GPU decode median with the CPU prescan (no sidecar).
+    prescan_median_us: f64,
+    /// GPU decode median driven by the decode sidecar.
+    sidecar_median_us: f64,
+    /// prescan / sidecar — the prescan-elimination speedup.
+    speedup: f64,
+    host_uploaded_bytes: u64,
+    device_decoded_bytes: u64,
+    fully_device_decoded: bool,
+    any_forbp_host_fallback: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +625,78 @@ fn bench_multi_shard(dev: &GpuDevice) -> Vec<BenchResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark #6: Sidecar-driven decode (Task 4.4a)
+// ---------------------------------------------------------------------------
+
+/// Compare GPU shard decode driven by the decode sidecar (no CPU prescan) vs the
+/// prescan path, and report the host↔device transfer stats. The dense config
+/// exposes the residual FOR-BP host-fallback (the Task 4.4b gap): its `indices`
+/// still upload from the host, so `fully_device_decoded` is false and
+/// `host_uploaded_bytes` includes `nnz*4`; the sparse config decodes fully on
+/// the device (only the tiny indptr uploaded).
+fn bench_sidecar_decode(dev: &GpuDevice) -> Vec<SidecarBenchResult> {
+    // (n_rows, n_vars, avg_nnz, label)
+    let configs: &[(usize, u32, usize, &str)] = &[
+        (16384, 30000, 50, "16384r_sparse50"), // <128 nnz: fully device-decoded
+        (16384, 30000, 256, "16384r_dense256"), // >=128 nnz: FOR-BP host-fallback
+    ];
+    let mut results = Vec::new();
+
+    for &(n_rows, n_vars, avg_nnz, label) in configs {
+        eprintln!("  Sidecar decode {label}...");
+        let (indptr, indices, values, n_rows_actual, nnz) = generate_shard(n_rows, avg_nnz, n_vars);
+        let (shard_bytes, meta) = build_test_shard_with_metadata(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            n_vars,
+        );
+        let meta = meta.expect("Scx1 shard emits decode metadata");
+
+        // No-sidecar (CPU prescan) path vs sidecar-driven path.
+        let prescan = time_fn(2, 10, || {
+            let _ = decode_shard_gpu_with_metadata(dev, &shard_bytes, None).unwrap();
+            dev.synchronize().unwrap();
+        });
+        let sidecar = time_fn(2, 10, || {
+            let _ = decode_shard_gpu_with_metadata(dev, &shard_bytes, Some(&meta)).unwrap();
+            dev.synchronize().unwrap();
+        });
+        // Capture the transfer stats once (deterministic; cheap relative to timing).
+        let (_, stats) = decode_shard_gpu_with_metadata(dev, &shard_bytes, Some(&meta)).unwrap();
+        dev.synchronize().unwrap();
+
+        let speedup = prescan.median_us / sidecar.median_us;
+        eprintln!(
+            "    prescan: {:.0} us  sidecar: {:.0} us  speedup: {:.2}x  uploaded: {} B  device: {} B  fully_device={}",
+            prescan.median_us,
+            sidecar.median_us,
+            speedup,
+            stats.host_uploaded_bytes,
+            stats.device_decoded_bytes,
+            stats.fully_device_decoded
+        );
+
+        results.push(SidecarBenchResult {
+            benchmark: "sidecar_decode".into(),
+            label: label.into(),
+            n_rows: n_rows_actual,
+            nnz,
+            prescan_median_us: prescan.median_us,
+            sidecar_median_us: sidecar.median_us,
+            speedup,
+            host_uploaded_bytes: stats.host_uploaded_bytes,
+            device_decoded_bytes: stats.device_decoded_bytes,
+            fully_device_decoded: stats.fully_device_decoded,
+            any_forbp_host_fallback: stats.any_forbp_host_fallback,
+        });
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -636,10 +731,16 @@ fn main() {
     eprintln!("\n--- Benchmark #5: Multi-shard parallel decode ---");
     all_results.extend(bench_multi_shard(&dev));
 
+    eprintln!("\n--- Benchmark #6: Sidecar-driven decode (Task 4.4a) ---");
+    let sidecar_results = bench_sidecar_decode(&dev);
+
     eprintln!("\n=== Done ===");
 
     // Output JSON lines to stdout
     for r in &all_results {
+        println!("{}", serde_json::to_string(r).unwrap());
+    }
+    for r in &sidecar_results {
         println!("{}", serde_json::to_string(r).unwrap());
     }
 }
