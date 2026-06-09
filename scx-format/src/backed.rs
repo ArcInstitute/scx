@@ -866,15 +866,17 @@ impl BackedCsrReader {
             ));
         }
 
-        // Pre-decode cold shards in parallel before the per-shard gather.
-        // No-op when every shard is already cached.
-        self.warm_shards(&shard_indices)?;
-
-        let mut slices = Vec::with_capacity(shard_indices.len());
+        // Plan each overlapping shard. A genuinely small window of an *uncached*
+        // shard is decoded directly via the sidecar-driven row-range path
+        // (O(window); no full-shard decode, no cache pollution). Everything else
+        // — large windows, cached shards, repeated/sequential access like the
+        // training loader — takes the full-decode + cache path, so only those
+        // shards are pre-warmed. Tuple: (shard_idx, local_start, local_end,
+        // use_row_range).
+        const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
+        let mut plans: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(shard_indices.len());
+        let mut full_shards: Vec<usize> = Vec::new();
         for &shard_idx in &shard_indices {
-            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
-
-            // Compute local row range within this shard
             let (s_start, s_end) =
                 self.index
                     .shard_range(shard_idx)
@@ -882,10 +884,34 @@ impl BackedCsrReader {
                         index: shard_idx,
                         count: self.index.n_shards(),
                     })?;
-
             let local_start = (start.max(s_start) - s_start) as usize;
             let local_end = (end.min(s_end) - s_start) as usize;
+            let window = (local_end - local_start) as u64;
+            let shard_rows = s_end - s_start;
+            let cached = self
+                .cache
+                .as_ref()
+                .is_some_and(|c| c.lock().unwrap().contains(&shard_idx));
+            let use_row_range = !cached && window * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
+            if !use_row_range {
+                full_shards.push(shard_idx);
+            }
+            plans.push((shard_idx, local_start, local_end, use_row_range));
+        }
 
+        // Pre-decode the cold full-path shards in parallel (no-op if all cached).
+        self.warm_shards(&full_shards)?;
+
+        let mut slices = Vec::with_capacity(plans.len());
+        for (shard_idx, local_start, local_end, use_row_range) in plans {
+            if use_row_range {
+                if let Some(sliced) = self.try_row_range_slice(shard_idx, local_start, local_end)? {
+                    slices.push(sliced);
+                    continue;
+                }
+                // No fresh sidecar — fall through to the full-decode path.
+            }
+            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
             let sliced = shard_csr
                 .row_slice(local_start, local_end)
                 .map_err(|e| ScxError::Io(std::io::Error::other(e)))?;
@@ -893,6 +919,32 @@ impl BackedCsrReader {
         }
 
         concatenate_csr(&slices, self.n_vars)
+    }
+
+    /// Decode just rows `[local_start, local_end)` of shard `shard_idx` directly
+    /// from its decode sidecar (O(window)), returning `None` when no fresh Scx1
+    /// sidecar is available so the caller can fall back to a full-shard decode.
+    /// Byte-identical to decoding the whole shard and slicing (4.3 parity).
+    fn try_row_range_slice(
+        &self,
+        shard_idx: usize,
+        local_start: usize,
+        local_end: usize,
+    ) -> Result<Option<ScxCsr>> {
+        let Some(lite) = self.shard_entry(shard_idx) else {
+            return Ok(None);
+        };
+        let entry = (*lite).into_transient_full_entry();
+        let n = local_end - local_start;
+        match self.reader.decode_scx1_row_range(&entry, local_start, n)? {
+            Some((indptr, indices, data)) => Ok(Some(ScxCsr::new_unchecked(
+                (n, self.n_vars),
+                indptr,
+                indices,
+                data,
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// Read specific row indices as a scipy-compatible `ScxCsr`.
@@ -3232,6 +3284,130 @@ mod tests {
         };
         let backed = BackedCsrReader::new(reader, cache_shards);
         (backed, full_csr)
+    }
+
+    /// Build a 2-shard Scx1 file with dense rows (so the encoder emits decode
+    /// sidecars within the overhead budget) and return the path + the raw CSR
+    /// triplet (f32 values) for reference slicing.
+    fn write_sidecar_scx1_file(
+        dir: &TempDir,
+        rows_per_shard: usize,
+        nnz_per_row: usize,
+    ) -> (std::path::PathBuf, Vec<u64>, Vec<u32>, Vec<f32>) {
+        let path = dir.path().join("sidecar.scx");
+        let n_obs = rows_per_shard * 2;
+        let n_vars = 200_000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64, 0);
+        header.index_dtype = 1; // u32 indices
+
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values_u8: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((r * 13 + k * 7) % 250) as u32; // gaps → frame_bits ~8
+                indices.push(col);
+                values_u8.push(1u8 + ((r + k) % 5) as u8);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
+
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        for s in 0..2 {
+            let r0 = s * rows_per_shard;
+            let r1 = r0 + rows_per_shard;
+            let lo = indptr[r0] as usize;
+            let local_indptr: Vec<u64> = indptr[r0..=r1].iter().map(|&p| p - indptr[r0]).collect();
+            let hi = indptr[r1] as usize;
+            writer
+                .write_csr_shard(
+                    &local_indptr,
+                    &indices[lo..hi],
+                    &values_u8[lo..hi],
+                    CodecId::Scx1,
+                    ValueEncoding::Uint8,
+                    r0 as u64,
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        (path, indptr, indices, values_f32)
+    }
+
+    /// Reference: extract rows `[a, b)` from a raw CSR triplet, rebasing indptr.
+    fn slice_raw(
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[f32],
+        a: usize,
+        b: usize,
+    ) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+        let lo = indptr[a] as usize;
+        let hi = indptr[b] as usize;
+        (
+            indptr[a..=b]
+                .iter()
+                .map(|&p| (p - indptr[a]) as i64)
+                .collect(),
+            indices[lo..hi].iter().map(|&v| v as i32).collect(),
+            values[lo..hi].to_vec(),
+        )
+    }
+
+    #[test]
+    fn read_rows_sidecar_row_range_matches_full_decode() {
+        let dir = TempDir::new().unwrap();
+        let rows_per_shard = 32usize;
+        let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+        // Confirm decode sidecars were actually emitted (else the row-range path
+        // is never taken and the test would be vacuous).
+        let probe = ScxReader::open(&path).unwrap();
+        let n_sidecars = probe
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == crate::section::SectionType::DecodeMetadataShard)
+            .count();
+        assert_eq!(n_sidecars, 2, "both Scx1 shards must carry decode sidecars");
+
+        let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+        // Small windows (< shard_rows/4 = 8) of cold shards take the row-range
+        // path; assert byte-identical to the reference slice. Cover a window in
+        // shard 0, a window in shard 1, and a single row.
+        for (a, b) in [(2usize, 6usize), (40, 44), (10, 11), (33, 37)] {
+            let got = backed.read_rows(a as u64, b as u64).unwrap();
+            let (eip, eix, ev) = slice_raw(&indptr, &indices, &values, a, b);
+            assert_eq!(got.indptr, eip, "indptr [{a},{b})");
+            assert_eq!(got.indices, eix, "indices [{a},{b})");
+            assert_eq!(got.data, ev, "data [{a},{b})");
+        }
+
+        // A large window (whole file) takes the full-decode path and must also
+        // match the reference.
+        let full = backed.read_rows(0, (rows_per_shard * 2) as u64).unwrap();
+        let (eip, eix, ev) = slice_raw(&indptr, &indices, &values, 0, rows_per_shard * 2);
+        assert_eq!(full.indptr, eip);
+        assert_eq!(full.indices, eix);
+        assert_eq!(full.data, ev);
+    }
+
+    #[test]
+    fn read_rows_small_window_falls_back_without_sidecar() {
+        // The None-codec helper emits no sidecars; a small-window read must
+        // still return correct rows via the full-decode fallback.
+        let dir = TempDir::new().unwrap();
+        let (backed, full) = write_test_file_and_open(&dir, 64, 100, 2, 4);
+        let got = backed.read_rows(2, 6).unwrap();
+        let expect = full.row_slice(2, 6).unwrap();
+        assert_eq!(got.indptr, expect.indptr);
+        assert_eq!(got.indices, expect.indices);
+        assert_eq!(got.data, expect.data);
     }
 
     // -----------------------------------------------------------------------
