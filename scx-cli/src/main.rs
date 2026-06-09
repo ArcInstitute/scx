@@ -12,8 +12,10 @@ mod delete;
 mod format;
 mod info;
 mod merge;
+mod modify_metadata;
 mod query;
 mod rollback;
+mod set_uns;
 mod subset;
 mod upgrade;
 mod validate;
@@ -328,6 +330,52 @@ enum Commands {
         /// Target manifest sequence number (default: previous version)
         #[arg(long)]
         to_seq: Option<u64>,
+    },
+    /// Replace the `uns` block in place, without re-encoding X (cheapest path)
+    SetUns {
+        /// SCX file to modify
+        file: PathBuf,
+        /// JSON file whose contents become the new `uns` (replace, not merge)
+        #[arg(long)]
+        uns: PathBuf,
+    },
+    /// Replace metadata sections (uns/obs/var/obsm/varm) in place, no X re-encode
+    ModifyMetadata {
+        /// SCX file to modify
+        file: PathBuf,
+        /// JSON file replacing the whole `uns` block
+        #[arg(long)]
+        uns: Option<PathBuf>,
+        /// Parquet file replacing obs metadata (num_rows must equal n_obs)
+        #[arg(long)]
+        obs: Option<PathBuf>,
+        /// Parquet file replacing var metadata (num_rows must equal n_vars)
+        #[arg(long)]
+        var: Option<PathBuf>,
+        /// Replace a named obsm matrix from a 2D .npy file: `name=path.npy`
+        /// (repeatable). Rows must equal n_obs.
+        #[arg(long, value_name = "NAME=PATH.npy")]
+        obsm: Vec<String>,
+        /// Replace a named varm matrix from a 2D .npy file: `name=path.npy`
+        /// (repeatable). Rows must equal n_vars.
+        #[arg(long, value_name = "NAME=PATH.npy")]
+        varm: Vec<String>,
+        /// Comma-separated obs columns to force-index when obs is replaced.
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to force-index when var is replaced.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns (obs/var rebuild).
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
+        /// Target modality. Only the global modality is supported today;
+        /// passing a name errors (multimodal metadata replace is deferred).
+        #[arg(long)]
+        modality: Option<String>,
     },
     /// Merge multiple SCX files into one
     Merge {
@@ -727,6 +775,32 @@ fn main() {
             reshape_obs,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
+        Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),
+        Commands::ModifyMetadata {
+            file,
+            uns,
+            obs,
+            var,
+            obsm,
+            varm,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
+            modality,
+        } => modify_metadata::run_modify_metadata(
+            &file,
+            uns.as_deref(),
+            obs.as_deref(),
+            var.as_deref(),
+            &obsm,
+            &varm,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
+            modality,
+        ),
         Commands::Merge {
             inputs,
             output,
