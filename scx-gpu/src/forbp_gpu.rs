@@ -148,11 +148,9 @@ fn preparse_forbp(
 
 /// Decode FOR-BP encoded column indices on GPU.
 ///
-/// Returns `(CudaSlice<u32>, Vec<usize>, bool)` — GPU indices, CPU row_lengths,
-/// and `took_host_fallback`. As of Task 4.4b both packing layouts decode on the
-/// device (scalar via `forbp_decode_kernel`, BitPacker4x via
-/// `forbp_decode_bp4x_kernel`), so `took_host_fallback` is always `false`; the
-/// field is retained for the caller's profiler bucketing. Row lengths are
+/// Returns `(CudaSlice<u32>, Vec<usize>)` — GPU indices and CPU row_lengths. Both
+/// packing layouts decode on the device (scalar via `forbp_decode_kernel`,
+/// BitPacker4x via `forbp_decode_bp4x_kernel`, Task 4.4b). Row lengths are
 /// returned on CPU since they're needed for CSR construction.
 ///
 /// Produces **bit-identical** output to `scx_codec::forbp::forbp_decode`.
@@ -161,7 +159,7 @@ pub fn forbp_decode_gpu(
     data: &[u8],
     n_rows: usize,
     index_dtype_u16: bool,
-) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
+) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
     // CPU pre-parse all headers
     let (metas, all_row_lengths, total_nnz) = preparse_forbp(data, n_rows, index_dtype_u16)?;
     forbp_decode_gpu_core(dev, data, metas, all_row_lengths, total_nnz)
@@ -182,7 +180,7 @@ pub fn forbp_decode_gpu_with_metadata(
     data: &[u8],
     rows: &[scx_codec::forbp::ForBpRowMetadata],
     n_rows: usize,
-) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
+) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
     if rows.len() != n_rows {
         return Err(GpuError::InvalidShard(format!(
             "FOR-BP sidecar: rows.len() {} != n_rows {n_rows}",
@@ -227,29 +225,31 @@ pub fn forbp_decode_gpu_with_metadata(
 /// writing into the same device output buffer at each row's global
 /// `output_offset`. No host fallback: the scalar (`index_packing == 1`) and
 /// BitPacker4x (`index_packing == 2`, Task 4.4b) kernels together cover every
-/// row, so the indices stay on the device (`took_host_fallback` is always
-/// `false`). Output is **bit-identical** to `scx_codec::forbp::forbp_decode`.
+/// row, so the indices stay on the device. Output is **bit-identical** to
+/// `scx_codec::forbp::forbp_decode`.
 fn forbp_decode_gpu_core(
     dev: &GpuDevice,
     data: &[u8],
-    metas: Vec<RowMeta>,
+    mut metas: Vec<RowMeta>,
     all_row_lengths: Vec<usize>,
     total_nnz: usize,
-) -> Result<(CudaSlice<u32>, Vec<usize>, bool), GpuError> {
+) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
     if total_nnz == 0 {
-        return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths, false));
+        return Ok((dev.alloc_zeros::<u32>(0)?, all_row_lengths));
     }
 
     let bitstream_len = data.len() as u32;
     let d_bitstream = dev.htod_copy(data)?;
     let mut d_output = dev.alloc_zeros::<u32>(total_nnz)?;
 
-    // Partition non-empty rows by packing layout. The scalar kernel decodes the
-    // contiguous LSB-first stream (index_packing == 1); the BitPacker4x kernel
-    // decodes the SIMD chunks (index_packing == 2, nnz >= 128). Both index
-    // d_output by each row's global output_offset, so the two passes compose.
-    let scalar: Vec<&RowMeta> = metas.iter().filter(|m| m.index_packing != 2).collect();
-    let bp4x: Vec<&RowMeta> = metas.iter().filter(|m| m.index_packing == 2).collect();
+    // Partition non-empty rows by packing layout (in place — rows write disjoint
+    // output_offset slots, so reordering is safe and avoids two temp Vecs). The
+    // scalar kernel decodes the contiguous LSB-first stream (index_packing == 1);
+    // the BitPacker4x kernel decodes the SIMD chunks (index_packing == 2,
+    // nnz >= 128). Both index d_output by each row's global output_offset.
+    metas.sort_by_key(|m| m.index_packing == 2); // scalar (false) first, bp4x (true) last
+    let split = metas.partition_point(|m| m.index_packing != 2);
+    let (scalar, bp4x) = metas.split_at(split);
 
     if !scalar.is_empty() {
         launch_forbp_group(
@@ -257,7 +257,7 @@ fn forbp_decode_gpu_core(
             FORBP_PTX,
             "forbp_decode_kernel",
             &d_bitstream,
-            &scalar,
+            scalar,
             &mut d_output,
             bitstream_len,
         )?;
@@ -268,13 +268,13 @@ fn forbp_decode_gpu_core(
             FORBP_BP4X_PTX,
             "forbp_decode_bp4x_kernel",
             &d_bitstream,
-            &bp4x,
+            bp4x,
             &mut d_output,
             bitstream_len,
         )?;
     }
 
-    Ok((d_output, all_row_lengths, false))
+    Ok((d_output, all_row_lengths))
 }
 
 /// Build the per-row struct-of-arrays for `metas` and launch `kernel_name` (from
@@ -285,7 +285,7 @@ fn launch_forbp_group(
     ptx: &'static str,
     kernel_name: &str,
     d_bitstream: &CudaSlice<u8>,
-    metas: &[&RowMeta],
+    metas: &[RowMeta],
     d_output: &mut CudaSlice<u32>,
     bitstream_len: u32,
 ) -> Result<(), GpuError> {
@@ -356,7 +356,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths, _took_host_fallback) =
+        let (d_output, gpu_row_lengths) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
@@ -403,7 +403,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths, _took_host_fallback) =
+        let (d_output, gpu_row_lengths) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
@@ -428,7 +428,7 @@ mod tests {
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), true).unwrap();
 
-        let (d_output, gpu_row_lengths, _took_host_fallback) =
+        let (d_output, gpu_row_lengths) =
             forbp_decode_gpu(&dev, &encoded, row_lengths.len(), true).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
@@ -469,21 +469,17 @@ mod tests {
     }
 
     /// Encode `rows`, then assert GPU decode == host `forbp_decode` byte-for-byte
-    /// and that the decode stayed on the device (no host fallback — Task 4.4b).
+    /// (including the >= 128-nnz BitPacker4x rows decoded on-device — Task 4.4b).
     fn assert_forbp_roundtrip(dev: &GpuDevice, rows: &[Vec<u32>], index_dtype_u16: bool) {
         let (indices, row_lengths) = flatten(rows);
         let encoded = forbp_encode(&indices, &row_lengths, index_dtype_u16).unwrap();
         let (cpu_indices, cpu_row_lengths) =
             forbp_decode(&encoded, row_lengths.len(), index_dtype_u16).unwrap();
 
-        let (d_output, gpu_row_lengths, took_host_fallback) =
+        let (d_output, gpu_row_lengths) =
             forbp_decode_gpu(dev, &encoded, row_lengths.len(), index_dtype_u16).unwrap();
         let gpu_indices = dev.dtoh_copy(&d_output).unwrap();
 
-        assert!(
-            !took_host_fallback,
-            "4.4b: FOR-BP indices must decode on the device, never host-fall-back"
-        );
         assert_eq!(gpu_indices, cpu_indices, "GPU indices must match host");
         assert_eq!(gpu_row_lengths, cpu_row_lengths);
     }

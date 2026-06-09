@@ -39,23 +39,20 @@ pub struct GpuCsr {
 /// ACC-RUST-OPT-V4 §4.4 `transfer_mode` / `bytes_uploaded` route metadata.
 ///
 /// Lets a caller distinguish a genuine in-VRAM Scx1 decode (only the tiny indptr
-/// uploaded) from a host-decode+HtoD bounce, and measures how much of a shard
-/// still falls back to the host — the evidence for whether the BitPacker4x GPU
-/// kernel (Task 4.4b) is worth building.
+/// uploaded) from a host-decode+HtoD bounce. All Scx1 indices+values (including
+/// the >= 128-nnz BitPacker4x rows, Task 4.4b) decode on the device; only a
+/// non-Scx1 codec shard decodes wholly on the host.
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceDecodeStats {
-    /// A FOR-BP row used the BitPacker4x host-decode fallback (the `>= 128`-nnz
-    /// gap Task 4.4b would close). Distinct from a non-Scx1 codec shard.
-    pub any_forbp_host_fallback: bool,
-    /// Total host→device bytes: the Scx1 indptr (always uploaded), any FOR-BP
-    /// host-fallback indices, and the full payload of any non-Scx1 shard.
+    /// Total host→device bytes: the Scx1 indptr (always uploaded) and the full
+    /// payload of any non-Scx1 shard.
     pub host_uploaded_bytes: u64,
     /// Bytes decoded directly on the device (Scx1 indices/values that took the
     /// GPU kernel path).
     pub device_decoded_bytes: u64,
-    /// True iff every shard decoded its indices+values on the device (all Scx1,
-    /// no FOR-BP host-fallback) — i.e. only indptr was uploaded. Drives the
-    /// `scx_device_decode_gpu` transfer-mode stamp.
+    /// True iff every shard decoded its indices+values on the device (all Scx1)
+    /// — i.e. only indptr was uploaded. Drives the `scx_device_decode_gpu`
+    /// transfer-mode stamp.
     pub fully_device_decoded: bool,
 }
 
@@ -64,7 +61,6 @@ impl Default for DeviceDecodeStats {
         // `fully_device_decoded` starts `true` so aggregation can AND it down as
         // shards are merged; a fresh single-shard stat sets it explicitly.
         Self {
-            any_forbp_host_fallback: false,
             host_uploaded_bytes: 0,
             device_decoded_bytes: 0,
             fully_device_decoded: true,
@@ -75,7 +71,6 @@ impl Default for DeviceDecodeStats {
 impl DeviceDecodeStats {
     /// Fold a per-shard stat into a running aggregate.
     pub fn merge(&mut self, other: &DeviceDecodeStats) {
-        self.any_forbp_host_fallback |= other.any_forbp_host_fallback;
         self.host_uploaded_bytes += other.host_uploaded_bytes;
         self.device_decoded_bytes += other.device_decoded_bytes;
         self.fully_device_decoded &= other.fully_device_decoded;
@@ -244,30 +239,15 @@ fn decode_scx1_gpu(
     // Both decode GPU-side; the bucket covers the bitstream upload + kernels.
     // With a sidecar, the per-row/per-block offsets feed the kernels directly
     // and the CPU prescan is skipped (Task 4.4a).
-    let t_forbp = profile::start();
-    let (d_indices_u32, _row_lengths, forbp_host_fallback) = match metadata {
+    let t_gpu = profile::start();
+    let (d_indices_u32, _row_lengths) = match metadata {
         Some(meta) => forbp_decode_gpu_with_metadata(dev, indices_bytes, &meta.rows, n_rows)?,
         None => forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?,
     };
-    // FOR-BP self-accounts its SIMD host fallback (host_decode_scx1 + htod_scx1),
-    // so only count it toward gpu_decode when it actually ran on the GPU; on the
-    // fallback path restart the timer after it returns so gpu_decode captures only
-    // the genuine GPU work that follows (Rice decode + the two casts) and the
-    // buckets stay disjoint.
-    let t_gpu = if forbp_host_fallback {
-        profile::start()
-    } else {
-        t_forbp
-    };
-    if forbp_host_fallback {
-        // The BitPacker4x (>=128-nnz) layout forced a host decode + HtoD of the
-        // u32 indices — the residual Task 4.4b's GPU kernel would eliminate.
-        stats.any_forbp_host_fallback = true;
-        stats.fully_device_decoded = false;
-        stats.host_uploaded_bytes += (nnz as u64) * 4;
-    } else {
-        stats.device_decoded_bytes += (nnz as u64) * 4;
-    }
+    // FOR-BP indices (scalar + BitPacker4x rows, Task 4.4b) and Rice values both
+    // decode on the device — the gpu_decode bucket covers the bitstream upload +
+    // kernels; only the indptr round-trips through the host.
+    stats.device_decoded_bytes += (nnz as u64) * 4;
     let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
     let d_values_u32 = match metadata {
@@ -337,7 +317,6 @@ fn decode_cpu_fallback(
     // Non-Scx1 codecs decode wholly on the host then upload the full CSR — never
     // a device decode, so this never counts as `fully_device_decoded`.
     let stats = DeviceDecodeStats {
-        any_forbp_host_fallback: false,
         host_uploaded_bytes: htod_bytes as u64,
         device_decoded_bytes: 0,
         fully_device_decoded: false,
@@ -546,14 +525,14 @@ mod tests {
         assert_eq!(gpu_data, cpu_data, "data mismatch");
     }
 
-    /// Regression for the FOR-BP SIMD-layout decode bug (Phase 0.4 follow-up).
+    /// FOR-BP SIMD-layout (BitPacker4x) GPU-decode parity (Task 4.4b).
     ///
     /// Rows with nnz >= `scx_codec::forbp::SIMD_THRESHOLD` (128) are bit-packed
-    /// by the encoder with BitPacker4x's SIMD layout, which the sequential GPU
-    /// kernel cannot decode — `forbp_decode_gpu` must route these to the host
-    /// reference decoder. The synthetic `test_shard_decode_gpu_scx1` uses only
-    /// small rows (<=20 nnz) and never exercises this path; real data (e.g.
-    /// pbmc3k cells expressing >=128 genes) does.
+    /// by the encoder with BitPacker4x's SIMD layout; `forbp_decode_gpu` decodes
+    /// them on-device via the BitPacker4x kernel. The synthetic
+    /// `test_shard_decode_gpu_scx1` uses only small rows (<=20 nnz) and never
+    /// exercises this path; real data (e.g. pbmc3k cells expressing >=128 genes)
+    /// does.
     #[test]
     fn test_shard_decode_gpu_scx1_dense_rows_u16() {
         let dev = require_gpu!();
@@ -564,8 +543,8 @@ mod tests {
         assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
     }
 
-    /// Same SIMD-layout regression for u32 column indices (n_cols > 65535), which
-    /// exercises the wider `frame_min` / `frame_bits` path on the host fallback.
+    /// Same SIMD-layout parity for u32 column indices (n_cols > 65535), which
+    /// exercises the wider `frame_min` / `frame_bits` path of the BitPacker4x kernel.
     #[test]
     fn test_shard_decode_gpu_scx1_dense_rows_u32() {
         let dev = require_gpu!();
@@ -648,10 +627,6 @@ mod tests {
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
         let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
         assert!(
-            !stats.any_forbp_host_fallback,
-            "all-sparse must not host-fallback"
-        );
-        assert!(
             stats.fully_device_decoded,
             "all-sparse must fully device-decode"
         );
@@ -673,12 +648,8 @@ mod tests {
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
         let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
         assert!(
-            !stats.any_forbp_host_fallback,
-            "dense rows must decode on the device (BitPacker4x kernel, Task 4.4b)"
-        );
-        assert!(
             stats.fully_device_decoded,
-            "mixed shard must be fully device-decoded"
+            "dense rows must decode on the device (BitPacker4x kernel, Task 4.4b)"
         );
         let nnz = indices.len() as u64;
         // Indices + values both decode on device; only the indptr uploads.
