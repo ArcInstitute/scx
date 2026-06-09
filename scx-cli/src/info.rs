@@ -74,6 +74,23 @@ pub fn run_info(
     let file_size = std::fs::metadata(path)?.len();
     println!("File size: {}", human_size(file_size));
 
+    // Line 6: orphaned bytes — file size minus live regions (header + root
+    // catalog placeholder, the active full catalog, and every live section).
+    // Repeated in-place edits (`scx set-uns` / `modify-metadata`, `append`)
+    // leave the superseded sections behind until `scx compact` reclaims them.
+    // This is an estimate: inter-section alignment padding (a few bytes per
+    // section) also counts as non-live but is negligible.
+    let live: u64 = scx_format::SECTIONS_START_OFFSET
+        + header.full_catalog_length
+        + catalog.entries.iter().map(|e| e.length).sum::<u64>();
+    let orphaned = file_size.saturating_sub(live);
+    if orphaned > 0 {
+        println!(
+            "Orphaned bytes: ~{} (run 'scx compact' to reclaim)",
+            human_size(orphaned)
+        );
+    }
+
     // Modality table (Phase F.1): when n_modalities > 0, print one
     // row per modality. Single-modality files skip this block to
     // keep their summary unchanged.

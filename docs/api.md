@@ -576,6 +576,12 @@ Revert to previous (or specific) manifest version — header-only update.
 ### `scx_ops::merge(inputs, output) → Result<()>`
 Streaming merge of multiple SCX files into one.
 
+### `scx_ops::modify_metadata(path, patch: &MetadataPatch) → Result<()>`
+Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) of an existing file **in place, without re-encoding `X`**. Appends only the replaced section bytes at EOF and atomically repoints the catalog — cost is O(replaced sections), the matrix shards are never read or rewritten. The CSC sidecar and `data_generation` are preserved (no `--rebuild-csc`). Any `None` field on `MetadataPatch` is left untouched; a predicate index over a replaced `obs`/`var` is dropped unless `patch.index` requests a rebuild. `n_obs` / `n_vars` are invariants — a shape mismatch is rejected before any write (`OpsError::ShapeMismatch`). Replace semantics, not merge. Multimodal (`modality_id != 0`) returns `OpsError::MultimodalUnsupported`. Advisory flock; rollback-able via the catalog chain.
+
+### `scx_ops::set_uns(path, uns: &serde_json::Value) → Result<()>`
+Convenience wrapper over `modify_metadata` for the headline case — replace the whole `uns` block (O(uns bytes)).
+
 ## scx-engine — Query Engine
 
 ### `QueryPipeline`
@@ -913,6 +919,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, reshape_obs=False)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output. `reshape_obs=True` migrates legacy single-section obs metadata to the sharded `ObsMetadataShard` layout (mirrors `scx compact --reshape-obs`; useful after a backed `from_anndata` conversion).
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
+- `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`.
+- `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. `index_*` kwargs rebuild predicate indexes over a replaced `obs`/`var` (otherwise the stale index is dropped). Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
 - `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `uns_policy` controls conflicting uns sections: `"first"` (keep first input), `"require_equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (write conflict report as `uns["_merge_uns_summary"]`). `shard_target_rows` overrides the default obs shard size during merge. Merge now streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
 ### Cloud operations (requires `--features cloud`)

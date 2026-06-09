@@ -11,6 +11,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 |-----------|---------------|--------------|--------------|-------------|-------------------|
 | **append** | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows |
 | **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
+| **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
 | **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
@@ -76,6 +77,37 @@ rewritten. Readers apply the bitmap during decode.
 | New catalog | O(catalog) |
 | Matrix shards | Unchanged |
 | Obs/var metadata | Unchanged |
+
+## Modify Metadata Complexity
+
+`scx_ops::modify_metadata` / `set_uns` (CLI: `scx modify-metadata` / `scx
+set-uns`; Python: `pyscx.modify_metadata` / `pyscx.set_uns`) replace metadata
+sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place. It appends only the
+replaced section bytes at EOF and repoints the catalog — **the matrix is never
+read or rewritten**, so the cost is O(size of the replaced sections), not
+O(matrix). This is the key difference from `from_anndata` / `from_h5ad`, which
+re-encode all of `X`.
+
+| Component | Complexity | Notes |
+|-----------|-----------|-------|
+| **Matrix shards (CSR/CSC)** | O(1) | Never read or rewritten — original catalog entries pass through verbatim. |
+| **`uns`** | O(uns bytes) | One fresh `UnsBlob` section. The headline cheap case. |
+| **`obs`** | O(n_obs) | Re-sharded `ObsMetadataShard` sections. Must match the file's `n_obs`. |
+| **`var`** | O(n_vars) | Single `VarMetadata` section. Must match `n_vars`. |
+| **`obsm` / `varm`** | O(replaced matrices) | Only the named matrices are rewritten; other keys pass through. |
+| **CSC sidecar** | **Preserved** | `data_generation` / `csc_build_generation` are left unchanged, so a pre-existing CSC sidecar stays valid — no `--rebuild-csc` needed. |
+| **Predicate indexes** | O(n_obs)/O(n_vars) when rebuilt | A predicate index over a replaced `obs`/`var` is dropped (its values are now stale); pass `--index-obs` / `--index-var` / `--index-preset` to rebuild. Untouched when only `uns`/`obsm`/`varm` change. |
+
+**Invariants (validated, never changed)**: `n_obs`, `n_vars`, `nnz`,
+`n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs.num_rows() != n_obs`, etc.) is
+rejected *before* any write, leaving the file byte-identical. Changing cell/gene
+count is out of scope — use `append`, `subset`, or `from_*`.
+
+**Commit point**: the single header `pwrite()` that repoints
+`full_catalog_offset` / `manifest_sequence` (rollback-able via the catalog
+chain). Replace semantics, not merge — a supplied section fully supersedes the
+old one. Repeated edits orphan the prior section bytes; run `scx compact` to
+reclaim them. Multimodal (`modality != 0`) is not yet supported.
 
 ## Compact
 

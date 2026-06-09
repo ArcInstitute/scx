@@ -194,6 +194,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] `scx compact` — rewrite file reclaiming space (docs/format.md §Compaction)
 - [x] `scx rollback` — revert to previous manifest (docs/format.md §Rollback)
 - [x] `scx merge` — streaming merge of multiple .scx files
+- [x] In-place metadata modification (`scx set-uns` / `scx modify-metadata`, `pyscx.set_uns` / `pyscx.modify_metadata`, `scx_ops::set_uns` / `modify_metadata`) — replace `uns`/`obs`/`var`/`obsm`/`varm` without re-encoding `X`; CSC sidecar + `data_generation` preserved (docs/operations.md §Modify Metadata Complexity). Multimodal deferred
 - [x] Streaming merge: obs/layers/obsm merged shard-by-shard (no full obs materialization)
 - [x] `ObsMetadataShard` / `VarMetadataShard` section types (ids 24–25) for row-sharded metadata emitted by merge, append, and from_anndata when n_obs exceeds shard_target_rows
 - [x] `pyscx.merge` var identity validation (index, column names, values) — `assume_identical_var=False` default (breaking change from unchecked)
