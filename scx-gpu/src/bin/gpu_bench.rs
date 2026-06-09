@@ -635,10 +635,13 @@ fn bench_multi_shard(dev: &GpuDevice) -> Vec<BenchResult> {
 /// `host_uploaded_bytes` includes `nnz*4`; the sparse config decodes fully on
 /// the device (only the tiny indptr uploaded).
 fn bench_sidecar_decode(dev: &GpuDevice) -> Vec<SidecarBenchResult> {
-    // (n_rows, n_vars, avg_nnz, label)
+    // (n_rows, n_vars, avg_nnz, label). As of Task 4.4b both decode fully on the
+    // device — the dense config (>=128 nnz) goes through the BitPacker4x kernel
+    // instead of the old FOR-BP host-fallback, so it now reports
+    // fully_device_decoded=true with bytes_uploaded ≈ indptr only.
     let configs: &[(usize, u32, usize, &str)] = &[
-        (16384, 30000, 50, "16384r_sparse50"), // <128 nnz: fully device-decoded
-        (16384, 30000, 256, "16384r_dense256"), // >=128 nnz: FOR-BP host-fallback
+        (16384, 30000, 50, "16384r_sparse50"),  // <128 nnz
+        (16384, 30000, 256, "16384r_dense256"), // >=128 nnz → BitPacker4x kernel
     ];
     let mut results = Vec::new();
 

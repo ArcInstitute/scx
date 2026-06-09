@@ -246,9 +246,7 @@ fn decode_scx1_gpu(
     // and the CPU prescan is skipped (Task 4.4a).
     let t_forbp = profile::start();
     let (d_indices_u32, _row_lengths, forbp_host_fallback) = match metadata {
-        Some(meta) => {
-            forbp_decode_gpu_with_metadata(dev, indices_bytes, &meta.rows, n_rows, index_dtype_u16)?
-        }
+        Some(meta) => forbp_decode_gpu_with_metadata(dev, indices_bytes, &meta.rows, n_rows)?,
         None => forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?,
     };
     // FOR-BP self-accounts its SIMD host fallback (host_decode_scx1 + htod_scx1),
@@ -664,30 +662,32 @@ mod tests {
     }
 
     /// Sidecar-driven GPU decode of a mixed shard (some rows >= 128 nnz) stays
-    /// byte-identical, but FOR-BP indices still take the host-fallback (the Task
-    /// 4.4b gap) while Rice values decode on the device via the sidecar.
+    /// byte-identical AND, as of Task 4.4b, decodes entirely on the device — the
+    /// BitPacker4x kernel handles the >= 128-nnz rows, so FOR-BP indices no longer
+    /// host-fall-back (only the tiny indptr uploads).
     #[test]
-    fn test_sidecar_decode_mixed_dense_host_fallback() {
+    fn test_sidecar_decode_mixed_dense_fully_device() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
         let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
         let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
         assert!(
-            stats.any_forbp_host_fallback,
-            "dense rows must host-fallback FOR-BP"
+            !stats.any_forbp_host_fallback,
+            "dense rows must decode on the device (BitPacker4x kernel, Task 4.4b)"
         );
         assert!(
-            !stats.fully_device_decoded,
-            "mixed shard is not fully device-decoded"
+            stats.fully_device_decoded,
+            "mixed shard must be fully device-decoded"
         );
         let nnz = indices.len() as u64;
-        // Only Rice values decode on device; FOR-BP indices upload from host.
-        assert_eq!(stats.device_decoded_bytes, nnz * 4, "only Rice on device");
+        // Indices + values both decode on device; only the indptr uploads.
         assert_eq!(
-            stats.host_uploaded_bytes,
-            (indptr.len() as u64) * 8 + nnz * 4
+            stats.device_decoded_bytes,
+            nnz * 8,
+            "indices + values on device"
         );
+        assert_eq!(stats.host_uploaded_bytes, (indptr.len() as u64) * 8);
     }
 
     /// u32-column (n_cols > 65535) sidecar-driven parity.
