@@ -431,6 +431,23 @@ no more than 25% of the source shard section length. Consumers MUST treat the
 sidecar as an optimization and fall back to normal shard decode when it is
 absent.
 
+The sidecar is consumed only by **SCX-internal decode paths** — random-access
+shard reads and the decode→device handoff (`to_gpu_anndata`) that produces a
+device-resident matrix for GPU analysis. External compute libraries such as
+**rapids-singlecell do not read it**: they receive an already-decoded
+(device-resident) matrix and are sidecar-agnostic. The sidecar therefore
+accelerates the step that *feeds* such a library, not the library itself.
+
+The Scx1-only scope is deliberate: Scx1's FOR-BP indices and Rice values are
+bitstreams with per-row / per-block frames that a sidecar can index for
+random-access and GPU-side decode (Scx1 has GPU decode kernels). Zstd / Pcodec /
+LZ4 are whole-stream frames (and LZ4 is globally byte-shuffled) with no GPU
+decoder, so a sidecar over them would neither enable row-level random access nor
+avoid a host decode. The practical consequence — store the GPU-relevant matrix
+as Scx1 integer counts and derive log-normalized values on-device rather than
+persisting a float (Pcodec) `X` — is covered in
+[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
+
 Catalog name: `decode/<source_section_name>`. The source identity is stored in
 the payload as `(source_section_offset, source_section_length,
 source_section_checksum)`. A reader validates that tuple against the active

@@ -244,6 +244,13 @@ does. When `X` arrives already device-resident (`scx_device_handoff`, from
 calls runs without re-uploading — that path is the way to keep data GPU-resident
 across ops.
 
+**Lay out data so the handoff is decode-light.** The device handoff's cost is
+dominated by per-shard decode, which is set by the on-disk codec. Prefer storing
+raw integer counts (Scx1 codec, decode-sidecar-accelerated) and deriving
+`normalize_total` / `log1p` in VRAM, rather than persisting a log-normalized
+float `X` (Pcodec → host decode, no sidecar). See
+[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
+
 These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
 `seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, and every
 **out-of-VRAM** path — a backed/lazy `X` (`ScxBackedSparseDataset` /

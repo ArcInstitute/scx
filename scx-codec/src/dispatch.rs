@@ -362,6 +362,22 @@ pub fn decode_shard_scipy(
     Ok((indptr, indices, data))
 }
 
+/// Convert a raw [`DecodedShard`] (`u64` indptr / `u32` indices / raw value
+/// bytes) into the scipy-compatible `(i64, i32, f32)` triple, matching
+/// [`decode_shard_scipy`]'s conversions. Lets callers that decode via the
+/// metadata offsets ([`decode_scx1_row_range`] / parallel decode) produce the
+/// same scipy types the sequential reader path returns.
+pub fn decoded_shard_to_scipy(
+    decoded: DecodedShard,
+    value_encoding: ValueEncoding,
+) -> Result<ScipyShard, CodecError> {
+    let (indptr_u64, indices_u32, values_raw) = decoded;
+    let indptr = u64_vec_to_i64(indptr_u64)?;
+    let indices = u32_vec_to_i32(indices_u32)?;
+    let data = values_raw_to_f32(&values_raw, value_encoding);
+    Ok((indptr, indices, data))
+}
+
 /// Decode **only** the indptr region of a shard, skipping indices/data.
 ///
 /// Used by callers that need just the row-pointer array — e.g. the
@@ -632,6 +648,118 @@ pub fn decode_scx1_with_metadata(
             values_u32.len()
         )));
     }
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
+
+    Ok((indptr, indices, values_bytes))
+}
+
+/// Random-access decode of a contiguous **row range** `[row_start, row_start +
+/// n_rows)` of an Scx1 shard, using the sidecar offsets to seek directly.
+///
+/// The result is byte-identical to the corresponding slice of
+/// [`decode_scx1_with_metadata`] / [`decode_shard_ref`], but the work is
+/// O(window) rather than O(shard): only the requested rows' FOR-BP deltas and
+/// the Rice blocks covering their value range are touched. Returns a shard-local
+/// `(indptr, indices, values_bytes)` whose `indptr` starts at 0.
+///
+/// FOR-BP rows are seeked by absolute `indices_bit_offset` (the row sub-slice is
+/// passed verbatim). The Rice blocks are keyed by value ordinal (256/block), so
+/// the covering block span is rebased to a 0-based `value_start` (absolute
+/// `bit_offset` untouched) to satisfy `rice_decode_with_metadata`'s continuity
+/// check, then the partial head/tail of the 256-value blocks is trimmed.
+pub fn decode_scx1_row_range(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    metadata: &Scx1DecodeMetadata,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<DecodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+    let row_end = row_start
+        .checked_add(n_rows)
+        .ok_or_else(|| CodecError::MalformedInput("Scx1 row range end overflows usize".into()))?;
+    if row_end > metadata.rows.len() {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 row range [{row_start}, {row_end}) exceeds shard rows {}",
+            metadata.rows.len()
+        )));
+    }
+    let row_slice = &metadata.rows[row_start..row_end];
+
+    // Shard-local indptr (starts at 0) + window nnz.
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0u64);
+    let mut window_nnz = 0u64;
+    for row in row_slice {
+        window_nnz = window_nnz
+            .checked_add(row.nnz as u64)
+            .ok_or_else(|| CodecError::MalformedInput("Scx1 row-range nnz overflows u64".into()))?;
+        indptr.push(window_nnz);
+    }
+    let window_nnz = window_nnz as usize;
+
+    // Indices: the row sub-slice decodes directly (absolute bit offsets).
+    let indices = forbp_decode_with_metadata(encoded.indices_bytes, row_slice)?;
+    if indices.len() != window_nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx1 row-range decoded {} indices, expected {window_nnz}",
+            indices.len()
+        )));
+    }
+
+    // Values: map the window's value ordinal range to the covering Rice blocks.
+    let values_u32 = if window_nnz == 0 {
+        Vec::new()
+    } else {
+        let v0 = row_slice[0].value_start;
+        let v1 = v0 + window_nnz as u64;
+        let blocks = &metadata.rice_blocks;
+        // First block covering v0 (largest start <= v0) and exclusive end (first
+        // block whose start is >= v1). Blocks are sorted by value_start.
+        let b0 = blocks
+            .partition_point(|b| b.value_start <= v0)
+            .saturating_sub(1);
+        let b1 = blocks.partition_point(|b| b.value_start < v1);
+        // A fresh-but-malformed sidecar (nonzero row nnz, yet empty or gapped
+        // `rice_blocks`) can leave an empty span (`b1 <= b0`) or a span that does
+        // not lead at `v0` (`blocks[b0].value_start > v0`). Reject it rather than
+        // panic on `covered[0]` / a `v0 - block_base` underflow: the hot
+        // `read_shard_from_entry` sidecar path reaches here without the deeper
+        // `validate_decode_sidecar_entries` coverage check, so a malformed
+        // optional `DecodeMetadataShard` must error, not abort the process. The
+        // `||` short-circuits so `blocks[b0]` is indexed only when `b1 > b0`
+        // (hence `b0 < b1 <= len`). The trailing-coverage case is caught by the
+        // `head + window_nnz > decoded.len()` check below.
+        if b1 <= b0 || blocks[b0].value_start > v0 {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx1 row-range: sidecar rice_blocks do not cover value ordinal {v0} \
+                 for rows [{row_start}, {row_end})"
+            )));
+        }
+        let covered = &blocks[b0..b1];
+        let block_base = covered[0].value_start;
+        let rebased: Vec<RiceBlockMetadata> = covered
+            .iter()
+            .map(|b| RiceBlockMetadata {
+                value_start: b.value_start - block_base,
+                n_values: b.n_values,
+                bit_offset: b.bit_offset,
+                k: b.k,
+            })
+            .collect();
+        let decoded = rice_decode_with_metadata(encoded.values_bytes, &rebased)?;
+        let head = (v0 - block_base) as usize;
+        if head + window_nnz > decoded.len() {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx1 row-range value window [{head}, {}) exceeds covered block decode {}",
+                head + window_nnz,
+                decoded.len()
+            )));
+        }
+        decoded[head..head + window_nnz].to_vec()
+    };
     let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
 
     Ok((indptr, indices, values_bytes))
@@ -1348,6 +1476,129 @@ mod tests {
             got.map_or(true, |d| d != canonical),
             "corrupted index bit offset must not reproduce the canonical decode"
         );
+    }
+
+    /// `decode_scx1_row_range` over any window must be byte-identical to the
+    /// corresponding slice of the canonical full decode — across Rice-block
+    /// (256) and FOR-BP SIMD (≥128 nnz) boundaries, leading empty rows, the
+    /// last partial block, single-row, and empty windows.
+    #[test]
+    fn decode_scx1_row_range_matches_canonical_slice() {
+        use crate::value_encoding::values_to_raw_bytes;
+
+        // Row nnz pattern mixing: empties, tiny rows, FOR-BP SIMD rows (≥128),
+        // and a total nnz spanning several 256-value Rice blocks.
+        let row_nnz: Vec<usize> = vec![
+            0, 1, 5, 130, 0, 200, 7, 256, 257, 3, 0, 140, 511, 1, 64, 300, 0, 2, 128, 90,
+        ];
+        let n_cols = 4000u32;
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut vals_f32: Vec<f32> = Vec::new();
+        for &m in &row_nnz {
+            for j in 0..m {
+                indices.push(j as u32); // strictly increasing, < n_cols
+                vals_f32.push((1 + (j % 97)) as f32); // non-zero (Scx1 Rice requires ≥1)
+            }
+            indptr.push(indices.len() as u64);
+        }
+        let n_rows = row_nnz.len();
+        let nnz = indices.len();
+        let venc = ValueEncoding::Uint16;
+        let bw = venc.byte_width();
+        let values = values_to_raw_bytes(&vals_f32, venc).unwrap();
+
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, venc, false).unwrap();
+        let meta = encoded.scx1_decode.clone().expect("Scx1 emits metadata");
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        let (full_indptr, full_indices, full_values) =
+            decode_shard_ref(&r, CodecId::Scx1, venc, n_rows, nnz, false).unwrap();
+
+        // Exhaustively check every contiguous window [s, s+k].
+        for s in 0..=n_rows {
+            for k in 0..=(n_rows - s) {
+                let (w_indptr, w_indices, w_values) =
+                    decode_scx1_row_range(&r, venc, &meta, s, k).unwrap();
+
+                // indptr: local, starts at 0, equals the full indptr slice rebased.
+                let base = full_indptr[s];
+                let expect_indptr: Vec<u64> =
+                    full_indptr[s..=s + k].iter().map(|&p| p - base).collect();
+                assert_eq!(w_indptr, expect_indptr, "indptr window s={s} k={k}");
+
+                let lo = full_indptr[s] as usize;
+                let hi = full_indptr[s + k] as usize;
+                assert_eq!(
+                    w_indices,
+                    full_indices[lo..hi],
+                    "indices window s={s} k={k}"
+                );
+                assert_eq!(
+                    w_values,
+                    full_values[lo * bw..hi * bw],
+                    "values window s={s} k={k}"
+                );
+            }
+        }
+
+        // Full-shard window equals the whole canonical decode.
+        let (fi, fx, fv) = decode_scx1_row_range(&r, venc, &meta, 0, n_rows).unwrap();
+        assert_eq!((fi, fx, fv), (full_indptr, full_indices, full_values));
+
+        // Out-of-range is rejected, not a panic.
+        assert!(decode_scx1_row_range(&r, venc, &meta, n_rows, 1).is_err());
+    }
+
+    /// A fresh-but-malformed sidecar (nonzero row nnz, but empty or gapped
+    /// `rice_blocks`) must make `decode_scx1_row_range` return `Err`, never
+    /// panic — this path is reachable from `read_shard_from_entry` without the
+    /// deeper coverage validation.
+    #[test]
+    fn decode_scx1_row_range_rejects_malformed_rice_spans() {
+        use crate::value_encoding::values_to_raw_bytes;
+
+        // Small shard spanning >1 Rice block (300 nnz > B_VAL=256).
+        let indptr = vec![0u64, 130, 300];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut vals_f32: Vec<f32> = Vec::new();
+        for &(start, end) in &[(0usize, 130usize), (130, 300)] {
+            for j in 0..(end - start) {
+                indices.push(j as u32);
+                vals_f32.push((1 + (j % 50)) as f32);
+            }
+        }
+        let (n_rows, nnz) = (2usize, 300usize);
+        let venc = ValueEncoding::Uint16;
+        let values = values_to_raw_bytes(&vals_f32, venc).unwrap();
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx1, venc, false).unwrap();
+        let good = encoded.scx1_decode.clone().unwrap();
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        // Sanity: the well-formed sidecar decodes a nonzero window.
+        assert!(decode_scx1_row_range(&r, venc, &good, 0, n_rows).is_ok());
+
+        // Empty rice_blocks while rows still claim nnz > 0 → error, not panic.
+        let mut empty_blocks = good.clone();
+        empty_blocks.rice_blocks.clear();
+        assert!(decode_scx1_row_range(&r, venc, &empty_blocks, 0, n_rows).is_err());
+
+        // Gapped: drop the leading block so no block covers value ordinal 0 →
+        // error (guards the `v0 - block_base` underflow), not panic.
+        let mut gapped = good.clone();
+        assert!(
+            gapped.rice_blocks.len() >= 2,
+            "shard must span >1 Rice block"
+        );
+        gapped.rice_blocks.remove(0);
+        assert!(decode_scx1_row_range(&r, venc, &gapped, 0, n_rows).is_err());
+        let _ = nnz;
     }
 
     /// Task 6.10: Zstd + Float32 round-trips correctly.

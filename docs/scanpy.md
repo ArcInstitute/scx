@@ -1335,6 +1335,56 @@ pdex_ref CSC-direct path. See
 [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating)
 for the full gate table.
 
+### Data layout for fast GPU decode (`to_gpu_anndata` / device-resident analysis)
+
+The device-handoff path — `pyscx.open(...).to_gpu_anndata()`, then chained
+`pyscx.accel.*` / `rsc.*` ops on the device-resident AnnData
+(`transfer_mode == "scx_device_handoff"`) — is only as fast as the cost of
+getting each shard onto the GPU. That cost is dominated by **decode**, and
+decode cost is set by the **value representation you persisted on disk**, not by
+the analysis op. So the layout choice matters as much as the device flag:
+
+- **Prefer storing raw integer counts (`X` → Scx1) and deriving log-norm
+  on-device.** Raw scRNA-seq counts auto-route to the Scx1 codec
+  (Delta-Golomb / FOR-BP / Rice) — the one codec with a decode-metadata sidecar
+  ([format.md §4.2](format.md#42-decode-metadata-sidecar)) and GPU decode
+  kernels, so it is the codec the device-side decode path targets. Open the
+  counts and run `normalize_total` / `log1p` in VRAM (the
+  `ScxLazyTransformedDataset` chain, or `rsc.pp.*` on the device AnnData) so the
+  log-normalized matrix is produced on the GPU and **never round-trips through a
+  host float buffer**. This is the recommended flow.
+- **A *persisted* log-normalized `X` is float → Pcodec, which decodes on the
+  host.** Public h5ad / CELLxGENE files often ship `X` already log-normalized.
+  That matrix has **no decode sidecar and no GPU decoder** (Pcodec is CPU-only),
+  so the handoff pays a host pcodec-decompress + HtoD per shard — *GPU-supported,
+  but not GPU-fast on the decode side*. If the file also carries a `counts`
+  layer, prefer opening that and deriving log-norm on-device (bullet above).
+- **If you must persist log-norm for the GPU and want decode-free upload, store
+  it uncompressed (`None` codec → raw `f32` / `f16`).** A raw float array needs
+  no decode — the handoff is a straight HtoD `memcpy` — at the cost of
+  compression ratio (`f16` halves the bytes if its precision is acceptable for
+  log-norm). This is the only float option that is GPU-fast to upload today; a
+  GPU-decodable *compressed* float codec does not exist.
+- **The decode sidecar is Scx1-only.** Zstd / Pcodec / LZ4 shards and float
+  layers carry no sidecar; the device decode path falls back to host decode +
+  HtoD for them. "Make `X` GPU-fast to decode" therefore means "store the
+  GPU-relevant matrix as Scx1 counts," **not** "add a sidecar to a float layer."
+
+Confirm the path actually taken via
+`adata.uns["scx_accel"][op]["transfer_mode"]` (`scx_device_handoff` = on-device,
+`anndata_to_gpu` = host re-upload), the same way you confirm `route` for DE.
+
+**rapids-singlecell does not read the decode sidecar.** The sidecar lives
+entirely on the SCX side of the handoff: it accelerates SCX's own
+decode→device step (`to_gpu_anndata`, the
+[format.md §4.2](format.md#42-decode-metadata-sidecar) sidecar consumer), which
+*produces* the `cupyx.scipy.sparse.csr_matrix` that rapids then operates on.
+rapids only ever sees that already-decoded, device-resident matrix (it validates
+inputs via its own `_check_gpu_X`) and has no knowledge of the SCX format,
+codecs, or sidecars. So choosing an Scx1-counts layout speeds up the
+SCX→device handoff that *feeds* rapids — it is not something rapids consumes, and
+it changes no rapids call.
+
 ### PCA (`pyscx.accel.pca`)
 
 Two methods, auto-routed by the number of variables:
