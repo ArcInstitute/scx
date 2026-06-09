@@ -77,6 +77,10 @@ ALL_BENCHMARKS: list[str] = [
     # the gate tracks speedup and CPU↔GPU parity. Variants live in
     # `benchmarks/comprehensive/benchmarks/accel_de.py`.
     "accel_de",
+    # ACC-RUST-OPT-V4 §4.4: to_gpu_anndata device-decode route + parity.
+    # Self-converts the count h5ad to Scx1 and asserts the decode runs
+    # fully in VRAM (transfer_mode=scx_device_decode_gpu).
+    "accel_to_gpu_anndata",
     # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
     # pseudobulk × {csr, csc} on a CSC-equipped fixture.
     "bench_csc_dispatch",

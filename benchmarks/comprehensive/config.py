@@ -684,6 +684,13 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(bench_csc_dispatch_variants())
     except ImportError:
         pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+            accel_to_gpu_anndata_variants,
+        )
+        out.extend(accel_to_gpu_anndata_variants())
+    except ImportError:
+        pass
     return out
 
 
@@ -966,6 +973,13 @@ def estimate_memory_gb(
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
         # 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.2)
+    elif benchmark == "accel_to_gpu_anndata":
+        # Self-converted fixture: h5ad read + `from_anndata` (Scx1) +
+        # a host scipy CSR reference decode + the GPU-resident decode held
+        # concurrently. The host CSR reference is the dominant host term, so
+        # size to dense × 1.0 rather than the generic accel × 0.1. Gate is
+        # scoped to pbmc3k + tabula_sapiens_100k, so over-budgeting is cheap.
+        peak_mb = max(base_mb, dense_mb * 1.0)
     elif benchmark.startswith("accel_"):
         # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
         # on 1M cells.
