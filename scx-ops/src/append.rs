@@ -10,8 +10,6 @@ use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format::compute_shard_stats;
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::modality::{ModalityTable, ModalityType};
 use scx_format::provenance::{Provenance, ProvenanceEntry};
 use scx_format::reader::ScxReader;
 use scx_format::section::{write_alignment_padding, SectionType};
@@ -20,13 +18,12 @@ use scx_format::shard::{
 };
 use scx_format::writer::ScxWriter;
 
-use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
+use crate::in_place::{commit_in_place, prepare_in_place, AppendPrep};
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
-use crate::rollback::build_root_catalog_from_full;
 
 /// Options controlling how new rows are appended to an SCX file.
 ///
@@ -520,125 +517,15 @@ pub fn append_from_reader_with_index_options(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Shared state captured during the prelude of any append: header, catalog,
-/// modality routing, and resolved per-modality `n_vars`. The exclusive
-/// `FileLock` is returned alongside this struct so helper functions can
-/// take `&mut FileLock` and `&AppendPrep` without aliasing.
-struct AppendPrep {
-    header: FileHeader,
-    header_index_dtype: u8,
-    old_catalog: FullCatalog,
-    old_n_obs: u64,
-    old_catalog_offset: u64,
-    modality_table: Option<ModalityTable>,
-    modality_id: u8,
-    modality_name: Option<String>,
-    modality_type: ModalityType,
-    target_n_vars: u64,
-    old_per_modality_csr: u32,
-}
-
 /// Acquire the exclusive lock, read the header + full catalog + modality
 /// table, resolve the requested modality, and apply pre-write validation
 /// that does not depend on the new data.
+///
+/// Thin wrapper over the shared [`prepare_in_place`] prelude. Append has no
+/// data-independent validation of its own today; the wrapper is kept as the
+/// named seam for any future append-specific pre-write checks.
 fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, AppendPrep)> {
-    let mut lock = FileLock::acquire_exclusive(target_path)?;
-
-    let header = {
-        lock.seek(SeekFrom::Start(0))?;
-        let mut buf = [0u8; HEADER_SIZE];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FileHeader::read_from(&mut Cursor::new(&buf))?
-    };
-
-    let old_catalog = {
-        let fc_offset = header.full_catalog_offset;
-        let fc_length = header.full_catalog_length;
-        lock.seek(SeekFrom::Start(fc_offset))?;
-        let mut buf = vec![0u8; fc_length as usize];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        FullCatalog::read_from(&mut Cursor::new(&buf), fc_length as usize, true)?
-    };
-
-    let mut modality_table = if header.n_modalities > 0
-        && header.modality_table_offset != 0
-        && header.modality_table_length != 0
-    {
-        let mt_off = header.modality_table_offset;
-        let mt_len = header.modality_table_length as usize;
-        lock.seek(SeekFrom::Start(mt_off))?;
-        let mut buf = vec![0u8; mt_len];
-        std::io::Read::read_exact(&mut lock, &mut buf)?;
-        Some(ModalityTable::read_from(&mut Cursor::new(&buf), mt_len)?)
-    } else {
-        None
-    };
-
-    if modality_id != 0 {
-        let table = modality_table.as_ref().ok_or_else(|| {
-            OpsError::Format(scx_format::ScxError::InvalidCatalog(format!(
-                "append: target file has no modality table but modality_id={modality_id} \
-                 was requested"
-            )))
-        })?;
-        if (modality_id as usize) > table.len() {
-            return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
-                format!(
-                    "append: modality_id={modality_id} out of range (file has {} modalities)",
-                    table.len()
-                ),
-            )));
-        }
-    }
-
-    let modality_info = modality_table.as_ref().and_then(|t| t.info_of(modality_id));
-    let modality_name: Option<String> = modality_info.map(|info| info.name.clone());
-    let modality_type: ModalityType = modality_info
-        .map(|info| info.modality_type)
-        .unwrap_or(ModalityType::Rna);
-    let target_n_vars: u64 = modality_info
-        .map(|info| info.n_vars)
-        .unwrap_or(header.n_vars);
-
-    let old_per_modality_csr = if modality_id == 0 {
-        header.n_csr_shards
-    } else {
-        old_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
-            .count() as u32
-    };
-
-    if target_n_vars > u32::MAX as u64 {
-        return Err(OpsError::Format(scx_format::ScxError::NVarsOverflow(
-            target_n_vars,
-        )));
-    }
-
-    let old_n_obs = header.n_obs;
-    let old_catalog_offset = header.full_catalog_offset;
-    let header_index_dtype = header.index_dtype;
-
-    // suppress unused mut warning when modality_table happens to be None
-    let _ = &mut modality_table;
-
-    Ok((
-        lock,
-        AppendPrep {
-            header,
-            header_index_dtype,
-            old_catalog,
-            old_n_obs,
-            old_catalog_offset,
-            modality_table,
-            modality_id,
-            modality_name,
-            modality_type,
-            target_n_vars,
-            old_per_modality_csr,
-        },
-    ))
+    prepare_in_place(target_path, modality_id)
 }
 
 /// Read an existing obs payload as a single `RecordBatch`, handling
@@ -1566,7 +1453,8 @@ fn finalize_append(
             table.write_to(&mut mt_buf)?;
             lock.write_all(&mt_buf)?;
             let mt_len = mt_buf.len() as u64;
-            write_offset += mt_len;
+            // `write_offset` is not threaded past this point: the shared
+            // `commit_in_place` seeks to EOF to place the catalog.
             (mt_offset, mt_len)
         } else {
             (
@@ -1575,35 +1463,9 @@ fn finalize_append(
             )
         };
 
-    // Write new catalog
-    let pad = write_alignment_padding(&mut *lock, write_offset)?;
-    write_offset += pad as u64;
-    let new_catalog_offset = write_offset;
-    let mut catalog_buf = Vec::new();
-    new_catalog.write_to(&mut catalog_buf)?;
-    lock.write_all(&catalog_buf)?;
-    let new_catalog_length = catalog_buf.len() as u64;
-
-    // Crash safety barrier 1: durable shard / obs / provenance / catalog
-    // before any pointer update.
-    lock.flush()?;
-    lock.sync_all()?;
-
-    // Rebuild root catalog
-    let root_catalog = build_root_catalog_from_full(&new_catalog);
-    let mut root_buf = Vec::new();
-    root_catalog.write_to(&mut root_buf)?;
-    let root_catalog_length = root_buf.len() as u64;
-    root_buf.resize(4096, 0);
-
-    lock.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
-    lock.write_all(&root_buf)?;
-
-    // Crash safety barrier 2: durable root catalog before header update.
-    lock.flush()?;
-    lock.sync_all()?;
-
-    // Finalize header
+    // Append-specific header fields. These read `new_catalog` / `total_new_nnz`
+    // and do not depend on the on-disk catalog offset, so they're stamped
+    // before the shared commit (which sets only the catalog-pointer fields).
     prep.header.n_obs = new_n_obs;
     prep.header.nnz += total_new_nnz;
     prep.header.n_csr_shards = new_catalog
@@ -1625,20 +1487,16 @@ fn finalize_append(
     } else {
         prep.header.clear_csc();
     }
-    prep.header.full_catalog_offset = new_catalog_offset;
-    prep.header.full_catalog_length = new_catalog_length;
-    prep.header.modality_table_offset = modality_table_offset;
-    prep.header.modality_table_length = modality_table_length;
-    prep.header.manifest_sequence = new_manifest_sequence;
-    prep.header.prev_catalog_offset = prep.old_catalog_offset;
-    prep.header.root_catalog_offset = HEADER_SIZE as u64;
-    prep.header.root_catalog_length = root_catalog_length;
 
-    prep.header.clear_front_catalog();
-    prep.header.front_catalog_offset = 0;
-    prep.header.front_catalog_length = 0;
-
-    finalize_header_with_checksum(lock, &mut prep.header)?;
+    // Two-barrier atomic commit: catalog @EOF → fsync → root catalog → fsync →
+    // header. Sets the catalog-pointer header fields and finalizes the header.
+    commit_in_place(
+        lock,
+        &mut prep.header,
+        &new_catalog,
+        modality_table_offset,
+        modality_table_length,
+    )?;
     Ok(PredicateIndexBuildSummary {
         result: index_result,
         multimodal_skip,
@@ -1669,7 +1527,7 @@ fn next_shard_idx(old_per_modality_csr: u32, n_appended_so_far: usize) -> Result
 /// applied by [`scx_engine::build_and_write_conversion_predicate_indexes`]
 /// so the Phase 2d streaming append produces byte-identical predicate
 /// indexes to the legacy batch path.
-fn predicate_index_build_options_for_obs(
+pub(crate) fn predicate_index_build_options_for_obs(
     index_options: &ConversionPredicateIndexOptions,
 ) -> scx_engine::PredicateIndexBuildOptions {
     let preset_obs = match index_options.index_preset.as_deref() {

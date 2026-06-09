@@ -1134,6 +1134,8 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::set_uns, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::modify_metadata, m)?)?;
     Ok(())
 }
 

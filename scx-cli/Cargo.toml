@@ -39,6 +39,10 @@ indicatif = { workspace = true }
 # live in scx-convert.
 hdf5 = { workspace = true, optional = true }
 arrow = { workspace = true }
+# `scx modify-metadata` reads obs/var from Parquet and obsm/varm from .npy.
+parquet = "58"
+ndarray = { workspace = true }
+ndarray-npy = "0.9"
 serde_json = { workspace = true }
 byteorder = { workspace = true }
 thiserror = { workspace = true }
