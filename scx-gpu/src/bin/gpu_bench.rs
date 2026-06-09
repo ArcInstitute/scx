@@ -51,8 +51,8 @@ struct BenchResult {
 
 /// Result of the sidecar-driven decode benchmark (Task 4.4a): GPU decode with
 /// the CPU prescan vs driven by the decode sidecar, plus the host↔device
-/// transfer accounting that quantifies the remaining FOR-BP host-fallback share
-/// (the 4.4b decision input).
+/// transfer accounting. As of Task 4.4b every Scx1 shard decodes fully on the
+/// device, so `host_uploaded_bytes` is just the indptr.
 #[derive(Serialize)]
 struct SidecarBenchResult {
     benchmark: String,
@@ -68,7 +68,6 @@ struct SidecarBenchResult {
     host_uploaded_bytes: u64,
     device_decoded_bytes: u64,
     fully_device_decoded: bool,
-    any_forbp_host_fallback: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -629,16 +628,18 @@ fn bench_multi_shard(dev: &GpuDevice) -> Vec<BenchResult> {
 // ---------------------------------------------------------------------------
 
 /// Compare GPU shard decode driven by the decode sidecar (no CPU prescan) vs the
-/// prescan path, and report the host↔device transfer stats. The dense config
-/// exposes the residual FOR-BP host-fallback (the Task 4.4b gap): its `indices`
-/// still upload from the host, so `fully_device_decoded` is false and
-/// `host_uploaded_bytes` includes `nnz*4`; the sparse config decodes fully on
-/// the device (only the tiny indptr uploaded).
+/// prescan path, and report the host↔device transfer stats. As of Task 4.4b both
+/// configs decode fully on the device — the dense config (>=128 nnz) goes through
+/// the BitPacker4x kernel rather than a host-fallback — so `fully_device_decoded`
+/// is true and only the tiny indptr is uploaded in each.
 fn bench_sidecar_decode(dev: &GpuDevice) -> Vec<SidecarBenchResult> {
-    // (n_rows, n_vars, avg_nnz, label)
+    // (n_rows, n_vars, avg_nnz, label). As of Task 4.4b both decode fully on the
+    // device — the dense config (>=128 nnz) goes through the BitPacker4x kernel
+    // instead of the old FOR-BP host-fallback, so it now reports
+    // fully_device_decoded=true with bytes_uploaded ≈ indptr only.
     let configs: &[(usize, u32, usize, &str)] = &[
-        (16384, 30000, 50, "16384r_sparse50"), // <128 nnz: fully device-decoded
-        (16384, 30000, 256, "16384r_dense256"), // >=128 nnz: FOR-BP host-fallback
+        (16384, 30000, 50, "16384r_sparse50"),  // <128 nnz
+        (16384, 30000, 256, "16384r_dense256"), // >=128 nnz → BitPacker4x kernel
     ];
     let mut results = Vec::new();
 
@@ -690,7 +691,6 @@ fn bench_sidecar_decode(dev: &GpuDevice) -> Vec<SidecarBenchResult> {
             host_uploaded_bytes: stats.host_uploaded_bytes,
             device_decoded_bytes: stats.device_decoded_bytes,
             fully_device_decoded: stats.fully_device_decoded,
-            any_forbp_host_fallback: stats.any_forbp_host_fallback,
         });
     }
     results

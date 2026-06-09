@@ -9,13 +9,10 @@
 //! Four buckets; the decode/upload buckets are split by codec class because
 //! Scx1 decodes GPU-side (Rice/FOR-BP) while None/Zstd/Lz4Shuffle/Pcodec decode
 //! on the host and then upload:
-//! - `host_decode` — CPU-side codec decode (Delta-Golomb indptr, scipy fallback,
-//!   and the FOR-BP SIMD-layout host fallback)
+//! - `host_decode` — CPU-side codec decode (Delta-Golomb indptr, scipy fallback)
 //! - `htod`        — host→device uploads (`htod_copy`)
-//! - `gpu_decode`  — GPU-side Scx1 decode only (Rice values + the two u32 casts
-//!   always; the FOR-BP indices kernel only when it ran on-GPU). When a dense row
-//!   forces the FOR-BP host fallback, that span is recorded in `host_decode`/`htod`
-//!   instead and excluded here, so the buckets stay disjoint (no double-count).
+//! - `gpu_decode`  — GPU-side Scx1 decode (FOR-BP indices — scalar + BitPacker4x
+//!   rows, Task 4.4b — plus Rice values and the two u32 casts), all on-device
 //! - `compute`     — cuSPARSE SpMM execution (and other instrumented kernels)
 //!
 //! When disabled (the default), every hook short-circuits on a single relaxed
