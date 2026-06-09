@@ -1376,10 +1376,12 @@ Confirm the path actually taken via
 for DE. `to_gpu_anndata` stamps one of:
 - `scx_device_decode_gpu` — Scx1 shards decoded **fully in VRAM** from the decode
   sidecar; only the tiny indptr is uploaded (`bytes_uploaded` ≈ indptr). The fast
-  path you want.
+  path you want. As of the BitPacker4x GPU kernel, this covers **every** Scx1 row,
+  including dense (≥128-nnz) cells — those no longer host-fall-back.
 - `scx_device_handoff_streamed` — on-device, but some shard still bounced through
-  the host: a FOR-BP ≥128-nnz BitPacker4x fallback or a non-Scx1 codec (the float
-  Pcodec case above). `bytes_uploaded` is the real HtoD total.
+  the host because it is **not** an Scx1 sidecar shard: a non-Scx1 codec (the float
+  Pcodec case above) or a sidecar-less Scx1 shard (e.g. byte-passthrough output).
+  `bytes_uploaded` is the real HtoD total.
 - `scx_device_handoff` — host-assembled CSR (filtered / projected / multimodal
   input), or an `X` that was already device-resident on entry.
 

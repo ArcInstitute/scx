@@ -629,10 +629,12 @@ impl PyExperiment {
                 let n_rows = gpu_csr.shape.0;
                 let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
                 // Honest transfer mode: a genuine fully-in-VRAM Scx1 decode (only the
-                // tiny indptr uploaded) vs a path where some shard still bounced
-                // through the host — a FOR-BP >=128-nnz BitPacker4x fallback (the
-                // Task 4.4b gap) or a non-Scx1 codec. `bytes_uploaded` is the real
-                // HtoD total from the decode, not a header estimate.
+                // tiny indptr uploaded — dense >=128-nnz FOR-BP rows now decode on
+                // device via the BitPacker4x kernel, Task 4.4b) vs a path where some
+                // shard still bounced through the host because it is not an Scx1
+                // sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard.
+                // `bytes_uploaded` is the real HtoD total from the decode, not a
+                // header estimate.
                 let transfer_mode = if decode_stats.fully_device_decoded {
                     "scx_device_decode_gpu"
                 } else {
