@@ -14,6 +14,9 @@
 //!   * `read_obs` is never called on the sharded path, and
 //!   * only the obs shards overlapping surviving CSR shards are decoded.
 
+// Reader debug counters are only incremented under `debug_assertions`, so the
+// counter-inspection imports/helper below are debug-only.
+#[cfg(debug_assertions)]
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -24,6 +27,7 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions, QueryPipeline,
 };
 use scx_format::header::{FileHeader, MAGIC};
+#[cfg(debug_assertions)]
 use scx_format::reader::ScxReader;
 use scx_format::writer::ScxWriter;
 use tempfile::TempDir;
@@ -170,6 +174,7 @@ fn build_sharded_indexed_file(dir: &TempDir) -> std::path::PathBuf {
     path
 }
 
+#[cfg(debug_assertions)]
 fn debug_reader(pipeline: &QueryPipeline) -> &ScxReader {
     pipeline
         .reader()
@@ -211,17 +216,20 @@ fn count_streams_obs_without_full_read() {
     assert_eq!(c.skipped_shards, 1, "CSR shard 1 (no 'A') must be skipped");
     assert_eq!(c.matched_rows, 4);
 
-    let reader = debug_reader(&pipeline);
-    assert_eq!(
-        reader.debug_counts().read_obs.load(Ordering::Relaxed),
-        0,
-        "the sharded path must never materialise the full obs table"
-    );
-    assert_eq!(
-        reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
-        2,
-        "only the 2 obs shards overlapping surviving CSR shard 0 may be read"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let reader = debug_reader(&pipeline);
+        assert_eq!(
+            reader.debug_counts().read_obs.load(Ordering::Relaxed),
+            0,
+            "the sharded path must never materialise the full obs table"
+        );
+        assert_eq!(
+            reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
+            2,
+            "only the 2 obs shards overlapping surviving CSR shard 0 may be read"
+        );
+    }
 }
 
 #[test]
@@ -268,13 +276,16 @@ fn collect_no_skip_reads_all_overlapping_shards() {
     let c = pipeline.count().unwrap();
     assert_eq!(c.skipped_shards, 0);
     assert_eq!(c.matched_rows, 4);
-    let reader = debug_reader(&pipeline);
-    assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
-        4,
-        "no-skip predicate must read all 4 obs shards (full cover)"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let reader = debug_reader(&pipeline);
+        assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
+            4,
+            "no-skip predicate must read all 4 obs shards (full cover)"
+        );
+    }
 
     let r = pipeline.collect().unwrap();
     assert_eq!(r.skipped_shards, 0);
@@ -312,6 +323,53 @@ fn limit_reads_minimal_obs_shards() {
     );
     // matched_rows is the pre-limit Level-2 count (4), not the returned 1.
     assert_eq!(r.matched_rows, 4);
+}
+
+#[test]
+fn no_match_indexed_value_skips_all_shards() {
+    let dir = TempDir::new().unwrap();
+    let path = build_sharded_indexed_file(&dir);
+
+    // 'Z' is absent from the `cell_type` predicate index (only "A"/"B" exist),
+    // so the engine proves the empty result from the index alone — every shard
+    // is skipped and NO obs metadata is touched (vs. the pre-fix behaviour of
+    // scanning all obs shards and reporting `skipped=0`).
+    let pipeline = QueryPipeline::open(&path)
+        .unwrap()
+        .filter_obs("cell_type == 'Z'")
+        .unwrap();
+    let c = pipeline.count().unwrap();
+    assert_eq!(c.total_shards, 2);
+    assert_eq!(
+        c.skipped_shards, 2,
+        "an absent indexed value must skip every shard"
+    );
+    assert_eq!(c.matched_rows, 0);
+
+    #[cfg(debug_assertions)]
+    {
+        let reader = debug_reader(&pipeline);
+        assert_eq!(
+            reader.debug_counts().read_obs.load(Ordering::Relaxed),
+            0,
+            "no-match short-circuit must not materialise obs"
+        );
+        assert_eq!(
+            reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
+            0,
+            "no-match short-circuit must not decode any obs shard"
+        );
+    }
+
+    let r = pipeline.collect().unwrap();
+    assert_eq!(r.x.n_rows(), 0);
+    assert_eq!(r.obs.num_rows(), 0);
+    assert_eq!(r.skipped_shards, 2);
+    assert_eq!(r.matched_rows, 0);
+    // Schema is intact even with zero rows.
+    let schema = r.obs.schema();
+    let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(cols.contains(&"cell_type"));
 }
 
 #[test]

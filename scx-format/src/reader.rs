@@ -47,6 +47,11 @@ pub struct ReaderDebugCounts {
     /// materialisation) and that this count stays bounded by the surviving
     /// shards (I/O skip).
     pub read_obs_shard: AtomicU64,
+    /// Per-shard X (CSR) decodes via `read_shard_from_entry[_verified]`. The
+    /// query `materialize` path increments this once per decoded shard; tests
+    /// assert it stays bounded by the prefix needed to satisfy `.limit(N)`
+    /// rather than scaling with the candidate-shard count.
+    pub read_shard_from_entry: AtomicU64,
     pub read_layer: AtomicU64,
     pub read_layer_for: AtomicU64,
     pub read_obsm: AtomicU64,
@@ -3109,6 +3114,10 @@ impl ScxReader {
         entry: &FullCatalogEntry,
         verify_checksum: bool,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_shard_from_entry
+            .fetch_add(1, Ordering::Relaxed);
         let section = self.section_bytes(entry)?;
         // Parallel sidecar-driven decode (Task 4.3): for large Scx1 shards that
         // carry a fresh decode sidecar, decode the rows concurrently via the
