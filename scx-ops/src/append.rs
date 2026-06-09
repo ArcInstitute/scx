@@ -1527,7 +1527,7 @@ fn next_shard_idx(old_per_modality_csr: u32, n_appended_so_far: usize) -> Result
 /// applied by [`scx_engine::build_and_write_conversion_predicate_indexes`]
 /// so the Phase 2d streaming append produces byte-identical predicate
 /// indexes to the legacy batch path.
-fn predicate_index_build_options_for_obs(
+pub(crate) fn predicate_index_build_options_for_obs(
     index_options: &ConversionPredicateIndexOptions,
 ) -> scx_engine::PredicateIndexBuildOptions {
     let preset_obs = match index_options.index_preset.as_deref() {
