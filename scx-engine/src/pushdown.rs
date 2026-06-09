@@ -136,10 +136,24 @@ fn can_exclude_shard(
                         let bit_index = match val {
                             ScalarValue::Int64(idx) => Some(*idx as usize),
                             ScalarValue::Utf8(s) => {
-                                // Look up string value in category dictionary
-                                category_dicts
-                                    .and_then(|dicts| dicts.get(cnh))
-                                    .and_then(|values| values.binary_search(s).ok())
+                                // Look up string value in category dictionary.
+                                match category_dicts.and_then(|dicts| dicts.get(cnh)) {
+                                    Some(values) => match values.binary_search(s) {
+                                        Ok(idx) => Some(idx),
+                                        // The dictionary is present (this column
+                                        // is indexed), so it is the complete
+                                        // global value set. A value absent from
+                                        // it exists in NO shard → exclude every
+                                        // shard. This is what lets a no-match
+                                        // equality short-circuit instead of
+                                        // scanning all obs metadata.
+                                        Err(_) => return true,
+                                    },
+                                    // No dictionary for this column (not indexed)
+                                    // → cannot resolve the value; stay
+                                    // conservative and do not exclude.
+                                    None => None,
+                                }
                             }
                             _ => None,
                         };

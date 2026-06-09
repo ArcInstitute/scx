@@ -257,6 +257,64 @@ fn range_overlaps_any(rs: u64, re: u64, sorted: &[(u64, u64)]) -> bool {
     sorted.get(i).is_some_and(|(s, _)| *s < re)
 }
 
+/// Resolve the effective gene-column projection (explicit gene indices
+/// intersected with any var predicates) and the resulting output column count.
+/// Operates on already-read var metadata — no obs/X shard decode. Shared by the
+/// normal `plan_and_mask` path and its empty-candidate short-circuit.
+fn resolve_gene_projection(
+    plan: &ExecutionPlan,
+    var_batch: &RecordBatch,
+    n_vars: usize,
+) -> Result<(Option<Vec<u32>>, usize)> {
+    let mut effective_gene_indices = plan.gene_indices.clone();
+
+    if !plan.var_predicates.is_empty() {
+        let var_mask = {
+            let mut mask = vec![true; var_batch.num_rows()];
+            for pred in &plan.var_predicates {
+                let mask_array = evaluate(pred, var_batch)?;
+                for (i, m) in mask.iter_mut().enumerate() {
+                    if *m {
+                        *m = mask_array.is_valid(i) && mask_array.value(i);
+                    }
+                }
+            }
+            mask
+        };
+
+        // Convert var mask to gene indices
+        let var_gene_indices: Vec<u32> = var_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &keep)| if keep { Some(i as u32) } else { None })
+            .collect();
+
+        // Intersect with explicit gene_indices if both present
+        effective_gene_indices = Some(match effective_gene_indices {
+            Some(explicit) => {
+                let var_set: std::collections::HashSet<u32> =
+                    var_gene_indices.iter().copied().collect();
+                explicit
+                    .into_iter()
+                    .filter(|g| var_set.contains(g))
+                    .collect()
+            }
+            None => var_gene_indices,
+        });
+    }
+
+    // Sort gene indices for consistent projection
+    if let Some(ref mut gi) = effective_gene_indices {
+        gi.sort_unstable();
+        gi.dedup();
+    }
+
+    let n_output_cols = effective_gene_indices
+        .as_ref()
+        .map_or(n_vars, |gi| gi.len());
+    Ok((effective_gene_indices, n_output_cols))
+}
+
 /// Cheap half of query execution: catalog pruning + obs/var predicate
 /// evaluation + per-shard row-keep masks + gene projection. No X-shard decode.
 fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
@@ -285,6 +343,31 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
                 .map(|s| (s.row_end - s.row_start) as usize)
         })
         .sum();
+
+    // No candidate shards survived catalog-level pruning — e.g. an indexed
+    // equality whose value is absent from every shard (typo / stale id), or a
+    // numeric equality outside every shard's [min, max]. The result is empty,
+    // so short-circuit: skip ALL obs/X shard reads. Peak RSS stays at the
+    // (MB-scale) predicate-index read regardless of file size, and we report
+    // every shard skipped. Var is still read (cheap) for the output schema.
+    if plan.candidate_shards.is_empty() {
+        let var_batch = reader.read_var()?;
+        let (effective_gene_indices, n_output_cols) =
+            resolve_gene_projection(&plan, &var_batch, n_vars)?;
+        return Ok(PlanAndMask {
+            plan,
+            legacy_obs: None,
+            obs_shard_ranges: Vec::new(),
+            var_batch,
+            shard_infos: Vec::new(),
+            effective_gene_indices,
+            n_output_cols,
+            skipped_shards, // == total_shards (no shard survived)
+            total_shards,
+            candidate_shard_rows, // == 0
+            matched_rows: 0,
+        });
+    }
 
     // Steps 2+3: Build the global obs row mask by evaluating the obs
     // predicates. On row-sharded (atlas-scale) files we stream one obs
@@ -442,52 +525,8 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
 
     // Step 6: Handle var predicates and gene projection (assembled via trait impl)
     let var_batch = reader.read_var()?;
-    let mut effective_gene_indices = plan.gene_indices.clone();
-
-    if !plan.var_predicates.is_empty() {
-        let var_mask = {
-            let mut mask = vec![true; var_batch.num_rows()];
-            for pred in &plan.var_predicates {
-                let mask_array = evaluate(pred, &var_batch)?;
-                for (i, m) in mask.iter_mut().enumerate() {
-                    if *m {
-                        *m = mask_array.is_valid(i) && mask_array.value(i);
-                    }
-                }
-            }
-            mask
-        };
-
-        // Convert var mask to gene indices
-        let var_gene_indices: Vec<u32> = var_mask
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &keep)| if keep { Some(i as u32) } else { None })
-            .collect();
-
-        // Intersect with explicit gene_indices if both present
-        effective_gene_indices = Some(match effective_gene_indices {
-            Some(explicit) => {
-                let var_set: std::collections::HashSet<u32> =
-                    var_gene_indices.iter().copied().collect();
-                explicit
-                    .into_iter()
-                    .filter(|g| var_set.contains(g))
-                    .collect()
-            }
-            None => var_gene_indices,
-        });
-    }
-
-    // Sort gene indices for consistent projection
-    if let Some(ref mut gi) = effective_gene_indices {
-        gi.sort_unstable();
-        gi.dedup();
-    }
-
-    let n_output_cols = effective_gene_indices
-        .as_ref()
-        .map_or(n_vars, |gi| gi.len());
+    let (effective_gene_indices, n_output_cols) =
+        resolve_gene_projection(&plan, &var_batch, n_vars)?;
 
     // Pre-limit Level-2 match count, computed from the keep masks alone — no
     // X decode required (CLI2/CLI6). Equals `csr.n_rows()` post-materialise.
@@ -621,9 +660,33 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     let reader = pipeline.reader();
     let sorted_shards = reader.catalog().shards_sorted();
 
-    // Step 7: Parallel shard decode with optional projection
+    // Step 7: Parallel shard decode with optional projection.
+    //
+    // Push `limit` into shard selection. `shard_infos` are ascending by
+    // `row_start` and each carries its keep mask, so the per-shard matched-row
+    // count is known without decoding X. We therefore only decode the first K
+    // shards whose cumulative matches reach the limit. This bounds peak decode +
+    // CSR memory to those K shards even when a low-selectivity predicate matches
+    // rows in every candidate shard — otherwise the entire matched X would be
+    // materialised here before Step 10 truncates it to `limit`.
+    let decode_count = match plan.limit {
+        Some(limit) => {
+            let mut cum = 0usize;
+            let mut k = 0usize;
+            for si in &shard_infos {
+                if cum >= limit {
+                    break;
+                }
+                cum += si.local_keep_mask.iter().filter(|&&keep| keep).count();
+                k += 1;
+            }
+            k
+        }
+        None => shard_infos.len(),
+    };
+
     // Each shard produces (indptr, indices, data) filtered to matching rows
-    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shard_infos
+    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shard_infos[..decode_count]
         .par_iter()
         .map(|si| {
             let entry = sorted_shards[si.shard_idx];
@@ -680,10 +743,17 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     apply_fused_ops(&mut csr, plan.normalize, plan.log1p);
 
     // `matched_rows` (pre-limit Level-2 count) was computed in `plan_and_mask`
-    // from the keep masks and equals `csr.n_rows()` here. Asserting their
-    // equality keeps the mask-only `count()` path honest against the decode
-    // path without re-deriving it.
-    debug_assert_eq!(matched_rows, csr.n_rows());
+    // from the keep masks. With no limit we decode every candidate shard, so it
+    // must equal `csr.n_rows()` here — asserting that keeps the mask-only
+    // `count()` path honest against the decode path without re-deriving it. With
+    // a limit we decode only the prefix of shards needed to fill it (Step 7), so
+    // the assembled CSR holds only those rows (>= limit, <= matched_rows) until
+    // Step 10 truncates.
+    debug_assert!(
+        plan.limit.is_some() || matched_rows == csr.n_rows(),
+        "unlimited query: matched_rows ({matched_rows}) must equal assembled rows ({})",
+        csr.n_rows(),
+    );
 
     // Step 10: Apply limit
     if let Some(limit) = plan.limit {
@@ -1185,5 +1255,216 @@ mod tests {
         assert_eq!(result.x.n_cols(), 5); // 5 projected genes
         assert_eq!(result.obs.num_rows(), 4);
         assert_eq!(result.var.num_rows(), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // FILTER-OBS-OOM follow-ups: full-scan limit-pushdown (#1) and no-match
+    // short-circuit (#2). Both run `plan_and_mask` + `materialize` against a
+    // *borrowed* pipeline so the per-shard X-decode counter
+    // (`read_shard_from_entry`) can be inspected after materialisation.
+    // -----------------------------------------------------------------------
+
+    const MS_SHARDS: usize = 4;
+    const MS_ROWS_PER_SHARD: usize = 3;
+
+    /// 4 CSR + 4 obs shards of 3 rows each (12 rows). `cell_type` is indexed
+    /// and cycles T/B/NK within every shard, so `'T cell'` appears in EVERY
+    /// shard (0 % catalog skip → the low-selectivity full-scan path), while a
+    /// value like `'Z'` is absent from the predicate index entirely.
+    fn write_indexed_multishard_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let n_obs = (MS_SHARDS * MS_ROWS_PER_SHARD) as u64;
+        let n_vars = 4usize;
+        let path = dir.path().join("indexed_multishard.scx");
+
+        let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let types: Vec<&str> = (0..n_obs as usize)
+            .map(|i| match i % MS_ROWS_PER_SHARD {
+                0 => "T cell",
+                1 => "B cell",
+                _ => "NK cell",
+            })
+            .collect();
+        let obs_schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, false),
+        ]);
+        let obs = RecordBatch::try_new(
+            Arc::new(obs_schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(types)),
+            ],
+        )
+        .unwrap();
+        let var = sample_var(n_vars);
+
+        let mut header = sample_header(n_obs, n_vars as u64, n_obs * 2);
+        header.shard_target_rows = MS_ROWS_PER_SHARD as u32;
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+
+        // Sharded obs aligned with the CSR shards.
+        for s in 0..MS_SHARDS {
+            let rs = (s * MS_ROWS_PER_SHARD) as u64;
+            let slice = obs.slice(rs as usize, MS_ROWS_PER_SHARD);
+            writer
+                .write_obs_shard(s as u32, rs, MS_ROWS_PER_SHARD as u64, n_obs, &slice)
+                .unwrap();
+        }
+        writer.write_var(&var).unwrap();
+
+        // CSR shards: 1 nnz/row.
+        let mut csr_row_ranges = Vec::new();
+        for s in 0..MS_SHARDS {
+            let rs = (s * MS_ROWS_PER_SHARD) as u64;
+            let indptr: Vec<u64> = (0..=MS_ROWS_PER_SHARD as u64).collect();
+            let indices: Vec<u32> = (0..MS_ROWS_PER_SHARD as u32)
+                .map(|i| i % n_vars as u32)
+                .collect();
+            let values: Vec<u8> = vec![1u8; MS_ROWS_PER_SHARD];
+            writer
+                .write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    rs,
+                )
+                .unwrap();
+            csr_row_ranges.push((rs, rs + MS_ROWS_PER_SHARD as u64));
+        }
+
+        let opts = crate::ConversionPredicateIndexOptions {
+            index_obs: vec!["cell_type".to_string()],
+            index_var: Vec::new(),
+            index_preset: None,
+            index_auto_threshold: 1000,
+        };
+        crate::build_and_write_conversion_predicate_indexes(
+            &mut writer,
+            &obs,
+            &var,
+            &csr_row_ranges,
+            n_vars,
+            &opts,
+        )
+        .unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    fn x_decode_count(pipeline: &QueryPipeline) -> u64 {
+        pipeline
+            .reader()
+            .as_any()
+            .downcast_ref::<scx_format::reader::ScxReader>()
+            .expect("local reader")
+            .debug_counts()
+            .read_shard_from_entry
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Item #1: a low-selectivity predicate matches a row in every shard
+    /// (0 % skip), so without limit-pushdown `materialize` would decode all 4
+    /// X shards. With `.limit(1)` the first shard alone fills the budget, so
+    /// only ONE X shard is decoded.
+    #[test]
+    fn limit_pushdown_bounds_full_scan_x_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_indexed_multishard_file(&dir);
+
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap()
+            .limit(1);
+        let pm = plan_and_mask(&pipeline).unwrap();
+        // No catalog skip: 'T cell' is present in every shard.
+        assert_eq!(pm.skipped_shards, 0);
+        assert_eq!(pm.matched_rows, MS_SHARDS); // one T cell per shard
+        let r = materialize(&pipeline, pm).unwrap();
+
+        assert_eq!(r.x.n_rows(), 1);
+        assert_eq!(r.obs.num_rows(), 1);
+        assert_eq!(r.matched_rows, MS_SHARDS, "pre-limit Level-2 count");
+        assert_eq!(
+            x_decode_count(&pipeline),
+            1,
+            "limit(1) must decode only the first X shard, not all {MS_SHARDS}"
+        );
+    }
+
+    /// Item #1 control: with no limit the full-scan path decodes every
+    /// candidate shard and the pre-limit count equals the assembled rows.
+    #[test]
+    fn no_limit_full_scan_decodes_all_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_indexed_multishard_file(&dir);
+
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'T cell'")
+            .unwrap();
+        let pm = plan_and_mask(&pipeline).unwrap();
+        let r = materialize(&pipeline, pm).unwrap();
+
+        assert_eq!(r.x.n_rows(), MS_SHARDS);
+        assert_eq!(
+            x_decode_count(&pipeline),
+            MS_SHARDS as u64,
+            "unlimited query decodes every candidate shard"
+        );
+    }
+
+    /// Item #2: an equality whose value is absent from the (indexed) column's
+    /// global dictionary must skip every shard and touch NO obs/X metadata.
+    #[test]
+    fn no_match_indexed_value_short_circuits_without_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_indexed_multishard_file(&dir);
+
+        let pipeline = QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'Z'")
+            .unwrap();
+        let pm = plan_and_mask(&pipeline).unwrap();
+        assert_eq!(pm.total_shards, MS_SHARDS);
+        assert_eq!(
+            pm.skipped_shards, MS_SHARDS,
+            "an absent indexed value skips every shard"
+        );
+        assert_eq!(pm.matched_rows, 0);
+        let r = materialize(&pipeline, pm).unwrap();
+        assert_eq!(r.x.n_rows(), 0);
+        assert_eq!(r.obs.num_rows(), 0);
+        assert_eq!(r.skipped_shards, MS_SHARDS);
+
+        let reader = pipeline
+            .reader()
+            .as_any()
+            .downcast_ref::<scx_format::reader::ScxReader>()
+            .unwrap();
+        let counts = reader.debug_counts();
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(
+            counts.read_obs.load(Relaxed),
+            0,
+            "short-circuit must not materialise the full obs table"
+        );
+        // The full obs scan is avoided entirely. `materialize` reads at most one
+        // obs shard as the 0-row schema template for the empty result (a
+        // bounded, MB-scale read) — never the whole file. `count()` skips
+        // materialise and reads zero (asserted in the integration test).
+        assert!(
+            counts.read_obs_shard.load(Relaxed) < MS_SHARDS as u64,
+            "short-circuit must not scan all obs shards"
+        );
+        assert_eq!(
+            counts.read_shard_from_entry.load(Relaxed),
+            0,
+            "short-circuit must not decode any X shard"
+        );
     }
 }

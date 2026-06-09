@@ -315,6 +315,50 @@ fn limit_reads_minimal_obs_shards() {
 }
 
 #[test]
+fn no_match_indexed_value_skips_all_shards() {
+    let dir = TempDir::new().unwrap();
+    let path = build_sharded_indexed_file(&dir);
+
+    // 'Z' is absent from the `cell_type` predicate index (only "A"/"B" exist),
+    // so the engine proves the empty result from the index alone — every shard
+    // is skipped and NO obs metadata is touched (vs. the pre-fix behaviour of
+    // scanning all obs shards and reporting `skipped=0`).
+    let pipeline = QueryPipeline::open(&path)
+        .unwrap()
+        .filter_obs("cell_type == 'Z'")
+        .unwrap();
+    let c = pipeline.count().unwrap();
+    assert_eq!(c.total_shards, 2);
+    assert_eq!(
+        c.skipped_shards, 2,
+        "an absent indexed value must skip every shard"
+    );
+    assert_eq!(c.matched_rows, 0);
+
+    let reader = debug_reader(&pipeline);
+    assert_eq!(
+        reader.debug_counts().read_obs.load(Ordering::Relaxed),
+        0,
+        "no-match short-circuit must not materialise obs"
+    );
+    assert_eq!(
+        reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
+        0,
+        "no-match short-circuit must not decode any obs shard"
+    );
+
+    let r = pipeline.collect().unwrap();
+    assert_eq!(r.x.n_rows(), 0);
+    assert_eq!(r.obs.num_rows(), 0);
+    assert_eq!(r.skipped_shards, 2);
+    assert_eq!(r.matched_rows, 0);
+    // Schema is intact even with zero rows.
+    let schema = r.obs.schema();
+    let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(cols.contains(&"cell_type"));
+}
+
+#[test]
 fn empty_result_has_correct_schema() {
     let dir = TempDir::new().unwrap();
     let path = build_sharded_indexed_file(&dir);

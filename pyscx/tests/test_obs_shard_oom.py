@@ -116,19 +116,81 @@ def test_filter_obs_full_collect_parity(tmp_path):
     assert all(adata.obs["cell_type"] == "fibroblast")
 
 
-def _count_under_memory_cap_worker(path, q):
-    """Module-level so it is picklable under the `spawn` start method."""
+def test_no_match_indexed_value_returns_empty(tmp_path):
+    """An equality on an INDEXED column whose value exists in no shard must
+    short-circuit to an empty result (count 0 / 0 rows) instead of scanning all
+    obs metadata. `batch` is indexed in the fixture, so a synthetic value the
+    predicate index has never seen is proven absent from the index alone."""
+    import pyscx
+
+    out, _ = _build(tmp_path)
+    exp = pyscx.open(out)
+    q = exp.query().filter_obs("batch == '__never_exists__'")
+    assert q.count() == 0
+    result = exp.query().filter_obs("batch == '__never_exists__'").limit(5).collect()
+    assert result.n_obs == 0
+    # Schema survives the empty result.
+    adata = result.to_anndata()
+    assert "batch" in adata.obs.columns
+
+
+def _cap_address_space_and_threads():
+    """Pin the rayon/polars thread pools small, THEN cap address space.
+
+    Each worker thread reserves stack + arena address space; on a many-core
+    host the default pool (one thread per core) can exhaust the tight
+    `RLIMIT_AS` cap before any query runs (`RuntimeError: can't start new
+    thread`). Pinning the pool keeps the cap measuring obs-streaming RSS — the
+    thing under test — not thread-stack reservations. Must run before `pyscx`
+    is imported so the global rayon pool is sized from these."""
+    import os
+
+    os.environ.setdefault("RAYON_NUM_THREADS", "4")
+    os.environ.setdefault("POLARS_MAX_THREADS", "4")
     try:
         import resource
 
-        # Cap address space at 1.5 GB. Generous (mmap + interpreter + arenas
-        # all count), but far below the hundreds of GB the old full-obs
-        # concat would reach at atlas shard counts.
         _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         cap = 1536 * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
     except (ImportError, ValueError, OSError):
         pass  # platform without RLIMIT_AS — still run for correctness
+
+
+def _no_match_under_memory_cap_worker(path, q):
+    """Module-level so it is picklable under the `spawn` start method."""
+    _cap_address_space_and_threads()
+    try:
+        import pyscx
+
+        n = pyscx.open(path).query().filter_obs("batch == '__never_exists__'").count()
+        q.put(("ok", n))
+    except Exception as exc:  # pragma: no cover - surfaced via assert
+        q.put(("err", repr(exc)))
+
+
+def test_no_match_count_in_child_process_under_memory_cap(tmp_path):
+    """A no-match indexed equality must short-circuit under the address-space
+    cap — the pre-fix path scanned all obs shards even for a value present in
+    none."""
+    import multiprocessing as mp
+
+    out, _ = _build(tmp_path)
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(target=_no_match_under_memory_cap_worker, args=(out, q))
+    p.start()
+    status, payload = q.get(timeout=120)
+    p.join(timeout=10)
+    assert not p.is_alive(), "no-match query under memory cap did not finish"
+    assert status == "ok", f"child failed: {payload}"
+    assert payload == 0
+
+
+def _count_under_memory_cap_worker(path, q):
+    """Module-level so it is picklable under the `spawn` start method."""
+    _cap_address_space_and_threads()
     try:
         import pyscx
 
