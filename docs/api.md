@@ -221,7 +221,7 @@ LRU thrashing across modalities.
   object as a multimodal SCX file. Per-modality CSR shards stamped
   with `modality_id` derived from the registration order; per-modality
   codec resolved via `select_codec_for_modality`.
-- `pyscx.open(path)` returns `PyExperiment`. New attrs / methods:
+- `pyscx.open(path)` returns an `Experiment`. New attrs / methods:
   - `is_multimodal: bool`, `n_modalities: int`, `modality_names: list[str]`.
   - `modality_id(name) -> int | None`, `modality_info(id) -> dict | None`.
   - `to_mudata() -> mudata.MuData` — round-trips back to MuData.
@@ -802,11 +802,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 
 ### Module-level functions
 
-- `pyscx.open(path) -> PyExperiment` — Open SCX file (local)
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None, shard_target_rows=None)` — Write AnnData to SCX.
+- `pyscx.open(path, verify=True) -> Experiment` — Open SCX file (local), returning a lazy `Experiment` handle.
+- `pyscx.read(path, *, verify=True, **kwargs) -> AnnData` — One-liner read mirroring `sc.read_h5ad`: shorthand for `pyscx.open(path).to_anndata(**kwargs)`. `**kwargs` forward to [`Experiment.to_anndata`](#experiment) (`backed=`, `var_names=`, `obs_filter=`, `layers=`, …).
+- `pyscx.write(adata, path, **kwargs)` — One-liner write mirroring `AnnData.write_h5ad`: shorthand for `pyscx.from_anndata(adata, path, **kwargs)`.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None, shard_target_rows=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
-  Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
+  Arrow IPC; higher-precision inputs are downcast on write. `in_place=True`
+  permits sorting the caller's CSR indices in place (avoids a copy when `X` is
+  an unsorted scipy CSR); leave it `False` (default) to keep the input AnnData
+  untouched. `uns_format`
   selects how `adata.uns` is serialized — see [`uns` serialization](#uns-serialization).
   Accepts backed AnnData (`sc.read_h5ad(path, backed='r')`) and auto-routes
   to the streaming converter — see `pyscx.from_h5ad` below for the
@@ -924,7 +929,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   - `modality_types`: optional dict `{name: "rna" | "protein" | "atac"
     | "spatial" | "methylation" | "custom"}`. Modalities not listed
     fall back to name inference and emit `ModalityTypeInferred`.
-- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")` — 10x HDF5 to SCX.
+- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False)` — 10x HDF5 to SCX.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX directory (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`) to SCX. Default shard size is 16384.
 - `pyscx.to_mtx(scx_path, output_dir)` — SCX to Cell Ranger–style MTX directory (`matrix.mtx.gz`, `barcodes.tsv.gz`, `features.tsv.gz`).
 - `pyscx.to_h5ad(path, out, stream=True, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None)` — Stream SCX → h5ad
@@ -977,7 +982,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, reshape_obs=False)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output. `reshape_obs=True` migrates legacy single-section obs metadata to the sharded `ObsMetadataShard` layout (mirrors `scx compact --reshape-obs`; useful after a backed `from_anndata` conversion).
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
-- `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`.
+- `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`. **`set_uns` is a strict subset of `modify_metadata`** — `pyscx.modify_metadata(path, uns=...)` does the same thing and also reaches `obs`/`var`/`obsm`/`varm`; prefer `modify_metadata` unless you only need the one-arg `uns` convenience.
 - `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. `index_*` kwargs rebuild predicate indexes over a replaced `obs`/`var` (otherwise the stale index is dropped). Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
 - `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `uns_policy` controls conflicting uns sections: `"first"` (keep first input), `"require_equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (write conflict report as `uns["_merge_uns_summary"]`). `shard_target_rows` overrides the default obs shard size during merge. Merge now streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
@@ -987,9 +992,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.cloud_optimize(input, output=None)` — Front-of-file catalog
 - `pyscx.explode(input, output)` — Packed → exploded directory
 - `pyscx.pack(input, output)` — Exploded → packed
-- `pyscx.open_cloud(url) -> PyCloudExperiment` — Direct cloud reads
+- `pyscx.open_cloud(url) -> CloudExperiment` — Direct cloud reads
+- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None) -> AnnData` — One-call cloud read (= `open_cloud(url).query()…collect().to_anndata()`); see [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
 
-### PyExperiment
+### Experiment
+
+The Python-visible class is `Experiment` (the Rust type is `PyExperiment`).
+`repr(exp)` is AnnData-style — a `Experiment object with n_obs × n_vars = …`
+header followed by indented `obs:` / `var:` / `uns:` / `obsm:` / `varm:` /
+`layers:` key lists. On-disk codec / shard / format-version internals moved off
+the repr onto `Experiment.info() -> str`.
 
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset)
@@ -1074,7 +1086,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   integer). Bitmap fast path when sidecars exist; CSR fallback
   otherwise.
 - `to_gpu_anndata()` — Minimal-copy on-device handoff: decodes shards, transfers to the GPU, and returns a GPU-resident AnnData whose `X` is a `cupyx.scipy.sparse.csr_matrix`. The returned object is suitable for direct use with rapids-singlecell (`rsc.pp.*`, `rsc.tl.*`) without additional host↔device copies. Requires `cupy` and a CUDA-capable GPU. Records its `transfer_mode` and real `bytes_uploaded` on `uns["scx_accel"]["to_gpu_anndata"]` — `scx_device_decode_gpu` (Scx1 sidecar shards decoded fully in VRAM, including dense ≥128-nnz rows via the BitPacker4x kernel; only indptr uploaded), `scx_device_handoff_streamed` (some shard host-bounced because it is not an Scx1 sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard), or `scx_device_handoff` (host-assembled filtered/projected/multimodal input). See **Accelerator route metadata** below.
-- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`
+- `info() -> str` — One-line codec / shard / format-version internals (kept off the AnnData-style `repr`).
+- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`, `layer_names`, and the AnnData-style key accessors `obs_keys`, `var_keys`, `obsm_keys`, `varm_keys`, `uns_keys` (all cheap — schema/catalog reads, no matrix decode; `obs_keys`/`var_keys` exclude the pandas index column).
 
 ### `uns` serialization
 
@@ -1127,12 +1140,16 @@ any JSON tool. Example for a `float32` array:
 - `to_csr()` — Return just the scipy CSR matrix
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
 
-### PyCloudExperiment
+### CloudExperiment
 
-Returned by `pyscx.open_cloud()`. Cloud-hosted SCX handle. Supports
-metadata accessors plus a cloud-native query path served over
+The Python-visible class is `CloudExperiment` (the Rust type is
+`PyCloudExperiment`). Returned by `pyscx.open_cloud()`. Cloud-hosted SCX
+handle. Supports metadata accessors plus a cloud-native query path served over
 `object_store` range reads; full `to_anndata()` and `validate()` still
-require `pyscx.pull()` to materialise the file locally.
+require `pyscx.pull()` to materialise the file locally. For a one-call read see
+[`pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read). Its
+`repr` is the AnnData-style header line (no key lists — listing them would need
+network reads).
 
 - `n_obs` `→ int` — Number of observations (cells)
 - `n_vars` `→ int` — Number of variables (genes)
@@ -1157,9 +1174,12 @@ require `pyscx.pull()` to materialise the file locally.
   )
   ```
 
+  The flat one-liner `pyscx.read_cloud(url, obs_filter=..., var_names=...)`
+  wraps this chain and returns an AnnData directly — see
+  [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
+
   Deferred follow-ons: `CloudQueryOptions` (parallelism,
-  max-inflight bytes, cache-dir, retry policy), the
-  `pyscx.read_cloud(...)` flat helper, and a batched async section
+  max-inflight bytes, cache-dir, retry policy) and a batched async section
   fetcher (current cloud reads block per shard from the rayon worker).
 
 ### pyscx.accel — Rust-Native Accelerators

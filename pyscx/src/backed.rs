@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyIndexError, PyRuntimeError};
+use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
@@ -592,7 +592,7 @@ impl ScxBackedSparseDataset {
                 let total: f64 = filtered.iter().sum();
                 Ok(total.into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -626,7 +626,7 @@ impl ScxBackedSparseDataset {
                 let n = (self.shape_val.0 as f64) * (self.shape_val.1 as f64);
                 Ok((total / n).into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -719,7 +719,7 @@ impl ScxBackedSparseDataset {
                 let variance = mean_sq - mean * mean;
                 Ok(variance.into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -749,7 +749,7 @@ impl ScxBackedSparseDataset {
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 Ok(total.into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -888,7 +888,7 @@ impl ScxBackedSparseDataset {
                 let total_max = maxes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 Ok(total_max.into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 
@@ -922,7 +922,7 @@ impl ScxBackedSparseDataset {
                 let total_min = mins.iter().cloned().fold(f64::INFINITY, f64::min);
                 Ok(total_min.into_pyobject(py)?.into_any())
             }
-            Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+            Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
         }
     }
 }
@@ -1984,7 +1984,7 @@ impl ScxComparisonResult {
                     let np = py.import("numpy")?;
                     np.call_method1("int64", (total as i64,))
                 }
-                Some(_) => Err(PyRuntimeError::new_err("axis must be 0, 1, or None")),
+                Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
             }
         } else {
             // Fallback: materialize and sum

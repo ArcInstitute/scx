@@ -12,6 +12,7 @@ SCX (Sparse Cell eXpression System) is a purpose-built binary file format, compr
 - **[docs/codec.md](docs/codec.md)** — Bit-level codec spec: Delta-Golomb-Rice, FOR-BP, Rice, LZ4+shuffle, auto-selection.
 - **[docs/api.md](docs/api.md)** — API reference and section type documentation.
 - **[docs/scanpy.md](docs/scanpy.md)** — Scanpy integration guide and accelerator usage.
+- **[docs/migrating-from-h5ad.md](docs/migrating-from-h5ad.md)** — Analyst-facing h5ad→SCX migration: loader decision tree, round-trip fidelity, scanpy-divergence gotchas.
 - **[docs/performance.md](docs/performance.md)** — Benchmark results and performance characteristics.
 - **[docs/gpu-setup.md](docs/gpu-setup.md)** — GPU setup: CUDA, RAPIDS, conda, container, SLURM, troubleshooting.
 - **[docs/development.md](docs/development.md)** — Developer build guide: CPU-only, HDF5, cloud, GPU, Python, R builds; test matrix; fuzzing.

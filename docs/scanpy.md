@@ -5,6 +5,11 @@ SCX integrates directly with [scanpy](https://scanpy.readthedocs.io/) and the
 that returns data produces a standard `anndata.AnnData` object — so any scanpy
 function works out of the box with zero glue code.
 
+> Migrating an existing h5ad workflow? Start with
+> [docs/migrating-from-h5ad.md](migrating-from-h5ad.md) — it has the loader
+> decision tree, the round-trip fidelity table, and the handful of
+> scanpy-divergence gotchas consolidated in one place.
+
 ## Choosing the right approach
 
 SCX offers three ways to work with data in Python. Each makes different
@@ -485,7 +490,7 @@ The returned `anndata.AnnData` is fully populated:
 > detach the AnnData from the SCX file handle — required when you
 > intend to close the experiment, hand the AnnData to a subprocess,
 > or otherwise outlive the underlying mmap. See
-> [`docs/api.md` § `PyExperiment`](api.md#pyexperiment) for the kwarg
+> [`docs/api.md` § `Experiment`](api.md#experiment) for the kwarg
 > table.
 >
 > The lazy default bounds the peak RSS of `to_anndata()` itself for
@@ -2689,12 +2694,17 @@ from h5ad-based training loops.
 
 ```python
 exp = pyscx.open("experiment.scx")
-print(exp)           # PyExperiment(n_obs=10000, n_vars=33694, ...)
+print(exp)           # AnnData-style repr:
+#   Experiment object with n_obs × n_vars = 10000 × 33694
+#       obs: 'cell_type', 'sample'
+#       var: 'gene_ids'
+#       layers: 'raw_counts', 'spliced'
 print(exp.n_obs)     # 10000
 print(exp.n_vars)    # 33694
 print(exp.nnz)       # 5234891
-print(exp.codec_id)  # 1 (Scx1)
+print(exp.obs_keys)  # ['cell_type', 'sample']
 print(exp.layer_names)  # ["raw_counts", "spliced"]
+print(exp.info())    # codec / shard / format-version internals
 
 # Validate checksums
 results = exp.validate()

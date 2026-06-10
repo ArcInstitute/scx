@@ -1,6 +1,6 @@
 //! Shared utility helpers for CSR extraction and type conversion.
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -80,17 +80,25 @@ pub(super) fn extract_csr_slices<'py>(
     let indptr_arr = np.call_method1("asarray", (&indptr_obj,))?;
     let indptr_arr = astype_no_copy(py, &indptr_arr, "int64")?;
     let indptr_ro: numpy::PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
-    indptr_ro
-        .as_slice()
-        .map_err(|e| PyRuntimeError::new_err(format!("indptr not contiguous: {e}")))?;
+    indptr_ro.as_slice().map_err(|e| {
+        PyValueError::new_err(format!(
+            "CSR indptr is not C-contiguous ({e}); pass a canonical scipy CSR \
+             (try `X = X.tocsr(); X.sort_indices()`) or re-run \
+             `pyscx.from_anndata(...)` to rewrite it"
+        ))
+    })?;
 
     let indices_obj = csr.getattr("indices")?;
     let indices_arr = np.call_method1("asarray", (&indices_obj,))?;
     let indices_arr = astype_no_copy(py, &indices_arr, "int32")?;
     let indices_ro: numpy::PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
-    indices_ro
-        .as_slice()
-        .map_err(|e| PyRuntimeError::new_err(format!("indices not contiguous: {e}")))?;
+    indices_ro.as_slice().map_err(|e| {
+        PyValueError::new_err(format!(
+            "CSR indices are not C-contiguous ({e}); pass a canonical scipy CSR \
+             (try `X = X.tocsr(); X.sort_indices()`) or re-run \
+             `pyscx.from_anndata(...)` to rewrite it"
+        ))
+    })?;
 
     let data_obj = csr.getattr("data")?;
     let data_arr = np.call_method1("asarray", (&data_obj,))?;

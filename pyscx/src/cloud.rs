@@ -236,7 +236,7 @@ pub fn pack(input: &str, output: &str) -> PyResult<()> {
 ///
 /// Provides metadata accessors (n_obs, n_vars, nnz, shard_count)
 /// and read methods for obs/var metadata.
-#[pyclass]
+#[pyclass(name = "CloudExperiment")]
 pub struct PyCloudExperiment {
     reader: Arc<scx_cloud::CloudReader>,
     // Kept alive so the runtime handle stored inside any
@@ -278,12 +278,14 @@ impl PyCloudExperiment {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "PyCloudExperiment(n_obs={}, n_vars={}, nnz={}, shards={})",
+        // No key lines: listing obs/var/obsm/uns keys would require
+        // network range reads, so the cloud repr stays to the cheap
+        // header line. Use `.query()` / `read_cloud()` to materialise.
+        crate::experiment::format_anndata_repr(
+            "CloudExperiment",
             self.reader.n_obs(),
             self.reader.n_vars(),
-            self.reader.nnz(),
-            self.reader.n_shards(),
+            &[],
         )
     }
 
@@ -335,4 +337,92 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         reader: Arc::new(reader),
         rt: Arc::new(rt),
     })
+}
+
+/// Read an SCX file from cloud/local object storage into an AnnData in
+/// one call — the flat helper mirroring `scanpy.read_h5ad` for cloud
+/// sources. Equivalent to
+/// `open_cloud(url).query().filter_obs(obs_filter).select_genes(...).collect().to_anndata()`
+/// but without the explicit chain.
+///
+/// Args:
+///     url: Source URL or local path (e.g., "gs://bucket/data.scxd/"
+///          or "file:///path/data.scxd").
+///     obs_filter: Optional obs predicate (e.g. "cell_type == 'T cell'")
+///                 pushed down so only matching shards are fetched.
+///     var_names: Optional list of gene names to project to. Resolved
+///                against the file's `var` index; an unknown name raises
+///                KeyError.
+///
+/// Returns an `anndata.AnnData`. Normalization / log1p transforms are
+/// not exposed here — build the explicit `open_cloud(url).query()` chain
+/// when you need them.
+#[pyfunction]
+#[pyo3(signature = (url, *, obs_filter=None, var_names=None))]
+pub fn read_cloud<'py>(
+    py: Python<'py>,
+    url: &str,
+    obs_filter: Option<&str>,
+    var_names: Option<Vec<String>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let rt = build_cloud_runtime()
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
+    let url_s = url.to_string();
+    let reader = py
+        .detach(|| rt.block_on(scx_cloud::open_cloud(&url_s)))
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let reader = Arc::new(reader);
+    let rt = Arc::new(rt);
+
+    // Resolve gene names → indices against the file's var index before
+    // the reader is moved into the section-reader adapter. An explicitly
+    // empty `var_names=[]` is honored as "project to zero genes" (it must
+    // NOT fall through to None / all-genes, which would silently download
+    // the full matrix for a caller-computed empty marker list).
+    let gene_indices: Option<Vec<u32>> = match var_names {
+        // Empty list → project to zero genes without a wasted var read.
+        Some(names) if names.is_empty() => Some(Vec::new()),
+        Some(names) => {
+            let reader_for_var = Arc::clone(&reader);
+            let var_batch = py
+                .detach(|| rt.block_on(reader_for_var.read_var()))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let mut indices = Vec::with_capacity(names.len());
+            for name in &names {
+                match crate::experiment::lookup_gene_in_batch(&var_batch, name) {
+                    Some(idx) => indices.push(idx),
+                    None => {
+                        return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                            "gene name '{name}' not found in var index"
+                        )))
+                    }
+                }
+            }
+            Some(indices)
+        }
+        _ => None,
+    };
+
+    let reader_for_adapter = Arc::clone(&reader);
+    let rt_for_adapter = Arc::clone(&rt);
+    let mut pipeline = py
+        .detach(|| {
+            let adapter = scx_cloud::CloudSectionReader::new(reader_for_adapter, rt_for_adapter);
+            QueryPipeline::from_reader(Box::new(adapter))
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    if let Some(expr) = obs_filter {
+        pipeline = pipeline
+            .filter_obs(expr)
+            .map_err(crate::query::engine_to_pyerr)?;
+    }
+    if let Some(indices) = gene_indices {
+        pipeline = pipeline.select_genes(indices);
+    }
+
+    let result = py
+        .detach(|| pipeline.collect())
+        .map_err(crate::query::engine_to_pyerr)?;
+    crate::query::query_result_to_anndata(py, result)
 }

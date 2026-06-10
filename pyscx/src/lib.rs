@@ -39,11 +39,56 @@ pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
         ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
             PyPermissionError::new_err(msg)
         }
+        // A truncated / too-short file is a corruption signal, not a
+        // transient runtime failure — surface it as ValueError.
+        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            PyValueError::new_err(format!(
+                "{msg} — the file appears truncated or is not a valid SCX file"
+            ))
+        }
+        // File looks corrupt or was written by an incompatible/newer SCX.
+        // ValueError (not RuntimeError) so callers can distinguish a bad
+        // file from a transient runtime failure.
+        ScxError::InvalidMagic
+        | ScxError::InvalidShardMagic
+        | ScxError::UnsupportedVersion
+        | ScxError::UnsupportedEndian
+        | ScxError::UnsupportedSectionVersion { .. }
+        | ScxError::ChecksumMismatch { .. }
+        | ScxError::InvalidCatalog(_) => PyValueError::new_err(format!(
+            "{msg} — the file appears corrupt or was written by an incompatible \
+             SCX version; re-run conversion to regenerate it"
+        )),
+        // The stale-sidecar error message already names the fix
+        // (`scx build-csc` / `--rebuild-csc`); surface it as a ValueError.
+        ScxError::StaleCscSidecar { .. } => PyValueError::new_err(msg),
         _ => PyRuntimeError::new_err(msg),
     }
 }
 
-/// Open an SCX file and return a PyExperiment handle.
+/// Convert a `scx_convert::ConvertError` into the most appropriate
+/// Python exception. A missing input file raises `FileNotFoundError`
+/// (not `RuntimeError`), a permission failure raises `PermissionError`,
+/// an embedded `ScxError` is routed through [`to_pyerr`], and everything
+/// else falls back to `RuntimeError`. Used by the h5ad/h5mu conversion
+/// entry points so the common "I typed the wrong path" case surfaces as
+/// the exception a Python user expects.
+#[cfg(feature = "hdf5")]
+pub(crate) fn convert_to_pyerr(e: scx_convert::ConvertError) -> PyErr {
+    use scx_convert::ConvertError;
+    match e {
+        ConvertError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            PyFileNotFoundError::new_err(io_err.to_string())
+        }
+        ConvertError::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
+            PyPermissionError::new_err(io_err.to_string())
+        }
+        ConvertError::Scx(scx) => to_pyerr(scx),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
+/// Open an SCX file and return an `Experiment` handle.
 ///
 /// Args:
 ///     path: Path to the SCX file.
@@ -367,6 +412,15 @@ fn from_h5ad(
     var_override: Option<Bound<'_, PyAny>>,
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
+    // A missing input is the common wrong-path case. The converter opens
+    // the h5ad via `hdf5::File::open`, which surfaces as `ConvertError::Hdf5`
+    // (not `Io`), so `convert_to_pyerr` cannot tell it apart from a real
+    // HDF5 failure — pre-check here so the user gets `FileNotFoundError`.
+    if !std::path::Path::new(path).exists() {
+        return Err(PyFileNotFoundError::new_err(format!(
+            "no such file: '{path}'"
+        )));
+    }
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
@@ -454,10 +508,10 @@ fn from_h5ad(
         py.detach(|| {
             scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
         })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(convert_to_pyerr)?;
     } else {
         py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(convert_to_pyerr)?;
     }
     anndata::emit_python_warnings(py, &sink)?;
     Ok(())
@@ -467,15 +521,11 @@ fn from_h5ad(
 ///
 /// Reads the 10x file with scanpy.read_10x_h5(), then writes via from_anndata.
 ///
-/// `in_place` has no observable effect (scanpy returns a fresh AnnData with no
-/// other reference) and is retained only for API compatibility with
-/// `from_anndata()`.
-///
 /// `csc`, `csc_cols_per_shard`, and `uns_format` mirror `from_anndata`
 /// — see those docs.
 #[pyfunction]
 #[pyo3(signature = (
-    h5_path, scx_path, codec=None, shard_size=None, in_place=false, csc="off",
+    h5_path, scx_path, codec=None, shard_size=None, csc="off",
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
@@ -487,7 +537,6 @@ fn from_10x(
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
-    in_place: bool,
     csc: &str,
     csc_cols_per_shard: usize,
     uns_format: &str,
@@ -526,7 +575,10 @@ fn from_10x(
         scx_path,
         codec,
         shard_size,
-        in_place,
+        // `in_place` has no observable effect here: scanpy.read_10x_h5
+        // returns a fresh AnnData with no other reference. The kwarg was
+        // removed from the public signature (T3.7); pass false.
+        false,
         csc,
         csc_cols_per_shard,
         uns_format,
@@ -692,7 +744,7 @@ fn to_h5ad(
             (None, false) => scx_convert::scx_to_h5ad(Path::new(path), Path::new(out), &mut sink),
         }
     })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(convert_to_pyerr)
 }
 
 /// Convert an SCX file to h5mu.
@@ -734,7 +786,7 @@ fn to_h5mu(
             scx_convert::scx_to_h5mu(Path::new(path), Path::new(out), &mut sink)
         }
     })
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(convert_to_pyerr)
 }
 
 /// Convert a `mudata.MuData` object to a multimodal SCX v2 file.
@@ -1165,6 +1217,7 @@ fn register_cloud(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cloud::explode, m)?)?;
     m.add_function(wrap_pyfunction!(cloud::pack, m)?)?;
     m.add_function(wrap_pyfunction!(cloud::open_cloud, m)?)?;
+    m.add_function(wrap_pyfunction!(cloud::read_cloud, m)?)?;
     m.add_class::<cloud::PyCloudExperiment>()?;
     Ok(())
 }
