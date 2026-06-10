@@ -137,8 +137,8 @@ pub trait ShardSource {
 ///
 /// Adapts an already-materialized [`ScxCsr`] to the streaming kernels (PCA,
 /// HVG, …) for small or in-memory matrices that don't come from a backed
-/// reader. Shared by the `pyscx` and `rscx` bindings (I-ORG-1 / T4.9), which
-/// each previously carried an identical bespoke single-shard adapter.
+/// reader. Shared by the `pyscx` and `rscx` bindings, which each previously
+/// carried an identical bespoke single-shard adapter.
 pub struct SingleShardSource<'a> {
     /// The borrowed in-memory matrix served as shard `0`.
     pub csr: &'a ScxCsr,

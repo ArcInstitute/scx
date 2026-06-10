@@ -59,7 +59,7 @@ pub use h5ad_read::{
 /// Canonically defined in `scx-format` (the shared dep of every binding) and
 /// re-exported here so existing `scx_convert::CATEGORICAL_ORDERED_KEY`
 /// references — including `pyscx`'s always-compiled `to_anndata` path — keep
-/// working regardless of which scx-convert features are enabled (I-ORG-1).
+/// working regardless of which scx-convert features are enabled.
 pub use scx_format::CATEGORICAL_ORDERED_KEY;
 
 // Re-exported from scx-format so existing `scx_convert::MemoryBudget`

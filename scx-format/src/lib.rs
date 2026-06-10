@@ -29,7 +29,7 @@ pub mod writer;
 /// Arrow `Field::metadata` key marking a dictionary column as an *ordered*
 /// categorical (R `ordered` factor / pandas ordered Categorical). Canonical
 /// home shared by every binding (scx-convert re-exports it; pyscx and rscx
-/// read it from here) so the wire key has a single definition (I-ORG-1 / T4.9).
+/// read it from here) so the wire key has a single definition.
 pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
 
 pub use arrow_compat::{

@@ -14,7 +14,10 @@ use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_R
 use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
-use crate::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
+use crate::shard::{
+    BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
+    SHARD_MAGIC,
+};
 use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 
 /// Encode a single shard's CSR triplet into a `PreEncodedSection`
@@ -145,7 +148,7 @@ pub fn encode_one_shard(
 
     let shard_header = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: 1,
+        shard_format_version: CURRENT_SHARD_FORMAT_VERSION,
         shard_type: 0, // CSR
         codec_id: shard_codec as u8,
         value_encoding: shard_value_encoding as u8,

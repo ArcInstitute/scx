@@ -20,12 +20,6 @@ use scx_sparse::canonicalize_csr;
 
 use crate::to_pyerr;
 
-/// Memory budget for the convert-time streaming CSR→CSC transpose.
-/// Matches scx-cli's convert pipeline. The full CSR matrix already
-/// lives in RAM at this point, so this only bounds the per-chunk
-/// transpose working set.
-const PYSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 /// Default memory budget for the eager [`to_anndata`] full-assembly
 /// path (Phase 4d). Estimated bytes above this threshold trigger a
 /// `UserWarning` that recommends `to_anndata(backed=True)` or
@@ -304,7 +298,7 @@ fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        PYSCX_CSC_MEMORY_BYTES,
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )
 }

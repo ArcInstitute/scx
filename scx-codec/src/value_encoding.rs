@@ -61,8 +61,15 @@ pub fn detect_value_encoding_f64(data: &[f64]) -> ValueEncoding {
         ValueEncoding::Uint8
     } else if max_val <= u16::MAX as f64 {
         ValueEncoding::Uint16
-    } else {
+    } else if max_val <= u32::MAX as f64 {
         ValueEncoding::Uint32
+    } else {
+        // f64 can exactly represent integers past u32::MAX (up to 2^53), so an
+        // integer-valued f64 > u32::MAX must fall back to float — encoding it as
+        // Uint32 would saturate the `f64 as u32` cast and silently corrupt the
+        // value. (The f32 detector can't hit this: f32 loses integer exactness
+        // above 2^24, well below u32::MAX.)
+        ValueEncoding::Float32
     }
 }
 
@@ -121,6 +128,51 @@ mod tests {
     #[test]
     fn detect_float32_for_negative() {
         assert_eq!(detect_value_encoding(&[1.0, -1.0]), ValueEncoding::Float32);
+    }
+
+    #[test]
+    fn detect_f64_buckets_match_f32() {
+        assert_eq!(
+            detect_value_encoding_f64(&[0.0, 1.0, 255.0]),
+            ValueEncoding::Uint8
+        );
+        assert_eq!(
+            detect_value_encoding_f64(&[256.0, 65535.0]),
+            ValueEncoding::Uint16
+        );
+        assert_eq!(
+            detect_value_encoding_f64(&[65536.0, 4_000_000_000.0]),
+            ValueEncoding::Uint32
+        );
+        assert_eq!(
+            detect_value_encoding_f64(&[1.5, 2.0]),
+            ValueEncoding::Float32
+        );
+        assert_eq!(
+            detect_value_encoding_f64(&[1.0, f64::NAN]),
+            ValueEncoding::Float32
+        );
+        assert_eq!(
+            detect_value_encoding_f64(&[1.0, -1.0]),
+            ValueEncoding::Float32
+        );
+    }
+
+    #[test]
+    fn detect_f64_falls_back_to_float_above_u32_max() {
+        // 5e9 > u32::MAX (≈4.29e9) is an exact f64 integer; encoding it as Uint32
+        // would saturate the `as u32` cast and corrupt the value, so it must fall
+        // back to Float32. (f32 can't reach this case — it loses integer
+        // exactness well below u32::MAX.)
+        assert_eq!(
+            detect_value_encoding_f64(&[5_000_000_000.0]),
+            ValueEncoding::Float32
+        );
+        // Exactly u32::MAX still fits Uint32.
+        assert_eq!(
+            detect_value_encoding_f64(&[u32::MAX as f64]),
+            ValueEncoding::Uint32
+        );
     }
 
     #[test]

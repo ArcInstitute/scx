@@ -140,13 +140,13 @@ impl Default for FileHeader {
     /// content/offset/modality field zeroed (`reserved = [0u8; 112]`).
     ///
     /// This is the single source of truth for the boilerplate that every
-    /// `FileHeader` literal used to hand-spell (I-ORG-1 / Task T4.9). Build a
-    /// header by overriding only the fields that vary, e.g.
+    /// `FileHeader` literal used to hand-spell. Build a header by overriding
+    /// only the fields that vary, e.g.
     /// `FileHeader { n_obs, n_vars, nnz, .. Default::default() }`, or use the
-    /// [`FileHeader::new_single_modality`] / [`FileHeader::new_multimodal`]
-    /// constructors for the common shapes. Writer-managed fields
-    /// (`n_csr_shards`, `n_csc_shards`, the catalog offsets/lengths,
-    /// `file_checksum`) stay `0` here and are filled in by `ScxWriter::finish`.
+    /// [`FileHeader::new_single_modality`] constructor for the common
+    /// single-modality shape. Writer-managed fields (`n_csr_shards`,
+    /// `n_csc_shards`, the catalog offsets/lengths, `file_checksum`) stay `0`
+    /// here and are filled in by `ScxWriter::finish`.
     fn default() -> Self {
         FileHeader {
             magic: MAGIC,
@@ -204,42 +204,6 @@ impl FileHeader {
             codec_id,
             index_dtype,
             manifest_sequence: 1,
-            ..Default::default()
-        }
-    }
-
-    /// Construct a multimodal header (`has_modalities` flag set, the three
-    /// modality-routing fields populated). `format_version` is the caller's
-    /// choice (multimodal requires ≥ 2); shard counts and catalog offsets stay
-    /// `0` for `ScxWriter::finish` to fill in.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_multimodal(
-        format_version: u16,
-        flags: u32,
-        n_obs: u64,
-        n_vars: u64,
-        nnz: u64,
-        shard_target_rows: u32,
-        codec_id: u8,
-        index_dtype: u8,
-        manifest_sequence: u64,
-        n_modalities: u32,
-        modality_table_offset: u64,
-        modality_table_length: u64,
-    ) -> Self {
-        FileHeader {
-            format_version,
-            flags,
-            n_obs,
-            n_vars,
-            nnz,
-            shard_target_rows,
-            codec_id,
-            index_dtype,
-            manifest_sequence,
-            n_modalities,
-            modality_table_offset,
-            modality_table_length,
             ..Default::default()
         }
     }

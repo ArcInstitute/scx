@@ -516,6 +516,36 @@ impl WeightedLruCache {
                 .fetch_max(self.bytes_used as u64, Ordering::Relaxed);
         }
     }
+
+    /// Current count cap.
+    fn capacity(&self) -> usize {
+        self.inner.cap().get()
+    }
+
+    /// Reserve the cache for a multi-pass op: raise the count cap to `min_cap`
+    /// (never shrink) and set the byte budget to `byte_budget` — the op's
+    /// authoritative RAM ceiling — evicting LRU entries to fit. Setting (rather
+    /// than only raising) the byte budget is deliberate: the common
+    /// count-only-opened reader starts at `usize::MAX` (unbounded), and an
+    /// out-of-core matrix must stay bounded, so the op's budget governs.
+    fn reserve_for(&mut self, min_cap: usize, byte_budget: usize) {
+        if let Some(cap) = NonZeroUsize::new(min_cap) {
+            if min_cap > self.inner.cap().get() {
+                self.inner.resize(cap);
+            }
+        }
+        self.bytes_budget = byte_budget;
+        while self.bytes_used > self.bytes_budget && !self.inner.is_empty() {
+            if let Some((_, evicted)) = self.inner.pop_lru() {
+                self.bytes_used = self.bytes_used.saturating_sub(evicted.bytes);
+                if let Some(m) = &self.metrics {
+                    m.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,13 +814,41 @@ impl BackedCsrReader {
         }
     }
 
-    /// Configured count cap on the decoded-shard LRU. `0` means no
-    /// cache was installed and the cached read APIs decode on every
-    /// call. Multi-pass kernels (e.g. streaming Wilcoxon) use this to
-    /// detect cache-too-small footguns and warn before paying the
-    /// silent perf cliff.
+    /// Live count cap on the decoded-shard LRU. `0` means no cache was
+    /// installed and the cached read APIs decode on every call. Reflects any
+    /// growth from [`Self::ensure_cache_capacity`] (not just the open-time
+    /// `cache_shards`). Multi-pass kernels (streaming Wilcoxon, out-of-core
+    /// PCA) use this to detect cache-too-small footguns and warn before paying
+    /// the silent perf cliff.
     pub fn cache_capacity(&self) -> usize {
-        self.cache_shards
+        match &self.cache {
+            Some(m) => m.lock().unwrap().capacity(),
+            None => 0,
+        }
+    }
+
+    /// Reserve the decoded-shard LRU for a multi-pass op so it can hold its
+    /// whole shard working set, returning the resulting count cap.
+    ///
+    /// Raises the count cap toward `min_shards` (never shrinks) and sets the
+    /// byte budget to `max_cache_bytes` — the op's RAM ceiling, which bounds
+    /// memory even on a count-only-opened reader (whose budget starts
+    /// unbounded). An out-of-core matrix larger than `max_cache_bytes` still
+    /// evicts, so the returned cap is honored only up to what the bytes allow;
+    /// callers warn when it can't hold all shards. No-op (returns `0`) when no
+    /// cache was installed at open time. Used by out-of-core PCA to turn the
+    /// open-time `cache_shards` default into a working-set-sized cache governed
+    /// by the op's memory budget; the byte budget persists for later reads on
+    /// this reader.
+    pub fn ensure_cache_capacity(&self, min_shards: usize, max_cache_bytes: usize) -> usize {
+        match &self.cache {
+            Some(m) => {
+                let mut cache = m.lock().unwrap();
+                cache.reserve_for(min_shards, max_cache_bytes);
+                cache.capacity()
+            }
+            None => 0,
+        }
     }
 
     /// Peek the singleflight table for `shard_idx`. Returns `false` when no
@@ -1983,7 +2041,10 @@ impl BackedCsrReader {
         let mut col_sum_sq = vec![0.0f64; n_vars];
 
         for shard_idx in 0..n_shards {
-            let csr = self.read_shard_uncached(shard_idx)?;
+            // Serve from the decoded-shard cache so this pass shares the LRU
+            // with the streaming SpMM passes (multi-pass out-of-core PCA reuses
+            // each shard instead of re-decoding it here).
+            let csr = self.read_shard_cached_arc(shard_idx)?;
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 let v = val as f64;
                 col_sums[col as usize] += v;
@@ -2047,9 +2108,11 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
             .unwrap_or(0))
     }
 
-    // col_means_and_sum_sq: use the default trait impl, which now iterates
-    // read_shard_arc() — so this first PCA pass populates (and subsequent
-    // passes reuse) the same LRU shard cache.
+    // col_means_and_sum_sq: not overridden here. Generic callers (`S:
+    // ShardSource`) get the trait default, which iterates read_shard_arc() and
+    // so shares the LRU cache. The inherent `BackedCsrReader::col_means_and_sum_sq`
+    // (used by concrete-typed callers, which Rust resolves to the inherent
+    // method) is likewise cache-backed — both paths warm/reuse the same LRU.
 }
 
 /// Total variance from pre-computed column sum-of-squares.
@@ -3464,6 +3527,41 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "cached read_shard_arc must return the same Arc on a hit"
         );
+    }
+
+    #[test]
+    fn ensure_cache_capacity_grows_count_cap() {
+        use crate::shard_source::ShardSource;
+
+        let dir = TempDir::new().unwrap();
+        // 4 shards, opened with the small default-style count cap of 1.
+        let (backed, _full) = write_test_file_and_open(&dir, 64, 100, 4, 1);
+        assert_eq!(backed.cache_capacity(), 1);
+        assert_eq!(ShardSource::n_shards(&backed), 4);
+
+        // Reserve for all 4 shards within a generous byte budget → cap grows,
+        // and the undersized signal clears.
+        let achieved = backed.ensure_cache_capacity(4, 1 << 30);
+        assert_eq!(achieved, 4);
+        assert_eq!(backed.cache_capacity(), 4);
+        assert_eq!(backed.shard_cache_capacity(), Some(4));
+
+        // All 4 shards now stay resident across reads (no eviction).
+        for i in 0..4 {
+            let _ = backed.read_shard_arc(i).unwrap();
+        }
+        for i in 0..4 {
+            assert!(backed.cache_contains(i), "shard {i} should be cached");
+        }
+    }
+
+    #[test]
+    fn ensure_cache_capacity_noop_without_cache() {
+        let dir = TempDir::new().unwrap();
+        // cache_shards = 0 → no cache installed.
+        let (backed, _full) = write_test_file_and_open(&dir, 64, 100, 4, 0);
+        assert_eq!(backed.cache_capacity(), 0);
+        assert_eq!(backed.ensure_cache_capacity(4, 1 << 30), 0);
     }
 
     #[test]

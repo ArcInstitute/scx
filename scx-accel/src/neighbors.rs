@@ -910,7 +910,7 @@ pub fn cuvs_available() -> bool {
 }
 
 // NOTE: the standalone host-bounce `build_knn_graph_gpu` entry point was
-// removed (review I-CMP-2 / Task T4.5). After the rapids-singlecell transition
+// removed as dead code. After the rapids-singlecell transition
 // no production path called it — the fused PCA→kNN pipeline (`fused.rs`) uses
 // the device-resident `scx_gpu::gpu_knn_cagra_device` to keep the embedding on
 // the GPU across the handoff, and in-VRAM kNN otherwise routes to

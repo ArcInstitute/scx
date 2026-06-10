@@ -175,13 +175,14 @@ pub struct MemoryBudget {
 /// better-mixed minibatches). A value of 4 keeps at least a few shards
 /// mixing per group; raise `max_memory_mb` (or `shard_group_size`) to
 /// recover full-entropy shuffling.
-pub const MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE: usize = 4;
+pub(crate) const MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE: usize = 4;
 
 /// Decide whether auto-tuning degraded shuffle quality and, if so, emit a
-/// one-shot warning. Returns the flag stored on [`MemoryBudget`]. Degraded
-/// means the effective group size both dropped below the quality threshold
-/// **and** was reduced from what the caller requested (so a caller that
-/// deliberately asked for a tiny group isn't warned spuriously).
+/// `log::warn!`. Returns the flag stored on [`MemoryBudget`]. Degraded means
+/// the effective group size both dropped below the quality threshold **and**
+/// was reduced from what the caller requested (so a caller that deliberately
+/// asked for a tiny group isn't warned spuriously). Called once per
+/// `compute_memory_budget`, so the warning fires once per budget computation.
 fn shuffle_quality_degraded(requested: usize, effective: usize) -> bool {
     let degraded = effective < MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE && effective < requested;
     if degraded {

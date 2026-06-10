@@ -7,7 +7,11 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::DataType;
 use extendr_api::prelude::*;
 use scx_codec::ValueEncoding;
+// Field-metadata key marking an Arrow dictionary column as an *ordered*
+// categorical, sourced from the canonical `scx-format` definition (shared with
+// scx-convert and pyscx) so the wire key has a single source of truth.
 use scx_format::ScxReader;
+use scx_format::CATEGORICAL_ORDERED_KEY;
 use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
@@ -468,8 +472,8 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
             vd <- vd[rownames(seu), , drop = FALSE]
         }
         # 'RNA' is intentional here: this write path always builds the assay as
-        # 'RNA' via CreateSeuratObject(counts=) above. The T4.2 de-hardcoding of
-        # the assay name targets the from_seurat *read* path, not this writer.
+        # 'RNA' via CreateSeuratObject(counts=) above. The de-hardcoding of the
+        # assay name targets the from_seurat *read* path, not this writer.
         seu[['RNA']]@meta.data <- vd
         seu
     ")
@@ -609,10 +613,12 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
         }
     }
 
-    // Detect value encoding via the shared scx-codec policy (I-ORG-1 / T4.9 —
-    // the `f64` variant avoids a lossy f64→f32 round-trip on the raw-Census
-    // count path). The byte serialization stays f64-native here so values
-    // beyond f32's 2^24 contiguous-integer range keep full precision.
+    // Detect value encoding via the shared scx-codec policy (the `f64` variant
+    // avoids a lossy f64→f32 round-trip on the raw-Census count path). The byte
+    // serialization stays f64-native here so values beyond f32's 2^24
+    // contiguous-integer range keep full precision. Float variants are matched
+    // explicitly (not `_`) so a future `ValueEncoding` addition fails to compile
+    // here rather than silently truncating to f32.
     let value_encoding = scx_codec::detect_value_encoding_f64(&csr_values_f64);
     let values_bytes: Vec<u8> = match value_encoding {
         ValueEncoding::Uint8 => csr_values_f64.iter().map(|&v| v as u8).collect(),
@@ -630,7 +636,10 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
             }
             buf
         }
-        _ => {
+        // `detect_value_encoding_f64` only yields the integer buckets or
+        // Float32; Float16 is never produced here but is matched so the arm
+        // set stays exhaustive without a wildcard.
+        ValueEncoding::Float32 | ValueEncoding::Float16 => {
             let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
             for &v in &csr_values_f64 {
                 buf.extend_from_slice(&(v as f32).to_le_bytes());
@@ -654,11 +663,6 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 /// This is the reverse of `record_batch_to_dataframe`.
 /// Extracts column names and values, creating Utf8 columns for character vectors
 /// and Float64 columns for numeric vectors.
-/// Field-metadata key marking an Arrow dictionary column as an *ordered*
-/// categorical, sourced from the canonical `scx-format` definition (shared by
-/// scx-convert and pyscx too) so the wire key has a single source of truth.
-use scx_format::CATEGORICAL_ORDERED_KEY;
-
 fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     use arrow::array::{BooleanArray, DictionaryArray, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
@@ -698,7 +702,7 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     for (i, name) in col_names.iter().enumerate() {
         let col_robj = &columns[i];
 
-        // Detect the R class to map to the closest Arrow type (T4.3), so
+        // Detect the R class to map to the closest Arrow type, so
         // meta.data column classes round-trip via the reverse map in
         // `arrow_column_to_robj`: factor → Dictionary(Int32,Utf8) (carrying
         // the `ordered` bit), integer → Int32, logical → Boolean, double →
@@ -961,16 +965,12 @@ fn write_csr_to_scx(
     Ok(())
 }
 
-/// Memory budget for the convert-time streaming CSR→CSC transpose
-/// (4 GiB, matches scx-convert and pyscx).
-const RSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 /// Streaming CSR → CSC transpose over the in-memory `(csr_indptr,
 /// csr_indices, values_bytes)` arrays, writing each chunk as one CSC
 /// shard. Decodes the pre-encoded value bytes to f32, then delegates to
 /// the shared `scx_format::csc_sidecar::write_csc_sidecar` so this and the
 /// `scx-convert` / `pyscx` import paths produce structurally identical CSC
-/// sidecars (I-ORG-1 / T4.9 — single transpose-and-write loop).
+/// sidecars (a single transpose-and-write loop).
 #[allow(clippy::too_many_arguments)]
 fn write_csc_shards_from_csr_r(
     writer: &mut scx_format::writer::ScxWriter,
@@ -1000,7 +1000,7 @@ fn write_csc_shards_from_csr_r(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        RSCX_CSC_MEMORY_BYTES,
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
@@ -1357,9 +1357,12 @@ fn from_seurat_multi_assay(
     let n_obs = shared_n_obs.unwrap_or(0);
     let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
 
-    // Build the multimodal v2 header. n_csr_shards / n_csc_shards /
-    // modality_table_offset are filled in by ScxWriter::finish based
-    // on the registered modalities + write_csr_shard_for calls.
+    // Build the header for a multimodal write. `new_single_modality` is
+    // intentional despite the multimodal output: the modality count, table
+    // offset, and `has_modalities` flag — along with n_csr_shards /
+    // n_csc_shards — are all stamped by `ScxWriter::finish` from the registered
+    // modalities + `write_csr_shard_for` calls, so the constructor only needs
+    // to seed the matrix dims here.
     let header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,

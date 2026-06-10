@@ -147,6 +147,11 @@ pub fn run_build_csc(
     // 13. Write CSC shards via the streaming transpose iterator. Each
     //     iterator chunk becomes one CSC shard; col_start is read from
     //     the iterator *before* advancing to the next chunk.
+    //
+    //     NOTE: this is the inline twin of `scx_format::csc_sidecar::write_csc_sidecar`
+    //     (the shared helper the convert/pyscx/rscx paths use). It stays inline
+    //     here because it drives a progress bar per chunk; keep the encode +
+    //     write_csc_shard logic in sync with that helper.
     pb.set_message("Transposing CSR → CSC (streaming)...");
     let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
         &csr_shards,

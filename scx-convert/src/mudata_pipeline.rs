@@ -792,11 +792,6 @@ fn sample_modality_values(
     }
 }
 
-/// Memory budget for the streaming CSR→CSC transpose during h5mu
-/// conversion. Mirrors the `CONVERT_CSC_MEMORY_BYTES` constant in the
-/// h5ad path (4 GiB).
-const CONVERT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 #[allow(clippy::too_many_arguments)]
 fn write_modality_csr_shards(
     writer: &mut ScxWriter,
@@ -894,7 +889,7 @@ fn write_modality_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        CONVERT_CSC_MEMORY_BYTES,
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         Some(modality_id),
     )?;
     Ok(())

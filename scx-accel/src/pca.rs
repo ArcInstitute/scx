@@ -342,9 +342,9 @@ fn warn_if_cache_undersized<S: ShardSource>(source: &S, op: &str) {
             log::warn!(
                 "{op}: shard cache capacity={cap} < n_shards={n_shards} — out-of-core \
                  PCA makes multiple passes over every shard, so the cached read path \
-                 will evict and re-decode each shard on each pass. Size the \
-                 BackedCsrReader cache to >= n_shards (raise the PCA memory budget) \
-                 for the documented speedup."
+                 will evict and re-decode each shard on each pass. Raise the PCA \
+                 `memory_budget` so the cache can hold all {n_shards} shards (or open \
+                 with `cache_shards >= {n_shards}`) to realize the speedup."
             );
         }
     }

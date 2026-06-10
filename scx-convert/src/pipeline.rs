@@ -1896,14 +1896,6 @@ pub(crate) mod test_hooks {
     }
 }
 
-/// Memory budget for the streaming CSR→CSC transpose at convert time.
-///
-/// 4 GiB matches the `scx build-csc` default. The convert pipeline
-/// already holds the full CSR matrix in RAM, so this only bounds
-/// the per-chunk transpose working set. Large enough for typical
-/// inputs; the user-facing knob is `csc_cols_per_shard`.
-const CONVERT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 /// Streaming CSR → CSC transpose over the in-memory matrix, with
 /// the result written shard-by-shard via `writer.write_csc_shard`.
 ///
@@ -1968,7 +1960,7 @@ fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        CONVERT_CSC_MEMORY_BYTES,
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )?;
     Ok(())

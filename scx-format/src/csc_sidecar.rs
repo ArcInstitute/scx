@@ -1,4 +1,4 @@
-// Shared CSR→CSC sidecar writer (I-ORG-1 / Task T4.9).
+// Shared CSR→CSC sidecar writer.
 //
 // The streaming CSR→CSC transpose-and-write loop used to be reimplemented at
 // four call sites across three crates (`pyscx`, `scx-convert` ×2, `rscx`),
@@ -64,6 +64,17 @@ pub fn write_csc_sidecar(
             None => break,
         };
 
+        // The transpose yields non-negative offsets/row-indices for valid CSR;
+        // assert it in debug builds before the unchecked widening casts (a
+        // negative would silently wrap). Release builds trust the contract.
+        debug_assert!(
+            chunk.indptr.iter().all(|&v| v >= 0),
+            "CSC chunk indptr must be non-negative before u64 cast"
+        );
+        debug_assert!(
+            chunk.indices.iter().all(|&i| i >= 0),
+            "CSC chunk indices must be non-negative before u32 cast"
+        );
         let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
         let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
         let raw_values = values_to_raw_bytes(&chunk.data, value_encoding)?;
@@ -89,4 +100,67 @@ pub fn write_csc_sidecar(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::FileHeader;
+    use crate::reader::ScxReader;
+    use crate::writer::ScxWriter;
+
+    /// Round-trip a small 3×3 canonical CSR through `write_csc_sidecar` and
+    /// read the CSC sidecar back, checking the column-major transpose.
+    #[test]
+    fn write_csc_sidecar_round_trips_single_modality() {
+        // CSR (3 rows × 3 cols):
+        //   row0: (c0=1, c2=3)
+        //   row1: (c1=2)
+        //   row2: (c2=4)
+        let csr = ScxCsr::new(
+            (3, 3),
+            vec![0, 2, 3, 4],
+            vec![0, 2, 1, 2],
+            vec![1.0, 3.0, 2.0, 4.0],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("csc.scx");
+        let header = FileHeader::new_single_modality(3, 3, 4, 16384, CodecId::None as u8, 0);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        let raw = values_to_raw_bytes(&csr.data, ValueEncoding::Uint8).unwrap();
+        writer
+            .write_csr_shard(
+                &csr.indptr.iter().map(|&v| v as u64).collect::<Vec<_>>(),
+                &csr.indices.iter().map(|&v| v as u32).collect::<Vec<_>>(),
+                &raw,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        write_csc_sidecar(
+            &mut writer,
+            std::slice::from_ref(&csr),
+            3,
+            3,
+            ValueEncoding::Uint8,
+            CodecId::None,
+            8, // cols_per_shard ≥ n_cols → one CSC shard
+            DEFAULT_CSC_MEMORY_BYTES,
+            None,
+        )
+        .unwrap();
+        let final_path = writer.finish().unwrap();
+
+        let reader = ScxReader::open(&final_path).unwrap();
+        assert!(reader.header().n_csc_shards >= 1);
+        let csc = reader.read_all_csc_shards_for(0).unwrap();
+        // Reconstruct dense from the CSC and compare to the CSR's dense form
+        // (both row-major n_obs × n_vars).
+        let dense_from_csc = csc.to_dense().unwrap();
+        let dense_from_csr = csr.to_dense().unwrap();
+        assert_eq!(dense_from_csc, dense_from_csr);
+    }
 }

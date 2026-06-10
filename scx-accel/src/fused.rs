@@ -270,9 +270,11 @@ mod tests {
             let hi = lo + n_neighbors;
             let mut a = knn.indices[lo..hi].to_vec();
             // knn_ref (GpuKnnResult) carries i64 indices; KnnResult is usize.
+            // try_into surfaces a negative (sentinel/corrupt) index instead of
+            // silently wrapping it to a huge usize.
             let mut b: Vec<usize> = knn_ref.indices[lo..hi]
                 .iter()
-                .map(|&x| x as usize)
+                .map(|&x| usize::try_from(x).expect("negative kNN index"))
                 .collect();
             a.sort_unstable();
             b.sort_unstable();

@@ -6,18 +6,21 @@ use std::collections::HashMap;
 /// first-seen level names — matching `pandas.factorize(sort=False)`.
 ///
 /// Single source of truth for the accelerator (`accel.rs`) and Harmony
-/// (`harmony.rs`) bindings (I-ORG-1 / T4.9). Callers that only need the level
+/// (`harmony.rs`) bindings. Callers that only need the level
 /// *count* take `levels.len()`.
 pub(crate) fn factorize_chars(labels: &[String]) -> (Vec<u32>, Vec<String>) {
-    let mut map: HashMap<String, u32> = HashMap::new();
+    // Key the map with `&str` borrowed from the input (which outlives the map),
+    // so only `levels` clones each unique label — one allocation per level
+    // instead of two.
+    let mut map: HashMap<&str, u32> = HashMap::new();
     let mut levels: Vec<String> = Vec::new();
     let mut codes: Vec<u32> = Vec::with_capacity(labels.len());
     for s in labels {
-        let code = match map.get(s) {
+        let code = match map.get(s.as_str()) {
             Some(&c) => c,
             None => {
                 let c = levels.len() as u32;
-                map.insert(s.clone(), c);
+                map.insert(s.as_str(), c);
                 levels.push(s.clone());
                 c
             }

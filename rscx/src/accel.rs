@@ -94,7 +94,7 @@ fn dgc_genes_by_cells_to_csr(dgc: &Robj) -> Result<ScxCsr> {
 }
 
 // The single-shard in-memory `ShardSource` adapter now lives in scx-format as
-// `SingleShardSource` (I-ORG-1 / T4.9), shared with pyscx.
+// `SingleShardSource`, shared with pyscx.
 use scx_format::shard_source::SingleShardSource;
 
 /// Repack a column-major `RMatrix<f64>` (R layout) into row-major `f32`
