@@ -27,9 +27,9 @@ fn vlu(s: &str) -> VarLenUnicode {
 
 use scx_format::reader::ScxReader;
 
-use super::h5ad_read::CATEGORICAL_ORDERED_KEY;
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
+use crate::CATEGORICAL_ORDERED_KEY;
 
 /// Resolve a categorical column's pandas `ordered` bit from the Arrow
 /// `Field::metadata` the h5ad reader stamps ([`CATEGORICAL_ORDERED_KEY`]).

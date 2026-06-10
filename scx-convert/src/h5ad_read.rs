@@ -14,12 +14,7 @@ use super::csc_transpose::csc_to_csr;
 use super::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat};
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
-
-/// Arrow `Field::metadata` key carrying a categorical column's pandas
-/// `ordered` bit. Arrow's `DictionaryArray` has no `ordered` flag, so the
-/// h5ad reader stamps it here and the h5ad writer emits it back; obs/var
-/// are Arrow IPC, which preserves field metadata across the SCX round-trip.
-pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+use crate::CATEGORICAL_ORDERED_KEY;
 
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
 type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);
