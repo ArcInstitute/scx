@@ -284,8 +284,9 @@ enum Commands {
         force: bool,
         /// Per-shard codec: `auto` (Scx1 for low-median integer counts, else
         /// Zstd) or `scx1` (force Scx1 on every integer shard so all shards
-        /// carry a decode sidecar). Default: auto.
-        #[arg(long, default_value = "auto")]
+        /// carry a decode sidecar). Other codecs are rejected — they drop the
+        /// decode sidecar, defeating the point of `optimize`. Default: auto.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1"])]
         codec: String,
     },
     /// Rewrite file reclaiming space from deletions

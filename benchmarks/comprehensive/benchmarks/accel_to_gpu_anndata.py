@@ -287,17 +287,69 @@ def run(
             },
         )
 
-        # Warm-up (PTX module load, allocator warm). A failure here is almost
-        # always an out-of-VRAM allocation on the largest tiers — record a
-        # typed stub rather than aborting the whole accel cohort.
+        # Warm-up (PTX module load, allocator warm) + timed runs under one
+        # guard. A failure anywhere here is almost always an out-of-VRAM
+        # allocation on the largest tiers — record a typed stub rather than
+        # aborting the whole accel cohort. Both loops share the guard so an OOM
+        # that only trips on a later (timed) iteration, or a benchmark config
+        # with N_WARMUP_RUNS == 0, is still caught.
         try:
             for _ in range(N_WARMUP_RUNS):
                 warm = pyscx.open(str(scx_path)).to_gpu_anndata(device="gpu")
                 del warm
                 gc.collect()
+
+            for i in range(n_runs):
+                gc.collect()
+                rss_before = _get_rss_mb()
+                t0 = time.perf_counter()
+                adata_gpu = pyscx.open(str(scx_path)).to_gpu_anndata(device="gpu")
+                wall = time.perf_counter() - t0
+                rss_after = _get_rss_mb()
+
+                info = adata_gpu.uns["scx_accel"]["to_gpu_anndata"]
+                transfer_mode = info.get("transfer_mode")
+                bytes_uploaded = int(info.get("bytes_uploaded") or 0)
+
+                # Byte-exact parity vs the host decode.
+                gpu_x = adata_gpu.X.get()  # cupyx CSR -> scipy CSR
+                gpu_x.sort_indices()
+                correct = (
+                    tuple(gpu_x.shape) == tuple(host_x.shape)
+                    and np.array_equal(gpu_x.indptr, host_x.indptr)
+                    and np.array_equal(gpu_x.indices, host_x.indices)
+                    and np.array_equal(gpu_x.data, host_x.data)
+                )
+
+                extras: dict[str, Any] = {
+                    "transfer_mode": transfer_mode,
+                    "bytes_uploaded": bytes_uploaded,
+                    "to_gpu_anndata_route_device_decode": (
+                        1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
+                    ),
+                    "to_gpu_anndata_decode_correct": 1.0 if correct else 0.0,
+                }
+                logger.info(
+                    "%s run %d/%d: transfer_mode=%s bytes_uploaded=%d correct=%s",
+                    variant_key,
+                    i + 1,
+                    n_runs,
+                    transfer_mode,
+                    bytes_uploaded,
+                    correct,
+                )
+                result.add_run(
+                    wall_s=wall,
+                    user_s=0.0,
+                    sys_s=0.0,
+                    peak_rss_mb=max(rss_before, rss_after),
+                    **extras,
+                )
+                del adata_gpu, gpu_x
+                gc.collect()
         except Exception as exc:  # noqa: BLE001 — cupy/cuda errors are opaque
             logger.warning(
-                "to_gpu_anndata warm-up failed for %s (likely >VRAM): %s",
+                "to_gpu_anndata decode failed for %s (likely >VRAM): %s",
                 dataset.name,
                 exc,
             )
@@ -309,54 +361,5 @@ def run(
                 notes=f"to_gpu_anndata raised on {dataset.name}: {exc}",
             )
             return None
-
-        for i in range(n_runs):
-            gc.collect()
-            rss_before = _get_rss_mb()
-            t0 = time.perf_counter()
-            adata_gpu = pyscx.open(str(scx_path)).to_gpu_anndata(device="gpu")
-            wall = time.perf_counter() - t0
-            rss_after = _get_rss_mb()
-
-            info = adata_gpu.uns["scx_accel"]["to_gpu_anndata"]
-            transfer_mode = info.get("transfer_mode")
-            bytes_uploaded = int(info.get("bytes_uploaded") or 0)
-
-            # Byte-exact parity vs the host decode.
-            gpu_x = adata_gpu.X.get()  # cupyx CSR -> scipy CSR
-            gpu_x.sort_indices()
-            correct = (
-                tuple(gpu_x.shape) == tuple(host_x.shape)
-                and np.array_equal(gpu_x.indptr, host_x.indptr)
-                and np.array_equal(gpu_x.indices, host_x.indices)
-                and np.array_equal(gpu_x.data, host_x.data)
-            )
-
-            extras: dict[str, Any] = {
-                "transfer_mode": transfer_mode,
-                "bytes_uploaded": bytes_uploaded,
-                "to_gpu_anndata_route_device_decode": (
-                    1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
-                ),
-                "to_gpu_anndata_decode_correct": 1.0 if correct else 0.0,
-            }
-            logger.info(
-                "%s run %d/%d: transfer_mode=%s bytes_uploaded=%d correct=%s",
-                variant_key,
-                i + 1,
-                n_runs,
-                transfer_mode,
-                bytes_uploaded,
-                correct,
-            )
-            result.add_run(
-                wall_s=wall,
-                user_s=0.0,
-                sys_s=0.0,
-                peak_rss_mb=max(rss_before, rss_after),
-                **extras,
-            )
-            del adata_gpu, gpu_x
-            gc.collect()
 
         return result
