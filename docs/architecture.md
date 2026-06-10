@@ -908,6 +908,13 @@ Cell Ranger MTX conversion uses the `scx-mtx` crate (always-on, no HDF5 dependen
   └── features.tsv.gz      ◀───────────────────────┘
 ```
 
+On read, `scx-mtx::read` detects matrix orientation by matching the size-line
+dimensions against the `barcodes.tsv` / `features.tsv` lengths. Cell Ranger's
+native **features × barcodes** layout is transposed (via `scx_sparse::csr_to_csc`
+reinterpretation) to the cells × genes CSR SCX stores; an already-cells×genes
+matrix is kept; a square matrix defaults to Cell Ranger's layout with a warning;
+and a dimension mismatch is a hard `MtxError::OrientationMismatch`.
+
 ### Query: filter → collect
 
 ```
