@@ -44,6 +44,28 @@ pub fn detect_value_encoding(data: &[f32]) -> ValueEncoding {
     }
 }
 
+/// `f64` variant of [`detect_value_encoding`] for callers whose values
+/// originate as `f64` (e.g. the R bindings' dgCMatrix `x` slot). Applies the
+/// identical integer-detection policy and max-value buckets without a lossy
+/// `f64 → f32` round-trip, so a value beyond `2^24` keeps full precision when
+/// choosing between `Uint16`/`Uint32`.
+pub fn detect_value_encoding_f64(data: &[f64]) -> ValueEncoding {
+    let all_integer = data
+        .iter()
+        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
+    if !all_integer {
+        return ValueEncoding::Float32;
+    }
+    let max_val: f64 = data.iter().copied().fold(0.0f64, f64::max);
+    if max_val <= u8::MAX as f64 {
+        ValueEncoding::Uint8
+    } else if max_val <= u16::MAX as f64 {
+        ValueEncoding::Uint16
+    } else {
+        ValueEncoding::Uint32
+    }
+}
+
 /// Serialize f32 values to LE raw bytes according to `encoding`.
 ///
 /// Thin wrapper over [`ValueEncoding::encode_f32_batch`] — kept as the

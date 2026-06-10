@@ -16,7 +16,7 @@ use std::path::Path;
 
 use scx_codec::CodecId;
 use scx_format::encoder::encode_one_shard;
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::modality::ModalityType;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
@@ -63,38 +63,18 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     }
     let out_flags = in_header.flags & !(1 << 0) & !(1 << 5);
 
+    // We canonicalize every shard below, so the default v3 invariant is real.
     let out_header = FileHeader {
-        magic: MAGIC,
-        // We canonicalize every shard below, so the v3 invariant is real.
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
         flags: out_flags,
         n_obs: in_header.n_obs,
         n_vars: in_header.n_vars,
-        nnz: 0, // set by finish
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
         // File-level codec hint for `scx info`. When the caller forces a codec,
         // reflect it; otherwise preserve the source hint (the real per-shard
         // codec is auto-selected by `encode_one_shard`).
         codec_id: codec.map(|c| c as u8).unwrap_or(in_header.codec_id),
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 0,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     let mut writer = ScxWriter::new(output_path, out_header)?

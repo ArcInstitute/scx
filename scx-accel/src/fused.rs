@@ -24,12 +24,11 @@ use crate::pca::PcaResult;
 /// [`scx_gpu::DeviceEmbedding`] is handed directly to
 /// [`scx_gpu::gpu_knn_cagra_device`] as the CAGRA dataset. The kNN neighbor
 /// indices/distances are downloaded once and the fuzzy connectivities are built
-/// on the CPU (matching [`crate::build_knn_graph_gpu`]); the embedding is
-/// downloaded once for the returned [`PcaResult`].
+/// on the CPU; the embedding is downloaded once for the returned [`PcaResult`].
 ///
-/// Returns `(PcaResult, KnnResult)` — byte-for-byte equivalent to running
-/// [`crate::randomized_pca_gpu`] followed by [`crate::build_knn_graph_gpu`] on
-/// its embedding, minus the intermediate host round-trip of the embedding.
+/// Returns `(PcaResult, KnnResult)` — equivalent to running
+/// [`crate::randomized_pca_gpu`] followed by a CAGRA kNN build on its
+/// embedding, minus the intermediate host round-trip of the embedding.
 ///
 /// ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance PCA path, so this
 /// fused pipeline now always uses device-resident randomized PCA.
@@ -79,7 +78,7 @@ pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
         .to_host(&dev)
         .map_err(|e| AccelError::InvalidInput(format!("GPU kNN download: {e}")))?;
 
-    // Build the KnnResult (fuzzy graph on the host — same as build_knn_graph_gpu).
+    // Build the KnnResult (fuzzy graph on the host).
     let indices: Vec<usize> = gpu_knn.indices.iter().map(|&idx| idx as usize).collect();
     let distances: Vec<f64> = gpu_knn.distances.iter().map(|&d| d as f64).collect();
     let (dist_indptr, dist_indices, dist_data) =
@@ -188,7 +187,7 @@ mod tests {
     }
 
     /// The fused `pca_then_knn_gpu` must produce the same `PcaResult` and
-    /// `KnnResult` as running `randomized_pca_gpu` then `build_knn_graph_gpu` on
+    /// `KnnResult` as running `randomized_pca_gpu` then a CAGRA kNN build on
     /// its embedding — the fused path only removes the host round-trip of the
     /// embedding between the two stages.
     #[test]
@@ -252,8 +251,17 @@ mod tests {
         //     break ties between equidistant neighbors in a different order, so
         //     compare per-row neighbor *sets*, not element order.
         let fused_emb_f32: Vec<f32> = pca.embeddings.iter().map(|&v| v as f32).collect();
-        let knn_ref =
-            crate::build_knn_graph_gpu(0, &fused_emb_f32, n_rows, k, n_neighbors).unwrap();
+        // Reference build via the device-resident CAGRA path (upload →
+        // DeviceEmbedding → gpu_knn_cagra_device → to_host) — the same entry
+        // point the fused pipeline uses, now that the host-bounce
+        // build_knn_graph_gpu wrapper is gone.
+        let dev = scx_gpu::GpuDevice::new(0).unwrap();
+        let d_emb = dev.htod_copy(&fused_emb_f32).unwrap();
+        let ref_embedding = scx_gpu::DeviceEmbedding::new(d_emb, n_rows, k).unwrap();
+        let knn_ref = scx_gpu::gpu_knn_cagra_device(&dev, &ref_embedding, n_neighbors)
+            .unwrap()
+            .to_host(&dev)
+            .unwrap();
         assert_eq!(knn.n_obs, n_rows);
         assert_eq!(knn.n_neighbors, n_neighbors);
         assert_eq!(knn.indices.len(), knn_ref.indices.len());
@@ -261,7 +269,11 @@ mod tests {
             let lo = i * n_neighbors;
             let hi = lo + n_neighbors;
             let mut a = knn.indices[lo..hi].to_vec();
-            let mut b = knn_ref.indices[lo..hi].to_vec();
+            // knn_ref (GpuKnnResult) carries i64 indices; KnnResult is usize.
+            let mut b: Vec<usize> = knn_ref.indices[lo..hi]
+                .iter()
+                .map(|&x| x as usize)
+                .collect();
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b, "row {i}: fused vs ref neighbor sets differ");

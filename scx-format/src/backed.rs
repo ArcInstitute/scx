@@ -2023,6 +2023,20 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
         self.read_shard_uncached(shard_idx)
     }
 
+    /// Cached override: serve from the decoded-shard LRU so multi-pass
+    /// kernels (out-of-core PCA) decode each shard once instead of
+    /// re-decoding from disk on every pass. Mirrors the DE streaming path,
+    /// which already goes through this cache.
+    fn read_shard_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
+        self.read_shard_cached_arc(shard_idx)
+    }
+
+    /// Expose the LRU's configured count cap so multi-pass callers can warn
+    /// when it is smaller than the shard count (evict-and-re-decode cliff).
+    fn shard_cache_capacity(&self) -> Option<usize> {
+        Some(self.cache_capacity())
+    }
+
     /// O(1) override: shard row counts live in `BackedCsrIndex`, no decode needed.
     fn max_shard_rows(&self) -> Result<usize> {
         let idx = &self.index;
@@ -2033,8 +2047,9 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
             .unwrap_or(0))
     }
 
-    // col_means_and_sum_sq: use the default trait impl which iterates
-    // read_shard() — functionally identical to the inherent method above.
+    // col_means_and_sum_sq: use the default trait impl, which now iterates
+    // read_shard_arc() — so this first PCA pass populates (and subsequent
+    // passes reuse) the same LRU shard cache.
 }
 
 /// Total variance from pre-computed column sum-of-squares.
@@ -3427,6 +3442,55 @@ mod tests {
         assert_eq!(full.indptr, eip);
         assert_eq!(full.indices, eix);
         assert_eq!(full.data, ev);
+    }
+
+    #[test]
+    fn shard_source_read_shard_arc_serves_cache_hits() {
+        use crate::shard_source::ShardSource;
+
+        let dir = TempDir::new().unwrap();
+        // 4 shards, cache big enough to hold all of them.
+        let (backed, _full) = write_test_file_and_open(&dir, 64, 100, 4, 4);
+
+        assert_eq!(backed.shard_cache_capacity(), Some(4));
+        assert_eq!(ShardSource::n_shards(&backed), 4);
+
+        // First read warms the cache; the second returns the *same* Arc (no
+        // re-decode) — the mechanism multi-pass PCA relies on.
+        let first = backed.read_shard_arc(1).unwrap();
+        assert!(backed.cache_contains(1));
+        let second = backed.read_shard_arc(1).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cached read_shard_arc must return the same Arc on a hit"
+        );
+    }
+
+    #[test]
+    fn shard_source_cache_capacity_none_for_uncached() {
+        // A non-caching ShardSource reports no cache capacity, so multi-pass
+        // kernels skip the undersized-cache warning.
+        use crate::shard_source::ShardSource;
+
+        struct Uncached;
+        impl ShardSource for Uncached {
+            fn n_shards(&self) -> usize {
+                1
+            }
+            fn n_obs(&self) -> usize {
+                1
+            }
+            fn n_vars(&self) -> usize {
+                1
+            }
+            fn read_shard(&self, _idx: usize) -> Result<ScxCsr> {
+                Ok(
+                    ScxCsr::new((1, 1), vec![0i64, 0], Vec::<i32>::new(), Vec::<f32>::new())
+                        .unwrap(),
+                )
+            }
+        }
+        assert_eq!(Uncached.shard_cache_capacity(), None);
     }
 
     #[test]

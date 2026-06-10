@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::error::ScxError;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::writer::ScxWriter;
 use scx_format::{select_codec_for_modality, ModalityType};
@@ -38,35 +38,14 @@ pub fn mtx_to_scx(
     let (value_encoding, codec_id) = detect_value_encoding(&mtx_data.data, explicit_codec)?;
     let index_dtype: u8 = if mtx_data.n_vars <= 65535 { 0 } else { 1 };
 
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: mtx_data.n_obs as u64,
-        n_vars: mtx_data.n_vars as u64,
+    let header = FileHeader::new_single_modality(
+        mtx_data.n_obs as u64,
+        mtx_data.n_vars as u64,
         nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows,
-        codec_id: codec_id as u8,
+        codec_id as u8,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
 

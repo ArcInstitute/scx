@@ -190,40 +190,18 @@ pub fn h5mu_to_scx(
     // a header-level setting). Pick the widest needed.
     let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
 
-    // Build header. n_modalities is set by writer.finish() once
-    // add_modality has been called for each modality; we leave the
-    // template at 0/0/0 here.
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: max_n_vars,
-        nnz: total_nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: opts.shard_target_rows,
-        // codec_id and value_encoding are per-modality at write time;
-        // the header values are nominal defaults.
-        codec_id: 0,
+    // Build header. n_modalities + modality-table fields are set by
+    // writer.finish() once add_modality has been called for each modality;
+    // codec_id/value_encoding are per-modality at write time, so the header
+    // value is a nominal default.
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        max_n_vars,
+        total_nnz,
+        opts.shard_target_rows,
+        0,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -523,35 +501,14 @@ pub fn h5mu_to_scx_streaming(
     // Placeholder header. `nnz`, `n_csr_shards`, `n_modalities`, the
     // modality table offset, and codec_id are all overwritten by
     // `ScxWriter::finish()` from running accumulators.
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: max_n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: opts.shard_target_rows,
-        codec_id: 0,
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        max_n_vars,
+        0,
+        opts.shard_target_rows,
+        0,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -920,47 +877,26 @@ fn write_modality_csc_shards_from_csr(
     codec_id: CodecId,
     csc_cols_per_shard: usize,
 ) -> Result<(), ConvertError> {
+    // Multimodal data arrives already canonical from upstream, so wrap it
+    // as-is (new_unchecked) and route through the shared transpose-and-write
+    // loop with this modality's id.
     let csr = scx_sparse::ScxCsr::new_unchecked(
         (n_obs, n_vars),
         indptr.to_vec(),
         indices.to_vec(),
         data.to_vec(),
     );
-    let shards = std::slice::from_ref(&csr);
-
-    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
-        shards,
+    scx_format::csc_sidecar::write_csc_sidecar(
+        writer,
+        std::slice::from_ref(&csr),
         n_obs,
         n_vars,
-        CONVERT_CSC_MEMORY_BYTES,
+        value_encoding,
+        codec_id,
         csc_cols_per_shard,
-    )
-    .map_err(|e| ConvertError::Other(format!("CSC transpose failed: {e}")))?;
-
-    loop {
-        let col_start = iter.current_col_start() as u64;
-        let chunk = match iter.next() {
-            Some(c) => c.map_err(|e| ConvertError::Other(format!("CSC chunk failed: {e}")))?,
-            None => break,
-        };
-
-        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values =
-            values_to_raw_bytes(&chunk.data, value_encoding).map_err(ScxError::from)?;
-
-        writer
-            .write_csc_shard_for(
-                modality_id,
-                &csc_indptr_u64,
-                &csc_indices_u32,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                col_start,
-            )
-            .map_err(ConvertError::from)?;
-    }
+        CONVERT_CSC_MEMORY_BYTES,
+        Some(modality_id),
+    )?;
     Ok(())
 }
 

@@ -20,7 +20,7 @@ use pyo3::exceptions::{PyImportError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_codec::CodecId;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
@@ -524,35 +524,14 @@ pub fn from_mudata_impl(
     let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
     let shard_target_rows = shard_size.unwrap_or(16384);
 
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: max_n_vars,
-        nnz: total_nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        max_n_vars,
+        total_nnz,
         shard_target_rows,
-        codec_id: 0,
+        0,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     // Open writer + emit sections.
     let mut writer = ScxWriter::new(Path::new(path), header).map_err(to_pyerr)?;

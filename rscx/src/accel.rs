@@ -11,43 +11,15 @@
 //! Normalize → HVG → PCA → Neighbors → UMAP → Leiden → FindMarkers is
 //! reachable from R and numerically consistent with the Python accelerators.
 
-use std::collections::HashMap;
-
 use extendr_api::prelude::*;
 
 use scx_accel::{
     build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, randomized_pca_inmemory,
     streaming_clip_square_sum, streaming_mean_var, wilcoxon_rank_sum, COVARIANCE_PCA_THRESHOLD,
 };
-use scx_format::shard_source::ShardSource;
 use scx_sparse::ScxCsr;
 
-// ─── Shared helpers ───────────────────────────────────────────────────
-
-/// Factorise a character vector into contiguous `u32` level codes plus the
-/// first-seen level names (matching `pandas.factorize(sort=False)`, like the
-/// harmony binding).
-///
-// TODO(T4.9): shares first-seen-order factorize logic with `harmony.rs`;
-// consolidate into one helper during the I-ORG-1 dedup sweep.
-fn factorize_chars(labels: &[String]) -> (Vec<u32>, Vec<String>) {
-    let mut map: HashMap<String, u32> = HashMap::new();
-    let mut levels: Vec<String> = Vec::new();
-    let mut codes: Vec<u32> = Vec::with_capacity(labels.len());
-    for s in labels {
-        let code = match map.get(s) {
-            Some(&c) => c,
-            None => {
-                let c = levels.len() as u32;
-                map.insert(s.clone(), c);
-                levels.push(s.clone());
-                c
-            }
-        };
-        codes.push(code);
-    }
-    (codes, levels)
-}
+use crate::util::factorize_chars;
 
 /// Transpose a **genes × cells** `dgCMatrix` (Seurat's native orientation,
 /// CSC over cells) into a **cells × genes** [`ScxCsr`] (the orientation the
@@ -121,41 +93,9 @@ fn dgc_genes_by_cells_to_csr(dgc: &Robj) -> Result<ScxCsr> {
         .map_err(|e| Error::Other(format!("CSR construction failed: {e}")))
 }
 
-/// Single-shard in-memory [`ShardSource`] over a borrowed [`ScxCsr`].
-///
-/// Presents the whole matrix as one shard so the streaming HVG kernels
-/// ([`streaming_mean_var`], [`streaming_clip_square_sum`]) run unmodified.
-/// Mirrors `pyscx::accel::pca::ScxCsrSource`.
-///
-// TODO(T4.9): hoist this single-shard in-memory `ShardSource` into
-// `scx-format`/`scx-accel` so rscx and pyscx share one definition (I-ORG-1).
-struct InMemoryShardSource<'a> {
-    csr: &'a ScxCsr,
-}
-
-impl ShardSource for InMemoryShardSource<'_> {
-    fn n_shards(&self) -> usize {
-        1
-    }
-    fn n_obs(&self) -> usize {
-        self.csr.n_rows()
-    }
-    fn n_vars(&self) -> usize {
-        self.csr.n_cols()
-    }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
-        if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
-                index: shard_idx,
-                count: 1,
-            });
-        }
-        Ok(self.csr.clone())
-    }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
-        Ok(self.csr.n_rows())
-    }
-}
+// The single-shard in-memory `ShardSource` adapter now lives in scx-format as
+// `SingleShardSource` (I-ORG-1 / T4.9), shared with pyscx.
+use scx_format::shard_source::SingleShardSource;
 
 /// Repack a column-major `RMatrix<f64>` (R layout) into row-major `f32`
 /// of shape `n_rows × n_cols`, rejecting non-finite entries.
@@ -552,7 +492,7 @@ fn scx_rank_genes(
 #[extendr]
 fn scx_hvg_mean_var(counts: Robj) -> Result<Robj> {
     let csr = dgc_genes_by_cells_to_csr(&counts)?;
-    let source = InMemoryShardSource { csr: &csr };
+    let source = SingleShardSource { csr: &csr };
     let stats =
         streaming_mean_var(&source).map_err(|e| Error::Other(format!("hvg pass 1: {e}")))?;
     let means = stats.means;
@@ -580,7 +520,7 @@ fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Result<Robj> {
             csr.n_cols()
         )));
     }
-    let source = InMemoryShardSource { csr: &csr };
+    let source = SingleShardSource { csr: &csr };
     let (counts_sum, sq_counts_sum) = streaming_clip_square_sum(&source, &clip_val)
         .map_err(|e| Error::Other(format!("hvg pass 2: {e}")))?;
     R!("list(counts_sum = {{counts_sum}}, sq_counts_sum = {{sq_counts_sum}})")
@@ -603,6 +543,8 @@ extendr_module! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // SingleShardSource's accessors come from the ShardSource trait.
+    use scx_format::shard_source::ShardSource;
 
     #[test]
     fn test_factorize_levels_first_seen() {
@@ -619,7 +561,7 @@ mod tests {
     fn test_in_memory_shard_source_roundtrips_csr() {
         // 2 cells × 3 genes.
         let csr = ScxCsr::new((2, 3), vec![0, 2, 3], vec![0, 2, 1], vec![1.0, 2.0, 3.0]).unwrap();
-        let src = InMemoryShardSource { csr: &csr };
+        let src = SingleShardSource { csr: &csr };
         assert_eq!(src.n_shards(), 1);
         assert_eq!(src.n_obs(), 2);
         assert_eq!(src.n_vars(), 3);

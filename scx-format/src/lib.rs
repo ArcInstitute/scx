@@ -7,6 +7,7 @@ pub mod catalog_view;
 pub mod checksum;
 pub mod codec_select;
 pub mod csc_policy;
+pub mod csc_sidecar;
 pub mod decode_sidecar;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
@@ -24,6 +25,12 @@ pub mod shard_source;
 pub(crate) mod validated_section;
 pub mod versioned;
 pub mod writer;
+
+/// Arrow `Field::metadata` key marking a dictionary column as an *ordered*
+/// categorical (R `ordered` factor / pandas ordered Categorical). Canonical
+/// home shared by every binding (scx-convert re-exports it; pyscx and rscx
+/// read it from here) so the wire key has a single definition (I-ORG-1 / T4.9).
+pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
 
 pub use arrow_compat::{
     downcast_large_types, downcast_large_types_schema, ensure_pandas_index_metadata,

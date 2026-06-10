@@ -38,7 +38,17 @@ pub struct LoaderConfig {
     /// Mini-batch size (default: 1024).
     pub batch_size: usize,
     /// Number of shards read per I/O group (default: 8).
-    /// Sequential I/O within each group for disk efficiency.
+    ///
+    /// This knob trades **I/O locality** against **shuffle quality**.
+    /// Shards within a group are read together (mostly-sequential I/O, lower
+    /// peak RSS), and the per-epoch shuffle mixes cells *only within* a
+    /// group (see `shuffle.rs`). A larger group → better-mixed minibatches
+    /// (higher shuffle entropy) at the cost of more resident decoded shards;
+    /// a smaller group → cheaper I/O and lower memory, but cells from the
+    /// same on-disk neighborhood co-occur in minibatches more often, which
+    /// can bias SGD. Auto-tuning may shrink this to fit `max_memory_mb`; if
+    /// it drops below [`MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE`] the loader
+    /// warns and sets [`MemoryBudget::shuffle_quality_degraded`].
     pub shard_group_size: usize,
     /// Ring buffer depth — number of pre-built batches to buffer (default: 4).
     pub prefetch_batches: usize,
@@ -144,6 +154,50 @@ pub struct MemoryBudget {
     /// `mmap_bytes`; the breakdown excludes mmap, matching the index-plan
     /// path's convention.
     pub breakdown: BudgetBreakdown,
+    /// True when auto-tuning reduced `shard_group_size` below the
+    /// shuffle-quality threshold ([`MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE`])
+    /// to fit `max_memory_mb`. Shuffling happens *within* a shard group
+    /// (`shuffle.rs`), so a small group lowers shuffle entropy: cells from
+    /// the same on-disk neighborhood co-occur in minibatches more often,
+    /// which can bias SGD. Surfaced so callers (and tests) can detect the
+    /// I/O-locality-vs-shuffle-quality tradeoff that a tight budget forced.
+    pub shuffle_quality_degraded: bool,
+}
+
+/// `shard_group_size` at or above which within-group shuffling is
+/// considered to provide adequate entropy. Below this, auto-tuning has
+/// traded shuffle quality for a smaller memory footprint and
+/// [`MemoryBudget::shuffle_quality_degraded`] is set with a `log::warn!`.
+///
+/// The loader shuffles only within a shard group (see `shuffle.rs`), so the
+/// group size is the knob that trades I/O locality (small groups → mostly
+/// sequential reads, lower RSS) against shuffle entropy (large groups →
+/// better-mixed minibatches). A value of 4 keeps at least a few shards
+/// mixing per group; raise `max_memory_mb` (or `shard_group_size`) to
+/// recover full-entropy shuffling.
+pub const MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE: usize = 4;
+
+/// Decide whether auto-tuning degraded shuffle quality and, if so, emit a
+/// one-shot warning. Returns the flag stored on [`MemoryBudget`]. Degraded
+/// means the effective group size both dropped below the quality threshold
+/// **and** was reduced from what the caller requested (so a caller that
+/// deliberately asked for a tiny group isn't warned spuriously).
+fn shuffle_quality_degraded(requested: usize, effective: usize) -> bool {
+    let degraded = effective < MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE && effective < requested;
+    if degraded {
+        log::warn!(
+            "loader auto-tune reduced shard_group_size from {} to {} to fit \
+             max_memory_mb (below the shuffle-quality threshold of {}). \
+             Shuffling is scoped to a shard group, so minibatch entropy is \
+             reduced and SGD may see correlated cells together. Raise \
+             max_memory_mb (or set hvg_indices to shrink per-batch memory) to \
+             restore full-entropy shuffling.",
+            requested,
+            effective,
+            MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE,
+        );
+    }
+    degraded
 }
 
 /// Compute the memory budget for the training pipeline.
@@ -207,6 +261,10 @@ pub fn compute_memory_budget(
                 mmap_bytes: file_size_bytes,
                 budget_exceeded: false,
                 breakdown,
+                shuffle_quality_degraded: shuffle_quality_degraded(
+                    config.shard_group_size,
+                    shard_group_size,
+                ),
             };
         }
 
@@ -245,6 +303,10 @@ pub fn compute_memory_budget(
             mmap_bytes: file_size_bytes,
             budget_exceeded: true,
             breakdown,
+            shuffle_quality_degraded: shuffle_quality_degraded(
+                config.shard_group_size,
+                shard_group_size,
+            ),
         };
     }
 }
@@ -1270,6 +1332,37 @@ mod tests {
             "prefetch_batches should be at minimum 2"
         );
         assert!(budget.batch_size <= 1024, "batch_size should be reduced");
+    }
+
+    #[test]
+    fn test_shuffle_quality_degraded_under_tight_budget() {
+        // 64 MB forces shard_group_size to 1 (below the quality threshold and
+        // below the requested default of 8) → degraded flag set.
+        let config = LoaderConfig {
+            max_memory_mb: 64,
+            ..LoaderConfig::default()
+        };
+        let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
+        assert!(budget.shard_group_size < MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE);
+        assert!(
+            budget.shuffle_quality_degraded,
+            "tight budget that shrinks shard_group_size to {} (< {}) should flag \
+             degraded shuffle quality",
+            budget.shard_group_size, MIN_SHUFFLE_QUALITY_SHARD_GROUP_SIZE
+        );
+    }
+
+    #[test]
+    fn test_shuffle_quality_not_degraded_with_room() {
+        // A generous budget keeps shard_group_size at the requested default,
+        // so shuffle quality is not flagged.
+        let config = LoaderConfig {
+            max_memory_mb: 4096,
+            ..LoaderConfig::default()
+        };
+        let budget = compute_memory_budget(&config, 2_000, 16_384, 10.0, 0);
+        assert_eq!(budget.shard_group_size, config.shard_group_size);
+        assert!(!budget.shuffle_quality_degraded);
     }
 
     #[test]

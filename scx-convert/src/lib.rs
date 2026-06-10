@@ -56,10 +56,11 @@ pub use h5ad_read::{
 /// `ordered` bit. Arrow's `DictionaryArray` has no `ordered` flag, so the
 /// h5ad reader stamps it here and the h5ad writer / `to_anndata` re-apply it.
 ///
-/// Defined at the crate root (not in the `hdf5`-gated `h5ad_read` module) so
-/// `pyscx` can reference it from the always-compiled `to_anndata` path
-/// regardless of which scx-convert features are enabled.
-pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+/// Canonically defined in `scx-format` (the shared dep of every binding) and
+/// re-exported here so existing `scx_convert::CATEGORICAL_ORDERED_KEY`
+/// references — including `pyscx`'s always-compiled `to_anndata` path — keep
+/// working regardless of which scx-convert features are enabled (I-ORG-1).
+pub use scx_format::CATEGORICAL_ORDERED_KEY;
 
 // Re-exported from scx-format so existing `scx_convert::MemoryBudget`
 // call sites keep working; the parser lives in scx-format so sibling

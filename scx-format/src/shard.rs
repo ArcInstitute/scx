@@ -9,6 +9,14 @@ use crate::section::SectionType;
 /// Size of the shard header in bytes.
 pub const SHARD_HEADER_SIZE: usize = 76;
 
+/// Current shard layout version emitted by writers. Readers reject any
+/// shard header whose `shard_format_version` exceeds this — cheap insurance
+/// so a future shard-layout bump errors out instead of being silently
+/// misinterpreted by today's readers (mirrors the file-header /
+/// catalog-version gates). Land any layout-changing bump together with a
+/// matching reader that knows the new layout.
+pub const CURRENT_SHARD_FORMAT_VERSION: u8 = 1;
+
 /// Magic bytes identifying an SCX shard.
 pub const SHARD_MAGIC: [u8; 4] = *b"SCXS";
 
@@ -105,6 +113,9 @@ impl ShardHeader {
         }
 
         let shard_format_version = r.read_u8()?;
+        if shard_format_version > CURRENT_SHARD_FORMAT_VERSION {
+            return Err(ScxError::UnsupportedVersion);
+        }
         let shard_type = r.read_u8()?;
         let codec_id = r.read_u8()?;
         let value_encoding = r.read_u8()?;
@@ -396,6 +407,30 @@ mod tests {
         let mut cursor = Cursor::new(&buf);
         let err = ShardHeader::read_from(&mut cursor).unwrap_err();
         assert!(matches!(err, ScxError::InvalidShardMagic));
+    }
+
+    #[test]
+    fn reject_future_shard_format_version() {
+        let mut header = sample_shard_header();
+        header.shard_format_version = CURRENT_SHARD_FORMAT_VERSION + 1;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let err = ShardHeader::read_from(&mut cursor).unwrap_err();
+        assert!(matches!(err, ScxError::UnsupportedVersion));
+    }
+
+    #[test]
+    fn accept_current_shard_format_version() {
+        let mut header = sample_shard_header();
+        header.shard_format_version = CURRENT_SHARD_FORMAT_VERSION;
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let decoded = ShardHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(decoded.shard_format_version, CURRENT_SHARD_FORMAT_VERSION);
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! GPU kNN via cuVS CAGRA with runtime library loading.
 //!
-//! Provides [`gpu_knn_cagra`] for GPU-accelerated k-nearest neighbor search
-//! using NVIDIA's CAGRA algorithm (part of the cuVS library). The cuVS C API
-//! (`libcuvs_c.so`) is loaded at runtime via `libloading`, so cuVS is NOT
-//! required at build time — users without cuVS get a clear error and can fall
-//! back to CPU HNSW.
+//! Provides [`gpu_knn_cagra_device`] for GPU-accelerated k-nearest neighbor
+//! search using NVIDIA's CAGRA algorithm (part of the cuVS library). The cuVS
+//! C API (`libcuvs_c.so`) is loaded at runtime via `libloading`, so cuVS is
+//! NOT required at build time — users without cuVS get a clear error and can
+//! fall back to CPU HNSW.
 //!
 //! ## DLPack v0.8
 //!
@@ -24,9 +24,8 @@
 //! ## Graceful Fallback
 //!
 //! When `libcuvs_c.so` is not available, [`cuvs_available`] returns `false`
-//! and [`gpu_knn_cagra`] returns `GpuError::LibraryNotFound`. The caller
-//! (typically `scx-accel::neighbors::build_knn_graph_gpu`) falls back to
-//! CPU HNSW.
+//! and [`gpu_knn_cagra_device`] returns `GpuError::LibraryNotFound`. The
+//! caller (the fused `scx-accel` PCA→kNN pipeline) falls back to CPU HNSW.
 
 use std::sync::OnceLock;
 
@@ -559,57 +558,6 @@ pub struct GpuKnnResult {
     pub n_neighbors: usize,
 }
 
-/// GPU kNN via cuVS CAGRA.
-///
-/// Builds a CAGRA graph index from the embedding matrix and performs
-/// batch k-nearest neighbor search, all on GPU.
-///
-/// # Arguments
-///
-/// * `dev` — GPU device handle
-/// * `data` — Row-major embedding matrix `(n_obs × n_dims)` on host
-/// * `n_obs` — Number of data points (rows)
-/// * `n_dims` — Dimensionality (columns, typically 50 PCs)
-/// * `n_neighbors` — Number of nearest neighbors to find
-///
-/// # Returns
-///
-/// `GpuKnnResult` with neighbor indices and distances on host.
-/// Indices are 0-based, self-hits are excluded (CAGRA may return self).
-///
-/// # Errors
-///
-/// * `GpuError::LibraryNotFound` — cuVS not installed
-/// * `GpuError::CuVsError` — CAGRA build or search failed
-/// * `GpuError::OutOfMemory` — GPU memory exhausted
-pub fn gpu_knn_cagra(
-    dev: &GpuDevice,
-    data: &[f32],
-    n_obs: usize,
-    n_dims: usize,
-    n_neighbors: usize,
-) -> Result<GpuKnnResult, GpuError> {
-    if data.len() != n_obs * n_dims {
-        return Err(GpuError::ShapeMismatch {
-            expected: format!(
-                "data length = n_obs × n_dims = {} × {} = {}",
-                n_obs,
-                n_dims,
-                n_obs * n_dims
-            ),
-            got: format!("{}", data.len()),
-        });
-    }
-
-    // Upload the host embedding once, then run the device-resident core and
-    // download + post-process. Output is byte-identical to running CAGRA
-    // inline (the post-process lives in `DeviceKnnGraph::to_host`).
-    let d_data = dev.htod_copy(data)?;
-    let embedding = DeviceEmbedding::new(d_data, n_obs, n_dims)?;
-    let graph = gpu_knn_cagra_device(dev, &embedding, n_neighbors)?;
-    graph.to_host(dev)
-}
-
 /// GPU kNN via cuVS CAGRA, **device-resident** input and output (V3 plan
 /// Phase 2.3).
 ///
@@ -866,6 +814,24 @@ pub fn gpu_knn_cagra_device(
 mod tests {
     use super::*;
 
+    /// Run CAGRA on host data via the device-resident path: upload →
+    /// [`DeviceEmbedding`] → [`gpu_knn_cagra_device`] → [`DeviceKnnGraph::to_host`].
+    /// This is the same three-step sequence the (removed) host-bounce wrapper
+    /// performed, kept here so the host-data correctness tests below exercise
+    /// the surviving device entry point.
+    fn knn_cagra_via_device(
+        dev: &GpuDevice,
+        data: &[f32],
+        n_obs: usize,
+        n_dims: usize,
+        n_neighbors: usize,
+    ) -> GpuKnnResult {
+        let d_data = dev.htod_copy(data).unwrap();
+        let embedding = DeviceEmbedding::new(d_data, n_obs, n_dims).unwrap();
+        let graph = gpu_knn_cagra_device(dev, &embedding, n_neighbors).unwrap();
+        graph.to_host(dev).unwrap()
+    }
+
     #[test]
     fn test_cuvs_available_check() {
         // This just checks that the availability check doesn't panic.
@@ -909,7 +875,7 @@ mod tests {
             data.push(10.0 + 0.05 * (i as f32));
         }
 
-        let result = gpu_knn_cagra(&dev, &data, n_obs, n_dims, n_neighbors).unwrap();
+        let result = knn_cagra_via_device(&dev, &data, n_obs, n_dims, n_neighbors);
 
         assert_eq!(result.n_obs, n_obs);
         assert_eq!(result.n_neighbors, n_neighbors);
@@ -967,7 +933,7 @@ mod tests {
             }
         }
 
-        let result = gpu_knn_cagra(&dev, &data, n_obs, n_dims, n_neighbors).unwrap();
+        let result = knn_cagra_via_device(&dev, &data, n_obs, n_dims, n_neighbors);
         assert_eq!(result.n_neighbors, n_neighbors);
         assert_eq!(result.indices.len(), n_obs * n_neighbors);
         for &idx in &result.indices {
@@ -975,76 +941,6 @@ mod tests {
         }
         for &dist in &result.distances {
             assert!(dist >= 0.0 && dist.is_finite(), "bad distance: {dist}");
-        }
-    }
-
-    /// `gpu_knn_cagra_device` (device-resident input/output) must produce the
-    /// exact same host `GpuKnnResult` as `gpu_knn_cagra` on the same data — the
-    /// host wrapper is just `htod_copy → device core → to_host`.
-    #[test]
-    fn test_gpu_knn_cagra_device_matches_host() {
-        let dev = match GpuDevice::new(0) {
-            Ok(dev) => dev,
-            Err(_) => {
-                eprintln!("CUDA not available — skipping GPU kNN device-parity test");
-                return;
-            }
-        };
-        if !cuvs_available() {
-            eprintln!("cuVS not available — skipping GPU kNN device-parity test");
-            return;
-        }
-
-        let n_per_cluster = 25;
-        let n_obs = n_per_cluster * 2;
-        let n_dims = 3;
-        let n_neighbors = 5;
-
-        let mut data = Vec::with_capacity(n_obs * n_dims);
-        for i in 0..n_per_cluster {
-            data.push(0.1 * (i as f32));
-            data.push(0.1 * ((i % 5) as f32));
-            data.push(0.05 * (i as f32));
-        }
-        for i in 0..n_per_cluster {
-            data.push(10.0 + 0.1 * (i as f32));
-            data.push(10.0 + 0.1 * ((i % 5) as f32));
-            data.push(10.0 + 0.05 * (i as f32));
-        }
-
-        // Host path (htod_copy → device core → to_host).
-        let host = gpu_knn_cagra(&dev, &data, n_obs, n_dims, n_neighbors).unwrap();
-
-        // Device path: upload → DeviceEmbedding → device core → to_host.
-        let d_data = dev.htod_copy(&data).unwrap();
-        let embedding = DeviceEmbedding::new(d_data, n_obs, n_dims).unwrap();
-        let graph = gpu_knn_cagra_device(&dev, &embedding, n_neighbors).unwrap();
-        assert_eq!(graph.n_obs(), n_obs);
-        assert_eq!(graph.n_neighbors(), n_neighbors);
-        assert_eq!(graph.search_k(), (n_neighbors + 1).min(n_obs));
-        let dev_result = graph.to_host(&dev).unwrap();
-
-        // The two paths run two *independent* CAGRA builds. CAGRA may break ties
-        // between equidistant neighbors in a different order across runs, so we
-        // compare per-row neighbor *sets* (order-independent) and sorted
-        // per-row distances (within f32 tol) rather than exact element order. A
-        // genuinely broken device path would scramble the sets entirely.
-        for i in 0..n_obs {
-            let lo = i * n_neighbors;
-            let hi = lo + n_neighbors;
-            let mut h_idx = host.indices[lo..hi].to_vec();
-            let mut d_idx = dev_result.indices[lo..hi].to_vec();
-            h_idx.sort_unstable();
-            d_idx.sort_unstable();
-            assert_eq!(h_idx, d_idx, "row {i}: neighbor sets differ");
-
-            let mut h_dist = host.distances[lo..hi].to_vec();
-            let mut d_dist = dev_result.distances[lo..hi].to_vec();
-            h_dist.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            d_dist.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            for (a, b) in h_dist.iter().zip(d_dist.iter()) {
-                assert!((a - b).abs() <= 1e-4, "row {i}: distance {a} vs {b}");
-            }
         }
     }
 

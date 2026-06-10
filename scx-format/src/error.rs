@@ -105,6 +105,9 @@ pub enum ScxError {
     #[error("codec error: {0}")]
     Codec(#[from] scx_codec::CodecError),
 
+    #[error("CSC transpose failed: {0}")]
+    CscTranspose(String),
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 

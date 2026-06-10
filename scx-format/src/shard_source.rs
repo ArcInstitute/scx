@@ -19,6 +19,7 @@
 //! never inside the generic kernels.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use scx_sparse::{ScxCsc, ScxCsr};
 
@@ -49,6 +50,32 @@ pub trait ShardSource {
     /// Implementations may apply transforms (e.g., NormalizeTotal, Log1p)
     /// and/or deletion vector filtering before returning.
     fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr>;
+
+    /// Read shard `shard_idx`, returning a shared handle that a cached
+    /// implementation can hand out without re-decoding.
+    ///
+    /// Multi-pass kernels (e.g. out-of-core PCA, which makes ~6–7 passes
+    /// over every shard) must call this instead of [`read_shard`] so a
+    /// caching source decodes each shard once and reuses the `Arc`. The
+    /// default wraps [`read_shard`] in a fresh `Arc` (no caching), so
+    /// non-caching sources behave exactly as before. `BackedCsrReader`
+    /// overrides this to serve from its LRU shard cache.
+    ///
+    /// [`read_shard`]: ShardSource::read_shard
+    fn read_shard_arc(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
+        Ok(Arc::new(self.read_shard(shard_idx)?))
+    }
+
+    /// Capacity (in shards) of this source's decode cache, if it has one.
+    ///
+    /// `None` means the source does not cache (every `read_shard_arc` call
+    /// re-decodes). `Some(cap)` lets multi-pass kernels warn when
+    /// `cap < n_shards`, i.e. the cache is too small to hold the working
+    /// set and will evict + re-decode each pass — mirroring the DE
+    /// streaming path's undersized-cache warning.
+    fn shard_cache_capacity(&self) -> Option<usize> {
+        None
+    }
 
     /// Maximum number of rows across all shards.
     ///
@@ -83,7 +110,7 @@ pub trait ShardSource {
         let mut col_sum_sq = vec![0.0f64; n_vars];
 
         for shard_idx in 0..self.n_shards() {
-            let csr = self.read_shard(shard_idx)?;
+            let csr = self.read_shard_arc(shard_idx)?;
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 let v = val as f64;
                 col_sums[col as usize] += v;
@@ -103,6 +130,41 @@ pub trait ShardSource {
         };
 
         Ok((means, col_sum_sq))
+    }
+}
+
+/// A [`ShardSource`] over a single in-memory CSR matrix (one shard).
+///
+/// Adapts an already-materialized [`ScxCsr`] to the streaming kernels (PCA,
+/// HVG, …) for small or in-memory matrices that don't come from a backed
+/// reader. Shared by the `pyscx` and `rscx` bindings (I-ORG-1 / T4.9), which
+/// each previously carried an identical bespoke single-shard adapter.
+pub struct SingleShardSource<'a> {
+    /// The borrowed in-memory matrix served as shard `0`.
+    pub csr: &'a ScxCsr,
+}
+
+impl ShardSource for SingleShardSource<'_> {
+    fn n_shards(&self) -> usize {
+        1
+    }
+    fn n_obs(&self) -> usize {
+        self.csr.n_rows()
+    }
+    fn n_vars(&self) -> usize {
+        self.csr.n_cols()
+    }
+    fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr> {
+        if shard_idx != 0 {
+            return Err(crate::error::ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: 1,
+            });
+        }
+        Ok(self.csr.clone())
+    }
+    fn max_shard_rows(&self) -> Result<usize> {
+        Ok(self.csr.n_rows())
     }
 }
 

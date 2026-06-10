@@ -93,8 +93,8 @@ impl DeviceEmbedding {
 /// as CAGRA writes it: `indices` are `u32` and `distances` are L2-**squared**,
 /// both laid out `(n_obs × search_k)` row-major where `search_k = min(n_obs,
 /// n_neighbors + 1)` (CAGRA may return self, so one extra slot is searched).
-/// [`Self::to_host`] applies the same self-filter + `sqrt` post-process the
-/// host `gpu_knn_cagra` path uses, yielding a byte-identical [`GpuKnnResult`].
+/// [`Self::to_host`] applies the self-filter + `sqrt` post-process, yielding
+/// the host [`GpuKnnResult`].
 pub struct DeviceKnnGraph {
     indices: CudaSlice<u32>,
     distances: CudaSlice<f32>,
@@ -160,11 +160,9 @@ impl DeviceKnnGraph {
 
     /// Download + post-process into a host [`GpuKnnResult`].
     ///
-    /// Mirrors the `gpu_knn_cagra` host path exactly: converts `u32` → `i64`,
-    /// drops the self-hit, takes `sqrt` of the L2-squared distances (Euclidean),
-    /// and pads with self / `0.0` if fewer than `n_neighbors` non-self neighbors
-    /// were returned. The output is identical to calling `gpu_knn_cagra` on the
-    /// same embedding.
+    /// Converts `u32` → `i64`, drops the self-hit, takes `sqrt` of the
+    /// L2-squared distances (Euclidean), and pads with self / `0.0` if fewer
+    /// than `n_neighbors` non-self neighbors were returned.
     pub fn to_host(&self, dev: &GpuDevice) -> Result<GpuKnnResult, GpuError> {
         dev.synchronize()?;
         let neighbors_u32 = dev.dtoh_copy(&self.indices)?;

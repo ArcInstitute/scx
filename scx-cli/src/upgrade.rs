@@ -86,35 +86,17 @@ fn rewrite_with_current_version(
 
     let csr_entries = reader.catalog().csr_shards_sorted();
 
-    // Set up output header
+    // Set up output header (canonical v3 upgrade: bump manifest, preserve
+    // flags/codec/index dtype from the source; writer fills nnz + shard counts).
     let out_header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
         flags: in_header.flags,
         n_obs: in_header.n_obs,
         n_vars: in_header.n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
         codec_id: in_header.codec_id,
         index_dtype: in_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
         manifest_sequence: in_header.manifest_sequence + 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // Read metadata

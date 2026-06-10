@@ -20,36 +20,12 @@ use super::util::{extract_csr_slices, CsrSlices};
 /// Used on the GPU path when the AnnData's `X` is a materialized
 /// scipy sparse / dense matrix that has been extracted into an in-memory
 /// `ScxCsr`. Parallels the CPU-path's `*_inmemory` entry points by presenting
-/// the whole CSR as a single shard to the streaming GPU code.
+/// the whole CSR as a single shard to the streaming GPU code. This is the
+/// shared `scx_format::shard_source::SingleShardSource` (I-ORG-1 / T4.9 — the
+/// rscx binding uses the same adapter); aliased here to keep the call sites'
+/// `ScxCsrSource { csr }` spelling.
 #[cfg(feature = "gpu")]
-pub(crate) struct ScxCsrSource<'a> {
-    pub(crate) csr: &'a scx_sparse::ScxCsr,
-}
-
-#[cfg(feature = "gpu")]
-impl ShardSource for ScxCsrSource<'_> {
-    fn n_shards(&self) -> usize {
-        1
-    }
-    fn n_obs(&self) -> usize {
-        self.csr.n_rows()
-    }
-    fn n_vars(&self) -> usize {
-        self.csr.n_cols()
-    }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
-        if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
-                index: shard_idx,
-                count: 1,
-            });
-        }
-        Ok(self.csr.clone())
-    }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
-        Ok(self.csr.n_rows())
-    }
-}
+pub(crate) use scx_format::shard_source::SingleShardSource as ScxCsrSource;
 
 /// Single-shard `ShardSource` adapter over **borrowed** numpy slices
 /// (Phase 10).

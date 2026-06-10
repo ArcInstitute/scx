@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::MAGIC;
 use scx_format::section::SectionType;
 use scx_format::{
     select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection, ProvenanceEntry,
@@ -295,38 +294,19 @@ fn write_csc_shards_from_csr(
         indices_u32.iter().map(|&v| v as i32).collect(),
         values,
     );
-    let shards = std::slice::from_ref(&csr);
 
-    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
-        shards,
+    // Shared transpose-and-write loop (single-modality → modality_id None).
+    scx_format::csc_sidecar::write_csc_sidecar(
+        writer,
+        std::slice::from_ref(&csr),
         n_obs,
         n_vars,
-        PYSCX_CSC_MEMORY_BYTES,
+        value_encoding,
+        codec_id,
         csc_cols_per_shard,
+        PYSCX_CSC_MEMORY_BYTES,
+        None,
     )
-    .map_err(|e| scx_format::ScxError::Io(std::io::Error::other(format!("CSC transpose: {e}"))))?;
-
-    loop {
-        let col_start = iter.current_col_start() as u64;
-        let chunk = match iter.next() {
-            Some(c) => c.map_err(|e| {
-                scx_format::ScxError::Io(std::io::Error::other(format!("CSC chunk: {e}")))
-            })?,
-            None => break,
-        };
-        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values = encode_values(&chunk.data, value_encoding)?;
-        writer.write_csc_shard(
-            &csc_indptr_u64,
-            &csc_indices_u32,
-            &raw_values,
-            codec_id,
-            value_encoding,
-            col_start,
-        )?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4186,34 +4166,15 @@ fn build_output_header(
     source_format_version: u16,
 ) -> FileHeader {
     FileHeader {
-        magic: MAGIC,
         // Single-modality output → feature floor 1.
         format_version: scx_format::rewrite_output_format_version(&[source_format_version], 1),
-        header_length: 256,
-        flags: 0,
         n_obs,
         n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows,
         codec_id: codec as u8,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
         manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     }
 }
 
@@ -5440,35 +5401,14 @@ pub fn from_anndata_impl(
     };
 
     // Build FileHeader
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
+    let header = FileHeader::new_single_modality(
         n_obs,
         n_vars,
         nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows,
-        codec_id: header_codec as u8,
+        header_codec as u8,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(path, header).map_err(to_pyerr)?;
 
