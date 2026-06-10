@@ -430,9 +430,17 @@ pub fn randomized_pca_inmemory(
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
+    // Fused pass: column sums + sum-of-squares in one sweep over the nonzeros,
+    // reused for both mean-centering and total variance (no separate variance
+    // pass). Mirrors the streaming path's `col_means_and_sum_sq`.
+    let (col_sums, col_sum_sq) = csr.col_sums_and_sum_sq();
     let means = if zero_center {
-        let sums = csr.col_sums();
-        Some(sums.iter().map(|&s| s / n_obs as f64).collect::<Vec<f64>>())
+        Some(
+            col_sums
+                .iter()
+                .map(|&s| s / n_obs as f64)
+                .collect::<Vec<f64>>(),
+        )
     } else {
         None
     };
@@ -460,7 +468,8 @@ pub fn randomized_pca_inmemory(
     }
 
     let b_rm = spmm_transpose_csr(csr, &q, means_ref);
-    let total_var = compute_total_variance_inmemory(csr, means_ref);
+    // Reuse the fused col_sum_sq (no extra full-matrix pass).
+    let total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
     let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
@@ -925,41 +934,6 @@ fn spmm_forward_row(
 // NOTE: `compute_total_variance_from_col_sq` has been moved to
 // `scx_format::backed::total_variance_from_col_sq()` (re-exported
 // from `scx_format::total_variance_from_col_sq`).
-
-/// Total variance (in-memory).
-///
-/// Uses the textbook two-pass variance formula: `Σ(x - μ)²` after a separate
-/// mean pass. This is numerically safe for scRNA data because raw counts and
-/// log1p-transformed values are small non-negative magnitudes where
-/// catastrophic cancellation doesn't occur. If future callers feed data with
-/// large offsets (e.g. non-centered embeddings), switch to Welford's
-/// single-pass algorithm.
-fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
-    let n_obs = csr.n_rows();
-    let n_vars = csr.n_cols();
-
-    if let Some(mu) = means {
-        let mut total = 0.0f64;
-        for r in 0..n_obs {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            for j in start..end {
-                let v = csr.data[j] as f64 - mu[csr.indices[j] as usize];
-                total += v * v;
-            }
-        }
-        // Add zero contributions per column
-        let col_nnz = csr.col_nnz();
-        for c in 0..n_vars {
-            let n_zeros = n_obs.saturating_sub(col_nnz[c] as usize);
-            total += n_zeros as f64 * mu[c] * mu[c];
-        }
-        total / (n_obs as f64 - 1.0).max(1.0)
-    } else {
-        let total: f64 = csr.data.iter().map(|&v| (v as f64) * (v as f64)).sum();
-        total / (n_obs as f64 - 1.0).max(1.0)
-    }
-}
 
 /// Build PcaResult from Q (column-major Mat) and B (MatRef, possibly row-major view).
 #[allow(clippy::too_many_arguments)]
