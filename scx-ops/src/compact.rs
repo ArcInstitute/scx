@@ -9,7 +9,7 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
 };
 use scx_format::codec_select::select_codec;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
@@ -191,33 +191,13 @@ pub fn compact_with_index_options(
     // without re-canonicalizing, so it can only claim v3 if the input already
     // guarantees the canonical invariant (floor 1 — single-modality compact).
     let out_header = FileHeader {
-        magic: MAGIC,
         format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 1),
-        header_length: 256,
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars,
-        nnz: 0, // will be set by finish
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
-        codec_id: 0,
         index_dtype: in_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 0,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // Copy obsm flag if present
@@ -926,34 +906,15 @@ fn compact_multimodal(
         .unwrap_or(0);
 
     // Multimodal compact: gate the v3 claim on the input version (floor 2).
+    // The modality table + n_modalities are stamped onto the header later.
     let out_header = FileHeader {
-        magic: MAGIC,
         format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 2),
-        header_length: 256,
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars: max_n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
-        codec_id: 0,
         index_dtype: in_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 0,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // Multimodal compact drops every CSC sidecar (rebuilt on demand), so
@@ -1390,7 +1351,7 @@ mod streaming_tests {
 
     fn test_header(n_obs: u64) -> FileHeader {
         FileHeader {
-            magic: MAGIC,
+            magic: scx_format::MAGIC,
             format_version: scx_format::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,

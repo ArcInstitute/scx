@@ -10,6 +10,7 @@ mod interop;
 mod lisi;
 mod ops;
 mod query;
+mod util;
 
 pub use query::{RQueryPipeline, RQueryResult};
 

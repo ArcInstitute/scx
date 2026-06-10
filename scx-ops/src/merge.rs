@@ -6,7 +6,7 @@ use arrow::array::RecordBatch;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::codec_select::select_codec;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
@@ -197,33 +197,12 @@ pub fn merge_with_options(
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
-        magic: MAGIC,
         format_version: scx_format::rewrite_output_format_version(&input_format_versions, 1),
-        header_length: 256,
-        flags: 0,
         n_obs: total_n_obs,
         n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: first_header.shard_target_rows,
-        codec_id: 0,
         index_dtype: first_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 0,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // Merge produces new CSR shards from multiple inputs and drops every
@@ -731,33 +710,12 @@ fn merge_multimodal(
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
-        magic: MAGIC,
         format_version: scx_format::rewrite_output_format_version(&input_format_versions, 2),
-        header_length: 256,
-        flags: 0,
         n_obs: total_n_obs,
         n_vars: max_n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: first_header.shard_target_rows,
-        codec_id: 0,
         index_dtype: first_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 0,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // As with single-modality merge: new CSR shards, CSC dropped — bump

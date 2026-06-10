@@ -12,6 +12,13 @@ use crate::lazy_transform::ScxLazyTransformedDataset;
 
 use super::gpu::resolve_device;
 use super::util::extract_materialized_csr;
+
+/// Default RAM ceiling for the out-of-core backed-PCA shard cache when the
+/// caller passes no `memory_budget`. Large enough to hold the working set for
+/// typical multi-shard files while bounding growth on a count-only-opened
+/// reader (whose byte budget is otherwise unbounded). Raise via `memory_budget`
+/// for atlas-scale matrices that exceed this.
+const DEFAULT_PCA_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 #[cfg(feature = "gpu")]
 use super::util::{extract_csr_slices, CsrSlices};
 
@@ -20,36 +27,12 @@ use super::util::{extract_csr_slices, CsrSlices};
 /// Used on the GPU path when the AnnData's `X` is a materialized
 /// scipy sparse / dense matrix that has been extracted into an in-memory
 /// `ScxCsr`. Parallels the CPU-path's `*_inmemory` entry points by presenting
-/// the whole CSR as a single shard to the streaming GPU code.
+/// the whole CSR as a single shard to the streaming GPU code. This is the
+/// shared `scx_format::shard_source::SingleShardSource` (the rscx binding uses
+/// the same adapter); aliased here to keep the call sites'
+/// `ScxCsrSource { csr }` spelling.
 #[cfg(feature = "gpu")]
-pub(crate) struct ScxCsrSource<'a> {
-    pub(crate) csr: &'a scx_sparse::ScxCsr,
-}
-
-#[cfg(feature = "gpu")]
-impl ShardSource for ScxCsrSource<'_> {
-    fn n_shards(&self) -> usize {
-        1
-    }
-    fn n_obs(&self) -> usize {
-        self.csr.n_rows()
-    }
-    fn n_vars(&self) -> usize {
-        self.csr.n_cols()
-    }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
-        if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
-                index: shard_idx,
-                count: 1,
-            });
-        }
-        Ok(self.csr.clone())
-    }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
-        Ok(self.csr.n_rows())
-    }
-}
+pub(crate) use scx_format::shard_source::SingleShardSource as ScxCsrSource;
 
 /// Single-shard `ShardSource` adapter over **borrowed** numpy slices
 /// (Phase 10).
@@ -357,7 +340,7 @@ fn stamp_pca_route(
 }
 
 #[pyfunction]
-#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr", allow_tf32=false, spmm_policy="default"))]
+#[pyo3(signature = (adata, n_comps=50, zero_center=true, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr", allow_tf32=false, spmm_policy="default", memory_budget=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pca(
     py: Python<'_>,
@@ -377,6 +360,11 @@ pub fn pca(
     // are no-ops on the CPU path (recorded on `uns["scx_accel"]["pca"]`).
     allow_tf32: bool,
     spmm_policy: &str,
+    // RAM ceiling (bytes, or a string like "8GB") for the out-of-core
+    // backed-PCA shard cache. PCA makes several passes over every shard, so a
+    // budget large enough to hold all shards turns the default warn-and-rescan
+    // into decode-once-per-pass. `None` uses a conservative default ceiling.
+    memory_budget: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let _device = resolve_device(device)?;
     // Validate user args even on CPU path — catches typos regardless of device.
@@ -457,6 +445,7 @@ pub fn pca(
                         prefer_format,
                         allow_tf32,
                         spmm_policy,
+                        memory_budget,
                     )?;
                     return super::rapids::stamp_no_rapids(
                         py,
@@ -653,11 +642,21 @@ pub fn pca(
         }
     };
 
+    // RAM ceiling for the backed-PCA shard cache. `None` → a conservative
+    // default so the common case gets the multi-pass speedup without
+    // unbounded growth on a count-only-opened reader.
+    let pca_cache_bytes = crate::anndata::parse_memory_budget(memory_budget)?
+        .unwrap_or(DEFAULT_PCA_CACHE_BYTES) as usize;
+
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         backend = "scx-accel-cpu";
         let reader = std::sync::Arc::clone(&backed.backed);
         let (_n_obs, n_vars) = reader.shape();
         drop(backed);
+        // Out-of-core PCA re-reads every shard once per pass; size the decoded
+        // shard cache to hold the whole working set within the RAM ceiling so
+        // each shard decodes once per pass instead of every pass.
+        reader.ensure_cache_capacity(reader.n_shards(), pca_cache_bytes);
         let m = pick_cpu_method(n_vars);
         py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca(&*reader, n_comps, zero_center),

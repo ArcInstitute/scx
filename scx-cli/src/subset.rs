@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use scx_engine::QueryPipeline;
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
+use scx_format::header::FileHeader;
 use scx_format::reader::ScxReader;
 use scx_format::section::SectionType;
 use scx_format::writer::ScxWriter;
@@ -431,35 +431,7 @@ fn extract_modality(
         .or_else(|| reader.read_uns().ok());
 
     let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: shard_size,
-        codec_id: 0,
-        index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header = FileHeader::new_single_modality(n_obs, n_vars, 0, shard_size, 0, index_dtype);
 
     let mut writer = ScxWriter::new(output, header)?;
     writer.write_obs(&obs)?;
@@ -667,35 +639,8 @@ fn extract_modality_with_filter(
     let n_obs_out = projected_csr.n_rows() as u64;
     let n_vars_out = projected_csr.n_cols() as u64;
     let index_dtype = if n_vars_out <= 65535 { 0u8 } else { 1u8 };
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs_out,
-        n_vars: n_vars_out,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: shard_size,
-        codec_id: 0,
-        index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header =
+        FileHeader::new_single_modality(n_obs_out, n_vars_out, 0, shard_size, 0, index_dtype);
 
     let mut writer = ScxWriter::new(output, header)?;
     writer.write_obs(&filtered_obs)?;
@@ -764,35 +709,8 @@ fn write_subset_scx(
 
     let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
 
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0, // filled in by finish()
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: shard_size,
-        codec_id: 0,
-        index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    // nnz filled in by finish()
+    let header = FileHeader::new_single_modality(n_obs, n_vars, 0, shard_size, 0, index_dtype);
 
     let mut writer = ScxWriter::new(output, header)?;
 

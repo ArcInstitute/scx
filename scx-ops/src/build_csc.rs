@@ -4,7 +4,7 @@ use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::writer::ScxWriter;
 use scx_format::MemoryBudget;
 use scx_format::ScxReader;
@@ -91,35 +91,17 @@ pub fn run_build_csc(
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
-    // 9. Set up output header
+    // 9. Set up output header (preserve flags/codec/index dtype, bump manifest;
+    // writer fills nnz + shard counts).
     let out_header = FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
         flags: in_header.flags,
         n_obs: in_header.n_obs,
         n_vars: in_header.n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
         codec_id: in_header.codec_id,
         index_dtype: in_header.index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
         manifest_sequence: in_header.manifest_sequence + 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     // 10. Read all metadata from input
@@ -165,6 +147,11 @@ pub fn run_build_csc(
     // 13. Write CSC shards via the streaming transpose iterator. Each
     //     iterator chunk becomes one CSC shard; col_start is read from
     //     the iterator *before* advancing to the next chunk.
+    //
+    //     NOTE: this is the inline twin of `scx_format::csc_sidecar::write_csc_sidecar`
+    //     (the shared helper the convert/pyscx/rscx paths use). It stays inline
+    //     here because it drives a progress bar per chunk; keep the encode +
+    //     write_csc_shard logic in sync with that helper.
     pb.set_message("Transposing CSR → CSC (streaming)...");
     let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
         &csr_shards,

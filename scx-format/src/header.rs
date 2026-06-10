@@ -134,7 +134,80 @@ pub struct FileHeader {
     pub reserved: [u8; 112],
 }
 
+impl Default for FileHeader {
+    /// The canonical zero-state header: correct `magic`, `header_length`,
+    /// `format_version = CURRENT_FORMAT_VERSION`, little-endian, and every
+    /// content/offset/modality field zeroed (`reserved = [0u8; 112]`).
+    ///
+    /// This is the single source of truth for the boilerplate that every
+    /// `FileHeader` literal used to hand-spell. Build a header by overriding
+    /// only the fields that vary, e.g.
+    /// `FileHeader { n_obs, n_vars, nnz, .. Default::default() }`, or use the
+    /// [`FileHeader::new_single_modality`] constructor for the common
+    /// single-modality shape. Writer-managed fields (`n_csr_shards`,
+    /// `n_csc_shards`, the catalog offsets/lengths, `file_checksum`) stay `0`
+    /// here and are filled in by `ScxWriter::finish`.
+    fn default() -> Self {
+        FileHeader {
+            magic: MAGIC,
+            format_version: CURRENT_FORMAT_VERSION,
+            header_length: HEADER_SIZE as u16,
+            flags: 0,
+            n_obs: 0,
+            n_vars: 0,
+            nnz: 0,
+            n_csr_shards: 0,
+            n_csc_shards: 0,
+            shard_target_rows: 0,
+            codec_id: 0,
+            index_dtype: 0,
+            endian: 0,
+            reserved_padding: 0,
+            root_catalog_offset: 0,
+            root_catalog_length: 0,
+            full_catalog_offset: 0,
+            full_catalog_length: 0,
+            manifest_sequence: 0,
+            prev_catalog_offset: 0,
+            file_checksum: 0,
+            front_catalog_offset: 0,
+            front_catalog_length: 0,
+            n_modalities: 0,
+            modality_table_offset: 0,
+            modality_table_length: 0,
+            reserved: [0u8; 112],
+        }
+    }
+}
+
 impl FileHeader {
+    /// Construct a single-modality header for a freshly written file
+    /// (`format_version = CURRENT_FORMAT_VERSION`, `flags = 0`,
+    /// `manifest_sequence = 1`, no modality table). Shard counts and catalog
+    /// offsets stay `0` — `ScxWriter::finish` fills them in. Callers that need
+    /// a different `format_version` (e.g. a passthrough rewrite via
+    /// [`rewrite_output_format_version`]), `flags`, or `manifest_sequence`
+    /// should build with `FileHeader { .., ..Default::default() }` instead.
+    pub fn new_single_modality(
+        n_obs: u64,
+        n_vars: u64,
+        nnz: u64,
+        shard_target_rows: u32,
+        codec_id: u8,
+        index_dtype: u8,
+    ) -> Self {
+        FileHeader {
+            n_obs,
+            n_vars,
+            nnz,
+            shard_target_rows,
+            codec_id,
+            index_dtype,
+            manifest_sequence: 1,
+            ..Default::default()
+        }
+    }
+
     /// Write the header to a writer in little-endian byte order.
     ///
     /// The on-disk layout depends on `format_version`:

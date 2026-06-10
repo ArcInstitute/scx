@@ -427,35 +427,8 @@ fn write_query_result(
     // input file's CSC sidecar (if any) does not match the projected
     // row/column space, so we don't carry it forward. Re-run
     // `scx build-csc` against the output if a CSC sidecar is needed.
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0, // filled in by finish()
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 10000,
-        codec_id: 0,
-        index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    // nnz filled in by finish().
+    let header = FileHeader::new_single_modality(n_obs, n_vars, 0, 10000, 0, index_dtype);
 
     let mut writer = ScxWriter::new(output, header)?;
 
