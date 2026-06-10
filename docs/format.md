@@ -526,7 +526,13 @@ section.
 
 - **Nullable columns**: standard Arrow validity bitmaps.
 - **Categorical columns**: Arrow dictionary encoding. Predicate indexes (§6)
-  are built on the dictionary values, not encoded indices.
+  are built on the dictionary values, not encoded indices. Arrow's
+  `DictionaryArray` carries no `ordered` bit, so the pandas/anndata `ordered`
+  flag is preserved out-of-band in **Arrow `Field` metadata** under the key
+  `scx.categorical.ordered` (`"true"` / `"false"`). Arrow IPC round-trips field
+  metadata, so the bit survives the obs/var section without a format-version
+  change; the h5ad reader stamps it from the source `ordered` attribute and the
+  h5ad writer re-emits it.
 - **Chunking**: for datasets > 10M cells, `obs` is split into multiple record
   batches (one per CSR shard group) inside a single IPC file. Readers can
   lazy-load metadata for just the shards they touch.

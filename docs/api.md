@@ -321,7 +321,7 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `DroppedObsp { name, reason }` | h5ad ingest (obsp/varp routing) and `scx merge` (multimodal) | A pairwise `obsp`/`varp` matrix could not be preserved: on ingest, a CSC or otherwise unsupported pairwise layout is dropped (CSR is stored directly; a **dense** pairwise matrix is preserved as nonzero COO, not dropped); on `scx merge`, `obsp` axis semantics don't compose. Default-dropped with a warning. |
 | `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
 | `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `PyExperiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
-| `ThreadsafeHdf5Unavailable` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
+| `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
 | `DroppedRaw { raw_n_vars }` | `PyExperiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
 
 ## Round-trip fidelity

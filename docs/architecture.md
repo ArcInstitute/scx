@@ -854,7 +854,11 @@ shard before `encode_one_shard` → `ScxWriter::write_preencoded_shard`.
 row-range at a time (`read_dense_mapping_shard` /
 `read_sparse_mapping_shard`) and emitted as row-sharded sections
 (`<section>/<name>_shard_<idx>`, types 20–23) so peak memory per
-metadata matrix matches one X shard's worth. Peak memory is therefore
+metadata matrix matches one X shard's worth. For pairwise
+`obsp` / `varp`, a CSR input is streamed straight to COO and a **dense**
+input is densified to nonzero COO one row-shard at a time; a CSC or
+otherwise unsupported pairwise layout is dropped with a `DroppedObsp`
+warning rather than silently skipped. Peak memory is therefore
 bounded by **one X shard + one row-shard per `obsm` / `varm` / `obsp`
 / `varp` matrix**, plus the resident indptr — independent of total
 dataset size or per-key embedding dimension. The pyscx backed-routing

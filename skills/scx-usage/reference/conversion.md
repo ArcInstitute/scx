@@ -37,7 +37,14 @@ from_h5ad(path, out, codec=None, shard_size=None, csc="off",
   API avoids).
 - `strict_uns=True` raises on the first unrepresentable uns entry; default
   `False` emits a `UserWarning` per skipped key. Other structured warnings:
-  `InferredEncoding`, `DenseSparsified`, `DuplicateCoordinatesMerged`.
+  `InferredEncoding`, `DenseSparsified`, `DuplicateCoordinatesMerged`,
+  `SkippedColumn` (unreadable obs/var column), `SkippedObsm` (unreadable
+  obsm/varm), `LayerSkipped` (unreadable / shape-mismatched layer),
+  `DroppedObsp` (CSC or unsupported pairwise `obsp`/`varp` dropped — CSR and
+  dense are preserved as COO), `FlattenedUnsDataframe` (a `uns` pandas
+  DataFrame is kept as a nested dict, not reconstructed as a DataFrame). All
+  formerly-silent skips now warn. For the full preserved/lossy/dropped matrix
+  see [docs/api.md § Round-trip fidelity](../../../docs/api.md#round-trip-fidelity).
 - `reader_threads`: parallel streaming reader. `None` → `RAYON_NUM_THREADS` or
   `os.cpu_count()`; `1` forces sequential; `>1` requests rayon workers
   (byte-identical output). Requires a thread-safe libhdf5 (conda-forge default);
