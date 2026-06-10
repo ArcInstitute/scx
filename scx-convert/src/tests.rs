@@ -4988,7 +4988,7 @@ fn test_boolean_round_trip_via_streaming_export() {
     assert_eq!(enc_v.as_str(), "0.1.0");
 
     // Reader round-trip via read_dataframe_group.
-    let obs = read_dataframe_group(&file, "obs").unwrap();
+    let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
     let idx = obs.schema().index_of("is_doublet").unwrap();
     let col = obs.column(idx);
     assert!(matches!(col.data_type(), DataType::Boolean));
@@ -5093,7 +5093,7 @@ fn test_categorical_wide_round_trip() {
     assert_eq!(enc_v.as_str(), "0.2.0");
 
     // Reader side: the new `read_categorical_group` path picks it up.
-    let obs = read_dataframe_group(&file, "obs").unwrap();
+    let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
     let idx = obs.schema().index_of("wide_cat").unwrap();
     let col = obs.column(idx);
     let dict = col
@@ -6379,7 +6379,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
-    let batch = read_dataframe_group(&file, "var").unwrap();
+    let batch = read_dataframe_group(&file, "var", &mut WarningSink::log()).unwrap();
 
     // anndata's `_index = "_index"` sentinel
     // (unnamed pandas index) is renamed to pyarrow's canonical
@@ -6479,7 +6479,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_unnamed() {
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
-    let batch = read_dataframe_group(&file, "var").unwrap();
+    let batch = read_dataframe_group(&file, "var", &mut WarningSink::log()).unwrap();
 
     let schema = batch.schema();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -6567,7 +6567,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_named() {
     drop(file);
 
     let file = hdf5::File::open(&h5_path).unwrap();
-    let batch = read_dataframe_group(&file, "var").unwrap();
+    let batch = read_dataframe_group(&file, "var", &mut WarningSink::log()).unwrap();
 
     let schema = batch.schema();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -7067,8 +7067,9 @@ mod streaming_obs_hdf5 {
         // task 6a).
         let stream_file = hdf5::File::open(&h5ad_stream).unwrap();
         let eager_file = hdf5::File::open(&h5ad_eager).unwrap();
-        let stream_obs = read_dataframe_group(&stream_file, "obs").unwrap();
-        let eager_obs = read_dataframe_group(&eager_file, "obs").unwrap();
+        let stream_obs =
+            read_dataframe_group(&stream_file, "obs", &mut WarningSink::log()).unwrap();
+        let eager_obs = read_dataframe_group(&eager_file, "obs", &mut WarningSink::log()).unwrap();
 
         assert_eq!(stream_obs.num_rows(), 200);
         assert_eq!(stream_obs.num_rows(), eager_obs.num_rows());
@@ -7126,8 +7127,9 @@ mod streaming_obs_hdf5 {
         // Logical column equality is the user-visible contract.
         let stream_file = hdf5::File::open(&h5ad_stream).unwrap();
         let eager_file = hdf5::File::open(&h5ad_eager).unwrap();
-        let stream_obs = read_dataframe_group(&stream_file, "obs").unwrap();
-        let eager_obs = read_dataframe_group(&eager_file, "obs").unwrap();
+        let stream_obs =
+            read_dataframe_group(&stream_file, "obs", &mut WarningSink::log()).unwrap();
+        let eager_obs = read_dataframe_group(&eager_file, "obs", &mut WarningSink::log()).unwrap();
 
         assert_eq!(stream_obs.num_rows(), eager_obs.num_rows());
         assert_eq!(stream_obs.num_columns(), eager_obs.num_columns());
@@ -7171,7 +7173,7 @@ mod streaming_obs_hdf5 {
 
         // Read obs back and verify row count + that deleted cell_ids
         // do not appear.
-        let obs = read_dataframe_group(&file, "obs").unwrap();
+        let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(obs.num_rows(), 76, "obs kept-row count must match /X");
         let cell_id_col = obs.column(obs.schema().index_of("cell_id").unwrap());
         let s = cell_id_col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -7220,7 +7222,7 @@ mod streaming_obs_hdf5 {
             .to_vec();
         assert_eq!(shape[0], 76, "non-streaming /X must filter DVs");
 
-        let obs = read_dataframe_group(&file, "obs").unwrap();
+        let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(
             obs.num_rows(),
             76,
@@ -7495,7 +7497,7 @@ mod streaming_obs_hdf5 {
         write_scx_to_h5ad_streaming(&scx_path, &h5ad_out, &opts, &mut WarningSink::log()).unwrap();
 
         let file = hdf5::File::open(&h5ad_out).unwrap();
-        let var = read_dataframe_group(&file, "var").unwrap();
+        let var = read_dataframe_group(&file, "var", &mut WarningSink::log()).unwrap();
         assert_eq!(var.num_rows(), n_vars as usize);
         let gene_id_col = var.column(var.schema().index_of("gene_id").unwrap());
         let s = gene_id_col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -7597,7 +7599,7 @@ mod streaming_obs_hdf5 {
 
         let file = hdf5::File::open(&h5mu_out).unwrap();
         // Global obs present.
-        let root_obs = read_dataframe_group(&file, "obs").unwrap();
+        let root_obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(root_obs.num_rows(), n_obs as usize);
         // Each column survived the streaming export.
         for col_name in ["cell_id", "n_genes", "is_doublet", "cell_type"] {
@@ -7608,9 +7610,9 @@ mod streaming_obs_hdf5 {
         }
         // Per-modality obs is also written (mudata convention) and
         // carries the same row count.
-        let rna_obs = read_dataframe_group(&file, "mod/rna/obs").unwrap();
+        let rna_obs = read_dataframe_group(&file, "mod/rna/obs", &mut WarningSink::log()).unwrap();
         assert_eq!(rna_obs.num_rows(), n_obs as usize);
-        let adt_obs = read_dataframe_group(&file, "mod/adt/obs").unwrap();
+        let adt_obs = read_dataframe_group(&file, "mod/adt/obs", &mut WarningSink::log()).unwrap();
         assert_eq!(adt_obs.num_rows(), n_obs as usize);
     }
 
@@ -7877,7 +7879,7 @@ mod streaming_obs_hdf5 {
 
         let file = hdf5::File::open(&h5ad).unwrap();
         assert_nullable_encodings(&file);
-        let obs = read_dataframe_group(&file, "obs").unwrap();
+        let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(obs.num_rows(), n_obs as usize);
         assert_nullable_values(&obs, n_obs as usize);
     }
@@ -7904,7 +7906,7 @@ mod streaming_obs_hdf5 {
 
         let file = hdf5::File::open(&h5ad).unwrap();
         assert_nullable_encodings(&file);
-        let obs = read_dataframe_group(&file, "obs").unwrap();
+        let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(obs.num_rows(), 60);
         assert_nullable_values(&obs, 60);
     }
@@ -8046,7 +8048,7 @@ mod streaming_obs_hdf5 {
             "Dictionary(_, LargeUtf8) column must use a categorical group"
         );
 
-        let obs = read_dataframe_group(&file, "obs").unwrap();
+        let obs = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
         assert_eq!(obs.num_rows(), 4);
 
         // `note`: null mask + values survive (reader yields Utf8).

@@ -625,8 +625,8 @@ pub fn h5ad_to_scx(
     let mut writer = ScxWriter::new(output, header)?;
 
     // Write obs/var
-    let obs = read_dataframe_group(&file, "obs")?;
-    let var = read_dataframe_group(&file, "var")?;
+    let obs = read_dataframe_group(&file, "obs", sink)?;
+    let var = read_dataframe_group(&file, "var", sink)?;
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
@@ -692,6 +692,7 @@ pub fn h5ad_to_scx(
         "obsp",
         opts.shard_target_rows,
         SparseMappingKind::Obsp,
+        sink,
     )?;
     write_sparse_mapping_section(
         &file,
@@ -700,6 +701,7 @@ pub fn h5ad_to_scx(
         "varp",
         opts.shard_target_rows,
         SparseMappingKind::Varp,
+        sink,
     )?;
 
     // Read /uns only when the group exists; key-level failures route
@@ -709,7 +711,7 @@ pub fn h5ad_to_scx(
         writer.write_uns(&uns)?;
     }
 
-    if let Ok(layers) = read_layers(&file) {
+    if let Ok(layers) = read_layers(&file, sink) {
         for (layer_name, (l_indptr, l_indices, l_data, l_nobs, l_nvars)) in &layers {
             // C2: validate the layer's shape against X, matching the streaming
             // path. A layer whose row/column count disagrees with /X would
@@ -1067,11 +1069,11 @@ pub fn h5ad_to_scx_streaming(
     // can preserve in-memory mutations.
     let obs = match overrides.obs.as_ref() {
         Some(batch) => batch.clone(),
-        None => read_dataframe_group(&file, "obs")?,
+        None => read_dataframe_group(&file, "obs", sink)?,
     };
     let var = match overrides.var.as_ref() {
         Some(batch) => batch.clone(),
-        None => read_dataframe_group(&file, "var")?,
+        None => read_dataframe_group(&file, "var", sink)?,
     };
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
@@ -1126,6 +1128,7 @@ pub fn h5ad_to_scx_streaming(
         "obsp",
         opts.shard_target_rows,
         SparseMappingKind::Obsp,
+        sink,
     )?;
     write_sparse_mapping_section(
         &file,
@@ -1134,6 +1137,7 @@ pub fn h5ad_to_scx_streaming(
         "varp",
         opts.shard_target_rows,
         SparseMappingKind::Varp,
+        sink,
     )?;
 
     // Optional `adata.raw` count matrix (its own var axis) → raw section
@@ -2289,7 +2293,7 @@ fn ingest_raw_streaming(
         sink,
     )?;
 
-    let raw_var = read_dataframe_group(file, "raw/var")?;
+    let raw_var = read_dataframe_group(file, "raw/var", sink)?;
     writer.write_raw_var(&raw_var)?;
     Ok(())
 }
@@ -2416,6 +2420,7 @@ fn write_sparse_mapping_section(
     group_path: &str,
     shard_target_rows: u32,
     kind: SparseMappingKind,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let emit = |w: &mut ScxWriter,
                 name: &str,
@@ -2457,8 +2462,41 @@ fn write_sparse_mapping_section(
         return Ok(());
     }
 
-    let infos = list_sparse_mapping_shapes(file, group_path)?;
-    for info in &infos {
+    // Disk-streaming path. Classify every member of the obsp/varp group:
+    //   * valid CSR sparse subgroup → existing COO shard path,
+    //   * valid 2D dense dataset    → dense→COO shard path (reuse of the
+    //     dense obsm/varm reader; only nonzeros are stored, so a mostly-
+    //     zero pairwise matrix never costs the full n_obs² on disk),
+    //   * anything else (CSC subgroup, non-2D, malformed CSR) → dropped
+    //     with a `DroppedObsp` warning so the loss is visible from Python
+    //     and counted in provenance instead of silently swallowed.
+    let sparse_infos = list_sparse_mapping_shapes(file, group_path)?;
+    let dense_infos = list_dense_mapping_shapes(file, group_path)?;
+
+    // Surface the drop for any member handled by neither reader. The
+    // group may be absent entirely (no obsp/varp) — that is not a drop.
+    if let Ok(group) = file.group(group_path) {
+        use std::collections::HashSet;
+        let handled: HashSet<&str> = sparse_infos
+            .iter()
+            .map(|i| i.name.as_str())
+            .chain(dense_infos.iter().map(|i| i.name.as_str()))
+            .collect();
+        for name in group.member_names()? {
+            if name.starts_with("__") || handled.contains(name.as_str()) {
+                continue;
+            }
+            sink.emit(ConvertWarning::DroppedObsp {
+                name: format!("{group_path}/{name}"),
+                reason: "not a CSR sparse group or 2D dense dataset \
+                         (CSC or unsupported pairwise layout)"
+                    .to_string(),
+            });
+        }
+    }
+
+    // CSR sparse members.
+    for info in &sparse_infos {
         let n_total = info.n_rows as u64;
         // Zero-row sparse mappings: emit a single empty shard so the
         // key survives round-trip (mirrors the override-path special
@@ -2488,7 +2526,120 @@ fn write_sparse_mapping_section(
             shard_idx += 1;
         }
     }
+
+    // Dense members → COO via the existing dense row-shard reader. Each
+    // shard's nonzeros are emitted as the same COO `RecordBatch` shape
+    // the CSR path produces, so the SCX `ObspEmbeddingShard` /
+    // `VarpEmbeddingShard` reader and the h5ad exporter need no changes.
+    // A dense `/obsp` therefore re-exports as a sparse matrix (values
+    // preserved). Per-shard memory stays bounded to one row-range.
+    for info in &dense_infos {
+        let n_total = info.n_rows as u64;
+        if info.n_rows == 0 {
+            let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
+            let coo = dense_shard_to_coo(&batch, 0, 0)?;
+            emit(writer, &info.name, 0, 0, 0, 0, &coo)?;
+            continue;
+        }
+        let step = shard_target_rows.max(1) as usize;
+        let mut shard_idx = 0u32;
+        let mut row_start = 0usize;
+        while row_start < info.n_rows {
+            let row_end = (row_start + step).min(info.n_rows);
+            let batch = read_dense_mapping_shard(file, group_path, &info.name, row_start, row_end)?;
+            let coo = dense_shard_to_coo(&batch, row_start as u64, info.n_rows)?;
+            let n_shard_rows = (row_end - row_start) as u64;
+            emit(
+                writer,
+                &info.name,
+                shard_idx,
+                row_start as u64,
+                n_shard_rows,
+                n_total,
+                &coo,
+            )?;
+            row_start = row_end;
+            shard_idx += 1;
+        }
+    }
     Ok(())
+}
+
+/// Convert one dense mapping row-shard (columns `"0".."{k-1}"`, Float32,
+/// as produced by [`read_dense_mapping_shard`]) into the COO
+/// `RecordBatch` shape the obsp/varp shard writers expect (`row: Int32`,
+/// `col: Int32`, `data: Float32` + `n_rows` / `n_cols` schema metadata).
+///
+/// Only nonzero entries are emitted. `row_start` is the global row offset
+/// of this shard; COO `row` values are global (not shard-local), matching
+/// [`read_sparse_mapping_shard`]. `n_rows_total` is the logical row count
+/// of the full pairwise matrix; `n_cols` is taken from the shard's column
+/// count.
+fn dense_shard_to_coo(
+    batch: &RecordBatch,
+    row_start: u64,
+    n_rows_total: usize,
+) -> Result<RecordBatch, ConvertError> {
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let n_cols = batch.num_columns();
+    let n_local = batch.num_rows();
+
+    let cols: Vec<&Float32Array> = (0..n_cols)
+        .map(|c| {
+            batch
+                .column(c)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    ConvertError::Other("dense mapping shard column is not Float32".to_string())
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut rows: Vec<i32> = Vec::new();
+    let mut col_idx: Vec<i32> = Vec::new();
+    let mut data: Vec<f32> = Vec::new();
+    for local in 0..n_local {
+        let global_row = row_start + local as u64;
+        let r_i32 = i32::try_from(global_row).map_err(|_| {
+            ConvertError::Other(format!(
+                "dense pairwise row index {global_row} exceeds i32::MAX \
+                 (Arrow COO uses i32 row indices)"
+            ))
+        })?;
+        for (c, arr) in cols.iter().enumerate() {
+            let v = arr.value(local);
+            if v != 0.0 {
+                rows.push(r_i32);
+                col_idx.push(c as i32);
+                data.push(v);
+            }
+        }
+    }
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        HashMap::from([
+            ("n_rows".to_string(), n_rows_total.to_string()),
+            ("n_cols".to_string(), n_cols.to_string()),
+        ]),
+    ));
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(rows)),
+            Arc::new(Int32Array::from(col_idx)),
+            Arc::new(Float32Array::from(data)),
+        ],
+    )?)
 }
 
 /// Slice an in-memory COO `RecordBatch` into row-aligned shards and

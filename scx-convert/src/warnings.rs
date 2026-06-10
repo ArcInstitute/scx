@@ -44,6 +44,20 @@ pub enum ConvertWarning {
     UnsupportedIndexColumn { column: String, reason: String },
     /// An `obsp` / `varp` entry was dropped (e.g. unsupported dtype).
     DroppedObsp { name: String, reason: String },
+    /// An obs/var DataFrame column could not be read and was skipped
+    /// (unsupported encoding-type, read error, or malformed group). The
+    /// column is absent from the converted output. Replaces the prior
+    /// `eprintln!` so Python callers can intercept via `warnings.warn`
+    /// and CLI callers get a machine-readable per-category count.
+    SkippedColumn {
+        group: String,
+        name: String,
+        reason: String,
+    },
+    /// An `obsm` / `varm` embedding could not be read and was skipped.
+    /// Replaces the prior `eprintln!` for the same reasons as
+    /// [`Self::SkippedColumn`].
+    SkippedObsm { name: String, reason: String },
     /// A modality's type was inferred (from var/obs schema or layer
     /// presence) rather than being declared in the source file.
     ModalityTypeInferred {
@@ -155,6 +169,8 @@ impl ConvertWarning {
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
             Self::UnsupportedIndexColumn { .. } => "unsupported_index_column",
             Self::DroppedObsp { .. } => "dropped_obsp",
+            Self::SkippedColumn { .. } => "skipped_column",
+            Self::SkippedObsm { .. } => "skipped_obsm",
             Self::ModalityTypeInferred { .. } => "modality_type_inferred",
             Self::DenseSparsified { .. } => "dense_sparsified",
             Self::DuplicateCoordinatesMerged { .. } => "duplicate_coordinates_merged",

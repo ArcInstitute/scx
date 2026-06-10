@@ -55,8 +55,8 @@ pub fn read_h5ad_metadata_from_path(
 ) -> Result<H5adMetadataParts, ConvertError> {
     let file = hdf5::File::open(path)?;
     let (n_obs, n_vars, x_format) = read_h5ad_x_shape(&file, sink)?;
-    let obs = read_dataframe_group(&file, "obs")?;
-    let var = read_dataframe_group(&file, "var")?;
+    let obs = read_dataframe_group(&file, "obs", sink)?;
+    let var = read_dataframe_group(&file, "var", sink)?;
     let uns = if file.group("uns").is_ok() {
         Some(read_uns(&file, strict_uns, sink)?)
     } else {
@@ -172,7 +172,7 @@ pub fn read_raw_group(
     let indptr: Vec<i64> = u_indptr.iter().map(|&v| v as i64).collect();
     let indices: Vec<i32> = u_indices.iter().map(|&v| v as i32).collect();
 
-    let raw_var = read_dataframe_group(file, "raw/var")?;
+    let raw_var = read_dataframe_group(file, "raw/var", sink)?;
 
     Ok(Some(((indptr, indices, data, n_obs, raw_n_vars), raw_var)))
 }
@@ -403,9 +403,15 @@ pub(super) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertEr
 }
 
 /// Read a DataFrame group (obs or var) from an h5ad file as an Arrow RecordBatch.
+///
+/// Columns that cannot be read (unsupported encoding-type, read error) are
+/// skipped and surfaced via `sink.emit(ConvertWarning::SkippedColumn { .. })`
+/// so the loss reaches the Python `warnings.warn` channel and the per-category
+/// provenance counter — never silently dropped.
 pub fn read_dataframe_group(
     file: &hdf5::File,
     group_name: &str,
+    sink: &mut WarningSink,
 ) -> Result<RecordBatch, ConvertError> {
     let group = file.group(group_name)?;
 
@@ -456,7 +462,11 @@ pub fn read_dataframe_group(
                     arrays.push(array);
                 }
                 Err(e) => {
-                    eprintln!("warning: skipping column '{name}' in {group_name}: {e}");
+                    sink.emit(ConvertWarning::SkippedColumn {
+                        group: group_name.to_string(),
+                        name: name.clone(),
+                        reason: e.to_string(),
+                    });
                 }
             }
             continue;
@@ -482,9 +492,11 @@ pub fn read_dataframe_group(
                             arrays.push(array);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "warning: skipping categorical group '{name}' in {group_name}: {e}"
-                            );
+                            sink.emit(ConvertWarning::SkippedColumn {
+                                group: group_name.to_string(),
+                                name: name.clone(),
+                                reason: format!("categorical group: {e}"),
+                            });
                         }
                     }
                     continue;
@@ -496,9 +508,11 @@ pub fn read_dataframe_group(
                             arrays.push(array);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "warning: skipping nullable-boolean group '{name}' in {group_name}: {e}"
-                            );
+                            sink.emit(ConvertWarning::SkippedColumn {
+                                group: group_name.to_string(),
+                                name: name.clone(),
+                                reason: format!("nullable-boolean group: {e}"),
+                            });
                         }
                     }
                     continue;
@@ -510,9 +524,11 @@ pub fn read_dataframe_group(
                             arrays.push(array);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "warning: skipping nullable-integer group '{name}' in {group_name}: {e}"
-                            );
+                            sink.emit(ConvertWarning::SkippedColumn {
+                                group: group_name.to_string(),
+                                name: name.clone(),
+                                reason: format!("nullable-integer group: {e}"),
+                            });
                         }
                     }
                     continue;
@@ -524,9 +540,11 @@ pub fn read_dataframe_group(
                             arrays.push(array);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "warning: skipping nullable-float group '{name}' in {group_name}: {e}"
-                            );
+                            sink.emit(ConvertWarning::SkippedColumn {
+                                group: group_name.to_string(),
+                                name: name.clone(),
+                                reason: format!("nullable-float group: {e}"),
+                            });
                         }
                     }
                     continue;
@@ -538,9 +556,11 @@ pub fn read_dataframe_group(
                             arrays.push(array);
                         }
                         Err(e) => {
-                            eprintln!(
-                                "warning: skipping nullable-string-array group '{name}' in {group_name}: {e}"
-                            );
+                            sink.emit(ConvertWarning::SkippedColumn {
+                                group: group_name.to_string(),
+                                name: name.clone(),
+                                reason: format!("nullable-string-array group: {e}"),
+                            });
                         }
                     }
                     continue;
@@ -556,10 +576,11 @@ pub fn read_dataframe_group(
                     // we don't decode (some future / exotic anndata
                     // encoding). Don't drop it silently — that's how the
                     // nullable-integer regression slipped through.
-                    eprintln!(
-                        "warning: skipping unsupported group column '{name}' \
-                         (encoding-type='{other}') in {group_name}"
-                    );
+                    sink.emit(ConvertWarning::SkippedColumn {
+                        group: group_name.to_string(),
+                        name: name.clone(),
+                        reason: format!("unsupported encoding-type '{other}'"),
+                    });
                 }
             }
         }
@@ -1176,14 +1197,20 @@ fn drop_explicit_zeros(
 /// [`list_dense_mapping_shapes`] + [`read_dense_mapping_shard`]). The
 /// `_at` form is also exposed for h5mu per-modality paths.
 #[allow(dead_code)]
-pub fn read_obsm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
-    read_obsm_at(file, "obsm")
+pub fn read_obsm(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<HashMap<String, RecordBatch>, ConvertError> {
+    read_obsm_at(file, "obsm", sink)
 }
 
 /// Read varm embeddings from h5ad file (root `/varm`). See [`read_obsm`].
 #[allow(dead_code)]
-pub fn read_varm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, ConvertError> {
-    read_obsm_at(file, "varm")
+pub fn read_varm(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<HashMap<String, RecordBatch>, ConvertError> {
+    read_obsm_at(file, "varm", sink)
 }
 
 /// Read an obsm group at an arbitrary path (e.g. `mod/rna/obsm` for an
@@ -1194,6 +1221,7 @@ pub fn read_varm(file: &hdf5::File) -> Result<HashMap<String, RecordBatch>, Conv
 pub fn read_obsm_at(
     file: &hdf5::File,
     path: &str,
+    sink: &mut WarningSink,
 ) -> Result<HashMap<String, RecordBatch>, ConvertError> {
     let mut result = HashMap::new();
     let obsm_group = match file.group(path) {
@@ -1207,7 +1235,10 @@ pub fn read_obsm_at(
                 result.insert(name.clone(), batch);
             }
             Err(e) => {
-                eprintln!("warning: skipping {path}/{name}: {e}");
+                sink.emit(ConvertWarning::SkippedObsm {
+                    name: format!("{path}/{name}"),
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -1372,6 +1403,23 @@ pub fn list_sparse_mapping_shapes(
             Ok(g) => g,
             Err(_) => continue,
         };
+        // Only CSR is read here. A *square* CSC pairwise matrix has
+        // `indptr.len() == n_cols + 1 == n_rows + 1`, so it would otherwise
+        // slip past the indptr-length check below and be mis-read as CSR
+        // (silently transposed). Skip any group whose `encoding-type` is
+        // present and not `csr_matrix` — the caller surfaces the skip as a
+        // `DroppedObsp` warning. Groups with no `encoding-type` attr fall
+        // through to the structural checks (legacy / attr-less CSR).
+        if let Some(enc) = sub
+            .attr("encoding-type")
+            .ok()
+            .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+            .map(|v| v.to_string())
+        {
+            if enc != "csr_matrix" {
+                continue;
+            }
+        }
         let shape_attr: Vec<i64> = match sub.attr("shape").and_then(|a| a.read_1d::<i64>()) {
             Ok(arr) => arr.to_vec(),
             Err(_) => continue,
@@ -1666,8 +1714,11 @@ fn read_uns_entry(
 
 /// Read layers from h5ad file (root `/layers`).
 /// Returns a map of layer_name → (indptr, indices, data, n_obs, n_vars).
-pub fn read_layers(file: &hdf5::File) -> Result<HashMap<String, CsrArrays>, ConvertError> {
-    read_layers_at(file, "layers")
+pub fn read_layers(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<HashMap<String, CsrArrays>, ConvertError> {
+    read_layers_at(file, "layers", sink)
 }
 
 /// Read layers from a layer group at an arbitrary path (e.g.
@@ -1676,6 +1727,7 @@ pub fn read_layers(file: &hdf5::File) -> Result<HashMap<String, CsrArrays>, Conv
 pub fn read_layers_at(
     file: &hdf5::File,
     path: &str,
+    sink: &mut WarningSink,
 ) -> Result<HashMap<String, CsrArrays>, ConvertError> {
     let mut result = HashMap::new();
     let layers_group = match file.group(path) {
@@ -1689,7 +1741,10 @@ pub fn read_layers_at(
                 result.insert(name.clone(), data);
             }
             Err(e) => {
-                eprintln!("warning: skipping layer '{path}/{name}': {e}");
+                sink.emit(ConvertWarning::LayerSkipped {
+                    name: format!("{path}/{name}"),
+                    reason: e.to_string(),
+                });
             }
         }
     }
