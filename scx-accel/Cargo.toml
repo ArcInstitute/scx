@@ -45,3 +45,7 @@ arrow = { workspace = true }
 [[bench]]
 name = "distances"
 harness = false
+
+[[bench]]
+name = "covariance_pca"
+harness = false

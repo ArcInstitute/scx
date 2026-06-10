@@ -94,8 +94,15 @@ fn mat_to_row_major_buf(mat: &Mat<f64>) -> Vec<f64> {
 /// Accumulate the sparse outer product X^T @ X directly from CSR nonzeros.
 ///
 /// For each row, iterates pairs of nonzeros and accumulates `C[c1, c2] += v1 * v2`.
-/// Exploits symmetry: only computes upper triangle and mirrors to lower.
+/// Exploits symmetry: writes **only the lower triangle** (entries `(r, c)` with
+/// `r >= c`). The eigensolver reads the lower triangle via
+/// `self_adjoint_eigen(Side::Lower)`, so the upper triangle is never populated —
+/// this halves the inner-loop stores and avoids a cache-unfriendly second scatter.
 /// Also accumulates `col_sums` in the same pass (caller provides the slice).
+///
+/// Retained as the serial reference for `test_sparse_covariance_matches_dense`; the
+/// production paths (streaming + in-memory) use the parallel variant below.
+#[allow(dead_code)]
 fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut Mat<f64>) {
     let n_rows = csr.n_rows();
     for r in 0..n_rows {
@@ -107,7 +114,7 @@ fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut
             let v = csr.data[idx] as f64;
             col_sums[c] += v;
         }
-        // Sparse outer product with symmetry exploitation
+        // Sparse outer product — lower triangle only
         for i in start..end {
             let c1 = csr.indices[i] as usize;
             let v1 = csr.data[i] as f64;
@@ -116,8 +123,9 @@ fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut
                 let c2 = csr.indices[j] as usize;
                 let v2 = csr.data[j] as f64;
                 let prod = v1 * v2;
-                cov[(c1, c2)] += prod;
-                cov[(c2, c1)] += prod;
+                // Write the lower-triangle entry only (row >= col).
+                let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+                cov[(hi, lo)] += prod;
             }
         }
     }
@@ -125,9 +133,10 @@ fn sparse_outer_product_accumulate(csr: &ScxCsr, col_sums: &mut [f64], cov: &mut
 
 /// Parallel sparse outer product accumulation using thread-local `Mat<f64>` accumulators.
 ///
-/// Same algorithm as [`sparse_outer_product_accumulate`] but distributes rows across
-/// rayon threads. Each thread gets its own n_vars × n_vars covariance matrix (~30 MB
-/// for n_vars=2000) and col_sums vector, then results are reduced by element-wise addition.
+/// Same algorithm as [`sparse_outer_product_accumulate`] (lower-triangle only) but
+/// distributes rows across rayon threads. Each thread gets its own n_vars × n_vars
+/// covariance matrix (~30 MB for n_vars=2000) and col_sums vector, then results are
+/// reduced by element-wise addition.
 fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>, Vec<f64>) {
     let n_rows = csr.n_rows();
     let chunk_size = (n_rows / rayon::current_num_threads()).max(256);
@@ -153,8 +162,9 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
                         let c2 = csr.indices[j] as usize;
                         let v2 = csr.data[j] as f64;
                         let prod = v1 * v2;
-                        cov_local[(c1, c2)] += prod;
-                        cov_local[(c2, c1)] += prod;
+                        // Write the lower-triangle entry only (row >= col).
+                        let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+                        cov_local[(hi, lo)] += prod;
                     }
                 }
                 (cov_local, sums_local)
@@ -898,7 +908,13 @@ pub fn covariance_pca<S: ShardSource>(
     let n_shards = source.n_shards();
     for shard_idx in 0..n_shards {
         let csr = source.read_shard(shard_idx)?;
-        sparse_outer_product_accumulate(&csr, &mut col_sums, &mut cov);
+        // Parallel per-shard accumulation (lower triangle only), folded into the
+        // running covariance. Near-linear speedup over the former serial path.
+        let (cov_shard, sums_shard) = sparse_outer_product_accumulate_par(&csr, n_vars);
+        cov += cov_shard;
+        for (acc, &s) in col_sums.iter_mut().zip(sums_shard.iter()) {
+            *acc += s;
+        }
     }
 
     // --- Mean centering ---
@@ -1629,9 +1645,12 @@ mod tests {
             );
         }
 
-        // Check covariance matrices match
+        // Check covariance matrices match. The sparse accumulators populate only
+        // the lower triangle (row >= col) — the eigensolver reads `Side::Lower` —
+        // so compare against the dense GEMM (which is fully symmetric) on the
+        // lower triangle only.
         for i in 0..n_vars {
-            for j in 0..n_vars {
+            for j in 0..=i {
                 assert!(
                     (cov_dense[(i, j)] - cov_sparse[(i, j)]).abs() < 1e-10,
                     "cov mismatch at ({i},{j}): dense={}, sparse={}",
