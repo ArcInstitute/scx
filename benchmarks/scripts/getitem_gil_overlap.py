@@ -62,10 +62,17 @@ def _run_serial(X, wl_a, wl_b, iters: int) -> float:
 
 
 def _run_parallel(X, wl_a, wl_b, iters: int) -> float:
-    results: list[int] = [0, 0]
+    results: list[int | None] = [None, None]
+    errors: list[BaseException | None] = [None, None]
 
     def worker(slot: int, idx: np.ndarray) -> None:
-        results[slot] = _gather(X, idx, iters)
+        # Capture any failure so it can be re-raised on the main thread —
+        # Thread.join() does not propagate worker exceptions, and a silent
+        # failure in the parallel path is exactly what this bench must catch.
+        try:
+            results[slot] = _gather(X, idx, iters)
+        except BaseException as exc:  # noqa: BLE001 — re-raised below
+            errors[slot] = exc
 
     t_a = threading.Thread(target=worker, args=(0, wl_a))
     t_b = threading.Thread(target=worker, args=(1, wl_b))
@@ -74,7 +81,14 @@ def _run_parallel(X, wl_a, wl_b, iters: int) -> float:
     t_b.start()
     t_a.join()
     t_b.join()
-    return time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+
+    for exc in errors:
+        if exc is not None:
+            raise RuntimeError("parallel gather worker failed") from exc
+    if any(r is None for r in results):
+        raise RuntimeError("parallel gather worker did not produce a result")
+    return elapsed
 
 
 def main() -> int:
