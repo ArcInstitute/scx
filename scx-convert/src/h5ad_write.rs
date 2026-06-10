@@ -29,6 +29,18 @@ use scx_format::reader::ScxReader;
 
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
+use crate::CATEGORICAL_ORDERED_KEY;
+
+/// Resolve a categorical column's pandas `ordered` bit from the Arrow
+/// `Field::metadata` the h5ad reader stamps ([`CATEGORICAL_ORDERED_KEY`]).
+/// Non-categorical or metadata-less fields resolve to `false`.
+fn field_ordered(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(CATEGORICAL_ORDERED_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
 
 /// Write an SCX file to h5ad format.
 pub fn write_scx_to_h5ad(
@@ -119,6 +131,16 @@ pub fn write_scx_to_h5ad(
 
     // Write /raw (DV-filtered on the obs axis like /X).
     write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
+
+    // Write obsp / varp pairwise matrices (COO → csr_matrix groups). obsp is
+    // square on the obs axis, so deletion vectors filter BOTH axes; varp lives
+    // on the var axis and is never obs-deleted.
+    if let Ok(obsp) = reader.read_all_obsp() {
+        write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
+    }
+    if let Ok(varp) = reader.read_all_varp() {
+        write_pairwise_group(&root, "varp", &varp, None)?;
+    }
 
     Ok(())
 }
@@ -278,24 +300,8 @@ fn write_dataframe_body(
             // exclude from `column-order` (matches anndata convention).
             // anndata requires `_index` to be a plain dataset, so the
             // nullable-group encoding is disabled for it.
-            write_column_to_hdf5(
-                group,
-                df_name,
-                on_disk_index,
-                col,
-                field.data_type(),
-                false,
-                sink,
-            )?;
-        } else if write_column_to_hdf5(
-            group,
-            df_name,
-            field.name(),
-            col,
-            field.data_type(),
-            true,
-            sink,
-        )? {
+            write_column_to_hdf5(group, df_name, on_disk_index, col, field, false, sink)?;
+        } else if write_column_to_hdf5(group, df_name, field.name(), col, field, true, sink)? {
             // Only list the column in `column-order` when a dataset
             // was actually created — unsupported types are
             // warn-and-skipped and must not appear in the index.
@@ -379,6 +385,132 @@ fn write_sparse_arrays(
         .create("shape")?
         .write(&shape)?;
 
+    Ok(())
+}
+
+/// Read a COO column (`row` / `col`) as `i64`, accepting both the v1
+/// (`Int32`) and v2 (`Int64`) coordinate widths the pairwise readers emit.
+fn coo_coord_column(batch: &RecordBatch, name: &str) -> Result<Vec<i64>, ConvertError> {
+    let col = batch.column_by_name(name).ok_or_else(|| {
+        ConvertError::Other(format!("pairwise COO batch missing '{name}' column"))
+    })?;
+    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        Ok(a.values().iter().map(|&v| v as i64).collect())
+    } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        Ok(a.values().to_vec())
+    } else {
+        Err(ConvertError::Other(format!(
+            "pairwise COO column '{name}' is neither Int32 nor Int64"
+        )))
+    }
+}
+
+/// CSR arrays (`indptr`, `indices`, `data`) plus the square dimension `n`.
+type CooCsr = (Vec<i64>, Vec<i32>, Vec<f32>, usize);
+
+/// Convert a pairwise COO `RecordBatch` (`row`, `col`, `data: Float32` +
+/// `n_rows` / `n_cols` schema metadata) into CSR arrays for an h5ad
+/// `csr_matrix` group. When `keep` is `Some`, the matrix is filtered on
+/// **both** axes by the obs keep-mask (pairwise matrices are square on the
+/// obs axis) and indices are remapped into the compacted space; `varp`
+/// passes `None`. Output is sorted by `(row, col)` and is `n × n`.
+fn coo_batch_to_csr(batch: &RecordBatch, keep: Option<&[bool]>) -> Result<CooCsr, ConvertError> {
+    let meta = batch.schema_ref().metadata();
+    let n_rows: usize = meta
+        .get("n_rows")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ConvertError::Other("pairwise COO batch missing n_rows metadata".into()))?;
+
+    let rows = coo_coord_column(batch, "row")?;
+    let cols = coo_coord_column(batch, "col")?;
+    let data = batch
+        .column_by_name("data")
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+        .ok_or_else(|| ConvertError::Other("pairwise COO batch missing Float32 'data'".into()))?;
+
+    // Build the old→new index remap (identity when no deletions). `remap[i]`
+    // is the compacted index of kept row/col `i`, or -1 when dropped.
+    let (remap, n_out): (Option<Vec<i64>>, usize) = match keep {
+        Some(mask) => {
+            let mut remap = vec![-1i64; n_rows];
+            let mut next = 0i64;
+            for (i, slot) in remap.iter_mut().enumerate().take(n_rows.min(mask.len())) {
+                if mask[i] {
+                    *slot = next;
+                    next += 1;
+                }
+            }
+            (Some(remap), next as usize)
+        }
+        None => (None, n_rows),
+    };
+
+    // Filter + remap into (row, col, value) triples.
+    let mut triples: Vec<(i64, i64, f32)> = Vec::with_capacity(rows.len());
+    for k in 0..rows.len() {
+        let (r, c) = (rows[k], cols[k]);
+        let (nr, nc) = match &remap {
+            Some(remap) => {
+                let (Some(&nr), Some(&nc)) = (remap.get(r as usize), remap.get(c as usize)) else {
+                    continue;
+                };
+                if nr < 0 || nc < 0 {
+                    continue;
+                }
+                (nr, nc)
+            }
+            // No remap (varp / no deletions): coordinates index `indptr`
+            // directly, so an out-of-range coord from a malformed COO section
+            // would panic. Reject it as a conversion error instead.
+            None => {
+                if r < 0 || r >= n_rows as i64 || c < 0 || c >= n_rows as i64 {
+                    return Err(ConvertError::Other(format!(
+                        "pairwise COO coordinate ({r}, {c}) out of bounds for \
+                         {n_rows}x{n_rows} matrix"
+                    )));
+                }
+                (r, c)
+            }
+        };
+        triples.push((nr, nc, data.value(k)));
+    }
+
+    // Canonical CSR: sort by (row, col), then build indptr.
+    triples.sort_by_key(|&(r, c, _)| (r, c));
+    let mut indptr = vec![0i64; n_out + 1];
+    let mut indices = Vec::with_capacity(triples.len());
+    let mut values = Vec::with_capacity(triples.len());
+    for &(r, c, v) in &triples {
+        indptr[r as usize + 1] += 1;
+        indices.push(c as i32);
+        values.push(v);
+    }
+    for i in 0..n_out {
+        indptr[i + 1] += indptr[i];
+    }
+
+    Ok((indptr, indices, values, n_out))
+}
+
+/// Write `obsp` / `varp` pairwise matrices into an h5ad group (one
+/// `csr_matrix` subgroup per key). `keep` filters both axes by the obs
+/// keep-mask (pass `Some` for `obsp` under deletion vectors, `None` for
+/// `varp`, which lives on the var axis and is never obs-deleted).
+pub(super) fn write_pairwise_group(
+    parent: &hdf5::Group,
+    group_name: &str,
+    entries: &HashMap<String, RecordBatch>,
+    keep: Option<&[bool]>,
+) -> Result<(), ConvertError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let group = parent.create_group(group_name)?;
+    for (name, batch) in entries {
+        let (indptr, indices, data, n) = coo_batch_to_csr(batch, keep)?;
+        let sub = group.create_group(name)?;
+        write_sparse_arrays(&sub, &indptr, &indices, &data, n, n)?;
+    }
     Ok(())
 }
 
@@ -520,10 +652,14 @@ fn write_column_to_hdf5(
     df_name: &str,
     name: &str,
     array: &dyn Array,
-    dtype: &DataType,
+    field: &Field,
     allow_nullable_group: bool,
     sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
+    // `dtype` selects the encoding; `ordered` (categorical only) is
+    // resolved from the field's `scx.categorical.ordered` metadata.
+    let dtype = field.data_type();
+    let ordered = field_ordered(field);
     match dtype {
         DataType::Int32 => {
             let arr = array
@@ -694,15 +830,15 @@ fn write_column_to_hdf5(
                 .new_attr::<VarLenUnicode>()
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.2.0"))?;
-            // `ordered=false` matches scipy / pandas default. Arrow's
-            // DictionaryArray doesn't carry an `ordered` bit so we
-            // never have richer information to forward. Native HDF5
+            // The pandas `ordered` bit is carried in the Arrow field
+            // metadata (`scx.categorical.ordered`) the h5ad reader stamps;
+            // `ordered` is resolved from it by the caller. Native HDF5
             // bool — anndata's categorical reader expects
             // `H5T_NATIVE_HBOOL_8`, not u8.
             cat_group
                 .new_attr::<bool>()
                 .create("ordered")?
-                .write_scalar(&false)?;
+                .write_scalar(&ordered)?;
         }
         _ => {
             sink.emit(ConvertWarning::UnsupportedExportColumn {
@@ -1190,6 +1326,10 @@ enum ColumnStreamWriter {
         // insertion order is preserved by walking `cat_order` at finalize.
         dict: HashMap<String, i32>,
         cat_order: Vec<String>,
+        // pandas `ordered` bit, resolved from the source field metadata
+        // ([`CATEGORICAL_ORDERED_KEY`]) at writer creation and emitted at
+        // finalize (the `Field` is gone by then).
+        ordered: bool,
     },
     /// anndata `nullable-integer` / `nullable-string-array` group: a
     /// `values` dataset (nulls filled with `0` / `""`) + a boolean `mask`
@@ -1359,6 +1499,7 @@ fn create_column_writer(
                 offset: 0,
                 dict: HashMap::new(),
                 cat_order: Vec::new(),
+                ordered: field_ordered(field),
             })
         }
         _ => {
@@ -1675,7 +1816,10 @@ fn append_shard_to_column(
 
 fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertError> {
     if let ColumnStreamWriter::Categorical {
-        group, cat_order, ..
+        group,
+        cat_order,
+        ordered,
+        ..
     } = writer
     {
         let cats: Vec<VarLenUnicode> = cat_order.iter().map(|s| vlu(s)).collect();
@@ -1695,7 +1839,7 @@ fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertErro
         group
             .new_attr::<bool>()
             .create("ordered")?
-            .write_scalar(&false)?;
+            .write_scalar(ordered)?;
     }
     Ok(())
 }
@@ -1928,4 +2072,76 @@ fn write_2d_dataset<T: hdf5::H5Type>(
         .create(name)?
         .write(&nd)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod pairwise_tests {
+    use super::*;
+    use arrow::array::{Float32Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// Build a COO pairwise `RecordBatch` (`row`/`col` Int32, `data` f32 +
+    /// `n_rows`/`n_cols` metadata) like the obsp/varp readers emit.
+    fn coo(n: usize, triples: &[(i32, i32, f32)]) -> RecordBatch {
+        let rows: Vec<i32> = triples.iter().map(|t| t.0).collect();
+        let cols: Vec<i32> = triples.iter().map(|t| t.1).collect();
+        let data: Vec<f32> = triples.iter().map(|t| t.2).collect();
+        let schema = Schema::new_with_metadata(
+            vec![
+                Field::new("row", DataType::Int32, false),
+                Field::new("col", DataType::Int32, false),
+                Field::new("data", DataType::Float32, false),
+            ],
+            HashMap::from([
+                ("n_rows".to_string(), n.to_string()),
+                ("n_cols".to_string(), n.to_string()),
+            ]),
+        );
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int32Array::from(rows)),
+                Arc::new(Int32Array::from(cols)),
+                Arc::new(Float32Array::from(data)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn coo_to_csr_identity_no_mask() {
+        // 4×4: (0,0)=1 (0,2)=2 (2,1)=3 (3,3)=4 — deliberately unsorted input.
+        let batch = coo(4, &[(0, 2, 2.0), (3, 3, 4.0), (0, 0, 1.0), (2, 1, 3.0)]);
+        let (indptr, indices, data, n) = coo_batch_to_csr(&batch, None).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(indptr, vec![0, 2, 2, 3, 4]);
+        assert_eq!(indices, vec![0, 2, 1, 3]); // row0 cols sorted, then row2, row3
+        assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn coo_to_csr_keep_mask_filters_both_axes() {
+        // Drop index 1 on both axes: keep = [T,F,T,T] → remap 0→0, 2→1, 3→2.
+        let batch = coo(4, &[(0, 0, 1.0), (0, 2, 2.0), (2, 1, 3.0), (3, 3, 4.0)]);
+        let keep = [true, false, true, true];
+        let (indptr, indices, data, n) = coo_batch_to_csr(&batch, Some(&keep)).unwrap();
+        // (2,1) is dropped (col 1 removed); the rest remap into a 3×3 matrix.
+        assert_eq!(n, 3);
+        assert_eq!(indptr, vec![0, 2, 2, 3]);
+        assert_eq!(indices, vec![0, 1, 2]); // row0: (0,0)->0,(0,2)->1 ; row2: (3,3)->2
+        assert_eq!(data, vec![1.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn coo_to_csr_out_of_bounds_coord_errors_no_mask() {
+        // Malformed COO: a coordinate >= n_rows would index `indptr` out of
+        // bounds. The no-mask path must reject it rather than panic.
+        let batch = coo(3, &[(0, 0, 1.0), (5, 1, 2.0)]);
+        let err = coo_batch_to_csr(&batch, None).unwrap_err();
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected out-of-bounds error, got: {err}"
+        );
+    }
 }

@@ -395,33 +395,107 @@ pub(crate) fn pyarrow_table_to_pandas<'py>(
     table: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let py = table.py();
+
+    // pyarrow's `to_pandas()` restores `pd.Categorical` for dictionary columns
+    // but ignores Arrow FIELD metadata, so it always returns the factor
+    // unordered. Collect the columns flagged ordered (`scx.categorical.ordered`,
+    // stamped by the h5ad reader) BEFORE conversion — `self_destruct` frees the
+    // Arrow buffers as columns convert — then restore the bit on the DataFrame.
+    let ordered_cols = ordered_categorical_columns(table)?;
+
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("self_destruct", true)?;
 
-    let Some(info) = extract_scx_envelope_info(table)? else {
-        return table.call_method("to_pandas", (), Some(&kwargs));
+    let df = match extract_scx_envelope_info(table)? {
+        // No envelope, or a full pyarrow envelope: `to_pandas()` restores
+        // dtypes / index natively.
+        None => table.call_method("to_pandas", (), Some(&kwargs))?,
+        Some(info) if !info.is_minimal => table.call_method("to_pandas", (), Some(&kwargs))?,
+        // Minimal envelope: strip + manual set_index.
+        Some(info) => {
+            let stripped = strip_pandas_metadata(table)?;
+            let df = stripped.call_method("to_pandas", (), Some(&kwargs))?;
+            let set_idx_kwargs = pyo3::types::PyDict::new(py);
+            set_idx_kwargs.set_item("drop", true)?;
+            set_idx_kwargs.set_item("inplace", true)?;
+            df.call_method(
+                "set_index",
+                (info.index_col.as_str(),),
+                Some(&set_idx_kwargs),
+            )?;
+            if info.index_col == "__index_level_0__" {
+                df.getattr("index")?.setattr("name", py.None())?;
+            }
+            df
+        }
     };
-    if !info.is_minimal {
-        // Full pyarrow envelope: let to_pandas() restore dtypes and
-        // index natively.
-        return table.call_method("to_pandas", (), Some(&kwargs));
-    }
 
-    // Minimal envelope: strip + manual set_index.
-    let stripped = strip_pandas_metadata(table)?;
-    let df = stripped.call_method("to_pandas", (), Some(&kwargs))?;
-    let set_idx_kwargs = pyo3::types::PyDict::new(py);
-    set_idx_kwargs.set_item("drop", true)?;
-    set_idx_kwargs.set_item("inplace", true)?;
-    df.call_method(
-        "set_index",
-        (info.index_col.as_str(),),
-        Some(&set_idx_kwargs),
-    )?;
-    if info.index_col == "__index_level_0__" {
-        df.getattr("index")?.setattr("name", py.None())?;
-    }
+    apply_categorical_ordered(&df, &ordered_cols)?;
     Ok(df)
+}
+
+/// Names of dictionary columns whose Arrow `Field` metadata flags them as
+/// ordered categoricals (`scx.categorical.ordered == "true"`). Read from the
+/// pyarrow Table schema; must be called before a `self_destruct` `to_pandas()`.
+fn ordered_categorical_columns(table: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    let py = table.py();
+    let schema = table.getattr("schema")?;
+    let names: Vec<String> = schema.getattr("names")?.extract()?;
+    let key = PyBytes::new(py, scx_convert::CATEGORICAL_ORDERED_KEY.as_bytes());
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let field = schema.call_method1("field", (i,))?;
+        let md = field.getattr("metadata")?;
+        let Ok(md) = md.cast::<PyDict>() else {
+            continue; // None (no metadata) or unexpected type
+        };
+        if let Some(val) = md.get_item(&key)? {
+            // pyarrow field metadata values are `bytes`, but tolerate `str`
+            // and any unexpected type (→ treat as not-ordered) so a stray
+            // metadata entry can never crash the whole `to_anndata`.
+            let is_ordered = val
+                .extract::<Vec<u8>>()
+                .map(|b| b == b"true")
+                .or_else(|_| val.extract::<String>().map(|s| s == "true"))
+                .unwrap_or(false);
+            if is_ordered {
+                out.push(name.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Apply `.cat.as_ordered()` to each named categorical column present in `df`.
+/// No-op for columns that were dropped (e.g. the index) or aren't categorical.
+///
+/// Replaces each flagged column with its `.cat.as_ordered()` form via
+/// `DataFrame.isetitem(pos, value)` — positional column replacement. This both
+/// allows the ordered→unordered dtype change (an in-place `.loc[:, col]` would
+/// reject it) and avoids the `df[col] = ...` path, which under pandas
+/// Copy-on-Write warn mode emits a spurious chained-assignment `FutureWarning`
+/// when `__setitem__` sees the low refcount of a frame held only from Rust.
+fn apply_categorical_ordered(df: &Bound<'_, PyAny>, ordered_cols: &[String]) -> PyResult<()> {
+    if ordered_cols.is_empty() {
+        return Ok(());
+    }
+    let columns = df.getattr("columns")?;
+    for col in ordered_cols {
+        if !columns.contains(col)? {
+            continue;
+        }
+        let series = df.get_item(col)?;
+        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        if dtype_name != "category" {
+            continue;
+        }
+        let ordered = series.getattr("cat")?.call_method0("as_ordered")?;
+        let pos: usize = columns
+            .call_method1("get_loc", (col.as_str(),))?
+            .extract()?;
+        df.call_method1("isetitem", (pos, ordered))?;
+    }
+    Ok(())
 }
 
 /// Shape of the pandas-metadata envelope on a pyarrow Table's schema,

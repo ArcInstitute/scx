@@ -149,7 +149,7 @@ pub fn h5mu_to_scx(
 
     // Outer obs is the shared global axis. Read it first to pin n_obs;
     // every modality's X must agree on n_obs.
-    let outer_obs = read_dataframe_group(&file, "obs")?;
+    let outer_obs = read_dataframe_group(&file, "obs", sink)?;
     let n_obs = outer_obs.num_rows();
     if n_obs == 0 {
         return Err(ConvertError::Other(
@@ -231,7 +231,7 @@ pub fn h5mu_to_scx(
     writer.write_obs(&outer_obs)?;
 
     // Outer obsm (global) → write as obsm/{key} with modality_id=0.
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm") {
+    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
         for (key, batch) in &global_obsm {
             writer.write_obsm(key, batch)?;
         }
@@ -272,7 +272,7 @@ pub fn h5mu_to_scx(
             .set_modality_n_vars(modality_id, *mod_n_vars as u64)
             .map_err(ConvertError::from)?;
 
-        let var = read_dataframe_group(&file, &var_path)?;
+        let var = read_dataframe_group(&file, &var_path, sink)?;
         writer
             .write_var_for(modality_id, &var)
             .map_err(ConvertError::from)?;
@@ -309,7 +309,7 @@ pub fn h5mu_to_scx(
         }
 
         // Per-modality obsm.
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path) {
+        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
             for (key, batch) in &obsm_map {
                 writer
                     .write_obsm_for(modality_id, key, batch)
@@ -319,7 +319,7 @@ pub fn h5mu_to_scx(
 
         // Per-modality layers — written as layer-CSR shards stamped
         // with this modality_id.
-        if let Ok(layers) = read_layers_at(&file, &layers_path) {
+        if let Ok(layers) = read_layers_at(&file, &layers_path, sink) {
             for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
                 let (l_enc, l_codec) =
                     detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
@@ -427,7 +427,7 @@ pub fn h5mu_to_scx_streaming(
         ));
     }
 
-    let outer_obs = read_dataframe_group(&file, "obs")?;
+    let outer_obs = read_dataframe_group(&file, "obs", sink)?;
     let n_obs = outer_obs.num_rows();
     if n_obs == 0 {
         return Err(ConvertError::Other(
@@ -557,7 +557,7 @@ pub fn h5mu_to_scx_streaming(
 
     // Outer obs / obsm / uns. Global obs goes first.
     writer.write_obs(&outer_obs)?;
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm") {
+    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
         for (key, batch) in &global_obsm {
             writer.write_obsm(key, batch)?;
         }
@@ -600,7 +600,7 @@ pub fn h5mu_to_scx_streaming(
             .set_modality_n_vars(modality_id, *mod_n_vars)
             .map_err(ConvertError::from)?;
 
-        let var = read_dataframe_group(&file, &var_path)?;
+        let var = read_dataframe_group(&file, &var_path, sink)?;
         writer
             .write_var_for(modality_id, &var)
             .map_err(ConvertError::from)?;
@@ -738,7 +738,7 @@ pub fn h5mu_to_scx_streaming(
 
         // Per-modality obsm (small dense; non-streaming reuse of the
         // existing helper).
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path) {
+        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
             for (key, batch) in &obsm_map {
                 writer
                     .write_obsm_for(modality_id, key, batch)

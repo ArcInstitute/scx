@@ -1098,3 +1098,64 @@ fn test_no_raw_means_has_raw_false() {
     let reader = ScxReader::open(&path).unwrap();
     assert!(!reader.has_raw());
 }
+
+/// T2.3: an obs categorical column's `scx.categorical.ordered` Arrow
+/// field metadata must survive the SCX obs Arrow-IPC round-trip — guards
+/// against the section reader re-deriving a bare schema that drops field
+/// metadata (the carrier for the pandas `ordered` bit on h5ad export).
+#[test]
+fn test_obs_categorical_ordered_metadata_round_trips() {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    use std::collections::HashMap;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ordered.scx");
+
+    // `phase` categorical carrying ordered=true; `kind` carrying
+    // ordered=false — both must round-trip with the exact value.
+    let mk_cat = |name: &str, ordered: &str| {
+        let keys = Int32Array::from(vec![0, 1, 2, 0]);
+        let values = StringArray::from(vec!["a", "b", "c"]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let field = Field::new(
+            name,
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            "scx.categorical.ordered".to_string(),
+            ordered.to_string(),
+        )]));
+        (field, Arc::new(dict) as arrow::array::ArrayRef)
+    };
+
+    let (phase_field, phase_arr) = mk_cat("phase", "true");
+    let (kind_field, kind_arr) = mk_cat("kind", "false");
+    let id_field = Field::new("cell_id", DataType::Utf8, false);
+    let ids = StringArray::from(vec!["c0", "c1", "c2", "c3"]);
+    let schema = Schema::new(vec![id_field, phase_field, kind_field]);
+    let obs = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(ids), phase_arr, kind_arr],
+    )
+    .unwrap();
+
+    let header = sample_header(4, 1, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(1)).unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    let read = reader.read_obs().unwrap();
+    let ordered_of = |name: &str| -> Option<String> {
+        read.schema()
+            .fields()
+            .iter()
+            .find(|f| f.name() == name)
+            .and_then(|f| f.metadata().get("scx.categorical.ordered").cloned())
+    };
+    assert_eq!(ordered_of("phase").as_deref(), Some("true"));
+    assert_eq!(ordered_of("kind").as_deref(), Some("false"));
+}

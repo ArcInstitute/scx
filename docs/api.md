@@ -307,6 +307,10 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | --- | --- | --- |
 | `InferredEncoding { path, inferred }` | h5ad layout detection (`detect_matrix_format_at`, `open_x_streaming`) | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
 | `SkippedUnsKey { key, reason }` | `read_uns` / `read_uns_entry` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
+| `FlattenedUnsDataframe { key }` | `read_uns_entry` | A `uns` pandas DataFrame (`encoding-type == "dataframe"`) was preserved as a nested dict (per-column values + `_index`) rather than reconstructed as a DataFrame; column order and per-column categorical dtypes are not restored. Data is not dropped. |
+| `SkippedColumn { group, name, reason }` | `read_dataframe_group` | An obs/var column could not be read (unsupported encoding-type or read error); skipped. The column is absent from output. |
+| `SkippedObsm { name, reason }` | `read_obsm_at` | An obsm/varm embedding could not be read; skipped. |
+| `LayerSkipped { name, reason }` | `read_layers_at` / streaming layer reader | A layer was skipped (open failed, shape mismatch with `/X`, or width exceeds `u32::MAX`). |
 | `DenseSparsified { path, density }` | Dense h5ad streaming reader | Dense `/X` slab was sparsified during streaming. Reports density to help users decide whether dense storage is worth keeping. |
 | `DuplicateCoordinatesMerged { count, policy }` | CSC h5ad streaming reader | CSC input contained duplicate `(row, col)` coordinates; values were summed (scipy `sum_duplicates` semantics). |
 | `ModalityTypeInferred { name, modality_type }` | h5mu streaming reader | Modality name → `ModalityType` was inferred by name; override via `--modality-types NAME:TYPE` / `modality_types={...}`. |
@@ -314,11 +318,38 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `UnsupportedIndexColumn { column, reason }` | Predicate-index builder | A user-forced (`--index-obs` / `--index-var`) or preset column has an unsupported dtype; forced columns hard-error, preset columns warn and skip. |
 | `PredicateIndexSkippedMultimodal` | Predicate-index builder | Predicate indexes are unimodal-only on the read side today; emitted (and indexes skipped) when conversion input is multimodal. |
 | `BitmapSkipped { reason }` | Detection bitmap auto policy | `--bitmap auto` rejected emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
-| `DroppedObsp { name, reason }` | `scx merge` (multimodal) | `obsp` could not be merged (axis semantics don't compose); default-dropped with a warning. |
+| `DroppedObsp { name, reason }` | h5ad ingest (obsp/varp routing) and `scx merge` (multimodal) | A pairwise `obsp`/`varp` matrix could not be preserved: on ingest, a CSC or otherwise unsupported pairwise layout is dropped (CSR is stored directly; a **dense** pairwise matrix is preserved as nonzero COO, not dropped); on `scx merge`, `obsp` axis semantics don't compose. Default-dropped with a warning. |
 | `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
 | `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `PyExperiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
-| `ThreadsafeHdf5Unavailable` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
+| `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
 | `DroppedRaw { raw_n_vars }` | `PyExperiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
+
+## Round-trip fidelity
+
+What survives an `h5ad → scx → h5ad` (or `→ AnnData`) conversion, and what is
+lossy or dropped. **Status** is one of: **preserved** (faithful round-trip),
+**lossy** (round-trips with a documented value/structure change), or **dropped**
+(not written; surfaced as a warning). The **Warning** column names the
+[`ConvertWarning`](#conversion-warnings-convertwarning) that fires; "—" means no
+warning (the behaviour is by-design and documented here). Nothing in this table
+is lost *silently*.
+
+| Feature | Status | Warning | Notes |
+| --- | --- | --- | --- |
+| `X` counts / values | lossy | — | On-disk `u8`–`u32` ↔ in-memory `f32`; `float64` `X` is **downcast to `f32`** to match scipy CSR zero-copy. Integer counts are bit-exact. |
+| obs/var columns (numeric, string, bool, nullable, categorical) | preserved | — | Nullable int/string/bool and categoricals round-trip via anndata's nullable-group / categorical encodings. |
+| obs/var **ordered** categoricals | preserved | — | The `ordered` bit + category order round-trip both `h5ad → scx → h5ad` and `pyscx.open(...).to_anndata()` (carried in Arrow field metadata, re-applied to the reconstructed pandas factor). |
+| obs/var **MultiIndex** | lossy | — | Only the single pandas `_index` is preserved; additional index levels are not carried. |
+| unreadable obs/var column | dropped | `SkippedColumn` | Unsupported encoding-type or read error; column absent from output. |
+| obsm / varm embeddings | preserved | `SkippedObsm` (on failure) | Dense embeddings round-trip; an unreadable embedding is dropped with the warning. |
+| layers | preserved | `LayerSkipped` (on failure) | CSR layers round-trip; a layer whose shape disagrees with `/X` (or whose width exceeds `u32::MAX`) is dropped with the warning. |
+| **dense** `obsp` / `varp` | lossy | — | Ingested as nonzero **float32 COO** (only nonzeros stored); both `to_anndata` and `to_h5ad` re-emit it as a **sparse** matrix (a dense input becomes sparse; values identical). |
+| CSR `obsp` / `varp` | lossy | — | Round-trips `h5ad → scx → h5ad` (and via `to_anndata`) as **float32 CSR**; values downcast to `f32`. Under deletion vectors, `obsp` is filtered on both axes; `varp` (var axis) is never obs-deleted. |
+| CSC / unsupported `obsp` / `varp` | dropped | `DroppedObsp` | CSC and other non-CSR/non-dense pairwise layouts are dropped on ingest. |
+| `adata.raw` | preserved² | `DroppedRaw` (some modes) | `h5ad → scx → h5ad` round-trips raw counts bit-exact with the wider var axis. ² Dropped under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files; `pyscx.from_anndata(adata)` does not yet write raw. See [`adata.raw`](#adataraw). |
+| `uns` scalars / 1-D & 2-D numeric arrays / nested dicts | preserved | — | Round-trip through the `uns` JSON representation. |
+| `uns` pandas **DataFrame** | lossy | `FlattenedUnsDataframe` | Preserved as a nested dict (per-column values + `_index`); **not** reconstructed as a `pd.DataFrame` (column order / categorical dtypes not restored). |
+| `uns` pickled / unrepresentable entry | dropped | `SkippedUnsKey` | Skipped under default `strict_uns=false`; `strict_uns=true` errors on the first occurrence. |
 
 ## `adata.raw`
 

@@ -52,6 +52,15 @@ pub use h5ad_read::{
     read_h5ad_x_shape_from_path, read_uns, H5adMetadataParts,
 };
 
+/// Arrow `Field::metadata` key carrying a categorical column's pandas
+/// `ordered` bit. Arrow's `DictionaryArray` has no `ordered` flag, so the
+/// h5ad reader stamps it here and the h5ad writer / `to_anndata` re-apply it.
+///
+/// Defined at the crate root (not in the `hdf5`-gated `h5ad_read` module) so
+/// `pyscx` can reference it from the always-compiled `to_anndata` path
+/// regardless of which scx-convert features are enabled.
+pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+
 // Re-exported from scx-format so existing `scx_convert::MemoryBudget`
 // call sites keep working; the parser lives in scx-format so sibling
 // crates (scx-ops) can share it without a dependency cycle.
