@@ -34,6 +34,7 @@ benchmarks/comprehensive/results/g4*/
 benchmarks/comprehensive/results/v*soak_*/
 benchmarks/comprehensive/results/v3on2_*/
 benchmarks/comprehensive/results/v*/
+benchmarks/comprehensive/results/opt*/
 benchmarks/scripts/g4*
 
 build_artifacts/
