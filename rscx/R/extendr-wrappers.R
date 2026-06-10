@@ -174,13 +174,16 @@ scx_leiden_graph <- function(indptr, indices, weights, n_nodes,
 }
 
 scx_rank_genes <- function(counts, gene_names, groups, reference,
-                           log_transformed) {
+                           log_transformed, rankby_abs = FALSE,
+                           tie_correct = FALSE) {
   .Call(wrap__scx_rank_genes,
         counts,
         as.character(gene_names),
         as.character(groups),
         if (is.null(reference)) NULL else as.character(reference),
-        as.logical(log_transformed))
+        as.logical(log_transformed),
+        as.logical(rankby_abs),
+        as.logical(tie_correct))
 }
 
 scx_hvg_mean_var <- function(counts) {

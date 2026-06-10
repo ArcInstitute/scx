@@ -467,6 +467,9 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
         if (all(rownames(seu) %in% rownames(vd))) {
             vd <- vd[rownames(seu), , drop = FALSE]
         }
+        # 'RNA' is intentional here: this write path always builds the assay as
+        # 'RNA' via CreateSeuratObject(counts=) above. The T4.2 de-hardcoding of
+        # the assay name targets the from_seurat *read* path, not this writer.
         seu[['RNA']]@meta.data <- vd
         seu
     ")
@@ -658,6 +661,8 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 /// Field-metadata key marking an Arrow dictionary column as an *ordered*
 /// categorical. Matches `scx_convert::CATEGORICAL_ORDERED_KEY` (rscx does not
 /// depend on scx-convert, so the literal is duplicated; keep them in sync).
+// TODO(T4.9): re-export this key through `scx-format` (a shared dep of both
+// rscx and pyscx) so the three copies collapse to one (I-ORG-1).
 const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
 
 fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
@@ -687,56 +692,41 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     let mut fields = Vec::with_capacity(n_cols);
     let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(n_cols);
 
+    // A data.frame is a VECSXP (list of columns); pull the columns once as a
+    // list so each column access is a Rust vector index rather than a runtime
+    // `R!("df[[i]]")` evaluation.
+    let columns: Vec<Robj> = df
+        .as_list()
+        .ok_or_else(|| Error::Other("data.frame is not a list".into()))?
+        .values()
+        .collect();
+
     for (i, name) in col_names.iter().enumerate() {
-        let col_idx = (i + 1) as i32; // R is 1-based
-        let col_robj = R!("{{df}}[[{{col_idx}}]]")
-            .map_err(|e| Error::Other(format!("failed to get column {}: {}", name, e)))?;
+        let col_robj = &columns[i];
 
         // Detect the R class to map to the closest Arrow type (T4.3), so
         // meta.data column classes round-trip via the reverse map in
         // `arrow_column_to_robj`: factor → Dictionary(Int32,Utf8) (carrying
         // the `ordered` bit), integer → Int32, logical → Boolean, double →
-        // Float64, character → Utf8. `is.factor` is checked before
-        // `is.integer` (a factor is stored as an integer vector underneath).
-        let r_pred = |pred_robj: Result<Robj>| -> bool {
-            pred_robj
-                .ok()
-                .and_then(|r| {
-                    r.as_logical_slice()
-                        .and_then(|s| s.first().map(|&b| b.is_true()))
-                })
-                .unwrap_or(false)
-        };
-        let is_factor = r_pred(
-            R!("is.factor({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("is.factor check failed: {}", e))),
-        );
-        let is_character = r_pred(
-            R!("is.character({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("is.character check failed: {}", e))),
-        );
-        let is_logical = r_pred(
-            R!("is.logical({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("is.logical check failed: {}", e))),
-        );
-        let is_integer = r_pred(
-            R!("is.integer({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("is.integer check failed: {}", e))),
-        );
+        // Float64, character → Utf8. Detection uses extendr's native
+        // `rtype()`/`inherits()` rather than per-column `R!` evaluations (which
+        // parse + eval R at runtime — a real cost across many columns). A
+        // factor is checked first because it is an INTSXP underneath.
+        let is_factor = col_robj.inherits("factor");
+        let is_character = col_robj.rtype() == Rtype::Strings;
+        let is_logical = col_robj.rtype() == Rtype::Logicals;
+        let is_integer = col_robj.rtype() == Rtype::Integers && !is_factor;
 
         if is_factor {
             // Factor → Arrow Dictionary(Int32, Utf8): levels become the
             // dictionary, R's 1-based codes (NA → null) become 0-based keys.
-            let levels: Vec<String> = R!("levels({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("levels() failed: {}", e)))?
-                .as_str_vector()
-                .ok_or_else(|| Error::Other(format!("levels({name}) not character")))?
-                .iter()
+            let levels: Vec<String> = col_robj
+                .levels()
+                .ok_or_else(|| Error::Other(format!("levels({name}) missing/not character")))?
                 .map(|s| s.to_string())
                 .collect();
-            let codes_robj = R!("as.integer({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("as.integer(factor) failed: {}", e)))?;
-            let keys: Int32Array = codes_robj
+            // A factor's underlying storage is its 1-based integer codes.
+            let keys: Int32Array = col_robj
                 .as_integer_slice()
                 .ok_or_else(|| Error::Other(format!("factor codes for {name} not integer")))?
                 .iter()
@@ -748,10 +738,7 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
             let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
                 .map_err(|e| Error::Other(format!("dictionary array for {name}: {e}")))?;
 
-            let is_ordered = r_pred(
-                R!("is.ordered({{df}}[[{{col_idx}}]])")
-                    .map_err(|e| Error::Other(format!("is.ordered check failed: {}", e))),
-            );
+            let is_ordered = col_robj.inherits("ordered");
             let mut field = Field::new(
                 name,
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),

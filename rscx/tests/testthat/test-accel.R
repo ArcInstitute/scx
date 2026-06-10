@@ -63,6 +63,11 @@ test_that("kNN -> UMAP -> Leiden chain runs on a dense embedding", {
   expect_length(cl$membership, nrow(emb))
   expect_true(all(cl$membership >= 1L))            # 1-based labels
   expect_equal(cl$n_communities, length(unique(cl$membership)))
+
+  # Reuse a precomputed kNN graph (PR #222 review #2): same connectivity in,
+  # same UMAP out — no internal recompute.
+  um_reuse <- scx_umap(emb, neighbors = knn, n_epochs = 50L, seed = 0L)
+  expect_equal(um_reuse$embeddings, um$embeddings)
 })
 
 test_that("scx_rank_genes_groups returns a tidy DE data.frame", {
@@ -74,6 +79,49 @@ test_that("scx_rank_genes_groups returns a tidy DE data.frame", {
                     "logfoldchange") %in% colnames(de)))
   expect_true(all(de$gene %in% rownames(counts)))
   expect_true(all(de$pval_adj >= 0 & de$pval_adj <= 1))
+})
+
+# ── Numerical correctness (value-level, no Python/Seurat needed) ──────
+# Full cross-language parity against pyscx (the T4.1 AC's "cross-check on
+# pbmc3k") needs a Python-enabled env and is deferred; these assert the
+# kernels' sign/selection semantics directly, which is what would have caught
+# the tie_correct default divergence flagged in PR #222 review.
+
+test_that("scx_rank_genes_groups ranks a planted marker top with positive score", {
+  set.seed(3)
+  ng <- 25L; nc <- 120L
+  m <- matrix(rpois(ng * nc, 1), nrow = ng, ncol = nc)
+  groups <- rep(c("A", "B"), each = nc / 2L)
+  # Gene 1 is strongly up in group A.
+  m[1L, groups == "A"] <- m[1L, groups == "A"] + 50L
+  counts <- methods::as(Matrix::Matrix(m, sparse = TRUE), "CsparseMatrix")
+  rownames(counts) <- paste0("g", seq_len(ng))
+
+  de <- scx_rank_genes_groups(counts, groups = groups, reference = "B",
+                              log_transformed = FALSE)
+  a <- de[de$group == "A", ]
+  a <- a[order(-a$score), ]
+  expect_equal(a$gene[1], "g1")            # planted marker ranks first
+  expect_gt(a$score[1], 0)                 # up in A → positive score
+  # Deterministic across runs.
+  de2 <- scx_rank_genes_groups(counts, groups = groups, reference = "B",
+                               log_transformed = FALSE)
+  expect_equal(de$score, de2$score)
+})
+
+test_that("scx_hvg_mean_var matches base-R mean/var (Bessel-corrected)", {
+  set.seed(5)
+  ng <- 30L; nc <- 200L
+  m <- matrix(rpois(ng * nc, 2), nrow = ng, ncol = nc)
+  m[7L, ] <- m[7L, ] + rbinom(nc, 1, 0.3) * 40L   # gene 7: clearly overdispersed
+  counts <- methods::as(Matrix::Matrix(m, sparse = TRUE), "CsparseMatrix")
+
+  st <- scx_hvg_mean_var(counts)
+  # Per-gene mean and (ddof=1) variance must match base R row-wise stats.
+  expect_equal(st$means, rowMeans(m), tolerance = 1e-6)
+  expect_equal(st$variances, apply(m, 1, var), tolerance = 1e-5)
+  # The planted overdispersed gene has the largest raw variance.
+  expect_equal(which.max(st$variances), 7L)
 })
 
 # ── Seurat-object path (skips when Seurat is absent) ──────────────────
@@ -95,7 +143,7 @@ test_that("the accelerators write into Seurat slots end to end", {
   expect_equal(ncol(Embeddings(obj[["pca"]])), 10L)
 
   obj <- scx_neighbors(obj, dims = 1:10, k = 15L)
-  expect_true(any(grepl("snn$", names(obj@graphs))))
+  expect_true(any(grepl("_nn$", names(obj@graphs))))
 
   obj <- scx_umap(obj, dims = 1:10, n_neighbors = 15L)
   expect_true("umap" %in% names(obj@reductions))

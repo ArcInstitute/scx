@@ -27,6 +27,9 @@ use scx_sparse::ScxCsr;
 /// Factorise a character vector into contiguous `u32` level codes plus the
 /// first-seen level names (matching `pandas.factorize(sort=False)`, like the
 /// harmony binding).
+///
+// TODO(T4.9): shares first-seen-order factorize logic with `harmony.rs`;
+// consolidate into one helper during the I-ORG-1 dedup sweep.
 fn factorize_chars(labels: &[String]) -> (Vec<u32>, Vec<String>) {
     let mut map: HashMap<String, u32> = HashMap::new();
     let mut levels: Vec<String> = Vec::new();
@@ -123,6 +126,9 @@ fn dgc_genes_by_cells_to_csr(dgc: &Robj) -> Result<ScxCsr> {
 /// Presents the whole matrix as one shard so the streaming HVG kernels
 /// ([`streaming_mean_var`], [`streaming_clip_square_sum`]) run unmodified.
 /// Mirrors `pyscx::accel::pca::ScxCsrSource`.
+///
+// TODO(T4.9): hoist this single-shard in-memory `ShardSource` into
+// `scx-format`/`scx-accel` so rscx and pyscx share one definition (I-ORG-1).
 struct InMemoryShardSource<'a> {
     csr: &'a ScxCsr,
 }
@@ -238,17 +244,13 @@ fn scx_pca_matrix(
     .map_err(|e| Error::Other(format!("pca: {e}")))?;
 
     let embeddings = row_major_to_rmatrix(&result.embeddings, result.n_obs, result.n_components)?;
-    // components is row-major (n_components × n_vars); loadings are genes ×
-    // components, i.e. the transpose. Repack from (comp, gene) to (gene, comp).
+    // `components` is row-major (n_components × n_vars); the genes × components
+    // loadings are its transpose. Row-major (comp, gene) and column-major
+    // (gene, comp) share the same flat layout, so the buffer needs no repack —
+    // hand it straight to `matrix()`.
     let loadings = {
-        let n_vars = result.n_vars;
-        let mut col_major = vec![0f64; n_vars * result.n_components];
-        for comp in 0..result.n_components {
-            for gene in 0..n_vars {
-                col_major[comp * n_vars + gene] = result.components[comp * n_vars + gene];
-            }
-        }
-        let nr = n_vars as i32;
+        let col_major = &result.components;
+        let nr = result.n_vars as i32;
         let nc = result.n_components as i32;
         R!("matrix({{col_major}}, nrow = {{nr}}, ncol = {{nc}})")
             .map_err(|e| Error::Other(e.to_string()))?
@@ -439,6 +441,10 @@ fn scx_leiden_graph(
 /// @param reference Reference group name, or NULL to test each group vs rest.
 /// @param log_transformed Whether the input is already log-transformed
 ///   (controls the logFC computation).
+/// @param rankby_abs Rank by absolute score (scanpy `rankby_abs`).
+/// @param tie_correct Apply tie correction to the rank-sum statistic. The R
+///   front end defaults this to `FALSE` to match `pyscx` / scanpy
+///   (`rank_genes_groups(..., tie_correct=False)`).
 ///
 /// @return list(`group_names`, and per-group lists `names`, `scores`,
 ///   `pvals`, `pvals_adj`, `logfoldchanges`).
@@ -449,6 +455,8 @@ fn scx_rank_genes(
     groups: Strings,
     reference: Nullable<String>,
     log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
 ) -> Result<Robj> {
     let csr = dgc_genes_by_cells_to_csr(&counts)?;
     let n_obs = csr.n_rows();
@@ -498,8 +506,8 @@ fn scx_rank_genes(
         &group_names,
         reference_idx,
         log_transformed,
-        false,
-        true,
+        rankby_abs,
+        tie_correct,
         0,
     )
     .map_err(|e| Error::Other(format!("wilcoxon_rank_sum: {e}")))?;
@@ -557,7 +565,10 @@ fn scx_hvg_mean_var(counts: Robj) -> Result<Robj> {
 ///
 /// @param counts A **genes × cells** raw-counts `dgCMatrix`.
 /// @param clip_val Per-gene clip threshold (length `n_genes`), derived in R
-///   from the seurat_v3 loess fit on the pass-1 mean/variance.
+///   from the seurat_v3 loess fit on the pass-1 mean/variance. `streaming_clip_square_sum`
+///   compares it against the f32 CSR values; the f64→f32 narrowing is safe
+///   here because `clip_val = reg_std * sqrt(N) + mean` stays far below f32's
+///   range for count data.
 /// @return list(`counts_sum`, `sq_counts_sum`).
 #[extendr]
 fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Result<Robj> {

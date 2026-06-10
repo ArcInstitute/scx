@@ -263,13 +263,25 @@ usable without Seurat installed):
   `VariableFeatures()`.
 - `scx_pca(obj, n_components=50, ...)` — randomized / covariance SVD; writes
   `obj[["pca"]]`.
-- `scx_neighbors(obj, dims, k=20)` — HNSW kNN; writes the SNN `Graph`.
-- `scx_umap(obj, dims, ...)` — UMAP from the kNN connectivity; writes
-  `obj[["umap"]]`.
-- `scx_leiden(obj, resolution=1.0, ...)` — Leiden clustering; sets
-  `Idents()` / `seurat_clusters`.
-- `scx_rank_genes_groups(obj, group.by, reference=NULL)` — Wilcoxon
-  rank-sum DE (FindAllMarkers analog); returns a tidy `data.frame`.
+- `scx_neighbors(obj, dims, k=20)` — HNSW kNN; writes the fuzzy connectivity
+  graph to the `<assay>_nn` slot.
+- `scx_umap(obj, dims, ..., neighbors=NULL)` — UMAP from the kNN connectivity;
+  writes `obj[["umap"]]`.
+- `scx_leiden(obj, resolution=1.0, ..., neighbors=NULL)` — Leiden clustering;
+  sets `Idents()` / `seurat_clusters`.
+- `scx_rank_genes_groups(obj, group.by, reference=NULL, tie_correct=FALSE)` —
+  Wilcoxon rank-sum DE (FindAllMarkers analog); returns a tidy `data.frame`.
+
+Notes:
+- `scx_umap` / `scx_leiden` build their **own** kNN (default `n_neighbors`)
+  and do not read the `_nn` slot; pass `neighbors=scx_neighbors(emb)` (matrix
+  form) to reuse a precomputed graph.
+- `scx_rank_genes_groups` densifies the matrix, so on a Seurat object it
+  defaults to `VariableFeatures()` when set; `tie_correct`/`rankby_abs` default
+  to `FALSE` to match `pyscx`/scanpy.
+- `scx_highly_variable_genes` runs the numeric passes in Rust but the loess fit
+  in R (`stats::loess`); the selected HVG set may differ slightly from the
+  Python accelerator's `skmisc.loess`.
 
 All are CPU-only (rscx links no GPU feature); for GPU runs use the Python
 accelerators. Joining `scx_harmony_integrate()` / `RunHarmony_scx()` and

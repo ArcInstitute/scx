@@ -92,10 +92,13 @@ scx_neighbors <- function(object, reduction = "pca", dims = 1:30, k = 20L,
 
   cells <- rownames(emb)
   g <- .scx_conn_to_graph(res, cells, assay)
+  # The slot holds the fuzzy nearest-neighbor connectivity graph (UMAP-style),
+  # not a shared-nearest-neighbor (SNN) graph, so name it `_nn` to avoid
+  # implying SNN semantics to FindClusters consumers.
   graph.name <- if (is.null(graph.name.prefix)) {
-    paste0(assay, "_snn")
+    paste0(assay, "_nn")
   } else {
-    paste0(graph.name.prefix, "_snn")
+    paste0(graph.name.prefix, "_nn")
   }
   object[[graph.name]] <- g
   invisible(object)
@@ -121,12 +124,16 @@ scx_neighbors <- function(object, reduction = "pca", dims = 1:30, k = 20L,
 #' @param n_neighbors Neighbors for the internal kNN build (default `15`).
 #' @param n_epochs SGD epochs (default `200`).
 #' @param min_dist,spread UMAP layout parameters.
+#' @param neighbors Optional precomputed kNN result from [scx_neighbors()]
+#'   (matrix form). When supplied, its connectivity graph is reused; when
+#'   `NULL`, `scx_umap` builds its **own** kNN (`n_neighbors`) and does **not**
+#'   read any graph slot written by `scx_neighbors()` on a Seurat object.
 #' @export
 scx_umap <- function(object, reduction = "pca", dims = 1:30,
                      n_neighbors = 15L, n_components = 2L, n_epochs = 200L,
                      min_dist = 0.1, spread = 1.0, seed = 0L,
                      assay = NULL, reduction.name = "umap",
-                     reduction.key = "UMAP_") {
+                     reduction.key = "UMAP_", neighbors = NULL) {
   if (.is_seurat(object)) {
     if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
     emb <- SeuratObject::Embeddings(object[[reduction]])
@@ -136,7 +143,11 @@ scx_umap <- function(object, reduction = "pca", dims = 1:30,
     emb <- as.matrix(object)
   }
 
-  knn <- scx_knn_matrix(emb, n_neighbors, 200L, 200L, seed)
+  knn <- if (is.null(neighbors)) {
+    scx_knn_matrix(emb, n_neighbors, 200L, 200L, seed)
+  } else {
+    neighbors
+  }
   um <- scx_umap_graph(knn$conn_indptr, knn$conn_indices, knn$conn_data,
                        knn$n_obs, n_components, n_epochs, min_dist, spread,
                        5L, 1.0, seed)
@@ -154,10 +165,14 @@ scx_umap <- function(object, reduction = "pca", dims = 1:30,
 #' @describeIn scx-accelerators Leiden clustering from a kNN graph.
 #' @param resolution Resolution parameter (default `1.0`).
 #' @param max_iterations Maximum Leiden outer iterations (default `100`).
+#' @param neighbors Optional precomputed kNN result from [scx_neighbors()]
+#'   (matrix form). When supplied, its connectivity graph is reused; when
+#'   `NULL`, `scx_leiden` builds its **own** kNN (`n_neighbors`) and does
+#'   **not** read any graph slot written by `scx_neighbors()`.
 #' @export
 scx_leiden <- function(object, reduction = "pca", dims = 1:30,
                        n_neighbors = 20L, resolution = 1.0, seed = 0L,
-                       max_iterations = 100L, assay = NULL) {
+                       max_iterations = 100L, assay = NULL, neighbors = NULL) {
   if (.is_seurat(object)) {
     emb <- SeuratObject::Embeddings(object[[reduction]])
     dims <- dims[dims <= ncol(emb)]
@@ -166,7 +181,11 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
     emb <- as.matrix(object)
   }
 
-  knn <- scx_knn_matrix(emb, n_neighbors, 200L, 200L, seed)
+  knn <- if (is.null(neighbors)) {
+    scx_knn_matrix(emb, n_neighbors, 200L, 200L, seed)
+  } else {
+    neighbors
+  }
   res <- scx_leiden_graph(knn$conn_indptr, knn$conn_indices, knn$conn_data,
                           knn$n_obs, resolution, seed, max_iterations)
   if (!.is_seurat(object)) return(res)
@@ -182,19 +201,31 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
 #' @param group.by `meta.data` column with per-cell group labels.
 #' @param reference Reference group, or `NULL` to test each group vs rest.
 #' @param log_transformed Whether `layer` is already log-transformed.
+#' @param rankby_abs,tie_correct Wilcoxon options; defaults (`FALSE`/`FALSE`)
+#'   match `pyscx`/scanpy. The kernel densifies the matrix internally, so on a
+#'   Seurat object with `features = NULL` this defaults to `VariableFeatures()`
+#'   when set; passing the full gene set materializes a dense matrix.
 #' @return For DE, a long-format `data.frame` with columns `group`, `gene`,
 #'   `score`, `pval`, `pval_adj`, `logfoldchange`.
 #' @export
 scx_rank_genes_groups <- function(object, group.by = NULL, assay = NULL,
                                   layer = "data", features = NULL,
                                   groups = NULL, reference = NULL,
-                                  log_transformed = TRUE) {
+                                  log_transformed = TRUE, rankby_abs = FALSE,
+                                  tie_correct = FALSE) {
   if (.is_seurat(object)) {
     if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
     if (is.null(group.by)) {
       labels <- as.character(SeuratObject::Idents(object))
     } else {
       labels <- as.character(object[[group.by, drop = TRUE]])
+    }
+    # The DE kernel densifies the matrix; default to the variable features
+    # when the caller did not restrict `features` (matches scanpy's
+    # rank_genes_groups-on-HVGs expectation and bounds memory).
+    if (is.null(features)) {
+      vf <- SeuratObject::VariableFeatures(object)
+      if (length(vf) > 0L) features <- vf
     }
     mat <- .scx_layer_matrix(object, assay, layer)
     if (!is.null(features)) mat <- mat[features, , drop = FALSE]
@@ -205,7 +236,18 @@ scx_rank_genes_groups <- function(object, group.by = NULL, assay = NULL,
   gene_names <- rownames(mat)
   if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(mat)))
 
-  res <- scx_rank_genes(mat, gene_names, labels, reference, log_transformed)
+  # scx_rank_genes() materializes a dense n_cells x n_genes matrix; warn before
+  # a large allocation so an accidental full-matrix call is not silent.
+  if (as.double(nrow(mat)) * as.double(ncol(mat)) > 5e7) {
+    warning(sprintf(
+      paste0("scx_rank_genes_groups densifies a %d x %d matrix (~%.1f GB); ",
+             "subset to highly variable genes via `features=` to bound memory."),
+      nrow(mat), ncol(mat), as.double(nrow(mat)) * as.double(ncol(mat)) * 4 / 1e9),
+      call. = FALSE)
+  }
+
+  res <- scx_rank_genes(mat, gene_names, labels, reference, log_transformed,
+                        rankby_abs = rankby_abs, tie_correct = tie_correct)
   .scx_de_to_dataframe(res)
 }
 
@@ -229,6 +271,12 @@ scx_rank_genes_groups <- function(object, group.by = NULL, assay = NULL,
 #' @describeIn scx-accelerators Highly variable genes (seurat_v3 / vst).
 #' @param n_top_genes Number of HVGs to select (default `2000`).
 #' @param span Loess span for the mean-variance fit (default `0.3`).
+#' @section Note:
+#' The mean/variance and clipped-sum passes run in Rust (identical to the
+#' Python accelerator), but the loess fit uses R's native `stats::loess`
+#' whereas `pyscx` uses `skmisc.loess`. The two LOESS implementations can give
+#' slightly different fitted values, so the selected HVG set may differ
+#' marginally between R and Python on the same data.
 #' @export
 scx_highly_variable_genes <- function(object, assay = NULL, layer = "counts",
                                       n_top_genes = 2000L, span = 0.3) {
