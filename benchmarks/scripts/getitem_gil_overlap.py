@@ -54,14 +54,14 @@ def _gather(X, idx: np.ndarray, iters: int) -> int:
     return total
 
 
-def _run_serial(X, wl_a, wl_b, iters: int) -> float:
+def _run_serial(X, wl_a, wl_b, iters: int) -> tuple[float, tuple[int, int]]:
     t0 = time.perf_counter()
-    _gather(X, wl_a, iters)
-    _gather(X, wl_b, iters)
-    return time.perf_counter() - t0
+    nnz_a = _gather(X, wl_a, iters)
+    nnz_b = _gather(X, wl_b, iters)
+    return time.perf_counter() - t0, (nnz_a, nnz_b)
 
 
-def _run_parallel(X, wl_a, wl_b, iters: int) -> float:
+def _run_parallel(X, wl_a, wl_b, iters: int) -> tuple[float, tuple[int, int]]:
     results: list[int | None] = [None, None]
     errors: list[BaseException | None] = [None, None]
 
@@ -88,7 +88,7 @@ def _run_parallel(X, wl_a, wl_b, iters: int) -> float:
             raise RuntimeError("parallel gather worker failed") from exc
     if any(r is None for r in results):
         raise RuntimeError("parallel gather worker did not produce a result")
-    return elapsed
+    return elapsed, (results[0], results[1])
 
 
 def main() -> int:
@@ -118,8 +118,15 @@ def main() -> int:
 
     serials, parallels = [], []
     for r in range(args.repeats):
-        ts = _run_serial(X, wl_a, wl_b, args.iters)
-        tp = _run_parallel(X, wl_a, wl_b, args.iters)
+        ts, nnz_serial = _run_serial(X, wl_a, wl_b, args.iters)
+        tp, nnz_parallel = _run_parallel(X, wl_a, wl_b, args.iters)
+        # Correctness guard: the parallel path must return the same data as the
+        # serial path — catches a decode/projection drift, not just a timing win.
+        if nnz_serial != nnz_parallel:
+            raise RuntimeError(
+                f"serial/parallel nnz mismatch: {nnz_serial} != {nnz_parallel} "
+                "— parallel gather returned different data"
+            )
         serials.append(ts)
         parallels.append(tp)
         print(f"  rep {r}: serial={ts:.3f}s  parallel={tp:.3f}s  "
