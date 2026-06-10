@@ -525,7 +525,17 @@ pub fn append_from_reader_with_index_options(
 /// data-independent validation of its own today; the wrapper is kept as the
 /// named seam for any future append-specific pre-write checks.
 fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, InPlacePrep)> {
-    prepare_in_place(target_path, modality_id)
+    let (lock, prep) = prepare_in_place(target_path, modality_id)?;
+    // append extends only X's obs axis; it does not yet extend the raw
+    // matrix, so proceeding would leave `raw.n_obs < n_obs` while `has_raw`
+    // stays set — a misaligned raw that `to_anndata` would mis-reconstruct.
+    // Refuse rather than silently corrupt (raw-aware append is a follow-up).
+    // `prepare_in_place` has only read so far (the exclusive lock drops on
+    // this early return); no file mutation has occurred.
+    if prep.header.has_raw() {
+        return Err(OpsError::RawUnsupported { op: "append" });
+    }
+    Ok((lock, prep))
 }
 
 /// Read an existing obs payload as a single `RecordBatch`, handling

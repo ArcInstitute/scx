@@ -1729,6 +1729,12 @@ impl ScxReader {
     /// The raw matrix column count (`raw.n_vars`), read from the first
     /// raw shard's stats without decoding any payload. `None` when the
     /// file has no raw matrix.
+    ///
+    /// For a row-major shard `compute_shard_stats` stores the minor-axis
+    /// extent (the full column count, passed as `raw_n_vars` in
+    /// `write_shard_inner`) in `col_end` — NOT a per-shard max index — so
+    /// `col_end` is the total raw column count and is identical on every
+    /// raw shard.
     pub fn raw_n_vars(&self) -> Option<usize> {
         self.full_catalog
             .raw_csr_shards_sorted()

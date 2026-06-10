@@ -66,6 +66,22 @@ pub fn compact_with_index_options(
     let reader = ScxReader::open(input_path)?;
     let in_header = reader.header().clone();
 
+    // compact rewrites X (applying deletions) and copies other sections via
+    // an explicit allowlist that does not include the raw section family, so
+    // `adata.raw` is not carried forward. `sync_from_catalog` then re-derives
+    // `has_raw=false` on the output, leaving a consistent (raw-free) file —
+    // but raw counts are dropped, so warn loudly rather than lose them
+    // silently (raw-aware compact, filtering raw's obs axis in lockstep with
+    // X, is a planned follow-up).
+    if in_header.has_raw() {
+        log::warn!(
+            "compact: input {input} carries an adata.raw matrix, which is not yet \
+             preserved through compact — raw will be dropped from the output. \
+             (Raw-aware compact is a planned follow-up.)",
+            input = input_path.display()
+        );
+    }
+
     // Phase 6: dispatch to the multimodal compact path. The single-modality
     // path below assumes one modality and would silently flatten the
     // ModalityTable.

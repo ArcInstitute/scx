@@ -1274,6 +1274,10 @@ impl ScxWriter {
                 // values as CSR shards (different layout, same
                 // entries). Adding here would double-count nnz.
             }
+            // Raw sections bump no counter here — see the note in
+            // `write_preencoded_shard`. A future raw-aware verbatim path
+            // must advance `self.raw_csr_shard_count` for `raw/X_shard`
+            // naming.
             _ => {}
         }
 
@@ -1336,6 +1340,13 @@ impl ScxWriter {
                 // values as CSR shards (different layout, same
                 // entries). Adding here would double-count nnz.
             }
+            // `RawCsrShard` (and metadata sections) deliberately bump no
+            // counter: raw must not perturb the main matrix's
+            // `n_csr_shards`/`total_nnz`. `raw_csr_shard_count` (which
+            // only names `raw/X_shard_<idx>` in `write_raw_csr_shard`) is
+            // not advanced here because no current caller feeds a raw
+            // shard through this pre-encoded path; a future one that needs
+            // sequential raw names must bump `self.raw_csr_shard_count`.
             _ => {}
         }
 
@@ -1408,6 +1419,10 @@ impl ScxWriter {
                 // Don't double-count nnz — CSC mirrors CSR (see
                 // `write_preencoded_shard`).
             }
+            // Raw sections bump no counter here — see the note in
+            // `write_preencoded_shard`. A future raw-aware verbatim copy
+            // must advance `self.raw_csr_shard_count` for `raw/X_shard`
+            // naming.
             _ => {}
         }
 

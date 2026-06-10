@@ -200,6 +200,13 @@ impl fmt::Display for ConvertWarning {
                     n = missing.len(),
                 )
             }
+            Self::DroppedRaw { raw_n_vars } => write!(
+                f,
+                "adata.raw ({raw_n_vars} genes) was present but dropped from this \
+                 reconstruction; the mode in use (obs-filtered query, backed mode, or \
+                 deletion-vectors-active file) cannot reproduce raw's obs-axis filtering. \
+                 The on-disk raw sections are preserved."
+            ),
             other => write!(f, "{other:?}"),
         }
     }

@@ -86,6 +86,23 @@ def test_raw_round_trips_to_h5ad(tmp_dir):
     assert list(rt.raw.var_names) == [f"raw_gene_{i}" for i in range(raw_n_vars)]
 
 
+def test_raw_dropped_with_warning_in_backed_mode(tmp_dir):
+    import anndata  # noqa: F401
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    # Backed mode does not reconstruct raw's obs axis → drop + warn
+    # (human-readable DroppedRaw message), never silent.
+    with pytest.warns(UserWarning, match="dropped_raw"):
+        out = pyscx.open(scx_path).to_anndata(backed=True)
+    assert out.raw is None
+
+
 def test_no_raw_is_none(tmp_dir):
     import anndata
     import pandas as pd
