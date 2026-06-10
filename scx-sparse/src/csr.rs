@@ -278,6 +278,25 @@ impl ScxCsr {
         sums
     }
 
+    /// Compute per-column sums and per-column sum-of-squares in a single pass.
+    ///
+    /// Returns `(col_sums, col_sum_sq)`, each an `n_cols`-length `f64` vector.
+    /// Only stored (non-zero) entries contribute (implicit zeros add 0). Fusing
+    /// both reductions avoids a second pass over the nonzeros when a caller needs
+    /// the column mean *and* the (centered) total variance — the latter via
+    /// `total_variance_from_col_sq(col_sum_sq, means, n_obs)`.
+    pub fn col_sums_and_sum_sq(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut sums = vec![0.0f64; self.shape.1];
+        let mut sum_sq = vec![0.0f64; self.shape.1];
+        for (&col, &val) in self.indices.iter().zip(self.data.iter()) {
+            let v = val as f64;
+            let c = col as usize;
+            sums[c] += v;
+            sum_sq[c] += v * v;
+        }
+        (sums, sum_sq)
+    }
+
     /// Compute per-row NNZ counts: `indptr[r+1] - indptr[r]` for each row.
     pub fn row_nnz(&self) -> Vec<i64> {
         let mut counts = Vec::with_capacity(self.shape.0);
@@ -779,6 +798,16 @@ mod tests {
         let sums = csr.col_sums();
         // col 0: 1, col 1: 5, col 2: 3+2=5, col 3: 10, col 4: 7
         assert_eq!(sums, vec![1.0, 5.0, 5.0, 10.0, 7.0]);
+    }
+
+    #[test]
+    fn test_col_sums_and_sum_sq() {
+        let csr = sample_csr();
+        let (sums, sum_sq) = csr.col_sums_and_sum_sq();
+        // sums match the standalone col_sums().
+        assert_eq!(sums, csr.col_sums());
+        // col 0: 1², col 1: 5², col 2: 3²+2², col 3: 10², col 4: 7²
+        assert_eq!(sum_sq, vec![1.0, 25.0, 13.0, 100.0, 49.0]);
     }
 
     #[test]
