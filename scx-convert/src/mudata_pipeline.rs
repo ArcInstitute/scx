@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::error::ScxError;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
