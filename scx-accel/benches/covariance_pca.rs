@@ -63,16 +63,12 @@ fn build_source(
         let mut indices: Vec<i32> = Vec::with_capacity(rows_per_shard * nnz_per_row);
         let mut data: Vec<f32> = Vec::with_capacity(rows_per_shard * nnz_per_row);
         indptr.push(0i64);
-        let mut cols: Vec<usize> = Vec::with_capacity(nnz_per_row);
         for _ in 0..rows_per_shard {
-            cols.clear();
-            // Sample `nnz_per_row` distinct columns, then sort (canonical CSR).
-            while cols.len() < nnz_per_row {
-                let c = rng.gen_range(0..n_vars);
-                if !cols.contains(&c) {
-                    cols.push(c);
-                }
-            }
+            // Sample `nnz_per_row` distinct columns in O(nnz_per_row), then sort
+            // (canonical CSR). `rand::seq::index::sample` avoids the O(nnz²)
+            // rejection loop a `contains`-check would incur.
+            let mut cols: Vec<usize> =
+                rand::seq::index::sample(&mut rng, n_vars, nnz_per_row).into_vec();
             cols.sort_unstable();
             for &c in &cols {
                 indices.push(c as i32);

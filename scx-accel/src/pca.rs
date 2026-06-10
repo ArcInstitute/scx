@@ -182,6 +182,135 @@ fn sparse_outer_product_accumulate_par(csr: &ScxCsr, n_vars: usize) -> (Mat<f64>
         )
 }
 
+/// Default per-call memory budget (bytes) for the streaming covariance-PCA
+/// accumulators. Caps how many `n_vars × n_vars` f64 matrices the parallel build
+/// holds concurrently. Override with `SCX_PCA_COV_MEMORY_BUDGET` (bytes). At the
+/// n_vars ≤ [`COVARIANCE_PCA_THRESHOLD`] route ceiling a single accumulator is
+/// ~200 MB, so this admits ~10 workers there and the full core count for smaller
+/// n_vars.
+const DEFAULT_COV_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Read the covariance-accumulator memory budget (bytes) from the environment,
+/// falling back to [`DEFAULT_COV_MEMORY_BUDGET`] when unset or unparseable.
+fn cov_memory_budget() -> u64 {
+    match std::env::var("SCX_PCA_COV_MEMORY_BUDGET") {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(DEFAULT_COV_MEMORY_BUDGET),
+        Err(_) => DEFAULT_COV_MEMORY_BUDGET,
+    }
+}
+
+/// Number of concurrent covariance accumulators that fit in `budget` bytes,
+/// clamped to `[1, max_threads]`. Each accumulator is one `n_vars × n_vars` f64
+/// matrix (`n_vars² × 8` bytes). Mirrors the worker-deration arithmetic used by
+/// scx-convert's parallel-streaming coordinator: `(budget / per_worker).max(1)`
+/// then clamped to the requested thread count.
+fn cov_accumulator_workers(n_vars: usize, budget: u64, max_threads: usize) -> usize {
+    let mat_bytes = (n_vars as u64)
+        .saturating_mul(n_vars as u64)
+        .saturating_mul(8)
+        .max(1);
+    let by_budget = (budget / mat_bytes).max(1) as usize;
+    by_budget.min(max_threads.max(1))
+}
+
+/// Stream shards and accumulate the covariance **lower triangle** + column sums,
+/// reusing a bounded set of thread-local accumulators across **all** shards.
+///
+/// Peak memory is bounded to ≈ `(workers + 1) × n_vars² × 8` bytes regardless of
+/// shard count or host core count, where `workers` is derived from
+/// [`cov_memory_budget`]. This preserves the out-of-core property of the streaming
+/// path — peak RAM scales with `n_vars` (≤ [`COVARIANCE_PCA_THRESHOLD`]), not
+/// `n_obs` — while avoiding the per-shard accumulator reallocation of a naive
+/// `fold`-per-shard loop. Like the accumulators above, only the lower triangle is
+/// written (the eigensolver reads `Side::Lower`).
+fn accumulate_covariance_streaming<S: ShardSource>(
+    source: &S,
+    n_vars: usize,
+) -> Result<(Mat<f64>, Vec<f64>)> {
+    let n_shards = source.n_shards();
+    let max_threads = rayon::current_num_threads();
+    let budget = cov_memory_budget();
+    let workers = cov_accumulator_workers(n_vars, budget, max_threads);
+    if workers < max_threads {
+        log::debug!(
+            "covariance_pca: capping accumulator workers to {workers} of {max_threads} \
+             (n_vars={n_vars}, budget={budget} B, ~{} MB/accumulator) to bound peak memory",
+            (n_vars as u64)
+                .saturating_mul(n_vars as u64)
+                .saturating_mul(8)
+                / (1024 * 1024)
+        );
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .map_err(|e| AccelError::InvalidInput(format!("rayon thread pool: {e}")))?;
+
+    // Per-thread accumulators, reused across every shard (≤ `workers` of them).
+    // Shards are read sequentially on the calling thread; only the per-row
+    // accumulation runs in the bounded pool, so `S` need not be `Sync`.
+    let mut tls: ThreadLocal<RefCell<(Mat<f64>, Vec<f64>)>> = ThreadLocal::new();
+
+    for shard_idx in 0..n_shards {
+        let csr = source.read_shard(shard_idx)?;
+        let n_rows = csr.n_rows();
+        if n_rows == 0 {
+            continue;
+        }
+        let chunk_size = (n_rows / workers.max(1)).max(256);
+        let csr_ref = &csr;
+        let tls_ref = &tls;
+        pool.install(move || {
+            (0..n_rows)
+                .into_par_iter()
+                .with_min_len(chunk_size)
+                .for_each(|r| {
+                    let cell = tls_ref.get_or(|| {
+                        RefCell::new((Mat::<f64>::zeros(n_vars, n_vars), vec![0.0f64; n_vars]))
+                    });
+                    let (cov_local, sums_local) = &mut *cell.borrow_mut();
+                    let start = csr_ref.indptr[r] as usize;
+                    let end = csr_ref.indptr[r + 1] as usize;
+                    for idx in start..end {
+                        let c = csr_ref.indices[idx] as usize;
+                        let v = csr_ref.data[idx] as f64;
+                        sums_local[c] += v;
+                    }
+                    for i in start..end {
+                        let c1 = csr_ref.indices[i] as usize;
+                        let v1 = csr_ref.data[i] as f64;
+                        cov_local[(c1, c1)] += v1 * v1;
+                        for j in (i + 1)..end {
+                            let c2 = csr_ref.indices[j] as usize;
+                            let v2 = csr_ref.data[j] as f64;
+                            let prod = v1 * v2;
+                            // Write the lower-triangle entry only (row >= col).
+                            let (lo, hi) = if c1 < c2 { (c1, c2) } else { (c2, c1) };
+                            cov_local[(hi, lo)] += prod;
+                        }
+                    }
+                });
+        });
+    }
+
+    // Reduce the thread-local lower triangles + column sums into the result.
+    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
+    let mut col_sums = vec![0.0f64; n_vars];
+    for cell in tls.iter_mut() {
+        let (cov_local, sums_local) = cell.get_mut();
+        for i in 0..n_vars {
+            for j in 0..=i {
+                cov[(i, j)] += cov_local[(i, j)];
+            }
+        }
+        for (acc, &s) in col_sums.iter_mut().zip(sums_local.iter()) {
+            *acc += s;
+        }
+    }
+    Ok((cov, col_sums))
+}
+
 /// Thin SVD: A = U Σ V^T. Returns (U, σ, V^T).
 fn thin_svd_decomp(mat: &Mat<f64>) -> Result<(Mat<f64>, Vec<f64>, Mat<f64>)> {
     let svd = mat
@@ -901,21 +1030,11 @@ pub fn covariance_pca<S: ShardSource>(
 
     // --- Pass 1: Accumulate covariance matrix and column sums ---
     // Sparse outer product: accumulate C[c1,c2] += v1*v2 directly from CSR nonzeros.
-    // No densification — touches only nonzero entries (~2% for typical HVG-selected data).
-    let mut cov = Mat::<f64>::zeros(n_vars, n_vars);
-    let mut col_sums = vec![0.0f64; n_vars];
-
-    let n_shards = source.n_shards();
-    for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx)?;
-        // Parallel per-shard accumulation (lower triangle only), folded into the
-        // running covariance. Near-linear speedup over the former serial path.
-        let (cov_shard, sums_shard) = sparse_outer_product_accumulate_par(&csr, n_vars);
-        cov += cov_shard;
-        for (acc, &s) in col_sums.iter_mut().zip(sums_shard.iter()) {
-            *acc += s;
-        }
-    }
+    // No densification — touches only nonzero entries (~2% for typical HVG-selected
+    // data). Streams shard-by-shard with a memory-bounded set of thread-local
+    // accumulators (see `accumulate_covariance_streaming`); only the lower triangle
+    // is populated.
+    let (mut cov, col_sums) = accumulate_covariance_streaming(source, n_vars)?;
 
     // --- Mean centering ---
     let means = if zero_center {
@@ -929,10 +1048,12 @@ pub fn covariance_pca<S: ShardSource>(
         None
     };
 
+    // Post-processing touches only the lower triangle (`j <= i`): the upper triangle
+    // is intentionally left unpopulated since the eigensolver reads `Side::Lower`.
     if let Some(ref mu) = means {
         // C -= n_obs * (mu^T @ mu)  (rank-1 correction for mean centering)
         for i in 0..n_vars {
-            for j in 0..n_vars {
+            for j in 0..=i {
                 cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
             }
         }
@@ -941,12 +1062,13 @@ pub fn covariance_pca<S: ShardSource>(
     // Convert to sample covariance: C /= (n-1)
     let denom = (n_obs as f64 - 1.0).max(1.0);
     for i in 0..n_vars {
-        for j in 0..n_vars {
+        for j in 0..=i {
             cov[(i, j)] /= denom;
         }
     }
 
     // --- Eigendecomposition ---
+    // Reads the lower triangle only; the upper triangle of `cov` is unpopulated.
     let evd = cov
         .self_adjoint_eigen(faer::Side::Lower)
         .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
@@ -1005,7 +1127,7 @@ pub fn covariance_pca<S: ShardSource>(
     });
 
     let mut global_row = 0usize;
-    for shard_idx in 0..n_shards {
+    for shard_idx in 0..source.n_shards() {
         let csr = source.read_shard(shard_idx)?;
         let shard_rows = csr.n_rows();
 
@@ -1072,9 +1194,11 @@ pub fn covariance_pca_inmemory(
         None
     };
 
+    // Post-processing touches only the lower triangle (`j <= i`): the accumulator
+    // populates only that triangle and the eigensolver reads `Side::Lower`.
     if let Some(ref mu) = means {
         for i in 0..n_vars {
-            for j in 0..n_vars {
+            for j in 0..=i {
                 cov[(i, j)] -= n_obs as f64 * mu[i] * mu[j];
             }
         }
@@ -1083,12 +1207,12 @@ pub fn covariance_pca_inmemory(
     // Sample covariance
     let denom = (n_obs as f64 - 1.0).max(1.0);
     for i in 0..n_vars {
-        for j in 0..n_vars {
+        for j in 0..=i {
             cov[(i, j)] /= denom;
         }
     }
 
-    // Eigendecomposition
+    // Eigendecomposition — reads the lower triangle only.
     let evd = cov
         .self_adjoint_eigen(faer::Side::Lower)
         .map_err(|e| AccelError::LinAlg(format!("Eigendecomposition failed: {e:?}")))?;
@@ -1287,6 +1411,29 @@ pub fn gpu_info() -> Option<GpuInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cov_accumulator_workers_budget_cap() {
+        // One n_vars=5000 accumulator is 5000² × 8 = 200 MB.
+        let mat_bytes = 5000u64 * 5000 * 8;
+        // A budget that fits ~3 accumulators caps workers to 3 regardless of cores.
+        assert_eq!(cov_accumulator_workers(5000, 3 * mat_bytes, 32), 3);
+        // A tiny budget collapses to a single worker (serial-equivalent), never 0.
+        assert_eq!(cov_accumulator_workers(5000, 1, 32), 1);
+        assert_eq!(cov_accumulator_workers(5000, 0, 32), 1);
+        // A generous budget is clamped to the available thread count, not exceeded.
+        assert_eq!(cov_accumulator_workers(2000, u64::MAX, 8), 8);
+        // Small n_vars under the default budget uses all cores.
+        assert_eq!(
+            cov_accumulator_workers(2000, DEFAULT_COV_MEMORY_BUDGET, 16),
+            16
+        );
+        // max_threads is floored at 1 even if a caller passes 0.
+        assert_eq!(
+            cov_accumulator_workers(100, DEFAULT_COV_MEMORY_BUDGET, 0),
+            1
+        );
+    }
 
     /// 10×5 sparse matrix for PCA tests.
     fn test_csr_10x5() -> ScxCsr {
