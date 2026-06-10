@@ -19,7 +19,7 @@ use super::warnings::{ConvertWarning, WarningSink};
 /// `ordered` bit. Arrow's `DictionaryArray` has no `ordered` flag, so the
 /// h5ad reader stamps it here and the h5ad writer emits it back; obs/var
 /// are Arrow IPC, which preserves field metadata across the SCX round-trip.
-pub(crate) const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
 
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
 type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);

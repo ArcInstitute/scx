@@ -338,23 +338,18 @@ is lost *silently*.
 | --- | --- | --- | --- |
 | `X` counts / values | lossy | — | On-disk `u8`–`u32` ↔ in-memory `f32`; `float64` `X` is **downcast to `f32`** to match scipy CSR zero-copy. Integer counts are bit-exact. |
 | obs/var columns (numeric, string, bool, nullable, categorical) | preserved | — | Nullable int/string/bool and categoricals round-trip via anndata's nullable-group / categorical encodings. |
-| obs/var **ordered** categoricals | preserved¹ | — | The `ordered` bit + category order round-trip `h5ad → scx → h5ad` (carried in Arrow field metadata). ¹ `pyscx.open(...).to_anndata()` currently returns the factor **unordered** (the in-memory pandas path does not yet apply the bit) — fast-follow. |
+| obs/var **ordered** categoricals | preserved | — | The `ordered` bit + category order round-trip both `h5ad → scx → h5ad` and `pyscx.open(...).to_anndata()` (carried in Arrow field metadata, re-applied to the reconstructed pandas factor). |
 | obs/var **MultiIndex** | lossy | — | Only the single pandas `_index` is preserved; additional index levels are not carried. |
 | unreadable obs/var column | dropped | `SkippedColumn` | Unsupported encoding-type or read error; column absent from output. |
 | obsm / varm embeddings | preserved | `SkippedObsm` (on failure) | Dense embeddings round-trip; an unreadable embedding is dropped with the warning. |
 | layers | preserved | `LayerSkipped` (on failure) | CSR layers round-trip; a layer whose shape disagrees with `/X` (or whose width exceeds `u32::MAX`) is dropped with the warning. |
-| **dense** `obsp` / `varp` | lossy³ | — | Ingested as nonzero **float32 COO** (only nonzeros stored); reconstructed by `to_anndata` as a **sparse** matrix (a dense input becomes sparse; values identical). |
-| CSR `obsp` / `varp` | lossy³ | — | Ingested and reconstructed (`to_anndata`) as **float32 COO**; values downcast to `f32`. |
+| **dense** `obsp` / `varp` | lossy | — | Ingested as nonzero **float32 COO** (only nonzeros stored); both `to_anndata` and `to_h5ad` re-emit it as a **sparse** matrix (a dense input becomes sparse; values identical). |
+| CSR `obsp` / `varp` | lossy | — | Round-trips `h5ad → scx → h5ad` (and via `to_anndata`) as **float32 CSR**; values downcast to `f32`. Under deletion vectors, `obsp` is filtered on both axes; `varp` (var axis) is never obs-deleted. |
 | CSC / unsupported `obsp` / `varp` | dropped | `DroppedObsp` | CSC and other non-CSR/non-dense pairwise layouts are dropped on ingest. |
 | `adata.raw` | preserved² | `DroppedRaw` (some modes) | `h5ad → scx → h5ad` round-trips raw counts bit-exact with the wider var axis. ² Dropped under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files; `pyscx.from_anndata(adata)` does not yet write raw. See [`adata.raw`](#adataraw). |
 | `uns` scalars / 1-D & 2-D numeric arrays / nested dicts | preserved | — | Round-trip through the `uns` JSON representation. |
 | `uns` pandas **DataFrame** | lossy | `FlattenedUnsDataframe` | Preserved as a nested dict (per-column values + `_index`); **not** reconstructed as a `pd.DataFrame` (column order / categorical dtypes not restored). |
 | `uns` pickled / unrepresentable entry | dropped | `SkippedUnsKey` | Skipped under default `strict_uns=false`; `strict_uns=true` errors on the first occurrence. |
-
-³ `obsp` / `varp` are reconstructed by `pyscx.open(...).to_anndata()`; the
-SCX → h5ad exporter (`pyscx.to_h5ad`) does **not** yet re-emit `/obsp` and
-`/varp`, so they do not survive a full `h5ad → scx → h5ad` round-trip via the
-file path today.
 
 ## `adata.raw`
 

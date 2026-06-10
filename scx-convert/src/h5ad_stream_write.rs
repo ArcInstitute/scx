@@ -259,6 +259,16 @@ pub fn write_scx_to_h5ad_streaming(
     // with the eager exporter.
     crate::h5ad_write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
 
+    // obsp / varp pairwise matrices (COO → csr_matrix groups). Read eagerly,
+    // mirroring obsm/varm above. obsp filters both axes by the obs keep mask;
+    // varp (var axis) is never obs-deleted. Shared with the eager exporter.
+    if let Ok(obsp) = reader.read_all_obsp() {
+        crate::h5ad_write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
+    }
+    if let Ok(varp) = reader.read_all_varp() {
+        crate::h5ad_write::write_pairwise_group(&root, "varp", &varp, None)?;
+    }
+
     Ok(())
 }
 

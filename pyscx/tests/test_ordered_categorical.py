@@ -73,3 +73,23 @@ def test_ordered_categorical_round_trips(tmp_dir, shard_size, label):
     assert list(out.obs["phase"].cat.categories) == ["G1", "S", "G2M"]
     # Unordered control stays unordered.
     assert out.obs["batch"].cat.ordered is False
+
+
+@pytest.mark.parametrize("backed", [False, True])
+def test_ordered_categorical_via_to_anndata(tmp_dir, backed):
+    """The in-memory `to_anndata()` path also restores the ordered bit
+    (read from Arrow field metadata), not just the h5ad export path."""
+    import anndata  # noqa: F401
+
+    import pyscx
+
+    src = _adata_with_ordered(12)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "ordered.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata(backed=backed)
+    assert out.obs["phase"].cat.ordered is True
+    assert list(out.obs["phase"].cat.categories) == ["G1", "S", "G2M"]
+    assert out.obs["batch"].cat.ordered is False

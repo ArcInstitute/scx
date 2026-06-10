@@ -49,7 +49,7 @@ pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XSt
 #[cfg(feature = "hdf5")]
 pub use h5ad_read::{
     read_dataframe_group, read_h5ad_metadata_from_path, read_h5ad_x_shape,
-    read_h5ad_x_shape_from_path, read_uns, H5adMetadataParts,
+    read_h5ad_x_shape_from_path, read_uns, H5adMetadataParts, CATEGORICAL_ORDERED_KEY,
 };
 
 // Re-exported from scx-format so existing `scx_convert::MemoryBudget`
