@@ -1284,6 +1284,110 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Write a raw-copied CSR shard section (single-modality) and, optionally,
+    /// its re-stamped decode sidecar.
+    ///
+    /// `section_bytes` is a complete shard section (76-byte header + payload)
+    /// whose header has already been patched for the new `global_offset` /
+    /// `n_minor` (see the merge / append raw-copy fast paths). This auto-names
+    /// `X_shard_<idx>` exactly like [`Self::write_csr_shard`] and advances the
+    /// same counters, so a file mixing raw-copied and re-encoded shards stays
+    /// catalog-consistent.
+    ///
+    /// When `sidecar` is `Some`, the source shard's decode sidecar is written
+    /// bound to *this* shard: `source_section_offset` / `source_section_length`
+    /// / `source_section_checksum` are re-stamped to the bytes actually written
+    /// here (the caller must have already set `major_start`). This reproduces
+    /// the sidecar [`Self::write_csr_shard`] would have emitted on the
+    /// decode/re-encode path, so raw-copy output stays byte-identical for Scx1
+    /// count shards.
+    pub fn write_csr_shard_raw_copy(
+        &mut self,
+        section_bytes: &[u8],
+        stats: ShardStats,
+        nnz: u64,
+        sidecar: Option<DecodeSidecar>,
+    ) -> Result<()> {
+        let name = format!("X_shard_{}", self.csr_shard_count);
+        self.write_csr_shard_raw_copy_inner(section_bytes, &name, stats, sidecar)?;
+        self.csr_shard_count += 1;
+        self.total_nnz += nnz;
+        Ok(())
+    }
+
+    /// Per-modality [`Self::write_csr_shard_raw_copy`]. Section name is
+    /// `X/{modality_name}/shard_{idx}`, mirroring [`Self::write_csr_shard_for`].
+    pub fn write_csr_shard_raw_copy_for(
+        &mut self,
+        modality_id: u8,
+        section_bytes: &[u8],
+        stats: ShardStats,
+        nnz: u64,
+        sidecar: Option<DecodeSidecar>,
+    ) -> Result<()> {
+        let mname = self.modality_name_for(modality_id)?;
+        let shard_idx = self
+            .modalities
+            .get((modality_id - 1) as usize)
+            .map(|m| m.n_csr_shards)
+            .unwrap_or(0);
+        let name = format!("X/{mname}/shard_{shard_idx}");
+        self.with_modality(modality_id, |this| {
+            this.write_csr_shard_raw_copy_inner(section_bytes, &name, stats, sidecar)
+        })?;
+        if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
+            info.n_csr_shards += 1;
+            info.nnz += nnz;
+        }
+        Ok(())
+    }
+
+    /// Shared body for the raw-copy CSR writers: write the patched section
+    /// bytes verbatim, record the catalog entry, and (optionally) write the
+    /// re-stamped decode sidecar bound to the bytes just written. Does NOT
+    /// advance shard counters — callers do that to match their single- vs
+    /// per-modality bookkeeping.
+    fn write_csr_shard_raw_copy_inner(
+        &mut self,
+        section_bytes: &[u8],
+        name: &str,
+        stats: ShardStats,
+        sidecar: Option<DecodeSidecar>,
+    ) -> Result<()> {
+        self.write_padding()?;
+        let shard_global_offset = self.current_offset;
+        let section_length = section_bytes.len() as u64;
+        let section_checksum = blake3_hash(section_bytes);
+        self.writer()?.write_all(section_bytes)?;
+        self.current_offset += section_length;
+
+        // Clone the stats for the sidecar only when there is a sidecar to
+        // write — the common (non-Scx1) shard copies no sidecar.
+        let sidecar_stats = sidecar.as_ref().map(|_| stats.clone());
+        self.entries.push(FullCatalogEntry {
+            name: name.to_string(),
+            offset: shard_global_offset,
+            length: section_length,
+            section_type: SectionType::CsrShard,
+            checksum: section_checksum,
+            modality_id: self.current_modality_id,
+            stats: Some(stats),
+        });
+
+        if let Some(mut sc) = sidecar {
+            // Re-bind the sidecar to the shard bytes actually written here.
+            // `major_start`, `n_cols`, `index_dtype`, and the row / Rice-block
+            // offsets are payload-relative or set by the caller and unchanged;
+            // only the source-section identity moves with the new position.
+            sc.source_section_offset = shard_global_offset;
+            sc.source_section_length = section_length;
+            sc.source_section_checksum = section_checksum;
+            // `sidecar_stats` is `Some` exactly when `sidecar` is `Some`.
+            self.write_decode_sidecar_for_source(name, sc, sidecar_stats)?;
+        }
+        Ok(())
+    }
+
     /// Write a pre-encoded shard section produced by parallel encoding.
     ///
     /// The encoding, checksums, and stats have all been computed in advance

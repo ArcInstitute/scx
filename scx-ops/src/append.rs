@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
-use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_codec::{CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format::checksum::{blake3_hash, blake3_truncated_64};
@@ -24,6 +24,7 @@ use crate::in_place::{commit_in_place, prepare_in_place, InPlacePrep};
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
+use crate::rewrite_helpers::{build_raw_copied_csr_section, raw_copy_csr_eligible};
 
 /// Options controlling how new rows are appended to an SCX file.
 ///
@@ -392,14 +393,13 @@ pub fn append_from_reader_with_index_options(
         }
         let global_row_start = prep.old_n_obs + cumulative_row_offset;
 
-        // Raw-copy fast path eligibility.
-        let raw_copy_ok = sh.index_dtype == target_index_dtype
-            && (sh.n_minor as u64) == prep.target_n_vars
-            && sh.n_major <= options.shard_target_rows.get()
-            && match options.codec {
-                CodecSelection::Auto => true,
-                CodecSelection::Explicit(c) => sh.codec_id == c as u8,
-            };
+        // Raw-copy fast path eligibility. The shared core check
+        // (dtype / n_minor / codec) is AND-ed with append's own re-split
+        // bound: append may split a source shard across `shard_target_rows`,
+        // so a verbatim copy is only valid when the source shard already fits.
+        let raw_copy_ok =
+            raw_copy_csr_eligible(&sh, target_index_dtype, prep.target_n_vars, options.codec)
+                && sh.n_major <= options.shard_target_rows.get();
 
         if raw_copy_ok {
             let shard_idx = next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;
@@ -838,46 +838,17 @@ fn raw_copy_csr_shard(
     shard_idx: u32,
     global_row_start: u64,
 ) -> Result<FullCatalogEntry> {
-    // Copy the source section into an owned buffer so we can mutate the
-    // header. `read_raw_shard_bytes` returns an mmap slice.
-    let src_bytes: Vec<u8> = source.read_raw_shard_bytes(entry)?.to_vec();
-    if src_bytes.len() < SHARD_HEADER_SIZE {
-        return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
-            format!("source shard '{}' too small for header", entry.name),
-        )));
-    }
-
-    // Build the new (patched) header with the same fields except n_minor /
-    // global_offset.
-    let new_sh = ShardHeader {
-        magic: sh.magic,
-        shard_format_version: sh.shard_format_version,
-        shard_type: sh.shard_type,
-        codec_id: sh.codec_id,
-        value_encoding: sh.value_encoding,
-        index_dtype: sh.index_dtype,
-        reserved_flags: sh.reserved_flags,
-        n_major: sh.n_major,
-        n_minor: prep.target_n_vars as u32,
-        nnz: sh.nnz,
-        global_offset: global_row_start,
-        indptr_rel_offset: sh.indptr_rel_offset,
-        indptr_length: sh.indptr_length,
-        indices_rel_offset: sh.indices_rel_offset,
-        indices_length: sh.indices_length,
-        values_rel_offset: sh.values_rel_offset,
-        values_length: sh.values_length,
-        block_index_rel_offset: sh.block_index_rel_offset,
-        block_index_length: sh.block_index_length,
-        checksum: sh.checksum,
-    };
-
-    let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-    new_sh.write_to(&mut header_buf)?;
-
-    let mut section_data = Vec::with_capacity(src_bytes.len());
-    section_data.extend_from_slice(&header_buf);
-    section_data.extend_from_slice(&src_bytes[SHARD_HEADER_SIZE..]);
+    // Build the patched section bytes + stats off the shared sink-agnostic
+    // helper (same logic merge's raw-copy path uses), then write through the
+    // in-place `FileLock` and hand-build the catalog entry below.
+    let (section_data, stats) = build_raw_copied_csr_section(
+        source,
+        entry,
+        sh,
+        prep.target_n_vars,
+        global_row_start,
+        value_encoding,
+    )?;
     let section_checksum = blake3_hash(&section_data);
     let section_length = section_data.len() as u64;
 
@@ -887,50 +858,6 @@ fn raw_copy_csr_shard(
     let shard_global_offset = *write_offset;
     lock.write_all(&section_data)?;
     *write_offset += section_length;
-
-    // Reuse the source entry's stats; only the row range is position-dependent.
-    // `nnz`, `value_min/max/sum`, `col_start/col_end`, and `column_stats` are
-    // invariant under raw copy because `raw_copy_ok` already requires
-    // `sh.n_minor == prep.target_n_vars` (so the column extent is preserved).
-    // The fallback path decodes only when the source entry is missing stats
-    // (not produced by the current writer, but format-permitted).
-    let stats = match entry.stats.as_ref() {
-        Some(src_stats) => {
-            let mut s = src_stats.clone();
-            s.row_start = global_row_start;
-            s.row_end = global_row_start + sh.n_major as u64;
-            s
-        }
-        None => {
-            let codec_id =
-                CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?;
-            if codec_id == CodecId::None {
-                let values_start = sh.values_rel_offset as usize;
-                let values_end = values_start + sh.values_length as usize;
-                compute_shard_stats(
-                    &src_bytes[values_start..values_end],
-                    value_encoding,
-                    scx_format::MajorAxis::Row,
-                    global_row_start,
-                    sh.n_major as u64,
-                    prep.target_n_vars,
-                    sh.nnz,
-                )
-            } else {
-                let (_, _, val_f32) = source.read_shard_from_entry(entry)?;
-                let raw = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
-                compute_shard_stats(
-                    &raw,
-                    value_encoding,
-                    scx_format::MajorAxis::Row,
-                    global_row_start,
-                    sh.n_major as u64,
-                    prep.target_n_vars,
-                    sh.nnz,
-                )
-            }
-        }
-    };
 
     let shard_name = match prep.modality_name.as_deref() {
         Some(mname) => format!("X/{mname}/shard_{shard_idx}"),
