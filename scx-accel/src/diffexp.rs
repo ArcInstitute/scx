@@ -161,6 +161,22 @@ pub fn wilcoxon_rank_sum(
         }
     }
 
+    // Pre-compute the total gene sum across all groups so the 1-vs-rest reference
+    // sum is O(1) per (gene, group) — `total_gene_sum[var] - group_gene_sums[g][var]`
+    // — instead of re-summing over all other groups (O(n_groups) per (gene, group),
+    // i.e. O(n_vars · n_groups²) overall). Only needed for the 1-vs-rest arm.
+    let total_gene_sum: Vec<f64> = if reference.is_none() {
+        let mut totals = vec![0.0f64; n_vars];
+        for sums in group_gene_sums.iter().take(n_groups) {
+            for (total, &s) in totals.iter_mut().zip(sums.iter()) {
+                *total += s;
+            }
+        }
+        totals
+    } else {
+        Vec::new()
+    };
+
     let n_test_groups = test_groups.len();
 
     // --- Pre-rank approach: rank once per gene, then derive per-group statistics ---
@@ -201,10 +217,7 @@ pub fn wilcoxon_rank_sum(
                                 wilcoxon_from_ranks(ranks_buf, &group_indices[g], n_obs, tc);
 
                             let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
-                            let rest_sum: f64 = (0..n_groups)
-                                .filter(|&gg| gg != g)
-                                .map(|gg| group_gene_sums[gg][var_idx])
-                                .sum();
+                            let rest_sum = total_gene_sum[var_idx] - group_gene_sums[g][var_idx];
                             let mean_ref = rest_sum / n2 as f64;
                             let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
                             group_results.push((score, pval, logfc));
