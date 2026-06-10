@@ -1370,6 +1370,15 @@ the analysis op. So the layout choice matters as much as the device flag:
   layers carry no sidecar; the device decode path falls back to host decode +
   HtoD for them. "Make `X` GPU-fast to decode" therefore means "store the
   GPU-relevant matrix as Scx1 counts," **not** "add a sidecar to a float layer."
+- **Upgrade a sidecar-less file in place with `scx optimize`.** A pre-v3 or
+  reconverted-without-sidecars file (Scx1 counts but no `decode/*` sections) does
+  not need a full reconvert to become device-decode-fast — run
+  `scx optimize in.scx --output out.scx`. It re-encodes + canonicalizes every CSR
+  shard so decode sidecars are emitted and the file is stamped `format_version=3`,
+  preserving rows / obs / var / obsm / uns / indexes (see
+  [operations.md § Optimize](operations.md#optimize)). Only Scx1 integer shards
+  gain a sidecar — a persisted float (Pcodec) `X` still won't (store counts per
+  the first bullet).
 
 Confirm the path actually taken via
 `adata.uns["scx_accel"][op]["transfer_mode"]`, the same way you confirm `route`

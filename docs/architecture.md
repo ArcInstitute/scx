@@ -57,14 +57,14 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 | **scx-codec** | Compression codecs (standalone, no I/O) | `rice`, `forbp`, `delta_golomb`, `bitstream`, `dispatch` |
 | **scx-sparse** | CSR/CSC matrix types with scipy-compatible dtypes | `csr` (`ScxCsr`), `csc` (`ScxCsc`), `transpose` (streaming CSR→CSC), `convert` (CSR ↔ dense) |
 | **scx-format** | File layout, reading, and writing | `header`, `catalog`, `shard`, `reader`, `writer`, `codec_select`, `provenance`, `deletion_vectors` |
-| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `merge`, `rollback`, `flock` |
+| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place sidecar + canonical v3 upgrade), `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
 | **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `route` (accelerator execution planner + rapids probe), `pca` (streaming/randomized SVD, auto-routed; in-VRAM routes to `rsc.pp.pca`), `neighbors` (HNSW kNN; in-VRAM routes to `rsc.pp.neighbors`), `umap` (routes to `rsc.tl.umap`), `hvg` (streaming `seurat_v3`; extra flavors route to `rsc.pp.highly_variable_genes`), `fused` (fused `pca_neighbors_umap` / `pca_neighbors` pipelines via rapids), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native CPU + cuGraph GPU), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled; rapids-singlecell detected at runtime (not a pip extra). |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA, device-resident fused path), `gpu_harmony` (distance / softmax+penalty / L2-normalize / batched correction kernels), `gpu_preprocess` (fused normalize+log1p), `gpu_matrix_source` (unified `GpuMatrixSource` capability trait over the row-major `GpuShardSource` (CSR) and column-major `GpuCscShardSource` (CSC) device shard sources, with G3-shaped pinned-ring staging), `gds` |
-| **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `merge`, `rollback`, `benchmark`, cloud ops |
+| **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `optimize`, `merge`, `rollback`, `benchmark`, cloud ops |
 | **pyscx** | Python bindings via PyO3 | `experiment`, `anndata`, `ops`, `query`, `cloud`, `backed`, `accel`, `preprocess`, `lazy_transform`, `projected_agg` |
 | **rscx** | R bindings via extendr | Seurat v5 + SingleCellExperiment interop, pipe-friendly query API |
 
@@ -492,6 +492,7 @@ Sections are **never overwritten** — operations append new data and update the
 | **append** | Add new shards at EOF | New sections + new catalog |
 | **delete** | Logical deletion via Roaring Bitmap | Deletion vectors section + new catalog |
 | **compact** | Reclaim space, merge small shards | Entire new file (atomic rename) |
+| **optimize** | Re-encode + canonicalize CSR shards → add decode sidecars, stamp v3 | Entire new file (atomic rename) |
 | **rollback** | Revert to previous catalog | Header-only update (pwrite) |
 | **merge** | Combine multiple SCX files | New file with merged data |
 
@@ -792,6 +793,7 @@ scx query experiment.scx "tissue == 'lung'" --output subset.scx --normalize 1e4 
 scx append atlas.scx --input new_batch.scx
 scx delete experiment.scx --filter "is_doublet == True" --dry-run
 scx compact experiment.scx --output compacted.scx
+scx optimize experiment.scx --output optimized.scx   # add decode sidecars + upgrade to v3
 scx rollback experiment.scx --to-seq 3
 scx merge batch1.scx batch2.scx batch3.scx --output atlas.scx
 

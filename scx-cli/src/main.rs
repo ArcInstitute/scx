@@ -13,6 +13,7 @@ mod format;
 mod info;
 mod merge;
 mod modify_metadata;
+mod optimize;
 mod query;
 mod rollback;
 mod set_uns;
@@ -268,6 +269,19 @@ enum Commands {
         /// Show count of matching cells without deleting
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Upgrade a file in place: re-encode CSR shards to add decode sidecars
+    /// and canonicalize to format_version 3 (single-modality; preserves obs/
+    /// var/obsm/uns/indexes). Drops the CSC sidecar — rerun `scx build-csc`.
+    Optimize {
+        /// SCX file to optimize
+        input: PathBuf,
+        /// Output path for the optimized file
+        #[arg(long)]
+        output: PathBuf,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
     },
     /// Rewrite file reclaiming space from deletions
     Compact {
@@ -749,6 +763,11 @@ fn main() {
             filter,
             dry_run,
         } => delete::run_delete(&file, &filter, dry_run),
+        Commands::Optimize {
+            input,
+            output,
+            force,
+        } => optimize::run_optimize(&input, &output, force),
         Commands::Compact {
             input,
             output,
