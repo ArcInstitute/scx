@@ -1881,24 +1881,49 @@ def accelerator_parity_table() -> TableBlock | TextBlock:
 
 
 def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
-    """SCX GPU vs rapids-singlecell GPU head-to-head, per (operation, dataset).
+    """Surviving native GPU paths vs rapids-singlecell, per (operation, dataset).
 
-    The V3 task 2.9 competitive comparison: for each accel op, join the SCX-GPU
-    row and the ``rapids_singlecell_gpu`` row from the same dataset and show the
-    wall-time ratio (SCX / rapids; >1 means rapids is faster) alongside each
-    side's accuracy metric. The ratio is *surfaced here* (not gated — rapids
-    version drift must not fail the build); correctness is gated separately.
-    The per-op split localizes the end-to-end pipeline gap (2.7) to a stage.
+    Post ACC-RUST-OPT-V4, in-VRAM PCA / kNN / UMAP / preprocess / HVG route to
+    rapids-singlecell, so SCX's default GPU path for those *is* rapids (a
+    head-to-head ratio is ~1.0 by construction). This table therefore compares
+    only the native GPU kernels that survive because they cover a regime rapids
+    does not — PCA randomized/streaming (>VRAM), HVG seurat_v3, Leiden cuGraph,
+    preprocess streaming/ML-loader — against rapids, to motivate the routing
+    decision. The native impl is chosen by explicit name (see
+    ``surviving_native_impl``) so the removed Phase-3 variants (`pyscx_gpu_cov`,
+    `pyscx_gpu_cagra`, native UMAP) and the `pyscx_gpu_no_rapids` diagnostic
+    fallback are never selected, even if stale JSONs linger in results/raw/.
+    The ratio is *surfaced* (not gated — rapids version drift must not fail the
+    build); correctness is gated separately.
     """
     store = get_store()
-    accel_benchmarks = [
-        "accel_pca", "accel_knn", "accel_umap", "accel_leiden",
-        "accel_preprocess", "accel_hvg",
-    ]
+    # Surviving native GPU paths after the ACC-RUST-OPT-V4 rapids transition.
+    # In-VRAM PCA / kNN / UMAP / preprocess / HVG route to rapids-singlecell, so
+    # SCX's *default* GPU path for those IS rapids (ratio ~1.0 by construction,
+    # not worth a row). A distinct native GPU kernel survives only where it
+    # covers a regime rapids does not; this table compares THOSE against rapids
+    # to motivate the routing decision. Each entry lists the accepted impl keys
+    # in preference order — selecting by explicit name means the removed Phase-3
+    # variants (`pyscx_gpu_cov`, `pyscx_gpu_cagra`, the native `pyscx_gpu` UMAP)
+    # and the rapids-disabled diagnostic fallback (`pyscx_gpu_no_rapids`) are
+    # never picked, even if stale JSONs for them still sit in results/raw/.
+    # kNN and UMAP have no surviving standalone native path → intentionally
+    # omitted (in-VRAM delegates fully to rapids).
+    surviving_native_impl: dict[str, tuple[str, ...]] = {
+        "accel_pca": ("pyscx_gpu_rand_hh", "pyscx_gpu_rand_chol"),
+        "accel_hvg": ("pyscx_gpu",),
+        "accel_leiden": ("pyscx_gpu",),
+        "accel_preprocess": ("pyscx_gpu",),
+    }
+    accel_benchmarks = list(surviving_native_impl)
+    # Labels name the surviving native path so the ratio is not misread as
+    # "SCX's GPU PCA is 13x slower" — it is the >VRAM randomized path, kept
+    # precisely because in-VRAM routes to rapids.
     op_labels = {
-        "accel_pca": "PCA", "accel_knn": "kNN", "accel_umap": "UMAP",
-        "accel_leiden": "Leiden", "accel_preprocess": "Preprocess",
-        "accel_hvg": "HVG",
+        "accel_pca": "PCA (randomized / >VRAM)",
+        "accel_leiden": "Leiden (cuGraph)",
+        "accel_preprocess": "Preprocess (streaming)",
+        "accel_hvg": "HVG (seurat_v3)",
     }
     parity_keys = {
         "accel_pca": "subspace_cos_min",
@@ -1947,15 +1972,10 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
         rapids = impls.get("rapids_singlecell_gpu")
         if rapids is None:
             continue
-        # Pick the representative SCX GPU impl. The native in-VRAM covariance
-        # PCA variant (`pyscx_gpu_cov`) was removed in ACC-RUST-OPT-V4 Phase 3,
-        # so PCA's SCX-GPU representative is now the randomized variant. For PCA
-        # this resolves to `pyscx_gpu_rand_*`; every other op has a single GPU
-        # impl. `sorted(...)` makes the choice deterministic (alphabetical:
-        # `rand_chol` before `rand_hh`) rather than dict-order-dependent.
+        # Select the surviving native GPU impl by explicit name (preference
+        # order), so removed variants / the no_rapids fallback are never picked.
         scx = next(
-            (r for k, r in sorted(impls.items())
-             if "pyscx_gpu" in k and "rapids" not in k),
+            (impls[k] for k in surviving_native_impl.get(bench, ()) if k in impls),
             None,
         )
         if scx is None:
@@ -1979,8 +1999,8 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
             "rapids-singlecell installed._"
         )
     return TableBlock(headers=headers, rows=rows, wide=True,
-                      caption="SCX GPU vs rapids-singlecell — wall-time ratio "
-                              "(>1 = rapids faster) + accuracy")
+                      caption="Surviving native GPU paths vs rapids-singlecell — "
+                              "wall-time ratio (>1 = rapids faster) + accuracy")
 
 
 def cell_eval_correctness_summary_table() -> TableBlock | TextBlock:

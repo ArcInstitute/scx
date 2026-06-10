@@ -98,26 +98,36 @@ def build(store: ResultStore) -> Chapter:
         title="GPU Accelerator Performance",
         blocks=[
             TextBlock(
-                "GPU-accelerated operations (kNN via cuVS CAGRA, PCA via "
-                "cuBLAS, UMAP, Leiden via cuGraph). Performance is sourced "
-                "from raw JSON where available; see the external sources "
-                "appendix for any manually curated entries."
+                "GPU-accelerated operations. In-VRAM PCA / kNN / UMAP / "
+                "preprocess / HVG route to rapids-singlecell; native GPU kernels "
+                "are retained for the >VRAM / streaming regimes, Leiden (cuGraph), "
+                "DE, and Harmony. Performance is sourced from raw JSON where "
+                "available; see the external sources appendix for any manually "
+                "curated entries."
             ),
             gpu_table,
         ],
     ))
 
-    # ── SCX GPU vs rapids-singlecell (V3 task 2.9) ───────────────────
+    # ── Surviving native GPU paths vs rapids-singlecell ──────────────
     c.sections.append(Section(
-        title="SCX GPU vs rapids-singlecell",
+        title="Native GPU paths vs rapids-singlecell",
         blocks=[
             TextBlock(
-                "Head-to-head against the leading GPU-scanpy stack "
-                "(rapids-singlecell). The ratio (SCX / rapids wall time; >1 means "
-                "rapids is faster) is surfaced for competitiveness tracking — it "
-                "is not gated, since rapids version drift must not fail the "
-                "build. Correctness is held to the same accuracy bar as SCX. The "
-                "per-op split localizes the end-to-end pipeline gap to a stage."
+                "After the ACC-RUST-OPT-V4 rapids transition, SCX routes in-VRAM "
+                "**PCA / kNN / UMAP / preprocess / HVG** to rapids-singlecell — so "
+                "for those ops SCX's GPU path *is* rapids and a head-to-head ratio "
+                "is ~1.0 by construction. This table therefore compares only the "
+                "native GPU kernels that survive because they cover a regime rapids "
+                "does not: **PCA randomized/streaming (>VRAM)**, **HVG seurat_v3**, "
+                "**Leiden (cuGraph)**, and **preprocess streaming**. The ratio "
+                "(native / rapids wall time; >1 means rapids is faster) motivates "
+                "the routing decision — it is surfaced, not gated, since rapids "
+                "version drift must not fail the build. kNN and UMAP have no "
+                "surviving standalone native GPU path and are intentionally "
+                "omitted; removed Phase-3 variants (`pyscx_gpu_cov`, "
+                "`pyscx_gpu_cagra`, native UMAP) and the `pyscx_gpu_no_rapids` "
+                "diagnostic fallback are never selected."
             ),
             tables.accelerator_gpu_vs_rapids_comparison_table(),
         ],
