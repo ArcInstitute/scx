@@ -106,6 +106,7 @@ written row-major sparse shards are canonical CSR (§4), and files may carry
 | 5 | `has_deletion_vectors` | Deletion vectors section present |
 | 6 | `has_front_catalog` | Cloud-ready layout — front catalog duplicate valid |
 | 7 | `has_modalities` | v2 only; set when `n_modalities > 0`. Fast capability check without reading the modality table. |
+| 8 | `has_raw` | `adata.raw` count matrix present (`raw_csr_shard` + `raw_var_metadata` sections). |
 
 ### Index dtype
 
@@ -217,13 +218,28 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 | 24 | `obs_metadata_shard` (Arrow IPC; row-shard of the obs metadata batch — see § Sharded metadata layout below) |
 | 25 | `var_metadata_shard` (Arrow IPC; row-shard of the var metadata batch — mirror of `obs_metadata_shard`) |
 | 26 | `decode_metadata_shard` (optional decode metadata sidecar for a source Scx1 CSR-like shard — see §4.2) |
-| 27–31 | Reserved for multimodal/spatial extensions |
+| 27 | `raw_csr_shard` (row-shard of the `adata.raw` count matrix — same obs axis as `csr_shard` but its OWN, typically wider, var axis; signalled by the `has_raw` flag) |
+| 28 | `raw_var_metadata` (Arrow IPC; the `adata.raw.var` DataFrame, companion to `raw_csr_shard`) |
+| 29–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
 
 Unknown types are skipped by readers with a warning, which allows the
 format to evolve without breaking old readers.
+
+#### `adata.raw` (raw section family)
+
+`adata.raw` holds pre-normalization counts on its **own var axis** (usually more
+genes than `X`, because `.raw` is captured before HVG subsetting), so it cannot be
+stored as a layer (layers share `X`'s `n_vars`). It is written as a dedicated
+family: `raw_csr_shard` sections (`raw/X_shard_<idx>`, row-major CSR sharing `X`'s
+obs axis, with per-shard `index_dtype` resolved against the raw var count — a raw
+matrix with > 65535 genes uses u32 column indices even when `X` uses u16) plus a
+single `raw_var_metadata` section (`raw/var`). Presence is signalled by the
+`has_raw` header flag (bit 8). Adding the flag does not bump `format_version`
+(stays 3), but a raw-containing file is only readable by readers that recognise
+bit 8 — older readers reject the unknown flag bit (pre-1.0; not a frozen format).
 
 ### Per-shard statistics
 

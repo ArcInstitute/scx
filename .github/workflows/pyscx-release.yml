@@ -16,12 +16,24 @@ permissions:
 
 jobs:
   build:
-    name: Build manylinux wheel (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.target }} wheel (py${{ matrix.python-version }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+        # Attach a runner to each target. aarch64 builds natively on an arm
+        # runner inside the manylinux2014 aarch64 container (no QEMU). Pin to
+        # ubuntu-22.04 for parity with scx-cli-release.yml; the manylinux
+        # container — not the host — sets the wheel's glibc floor.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +46,7 @@ jobs:
         with:
           command: build
           working-directory: pyscx
-          target: x86_64-unknown-linux-gnu
+          target: ${{ matrix.target }}
           manylinux: "2014"
           args: >-
             --release
@@ -48,7 +60,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pyscx-wheel-py${{ matrix.python-version }}
+          name: pyscx-wheel-${{ matrix.target }}-py${{ matrix.python-version }}
           path: pyscx/dist/*.whl
           if-no-files-found: error
 

@@ -49,12 +49,12 @@ pub fn rewrite_output_format_version(source_versions: &[u16], feature_floor: u16
     min_source.clamp(feature_floor, CURRENT_FORMAT_VERSION)
 }
 
-/// Bitmask of currently-defined flag bits. Reserved bits (4 and 8..=31)
+/// Bitmask of currently-defined flag bits. Reserved bits (4 and 9..=31)
 /// must be zero per the on-disk spec; `read_from` rejects any header
 /// whose `flags & !KNOWN_FLAGS != 0` so future writers can't sneak
 /// undefined bits past today's readers.
 pub const KNOWN_FLAGS: u32 =
-    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7);
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
 
 /// The 256-byte file header that starts every SCX file.
 #[derive(Debug, Clone)]
@@ -77,7 +77,8 @@ pub struct FileHeader {
     /// |   5 | `has_deletion_vectors`                               |
     /// |   6 | `has_front_catalog`                                  |
     /// |   7 | `has_modalities` (v2; set when `n_modalities > 0`)    |
-    /// | 8–31 | **reserved** — must be zero; rejected on read         |
+    /// |   8 | `has_raw` (`adata.raw` count matrix + raw var present) |
+    /// | 9–31 | **reserved** — must be zero; rejected on read         |
     pub flags: u32,
     /// Number of observations (rows)
     pub n_obs: u64,
@@ -438,6 +439,24 @@ impl FileHeader {
         self.flags &= !(1 << 7);
     }
 
+    /// Returns true if the has_raw flag (bit 8) is set — the file
+    /// carries an `adata.raw` count matrix (`RawCsrShard` sections) plus
+    /// its `raw/var` (`RawVarMetadata`) companion.
+    pub fn has_raw(&self) -> bool {
+        self.flags & (1 << 8) != 0
+    }
+
+    /// Set the has_raw flag (bit 8).
+    pub fn set_raw(&mut self) {
+        self.flags |= 1 << 8;
+    }
+
+    /// Clear the has_raw flag (bit 8). Used by mutating ops that drop the
+    /// raw matrix from the output.
+    pub fn clear_raw(&mut self) {
+        self.flags &= !(1 << 8);
+    }
+
     /// Re-derive every shard counter and section-presence flag this
     /// header owns from `catalog` — the single source of truth shared
     /// by the writer-finalize path and `scx_ops::rollback`, so a new
@@ -469,6 +488,7 @@ impl FileHeader {
         let mut has_obsp = false;
         let mut has_bitmap = false;
         let mut has_dv = false;
+        let mut has_raw = false;
 
         for entry in &catalog.entries {
             match entry.section_type {
@@ -481,6 +501,9 @@ impl FileHeader {
                 SectionType::ObspEmbeddingShard | SectionType::ObspCsrShard => has_obsp = true,
                 SectionType::BitmapShard => has_bitmap = true,
                 SectionType::DeletionVectors => has_dv = true,
+                // Raw shares the obs axis and does not contribute to the
+                // main matrix counts; it only drives the has_raw flag.
+                SectionType::RawCsrShard => has_raw = true,
                 _ => {}
             }
         }
@@ -513,6 +536,11 @@ impl FileHeader {
             self.set_deletion_vectors();
         } else {
             self.clear_deletion_vectors();
+        }
+        if has_raw {
+            self.set_raw();
+        } else {
+            self.clear_raw();
         }
     }
 }

@@ -22,15 +22,16 @@ has no compiled extension until you run `maturin develop`.
 
 pyscx is **not** published on PyPI. The `pypi.org/project/pyscx/` package is
 **unrelated**. Pre-built wheels are attached to GitHub Releases tagged `pyscx-v*`
-at <https://github.com/ArcInstitute/scx/releases>. Wheels are Linux x86_64 only,
-Python 3.11–3.14.
+at <https://github.com/ArcInstitute/scx/releases>. Wheels are Linux x86_64 and
+aarch64, Python 3.11–3.14.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or: . .venv/bin/activate
-# Download the wheel for your Python version from GitHub Releases:
-# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
-pip install ./pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# Download the wheel for your Python version + architecture from GitHub Releases:
+# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags).
+# Replace <version> with the release you downloaded (e.g. 0.7.0).
+pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
@@ -40,7 +41,7 @@ python -c "import pyscx; print(pyscx.__version__)"
   `to_h5mu` work without system HDF5 libraries.
 - **cloud** (Rust) — `open_cloud`, cloud query pipeline, and related native
   cloud I/O are compiled in.
-- **Platform** — manylinux x86_64 only (Linux). Python 3.11–3.14.
+- **Platform** — manylinux x86_64 and aarch64 (Linux). Python 3.11–3.14.
 - **Not included** — GPU acceleration. For `device="gpu"` you must build from
   source with `--features gpu` (see below).
 
@@ -62,7 +63,7 @@ pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"  # combine as needed
 ```
 
 Or just spell out the full filename, e.g.
-`pip install './pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'`.
+`pip install './pyscx-0.7.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'`.
 
 Notes on extras:
 
@@ -270,8 +271,14 @@ tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Linux
 x86_64 and arm64, glibc ≥ 2.35. Bundles hdf5 + cloud; libhdf5 statically linked.
 
 ```bash
-# Example — see README.md for full download instructions
-cargo install --features default-bin scx-cli
+# Set VERSION to the latest release — see the Releases page above.
+VERSION=0.7.0
+TARGET=x86_64-unknown-linux-gnu   # or: aarch64-unknown-linux-gnu
+gh release download "scx-cli-v${VERSION}" -R ArcInstitute/scx \
+  -p "scx-cli-${VERSION}-${TARGET}.tar.gz"
+tar xzf "scx-cli-${VERSION}-${TARGET}.tar.gz"
+install -m 0755 "scx-cli-${VERSION}-${TARGET}/scx" ~/.local/bin/scx
+# See README.md for the curl-based download (once the repo is public).
 ```
 
 **Build from source** (macOS, custom features, etc.):
@@ -279,10 +286,14 @@ cargo install --features default-bin scx-cli
 ```bash
 cargo build -p scx-cli --release --features hdf5,cloud
 # hdf5 conversion needs libhdf5-dev at build time unless using hdf5-static
+
+# Or install from a clone onto PATH (the crate is not on crates.io, so plain
+# `cargo install scx-cli` does not work — install from the local checkout):
+cargo install --path scx-cli --features default-bin
 ```
 
-Plain `cargo install scx-cli` (without `default-bin`) omits h5ad conversion —
-use `--features default-bin` for the end-user bundle.
+`default-bin` bundles h5ad/h5mu/10x conversion; without it the CLI omits h5ad
+conversion (SCX → SCX ops only).
 
 ---
 

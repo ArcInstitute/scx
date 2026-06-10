@@ -1,5 +1,9 @@
 # Quickstart
 
+> **Status:** pre-1.0 (v0.7.x). Install from
+> [GitHub Releases](https://github.com/ArcInstitute/scx/releases); PyPI + conda
+> planned at public release.
+
 A 5-minute end-to-end pipeline: convert an h5ad file to SCX, run QC, normalize,
 find HVGs, embed, cluster, and rank markers. Uses the [`pyscx.accel`](scanpy.md#rust-native-accelerators)
 Rust-native pipeline.
@@ -9,27 +13,51 @@ For the full scanpy integration story, see [docs/scanpy.md](scanpy.md).
 
 ## Install
 
-```bash
-# Python bindings — download wheel from GitHub Releases:
-# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
-uv pip install ./pyscx-<version>-<python>-<abi>-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+pyscx and the `scx` CLI are distributed as pre-built artifacts on
+[GitHub Releases](https://github.com/ArcInstitute/scx/releases) (not yet on
+PyPI / crates.io). Set `VERSION` to the latest release tag.
 
-# CLI (one-shot, end-user)
-cargo install --features default-bin scx-cli
-# `default-bin` bundles h5ad / h5mu / 10x conversion. Plain
-# `cargo install scx-cli` is also fine if you only need SCX → SCX ops.
+```bash
+# Pick the latest release version (see the Releases page above):
+VERSION=0.7.0
+
+# Python bindings — download the wheel matching your Python from GitHub Releases
+# (pyscx-v* tags); Linux x86_64 and aarch64, CPython 3.11–3.14. See
+# skills/scx-usage/reference/installation.md for resolving the exact filename.
+uv pip install ./pyscx-${VERSION}-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+
+# CLI — download the pre-built binary (Linux x86_64 / arm64):
+TARGET=x86_64-unknown-linux-gnu   # or: aarch64-unknown-linux-gnu
+gh release download "scx-cli-v${VERSION}" -R ArcInstitute/scx \
+  -p "scx-cli-${VERSION}-${TARGET}.tar.gz"
+tar xzf "scx-cli-${VERSION}-${TARGET}.tar.gz"
+install -m 0755 "scx-cli-${VERSION}-${TARGET}/scx" ~/.local/bin/scx
+```
+
+To build the CLI from source instead (macOS, Windows, custom features), see the
+[README install section](../README.md#rust-cli).
+
+## Get a dataset
+
+This walkthrough uses the standard scanpy PBMC fixture — no external download
+needed:
+
+```python
+import scanpy as sc
+sc.datasets.pbmc3k().write("pbmc3k.h5ad")
 ```
 
 ## Convert an h5ad to SCX
 
 ```bash
-scx convert pbmc10k.h5ad pbmc10k.scx --stream --index-preset cellxgene
-scx info pbmc10k.scx
+scx convert pbmc3k.h5ad pbmc3k.scx --stream --index-preset cellxgene
+scx info pbmc3k.scx
 ```
 
 `--stream` keeps peak RSS bounded by one shard at a time. `--index-preset cellxgene`
 materialises predicate indexes at write time so `pyscx.open(...).query()` can push
-filters down on the resulting file.
+filters down on the resulting file. (PBMC3k is small enough that `--stream` is not
+required; it is shown here because it is the recommended default at scale.)
 
 ## Analyze in Python
 
@@ -37,7 +65,7 @@ filters down on the resulting file.
 import pyscx
 from pyscx import accel
 
-exp = pyscx.open("pbmc10k.scx")
+exp = pyscx.open("pbmc3k.scx")
 adata = exp.to_anndata()           # CSR float32, exactly what scanpy expects
 
 # QC. MT genes must be tagged explicitly (same contract as scanpy) — without
@@ -72,7 +100,7 @@ accel.rank_genes_groups(adata, groupby="leiden")
 # unmodified on-disk SCX file — to save the analysis you just ran, write
 # `adata` directly. Use `pyscx.from_anndata(adata, "out.scx")` instead to
 # round-trip the processed AnnData back to SCX.
-adata.write_h5ad("pbmc10k_processed.h5ad")
+adata.write_h5ad("pbmc3k_processed.h5ad")
 ```
 
 ## Train a model
@@ -88,7 +116,7 @@ import torch
 hvg_indices = np.where(adata.var["highly_variable"])[0].astype(np.uint32)
 
 dataset = pyscx.TrainingDataset(
-    "pbmc10k.scx",
+    "pbmc3k.scx",
     batch_size=1024,
     hvg_indices=hvg_indices,
     normalize=True,

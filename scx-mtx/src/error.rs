@@ -19,6 +19,19 @@ pub enum MtxError {
     #[error("missing required file: {0}")]
     MissingFile(String),
 
+    #[error(
+        "MTX orientation mismatch: matrix is {n_rows}×{n_cols}, but barcodes.tsv has \
+         {n_barcodes} entries and features.tsv has {n_features}; neither \
+         (features×barcodes = {n_features}×{n_barcodes}) nor \
+         (barcodes×features = {n_barcodes}×{n_features}) matches the matrix dimensions"
+    )]
+    OrientationMismatch {
+        n_rows: usize,
+        n_cols: usize,
+        n_barcodes: usize,
+        n_features: usize,
+    },
+
     #[error("invalid codec: {0}")]
     InvalidCodec(String),
 

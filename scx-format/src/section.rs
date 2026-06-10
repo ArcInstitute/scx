@@ -80,6 +80,19 @@ pub enum SectionType {
     VarMetadataShard = 25,
     /// Decode metadata sidecar for an encoded CSR-like shard.
     DecodeMetadataShard = 26,
+    /// Row-shard of the `adata.raw` count matrix (`raw/X`). Same row
+    /// (obs) axis as the main `CsrShard` matrix but its OWN column
+    /// (var) axis — `raw.n_vars` is typically larger than `n_vars`
+    /// because `.raw` is captured before HVG subsetting. Section name:
+    /// `raw/X_shard_<idx>`. Per-shard `index_dtype` is resolved against
+    /// `raw_n_vars`, so a raw matrix with > 65535 genes uses u32 column
+    /// indices even when the main matrix uses u16. Presence is signalled
+    /// by the `has_raw` header flag.
+    RawCsrShard = 27,
+    /// The `adata.raw.var` DataFrame (Arrow IPC), companion to
+    /// [`RawCsrShard`]. Section name: `raw/var`. Same payload schema as
+    /// [`VarMetadata`] but describes the raw var axis.
+    RawVarMetadata = 28,
 }
 
 impl SectionType {
@@ -113,6 +126,8 @@ impl SectionType {
             24 => Some(Self::ObsMetadataShard),
             25 => Some(Self::VarMetadataShard),
             26 => Some(Self::DecodeMetadataShard),
+            27 => Some(Self::RawCsrShard),
+            28 => Some(Self::RawVarMetadata),
             _ => None,
         }
     }
@@ -193,11 +208,13 @@ mod tests {
             SectionType::from_u8(26),
             Some(SectionType::DecodeMetadataShard)
         );
+        assert_eq!(SectionType::from_u8(27), Some(SectionType::RawCsrShard));
+        assert_eq!(SectionType::from_u8(28), Some(SectionType::RawVarMetadata));
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(27), None);
+        assert_eq!(SectionType::from_u8(29), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 

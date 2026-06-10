@@ -430,6 +430,151 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
     }
 }
 
+/// Append an `adata.raw` group (`raw/X` CSR + `raw/var`) to an existing
+/// h5ad. `raw_n_vars` is the raw matrix's OWN (wider) gene axis. Returns
+/// the canonical raw CSR `(indptr, indices, data)` for comparison.
+fn add_raw_group(path: &Path, n_obs: usize, raw_n_vars: usize) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
+    let file = hdf5::File::open_rw(path).unwrap();
+
+    let mut indptr = vec![0i64];
+    let mut indices: Vec<i32> = Vec::new();
+    let mut data: Vec<f32> = Vec::new();
+    for row in 0..n_obs {
+        let a = (row % raw_n_vars) as i32;
+        let b = (raw_n_vars - 1 - (row % raw_n_vars)) as i32;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        if lo == hi {
+            indices.push(lo);
+            data.push((row + 1) as f32);
+        } else {
+            indices.push(lo);
+            data.push((row + 1) as f32);
+            indices.push(hi);
+            data.push((row + 2) as f32);
+        }
+        indptr.push(data.len() as i64);
+    }
+
+    let raw = file.create_group("raw").unwrap();
+    let rx = raw.create_group("X").unwrap();
+    rx.new_dataset::<i64>()
+        .shape([indptr.len()])
+        .create("indptr")
+        .unwrap()
+        .write(&indptr)
+        .unwrap();
+    rx.new_dataset::<i32>()
+        .shape([indices.len()])
+        .create("indices")
+        .unwrap()
+        .write(&indices)
+        .unwrap();
+    rx.new_dataset::<f32>()
+        .shape([data.len()])
+        .create("data")
+        .unwrap()
+        .write(&data)
+        .unwrap();
+    rx.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("csr_matrix"))
+        .unwrap();
+    rx.new_attr::<i64>()
+        .shape([2])
+        .create("shape")
+        .unwrap()
+        .write(&[n_obs as i64, raw_n_vars as i64])
+        .unwrap();
+
+    let rv = raw.create_group("var").unwrap();
+    let rv_index: Vec<VarLenUnicode> = (0..raw_n_vars)
+        .map(|i| vlu(&format!("raw_gene_{i}")))
+        .collect();
+    rv.new_dataset::<VarLenUnicode>()
+        .shape([raw_n_vars])
+        .create("_index")
+        .unwrap()
+        .write(&rv_index)
+        .unwrap();
+    rv.new_attr::<VarLenUnicode>()
+        .create("_index")
+        .unwrap()
+        .write_scalar(&vlu("_index"))
+        .unwrap();
+
+    (indptr, indices, data)
+}
+
+/// `adata.raw` (its own, wider var axis) round-trips h5ad → scx → h5ad
+/// through both the eager and streaming convert paths.
+#[test]
+fn test_h5ad_raw_round_trip() {
+    use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 12;
+    let n_vars = 15;
+    let raw_n_vars = 23; // raw is WIDER than X
+
+    // Small shard target so raw spans multiple shards on both paths,
+    // exercising the streaming coordinator + multi-shard raw assembly.
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        ..ConvertOptions::default()
+    };
+
+    for streaming in [false, true] {
+        let tag = if streaming { "stream" } else { "eager" };
+        let h5ad_path = dir.path().join(format!("raw_{tag}.h5ad"));
+        create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+        let (raw_ip, raw_ix, raw_dt) = add_raw_group(&h5ad_path, n_obs, raw_n_vars);
+
+        // h5ad → scx
+        let scx_path = dir.path().join(format!("raw_{tag}.scx"));
+        if streaming {
+            h5ad_to_scx_streaming(
+                &h5ad_path,
+                &scx_path,
+                &opts,
+                &StreamingOverrides::default(),
+                &mut WarningSink::log(),
+            )
+            .unwrap();
+        } else {
+            h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+        }
+
+        // Verify the raw section family in SCX.
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert!(reader.has_raw(), "{tag}: has_raw flag must be set");
+        assert_eq!(reader.n_vars(), n_vars as u64, "{tag}: X n_vars unchanged");
+        let raw = reader.read_all_raw_csr_shards().unwrap();
+        assert_eq!(raw.shape, (n_obs, raw_n_vars), "{tag}: raw shape");
+        assert_eq!(raw.indptr, raw_ip, "{tag}: raw indptr");
+        assert_eq!(raw.indices, raw_ix, "{tag}: raw indices");
+        assert_eq!(raw.data, raw_dt, "{tag}: raw data");
+        let rv = reader.read_raw_var().unwrap();
+        assert_eq!(rv.num_rows(), raw_n_vars, "{tag}: raw var rows");
+        drop(reader);
+
+        // scx → h5ad and verify /raw/X + /raw/var present & bit-exact.
+        let out = dir.path().join(format!("raw_out_{tag}.h5ad"));
+        scx_to_h5ad(&scx_path, &out, &mut WarningSink::log()).unwrap();
+        let of = hdf5::File::open(&out).unwrap();
+        let orx = of.group("raw/X").unwrap();
+        let out_data: Vec<f32> = orx.dataset("data").unwrap().read_1d().unwrap().to_vec();
+        assert_eq!(out_data, raw_dt, "{tag}: exported raw data");
+        let shape: Vec<i64> = orx.attr("shape").unwrap().read_1d().unwrap().to_vec();
+        assert_eq!(
+            shape,
+            vec![n_obs as i64, raw_n_vars as i64],
+            "{tag}: exported raw shape"
+        );
+        assert!(of.group("raw/var").is_ok(), "{tag}: raw/var present");
+    }
+}
+
 #[test]
 fn test_tenx_to_scx() {
     let dir = tempfile::tempdir().unwrap();

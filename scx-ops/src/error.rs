@@ -67,6 +67,13 @@ pub enum OpsError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error(
+        "{op} does not yet support adata.raw: the target carries a raw count matrix \
+         (has_raw set). Re-export without raw or drop raw first; raw-aware {op} is a \
+         planned follow-up. (Proceeding would leave raw's obs axis misaligned with X.)"
+    )]
+    RawUnsupported { op: &'static str },
+
     #[error("modality mismatch on merge: {detail}")]
     ModalityMismatch { detail: String },
 

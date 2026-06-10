@@ -1716,6 +1716,122 @@ impl ScxReader {
     }
 
     // -----------------------------------------------------------------------
+    // adata.raw reading
+    // -----------------------------------------------------------------------
+
+    /// True if this file carries an `adata.raw` count matrix
+    /// ([`SectionType::RawCsrShard`] + `raw/var`), per the `has_raw`
+    /// header flag.
+    pub fn has_raw(&self) -> bool {
+        self.header.has_raw()
+    }
+
+    /// The raw matrix column count (`raw.n_vars`), read from the first
+    /// raw shard's stats without decoding any payload. `None` when the
+    /// file has no raw matrix.
+    ///
+    /// For a row-major shard `compute_shard_stats` stores the minor-axis
+    /// extent (the full column count, passed as `raw_n_vars` in
+    /// `write_shard_inner`) in `col_end` — NOT a per-shard max index — so
+    /// `col_end` is the total raw column count and is identical on every
+    /// raw shard.
+    pub fn raw_n_vars(&self) -> Option<usize> {
+        self.full_catalog
+            .raw_csr_shards_sorted()
+            .first()
+            .and_then(|e| e.stats.as_ref())
+            .map(|s| s.col_end as usize)
+    }
+
+    /// Read the `adata.raw.var` DataFrame ([`SectionType::RawVarMetadata`]).
+    pub fn read_raw_var(&self) -> Result<RecordBatch> {
+        let entry = self
+            .full_catalog
+            .get("raw/var")
+            .ok_or_else(|| ScxError::SectionNotFound("raw/var".to_string()))?;
+        self.read_arrow_ipc(entry)
+    }
+
+    /// Read all `adata.raw` CSR shards and concatenate along the row
+    /// (obs) axis. The result's column count is the raw matrix's OWN
+    /// `raw_n_vars` (recovered from the shards' stats), which may exceed
+    /// the main matrix `n_vars`. Mirrors [`Self::read_all_csr_shards`]
+    /// but over the raw section family.
+    pub fn read_all_raw_csr_shards(&self) -> Result<ScxCsr> {
+        let shards = self.full_catalog.raw_csr_shards_sorted();
+        if shards.is_empty() {
+            return Ok(ScxCsr::new_unchecked(
+                (self.header.n_obs as usize, 0),
+                vec![0],
+                vec![],
+                vec![],
+            ));
+        }
+
+        // raw_n_vars is the minor extent of any raw shard (row-major
+        // stats store it as col_end). All shards share it.
+        let raw_n_vars = shards[0]
+            .stats
+            .as_ref()
+            .map(|s| s.col_end as usize)
+            .ok_or_else(|| {
+                ScxError::InvalidCatalog(format!(
+                    "raw CSR shard '{}' has no stats block",
+                    shards[0].name
+                ))
+            })?;
+
+        let shard_sizes: Vec<(usize, usize)> = shards
+            .iter()
+            .map(|e| {
+                let stats = e.stats.as_ref().ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "raw CSR shard '{}' at offset {} has no stats block",
+                        e.name, e.offset
+                    ))
+                })?;
+                Ok::<_, ScxError>((
+                    (stats.row_end - stats.row_start) as usize,
+                    stats.nnz as usize,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
+        let total_nnz: usize = shard_sizes.iter().map(|(_, n)| *n).sum();
+
+        let mut indptr = vec![0i64; total_rows + 1];
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        let mut cum_rows = 0usize;
+        let mut cum_nnz = 0usize;
+        for (i, entry) in shards.iter().enumerate() {
+            let (n_rows, nnz) = shard_sizes[i];
+            let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
+            indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
+            data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
+            if i == 0 {
+                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
+            } else {
+                let nnz_off_i64 = cum_nnz as i64;
+                for j in 0..n_rows {
+                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
+                }
+            }
+            cum_rows += n_rows;
+            cum_nnz += nnz;
+        }
+
+        let n_rows = indptr.len().saturating_sub(1);
+        Ok(ScxCsr::new_unchecked(
+            (n_rows, raw_n_vars),
+            indptr,
+            indices,
+            data,
+        ))
+    }
+
+    // -----------------------------------------------------------------------
     // CSC shard reading (Phase A.3)
     // -----------------------------------------------------------------------
 

@@ -1269,6 +1269,34 @@ fn to_anndata_with_layers<'py>(
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
 
+    // Reconstruct `adata.raw` if the file carries a raw count matrix.
+    // Raw shares X's obs axis; when deletion vectors are active the raw
+    // rows would need the same filtering as X, which this path does not
+    // yet apply — warn and drop rather than emit a misaligned raw.
+    if reader.has_raw() {
+        if reader.header().has_deletion_vectors() {
+            warn_python_convert(
+                py,
+                &scx_convert::ConvertWarning::DroppedRaw {
+                    raw_n_vars: reader.raw_n_vars().unwrap_or(0),
+                },
+            )?;
+        } else {
+            let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
+            let raw_x = csr_to_scipy(py, raw_csr)?;
+            let raw_var_batch = reader.read_raw_var().map_err(to_pyerr)?;
+            let raw_var_table = record_batch_to_pyarrow(py, &raw_var_batch)?;
+            let raw_var = pyarrow_table_to_pandas(&raw_var_table)?;
+            let raw_kwargs = pyo3::types::PyDict::new(py);
+            raw_kwargs.set_item("X", raw_x)?;
+            raw_kwargs.set_item("var", raw_var)?;
+            let raw_adata = anndata_mod.call_method("AnnData", (), Some(&raw_kwargs))?;
+            // `adata.raw = AnnData(X=..., var=...)` stores it as a Raw —
+            // the canonical scanpy idiom.
+            adata.setattr("raw", raw_adata)?;
+        }
+    }
+
     if !eager {
         // Lazy mode: attach each bridge to AnnData's private `_obsp` /
         // `_varp` / `_varm` / `_layers` storage. AnnData's
@@ -1498,6 +1526,17 @@ pub fn to_anndata_filtered<'py>(
                      pushdown), use backed=True, or load the full dataset and filter in Python.",
                     parts.join(", ")
                 ),),
+            )?;
+        }
+
+        // The obs-filtered query path does not subset the raw matrix's
+        // obs axis — warn + drop rather than emit a misaligned raw.
+        if reader.has_raw() {
+            warn_python_convert(
+                py,
+                &scx_convert::ConvertWarning::DroppedRaw {
+                    raw_n_vars: reader.raw_n_vars().unwrap_or(0),
+                },
             )?;
         }
 
@@ -1968,6 +2007,16 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     }
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
+
+    // Backed mode does not reconstruct the raw matrix — warn + drop.
+    if reader.has_raw() {
+        warn_python_convert(
+            py,
+            &scx_convert::ConvertWarning::DroppedRaw {
+                raw_n_vars: reader.raw_n_vars().unwrap_or(0),
+            },
+        )?;
+    }
 
     if !eager {
         // Lazy mode: attach bridges directly to AnnData's private

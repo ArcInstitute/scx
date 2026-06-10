@@ -318,6 +318,24 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
 | `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `PyExperiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
 | `ThreadsafeHdf5Unavailable` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to a single reader thread. |
+| `DroppedRaw { raw_n_vars }` | `PyExperiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
+
+## `adata.raw`
+
+`adata.raw` (pre-normalization counts on its own, usually wider, var axis) is
+preserved end-to-end. `pyscx.from_h5ad` ingests the h5ad `/raw` group into a
+dedicated raw section family (CSR shards on `X`'s obs axis + a `raw/var` Arrow IPC
+section; see [docs/format.md § raw section family](format.md#adataraw-raw-section-family)).
+On the streaming convert path (`stream=True`, the default) `raw/X` is read and
+written shard-by-shard through the same coordinator as `/X`, so peak RSS stays
+bounded; the materializing path (`stream=False`) reads it eagerly.
+`pyscx.open(...).to_anndata()` reconstructs `adata.raw` (an AnnData with raw `X` +
+`var`), and `pyscx.to_h5ad` re-emits `/raw/X` + `/raw/var`, so
+`h5ad → scx → h5ad` round-trips raw with integer counts bit-exact and the wider var
+axis intact. Raw is **dropped with a `DroppedRaw` warning** under obs-filtered
+`to_anndata`, backed mode, and deletion-vector-active files (those modes do not yet
+re-filter raw's obs axis). The in-memory `pyscx.from_anndata(adata)` path does not
+yet write raw.
 
 ## Memory budgets
 
@@ -1699,4 +1717,4 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx pull <source-url> <dest> [--parallelism N] [--no-cloud-ready] [--filter <expr>]`
 - `scx push <source> <dest-url> [--parallelism N]`
 
-Note: the `scx-cli` crate has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`). End-users installing via `cargo install` can pass `--features default-bin` to get an h5ad-capable build in one command.
+Note: the `scx-cli` crate has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`). End-users building from a clone with `cargo install --path scx-cli` can pass `--features default-bin` to get an h5ad-capable build in one command (the crate is not on crates.io, so plain `cargo install scx-cli` does not work — prefer the pre-built binary from GitHub Releases).

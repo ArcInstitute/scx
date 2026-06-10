@@ -304,6 +304,26 @@ pyscx.from_10x("filtered_feature_bc_matrix.h5", "dataset.scx")
 pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "dataset.scx")
 ```
 
+Cell Ranger writes `matrix.mtx` as **features × barcodes** (the size line is
+`<genes> <cells> <nnz>`). The reader detects orientation by matching the matrix
+dimensions against the `barcodes.tsv` / `features.tsv` lengths and transposes a
+features×barcodes matrix to the cells×genes layout SCX stores, so a standard
+`filtered_feature_bc_matrix/` converts correctly and `to_anndata()` returns shape
+`(n_cells, n_genes)`. An already-cells×genes matrix is kept as-is; a square matrix
+is assumed to be Cell Ranger's features×barcodes (transposed, with a warning); and
+a matrix whose dimensions match neither layout is a hard error rather than a silent
+mis-orientation.
+
+### adata.raw
+
+`adata.raw` (pre-normalization counts on its own, usually wider, var axis) is
+preserved. `from_h5ad` ingests the h5ad `/raw` group, `pyscx.open(...).to_anndata()`
+reconstructs `adata.raw`, and `to_h5ad` re-emits `/raw/X` + `/raw/var`, so
+`h5ad → scx → h5ad` round-trips raw with integer counts bit-exact. Raw is dropped
+(with a `DroppedRaw` warning) under obs-filtered `to_anndata`, backed mode, and
+deletion-vector-active files; the in-memory `from_anndata(adata)` path does not yet
+write raw. See [docs/api.md § `adata.raw`](api.md#adataraw).
+
 ### Exporting back to MTX
 
 ```python

@@ -135,6 +135,12 @@ pub enum ConvertWarning {
     /// callers can intercept via `warnings.warn` and CLI callers get a
     /// machine-readable per-category count.
     UnsupportedExportColumn { column: String, dtype: String },
+    /// The `adata.raw` matrix was present but dropped from the
+    /// reconstructed AnnData because the current mode cannot reproduce
+    /// its obs-axis filtering (deletion vectors active, obs-filtered
+    /// query, or backed mode). The on-disk raw sections are preserved;
+    /// only this particular reconstruction omits raw.
+    DroppedRaw { raw_n_vars: usize },
 }
 
 impl ConvertWarning {
@@ -162,6 +168,7 @@ impl ConvertWarning {
             Self::EagerAssemblyMemoryHigh { .. } => "eager_assembly_memory_high",
             Self::CoercedNulls { .. } => "coerced_nulls",
             Self::UnsupportedExportColumn { .. } => "unsupported_export_column",
+            Self::DroppedRaw { .. } => "dropped_raw",
         }
     }
 }
@@ -193,6 +200,13 @@ impl fmt::Display for ConvertWarning {
                     n = missing.len(),
                 )
             }
+            Self::DroppedRaw { raw_n_vars } => write!(
+                f,
+                "adata.raw ({raw_n_vars} genes) was present but dropped from this \
+                 reconstruction; the mode in use (obs-filtered query, backed mode, or \
+                 deletion-vectors-active file) cannot reproduce raw's obs-axis filtering. \
+                 The on-disk raw sections are preserved."
+            ),
             other => write!(f, "{other:?}"),
         }
     }

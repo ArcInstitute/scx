@@ -9,7 +9,7 @@ configurations. For project architecture and coding conventions, see
 | Tool | Minimum version | Purpose |
 |------|----------------|---------|
 | Rust toolchain | stable ≥ 1.78 | Core workspace build |
-| Python | 3.10+ | pyscx bindings, benchmarks, validation |
+| Python | 3.11+ | pyscx bindings, benchmarks, validation |
 | uv | latest | Python virtualenv management (`.venv/`) |
 | R | 4.2+ (optional) | rscx bindings |
 | CUDA Toolkit | 12.0+ (optional) | GPU kernel compilation for scx-gpu |
