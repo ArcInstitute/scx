@@ -422,6 +422,32 @@ and returns results identical to the local in-process query. The single
 file-scope `ObsPredicateIndex` is read unchanged, so catalog-level
 predicate pushdown still applies.
 
+#### `pyscx.read_cloud(...)` — one-liner cloud read
+
+The flat helper mirroring `scanpy.read_h5ad` for cloud sources — it
+wraps `open_cloud(url).query()…collect().to_anndata()`:
+
+```python
+import pyscx
+
+# Whole file:
+adata = pyscx.read_cloud("gs://bucket/atlas.scxd/")
+
+# Predicate-pushed subset (only matching shards are fetched):
+adata = pyscx.read_cloud(
+    "gs://bucket/atlas.scxd/",
+    obs_filter="cell_type == 'T cell' and tissue == 'lung'",
+    var_names=["CD3D", "CD8A", "IL7R"],   # resolved against the file's var index
+)
+```
+
+`obs_filter` is an obs predicate expression; `var_names` is a list of gene
+names resolved to indices against the file's `var`. Normalization / log1p
+transforms are not exposed on `read_cloud` — build the explicit
+`open_cloud(url).query()` chain (`.with_normalize()` / `.with_log1p()`) when
+you need them. Returns a regular `anndata.AnnData`. `file://` URLs and local
+paths work too, so the same call serves local exploded directories.
+
 > **Caveat — stale index after append.** `scx append` with the default
 > `--rebuild-index=false` leaves the file-scope predicate index covering
 > only the original rows; it is *not* auto-merged across the appended
@@ -435,7 +461,6 @@ predicate pushdown still applies.
   retry policy) — today's cloud reads inherit the same retry layering
   documented under [Tuning throughput](#tuning-throughput) but are
   not yet individually configurable for the query path.
-- `pyscx.read_cloud(url, obs_filter=..., var_names=...)` flat helper.
 - A batched async section fetcher; today each cloud read uses
   `block_on` from a rayon worker, so cloud bandwidth is bounded by
   the rayon thread pool rather than fully saturated.

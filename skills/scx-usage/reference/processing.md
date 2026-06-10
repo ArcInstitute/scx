@@ -31,7 +31,15 @@ small indptr). E.g. 1M cells × 30K genes @ 5% density (1.5B nnz) ≈ 12 GB. SCX
 advantage is on-disk size; the in-memory AnnData is identical to one loaded from
 h5ad. **Hybrid:** query a subset, then go in-memory with standard scanpy.
 
-## PyExperiment (returned by `pyscx.open(path)`)
+## Experiment (returned by `pyscx.open(path)`)
+
+The Python-visible class is `Experiment` (Rust type `PyExperiment`). `repr` is
+AnnData-style (`Experiment object with n_obs × n_vars = …` + indented
+`obs:`/`var:`/`uns:`/`obsm:`/`varm:`/`layers:` key lists); codec/shard internals
+are on `.info()`. Key accessors: `obs_keys`, `var_keys`, `obsm_keys`,
+`varm_keys`, `uns_keys`, `layer_names`, plus `has_csc` / `has_deletions`.
+One-liners: `pyscx.read(path, **kwargs)` (= `open(path).to_anndata(**kwargs)`)
+and `pyscx.write(adata, path, **kwargs)` (= `from_anndata`).
 
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — convert to AnnData.
   - `var_names`: gene-name list to project (column subset).

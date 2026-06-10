@@ -16,7 +16,7 @@ use crate::to_pyerr;
 /// A handle to an open SCX file.
 ///
 /// Provides metadata accessors and methods to convert to AnnData.
-#[pyclass]
+#[pyclass(name = "Experiment")]
 pub struct PyExperiment {
     reader: ScxReader,
     pub(crate) path: PathBuf,
@@ -117,6 +117,19 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
     //      unnamed pandas index.
     //   3. The original heuristic list, kept so any files that pre-date
     //      pandas-metadata-aware writes still resolve.
+    lookup_gene_in_batch(&batch, name).ok_or_else(|| {
+        pyo3::exceptions::PyKeyError::new_err(format!("gene name '{name}' not found in var index"))
+    })
+}
+
+/// Resolve a single gene name to its row index within a `var`
+/// `RecordBatch`, probing the pandas index column(s) first and then a
+/// fallback list of conventional gene-id column names. Shared by the
+/// local `resolve_gene_name` and the cloud `read_cloud` paths.
+pub(crate) fn lookup_gene_in_batch(
+    batch: &arrow::record_batch::RecordBatch,
+    name: &str,
+) -> Option<u32> {
     let pandas_index_cols = scx_format::pandas_index_columns(batch.schema().as_ref());
     let fallback_columns = [
         "__index_level_0__",
@@ -131,13 +144,11 @@ fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> 
         .map(String::as_str)
         .chain(fallback_columns.iter().copied());
     for col_name in probe {
-        if let Some(idx) = lookup_string_in_column(&batch, col_name, name) {
-            return Ok(idx);
+        if let Some(idx) = lookup_string_in_column(batch, col_name, name) {
+            return Some(idx);
         }
     }
-    Err(pyo3::exceptions::PyKeyError::new_err(format!(
-        "gene name '{name}' not found in var index"
-    )))
+    None
 }
 
 /// Scan a single string column of a `RecordBatch` for an exact match
@@ -169,6 +180,48 @@ fn lookup_string_in_column(
         }
     }
     None
+}
+
+/// Field names of an Arrow schema, dropping the pandas index column(s)
+/// so the result mirrors `adata.obs.columns` / `adata.var.columns`
+/// rather than including the `_index` / `__index_level_0__` field.
+fn schema_data_columns(schema: Option<arrow::datatypes::Schema>) -> Vec<String> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    let index_cols = scx_format::pandas_index_columns(&schema);
+    schema
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .filter(|name| {
+            !index_cols.contains(name) && name != "__index_level_0__" && name != "_index"
+        })
+        .collect()
+}
+
+/// Render the AnnData-style `repr` lines shared by `Experiment` and
+/// `CloudExperiment`: a header line plus one indented line per non-empty
+/// metadata group (`obs: 'a', 'b'`). Mirrors `anndata.AnnData.__repr__`.
+pub(crate) fn format_anndata_repr(
+    kind: &str,
+    n_obs: u64,
+    n_vars: u64,
+    groups: &[(&str, Vec<String>)],
+) -> String {
+    let mut out = format!("{kind} object with n_obs × n_vars = {n_obs} × {n_vars}");
+    for (label, keys) in groups {
+        if keys.is_empty() {
+            continue;
+        }
+        let joined = keys
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("\n    {label}: {joined}"));
+    }
+    out
 }
 
 #[pymethods]
@@ -252,10 +305,77 @@ impl PyExperiment {
         self.reader.layer_names()
     }
 
+    /// Column names in `obs` (the cell metadata), excluding the pandas
+    /// index column. Pure Arrow IPC footer read — no batch decode.
+    /// Raises if the obs section cannot be read (e.g. corrupt file).
+    #[getter]
+    fn obs_keys(&self) -> PyResult<Vec<String>> {
+        let schema = self.reader.read_obs_schema_physical().map_err(to_pyerr)?;
+        Ok(schema_data_columns(Some(schema)))
+    }
+
+    /// Column names in `var` (the gene metadata), excluding the pandas
+    /// index column. Pure Arrow IPC footer read — no batch decode.
+    /// Raises if the var section cannot be read (e.g. corrupt file).
+    #[getter]
+    fn var_keys(&self) -> PyResult<Vec<String>> {
+        let schema = self.reader.read_var_schema_physical().map_err(to_pyerr)?;
+        Ok(schema_data_columns(Some(schema)))
+    }
+
+    /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan.
+    #[getter]
+    fn obsm_keys(&self) -> Vec<String> {
+        self.reader.list_obsm()
+    }
+
+    /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
+    #[getter]
+    fn varm_keys(&self) -> Vec<String> {
+        self.reader.list_varm()
+    }
+
+    /// Top-level keys of the unstructured `uns` mapping. Reads the small
+    /// `uns` JSON section but not any matrix payload.
+    #[getter]
+    fn uns_keys(&self) -> Vec<String> {
+        match self.reader.read_uns() {
+            Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Codec / shard / format-version internals as a one-line string.
+    ///
+    /// The AnnData-style `repr` lists the obs/var/obsm/uns keys a scanpy
+    /// user expects; the on-disk encoding details live here instead.
+    fn info(&self) -> String {
+        let h = self.reader.header();
+        format!(
+            "SCX file: format_version={}, codec_id={}, index_dtype={}, \
+             csr_shards={}, nnz={}, has_csc={}, path={}",
+            h.format_version,
+            h.codec_id,
+            h.index_dtype,
+            h.n_csr_shards,
+            self.reader.nnz(),
+            h.has_csc(),
+            self.path.display(),
+        )
+    }
+
     /// `True` when the file has a CSC sidecar (gene-major shards).
     #[getter]
     fn has_csc(&self) -> bool {
         self.reader.header().has_csc()
+    }
+
+    /// `True` when the file carries logical deletion vectors — i.e. some
+    /// rows are marked deleted and will be dropped (row count shrinks) on
+    /// `to_anndata` / `to_h5ad` export.
+    #[getter]
+    fn has_deletions(&self) -> bool {
+        self.reader.header().has_deletion_vectors()
     }
 
     /// Read the provenance chain as a list of dicts:
@@ -948,13 +1068,27 @@ impl PyExperiment {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "PyExperiment(n_obs={}, n_vars={}, nnz={}, shards={}, codec={})",
+        // Best-effort: the repr must always render, so a failed schema read
+        // degrades to an empty key list here (the public `obs_keys` /
+        // `var_keys` getters surface the error loudly instead).
+        format_anndata_repr(
+            "Experiment",
             self.reader.n_obs(),
             self.reader.n_vars(),
-            self.reader.nnz(),
-            self.reader.header().n_csr_shards,
-            self.reader.header().codec_id,
+            &[
+                (
+                    "obs",
+                    schema_data_columns(self.reader.read_obs_schema_physical().ok()),
+                ),
+                (
+                    "var",
+                    schema_data_columns(self.reader.read_var_schema_physical().ok()),
+                ),
+                ("uns", self.uns_keys()),
+                ("obsm", self.obsm_keys()),
+                ("varm", self.varm_keys()),
+                ("layers", self.layer_names()),
+            ],
         )
     }
 }

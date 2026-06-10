@@ -9,6 +9,8 @@ big picture, then [api.md](api.md) (Rust/CLI/Python APIs) or
 
 ## User guides
 
+- [quickstart.md](quickstart.md) — 5-minute end-to-end pipeline (convert → QC → normalize → HVG → embed → cluster → markers).
+- [migrating-from-h5ad.md](migrating-from-h5ad.md) — For scanpy users: which loader to use, what changes on conversion, round-trip fidelity, and scanpy-divergence gotchas.
 - [scanpy.md](scanpy.md) — Scanpy integration guide and Rust-native accelerator usage (PCA, kNN, UMAP, DE, Leiden, Harmony2, LISI, HVG, pseudobulk).
 - [gpu-setup.md](gpu-setup.md) — GPU setup: CUDA, RAPIDS, conda, containers, SLURM, troubleshooting.
 - [cloud.md](cloud.md) — Cloud auth, layouts, tuning, provider-specific notes, and cloud-native query.

@@ -20,6 +20,8 @@ I/O & file lifecycle
    :nosignatures:
 
    open
+   read
+   write
    validate
    from_anndata
    from_h5ad
@@ -66,7 +68,8 @@ Cloud operations (requires ``--features cloud``)
    explode
    pack
    open_cloud
-   PyCloudExperiment
+   read_cloud
+   CloudExperiment
 
 Datasets & readers
 ------------------
@@ -75,7 +78,7 @@ Datasets & readers
    :toctree: _autosummary
    :nosignatures:
 
-   PyExperiment
+   Experiment
    ScxBackedSparseDataset
    ScxBackedLayerDataset
    ScxBackedMuDataset
