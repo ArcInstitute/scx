@@ -148,6 +148,15 @@ in-place invocation (`--output` == input) is safe: the writer stages a sibling
 tempfile and atomically renames over the target. Verify the result with
 `scx validate --deep <out>`.
 
+`--codec {auto|scx1}` selects the per-shard codec (default `auto`). `auto` keeps
+the encoder's per-shard choice (Scx1 for low-median integer counts, else Zstd),
+so a high-median count shard lands as Zstd and carries **no** decode sidecar.
+`scx1` forces Scx1 on every integer shard, guaranteeing a sidecar on each — use
+it when you want the whole file to take the `to_gpu_anndata` device-decode route
+regardless of per-shard count magnitude (Scx1 is less compact than Zstd on
+high-median data, the trade-off for a fully on-device decode). Non-integer
+(float) shards fall back to Zstd either way; `--codec zstd` is rejected.
+
 ## Rollback
 
 `scx rollback` is a single header `pwrite()` that repoints

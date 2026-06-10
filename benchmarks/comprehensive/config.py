@@ -974,12 +974,16 @@ def estimate_memory_gb(
         # 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.2)
     elif benchmark == "accel_to_gpu_anndata":
-        # Self-converted fixture: h5ad read + `from_anndata` (Scx1) +
-        # a host scipy CSR reference decode + the GPU-resident decode held
-        # concurrently. The host CSR reference is the dominant host term, so
-        # size to dense × 1.0 rather than the generic accel × 0.1. Gate is
-        # scoped to pbmc3k + tabula_sapiens_100k, so over-budgeting is cheap.
-        peak_mb = max(base_mb, dense_mb * 1.0)
+        # Sidecar fixture is now prepared by `scx optimize` (a streaming,
+        # one-shard-bounded subprocess), so the dense h5ad self-convert no
+        # longer dominates. Host peak is two concurrent sparse CSR copies —
+        # the `to_anndata` host reference and `adata_gpu.X.get()` held side by
+        # side for the byte-exact compare — i.e. ~2 × the on-disk sparse size
+        # (≈ base_mb, which is 2 × h5ad). Size to base_mb × 1.5 for scipy
+        # temporaries + the optimize subprocess shard buffer; NOT dense_mb,
+        # which over-budgeted census_1m at 352 GB. The decoded matrix lives in
+        # VRAM (H100 80 GB), not host RAM.
+        peak_mb = max(base_mb * 1.5, dense_mb * 0.05)
     elif benchmark.startswith("accel_"):
         # PCA / kNN stream through sparse or GPU buffers. Observed 2-10 GB
         # on 1M cells.

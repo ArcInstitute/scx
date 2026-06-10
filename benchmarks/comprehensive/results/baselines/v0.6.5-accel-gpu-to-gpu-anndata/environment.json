@@ -1,0 +1,51 @@
+{
+  "captured_at": "2026-06-09T17:40:14-0700",
+  "git_sha": "749640ad000ae48eeb50907d4339f461e280fbd3",
+  "git_branch": "main",
+  "git_dirty": true,
+  "git_describe": "pyscx-v0.7.0-6-g749640a-dirty",
+  "determinism_env": {
+    "RAYON_NUM_THREADS": "unset",
+    "OMP_NUM_THREADS": "unset",
+    "MKL_NUM_THREADS": "unset"
+  },
+  "system": {
+    "hostname": "CPUDFDB6C",
+    "os": "Linux 5.15.0-176-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.6.4"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    }
+  },
+  "snapshot_name": "candidate_749640a_20260609"
+}
