@@ -3710,6 +3710,7 @@ dependencies = [
 name = "scx-sparse"
 version = "0.7.0"
 dependencies = [
+ "criterion",
  "log",
  "proptest",
  "rand 0.8.5",
