@@ -99,12 +99,14 @@ pub fn csr_to_csc(csr: &ScxCsr) -> CscArrays {
 ///
 /// **Algorithm** — multi-pass column-chunked approach:
 ///   1. Determine `chunk_cols = max_memory_bytes / (n_rows × 12)` columns per pass
-///      (12 bytes per nnz entry: 4 for i32 index + 4 for f32 value + 4 overhead)
-///   2. For each chunk of columns `[col_start..col_end)`:
-///      a. Scan all CSR rows across all shards, collecting entries where
-///      `col_start <= col_idx < col_end`
-///      b. Sort entries by column within the chunk
-///      c. Build CSC indptr/indices/data for this column range
+///      (a conservative worst-case bound; see `compute_chunk_cols`)
+///   2. For each chunk of columns `[col_start..col_end)`, transpose via an
+///      O(nnz) two-pass counting scatter (same algorithm as the in-memory
+///      `csr_to_csc`), restricted to that column range:
+///      a. Count per-column nnz for entries where `col_start <= col_idx < col_end`
+///      b. Prefix-sum the counts into the chunk's CSC indptr
+///      c. Scatter entries into column positions via a per-column write cursor
+///      (no sort — scan order already yields ascending row order)
 ///   3. Concatenate chunk results into final CSC arrays
 ///
 /// **Memory usage**: O(chunk_cols × avg_nnz_per_col) per pass, bounded by
@@ -299,9 +301,13 @@ pub fn compute_chunk_cols_with_cap(
 
 /// Compute the number of columns per chunk, given a memory budget.
 ///
-/// Each potential entry costs ~12 bytes (4 for i32 index + 4 for f32 value + 4 overhead).
-/// We size the chunk so worst-case (every row has an entry in every column of the chunk)
-/// fits in `max_memory_bytes`.
+/// Budgets ~12 bytes per potential entry and sizes the chunk so the worst case
+/// (every row has an entry in every column of the chunk) fits in
+/// `max_memory_bytes`. Since the counting-scatter transpose (OPT-1.4) dropped
+/// the old 12-byte `(usize, i32, f32)` tuple buffer, the actual per-entry peak
+/// is now 8 bytes (i32 index + f32 value) plus small `chunk_n_cols`-sized
+/// `col_counts`/`cursor` workspaces — so the 12 is a conservative over-estimate
+/// that keeps chunking on the safe (smaller-chunk) side.
 fn compute_chunk_cols(
     n_rows_total: usize,
     max_memory_bytes: usize,
