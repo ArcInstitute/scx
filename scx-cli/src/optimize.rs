@@ -11,10 +11,28 @@ pub fn run_optimize(
     input: &Path,
     output: &Path,
     force: bool,
+    codec: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
     }
+    // Explicit allow-set rather than `CodecId::parse_cli` (which also accepts
+    // none/zstd/lz4/pcodec): every codec other than Scx1 drops the decode
+    // sidecar, defeating the point of `optimize`. `auto` → None (auto-codec,
+    // Scx1 for low-median integer shards), `scx1` → force Scx1 on every integer
+    // shard. clap's `value_parser` already restricts the surface to these two;
+    // this match is the in-function source of truth (and guards direct callers).
+    let codec_id = match codec {
+        "auto" => None,
+        "scx1" => Some(scx_codec::CodecId::Scx1),
+        other => {
+            return Err(format!(
+                "--codec {other:?} is not supported by optimize \
+                 (only `auto` or `scx1`; other codecs drop decode sidecars)"
+            )
+            .into())
+        }
+    };
     // Allow an explicit in-place upgrade (`--output` == input): `ScxWriter`
     // writes a sibling tempfile and atomically renames over the target on
     // `finish()`, so the input is read in full before it is replaced. Only
@@ -38,7 +56,7 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    scx_ops::optimize(input, output)?;
+    scx_ops::optimize(input, output, codec_id)?;
 
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();

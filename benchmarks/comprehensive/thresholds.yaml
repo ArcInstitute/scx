@@ -482,32 +482,33 @@ absolute_floors:
   # legitimately falls back to CPU (documented), so a 1.0 floor would false-fail;
   # that module records `gpu_dispatch_route` for visibility only.
   # --- ACC-RUST-OPT-V4 §4.4: to_gpu_anndata device-decode route floor ---
-  # STAGED (commented): a floor on a metric the baseline does not yet carry
-  # reads as a violation, so these activate only AFTER a comprehensive accel
-  # capture promotes a baseline that includes `accel_to_gpu_anndata`. Until
-  # then the benchmark surfaces the metrics (transfer_mode / bytes_uploaded /
-  # route-correct / decode-correct) without hard-gating. Uncomment in a tiny
-  # follow-up once `results/baselines/LATEST` carries them.
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__scx1_gpu
-  #   dataset: pbmc3k
-  #   metric: to_gpu_anndata_route_device_decode
-  #   min: 1.0
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__scx1_gpu
-  #   dataset: tabula_sapiens_100k
-  #   metric: to_gpu_anndata_route_device_decode
-  #   min: 1.0
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__scx1_gpu
-  #   dataset: pbmc3k
-  #   metric: to_gpu_anndata_decode_correct
-  #   min: 1.0
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__scx1_gpu
-  #   dataset: tabula_sapiens_100k
-  #   metric: to_gpu_anndata_decode_correct
-  #   min: 1.0
+  # ACTIVE: the promoted baseline (v0.6.5-accel-gpu-to-gpu-anndata) carries
+  # `accel_to_gpu_anndata` device-decode metrics for pbmc3k + tabula_sapiens_100k
+  # (transfer_mode == scx_device_decode_gpu, route/decode == 1.0). These floors
+  # turn a silent device-decode → host-handoff regression into a hard failure.
+  # Census tiers populate the metric on the next full capture; their floors are
+  # added in a follow-up once a baseline carries them (a floor on a metric the
+  # baseline lacks reads as a violation).
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__scx1_gpu
+    dataset: pbmc3k
+    metric: to_gpu_anndata_route_device_decode
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__scx1_gpu
+    dataset: tabula_sapiens_100k
+    metric: to_gpu_anndata_route_device_decode
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__scx1_gpu
+    dataset: pbmc3k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__scx1_gpu
+    dataset: tabula_sapiens_100k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k

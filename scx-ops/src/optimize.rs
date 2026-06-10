@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use scx_codec::CodecId;
 use scx_format::encoder::encode_one_shard;
 use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
 use scx_format::modality::ModalityType;
@@ -28,7 +29,14 @@ use crate::rewrite_helpers::{append_provenance, copy_predicate_indices};
 /// Re-encode + canonicalize every CSR shard of `input_path` into `output_path`,
 /// emitting decode sidecars and stamping `format_version = 3`. Single-modality
 /// only (multimodal files should use `scx compact`).
-pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
+///
+/// `codec` selects the per-shard codec passed to the encoder: `None` keeps the
+/// auto-codec (Scx1 for low-median integer counts, else Zstd), while
+/// `Some(CodecId::Scx1)` forces Scx1 on every integer shard — guaranteeing a
+/// `decode/*` sidecar (and thus the `to_gpu_anndata` device-decode route) even
+/// for high-median shards that auto would route to Zstd. Non-integer shards
+/// fall back to Zstd regardless (handled inside `encode_one_shard`).
+pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -> Result<()> {
     let reader = ScxReader::open(input_path)?;
     if reader.is_multimodal() {
         return Err(OpsError::InvalidInput(
@@ -67,9 +75,10 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
         n_csr_shards: 0,
         n_csc_shards: 0,
         shard_target_rows: in_header.shard_target_rows,
-        // File-level codec hint; the real per-shard codec is auto-selected by
-        // `encode_one_shard`. Preserve the source hint for `scx info`.
-        codec_id: in_header.codec_id,
+        // File-level codec hint for `scx info`. When the caller forces a codec,
+        // reflect it; otherwise preserve the source hint (the real per-shard
+        // codec is auto-selected by `encode_one_shard`).
+        codec_id: codec.map(|c| c as u8).unwrap_or(in_header.codec_id),
         index_dtype,
         endian: 0,
         reserved_padding: 0,
@@ -142,7 +151,7 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
             &indptr,
             &indices,
             &values,
-            None, // auto-codec (Scx1 for low-median integer counts → emits sidecar)
+            codec, // None = auto-codec; Some(Scx1) forces sidecars on every integer shard
             index_dtype,
             n_minor,
             row_start,
@@ -275,7 +284,7 @@ mod tests {
             .iter()
             .any(|e| e.section_type == SectionType::DecodeMetadataShard));
 
-        optimize(&input, &output).unwrap();
+        optimize(&input, &output, None).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(out.header().format_version, 3, "optimize stamps v3");
@@ -308,6 +317,98 @@ mod tests {
         // obs/var preserved.
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
         assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+    }
+
+    #[test]
+    fn optimize_codec_scx1_forces_sidecar_on_high_median_shard() {
+        // A high-median integer shard (all counts == 100) routes to Zstd under
+        // the auto-codec → NO decode sidecar. `Some(Scx1)` must force Scx1 and
+        // emit the sidecar, which `to_gpu_anndata`'s device-decode route needs.
+        // Dense rows (512 nnz, moderate gaps, 200k vars) so the Scx1 decode
+        // sidecar fits the 25% overhead budget — matching the dims the
+        // auto-codec test uses; only the value magnitude differs.
+        let n_obs = 40usize;
+        let nnz_per_row = 512usize;
+        let n_vars = 200_000usize;
+
+        let build_input = |path: &Path| {
+            let mut header = sample_header(n_obs as u64, n_vars as u64);
+            header.format_version = 2;
+            header.index_dtype = 1; // u32 indices
+            let mut indptr = vec![0u64];
+            let mut indices: Vec<u32> = Vec::new();
+            let mut values: Vec<u8> = Vec::new();
+            for r in 0..n_obs {
+                let mut col = 0u32;
+                for k in 0..nnz_per_row {
+                    col += 1 + ((r * 13 + k * 7) % 250) as u32;
+                    indices.push(col);
+                    values.push(100u8); // median == 100 (> 8) → auto picks Zstd
+                }
+                indptr.push(indices.len() as u64);
+            }
+            let mut w = ScxWriter::new(path, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        };
+
+        let count_sidecars = |path: &Path| {
+            ScxReader::open(path)
+                .unwrap()
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+                .count()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        build_input(&input);
+
+        // Auto-codec: high-median shard → Zstd → no sidecar.
+        let auto_out = dir.path().join("auto.scx");
+        optimize(&input, &auto_out, None).unwrap();
+        assert_eq!(
+            count_sidecars(&auto_out),
+            0,
+            "auto-codec leaves the high-median shard sidecar-less"
+        );
+
+        // Forced Scx1: sidecar present + decode-parity holds.
+        let scx1_out = dir.path().join("scx1.scx");
+        optimize(&input, &scx1_out, Some(CodecId::Scx1)).unwrap();
+        let out = ScxReader::open(&scx1_out).unwrap();
+        let sidecars: Vec<_> = out
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+            .cloned()
+            .collect();
+        assert_eq!(sidecars.len(), 1, "forced Scx1 emits a decode sidecar");
+        for e in &sidecars {
+            out.validate_decode_sidecar_entry(e).unwrap();
+        }
+        // The decoded matrix is unchanged by the codec choice.
+        let (a_indptr, a_indices, a_values) = ScxReader::open(&auto_out)
+            .unwrap()
+            .read_csr_shard(0)
+            .unwrap();
+        let (s_indptr, s_indices, s_values) = out.read_csr_shard(0).unwrap();
+        assert_eq!(a_indptr, s_indptr);
+        assert_eq!(a_indices, s_indices);
+        assert_eq!(a_values, s_values);
     }
 
     /// Build a small canonical Scx1-eligible CSR triplet (strictly-increasing
@@ -365,7 +466,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output).unwrap();
+        optimize(&input, &output, None).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(out.header().format_version, 3);
@@ -441,7 +542,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output).unwrap();
+        optimize(&input, &output, None).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         // The CSR-backed obsp graph survives (it would be silently dropped if
@@ -530,7 +631,7 @@ mod tests {
         assert_eq!(in_shards.len(), 2);
         drop(in_reader);
 
-        optimize(&input, &output).unwrap();
+        optimize(&input, &output, None).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         let out_shards: Vec<(String, Vec<u8>)> = out
