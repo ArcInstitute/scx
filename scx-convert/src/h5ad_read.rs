@@ -11,7 +11,7 @@ use hdf5::types::TypeDescriptor;
 use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
-use super::detect::{detect_matrix_format, MatrixFormat};
+use super::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat};
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
 
@@ -135,6 +135,46 @@ pub fn read_x_matrix_at(
         MatrixFormat::Csc => read_sparse_matrix(file, path, true),
         MatrixFormat::Dense => read_dense_matrix(file, path),
     }
+}
+
+/// Read the AnnData `/raw` group (`raw/X` + `raw/var`) if present.
+///
+/// Returns the raw CSR arrays (always obs×raw_n_vars, canonicalized) and
+/// the raw var `RecordBatch`, or `None` when the file has no usable
+/// `/raw/X`. `raw.X` has its OWN var axis — `raw_n_vars` is typically
+/// larger than `n_vars` because `.raw` is captured before HVG subsetting
+/// — so it is stored as a dedicated raw section family rather than a
+/// layer. Reuses the same CSR/CSC/dense detectors and readers as `/X`.
+/// The caller asserts `raw.n_obs == n_obs` (raw shares the obs axis).
+pub fn read_raw_group(
+    file: &hdf5::File,
+    sink: &mut WarningSink,
+) -> Result<Option<(CsrArrays, RecordBatch)>, ConvertError> {
+    // No `/raw` group, or no `/raw/X` payload → nothing to ingest.
+    if file.group("raw").is_err() {
+        return Ok(None);
+    }
+    if file.group("raw/X").is_err() && file.dataset("raw/X").is_err() {
+        return Ok(None);
+    }
+
+    let format = detect_matrix_format_at(file, "raw/X", sink)?;
+    let (indptr, indices, mut data, n_obs, raw_n_vars) = read_x_matrix_at(file, "raw/X", format)?;
+
+    // Canonicalize defensively: the CSR reader drops explicit zeros but
+    // does not sort/dedup, so a messy raw CSR (unsorted columns, dup
+    // coords) is made canonical before it is sharded and encoded. Mirrors
+    // the X CSC path. `canonicalize_csr` short-circuits on already-canonical
+    // input (the common case for a scipy-written raw matrix).
+    let mut u_indptr: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+    let mut u_indices: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
+    scx_sparse::canonicalize_csr(&mut u_indptr, &mut u_indices, &mut data);
+    let indptr: Vec<i64> = u_indptr.iter().map(|&v| v as i64).collect();
+    let indices: Vec<i32> = u_indices.iter().map(|&v| v as i32).collect();
+
+    let raw_var = read_dataframe_group(file, "raw/var")?;
+
+    Ok(Some(((indptr, indices, data, n_obs, raw_n_vars), raw_var)))
 }
 
 /// Read a sparse matrix group (CSR or CSC) and return as CSR.

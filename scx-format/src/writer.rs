@@ -65,6 +65,17 @@ pub struct ScxWriter {
     entries: Vec<FullCatalogEntry>,
     csr_shard_count: u32,
     csc_shard_count: u32,
+    /// Count of `raw/X` (`RawCsrShard`) shards written so far — drives
+    /// the `raw/X_shard_<idx>` naming. Kept separate from
+    /// `csr_shard_count` so the main matrix's `n_csr_shards` header count
+    /// is unaffected by the raw matrix.
+    raw_csr_shard_count: u32,
+    /// Column count (`raw.n_vars`) of the raw matrix. Set via
+    /// [`Self::set_raw_n_vars`] before writing `RawCsrShard` shards so
+    /// `write_shard_inner` stamps the correct minor-axis extent and picks
+    /// the right per-shard `index_dtype` (raw has its OWN var axis,
+    /// independent of `header.n_vars`).
+    raw_n_vars: u64,
     /// Phase 5b: count of bitmap sidecar shards written so far. Used by
     /// `finish()` to flip `FileHeader::set_bitmap()` and (in the
     /// unimodal case) by `write_bitmap_shard` to derive the next
@@ -261,6 +272,8 @@ impl ScxWriter {
             entries: Vec::new(),
             csr_shard_count: 0,
             csc_shard_count: 0,
+            raw_csr_shard_count: 0,
+            raw_n_vars: 0,
             #[cfg(feature = "deletion-vectors")]
             bitmap_shard_count: 0,
             #[cfg(feature = "deletion-vectors")]
@@ -345,6 +358,8 @@ impl ScxWriter {
             entries: existing_entries,
             csr_shard_count: 0,
             csc_shard_count: 0,
+            raw_csr_shard_count: 0,
+            raw_n_vars: 0,
             #[cfg(feature = "deletion-vectors")]
             bitmap_shard_count: 0,
             #[cfg(feature = "deletion-vectors")]
@@ -825,6 +840,53 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Set the raw matrix column count (`raw.n_vars`). MUST be called
+    /// before the first [`Self::write_raw_csr_shard`] so the shard
+    /// machinery stamps the correct minor-axis extent and per-shard
+    /// `index_dtype` for the raw matrix's own (independent) var axis.
+    pub fn set_raw_n_vars(&mut self, raw_n_vars: u64) {
+        self.raw_n_vars = raw_n_vars;
+    }
+
+    /// Write one row-shard of the `adata.raw` count matrix
+    /// ([`SectionType::RawCsrShard`]). Structurally identical to
+    /// [`Self::write_csr_shard`] but emits the raw section type and is
+    /// named `raw/X_shard_<idx>`. Does NOT touch `csr_shard_count` /
+    /// `total_nnz` (those track the main matrix). Call
+    /// [`Self::set_raw_n_vars`] first.
+    pub fn write_raw_csr_shard(
+        &mut self,
+        indptr: &[u64],
+        indices: &[u32],
+        values: &[u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+        row_start: u64,
+    ) -> Result<()> {
+        let shard_idx = self.raw_csr_shard_count;
+        let name = format!("raw/X_shard_{shard_idx}");
+        self.write_shard_inner(
+            indptr,
+            indices,
+            values,
+            codec_id,
+            value_encoding,
+            row_start,
+            &name,
+            SectionType::RawCsrShard,
+        )?;
+        self.raw_csr_shard_count += 1;
+        Ok(())
+    }
+
+    /// Write the raw var metadata section ([`SectionType::RawVarMetadata`],
+    /// Arrow IPC, single batch). Companion to the `raw/X` shards.
+    pub fn write_raw_var(&mut self, raw_var: &RecordBatch) -> Result<()> {
+        let data = Self::write_arrow_ipc(raw_var)?;
+        self.write_section_bytes("raw/var", SectionType::RawVarMetadata, &data, None)?;
+        Ok(())
+    }
+
     /// Write a CSC shard (column-major sparse matrix).
     ///
     /// Structurally identical to a CSR shard but uses `SectionType::CscShard (5)`.
@@ -985,6 +1047,9 @@ impl ScxWriter {
         // header says u16.
         let index_max_value: u64 = match section_type {
             SectionType::CscShard => self.header.n_obs.saturating_sub(1),
+            // Raw is row-major but has its OWN column axis (`raw_n_vars`),
+            // independent of `header.n_vars`.
+            SectionType::RawCsrShard => self.raw_n_vars.saturating_sub(1),
             _ => row_major_n_minor.saturating_sub(1),
         };
         let index_dtype_u16 = index_max_value <= u16::MAX as u64;
@@ -1043,6 +1108,7 @@ impl ScxWriter {
                 // above so multimodal files stamp the correct extent.
                 let header_n_minor = match section_type {
                     SectionType::CscShard => self.header.n_obs,
+                    SectionType::RawCsrShard => self.raw_n_vars,
                     _ => row_major_n_minor,
                 };
                 if header_n_minor > u32::MAX as u64 {
@@ -1103,6 +1169,7 @@ impl ScxWriter {
         // passes its `col_start` argument as the inner `row_start`).
         let (major_kind, n_minor) = match section_type {
             SectionType::CscShard => (MajorAxis::Col, self.header.n_obs),
+            SectionType::RawCsrShard => (MajorAxis::Row, self.raw_n_vars),
             _ => (MajorAxis::Row, row_major_n_minor),
         };
         let stats = compute_shard_stats(

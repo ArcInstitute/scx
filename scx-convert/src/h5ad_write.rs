@@ -117,7 +117,63 @@ pub fn write_scx_to_h5ad(
         }
     }
 
+    // Write /raw (DV-filtered on the obs axis like /X).
+    write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
+
     Ok(())
+}
+
+/// Write the `adata.raw` group (`raw/X` + `raw/var`) into an output
+/// h5ad if the SCX file carries a raw matrix. Raw shares X's obs axis,
+/// so the same deletion-vector keep mask is applied to its rows. Shared
+/// by the eager and streaming SCX→h5ad export paths.
+pub(super) fn write_raw_to_h5ad(
+    root: &hdf5::Group,
+    reader: &ScxReader,
+    keep_mask: Option<&[bool]>,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    if !reader.has_raw() {
+        return Ok(());
+    }
+    let raw = reader.read_all_raw_csr_shards()?;
+    let raw_n_vars = raw.shape.1;
+    let (indptr, indices, data, n_obs) = match keep_mask {
+        Some(mask) => filter_csr_rows(&raw.indptr, &raw.indices, &raw.data, mask),
+        None => (raw.indptr, raw.indices, raw.data, raw.shape.0),
+    };
+
+    let raw_group = root.create_group("raw")?;
+    write_sparse_group_at(&raw_group, "X", &indptr, &indices, &data, n_obs, raw_n_vars)?;
+    let raw_var = reader.read_raw_var()?;
+    write_dataframe_group_at(&raw_group, "var", &raw_var, sink)?;
+    Ok(())
+}
+
+/// Subset CSR rows by a boolean obs keep-mask, returning new
+/// `(indptr, indices, data, n_kept_rows)`. Used to apply deletion
+/// vectors to the raw matrix on export (raw shares the obs axis).
+fn filter_csr_rows(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    mask: &[bool],
+) -> (Vec<i64>, Vec<i32>, Vec<f32>, usize) {
+    let n_rows = indptr.len().saturating_sub(1).min(mask.len());
+    let mut out_indptr = vec![0i64];
+    let mut out_indices = Vec::new();
+    let mut out_data = Vec::new();
+    for (row, &keep) in mask.iter().enumerate().take(n_rows) {
+        if keep {
+            let s = indptr[row] as usize;
+            let e = indptr[row + 1] as usize;
+            out_indices.extend_from_slice(&indices[s..e]);
+            out_data.extend_from_slice(&data[s..e]);
+            out_indptr.push(out_indices.len() as i64);
+        }
+    }
+    let n = out_indptr.len() - 1;
+    (out_indptr, out_indices, out_data, n)
 }
 
 fn write_sparse_group(

@@ -1093,6 +1093,23 @@ impl FullCatalog {
         shards
     }
 
+    /// Return `adata.raw` CSR shard entries ([`SectionType::RawCsrShard`])
+    /// sorted by `stats.row_start`. Entries without stats are placed at
+    /// the end.
+    pub fn raw_csr_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::RawCsrShard)
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(SectionType::RawCsrShard))
+        });
+        shards
+    }
+
     /// Return CSC shard entries sorted by `stats.col_start`. Entries
     /// without stats go at the end.
     pub fn csc_shards_sorted(&self) -> Vec<&FullCatalogEntry> {

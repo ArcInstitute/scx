@@ -1003,3 +1003,98 @@ fn test_mixed_value_encoding_shards() {
     // Verify shard 2 values (uint16 range)
     assert_eq!(&csr.data[n_rows_per_shard * 2..], &expected_values2_f32[..]);
 }
+
+// ===========================================================================
+// adata.raw section family: write raw CSR shards + raw/var, read them back.
+// Exercises raw_n_vars > 65535 (u32 column indices) independent of X's n_vars.
+// ===========================================================================
+
+#[test]
+fn test_raw_section_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.scx");
+
+    let n_obs = 6usize;
+    let n_vars = 20usize; // main matrix: small (u16 indices)
+    let raw_n_vars = 70_000usize; // raw matrix: > 65535 → u32 indices
+
+    let header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // Main X shard.
+    let (x_ip, x_ix, x_val) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(&x_ip, &x_ix, &x_val, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+
+    // Raw matrix: each row has two nonzeros at high column indices to force
+    // u32 encoding. Build CSR directly.
+    let mut raw_ip = vec![0u64];
+    let mut raw_ix: Vec<u32> = Vec::new();
+    let mut raw_val: Vec<u8> = Vec::new();
+    for row in 0..n_obs {
+        let c0 = (65_500 + row) as u32;
+        let c1 = (raw_n_vars - 1 - row) as u32;
+        raw_ix.push(c0.min(c1));
+        raw_ix.push(c0.max(c1));
+        raw_val.push((row + 1) as u8);
+        raw_val.push((row + 2) as u8);
+        raw_ip.push(raw_ip.last().unwrap() + 2);
+    }
+
+    writer.set_raw_n_vars(raw_n_vars as u64);
+    writer
+        .write_raw_csr_shard(
+            &raw_ip,
+            &raw_ix,
+            &raw_val,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // raw/var with its own (larger) gene axis.
+    writer.write_raw_var(&sample_var(raw_n_vars)).unwrap();
+
+    writer.finish().unwrap();
+
+    // Read back.
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.has_raw(), "has_raw flag must be set");
+    assert_eq!(reader.n_obs(), n_obs as u64);
+    assert_eq!(reader.n_vars(), n_vars as u64, "X n_vars unchanged by raw");
+
+    let raw = reader.read_all_raw_csr_shards().unwrap();
+    assert_eq!(
+        raw.shape,
+        (n_obs, raw_n_vars),
+        "raw matrix keeps its own var axis"
+    );
+    assert_eq!(
+        raw.indptr,
+        raw_ip.iter().map(|&v| v as i64).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        raw.indices,
+        raw_ix.iter().map(|&v| v as i32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        raw.data,
+        raw_val.iter().map(|&v| v as f32).collect::<Vec<_>>()
+    );
+
+    let raw_var = reader.read_raw_var().unwrap();
+    assert_eq!(raw_var.num_rows(), raw_n_vars);
+}
+
+#[test]
+fn test_no_raw_means_has_raw_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "no_raw.scx", 8, 16, 1, CodecId::None, false);
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(!reader.has_raw());
+}

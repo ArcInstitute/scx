@@ -255,6 +255,10 @@ pub fn write_scx_to_h5ad_streaming(
     // /layers/{name}.
     stream_layers_at(&root, &reader, 0, keep_mask.as_deref(), opts, sink)?;
 
+    // /raw (DV-filtered on the obs axis like /X). Read eagerly; shared
+    // with the eager exporter.
+    crate::h5ad_write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
+
     Ok(())
 }
 
