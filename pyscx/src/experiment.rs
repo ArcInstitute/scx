@@ -307,16 +307,20 @@ impl PyExperiment {
 
     /// Column names in `obs` (the cell metadata), excluding the pandas
     /// index column. Pure Arrow IPC footer read — no batch decode.
+    /// Raises if the obs section cannot be read (e.g. corrupt file).
     #[getter]
-    fn obs_keys(&self) -> Vec<String> {
-        schema_data_columns(self.reader.read_obs_schema_physical().ok())
+    fn obs_keys(&self) -> PyResult<Vec<String>> {
+        let schema = self.reader.read_obs_schema_physical().map_err(to_pyerr)?;
+        Ok(schema_data_columns(Some(schema)))
     }
 
     /// Column names in `var` (the gene metadata), excluding the pandas
     /// index column. Pure Arrow IPC footer read — no batch decode.
+    /// Raises if the var section cannot be read (e.g. corrupt file).
     #[getter]
-    fn var_keys(&self) -> Vec<String> {
-        schema_data_columns(self.reader.read_var_schema_physical().ok())
+    fn var_keys(&self) -> PyResult<Vec<String>> {
+        let schema = self.reader.read_var_schema_physical().map_err(to_pyerr)?;
+        Ok(schema_data_columns(Some(schema)))
     }
 
     /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan.
@@ -1064,13 +1068,22 @@ impl PyExperiment {
     }
 
     fn __repr__(&self) -> String {
+        // Best-effort: the repr must always render, so a failed schema read
+        // degrades to an empty key list here (the public `obs_keys` /
+        // `var_keys` getters surface the error loudly instead).
         format_anndata_repr(
             "Experiment",
             self.reader.n_obs(),
             self.reader.n_vars(),
             &[
-                ("obs", self.obs_keys()),
-                ("var", self.var_keys()),
+                (
+                    "obs",
+                    schema_data_columns(self.reader.read_obs_schema_physical().ok()),
+                ),
+                (
+                    "var",
+                    schema_data_columns(self.reader.read_var_schema_physical().ok()),
+                ),
                 ("uns", self.uns_keys()),
                 ("obsm", self.obsm_keys()),
                 ("varm", self.varm_keys()),

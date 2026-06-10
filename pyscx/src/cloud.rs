@@ -375,9 +375,14 @@ pub fn read_cloud<'py>(
     let rt = Arc::new(rt);
 
     // Resolve gene names → indices against the file's var index before
-    // the reader is moved into the section-reader adapter.
+    // the reader is moved into the section-reader adapter. An explicitly
+    // empty `var_names=[]` is honored as "project to zero genes" (it must
+    // NOT fall through to None / all-genes, which would silently download
+    // the full matrix for a caller-computed empty marker list).
     let gene_indices: Option<Vec<u32>> = match var_names {
-        Some(names) if !names.is_empty() => {
+        // Empty list → project to zero genes without a wasted var read.
+        Some(names) if names.is_empty() => Some(Vec::new()),
+        Some(names) => {
             let reader_for_var = Arc::clone(&reader);
             let var_batch = py
                 .detach(|| rt.block_on(reader_for_var.read_var()))

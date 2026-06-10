@@ -808,7 +808,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None, shard_target_rows=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
-  Arrow IPC; higher-precision inputs are downcast on write. `uns_format`
+  Arrow IPC; higher-precision inputs are downcast on write. `in_place=True`
+  permits sorting the caller's CSR indices in place (avoids a copy when `X` is
+  an unsorted scipy CSR); leave it `False` (default) to keep the input AnnData
+  untouched. `uns_format`
   selects how `adata.uns` is serialized — see [`uns` serialization](#uns-serialization).
   Accepts backed AnnData (`sc.read_h5ad(path, backed='r')`) and auto-routes
   to the streaming converter — see `pyscx.from_h5ad` below for the

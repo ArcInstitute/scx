@@ -91,9 +91,11 @@ def _warn_if_deletions(src_path, out_fmt):
                 UserWarning,
                 stacklevel=3,
             )
-    except Exception:
+    except (OSError, RuntimeError, ValueError):
         # A header probe failure should never block the actual export;
-        # the converter below will surface any real error.
+        # the converter below will surface any real error. Narrow to the
+        # expected I/O / open failures so a genuine binding bug
+        # (TypeError / AttributeError) still surfaces during development.
         pass
 
 

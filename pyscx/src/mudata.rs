@@ -278,6 +278,14 @@ pub fn from_h5mu_impl(
     writer_queue_depth: usize,
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
+    // Missing input → FileNotFoundError (the converter opens the h5mu via
+    // `hdf5::File::open`, which surfaces as `ConvertError::Hdf5`, so the
+    // common wrong-path case would otherwise raise `RuntimeError`).
+    if !std::path::Path::new(path).exists() {
+        return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+            "no such file: '{path}'"
+        )));
+    }
     let explicit_codec = crate::anndata::parse_codec(codec)?;
     let csc_policy =
         scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;

@@ -203,6 +203,45 @@ def validate(path: Any) -> list[tuple[str, bool]]: ...
 
 
 # ---------------------------------------------------------------------------
+# Cloud surface (present only when built with `--features cloud`).
+# ---------------------------------------------------------------------------
+
+
+class CloudExperiment:
+    """Cloud-hosted SCX handle. Returned by `pyscx.open_cloud(url)`."""
+
+    @property
+    def n_obs(self) -> int: ...
+    @property
+    def n_vars(self) -> int: ...
+    @property
+    def nnz(self) -> int: ...
+    @property
+    def shard_count(self) -> int: ...
+    @property
+    def format_version(self) -> int: ...
+    @property
+    def codec_id(self) -> int: ...
+
+    def query(self) -> Any: ...
+    def __repr__(self) -> str: ...
+
+
+def open_cloud(url: str) -> CloudExperiment: ...
+
+
+def read_cloud(
+    url: str,
+    *,
+    obs_filter: str | None = ...,
+    var_names: list[str] | None = ...,
+) -> Any:
+    """One-call cloud read into an AnnData (= `open_cloud(url).query()…
+    collect().to_anndata()`)."""
+    ...
+
+
+# ---------------------------------------------------------------------------
 # Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 # `Any` here. Add explicit stubs above if/when type-checking on those
 # symbols becomes load-bearing.

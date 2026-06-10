@@ -5368,13 +5368,18 @@ pub fn from_anndata_impl(
         .and_then(|n| n.extract::<String>())
     {
         if name == "float64" || name == "float128" {
-            py.import("warnings")?.call_method1(
-                "warn",
+            // stacklevel=2 so `-W error` points at the user's
+            // `write()` / `from_anndata()` call, not the PyO3 bridge frame.
+            let warn_fn = py.import("warnings")?.getattr("warn")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("stacklevel", 2)?;
+            warn_fn.call(
                 (format!(
                     "X values are stored as float32 in SCX; the source matrix is \
                      {name}, so values are downcast and precision is reduced. \
                      This is expected — see the round-trip fidelity table in the docs."
                 ),),
+                Some(&kwargs),
             )?;
         }
     }

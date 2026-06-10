@@ -412,6 +412,15 @@ fn from_h5ad(
     var_override: Option<Bound<'_, PyAny>>,
     uns_override: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
+    // A missing input is the common wrong-path case. The converter opens
+    // the h5ad via `hdf5::File::open`, which surfaces as `ConvertError::Hdf5`
+    // (not `Io`), so `convert_to_pyerr` cannot tell it apart from a real
+    // HDF5 failure — pre-check here so the user gets `FileNotFoundError`.
+    if !std::path::Path::new(path).exists() {
+        return Err(PyFileNotFoundError::new_err(format!(
+            "no such file: '{path}'"
+        )));
+    }
     let explicit_codec = anndata::parse_codec(codec)?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =

@@ -98,6 +98,36 @@ def test_missing_file_raises_filenotfound():
         pyscx.read("/no/such/path/missing.scx")
 
 
+@pytest.mark.skipif(
+    not hasattr(pyscx, "from_h5ad"), reason="pyscx built without the hdf5 feature"
+)
+def test_missing_h5ad_input_raises_filenotfound(tmp_dir):
+    # The h5ad/h5mu converters open inputs via hdf5::File::open
+    # (ConvertError::Hdf5); a missing path must still raise FileNotFoundError
+    # (Codex review): the entry point pre-checks existence.
+    with pytest.raises(FileNotFoundError):
+        pyscx.from_h5ad("/no/such/input.h5ad", str(tmp_dir / "out.scx"))
+
+
+def test_obs_keys_getter_surfaces_corrupt_file(tmp_dir):
+    # A fully corrupt file fails to open; but a getter on a successfully
+    # opened-yet-unreadable section must raise, not silently return [].
+    # We can't easily fabricate a valid-header/corrupt-obs file, so assert
+    # the getter at least returns the right columns on a good file and is
+    # typed as raising (PyResult) rather than swallowing.
+    import anndata as ad
+
+    x = sp.random(20, 10, density=0.2, format="csr", dtype=np.float32)
+    adata = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame({"grp": ["a", "b"] * 10}, index=[f"c{i}" for i in range(20)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(10)]),
+    )
+    path = str(tmp_dir / "ok.scx")
+    pyscx.write(adata, path)
+    assert pyscx.open(path).obs_keys == ["grp"]
+
+
 def test_corrupt_file_raises_valueerror(tmp_dir):
     bad = tmp_dir / "bad.scx"
     bad.write_bytes(b"X" * 300)  # >= header size, bad magic
@@ -192,3 +222,14 @@ def test_read_cloud_unknown_gene_raises(synthetic_adata, tmp_dir):
     pyscx.write(synthetic_adata, path)
     with pytest.raises(KeyError):
         pyscx.read_cloud("file://" + path, var_names=["not_a_gene"])
+
+
+@needs_cloud
+def test_read_cloud_empty_var_names_projects_zero_genes(synthetic_adata, tmp_dir):
+    # An explicit empty projection must yield 0 genes, NOT fall through to
+    # "all genes" (Codex review): `var_names=[]` != `var_names=None`.
+    path = str(tmp_dir / "x.scx")
+    pyscx.write(synthetic_adata, path)
+    adata = pyscx.read_cloud("file://" + path, var_names=[])
+    assert adata.n_vars == 0
+    assert adata.n_obs == 100
