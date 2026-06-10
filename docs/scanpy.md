@@ -170,6 +170,10 @@ sc.pl.umap(adata, color="leiden")
 
 ## Converting existing data to SCX
 
+> **What round-trips?** For the canonical table of which AnnData fields are
+> preserved, lossy, or dropped on conversion (and which warning fires for each),
+> see [docs/api.md § Round-trip fidelity](api.md#round-trip-fidelity).
+
 > **Benchmarks**: for h5ad → SCX conversion throughput across datasets, codecs,
 > and thread counts (including `full` mode that covers the h5ad read + SCX
 > write), see [docs/performance.md §Conversion (h5ad → format)](performance.md#conversion-h5ad--format)
