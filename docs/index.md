@@ -54,6 +54,7 @@ Benchmarks, operational semantics (append/delete/compact), and test infrastructu
 :hidden:
 
 quickstart
+migrating-from-h5ad
 training
 scanpy
 gpu-setup

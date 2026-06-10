@@ -69,7 +69,7 @@ def test_categorical_round_trip(tmp_dir):
 
 
 def test_experiment_repr(synthetic_adata, tmp_dir):
-    """15.16: PyExperiment repr shows useful info."""
+    """15.16: Experiment repr is AnnData-style (T3.4)."""
     import pyscx
 
     path = str(tmp_dir / "repr.scx")
@@ -77,9 +77,11 @@ def test_experiment_repr(synthetic_adata, tmp_dir):
     exp = pyscx.open(path)
 
     r = repr(exp)
-    assert "PyExperiment" in r
-    assert "n_obs=100" in r
-    assert "n_vars=50" in r
+    # AnnData-style header line; no Rusty `Py` prefix leaking through.
+    assert r.startswith("Experiment object with n_obs × n_vars = 100 × 50")
+    assert "PyExperiment" not in r
+    # Codec/shard internals moved off the repr onto .info().
+    assert "codec" in exp.info()
 
 
 def test_validate(synthetic_adata, tmp_dir):

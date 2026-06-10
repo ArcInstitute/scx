@@ -340,10 +340,10 @@ pub fn from_h5mu_impl(
     let mut sink = scx_convert::WarningSink::log();
     if stream {
         py.detach(|| scx_convert::h5mu_to_scx_streaming(&input, &output, &opts, &mut sink))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::convert_to_pyerr)?;
     } else {
         py.detach(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::convert_to_pyerr)?;
     }
     crate::anndata::emit_python_warnings(py, &sink)?;
     Ok(())

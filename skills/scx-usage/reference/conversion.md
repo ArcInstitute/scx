@@ -80,7 +80,7 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
 
 ### Other ingest
 - `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — multimodal SCX v2. `modalities=["rna","adt"]` keeps a subset (unknown names raise); `modality_types={"adt":"protein","peaks":"atac"}` overrides inferred types (others emit `ModalityTypeInferred`). Per-modality dispatch mirrors `from_h5ad`.
-- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off")`.
+- `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False)`.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX dir (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`). Default shard size 16384. Orientation is auto-detected: Cell Ranger's native **features × barcodes** matrix is transposed to cells×genes (an already-cells×genes matrix is kept; a square matrix assumes Cell Ranger's layout with a warning; a dimension mismatch is a hard error), so a standard `filtered_feature_bc_matrix/` converts to a `(n_cells, n_genes)` SCX file.
 
 ## Export out of SCX
@@ -184,6 +184,7 @@ feature.
 
 ## Cloud (requires the cloud feature)
 - `pyscx.pull(source, dest, filter=None, parallelism=None)` / `pyscx.push(source, dest, parallelism=None)`.
-- `pyscx.open_cloud(url) -> PyCloudExperiment` — direct range reads; `.query().filter_obs(...).select_genes(...).collect()` with no `scx pull` step.
+- `pyscx.open_cloud(url) -> CloudExperiment` — direct range reads; `.query().filter_obs(...).select_genes(...).collect()` with no `scx pull` step.
+- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None) -> AnnData` — one-call cloud read (wraps `open_cloud(url).query()…collect().to_anndata()`); `file://` / local paths work too.
 - `pyscx.cloud_optimize(input, output=None)`, `pyscx.explode(input, output)`, `pyscx.pack(input, output)`.
 - CLI: `scx cloud-optimize`, `scx explode`, `scx pack`, `scx pull <url> <dest> [--filter EXPR]`, `scx push <src> <url>`.

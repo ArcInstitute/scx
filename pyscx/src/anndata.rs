@@ -5359,6 +5359,25 @@ pub fn from_anndata_impl(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let data_obj = x_csr.getattr("data")?;
+    // T3.7: warn on lossy float64 → float32 value downcast at the write
+    // boundary so the precision loss recorded in the round-trip fidelity
+    // table is also visible at runtime, not just in docs.
+    if let Ok(name) = data_obj
+        .getattr("dtype")
+        .and_then(|d| d.getattr("name"))
+        .and_then(|n| n.extract::<String>())
+    {
+        if name == "float64" || name == "float128" {
+            py.import("warnings")?.call_method1(
+                "warn",
+                (format!(
+                    "X values are stored as float32 in SCX; the source matrix is \
+                     {name}, so values are downcast and precision is reduced. \
+                     This is expected — see the round-trip fidelity table in the docs."
+                ),),
+            )?;
+        }
+    }
     let data_arr = astype_if_needed(&data_obj, &np, "float32")?;
     let data: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
     let data_slice = data

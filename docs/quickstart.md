@@ -10,6 +10,30 @@ Rust-native pipeline.
 
 For the design and architecture, see [docs/architecture.md](architecture.md).
 For the full scanpy integration story, see [docs/scanpy.md](scanpy.md).
+Coming from h5ad? See [docs/migrating-from-h5ad.md](migrating-from-h5ad.md) for
+the round-trip fidelity table and the scanpy-divergence gotchas.
+
+## Which loader do I use?
+
+```
+                         Is your dataset small enough
+                         to fit in memory (~500K cells)?
+                                    │
+                        ┌───yes─────┴──────no───┐
+                        ▼                       ▼
+                  pyscx.read(path)        Do you need
+              (or .to_anndata();          the full dataset?
+               simplest, full                   │
+               scanpy compat)      ┌───yes──────┴──────no───┐
+                                   ▼                        ▼
+                          to_anndata(backed=True)     .query().filter_obs()
+                          + pyscx.accel.*             .collect()  (subset,
+                          (out-of-core)               then in-memory)
+```
+
+Training a model? Use the `TrainingDataset` loader instead — see
+[docs/training.md](training.md). Full trade-off table:
+[docs/scanpy.md § Choosing the right approach](scanpy.md#choosing-the-right-approach).
 
 ## Install
 
@@ -67,6 +91,8 @@ from pyscx import accel
 
 exp = pyscx.open("pbmc3k.scx")
 adata = exp.to_anndata()           # CSR float32, exactly what scanpy expects
+# Or the one-liner, mirroring sc.read_h5ad:
+#   adata = pyscx.read("pbmc3k.scx")
 
 # QC. MT genes must be tagged explicitly (same contract as scanpy) — without
 # `qc_vars=["mt"]` the `pct_counts_mt` column is not produced. `pyscx.accel`

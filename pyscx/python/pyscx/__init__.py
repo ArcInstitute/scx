@@ -50,6 +50,7 @@ import os as _os                                   # noqa: E402
 
 from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
+from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -72,6 +73,28 @@ except ImportError:
     _to_h5mu_native = None
     _read_h5ad_metadata_native = None
     _HAS_HDF5 = False
+
+
+def _warn_if_deletions(src_path, out_fmt):
+    """Emit a UserWarning when exporting a source that carries logical
+    deletion vectors — those rows are dropped on export, so the written
+    file has fewer cells than the SCX source. Cheap: header-only open.
+    Never fails the export (best-effort)."""
+    import warnings as _warnings
+    try:
+        exp = _open_native(src_path, verify=False)
+        if getattr(exp, "has_deletions", False):
+            _warnings.warn(
+                f"source SCX file has logically-deleted rows; the exported "
+                f"{out_fmt} will contain only the kept cells (row count is "
+                f"smaller than the SCX source).",
+                UserWarning,
+                stacklevel=3,
+            )
+    except Exception:
+        # A header probe failure should never block the actual export;
+        # the converter below will surface any real error.
+        pass
 
 
 def _require_hdf5(fn_name):
@@ -139,6 +162,51 @@ def validate(path):
     """Validate an SCX file by walking its catalog and checking BLAKE3
     checksums. Accepts str or `os.PathLike`."""
     return _validate_native(_coerce_path(path))
+
+
+def read(path, *, verify=True, **kwargs):
+    """Read an SCX file into an `anndata.AnnData` in one call.
+
+    The flat counterpart to `scanpy.read_h5ad` — shorthand for
+    `pyscx.open(path).to_anndata(**kwargs)`. Accepts str or `os.PathLike`.
+
+    Args:
+        path: SCX file to read (str or os.PathLike).
+        verify: Forwarded to `pyscx.open` — verify the catalog checksum
+            on open (default True). Set False for trusted files.
+        **kwargs: Forwarded to `Experiment.to_anndata` (e.g. `backed=True`,
+            `var_names=[...]`, `obs_filter="..."`, `layers=[...]`). See
+            `Experiment.to_anndata` for the full set.
+
+    Returns:
+        `anndata.AnnData`.
+
+    Example:
+        import pyscx
+        adata = pyscx.read("data.scx")
+        backed = pyscx.read("atlas.scx", backed=True)
+    """
+    return open(path, verify=verify).to_anndata(**kwargs)
+
+
+def write(adata, path, **kwargs):
+    """Write an `anndata.AnnData` to an SCX file in one call.
+
+    The flat counterpart to `AnnData.write_h5ad` — shorthand for
+    `pyscx.from_anndata(adata, path, **kwargs)`. Accepts str or
+    `os.PathLike` for `path`.
+
+    Args:
+        adata: The `anndata.AnnData` (or backed/lazy SCX `X`) to write.
+        path: Destination SCX file (str or os.PathLike).
+        **kwargs: Forwarded to `pyscx.from_anndata` (e.g. `codec=...`,
+            `shard_size=...`, `csc=...`, `index_preset=...`).
+
+    Example:
+        import pyscx
+        pyscx.write(adata, "data.scx")
+    """
+    return _from_anndata_native(adata, _coerce_path(path), **kwargs)
 
 
 def from_h5ad(path, out, **kwargs):
@@ -270,7 +338,9 @@ def to_h5ad(path, out, **kwargs):
             smaller mismatches emit ReaderThreadsDerated.
     """
     _require_hdf5("to_h5ad")
-    return _to_h5ad_native(_coerce_path(path), _coerce_path(out), **kwargs)
+    src = _coerce_path(path)
+    _warn_if_deletions(src, "h5ad")
+    return _to_h5ad_native(src, _coerce_path(out), **kwargs)
 
 
 def from_h5mu(path, out, **kwargs):
@@ -346,7 +416,9 @@ def to_h5mu(path, out, **kwargs):
             KB/MB/GB/TB is rejected. E.g. "4G".
     """
     _require_hdf5("to_h5mu")
-    return _to_h5mu_native(_coerce_path(path), _coerce_path(out), **kwargs)
+    src = _coerce_path(path)
+    _warn_if_deletions(src, "h5mu")
+    return _to_h5mu_native(src, _coerce_path(out), **kwargs)
 
 
 def iter_chunks(adata, chunk_size="shard"):
