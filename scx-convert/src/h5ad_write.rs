@@ -27,8 +27,20 @@ fn vlu(s: &str) -> VarLenUnicode {
 
 use scx_format::reader::ScxReader;
 
+use super::h5ad_read::CATEGORICAL_ORDERED_KEY;
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
+
+/// Resolve a categorical column's pandas `ordered` bit from the Arrow
+/// `Field::metadata` the h5ad reader stamps ([`CATEGORICAL_ORDERED_KEY`]).
+/// Non-categorical or metadata-less fields resolve to `false`.
+fn field_ordered(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(CATEGORICAL_ORDERED_KEY)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
 
 /// Write an SCX file to h5ad format.
 pub fn write_scx_to_h5ad(
@@ -278,24 +290,8 @@ fn write_dataframe_body(
             // exclude from `column-order` (matches anndata convention).
             // anndata requires `_index` to be a plain dataset, so the
             // nullable-group encoding is disabled for it.
-            write_column_to_hdf5(
-                group,
-                df_name,
-                on_disk_index,
-                col,
-                field.data_type(),
-                false,
-                sink,
-            )?;
-        } else if write_column_to_hdf5(
-            group,
-            df_name,
-            field.name(),
-            col,
-            field.data_type(),
-            true,
-            sink,
-        )? {
+            write_column_to_hdf5(group, df_name, on_disk_index, col, field, false, sink)?;
+        } else if write_column_to_hdf5(group, df_name, field.name(), col, field, true, sink)? {
             // Only list the column in `column-order` when a dataset
             // was actually created — unsupported types are
             // warn-and-skipped and must not appear in the index.
@@ -520,10 +516,14 @@ fn write_column_to_hdf5(
     df_name: &str,
     name: &str,
     array: &dyn Array,
-    dtype: &DataType,
+    field: &Field,
     allow_nullable_group: bool,
     sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
+    // `dtype` selects the encoding; `ordered` (categorical only) is
+    // resolved from the field's `scx.categorical.ordered` metadata.
+    let dtype = field.data_type();
+    let ordered = field_ordered(field);
     match dtype {
         DataType::Int32 => {
             let arr = array
@@ -694,15 +694,15 @@ fn write_column_to_hdf5(
                 .new_attr::<VarLenUnicode>()
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.2.0"))?;
-            // `ordered=false` matches scipy / pandas default. Arrow's
-            // DictionaryArray doesn't carry an `ordered` bit so we
-            // never have richer information to forward. Native HDF5
+            // The pandas `ordered` bit is carried in the Arrow field
+            // metadata (`scx.categorical.ordered`) the h5ad reader stamps;
+            // `ordered` is resolved from it by the caller. Native HDF5
             // bool — anndata's categorical reader expects
             // `H5T_NATIVE_HBOOL_8`, not u8.
             cat_group
                 .new_attr::<bool>()
                 .create("ordered")?
-                .write_scalar(&false)?;
+                .write_scalar(&ordered)?;
         }
         _ => {
             sink.emit(ConvertWarning::UnsupportedExportColumn {
@@ -1190,6 +1190,10 @@ enum ColumnStreamWriter {
         // insertion order is preserved by walking `cat_order` at finalize.
         dict: HashMap<String, i32>,
         cat_order: Vec<String>,
+        // pandas `ordered` bit, resolved from the source field metadata
+        // ([`CATEGORICAL_ORDERED_KEY`]) at writer creation and emitted at
+        // finalize (the `Field` is gone by then).
+        ordered: bool,
     },
     /// anndata `nullable-integer` / `nullable-string-array` group: a
     /// `values` dataset (nulls filled with `0` / `""`) + a boolean `mask`
@@ -1359,6 +1363,7 @@ fn create_column_writer(
                 offset: 0,
                 dict: HashMap::new(),
                 cat_order: Vec::new(),
+                ordered: field_ordered(field),
             })
         }
         _ => {
@@ -1675,7 +1680,10 @@ fn append_shard_to_column(
 
 fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertError> {
     if let ColumnStreamWriter::Categorical {
-        group, cat_order, ..
+        group,
+        cat_order,
+        ordered,
+        ..
     } = writer
     {
         let cats: Vec<VarLenUnicode> = cat_order.iter().map(|s| vlu(s)).collect();
@@ -1695,7 +1703,7 @@ fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertErro
         group
             .new_attr::<bool>()
             .create("ordered")?
-            .write_scalar(&false)?;
+            .write_scalar(ordered)?;
     }
     Ok(())
 }

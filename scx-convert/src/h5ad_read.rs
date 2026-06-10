@@ -15,6 +15,12 @@ use super::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat}
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
 
+/// Arrow `Field::metadata` key carrying a categorical column's pandas
+/// `ordered` bit. Arrow's `DictionaryArray` has no `ordered` flag, so the
+/// h5ad reader stamps it here and the h5ad writer emits it back; obs/var
+/// are Arrow IPC, which preserves field metadata across the SCX round-trip.
+pub(crate) const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
 type CsrArrays = (Vec<i64>, Vec<i32>, Vec<f32>, usize, usize);
 
@@ -853,11 +859,23 @@ fn read_categorical_group(
     let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
 
+    // Carry the pandas `ordered` bit (anndata stores it as a scalar bool
+    // attribute on the categorical group) in Arrow field metadata so the
+    // h5ad writer can re-emit it; absent → false (pandas default).
+    let ordered = cat_group
+        .attr("ordered")
+        .ok()
+        .and_then(|a| a.read_scalar::<bool>().ok())
+        .unwrap_or(false);
     let field = Field::new(
         name,
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         true,
-    );
+    )
+    .with_metadata(HashMap::from([(
+        CATEGORICAL_ORDERED_KEY.to_string(),
+        ordered.to_string(),
+    )]));
     Ok((field, Arc::new(dict)))
 }
 
@@ -1145,11 +1163,22 @@ fn read_categorical_column(
     let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
 
+    // Carry the `ordered` bit (legacy attr-form stores it on the dataset)
+    // in Arrow field metadata; absent → false (pandas default).
+    let ordered = ds
+        .attr("ordered")
+        .ok()
+        .and_then(|a| a.read_scalar::<bool>().ok())
+        .unwrap_or(false);
     let field = Field::new(
         name,
         DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
         true,
-    );
+    )
+    .with_metadata(HashMap::from([(
+        CATEGORICAL_ORDERED_KEY.to_string(),
+        ordered.to_string(),
+    )]));
 
     Ok((field, Arc::new(dict)))
 }
