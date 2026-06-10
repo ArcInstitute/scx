@@ -24,6 +24,12 @@ pub enum ConvertWarning {
     InferredEncoding { path: String, inferred: String },
     /// An `uns` entry could not be represented and was skipped.
     SkippedUnsKey { key: String, reason: String },
+    /// A `uns` entry stored as a pandas DataFrame (`encoding-type ==
+    /// "dataframe"`) was preserved as a nested dict (per-column values +
+    /// `_index`) rather than reconstructed as a DataFrame. The column data
+    /// survives, but column order and per-column categorical dtypes are not
+    /// restored on read. Surfaces the structure loss so it is never silent.
+    FlattenedUnsDataframe { key: String },
     /// A column requested via `--index-preset` was missing from the
     /// source DataFrame. Emitted for partial preset/file mismatch only —
     /// when EVERY preset column is missing, the convert layer batches
@@ -165,6 +171,7 @@ impl ConvertWarning {
         match self {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
+            Self::FlattenedUnsDataframe { .. } => "flattened_uns_dataframe",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
             Self::UnsupportedIndexColumn { .. } => "unsupported_index_column",
@@ -216,6 +223,13 @@ impl fmt::Display for ConvertWarning {
                     n = missing.len(),
                 )
             }
+            Self::FlattenedUnsDataframe { key } => write!(
+                f,
+                "uns['{key}'] is a pandas DataFrame; it was preserved as a nested \
+                 dict (per-column values + `_index`) but not reconstructed as a \
+                 DataFrame — column order and per-column categorical dtypes are not \
+                 restored on read."
+            ),
             Self::DroppedRaw { raw_n_vars } => write!(
                 f,
                 "adata.raw ({raw_n_vars} genes) was present but dropped from this \

@@ -1715,6 +1715,24 @@ fn read_uns_entry(
 
     // Try reading as subgroup → recurse
     if let Ok(subgroup) = group.group(name) {
+        // A pandas DataFrame in uns (`encoding-type == "dataframe"`) is
+        // preserved by the generic recurse below as a nested dict of
+        // per-column values + `_index`, but column order (carried only in
+        // the group's `column-order` attribute) and per-column categorical
+        // dtypes are NOT reconstructed. Surface that structure loss so it
+        // is never silent. The data still round-trips as a dict.
+        let enc = subgroup
+            .attr("encoding-type")
+            .ok()
+            .and_then(|a| a.read_scalar::<hdf5::types::VarLenUnicode>().ok())
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        if enc == "dataframe" {
+            sink.emit(ConvertWarning::FlattenedUnsDataframe {
+                key: name.to_string(),
+            });
+        }
+
         let sub_members = subgroup.member_names()?;
         let mut sub_map = serde_json::Map::new();
         for sub_name in &sub_members {
