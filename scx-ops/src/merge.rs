@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use arrow::array::RecordBatch;
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format::codec_select::select_codec;
 use scx_format::header::{FileHeader, MAGIC};
@@ -19,6 +19,9 @@ use crate::helpers::encode_value;
 use crate::merge_options::MergeOptions;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+};
+use crate::rewrite_helpers::{
+    build_raw_copied_csr_section, raw_copy_csr_eligible, source_decode_sidecar,
 };
 
 /// Merge multiple SCX files into a single output file.
@@ -317,21 +320,61 @@ pub fn merge_with_options(
     // write loop so the predicate-index builder can map global row ids to
     // output-shard local rows.
     let mut output_shard_row_ranges: Vec<(u64, u64)> = Vec::new();
+    // The merged output stamps each CSR shard's index dtype from the merged
+    // column count (mirrors `write_shard_inner`): u16 indices when `n_vars - 1`
+    // fits, else u32. Raw-copy is only valid when the source shard already uses
+    // this width.
+    let target_index_dtype: u8 = if n_vars.saturating_sub(1) <= u16::MAX as u64 {
+        0
+    } else {
+        1
+    };
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
         for shard_entry in &shards {
-            // Read this shard's value_encoding from its header
-            let shard_section = reader.section_bytes(shard_entry)?;
-            let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
-                &shard_section[..SHARD_HEADER_SIZE],
-            ))?;
+            // Read this shard's header (value_encoding + raw-copy eligibility).
+            let sh = reader.read_shard_header(shard_entry)?;
             let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
                 .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
+            let row_start = cumulative_rows;
 
+            // Raw-copy fast path: when the source shard's on-disk layout already
+            // matches the merged output (index dtype + column extent) and the
+            // var axis is verified-identical, byte-copy the section instead of
+            // decode → re-encode → codec-search. Merge always auto-selects the
+            // codec, so the codec precondition is `Auto`. Disabled under
+            // `assume_identical_var` (column indices are not guaranteed to match
+            // when var is assumed-but-not-verified equal).
+            let raw_copy_ok =
+                raw_copy_csr_eligible(&sh, target_index_dtype, n_vars, CodecSelection::Auto)
+                    && !options.assume_identical_var;
+            if raw_copy_ok {
+                // The decode/re-encode path emits a decode sidecar for Scx1
+                // shards; preserve byte-identical output by copying the
+                // source's sidecar too. If an Scx1 source lacks one (pre-v3 or
+                // over the overhead budget), we cannot reproduce what the slow
+                // path would emit, so fall through to decode/re-encode.
+                let sidecar = source_decode_sidecar(reader, shard_entry, row_start)?;
+                let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
+                if !is_scx1 || sidecar.is_some() {
+                    let (section_bytes, stats) = build_raw_copied_csr_section(
+                        reader,
+                        shard_entry,
+                        &sh,
+                        n_vars,
+                        row_start,
+                        shard_value_encoding,
+                    )?;
+                    writer.write_csr_shard_raw_copy(&section_bytes, stats, sh.nnz, sidecar)?;
+                    cumulative_rows += sh.n_major as u64;
+                    output_shard_row_ranges.push((row_start, cumulative_rows));
+                    continue;
+                }
+            }
+
+            // Slow path: decode → re-encode with the shard's own value encoding.
             let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
             let n_rows = indptr.len() - 1;
-
-            // Convert back to on-disk format using the shard's own value encoding
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
             let mut values_bytes = Vec::new();
@@ -342,14 +385,13 @@ pub fn merge_with_options(
             // Auto-select optimal codec for this shard's data
             let shard_codec = select_codec(&values_bytes, shard_value_encoding);
 
-            let row_start = cumulative_rows;
             writer.write_csr_shard(
                 &indptr_u64,
                 &indices_u32,
                 &values_bytes,
                 shard_codec,
                 shard_value_encoding,
-                cumulative_rows,
+                row_start,
             )?;
             cumulative_rows += n_rows as u64;
             output_shard_row_ranges.push((row_start, cumulative_rows));
@@ -789,22 +831,60 @@ fn merge_multimodal(
     // the modality's shards collectively cover the input's n_obs rows;
     // after one input we advance the offset by that input's n_obs so
     // the next input's shards line up against the merged obs.
-    for (idx, _info) in table.entries.iter().enumerate() {
+    for (idx, info) in table.entries.iter().enumerate() {
         let modality_id = (idx + 1) as u8;
+        let modality_n_vars = info.n_vars;
+        // Per-modality CSR shards stamp their index dtype from the modality's
+        // own column count (see `write_shard_inner`'s `row_major_n_minor`).
+        let target_index_dtype: u8 = if modality_n_vars.saturating_sub(1) <= u16::MAX as u64 {
+            0
+        } else {
+            1
+        };
         let mut input_offset: u64 = 0;
         for reader in readers {
             let entries = reader.catalog().csr_shards_for_modality(modality_id);
             for shard_entry in entries {
-                let section = reader.section_bytes(shard_entry)?;
-                let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
-                    &section[..SHARD_HEADER_SIZE],
-                ))?;
+                let sh = reader.read_shard_header(shard_entry)?;
                 let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
                     .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
-                let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
                 let shard_local_row_start =
                     shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+                let row_start = input_offset + shard_local_row_start;
 
+                // Raw-copy fast path (see the single-modality X loop above for
+                // the full rationale). Eligibility uses the modality's own
+                // column extent / index dtype.
+                let raw_copy_ok = raw_copy_csr_eligible(
+                    &sh,
+                    target_index_dtype,
+                    modality_n_vars,
+                    CodecSelection::Auto,
+                ) && !options.assume_identical_var;
+                if raw_copy_ok {
+                    let sidecar = source_decode_sidecar(reader, shard_entry, row_start)?;
+                    let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
+                    if !is_scx1 || sidecar.is_some() {
+                        let (section_bytes, stats) = build_raw_copied_csr_section(
+                            reader,
+                            shard_entry,
+                            &sh,
+                            modality_n_vars,
+                            row_start,
+                            shard_value_encoding,
+                        )?;
+                        writer.write_csr_shard_raw_copy_for(
+                            modality_id,
+                            &section_bytes,
+                            stats,
+                            sh.nnz,
+                            sidecar,
+                        )?;
+                        continue;
+                    }
+                }
+
+                let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
                 let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
                 let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
                 let mut values_bytes = Vec::new();
@@ -819,7 +899,7 @@ fn merge_multimodal(
                     &values_bytes,
                     shard_codec,
                     shard_value_encoding,
-                    input_offset + shard_local_row_start,
+                    row_start,
                 )?;
             }
             input_offset += reader.n_obs();

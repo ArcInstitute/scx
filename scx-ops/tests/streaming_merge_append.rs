@@ -338,6 +338,233 @@ fn merge_var_mismatch_assume_identical_var_proceeds() {
     );
 }
 
+/// A wide var axis (`g0..g{n}`) so an Scx1 count shard stays within the
+/// decode-sidecar overhead budget.
+fn wide_var(n_vars: usize) -> RecordBatch {
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+    let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(StringArray::from(gene_ids))],
+    )
+    .unwrap()
+}
+
+/// Build a single-shard Scx1 count-matrix input. The data is dense enough
+/// that the writer routes to Scx1 and emits a decode sidecar, so the
+/// raw-copy fast path's sidecar handling is exercised.
+fn write_scx1_count_input(path: &std::path::Path, n_obs: usize, donor: &str, var: &RecordBatch) {
+    let n_vars = var.num_rows();
+    let nnz_per_row = 256usize;
+    let mut indptr = vec![0u64];
+    let mut indices: Vec<u32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for r in 0..n_obs {
+        let mut col = 0u32;
+        for k in 0..nnz_per_row {
+            col += 1 + ((r * 13 + k * 7) % 97) as u32;
+            if col as usize >= n_vars {
+                break;
+            }
+            indices.push(col);
+            values.push(1 + ((r + k) % 5) as u8); // small counts → Scx1
+        }
+        indptr.push(indices.len() as u64);
+    }
+    let mut writer = ScxWriter::new(path, header(n_obs as u64, n_vars as u64)).unwrap();
+    writer.write_obs(&obs_batch(0, n_obs, donor)).unwrap();
+    writer.write_var(var).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "streaming_merge_append test fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+fn sidecar_count(reader: &ScxReader) -> usize {
+    reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+        .count()
+}
+
+#[test]
+fn merge_raw_copy_byte_identical_to_reencode() {
+    // Two inputs with identical var axis + single-shard layout, Scx1 count
+    // data carrying decode sidecars. The raw-copy fast path
+    // (`assume_identical_var = false`) must produce byte-identical X-shard
+    // *and* decode-sidecar sections to the decode/re-encode path
+    // (`assume_identical_var = true` disables raw-copy but, with identical
+    // var, yields the same var + X).
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    write_scx1_count_input(&a, 40, "donor_A", &var);
+    write_scx1_count_input(&b, 40, "donor_B", &var);
+
+    // The inputs must actually carry sidecars, else the sidecar-copy path is
+    // never exercised.
+    assert!(
+        sidecar_count(&ScxReader::open(&a).unwrap()) >= 1,
+        "input must carry a decode sidecar to exercise the copy path"
+    );
+
+    let out_fast = dir.path().join("fast.scx");
+    let out_slow = dir.path().join("slow.scx");
+    scx_ops::merge_with_options(
+        &[a.as_path(), b.as_path()],
+        &out_fast,
+        &scx_ops::MergeOptions::default(),
+    )
+    .unwrap();
+    scx_ops::merge_with_options(
+        &[a.as_path(), b.as_path()],
+        &out_slow,
+        &scx_ops::MergeOptions {
+            assume_identical_var: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rf = ScxReader::open(&out_fast).unwrap();
+    let rs = ScxReader::open(&out_slow).unwrap();
+
+    let cf = rf.catalog().shards_sorted();
+    let cs = rs.catalog().shards_sorted();
+    assert_eq!(cf.len(), 2, "one output shard per input shard");
+    assert_eq!(cf.len(), cs.len(), "fast/slow shard count");
+    assert_eq!(
+        sidecar_count(&rf),
+        sidecar_count(&rs),
+        "fast/slow sidecar count"
+    );
+    assert_eq!(
+        sidecar_count(&rf),
+        2,
+        "raw-copy preserves both Scx1 decode sidecars"
+    );
+
+    // X-shard sections byte-identical between raw-copy and re-encode.
+    for (sf, ss) in cf.iter().zip(cs.iter()) {
+        assert_eq!(
+            rf.read_raw_shard_bytes(sf).unwrap(),
+            rs.read_raw_shard_bytes(ss).unwrap(),
+            "X-shard section bytes must be byte-identical (raw-copy vs re-encode)"
+        );
+    }
+
+    // Decode sidecars byte-identical and self-consistent.
+    let sf: Vec<_> = rf
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+        .cloned()
+        .collect();
+    let ss: Vec<_> = rs
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+        .cloned()
+        .collect();
+    for (ef, es) in sf.iter().zip(ss.iter()) {
+        assert_eq!(
+            rf.section_bytes(ef).unwrap(),
+            rs.section_bytes(es).unwrap(),
+            "decode sidecar section bytes must match"
+        );
+        rf.validate_decode_sidecar_entry(ef).unwrap();
+    }
+
+    // Decoded matrices agree across both paths.
+    for i in 0..cf.len() {
+        assert_eq!(
+            rf.read_csr_shard(i).unwrap(),
+            rs.read_csr_shard(i).unwrap(),
+            "decoded shard {i} must match"
+        );
+    }
+}
+
+/// Micro-bench (P2 / OPT-1.2): same-layout merge via the raw-copy fast path
+/// vs the decode/re-encode path. The slow path is exactly the pre-change
+/// behaviour (raw-copy disabled), so `slow / fast` is the merge speedup.
+/// Run with: `cargo test --release -p scx-ops --test streaming_merge_append \
+///   merge_rawcopy_microbench -- --ignored --nocapture`.
+#[test]
+#[ignore = "micro-bench; run with --release --ignored --nocapture"]
+fn merge_rawcopy_microbench() {
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    write_scx1_count_input(&a, 20_000, "donor_A", &var);
+    write_scx1_count_input(&b, 20_000, "donor_B", &var);
+    assert!(
+        sidecar_count(&ScxReader::open(&a).unwrap()) >= 1,
+        "inputs must carry sidecars, else raw-copy falls back to re-encode"
+    );
+
+    let inputs = [a.as_path(), b.as_path()];
+    let iters = 5;
+
+    // Warm the page cache so both paths read the same hot inputs.
+    let warm = dir.path().join("warm.scx");
+    scx_ops::merge_with_options(&inputs, &warm, &scx_ops::MergeOptions::default()).unwrap();
+
+    let time_merge = |opts: &scx_ops::MergeOptions, tag: &str| {
+        let mut best = f64::INFINITY;
+        for i in 0..iters {
+            let out = dir.path().join(format!("{tag}_{i}.scx"));
+            let t0 = std::time::Instant::now();
+            scx_ops::merge_with_options(&inputs, &out, opts).unwrap();
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        best
+    };
+
+    // Raw-copy fast path (new default).
+    let fast = time_merge(&scx_ops::MergeOptions::default(), "fast");
+    // Forced decode → re-encode (pre-change behaviour). With identical var,
+    // `assume_identical_var = true` only disables raw-copy; output is the same.
+    let slow = time_merge(
+        &scx_ops::MergeOptions {
+            assume_identical_var: true,
+            ..Default::default()
+        },
+        "slow",
+    );
+
+    eprintln!("\n=== merge raw-copy micro-bench (2 × 20k rows × 50k vars, Scx1) ===");
+    eprintln!("  raw-copy  (new): {fast:.4}s  (best of {iters})");
+    eprintln!("  re-encode (old): {slow:.4}s  (best of {iters})");
+    eprintln!("  speedup: {:.2}x", slow / fast);
+    assert!(
+        fast < slow,
+        "raw-copy ({fast:.4}s) should beat re-encode ({slow:.4}s)"
+    );
+}
+
 #[test]
 fn merge_obs_mismatch_errors_by_default() {
     // Default (assume_identical_obs = false): obs schema identity

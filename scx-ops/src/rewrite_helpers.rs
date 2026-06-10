@@ -3,11 +3,150 @@
 // Used by build_csc and upgrade to avoid duplicating layer/obsm/uns/
 // predicate-index/provenance copy logic.
 
-use scx_codec::{CodecId, ValueEncoding};
+use scx_codec::{CodecId, CodecSelection, ValueEncoding};
+use scx_format::catalog::{FullCatalogEntry, ShardStats};
+use scx_format::decode_sidecar::DecodeSidecar;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
+use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format::{compute_shard_stats, MajorAxis, ScxReader};
+
+use crate::error::{OpsError, Result as OpsResult};
+
+/// Core eligibility for raw-copying a CSR shard's section bytes verbatim:
+/// the source shard's index dtype, column extent, and codec all match what
+/// the target would emit, so a byte-copy reproduces the decode/re-encode
+/// output. Callers AND their own extra preconditions onto this:
+/// `append` adds `sh.n_major <= shard_target_rows` (it may re-split shards);
+/// `merge` adds `!assume_identical_var` (column indices are not guaranteed
+/// identical when the var axis is assumed-but-not-verified equal).
+pub(crate) fn raw_copy_csr_eligible(
+    sh: &ShardHeader,
+    target_index_dtype: u8,
+    target_n_vars: u64,
+    codec: CodecSelection,
+) -> bool {
+    sh.index_dtype == target_index_dtype
+        && (sh.n_minor as u64) == target_n_vars
+        && match codec {
+            CodecSelection::Auto => true,
+            CodecSelection::Explicit(c) => sh.codec_id == c as u8,
+        }
+}
+
+/// Build the patched section bytes + stats for a raw-copied CSR shard,
+/// sink-agnostic.
+///
+/// Patches only `ShardHeader.n_minor` (→ `target_n_vars`) and `global_offset`
+/// (→ `global_row_start`); the indptr/indices/values/block-index payload is
+/// byte-identical to the source. The caller writes the returned bytes through
+/// its own sink — the in-place `FileLock` (append) or
+/// [`ScxWriter::write_csr_shard_raw_copy`] (merge) — and records the catalog
+/// entry. Reuses the source entry's stats (only the row range is
+/// position-dependent); decodes to recompute stats only when the source entry
+/// is missing them (format-permitted but not produced by the current writer).
+pub(crate) fn build_raw_copied_csr_section(
+    source: &ScxReader,
+    entry: &FullCatalogEntry,
+    sh: &ShardHeader,
+    target_n_vars: u64,
+    global_row_start: u64,
+    value_encoding: ValueEncoding,
+) -> OpsResult<(Vec<u8>, ShardStats)> {
+    // `read_raw_shard_bytes` returns an mmap slice; copy it so we can mutate
+    // the header.
+    let src_bytes: Vec<u8> = source.read_raw_shard_bytes(entry)?.to_vec();
+    if src_bytes.len() < SHARD_HEADER_SIZE {
+        return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+            format!("source shard '{}' too small for header", entry.name),
+        )));
+    }
+
+    let new_sh = ShardHeader {
+        n_minor: target_n_vars as u32,
+        global_offset: global_row_start,
+        ..sh.clone()
+    };
+    let mut header_buf = Vec::with_capacity(SHARD_HEADER_SIZE);
+    new_sh.write_to(&mut header_buf)?;
+
+    let mut section_data = Vec::with_capacity(src_bytes.len());
+    section_data.extend_from_slice(&header_buf);
+    section_data.extend_from_slice(&src_bytes[SHARD_HEADER_SIZE..]);
+
+    // Reuse the source entry's stats; only the row range is position-dependent.
+    // `nnz`, `value_min/max/sum`, `col_start/col_end`, and `column_stats` are
+    // invariant under raw copy because eligibility already requires
+    // `sh.n_minor == target_n_vars` (so the column extent is preserved).
+    let stats = match entry.stats.as_ref() {
+        Some(src_stats) => {
+            let mut s = src_stats.clone();
+            s.row_start = global_row_start;
+            s.row_end = global_row_start + sh.n_major as u64;
+            s
+        }
+        None => {
+            let codec_id =
+                CodecId::from_u8(sh.codec_id).ok_or(OpsError::UnknownCodec(sh.codec_id))?;
+            if codec_id == CodecId::None {
+                let values_start = sh.values_rel_offset as usize;
+                let values_end = values_start + sh.values_length as usize;
+                compute_shard_stats(
+                    &src_bytes[values_start..values_end],
+                    value_encoding,
+                    MajorAxis::Row,
+                    global_row_start,
+                    sh.n_major as u64,
+                    target_n_vars,
+                    sh.nnz,
+                )
+            } else {
+                let (_, _, val_f32) = source.read_shard_from_entry(entry)?;
+                let raw = scx_codec::values_to_raw_bytes(&val_f32, value_encoding)?;
+                compute_shard_stats(
+                    &raw,
+                    value_encoding,
+                    MajorAxis::Row,
+                    global_row_start,
+                    sh.n_major as u64,
+                    target_n_vars,
+                    sh.nnz,
+                )
+            }
+        }
+    };
+
+    Ok((section_data, stats))
+}
+
+/// Look up the decode sidecar the source file holds for `shard_entry`
+/// (named `decode/{shard_name}`), parsed into a [`DecodeSidecar`] with its
+/// `major_start` re-stamped to `global_row_start`. Returns `None` when the
+/// source has no sidecar for this shard (non-Scx1 codec, sidecar over the
+/// overhead budget, or a pre-v3 source). The remaining source-section
+/// identity fields are re-stamped by [`ScxWriter::write_csr_shard_raw_copy`]
+/// once the shard's final position is known.
+pub(crate) fn source_decode_sidecar(
+    source: &ScxReader,
+    shard_entry: &FullCatalogEntry,
+    global_row_start: u64,
+) -> OpsResult<Option<DecodeSidecar>> {
+    let sidecar_name = format!("decode/{}", shard_entry.name);
+    let entry = source
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::DecodeMetadataShard && e.name == sidecar_name);
+    match entry {
+        Some(e) => {
+            let mut sc = source.read_decode_sidecar_from_entry(e)?;
+            sc.major_start = global_row_start;
+            Ok(Some(sc))
+        }
+        None => Ok(None),
+    }
+}
 
 /// Copy all auxiliary sections (layers, obsm, uns, predicate indices) from
 /// reader to writer, then append a new provenance entry.
