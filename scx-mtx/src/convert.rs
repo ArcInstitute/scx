@@ -11,6 +11,7 @@ use scx_format::writer::ScxWriter;
 use scx_format::{select_codec_for_modality, ModalityType};
 
 use crate::error::MtxError;
+use crate::read::MtxOrientation;
 
 /// Convert an MTX directory to an SCX file.
 ///
@@ -18,14 +19,19 @@ use crate::error::MtxError;
 /// and writes an SCX file with the specified codec and shard size.
 ///
 /// `tool_name` is recorded in provenance (e.g. `"pyscx"` or `"scx"`).
+///
+/// Returns the detected on-disk [`MtxOrientation`] so callers (the CLI, pyscx)
+/// can surface the ambiguous (square-matrix) case to the user; the orientation
+/// is also recorded in provenance regardless of the caller.
 pub fn mtx_to_scx(
     input_dir: &Path,
     output: &Path,
     shard_target_rows: u32,
     codec_str: &str,
     tool_name: &str,
-) -> Result<(), MtxError> {
+) -> Result<MtxOrientation, MtxError> {
     let mtx_data = crate::read_mtx_directory(input_dir)?;
+    let orientation = mtx_data.orientation;
 
     let explicit_codec = parse_codec_str(codec_str)?;
     let nnz = *mtx_data.indptr.last().unwrap_or(&0) as u64;
@@ -85,6 +91,7 @@ pub fn mtx_to_scx(
     let params_json = serde_json::json!({
         "input": input_dir.display().to_string(),
         "format": "mtx",
+        "mtx_orientation": orientation.as_str(),
     })
     .to_string();
     writer.write_provenance(vec![ProvenanceEntry {
@@ -96,7 +103,7 @@ pub fn mtx_to_scx(
     }])?;
 
     writer.finish()?;
-    Ok(())
+    Ok(orientation)
 }
 
 fn parse_codec_str(s: &str) -> Result<Option<CodecId>, MtxError> {

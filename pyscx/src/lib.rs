@@ -789,19 +789,37 @@ fn from_mudata(
 #[pyfunction]
 #[pyo3(signature = (mtx_dir, scx_path, codec=None, shard_size=None))]
 fn from_mtx(
+    py: Python<'_>,
     mtx_dir: &str,
     scx_path: &str,
     codec: Option<&str>,
     shard_size: Option<u32>,
 ) -> PyResult<()> {
-    scx_mtx::mtx_to_scx(
+    let orientation = scx_mtx::mtx_to_scx(
         std::path::Path::new(mtx_dir),
         std::path::Path::new(scx_path),
         shard_size.unwrap_or(16384),
         codec.unwrap_or("auto"),
         "pyscx",
     )
-    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // A square matrix can't be disambiguated by dimension, so the reader
+    // assumed the Cell Ranger default (features × barcodes) and transposed.
+    // Surface that as a catchable warning — if the input was already
+    // cells × genes, obs/var are now swapped.
+    if orientation == scx_mtx::MtxOrientation::Ambiguous {
+        py.import("warnings")?.call_method1(
+            "warn",
+            (
+                "MTX matrix is square, so its orientation is ambiguous; assumed the Cell \
+              Ranger default (features × barcodes) and transposed to cells × genes. If \
+              your matrix was already cells × genes, obs and var are now swapped — verify \
+              the resulting shape and var_names/obs_names.",
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 /// Convert an SCX file to a Cell Ranger–style MTX directory.

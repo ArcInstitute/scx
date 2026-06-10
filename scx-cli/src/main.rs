@@ -1374,8 +1374,17 @@ fn dispatch_mtx_to_scx(
     );
     pb.set_message(format!("Converting MTX {}...", input.display()));
 
-    mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
+    let orientation = mtx_pipeline::mtx_to_scx(input, output, shard_size, codec)?;
     pb.finish_and_clear();
+
+    if orientation == convert::MtxOrientation::Ambiguous {
+        eprintln!(
+            "warning: MTX matrix is square, so its orientation is ambiguous; assumed the \
+             Cell Ranger default (features × barcodes) and transposed to cells × genes. \
+             If your matrix was already cells × genes, obs and var are now swapped — \
+             verify the output shape and names."
+        );
+    }
 
     // MTX conversion is delegated to the standalone `scx-mtx` crate,
     // which doesn't know about CSC. When the policy resolves to build,

@@ -437,6 +437,38 @@ fn orientation_mismatch_is_fail_loud() {
     );
 }
 
+/// A COO coordinate outside the declared size line must fail loud with a
+/// `Parse` error rather than panicking in the CSR build or the transpose.
+#[test]
+fn out_of_range_coordinate_is_fail_loud() {
+    let tmp = TempDir::new().unwrap();
+    let mtx_in = tmp.path().join("mtx_in");
+    std::fs::create_dir_all(&mtx_in).unwrap();
+
+    // Declares 4 genes × 3 cells, but a triplet references gene 5 (row 5).
+    let mtx = "\
+%%MatrixMarket matrix coordinate integer general
+4 3 1
+5 1 7
+";
+    write_gz(&mtx_in, "matrix.mtx.gz", mtx.as_bytes());
+    write_gz(&mtx_in, "barcodes.tsv.gz", b"A-1\nB-1\nC-1\n");
+    write_gz(
+        &mtx_in,
+        "features.tsv.gz",
+        b"G1\tg1\tGE\nG2\tg2\tGE\nG3\tg3\tGE\nG4\tg4\tGE\n",
+    );
+
+    match read_mtx_directory(&mtx_in) {
+        Err(MtxError::Parse(msg)) => assert!(
+            msg.contains("row index 5") && msg.contains("out of range"),
+            "expected a row-out-of-range Parse error, got: {msg}"
+        ),
+        Err(other) => panic!("expected MtxError::Parse, got: {other:?}"),
+        Ok(_) => panic!("expected MtxError::Parse, got Ok"),
+    }
+}
+
 /// Verify that empty matrix round-trips cleanly (edge case).
 #[test]
 fn round_trip_empty_matrix() {

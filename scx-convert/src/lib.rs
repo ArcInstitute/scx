@@ -84,6 +84,7 @@ pub use mudata_write::{
 };
 
 pub mod mtx_pipeline;
+pub use scx_mtx::MtxOrientation;
 
 #[cfg(all(test, feature = "hdf5"))]
 mod tests;

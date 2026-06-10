@@ -34,6 +34,17 @@ pub enum MtxOrientation {
     Ambiguous,
 }
 
+impl MtxOrientation {
+    /// Stable string form, used for provenance and diagnostics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MtxOrientation::FeaturesByBarcodes => "features_by_barcodes",
+            MtxOrientation::BarcodesByFeatures => "barcodes_by_features",
+            MtxOrientation::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 /// Parsed MTX directory data, ready for SCX conversion.
 ///
 /// `indptr`/`indices`/`data` and `n_obs`/`n_vars` are always in
@@ -121,15 +132,12 @@ pub fn read_mtx_directory(dir: &Path) -> Result<MtxData, MtxError> {
         }
     };
 
-    if orientation == MtxOrientation::Ambiguous {
-        tracing::warn!(
-            n_cells = n_barcodes,
-            n_genes = n_features,
-            "MTX matrix is square ({n_rows}×{n_cols}); orientation is ambiguous. \
-             Assuming the Cell Ranger default (features × barcodes) and transposing \
-             to cells×genes."
-        );
-    }
+    // The `Ambiguous` (square-matrix) case is a heuristic decision; the
+    // user-facing warning is emitted at the binding boundary (pyscx
+    // `from_mtx` / the CLI) where it can reach Python `warnings.warn` and
+    // stderr, and the chosen orientation is recorded in provenance by
+    // `mtx_to_scx`. `read_mtx_directory` simply reports it via
+    // `MtxData.orientation`.
 
     // Transpose features×barcodes → cells×genes using the established
     // zero-copy reinterpretation idiom (mirrors `tenx_read.rs`): the
@@ -333,6 +341,26 @@ fn parse_mtx_file(
             .parse()
             .map_err(|_| MtxError::Parse(format!("invalid value: {}", parts[2])))?;
 
+        // Reject out-of-range coordinates before they reach the CSR build
+        // (`indptr[row + 1]`) or the orientation transpose
+        // (`csr_to_csc` indexes `col_counts[col]`), both of which would
+        // otherwise panic on malformed input. Report the original
+        // 1-indexed value from the file.
+        if row >= n_rows {
+            return Err(MtxError::Parse(format!(
+                "row index {} out of range (matrix declares {} rows)",
+                row + 1,
+                n_rows
+            )));
+        }
+        if col >= n_cols {
+            return Err(MtxError::Parse(format!(
+                "col index {} out of range (matrix declares {} cols)",
+                col + 1,
+                n_cols
+            )));
+        }
+
         entries.push((row, col, val));
     }
 
@@ -386,12 +414,16 @@ fn parse_barcodes_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
             barcodes.push(barcode.to_string());
         }
     }
-    let schema = Schema::new(vec![Field::new("barcode", DataType::Utf8, false)]);
+    // Name the barcode column `__index_level_0__` (pyarrow's canonical name
+    // for an unnamed pandas index) and stamp the `pandas` index-columns
+    // metadata so `to_anndata` promotes barcodes to `obs_names` rather than
+    // leaving a RangeIndex and a stray `barcode` column.
+    let schema = Schema::new(vec![Field::new("__index_level_0__", DataType::Utf8, false)]);
     let batch = RecordBatch::try_new(
         Arc::new(schema),
         vec![Arc::new(StringArray::from(barcodes)) as ArrayRef],
     )?;
-    Ok(batch)
+    Ok(scx_format::ensure_pandas_index_metadata(&batch))
 }
 
 /// Parse `features.tsv[.gz]` or `genes.tsv[.gz]`.
@@ -430,8 +462,12 @@ fn parse_features_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
         }
     }
 
+    // Use the gene/feature ID as the var index (`var_names`), mirroring
+    // `scanpy.read_10x_mtx(var_names="gene_ids")`; the symbol and feature
+    // type stay as regular columns. Naming the ID column `__index_level_0__`
+    // + stamping the `pandas` metadata makes `to_anndata` set it as the index.
     let mut fields = vec![
-        Field::new("gene_id", DataType::Utf8, false),
+        Field::new("__index_level_0__", DataType::Utf8, false),
         Field::new("gene_name", DataType::Utf8, false),
     ];
     let mut arrays: Vec<ArrayRef> = vec![
@@ -445,7 +481,7 @@ fn parse_features_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
     }
 
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-    Ok(batch)
+    Ok(scx_format::ensure_pandas_index_metadata(&batch))
 }
 
 #[cfg(test)]
