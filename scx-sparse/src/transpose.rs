@@ -341,10 +341,43 @@ fn transpose_column_chunk(
 ) -> CscArrays {
     let chunk_n_cols = col_end - col_start;
 
-    // Collect (local_col, row, value) entries for columns in [col_start..col_end)
-    let mut entries: Vec<(usize, i32, f32)> = Vec::new();
-    let mut row_offset: usize = 0;
+    // O(nnz) counting scatter over the in-range entries — same algorithm as the
+    // in-memory `csr_to_csc` (count → prefix-sum → scatter), restricted to
+    // columns in `[col_start..col_end)`. Replaces the old collect-into-tuples +
+    // `O(nnz log nnz)` sort (and its 12-byte-per-entry buffer). Output is
+    // byte-identical: shards are scanned in order and rows in order, so
+    // `global_row` is non-decreasing in scan order and CSR rows have unique
+    // sorted column indices, so the per-column write cursor lays each column's
+    // rows down in strictly increasing `global_row` order — exactly what the
+    // stable `sort_by_key((col, row))` produced.
 
+    // Pass 1: count per-(local) column nnz in the chunk's column range.
+    let mut col_counts = vec![0usize; chunk_n_cols];
+    for shard in shards {
+        for &col in &shard.indices {
+            let col = col as usize;
+            if col >= col_start && col < col_end {
+                col_counts[col - col_start] += 1;
+            }
+        }
+    }
+
+    // Prefix sum → CSC indptr (length chunk_n_cols + 1).
+    let mut indptr = Vec::with_capacity(chunk_n_cols + 1);
+    indptr.push(0i64);
+    let mut cumsum = 0i64;
+    for &count in &col_counts {
+        cumsum += count as i64;
+        indptr.push(cumsum);
+    }
+    let nnz = cumsum as usize;
+
+    // Pass 2: scatter entries into their column positions. `cursor` tracks the
+    // current write offset within each column.
+    let mut indices = vec![0i32; nnz];
+    let mut data = vec![0.0f32; nnz];
+    let mut cursor = vec![0usize; chunk_n_cols];
+    let mut row_offset: usize = 0;
     for shard in shards {
         let shard_n_rows = shard.n_rows();
         for row in 0..shard_n_rows {
@@ -353,38 +386,15 @@ fn transpose_column_chunk(
             for j in start..end {
                 let col = shard.indices[j] as usize;
                 if col >= col_start && col < col_end {
-                    let global_row = (row_offset + row) as i32;
                     let local_col = col - col_start;
-                    entries.push((local_col, global_row, shard.data[j]));
+                    let dest = indptr[local_col] as usize + cursor[local_col];
+                    indices[dest] = (row_offset + row) as i32;
+                    data[dest] = shard.data[j];
+                    cursor[local_col] += 1;
                 }
             }
         }
         row_offset += shard_n_rows;
-    }
-
-    // Sort by local column, then by row within each column (stable sort preserves
-    // row order for equal columns since we scanned rows in order)
-    entries.sort_by_key(|&(col, row, _)| (col, row));
-
-    // Build CSC indptr/indices/data from sorted entries
-    let mut indptr = vec![0i64; chunk_n_cols + 1];
-    let mut indices = Vec::with_capacity(entries.len());
-    let mut data = Vec::with_capacity(entries.len());
-
-    // Count entries per column
-    for &(local_col, _, _) in &entries {
-        indptr[local_col + 1] += 1;
-    }
-
-    // Prefix sum
-    for i in 1..=chunk_n_cols {
-        indptr[i] += indptr[i - 1];
-    }
-
-    // Fill indices and data (already sorted)
-    for &(_, row, val) in &entries {
-        indices.push(row);
-        data.push(val);
     }
 
     CscArrays {
