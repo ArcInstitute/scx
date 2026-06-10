@@ -78,8 +78,8 @@ fn workspace_members_match_documented_crates() {
 /// Tracked source and docs must not cite the gitignored root scratch docs
 /// (`ACC-RUST-OPT-V2`/`-V3`) or reference the removed `SCX_GPU_DE_V2=` /
 /// `SCX_GPU_DE_V3=` opt-in gates as if functional (D5/D6). The `=` form is
-/// deliberately required so the live `SCX_GPU_DE_V3_TRACE`/`_DISPATCH` debug
-/// vars and "the gates were removed" historical prose are not flagged.
+/// deliberately required so "the gates were removed" historical prose (which
+/// names the bare `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` symbols) is not flagged.
 #[test]
 fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
     const BANNED: &[&str] = &[

@@ -306,7 +306,7 @@ values. Future codec versions should prioritize index improvements.
 |-------|--------|
 | Scalar Rice encode/decode | `scx-codec/src/rice.rs` |
 | FOR-BP + BitPacker4x | `scx-codec/src/forbp.rs` |
-| Delta-Golomb-Rice indptr | `scx-codec/src/deltagolomb.rs` |
+| Delta-Golomb-Rice indptr | `scx-codec/src/delta_golomb.rs` |
 | LZ4+Shuffle byte permutation | `scx-codec/src/shuffle.rs` |
 | Codec dispatch (`codec_id`) | `scx-codec/src/dispatch.rs` |
 | Auto codec selection | `scx-format/src/codec_select.rs` |

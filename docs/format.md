@@ -945,7 +945,7 @@ encrypted section types. For PHI datasets, use filesystem-level encryption
 
 - **`format_version`** — bump for breaking changes. Readers MUST reject files
   with `format_version` higher than their supported maximum.
-- **Unknown section types** (≥26 for the current format) are skipped with a
+- **Unknown section types** (≥29 for the current format) are skipped with a
   warning, enabling incremental extension without breaking old readers.
 - **`header_length`** reserves space for future header growth — older readers
   that only handle 256-byte headers detect a larger `header_length` and exit

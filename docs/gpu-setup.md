@@ -278,6 +278,9 @@ unimportable. It exists so the no-rapids fallback contract can be exercised
 (tests / the Phase 2 benchmark gate) without uninstalling rapids; it takes
 precedence over `SCX_FORCE_NATIVE_GPU`.
 
+See [architecture.md § Environment variables](architecture.md#environment-variables)
+for the full canonical list of `SCX_*` variables.
+
 ## SLURM / HPC configuration
 
 On HPC clusters, GPU nodes typically require module loads or conda activation

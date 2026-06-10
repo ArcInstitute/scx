@@ -391,7 +391,8 @@ The `csc` knob on the conversion entry points (`pyscx.from_anndata` /
   column-axis acceleration pays for the extra write-time transpose and
   storage: `n_obs ≥ 50000` **and** `n_vars ≥ 5000`. Both thresholds are
   tunable via the `SCX_CSC_AUTO_OBS_THRESHOLD` and `SCX_CSC_AUTO_VARS_THRESHOLD`
-  environment variables (set either to `0` to force a build on any shape).
+  environment variables (set either to `0` to force a build on any shape) — see
+  [architecture.md § Environment variables](architecture.md#environment-variables).
 
 `auto` is resolved against the matrix shape at write time, so a (unimodal)
 streaming conversion picks it up from the X reader's reported dimensions.
