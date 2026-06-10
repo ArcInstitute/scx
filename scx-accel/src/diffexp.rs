@@ -161,6 +161,22 @@ pub fn wilcoxon_rank_sum(
         }
     }
 
+    // Pre-compute the total gene sum across all groups so the 1-vs-rest reference
+    // sum is O(1) per (gene, group) — `total_gene_sum[var] - group_gene_sums[g][var]`
+    // — instead of re-summing over all other groups (O(n_groups) per (gene, group),
+    // i.e. O(n_vars · n_groups²) overall). Only needed for the 1-vs-rest arm.
+    let total_gene_sum: Vec<f64> = if reference.is_none() {
+        let mut totals = vec![0.0f64; n_vars];
+        for sums in &group_gene_sums {
+            for (total, &s) in totals.iter_mut().zip(sums.iter()) {
+                *total += s;
+            }
+        }
+        totals
+    } else {
+        Vec::new()
+    };
+
     let n_test_groups = test_groups.len();
 
     // --- Pre-rank approach: rank once per gene, then derive per-group statistics ---
@@ -201,10 +217,7 @@ pub fn wilcoxon_rank_sum(
                                 wilcoxon_from_ranks(ranks_buf, &group_indices[g], n_obs, tc);
 
                             let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
-                            let rest_sum: f64 = (0..n_groups)
-                                .filter(|&gg| gg != g)
-                                .map(|gg| group_gene_sums[gg][var_idx])
-                                .sum();
+                            let rest_sum = total_gene_sum[var_idx] - group_gene_sums[g][var_idx];
                             let mean_ref = rest_sum / n2 as f64;
                             let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
                             group_results.push((score, pval, logfc));
@@ -1747,6 +1760,88 @@ mod tests {
             (logfc_log - logfc_raw).abs() > 0.1,
             "log_transformed and raw logFC should differ, got log={logfc_log:.4} raw={logfc_raw:.4}"
         );
+    }
+
+    /// Locks the O(1) 1-vs-rest reference-sum optimization (P4/OPT-1.3) against a
+    /// brute-force filtered re-sum. The production path derives the rest mean as
+    /// `(total_gene_sum[var] − group_gene_sums[g][var]) / n2`; this recomputes it
+    /// the old way (`Σ_{gg≠g} group_gene_sums[gg][var] / n2`) and asserts the
+    /// resulting logFC matches across a many-group fixture. The same algebra now
+    /// backs the GPU host-side logFC pass in `diffexp_gpu.rs`.
+    #[test]
+    fn test_one_vs_rest_logfc_matches_bruteforce_restsum() {
+        let n_groups = 10usize;
+        let n_vars = 4usize;
+        let per_group = 8usize;
+        let n_obs = n_groups * per_group;
+
+        // Deterministic, varied non-negative counts.
+        let groups: Vec<usize> = (0..n_obs).map(|i| i / per_group).collect();
+        let mut data = vec![0.0f32; n_obs * n_vars];
+        for (cell, g) in groups.iter().enumerate() {
+            for var in 0..n_vars {
+                // Vary by group, gene, and cell so means differ across groups.
+                data[cell * n_vars + var] = ((g * 3 + var * 2 + (cell % per_group)) % 17) as f32;
+            }
+        }
+
+        let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+        let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+
+        let log_transformed = false;
+        let result = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None, // 1-vs-rest
+            log_transformed,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+
+        // Independent brute-force group/gene sums.
+        let mut group_gene_sums = vec![vec![0.0f64; n_vars]; n_groups];
+        for (cell, &g) in groups.iter().enumerate() {
+            for var in 0..n_vars {
+                group_gene_sums[g][var] += data[cell * n_vars + var] as f64;
+            }
+        }
+
+        for (g, gname) in group_names.iter().enumerate() {
+            // Result rows are gene-reordered per group; locate this group's row.
+            let row = result
+                .group_names
+                .iter()
+                .position(|n| n == gname)
+                .expect("group present in result");
+            let n1 = per_group as f64;
+            let n2 = (n_obs - per_group) as f64;
+            for (var, vname) in gene_names.iter().enumerate() {
+                let mean_group = group_gene_sums[g][var] / n1;
+                // Old O(n_groups) filtered re-sum.
+                let rest_sum: f64 = (0..n_groups)
+                    .filter(|&gg| gg != g)
+                    .map(|gg| group_gene_sums[gg][var])
+                    .sum();
+                let mean_ref = rest_sum / n2;
+                let expected = compute_logfc(mean_group, mean_ref, log_transformed);
+
+                let col = result.names[row]
+                    .iter()
+                    .position(|n| n == vname)
+                    .expect("gene present in result row");
+                let got = result.logfoldchanges[row][col];
+                assert!(
+                    (got - expected).abs() < 1e-9,
+                    "logFC mismatch for {gname}/{vname}: got {got}, expected {expected}"
+                );
+            }
+        }
     }
 
     #[test]

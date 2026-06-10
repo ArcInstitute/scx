@@ -1752,6 +1752,23 @@ where
             }
         }
 
+        // 1-vs-rest reference sum in O(1): precompute the chunk-local total gene
+        // sum across all groups once, then derive each group's rest_sum via
+        // subtraction (mirrors `diffexp.rs::wilcoxon_rank_sum`). Avoids the
+        // O(n_groups) re-scan per (gene, group) — i.e. O(sz·n_groups²) per chunk.
+        // Only needed for the 1-vs-rest arm.
+        let total_gene_sum: Vec<f64> = if reference.is_none() {
+            let mut totals = vec![0.0f64; sz];
+            for sums in &group_gene_sums {
+                for (total, &s) in totals.iter_mut().zip(sums.iter()) {
+                    *total += s;
+                }
+            }
+            totals
+        } else {
+            Vec::new()
+        };
+
         let chunk_max = scratch.chunk_max();
         let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };
         wilcoxon_chunk_gpu_sequence_v3(
@@ -1855,10 +1872,7 @@ where
                         }
                     }
                     None => {
-                        let rest_sum: f64 = (0..n_groups)
-                            .filter(|&gg| gg != g)
-                            .map(|gg| group_gene_sums[gg][var])
-                            .sum();
+                        let rest_sum = total_gene_sum[var] - group_gene_sums[g][var];
                         let rest_n = n_obs - n_g;
                         if rest_n == 0 {
                             f64::NAN
