@@ -31,7 +31,7 @@ test_that("from_seurat detects v5 multi-assay and writes a multimodal SCX file",
   colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
 
   seu <- Seurat::CreateSeuratObject(counts = rna_counts, assay = "rna")
-  seu[["adt"]] <- Seurat::CreateAssay5Object(counts = adt_counts)
+  seu[["adt"]] <- SeuratObject::CreateAssay5Object(counts = adt_counts)
 
   out <- tempfile(fileext = ".scx")
   on.exit(unlink(out), add = TRUE)
@@ -66,7 +66,7 @@ test_that("scx_open(...)$to_seurat() reconstructs a v5 multi-assay object", {
   colnames(rna_counts) <- paste0("cell_", seq_len(n_cells))
   colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
   seu <- Seurat::CreateSeuratObject(counts = rna_counts, assay = "rna")
-  seu[["adt"]] <- Seurat::CreateAssay5Object(counts = adt_counts)
+  seu[["adt"]] <- SeuratObject::CreateAssay5Object(counts = adt_counts)
 
   scx_path <- tempfile(fileext = ".scx")
   on.exit(unlink(scx_path), add = TRUE)
