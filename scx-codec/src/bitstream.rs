@@ -10,10 +10,22 @@ pub struct BitStreamError;
 // ---------------------------------------------------------------------------
 
 /// Writes bits in LSB-first order into a growable byte buffer.
+///
+/// Bits accumulate LSB-first into a `u64` (`acc`); whole bytes are flushed to
+/// `buffer` as soon as eight bits are available, mirroring the u64-buffered
+/// [`BitReader`]. This packs whole codewords with a mask+shift+OR instead of the
+/// per-bit branch loop the writer used previously — every Scx1/FOR-BP encode runs
+/// through `write_bits` / `write_unary`, so the whole write path benefits.
+///
+/// Invariant: after every public call, `acc` holds only its low `n_bits` valid
+/// bits (`n_bits` in `0..=7`) and all higher bits are zero, so the partial byte
+/// is exactly the LSB-first byte the old per-bit writer produced.
 pub struct BitWriter {
     buffer: Vec<u8>,
-    current_byte: u8,
-    bit_pos: u8, // 0–7: next bit position to write within current_byte
+    /// Pending bits, LSB-aligned. The lowest `n_bits` bits are valid.
+    acc: u64,
+    /// Number of valid bits in `acc` (0–7 after any public call).
+    n_bits: u8,
 }
 
 impl BitWriter {
@@ -21,54 +33,109 @@ impl BitWriter {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
-            current_byte: 0,
-            bit_pos: 0,
+            acc: 0,
+            n_bits: 0,
+        }
+    }
+
+    /// Flush every whole byte currently in `acc` to the output buffer.
+    #[inline]
+    fn flush_bytes(&mut self) {
+        while self.n_bits >= 8 {
+            self.buffer.push(self.acc as u8);
+            self.acc >>= 8;
+            self.n_bits -= 8;
         }
     }
 
     /// Write a single bit (LSB-first).
     #[inline]
     pub fn write_bit(&mut self, bit: bool) {
-        if bit {
-            self.current_byte |= 1 << self.bit_pos;
-        }
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.buffer.push(self.current_byte);
-            self.current_byte = 0;
-            self.bit_pos = 0;
+        self.acc |= (bit as u64) << self.n_bits;
+        self.n_bits += 1;
+        if self.n_bits == 8 {
+            self.buffer.push(self.acc as u8);
+            self.acc = 0;
+            self.n_bits = 0;
         }
     }
 
     /// Write the lowest `n_bits` bits of `value`, LSB first.
+    ///
+    /// Bits are packed into the `u64` accumulator in chunks of up to 32 — small
+    /// enough that `n_bits (≤7) + chunk (≤32)` never overflows the accumulator —
+    /// then whole bytes are flushed. Bit layout is identical to the old per-bit
+    /// loop.
     #[inline]
     pub fn write_bits(&mut self, value: u64, n_bits: u8) {
-        for i in 0..n_bits {
-            self.write_bit((value >> i) & 1 != 0);
+        // Encode-side internal invariant: callers pass controlled widths (Rice
+        // k<=15, FOR-BP frame_bits<=32, fixed 8/32/64). The untrusted boundary
+        // is decode (read_bits), which validates n_bits > 64 at runtime.
+        // debug-assert-ok: not an untrusted-input boundary.
+        debug_assert!(n_bits <= 64);
+        if n_bits == 0 {
+            return;
+        }
+        // Fast path: every production caller writes <= 32 bits (Rice/FOR-BP
+        // widths, 8-bit headers), so a single mask+shift+OR avoids the chunk
+        // loop's bookkeeping. `n_bits (<=7) + 32` reaches at most bit 38, well
+        // inside the u64 accumulator.
+        if n_bits <= 32 {
+            let mask = (1u64 << n_bits) - 1;
+            self.acc |= (value & mask) << self.n_bits;
+            self.n_bits += n_bits;
+            self.flush_bytes();
+            return;
+        }
+        // Slow path for 33..=64-bit writes: pack in <= 32-bit chunks so the
+        // accumulator never overflows. Only exercised by tests today.
+        let mut v = value;
+        let mut remaining = n_bits;
+        while remaining > 0 {
+            let take = remaining.min(32);
+            // `take <= 32`, so `(1 << take) - 1` is a well-defined u64 mask.
+            let mask = (1u64 << take) - 1;
+            self.acc |= (v & mask) << self.n_bits;
+            self.n_bits += take;
+            v >>= take;
+            remaining -= take;
+            self.flush_bytes();
         }
     }
 
     /// Write a unary code: `q` ones followed by a zero.
+    ///
+    /// The ones are emitted in chunks of 32 through the fast `write_bits` path
+    /// rather than bit-by-bit; for the small quotients typical of Scx1-routed
+    /// count data this is one `write_bits` call plus the terminating zero.
     #[inline]
     pub fn write_unary(&mut self, q: u64) {
-        for _ in 0..q {
-            self.write_bit(true);
+        let mut remaining = q;
+        while remaining >= 32 {
+            self.write_bits(0xFFFF_FFFF, 32);
+            remaining -= 32;
+        }
+        if remaining > 0 {
+            // `remaining < 32`, so `(1 << remaining) - 1` is `remaining` ones.
+            self.write_bits((1u64 << remaining) - 1, remaining as u8);
         }
         self.write_bit(false);
     }
 
     /// Return the current write position in bits from the start of the stream.
     pub fn position(&self) -> usize {
-        self.buffer.len() * 8 + self.bit_pos as usize
+        self.buffer.len() * 8 + self.n_bits as usize
     }
 
     /// Pad the current byte to a byte boundary (zero-fill remaining bits)
     /// without consuming the writer. Needed by Rice encoder between blocks.
     pub fn pad_to_byte(&mut self) {
-        if self.bit_pos > 0 {
-            self.buffer.push(self.current_byte);
-            self.current_byte = 0;
-            self.bit_pos = 0;
+        if self.n_bits > 0 {
+            // `acc` holds only the low `n_bits` valid bits; higher bits are
+            // zero, so casting to u8 yields the zero-padded partial byte.
+            self.buffer.push(self.acc as u8);
+            self.acc = 0;
+            self.n_bits = 0;
         }
     }
 
@@ -548,5 +615,100 @@ mod tests {
         writer.write_bits(0b11, 2);
         let data = writer.flush();
         assert_eq!(data, vec![0b11]);
+    }
+
+    /// Reference per-bit writer: the pre-u64-buffer implementation, used to pin
+    /// byte-identical output for the chunked fast path.
+    fn write_bits_per_bit(out: &mut Vec<bool>, value: u64, n_bits: u8) {
+        for i in 0..n_bits {
+            out.push((value >> i) & 1 != 0);
+        }
+    }
+
+    fn write_unary_per_bit(out: &mut Vec<bool>, q: u64) {
+        for _ in 0..q {
+            out.push(true);
+        }
+        out.push(false);
+    }
+
+    fn pack_bits(bits: &[bool]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        for &b in bits {
+            w.write_bit(b);
+        }
+        w.flush()
+    }
+
+    /// `write_bits` must be byte-identical to the per-bit loop across every
+    /// width, including the 32-bit chunk boundary and partial-byte start
+    /// positions where the high bits of `value` must be ignored.
+    #[test]
+    fn write_bits_matches_per_bit_all_widths() {
+        let values: [u64; 6] = [
+            0,
+            1,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xDEAD_BEEF_CAFE_BABE,
+            0x8000_0000_0000_0001,
+            0x0123_4567_89AB_CDEF,
+        ];
+        // Start offsets exercise a non-empty accumulator before the wide write.
+        for prefix in 0u8..8 {
+            for n_bits in 0u8..=64 {
+                for &v in &values {
+                    let mut fast = BitWriter::new();
+                    let mut bits = Vec::new();
+                    if prefix > 0 {
+                        fast.write_bits(0b1010101, prefix);
+                        write_bits_per_bit(&mut bits, 0b1010101, prefix);
+                    }
+                    fast.write_bits(v, n_bits);
+                    write_bits_per_bit(&mut bits, v, n_bits);
+                    assert_eq!(
+                        fast.flush(),
+                        pack_bits(&bits),
+                        "mismatch prefix={prefix} n_bits={n_bits} v={v:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `write_unary` (chunked ones + byte-fill) must match the per-bit loop,
+    /// including runs that cross the 32-bit chunk boundary.
+    #[test]
+    fn write_unary_matches_per_bit() {
+        for prefix in 0u8..8 {
+            for &q in &[0u64, 1, 7, 8, 31, 32, 33, 64, 100, 257] {
+                let mut fast = BitWriter::new();
+                let mut bits = Vec::new();
+                if prefix > 0 {
+                    fast.write_bits(0b110, prefix);
+                    write_bits_per_bit(&mut bits, 0b110, prefix);
+                }
+                fast.write_unary(q);
+                write_unary_per_bit(&mut bits, q);
+                assert_eq!(
+                    fast.flush(),
+                    pack_bits(&bits),
+                    "mismatch prefix={prefix} q={q}"
+                );
+            }
+        }
+    }
+
+    /// Position tracking is consumed by the Rice encoder for block bit offsets;
+    /// it must match the buffered-byte + partial-bit count after wide writes.
+    #[test]
+    fn position_after_wide_writes() {
+        let mut w = BitWriter::new();
+        assert_eq!(w.position(), 0);
+        w.write_bits(0, 40);
+        assert_eq!(w.position(), 40);
+        w.write_unary(10); // 11 bits
+        assert_eq!(w.position(), 51);
+        w.write_bits(0, 64);
+        assert_eq!(w.position(), 115);
     }
 }
