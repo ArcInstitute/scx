@@ -570,6 +570,15 @@ Logical deletion via Roaring Bitmap deletion vectors. Returns total deleted coun
 ### `scx_ops::compact(input, output) → Result<()>`
 Rewrite file reclaiming deleted/orphaned space.
 
+### `scx_ops::optimize(input, output) → Result<()>`
+Faithful 1:1 upgrade of a single-modality file: re-encode + `canonicalize_csr`
+every CSR-backed shard (X / layer / obsp-CSR) so the output carries decode
+sidecars and a real `format_version=3` canonical-CSR claim, without a full
+reconvert. Preserves row layout, obs/var, obsm/varm/obsp/varp, uns, predicate
+indexes, and the deletion-vector section (does not apply deletions); drops the
+CSC sidecar. Multimodal inputs are rejected (use `compact`). See
+[docs/operations.md § Optimize](operations.md#optimize).
+
 ### `scx_ops::rollback(path) → Result<()>` / `rollback_to(path, seq) → Result<()>`
 Revert to previous (or specific) manifest version — header-only update.
 
@@ -1675,6 +1684,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Streaming append (reads source one shard at a time). `--index-*` rebuilds predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `scx delete <file> --filter <expr> [--dry-run]`
 - `scx compact <input> --output <path> [--force] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Rewrite reclaiming space; `--index-*` rebuilds the predicate index against the compacted output.
+- `scx optimize <input> --output <path> [--force]` — In-place upgrade (single-modality): re-encode + canonicalize every CSR shard so the output gains decode sidecars and `format_version=3`, preserving row layout / obs / var / obsm / uns / indexes / deletion vectors. Drops the CSC sidecar (rerun `scx build-csc`). `--output` may equal `<input>` (atomic rename). See [docs/operations.md § Optimize](operations.md#optimize).
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> <filter> [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).

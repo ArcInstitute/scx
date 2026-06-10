@@ -426,10 +426,13 @@ correctly populated `n_csc_shards` count + `has_csc` flag.
 `decode_metadata_shard` (section type 26) is optional metadata for direct
 random-access or device decode of an existing encoded shard. It does not
 duplicate matrix values. Current writers emit it only for Scx1 integer
-`csr_shard` and `layer_csr_shard` sections when the estimated sidecar size is
-no more than 25% of the source shard section length. Consumers MUST treat the
-sidecar as an optimization and fall back to normal shard decode when it is
-absent.
+`csr_shard`, `layer_csr_shard`, and `obsp_csr_shard` sections when the estimated
+sidecar size is no more than 25% of the source shard section length. Consumers
+MUST treat the sidecar as an optimization and fall back to normal shard decode
+when it is absent. An existing sidecar-less file can gain sidecars without a full
+reconvert via `scx optimize <in> --output <out>`, which re-encodes + canonicalizes
+every CSR shard and stamps `format_version=3` (see
+[operations.md § Optimize](operations.md#optimize)).
 
 The sidecar is consumed only by **SCX-internal decode paths** — random-access
 shard reads and the decode→device handoff (`to_gpu_anndata`) that produces a

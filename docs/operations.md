@@ -13,6 +13,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 | **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
 | **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
 | **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
+| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; adds decode sidecars; stamps `format_version=3` | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
 | **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
 | **rollback** | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored |
@@ -120,6 +121,32 @@ reclaim them. Multimodal (`modality != 0`) is not yet supported.
 The output is a clean single-manifest file (`manifest_sequence=0`).
 Complexity is O(live data) — proportional to the surviving cells, not the
 historical file size.
+
+## Optimize
+
+`scx optimize <input> --output <out>` upgrades an existing **single-modality**
+file in place: it decodes → `canonicalize_csr` → re-encodes every CSR-backed
+shard (`X`, layers, and obs×obs `obsp` CSR graphs), so the output carries
+[decode-metadata sidecars](format.md#42-decode-metadata-sidecar) and legitimately
+claims the v3 canonical-CSR invariant — without a full reconvert. This is how a
+pre-v3 / sidecar-less file gains the random-access and GPU device-decode benefits
+(see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
+
+Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
+- It does **not** apply deletions — the deletion-vector section is carried
+  through unchanged (use `compact` to reclaim deleted rows).
+- It does **not** change shard boundaries or row layout; obs/var, obsm/varm,
+  COO obsp/varp (copied verbatim — sharded layouts preserved), uns, and predicate
+  indexes pass through unchanged.
+- It **does** re-canonicalize every shard (sorting indices, summing duplicate
+  coordinates, dropping explicit zeros), so nnz may legitimately drop.
+
+The CSC sidecar is dropped (re-canonicalizing can change nnz and would leave the
+column-major sidecar referencing stale offsets) — rerun `scx build-csc`.
+Multimodal inputs are rejected with a message pointing at `scx compact`. An
+in-place invocation (`--output` == input) is safe: the writer stages a sibling
+tempfile and atomically renames over the target. Verify the result with
+`scx validate --deep <out>`.
 
 ## Rollback
 

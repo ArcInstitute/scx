@@ -136,7 +136,8 @@ Most-used kwargs (shared across ingest entry points):
 ### Inspect / file ops (CLI)
 `scx info <file> [--json --history]`, `scx validate <file>`,
 `scx subset <in> --filter <expr> --genes <path>`, `scx merge`, `scx append`,
-`scx compact`. Full flag lists in `reference/conversion.md`.
+`scx compact`, `scx optimize` (in-place sidecar + canonical v3 upgrade). Full
+flag lists in `reference/conversion.md`.
 
 ---
 
