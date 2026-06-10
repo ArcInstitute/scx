@@ -450,7 +450,15 @@ fn ordered_categorical_columns(table: &Bound<'_, PyAny>) -> PyResult<Vec<String>
             continue; // None (no metadata) or unexpected type
         };
         if let Some(val) = md.get_item(&key)? {
-            if val.extract::<Vec<u8>>()? == b"true" {
+            // pyarrow field metadata values are `bytes`, but tolerate `str`
+            // and any unexpected type (→ treat as not-ordered) so a stray
+            // metadata entry can never crash the whole `to_anndata`.
+            let is_ordered = val
+                .extract::<Vec<u8>>()
+                .map(|b| b == b"true")
+                .or_else(|_| val.extract::<String>().map(|s| s == "true"))
+                .unwrap_or(false);
+            if is_ordered {
                 out.push(name.clone());
             }
         }

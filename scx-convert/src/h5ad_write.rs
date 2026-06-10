@@ -459,7 +459,18 @@ fn coo_batch_to_csr(batch: &RecordBatch, keep: Option<&[bool]>) -> Result<CooCsr
                 }
                 (nr, nc)
             }
-            None => (r, c),
+            // No remap (varp / no deletions): coordinates index `indptr`
+            // directly, so an out-of-range coord from a malformed COO section
+            // would panic. Reject it as a conversion error instead.
+            None => {
+                if r < 0 || r >= n_rows as i64 || c < 0 || c >= n_rows as i64 {
+                    return Err(ConvertError::Other(format!(
+                        "pairwise COO coordinate ({r}, {c}) out of bounds for \
+                         {n_rows}x{n_rows} matrix"
+                    )));
+                }
+                (r, c)
+            }
         };
         triples.push((nr, nc, data.value(k)));
     }
@@ -2120,5 +2131,17 @@ mod pairwise_tests {
         assert_eq!(indptr, vec![0, 2, 2, 3]);
         assert_eq!(indices, vec![0, 1, 2]); // row0: (0,0)->0,(0,2)->1 ; row2: (3,3)->2
         assert_eq!(data, vec![1.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn coo_to_csr_out_of_bounds_coord_errors_no_mask() {
+        // Malformed COO: a coordinate >= n_rows would index `indptr` out of
+        // bounds. The no-mask path must reject it rather than panic.
+        let batch = coo(3, &[(0, 0, 1.0), (5, 1, 2.0)]);
+        let err = coo_batch_to_csr(&batch, None).unwrap_err();
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected out-of-bounds error, got: {err}"
+        );
     }
 }
