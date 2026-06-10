@@ -53,8 +53,8 @@ test_that("from_seurat → pyscx.open round-trips modality metadata", {
   colnames(rna_counts) <- paste0("cell_", seq_len(n_cells))
   colnames(adt_counts) <- paste0("cell_", seq_len(n_cells))
 
-  rna_assay <- Seurat::CreateAssay5Object(counts = rna_counts)
-  adt_assay <- Seurat::CreateAssay5Object(counts = adt_counts)
+  rna_assay <- SeuratObject::CreateAssay5Object(counts = rna_counts)
+  adt_assay <- SeuratObject::CreateAssay5Object(counts = adt_counts)
   seu <- Seurat::CreateSeuratObject(rna_assay, assay = "rna")
   seu[["adt"]] <- adt_assay
 

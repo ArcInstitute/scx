@@ -4,6 +4,7 @@ use extendr_api::prelude::*;
 use scx_engine::pipeline::QueryResult;
 use scx_format::ScxReader;
 
+mod accel;
 mod harmony;
 mod interop;
 mod lisi;
@@ -196,5 +197,6 @@ extendr_module! {
     use interop;
     use harmony;
     use lisi;
+    use accel;
     impl ScxExperiment;
 }

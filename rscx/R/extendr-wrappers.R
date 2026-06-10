@@ -120,6 +120,80 @@ scx_compute_lisi <- function(embeddings, labels,
         if (is.null(n_neighbors)) NULL else as.integer(n_neighbors))
 }
 
+# ── Analysis accelerators (accel module) ──────────────────────
+# Low-level matrix/graph wrappers; the Seurat-aware front ends
+# (scx_pca, scx_neighbors, …) live in R/accel.R.
+scx_pca_matrix <- function(counts, n_components, zero_center,
+                           n_oversamples, n_power_iterations, seed) {
+  .Call(wrap__scx_pca_matrix,
+        counts,
+        as.integer(n_components),
+        as.logical(zero_center),
+        as.integer(n_oversamples),
+        as.integer(n_power_iterations),
+        as.numeric(seed))
+}
+
+scx_knn_matrix <- function(embeddings, n_neighbors,
+                           ef_construction, ef_search, seed) {
+  .Call(wrap__scx_knn_matrix,
+        embeddings,
+        as.integer(n_neighbors),
+        as.integer(ef_construction),
+        as.integer(ef_search),
+        as.numeric(seed))
+}
+
+scx_umap_graph <- function(conn_indptr, conn_indices, conn_data,
+                           n_obs, n_components, n_epochs, min_dist, spread,
+                           negative_sample_rate, learning_rate, seed) {
+  .Call(wrap__scx_umap_graph,
+        as.numeric(conn_indptr),
+        as.integer(conn_indices),
+        as.numeric(conn_data),
+        as.integer(n_obs),
+        as.integer(n_components),
+        as.integer(n_epochs),
+        as.numeric(min_dist),
+        as.numeric(spread),
+        as.integer(negative_sample_rate),
+        as.numeric(learning_rate),
+        as.numeric(seed))
+}
+
+scx_leiden_graph <- function(indptr, indices, weights, n_nodes,
+                             resolution, seed, max_iterations) {
+  .Call(wrap__scx_leiden_graph,
+        as.numeric(indptr),
+        as.integer(indices),
+        as.numeric(weights),
+        as.integer(n_nodes),
+        as.numeric(resolution),
+        as.numeric(seed),
+        as.integer(max_iterations))
+}
+
+scx_rank_genes <- function(counts, gene_names, groups, reference,
+                           log_transformed, rankby_abs = FALSE,
+                           tie_correct = FALSE) {
+  .Call(wrap__scx_rank_genes,
+        counts,
+        as.character(gene_names),
+        as.character(groups),
+        if (is.null(reference)) NULL else as.character(reference),
+        as.logical(log_transformed),
+        as.logical(rankby_abs),
+        as.logical(tie_correct))
+}
+
+scx_hvg_mean_var <- function(counts) {
+  .Call(wrap__scx_hvg_mean_var, counts)
+}
+
+scx_hvg_clipped_sums <- function(counts, clip_val) {
+  .Call(wrap__scx_hvg_clipped_sums, counts, as.numeric(clip_val))
+}
+
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path, codec = NULL,

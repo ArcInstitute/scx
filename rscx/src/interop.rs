@@ -114,7 +114,12 @@ pub fn record_batch_to_dataframe(batch: &RecordBatch) -> Result<Robj> {
         }
         let col = batch.column(i);
         let name = field.name().as_str();
-        let robj = arrow_column_to_robj(col, field.data_type())?;
+        let ordered = field
+            .metadata()
+            .get(CATEGORICAL_ORDERED_KEY)
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let robj = arrow_column_to_robj(col, field.data_type(), ordered)?;
         columns.push((name, robj));
     }
 
@@ -175,16 +180,16 @@ fn string_to_robj<O: arrow::array::OffsetSizeTrait>(col: &dyn Array) -> Result<R
 }
 
 /// Convert a single Arrow array column to an R vector.
-fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType) -> Result<Robj> {
+fn arrow_column_to_robj(col: &dyn Array, dtype: &DataType, ordered: bool) -> Result<Robj> {
     use arrow::datatypes::*;
     match dtype {
         // String types → character vector
         DataType::Utf8 => string_to_robj::<i32>(col),
         DataType::LargeUtf8 => string_to_robj::<i64>(col),
 
-        // Dictionary → R factor
+        // Dictionary → R factor (ordered factor when the field is marked so)
         DataType::Dictionary(key_type, value_type) => {
-            dictionary_to_factor(col, key_type, value_type)
+            dictionary_to_factor(col, key_type, value_type, ordered)
         }
 
         // Integer types → R integer (i32)
@@ -242,15 +247,18 @@ fn dictionary_to_factor(
     col: &dyn Array,
     key_type: &DataType,
     value_type: &DataType,
+    ordered: bool,
 ) -> Result<Robj> {
     // We support Dictionary<Int8/16/32, Utf8> which is the common h5ad categorical pattern
     match (key_type, value_type) {
-        (DataType::Int8, DataType::Utf8) => typed_dict_to_factor::<arrow::datatypes::Int8Type>(col),
+        (DataType::Int8, DataType::Utf8) => {
+            typed_dict_to_factor::<arrow::datatypes::Int8Type>(col, ordered)
+        }
         (DataType::Int16, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int16Type>(col)
+            typed_dict_to_factor::<arrow::datatypes::Int16Type>(col, ordered)
         }
         (DataType::Int32, DataType::Utf8) => {
-            typed_dict_to_factor::<arrow::datatypes::Int32Type>(col)
+            typed_dict_to_factor::<arrow::datatypes::Int32Type>(col, ordered)
         }
         _ => Err(Error::Other(format!(
             "unsupported Dictionary key/value types: {:?}/{:?}",
@@ -260,7 +268,7 @@ fn dictionary_to_factor(
 }
 
 /// Helper: extract factor levels and codes from a typed DictionaryArray.
-fn typed_dict_to_factor<K>(col: &dyn Array) -> Result<Robj>
+fn typed_dict_to_factor<K>(col: &dyn Array, ordered: bool) -> Result<Robj>
 where
     K: arrow::datatypes::ArrowDictionaryKeyType,
     K::Native: TryInto<i32>,
@@ -306,10 +314,17 @@ where
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Build factor in R: integer vector with "levels" and "class" attributes
+    // Build factor in R: integer vector with "levels" and "class" attributes.
+    // An ordered categorical (marked via the field metadata) becomes an
+    // ordered factor (`class = c("ordered", "factor")`) so the bit round-trips.
     let levels_robj: Robj = levels.into_robj();
     let codes_robj: Robj = codes.into_robj();
-    R!("{ x <- {{codes_robj}}; attr(x, 'levels') <- {{levels_robj}}; class(x) <- 'factor'; x }")
+    let class_robj: Robj = if ordered {
+        vec!["ordered", "factor"].into_robj()
+    } else {
+        "factor".into_robj()
+    };
+    R!("{ x <- {{codes_robj}}; attr(x, 'levels') <- {{levels_robj}}; class(x) <- {{class_robj}}; x }")
         .map_err(|e| Error::Other(format!("factor construction failed: {}", e)))
 }
 
@@ -433,8 +448,29 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
             stop('Seurat >= 5.0.0 is required for to_seurat()')
         counts_t <- Matrix::t({{dgc}})
         seu <- Seurat::CreateSeuratObject(counts = counts_t)
-        seu@meta.data <- {{obs_df}}
-        seu[['RNA']]@meta.data <- {{var_df}}
+        # Attach obs via AddMetaData keyed on barcodes: preserves Seurat's
+        # computed columns (nCount_RNA, nFeature_RNA) that a wholesale
+        # `seu@meta.data <-` would wipe, and survives any CreateSeuratObject
+        # cell filtering. Align by barcode when present, else positionally.
+        md <- {{obs_df}}
+        if (all(colnames(seu) %in% rownames(md))) {
+            md <- md[colnames(seu), , drop = FALSE]
+        } else if (nrow(md) == ncol(seu)) {
+            rownames(md) <- colnames(seu)
+        } else {
+            stop('to_seurat: obs metadata rows do not align to Seurat cells')
+        }
+        seu <- Seurat::AddMetaData(seu, metadata = md)
+        # Feature metadata: align to the assay's feature order by name when
+        # gene IDs are present, else attach positionally.
+        vd <- {{var_df}}
+        if (all(rownames(seu) %in% rownames(vd))) {
+            vd <- vd[rownames(seu), , drop = FALSE]
+        }
+        # 'RNA' is intentional here: this write path always builds the assay as
+        # 'RNA' via CreateSeuratObject(counts=) above. The T4.2 de-hardcoding of
+        # the assay name targets the from_seurat *read* path, not this writer.
+        seu[['RNA']]@meta.data <- vd
         seu
     ")
     .map_err(|e| Error::Other(format!("Seurat construction failed: {}", e)))
@@ -622,9 +658,17 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 /// This is the reverse of `record_batch_to_dataframe`.
 /// Extracts column names and values, creating Utf8 columns for character vectors
 /// and Float64 columns for numeric vectors.
+/// Field-metadata key marking an Arrow dictionary column as an *ordered*
+/// categorical. Matches `scx_convert::CATEGORICAL_ORDERED_KEY` (rscx does not
+/// depend on scx-convert, so the literal is duplicated; keep them in sync).
+// TODO(T4.9): re-export this key through `scx-format` (a shared dep of both
+// rscx and pyscx) so the three copies collapse to one (I-ORG-1).
+const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
+
 fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
-    use arrow::array::{Float64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{BooleanArray, DictionaryArray, Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     let names_robj =
@@ -635,34 +679,80 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
         .map(|s| s.to_string())
         .collect();
 
+    // Row count must be captured up front: a 0-column data.frame (e.g. a
+    // Seurat object with no feature metadata) yields an empty schema, and
+    // `RecordBatch::try_new` cannot infer the row count from zero arrays.
+    let n_rows = R!("nrow({{df}})")
+        .map_err(|e| Error::Other(format!("nrow() failed: {}", e)))?
+        .as_integer()
+        .ok_or_else(|| Error::Other("nrow() not a scalar integer".into()))?
+        as usize;
+
     let n_cols = col_names.len();
     let mut fields = Vec::with_capacity(n_cols);
     let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::with_capacity(n_cols);
 
+    // A data.frame is a VECSXP (list of columns); pull the columns once as a
+    // list so each column access is a Rust vector index rather than a runtime
+    // `R!("df[[i]]")` evaluation.
+    let columns: Vec<Robj> = df
+        .as_list()
+        .ok_or_else(|| Error::Other("data.frame is not a list".into()))?
+        .values()
+        .collect();
+
     for (i, name) in col_names.iter().enumerate() {
-        let col_idx = (i + 1) as i32; // R is 1-based
-        let col_robj = R!("{{df}}[[{{col_idx}}]]")
-            .map_err(|e| Error::Other(format!("failed to get column {}: {}", name, e)))?;
+        let col_robj = &columns[i];
 
-        let is_char = R!("is.character({{df}}[[{{col_idx}}]])")
-            .map_err(|e| Error::Other(format!("is.character check failed: {}", e)))?;
-        let is_character = is_char
-            .as_logical_slice()
-            .and_then(|s| s.first().map(|&b| b.is_true()))
-            .unwrap_or(false);
+        // Detect the R class to map to the closest Arrow type (T4.3), so
+        // meta.data column classes round-trip via the reverse map in
+        // `arrow_column_to_robj`: factor → Dictionary(Int32,Utf8) (carrying
+        // the `ordered` bit), integer → Int32, logical → Boolean, double →
+        // Float64, character → Utf8. Detection uses extendr's native
+        // `rtype()`/`inherits()` rather than per-column `R!` evaluations (which
+        // parse + eval R at runtime — a real cost across many columns). A
+        // factor is checked first because it is an INTSXP underneath.
+        let is_factor = col_robj.inherits("factor");
+        let is_character = col_robj.rtype() == Rtype::Strings;
+        let is_logical = col_robj.rtype() == Rtype::Logicals;
+        let is_integer = col_robj.rtype() == Rtype::Integers && !is_factor;
 
-        let is_fac = R!("is.factor({{df}}[[{{col_idx}}]])")
-            .map_err(|e| Error::Other(format!("is.factor check failed: {}", e)))?;
-        let is_factor = is_fac
-            .as_logical_slice()
-            .and_then(|s| s.first().map(|&b| b.is_true()))
-            .unwrap_or(false);
+        if is_factor {
+            // Factor → Arrow Dictionary(Int32, Utf8): levels become the
+            // dictionary, R's 1-based codes (NA → null) become 0-based keys.
+            let levels: Vec<String> = col_robj
+                .levels()
+                .ok_or_else(|| Error::Other(format!("levels({name}) missing/not character")))?
+                .map(|s| s.to_string())
+                .collect();
+            // A factor's underlying storage is its 1-based integer codes.
+            let keys: Int32Array = col_robj
+                .as_integer_slice()
+                .ok_or_else(|| Error::Other(format!("factor codes for {name} not integer")))?
+                .iter()
+                .map(|&c| if c == i32::MIN { None } else { Some(c - 1) }) // NA sentinel; 1- → 0-based
+                .collect();
+            let values: arrow::array::ArrayRef = Arc::new(StringArray::from(
+                levels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ));
+            let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
+                .map_err(|e| Error::Other(format!("dictionary array for {name}: {e}")))?;
 
-        if is_character || is_factor {
-            // Convert to character vector (handles factors too)
-            let char_robj = R!("as.character({{df}}[[{{col_idx}}]])")
-                .map_err(|e| Error::Other(format!("as.character failed: {}", e)))?;
-            let strings: Vec<Option<String>> = char_robj
+            let is_ordered = col_robj.inherits("ordered");
+            let mut field = Field::new(
+                name,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            );
+            if is_ordered {
+                let mut md = HashMap::new();
+                md.insert(CATEGORICAL_ORDERED_KEY.to_string(), "true".to_string());
+                field = field.with_metadata(md);
+            }
+            fields.push(field);
+            arrays.push(Arc::new(dict));
+        } else if is_character {
+            let strings: Vec<Option<String>> = col_robj
                 .as_str_iter()
                 .ok_or_else(|| Error::Other(format!("column {} not iterable as str", name)))?
                 .map(|s| Some(s.to_string()))
@@ -670,8 +760,29 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
             let arr = StringArray::from(strings.iter().map(|s| s.as_deref()).collect::<Vec<_>>());
             fields.push(Field::new(name, DataType::Utf8, true));
             arrays.push(Arc::new(arr));
+        } else if is_logical {
+            // R logical → Arrow Boolean (NA → null). R NA is the i32::MIN
+            // sentinel in the logical slice.
+            let arr: BooleanArray = col_robj
+                .as_logical_slice()
+                .ok_or_else(|| Error::Other(format!("column {} not logical", name)))?
+                .iter()
+                .map(|b| if b.is_na() { None } else { Some(b.is_true()) })
+                .collect();
+            fields.push(Field::new(name, DataType::Boolean, true));
+            arrays.push(Arc::new(arr));
+        } else if is_integer {
+            // R integer → Arrow Int32 (NA → null via the i32::MIN sentinel).
+            let arr: Int32Array = col_robj
+                .as_integer_slice()
+                .ok_or_else(|| Error::Other(format!("column {} not integer", name)))?
+                .iter()
+                .map(|&v| if v == i32::MIN { None } else { Some(v) })
+                .collect();
+            fields.push(Field::new(name, DataType::Int32, true));
+            arrays.push(Arc::new(arr));
         } else {
-            // Numeric → f64 array
+            // double (and any other numeric) → Float64 (NaN → null).
             let vals: Vec<Option<f64>> = col_robj
                 .as_real_slice()
                 .ok_or_else(|| Error::Other(format!("column {} not numeric", name)))?
@@ -684,8 +795,30 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
         }
     }
 
+    // Preserve the data.frame's explicit row names (cell barcodes / gene IDs)
+    // as the canonical `__index_level_0__` index column so they round-trip;
+    // `record_batch_to_dataframe` reads it back into `row.names`. R stores
+    // auto-generated row names as an integer vector (`1..n`) and explicit ones
+    // as a character vector, so emit only the latter.
+    let row_names: Vec<String> = R!("if (is.character(attr({{df}}, 'row.names'))) \
+            as.character(attr({{df}}, 'row.names')) else character(0)")
+    .map_err(|e| Error::Other(format!("row.names extraction failed: {}", e)))?
+    .as_str_vector()
+    .unwrap_or_default()
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if row_names.len() == n_rows {
+        let arr = StringArray::from(row_names.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        fields.push(Field::new("__index_level_0__", DataType::Utf8, false));
+        arrays.push(Arc::new(arr));
+    }
+
     let schema = Arc::new(Schema::new(fields));
-    arrow::array::RecordBatch::try_new(schema, arrays)
+    // Use the explicit-row-count constructor so a 0-column metadata frame
+    // (no obs/var columns) still produces a valid n_rows-row batch.
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(n_rows));
+    arrow::array::RecordBatch::try_new_with_options(schema, arrays, &options)
         .map_err(|e| Error::Other(format!("RecordBatch construction failed: {}", e)))
 }
 
@@ -1044,6 +1177,11 @@ pub fn from_seurat(
         );
     }
 
+    // The sole assay's actual name — do not hardcode 'RNA', so an object
+    // whose only assay is SCT / originalexp / etc. round-trips its feature
+    // metadata. (At this point `assay_names_vec.len() <= 1`.)
+    let sole_assay = assay_names_vec.first().map(|s| s.as_str()).unwrap_or("RNA");
+
     // Single R!() call — moves seurat_obj once, returns a lightweight list
     let parts = R!("
         if (!requireNamespace('Seurat', quietly = TRUE))
@@ -1051,8 +1189,12 @@ pub fn from_seurat(
         seu <- {{seurat_obj}}
         counts <- Seurat::GetAssayData(seu, layer = 'counts')
         obs_df <- seu@meta.data
-        var_df <- tryCatch(seu[['RNA']]@meta.data,
+        var_df <- tryCatch(seu[[{{sole_assay}}]]@meta.data,
             error = function(e) data.frame(gene_id = rownames(seu)))
+        # An assay's feature metadata can come back with no (or auto-integer)
+        # row names; pin them to the feature names so gene IDs round-trip and
+        # to_seurat() can restore dimnames.
+        if (nrow(var_df) == length(rownames(seu))) rownames(var_df) <- rownames(seu)
         list(counts = counts, obs = obs_df, var = var_df)
     ")
     .map_err(|e| Error::Other(format!("failed to extract Seurat data: {}", e)))?;
@@ -1455,7 +1597,7 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
             if (!requireNamespace('Seurat', quietly = TRUE))
                 stop('Seurat >= 5.0.0 is required for to_seurat()')
             counts_t <- Matrix::t({{dgc}})
-            a <- Seurat::CreateAssay5Object(counts = counts_t)
+            a <- SeuratObject::CreateAssay5Object(counts = counts_t)
             features_df <- {{var_df}}
             if (nrow(features_df) == nrow(a)) {
                 # Attach feature metadata to the assay's @meta.data slot.
@@ -1474,7 +1616,17 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
     let (first_name, first_assay) = &assay_robjs[0];
     let seu = R!("
         seu <- Seurat::CreateSeuratObject(counts = {{first_assay}}, assay = {{first_name.as_str()}})
-        seu@meta.data <- {{obs_df}}
+        # AddMetaData keyed on barcodes (see to_seurat_v5): preserves the
+        # per-assay computed columns and survives any cell filtering.
+        md <- {{obs_df}}
+        if (all(colnames(seu) %in% rownames(md))) {
+            md <- md[colnames(seu), , drop = FALSE]
+        } else if (nrow(md) == ncol(seu)) {
+            rownames(md) <- colnames(seu)
+        } else {
+            stop('to_seurat: obs metadata rows do not align to Seurat cells')
+        }
+        seu <- Seurat::AddMetaData(seu, metadata = md)
         seu
     ")
     .map_err(|e| Error::Other(format!("CreateSeuratObject: {e}")))?;
