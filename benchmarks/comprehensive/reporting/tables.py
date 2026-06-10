@@ -12,6 +12,7 @@ store's compatibility layer.
 
 from __future__ import annotations
 
+import logging
 import statistics
 from typing import Any
 
@@ -19,6 +20,8 @@ from benchmarks.comprehensive.config import DATASETS, DatasetConfig
 from benchmarks.comprehensive.config import DATASETS, DatasetConfig
 from benchmarks.comprehensive.reporting.result_store import get_store, SourceRef, SourceKind
 from benchmarks.comprehensive.reporting.report_model import TableBlock, TextBlock, Block
+
+logger = logging.getLogger(__name__)
 
 
 def load_all_results(
@@ -1968,10 +1971,16 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
     headers = ["Operation", "Dataset", "SCX GPU time", "rapids time",
                "SCX/rapids", "Metric", "SCX", "rapids"]
     rows: list[list[str]] = []
+    # Track, per benchmark, whether rapids data existed and whether a
+    # surviving-native impl actually matched — so a variant-key rename that
+    # silently empties an op's rows surfaces a warning instead of vanishing.
+    rapids_benches: set[str] = set()
+    native_matched_benches: set[str] = set()
     for (bench, ds), impls in sorted(by_key.items()):
         rapids = impls.get("rapids_singlecell_gpu")
         if rapids is None:
             continue
+        rapids_benches.add(bench)
         # Select the surviving native GPU impl by explicit name (preference
         # order), so removed variants / the no_rapids fallback are never picked.
         scx = next(
@@ -1980,6 +1989,7 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
         )
         if scx is None:
             continue
+        native_matched_benches.add(bench)
         scx_t = scx.median_wall_s
         rap_t = rapids.median_wall_s
         ratio = (scx_t / rap_t) if (scx_t and rap_t) else None
@@ -1991,6 +2001,17 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
             _fmt_metric_name(mkey), _fmt_metric(_metric(scx, mkey)),
             _fmt_metric(_metric(rapids, mkey)),
         ])
+
+    # A configured op with rapids data but no native match means its expected
+    # impl key(s) drifted (rename / removal) — warn so the row isn't silently
+    # dropped from the report unnoticed.
+    for bench in sorted(rapids_benches - native_matched_benches):
+        logger.warning(
+            "native-vs-rapids: no surviving-native impl %s found for %s "
+            "(rapids data present) — variant-key drift? row(s) omitted.",
+            surviving_native_impl.get(bench, ()),
+            bench,
+        )
 
     if not rows:
         return TextBlock(
