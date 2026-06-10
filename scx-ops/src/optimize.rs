@@ -6,10 +6,11 @@
 //!
 //! Unlike `compact` (which targets deletion reclaim + re-sharding and keeps the
 //! source `format_version`), `optimize` is a faithful 1:1 upgrade: it does not
-//! apply deletions, does not change shard boundaries, and canonicalizes each
-//! shard so the output is a real v3 file with sidecars. The CSC sidecar is
-//! dropped (rerun `scx build-csc` / `--rebuild-csc`); a `decode/*` sidecar is
-//! emitted for every Scx1 integer shard automatically by the encoder.
+//! apply deletions (the deletion-vector section is carried through unchanged),
+//! does not change shard boundaries, and canonicalizes each shard so the output
+//! is a real v3 file with sidecars. The CSC sidecar is dropped (rerun
+//! `scx build-csc` / `--rebuild-csc`); a `decode/*` sidecar is emitted for every
+//! Scx1 integer shard automatically by the encoder.
 
 use std::path::Path;
 
@@ -37,12 +38,13 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
 
     let in_header = reader.header().clone();
     let index_dtype = in_header.index_dtype;
-    let n_vars = u32::try_from(in_header.n_vars)
-        .map_err(|_| OpsError::InvalidInput("n_vars exceeds u32".into()))?;
 
     // The CSC sidecar (bit 0) is dropped — re-canonicalizing may change nnz and
     // would leave the column-major sidecar referencing stale offsets. The
-    // deletion-vector flag (bit 5) is preserved: optimize keeps every row.
+    // deletion-vector flag (bit 5) is cleared here and re-set below only if we
+    // actually carry the `DeletionVectors` section through (otherwise the header
+    // would claim deletions with no section, and the logically-deleted rows
+    // would silently reappear).
     let had_csc = in_header.has_csc();
     if had_csc {
         log::warn!(
@@ -51,7 +53,7 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
             input_path.display()
         );
     }
-    let out_flags = in_header.flags & !(1 << 0);
+    let out_flags = in_header.flags & !(1 << 0) & !(1 << 5);
 
     let out_header = FileHeader {
         magic: MAGIC,
@@ -93,9 +95,12 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
     writer.write_obs(&reader.read_obs()?)?;
     writer.write_var(&reader.read_var()?)?;
 
-    // Re-encode every CSR shard (X first, then layers) preserving its name and
-    // global row offset, canonicalizing the triplet so the output is canonical
-    // and the encoder emits a decode sidecar for Scx1 integer shards.
+    // Re-encode every CSR-backed shard (X first, then layers, then obs×obs
+    // pairwise graphs) preserving its name and global row offset, canonicalizing
+    // the triplet so the output is canonical and the encoder emits a decode
+    // sidecar for Scx1 integer shards. `ObspCsrShard` is X-class CSR (minor axis
+    // is `n_obs`, not `n_vars`), so it is re-encoded here too — dropping it would
+    // silently lose the pairwise graph.
     let mut x_entries: Vec<_> = reader
         .catalog()
         .entries
@@ -110,13 +115,27 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
         .filter(|e| e.section_type == SectionType::LayerCsrShard)
         .collect();
     layer_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut obsp_csr_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObspCsrShard)
+        .collect();
+    obsp_csr_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for entry in x_entries.into_iter().chain(layer_entries) {
+    for entry in x_entries
+        .into_iter()
+        .chain(layer_entries)
+        .chain(obsp_csr_entries)
+    {
         let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
-        let (indptr_i64, indices_i32, values) = reader.read_shard_from_entry(entry)?;
+        // Use the shard's own minor dimension rather than the file-level
+        // `n_vars`: correct for `ObspCsrShard` (minor axis = `n_obs`) and robust
+        // against any per-shard width difference.
+        let n_minor = reader.read_shard_header(entry)?.n_minor;
+        let (indptr_i64, indices_i32, mut values) = reader.read_shard_from_entry(entry)?;
         let mut indptr: Vec<u64> = indptr_i64.iter().map(|&v| v as u64).collect();
         let mut indices: Vec<u32> = indices_i32.iter().map(|&v| v as u32).collect();
-        let mut values = values;
         canonicalize_csr(&mut indptr, &mut indices, &mut values);
 
         let pre = encode_one_shard(
@@ -125,7 +144,7 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
             &values,
             None, // auto-codec (Scx1 for low-median integer counts → emits sidecar)
             index_dtype,
-            n_vars,
+            n_minor,
             row_start,
             entry.section_type,
             ModalityType::Rna,
@@ -134,30 +153,45 @@ pub fn optimize(input_path: &Path, output_path: &Path) -> Result<()> {
         writer.write_preencoded_shard(pre)?;
     }
 
-    // Auxiliary matrices pass through unchanged (rows/cols preserved). Sorted
-    // for deterministic output.
-    let mut obsm: Vec<_> = reader.read_all_obsm()?.into_iter().collect();
-    obsm.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, batch) in &obsm {
-        writer.write_obsm(name, batch)?;
-    }
-    let mut varm: Vec<_> = reader.read_all_varm()?.into_iter().collect();
-    varm.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, batch) in &varm {
-        writer.write_varm(name, batch)?;
-    }
-    let mut obsp: Vec<_> = reader.read_all_obsp()?.into_iter().collect();
-    obsp.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, batch) in &obsp {
-        writer.write_obsp(name, batch)?;
-    }
-    let mut varp: Vec<_> = reader.read_all_varp()?.into_iter().collect();
-    varp.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, batch) in &varp {
-        writer.write_varp(name, batch)?;
+    // Auxiliary matrices (obsm/varm + COO obsp/varp) are unchanged by optimize,
+    // so they are copied byte-for-byte. Verbatim copy preserves any sharded
+    // layout (e.g. `ObsmEmbeddingShard`) and avoids decoding large `obsp`/`varp`
+    // graphs into one section (OOM / the 2 GB Arrow IPC ceiling). `ObspCsrShard`
+    // is excluded — it is the CSR-backed obsp graph, re-encoded in the loop
+    // above. Sorted by name for deterministic output.
+    let mut aux_entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.section_type,
+                SectionType::ObsmEmbedding
+                    | SectionType::ObsmEmbeddingShard
+                    | SectionType::VarmEmbedding
+                    | SectionType::VarmEmbeddingShard
+                    | SectionType::ObspEmbedding
+                    | SectionType::ObspEmbeddingShard
+                    | SectionType::VarpEmbedding
+                    | SectionType::VarpEmbeddingShard
+            )
+        })
+        .collect();
+    aux_entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for entry in aux_entries {
+        let bytes = reader.section_bytes(entry)?;
+        writer.copy_section_verbatim(entry, bytes)?;
     }
     if let Ok(uns) = reader.read_uns() {
         writer.write_uns(&uns)?;
+    }
+
+    // Deletion vectors are carried through unchanged (optimize does not apply
+    // them — that is `compact`'s job). The section references obs row ranges /
+    // shard ids, both preserved here, so it stays valid; `write_deletion_vectors`
+    // re-sets the header flag (cleared above) so it is set iff the section exists.
+    if let Some(dv) = reader.read_deletion_vectors()? {
+        writer.write_deletion_vectors(&dv)?;
     }
 
     // Predicate indexes reference obs row ranges; rows + shard boundaries are
@@ -274,5 +308,247 @@ mod tests {
         // obs/var preserved.
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
         assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+    }
+
+    /// Build a small canonical Scx1-eligible CSR triplet (strictly-increasing
+    /// per-row indices, small positive counts) with `n_obs` rows.
+    fn small_csr(n_obs: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let mut col = 0u32;
+            for k in 0..16usize {
+                col += 1 + ((r + k) % 7) as u32;
+                indices.push(col);
+                values.push(1u8 + ((r + k) % 4) as u8);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        (indptr, indices, values)
+    }
+
+    #[test]
+    fn optimize_preserves_deletion_vectors() {
+        use roaring::RoaringBitmap;
+        use scx_format::deletion_vectors::DeletionVectors;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 8usize;
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        let (indptr, indices, values) = small_csr(n_obs);
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            // Mark local row 1 of shard 0 as logically deleted.
+            let mut dv = DeletionVectors::new();
+            let mut bm = RoaringBitmap::new();
+            bm.insert(1);
+            dv.insert(0, bm);
+            w.write_deletion_vectors(&dv).unwrap();
+            w.finish().unwrap();
+        }
+
+        optimize(&input, &output).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(out.header().format_version, 3);
+        // The deletion-vector section is carried through (flag re-set + section
+        // present), not dropped — so the deleted row is not silently resurrected.
+        assert!(
+            out.header().has_deletion_vectors(),
+            "deletion-vector flag preserved"
+        );
+        let dv = out
+            .read_deletion_vectors()
+            .unwrap()
+            .expect("deletion-vector section present after optimize");
+        assert!(dv.is_deleted(0, 1));
+        assert_eq!(dv.total_deleted(), 1);
+        // optimize does NOT apply deletions — rows stay (logical deletion).
+        assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
+        let (out_indptr, _, _) = out.read_csr_shard(0).unwrap();
+        assert_eq!(out_indptr.len(), n_obs + 1);
+    }
+
+    #[test]
+    fn optimize_preserves_and_canonicalizes_obsp_csr_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 8usize;
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        let (indptr, indices, values) = small_csr(n_obs);
+        // Canonical obs×obs graph: each row links to two distinct, sorted
+        // neighbors (indices < n_obs).
+        let mut op_indptr = vec![0u64];
+        let mut op_indices: Vec<u32> = Vec::new();
+        let mut op_values: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let a = ((r + 1) % n_obs) as u32;
+            let b = ((r + 3) % n_obs) as u32;
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            op_indices.push(lo);
+            op_values.push(1u8);
+            op_indices.push(hi);
+            op_values.push(1u8);
+            op_indptr.push(op_indices.len() as u64);
+        }
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.write_obsp_shard(
+                &op_indptr,
+                &op_indices,
+                &op_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+                "connectivities",
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        optimize(&input, &output).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        // The CSR-backed obsp graph survives (it would be silently dropped if
+        // the re-encode loop only handled CsrShard/LayerCsrShard).
+        let obsp_shards: Vec<_> = out
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObspCsrShard)
+            .collect();
+        assert_eq!(obsp_shards.len(), 1, "obsp CSR shard preserved");
+        // Every CSR-class shard (X + obsp) is canonical post-optimize.
+        assert!(out
+            .validate_canonical_csr_shards()
+            .iter()
+            .all(|(_, ok)| *ok));
+    }
+
+    #[test]
+    fn optimize_copies_sharded_obsm_verbatim() {
+        use arrow::array::{Float32Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 6usize;
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        let (indptr, indices, values) = small_csr(n_obs);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pc1", DataType::Float32, false),
+            Field::new("pc2", DataType::Float32, false),
+        ]));
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            // Two 3-row obsm shards (sharded layout to prove it is preserved).
+            for shard_idx in 0u32..2 {
+                let row_start = shard_idx as usize * 3;
+                let rows: Vec<f32> = (row_start..row_start + 3).map(|r| r as f32).collect();
+                let rows2: Vec<f32> = rows.iter().map(|r| r * 2.0).collect();
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Float32Array::from(rows)),
+                        Arc::new(Float32Array::from(rows2)),
+                    ],
+                )
+                .unwrap();
+                w.write_obsm_shard(
+                    "X_pca",
+                    shard_idx,
+                    row_start as u64,
+                    batch.num_rows() as u64,
+                    n_obs as u64,
+                    &batch,
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        let in_reader = ScxReader::open(&input).unwrap();
+        let in_shards: Vec<(String, Vec<u8>)> = in_reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsmEmbeddingShard)
+            .map(|e| (e.name.clone(), in_reader.section_bytes(e).unwrap().to_vec()))
+            .collect();
+        assert_eq!(in_shards.len(), 2);
+        drop(in_reader);
+
+        optimize(&input, &output).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        let out_shards: Vec<(String, Vec<u8>)> = out
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::ObsmEmbeddingShard)
+            .map(|e| (e.name.clone(), out.section_bytes(e).unwrap().to_vec()))
+            .collect();
+        // Sharded layout preserved (not flattened) and copied byte-for-byte.
+        assert_eq!(out_shards.len(), 2, "sharded obsm preserved as shards");
+        assert_eq!(in_shards, out_shards, "obsm shards copied verbatim");
+        assert!(
+            !out.catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::ObsmEmbedding),
+            "no flattened single-section obsm emitted"
+        );
     }
 }
