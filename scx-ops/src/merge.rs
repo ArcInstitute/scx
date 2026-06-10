@@ -21,7 +21,8 @@ use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
 use crate::rewrite_helpers::{
-    build_raw_copied_csr_section, raw_copy_csr_eligible, source_decode_sidecar,
+    build_raw_copied_csr_section, decode_sidecar_index, raw_copy_csr_eligible,
+    source_decode_sidecar,
 };
 
 /// Merge multiple SCX files into a single output file.
@@ -331,6 +332,9 @@ pub fn merge_with_options(
     };
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
+        // Index this reader's decode sidecars once so the per-shard lookup is
+        // O(1) rather than a full catalog scan per shard.
+        let sidecar_index = decode_sidecar_index(reader);
         for shard_entry in &shards {
             // Read this shard's header (value_encoding + raw-copy eligibility).
             let sh = reader.read_shard_header(shard_entry)?;
@@ -342,9 +346,15 @@ pub fn merge_with_options(
             // matches the merged output (index dtype + column extent) and the
             // var axis is verified-identical, byte-copy the section instead of
             // decode → re-encode → codec-search. Merge always auto-selects the
-            // codec, so the codec precondition is `Auto`. Disabled under
-            // `assume_identical_var` (column indices are not guaranteed to match
-            // when var is assumed-but-not-verified equal).
+            // codec, so the codec precondition is `Auto`.
+            //
+            // Disabled under `assume_identical_var`: that flag tells merge to
+            // trust the caller's claim that the var axes match without
+            // verifying, so column indices are not guaranteed identical. Note
+            // merge never remaps indices (pure i32→u32 cast) on *either* path,
+            // so for valid inputs the decode/re-encode and raw-copy outputs are
+            // byte-identical — this gate is a conservative guard, not a
+            // behavioural fork. (See `merge_var_mismatch_assume_identical_var_proceeds`.)
             let raw_copy_ok =
                 raw_copy_csr_eligible(&sh, target_index_dtype, n_vars, CodecSelection::Auto)
                     && !options.assume_identical_var;
@@ -354,7 +364,8 @@ pub fn merge_with_options(
                 // source's sidecar too. If an Scx1 source lacks one (pre-v3 or
                 // over the overhead budget), we cannot reproduce what the slow
                 // path would emit, so fall through to decode/re-encode.
-                let sidecar = source_decode_sidecar(reader, shard_entry, row_start)?;
+                let sidecar =
+                    source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
                 let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
                 if !is_scx1 || sidecar.is_some() {
                     let (section_bytes, stats) = build_raw_copied_csr_section(
@@ -448,7 +459,14 @@ pub fn merge_with_options(
             ValueEncoding::Uint8
         };
 
-        // Accumulate and flush at shard_target_rows, matching compact.rs pattern
+        // Accumulate and flush at shard_target_rows, matching compact.rs pattern.
+        //
+        // TODO(#221): the X loop raw-copies identical-layout shards verbatim,
+        // but this layer loop re-packs across `shard_target` boundaries, so a
+        // source layer shard does not map 1:1 to an output shard — the
+        // byte-copy fast path does not apply here as-is. A future change could
+        // raw-copy a layer shard only when it already aligns to an output
+        // boundary; deferred for now (see PR #221 / OPT-1.2).
         let mut layer_indptr: Vec<u64> = vec![0];
         let mut layer_indices: Vec<u32> = Vec::new();
         let mut layer_values: Vec<u8> = Vec::new();
@@ -844,6 +862,8 @@ fn merge_multimodal(
         let mut input_offset: u64 = 0;
         for reader in readers {
             let entries = reader.catalog().csr_shards_for_modality(modality_id);
+            // O(1) per-shard sidecar lookup (see the single-modality loop).
+            let sidecar_index = decode_sidecar_index(reader);
             for shard_entry in entries {
                 let sh = reader.read_shard_header(shard_entry)?;
                 let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
@@ -862,7 +882,8 @@ fn merge_multimodal(
                     CodecSelection::Auto,
                 ) && !options.assume_identical_var;
                 if raw_copy_ok {
-                    let sidecar = source_decode_sidecar(reader, shard_entry, row_start)?;
+                    let sidecar =
+                        source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
                     let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
                     if !is_scx1 || sidecar.is_some() {
                         let (section_bytes, stats) = build_raw_copied_csr_section(

@@ -3,6 +3,8 @@
 // Used by build_csc and upgrade to avoid duplicating layer/obsm/uns/
 // predicate-index/provenance copy logic.
 
+use std::collections::HashMap;
+
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format::catalog::{FullCatalogEntry, ShardStats};
 use scx_format::decode_sidecar::DecodeSidecar;
@@ -54,9 +56,10 @@ pub(crate) fn build_raw_copied_csr_section(
     global_row_start: u64,
     value_encoding: ValueEncoding,
 ) -> OpsResult<(Vec<u8>, ShardStats)> {
-    // `read_raw_shard_bytes` returns an mmap slice; copy it so we can mutate
-    // the header.
-    let src_bytes: Vec<u8> = source.read_raw_shard_bytes(entry)?.to_vec();
+    // `read_raw_shard_bytes` returns an mmap slice. We never mutate it: the
+    // patched header is built in a separate `header_buf` and the payload is
+    // copied read-only into `section_data`, so borrow it directly (no alloc).
+    let src_bytes = source.read_raw_shard_bytes(entry)?;
     if src_bytes.len() < SHARD_HEADER_SIZE {
         return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
             format!("source shard '{}' too small for header", entry.name),
@@ -92,6 +95,19 @@ pub(crate) fn build_raw_copied_csr_section(
             if codec_id == CodecId::None {
                 let values_start = sh.values_rel_offset as usize;
                 let values_end = values_start + sh.values_length as usize;
+                // Defend against a malformed/corrupt header: error rather than
+                // panic on an out-of-bounds values slice (readers never panic
+                // on bad input).
+                if values_start > values_end || values_end > src_bytes.len() {
+                    return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+                        format!(
+                            "source shard '{}' has invalid values offset/length \
+                             ({values_start}..{values_end} of {} bytes)",
+                            entry.name,
+                            src_bytes.len(),
+                        ),
+                    )));
+                }
                 compute_shard_stats(
                     &src_bytes[values_start..values_end],
                     value_encoding,
@@ -120,25 +136,36 @@ pub(crate) fn build_raw_copied_csr_section(
     Ok((section_data, stats))
 }
 
-/// Look up the decode sidecar the source file holds for `shard_entry`
-/// (named `decode/{shard_name}`), parsed into a [`DecodeSidecar`] with its
-/// `major_start` re-stamped to `global_row_start`. Returns `None` when the
-/// source has no sidecar for this shard (non-Scx1 codec, sidecar over the
-/// overhead budget, or a pre-v3 source). The remaining source-section
-/// identity fields are re-stamped by [`ScxWriter::write_csr_shard_raw_copy`]
-/// once the shard's final position is known.
-pub(crate) fn source_decode_sidecar(
-    source: &ScxReader,
-    shard_entry: &FullCatalogEntry,
-    global_row_start: u64,
-) -> OpsResult<Option<DecodeSidecar>> {
-    let sidecar_name = format!("decode/{}", shard_entry.name);
-    let entry = source
+/// Index a reader's `DecodeMetadataShard` sidecar entries by their parent
+/// shard name (the sidecar name with the `decode/` prefix stripped), so the
+/// merge X loop can resolve a shard's sidecar in `O(1)` instead of scanning
+/// the whole catalog per shard (avoids `O(shards × entries)` on atlas-scale
+/// merges). Build once per reader.
+pub(crate) fn decode_sidecar_index(reader: &ScxReader) -> HashMap<&str, &FullCatalogEntry> {
+    reader
         .catalog()
         .entries
         .iter()
-        .find(|e| e.section_type == SectionType::DecodeMetadataShard && e.name == sidecar_name);
-    match entry {
+        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
+        .filter_map(|e| e.name.strip_prefix("decode/").map(|parent| (parent, e)))
+        .collect()
+}
+
+/// Look up the decode sidecar the source file holds for `shard_entry`
+/// (named `decode/{shard_name}`) via a prebuilt [`decode_sidecar_index`],
+/// parsed into a [`DecodeSidecar`] with its `major_start` re-stamped to
+/// `global_row_start`. Returns `None` when the source has no sidecar for this
+/// shard (non-Scx1 codec, sidecar over the overhead budget, or a pre-v3
+/// source). The remaining source-section identity fields are re-stamped by
+/// [`ScxWriter::write_csr_shard_raw_copy`] once the shard's final position is
+/// known.
+pub(crate) fn source_decode_sidecar(
+    source: &ScxReader,
+    sidecar_index: &HashMap<&str, &FullCatalogEntry>,
+    shard_entry: &FullCatalogEntry,
+    global_row_start: u64,
+) -> OpsResult<Option<DecodeSidecar>> {
+    match sidecar_index.get(shard_entry.name.as_str()) {
         Some(e) => {
             let mut sc = source.read_decode_sidecar_from_entry(e)?;
             sc.major_start = global_row_start;

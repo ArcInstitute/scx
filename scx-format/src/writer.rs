@@ -1361,7 +1361,9 @@ impl ScxWriter {
         self.writer()?.write_all(section_bytes)?;
         self.current_offset += section_length;
 
-        let sidecar_stats = stats.clone();
+        // Clone the stats for the sidecar only when there is a sidecar to
+        // write — the common (non-Scx1) shard copies no sidecar.
+        let sidecar_stats = sidecar.as_ref().map(|_| stats.clone());
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
             offset: shard_global_offset,
@@ -1380,7 +1382,8 @@ impl ScxWriter {
             sc.source_section_offset = shard_global_offset;
             sc.source_section_length = section_length;
             sc.source_section_checksum = section_checksum;
-            self.write_decode_sidecar_for_source(name, sc, Some(sidecar_stats))?;
+            // `sidecar_stats` is `Some` exactly when `sidecar` is `Some`.
+            self.write_decode_sidecar_for_source(name, sc, sidecar_stats)?;
         }
         Ok(())
     }
