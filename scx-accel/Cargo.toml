@@ -49,3 +49,7 @@ harness = false
 [[bench]]
 name = "covariance_pca"
 harness = false
+
+[[bench]]
+name = "randomized_pca_inmemory"
+harness = false

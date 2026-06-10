@@ -408,8 +408,26 @@ pub fn randomized_pca<S: ShardSource>(
     // Step 6: B = (X - μ)^T @ Q
     let b_rm = streaming_spmm_transpose(source, &q, means_ref)?;
 
-    // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass)
-    let total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
+    // Step 7 + 8: SVD of B, recover embeddings (uses pre-computed col_sum_sq — no extra pass).
+    // For the centered case, guard against catastrophic cancellation in the closed
+    // form; on the rare unstable input re-stream the shards once for a stable
+    // centered recompute (read_shard_arc is cached — T4.4).
+    let mut total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
+    if let Some(mu) = means_ref {
+        if closed_form_variance_unstable(&col_sum_sq, mu, n_obs) {
+            log::debug!(
+                "randomized_pca: closed-form total variance lost precision to \
+                 cancellation; re-streaming shards for a stable centered recompute"
+            );
+            let mut total = 0.0f64;
+            let mut col_nnz = vec![0u64; n_vars];
+            for shard_idx in 0..source.n_shards() {
+                let csr = source.read_shard_arc(shard_idx)?;
+                accumulate_centered_ss(&csr, mu, &mut total, &mut col_nnz);
+            }
+            total_var = finalize_centered_variance(total, &col_nnz, mu, n_obs);
+        }
+    }
     let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
@@ -430,9 +448,17 @@ pub fn randomized_pca_inmemory(
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
 
+    // Fused pass: column sums + sum-of-squares in one sweep over the nonzeros,
+    // reused for both mean-centering and total variance (no separate variance
+    // pass). Mirrors the streaming path's `col_means_and_sum_sq`.
+    let (col_sums, col_sum_sq) = csr.col_sums_and_sum_sq();
     let means = if zero_center {
-        let sums = csr.col_sums();
-        Some(sums.iter().map(|&s| s / n_obs as f64).collect::<Vec<f64>>())
+        Some(
+            col_sums
+                .iter()
+                .map(|&s| s / n_obs as f64)
+                .collect::<Vec<f64>>(),
+        )
     } else {
         None
     };
@@ -460,7 +486,16 @@ pub fn randomized_pca_inmemory(
     }
 
     let b_rm = spmm_transpose_csr(csr, &q, means_ref);
-    let total_var = compute_total_variance_inmemory(csr, means_ref);
+    // Reuse the fused col_sum_sq (no extra full-matrix pass). For the centered
+    // case, guard against catastrophic cancellation in the closed form
+    // (`Σx² − nμ²`); on the rare unstable input recompute the stable centered
+    // variance over the resident CSR.
+    let mut total_var = total_variance_from_col_sq(&col_sum_sq, means_ref, n_obs);
+    if let Some(mu) = means_ref {
+        if closed_form_variance_unstable(&col_sum_sq, mu, n_obs) {
+            total_var = stable_centered_total_variance_inmemory(csr, mu, n_obs);
+        }
+    }
     let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
@@ -514,6 +549,59 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 // `ShardSource::col_means_and_sum_sq()` in scx-format.
 // `compute_total_variance_from_col_sq` has been replaced by
 // `scx_format::total_variance_from_col_sq()`.
+
+/// Relative-cancellation threshold for the closed-form total variance.
+///
+/// The closed form `Σ col_sum_sq − n·Σ μ²` (via `total_variance_from_col_sq`)
+/// loses precision to catastrophic cancellation when the true variance is tiny
+/// relative to the magnitude being subtracted (e.g. near-constant large-offset
+/// columns). For real scRNA data (counts / log1p — small non-negative values)
+/// the ratio is O(1), far above this threshold, so the guard never fires on the
+/// hot path; it only engages for pathological large-offset inputs.
+const CLOSED_FORM_VAR_REL_EPS: f64 = 1e-7;
+
+/// Returns `true` when the closed-form centered total variance has lost too much
+/// precision to cancellation and the caller should recompute via the stable
+/// centered formula. Only meaningful for the centered (`zero_center`) case — the
+/// uncentered path sums `col_sum_sq` directly with no subtraction.
+fn closed_form_variance_unstable(col_sum_sq: &[f64], means: &[f64], n_obs: usize) -> bool {
+    let sum_sq: f64 = col_sum_sq.iter().sum();
+    let mean_sq: f64 = means.iter().map(|&m| m * m).sum::<f64>() * n_obs as f64;
+    // Catches both `≤ 0` (sign-flipped garbage) and tiny-positive garbage.
+    (sum_sq - mean_sq) <= CLOSED_FORM_VAR_REL_EPS * sum_sq
+}
+
+/// Accumulate the centered sum-of-squares `Σ (x − μ_c)²` over one CSR shard's
+/// stored entries, and tally per-column nnz (for the later zero-fill).
+///
+/// Numerically stable: it forms `(x − μ_c)` directly rather than the
+/// cancellation-prone `Σx² − nμ²`. Used by the stable fallback in both PCA paths.
+fn accumulate_centered_ss(csr: &ScxCsr, means: &[f64], total: &mut f64, col_nnz: &mut [u64]) {
+    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+        let c = col as usize;
+        let d = val as f64 - means[c];
+        *total += d * d;
+        col_nnz[c] += 1;
+    }
+}
+
+/// Finalize the stable centered total variance: fold the implicit-zero
+/// contribution `(n_obs − nnz_c)·μ_c²` per column and divide by `n_obs − 1`.
+fn finalize_centered_variance(mut total: f64, col_nnz: &[u64], means: &[f64], n_obs: usize) -> f64 {
+    for (c, &nnz) in col_nnz.iter().enumerate() {
+        let n_zeros = (n_obs as u64).saturating_sub(nnz) as f64;
+        total += n_zeros * means[c] * means[c];
+    }
+    total / (n_obs as f64 - 1.0).max(1.0)
+}
+
+/// Stable centered total variance for an in-memory CSR (single shard).
+fn stable_centered_total_variance_inmemory(csr: &ScxCsr, means: &[f64], n_obs: usize) -> f64 {
+    let mut total = 0.0f64;
+    let mut col_nnz = vec![0u64; means.len()];
+    accumulate_centered_ss(csr, means, &mut total, &mut col_nnz);
+    finalize_centered_variance(total, &col_nnz, means, n_obs)
+}
 
 /// Generate a random Gaussian matrix (rows × cols), row-major.
 fn random_gaussian(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
@@ -925,41 +1013,6 @@ fn spmm_forward_row(
 // NOTE: `compute_total_variance_from_col_sq` has been moved to
 // `scx_format::backed::total_variance_from_col_sq()` (re-exported
 // from `scx_format::total_variance_from_col_sq`).
-
-/// Total variance (in-memory).
-///
-/// Uses the textbook two-pass variance formula: `Σ(x - μ)²` after a separate
-/// mean pass. This is numerically safe for scRNA data because raw counts and
-/// log1p-transformed values are small non-negative magnitudes where
-/// catastrophic cancellation doesn't occur. If future callers feed data with
-/// large offsets (e.g. non-centered embeddings), switch to Welford's
-/// single-pass algorithm.
-fn compute_total_variance_inmemory(csr: &ScxCsr, means: Option<&[f64]>) -> f64 {
-    let n_obs = csr.n_rows();
-    let n_vars = csr.n_cols();
-
-    if let Some(mu) = means {
-        let mut total = 0.0f64;
-        for r in 0..n_obs {
-            let start = csr.indptr[r] as usize;
-            let end = csr.indptr[r + 1] as usize;
-            for j in start..end {
-                let v = csr.data[j] as f64 - mu[csr.indices[j] as usize];
-                total += v * v;
-            }
-        }
-        // Add zero contributions per column
-        let col_nnz = csr.col_nnz();
-        for c in 0..n_vars {
-            let n_zeros = n_obs.saturating_sub(col_nnz[c] as usize);
-            total += n_zeros as f64 * mu[c] * mu[c];
-        }
-        total / (n_obs as f64 - 1.0).max(1.0)
-    } else {
-        let total: f64 = csr.data.iter().map(|&v| (v as f64) * (v as f64)).sum();
-        total / (n_obs as f64 - 1.0).max(1.0)
-    }
-}
 
 /// Build PcaResult from Q (column-major Mat) and B (MatRef, possibly row-major view).
 #[allow(clippy::too_many_arguments)]
@@ -1456,6 +1509,154 @@ mod tests {
         assert_eq!(
             cov_accumulator_workers(100, DEFAULT_COV_MEMORY_BUDGET, 0),
             1
+        );
+    }
+
+    /// A simple in-memory multi-shard `ShardSource` for streaming-PCA tests.
+    struct VecShardSource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        n_vars: usize,
+    }
+
+    impl ShardSource for VecShardSource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+            Ok(self.shards[shard_idx].clone())
+        }
+    }
+
+    /// Build an `n_rows × 3` CSR with one near-constant large-offset column
+    /// (1e6 ± 1, present in every row) plus a small-variance column. The
+    /// large-offset column makes the variance minuscule relative to the
+    /// magnitude being subtracted in the closed form `Σx² − nμ²`, which the
+    /// relative-cancellation guard detects. `n_rows` must be a multiple of 10.
+    ///
+    /// Analytic centered variance (for `n_rows` a multiple of 10):
+    /// - col 0: mean 1e6, dev ±1 every row → `Σ(x−μ)² = n_rows`.
+    /// - col 1: values `r % 5` (mean 2, per-5-cycle Σdev² = 10) → `2·n_rows`.
+    /// - total numerator `= 3·n_rows`, so variance `= 3·n_rows / (n_rows − 1)`.
+    fn cancellation_csr(n_rows: usize) -> ScxCsr {
+        assert!(n_rows % 10 == 0, "n_rows must be a multiple of 10");
+        let mut indptr = vec![0i64];
+        let mut indices = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for r in 0..n_rows {
+            indices.push(0i32);
+            data.push(1.0e6_f32 + if r % 2 == 0 { 1.0 } else { -1.0 });
+            indices.push(1i32);
+            data.push((r % 5) as f32);
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new((n_rows, 3), indptr, indices, data).unwrap()
+    }
+
+    #[test]
+    fn test_stable_centered_variance_matches_closed_form() {
+        // On benign small data, the stable centered formula and the closed form
+        // agree to tight tolerance (locks the equivalence into the unit suite).
+        let csr = test_csr_10x5();
+        let n_obs = csr.n_rows();
+        let (sums, col_sum_sq) = csr.col_sums_and_sum_sq();
+        let means: Vec<f64> = sums.iter().map(|&s| s / n_obs as f64).collect();
+
+        let closed = total_variance_from_col_sq(&col_sum_sq, Some(&means), n_obs);
+        let stable = stable_centered_total_variance_inmemory(&csr, &means, n_obs);
+        assert!(
+            (closed - stable).abs() <= 1e-9 * closed.abs().max(1.0),
+            "closed-form {closed} vs stable {stable} diverged on benign data"
+        );
+        // Guard must NOT fire for benign data.
+        assert!(!closed_form_variance_unstable(&col_sum_sq, &means, n_obs));
+    }
+
+    #[test]
+    fn test_cancellation_guard_detects_degenerate_closed_form() {
+        let n_obs = 100usize;
+        let means = vec![1.0e6_f64];
+        // Σx² == n·μ² → closed-form numerator is 0 (the degenerate boundary
+        // rounding pushes ≤0 in practice); the closed form yields a non-positive
+        // total variance that would zero out variance_ratio. The guard must flag it.
+        let degenerate = vec![n_obs as f64 * means[0] * means[0]];
+        assert!(closed_form_variance_unstable(&degenerate, &means, n_obs));
+        assert!(total_variance_from_col_sq(&degenerate, Some(&means), n_obs) <= 0.0);
+
+        // A typical scRNA-scale column (small mean, variance comparable to the
+        // magnitude) is NOT flagged: mean 2, per-element variance 1 →
+        // numerator/Σx² = 1/5, far above the threshold.
+        let healthy_means = vec![2.0_f64];
+        let healthy = vec![n_obs as f64 * (healthy_means[0] * healthy_means[0] + 1.0)];
+        assert!(!closed_form_variance_unstable(
+            &healthy,
+            &healthy_means,
+            n_obs
+        ));
+    }
+
+    #[test]
+    fn test_inmemory_pca_variance_ratio_stable_under_cancellation() {
+        // Large-offset near-constant column drives the variance far below the
+        // magnitude being subtracted in the closed form. The relative guard must
+        // detect this and route through the stable centered fallback.
+        let n = 200usize;
+        let csr = cancellation_csr(n);
+        let (sums, col_sum_sq) = csr.col_sums_and_sum_sq();
+        let means: Vec<f64> = sums.iter().map(|&s| s / n as f64).collect();
+
+        // Guard fires for this regime.
+        assert!(
+            closed_form_variance_unstable(&col_sum_sq, &means, n),
+            "fixture should trigger the cancellation guard"
+        );
+        // The stable fallback recovers the analytic variance 3·n / (n−1).
+        let stable = stable_centered_total_variance_inmemory(&csr, &means, n);
+        let expected = 3.0 * n as f64 / (n as f64 - 1.0);
+        assert!(
+            (stable - expected).abs() <= 1e-6 * expected,
+            "stable variance {stable} != analytic {expected}"
+        );
+
+        // The PCA path uses the fallback: non-degenerate variance_ratio, and the
+        // implied total variance (variance_explained / variance_ratio) matches the
+        // stable value rather than a cancellation-corrupted one.
+        let result = randomized_pca_inmemory(&csr, 2, 5, 2, true, 42).unwrap();
+        assert!(
+            result.variance_ratio.iter().any(|&r| r > 0.0),
+            "variance_ratio should be non-degenerate, got {:?}",
+            result.variance_ratio
+        );
+        let implied_total = result.variance_explained[0] / result.variance_ratio[0];
+        assert!(
+            (implied_total - stable).abs() <= 1e-3 * stable,
+            "PCA implied total variance {implied_total} != stable {stable}"
+        );
+    }
+
+    #[test]
+    fn test_streaming_pca_variance_ratio_stable_under_cancellation() {
+        // Same pathological data, split across 2 shards, through the streaming path.
+        let full = cancellation_csr(200);
+        let s0 = full.row_slice(0, 100).unwrap();
+        let s1 = full.row_slice(100, 200).unwrap();
+        let source = VecShardSource {
+            shards: vec![s0, s1],
+            n_obs: 200,
+            n_vars: full.n_cols(),
+        };
+        let result = randomized_pca(&source, 2, 5, 2, true, 42).unwrap();
+        let ratio_sum: f64 = result.variance_ratio.iter().sum();
+        assert!(
+            ratio_sum > 0.0 && result.variance_ratio.iter().any(|&r| r > 0.0),
+            "streaming variance_ratio should be non-degenerate, got {:?}",
+            result.variance_ratio
         );
     }
 
