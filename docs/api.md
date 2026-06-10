@@ -1699,4 +1699,4 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx pull <source-url> <dest> [--parallelism N] [--no-cloud-ready] [--filter <expr>]`
 - `scx push <source> <dest-url> [--parallelism N]`
 
-Note: the `scx-cli` crate has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`). End-users installing via `cargo install` can pass `--features default-bin` to get an h5ad-capable build in one command.
+Note: the `scx-cli` crate has optional `hdf5` and `cloud` feature flags. HDF5 support is opt-in (`--features hdf5`). Cloud operations are opt-in (`--features cloud`). End-users building from a clone with `cargo install --path scx-cli` can pass `--features default-bin` to get an h5ad-capable build in one command (the crate is not on crates.io, so plain `cargo install scx-cli` does not work — prefer the pre-built binary from GitHub Releases).

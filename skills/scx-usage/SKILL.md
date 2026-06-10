@@ -30,9 +30,10 @@ directory):
 **End users** — install the wheel; no Rust toolchain needed:
 
 ```bash
-# Download the wheel for your Python version from GitHub Releases:
-# https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags)
-pip install ./pyscx-0.6.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# Download the wheel for your Python version + arch (x86_64 / aarch64) from
+# GitHub Releases: https://github.com/ArcInstitute/scx/releases (pyscx-v* tags).
+# Replace <version> with the release you downloaded (e.g. 0.7.0).
+pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
@@ -78,7 +79,10 @@ print(accel.gpu_available())       # False is fine on CPU-only / pre-built wheel
 | `open_cloud` missing | Source build without cloud feature | `maturin develop --features cloud` (included in pre-built wheels) |
 | maturin errors with venv + conda | Both `VIRTUAL_ENV` and `CONDA_PREFIX` set | `unset VIRTUAL_ENV` or deactivate conda before building |
 
-The CLI binary `scx` is separate from pyscx (`cargo install --features default-bin scx-cli`).
+The CLI binary `scx` is separate from pyscx — install the pre-built binary from
+[GitHub Releases](https://github.com/ArcInstitute/scx/releases) (`scx-cli-v*` tags),
+or build from a clone with `cargo install --path scx-cli --features default-bin`
+(the crate is not on crates.io). See `reference/installation.md`.
 
 ---
 
