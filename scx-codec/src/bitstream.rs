@@ -68,10 +68,27 @@ impl BitWriter {
     /// loop.
     #[inline]
     pub fn write_bits(&mut self, value: u64, n_bits: u8) {
+        // Encode-side internal invariant: callers pass controlled widths (Rice
+        // k<=15, FOR-BP frame_bits<=32, fixed 8/32/64). The untrusted boundary
+        // is decode (read_bits), which validates n_bits > 64 at runtime.
+        // debug-assert-ok: not an untrusted-input boundary.
         debug_assert!(n_bits <= 64);
         if n_bits == 0 {
             return;
         }
+        // Fast path: every production caller writes <= 32 bits (Rice/FOR-BP
+        // widths, 8-bit headers), so a single mask+shift+OR avoids the chunk
+        // loop's bookkeeping. `n_bits (<=7) + 32` reaches at most bit 38, well
+        // inside the u64 accumulator.
+        if n_bits <= 32 {
+            let mask = (1u64 << n_bits) - 1;
+            self.acc |= (value & mask) << self.n_bits;
+            self.n_bits += n_bits;
+            self.flush_bytes();
+            return;
+        }
+        // Slow path for 33..=64-bit writes: pack in <= 32-bit chunks so the
+        // accumulator never overflows. Only exercised by tests today.
         let mut v = value;
         let mut remaining = n_bits;
         while remaining > 0 {
