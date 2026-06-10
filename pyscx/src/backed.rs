@@ -1123,11 +1123,14 @@ impl ScxBackedSparseDataset {
         if let Ok(i) = row_idx.extract::<i64>() {
             let row = self.normalize_row_index(i)?;
             let global_row = self.to_global_row(row)?;
-            let csr = self
-                .backed
-                .read_rows(global_row as u64, global_row as u64 + 1)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let csr = self.apply_col_projection(csr);
+            // Decode + project off the GIL (P1); build the scipy object on-GIL.
+            let csr = detached(py, || {
+                self.backed
+                    .read_rows(global_row as u64, global_row as u64 + 1)
+                    .map(|csr| self.apply_col_projection(csr))
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1139,12 +1142,15 @@ impl ScxBackedSparseDataset {
             let step = indices.step;
 
             if step == 1 && self.kept_to_global.is_none() {
-                // Contiguous slice, no deletions — direct range read
-                let csr = self
-                    .backed
-                    .read_rows(start, stop)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let csr = self.apply_col_projection(csr);
+                // Contiguous slice, no deletions — direct range read.
+                // Decode + project off the GIL (P1).
+                let csr = detached(py, || {
+                    self.backed
+                        .read_rows(start, stop)
+                        .map(|csr| self.apply_col_projection(csr))
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(PyRuntimeError::new_err)?;
                 return csr_to_scipy(py, csr);
             }
 
@@ -1159,12 +1165,15 @@ impl ScxBackedSparseDataset {
             }
 
             // If contiguous after remapping (unit step, no deletions was
-            // already handled above), use read_row_indices for correctness
-            let csr = self
-                .backed
-                .read_row_indices(&rows)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let csr = self.apply_col_projection(csr);
+            // already handled above), use read_row_indices for correctness.
+            // Decode + project off the GIL (P1).
+            let csr = detached(py, || {
+                self.backed
+                    .read_row_indices(&rows)
+                    .map(|csr| self.apply_col_projection(csr))
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1188,11 +1197,14 @@ impl ScxBackedSparseDataset {
                 .iter()
                 .map(|&v| self.to_global_row(v as usize).map(|g| g as u64))
                 .collect::<PyResult<Vec<u64>>>()?;
-            let csr = self
-                .backed
-                .read_row_indices(&rows)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let csr = self.apply_col_projection(csr);
+            // Decode + project off the GIL (P1).
+            let csr = detached(py, || {
+                self.backed
+                    .read_row_indices(&rows)
+                    .map(|csr| self.apply_col_projection(csr))
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1216,11 +1228,14 @@ impl ScxBackedSparseDataset {
                 self.to_global_row(normalized as usize).map(|g| g as u64)
             })
             .collect::<PyResult<Vec<u64>>>()?;
-        let csr = self
-            .backed
-            .read_row_indices(&rows)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let csr = self.apply_col_projection(csr);
+        // Decode + project off the GIL (P1).
+        let csr = detached(py, || {
+            self.backed
+                .read_row_indices(&rows)
+                .map(|csr| self.apply_col_projection(csr))
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)?;
         csr_to_scipy(py, csr)
     }
 
@@ -1249,12 +1264,15 @@ impl ScxBackedSparseDataset {
                     col, self.shape_val.1
                 )));
             }
-            // Read single row, extract single column
+            // Read single row, extract single column. Decode off the GIL (P1)
+            // — the cost is a full shard decode even for one element.
             let global_row = self.to_global_row(row)?;
-            let csr = self
-                .backed
-                .read_rows(global_row as u64, global_row as u64 + 1)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let csr = detached(py, || {
+                self.backed
+                    .read_rows(global_row as u64, global_row as u64 + 1)
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             // When col_projection is active, remap user-visible col to on-disk col
             let lookup_col = if let Some(ref proj) = self.col_projection {
                 *proj.get(col).ok_or_else(|| {
@@ -1825,16 +1843,17 @@ impl ScxComparisonResult {
             return mat.call_method1(method, (self.threshold,));
         }
 
-        // Standard path: read raw data
-        let csr = if let Some(ref kept) = self.kept_to_global {
-            self.backed
-                .read_row_indices(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            self.backed
-                .read_all()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        };
+        // Standard path: read raw data. Decode the full matrix off the GIL (P1).
+        let csr = detached(py, || {
+            if let Some(ref kept) = self.kept_to_global {
+                self.backed
+                    .read_row_indices(kept)
+                    .map_err(|e| e.to_string())
+            } else {
+                self.backed.read_all().map_err(|e| e.to_string())
+            }
+        })
+        .map_err(PyRuntimeError::new_err)?;
         let mat = csr_to_scipy(py, csr)?;
         let method = match self.op.as_str() {
             "gt" => "__gt__",
@@ -2633,10 +2652,13 @@ impl ScxBackedObsmDataset {
 
     /// Gather `rows` and return a 2-D numpy array `(rows.len(), n_cols)`.
     fn gather_rows_2d<'py>(&self, py: Python<'py>, rows: &[u64]) -> PyResult<Bound<'py, PyAny>> {
-        let batch = self
-            .backed
-            .read_row_indices(rows)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Decode off the GIL (P1); build the numpy array on-GIL.
+        let batch = detached(py, || {
+            self.backed
+                .read_row_indices(rows)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)?;
         obsm_batch_to_numpy(py, &batch)
     }
 }
@@ -2738,10 +2760,9 @@ impl ScxBackedObsmDataset {
         match &self.kept_to_global {
             Some(kept) => self.gather_rows_2d(py, kept),
             None => {
-                let batch = self
-                    .backed
-                    .read_all()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // Decode off the GIL (P1); consistent with gather_rows_2d.
+                let batch = detached(py, || self.backed.read_all().map_err(|e| e.to_string()))
+                    .map_err(PyRuntimeError::new_err)?;
                 obsm_batch_to_numpy(py, &batch)
             }
         }
