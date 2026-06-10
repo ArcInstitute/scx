@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format::encode_one_shard;
 use scx_format::error::ScxError;
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format::header::FileHeader;
 use scx_format::modality::ModalityType;
 use scx_format::provenance::ProvenanceEntry;
 use scx_format::section::SectionType;
@@ -592,35 +592,14 @@ pub fn h5ad_to_scx(
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
 
     // Build header
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
         nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: opts.shard_target_rows,
-        codec_id: codec_id as u8,
+        opts.shard_target_rows,
+        codec_id as u8,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -811,35 +790,14 @@ pub fn tenx_to_scx(
         detect_value_encoding(&tenx.data, opts.codec).map_err(ScxError::from)?;
     let index_dtype: u8 = if tenx.n_genes <= 65535 { 0 } else { 1 };
 
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: tenx.n_cells as u64,
-        n_vars: tenx.n_genes as u64,
+    let header = FileHeader::new_single_modality(
+        tenx.n_cells as u64,
+        tenx.n_genes as u64,
         nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: opts.shard_target_rows,
-        codec_id: codec_id as u8,
+        opts.shard_target_rows,
+        codec_id as u8,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
     writer.write_obs(&tenx.obs)?;
@@ -1032,35 +990,14 @@ pub fn h5ad_to_scx_streaming(
     // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
     // `codec_id` are overwritten by `ScxWriter::finish()` from
     // running accumulators (see scx-format/src/writer.rs).
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: opts.shard_target_rows,
-        codec_id: 0,
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        0,
+        opts.shard_target_rows,
+        0,
         index_dtype,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    );
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -1959,14 +1896,6 @@ pub(crate) mod test_hooks {
     }
 }
 
-/// Memory budget for the streaming CSR→CSC transpose at convert time.
-///
-/// 4 GiB matches the `scx build-csc` default. The convert pipeline
-/// already holds the full CSR matrix in RAM, so this only bounds
-/// the per-chunk transpose working set. Large enough for typical
-/// inputs; the user-facing knob is `csc_cols_per_shard`.
-const CONVERT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 /// Streaming CSR → CSC transpose over the in-memory matrix, with
 /// the result written shard-by-shard via `writer.write_csc_shard`.
 ///
@@ -2022,38 +1951,18 @@ fn write_csc_shards_from_csr(
         indices_u32.iter().map(|&v| v as i32).collect(),
         values,
     );
-    let shards = std::slice::from_ref(&csr);
-
-    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
-        shards,
+    // Shared transpose-and-write loop (single-modality → modality_id None).
+    scx_format::csc_sidecar::write_csc_sidecar(
+        writer,
+        std::slice::from_ref(&csr),
         n_obs,
         n_vars,
-        CONVERT_CSC_MEMORY_BYTES,
+        value_encoding,
+        codec_id,
         csc_cols_per_shard,
-    )
-    .map_err(|e| ConvertError::Other(format!("CSC transpose failed: {e}")))?;
-
-    loop {
-        let col_start = iter.current_col_start() as u64;
-        let chunk = match iter.next() {
-            Some(c) => c.map_err(|e| ConvertError::Other(format!("CSC chunk failed: {e}")))?,
-            None => break,
-        };
-
-        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values =
-            values_to_raw_bytes(&chunk.data, value_encoding).map_err(ScxError::from)?;
-
-        writer.write_csc_shard(
-            &csc_indptr_u64,
-            &csc_indices_u32,
-            &raw_values,
-            codec_id,
-            value_encoding,
-            col_start,
-        )?;
-    }
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        None,
+    )?;
     Ok(())
 }
 

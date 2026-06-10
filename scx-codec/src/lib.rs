@@ -14,4 +14,6 @@ pub use dispatch::{
     Scx1DecodeMetadata, ValueEncoding,
 };
 pub use median::{floor_median_u32, floor_median_u64};
-pub use value_encoding::{detect_value_encoding, is_integer_data, values_to_raw_bytes};
+pub use value_encoding::{
+    detect_value_encoding, detect_value_encoding_f64, is_integer_data, values_to_raw_bytes,
+};

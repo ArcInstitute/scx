@@ -7,22 +7,37 @@ use blake3;
 
 use scx_codec::value_encoding::{detect_value_encoding, values_to_raw_bytes};
 use scx_codec::{encode_shard, CodecId, ValueEncoding};
+use scx_sparse::is_canonical_csr;
 
 use crate::codec_select::select_codec_for_modality;
 use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO};
 use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
-use crate::shard::{BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE, SHARD_MAGIC};
+use crate::shard::{
+    BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
+    SHARD_MAGIC,
+};
 use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 
 /// Encode a single shard's CSR triplet into a `PreEncodedSection`
 /// ready for sequential write via
 /// [`crate::ScxWriter::write_preencoded_shard`].
 ///
-/// Inputs must already be:
+/// Inputs must already be **canonical CSR**:
 /// - shard-local (`shard_indptr[0] == 0`, length `n_rows + 1`),
-/// - validated (use `scx_sparse::validate_csr_arrays` upstream).
+/// - column indices sorted ascending within each row,
+/// - no duplicate column indices within a row,
+/// - no explicit stored zeros.
+///
+/// Canonicalize upstream with [`scx_sparse::canonicalize_csr`] (and
+/// validate with `scx_sparse::validate_csr_arrays`). This contract is not
+/// cosmetic: the Scx1 codec assumes canonical input, and a non-canonical
+/// shard (e.g. a stored zero combined with a small per-row median) can hit
+/// a hard `CodecError::FloatWithScx1` / bitstream error — or silently
+/// encode incorrect values. Debug builds assert canonicality at this
+/// boundary so a forgetful new call site fails fast with a clear message;
+/// release builds trust the contract (no extra scan).
 ///
 /// `explicit_codec = None` selects per-shard auto-codec via
 /// [`select_codec_for_modality`]. `Some(CodecId::Scx1)` on non-integer
@@ -32,6 +47,25 @@ use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 /// `index_dtype` encodes the *file-wide* index encoding choice
 /// (`0` → u16 indices, `1` → u32). This drives the codec's index
 /// packing path and is recorded in the shard header for the reader.
+///
+/// # Examples
+///
+/// ```
+/// use scx_format::encoder::encode_one_shard;
+/// use scx_format::section::SectionType;
+/// use scx_format::modality::ModalityType;
+///
+/// // Canonical CSR: indptr[0] == 0, indices sorted per row, no dup, no zeros.
+/// let indptr = [0u64, 2];
+/// let indices = [0u32, 2];
+/// let values = [1.0f32, 3.0];
+/// let section = encode_one_shard(
+///     &indptr, &indices, &values, None, 1, 3, 0,
+///     SectionType::CsrShard, ModalityType::Rna, "X".to_string(),
+/// )
+/// .unwrap();
+/// assert!(section.section_length > 0);
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub fn encode_one_shard(
     shard_indptr: &[u64],
@@ -45,6 +79,16 @@ pub fn encode_one_shard(
     modality_type: ModalityType,
     name: String,
 ) -> Result<PreEncodedSection, ScxError> {
+    // Enforce the canonical-CSR contract in debug builds. Release builds
+    // trust the caller (callers canonicalize upstream); this catches a
+    // forgetful new call site before it produces a hard codec error or
+    // silently-wrong Scx1 output.
+    debug_assert!(
+        is_canonical_csr(shard_indptr, shard_indices, shard_values),
+        "encode_one_shard requires canonical CSR (sorted, deduped, no explicit \
+         zeros); call scx_sparse::canonicalize_csr upstream"
+    );
+
     let index_dtype_u16 = index_dtype == 0;
 
     // 3. Detect value encoding and encode values.
@@ -104,7 +148,7 @@ pub fn encode_one_shard(
 
     let shard_header = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: 1,
+        shard_format_version: CURRENT_SHARD_FORMAT_VERSION,
         shard_type: 0, // CSR
         codec_id: shard_codec as u8,
         value_encoding: shard_value_encoding as u8,

@@ -7,7 +7,11 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::DataType;
 use extendr_api::prelude::*;
 use scx_codec::ValueEncoding;
+// Field-metadata key marking an Arrow dictionary column as an *ordered*
+// categorical, sourced from the canonical `scx-format` definition (shared with
+// scx-convert and pyscx) so the wire key has a single source of truth.
 use scx_format::ScxReader;
+use scx_format::CATEGORICAL_ORDERED_KEY;
 use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
@@ -468,8 +472,8 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
             vd <- vd[rownames(seu), , drop = FALSE]
         }
         # 'RNA' is intentional here: this write path always builds the assay as
-        # 'RNA' via CreateSeuratObject(counts=) above. The T4.2 de-hardcoding of
-        # the assay name targets the from_seurat *read* path, not this writer.
+        # 'RNA' via CreateSeuratObject(counts=) above. The de-hardcoding of the
+        # assay name targets the from_seurat *read* path, not this writer.
         seu[['RNA']]@meta.data <- vd
         seu
     ")
@@ -609,38 +613,39 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
         }
     }
 
-    // Detect value encoding: integer-like values get uint8/uint16/uint32,
-    // otherwise fall back to float32. Mirrors scx-cli detect_value_encoding_only().
-    let all_integer = csr_values_f64
-        .iter()
-        .all(|&v| v.is_finite() && v >= 0.0 && v == v.floor());
-
-    let (values_bytes, value_encoding) = if all_integer {
-        let max_val: f64 = csr_values_f64.iter().copied().fold(0.0f64, f64::max);
-        if max_val <= 255.0 {
-            (
-                csr_values_f64.iter().map(|&v| v as u8).collect(),
-                ValueEncoding::Uint8,
-            )
-        } else if max_val <= 65535.0 {
+    // Detect value encoding via the shared scx-codec policy (the `f64` variant
+    // avoids a lossy f64→f32 round-trip on the raw-Census count path). The byte
+    // serialization stays f64-native here so values beyond f32's 2^24
+    // contiguous-integer range keep full precision. Float variants are matched
+    // explicitly (not `_`) so a future `ValueEncoding` addition fails to compile
+    // here rather than silently truncating to f32.
+    let value_encoding = scx_codec::detect_value_encoding_f64(&csr_values_f64);
+    let values_bytes: Vec<u8> = match value_encoding {
+        ValueEncoding::Uint8 => csr_values_f64.iter().map(|&v| v as u8).collect(),
+        ValueEncoding::Uint16 => {
             let mut buf = Vec::with_capacity(csr_values_f64.len() * 2);
             for &v in &csr_values_f64 {
                 buf.extend_from_slice(&(v as u16).to_le_bytes());
             }
-            (buf, ValueEncoding::Uint16)
-        } else {
+            buf
+        }
+        ValueEncoding::Uint32 => {
             let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
             for &v in &csr_values_f64 {
                 buf.extend_from_slice(&(v as u32).to_le_bytes());
             }
-            (buf, ValueEncoding::Uint32)
+            buf
         }
-    } else {
-        let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
-        for &v in &csr_values_f64 {
-            buf.extend_from_slice(&(v as f32).to_le_bytes());
+        // `detect_value_encoding_f64` only yields the integer buckets or
+        // Float32; Float16 is never produced here but is matched so the arm
+        // set stays exhaustive without a wildcard.
+        ValueEncoding::Float32 | ValueEncoding::Float16 => {
+            let mut buf = Vec::with_capacity(csr_values_f64.len() * 4);
+            for &v in &csr_values_f64 {
+                buf.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            buf
         }
-        (buf, ValueEncoding::Float32)
     };
 
     Ok((
@@ -658,13 +663,6 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
 /// This is the reverse of `record_batch_to_dataframe`.
 /// Extracts column names and values, creating Utf8 columns for character vectors
 /// and Float64 columns for numeric vectors.
-/// Field-metadata key marking an Arrow dictionary column as an *ordered*
-/// categorical. Matches `scx_convert::CATEGORICAL_ORDERED_KEY` (rscx does not
-/// depend on scx-convert, so the literal is duplicated; keep them in sync).
-// TODO(T4.9): re-export this key through `scx-format` (a shared dep of both
-// rscx and pyscx) so the three copies collapse to one (I-ORG-1).
-const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
-
 fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     use arrow::array::{BooleanArray, DictionaryArray, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
@@ -704,7 +702,7 @@ fn dataframe_to_record_batch(df: &Robj) -> Result<arrow::array::RecordBatch> {
     for (i, name) in col_names.iter().enumerate() {
         let col_robj = &columns[i];
 
-        // Detect the R class to map to the closest Arrow type (T4.3), so
+        // Detect the R class to map to the closest Arrow type, so
         // meta.data column classes round-trip via the reverse map in
         // `arrow_column_to_robj`: factor → Dictionary(Int32,Utf8) (carrying
         // the `ordered` bit), integer → Int32, logical → Boolean, double →
@@ -878,33 +876,15 @@ fn write_csr_to_scx(
     let n_shards = n_obs.div_ceil(shard_target_rows.max(1));
 
     let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
         n_obs: n_obs as u64,
         n_vars: n_vars as u64,
         nnz,
         n_csr_shards: n_shards as u32,
-        n_csc_shards: 0,
         shard_target_rows: shard_target_rows as u32,
         codec_id: CodecId::None as u8,
         index_dtype: if n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
         manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
+        ..Default::default()
     };
 
     let mut writer = ScxWriter::new(output_path, header)
@@ -985,15 +965,12 @@ fn write_csr_to_scx(
     Ok(())
 }
 
-/// Memory budget for the convert-time streaming CSR→CSC transpose
-/// (4 GiB, matches scx-cli and pyscx).
-const RSCX_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-
 /// Streaming CSR → CSC transpose over the in-memory `(csr_indptr,
 /// csr_indices, values_bytes)` arrays, writing each chunk as one CSC
-/// shard. Mirrors the helpers in `scx-cli::convert` and
-/// `pyscx::anndata` so all three import paths produce structurally
-/// identical CSC sidecars.
+/// shard. Decodes the pre-encoded value bytes to f32, then delegates to
+/// the shared `scx_format::csc_sidecar::write_csc_sidecar` so this and the
+/// `scx-convert` / `pyscx` import paths produce structurally identical CSC
+/// sidecars (a single transpose-and-write loop).
 #[allow(clippy::too_many_arguments)]
 fn write_csc_shards_from_csr_r(
     writer: &mut scx_format::writer::ScxWriter,
@@ -1015,38 +992,18 @@ fn write_csc_shards_from_csr_r(
     let indices_i32: Vec<i32> = csr_indices.iter().map(|&v| v as i32).collect();
 
     let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr_i64, indices_i32, data_f32);
-    let shards = std::slice::from_ref(&csr);
-
-    let mut iter = scx_sparse::streaming_csr_to_csc_iter_with_cap(
-        shards,
+    scx_format::csc_sidecar::write_csc_sidecar(
+        writer,
+        std::slice::from_ref(&csr),
         n_obs,
         n_vars,
-        RSCX_CSC_MEMORY_BYTES,
+        value_encoding,
+        codec_id,
         csc_cols_per_shard,
+        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        None,
     )
-    .map_err(|e| Error::Other(format!("CSC transpose: {}", e)))?;
-
-    loop {
-        let col_start = iter.current_col_start() as u64;
-        let chunk = match iter.next() {
-            Some(c) => c.map_err(|e| Error::Other(format!("CSC chunk: {}", e)))?,
-            None => break,
-        };
-        let csc_indptr_u64: Vec<u64> = chunk.indptr.iter().map(|&v| v as u64).collect();
-        let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
-        let raw_values = encode_values_from_f32(&chunk.data, value_encoding)?;
-        writer
-            .write_csc_shard(
-                &csc_indptr_u64,
-                &csc_indices_u32,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                col_start,
-            )
-            .map_err(|e| Error::Other(format!("write_csc_shard failed: {}", e)))?;
-    }
-    Ok(())
+    .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
 }
 
 /// Decode raw little-endian value bytes back to f32.
@@ -1094,17 +1051,6 @@ fn decode_values_to_f32(values_bytes: &[u8], encoding: ValueEncoding) -> Result<
             "Float16 value encoding not supported by rscx CSC sidecar".into(),
         )),
     }
-}
-
-/// Encode f32 values back to the requested LE byte representation.
-fn encode_values_from_f32(values: &[f32], encoding: ValueEncoding) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(values.len() * encoding.byte_width());
-    for &v in values {
-        encoding
-            .encode_f32(&mut buf, v)
-            .map_err(|e| Error::Other(format!("encode_f32 failed: {}", e)))?;
-    }
-    Ok(buf)
 }
 
 // ─── Import from Seurat/SCE ─────────────────────────────────────────────────
@@ -1411,38 +1357,20 @@ fn from_seurat_multi_assay(
     let n_obs = shared_n_obs.unwrap_or(0);
     let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
 
-    // Build the multimodal v2 header. n_csr_shards / n_csc_shards /
-    // modality_table_offset are filled in by ScxWriter::finish based
-    // on the registered modalities + write_csr_shard_for calls.
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: max_n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: CodecId::None as u8,
-        index_dtype: if max_n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    // Build the header for a multimodal write. `new_single_modality` is
+    // intentional despite the multimodal output: the modality count, table
+    // offset, and `has_modalities` flag — along with n_csr_shards /
+    // n_csc_shards — are all stamped by `ScxWriter::finish` from the registered
+    // modalities + `write_csr_shard_for` calls, so the constructor only needs
+    // to seed the matrix dims here.
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        max_n_vars,
+        0,
+        16384,
+        CodecId::None as u8,
+        if max_n_vars <= 65535 { 0 } else { 1 },
+    );
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
 
@@ -1817,35 +1745,14 @@ pub fn from_mae(
 
     let n_obs = shared_n_obs.unwrap_or(0);
     let max_n_vars = payloads.iter().map(|p| p.n_vars).max().unwrap_or(0) as u64;
-    let header = FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: max_n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: CodecId::None as u8,
-        index_dtype: if max_n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        max_n_vars,
+        0,
+        16384,
+        CodecId::None as u8,
+        if max_n_vars <= 65535 { 0 } else { 1 },
+    );
     let mut writer = ScxWriter::new(output_path, header)
         .map_err(|e| Error::Other(format!("ScxWriter::new failed: {}", e)))?;
     writer

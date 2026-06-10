@@ -6,34 +6,11 @@
 //! returns a named list with the corrected embeddings, convergence flag,
 //! iteration count, and per-iteration objective.
 
-use std::collections::HashMap;
-
 use extendr_api::prelude::*;
 
 use scx_accel::{harmony_integrate, BatchCovariate, HarmonyConfig};
 
-/// Factorise a character vector into contiguous `u32` level codes.
-///
-/// Level order is first-seen (stable w.r.t. the input, matching
-/// `pandas.factorize(sort=False)` in the Python binding).
-fn factorize_chars(labels: &[String]) -> (Vec<u32>, usize) {
-    let mut map: HashMap<String, u32> = HashMap::new();
-    let mut codes: Vec<u32> = Vec::with_capacity(labels.len());
-    let mut next: u32 = 0;
-    for s in labels {
-        let code = match map.get(s) {
-            Some(&c) => c,
-            None => {
-                let c = next;
-                map.insert(s.clone(), c);
-                next += 1;
-                c
-            }
-        };
-        codes.push(code);
-    }
-    (codes, next as usize)
-}
+use crate::util::factorize_chars;
 
 /// Run Harmony2 batch integration on PCA-style embeddings.
 ///
@@ -99,7 +76,8 @@ fn scx_harmony_integrate(
             n_obs
         )));
     }
-    let (labels, n_levels) = factorize_chars(&batch_strs);
+    let (labels, levels) = factorize_chars(&batch_strs);
+    let n_levels = levels.len();
     if n_levels < 2 {
         return Err(Error::Other(format!(
             "batch has only {n_levels} level(s); Harmony requires >= 2",
@@ -218,9 +196,10 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (codes, n) = factorize_chars(&labels);
-        assert_eq!(n, 3);
+        let (codes, levels) = factorize_chars(&labels);
+        assert_eq!(levels.len(), 3);
         // First-seen order: B→0, A→1, C→2.
+        assert_eq!(levels, vec!["B", "A", "C"]);
         assert_eq!(codes, vec![0, 1, 1, 0, 2, 1]);
     }
 }

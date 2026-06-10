@@ -226,6 +226,7 @@ pub fn randomized_pca<S: ShardSource>(
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
+    warn_if_cache_undersized(source, "randomized_pca");
 
     let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
     // Fused pass: compute column means and sum-of-squares together (1 shard pass)
@@ -328,6 +329,27 @@ pub fn randomized_pca_inmemory(
 // Internals
 // ---------------------------------------------------------------------------
 
+/// Warn when a caching `ShardSource`'s decode cache is too small to hold
+/// the shard working set across PCA's multiple passes. Out-of-core PCA
+/// re-reads every shard ~6–7× (randomized) or 2× (covariance); if the LRU
+/// can't hold `n_shards`, each pass evicts and re-decodes from disk — the
+/// same silent perf cliff the DE streaming path warns about. No-op for
+/// non-caching sources (`shard_cache_capacity() == None`).
+fn warn_if_cache_undersized<S: ShardSource>(source: &S, op: &str) {
+    if let Some(cap) = source.shard_cache_capacity() {
+        let n_shards = source.n_shards();
+        if n_shards > 1 && cap < n_shards {
+            log::warn!(
+                "{op}: shard cache capacity={cap} < n_shards={n_shards} — out-of-core \
+                 PCA makes multiple passes over every shard, so the cached read path \
+                 will evict and re-decode each shard on each pass. Raise the PCA \
+                 `memory_budget` so the cache can hold all {n_shards} shards (or open \
+                 with `cache_shards >= {n_shards}`) to realize the speedup."
+            );
+        }
+    }
+}
+
 fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<()> {
     if n_components == 0 {
         return Err(AccelError::InvalidInput(
@@ -391,7 +413,7 @@ fn streaming_spmm_forward<S: ShardSource>(
     let mut global_row = 0usize;
 
     for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx)?;
+        let csr = source.read_shard_arc(shard_idx)?;
         let shard_rows = csr.n_rows();
 
         spmm_forward_into(
@@ -443,7 +465,7 @@ fn streaming_spmm_transpose<S: ShardSource>(
     let sq_len = if means.is_some() { k } else { 0 };
 
     for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx)?;
+        let csr = source.read_shard_arc(shard_idx)?;
         let shard_rows = csr.n_rows();
         let use_parallel = shard_rows * k > 10_000;
 
@@ -888,6 +910,7 @@ pub fn covariance_pca<S: ShardSource>(
 ) -> Result<PcaResult> {
     let (n_obs, n_vars) = source.shape();
     validate_inputs(n_obs, n_vars, n_components)?;
+    warn_if_cache_undersized(source, "covariance_pca");
 
     // --- Pass 1: Accumulate covariance matrix and column sums ---
     // Sparse outer product: accumulate C[c1,c2] += v1*v2 directly from CSR nonzeros.
@@ -897,7 +920,7 @@ pub fn covariance_pca<S: ShardSource>(
 
     let n_shards = source.n_shards();
     for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx)?;
+        let csr = source.read_shard_arc(shard_idx)?;
         sparse_outer_product_accumulate(&csr, &mut col_sums, &mut cov);
     }
 
@@ -990,7 +1013,7 @@ pub fn covariance_pca<S: ShardSource>(
 
     let mut global_row = 0usize;
     for shard_idx in 0..n_shards {
-        let csr = source.read_shard(shard_idx)?;
+        let csr = source.read_shard_arc(shard_idx)?;
         let shard_rows = csr.n_rows();
 
         // E[row, :] = X[row, :] @ V - mc

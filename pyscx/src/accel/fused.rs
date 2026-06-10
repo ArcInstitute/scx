@@ -313,6 +313,7 @@ pub fn pca_neighbors(
         // Task 2.5 tuning knobs: the fused entry points keep PCA defaults.
         false,     // allow_tf32
         "default", // spmm_policy
+        None,      // memory_budget (default PCA cache ceiling)
     )?;
     super::neighbors::neighbors(
         py,
@@ -485,6 +486,7 @@ pub fn pca_neighbors_umap(
         // Task 2.5 tuning knobs: the fused entry points keep PCA defaults.
         false,     // allow_tf32
         "default", // spmm_policy
+        None,      // memory_budget (default PCA cache ceiling)
     )?;
     super::neighbors::neighbors(
         py,

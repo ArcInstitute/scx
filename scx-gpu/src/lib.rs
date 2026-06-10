@@ -117,7 +117,7 @@ pub use gpu_hvg::{
     gpu_streaming_clip_square_sum_csc, gpu_streaming_mean_var, gpu_streaming_mean_var_batched,
     gpu_streaming_mean_var_csc,
 };
-pub use gpu_knn::{cuvs_available, gpu_knn_cagra, gpu_knn_cagra_device, GpuKnnResult};
+pub use gpu_knn::{cuvs_available, gpu_knn_cagra_device, GpuKnnResult};
 pub use gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata};
 pub use gpu_pca::{
     gpu_randomized_pca, gpu_randomized_pca_device, mean_correct_gpu, GpuPcaDeviceResult,

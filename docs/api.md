@@ -786,8 +786,8 @@ Mean-centering correction kernel: Y[i,j] -= mc[j] for all rows.
 
 ### GPU kNN
 
-#### `gpu_knn_cagra(dev, embeddings, n_obs, n_dims, n_neighbors) → Result<GpuKnnResult, GpuError>`
-Build kNN graph on GPU using NVIDIA CAGRA (cuVS). L2 distance, optimized for PCA embeddings. Returns `GpuKnnResult { indices, distances, n_obs, n_neighbors }`.
+#### `gpu_knn_cagra_device(dev, embedding, n_neighbors) → Result<DeviceKnnGraph, GpuError>`
+Build kNN graph on GPU using NVIDIA CAGRA (cuVS), **device-resident** input and output. Reads a `DeviceEmbedding` (e.g. straight from `gpu_randomized_pca_device`) directly as the CAGRA dataset — no host upload — and returns a `DeviceKnnGraph` on the GPU; call `.to_host(dev)` for the host `GpuKnnResult { indices, distances, n_obs, n_neighbors }`. L2 distance, optimized for PCA embeddings. The fused PCA→kNN pipeline uses this to keep the embedding resident across the handoff. (The host-bounce `gpu_knn_cagra` wrapper and the standalone `scx-accel` `build_knn_graph_gpu` entry point were removed in ACC-RUST-OPT-V4 / Task T4.5 — no production path called them after the rapids-singlecell transition.)
 
 #### `cuvs_available() → bool`
 Check if `libcuvs.so` is available at runtime.

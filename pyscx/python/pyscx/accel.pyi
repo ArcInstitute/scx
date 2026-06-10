@@ -138,6 +138,9 @@ def pca(
     method: str = "auto",
     qr_method: str = "householder",
     prefer_format: PreferFormat = "csr",
+    allow_tf32: bool = False,
+    spmm_policy: str = "default",
+    memory_budget: int | str | None = None,
 ) -> None: ...
 
 

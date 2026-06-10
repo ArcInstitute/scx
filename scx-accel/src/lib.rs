@@ -91,7 +91,7 @@ pub use hvg::{
     streaming_mean_var_batched_with_device, streaming_mean_var_with_device,
 };
 #[cfg(feature = "gpu")]
-pub use neighbors::{build_knn_graph_gpu, cuvs_available};
+pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]
 pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
 #[cfg(feature = "gpu")]
