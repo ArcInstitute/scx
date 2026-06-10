@@ -16,5 +16,5 @@ mod write;
 
 pub use convert::mtx_to_scx;
 pub use error::MtxError;
-pub use read::{read_mtx_directory, MtxData};
+pub use read::{read_mtx_directory, MtxData, MtxOrientation};
 pub use write::write_scx_to_mtx;

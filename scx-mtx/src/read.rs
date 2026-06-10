@@ -15,7 +15,30 @@ use flate2::read::GzDecoder;
 
 use crate::error::MtxError;
 
+/// How the on-disk MTX matrix was oriented relative to the
+/// `barcodes.tsv` / `features.tsv` files.
+///
+/// Cell Ranger writes `matrix.mtx` as **features × barcodes** (the
+/// size line is `<genes> <cells> <nnz>`); SCX always stores cells×genes
+/// CSR, so the features×barcodes case is transposed on read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtxOrientation {
+    /// Matrix was features × barcodes (Cell Ranger default); transposed
+    /// to cells×genes on read.
+    FeaturesByBarcodes,
+    /// Matrix was already barcodes × features (cells×genes); kept as-is.
+    BarcodesByFeatures,
+    /// Square matrix (`n_barcodes == n_features`): orientation is
+    /// ambiguous, so the Cell Ranger default (features × barcodes) is
+    /// assumed and the matrix is transposed.
+    Ambiguous,
+}
+
 /// Parsed MTX directory data, ready for SCX conversion.
+///
+/// `indptr`/`indices`/`data` and `n_obs`/`n_vars` are always in
+/// cells×genes CSR orientation, regardless of the on-disk layout (see
+/// [`MtxOrientation`]).
 pub struct MtxData {
     pub indptr: Vec<i64>,
     pub indices: Vec<i32>,
@@ -24,6 +47,8 @@ pub struct MtxData {
     pub n_vars: usize,
     pub obs: RecordBatch,
     pub var: RecordBatch,
+    /// The detected on-disk orientation (before any transpose).
+    pub orientation: MtxOrientation,
 }
 
 /// Read a Cell Ranger–style MTX directory.
@@ -68,30 +93,75 @@ pub fn read_mtx_directory(dir: &Path) -> Result<MtxData, MtxError> {
     let features_reader = open_maybe_gzipped(&features_path)?;
     let var = parse_features_tsv(features_reader)?;
 
-    // Validate dimensions
-    if obs.num_rows() != n_rows {
-        return Err(MtxError::Parse(format!(
-            "barcodes count ({}) != matrix rows ({})",
-            obs.num_rows(),
-            n_rows
-        )));
+    // Detect orientation and transpose to cells×genes if needed.
+    //
+    // Cell Ranger writes `matrix.mtx` as features × barcodes (size line
+    // `<genes> <cells> <nnz>`), so the parsed CSR is genes-as-rows and
+    // must be transposed. SCX always stores cells×genes CSR. We decide
+    // by matching the parsed (n_rows, n_cols) against the barcode and
+    // feature file lengths.
+    let n_barcodes = obs.num_rows();
+    let n_features = var.num_rows();
+    let cells_by_genes = n_rows == n_barcodes && n_cols == n_features;
+    let features_by_barcodes = n_rows == n_features && n_cols == n_barcodes;
+
+    let orientation = match (features_by_barcodes, cells_by_genes) {
+        // Square matrix where both interpretations fit: ambiguous, assume
+        // the Cell Ranger default (features × barcodes) and transpose.
+        (true, true) => MtxOrientation::Ambiguous,
+        (true, false) => MtxOrientation::FeaturesByBarcodes,
+        (false, true) => MtxOrientation::BarcodesByFeatures,
+        (false, false) => {
+            return Err(MtxError::OrientationMismatch {
+                n_rows,
+                n_cols,
+                n_barcodes,
+                n_features,
+            });
+        }
+    };
+
+    if orientation == MtxOrientation::Ambiguous {
+        tracing::warn!(
+            n_cells = n_barcodes,
+            n_genes = n_features,
+            "MTX matrix is square ({n_rows}×{n_cols}); orientation is ambiguous. \
+             Assuming the Cell Ranger default (features × barcodes) and transposing \
+             to cells×genes."
+        );
     }
-    if var.num_rows() != n_cols {
-        return Err(MtxError::Parse(format!(
-            "features count ({}) != matrix columns ({})",
-            var.num_rows(),
-            n_cols
-        )));
-    }
+
+    // Transpose features×barcodes → cells×genes using the established
+    // zero-copy reinterpretation idiom (mirrors `tenx_read.rs`): the
+    // genes×cells CSR is, by definition, the CSC of the cells×genes
+    // matrix, so transposing the parsed CSR to CSC and reinterpreting the
+    // CSC arrays as CSR yields the cells×genes CSR directly.
+    //
+    // No `canonicalize_csr` pass is needed afterward: `parse_mtx_file`
+    // already sorts/coalesces the COO and drops explicit zeros, and the
+    // CSC scatter visits source rows in increasing order, so each output
+    // row's column indices are strictly increasing (canonical) by
+    // construction.
+    let (indptr, indices, data, n_obs, n_vars) = match orientation {
+        MtxOrientation::BarcodesByFeatures => (indptr, indices, data, n_rows, n_cols),
+        MtxOrientation::FeaturesByBarcodes | MtxOrientation::Ambiguous => {
+            let genes_by_cells =
+                scx_sparse::ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data);
+            let csc = scx_sparse::transpose::csr_to_csc(&genes_by_cells);
+            // CSC of (genes × cells) ≡ CSR of (cells × genes).
+            (csc.indptr, csc.indices, csc.data, n_cols, n_rows)
+        }
+    };
 
     Ok(MtxData {
         indptr,
         indices,
         data,
-        n_obs: n_rows,
-        n_vars: n_cols,
+        n_obs,
+        n_vars,
         obs,
         var,
+        orientation,
     })
 }
 
