@@ -326,6 +326,9 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 preserved end-to-end. `pyscx.from_h5ad` ingests the h5ad `/raw` group into a
 dedicated raw section family (CSR shards on `X`'s obs axis + a `raw/var` Arrow IPC
 section; see [docs/format.md § raw section family](format.md#adataraw-raw-section-family)).
+On the streaming convert path (`stream=True`, the default) `raw/X` is read and
+written shard-by-shard through the same coordinator as `/X`, so peak RSS stays
+bounded; the materializing path (`stream=False`) reads it eagerly.
 `pyscx.open(...).to_anndata()` reconstructs `adata.raw` (an AnnData with raw `X` +
 `var`), and `pyscx.to_h5ad` re-emits `/raw/X` + `/raw/var`, so
 `h5ad → scx → h5ad` round-trips raw with integer counts bit-exact and the wider var

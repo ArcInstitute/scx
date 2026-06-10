@@ -1137,9 +1137,9 @@ pub fn h5ad_to_scx_streaming(
     )?;
 
     // Optional `adata.raw` count matrix (its own var axis) → raw section
-    // family. Read eagerly (one raw matrix in memory); streaming raw is a
-    // deferred optimization.
-    ingest_raw_if_present(&file, &mut writer, n_obs, opts, sink)?;
+    // family, streamed shard-by-shard so peak RSS stays bounded (mirrors
+    // the streaming `/X` path).
+    ingest_raw_streaming(&file, &mut writer, n_obs, opts, sink)?;
 
     match overrides.uns.as_ref() {
         Some(json) => writer.write_uns(json)?,
@@ -2232,6 +2232,66 @@ fn ingest_raw_if_present(
         codec_id,
         value_encoding,
     )
+}
+
+/// Streaming variant of [`ingest_raw_if_present`]: open `raw/X` as a
+/// streaming reader and drive it through the shared writer coordinator
+/// with the `RawCsrShard` section type, so peak RSS stays bounded to one
+/// raw shard at a time (mirrors the streaming `/X` path). `raw/var` is a
+/// small DataFrame and is read eagerly. Used by `h5ad_to_scx_streaming`.
+///
+/// The coordinator gates detection bitmaps on `section_type == CsrShard`
+/// and `write_preencoded_shard` only bumps `csr`/`csc` counters, so raw
+/// shards add no bitmap and do not perturb the main matrix's header
+/// counts; presence is recorded via the `has_raw` flag at `finish()`.
+fn ingest_raw_streaming(
+    file: &hdf5::File,
+    writer: &mut ScxWriter,
+    n_obs: usize,
+    opts: &ConvertOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    if file.group("raw").is_err() {
+        return Ok(());
+    }
+    if file.group("raw/X").is_err() && file.dataset("raw/X").is_err() {
+        return Ok(());
+    }
+
+    let raw_format = super::detect::detect_matrix_format_at(file, "raw/X", sink)?;
+    let mut raw_reader: Box<dyn CsrShardStream> = match raw_format {
+        MatrixFormat::Csr => Box::new(open_x_streaming(file, "raw/X", raw_format, sink)?),
+        MatrixFormat::Dense => Box::new(open_dense_streaming(file, "raw/X", opts, sink)?),
+        MatrixFormat::Csc => open_csc_streaming(file, "raw/X", opts, sink)?,
+    };
+
+    let raw_n_obs = raw_reader.n_obs() as usize;
+    if raw_n_obs != n_obs {
+        return Err(ConvertError::Other(format!(
+            "raw/X has {raw_n_obs} rows but X has {n_obs}; \
+             adata.raw must share the obs axis"
+        )));
+    }
+    let raw_n_vars = raw_reader.n_vars() as usize;
+    let raw_n_vars_u32 = u32::try_from(raw_n_vars)
+        .map_err(|_| ConvertError::Other(format!("raw n_vars {raw_n_vars} exceeds u32::MAX")))?;
+    let raw_index_dtype: u8 = if raw_n_vars <= 65535 { 0 } else { 1 };
+
+    run_streaming_writer_coordinator(
+        raw_reader.as_mut(),
+        writer,
+        opts,
+        raw_index_dtype,
+        raw_n_vars_u32,
+        SectionType::RawCsrShard,
+        ModalityType::Rna,
+        "raw/X_shard",
+        sink,
+    )?;
+
+    let raw_var = read_dataframe_group(file, "raw/var")?;
+    writer.write_raw_var(&raw_var)?;
+    Ok(())
 }
 
 /// Dispatch tag for [`write_dense_mapping_section`] so the shard

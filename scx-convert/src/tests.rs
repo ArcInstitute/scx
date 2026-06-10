@@ -517,6 +517,13 @@ fn test_h5ad_raw_round_trip() {
     let n_vars = 15;
     let raw_n_vars = 23; // raw is WIDER than X
 
+    // Small shard target so raw spans multiple shards on both paths,
+    // exercising the streaming coordinator + multi-shard raw assembly.
+    let opts = ConvertOptions {
+        shard_target_rows: 4,
+        ..ConvertOptions::default()
+    };
+
     for streaming in [false, true] {
         let tag = if streaming { "stream" } else { "eager" };
         let h5ad_path = dir.path().join(format!("raw_{tag}.h5ad"));
@@ -529,19 +536,13 @@ fn test_h5ad_raw_round_trip() {
             h5ad_to_scx_streaming(
                 &h5ad_path,
                 &scx_path,
-                &ConvertOptions::default(),
+                &opts,
                 &StreamingOverrides::default(),
                 &mut WarningSink::log(),
             )
             .unwrap();
         } else {
-            h5ad_to_scx(
-                &h5ad_path,
-                &scx_path,
-                &ConvertOptions::default(),
-                &mut WarningSink::log(),
-            )
-            .unwrap();
+            h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
         }
 
         // Verify the raw section family in SCX.
