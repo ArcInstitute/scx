@@ -1,6 +1,6 @@
 Package: rscx
 Title: SCX File Format for Single-Cell RNA-seq
-Version: 0.7.0
+Version: 0.7.1
 Authors@R:
     person("Arc Institute", role = c("aut", "cre"),
            email = "scx@arcinstitute.org")
