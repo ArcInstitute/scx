@@ -1454,19 +1454,18 @@ fn phase3_streaming_h5mu_round_trip_matches_bulk() {
 }
 
 #[test]
-fn bulk_h5mu_per_modality_layer_round_trips() {
-    // Regression (PR #239): per-modality layers live at
-    // `mod/<modality>/layers/<name>`. The bulk h5mu pipeline ingests them
-    // via `read_layers_at`, whose `read_layer_entry` must resolve the full
-    // parent path — not a hardcoded root `layers/<name>`. Before the fix,
-    // `detect_matrix_format_at("layers/spliced")` missed the root group, so
-    // the per-modality layer was skipped (or, given a stray root `/layers`,
-    // read from the wrong group). After the fix it round-trips to the
-    // original matrix under the correct modality.
+fn h5mu_per_modality_layer_round_trips_bulk_and_streaming() {
+    // Per-modality layers live at `mod/<modality>/layers/<name>` and must
+    // round-trip under the correct modality on BOTH ingest paths:
     //
-    // (The h5mu *streaming* path has its own inline per-modality layer loop,
-    // untouched by this PR, and is exercised elsewhere.)
-    use crate::h5mu::pipeline::h5mu_to_scx;
+    // - Bulk: `read_layers_at`'s `read_layer_entry` must resolve the full
+    //   parent path, not a hardcoded root `layers/<name>` (PR #239 fix).
+    // - Streaming: the per-modality layer shards must be named
+    //   `layer/{mname}/{layer_name}/shard_{idx}` to match what
+    //   `layer_csr_shards_for_modality` (needle `/{layer_name}/`) and
+    //   `layer_names_for` parse — the plain `{mname}_{layer_name}_shard`
+    //   prefix left streaming-written layers unreadable via `read_layer_for`.
+    use crate::h5mu::pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("layer.h5mu");
 
@@ -1536,23 +1535,37 @@ fn bulk_h5mu_per_modality_layer_round_trips() {
 
     let opts = streaming_opts(8);
     let scx_bulk = dir.path().join("bulk.scx");
-    let mut sink = WarningSink::log();
-    h5mu_to_scx(&h5mu, &scx_bulk, &opts, &mut sink).unwrap();
+    let scx_stream = dir.path().join("stream.scx");
+    let mut sink_bulk = WarningSink::log();
+    h5mu_to_scx(&h5mu, &scx_bulk, &opts, &mut sink_bulk).unwrap();
+    let mut sink_stream = WarningSink::log();
+    h5mu_to_scx_streaming(&h5mu, &scx_stream, &opts, &mut sink_stream).unwrap();
 
-    assert_eq!(
-        sink.counts().get("layer_skipped").copied().unwrap_or(0),
-        0,
-        "per-modality layer must be ingested, not skipped"
-    );
-    let reader = ScxReader::open(&scx_bulk).unwrap();
-    let rna_id = reader.modality_id("rna").expect("rna modality present");
-    let csr = reader.read_layer_for(rna_id, "spliced").unwrap();
-    assert_eq!(csr.shape, (n_obs, rna_n_vars), "layer shape");
-    assert_eq!(
-        csr.to_dense().unwrap(),
-        dense,
-        "per-modality layer must decode to the original matrix"
-    );
+    for (label, scx, sink) in [
+        ("bulk", &scx_bulk, &sink_bulk),
+        ("stream", &scx_stream, &sink_stream),
+    ] {
+        assert_eq!(
+            sink.counts().get("layer_skipped").copied().unwrap_or(0),
+            0,
+            "{label}: per-modality layer must be ingested, not skipped"
+        );
+        let reader = ScxReader::open(scx).unwrap();
+        let rna_id = reader.modality_id("rna").expect("rna modality present");
+        assert!(
+            reader
+                .layer_names_for(rna_id)
+                .contains(&"spliced".to_string()),
+            "{label}: layer_names_for must list the per-modality layer"
+        );
+        let csr = reader.read_layer_for(rna_id, "spliced").unwrap();
+        assert_eq!(csr.shape, (n_obs, rna_n_vars), "{label}: layer shape");
+        assert_eq!(
+            csr.to_dense().unwrap(),
+            dense,
+            "{label}: per-modality layer must decode to the original matrix"
+        );
+    }
 }
 
 #[test]
