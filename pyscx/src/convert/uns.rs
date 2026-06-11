@@ -11,7 +11,7 @@ use scx_format::ScxReader;
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Sentinel key marking a tagged envelope in the on-disk JSON.
 const SCX_TYPE_KEY: &str = "__scx_type__";

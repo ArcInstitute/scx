@@ -877,13 +877,13 @@ pub enum BuildOutcome {
 /// available column list and, when one is close enough, a single
 /// `Did you mean '<col>'?` suggestion (Levenshtein-normalised
 /// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline.rs` (CLI
-/// path) and `pyscx/src/anndata.rs` (Python path) so both surfaces
+/// path) and `pyscx/src/convert/from_anndata.rs` (Python path) so both surfaces
 /// emit the same message. — E2-2026-05-20.
 ///
 /// Lives in `scx-engine` rather than `scx-convert` because pyscx
 /// depends on `scx-engine` unconditionally but only pulls in
 /// `scx-convert` under the `hdf5` feature; the helper must remain
-/// callable from `pyscx::anndata::build_and_write_predicate_indexes_inline`
+/// callable from `pyscx::convert::build_and_write_predicate_indexes_inline`
 /// (which is reachable from CPU-only `pyscx.from_anndata` paths).
 pub fn forced_column_missing_message(axis: &str, column: &str, available: &[String]) -> String {
     format!(
@@ -2128,7 +2128,7 @@ pub struct ConversionPredicateIndexResult {
 /// write them to `writer`. Returns the per-axis outcomes + indexed
 /// column names; the caller maps outcomes to its own
 /// warning/error types (see `scx-convert::pipeline` and
-/// `pyscx::anndata` for examples).
+/// `pyscx::convert` for examples).
 ///
 /// `obs_row_ranges` must reflect the actual on-disk CSR shard
 /// boundaries. `var` is treated as a single shard `[(0, n_vars)]`

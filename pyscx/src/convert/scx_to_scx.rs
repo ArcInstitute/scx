@@ -13,7 +13,7 @@ use scx_format::{ModalityType, ProvenanceEntry, ScxReader, ScxWriter};
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Route an AnnData with `adata.X = ScxBackedSparseDataset` through
 /// an SCX → SCX streaming writer.

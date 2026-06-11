@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 #[cfg(feature = "hdf5")]
 use scx_codec::CodecId;
 
-use crate::convert::*;
+use super::*;
 
 /// Route a backed AnnData object through the streaming converter.
 /// Extracts in-memory `obs` / `var` / `uns` / `obsm` / `varm` /

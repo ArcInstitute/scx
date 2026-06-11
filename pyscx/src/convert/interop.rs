@@ -13,7 +13,7 @@ use scx_format::ScxReader;
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Convert an Arrow RecordBatch to a pyarrow Table via IPC bytes.
 ///

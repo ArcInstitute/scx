@@ -11,7 +11,7 @@ use scx_format::ScxReader;
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Default memory budget for the eager [`to_anndata`] full-assembly
 /// path (Phase 4d). Estimated bytes above this threshold trigger a
@@ -914,8 +914,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     } else {
         None
     };
-    // Backed-path obsp filter mirrors the eager pre-fix logic at
-    // anndata.rs (kept_to_global composes deletion vectors with
+    // Backed-path obsp filter mirrors the eager pre-fix logic in this
+    // module (kept_to_global composes deletion vectors with
     // obs_filter); shared by Arc so the bridge holds its own ref.
     let kept_to_global_arc = kept_to_global.as_ref().map(|k| Arc::new(k.clone()));
     let lazy_obsp = lazy_reader.as_ref().filter(|_| has_obsp).map(|r| {
@@ -1113,16 +1113,3 @@ pub(crate) fn filter_obs_by_deletion_vectors(
     arrow::compute::filter_record_batch(&obs, &bool_array)
         .map_err(|e| PyRuntimeError::new_err(format!("failed to filter obs: {}", e)))
 }
-
-// ---------------------------------------------------------------------------
-// from_anndata: AnnData → SCX
-// ---------------------------------------------------------------------------
-
-// Detection lives in `scx_codec::value_encoding` — re-exported here under
-// the historical name so call sites elsewhere in `pyscx/` don't have to
-// change.
-pub(crate) use scx_codec::value_encoding::detect_value_encoding;
-
-// ---------------------------------------------------------------------------
-// Type conversion helpers (D2)
-// ---------------------------------------------------------------------------

@@ -403,7 +403,7 @@ pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
 /// [`scx_engine::build_and_write_conversion_predicate_indexes`]; this
 /// wrapper only maps the engine's typed outcomes into `ConvertError` /
 /// `ConvertWarning::{MissingPresetIndexColumn, UnsupportedIndexColumn}`.
-/// `pyscx::anndata::build_and_write_predicate_indexes_inline` is the
+/// `pyscx::convert::build_and_write_predicate_indexes_inline` is the
 /// Python-side mirror — keep their outcome handling shapes in sync.
 fn build_and_write_predicate_indexes(
     writer: &mut ScxWriter,

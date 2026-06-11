@@ -19,7 +19,7 @@ use scx_sparse::canonicalize_csr;
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Phase 5b: build and (conditionally) write a detection-bitmap shard
 /// for the in-memory `from_anndata` write path. Mirrors

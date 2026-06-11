@@ -23,7 +23,7 @@ use crate::reader::SectionReader;
 /// wrong-but-not-noisy result. Callers passing a scipy `csr_matrix`
 /// must either check `has_sorted_indices` or call `.sort_indices()` /
 /// `.sorted_indices()` before extracting `indices`. The canonical pyscx
-/// boundary helper is `pyscx::anndata::ensure_csr`, which already
+/// boundary helper is `pyscx::convert::ensure_csr`, which already
 /// enforces this. Debug builds catch violations via `debug_assert!`;
 /// release builds skip the check, so the boundary fix is what holds
 /// correctness in production.
@@ -38,7 +38,7 @@ pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<
         "project_csr_row: row indices are not sorted ascending — unsorted input \
          silently produces wrong results because the merge scan uses a monotonic \
          pointer. Sort indices at the caller (e.g. via scipy `sort_indices()` or \
-         `pyscx::anndata::ensure_csr`) before invoking."
+         `pyscx::convert::ensure_csr`) before invoking."
     );
     debug_assert!(
         gene_set.windows(2).all(|w| w[0] <= w[1]),

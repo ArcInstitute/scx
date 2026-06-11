@@ -62,6 +62,11 @@ pub(crate) fn encode_values(
     scx_codec::value_encoding::values_to_raw_bytes(data, encoding)
 }
 
+// Detection lives in `scx_codec::value_encoding` — re-exported here under
+// the historical name so call sites elsewhere in `pyscx/` don't have to
+// change.
+pub(crate) use scx_codec::value_encoding::detect_value_encoding;
+
 /// Parse codec name string to Option<CodecId>.
 /// Returns None for auto mode (default), Some(id) for explicit codec.
 pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {

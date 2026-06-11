@@ -262,7 +262,7 @@ impl ScxLazyPairwiseMapping {
 
 /// Lazy mapping for `ad.varm`. Each value is decoded to a dense numpy
 /// 2-D array on first access (mirrors the eager pre-fix behaviour at
-/// `anndata.rs:obsm_batch_to_numpy`).
+/// `convert/interop.rs:obsm_batch_to_numpy`).
 #[pyclass(name = "ScxLazyVarmMapping", mapping)]
 pub struct ScxLazyVarmMapping {
     reader: Arc<ScxReader>,
@@ -435,7 +435,7 @@ impl ScxLazyVarmMapping {
 
 /// Lazy mapping for `ad.obsm`. Each value is decoded to a dense numpy
 /// 2-D array on first access (mirrors the eager pre-fix behaviour at
-/// `anndata.rs:obsm_batch_to_numpy`), with the file's deletion vectors
+/// `convert/interop.rs:obsm_batch_to_numpy`), with the file's deletion vectors
 /// applied so rows line up with `obs` — unlike [`ScxLazyVarmMapping`],
 /// which sits on the `var` axis and needs no row filtering.
 ///
@@ -676,7 +676,7 @@ impl ScxLazyObsmMapping {
 /// path. Each value is decoded to a scipy `csr_matrix` on first
 /// access via `ScxReader::read_layer_filtered` (which applies the
 /// file's deletion vector, matching the eager pre-fix code at
-/// `anndata.rs:read_layer_filtered`).
+/// `convert/to_anndata.rs:to_anndata_with_layers`).
 ///
 /// The backed `to_anndata_backed()` path continues to use the
 /// existing per-layer `ScxBackedLayerDataset` wrappers, which are

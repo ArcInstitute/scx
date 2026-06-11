@@ -11,7 +11,7 @@ use scx_format::ScxReader;
 
 use crate::to_pyerr;
 
-use crate::convert::*;
+use super::*;
 
 /// Assemble a backed AnnData scoped to a single modality. `obs_df` is the
 /// pre-built pandas DataFrame (shared across modalities); pass `None` to

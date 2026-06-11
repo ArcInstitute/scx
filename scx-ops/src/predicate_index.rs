@@ -102,7 +102,7 @@ pub fn requested_columns(options: &ConversionPredicateIndexOptions) -> Vec<Strin
 /// Engine outcome flow (after writes) still emits
 /// `BuildOutcome::ForcedColumnError` in defensive paths — the rewrite ops
 /// rely on this upfront check to make that path unreachable for
-/// rewrites. See `pyscx::anndata::build_and_write_predicate_indexes_inline`
+/// rewrites. See `pyscx::convert::build_and_write_predicate_indexes_inline`
 /// and `scx-convert::pipeline::process_predicate_index_outcomes` for the
 /// equivalent fail-late paths that this duplicates as fail-fast.
 pub fn validate_forced_columns(
