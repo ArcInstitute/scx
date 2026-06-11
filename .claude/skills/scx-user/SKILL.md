@@ -9,10 +9,16 @@ This skill is a *role*, not a workflow. When invoked, you stop being a Claude Co
 
 Sibling skill `.claude/skills/scx-dev/SKILL.md` covers releases / build / dev-env. This skill is the inverse: you are the consumer, not the maintainer.
 
-**Working directory.** All session artifacts live under `/data/scx-dev/scx-user/` (Lambda `/data` partition — persistent, outside the scx git checkout). Cache it as an env var at the top of every session:
+**Working directory.** All session artifacts live in a persistent scratch area *outside* the scx git checkout. The right location depends on which cluster you're on — this skill runs on either Lambda or Chimera:
+
+- **Chimera** (default): `/scratch/<group>/<user>/scx-user` — the Weka high-speed temp filesystem. `/scratch` is **not backed up** (20 TB soft / 30 TB hard per group), which is fine for ephemeral downloads, `.scx` outputs, and notes; copy anything you want to keep to `/large_storage/<group>/`. Never use `/home` (0.5 TB soft quota) for session artifacts.
+- **Lambda**: `/data/scx-dev/scx-user` — the persistent `/data` partition.
+
+Cache the working dir as an env var at the top of every session. On Chimera:
 
 ```bash
-export SCX_USER_DIR=/data/scx-dev/scx-user
+export SCX_USER_DIR="/scratch/$(id -gn)/$USER/scx-user"   # Chimera: e.g. /scratch/ctc/nickyoungblut/scx-user
+# On Lambda instead: export SCX_USER_DIR=/data/scx-dev/scx-user
 export SCX_DATA_DIR="$SCX_USER_DIR/datasets"
 export SCX_REPO="${SCX_REPO:-$HOME/dev/rust/scx}"   # adjust to where scx is checked out on this host
 mkdir -p "$SCX_USER_DIR" "$SCX_DATA_DIR"
@@ -39,7 +45,7 @@ You are a computational biologist at a research institute. You spend most of you
 
 1. Set `SCX_USER_DIR`, `SCX_DATA_DIR`, `SCX_REPO` (see Working directory above) and `cd "$SCX_USER_DIR"`.
 2. Confirm `$SCX_REPO/.venv/` exists and `pyscx` is built (`"$SCX_REPO/.venv/bin/python" -c "import pyscx; print(pyscx.__file__)"`). If not, rebuild via `cd "$SCX_REPO/pyscx" && ../.venv/bin/maturin develop` before going further.
-3. Pick a tier based on context — workstation/dev box → Tier 1; on Lambda → Tier 2 or 3.
+3. Pick a tier based on context — workstation/dev box → Tier 1; on an HPC (Lambda or Chimera) → Tier 2 or 3. See **HPC clusters & partitions** below for the per-cluster `sbatch` partition names used in Tiers 2–3.
 4. Stage data via the existing downloader in `$SCX_REPO/benchmarks/scripts/`. Do **not** write a new downloader. Downloaders honour `$SCX_DATA_DIR`, so outputs land under `$SCX_USER_DIR/datasets/`.
 5. Run the pipeline end-to-end from `$SCX_USER_DIR`. Take notes inline (as comments or in `$SCX_USER_DIR/notes-$(date -u +%F).md`) as you go.
 6. When something surprises you, isolate the smallest repro you can on the spot — not at session end.
@@ -131,11 +137,28 @@ pyscx.to_h5ad(f"{data}/pbmc10k.scx", f"{data}/pbmc10k_roundtrip.h5ad", stream=Tr
 
 Then `import anndata as ad; ad.read_h5ad(f"{data}/pbmc10k_roundtrip.h5ad")` and verify pipeline-added obs/var columns survived.
 
-## Tier 2 — Medium pipeline on Lambda (census_500k)
+## HPC clusters & partitions
 
-**Goal:** end-to-end QC → HVG → PCA → neighbors → leiden on 500k human cells. Out-of-memory for many workstations; comfortable on one Lambda node.
+Tiers 2–3 run via `sbatch`. Partition names differ by cluster — the sbatch examples below are written for **Lambda** (`--partition=standard`); on **Chimera**, substitute:
 
-**Always `sbatch`** — never run this in the login shell or in an interactive `srun`. (See the `lambda-hpc:lambda-hpc` plugin skill for partitions and storage layout.)
+| Job type | Lambda | Chimera |
+|----------|--------|---------|
+| CPU (convert / staging / CPU analysis) | `standard` | `cpu` (≤12 h, max 2 running jobs/user) or `cpu_batch` (longer queue, up to 14 days) |
+| GPU | `standard` + `--gres=gpu:N` | `gpu` (≤24 h) or `gpu_batch` (up to 14 days) + `--gres=gpu:N` |
+
+Chimera caveats (see the `chimera-hpc:chimera-hpc` plugin skill for the full table):
+
+- **GPU node RAM is capped at 320 GB** on `gpu`/`gpu_batch` (32 cores/node). The Tier 3 example requests `--mem=512G`, which **won't schedule** on `gpu` — either drop to `--mem=320G` (and `--cpus-per-task=32`) or use `gpu_high_mem` (640 GB/node). CPU partitions (`cpu`) go up to 576 GB / 144 cores.
+- A GPU allocation defaults to 8 cores + 80 GB RAM per GPU; override with `--cpus-per-task` / `--mem`.
+- Don't set `CUDA_VISIBLE_DEVICES` yourself — SLURM sets it from `--gres`/`--gpus`.
+
+Pick the partition for your cluster and adjust the `#SBATCH --partition=` / `sbatch --partition=` lines accordingly. On Chimera you can also override the in-file partition at submit time, e.g. `sbatch --partition=cpu "$SCX_USER_DIR/scx_user_census500k.sbatch"`.
+
+## Tier 2 — Medium pipeline on an HPC (census_500k)
+
+**Goal:** end-to-end QC → HVG → PCA → neighbors → leiden on 500k human cells. Out-of-memory for many workstations; comfortable on one Lambda or Chimera node.
+
+**Always `sbatch`** — never run this in the login shell or in an interactive `srun`. (See the `lambda-hpc:lambda-hpc` or `chimera-hpc:chimera-hpc` plugin skill for partitions and storage layout.)
 
 **Stage data (separate small CPU job):**
 
@@ -231,7 +254,7 @@ sbatch "$SCX_USER_DIR/scx_user_census500k.sbatch"
 - Did `--index-preset cellxgene` change query speed in a measurable way?
 - Did any `ConvertWarning` show up during ingest? Was the message actionable?
 
-## Tier 3 — Large pipeline on Lambda with GPU (census_1m+)
+## Tier 3 — Large pipeline on an HPC with GPU (census_1m+)
 
 **Goal:** ingest + GPU-accelerated preprocessing + PCA + UMAP on 1M+ cells. This is the headline scx value proposition — exercise it on a real Census file.
 
@@ -248,6 +271,9 @@ sbatch --partition=standard --cpus-per-task=16 --mem=512G --time=04:00:00 \
 ```bash
 cat > "$SCX_USER_DIR/scx_user_census1m_gpu.sbatch" <<EOF
 #!/bin/bash
+# Partition is written for Lambda. On Chimera, use --partition=gpu_high_mem
+# (640 GB/node) for the --mem=512G below, or switch to --partition=gpu with
+# --mem=320G (the 320 GB cap on gpu/gpu_batch). See "HPC clusters & partitions".
 #SBATCH --partition=standard
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
@@ -410,7 +436,7 @@ Write to `$SCX_USER_DIR/SCX-USER-REPORT-$(date -u +%F).md`. Date is UTC. The rep
 
 ## Guardrails — what NOT to do
 
-- **Do NOT run heavy work inline on Lambda.** If you are on a `vci-steady-state-node-*`, the interactive shell is bound by the active SLURM cgroup (commonly `--cpus-per-task=8`, default per-GPU memory). Always `sbatch` with explicit `--cpus-per-task`, `--mem`, `--time`, `--partition`. See the `lambda-hpc:lambda-hpc` plugin skill.
+- **Do NOT run heavy work inline on an HPC login or interactive node.** On Lambda (`vci-steady-state-node-*`) or Chimera, the interactive shell (`sh_dev` / `sh_gpu`) is bound by the active SLURM cgroup (commonly a small core/memory slice), and the Chimera login node is shared. Always `sbatch` with explicit `--cpus-per-task`, `--mem`, `--time`, `--partition`. See the `lambda-hpc:lambda-hpc` or `chimera-hpc:chimera-hpc` plugin skill.
 - **Do NOT use the GPU code path without `--features gpu` built.** Build first, then run. Assume nothing about the active feature set of the existing `.venv/`.
 - **Do NOT make up dataset shapes.** Run `scx info` (or `anndata.read_h5ad(...).shape`) before quoting cell/gene counts in the report.
 - **Do NOT fix the bugs you find.** This session produces a report. A fix is a separate task with a fresh context.
@@ -432,5 +458,5 @@ Tracked docs only — never link to scratch / gitignored markdown.
 - Multimodal (CITE-seq / Multiome / TEA-seq): `docs/multimodal.md`.
 - Compatibility matrix (anndata / scanpy / numpy versions tested): `docs/compatibility-matrix.md`.
 - Data-prep scripts: `$SCX_REPO/benchmarks/scripts/download_pbmc10k.py`, `download_census_500k.py`, `download_census_1m.py`, `download_citeseq_pbmc.py`, `download_multiome_pbmc.py`. Output dir: `$SCX_DATA_DIR` (defaults to `$SCX_USER_DIR/datasets`).
-- Lambda HPC partitions / storage / `sbatch` shape: `lambda-hpc:lambda-hpc` plugin skill.
+- HPC partitions / storage / `sbatch` shape: `lambda-hpc:lambda-hpc` (Lambda) or `chimera-hpc:chimera-hpc` (Chimera) plugin skill. Chimera default working dir: `/scratch/<group>/<user>/scx-user`.
 - Rebuild / dev-env questions (only if you need to rebuild pyscx mid-session): `.claude/skills/scx-dev/SKILL.md`.
