@@ -9,7 +9,7 @@
 //! The view + source defined here are the GPU-side mirror of
 //! `scx-format::shard_source::ColumnShardSource`. Built for the G4 v3 DE
 //! pipeline (`pdex_ref_gpu_chunked_v3_csc`) — see
-//! `scx-accel/src/diffexp_gpu.rs` for the consumer.
+//! `scx-accel/src/diffexp/gpu.rs` for the consumer.
 //!
 //! [`RawGpuCscShardSource`] mirrors [`crate::gpu_shard_source::RawGpuShardSource`]'s
 //! G3-shaped pipelining: a 2-slot pinned host ring, a dedicated copy

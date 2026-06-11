@@ -16,7 +16,7 @@
 //! which scx-gpu already targets via `compute_70` in `build.rs`).
 //!
 //! These GPU kernels are accessed via the `scx_accel::*_with_device` dispatch
-//! wrappers (see `scx-accel/src/hvg.rs`) when `device = "gpu"`. The f64
+//! wrappers (see `scx-accel/src/hvg/gpu.rs`) when `device = "gpu"`. The f64
 //! accumulator path keeps numerical behaviour parity with the CPU fallback —
 //! the two implementations agree to ~1e-5 relative error on typical scRNA-seq
 //! densities.

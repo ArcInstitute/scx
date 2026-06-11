@@ -1,3 +1,5 @@
+#[cfg(feature = "gpu")]
+use super::gpu::harmony_integrate_gpu;
 use super::*;
 
 // --- helpers ----------------------------------------------------------
@@ -629,9 +631,9 @@ fn test_gpu_harmony_captures_once_across_outer_iters() {
     };
 
     let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
-    gpu_impl::HARMONY_CAPTURE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    super::gpu::HARMONY_CAPTURE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
     let _ = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
-    let captures = gpu_impl::HARMONY_CAPTURE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+    let captures = super::gpu::HARMONY_CAPTURE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
     scx_gpu::set_cuda_graphs_enabled_override(prev);
 
     assert_eq!(

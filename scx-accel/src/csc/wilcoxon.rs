@@ -182,7 +182,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     use crate::diffexp::DiffExpResult;
     #[cfg(feature = "gpu")]
-    use crate::diffexp_gpu::{wilcoxon_rank_sum_gpu, GpuDeShardInput};
+    use crate::diffexp::{wilcoxon_rank_sum_gpu, GpuDeShardInput};
     #[cfg(feature = "gpu")]
     use crate::route::AccelRoute;
     #[cfg(feature = "gpu")]

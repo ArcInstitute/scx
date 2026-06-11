@@ -34,7 +34,7 @@ use scx_gpu::{
     BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource,
 };
 
-use crate::diffexp::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
+use super::cpu::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
 use crate::pseudobulk::GeomMeanMode;
 use crate::route::{
     plan_de_route_from_source, AccelExecutionInfo, AccelRoute, DeviceRequest, InputLayout,
@@ -2244,7 +2244,7 @@ fn assemble_chunk_diffexp_result(
         let n = g_scores.len();
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| {
-            crate::diffexp::de_rank_cmp(
+            super::cpu::de_rank_cmp(
                 g_scores[a],
                 gene_index_base + a,
                 g_scores[b],
@@ -2400,5 +2400,5 @@ fn validate_wilcoxon_inputs(
 }
 
 #[cfg(test)]
-#[path = "diffexp_gpu_tests.rs"]
+#[path = "gpu_tests.rs"]
 mod tests;

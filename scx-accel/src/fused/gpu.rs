@@ -13,7 +13,7 @@
 use scx_format_io::ShardSource;
 
 use crate::error::{AccelError, Result};
-use crate::neighbors::{build_knn_csr, compute_connectivities, KnnResult};
+use crate::neighbors::cpu::{build_knn_csr, compute_connectivities, KnnResult};
 use crate::pca::PcaResult;
 
 /// Run GPU PCA then GPU CAGRA kNN with the embedding kept **device-resident**
