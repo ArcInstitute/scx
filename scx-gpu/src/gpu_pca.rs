@@ -858,9 +858,9 @@ pub(crate) fn gpu_scale_columns(
 }
 
 // NOTE: `compute_means_and_col_sq` has been replaced by
-// `BackedCsrReader::col_means_and_sum_sq()` in scx-format.
+// `BackedCsrReader::col_means_and_sum_sq()` in scx-format-io.
 // `compute_total_variance_from_col_sq` has been replaced by
-// `scx_format_io::total_variance_from_col_sq()`.
+// `scx_sparse::total_variance_from_col_sq()`.
 
 /// Format ScxError as GpuError.
 fn format_scx_error(e: scx_format_io::ScxError) -> GpuError {

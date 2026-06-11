@@ -546,9 +546,9 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 }
 
 // NOTE: `compute_means_and_col_sq` has been replaced by
-// `ShardSource::col_means_and_sum_sq()` in scx-format.
+// `ShardSource::col_means_and_sum_sq()` in scx-format-io.
 // `compute_total_variance_from_col_sq` has been replaced by
-// `scx_format_io::total_variance_from_col_sq()`.
+// `scx_sparse::total_variance_from_col_sq()`.
 
 /// Relative-cancellation threshold for the closed-form total variance.
 ///
@@ -1011,8 +1011,7 @@ fn spmm_forward_row(
 }
 
 // NOTE: `compute_total_variance_from_col_sq` has been moved to
-// `scx_format_io::backed::total_variance_from_col_sq()` (re-exported
-// from `scx_format_io::total_variance_from_col_sq`).
+// `scx_sparse::total_variance_from_col_sq()`.
 
 /// Build PcaResult from Q (column-major Mat) and B (MatRef, possibly row-major view).
 #[allow(clippy::too_many_arguments)]

@@ -15,7 +15,6 @@ deletion-vectors = ["roaring"]
 rayon = { workspace = true, optional = true }
 blake3 = { workspace = true }
 arrow = { workspace = true }
-zstd = { workspace = true }
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }

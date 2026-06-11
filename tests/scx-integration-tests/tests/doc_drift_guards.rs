@@ -207,15 +207,22 @@ fn scx_format_layout_crate_has_no_fs_io() {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
+            // I/O / mmap tokens that must never appear in the pure layout crate.
+            // `tempfile`/`libc` are also guarded at the `Cargo.toml` level (the
+            // stronger guarantee — they aren't deps, so use is a compile error);
+            // scanning here is belt-and-suspenders against an accidental import.
+            const BANNED: &[&str] = &["std::fs", "memmap2", "Mmap", "tempfile", "libc::"];
             let content = std::fs::read_to_string(&path).expect("source readable");
             for (i, line) in content.lines().enumerate() {
-                // Skip doc/comment lines: the module docs legitimately *mention*
-                // these as the things this crate must NOT use.
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                if line.contains("std::fs") || line.contains("memmap2") || line.contains("Mmap") {
+                // Scan only the code portion: strip any `//` comment (full-line
+                // *or* trailing-inline) so the module docs — which legitimately
+                // *mention* these tokens as the things this crate must NOT use —
+                // don't false-positive.
+                let code = match line.find("//") {
+                    Some(pos) => &line[..pos],
+                    None => line,
+                };
+                if BANNED.iter().any(|tok| code.contains(tok)) {
                     offenders.push(format!("{}:{}", path.display(), i + 1));
                 }
             }
@@ -224,7 +231,7 @@ fn scx_format_layout_crate_has_no_fs_io() {
     assert!(
         offenders.is_empty(),
         "scx-format is the pure layout/spec crate and must contain no filesystem/mmap I/O \
-         (move it to scx-format-io):\n{}",
+         (std::fs / memmap2 / Mmap / tempfile / libc::) — move it to scx-format-io:\n{}",
         offenders.join("\n")
     );
 }
