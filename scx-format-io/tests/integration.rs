@@ -5,7 +5,6 @@
 use arrow::array::{Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::dispatch::{CodecId, ValueEncoding};
-use scx_format_io::header::{HEADER_SIZE, MAGIC};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::shard::SHARD_HEADER_SIZE;
 use scx_format_io::{FileHeader, ScxError, ScxReader, ScxWriter};
@@ -18,35 +17,8 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
-    FileHeader {
-        magic: MAGIC,
-        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
-        header_length: HEADER_SIZE as u16,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: 0,
-        index_dtype: if n_vars <= 65535 { 0 } else { 1 },
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    let index_dtype = if n_vars <= 65535 { 0 } else { 1 };
+    FileHeader::new_single_modality(n_obs, n_vars, nnz, 16384, 0, index_dtype)
 }
 
 fn sample_obs(n: usize) -> arrow::record_batch::RecordBatch {

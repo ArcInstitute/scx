@@ -15,42 +15,14 @@ use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
     build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions, QueryPipeline,
 };
-use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
 use tempfile::TempDir;
 
 const N_VARS: usize = 4;
 
 fn header(n_obs: u64) -> FileHeader {
-    FileHeader {
-        magic: MAGIC,
-        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars: N_VARS as u64,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: 0,
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    FileHeader::new_single_modality(n_obs, N_VARS as u64, 0, 16384, 0, 0)
 }
 
 /// obs for 8 rows in two shards of 4. `cell_type` is "A" in shard 0 and "B" in

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::array::{AsArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::header::FileHeader;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
 use scx_ops::AppendOptions;
@@ -19,35 +19,8 @@ use scx_ops::AppendOptions;
 // ---------------------------------------------------------------------------
 
 fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
-    FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 10_000,
-        codec_id: 0,
-        index_dtype: 0, // u16
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    // index_dtype (last arg) = 0 (u16 on-disk indices).
+    FileHeader::new_single_modality(n_obs, n_vars, 0, 10_000, 0, 0)
 }
 
 /// Build obs metadata with cell_id and cell_type columns.

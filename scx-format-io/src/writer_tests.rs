@@ -4,35 +4,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
 fn sample_header() -> FileHeader {
-    FileHeader {
-        magic: crate::header::MAGIC,
-        format_version: crate::header::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: 100,
-        n_vars: 50,
-        nnz: 500,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: crate::DEFAULT_SHARD_TARGET_ROWS,
-        codec_id: 0,
-        index_dtype: 0, // u16
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    FileHeader::new_single_modality(100, 50, 500, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0)
 }
 
 fn sample_obs() -> RecordBatch {
@@ -1398,39 +1370,11 @@ fn csc_arrays_for_col_range(
 
 /// Build a header for a CSC round-trip test fixture.
 fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
-    FileHeader {
-        magic: crate::header::MAGIC,
-        format_version: crate::header::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: crate::DEFAULT_SHARD_TARGET_ROWS,
-        codec_id: 0,
-        // u32 indices on disk (Phase A test fixtures use n_vars=6
-        // which fits in u16, but we want index_dtype to track
-        // arrays we hand the writer; the writer reads it from the
-        // header). u16 index_dtype byte = 0; u32 = 1.
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    // u32 indices on disk (Phase A test fixtures use n_vars=6
+    // which fits in u16, but we want index_dtype to track
+    // arrays we hand the writer; the writer reads it from the
+    // header). u16 index_dtype byte = 0; u32 = 1.
+    FileHeader::new_single_modality(n_obs, n_vars, 0, crate::DEFAULT_SHARD_TARGET_ROWS, 0, 0)
 }
 
 /// Round-trip a 2-shard CSC file and verify that
