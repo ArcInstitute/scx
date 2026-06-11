@@ -706,14 +706,14 @@ mod streaming_obs_hdf5 {
     use crate::warnings::WarningSink;
 
     fn header(n_obs: u64, n_vars: u64) -> FileHeader {
-        FileHeader {
+        FileHeader::new_single_modality(
             n_obs,
             n_vars,
-            shard_target_rows: 16384,
-            index_dtype: if n_vars <= 65535 { 0 } else { 1 },
-            manifest_sequence: 1,
-            ..Default::default()
-        }
+            0,
+            16384,
+            0,
+            if n_vars <= 65535 { 0 } else { 1 },
+        )
     }
 
     /// Build an obs `RecordBatch` for a shard. Columns:

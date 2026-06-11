@@ -19,7 +19,7 @@ use scx_ops::AppendOptions;
 // ---------------------------------------------------------------------------
 
 fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
-    // index_dtype: 0 // u16
+    // index_dtype (last arg) = 0 (u16 on-disk indices).
     FileHeader::new_single_modality(n_obs, n_vars, 0, 10_000, 0, 0)
 }
 

@@ -62,9 +62,12 @@ jobs:
       # or FileHeader { .., ..Default::default() }. The `reserved: [0u8; 112]` field
       # initializer is the fingerprint of a hand-spelled full literal; the only
       # legitimate occurrences live in scx-format/src/header.rs (Default + read_from).
+      # The pattern tolerates formatting variants (whitespace, the type-inferred
+      # `[0; 112]` form) so the guard does not silently depend on `cargo fmt`.
       - name: No hand-spelled FileHeader literals
         run: |
-          if grep -rn --include='*.rs' 'reserved: \[0u8; 112\]' . \
+          if grep -rEn --include='*.rs' \
+               'reserved:[[:space:]]*\[[[:space:]]*0(u8)?[[:space:]]*;[[:space:]]*112[[:space:]]*\]' . \
                | grep -v 'scx-format/src/header.rs'; then
             echo "::error::Hand-spelled FileHeader literal found — use FileHeader::new_single_modality(...) or FileHeader { .., ..Default::default() }."
             exit 1

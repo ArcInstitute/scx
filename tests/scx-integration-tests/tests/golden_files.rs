@@ -229,7 +229,7 @@ fn make_var() -> RecordBatch {
 }
 
 fn make_header() -> FileHeader {
-    // index_dtype: 0 // u16 since n_vars=50 < 65535
+    // N_VARS=50 < 65535, so index_dtype (last arg) = 0 (u16 on-disk indices).
     FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, 10_000, 0, 0)
 }
 
