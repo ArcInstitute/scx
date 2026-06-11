@@ -12,9 +12,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use roaring::RoaringBitmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{build_indexes, QueryPipeline};
-use scx_format::header::FileHeader;
-use scx_format::writer::ScxWriter;
-use scx_format::DeletionVectors;
+use scx_format_io::header::FileHeader;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::DeletionVectors;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -23,8 +23,8 @@ use tempfile::TempDir;
 
 fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
-        magic: scx_format::MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        magic: scx_format_io::MAGIC,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,

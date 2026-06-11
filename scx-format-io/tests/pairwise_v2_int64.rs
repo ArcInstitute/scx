@@ -20,13 +20,13 @@ use arrow::array::{Float32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::dispatch::{CodecId, ValueEncoding};
-use scx_format::header::{HEADER_SIZE, MAGIC};
-use scx_format::{FileHeader, ScxReader, ScxWriter};
+use scx_format_io::header::{HEADER_SIZE, MAGIC};
+use scx_format_io::{FileHeader, ScxReader, ScxWriter};
 
 fn header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: HEADER_SIZE as u16,
         flags: 0,
         n_obs,

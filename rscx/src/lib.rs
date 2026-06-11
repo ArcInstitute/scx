@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use extendr_api::prelude::*;
 use scx_engine::pipeline::QueryResult;
-use scx_format::ScxReader;
+use scx_format_io::ScxReader;
 
 mod accel;
 mod harmony;

@@ -4,11 +4,11 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::error::ScxError;
-use scx_format::header::FileHeader;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::writer::ScxWriter;
-use scx_format::{select_codec_for_modality, ModalityType};
+use scx_format_io::error::ScxError;
+use scx_format_io::header::FileHeader;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::{select_codec_for_modality, ModalityType};
 
 use crate::error::MtxError;
 use crate::read::MtxOrientation;

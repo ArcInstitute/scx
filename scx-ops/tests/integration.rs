@@ -1,10 +1,10 @@
 use arrow::array::{DictionaryArray, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::writer::ScxWriter;
-use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 use scx_ops::AppendOptions;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use tempfile::TempDir;
 fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -1357,7 +1357,7 @@ fn write_multimodal_with_per_modality_mappings(
     n_obs: usize,
     rna_n_vars: u64,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_n_vars);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -1472,7 +1472,7 @@ fn write_multimodal_with_global_and_per_modality_mappings(
     n_obs: usize,
     rna_n_vars: u64,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_n_vars);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -1690,7 +1690,7 @@ fn test_compact_multimodal_filters_global_obsp_with_deletions() {
 
 /// Read the codec_id from the most recently appended CSR shard.
 fn last_appended_shard_codec(path: &std::path::Path) -> CodecId {
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
     let reader = ScxReader::open(path).unwrap();
     let shards = reader.catalog().shards(SectionType::CsrShard);
     let last = shards
@@ -1827,10 +1827,10 @@ fn test_append_with_codec_auto_matches_select_codec_for_modality() {
 
     let new_obs = sample_obs(4);
     let (indptr, indices, values) = sample_shard_data(4, 10);
-    let expected = scx_format::select_codec_for_modality(
+    let expected = scx_format_io::select_codec_for_modality(
         &values,
         ValueEncoding::Uint8,
-        scx_format::ModalityType::Rna,
+        scx_format_io::ModalityType::Rna,
     );
     scx_ops::append(
         &path,
@@ -2145,7 +2145,7 @@ fn test_append_drops_csc_from_input() {
         .catalog()
         .entries
         .iter()
-        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
         .count();
     assert_eq!(csc_count, 0);
 
@@ -2161,7 +2161,7 @@ fn test_append_drops_csc_from_input() {
 /// `BackedCscReader`.
 #[test]
 fn test_csc_generation_lifecycle_append_then_rebuild() {
-    use scx_format::backed::BackedCscReader;
+    use scx_format_io::backed::BackedCscReader;
 
     let dir = tempfile::tempdir().unwrap();
     let path = write_csc_test_file(&dir, "csc_gen.scx", 6, 8, 4);
@@ -2279,7 +2279,7 @@ fn test_compact_drops_csc_from_input() {
         .catalog()
         .entries
         .iter()
-        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
         .count();
     assert_eq!(csc_count, 0);
 }
@@ -2304,7 +2304,7 @@ fn test_merge_drops_csc_from_inputs() {
         .catalog()
         .entries
         .iter()
-        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
         .count();
     assert_eq!(csc_count, 0);
 }
@@ -2549,8 +2549,8 @@ fn test_merge_preserves_utf8_schema_via_largeutf8_round_trip() {
 /// sites in `scx-ops::append::append`.
 #[test]
 fn test_append_for_modality_uses_per_modality_n_vars() {
-    use scx_format::modality::ModalityType;
-    use scx_format::section::SectionType;
+    use scx_format_io::modality::ModalityType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("multimodal_append.scx");
@@ -2643,7 +2643,7 @@ fn test_append_for_modality_uses_per_modality_n_vars() {
     // The appended shard should carry adt.n_vars in both stats and
     // on-disk header — not rna.n_vars (which is the file-wide max).
     let reader = ScxReader::open(&path).unwrap();
-    let adt_shards: Vec<&scx_format::FullCatalogEntry> = reader
+    let adt_shards: Vec<&scx_format_io::FullCatalogEntry> = reader
         .catalog()
         .shards(SectionType::CsrShard)
         .into_iter()
@@ -2787,9 +2787,9 @@ fn test_streaming_append_respects_explicit_codec() {
 
     // Every appended shard (source had 2) must carry codec_id == Zstd.
     let reader = ScxReader::open(&target).unwrap();
-    let appended: Vec<&scx_format::FullCatalogEntry> = reader
+    let appended: Vec<&scx_format_io::FullCatalogEntry> = reader
         .catalog()
-        .shards(scx_format::section::SectionType::CsrShard)
+        .shards(scx_format_io::section::SectionType::CsrShard)
         .into_iter()
         .filter(|e| e.stats.as_ref().map(|s| s.row_start >= 4).unwrap_or(false))
         .collect();
@@ -2822,7 +2822,7 @@ fn test_streaming_append_raw_copy_fast_path() {
         let r = ScxReader::open(&source).unwrap();
         let shards = r
             .catalog()
-            .shards(scx_format::section::SectionType::CsrShard);
+            .shards(scx_format_io::section::SectionType::CsrShard);
         assert_eq!(shards.len(), 1);
         let bytes = r.section_bytes(shards[0]).unwrap();
         bytes[SHARD_HEADER_SIZE..].to_vec()
@@ -2836,7 +2836,7 @@ fn test_streaming_append_raw_copy_fast_path() {
     // Locate the appended shard (row_start == 4).
     let appended = reader
         .catalog()
-        .shards(scx_format::section::SectionType::CsrShard)
+        .shards(scx_format_io::section::SectionType::CsrShard)
         .into_iter()
         .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
         .expect("appended shard not found");
@@ -2898,7 +2898,7 @@ fn test_streaming_append_raw_copy_reuses_stats() {
         let r = ScxReader::open(&source).unwrap();
         let shards = r
             .catalog()
-            .shards(scx_format::section::SectionType::CsrShard);
+            .shards(scx_format_io::section::SectionType::CsrShard);
         assert_eq!(shards.len(), 1);
         shards[0].stats.clone().expect("source shard has stats")
     };
@@ -2949,7 +2949,7 @@ fn test_streaming_append_raw_copy_reuses_stats() {
     let reader = ScxReader::open(&target).unwrap();
     let appended = reader
         .catalog()
-        .shards(scx_format::section::SectionType::CsrShard)
+        .shards(scx_format_io::section::SectionType::CsrShard)
         .into_iter()
         .find(|e| e.stats.as_ref().map(|s| s.row_start == 4).unwrap_or(false))
         .expect("appended shard not found");
@@ -2997,7 +2997,7 @@ fn test_streaming_append_drops_csc_from_input() {
         .catalog()
         .entries
         .iter()
-        .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
         .count();
     assert_eq!(csc_count, 0);
 }
@@ -3006,8 +3006,8 @@ fn test_streaming_append_drops_csc_from_input() {
 /// shard's `ShardHeader.n_minor` with the target modality's `n_vars`.
 #[test]
 fn test_streaming_append_multimodal() {
-    use scx_format::modality::ModalityType;
-    use scx_format::section::SectionType;
+    use scx_format_io::modality::ModalityType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stream_multimodal.scx");
@@ -3093,7 +3093,7 @@ fn test_streaming_append_multimodal() {
     drop(src_reader);
 
     let reader = ScxReader::open(&path).unwrap();
-    let adt_shards: Vec<&scx_format::FullCatalogEntry> = reader
+    let adt_shards: Vec<&scx_format_io::FullCatalogEntry> = reader
         .catalog()
         .shards(SectionType::CsrShard)
         .into_iter()
@@ -3132,7 +3132,7 @@ fn write_multimodal_with_csc(
     adt_n_vars: u64,
     with_adt_csc: bool,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_n_vars);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -3239,7 +3239,7 @@ fn write_multimodal_with_csc(
 /// premature preservation.
 #[test]
 fn test_append_into_rna_drops_adt_csc() {
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let path = write_multimodal_with_csc(&dir, "partial_csc.scx", 4, 30, 10, true);
@@ -3306,7 +3306,7 @@ fn test_append_into_rna_drops_adt_csc() {
 /// clears the file-wide HAS_CSC flag.
 #[test]
 fn test_append_into_adt_drops_csc() {
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
     let dir = tempfile::tempdir().unwrap();
     let path = write_multimodal_with_csc(&dir, "partial_csc_target.scx", 4, 30, 10, true);
 
@@ -3355,7 +3355,7 @@ fn test_append_into_adt_drops_csc() {
 /// modalities and preserves the modality table.
 #[test]
 fn test_compact_multimodal_applies_to_all_modalities() {
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
     let dir = tempfile::tempdir().unwrap();
     let n_obs = 6;
     let path = write_multimodal_with_csc(&dir, "compact_mm.scx", n_obs, 30, 10, false);
@@ -3447,7 +3447,7 @@ fn write_multimodal_with_layers_and_obsm(
     rna_n_vars: u64,
     adt_n_vars: u64,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_n_vars);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -3626,7 +3626,7 @@ fn write_multimodal_with_options_fixture(
     rna_uns: Option<&serde_json::Value>,
     adt_uns: Option<&serde_json::Value>,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_var.num_rows() as u64);
     let mut writer = ScxWriter::new(&path, header).unwrap();
@@ -4005,7 +4005,7 @@ fn write_multimodal_single_section_obs_file(
     adt_n_vars: u64,
     shard_target_rows: u32,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let mut header = sample_header(n_obs as u64, rna_n_vars);
     header.shard_target_rows = shard_target_rows;
@@ -4184,7 +4184,7 @@ fn write_multimodal_sharded_obs_file(
     adt_n_vars: u64,
     obs_shard_rows: usize,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let mut header = sample_header(n_obs as u64, rna_n_vars);
     header.shard_target_rows = obs_shard_rows as u32;

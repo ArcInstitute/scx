@@ -16,11 +16,11 @@ use arrow::array::{Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 
 use scx_ops::{modify_metadata, set_uns, MetadataPatch, OpsError};
 
@@ -31,7 +31,7 @@ use scx_ops::{modify_metadata, set_uns, MetadataPatch, OpsError};
 fn header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -268,7 +268,7 @@ fn set_uns_round_trip_leaves_matrix_untouched() {
 
 #[test]
 fn set_uns_preserves_generations_and_csc_sidecar() {
-    use scx_format::backed::BackedCscReader;
+    use scx_format_io::backed::BackedCscReader;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("csc.scx");

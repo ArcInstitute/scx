@@ -33,10 +33,10 @@ use scx_engine::{
     build_obs_predicate_index_bytes, build_var_predicate_index_bytes, BuildOutcome,
     PredicateIndexBuildOptions,
 };
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
-use scx_format::{BitmapShard, DeletionVectors, FullCatalog, ModalityType, SectionType};
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::{BitmapShard, DeletionVectors, FullCatalog, ModalityType, SectionType};
 use serde::{Deserialize, Serialize};
 
 const SEED: u64 = 0xDEAD_BEEF_CAFE_1234;
@@ -640,8 +640,8 @@ fn generate_v2_bitmap(out: &Path) {
 // =========================================================================
 
 fn extract_catalog_summary(path: &Path) -> Vec<CatalogSummaryEntry> {
-    use scx_format::catalog::FullCatalog;
-    use scx_format::header::HEADER_SIZE;
+    use scx_format_io::catalog::FullCatalog;
+    use scx_format_io::header::HEADER_SIZE;
     let bytes = fs::read(path).unwrap();
     let header = FileHeader::read_from(&mut std::io::Cursor::new(&bytes[..HEADER_SIZE])).unwrap();
     let fc_off = header.full_catalog_offset as usize;
@@ -848,8 +848,8 @@ fn write_sidecar(fixture: &Fixture, dir: &Path) {
             (h, c, csr)
         }
         FixtureKind::Directory => {
-            use scx_format::catalog::FullCatalog;
-            use scx_format::header::HEADER_SIZE;
+            use scx_format_io::catalog::FullCatalog;
+            use scx_format_io::header::HEADER_SIZE;
             let header_bytes = fs::read(scx_path.join("_header.bin")).unwrap();
             let header =
                 FileHeader::read_from(&mut std::io::Cursor::new(&header_bytes[..HEADER_SIZE]))
@@ -1047,7 +1047,7 @@ fn test_conformance_files_header_summary() {
         let actual = match fixture.kind {
             FixtureKind::File => extract_header_summary(&path),
             FixtureKind::Directory => {
-                use scx_format::header::HEADER_SIZE;
+                use scx_format_io::header::HEADER_SIZE;
                 let header_bytes = fs::read(path.join("_header.bin")).unwrap();
                 let header =
                     FileHeader::read_from(&mut std::io::Cursor::new(&header_bytes[..HEADER_SIZE]))
@@ -1177,7 +1177,7 @@ fn test_conformance_files_catalog_summary() {
         let actual = match fixture.kind {
             FixtureKind::File => extract_catalog_summary(&path),
             FixtureKind::Directory => {
-                use scx_format::catalog::FullCatalog;
+                use scx_format_io::catalog::FullCatalog;
                 let catalog_bytes = fs::read(path.join("_catalog.bin")).unwrap();
                 let cat = FullCatalog::read_from(
                     &mut std::io::Cursor::new(&catalog_bytes),

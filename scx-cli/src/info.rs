@@ -4,10 +4,10 @@ use std::path::Path;
 
 use crate::format::human_size;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::catalog::FullCatalog;
-use scx_format::modality::ModalityType;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::modality::ModalityType;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
 
 pub fn run_info(
     path: &Path,
@@ -80,7 +80,7 @@ pub fn run_info(
     // leave the superseded sections behind until `scx compact` reclaims them.
     // This is an estimate: inter-section alignment padding (a few bytes per
     // section) also counts as non-live but is negligible.
-    let live: u64 = scx_format::SECTIONS_START_OFFSET
+    let live: u64 = scx_format_io::SECTIONS_START_OFFSET
         + header.full_catalog_length
         + catalog.entries.iter().map(|e| e.length).sum::<u64>();
     let orphaned = file_size.saturating_sub(live);
@@ -632,7 +632,7 @@ fn fmt_num(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::test_utils::{sample_header, sample_obs, sample_var, write_test_file};
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::writer::ScxWriter;
 
     /// Write a 2-shard file whose shards use different value encodings:
     /// shard 0 `Uint16`, shard 1 `Uint32` (holds 66279, > u16 max).

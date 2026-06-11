@@ -762,11 +762,12 @@ Full benchmark suite in [`docs/performance.md`](docs/performance.md): compressio
 
 ## Architecture
 
-SCX is a Rust workspace with 14 crates:
+SCX is a Rust workspace with 15 crates:
 
 | Crate | Purpose |
 |-------|---------|
-| `scx-format` | File layout, reader/writer, catalog, checksums |
+| `scx-format` | Pure on-disk layout/spec: header, catalog, shard structs, checksums (no I/O) |
+| `scx-format-io` | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars |
 | `scx-codec` | Domain-specific codecs: Rice, FOR-BP, Delta-Golomb, Zstd |
 | `scx-sparse` | CSR matrix type (scipy-compatible) |
 | `scx-ops` | Append, delete, compact, merge, rollback |

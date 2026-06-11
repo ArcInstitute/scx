@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 use hdf5::types::VarLenUnicode;
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 fn vlu(s: &str) -> VarLenUnicode {
     s.parse::<VarLenUnicode>().expect("valid VarLenUnicode")

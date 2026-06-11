@@ -24,7 +24,7 @@
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
-use scx_format::{ColumnShardSource, ShardSource};
+use scx_format_io::{ColumnShardSource, ShardSource};
 
 use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
 use crate::device::GpuDevice;
@@ -611,7 +611,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }
@@ -974,7 +974,7 @@ mod tests {
         n_vars: usize,
     }
 
-    impl scx_format::ColumnShardSource for InMemCscSource {
+    impl scx_format_io::ColumnShardSource for InMemCscSource {
         fn n_csc_shards(&self) -> usize {
             self.shards.len()
         }
@@ -984,10 +984,10 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_csc_shard(&self, i: usize) -> scx_format::Result<ScxCsc> {
+        fn read_csc_shard(&self, i: usize) -> scx_format_io::Result<ScxCsc> {
             Ok(self.shards[i].clone())
         }
-        fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> scx_format::Result<ScxCsc> {
+        fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> scx_format_io::Result<ScxCsc> {
             unimplemented!("HVG CSC reduce only calls read_csc_shard")
         }
         fn csc_shard_col_range(&self, i: usize) -> Option<(u32, u32)> {

@@ -24,16 +24,16 @@ use arrow::array::{DictionaryArray, Float32Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 
 fn header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -1811,7 +1811,7 @@ fn write_multimodal_with_per_modality_obsm(
     donor: &str,
     rna_obsm_shard_rows: u64,
 ) {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
     writer
         .write_obs(&obs_batch(0, n_obs as usize, donor))

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use arrow::array::{Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::shard::SHARD_HEADER_SIZE;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::shard::SHARD_HEADER_SIZE;
+use scx_format_io::writer::ScxWriter;
 
 // ---------------------------------------------------------------------------
 // Test helpers (mirrored from scx-format reader tests)
@@ -17,7 +17,7 @@ use scx_format::writer::ScxWriter;
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -170,14 +170,14 @@ fn test_info_runs_on_valid_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "info_test.scx", 6, 10, 2, true);
 
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     let header = reader.header();
 
     // Basic assertions on what info would display
     assert_eq!(header.n_obs, 6);
     assert_eq!(header.n_vars, 10);
     assert_eq!(header.nnz, 12);
-    assert_eq!(header.format_version, scx_format::CURRENT_FORMAT_VERSION);
+    assert_eq!(header.format_version, scx_format_io::CURRENT_FORMAT_VERSION);
     assert_eq!(header.n_csr_shards, 2);
 
     let catalog = reader.catalog();
@@ -194,13 +194,13 @@ fn test_validate_passes_clean_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "valid.scx", 6, 10, 2, true);
 
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     let catalog = reader.catalog();
 
     // Manually validate all checksums (same logic as validate command)
     for entry in &catalog.entries {
         let bytes = reader.section_bytes(entry).unwrap();
-        let computed = scx_format::blake3_hash(bytes);
+        let computed = scx_format_io::blake3_hash(bytes);
         assert_eq!(
             computed, entry.checksum,
             "checksum mismatch for section '{}'",
@@ -216,7 +216,7 @@ fn test_validate_detects_corruption() {
     let path = write_test_file(&dir, "corrupt.scx", 6, 10, 2, false);
 
     // Corrupt a byte in a CSR shard
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     let shards = reader.catalog().shards_sorted();
     let shard_offset = shards[0].offset as usize;
     let corrupt_pos = shard_offset + SHARD_HEADER_SIZE + 1;
@@ -227,13 +227,13 @@ fn test_validate_detects_corruption() {
     std::fs::write(&path, &data).unwrap();
 
     // Re-open and check: at least one section should fail
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     let catalog = reader.catalog();
 
     let mut any_failed = false;
     for entry in &catalog.entries {
         let bytes = reader.section_bytes(entry).unwrap();
-        let computed = scx_format::blake3_hash(bytes);
+        let computed = scx_format_io::blake3_hash(bytes);
         if computed != entry.checksum {
             any_failed = true;
         }
@@ -247,7 +247,7 @@ fn test_info_minimal_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "minimal.scx", 4, 8, 1, false);
 
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 4);
     assert_eq!(reader.n_vars(), 8);
     assert_eq!(reader.header().n_csr_shards, 1);
@@ -291,7 +291,7 @@ fn test_cli_info_subcommand() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(&format!("SCX v{}", scx_format::CURRENT_FORMAT_VERSION)));
+    assert!(stdout.contains(&format!("SCX v{}", scx_format_io::CURRENT_FORMAT_VERSION)));
     assert!(stdout.contains("6 cells"));
     assert!(stdout.contains("10 genes"));
 }
@@ -323,7 +323,7 @@ fn test_cli_validate_fails_on_corruption() {
     let path = write_test_file(&dir, "cli_corrupt.scx", 6, 10, 2, false);
 
     // Corrupt
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     let shards = reader.catalog().shards_sorted();
     let corrupt_pos = shards[0].offset as usize + SHARD_HEADER_SIZE + 1;
     drop(reader);

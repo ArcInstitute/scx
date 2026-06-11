@@ -11,7 +11,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-scx-format = { path = ".." }
+# This fuzz crate stays physically under `scx-format/fuzz/` so the CI
+# `working-directory` in .github/workflows/fuzz.yml is unchanged, but it depends
+# on `scx-format-io`: most targets exercise runtime decode paths (e.g.
+# `decode_shard_bytes`, `BitmapShard`) that moved there in the T5.5 split. The
+# layout-only targets (`fuzz_header`/`fuzz_modality_table`/`fuzz_provenance`)
+# reach the pure `scx-format` parse paths via its `pub use scx_format::*` glob.
+scx-format-io = { path = "../../scx-format-io" }
 
 [[bin]]
 name = "fuzz_header"

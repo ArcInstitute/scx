@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use object_store::ObjectStore;
 
-use scx_format::catalog::FullCatalog;
-use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
 
 use crate::error::{CloudError, Result};
 use crate::explode::section_name_to_path;
@@ -173,9 +173,9 @@ pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<Pus
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_format::header::MAGIC;
-    use scx_format::reader::ScxReader;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::MAGIC;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -185,7 +185,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

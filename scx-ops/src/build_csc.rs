@@ -4,10 +4,10 @@ use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::FileHeader;
-use scx_format::writer::ScxWriter;
-use scx_format::MemoryBudget;
-use scx_format::ScxReader;
+use scx_format_io::header::FileHeader;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::MemoryBudget;
+use scx_format_io::ScxReader;
 
 use crate::rewrite_helpers;
 
@@ -148,7 +148,7 @@ pub fn run_build_csc(
     //     iterator chunk becomes one CSC shard; col_start is read from
     //     the iterator *before* advancing to the next chunk.
     //
-    //     NOTE: this is the inline twin of `scx_format::csc_sidecar::write_csc_sidecar`
+    //     NOTE: this is the inline twin of `scx_format_io::csc_sidecar::write_csc_sidecar`
     //     (the shared helper the convert/pyscx/rscx paths use). It stays inline
     //     here because it drives a progress bar per chunk; keep the encode +
     //     write_csc_shard logic in sync with that helper.
@@ -294,7 +294,7 @@ mod tests {
             .catalog()
             .entries
             .iter()
-            .filter(|e| e.section_type == scx_format::section::SectionType::CscShard)
+            .filter(|e| e.section_type == scx_format_io::section::SectionType::CscShard)
             .collect();
         assert_eq!(csc_entries.len(), 1, "should have exactly 1 CSC shard");
 
@@ -416,8 +416,8 @@ mod tests {
         let data = std::fs::read(&output).unwrap();
         for entry in &csc_entries {
             let section = &data[entry.offset as usize..][..entry.length as usize];
-            let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::shard::SHARD_HEADER_SIZE],
+            let sh = scx_format_io::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format_io::shard::SHARD_HEADER_SIZE],
             ))
             .unwrap();
             assert_eq!(sh.shard_type, 1);

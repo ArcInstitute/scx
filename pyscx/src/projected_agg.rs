@@ -8,9 +8,9 @@
 // which cannot depend on each other.
 
 use scx_engine::projection::project_csr;
-use scx_format::BackedCsrReader;
+use scx_format_io::BackedCsrReader;
 
-type Result<T> = std::result::Result<T, scx_format::ScxError>;
+type Result<T> = std::result::Result<T, scx_format_io::ScxError>;
 
 // ---------------------------------------------------------------------------
 // Column-axis aggregation (axis=0), projected
@@ -545,7 +545,7 @@ pub fn col_var_masked_projected(
 // requested columns, no per-shard CSR decode + project_csr round trip.
 // ---------------------------------------------------------------------------
 
-use scx_format::ColumnShardSource;
+use scx_format_io::ColumnShardSource;
 
 /// Helper: walk `col_indices` in sorted contiguous-run order, calling
 /// `f(local_col_in_run, output_col_idx, csc_run)` for each output

@@ -18,10 +18,10 @@
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use scx_format::catalog::FullCatalog;
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::modality::{ModalityTable, ModalityType};
-use scx_format::section::{write_alignment_padding, SectionType};
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::modality::{ModalityTable, ModalityType};
+use scx_format_io::section::{write_alignment_padding, SectionType};
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -87,13 +87,13 @@ pub(crate) fn prepare_in_place(
 
     if modality_id != 0 {
         let table = modality_table.as_ref().ok_or_else(|| {
-            OpsError::Format(scx_format::ScxError::InvalidCatalog(format!(
+            OpsError::Format(scx_format_io::ScxError::InvalidCatalog(format!(
                 "in-place op: target file has no modality table but modality_id={modality_id} \
                  was requested"
             )))
         })?;
         if (modality_id as usize) > table.len() {
-            return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+            return Err(OpsError::Format(scx_format_io::ScxError::InvalidCatalog(
                 format!(
                     "in-place op: modality_id={modality_id} out of range (file has {} modalities)",
                     table.len()
@@ -122,7 +122,7 @@ pub(crate) fn prepare_in_place(
     };
 
     if target_n_vars > u32::MAX as u64 {
-        return Err(OpsError::Format(scx_format::ScxError::NVarsOverflow(
+        return Err(OpsError::Format(scx_format_io::ScxError::NVarsOverflow(
             target_n_vars,
         )));
     }

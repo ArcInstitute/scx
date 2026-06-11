@@ -299,7 +299,7 @@ fn extract_single_column(
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
             // String → categorical via unique-value indexing. The
-            // opportunistic downcast in `scx_format::arrow_compat` may
+            // opportunistic downcast in `scx_format_io::arrow_compat` may
             // surface obs as either `Utf8` (StringArray, i32 offsets)
             // or `LargeUtf8` (LargeStringArray, i64 offsets) on >2 GB
             // single-column metadata. Both array types share the same
@@ -339,7 +339,7 @@ fn extract_single_column(
         }
         DataType::Dictionary(key_type, _value_type) => {
             // Arrow dictionary encoding → Categorical.
-            // Values may be `Utf8` or `LargeUtf8` (`scx_format::arrow_compat`
+            // Values may be `Utf8` or `LargeUtf8` (`scx_format_io::arrow_compat`
             // opportunistic downcast surfaces wide types when offsets
             // overflow). Keys come in the usual signed/unsigned int spread.
             fn dict_categories(values: &dyn Array, col_name: &str) -> Result<Vec<String>> {
@@ -868,7 +868,7 @@ mod tests {
     fn test_extract_large_utf8_column_decodes_as_categorical() {
         // Mirrors `test_extract_categorical_column` but the obs column is
         // `LargeUtf8` (i64 offsets) — the in-memory shape that
-        // `scx_format::arrow_compat::downcast_large_types` surfaces when
+        // `scx_format_io::arrow_compat::downcast_large_types` surfaces when
         // a >2 GB obs column does not fit back in i32 offsets. Without
         // the LargeUtf8 arm in `extract_single_column`, this would error
         // out as "unsupported data type".

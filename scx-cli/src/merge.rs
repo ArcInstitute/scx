@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 use scx_ops::{MergeOptions, UnsPolicy};
 
 use crate::index_warnings::emit_index_summary;

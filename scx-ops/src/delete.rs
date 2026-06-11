@@ -3,12 +3,12 @@
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use scx_format::catalog::{FullCatalog, FullCatalogEntry};
-use scx_format::checksum::blake3_hash;
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::provenance::{Provenance, ProvenanceEntry};
-use scx_format::section::{write_alignment_padding, SectionType};
-use scx_format::DeletionVectors;
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
+use scx_format_io::checksum::blake3_hash;
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::provenance::{Provenance, ProvenanceEntry};
+use scx_format_io::section::{write_alignment_padding, SectionType};
+use scx_format_io::DeletionVectors;
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -195,7 +195,7 @@ pub fn mark_deleted(path: &Path, cell_indices: &[u64]) -> Result<u64> {
 
     let new_manifest_sequence = header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
-        catalog_version: scx_format::CURRENT_CATALOG_VERSION,
+        catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
         manifest_sequence: new_manifest_sequence,
         prev_catalog_offset: old_catalog_offset,
         n_obs: header.n_obs,

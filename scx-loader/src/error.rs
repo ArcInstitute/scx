@@ -13,7 +13,7 @@ pub enum LoaderError {
 
     /// Propagated from scx-format.
     #[error(transparent)]
-    FormatError(#[from] scx_format::error::ScxError),
+    FormatError(#[from] scx_format_io::error::ScxError),
 
     /// Propagated from Arrow.
     #[error(transparent)]

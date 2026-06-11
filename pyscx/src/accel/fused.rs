@@ -26,7 +26,7 @@ use crate::lazy_transform::ScxLazyTransformedDataset;
 #[cfg(feature = "gpu")]
 use pyo3::exceptions::PyRuntimeError;
 #[cfg(feature = "gpu")]
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 /// GPU PCA → kNN in one call, with the embedding kept device-resident.
 ///

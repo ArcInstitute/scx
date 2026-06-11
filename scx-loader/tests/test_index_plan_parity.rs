@@ -15,7 +15,7 @@
 mod common;
 
 use common::write_multi_shard_fixture;
-use scx_format::{BackedCsrReader, ScxReader};
+use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_loader::{
     fused_normalize_log1p_dense, scatter_row_full, HvgProjection, IndexPlanLoader, LoaderConfig,
 };

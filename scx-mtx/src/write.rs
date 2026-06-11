@@ -12,7 +12,7 @@ use arrow::array::{Array, AsArray};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 use crate::error::MtxError;
 

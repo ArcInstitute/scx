@@ -24,10 +24,10 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use proptest::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 use scx_ops::AppendOptions;
 
 // =========================================================================

@@ -16,9 +16,9 @@ use futures::stream::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 
-use scx_format::catalog::{FullCatalog, FullCatalogEntry};
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::section::SectionType;
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::section::SectionType;
 
 use crate::backend::CloudLocation;
 use crate::error::{CloudError, Result};
@@ -184,10 +184,10 @@ impl CloudReader {
     /// Transparently handles both layouts: assembles every
     /// [`SectionType::ObsMetadataShard`] section in `shard_idx` order on
     /// Phase 2 sharded files (parallel range reads → shared
-    /// [`scx_format::assemble_sharded_metadata`]), or reads the single
+    /// [`scx_format_io::assemble_sharded_metadata`]), or reads the single
     /// legacy [`SectionType::ObsMetadata`] section otherwise. Bypasses
     /// `ScxReader::read_arrow_ipc`, so applies
-    /// `scx_format::downcast_large_types` explicitly to surface the
+    /// `scx_format_io::downcast_large_types` explicitly to surface the
     /// canonical narrow `Utf8` / `Binary` types regardless of the
     /// on-disk encoding.
     pub async fn read_obs(&self) -> Result<RecordBatch> {
@@ -209,9 +209,9 @@ impl CloudReader {
                 .await;
         }
         let obs_data = self.read_metadata_section("obs").await?;
-        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
-            &obs_data, "obs",
-        )?)?)
+        Ok(scx_format_io::downcast_large_types(
+            &decode_arrow_ipc_batch(&obs_data, "obs")?,
+        )?)
     }
 
     /// Read one obs metadata row-shard by index, decoded and narrowed to
@@ -229,10 +229,9 @@ impl CloudReader {
             .find(|e| e.section_type == SectionType::ObsMetadataShard && e.name == name)
             .ok_or_else(|| CloudError::SectionNotFound(name.clone()))?;
         let bytes = self.read_section_for_entry(entry).await?;
-        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
-            &bytes,
-            "obs_metadata",
-        )?)?)
+        Ok(scx_format_io::downcast_large_types(
+            &decode_arrow_ipc_batch(&bytes, "obs_metadata")?,
+        )?)
     }
 
     /// Read var metadata as an Arrow RecordBatch. Mirror of
@@ -257,15 +256,15 @@ impl CloudReader {
                 .await;
         }
         let var_data = self.read_metadata_section("var").await?;
-        Ok(scx_format::downcast_large_types(&decode_arrow_ipc_batch(
-            &var_data, "var",
-        )?)?)
+        Ok(scx_format_io::downcast_large_types(
+            &decode_arrow_ipc_batch(&var_data, "var")?,
+        )?)
     }
 
     /// Fetch every metadata shard of `shard_type` whose name starts with
     /// `prefix` (e.g. `"obs_metadata/shard_"`), decode each Arrow IPC
     /// batch **without** downcast, and assemble into one logical batch
-    /// via [`scx_format::assemble_sharded_metadata`] — the same
+    /// via [`scx_format_io::assemble_sharded_metadata`] — the same
     /// upcast → cover-validation → concat → downcast pipeline the local
     /// `ScxReader` uses, so the cloud and local read paths return
     /// byte-identical batches. Shard reads are issued concurrently, capped
@@ -302,7 +301,10 @@ impl CloudReader {
             .try_collect()
             .await?;
 
-        Ok(scx_format::assemble_sharded_metadata(logical, raw_batches)?)
+        Ok(scx_format_io::assemble_sharded_metadata(
+            logical,
+            raw_batches,
+        )?)
     }
 
     /// Read multiple shard sections in parallel.
@@ -390,7 +392,7 @@ impl CloudReader {
     }
 
     /// Deletion vectors, if present in the file.
-    pub async fn read_deletion_vectors(&self) -> Result<Option<scx_format::DeletionVectors>> {
+    pub async fn read_deletion_vectors(&self) -> Result<Option<scx_format_io::DeletionVectors>> {
         if !self.header.has_deletion_vectors() {
             return Ok(None);
         }
@@ -405,7 +407,7 @@ impl CloudReader {
             None => return Ok(None),
         };
         let bytes = self.read_section_for_entry(&entry).await?;
-        let dv = scx_format::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
+        let dv = scx_format_io::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
             .map_err(CloudError::from)?;
         Ok(Some(dv))
     }
@@ -413,7 +415,7 @@ impl CloudReader {
 
 /// Decode just the schema from an Arrow IPC file's footer.
 ///
-/// Delegates to [`scx_format::downcast_large_types_schema`] so the
+/// Delegates to [`scx_format_io::downcast_large_types_schema`] so the
 /// schema matches what `ScxReader::read_obs_schema` returns even when
 /// the on-disk Arrow IPC encodes `LargeUtf8` / `LargeBinary` or
 /// `Dictionary(_, Large*)`. (Local fast path preserves narrow types as
@@ -596,15 +598,15 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::MAGIC;
-    use scx_format::section::SectionType;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::MAGIC;
+    use scx_format_io::section::SectionType;
+    use scx_format_io::writer::ScxWriter;
     use std::sync::Arc as StdArc;
 
     fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

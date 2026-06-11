@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use scx_format::BackedCsrReader;
+use scx_format_io::BackedCsrReader;
 
 use super::*;
 

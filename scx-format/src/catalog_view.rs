@@ -9,8 +9,8 @@
 //! are the major-axis range and `nnz`; for layer prefix filtering the
 //! name is needed, but for ordinary X-shard construction it is not.
 //!
-//! `CatalogView` integrates with `BackedCsrReader::new*` (see
-//! [`crate::backed`]); see [`crate::catalog::FullCatalog`] for the
+//! `CatalogView` integrates with `BackedCsrReader::new*` (in the
+//! `scx-format-io` crate); see [`crate::catalog::FullCatalog`] for the
 //! full eagerly-parsed representation used by validation, mutation,
 //! and `scx-engine` predicate pushdown. The `from_full` constructor
 //! is exposed primarily for tests and for callers that hold a

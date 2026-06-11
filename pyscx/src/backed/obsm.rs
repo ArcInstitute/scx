@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
-use scx_format::BackedDenseReader;
+use scx_format_io::BackedDenseReader;
 
 use crate::convert::obsm_batch_to_numpy;
 

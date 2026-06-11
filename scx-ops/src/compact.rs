@@ -8,12 +8,12 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
 };
-use scx_format::codec_select::select_codec;
-use scx_format::header::FileHeader;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::codec_select::select_codec;
+use scx_format_io::header::FileHeader;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 
 use crate::error::Result;
 use crate::flock::SharedFileLock;
@@ -191,7 +191,10 @@ pub fn compact_with_index_options(
     // without re-canonicalizing, so it can only claim v3 if the input already
     // guarantees the canonical invariant (floor 1 — single-modality compact).
     let out_header = FileHeader {
-        format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 1),
+        format_version: scx_format_io::rewrite_output_format_version(
+            &[in_header.format_version],
+            1,
+        ),
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars,
@@ -228,8 +231,8 @@ pub fn compact_with_index_options(
     let value_encoding = {
         if !shards.is_empty() {
             let section = reader.section_bytes(shards[0])?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
+            let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format_io::SHARD_HEADER_SIZE],
             ))?;
             ValueEncoding::from_u8(sh.value_encoding).ok_or(
                 crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
@@ -346,7 +349,7 @@ pub fn compact_with_index_options(
     for layer_name in &layer_names {
         // Determine this layer's value encoding from its first shard header
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader
+        let layer_shard_entries: Vec<&scx_format_io::FullCatalogEntry> = reader
             .catalog()
             .entries
             .iter()
@@ -356,8 +359,8 @@ pub fn compact_with_index_options(
             .collect();
         let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
             let section = reader.section_bytes(first_entry)?;
-            let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::SHARD_HEADER_SIZE],
+            let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format_io::SHARD_HEADER_SIZE],
             ))?;
             ValueEncoding::from_u8(sh.value_encoding).ok_or(
                 crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
@@ -882,7 +885,7 @@ fn compact_multimodal(
     let table = reader
         .modality_table()
         .ok_or_else(|| {
-            scx_format::ScxError::InvalidCatalog(
+            scx_format_io::ScxError::InvalidCatalog(
                 "compact_multimodal: file has no modality table".to_string(),
             )
         })?
@@ -908,7 +911,10 @@ fn compact_multimodal(
     // Multimodal compact: gate the v3 claim on the input version (floor 2).
     // The modality table + n_modalities are stamped onto the header later.
     let out_header = FileHeader {
-        format_version: scx_format::rewrite_output_format_version(&[in_header.format_version], 2),
+        format_version: scx_format_io::rewrite_output_format_version(
+            &[in_header.format_version],
+            2,
+        ),
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars: max_n_vars,
@@ -963,8 +969,8 @@ fn compact_multimodal(
             let entries = reader.catalog().csr_shards_for_modality(in_modality_id);
             if let Some(first) = entries.first() {
                 let section = reader.section_bytes(first)?;
-                let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                    &section[..scx_format::SHARD_HEADER_SIZE],
+                let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
+                    &section[..scx_format_io::SHARD_HEADER_SIZE],
                 ))?;
                 ValueEncoding::from_u8(sh.value_encoding).ok_or(
                     crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
@@ -1131,8 +1137,8 @@ fn compact_multimodal(
                     .layer_csr_shards_for_modality(in_modality_id, &layer_name);
                 if let Some(first) = shards.first() {
                     let section = reader.section_bytes(first)?;
-                    let sh = scx_format::ShardHeader::read_from(&mut std::io::Cursor::new(
-                        &section[..scx_format::SHARD_HEADER_SIZE],
+                    let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
+                        &section[..scx_format_io::SHARD_HEADER_SIZE],
                     ))?;
                     ValueEncoding::from_u8(sh.value_encoding).ok_or(
                         crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
@@ -1310,8 +1316,8 @@ fn compact_multimodal(
 /// Build a keep mask based on deletion vectors.
 fn build_keep_mask(
     n_obs: usize,
-    dv: &Option<scx_format::DeletionVectors>,
-    catalog: &scx_format::FullCatalog,
+    dv: &Option<scx_format_io::DeletionVectors>,
+    catalog: &scx_format_io::FullCatalog,
 ) -> Option<Vec<bool>> {
     let dv = dv.as_ref()?;
     if dv.total_deleted() == 0 {
@@ -1351,8 +1357,8 @@ mod streaming_tests {
 
     fn test_header(n_obs: u64) -> FileHeader {
         FileHeader {
-            magic: scx_format::MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            magic: scx_format_io::MAGIC,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

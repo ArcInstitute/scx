@@ -25,7 +25,7 @@ use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
-use scx_format::CacheMetrics;
+use scx_format_io::CacheMetrics;
 
 use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
@@ -375,7 +375,7 @@ impl MultimodalTrainingDataset {
         seed: Option<u64>,
         max_memory_mb: Option<usize>,
     ) -> PyResult<Self> {
-        use scx_format::ScxReader;
+        use scx_format_io::ScxReader;
         if modalities.is_empty() {
             return Err(PyRuntimeError::new_err(
                 "MultimodalTrainingDataset: `modalities` must contain at least one name",
@@ -1164,7 +1164,7 @@ fn resolve_modality_id_with_warning(
     path: &str,
     modality: Option<&str>,
 ) -> PyResult<Option<u8>> {
-    use scx_format::ScxReader;
+    use scx_format_io::ScxReader;
     let reader = ScxReader::open(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     if !reader.is_multimodal() {

@@ -20,7 +20,7 @@
 
 use cudarc::cublas::sys as cbs;
 use cudarc::driver::safe::CudaSlice;
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use crate::cublas::{gpu_sgemm, gpu_sgemv, gpu_sger, CublasHandle};
 use crate::cusparse::{
@@ -383,7 +383,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }

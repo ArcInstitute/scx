@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use std::collections::HashSet;
 
-use scx_format::ScxReader;
+use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
 
@@ -1057,7 +1057,7 @@ pub(crate) fn read_uns_as_pyobject<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     let json_val = match reader.read_uns() {
         Ok(v) => v,
-        Err(scx_format::ScxError::SectionNotFound(_)) => return Ok(None),
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => return Ok(None),
         Err(e) => return Err(to_pyerr(e)),
     };
     let mut ctx = UnsReadCtx::new(py)?;

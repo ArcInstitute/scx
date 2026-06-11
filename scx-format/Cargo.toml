@@ -2,35 +2,21 @@
 name = "scx-format"
 version = "0.7.1"
 edition = "2021"
-description = "File layout, header, catalog, and shard I/O for SCX format"
+description = "On-disk layout/spec for the SCX format: header, catalog, shard structs, modality, codec selection (pure, no I/O)"
 license.workspace = true
 authors.workspace = true
 
-[features]
-default = ["parallel", "deletion-vectors"]
-parallel = ["rayon"]
-deletion-vectors = ["roaring"]
-
 [dependencies]
-rayon = { workspace = true, optional = true }
 blake3 = { workspace = true }
 arrow = { workspace = true }
-zstd = { workspace = true }
-memmap2 = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-roaring = { workspace = true, optional = true }
 half = { workspace = true }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
-lru = { workspace = true }
-tempfile = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -38,8 +24,4 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "catalog_parse"
-harness = false
-
-[[bench]]
-name = "sidecar_decode"
 harness = false

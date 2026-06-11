@@ -17,9 +17,9 @@ use std::sync::Arc;
 use arrow::array::{AsArray, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

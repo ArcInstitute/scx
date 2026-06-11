@@ -2138,7 +2138,7 @@ pub struct ConversionPredicateIndexResult {
 /// exists to keep a forced/preset column from blowing up the index;
 /// auto-detect uses `options.index_auto_threshold` (default 1000).
 pub fn build_and_write_conversion_predicate_indexes(
-    writer: &mut scx_format::ScxWriter,
+    writer: &mut scx_format_io::ScxWriter,
     obs: &arrow::array::RecordBatch,
     var: &arrow::array::RecordBatch,
     obs_row_ranges: &[(u64, u64)],
@@ -2176,7 +2176,7 @@ pub fn build_and_write_conversion_predicate_indexes(
 /// rarely overflows the 2 GB ceiling and the var predicate-index
 /// path does not benefit meaningfully from shard streaming today.
 pub fn build_and_write_conversion_predicate_indexes_streaming(
-    writer: &mut scx_format::ScxWriter,
+    writer: &mut scx_format_io::ScxWriter,
     obs_schema: arrow::datatypes::SchemaRef,
     obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
     var: &arrow::array::RecordBatch,
@@ -2196,7 +2196,7 @@ pub fn build_and_write_conversion_predicate_indexes_streaming(
 }
 
 fn streaming_impl(
-    writer: &mut scx_format::ScxWriter,
+    writer: &mut scx_format_io::ScxWriter,
     obs_schema: arrow::datatypes::SchemaRef,
     obs_shards: impl IntoIterator<Item = Result<(arrow::array::RecordBatch, u64)>>,
     var: &arrow::array::RecordBatch,
@@ -2299,13 +2299,13 @@ fn streaming_impl(
 pub fn derive_shard_column_stats(
     index: &PredicateIndex,
     n_shards: usize,
-) -> Vec<Vec<scx_format::catalog::ColumnStat>> {
-    use scx_format::catalog::ColumnStat;
+) -> Vec<Vec<scx_format_io::catalog::ColumnStat>> {
+    use scx_format_io::catalog::ColumnStat;
     let mut per_shard: Vec<Vec<ColumnStat>> = vec![Vec::new(); n_shards];
     for column in &index.columns {
         match column {
             IndexedColumn::Categorical(cat) => {
-                let hash = scx_format::column_name_hash(&cat.column_name);
+                let hash = scx_format_io::column_name_hash(&cat.column_name);
                 let n_values = cat.entries.len();
                 let n_bytes = n_values.div_ceil(8);
                 let mut bitsets: Vec<Vec<u8>> = vec![vec![0u8; n_bytes]; n_shards];
@@ -2330,7 +2330,7 @@ pub fn derive_shard_column_stats(
                 }
             }
             IndexedColumn::Numeric(num) => {
-                let hash = scx_format::column_name_hash(&num.column_name);
+                let hash = scx_format_io::column_name_hash(&num.column_name);
                 let mut minmax: Vec<Option<(f64, f64)>> = vec![None; n_shards];
                 for page in &num.leaf_pages {
                     for entry in &page.entries {
@@ -2370,7 +2370,7 @@ pub fn derive_shard_column_stats(
 /// `shard_row_ranges` the index was built with. Called after
 /// `write_obs_predicate_index` in every fresh-writer build path.
 pub fn apply_obs_shard_column_stats(
-    writer: &mut scx_format::ScxWriter,
+    writer: &mut scx_format_io::ScxWriter,
     obs_index_bytes: &[u8],
     n_shards: usize,
 ) -> Result<()> {

@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-scx-format = { path = "../scx-format", features = ["deletion-vectors"] }
+scx-format-io = { path = "../scx-format-io", features = ["deletion-vectors"] }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-engine = { path = "../scx-engine" }

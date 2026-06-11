@@ -6,8 +6,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use std::sync::Arc;
 
-use scx_format::section::SectionType;
-use scx_format::ScxReader;
+use scx_format_io::section::SectionType;
+use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
 
@@ -20,14 +20,14 @@ use super::*;
 pub fn build_backed_anndata_for_modality<'py>(
     py: Python<'py>,
     path: &std::path::Path,
-    shared_catalog: &Arc<scx_format::FullCatalog>,
+    shared_catalog: &Arc<scx_format_io::FullCatalog>,
     modality_id: u8,
     modality_name: &str,
     cache_shards: usize,
     obs_df: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::ScxBackedSparseDataset;
-    use scx_format::BackedCsrReader;
+    use scx_format_io::BackedCsrReader;
 
     let anndata_mod = py.import("anndata")?;
 
@@ -55,7 +55,7 @@ pub fn build_backed_anndata_for_modality<'py>(
         let csc_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(shared_catalog))
             .map_err(to_pyerr)?;
         Some(Arc::new(
-            scx_format::BackedCscReader::for_modality(csc_reader, modality_id, cache_shards)
+            scx_format_io::BackedCscReader::for_modality(csc_reader, modality_id, cache_shards)
                 .map_err(to_pyerr)?,
         ))
     } else {
@@ -133,7 +133,7 @@ pub fn to_anndata_backed_for_modality<'py>(
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 

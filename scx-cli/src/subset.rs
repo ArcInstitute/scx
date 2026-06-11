@@ -4,10 +4,10 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use scx_engine::QueryPipeline;
-use scx_format::header::FileHeader;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::FileHeader;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_subset(
@@ -315,7 +315,7 @@ fn resolve_gene_names(
 }
 
 /// Write an in-memory CSR matrix to `writer` as row-major shards, routing
-/// each shard through the shared [`scx_format::encode_one_shard`] path that
+/// each shard through the shared [`scx_format_io::encode_one_shard`] path that
 /// `scx convert` and pyscx use.
 ///
 /// Value encoding (uint8/uint16/uint32/float32) is auto-detected **per shard**
@@ -333,7 +333,7 @@ fn write_csr_shards_auto(
     shard_size: u32,
     index_dtype: u8,
     explicit_codec: Option<scx_codec::CodecId>,
-    modality_type: scx_format::ModalityType,
+    modality_type: scx_format_io::ModalityType,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_target = shard_size as usize;
     debug_assert!(shard_target > 0, "shard_size must be greater than 0");
@@ -364,7 +364,7 @@ fn write_csr_shards_auto(
             .collect();
         let shard_values = &data[idx_start..idx_end];
 
-        let pre = scx_format::encode_one_shard(
+        let pre = scx_format_io::encode_one_shard(
             &shard_indptr,
             &shard_indices,
             shard_values,
@@ -455,7 +455,7 @@ fn extract_modality(
     if let Some(uns_data) = &uns {
         writer.write_uns(uns_data)?;
     }
-    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -672,7 +672,7 @@ fn extract_modality_with_filter(
         "filter": filter,
         "n_genes": gene_indices.as_ref().map(|g| g.len()),
     });
-    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -730,7 +730,7 @@ fn write_subset_scx(
         shard_size,
         index_dtype,
         explicit_codec,
-        scx_format::ModalityType::Rna,
+        scx_format_io::ModalityType::Rna,
     )?;
 
     // Write uns if present in the input file
@@ -752,7 +752,7 @@ fn write_subset_scx(
     params.push('}');
 
     // Write provenance
-    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1086,7 +1086,7 @@ mod tests {
         rna_uns: Option<serde_json::Value>,
     ) -> std::path::PathBuf {
         use crate::test_utils::{sample_obs, sample_var};
-        use scx_format::modality::ModalityType;
+        use scx_format_io::modality::ModalityType;
 
         let path = dir.path().join("multimodal_uns.scx");
         // header.n_vars = max across modalities = 5.

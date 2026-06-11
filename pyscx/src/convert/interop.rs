@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::sync::Arc;
 
-use scx_format::ScxReader;
+use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
 
@@ -19,22 +19,22 @@ use super::*;
 ///
 /// Upcasts `Utf8 → LargeUtf8` so the in-memory IPC buffer doesn't
 /// overflow Arrow's 32-bit offset limit on multi-million-cell obs
-/// (see [`scx_format::arrow_compat`]). pyarrow handles `LargeUtf8`
+/// (see [`scx_format_io::arrow_compat`]). pyarrow handles `LargeUtf8`
 /// natively and pandas conversion via `to_pandas()` produces the same
 /// `object` dtype either way.
 pub(crate) fn record_batch_to_pyarrow<'py>(
     py: Python<'py>,
     batch: &RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let batch = scx_format::upcast_to_large_types(batch)
+    let batch = scx_format_io::upcast_to_large_types(batch)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     // Defensive: stamp pandas `index_columns` metadata if the schema
     // carries a literal `__index_level_0__` / `_index` column without
     // it. anndata 0.10+ hard-rejects `_index` as a regular DataFrame
     // column on `write_h5ad`, so this prevents `_index` from leaking
     // into `df.columns` regardless of how the underlying SCX was
-    // written. See `scx_format::ensure_pandas_index_metadata` doc.
-    let batch = scx_format::ensure_pandas_index_metadata(&batch);
+    // written. See `scx_format_io::ensure_pandas_index_metadata` doc.
+    let batch = scx_format_io::ensure_pandas_index_metadata(&batch);
     // Serialize to Arrow IPC file format
     let mut buf = Vec::new();
     {
@@ -68,7 +68,7 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ///   `boolean`, `Categorical`, …) from the envelope.
 /// - **Minimal envelope** `{"index_columns": [...]}` (stamped by
 ///   `scx-convert/src/h5ad_read.rs::read_dataframe_group` and
-///   `scx_format::ensure_pandas_index_metadata`) → `Table.to_pandas()`
+///   `scx_format_io::ensure_pandas_index_metadata`) → `Table.to_pandas()`
 ///   KeyErrors on the missing `columns` field, so strip the `pandas`
 ///   key first, then `set_index(drop=True, inplace=True)` manually.
 ///   The `__index_level_0__` sentinel becomes `df.index.name = None`
@@ -191,7 +191,7 @@ pub(crate) struct EnvelopeInfo {
     index_col: String,
     /// `true` when the envelope is the bare `{"index_columns": [...]}`
     /// shape stamped by `scx-convert/src/h5ad_read.rs` and
-    /// `scx_format::ensure_pandas_index_metadata`. `false` when the
+    /// `scx_format_io::ensure_pandas_index_metadata`. `false` when the
     /// envelope is the full pyarrow shape stamped by
     /// `pyarrow.Table.from_pandas` (carries `columns`,
     /// `column_indexes`, `pandas_version`, `creator`).
@@ -402,7 +402,9 @@ pub(crate) fn read_obsm_selected(
     match filter {
         None => match reader.read_all_obsm() {
             Ok(map) => Ok(map),
-            Err(scx_format::ScxError::SectionNotFound(_)) => Ok(std::collections::HashMap::new()),
+            Err(scx_format_io::ScxError::SectionNotFound(_)) => {
+                Ok(std::collections::HashMap::new())
+            }
             Err(e) => Err(to_pyerr(e)),
         },
         Some(keys) => {

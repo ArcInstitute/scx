@@ -23,8 +23,8 @@ use cudarc::driver::safe::LaunchConfig;
 use cudarc::driver::PushKernelArg;
 use faer::Mat;
 
-use scx_format::total_variance_from_col_sq;
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
+use scx_sparse::total_variance_from_col_sq;
 
 use crate::cublas::{gpu_sgemm, gpu_transpose_f32, CublasHandle};
 use crate::curand::random_gaussian_gpu;
@@ -858,12 +858,12 @@ pub(crate) fn gpu_scale_columns(
 }
 
 // NOTE: `compute_means_and_col_sq` has been replaced by
-// `BackedCsrReader::col_means_and_sum_sq()` in scx-format.
+// `BackedCsrReader::col_means_and_sum_sq()` in scx-format-io.
 // `compute_total_variance_from_col_sq` has been replaced by
-// `scx_format::total_variance_from_col_sq()`.
+// `scx_sparse::total_variance_from_col_sq()`.
 
 /// Format ScxError as GpuError.
-fn format_scx_error(e: scx_format::ScxError) -> GpuError {
+fn format_scx_error(e: scx_format_io::ScxError) -> GpuError {
     GpuError::InvalidShard(format!("SCX read error: {e}"))
 }
 
@@ -1025,7 +1025,7 @@ mod tests {
         // — scx-gpu cannot depend on scx-accel).
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
-        use scx_format::ShardSource;
+        use scx_format_io::ShardSource;
         use scx_sparse::ScxCsr;
 
         let dev = require_gpu!();
@@ -1045,7 +1045,7 @@ mod tests {
             fn n_vars(&self) -> usize {
                 self.n_vars
             }
-            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+            fn read_shard(&self, i: usize) -> scx_format_io::Result<ScxCsr> {
                 Ok(self.shards[i].clone())
             }
         }
@@ -1158,7 +1158,7 @@ mod tests {
         // the only algorithmic difference is the QR step.
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
-        use scx_format::ShardSource;
+        use scx_format_io::ShardSource;
         use scx_sparse::ScxCsr;
 
         let dev = require_gpu!();
@@ -1178,7 +1178,7 @@ mod tests {
             fn n_vars(&self) -> usize {
                 self.n_vars
             }
-            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+            fn read_shard(&self, i: usize) -> scx_format_io::Result<ScxCsr> {
                 Ok(self.shards[i].clone())
             }
         }
@@ -1302,7 +1302,7 @@ mod tests {
     fn test_gpu_randomized_pca_device_matches_host() {
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
-        use scx_format::ShardSource;
+        use scx_format_io::ShardSource;
         use scx_sparse::ScxCsr;
 
         let dev = require_gpu!();
@@ -1322,7 +1322,7 @@ mod tests {
             fn n_vars(&self) -> usize {
                 self.n_vars
             }
-            fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+            fn read_shard(&self, i: usize) -> scx_format_io::Result<ScxCsr> {
                 Ok(self.shards[i].clone())
             }
         }

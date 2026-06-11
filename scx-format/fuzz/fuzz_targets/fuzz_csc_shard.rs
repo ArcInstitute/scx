@@ -10,7 +10,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use scx_format::shard::ShardHeader;
+use scx_format_io::shard::ShardHeader;
 
 fuzz_target!(|data: &[u8]| {
     // Mirror `fuzz_shard.rs`. The header parser must terminate without

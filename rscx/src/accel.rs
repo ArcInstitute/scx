@@ -95,7 +95,7 @@ fn dgc_genes_by_cells_to_csr(dgc: &Robj) -> Result<ScxCsr> {
 
 // The single-shard in-memory `ShardSource` adapter now lives in scx-format as
 // `SingleShardSource`, shared with pyscx.
-use scx_format::shard_source::SingleShardSource;
+use scx_format_io::shard_source::SingleShardSource;
 
 /// Repack a column-major `RMatrix<f64>` (R layout) into row-major `f32`
 /// of shape `n_rows × n_cols`, rejecting non-finite entries.
@@ -544,7 +544,7 @@ extendr_module! {
 mod tests {
     use super::*;
     // SingleShardSource's accessors come from the ShardSource trait.
-    use scx_format::shard_source::ShardSource;
+    use scx_format_io::shard_source::ShardSource;
 
     #[test]
     fn test_factorize_levels_first_seen() {

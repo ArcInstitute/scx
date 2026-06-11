@@ -295,7 +295,7 @@ impl IndexedCsrShardStream for DenseXStreamReader {
     fn per_worker_bytes(
         &self,
         shard_target_rows: u32,
-        _modality_type: scx_format::modality::ModalityType,
+        _modality_type: scx_format_io::modality::ModalityType,
     ) -> u64 {
         // Dense slab buffer is the binding bound (the sparsified
         // output is bounded by it). Match the sequential reservation

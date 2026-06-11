@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream, CudaView};
 
-use scx_format::shard_source::ColumnShardSource;
+use scx_format_io::shard_source::ColumnShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -339,7 +339,7 @@ impl<'a> RawGpuCscShardSource<'a> {
 
         let scope_result = std::thread::scope(|scope| -> Result<(), GpuError> {
             use std::sync::mpsc;
-            type Msg = Result<(usize, scx_sparse::ScxCsc, u32, u32), scx_format::ScxError>;
+            type Msg = Result<(usize, scx_sparse::ScxCsc, u32, u32), scx_format_io::ScxError>;
             let (tx, rx) = mpsc::sync_channel::<Msg>(1);
 
             let indices_for_worker = indices.clone();
@@ -355,7 +355,7 @@ impl<'a> RawGpuCscShardSource<'a> {
                     let range = match source.csc_shard_col_range(i) {
                         Some(r) => r,
                         None => {
-                            let _ = tx.send(Err(scx_format::ScxError::InvalidCatalog(format!(
+                            let _ = tx.send(Err(scx_format_io::ScxError::InvalidCatalog(format!(
                                 "csc_shard_col_range({i}) returned None"
                             ))));
                             break;
@@ -542,10 +542,13 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_csc_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsc> {
+        fn read_csc_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
             Ok(self.shards[shard_idx].clone())
         }
-        fn read_csc_columns(&self, _col_range: std::ops::Range<u32>) -> scx_format::Result<ScxCsc> {
+        fn read_csc_columns(
+            &self,
+            _col_range: std::ops::Range<u32>,
+        ) -> scx_format_io::Result<ScxCsc> {
             unimplemented!("test stub does not implement read_csc_columns")
         }
         fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {

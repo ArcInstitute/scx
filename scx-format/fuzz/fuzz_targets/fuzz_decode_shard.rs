@@ -6,7 +6,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use scx_format::{decode_shard_bytes, FullCatalogEntry, SectionType};
+use scx_format_io::{decode_shard_bytes, FullCatalogEntry, SectionType};
 
 fuzz_target!(|data: &[u8]| {
     let entry = FullCatalogEntry {

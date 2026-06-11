@@ -11,7 +11,7 @@ use cudarc::driver::safe::CudaSlice;
 use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
 use scx_codec::{CodecId, EncodedShardRef, Scx1DecodeMetadata, ValueEncoding};
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
@@ -338,7 +338,7 @@ mod tests {
     use super::*;
     use crate::test_utils::build_test_shard;
     use scx_codec::decode_shard_scipy;
-    use scx_format::shard::ShardHeader;
+    use scx_format_io::shard::ShardHeader;
 
     /// CPU reference decode for comparison.
     fn cpu_decode(

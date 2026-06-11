@@ -1,6 +1,6 @@
 // MTX-pipeline round-trip tests. Don't need hdf5 — only MTX I/O.
 
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 use std::io::Write;
 
 /// Create a synthetic Cell Ranger–style MTX directory for testing.

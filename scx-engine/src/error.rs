@@ -16,7 +16,7 @@ pub enum EngineError {
     UnknownIndexPreset(String),
 
     #[error(transparent)]
-    FormatError(#[from] scx_format::ScxError),
+    FormatError(#[from] scx_format_io::ScxError),
 
     #[error(transparent)]
     ArrowError(#[from] arrow::error::ArrowError),

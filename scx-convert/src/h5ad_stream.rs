@@ -340,7 +340,7 @@ impl IndexedCsrShardStream for XStreamReader {
     fn per_worker_bytes(
         &self,
         shard_target_rows: u32,
-        _modality_type: scx_format::modality::ModalityType,
+        _modality_type: scx_format_io::modality::ModalityType,
     ) -> u64 {
         let n_obs = self.indptr.len().saturating_sub(1);
         if n_obs == 0 {

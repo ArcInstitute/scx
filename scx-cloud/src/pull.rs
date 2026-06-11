@@ -21,9 +21,9 @@ use futures::stream::StreamExt;
 use object_store::path::Path as ObjPath;
 use object_store::ObjectStore;
 
-use scx_format::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::section::{align_to_8, SectionType};
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::section::{align_to_8, SectionType};
 
 use crate::error::{CloudError, Result};
 use crate::explode::section_name_to_path;
@@ -460,7 +460,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     //    (`stream::buffered`): downloads run up to `parallelism` at a time and
     //    are yielded in write order, so each is written as it arrives. Peak
     //    memory is bounded by `parallelism × max_section_size` (LC2).
-    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
+    let (raw_file, tmp_path) = scx_format_io::make_sibling_tempfile(dest)?;
     let mut writer = HashingWriter::new(BufWriter::new(raw_file));
 
     writer.write_all(&header_bytes)?;
@@ -555,7 +555,7 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     // 7. Finalize hash, patch file_checksum into the header on disk.
     writer.flush()?;
     let (buf_writer, hasher) = writer.into_parts();
-    let file_checksum = scx_format::checksum::truncate_hash_to_u64(&hasher.finalize());
+    let file_checksum = scx_format_io::checksum::truncate_hash_to_u64(&hasher.finalize());
     let mut file = buf_writer.into_inner().map_err(std::io::Error::from)?;
     new_header.file_checksum = file_checksum;
     file.seek(SeekFrom::Start(0))?;
@@ -567,8 +567,8 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     tmp_path
         .persist(dest)
         .map_err(|e| CloudError::Io(e.error))?;
-    scx_format::chmod_to_umask(dest)?;
-    scx_format::fsync_parent_dir(dest)?;
+    scx_format_io::chmod_to_umask(dest)?;
+    scx_format_io::fsync_parent_dir(dest)?;
 
     let elapsed = start.elapsed();
     let throughput_mbps = if elapsed.as_secs_f64() > 0.0 {
@@ -638,7 +638,7 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
         hasher.update(&chunk[..n]);
     }
     let hash = hasher.finalize();
-    Ok(scx_format::checksum::truncate_hash_to_u64(&hash))
+    Ok(scx_format_io::checksum::truncate_hash_to_u64(&hash))
 }
 
 /// `Write` adapter that incrementally feeds every byte written to it
@@ -775,7 +775,7 @@ pub async fn pull_filtered(
             ))
         })?
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-    let obs_batch = scx_format::downcast_large_types(&raw_batch)?;
+    let obs_batch = scx_format_io::downcast_large_types(&raw_batch)?;
     let obs_schema = obs_batch.schema();
 
     // Parse and evaluate predicate
@@ -931,7 +931,7 @@ pub async fn pull_filtered(
     //    `parallelism × max_section_size`.
     let parallelism = options.parallelism.max(1);
     // Collision-safe sibling temp file.
-    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(dest)?;
+    let (raw_file, tmp_path) = scx_format_io::make_sibling_tempfile(dest)?;
     let mut writer = BufWriter::new(raw_file);
 
     writer.write_all(&vec![0u8; SECTIONS_START_OFFSET as usize])?;
@@ -1012,7 +1012,7 @@ pub async fn pull_filtered(
         let new_stats = if entry.section_type == SectionType::CsrShard {
             if let Some(old_stats) = &entry.stats {
                 let shard_rows = old_stats.row_end - old_stats.row_start;
-                let ns = scx_format::catalog::ShardStats {
+                let ns = scx_format_io::catalog::ShardStats {
                     row_start: new_row_offset,
                     row_end: new_row_offset + shard_rows,
                     col_start: old_stats.col_start,
@@ -1061,8 +1061,10 @@ pub async fn pull_filtered(
     // (names, types, n_vars) survives the filter unchanged.
     let (modality_table_offset_new, modality_table_length_new) = if header.n_modalities > 0 {
         if let Some(mt_bytes) = &modality_table_bytes {
-            let mut table =
-                scx_format::ModalityTable::read_from(&mut Cursor::new(mt_bytes), mt_bytes.len())?;
+            let mut table = scx_format_io::ModalityTable::read_from(
+                &mut Cursor::new(mt_bytes),
+                mt_bytes.len(),
+            )?;
             // Reset per-modality counts before recomputing from
             // the filtered catalog. CSC sidecars are dropped
             // file-wide on pull_filtered (matching the
@@ -1072,8 +1074,8 @@ pub async fn pull_filtered(
                 info.n_csr_shards = 0;
                 info.n_csc_shards = 0;
                 info.nnz = 0;
-                info.flags = scx_format::ModalityFlags::from_bits_truncate(
-                    info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                info.flags = scx_format_io::ModalityFlags::from_bits_truncate(
+                    info.flags.bits() & !scx_format_io::ModalityFlags::HAS_CSC,
                 );
             }
             for entry in &new_entries {
@@ -1200,8 +1202,8 @@ pub async fn pull_filtered(
     tmp_path
         .persist(dest)
         .map_err(|e| CloudError::Io(e.error))?;
-    scx_format::chmod_to_umask(dest)?;
-    scx_format::fsync_parent_dir(dest)?;
+    scx_format_io::chmod_to_umask(dest)?;
+    scx_format_io::fsync_parent_dir(dest)?;
 
     let elapsed = start.elapsed();
 
@@ -1266,9 +1268,9 @@ fn filter_record_batch(
 ///
 /// Upcasts `Utf8 → LargeUtf8` so columns larger than 2 GB do not
 /// overflow Arrow IPC's 32-bit offset limit (see
-/// [`scx_format::arrow_compat`]).
+/// [`scx_format_io::arrow_compat`]).
 fn record_batch_to_arrow_ipc(batch: &arrow::array::RecordBatch) -> Result<Vec<u8>> {
-    let batch = scx_format::upcast_to_large_types(batch)?;
+    let batch = scx_format_io::upcast_to_large_types(batch)?;
     let mut buf = Vec::new();
     {
         let mut ipc_writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &batch.schema())
@@ -1286,9 +1288,9 @@ fn record_batch_to_arrow_ipc(batch: &arrow::array::RecordBatch) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_format::header::MAGIC;
-    use scx_format::reader::ScxReader;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::MAGIC;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1298,7 +1300,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -2520,7 +2522,7 @@ mod tests {
             }
             hasher.update(&chunk[..n]);
         }
-        let recomputed = scx_format::checksum::truncate_hash_to_u64(&hasher.finalize());
+        let recomputed = scx_format_io::checksum::truncate_hash_to_u64(&hasher.finalize());
         assert_eq!(
             stored, recomputed,
             "hash-while-write checksum must match the zeroed-header rehash convention"

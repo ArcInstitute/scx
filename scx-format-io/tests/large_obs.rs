@@ -1,7 +1,7 @@
 //! End-to-end >2 GiB obs round-trip test for the Arrow IPC offset fix.
 //!
 //! Arrow IPC's `Utf8`/`Binary` offsets are i32, so any single string
-//! buffer is capped at ~2.15 GB. `scx_format::arrow_compat`
+//! buffer is capped at ~2.15 GB. `scx_format_io::arrow_compat`
 //! widens to `LargeUtf8`/`LargeBinary` on write and **opportunistically**
 //! narrows back on read — so columns whose offsets actually exceed
 //! `i32::MAX` stay wide in memory rather than blowing up in
@@ -27,13 +27,13 @@ use arrow::array::{LargeStringArray, LargeStringBuilder, StringArray, UInt32Arra
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::dispatch::{CodecId, ValueEncoding};
-use scx_format::header::{HEADER_SIZE, MAGIC};
-use scx_format::{FileHeader, ScxReader, ScxWriter};
+use scx_format_io::header::{HEADER_SIZE, MAGIC};
+use scx_format_io::{FileHeader, ScxReader, ScxWriter};
 
 fn header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: HEADER_SIZE as u16,
         flags: 0,
         n_obs,
@@ -332,7 +332,7 @@ fn test_mixed_obs_writes_rejected() {
             .write_obs_shard(0, 0, 100, 100, &obs_batch(0, 100))
             .unwrap_err();
         assert!(
-            matches!(err, scx_format::ScxError::ObsLayoutConflict { .. }),
+            matches!(err, scx_format_io::ScxError::ObsLayoutConflict { .. }),
             "expected ObsLayoutConflict, got: {err:?}"
         );
     }
@@ -344,7 +344,7 @@ fn test_mixed_obs_writes_rejected() {
             .unwrap();
         let err = w.write_obs(&obs_batch(0, 100)).unwrap_err();
         assert!(
-            matches!(err, scx_format::ScxError::ObsLayoutConflict { .. }),
+            matches!(err, scx_format_io::ScxError::ObsLayoutConflict { .. }),
             "expected ObsLayoutConflict, got: {err:?}"
         );
     }
@@ -563,7 +563,7 @@ fn test_reader_rejects_contracting_n_rows_total() {
     let reader = ScxReader::open(&path).unwrap();
     let err = reader.read_obs().unwrap_err();
     assert!(
-        matches!(err, scx_format::ScxError::InvalidCatalog(_)),
+        matches!(err, scx_format_io::ScxError::InvalidCatalog(_)),
         "expected InvalidCatalog for contracting n_rows_total, got: {err:?}"
     );
 }

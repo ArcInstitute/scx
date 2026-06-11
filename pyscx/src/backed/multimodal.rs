@@ -8,10 +8,10 @@ use std::sync::Arc;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use scx_format::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{BackedCscReader, BackedCsrReader};
 
 use super::*;
-use scx_format::ScxReader;
+use scx_format_io::ScxReader;
 use std::sync::Mutex as StdMutex;
 
 /// Phase D.4: backed wrapper for multimodal SCX files. Holds an

@@ -1,6 +1,6 @@
 //! PCA bindings — randomized and covariance PCA, streaming + in-memory.
 
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use numpy::PyArray2;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -28,11 +28,11 @@ use super::util::{extract_csr_slices, CsrSlices};
 /// scipy sparse / dense matrix that has been extracted into an in-memory
 /// `ScxCsr`. Parallels the CPU-path's `*_inmemory` entry points by presenting
 /// the whole CSR as a single shard to the streaming GPU code. This is the
-/// shared `scx_format::shard_source::SingleShardSource` (the rscx binding uses
+/// shared `scx_format_io::shard_source::SingleShardSource` (the rscx binding uses
 /// the same adapter); aliased here to keep the call sites'
 /// `ScxCsrSource { csr }` spelling.
 #[cfg(feature = "gpu")]
-pub(crate) use scx_format::shard_source::SingleShardSource as ScxCsrSource;
+pub(crate) use scx_format_io::shard_source::SingleShardSource as ScxCsrSource;
 
 /// Single-shard `ShardSource` adapter over **borrowed** numpy slices
 /// (Phase 10).
@@ -69,9 +69,9 @@ impl ShardSource for BorrowedCsrSource<'_> {
     fn n_vars(&self) -> usize {
         self.shape.1
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
         if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+            return Err(scx_format_io::ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
                 count: 1,
             });
@@ -83,7 +83,7 @@ impl ShardSource for BorrowedCsrSource<'_> {
             self.data.to_vec(),
         ))
     }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+    fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         Ok(self.shape.0)
     }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::section::SectionType;
-use scx_format::{
+use scx_format_io::section::SectionType;
+use scx_format_io::{
     select_codec_for_modality, FileHeader, ModalityType, PreEncodedSection, ProvenanceEntry,
     ScxWriter,
 };
@@ -39,10 +39,10 @@ pub(crate) fn build_and_write_bitmap_for_shard_python(
     n_rows: u32,
     n_vars: u32,
     encoded_csr_size: usize,
-    policy: scx_format::BitmapPolicy,
+    policy: scx_format_io::BitmapPolicy,
 ) -> PyResult<()> {
-    use scx_format::bitmap::BitmapShard;
-    use scx_format::BitmapPolicy;
+    use scx_format_io::bitmap::BitmapShard;
+    use scx_format_io::BitmapPolicy;
     const DENSITY_THRESHOLD: f32 = 0.30;
     const N_VARS_CAP: u32 = 1_000_000;
     const SIZE_PERCENT: usize = 15;
@@ -213,12 +213,12 @@ pub(crate) fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
-) -> Result<(), scx_format::ScxError> {
+) -> Result<(), scx_format_io::ScxError> {
     let mut indptr_u64: Vec<u64> = indptr
         .iter()
         .map(|&v| {
             if v < 0 {
-                Err(scx_format::ScxError::InvalidCatalog(format!(
+                Err(scx_format_io::ScxError::InvalidCatalog(format!(
                     "negative CSR indptr value {v} before CSC transpose"
                 )))
             } else {
@@ -230,7 +230,7 @@ pub(crate) fn write_csc_shards_from_csr(
         .iter()
         .map(|&v| {
             if v < 0 {
-                Err(scx_format::ScxError::InvalidCatalog(format!(
+                Err(scx_format_io::ScxError::InvalidCatalog(format!(
                     "negative CSR index value {v} before CSC transpose"
                 )))
             } else {
@@ -248,7 +248,7 @@ pub(crate) fn write_csc_shards_from_csr(
     );
 
     // Shared transpose-and-write loop (single-modality → modality_id None).
-    scx_format::csc_sidecar::write_csc_sidecar(
+    scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
         n_obs,
@@ -256,7 +256,7 @@ pub(crate) fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )
 }
@@ -356,7 +356,7 @@ pub(crate) fn parallel_encode_csr_shards(
                 // canonical (the common case); only materialize + canonicalize
                 // a genuinely non-canonical shard.
                 let encode = |indptr: &[u64], indices: &[u32], data: &[f32]| {
-                    scx_format::encode_one_shard(
+                    scx_format_io::encode_one_shard(
                         indptr,
                         indices,
                         data,
@@ -475,7 +475,7 @@ pub(crate) fn build_output_header(
 ) -> FileHeader {
     FileHeader {
         // Single-modality output → feature floor 1.
-        format_version: scx_format::rewrite_output_format_version(&[source_format_version], 1),
+        format_version: scx_format_io::rewrite_output_format_version(&[source_format_version], 1),
         n_obs,
         n_vars,
         shard_target_rows,
@@ -514,7 +514,7 @@ pub fn from_anndata_impl(
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
     let csc_policy =
-        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = parse_uns_format(uns_format)?;
 
     // Backed AnnData → route through the streaming converter
@@ -777,7 +777,7 @@ pub fn from_anndata_impl(
     let var_rows = var_batch.num_rows();
     let shard_obs = !force_legacy_metadata && obs_rows > step;
     let shard_var = !force_legacy_metadata && var_rows > step;
-    py.detach(|| -> std::result::Result<(), scx_format::ScxError> {
+    py.detach(|| -> std::result::Result<(), scx_format_io::ScxError> {
         if shard_obs {
             let n_total = obs_rows as u64;
             let mut shard_idx: u32 = 0;
@@ -857,13 +857,13 @@ pub fn from_anndata_impl(
         "X",
     )?;
     // Phase 5b: parse bitmap policy once.
-    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     for (boundary, section) in boundaries.iter().zip(pre_encoded) {
         let encoded_csr_size = section.section_length as usize;
         writer.write_preencoded_shard(section).map_err(to_pyerr)?;
-        if !matches!(bitmap_policy, scx_format::BitmapPolicy::Off) {
+        if !matches!(bitmap_policy, scx_format_io::BitmapPolicy::Off) {
             // Build the bitmap from the same canonical local CSR
             // representation used by the encoded shard.
             let lo = boundary.row_start;
@@ -925,7 +925,7 @@ pub fn from_anndata_impl(
                 )?;
             }
         }
-        py.detach(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format_io::ScxError> {
             for_each_dense_shard(
                 &batch,
                 shard_target_rows,
@@ -961,7 +961,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.detach(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format_io::ScxError> {
                 for_each_dense_shard(
                     &batch,
                     shard_target_rows,
@@ -997,7 +997,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.detach(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format_io::ScxError> {
                 for_each_coo_shard(
                     &batch,
                     shard_target_rows,
@@ -1040,7 +1040,7 @@ pub fn from_anndata_impl(
                     )?;
                 }
             }
-            py.detach(|| -> Result<(), scx_format::ScxError> {
+            py.detach(|| -> Result<(), scx_format_io::ScxError> {
                 for_each_coo_shard(
                     &batch,
                     shard_target_rows,
@@ -1183,7 +1183,7 @@ pub fn from_anndata_impl(
     // CSR view of X. Layers are CSR-only (no layer-CSC support yet —
     // a `LayerCscShard` section type would need to land first).
     if csc_build {
-        py.detach(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format_io::ScxError> {
             write_csc_shards_from_csr(
                 &mut writer,
                 indptr_slice,

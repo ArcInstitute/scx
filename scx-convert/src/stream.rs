@@ -4,7 +4,7 @@
 // (future) Zarr-backed readers all implement `CsrShardStream` so the
 // writer-side coordinator can drive any of them uniformly.
 
-use scx_format::modality::ModalityType;
+use scx_format_io::modality::ModalityType;
 
 use super::pipeline::ConvertError;
 

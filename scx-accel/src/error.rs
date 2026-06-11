@@ -1,5 +1,5 @@
 use scx_engine::EngineError;
-use scx_format::ScxError;
+use scx_format_io::ScxError;
 
 /// Errors from accelerator operations.
 #[derive(Debug, thiserror::Error)]

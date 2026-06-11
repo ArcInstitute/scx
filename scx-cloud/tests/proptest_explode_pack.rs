@@ -19,9 +19,9 @@ use proptest::prelude::*;
 use scx_cloud::explode::explode;
 use scx_cloud::pack::pack;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::catalog::FullCatalog;
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
-use scx_format::writer::ScxWriter;
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC};
+use scx_format_io::writer::ScxWriter;
 
 // =========================================================================
 // SCX fixture construction

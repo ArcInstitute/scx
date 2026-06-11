@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use scx_engine::{evaluate, parse_predicate};
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 pub fn run_delete(
     file: &Path,

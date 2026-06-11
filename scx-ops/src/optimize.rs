@@ -15,12 +15,12 @@
 use std::path::Path;
 
 use scx_codec::CodecId;
-use scx_format::encoder::encode_one_shard;
-use scx_format::header::FileHeader;
-use scx_format::modality::ModalityType;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::encoder::encode_one_shard;
+use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityType;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 use scx_sparse::canonicalize_csr;
 
 use crate::error::{OpsError, Result};
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn optimize_preserves_deletion_vectors() {
         use roaring::RoaringBitmap;
-        use scx_format::deletion_vectors::DeletionVectors;
+        use scx_format_io::deletion_vectors::DeletionVectors;
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.scx");

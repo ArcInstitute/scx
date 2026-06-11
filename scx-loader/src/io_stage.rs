@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
@@ -65,7 +65,7 @@ pub struct ShardData {
 pub async fn io_stage(
     reader: Arc<ScxReader>,
     shard_groups: Vec<Vec<usize>>,
-    deletion_vectors: Option<scx_format::deletion_vectors::DeletionVectors>,
+    deletion_vectors: Option<scx_format_io::deletion_vectors::DeletionVectors>,
     modality_id: Option<u8>,
     tx: tokio::sync::mpsc::Sender<ShardGroup>,
 ) -> Result<()> {
@@ -76,7 +76,7 @@ pub async fn io_stage(
     // that modality's CSR shards (matching the filter applied in
     // `pipeline.rs::start_epoch`). Per-modality and global runs use the
     // same code path; only the entry list differs.
-    let sorted_entries: Vec<&scx_format::FullCatalogEntry> = match modality_id {
+    let sorted_entries: Vec<&scx_format_io::FullCatalogEntry> = match modality_id {
         Some(mid) => reader.catalog().csr_shards_for_modality(mid),
         None => reader.catalog().shards_sorted(),
     };
@@ -160,7 +160,7 @@ pub async fn io_stage(
         let group_modality_id = modality_id;
         let group = tokio::task::spawn_blocking(move || -> Result<ShardGroup> {
             let t0 = Instant::now();
-            let sorted: Vec<&scx_format::FullCatalogEntry> = match group_modality_id {
+            let sorted: Vec<&scx_format_io::FullCatalogEntry> = match group_modality_id {
                 Some(mid) => reader.catalog().csr_shards_for_modality(mid),
                 None => reader.catalog().shards_sorted(),
             };
@@ -285,19 +285,19 @@ pub async fn io_stage(
 mod tests {
     use super::*;
     use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as StdArc;
 
-    use scx_format::header::MAGIC;
+    use scx_format_io::header::MAGIC;
 
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -535,7 +535,7 @@ mod tests {
             let reader = Arc::new(ScxReader::open(&path).unwrap());
 
             // Delete ALL rows in shard 0 (local rows 0..5)
-            let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
+            let mut dv = scx_format_io::deletion_vectors::DeletionVectors::new();
             let mut bm = RoaringBitmap::new();
             for i in 0..5u32 {
                 bm.insert(i);
@@ -566,7 +566,7 @@ mod tests {
             let reader = Arc::new(ScxReader::open(&path).unwrap());
 
             // Delete rows 1 and 3 (local) from shard 0
-            let mut dv = scx_format::deletion_vectors::DeletionVectors::new();
+            let mut dv = scx_format_io::deletion_vectors::DeletionVectors::new();
             let mut bm = RoaringBitmap::new();
             bm.insert(1);
             bm.insert(3);

@@ -25,10 +25,10 @@ use std::path::Path;
 
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
-use scx_format::catalog::{FullCatalogEntry, ShardStats};
-use scx_format::error::ScxError;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
+use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
+use scx_format_io::error::ScxError;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
 
 use super::h5ad_write::{
     scan_nullable_columns, write_dataframe_group_at, write_dataframe_group_streaming,

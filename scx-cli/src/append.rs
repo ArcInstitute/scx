@@ -5,7 +5,7 @@ use std::path::Path;
 
 use scx_codec::{CodecId, CodecSelection};
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 use crate::index_warnings::emit_index_summary;
 

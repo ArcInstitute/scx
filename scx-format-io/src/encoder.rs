@@ -51,9 +51,9 @@ use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 /// # Examples
 ///
 /// ```
-/// use scx_format::encoder::encode_one_shard;
-/// use scx_format::section::SectionType;
-/// use scx_format::modality::ModalityType;
+/// use scx_format_io::encoder::encode_one_shard;
+/// use scx_format_io::section::SectionType;
+/// use scx_format_io::modality::ModalityType;
 ///
 /// // Canonical CSR: indptr[0] == 0, indices sorted per row, no dup, no zeros.
 /// let indptr = [0u64, 2];

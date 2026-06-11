@@ -10,8 +10,8 @@ use scx_codec::ValueEncoding;
 // Field-metadata key marking an Arrow dictionary column as an *ordered*
 // categorical, sourced from the canonical `scx-format` definition (shared with
 // scx-convert and pyscx) so the wire key has a single source of truth.
-use scx_format::ScxReader;
-use scx_format::CATEGORICAL_ORDERED_KEY;
+use scx_format_io::ScxReader;
+use scx_format_io::CATEGORICAL_ORDERED_KEY;
 use scx_sparse::ScxCsr;
 
 // ─── Arrow RecordBatch → R data.frame ────────────────────────────────────────
@@ -867,9 +867,9 @@ fn write_csr_to_scx(
     csc_cols_per_shard: usize,
 ) -> Result<()> {
     use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
-    use scx_format::{select_codec_for_modality, ModalityType};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use scx_format_io::{select_codec_for_modality, ModalityType};
 
     let nnz = *csr_indptr.last().unwrap_or(&0);
     let shard_target_rows: usize = 16384;
@@ -968,12 +968,12 @@ fn write_csr_to_scx(
 /// Streaming CSR → CSC transpose over the in-memory `(csr_indptr,
 /// csr_indices, values_bytes)` arrays, writing each chunk as one CSC
 /// shard. Decodes the pre-encoded value bytes to f32, then delegates to
-/// the shared `scx_format::csc_sidecar::write_csc_sidecar` so this and the
+/// the shared `scx_format_io::csc_sidecar::write_csc_sidecar` so this and the
 /// `scx-convert` / `pyscx` import paths produce structurally identical CSC
 /// sidecars (a single transpose-and-write loop).
 #[allow(clippy::too_many_arguments)]
 fn write_csc_shards_from_csr_r(
-    writer: &mut scx_format::writer::ScxWriter,
+    writer: &mut scx_format_io::writer::ScxWriter,
     csr_indptr: &[u64],
     csr_indices: &[u32],
     values_bytes: &[u8],
@@ -992,7 +992,7 @@ fn write_csc_shards_from_csr_r(
     let indices_i32: Vec<i32> = csr_indices.iter().map(|&v| v as i32).collect();
 
     let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr_i64, indices_i32, data_f32);
-    scx_format::csc_sidecar::write_csc_sidecar(
+    scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
         n_obs,
@@ -1000,7 +1000,7 @@ fn write_csc_shards_from_csr_r(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
@@ -1271,9 +1271,9 @@ fn from_seurat_multi_assay(
     csc_cols_per_shard: usize,
 ) -> Result<()> {
     use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
-    use scx_format::{select_codec_for_modality, ModalityType};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use scx_format_io::{select_codec_for_modality, ModalityType};
 
     if csc_always {
         return Err(Error::Other(
@@ -1455,20 +1455,20 @@ fn from_seurat_multi_assay(
 /// name. Mirrors the heuristic in `pyscx::mudata::infer_modality_type`
 /// so multimodal SCX files written from Seurat / MAE / MuData carry
 /// consistent `ModalityType` tags.
-fn infer_modality_type_from_name(name: &str) -> scx_format::ModalityType {
+fn infer_modality_type_from_name(name: &str) -> scx_format_io::ModalityType {
     let lower = name.to_ascii_lowercase();
     if lower.contains("atac") || lower.contains("peak") {
-        scx_format::ModalityType::Atac
+        scx_format_io::ModalityType::Atac
     } else if lower.contains("adt") || lower.contains("protein") || lower.contains("antibody") {
-        scx_format::ModalityType::Protein
+        scx_format_io::ModalityType::Protein
     } else if lower.contains("spatial") {
-        scx_format::ModalityType::Spatial
+        scx_format_io::ModalityType::Spatial
     } else if lower.contains("methyl") {
-        scx_format::ModalityType::Methylation
+        scx_format_io::ModalityType::Methylation
     } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
-        scx_format::ModalityType::Rna
+        scx_format_io::ModalityType::Rna
     } else {
-        scx_format::ModalityType::Custom
+        scx_format_io::ModalityType::Custom
     }
 }
 
@@ -1674,9 +1674,9 @@ pub fn from_mae(
     let _ = csc_cols_per_shard;
 
     use scx_codec::CodecId;
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
-    use scx_format::{select_codec_for_modality, ModalityType};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use scx_format_io::{select_codec_for_modality, ModalityType};
 
     // colData becomes the global obs; rowData(experiments[[i]])
     // becomes per-modality var.

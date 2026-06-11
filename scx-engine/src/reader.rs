@@ -14,11 +14,11 @@ use std::any::Any;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use scx_format::catalog::FullCatalogEntry;
-use scx_format::header::FileHeader;
-use scx_format::reader::ScxReader;
-use scx_format::DeletionVectors;
-use scx_format::FullCatalog;
+use scx_format_io::catalog::FullCatalogEntry;
+use scx_format_io::header::FileHeader;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::DeletionVectors;
+use scx_format_io::FullCatalog;
 
 use crate::error::Result;
 

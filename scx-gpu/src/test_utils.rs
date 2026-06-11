@@ -1,7 +1,7 @@
 //! Shared test utilities for scx-gpu tests and benchmarks.
 
 use scx_codec::{encode_shard, CodecId, ValueEncoding};
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
 /// Build a complete shard byte buffer from raw CSR arrays.
 ///

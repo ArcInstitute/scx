@@ -13,10 +13,10 @@ use std::collections::BTreeMap;
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use scx_format::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
 
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::section::{align_to_8, SectionType};
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::section::{align_to_8, SectionType};
 
 use crate::error::Result;
 
@@ -126,7 +126,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     }
 
     // 3. Create output file via collision-safe sibling tempfile.
-    let (raw_file, tmp_path) = scx_format::make_sibling_tempfile(output)?;
+    let (raw_file, tmp_path) = scx_format_io::make_sibling_tempfile(output)?;
     let mut writer = BufWriter::new(raw_file);
 
     // Write placeholder for header + root catalog
@@ -293,8 +293,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     tmp_path
         .persist(output)
         .map_err(|e| crate::error::CloudError::Io(e.error))?;
-    scx_format::chmod_to_umask(output)?;
-    scx_format::fsync_parent_dir(output)?;
+    scx_format_io::chmod_to_umask(output)?;
+    scx_format_io::fsync_parent_dir(output)?;
 
     Ok(())
 }
@@ -342,15 +342,15 @@ fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
         hasher.update(&chunk[..n]);
     }
     let hash = hasher.finalize();
-    Ok(scx_format::checksum::truncate_hash_to_u64(&hash))
+    Ok(scx_format_io::checksum::truncate_hash_to_u64(&hash))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_format::header::MAGIC;
-    use scx_format::reader::ScxReader;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::MAGIC;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -360,7 +360,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

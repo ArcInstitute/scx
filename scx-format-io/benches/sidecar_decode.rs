@@ -16,7 +16,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use scx_codec::{
     decode_scx1_row_range, decode_shard_ref, encode_shard, CodecId, EncodedShardRef, ValueEncoding,
 };
-use scx_format::decode_scx1_parallel;
+use scx_format_io::decode_scx1_parallel;
 
 /// Build one Scx1 shard (+ its encoder-emitted sidecar metadata) shaped like
 /// real scRNA-seq: `n_rows` rows averaging `avg_nnz` non-zeros (≥128 ⇒ BitPacker4x).

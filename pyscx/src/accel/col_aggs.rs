@@ -37,14 +37,14 @@ fn validated_prefer(prefer_format: &str) -> PyResult<&'static str> {
 fn run_csr_f64<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
-    full: impl FnOnce(&scx_format::BackedCsrReader) -> scx_format::Result<Vec<f64>>,
-    proj: impl FnOnce(&scx_format::BackedCsrReader, &[u32]) -> scx_format::Result<Vec<f64>>,
-    masked: impl FnOnce(&scx_format::BackedCsrReader, &[u64]) -> scx_format::Result<Vec<f64>>,
+    full: impl FnOnce(&scx_format_io::BackedCsrReader) -> scx_format_io::Result<Vec<f64>>,
+    proj: impl FnOnce(&scx_format_io::BackedCsrReader, &[u32]) -> scx_format_io::Result<Vec<f64>>,
+    masked: impl FnOnce(&scx_format_io::BackedCsrReader, &[u64]) -> scx_format_io::Result<Vec<f64>>,
     masked_proj: impl FnOnce(
-        &scx_format::BackedCsrReader,
+        &scx_format_io::BackedCsrReader,
         &[u64],
         &[u32],
-    ) -> scx_format::Result<Vec<f64>>,
+    ) -> scx_format_io::Result<Vec<f64>>,
 ) -> PyResult<Vec<f64>> {
     let _ = py;
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {

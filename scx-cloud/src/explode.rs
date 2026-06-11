@@ -19,9 +19,9 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use scx_format::catalog::FullCatalog;
-use scx_format::header::{FileHeader, HEADER_SIZE};
-use scx_format::section::SectionType;
+use scx_format_io::catalog::FullCatalog;
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::section::SectionType;
 
 use crate::error::Result;
 

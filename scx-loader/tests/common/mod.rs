@@ -12,8 +12,8 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::writer::ScxWriter;
 use scx_loader::{IndexPlanLoader, LoaderConfig};
 
 /// Build a multi-shard `.scx` fixture with one nonzero per row at column
@@ -32,7 +32,7 @@ pub fn write_multi_shard_fixture(
 
     let header = FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs: n_obs as u64,

@@ -20,16 +20,16 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_cloud::{pull, pull_filtered, push, PullOptions, PushOptions};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
 
 const GCS_TEST_PREFIX: &str = "gs://arc-ctc-nextflow/scx-test";
 
 fn test_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -344,8 +344,10 @@ async fn test_gcs_pulled_file_info_correct() {
 
     // Verify header is valid
     let data = std::fs::read(&output).unwrap();
-    let hdr =
-        FileHeader::read_from(&mut Cursor::new(&data[..scx_format::header::HEADER_SIZE])).unwrap();
+    let hdr = FileHeader::read_from(&mut Cursor::new(
+        &data[..scx_format_io::header::HEADER_SIZE],
+    ))
+    .unwrap();
     assert_eq!(hdr.magic, MAGIC);
     assert_eq!(hdr.n_obs, 3000);
     assert_eq!(hdr.n_vars, 500);

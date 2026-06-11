@@ -18,7 +18,7 @@ fn vlu(s: &str) -> VarLenUnicode {
     })
 }
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 use super::csc_transpose::csc_to_csr;
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
@@ -1481,7 +1481,7 @@ fn test_float_data_uses_zstd() {
 /// ranges, and densified contents matching the CSR data.
 #[test]
 fn test_h5ad_to_scx_csc_always() {
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad_path = dir.path().join("input.h5ad");
@@ -1519,8 +1519,8 @@ fn test_h5ad_to_scx_csc_always() {
     for entry in &csc_entries {
         assert_eq!(entry.section_type, SectionType::CscShard);
         let section = &bytes[entry.offset as usize..][..entry.length as usize];
-        let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-            &section[..scx_format::shard::SHARD_HEADER_SIZE],
+        let sh = scx_format_io::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+            &section[..scx_format_io::shard::SHARD_HEADER_SIZE],
         ))
         .unwrap();
         assert_eq!(sh.shard_type, 1);
@@ -1871,7 +1871,7 @@ fn test_h5mu_round_trip() {
 #[test]
 fn test_h5mu_per_modality_codec_routing() {
     use super::mudata_pipeline::h5mu_to_scx;
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_path = dir.path().join("cite.h5mu");
@@ -1893,8 +1893,8 @@ fn test_h5mu_per_modality_codec_routing() {
             continue;
         }
         let section = &bytes[entry.offset as usize..][..entry.length as usize];
-        let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-            &section[..scx_format::shard::SHARD_HEADER_SIZE],
+        let sh = scx_format_io::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+            &section[..scx_format_io::shard::SHARD_HEADER_SIZE],
         ))
         .unwrap();
         if entry.modality_id == rna_id {
@@ -2128,7 +2128,7 @@ fn test_compact_multimodal_unsupported() {
 #[test]
 fn test_append_for_modality_updates_table() {
     use super::mudata_pipeline::h5mu_to_scx;
-    use scx_format::section::SectionType;
+    use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_path = dir.path().join("cite.h5mu");
@@ -2441,7 +2441,7 @@ fn streaming_handles_empty_rows() {
 // -----------------------------------------------------------------------
 
 use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
-use scx_format::section::SectionType as FmtSectionType;
+use scx_format_io::section::SectionType as FmtSectionType;
 
 fn streaming_opts(shard_size: u32) -> ConvertOptions {
     ConvertOptions {
@@ -4046,7 +4046,10 @@ fn phase3_streaming_h5mu_modality_types_override() {
     // ModalityTypeInferred warning emitted for rna only.
     let opts = ConvertOptions {
         shard_target_rows: 4,
-        modality_types: vec![("adt".to_string(), scx_format::modality::ModalityType::Atac)],
+        modality_types: vec![(
+            "adt".to_string(),
+            scx_format_io::modality::ModalityType::Atac,
+        )],
         ..ConvertOptions::default()
     };
     let mut sink = WarningSink::log();
@@ -4054,9 +4057,15 @@ fn phase3_streaming_h5mu_modality_types_override() {
     let reader = ScxReader::open(&scx).unwrap();
     let table = reader.modality_table().expect("modality table present");
     let adt = table.entries.iter().find(|m| m.name == "adt").unwrap();
-    assert_eq!(adt.modality_type, scx_format::modality::ModalityType::Atac);
+    assert_eq!(
+        adt.modality_type,
+        scx_format_io::modality::ModalityType::Atac
+    );
     let rna = table.entries.iter().find(|m| m.name == "rna").unwrap();
-    assert_eq!(rna.modality_type, scx_format::modality::ModalityType::Rna);
+    assert_eq!(
+        rna.modality_type,
+        scx_format_io::modality::ModalityType::Rna
+    );
     // rna had no override → one inferred-type warning. adt was
     // explicitly overridden → no inferred warning for it.
     let inferred = sink
@@ -4506,8 +4515,8 @@ fn convert_h5mu_with_index_obs_emits_skip_warning() {
 
 #[test]
 fn convert_with_bitmap_always_emits_section() {
-    use scx_format::section::SectionType;
-    use scx_format::BitmapShard;
+    use scx_format_io::section::SectionType;
+    use scx_format_io::BitmapShard;
     let dir = tempfile::tempdir().unwrap();
     let h5ad_path = dir.path().join("input.h5ad");
     let scx_path = dir.path().join("output.scx");
@@ -5494,7 +5503,7 @@ fn parallel_in_flight_bounded_by_window() {
 #[test]
 fn parallel_per_worker_bytes_atac_higher_density() {
     use super::stream::{IndexedCsrShardStream, StreamedCsrShard};
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
 
     struct StubReader {
         n_obs: u64,
@@ -5540,7 +5549,7 @@ fn parallel_per_worker_bytes_atac_higher_density() {
 fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     use super::dense_stream::open_dense_streaming;
     use super::stream::IndexedCsrShardStream;
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("dense.h5ad");
@@ -5961,7 +5970,7 @@ fn per_shard_export_bytes_matches_payload_layout() {
     // scratch (nnz×8). Anchors the budget arithmetic against
     // accidental regressions.
     use super::h5ad_stream_write::per_shard_export_bytes_for_test;
-    use scx_format::catalog::ShardStats;
+    use scx_format_io::catalog::ShardStats;
     let stats = ShardStats {
         row_start: 0,
         row_end: 100,
@@ -6391,7 +6400,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     assert_eq!(batch.num_columns(), 1, "expected single index column");
     assert_eq!(batch.schema().field(0).name(), "__index_level_0__");
     assert_eq!(
-        scx_format::pandas_index_columns(batch.schema_ref()),
+        scx_format_io::pandas_index_columns(batch.schema_ref()),
         vec!["__index_level_0__".to_string()],
         "schema must carry pandas metadata pointing at the index column"
     );
@@ -6493,7 +6502,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_unnamed() {
         "fields={field_names:?} — B1 reader must inject the index column"
     );
     assert_eq!(
-        scx_format::pandas_index_columns(batch.schema_ref()),
+        scx_format_io::pandas_index_columns(batch.schema_ref()),
         vec!["__index_level_0__".to_string()],
         "schema must carry pandas metadata pointing at the index column"
     );
@@ -6581,7 +6590,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_named() {
         "named index must NOT be renamed: {field_names:?}"
     );
     assert_eq!(
-        scx_format::pandas_index_columns(batch.schema_ref()),
+        scx_format_io::pandas_index_columns(batch.schema_ref()),
         vec!["gene_symbols".to_string()],
         "pandas metadata must point at the named index"
     );
@@ -6615,7 +6624,7 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
     let reader = ScxReader::open(&scx_path).unwrap();
     let obs = reader.read_obs().unwrap();
     assert_eq!(
-        scx_format::pandas_index_columns(obs.schema_ref()),
+        scx_format_io::pandas_index_columns(obs.schema_ref()),
         vec!["__index_level_0__".to_string()],
         "obs schema must identify the index column"
     );
@@ -6633,7 +6642,7 @@ fn h5ad_to_scx_streaming_preserves_obs_var_names() {
 
     let var = reader.read_var().unwrap();
     assert_eq!(
-        scx_format::pandas_index_columns(var.schema_ref()),
+        scx_format_io::pandas_index_columns(var.schema_ref()),
         vec!["__index_level_0__".to_string()],
         "var schema must identify the index column"
     );
@@ -6896,8 +6905,8 @@ mod streaming_obs_hdf5 {
     use arrow::datatypes::{DataType, Field, Int32Type, Int8Type, Schema};
 
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::{HEADER_SIZE, MAGIC};
-    use scx_format::{FileHeader, ScxReader, ScxWriter};
+    use scx_format_io::header::{HEADER_SIZE, MAGIC};
+    use scx_format_io::{FileHeader, ScxReader, ScxWriter};
 
     use crate::h5ad_read::read_dataframe_group;
     use crate::h5ad_stream_write::write_scx_to_h5ad_streaming;
@@ -6910,7 +6919,7 @@ mod streaming_obs_hdf5 {
     fn header(n_obs: u64, n_vars: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: HEADER_SIZE as u16,
             flags: 0,
             n_obs,
@@ -7515,7 +7524,7 @@ mod streaming_obs_hdf5 {
     #[test]
     fn test_streaming_obs_round_trip_sharded_to_h5mu() {
         use crate::mudata_write::scx_to_h5mu_streaming;
-        use scx_format::modality::ModalityType;
+        use scx_format_io::modality::ModalityType;
 
         let dir = tempfile::tempdir().unwrap();
         let scx_path = dir.path().join("sharded_mm.scx");
@@ -7973,7 +7982,8 @@ mod streaming_obs_hdf5 {
         .unwrap();
 
         let needs_nullable = vec![false; schema.fields().len()];
-        let shards: Vec<Result<RecordBatch, scx_format::error::ScxError>> = vec![Ok(good), Ok(bad)];
+        let shards: Vec<Result<RecordBatch, scx_format_io::error::ScxError>> =
+            vec![Ok(good), Ok(bad)];
         let res = write_dataframe_group_streaming(
             &root,
             "obs",

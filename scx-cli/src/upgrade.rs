@@ -6,9 +6,9 @@
 use std::path::Path;
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION};
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
 
 pub fn run_upgrade(
     input: &Path,
@@ -189,7 +189,10 @@ mod tests {
         let new_hdr = new_reader.header();
         assert_eq!(new_hdr.n_obs, orig_hdr.n_obs);
         assert_eq!(new_hdr.n_vars, orig_hdr.n_vars);
-        assert_eq!(new_hdr.format_version, scx_format::CURRENT_FORMAT_VERSION);
+        assert_eq!(
+            new_hdr.format_version,
+            scx_format_io::CURRENT_FORMAT_VERSION
+        );
 
         // Verify CSR data matches
         let orig_csr = orig_reader.read_all_csr_shards().unwrap();
@@ -248,7 +251,7 @@ mod tests {
         assert_eq!(reader.header().n_obs, orig_n_obs);
         assert_eq!(
             reader.header().format_version,
-            scx_format::CURRENT_FORMAT_VERSION
+            scx_format_io::CURRENT_FORMAT_VERSION
         );
 
         let csr = reader.read_all_csr_shards().unwrap();
@@ -276,7 +279,7 @@ mod tests {
     #[test]
     fn test_upgrade_preserves_csc_multi_shard() {
         use crate::test_utils::{sample_header, sample_obs, sample_var};
-        use scx_format::section::SectionType;
+        use scx_format_io::section::SectionType;
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("with_csc.scx");
@@ -379,8 +382,8 @@ mod tests {
         let out_data = std::fs::read(&output).unwrap();
         for entry in &out_csc_entries {
             let section = &out_data[entry.offset as usize..][..entry.length as usize];
-            let sh = scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format::shard::SHARD_HEADER_SIZE],
+            let sh = scx_format_io::shard::ShardHeader::read_from(&mut std::io::Cursor::new(
+                &section[..scx_format_io::shard::SHARD_HEADER_SIZE],
             ))
             .unwrap();
             assert_eq!(sh.shard_type, 1, "CSC shard byte must be 1 after upgrade");

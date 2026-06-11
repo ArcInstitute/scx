@@ -1,6 +1,6 @@
 // CSC sidecar generation policy. Mirrors the `--csc off|auto|always`
 // CLI flag and the `csc="..."` pyscx kwarg, in the same spirit as
-// [`crate::bitmap::BitmapPolicy`].
+// `scx_format_io::BitmapPolicy`.
 //
 // Lives in `scx-format` (rather than `scx-ops` / `scx-convert`) so the
 // CPU-only pyscx in-memory write path — where `scx-convert` is behind the

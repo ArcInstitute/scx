@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::record_batch::RecordBatch;
-use scx_format::deletion_vectors::DeletionVectors;
-use scx_format::reader::ScxReader;
+use scx_format_io::deletion_vectors::DeletionVectors;
+use scx_format_io::reader::ScxReader;
 
 use crate::batch::Batch;
 use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
@@ -1063,8 +1063,8 @@ impl Drop for TrainingPipeline {
 mod tests {
     use super::*;
     use scx_codec::CodecId;
-    use scx_format::header::{FileHeader, MAGIC};
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::{FileHeader, MAGIC};
+    use scx_format_io::writer::ScxWriter;
 
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1073,7 +1073,7 @@ mod tests {
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

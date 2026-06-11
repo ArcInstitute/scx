@@ -8,7 +8,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use scx_format::ModalityTable;
+use scx_format_io::ModalityTable;
 
 fuzz_target!(|data: &[u8]| {
     let _ = ModalityTable::read_from(&mut std::io::Cursor::new(data), data.len());

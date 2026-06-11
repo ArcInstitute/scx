@@ -540,6 +540,70 @@ impl ScxCsr {
     }
 }
 
+/// Total variance from pre-computed column sum-of-squares.
+///
+/// Uses the identity: `Var(X_j) = (Σ x²_j − n·μ_j²) / (n−1)`.
+/// Sums variance contributions across all columns to get total variance.
+///
+/// - `col_sum_sq`: per-column sum-of-squares (e.g. from [`ScxCsr::col_sums_and_sum_sq`])
+/// - `means`: column means (if centering was applied)
+/// - `n_obs`: number of observations
+pub fn total_variance_from_col_sq(col_sum_sq: &[f64], means: Option<&[f64]>, n_obs: usize) -> f64 {
+    let total = if let Some(mu) = means {
+        col_sum_sq
+            .iter()
+            .zip(mu.iter())
+            .map(|(&sq, &m)| sq - n_obs as f64 * m * m)
+            .sum::<f64>()
+    } else {
+        col_sum_sq.iter().sum::<f64>()
+    };
+    total / (n_obs as f64 - 1.0).max(1.0)
+}
+
+/// Merge multiple `ScxCsr` values into one, rebasing indptr.
+///
+/// All CSRs must have the same number of columns (`n_vars`).
+pub fn concatenate_csr(csrs: &[ScxCsr], n_vars: usize) -> Result<ScxCsr, CsrError> {
+    if csrs.is_empty() {
+        return Ok(ScxCsr::new_unchecked((0, n_vars), vec![0], vec![], vec![]));
+    }
+
+    if csrs.len() == 1 {
+        return Ok(csrs[0].clone());
+    }
+
+    // Pre-compute total sizes for allocation
+    let total_rows: usize = csrs.iter().map(|c| c.n_rows()).sum();
+    let total_nnz: usize = csrs.iter().map(|c| c.nnz()).sum();
+
+    let mut merged_indptr = Vec::with_capacity(total_rows + 1);
+    let mut merged_indices = Vec::with_capacity(total_nnz);
+    let mut merged_data = Vec::with_capacity(total_nnz);
+    let mut cumulative_nnz: i64 = 0;
+
+    for (i, csr) in csrs.iter().enumerate() {
+        if i == 0 {
+            merged_indptr.extend_from_slice(&csr.indptr);
+        } else {
+            // Skip first element (0) and offset by cumulative nnz
+            for &v in &csr.indptr[1..] {
+                merged_indptr.push(v + cumulative_nnz);
+            }
+        }
+        cumulative_nnz += *csr.indptr.last().unwrap_or(&0);
+        merged_indices.extend_from_slice(&csr.indices);
+        merged_data.extend_from_slice(&csr.data);
+    }
+
+    Ok(ScxCsr::new_unchecked(
+        (total_rows, n_vars),
+        merged_indptr,
+        merged_indices,
+        merged_data,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

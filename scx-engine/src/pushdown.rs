@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use scx_format::catalog::{ColumnStat, FullCatalog};
-use scx_format::column_name_hash;
-use scx_format::DeletionVectors;
+use scx_format_io::catalog::{ColumnStat, FullCatalog};
+use scx_format_io::column_name_hash;
+use scx_format_io::DeletionVectors;
 
 use crate::predicate::{Predicate, ScalarValue};
 
@@ -313,9 +313,9 @@ fn scalar_to_f64_ref(val: &ScalarValue) -> Option<f64> {
 mod tests {
     use super::*;
     use roaring::RoaringBitmap;
-    use scx_format::catalog::{FullCatalog, FullCatalogEntry, ShardStats};
-    use scx_format::section::SectionType;
-    use scx_format::DeletionVectors;
+    use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, ShardStats};
+    use scx_format_io::section::SectionType;
+    use scx_format_io::DeletionVectors;
 
     /// Build a catalog with N CSR shards, each having the given column stats.
     fn catalog_with_shards(shard_specs: Vec<(u64, u64, Vec<ColumnStat>)>) -> FullCatalog {
@@ -364,7 +364,7 @@ mod tests {
         }
 
         FullCatalog {
-            catalog_version: scx_format::CURRENT_CATALOG_VERSION,
+            catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
             manifest_sequence: 1,
             prev_catalog_offset: 0,
             n_obs: entries

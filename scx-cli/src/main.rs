@@ -59,7 +59,7 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
         /// Target rows per shard
-        #[arg(long, default_value_t = scx_format::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
+        #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
@@ -220,7 +220,7 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Target rows per shard (must be > 0)
-        #[arg(long, default_value_t = NonZeroU32::new(scx_format::DEFAULT_SHARD_TARGET_ROWS).unwrap())]
+        #[arg(long, default_value_t = NonZeroU32::new(scx_format_io::DEFAULT_SHARD_TARGET_ROWS).unwrap())]
         shard_size: NonZeroU32,
         /// Rebuild the CSC sidecar after appending (drops + re-emits via
         /// `scx build-csc`). Without this flag, append drops the CSC
@@ -618,7 +618,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
         /// Target rows per shard in the output file
-        #[arg(long, default_value_t = scx_format::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
+        #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
         /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
         #[arg(long, default_value = "auto")]
@@ -1093,7 +1093,7 @@ fn run_convert(
                 .collect(),
         ),
     };
-    let modality_types_list: Vec<(String, scx_format::modality::ModalityType)> =
+    let modality_types_list: Vec<(String, scx_format_io::modality::ModalityType)> =
         match modality_types {
             None => Vec::new(),
             Some(s) if s.trim().is_empty() => Vec::new(),
@@ -1145,8 +1145,8 @@ fn parse_index_columns(value: Option<&str>) -> Vec<String> {
 /// names match `/mod/{name}` keys verbatim.
 fn parse_modality_types(
     s: &str,
-) -> Result<Vec<(String, scx_format::modality::ModalityType)>, Box<dyn std::error::Error>> {
-    use scx_format::modality::ModalityType;
+) -> Result<Vec<(String, scx_format_io::modality::ModalityType)>, Box<dyn std::error::Error>> {
+    use scx_format_io::modality::ModalityType;
     s.split(',')
         .map(|kv| {
             let trimmed = kv.trim();
@@ -1190,7 +1190,7 @@ fn dispatch_convert(
     dense_zero_epsilon: f32,
     temp_dir: Option<std::path::PathBuf>,
     modalities: Option<Vec<String>>,
-    modality_types: Vec<(String, scx_format::modality::ModalityType)>,
+    modality_types: Vec<(String, scx_format_io::modality::ModalityType)>,
     index_obs: Vec<String>,
     index_var: Vec<String>,
     index_preset: Option<String>,
@@ -1278,7 +1278,7 @@ fn dispatch_convert(
                 // If the file is multimodal, raise with a clear
                 // message; if single-modality, fall through to the
                 // h5ad writer (streaming by default).
-                let reader = scx_format::reader::ScxReader::open(input)?;
+                let reader = scx_format_io::reader::ScxReader::open(input)?;
                 let is_multimodal = reader.is_multimodal();
                 let n_modalities = reader.n_modalities();
                 drop(reader);
@@ -1345,7 +1345,7 @@ fn dispatch_convert(
     _dense_zero_epsilon: f32,
     _temp_dir: Option<std::path::PathBuf>,
     _modalities: Option<Vec<String>>,
-    _modality_types: Vec<(String, scx_format::modality::ModalityType)>,
+    _modality_types: Vec<(String, scx_format_io::modality::ModalityType)>,
     _index_obs: Vec<String>,
     _index_var: Vec<String>,
     _index_preset: Option<String>,
@@ -1404,7 +1404,7 @@ fn dispatch_mtx_to_scx(
         convert::CscPolicy::Off => false,
         convert::CscPolicy::Always => true,
         convert::CscPolicy::Auto => {
-            let reader = scx_format::ScxReader::open(output)?;
+            let reader = scx_format_io::ScxReader::open(output)?;
             let header = reader.header();
             csc_policy.should_build_csc(header.n_obs, header.n_vars)
         }

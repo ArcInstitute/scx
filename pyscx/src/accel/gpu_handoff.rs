@@ -300,7 +300,7 @@ pub fn gpu_decode_shard(
             )
         })?;
 
-        let reader = scx_format::ScxReader::open(path)
+        let reader = scx_format_io::ScxReader::open(path)
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open '{path}': {e}")))?;
         let shard_bytes = reader
             .read_raw_csr_shard_bytes_for(modality_id, shard_idx)

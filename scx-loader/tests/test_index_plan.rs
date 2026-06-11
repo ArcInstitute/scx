@@ -438,8 +438,8 @@ fn singleflight_dedupes_concurrent_decode() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
 
-    let reader = scx_format::ScxReader::open(&path).unwrap();
-    let mut backed = scx_format::BackedCsrReader::new(reader, /*cache_shards=*/ 4);
+    let reader = scx_format_io::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format_io::BackedCsrReader::new(reader, /*cache_shards=*/ 4);
     let metrics = backed.enable_metrics();
     let backed = Arc::new(backed);
 
@@ -506,8 +506,8 @@ fn cache_byte_budget_evicts_when_exceeded() {
     let per_shard_bytes_approx: usize = 21 * 8 + 20 * 4 + 20 * 4;
     let budget = per_shard_bytes_approx; // 1 shard fits
 
-    let reader = scx_format::ScxReader::open(&path).unwrap();
-    let mut backed = scx_format::BackedCsrReader::new_with_byte_budget(
+    let reader = scx_format_io::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format_io::BackedCsrReader::new_with_byte_budget(
         reader, /*cache_shards=*/ 10, // count cap loose; byte cap binds
         budget,
     );
@@ -695,8 +695,8 @@ fn peak_bytes_in_cache_records_high_water() {
     let dir = tempfile::tempdir().unwrap();
     let path = fixture(&dir);
 
-    let reader = scx_format::ScxReader::open(&path).unwrap();
-    let mut backed = scx_format::BackedCsrReader::new(reader, /*cache_shards=*/ 16);
+    let reader = scx_format_io::ScxReader::open(&path).unwrap();
+    let mut backed = scx_format_io::BackedCsrReader::new(reader, /*cache_shards=*/ 16);
     let metrics = backed.enable_metrics();
 
     // Touch every shard so the cache fills up (N_SHARDS = 5 well below the

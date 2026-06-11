@@ -26,11 +26,11 @@ use arrow::datatypes::Schema;
 use serde_json::Value;
 
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
-use scx_format::checksum::blake3_hash;
-use scx_format::provenance::{Provenance, ProvenanceEntry};
-use scx_format::section::{write_alignment_padding, SectionType};
-use scx_format::writer::ScxWriter;
+use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
+use scx_format_io::checksum::blake3_hash;
+use scx_format_io::provenance::{Provenance, ProvenanceEntry};
+use scx_format_io::section::{write_alignment_padding, SectionType};
+use scx_format_io::writer::ScxWriter;
 
 use crate::append::{predicate_index_build_options_for_obs, unify_dict_columns};
 use crate::error::{OpsError, Result};
@@ -364,11 +364,11 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<()> {
         stats: None,
     });
     if let Some(per_shard) = per_shard_obs_stats {
-        scx_format::assign_csr_shard_column_stats(&mut entries, per_shard)?;
+        scx_format_io::assign_csr_shard_column_stats(&mut entries, per_shard)?;
     }
 
     let new_catalog = FullCatalog {
-        catalog_version: scx_format::CURRENT_CATALOG_VERSION,
+        catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
         manifest_sequence: manifest + 1,
         prev_catalog_offset: old_catalog_offset,
         n_obs: prep.old_n_obs, // UNCHANGED

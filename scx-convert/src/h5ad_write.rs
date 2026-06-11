@@ -25,7 +25,7 @@ fn vlu(s: &str) -> VarLenUnicode {
     })
 }
 
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 use super::pipeline::ConvertError;
 use super::warnings::{ConvertWarning, WarningSink};
@@ -269,7 +269,7 @@ fn write_dataframe_body(
     //   2. Fallback: `schema.field(0)` — preserves the CLI path's
     //      behaviour where obs/var come from disk without pandas
     //      metadata, and the first field already IS the index dataset.
-    let pandas_idx_cols = scx_format::pandas_index_columns(schema.as_ref());
+    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema.as_ref());
     let index_field_name: Option<String> = pandas_idx_cols
         .into_iter()
         .find(|n| schema.field_with_name(n).is_ok())
@@ -964,7 +964,7 @@ pub(super) fn scan_nullable_columns<I>(
     schema: &Schema,
 ) -> Result<Vec<bool>, ConvertError>
 where
-    I: IntoIterator<Item = Result<RecordBatch, scx_format::error::ScxError>>,
+    I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
 {
     let eligible: Vec<bool> = schema
         .fields()
@@ -1036,7 +1036,7 @@ pub(super) fn write_dataframe_group_streaming<I>(
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError>
 where
-    I: IntoIterator<Item = Result<RecordBatch, scx_format::error::ScxError>>,
+    I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
 {
     let group = parent.group(name).or_else(|_| parent.create_group(name))?;
 
@@ -1053,7 +1053,7 @@ where
 
     // Resolve the pandas index field (same probe order as
     // `write_dataframe_body`: pandas metadata first, else field(0)).
-    let pandas_idx_cols = scx_format::pandas_index_columns(schema);
+    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema);
     let index_field_name: Option<String> = pandas_idx_cols
         .into_iter()
         .find(|n| schema.field_with_name(n).is_ok())

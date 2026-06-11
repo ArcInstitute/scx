@@ -5,9 +5,9 @@ use std::path::Path;
 
 use scx_codec::ValueEncoding;
 use scx_engine::{QueryPipeline, QueryResult};
-use scx_format::header::FileHeader;
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::FileHeader;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
 
 /// Return true if `source` should be opened via `scx_cloud::open_cloud`.
 ///
@@ -334,8 +334,8 @@ pub fn parse_gene_indices(path: &Path) -> Result<Vec<u32>, Box<dyn std::error::E
 
 /// Detect the ValueEncoding from the first CSR shard of an SCX file.
 fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    use scx_format::section::SectionType;
-    use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+    use scx_format_io::section::SectionType;
+    use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
 
     let reader = ScxReader::open(path)?;
     let csr_entries = reader.catalog().shards(SectionType::CsrShard);
@@ -365,7 +365,7 @@ fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::erro
 /// canonical first shard `X/000000.shard`, and if absent, walk one
 /// level deep to find any `*.shard` file under `X/`.
 fn detect_value_encoding_from_dir(dir: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
+    use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
     use std::fs::File;
     use std::io::Read;
 
@@ -474,10 +474,10 @@ fn write_query_result(
         let shard_values = &raw_values[val_start..val_end];
 
         // Auto-codec selection (single-modality query → RNA default)
-        let codec_id = scx_format::select_codec_for_modality(
+        let codec_id = scx_format_io::select_codec_for_modality(
             shard_values,
             value_encoding,
-            scx_format::ModalityType::Rna,
+            scx_format_io::ModalityType::Rna,
         );
 
         writer.write_csr_shard(
@@ -493,7 +493,7 @@ fn write_query_result(
     }
 
     // Write provenance
-    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn detect_value_encoding_from_dir_reads_first_shard_header() {
         use scx_codec::CodecId;
-        use scx_format::shard::SHARD_HEADER_SIZE;
+        use scx_format_io::shard::SHARD_HEADER_SIZE;
 
         let dir = tempfile::tempdir().unwrap();
         let x_dir = dir.path().join("X");
@@ -585,8 +585,8 @@ mod tests {
         let shard_path = x_dir.join("000000.shard");
 
         // Synthesize a minimal valid ShardHeader with Uint8 encoding.
-        let sh = scx_format::shard::ShardHeader {
-            magic: scx_format::shard::SHARD_MAGIC,
+        let sh = scx_format_io::shard::ShardHeader {
+            magic: scx_format_io::shard::SHARD_MAGIC,
             shard_format_version: 1,
             shard_type: 0,
             codec_id: CodecId::None as u8,

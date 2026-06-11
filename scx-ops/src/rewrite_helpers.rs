@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
-use scx_format::catalog::{FullCatalogEntry, ShardStats};
-use scx_format::decode_sidecar::DecodeSidecar;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_format::writer::ScxWriter;
-use scx_format::{compute_shard_stats, MajorAxis, ScxReader};
+use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
+use scx_format_io::decode_sidecar::DecodeSidecar;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::{compute_shard_stats, MajorAxis, ScxReader};
 
 use crate::error::{OpsError, Result as OpsResult};
 
@@ -61,7 +61,7 @@ pub(crate) fn build_raw_copied_csr_section(
     // copied read-only into `section_data`, so borrow it directly (no alloc).
     let src_bytes = source.read_raw_shard_bytes(entry)?;
     if src_bytes.len() < SHARD_HEADER_SIZE {
-        return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+        return Err(OpsError::Format(scx_format_io::ScxError::InvalidCatalog(
             format!("source shard '{}' too small for header", entry.name),
         )));
     }
@@ -99,7 +99,7 @@ pub(crate) fn build_raw_copied_csr_section(
                 // panic on an out-of-bounds values slice (readers never panic
                 // on bad input).
                 if values_start > values_end || values_end > src_bytes.len() {
-                    return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+                    return Err(OpsError::Format(scx_format_io::ScxError::InvalidCatalog(
                         format!(
                             "source shard '{}' has invalid values offset/length \
                              ({values_start}..{values_end} of {} bytes)",
@@ -199,7 +199,7 @@ fn copy_layers(
     let layer_names = reader.layer_names();
     for layer_name in &layer_names {
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format::FullCatalogEntry> = reader
+        let layer_shard_entries: Vec<&scx_format_io::FullCatalogEntry> = reader
             .catalog()
             .entries
             .iter()

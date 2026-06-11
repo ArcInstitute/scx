@@ -590,7 +590,7 @@ pub fn read_dataframe_group(
     // Inject the pandas index column (referenced by the `_index` HDF5
     // attribute) into the RecordBatch. `column-order` excludes it by
     // anndata convention, so the loop above never visited it — yet
-    // downstream consumers (`scx_format::pandas_index_columns`, used
+    // downstream consumers (`scx_format_io::pandas_index_columns`, used
     // by `pyscx.open(...).to_anndata()` and by
     // `scx-convert/src/h5ad_write.rs::write_dataframe_body`) rely on
     // the resulting schema's `pandas` metadata envelope to identify

@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 arrow = { workspace = true }
-scx-format = { path = "../scx-format" }
+scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-loader = { path = "../scx-loader", features = ["python"] }

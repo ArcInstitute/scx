@@ -4,7 +4,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CloudError {
     #[error("SCX format error: {0}")]
-    Format(#[from] scx_format::ScxError),
+    Format(#[from] scx_format_io::ScxError),
 
     #[error("Object store error: {0}")]
     ObjectStore(#[from] object_store::Error),
