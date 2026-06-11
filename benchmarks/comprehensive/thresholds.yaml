@@ -39,9 +39,9 @@ absolute_floors:
   # tabula_sapiens_100k, which exercises the **multi-shard** CSC-direct path
   # (multi-shard CSC iteration + range prefiltering) that pbmc3k can't reach,
   # and census_1m (the largest tier with a built CSC sidecar — guards the
-  # range-prefilter path at atlas scale). All are no-ops unless a run sets
-  # SCX_GPU_DE_V3=1 with a CSC fixture; then a silent multi-shard CSC->CSR
-  # fallback at scale fails the gate. `check_absolute_floors` skips any
+  # range-prefilter path at atlas scale). All are no-ops unless a run builds a
+  # CSC fixture (v3 CSC-direct is the default route); then a silent multi-shard
+  # CSC->CSR fallback at scale fails the gate. `check_absolute_floors` skips any
   # triple silently on runs that didn't execute it.
   - benchmark: accel_de
     format: accel_de__pyscx_pdex_ref_gpu

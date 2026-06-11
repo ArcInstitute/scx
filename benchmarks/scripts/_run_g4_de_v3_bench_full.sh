@@ -1,7 +1,9 @@
 #!/bin/bash
-# Three-way G4.3 bench (FULL tier): v1 (default), v2 (G4.1), v3 (CSC-first).
-# All 6 accel-gate fixtures now have CSC sidecars (small + full tier;
-# census_500k / census_1m unlocked by the u16 fix in scx-format/writer.rs).
+# G4.3 bench (FULL tier): GPU DE v3 (CSC-first) — now the unconditional default
+# route (the former v1/v2/v3 gate sweep collapsed to one run when the
+# SCX_GPU_DE_V2/SCX_GPU_DE_V3 gates were removed). All 6 accel-gate fixtures
+# now have CSC sidecars (small + full tier; census_500k / census_1m unlocked by
+# the u16 fix in scx-format/writer.rs).
 
 set -uo pipefail
 
@@ -36,9 +38,7 @@ run_one () {
     echo "=== ${label} exit=$? ==="
 }
 
-run_one "v1_default"
-run_one "v2_on"    SCX_GPU_DE_V2=1
-run_one "v3_on"    SCX_GPU_DE_V3=1
+run_one "v3_default"
 
 echo
-echo "=== all three full-tier configs done ==="
+echo "=== done ==="

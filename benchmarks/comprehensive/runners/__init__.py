@@ -45,11 +45,11 @@ def make_runner(fmt) -> FormatRunner:
     """Instantiate a FormatRunner from a FormatVariant."""
     cls = _RUNNER_MAP[fmt.runner]
     params = dict(fmt.params)
-    # G4.3: opt-in CSC sidecar write at convert time. Required for the v3
-    # GPU DE path (`SCX_GPU_DE_V3=1`) to exercise CSC-direct kernels.
-    # Without this, v3 falls back to CSR-direct atomicAdd path on every
-    # fixture. Cheap to leave on for non-GPU runs (modest convert-time
-    # overhead + larger SCX file). Off by default to preserve back-compat.
+    # G4.3: opt-in CSC sidecar write at convert time. Required for the GPU DE
+    # CSC-direct path to be exercised; without it, GPU DE falls back to the
+    # CSR-direct atomicAdd path on every fixture. Cheap to leave on for non-GPU
+    # runs (modest convert-time overhead + larger SCX file). Off by default to
+    # preserve back-compat.
     import os
     if cls is ScxRunner and os.environ.get("SCX_BENCH_WITH_CSC", "").strip() in ("1", "true", "TRUE"):
         params.setdefault("with_csc", True)

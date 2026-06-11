@@ -16,13 +16,12 @@ Usage:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
-# DE CSC-direct routing is opt-in; turn it on so the pdex_ref GPU triple takes
-# the gpu_csc_v3 route on the CSC fixture (exercises de_route_csc_direct).
-os.environ.setdefault("SCX_GPU_DE_V3", "1")
+# GPU DE v3 is the unconditional default, so the pdex_ref GPU triple takes the
+# gpu_csc_v3 route whenever a CSC fixture is present (exercises
+# de_route_csc_direct) — no env gate needed.
 
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO))
@@ -105,7 +104,7 @@ def main() -> int:
     out = Path(sys.argv[1])
     (out / "raw").mkdir(parents=True, exist_ok=True)
 
-    print(f"[route-gate] SCX_GPU_DE_V3={os.environ.get('SCX_GPU_DE_V3')}")
+    print("[route-gate] GPU DE v3 is the unconditional default route")
     for bench, ds, fmt in _TRIPLES:
         try:
             d = _run_benchmark(bench, ds, fmt, "accel_runner", {}, 3, False, None)
