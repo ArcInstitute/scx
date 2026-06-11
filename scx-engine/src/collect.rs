@@ -626,11 +626,14 @@ fn materialize_filtered_obs(
         vec![reader.read_obs_shard(0)?.slice(0, 0)]
     } else {
         groups
-            .par_iter()
+            .into_par_iter()
             .map(|(bi, locals)| {
-                let (shard_idx, _, _) = by_start[*bi];
+                let (shard_idx, _, _) = by_start[bi];
                 let batch = reader.read_obs_shard(shard_idx)?;
-                let take_indices = UInt32Array::from_iter_values(locals.iter().copied());
+                // Consume the owned `locals` Vec: `UInt32Array::from(Vec<u32>)`
+                // takes the allocation via `Buffer::from_vec` (zero-copy), so no
+                // elements are copied into a fresh Arrow buffer.
+                let take_indices = UInt32Array::from(locals);
                 let columns: Vec<_> = batch
                     .columns()
                     .iter()

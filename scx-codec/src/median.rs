@@ -173,6 +173,12 @@ mod tests {
         for case in cases_u64 {
             let mut buf = case.to_vec();
             assert_eq!(floor_median_u64_inplace(&mut buf), floor_median_u64(case));
+            // In-place leaves a permutation of the original values.
+            let mut got = buf.clone();
+            let mut want = case.to_vec();
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want);
         }
     }
 }
