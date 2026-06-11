@@ -46,7 +46,7 @@ fn import_mudata(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     })
 }
 
-/// Convenience: same heuristic as the CLI's `mudata_pipeline.rs` but
+/// Convenience: same heuristic as the CLI's `h5mu/pipeline.rs` but
 /// invoked from Python. Maps a modality name to a `ModalityType`
 /// based on common naming conventions for CITE-seq / multiome.
 fn infer_modality_type(name: &str) -> ModalityType {

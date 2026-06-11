@@ -192,7 +192,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 ## Parallel streaming reader — export direction (scx-convert)
 
 The SCX → h5ad / h5mu export path
-(`h5ad_stream_write::stream_csr_to_group_at`) mirrors the ingest
+(`h5ad::stream_write::stream_csr_to_group_at`) mirrors the ingest
 dispatcher but with a simpler precondition set:
 
 - **No libhdf5 thread-safety probe.** Workers only read SCX shards

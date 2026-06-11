@@ -342,7 +342,7 @@ for the binary layout.
 
 `pyscx.to_h5ad` / `pyscx.to_h5mu` (and `scx convert --to h5ad/h5mu`)
 stream sharded obs/var through `write_dataframe_group_streaming` in
-`scx-convert/src/h5ad_write.rs`: HDF5 datasets are pre-allocated to
+`scx-convert/src/h5ad/write.rs`: HDF5 datasets are pre-allocated to
 `n_rows_kept` (computed catalog-only from `obs_metadata_shard_count`
 + catalog stats, minus deletion-vector kept-count when active), then
 `obs_shards()` / `var_shards()` are drained one shard at a time and

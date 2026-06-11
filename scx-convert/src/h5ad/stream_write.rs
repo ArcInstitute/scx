@@ -1,6 +1,6 @@
 // Streaming SCX → h5ad writer.
 //
-// Symmetrical to `h5ad_stream.rs` on the read side: walks SCX CSR
+// Symmetrical to `stream.rs` on the read side: walks SCX CSR
 // shards in row order and writes hyperslab slices into pre-allocated
 // `/X/{indptr,indices,data}` (and `/layers/{name}/…`) HDF5 datasets.
 // Peak RSS is bounded by one shard's worth of CSR plus encode buffers
@@ -17,7 +17,7 @@
 //   second decode is acceptable for export — deterministic on-disk
 //   layout is worth one extra pass over the CSR shards.
 // * Metadata writes (`obs`, `var`, `obsm`, `varm`, `obsp`, `varp`,
-//   `uns`) reuse the non-streaming helpers in `h5ad_write.rs`. Only
+//   `uns`) reuse the non-streaming helpers in `write.rs`. Only
 //   `/X` and `/layers/{name}` change.
 
 use std::collections::BTreeMap;
@@ -172,7 +172,7 @@ fn vlu(s: &str) -> VarLenUnicode {
 }
 
 /// Streaming SCX → h5ad entry point. Mirrors `write_scx_to_h5ad`
-/// (`h5ad_write.rs:28`) but writes `/X` and `/layers/{name}` shard-
+/// (`write.rs`) but writes `/X` and `/layers/{name}` shard-
 /// by-shard via pre-allocated hyperslab datasets. Single-modality
 /// SCX files only; multimodal files must use `scx_to_h5mu_streaming`
 /// or `scx_modality_to_h5ad_streaming`.

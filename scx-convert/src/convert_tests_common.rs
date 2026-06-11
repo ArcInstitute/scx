@@ -600,7 +600,7 @@ pub(crate) fn create_test_h5mu(path: &Path, n_obs: usize, rna_n_vars: usize, adt
 /// Like [`create_test_h5mu`] but writes a second modality
 /// `dense_adt` whose `/X` is a 2D dense **f64** dataset with
 /// `encoding-type="array"`. Exercises the dense-non-f32 sampling
-/// path in `mudata_pipeline::sample_modality_values`.
+/// path in `h5mu::pipeline::sample_modality_values`.
 #[cfg(test)]
 pub(crate) fn create_test_h5mu_with_dense_f64_modality(
     path: &Path,

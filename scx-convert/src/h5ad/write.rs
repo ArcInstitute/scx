@@ -994,7 +994,7 @@ where
 /// `shards` and hyperslab-writes the kept-row slice of each column.
 ///
 /// Mirrors the pre-allocate-then-hyperslab pattern in
-/// `h5ad_stream_write::create_csr_triplet` + `stream_csr_to_group_at`
+/// `stream_write::create_csr_triplet` + `stream_csr_to_group_at`
 /// (the `/X` and `/layers/{name}` path). Peak RSS per column is bounded
 /// to one shard's worth — atlas-scale obs no longer needs to live in
 /// memory at once.

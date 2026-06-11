@@ -3,10 +3,10 @@
 // only by the h5ad reader. Crate-root `lib.rs` re-exports the public surface
 // from here, so `scx_convert::*` paths are unchanged.
 
-pub mod csc_stream;
+pub(crate) mod csc_stream;
 pub(crate) mod csc_transpose;
-pub mod dense_stream;
-pub mod read;
-pub mod stream;
-pub mod stream_write;
-pub mod write;
+pub(crate) mod dense_stream;
+pub(crate) mod read;
+pub(crate) mod stream;
+pub(crate) mod stream_write;
+pub(crate) mod write;

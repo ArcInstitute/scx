@@ -309,7 +309,7 @@ fn from_anndata(
 /// Internally this routes straight to `scx_convert::h5ad_to_scx_streaming`
 /// with the on-disk h5ad path — no `anndata.read_h5ad` call, no
 /// backed-AnnData round-trip. obs / var / uns are read via pure-Rust
-/// HDF5 (`scx-convert/src/h5ad_read.rs`) when no override is supplied,
+/// HDF5 (`scx-convert/src/h5ad/read.rs`) when no override is supplied,
 /// which dodges anndata's eager `obsm` materialisation on `read_h5ad`
 /// (anndata 0.12 reads `obsm` into Python heap on every call, including
 /// in `backed='r'` mode). The pure-Rust path stamps the same pandas

@@ -1,9 +1,9 @@
 //! Shared HDF5 numeric-dtype enum used by all typed readers in this crate.
 //!
-//! Used by the typed readers in `h5ad_read.rs` (whole-dataset reads of
+//! Used by the typed readers in `h5ad/read.rs` (whole-dataset reads of
 //! categorical codes and CSR `indptr` / `indices` / `data`) and
-//! `h5ad_stream.rs` (slice-read twins for the streaming CSR path), as
-//! well as the dense-X reader in `dense_stream.rs`. Centralising the
+//! `h5ad/stream.rs` (slice-read twins for the streaming CSR path), as
+//! well as the dense-X reader in `h5ad/dense_stream.rs`. Centralising the
 //! `TypeDescriptor → enum` mapping keeps every reader honest about
 //! which HDF5 widths it accepts and surfaces unsupported dtypes via a
 //! single error path.
@@ -55,7 +55,7 @@ impl HdfNumericDtype {
         }
     }
 
-    // Used by the readers in `h5ad_read.rs` and `h5ad_stream.rs` to
+    // Used by the readers in `h5ad/read.rs` and `h5ad/stream.rs` to
     // attach a source-dtype tag to `ConvertError::IndexOverflow`.
     pub(crate) fn name(&self) -> &'static str {
         match self {

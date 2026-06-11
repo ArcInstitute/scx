@@ -359,7 +359,7 @@ impl IndexedCsrShardStream for XStreamReader {
     }
 }
 
-/// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
+/// Slice-read variant of `read_i32_dataset` from `read.rs`.
 /// Accepts every integer width; widens narrow source values and
 /// range-checks narrowing casts (`i64` / `u32` / `u64`). Overflow
 /// returns [`ConvertError::IndexOverflow`] — silent truncation of CSR
@@ -445,7 +445,7 @@ pub(crate) fn read_slice_i32(
     }
 }
 
-/// Slice-read variant of `read_f32_dataset` from `h5ad_read.rs`.
+/// Slice-read variant of `read_f32_dataset` from `read.rs`.
 /// Accepts every numeric width; casts signed and unsigned integers
 /// and `f64` to `f32`. Casts from `i64` / `u64` may lose precision
 /// for values above 2^24 — documented behaviour.

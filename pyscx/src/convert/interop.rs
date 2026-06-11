@@ -67,7 +67,7 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
 ///   multi-level indexes, and pandas-extension dtypes (`Int64`,
 ///   `boolean`, `Categorical`, …) from the envelope.
 /// - **Minimal envelope** `{"index_columns": [...]}` (stamped by
-///   `scx-convert/src/h5ad_read.rs::read_dataframe_group` and
+///   `scx-convert/src/h5ad/read.rs::read_dataframe_group` and
 ///   `scx_format_io::ensure_pandas_index_metadata`) → `Table.to_pandas()`
 ///   KeyErrors on the missing `columns` field, so strip the `pandas`
 ///   key first, then `set_index(drop=True, inplace=True)` manually.
@@ -190,7 +190,7 @@ pub(crate) struct EnvelopeInfo {
     /// the DataFrame index on the minimal-envelope branch.
     index_col: String,
     /// `true` when the envelope is the bare `{"index_columns": [...]}`
-    /// shape stamped by `scx-convert/src/h5ad_read.rs` and
+    /// shape stamped by `scx-convert/src/h5ad/read.rs` and
     /// `scx_format_io::ensure_pandas_index_metadata`. `false` when the
     /// envelope is the full pyarrow shape stamped by
     /// `pyarrow.Table.from_pandas` (carries `columns`,

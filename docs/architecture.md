@@ -887,7 +887,7 @@ HDF5 datasets. The total `nnz` is computed up front from catalog
 `ShardStats` (single pre-scan decode when deletion vectors are
 active) so the on-disk layout is deterministic — no extendable HDF5
 datasets. Obs and var metadata stream through the symmetric
-`h5ad_write::write_dataframe_group_streaming`: schema comes from
+`h5ad::write::write_dataframe_group_streaming`: schema comes from
 `read_obs_schema_logical_lossy()` (catalog-only), HDF5 datasets are
 pre-allocated to `n_rows_kept`, then `obs_shards()` / `var_shards()`
 are drained shard-by-shard with kept-row hyperslab writes per column.

@@ -1096,7 +1096,7 @@ pub fn h5ad_to_scx_streaming(
     // an open failure (dense/CSC layer, malformed encoding, shape
     // mismatch with X) is logged and skipped, mirroring the
     // non-streaming `read_layers` warn-and-continue behaviour
-    // (scx-convert/src/h5ad_read.rs). Once a layer's shards start
+    // (scx-convert/src/h5ad/read.rs). Once a layer's shards start
     // writing, a mid-stream shard error aborts — leaving a
     // half-written layer in the SCX file would be worse than failing
     // loudly. Width-dependent encoding values are recomputed per
