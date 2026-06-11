@@ -28,7 +28,7 @@ use scx_format::select_codec_for_modality;
 use scx_format::writer::ScxWriter;
 use scx_format::ScxReader;
 
-use crate::anndata::{
+use crate::convert::{
     csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, pyarrow_table_to_pandas,
     record_batch_to_pyarrow,
 };
@@ -103,7 +103,7 @@ pub fn to_mudata_backed<'py>(
                 ))
             })?;
             let mname = info.name.clone();
-            let adata = crate::anndata::build_backed_anndata_for_modality(
+            let adata = crate::convert::build_backed_anndata_for_modality(
                 py,
                 path,
                 &shared_catalog,
@@ -129,7 +129,7 @@ pub fn to_mudata_backed<'py>(
         } else {
             "X".to_string()
         };
-        let adata = crate::anndata::to_anndata_backed_with_options(
+        let adata = crate::convert::to_anndata_backed_with_options(
             py,
             path,
             cache_shards,
@@ -286,13 +286,13 @@ pub fn from_h5mu_impl(
             "no such file: '{path}'"
         )));
     }
-    let explicit_codec = crate::anndata::parse_codec(codec)?;
+    let explicit_codec = crate::convert::parse_codec(codec)?;
     let csc_policy =
         scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
-    let memory_budget_bytes = crate::anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let memory_budget_bytes = crate::convert::parse_memory_budget(memory_budget.as_ref())?;
 
     // Translate the Python dict form into ConvertOptions::modality_types.
     let modality_types_vec: Vec<(String, ModalityType)> = match modality_types {
@@ -353,7 +353,7 @@ pub fn from_h5mu_impl(
         py.detach(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
             .map_err(crate::convert_to_pyerr)?;
     }
-    crate::anndata::emit_python_warnings(py, &sink)?;
+    crate::convert::emit_python_warnings(py, &sink)?;
     Ok(())
 }
 

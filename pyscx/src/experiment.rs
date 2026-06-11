@@ -9,7 +9,7 @@ use scx_engine::QueryPipeline;
 use scx_format::backed::BackedCsrReader;
 use scx_format::ScxReader;
 
-use crate::anndata;
+use crate::convert;
 use crate::query::PyQueryPipeline;
 use crate::to_pyerr;
 
@@ -537,7 +537,7 @@ impl PyExperiment {
         memory_budget: Option<Bound<'_, PyAny>>,
         obsm: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+        let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
         if let Some(name) = modality.as_deref() {
             if !backed {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -553,10 +553,10 @@ impl PyExperiment {
                      a filtered single-modality file first",
                 ));
             }
-            return anndata::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
+            return convert::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
         }
         if backed {
-            anndata::to_anndata_backed(
+            convert::to_anndata_backed(
                 py,
                 &self.path,
                 cache_shards,
@@ -567,7 +567,7 @@ impl PyExperiment {
                 eager,
             )
         } else {
-            anndata::to_anndata_filtered(
+            convert::to_anndata_filtered(
                 py,
                 &self.path,
                 &self.reader,
@@ -641,7 +641,7 @@ impl PyExperiment {
             let dev = scx_accel::GpuDevice::new(gpu_id)
                 .map_err(|e| PyRuntimeError::new_err(format!("GPU device {gpu_id}: {e}")))?;
             const HEADROOM: f64 = 1.2;
-            let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+            let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
 
             // Fast path: a full-matrix handoff with no row/column reshaping decodes
             // X straight onto the device (no host scipy CSR, no re-upload — the
@@ -667,7 +667,7 @@ impl PyExperiment {
             ) = if fast_path {
                 // X-less skeleton (obs / var / obsm / uns / layers assembled eagerly;
                 // X is assigned after the device decode below).
-                let adata = anndata::to_anndata_filtered(
+                let adata = convert::to_anndata_filtered(
                     py,
                     &self.path,
                     &self.reader,
@@ -771,7 +771,7 @@ impl PyExperiment {
             } else {
                 // Host-assemble fallback (filtered / projected / multimodal inputs):
                 // the full option surface via the eager path, then a single HtoD.
-                let adata = anndata::to_anndata_filtered(
+                let adata = convert::to_anndata_filtered(
                     py,
                     &self.path,
                     &self.reader,

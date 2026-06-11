@@ -431,7 +431,7 @@ fn run_rank_genes_groups_inner(
             // `scx_engine::project_csr_row`; without this step the CPU
             // sparse path silently returns U = n_g·n_ref/2 for every gene
             // on inputs with unsorted CSRs (e.g. pbmc10k.h5ad).
-            let (csr_obj, _) = crate::anndata::ensure_csr(py, &x, /* in_place */ false)?;
+            let (csr_obj, _) = crate::convert::ensure_csr(py, &x, /* in_place */ false)?;
             let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
             let np = py.import("numpy")?;
             let indptr: Vec<i64> = np
@@ -1365,7 +1365,7 @@ fn run_pdex_ref_inner(
         // `ensure_csr` enforces sorted column indices — required by
         // `scx_engine::project_csr_row`. Without this, unsorted scipy
         // CSR inputs silently return U = n_g·n_ref/2 for every gene.
-        let (csr_obj, _) = crate::anndata::ensure_csr(py, &x, /* in_place */ false)?;
+        let (csr_obj, _) = crate::convert::ensure_csr(py, &x, /* in_place */ false)?;
         let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
         let np = py.import("numpy")?;
         let indptr: Vec<i64> = np

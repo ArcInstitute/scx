@@ -645,7 +645,7 @@ pub fn pca(
     // RAM ceiling for the backed-PCA shard cache. `None` → a conservative
     // default so the common case gets the multi-pass speedup without
     // unbounded growth on a count-only-opened reader.
-    let pca_cache_bytes = crate::anndata::parse_memory_budget(memory_budget)?
+    let pca_cache_bytes = crate::convert::parse_memory_budget(memory_budget)?
         .unwrap_or(DEFAULT_PCA_CACHE_BYTES) as usize;
 
     let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {

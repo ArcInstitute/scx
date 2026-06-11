@@ -29,7 +29,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use scx_format::ScxReader;
 
-use crate::anndata::{
+use crate::convert::{
     coo_record_batch_to_scipy, csr_to_scipy, filter_coo_obsp_by_kept_rows,
     filter_obs_by_deletion_vectors, obsm_batch_to_numpy,
 };
