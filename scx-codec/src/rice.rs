@@ -9,7 +9,7 @@
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 use crate::dispatch::CodecError;
-use crate::median::floor_median_u32;
+use crate::median::floor_median_u32_inplace;
 
 /// Default block size for Rice coding of values.
 pub const B_VAL: usize = 256;
@@ -73,11 +73,13 @@ pub fn rice_encode_with_metadata(
         if chunk.len() > u16::MAX as usize {
             return Err(BitStreamError);
         }
-        // Shift: subtract 1 from each value
-        let shifted: Vec<u32> = chunk.iter().map(|&v| v - 1).collect();
+        // Shift: subtract 1 from each value. This buffer is a throwaway scratch
+        // used only to derive the Rice parameter, so the median selection may
+        // reorder it in place (the encode loop below reads `chunk` directly).
+        let mut shifted: Vec<u32> = chunk.iter().map(|&v| v - 1).collect();
 
         // Compute Rice parameter k
-        let median = floor_median_u32(&shifted);
+        let median = floor_median_u32_inplace(&mut shifted);
         let k = compute_k(median);
         let bit_offset = writer.position() as u64;
 
@@ -91,8 +93,10 @@ pub fn rice_encode_with_metadata(
         // Write block header: 1 byte with k in low nibble
         writer.write_bits(k as u64, 8);
 
-        // Encode each shifted value
-        for &s in &shifted {
+        // Encode each shifted value, recomputing the shift from `chunk` so the
+        // values are emitted in original order (`shifted` was reordered above).
+        for &v in chunk {
+            let s = v - 1;
             let q = (s >> k) as u64;
             let r = (s & ((1u32 << k) - 1)) as u64;
             writer.write_unary(q);
@@ -236,6 +240,7 @@ pub fn rice_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::median::floor_median_u32;
 
     // --- Helper tests ---
 

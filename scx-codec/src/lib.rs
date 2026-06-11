@@ -13,7 +13,9 @@ pub use dispatch::{
     CodecId, CodecSelection, DecodedShard, EncodedShard, EncodedShardRef, ScipyShard,
     Scx1DecodeMetadata, ValueEncoding,
 };
-pub use median::{floor_median_u32, floor_median_u64};
+pub use median::{
+    floor_median_u32, floor_median_u32_inplace, floor_median_u64, floor_median_u64_inplace,
+};
 pub use value_encoding::{
     detect_value_encoding, detect_value_encoding_f64, is_integer_data, values_to_raw_bytes,
 };
