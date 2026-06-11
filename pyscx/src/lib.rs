@@ -1,6 +1,6 @@
 mod accel;
-mod anndata;
 pub(crate) mod backed;
+mod convert;
 mod experiment;
 #[cfg(feature = "hdf5")]
 mod h5ad_metadata;
@@ -266,9 +266,9 @@ fn from_anndata(
     memory_budget: Option<Bound<'_, PyAny>>,
     force_legacy_metadata: bool,
 ) -> PyResult<()> {
-    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
-    anndata::from_anndata_impl(
+    convert::from_anndata_impl(
         py,
         adata,
         path,
@@ -421,13 +421,13 @@ fn from_h5ad(
             "no such file: '{path}'"
         )));
     }
-    let explicit_codec = anndata::parse_codec(codec)?;
+    let explicit_codec = convert::parse_codec(codec)?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
         scx_format::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let uns_format_parsed = anndata::parse_uns_format(uns_format)?;
+    let uns_format_parsed = convert::parse_uns_format(uns_format)?;
     let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
-    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
@@ -452,7 +452,7 @@ fn from_h5ad(
         let (n_obs_disk, n_vars_disk, _x_format) = py
             .detach(|| scx_convert::read_h5ad_x_shape_from_path(&path_buf, &mut shape_sink))
             .map_err(|e| PyRuntimeError::new_err(format!("read X shape '{path}': {e}")))?;
-        anndata::emit_python_warnings(py, &shape_sink)?;
+        convert::emit_python_warnings(py, &shape_sink)?;
         if let Some(obs) = obs_override.as_ref() {
             let rows: usize = obs.getattr("shape")?.get_item(0)?.extract()?;
             if rows != n_obs_disk {
@@ -460,7 +460,7 @@ fn from_h5ad(
                     "obs_override has {rows} rows but X has n_obs={n_obs_disk}"
                 )));
             }
-            overrides.obs = Some(anndata::pandas_to_record_batch(py, obs)?);
+            overrides.obs = Some(convert::pandas_to_record_batch(py, obs)?);
         }
         if let Some(var) = var_override.as_ref() {
             let rows: usize = var.getattr("shape")?.get_item(0)?.extract()?;
@@ -469,14 +469,14 @@ fn from_h5ad(
                     "var_override has {rows} rows but X has n_vars={n_vars_disk}"
                 )));
             }
-            overrides.var = Some(anndata::pandas_to_record_batch(py, var)?);
+            overrides.var = Some(convert::pandas_to_record_batch(py, var)?);
         }
     }
     if let Some(uns) = uns_override.as_ref() {
         // Replace-not-merge semantics: the supplied dict is the new uns
         // section in full, matching the existing backed-router behaviour
         // when section_keys_match returns false.
-        overrides.uns = Some(anndata::uns_py_to_json(py, uns, uns_format_parsed)?);
+        overrides.uns = Some(convert::uns_py_to_json(py, uns, uns_format_parsed)?);
     }
 
     let opts = scx_convert::ConvertOptions {
@@ -513,7 +513,7 @@ fn from_h5ad(
         py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
             .map_err(convert_to_pyerr)?;
     }
-    anndata::emit_python_warnings(py, &sink)?;
+    convert::emit_python_warnings(py, &sink)?;
     Ok(())
 }
 
@@ -568,8 +568,8 @@ fn from_10x(
         e
     })?;
     let adata = scanpy.call_method1("read_10x_h5", (h5_path,))?;
-    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
-    anndata::from_anndata_impl(
+    let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
+    convert::from_anndata_impl(
         py,
         &adata,
         scx_path,
@@ -713,7 +713,7 @@ fn to_h5ad(
     memory_budget: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     use std::path::Path;
-    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let opts = scx_convert::ConvertOptions {
         stream,
         tool: "pyscx".into(),
@@ -769,7 +769,7 @@ fn to_h5mu(
     memory_budget: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     use std::path::Path;
-    let memory_budget_bytes = anndata::parse_memory_budget(memory_budget.as_ref())?;
+    let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let opts = scx_convert::ConvertOptions {
         stream,
         tool: "pyscx".into(),

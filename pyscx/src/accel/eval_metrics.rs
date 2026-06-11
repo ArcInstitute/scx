@@ -1290,7 +1290,7 @@ pub fn knockdown_efficiency<'py>(
     // short-circuits when sorted (cheap clone for the backed / lazy /
     // dense-derived CSR branches above) and calls `.sorted_indices()`
     // when not.
-    let (csr_obj, _) = crate::anndata::ensure_csr(py, &csr_obj, /* in_place */ false)?;
+    let (csr_obj, _) = crate::convert::ensure_csr(py, &csr_obj, /* in_place */ false)?;
 
     let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
     if shape.0 != n_obs {

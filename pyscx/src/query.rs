@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 use scx_engine::pipeline::{QueryPipeline, QueryResult};
 use scx_engine::EngineError;
 
-use crate::anndata;
+use crate::convert;
 
 // ---------------------------------------------------------------------------
 // Error conversion
@@ -37,15 +37,15 @@ pub(crate) fn query_result_to_anndata<'py>(
     let anndata_mod = py.import("anndata")?;
 
     // X — zero-copy CSR → scipy
-    let x = anndata::csr_to_scipy(py, result.x)?;
+    let x = convert::csr_to_scipy(py, result.x)?;
 
     // obs → pandas DataFrame
-    let obs_table = anndata::record_batch_to_pyarrow(py, &result.obs)?;
-    let obs_df = anndata::pyarrow_table_to_pandas(&obs_table)?;
+    let obs_table = convert::record_batch_to_pyarrow(py, &result.obs)?;
+    let obs_df = convert::pyarrow_table_to_pandas(&obs_table)?;
 
     // var → pandas DataFrame
-    let var_table = anndata::record_batch_to_pyarrow(py, &result.var)?;
-    let var_df = anndata::pyarrow_table_to_pandas(&var_table)?;
+    let var_table = convert::record_batch_to_pyarrow(py, &result.var)?;
+    let var_df = convert::pyarrow_table_to_pandas(&var_table)?;
 
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("X", x)?;
@@ -274,7 +274,7 @@ impl PyQueryResult {
     #[allow(clippy::wrong_self_convention)]
     fn to_csr<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let result = self.take_result()?;
-        anndata::csr_to_scipy(py, result.x)
+        convert::csr_to_scipy(py, result.x)
     }
 
     /// Number of observations (cells) in the result.

@@ -256,7 +256,7 @@ fn scx_validate(path: &str) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// Encode f32 values to raw little-endian bytes according to value encoding.
-/// Same logic as pyscx::anndata::encode_values.
+/// Same logic as pyscx::convert::encode_values.
 fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
     match encoding {
         ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),

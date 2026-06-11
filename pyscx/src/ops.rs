@@ -21,7 +21,7 @@ use scx_format::ScxReader;
 
 use scx_ops::{OpsError, PredicateIndexBuildSummary};
 
-use crate::anndata;
+use crate::convert;
 
 // ---------------------------------------------------------------------------
 // Predicate-index kwarg helpers
@@ -62,7 +62,7 @@ fn build_index_options(
 /// `PyValueError`; preset skips become `warnings.warn(...)`; the
 /// multimodal skip becomes a single `warnings.warn(...)`. Mirrors the
 /// outcome handling in
-/// `pyscx::anndata::build_and_write_predicate_indexes_inline` so the
+/// `pyscx::convert::build_and_write_predicate_indexes_inline` so the
 /// rewrite ops surface the same errors / warnings as `from_anndata`.
 fn process_index_summary(py: Python<'_>, summary: PredicateIndexBuildSummary) -> PyResult<()> {
     let emit_warning = |msg: String| -> PyResult<()> {
@@ -145,7 +145,7 @@ fn validate_shard_size(shard_size: Option<i64>) -> PyResult<NonZeroU32> {
     NonZeroU32::new(v_u32).ok_or_else(|| PyValueError::new_err("shard_size must be > 0"))
 }
 
-/// Map an Option<CodecId> (from anndata::parse_codec) plus the detected
+/// Map an Option<CodecId> (from convert::parse_codec) plus the detected
 /// value encoding into a CodecSelection. Preserves the legacy
 /// Scx1+float silent fixup at the binding boundary.
 fn resolve_codec_selection(
@@ -223,7 +223,7 @@ pub fn append(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
 ) -> PyResult<()> {
-    let explicit_codec = anndata::parse_codec(codec)?;
+    let explicit_codec = convert::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Open input file
@@ -325,12 +325,12 @@ pub fn append_from_anndata(
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
 ) -> PyResult<()> {
-    let explicit_codec = anndata::parse_codec(codec)?;
+    let explicit_codec = convert::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
 
     // Extract CSR from adata.X
     let x = adata.getattr("X")?;
-    let (x_csr, _csr_validated) = anndata::ensure_csr(py, &x, in_place)?;
+    let (x_csr, _csr_validated) = convert::ensure_csr(py, &x, in_place)?;
 
     // Get shape and validate n_vars match
     let shape: (u64, u64) = x_csr.getattr("shape")?.extract()?;
@@ -351,21 +351,21 @@ pub fn append_from_anndata(
     let np = py.import("numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
-    let indptr_arr = anndata::astype_if_needed(&indptr_obj, &np, "int64")?;
+    let indptr_arr = convert::astype_if_needed(&indptr_obj, &np, "int64")?;
     let indptr_ro: PyReadonlyArray1<'_, i64> = indptr_arr.extract()?;
     let indptr_slice = indptr_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let indices_obj = x_csr.getattr("indices")?;
-    let indices_arr = anndata::astype_if_needed(&indices_obj, &np, "int32")?;
+    let indices_arr = convert::astype_if_needed(&indices_obj, &np, "int32")?;
     let indices_ro: PyReadonlyArray1<'_, i32> = indices_arr.extract()?;
     let indices_slice = indices_ro
         .as_slice()
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
     let data_obj = x_csr.getattr("data")?;
-    let data_arr = anndata::astype_if_needed(&data_obj, &np, "float32")?;
+    let data_arr = convert::astype_if_needed(&data_obj, &np, "float32")?;
     let data_ro: PyReadonlyArray1<'_, f32> = data_arr.extract()?;
     let data_slice = data_ro
         .as_slice()
@@ -401,22 +401,22 @@ pub fn append_from_anndata(
     // case. Detect encoding + encode from the (possibly canonicalized) values.
     let (value_encoding, values_bytes) =
         if scx_sparse::is_canonical_csr(&indptr, &indices, data_slice) {
-            let ve = anndata::detect_value_encoding(data_slice);
-            let vb = anndata::encode_values(data_slice, ve)
+            let ve = convert::detect_value_encoding(data_slice);
+            let vb = convert::encode_values(data_slice, ve)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             (ve, vb)
         } else {
             let mut data_vec = data_slice.to_vec();
             scx_sparse::canonicalize_csr(&mut indptr, &mut indices, &mut data_vec);
-            let ve = anndata::detect_value_encoding(&data_vec);
-            let vb = anndata::encode_values(&data_vec, ve)
+            let ve = convert::detect_value_encoding(&data_vec);
+            let vb = convert::encode_values(&data_vec, ve)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             (ve, vb)
         };
 
     // Read obs from AnnData
     let obs_df = adata.getattr("obs")?;
-    let obs = anndata::pandas_to_record_batch(py, &obs_df)?;
+    let obs = convert::pandas_to_record_batch(py, &obs_df)?;
 
     // Resolve codec selection. None / "auto" → CodecSelection::Auto.
     // Explicit Scx1 with non-integer encoding falls back to Zstd
@@ -737,9 +737,9 @@ fn obs_var_to_record_batch(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<R
     let table_cls = pa.getattr("Table")?;
     if obj.is_instance(&table_cls)? {
         let df = obj.call_method0("to_pandas")?;
-        anndata::pandas_to_record_batch(py, &df)
+        convert::pandas_to_record_batch(py, &df)
     } else {
-        anndata::pandas_to_record_batch(py, obj)
+        convert::pandas_to_record_batch(py, obj)
     }
 }
 
@@ -758,7 +758,7 @@ fn dense_dict_to_batches(
         let name: String = k
             .extract()
             .map_err(|_| PyValueError::new_err(format!("{axis} keys must be strings")))?;
-        let batch = anndata::numpy_or_pandas_to_record_batch(py, &v)?;
+        let batch = convert::numpy_or_pandas_to_record_batch(py, &v)?;
         out.push((name, batch));
     }
     Ok(out)
@@ -806,7 +806,7 @@ fn resolve_modality_id(modality: Option<&Bound<'_, PyAny>>) -> PyResult<u8> {
 ///     pyscx.set_uns(path, dict(adata.uns))
 #[pyfunction]
 pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<()> {
-    let json = anndata::uns_py_to_json(py, uns, anndata::UnsFormat::Tagged)?;
+    let json = convert::uns_py_to_json(py, uns, convert::UnsFormat::Tagged)?;
     let path_buf = PathBuf::from(path);
     py.detach(|| scx_ops::set_uns(&path_buf, &json))
         .map_err(ops_to_pyerr)?;
@@ -860,7 +860,7 @@ pub fn modify_metadata(
     modality: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let uns_json = match uns {
-        Some(u) => Some(anndata::uns_py_to_json(py, u, anndata::UnsFormat::Tagged)?),
+        Some(u) => Some(convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?),
         None => None,
     };
     let obs_batch = match obs {

@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::anndata::{
+use crate::convert::{
     emit_python_warnings, pyarrow_table_to_pandas, record_batch_to_pyarrow, uns_json_to_py,
 };
 
