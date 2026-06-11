@@ -13,7 +13,7 @@
 
 use crate::diffexp::{merge_diff_exp_results, wilcoxon_rank_sum, DiffExpResult};
 use crate::error::{AccelError, Result};
-use scx_format::ColumnShardSource;
+use scx_format_io::ColumnShardSource;
 
 /// Gene-chunked Wilcoxon rank-sum DE driven by a CSC source.
 ///
@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::csc::test_helpers::{deterministic_dense, write_csr_csc_test_file};
     use crate::diffexp::wilcoxon_rank_sum_streaming;
-    use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
+    use scx_format_io::{BackedCscReader, BackedCsrReader, ScxReader};
     use tempfile::tempdir;
 
     #[test]

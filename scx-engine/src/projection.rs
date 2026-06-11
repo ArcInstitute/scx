@@ -5,7 +5,7 @@
 
 use arrow::array::{RecordBatch, UInt32Array};
 use arrow::compute;
-use scx_format::catalog::FullCatalogEntry;
+use scx_format_io::catalog::FullCatalogEntry;
 use scx_sparse::{ScxCsc, ScxCsr};
 
 use crate::error::Result;
@@ -247,9 +247,9 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
-    use scx_format::ScxReader;
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use scx_format_io::ScxReader;
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------
@@ -496,8 +496,8 @@ mod tests {
 
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
-            magic: scx_format::MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            magic: scx_format_io::MAGIC,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,

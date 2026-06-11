@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
-scx-format = { path = "../../scx-format", features = ["deletion-vectors"] }
+scx-format-io = { path = "../../scx-format-io", features = ["deletion-vectors"] }
 scx-codec = { path = "../../scx-codec" }
 scx-ops = { path = "../../scx-ops" }
 scx-engine = { path = "../../scx-engine" }

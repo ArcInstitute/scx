@@ -10,7 +10,7 @@ authors.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
-scx-format = { path = "../scx-format" }
+scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-engine = { path = "../scx-engine" }

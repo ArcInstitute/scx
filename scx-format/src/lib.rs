@@ -1,30 +1,23 @@
-pub mod arrow_compat;
-pub mod backed;
-#[cfg(feature = "deletion-vectors")]
-pub mod bitmap;
+//! On-disk layout and spec for the SCX format: file header, catalogs, shard
+//! structs, modality table, provenance, codec selection, and the error/checksum
+//! primitives. This crate is **pure** — no `std::fs`, no `memmap2`, no decode
+//! dispatch. The runtime reader/writer and backed/streaming access live in the
+//! `scx-format-io` crate, which depends on this one. This is the surface an
+//! independent reader implementation and the format conformance vectors verify
+//! against.
+
 pub mod catalog;
 pub mod catalog_view;
 pub mod checksum;
 pub mod codec_select;
 pub mod csc_policy;
-pub mod csc_sidecar;
-pub mod decode_sidecar;
-#[cfg(feature = "deletion-vectors")]
-pub mod deletion_vectors;
-pub mod encoder;
 pub mod error;
 pub mod header;
-pub mod mem;
 pub mod modality;
 pub mod provenance;
-pub mod reader;
 pub mod section;
 pub mod shard;
-pub mod shard_decode;
-pub mod shard_source;
-pub(crate) mod validated_section;
 pub mod versioned;
-pub mod writer;
 
 /// Arrow `Field::metadata` key marking a dictionary column as an *ordered*
 /// categorical (R `ordered` factor / pandas ordered Categorical). Canonical
@@ -32,19 +25,6 @@ pub mod writer;
 /// read it from here) so the wire key has a single definition.
 pub const CATEGORICAL_ORDERED_KEY: &str = "scx.categorical.ordered";
 
-pub use arrow_compat::{
-    downcast_large_types, downcast_large_types_schema, ensure_pandas_index_metadata,
-    pandas_index_columns, upcast_to_large_types,
-};
-pub use backed::{
-    concatenate_csr, total_variance_from_col_sq, BackedCscIndex, BackedCscReader, BackedCsrIndex,
-    BackedCsrReader, BackedDenseReader, CacheMetrics,
-};
-#[cfg(feature = "deletion-vectors")]
-pub use bitmap::{
-    BitmapPolicy, BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC,
-    BITMAP_SHARD_VERSION,
-};
 #[allow(deprecated)]
 pub use catalog::SHARD_STATS_BASE_SIZE;
 pub use catalog::{
@@ -61,37 +41,21 @@ pub use csc_policy::{
     auto_obs_threshold, auto_vars_threshold, CscPolicy, AUTO_CSC_OBS_THRESHOLD,
     AUTO_CSC_VARS_THRESHOLD,
 };
-pub use decode_sidecar::{
-    decode_scx1_parallel, DecodeRowEntry, DecodeSidecar, RiceBlockEntry,
-    DECODE_SIDECAR_KIND_SCX1_CSR, DECODE_SIDECAR_MAGIC, DECODE_SIDECAR_VERSION,
-    DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO,
-};
-#[cfg(feature = "deletion-vectors")]
-pub use deletion_vectors::{DeletionVectors, ShardDeletion};
-pub use encoder::encode_one_shard;
 pub use error::{validate_allocation, Result, ScxError};
 pub use header::{
     rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
 };
-pub use mem::MemoryBudget;
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,
     MODALITY_NAME_MAX_BYTES, MODALITY_TABLE_MAGIC, MODALITY_TABLE_VERSION,
 };
 pub use provenance::{Provenance, ProvenanceEntry};
-pub use reader::{assemble_filtered_metadata, assemble_sharded_metadata, ScxReader};
 pub use section::{align_to_8, SectionType};
 pub use shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE,
     SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
-pub use shard_decode::decode_shard_bytes;
-pub use shard_source::{ColumnShardSource, ShardSource};
 pub use versioned::VersionedSection;
-pub use writer::{
-    assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,
-    make_sibling_tempfile, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
-};
 
 /// Default number of rows per CSR shard when callers don't override it.
 ///

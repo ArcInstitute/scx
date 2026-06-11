@@ -17,7 +17,7 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
 
 use crate::error::Result;
 
@@ -75,7 +75,7 @@ pub fn finalize_header_with_checksum<F: Read + Write + Seek + SyncAllIfApplicabl
         hasher.update(&chunk[..n]);
     }
     let digest = hasher.finalize();
-    let file_checksum = scx_format::checksum::truncate_hash_to_u64(&digest);
+    let file_checksum = scx_format_io::checksum::truncate_hash_to_u64(&digest);
 
     // 4. Patch the checksum field of the in-memory header bytes. Keeps the
     //    struct in sync with what hits disk.
@@ -126,7 +126,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    use scx_format::header::{CURRENT_FORMAT_VERSION, MAGIC};
+    use scx_format_io::header::{CURRENT_FORMAT_VERSION, MAGIC};
 
     fn scratch_header() -> FileHeader {
         FileHeader {
@@ -195,7 +195,7 @@ mod tests {
         copy[..HEADER_SIZE].copy_from_slice(&zhb);
 
         let digest = blake3::hash(&copy);
-        let expected = scx_format::checksum::truncate_hash_to_u64(&digest);
+        let expected = scx_format_io::checksum::truncate_hash_to_u64(&digest);
         assert_eq!(expected, hdr.file_checksum);
     }
 

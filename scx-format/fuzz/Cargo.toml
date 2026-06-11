@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-scx-format = { path = ".." }
+scx-format-io = { path = "../../scx-format-io" }
 
 [[bin]]
 name = "fuzz_header"

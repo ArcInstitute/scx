@@ -7,7 +7,7 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use scx_format::BackedCsrReader;
+use scx_format_io::BackedCsrReader;
 
 use crate::convert::csr_to_scipy;
 use crate::lazy_transform::Transform;

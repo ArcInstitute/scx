@@ -31,7 +31,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_policy: scx_format::CscPolicy,
+    csc_policy: scx_format_io::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
     stream: bool,
@@ -47,7 +47,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
 ) -> PyResult<()> {
-    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     // Resolve the on-disk h5ad path. `anndata` 0.12 exposes both
     // `adata.filename` (preferred) and `adata.file.filename` (older

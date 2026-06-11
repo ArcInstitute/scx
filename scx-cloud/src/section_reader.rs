@@ -18,9 +18,9 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use scx_engine::error::EngineError;
 use scx_engine::SectionReader;
-use scx_format::catalog::FullCatalogEntry;
-use scx_format::header::FileHeader;
-use scx_format::{DeletionVectors, FullCatalog};
+use scx_format_io::catalog::FullCatalogEntry;
+use scx_format_io::header::FileHeader;
+use scx_format_io::{DeletionVectors, FullCatalog};
 use tokio::runtime::Runtime;
 
 use crate::cloud_reader::CloudReader;
@@ -132,7 +132,7 @@ impl SectionReader for CloudSectionReader {
             .block_on(self.inner.read_section_for_entry(entry))
             .map_err(cloud_to_engine)?;
         let catalog_version = self.inner.catalog().catalog_version;
-        Ok(scx_format::decode_shard_bytes(
+        Ok(scx_format_io::decode_shard_bytes(
             &bytes,
             entry,
             catalog_version,

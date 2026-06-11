@@ -7,8 +7,8 @@
 #![cfg(test)]
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::ScxWriter;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::ScxWriter;
 use std::path::PathBuf;
 
 use arrow::array::{RecordBatch, StringArray};
@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub(crate) fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,

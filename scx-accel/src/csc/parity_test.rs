@@ -34,7 +34,7 @@ use crate::csc::wilcoxon::wilcoxon_rank_sum_streaming_csc;
 use crate::diffexp::{pdex_ref_streaming, wilcoxon_rank_sum_streaming};
 use crate::hvg::{streaming_clip_square_sum, streaming_mean_var};
 use crate::pseudobulk::{pseudobulk_aggregate, AggregationMethod, GeomMeanMode};
-use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
+use scx_format_io::{BackedCscReader, BackedCsrReader, ScxReader};
 use tempfile::tempdir;
 
 /// LCG-generated dense reference matrix for parity testing.

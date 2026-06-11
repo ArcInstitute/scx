@@ -21,7 +21,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use scx_format::total_variance_from_col_sq;
+use scx_sparse::total_variance_from_col_sq;
 use scx_sparse::ScxCsr;
 
 /// Build a synthetic HVG-like CSR: `n_obs × n_vars`, ~`density` nonzeros per row

@@ -10,7 +10,7 @@
 
 #![cfg(feature = "gpu")]
 
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use crate::error::{AccelError, Result};
 use crate::neighbors::{build_knn_csr, compute_connectivities, KnnResult};
@@ -142,7 +142,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, i: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, i: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[i].clone())
         }
     }

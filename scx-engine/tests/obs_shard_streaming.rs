@@ -26,10 +26,10 @@ use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
     build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions, QueryPipeline,
 };
-use scx_format::header::{FileHeader, MAGIC};
+use scx_format_io::header::{FileHeader, MAGIC};
 #[cfg(debug_assertions)]
-use scx_format::reader::ScxReader;
-use scx_format::writer::ScxWriter;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::writer::ScxWriter;
 use tempfile::TempDir;
 
 const N_VARS: usize = 4;
@@ -38,7 +38,7 @@ const N_OBS: u64 = 8;
 fn header(n_obs: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,

@@ -1,6 +1,6 @@
 //! Device-resident shard sources for fully-GPU pipelines.
 //!
-//! [`GpuShardSource`] is the GPU counterpart of [`scx_format::ShardSource`]:
+//! [`GpuShardSource`] is the GPU counterpart of [`scx_format_io::ShardSource`]:
 //! a sequence of GPU-resident CSR shards that consumers iterate over
 //! without materialising the full matrix on the host.
 //!
@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream};
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -296,7 +296,7 @@ impl<'a> RawGpuShardSource<'a> {
 
         let scope_result = std::thread::scope(|scope| -> Result<(), GpuError> {
             use std::sync::mpsc;
-            type Msg = Result<(usize, scx_sparse::ScxCsr), scx_format::ScxError>;
+            type Msg = Result<(usize, scx_sparse::ScxCsr), scx_format_io::ScxError>;
             let (tx, rx) = mpsc::sync_channel::<Msg>(1);
 
             scope.spawn(move || {
@@ -549,7 +549,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }

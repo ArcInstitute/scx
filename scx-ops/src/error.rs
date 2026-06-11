@@ -4,7 +4,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum OpsError {
     #[error("format error: {0}")]
-    Format(#[from] scx_format::ScxError),
+    Format(#[from] scx_format_io::ScxError),
 
     #[error("failed to acquire file lock: {0}")]
     LockFailed(std::io::Error),

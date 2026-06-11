@@ -2499,7 +2499,7 @@ mod tests {
     #[test]
     fn test_csr_shard_to_dense_chunk_parity() {
         use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
-        use scx_format::ShardSource;
+        use scx_format_io::ShardSource;
         use scx_sparse::ScxCsr;
 
         let dev = require_gpu!();
@@ -2522,7 +2522,7 @@ mod tests {
             fn n_vars(&self) -> usize {
                 self.n_vars
             }
-            fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+            fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
                 Ok(self.shards[shard_idx].clone())
             }
         }

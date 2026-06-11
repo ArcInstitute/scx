@@ -623,7 +623,7 @@ impl GpuCsrSlot {
 // --------------------------------------------------------------------------
 
 /// Adapter exposing a borrowed [`ScxCsr`] as a single-shard
-/// [`scx_format::ShardSource`].
+/// [`scx_format_io::ShardSource`].
 ///
 /// Lets the in-memory-CSR arm of the unified GPU DE entry points
 /// (`pdex_ref_gpu` / `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Csr`) feed
@@ -648,7 +648,7 @@ impl<'a> InMemoryCsrShardSource<'a> {
     }
 }
 
-impl<'a> scx_format::ShardSource for InMemoryCsrShardSource<'a> {
+impl<'a> scx_format_io::ShardSource for InMemoryCsrShardSource<'a> {
     fn n_shards(&self) -> usize {
         1
     }
@@ -658,16 +658,16 @@ impl<'a> scx_format::ShardSource for InMemoryCsrShardSource<'a> {
     fn n_vars(&self) -> usize {
         self.csr.shape.1
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
         if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+            return Err(scx_format_io::ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
                 count: 1,
             });
         }
         Ok(self.csr.clone())
     }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+    fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         Ok(self.csr.shape.0)
     }
 }

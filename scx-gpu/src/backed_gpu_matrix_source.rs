@@ -14,7 +14,7 @@
 
 use std::ops::Range;
 
-use scx_format::{ColumnShardSource, ShardSource};
+use scx_format_io::{ColumnShardSource, ShardSource};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -115,7 +115,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[idx].clone())
         }
     }
@@ -138,10 +138,10 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_csc_shard(&self, idx: usize) -> scx_format::Result<ScxCsc> {
+        fn read_csc_shard(&self, idx: usize) -> scx_format_io::Result<ScxCsc> {
             Ok(self.shards[idx].clone())
         }
-        fn read_csc_columns(&self, _r: Range<u32>) -> scx_format::Result<ScxCsc> {
+        fn read_csc_columns(&self, _r: Range<u32>) -> scx_format_io::Result<ScxCsc> {
             unimplemented!("test stub")
         }
         fn csc_shard_col_range(&self, idx: usize) -> Option<(u32, u32)> {

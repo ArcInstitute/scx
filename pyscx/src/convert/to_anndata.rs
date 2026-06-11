@@ -6,8 +6,8 @@ use numpy::PyArray1;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use scx_format::section::SectionType;
-use scx_format::ScxReader;
+use scx_format_io::section::SectionType;
+use scx_format_io::ScxReader;
 
 use crate::to_pyerr;
 
@@ -127,7 +127,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
             let table = record_batch_to_pyarrow(py, &filtered_batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 
@@ -137,7 +137,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 
@@ -579,7 +579,7 @@ pub(crate) fn resolve_var_names_to_indices(
 ) -> PyResult<Vec<u32>> {
     let var_batch = match reader.read_var() {
         Ok(batch) => batch,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {
             return Err(PyRuntimeError::new_err(
                 "Cannot resolve var_names: this SCX file has no var metadata. \
                  Open without var_names to load all genes."
@@ -687,7 +687,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyObsmMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
     };
-    use scx_format::BackedCsrReader;
+    use scx_format_io::BackedCsrReader;
     use std::sync::Arc;
 
     let anndata_mod = py.import("anndata")?;
@@ -727,7 +727,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             let table = record_batch_to_pyarrow(py, &filtered_batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 
@@ -791,7 +791,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog)).map_err(to_pyerr)?;
     let has_csc = x_reader.header().has_csc();
     let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
-    let x_backed_csc: Option<Arc<scx_format::BackedCscReader>> = if has_csc {
+    let x_backed_csc: Option<Arc<scx_format_io::BackedCscReader>> = if has_csc {
         // Open a separate ScxReader for the CSC sidecar (BackedCscReader
         // takes ownership). Header check is cheap; the reader holds a
         // mmap and per-shard catalog, but no shards decode until we
@@ -800,7 +800,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         let csc_reader = ScxReader::open_with_shared_catalog(path, Arc::clone(&shared_catalog))
             .map_err(to_pyerr)?;
         Some(Arc::new(
-            scx_format::BackedCscReader::new(csc_reader, cache_shards).map_err(to_pyerr)?,
+            scx_format_io::BackedCscReader::new(csc_reader, cache_shards).map_err(to_pyerr)?,
         ))
     } else {
         None
@@ -838,7 +838,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
                 Some(df)
             }
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 

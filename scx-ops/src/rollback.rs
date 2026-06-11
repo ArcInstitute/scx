@@ -5,8 +5,8 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use scx_format::catalog::{FullCatalog, RootCatalog, RootCatalogEntry};
-use scx_format::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::catalog::{FullCatalog, RootCatalog, RootCatalogEntry};
+use scx_format_io::header::{FileHeader, HEADER_SIZE};
 
 use crate::checksum::finalize_header_with_checksum;
 use crate::error::{OpsError, Result};
@@ -222,7 +222,7 @@ fn apply_catalog_at<F: Read + Write + Seek + crate::checksum::SyncAllIfApplicabl
 }
 
 pub(crate) fn build_root_catalog(catalog: &FullCatalog) -> RootCatalog {
-    let mut groups: BTreeMap<u8, Vec<&scx_format::FullCatalogEntry>> = BTreeMap::new();
+    let mut groups: BTreeMap<u8, Vec<&scx_format_io::FullCatalogEntry>> = BTreeMap::new();
     for entry in &catalog.entries {
         groups
             .entry(entry.section_type as u8)

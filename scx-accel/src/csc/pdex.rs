@@ -20,7 +20,7 @@ use crate::diffexp::{
 };
 use crate::error::{AccelError, Result};
 use crate::pseudobulk::GeomMeanMode;
-use scx_format::ColumnShardSource;
+use scx_format_io::ColumnShardSource;
 
 /// Gene-chunked `pdex_ref` driven by a CSC source.
 ///
@@ -123,7 +123,7 @@ mod tests {
     use super::*;
     use crate::csc::test_helpers::{deterministic_dense, write_csr_csc_test_file};
     use crate::diffexp::pdex_ref_streaming;
-    use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
+    use scx_format_io::{BackedCscReader, BackedCsrReader, ScxReader};
     use tempfile::tempdir;
 
     /// CSR↔CSC parity: `pdex_ref_streaming` (CSR) and `pdex_ref_streaming_csc`

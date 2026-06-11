@@ -18,7 +18,7 @@ use crate::predicate::{evaluate, Predicate};
 use crate::projection::{decode_shard_projected, project_var};
 use crate::pushdown::{prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate};
 
-use scx_format::{assemble_filtered_metadata, DeletionVectors, SectionType};
+use scx_format_io::{assemble_filtered_metadata, DeletionVectors, SectionType};
 
 // ============================================================================
 // F1. Execution plan
@@ -94,7 +94,7 @@ fn build_category_dicts(index: &Option<PredicateIndex>) -> CategoryDictionaries 
     };
     for col in &index.columns {
         if let IndexedColumn::Categorical(cat) = col {
-            let hash = scx_format::column_name_hash(&cat.column_name);
+            let hash = scx_format_io::column_name_hash(&cat.column_name);
             let values: Vec<String> = cat.entries.iter().map(|e| e.value.clone()).collect();
             // CategoricalIndex entries are already sorted by BTreeMap in build_indexes
             dicts.insert(hash, values);
@@ -203,7 +203,7 @@ struct PlanAndMask {
 /// lacks row-range stats (files written before stats were stamped on
 /// metadata shards) — the caller then falls back to streaming every shard.
 fn obs_shard_ranges_from_catalog(
-    catalog: &scx_format::FullCatalog,
+    catalog: &scx_format_io::FullCatalog,
 ) -> Option<Vec<(u32, u64, u64)>> {
     let mut ranges: Vec<(u32, u64, u64)> = Vec::new();
     for e in &catalog.entries {
@@ -846,14 +846,14 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::FileHeader;
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
     use std::sync::Arc;
 
     fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
         FileHeader {
-            magic: scx_format::MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            magic: scx_format_io::MAGIC,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs,
@@ -1379,7 +1379,7 @@ mod tests {
         pipeline
             .reader()
             .as_any()
-            .downcast_ref::<scx_format::reader::ScxReader>()
+            .downcast_ref::<scx_format_io::reader::ScxReader>()
             .expect("local reader")
             .debug_counts()
             .read_shard_from_entry
@@ -1473,7 +1473,7 @@ mod tests {
             let reader = pipeline
                 .reader()
                 .as_any()
-                .downcast_ref::<scx_format::reader::ScxReader>()
+                .downcast_ref::<scx_format_io::reader::ScxReader>()
                 .unwrap();
             let counts = reader.debug_counts();
             use std::sync::atomic::Ordering::Relaxed;

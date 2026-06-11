@@ -60,12 +60,12 @@ pub use h5ad_read::{
 /// re-exported here so existing `scx_convert::CATEGORICAL_ORDERED_KEY`
 /// references — including `pyscx`'s always-compiled `to_anndata` path — keep
 /// working regardless of which scx-convert features are enabled.
-pub use scx_format::CATEGORICAL_ORDERED_KEY;
+pub use scx_format_io::CATEGORICAL_ORDERED_KEY;
 
 // Re-exported from scx-format so existing `scx_convert::MemoryBudget`
 // call sites keep working; the parser lives in scx-format so sibling
 // crates (scx-ops) can share it without a dependency cycle.
-pub use scx_format::MemoryBudget;
+pub use scx_format_io::MemoryBudget;
 #[cfg(feature = "hdf5")]
 pub use stream::{CsrShardStream, MajorAxis, StreamedCsrShard};
 pub use warnings::{ConvertWarning, WarningSink};
@@ -73,7 +73,7 @@ pub use warnings::{ConvertWarning, WarningSink};
 // CSC policy re-export is ungated: the always-available MTX → SCX path
 // (no `hdf5` feature) drives it too, so it must not live behind the
 // hdf5-gated `pipeline` module.
-pub use scx_format::CscPolicy;
+pub use scx_format_io::CscPolicy;
 
 #[cfg(feature = "hdf5")]
 pub mod pipeline;

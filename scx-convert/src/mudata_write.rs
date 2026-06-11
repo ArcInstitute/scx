@@ -21,8 +21,8 @@
 use std::path::Path;
 
 use hdf5::types::VarLenUnicode;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
 
 use super::h5ad_stream_write::{
     stream_csr_to_group_at, stream_layers_at, write_obs_streaming_or_eager,

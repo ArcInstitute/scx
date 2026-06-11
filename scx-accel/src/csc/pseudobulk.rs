@@ -14,7 +14,7 @@
 
 use crate::error::{AccelError, Result};
 use crate::pseudobulk::{AggregationMethod, PseudobulkResult};
-use scx_format::ColumnShardSource;
+use scx_format_io::ColumnShardSource;
 
 /// Aggregate counts per group on a CSC source, restricted to the
 /// `col_indices` gene subset.
@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use crate::csc::test_helpers::{deterministic_dense, write_csr_csc_test_file};
     use crate::pseudobulk::pseudobulk_aggregate;
-    use scx_format::{BackedCscReader, BackedCsrReader, ScxReader};
+    use scx_format_io::{BackedCscReader, BackedCsrReader, ScxReader};
     use tempfile::tempdir;
 
     #[test]

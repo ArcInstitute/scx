@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use scx_format::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{BackedCscReader, BackedCsrReader};
 use scx_sparse::{ScxCsc, ScxCsr};
 
 use super::*;
@@ -90,7 +90,7 @@ impl LazyShardSource {
     }
 }
 
-impl scx_format::ShardSource for LazyShardSource {
+impl scx_format_io::ShardSource for LazyShardSource {
     fn n_shards(&self) -> usize {
         self.backed.index().n_shards()
     }
@@ -108,13 +108,13 @@ impl scx_format::ShardSource for LazyShardSource {
 
     /// Row counts are unchanged by transforms and column projection — delegate
     /// to the wrapped reader's O(1) implementation.
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+    fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         self.backed.max_shard_rows()
     }
 
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
         let (s_start, _) = self.backed.index().shard_range(shard_idx).ok_or_else(|| {
-            scx_format::ScxError::ShardIndexOutOfBounds {
+            scx_format_io::ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
                 count: self.backed.index().n_shards(),
             }
@@ -165,7 +165,10 @@ impl scx_format::ShardSource for LazyShardSource {
 /// than silently producing wrong results if a non-column-local
 /// transform sneaks through (e.g., a future caller that bypasses the
 /// gate).
-fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) -> scx_format::Result<()> {
+fn apply_transforms_to_csc(
+    transforms: &[Transform],
+    csc: &mut ScxCsc,
+) -> scx_format_io::Result<()> {
     for transform in transforms {
         match transform {
             Transform::Log1p => {
@@ -174,7 +177,7 @@ fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) -> scx_fo
                 }
             }
             Transform::NormalizeTotal { .. } | Transform::RowScale { .. } => {
-                return Err(scx_format::ScxError::Io(std::io::Error::other(
+                return Err(scx_format_io::ScxError::Io(std::io::Error::other(
                     "CSC unavailable: chain contains a non-column-local transform \
                      (NormalizeTotal or RowScale). Use prefer_format='csr' or remove \
                      the transform.",
@@ -185,7 +188,7 @@ fn apply_transforms_to_csc(transforms: &[Transform], csc: &mut ScxCsc) -> scx_fo
     Ok(())
 }
 
-impl scx_format::ColumnShardSource for LazyShardSource {
+impl scx_format_io::ColumnShardSource for LazyShardSource {
     fn n_csc_shards(&self) -> usize {
         match &self.backed_csc {
             Some(b) => b.n_shards(),
@@ -204,14 +207,14 @@ impl scx_format::ColumnShardSource for LazyShardSource {
         }
     }
 
-    fn read_csc_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsc> {
+    fn read_csc_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
         if self.kept_to_global.is_some() {
-            return Err(scx_format::ScxError::Io(std::io::Error::other(
+            return Err(scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: row deletion vector is active",
             )));
         }
         let backed = self.backed_csc.as_ref().ok_or_else(|| {
-            scx_format::ScxError::Io(std::io::Error::other(
+            scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
             ))
         })?;
@@ -223,12 +226,12 @@ impl scx_format::ColumnShardSource for LazyShardSource {
             // Filter `proj` to entries inside this shard's global range,
             // remap to shard-local, then project.
             let (g_lo, g_hi) =
-                scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)
+                scx_format_io::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)
                     .ok_or_else(|| {
-                        scx_format::ScxError::Io(std::io::Error::other(
-                            "CSC unavailable: missing shard col range for projection remap",
-                        ))
-                    })?;
+                    scx_format_io::ScxError::Io(std::io::Error::other(
+                        "CSC unavailable: missing shard col range for projection remap",
+                    ))
+                })?;
             let p_lo = proj.partition_point(|&g| g < g_lo);
             let p_hi = proj.partition_point(|&g| g < g_hi);
             let local: Vec<u32> = proj[p_lo..p_hi].iter().map(|&g| g - g_lo).collect();
@@ -237,14 +240,14 @@ impl scx_format::ColumnShardSource for LazyShardSource {
         Ok(csc)
     }
 
-    fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> scx_format::Result<ScxCsc> {
+    fn read_csc_columns(&self, col_range: std::ops::Range<u32>) -> scx_format_io::Result<ScxCsc> {
         if self.kept_to_global.is_some() {
-            return Err(scx_format::ScxError::Io(std::io::Error::other(
+            return Err(scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: row deletion vector is active",
             )));
         }
         let backed = self.backed_csc.as_ref().ok_or_else(|| {
-            scx_format::ScxError::Io(std::io::Error::other(
+            scx_format_io::ScxError::Io(std::io::Error::other(
                 "CSC unavailable: file has no CSC sidecar (open with CSC enabled)",
             ))
         })?;
@@ -280,7 +283,7 @@ impl scx_format::ColumnShardSource for LazyShardSource {
     fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
         let backed = self.backed_csc.as_ref()?;
         let (g_lo, g_hi) =
-            scx_format::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)?;
+            scx_format_io::ColumnShardSource::csc_shard_col_range(backed.as_ref(), shard_idx)?;
         match &self.col_projection {
             Some(proj) => {
                 // Map the inner shard's global range [g_lo, g_hi) onto

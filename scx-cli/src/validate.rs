@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use scx_format::checksum::blake3_hash;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
+use scx_format_io::checksum::blake3_hash;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
 
 /// Validate all section checksums. Returns true if all pass.
 ///

@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 
-use scx_format::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{BackedCscReader, BackedCsrReader};
 use scx_sparse::ScxCsr;
 
 use crate::backed::ScxComparisonResult;

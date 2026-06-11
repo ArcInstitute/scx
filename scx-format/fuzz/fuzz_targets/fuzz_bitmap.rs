@@ -8,7 +8,7 @@
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use scx_format::BitmapShard;
+use scx_format_io::BitmapShard;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(shard) = BitmapShard::read_from(&mut std::io::Cursor::new(data), data.len()) {

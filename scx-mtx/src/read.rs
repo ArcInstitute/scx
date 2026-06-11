@@ -423,7 +423,7 @@ fn parse_barcodes_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
         Arc::new(schema),
         vec![Arc::new(StringArray::from(barcodes)) as ArrayRef],
     )?;
-    Ok(scx_format::ensure_pandas_index_metadata(&batch))
+    Ok(scx_format_io::ensure_pandas_index_metadata(&batch))
 }
 
 /// Parse `features.tsv[.gz]` or `genes.tsv[.gz]`.
@@ -481,7 +481,7 @@ fn parse_features_tsv(reader: Box<dyn BufRead>) -> Result<RecordBatch, MtxError>
     }
 
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
-    Ok(scx_format::ensure_pandas_index_metadata(&batch))
+    Ok(scx_format_io::ensure_pandas_index_metadata(&batch))
 }
 
 #[cfg(test)]

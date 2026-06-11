@@ -15,9 +15,9 @@ use arrow::record_batch::RecordBatch;
 
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, SkipReason};
-use scx_format::section::SectionType;
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_format::ScxReader;
+use scx_format_io::section::SectionType;
+use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::ScxReader;
 
 use scx_ops::{OpsError, PredicateIndexBuildSummary};
 
@@ -124,7 +124,7 @@ fn process_index_summary(py: Python<'_>, summary: PredicateIndexBuildSummary) ->
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SHARD_SIZE: i64 = scx_format::DEFAULT_SHARD_TARGET_ROWS as i64;
+const DEFAULT_SHARD_SIZE: i64 = scx_format_io::DEFAULT_SHARD_TARGET_ROWS as i64;
 
 /// Validate the Python-side `shard_size` kwarg and convert to NonZeroU32.
 ///

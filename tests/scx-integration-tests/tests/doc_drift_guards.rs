@@ -23,7 +23,7 @@ fn workspace_root() -> PathBuf {
 #[test]
 fn default_shard_target_rows_pinned() {
     assert_eq!(
-        scx_format::DEFAULT_SHARD_TARGET_ROWS,
+        scx_format_io::DEFAULT_SHARD_TARGET_ROWS,
         16_384,
         "docs (format.md / sharding.md / AGENTS.md) cite 16,384; update them together"
     );
@@ -50,6 +50,7 @@ fn workspace_members_match_documented_crates() {
     let members = parse_members(&cargo);
     let expected: BTreeSet<String> = [
         "scx-format",
+        "scx-format-io",
         "scx-codec",
         "scx-sparse",
         "scx-cli",
@@ -147,7 +148,7 @@ fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
 fn no_debug_assert_in_hot_paths() {
     // (crate dir, source file relative to `<crate>/src`)
     const HOT_PATHS: &[(&str, &str)] = &[
-        ("scx-format", "shard_decode.rs"),
+        ("scx-format-io", "shard_decode.rs"),
         ("scx-codec", "bitstream.rs"),
         ("scx-codec", "rice.rs"),
         ("scx-codec", "delta_golomb.rs"),
@@ -181,6 +182,49 @@ fn no_debug_assert_in_hot_paths() {
          trust boundary), not debug_assert! (which is compiled out in release). Convert these, \
          or add a `debug-assert-ok:` justification if the assert is a genuinely-internal \
          invariant:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// `scx-format` is the **pure on-disk layout/spec** crate — the surface an
+/// independent reader and the format conformance vectors verify against. It
+/// must carry no filesystem or mmap I/O; all runtime access lives in
+/// `scx-format-io`. The crate's `Cargo.toml` already omits `memmap2`/`tempfile`
+/// (so misuse is a compile error), and this guard pins the `std::fs` half of
+/// the contract (T5.5).
+#[test]
+fn scx_format_layout_crate_has_no_fs_io() {
+    let src = workspace_root().join("scx-format").join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("scx-format/src readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("source readable");
+            for (i, line) in content.lines().enumerate() {
+                // Skip doc/comment lines: the module docs legitimately *mention*
+                // these as the things this crate must NOT use.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains("std::fs") || line.contains("memmap2") || line.contains("Mmap") {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "scx-format is the pure layout/spec crate and must contain no filesystem/mmap I/O \
+         (move it to scx-format-io):\n{}",
         offenders.join("\n")
     );
 }

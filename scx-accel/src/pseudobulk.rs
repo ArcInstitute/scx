@@ -216,7 +216,7 @@ pub fn build_group_mapping(
 /// * `method` — Aggregation method (Sum or Mean).
 /// * `min_cells_per_group` — Groups with fewer cells are excluded from the result.
 pub fn pseudobulk_aggregate(
-    reader: &scx_format::backed::BackedCsrReader,
+    reader: &scx_format_io::backed::BackedCsrReader,
     obs_groups: &[Vec<String>],
     groupby_columns: &[String],
     gene_names: &[String],

@@ -24,7 +24,7 @@
 
 #![cfg(feature = "gpu")]
 
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 use scx_gpu::{
     build_cell_to_group_dev, build_cell_to_pos_dev, cuda_graphs_enabled,
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_combined_tie_term,
@@ -152,8 +152,8 @@ pub enum GpuDeShardInput<'a> {
     /// SCX-backed CSR reader plus an optional gene-major CSC sidecar. When the
     /// sidecar is present and v3 is enabled, dispatch routes CSC-direct.
     Backed {
-        csr: &'a scx_format::backed::BackedCsrReader,
-        csc: Option<&'a scx_format::backed::BackedCscReader>,
+        csr: &'a scx_format_io::backed::BackedCsrReader,
+        csc: Option<&'a scx_format_io::backed::BackedCscReader>,
     },
     /// Generic lazy `ShardSource` (CSR-shaped; no CSC capability surface).
     Lazy(&'a (dyn ShardSource + Sync)),

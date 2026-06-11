@@ -7,7 +7,7 @@ pub mod validate;
 
 pub use convert::{csr_to_dense, dense_to_csr};
 pub use csc::{CscError, ScxCsc};
-pub use csr::{CsrError, ScxCsr};
+pub use csr::{concatenate_csr, total_variance_from_col_sq, CsrError, ScxCsr};
 pub use transpose::{
     compute_chunk_cols_with_cap, streaming_csr_to_csc_iter_with_cap, CscArrays, CscShardIterator,
     TransposeError,

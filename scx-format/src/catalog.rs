@@ -660,7 +660,7 @@ pub struct FullCatalog {
     /// The `data_generation` value the current CSC sidecar was built
     /// against (v4+), or `0` when there is no sidecar. A sidecar is fresh
     /// iff `csc_build_generation == data_generation`; readers reject a
-    /// mismatch (see [`crate::backed::BackedCscReader`]). `0` on v1–v3.
+    /// mismatch (see `scx_format_io::BackedCscReader`). `0` on v1–v3.
     pub csc_build_generation: u64,
 }
 

@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-scx-format = { path = "../scx-format" }
+scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 cudarc = { workspace = true, features = ["cublas", "cusparse", "cusolver", "curand"] }

@@ -12,7 +12,7 @@ use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use super::filtering::update_layers_col_projection;
 use super::util::extract_materialized_csr;
 
-/// Single-shard [`scx_format::ShardSource`] adapter over a borrowed in-memory
+/// Single-shard [`scx_format_io::ShardSource`] adapter over a borrowed in-memory
 /// [`scx_sparse::ScxCsr`].
 ///
 /// Lets a materialized scipy/dense `adata.X` flow through the same native HVG
@@ -26,7 +26,7 @@ struct InMemoryCsrSource<'a> {
     csr: &'a scx_sparse::ScxCsr,
 }
 
-impl scx_format::ShardSource for InMemoryCsrSource<'_> {
+impl scx_format_io::ShardSource for InMemoryCsrSource<'_> {
     fn n_shards(&self) -> usize {
         1
     }
@@ -36,9 +36,9 @@ impl scx_format::ShardSource for InMemoryCsrSource<'_> {
     fn n_vars(&self) -> usize {
         self.csr.n_cols()
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<scx_sparse::ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
         if shard_idx != 0 {
-            return Err(scx_format::ScxError::ShardIndexOutOfBounds {
+            return Err(scx_format_io::ScxError::ShardIndexOutOfBounds {
                 index: shard_idx,
                 count: 1,
             });
@@ -48,7 +48,7 @@ impl scx_format::ShardSource for InMemoryCsrSource<'_> {
         // remove it later if in-memory HVG RSS becomes a concern.
         Ok(self.csr.clone())
     }
-    fn max_shard_rows(&self) -> scx_format::Result<usize> {
+    fn max_shard_rows(&self) -> scx_format_io::Result<usize> {
         Ok(self.csr.n_rows())
     }
 }
@@ -507,7 +507,7 @@ pub fn highly_variable_genes<'py>(
 /// (`InMemoryCsrSource`). `+ Sync` is required by the GPU kernel variants;
 /// both source types satisfy it.
 #[allow(clippy::too_many_arguments)]
-fn hvg_on_source<'py, S: scx_format::ShardSource + Sync>(
+fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
@@ -597,7 +597,7 @@ fn emit_hvg_loess_singularity_warning(
 /// to the batched streaming kernels, so this always builds the whole-dataset
 /// source (the previous `batch_indices` branch was unused).
 fn build_shard_source(
-    reader: &Arc<scx_format::BackedCsrReader>,
+    reader: &Arc<scx_format_io::BackedCsrReader>,
     transforms: &[Transform],
     kept_to_global: &Option<Arc<Vec<u64>>>,
     col_projection: &Option<Arc<Vec<u32>>>,
@@ -623,7 +623,7 @@ fn build_shard_source(
 
 /// seurat_v3 flavor: raw count data, loess fit, clipped variance.
 #[allow(clippy::too_many_arguments)]
-fn hvg_seurat_v3<'py, S: scx_format::ShardSource + Sync>(
+fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
@@ -1027,7 +1027,7 @@ fn hvg_seurat_v3<'py, S: scx_format::ShardSource + Sync>(
 
 /// seurat flavor: log-normalized data, binned dispersion normalization.
 #[allow(clippy::too_many_arguments)]
-fn hvg_seurat<'py, S: scx_format::ShardSource + Sync>(
+fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
     x_obj: &Bound<'py, PyAny>,
@@ -1336,7 +1336,7 @@ fn csc_finish_seurat_v3(
 /// Device-dispatched per-column mean/var on a `Sync` CSC source: GPU CSC
 /// reduce when `device_id` is `Some` (no `atomicAdd`), else CPU CSC.
 #[cfg(feature = "gpu")]
-fn csc_mean_var_dispatch<S: scx_format::ColumnShardSource + Sync>(
+fn csc_mean_var_dispatch<S: scx_format_io::ColumnShardSource + Sync>(
     py: Python<'_>,
     source: &S,
     device_id: Option<usize>,
@@ -1352,7 +1352,7 @@ fn csc_mean_var_dispatch<S: scx_format::ColumnShardSource + Sync>(
 
 /// Device-dispatched per-column clipped sums on a `Sync` CSC source.
 #[cfg(feature = "gpu")]
-fn csc_clip_dispatch<S: scx_format::ColumnShardSource + Sync>(
+fn csc_clip_dispatch<S: scx_format_io::ColumnShardSource + Sync>(
     py: Python<'_>,
     source: &S,
     clip_val: &[f64],
@@ -1388,7 +1388,7 @@ fn hvg_seurat_v3_csc(
     flavor: &str,
     device_id: Option<usize>,
 ) -> PyResult<()> {
-    use scx_format::ColumnShardSource;
+    use scx_format_io::ColumnShardSource;
     let _ = flavor; // single-batch: seurat_v3 / seurat_v3_paper share ordering.
 
     let x = adata.getattr("X")?;

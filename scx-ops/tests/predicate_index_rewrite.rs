@@ -12,18 +12,18 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::{ConversionPredicateIndexOptions, QueryPipeline};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 use scx_ops::{AppendOptions, PredicateIndexBuildSummary};
 use tempfile::TempDir;
 
 fn sample_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -394,7 +394,7 @@ fn write_multimodal_test_file(
     adt_n_vars: usize,
     perturbation: &str,
 ) -> PathBuf {
-    use scx_format::modality::ModalityType;
+    use scx_format_io::modality::ModalityType;
     let path = dir.path().join(filename);
     let header = sample_header(n_obs as u64, rna_n_vars as u64);
     let mut writer = ScxWriter::new(&path, header).unwrap();

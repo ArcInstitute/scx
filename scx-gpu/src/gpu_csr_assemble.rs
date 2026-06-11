@@ -19,7 +19,7 @@
 use std::io::Cursor;
 
 use scx_codec::Scx1DecodeMetadata;
-use scx_format::shard::ShardHeader;
+use scx_format_io::shard::ShardHeader;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -191,7 +191,7 @@ mod tests {
 
     /// Host reference: decode a shard's CSR arrays via the canonical codec path.
     fn host_decode(shard_bytes: &[u8], n_cols: u32) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
-        use scx_format::shard::ShardHeader;
+        use scx_format_io::shard::ShardHeader;
         use std::io::Cursor;
         let header = ShardHeader::read_from(&mut Cursor::new(shard_bytes)).unwrap();
         let n_rows = header.n_major as usize;

@@ -20,7 +20,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 half = { workspace = true }
 chrono = "0.4"
-scx-format = { path = "../scx-format" }
+scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-mtx = { path = "../scx-mtx" }

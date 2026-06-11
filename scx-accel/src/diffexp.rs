@@ -610,7 +610,7 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 ///       shard cache (≈ 640 MB / shard on Replogle-scale inputs)
 #[allow(clippy::too_many_arguments)]
 pub fn wilcoxon_rank_sum_streaming(
-    reader: &scx_format::backed::BackedCsrReader,
+    reader: &scx_format_io::backed::BackedCsrReader,
     gene_names: &[String],
     groups: &[usize],
     group_names: &[String],
@@ -1316,7 +1316,7 @@ pub fn pdex_ref_sparse(
 /// `>= n_shards` to keep the inner loop cache-resident across chunks.
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref_streaming(
-    reader: &scx_format::backed::BackedCsrReader,
+    reader: &scx_format_io::backed::BackedCsrReader,
     gene_names: &[String],
     groups: &[usize],
     group_names: &[String],
@@ -2235,8 +2235,8 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::{FileHeader, MAGIC};
-    use scx_format::{BackedCsrReader, ScxReader, ScxWriter};
+    use scx_format_io::header::{FileHeader, MAGIC};
+    use scx_format_io::{BackedCsrReader, ScxReader, ScxWriter};
     use std::path::Path;
     use std::sync::Arc as StdArc;
 
@@ -2267,7 +2267,7 @@ mod tests {
     ) -> std::io::Result<()> {
         let header = FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,

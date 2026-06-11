@@ -91,8 +91,8 @@ pub struct PreprocessConfig {
 ///
 /// All dynamic fields (nnz, catalog offsets, checksum) are zeroed — the writer
 /// populates them during `finish()`.
-fn build_output_header(src: &scx_format::FileHeader, codec_id: u8) -> scx_format::FileHeader {
-    scx_format::FileHeader {
+fn build_output_header(src: &scx_format_io::FileHeader, codec_id: u8) -> scx_format_io::FileHeader {
+    scx_format_io::FileHeader {
         format_version: src.format_version,
         n_obs: src.n_obs,
         n_vars: src.n_vars,
@@ -106,11 +106,11 @@ fn build_output_header(src: &scx_format::FileHeader, codec_id: u8) -> scx_format
 
 /// Write a provenance entry recording a preprocessing action.
 fn write_preprocess_provenance(
-    writer: &mut scx_format::ScxWriter,
+    writer: &mut scx_format_io::ScxWriter,
     action: &str,
     params: &str,
 ) -> crate::Result<()> {
-    writer.write_provenance(vec![scx_format::ProvenanceEntry {
+    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -154,7 +154,7 @@ pub fn streaming_preprocess(
 ) -> crate::Result<usize> {
     use byteorder::{LittleEndian, WriteBytesExt};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::{ScxReader, ScxWriter};
+    use scx_format_io::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
     let header = build_output_header(reader.header(), CodecId::Zstd as u8);
@@ -167,12 +167,12 @@ pub fn streaming_preprocess(
     // moderate-size paths).
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
     match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -217,12 +217,12 @@ pub fn streaming_preprocess(
                 writer.write_obsm(name, batch)?;
             }
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
     match reader.read_uns() {
         Ok(json) => writer.write_uns(&json)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -266,7 +266,7 @@ pub fn streaming_save_layer(
     config: &PreprocessConfig,
 ) -> crate::Result<usize> {
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::{ScxReader, ScxWriter};
+    use scx_format_io::{ScxReader, ScxWriter};
 
     let reader = ScxReader::open(source_path)?;
     let header = build_output_header(reader.header(), reader.header().codec_id);
@@ -277,12 +277,12 @@ pub fn streaming_save_layer(
     // above).
     match reader.read_obs() {
         Ok(batch) => writer.write_obs(&batch)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
     match reader.read_var() {
         Ok(batch) => writer.write_var(&batch)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -293,11 +293,11 @@ pub fn streaming_save_layer(
         let stats = shard_entry
             .stats
             .clone()
-            .ok_or_else(|| scx_format::ScxError::SectionNotFound("shard stats".into()))?;
+            .ok_or_else(|| scx_format_io::ScxError::SectionNotFound("shard stats".into()))?;
         let nnz = stats.nnz;
         writer.write_raw_shard(
             raw,
-            scx_format::SectionType::CsrShard,
+            scx_format_io::SectionType::CsrShard,
             &format!("X_shard_{shard_idx}"),
             stats,
             nnz,
@@ -342,12 +342,12 @@ pub fn streaming_save_layer(
                 writer.write_obsm(name, batch)?;
             }
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
     match reader.read_uns() {
         Ok(json) => writer.write_uns(&json)?,
-        Err(scx_format::ScxError::SectionNotFound(_)) => {}
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
 

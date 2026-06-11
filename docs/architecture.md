@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 14 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
+The workspace contains 15 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -37,17 +37,24 @@ The workspace contains 14 crates plus an integration-test crate (`scx-integratio
        │    │                │              │             │            │ │
        └────┴────────────────┼──────────────┴─────────────┴────────────┘ │
                              │                         ┌───────────┐     │
-                       ┌──────┴──────┐                 │  scx-gpu  │◀────┘
-                       │ scx-format  │                 │ GPU codec │
-                       └──────┬──────┘                 │ + analysis│
-                  ┌───────────┼────────────────────────┴────┬──────┘
-                  │                     │
-           ┌──────┴──────┐        ┌─────┴──────┐
-           │  scx-codec  │        │ scx-sparse │
-           │ compression │        │ CSR types  │
-           └─────────────┘        └────────────┘
+                    ┌────────┴───────┐                 │  scx-gpu  │◀────┘
+                    │ scx-format-io  │                 │ GPU codec │
+                    │ runtime I/O:   │                 │ + analysis│
+                    │ reader/writer/ │◀────────────────┴─────┬─────┘
+                    │ backed/decode  │                       │
+                    └────────┬───────┘                       │
+                       ┌─────┴───────┐                        (scx-gpu also
+                       │ scx-format  │  pure on-disk           depends on
+                       │ layout/spec │  layout (no I/O)        scx-format-io)
+                       └──────┬──────┘
+                  ┌───────────┼────────────┐
+                  │                        │
+           ┌──────┴──────┐         ┌───────┴────┐
+           │  scx-codec  │         │ scx-sparse │
+           │ compression │         │ CSR types  │
+           └─────────────┘         └────────────┘
 
-rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-engine, scx-ops)
+rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, scx-engine, scx-ops)
 ```
 
 ### Crate Summary
@@ -56,7 +63,8 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 |-------|------|-------------|
 | **scx-codec** | Compression codecs (standalone, no I/O) | `rice`, `forbp`, `delta_golomb`, `bitstream`, `dispatch` |
 | **scx-sparse** | CSR/CSC matrix types with scipy-compatible dtypes | `csr` (`ScxCsr`), `csc` (`ScxCsc`), `transpose` (streaming CSR→CSC), `convert` (CSR ↔ dense) |
-| **scx-format** | File layout, reading, and writing | `header`, `catalog`, `shard`, `reader`, `writer`, `codec_select`, `provenance`, `deletion_vectors` |
+| **scx-format** | Pure on-disk layout/spec — no `std::fs`, no `memmap2` (the surface conformance vectors verify against) | `header`, `catalog`, `catalog_view`, `shard`, `section`, `modality`, `codec_select`, `provenance`, `csc_policy`, `error`, `checksum` |
+| **scx-format-io** | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars; re-exports the full `scx-format` surface | `reader`, `writer`, `backed`, `shard_decode`, `shard_source`, `encoder`, `decode_sidecar`, `csc_sidecar`, `bitmap`, `deletion_vectors`, `mem`, `arrow_compat` |
 | **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place sidecar + canonical v3 upgrade), `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
@@ -75,7 +83,7 @@ rscx (R bindings via extendr, depends on scx-format, scx-codec, scx-sparse, scx-
 > `scx-cloud` reuses `scx-engine` for predicate parsing (selective pull).
 > `scx-mtx` is **always-on** (no feature gate) since MTX is pure text I/O with no
 > HDF5 dependency. Both `scx-cli` and `pyscx` depend on it.
-> `scx-accel` depends on `scx-format`, `scx-sparse`, and `scx-engine` (for
+> `scx-accel` depends on `scx-format-io`, `scx-sparse`, and `scx-engine` (for
 > `project_csr` in `diffexp.rs`) — no loader dependency.
 > It uses `faer` for dense linear algebra (QR, SVD, eigendecomposition),
 > `instant-distance` for HNSW kNN, `rand_chacha` for deterministic Leiden seeding,

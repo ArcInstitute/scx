@@ -9,7 +9,7 @@ use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PySlice, PyTuple};
 
-use scx_format::{BackedCscReader, BackedCsrReader};
+use scx_format_io::{BackedCscReader, BackedCsrReader};
 
 use crate::convert::csr_to_scipy;
 use crate::lazy_transform::Transform;
@@ -173,12 +173,12 @@ impl ScxBackedSparseDataset {
     /// callers of `as_column_source` on a projected
     /// `ScxBackedSparseDataset` get the full-axis view; reach for
     /// `col_projection()` if you need projected reads.
-    pub fn as_column_source(&self) -> Option<&dyn scx_format::ColumnShardSource> {
+    pub fn as_column_source(&self) -> Option<&dyn scx_format_io::ColumnShardSource> {
         if self.kept_to_global.is_some() {
             return None;
         }
         let backed_csc = self.backed_csc.as_ref()?;
-        Some(backed_csc.as_ref() as &dyn scx_format::ColumnShardSource)
+        Some(backed_csc.as_ref() as &dyn scx_format_io::ColumnShardSource)
     }
 
     /// Set column projection on this dataset.

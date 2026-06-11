@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 
 use experiment::PyExperiment;
 use query::{PyQueryPipeline, PyQueryResult};
-use scx_format::ScxError;
+use scx_format_io::ScxError;
 
 /// Convert an ScxError into the most appropriate Python exception.
 ///
@@ -116,9 +116,9 @@ pub(crate) fn convert_to_pyerr(e: scx_convert::ConvertError) -> PyErr {
 #[pyo3(signature = (path, verify=true))]
 fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
     let reader = if verify {
-        scx_format::ScxReader::open(path)
+        scx_format_io::ScxReader::open(path)
     } else {
-        scx_format::ScxReader::open_unchecked(path)
+        scx_format_io::ScxReader::open_unchecked(path)
     }
     .map_err(to_pyerr)?;
     Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
@@ -141,7 +141,7 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 ///         print(f"{name}: {'OK' if passed else 'FAIL'}")
 #[pyfunction]
 fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
-    let reader = scx_format::ScxReader::open(path).map_err(to_pyerr)?;
+    let reader = scx_format_io::ScxReader::open(path).map_err(to_pyerr)?;
     reader.validate().map_err(to_pyerr)
 }
 
@@ -424,11 +424,11 @@ fn from_h5ad(
     let explicit_codec = convert::parse_codec(codec)?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     let csc_policy =
-        scx_format::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        scx_format_io::CscPolicy::parse(&csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let uns_format_parsed = convert::parse_uns_format(uns_format)?;
-    let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+    let shard_target_rows = shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+    let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let has_override = obs_override.is_some() || var_override.is_some() || uns_override.is_some();

@@ -20,13 +20,13 @@ use pyo3::exceptions::{PyImportError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_codec::CodecId;
-use scx_format::header::FileHeader;
-use scx_format::modality::ModalityType;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::select_codec_for_modality;
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityType;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::select_codec_for_modality;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 
 use crate::convert::{
     csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, pyarrow_table_to_pandas,
@@ -88,7 +88,7 @@ pub fn to_mudata_backed<'py>(
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 
@@ -172,7 +172,7 @@ pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py
             let table = record_batch_to_pyarrow(py, &batch)?;
             Some(pyarrow_table_to_pandas(&table)?)
         }
-        Err(scx_format::ScxError::SectionNotFound(_)) => None,
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => None,
         Err(e) => return Err(to_pyerr(e)),
     };
 
@@ -288,10 +288,10 @@ pub fn from_h5mu_impl(
     }
     let explicit_codec = crate::convert::parse_codec(codec)?;
     let csc_policy =
-        scx_format::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let bitmap_policy = scx_format::BitmapPolicy::parse(bitmap)
+        scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let shard_target_rows = shard_size.unwrap_or(scx_format::DEFAULT_SHARD_TARGET_ROWS);
+    let shard_target_rows = shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS);
     let memory_budget_bytes = crate::convert::parse_memory_budget(memory_budget.as_ref())?;
 
     // Translate the Python dict form into ConvertOptions::modality_types.
@@ -380,11 +380,11 @@ pub fn from_mudata_impl(
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
     let csc_policy =
-        scx_format::CscPolicy::parse(csc).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        scx_format_io::CscPolicy::parse(csc).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     // The in-memory MuData path cannot build per-modality CSC sidecars yet.
     // An explicit `always` request is rejected (the user asked for something
     // we cannot honour); `auto` degrades gracefully to no-CSC.
-    if csc_policy == scx_format::CscPolicy::Always {
+    if csc_policy == scx_format_io::CscPolicy::Always {
         return Err(PyRuntimeError::new_err(
             "from_mudata(csc='always') is a Phase D+ follow-on (auto-emit \
              per-modality CSC). Use from_mudata(csc='off') for now and run \
@@ -585,7 +585,7 @@ pub fn from_mudata_impl(
                     // multimodal compression benchmark to compare the
                     // uniform-auto baseline against per-modality
                     // routing.
-                    scx_format::select_codec(&raw_values_bytes, value_encoding)
+                    scx_format_io::select_codec(&raw_values_bytes, value_encoding)
                 }
             }
         };

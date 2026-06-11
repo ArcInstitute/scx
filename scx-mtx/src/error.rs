@@ -1,6 +1,6 @@
 //! Error types for MTX I/O.
 
-use scx_format::error::ScxError;
+use scx_format_io::error::ScxError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MtxError {

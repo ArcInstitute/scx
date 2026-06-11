@@ -8,12 +8,12 @@ use std::sync::Arc;
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::shard::{ShardHeader, SHARD_HEADER_SIZE};
-use scx_format::writer::ScxWriter;
-use scx_format::ScxReader;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -22,7 +22,7 @@ use scx_format::ScxReader;
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -279,7 +279,7 @@ fn test_rollback_lifecycle() {
     assert!(output.status.success());
 
     // Verify n_obs increased
-    let reader = scx_format::reader::ScxReader::open(&target).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&target).unwrap();
     assert_eq!(reader.header().n_obs, 14);
     drop(reader);
 
@@ -297,7 +297,7 @@ fn test_rollback_lifecycle() {
     assert!(stdout.contains("Rolled back"));
 
     // Verify n_obs is back to original
-    let reader = scx_format::reader::ScxReader::open(&target).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&target).unwrap();
     assert_eq!(reader.header().n_obs, 10);
 }
 
@@ -462,7 +462,7 @@ fn test_query_output_writes_valid_file() {
     );
 
     // Check it has the right number of cells
-    let reader = scx_format::reader::ScxReader::open(&output_path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&output_path).unwrap();
     assert_eq!(reader.header().n_obs, 4); // 12/3 = 4 T cells
 }
 
@@ -773,7 +773,7 @@ fn test_delete_dry_run() {
     assert!(stdout.contains("4 cells"));
 
     // Verify file wasn't modified
-    let reader = scx_format::reader::ScxReader::open(&path).unwrap();
+    let reader = scx_format_io::reader::ScxReader::open(&path).unwrap();
     assert!(!reader.header().has_deletion_vectors());
 }
 

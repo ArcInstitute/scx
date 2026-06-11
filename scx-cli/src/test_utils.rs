@@ -8,8 +8,8 @@
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::writer::ScxWriter;
 use std::sync::Arc;
 
 /// Create a sample FileHeader for testing.

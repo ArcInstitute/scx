@@ -6,8 +6,8 @@ use arrow::array::Array;
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::prelude::*;
 use scx_engine::QueryPipeline;
-use scx_format::backed::BackedCsrReader;
-use scx_format::ScxReader;
+use scx_format_io::backed::BackedCsrReader;
+use scx_format_io::ScxReader;
 
 use crate::convert;
 use crate::query::PyQueryPipeline;
@@ -61,7 +61,7 @@ fn open_backed_csr(path: &PathBuf, modality: Option<&str>) -> PyResult<BackedCsr
 
 /// Resolve a gene name against the appropriate modality's `var`.
 fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> PyResult<u32> {
-    use scx_format::SectionType;
+    use scx_format_io::SectionType;
     let modality_id = if reader.is_multimodal() {
         match modality {
             Some(m) => reader.modality_id(m).ok_or_else(|| {
@@ -130,7 +130,7 @@ pub(crate) fn lookup_gene_in_batch(
     batch: &arrow::record_batch::RecordBatch,
     name: &str,
 ) -> Option<u32> {
-    let pandas_index_cols = scx_format::pandas_index_columns(batch.schema().as_ref());
+    let pandas_index_cols = scx_format_io::pandas_index_columns(batch.schema().as_ref());
     let fallback_columns = [
         "__index_level_0__",
         "_index",
@@ -189,7 +189,7 @@ fn schema_data_columns(schema: Option<arrow::datatypes::Schema>) -> Vec<String> 
     let Some(schema) = schema else {
         return Vec::new();
     };
-    let index_cols = scx_format::pandas_index_columns(&schema);
+    let index_cols = scx_format_io::pandas_index_columns(&schema);
     schema
         .fields()
         .iter()
@@ -390,7 +390,7 @@ impl PyExperiment {
         let list = PyList::empty(py);
         let prov = match self.reader.read_provenance() {
             Ok(p) => p,
-            Err(scx_format::ScxError::SectionNotFound(_)) => return Ok(list),
+            Err(scx_format_io::ScxError::SectionNotFound(_)) => return Ok(list),
             Err(e) => return Err(to_pyerr(e)),
         };
         for entry in prov.operations {
@@ -693,11 +693,10 @@ impl PyExperiment {
                         .reader
                         .read_raw_csr_shard_bytes_for(0, i)
                         .map_err(|e| PyRuntimeError::new_err(format!("read CSR shard {i}: {e}")))?;
-                    let header =
-                        scx_format::shard::ShardHeader::read_from(&mut std::io::Cursor::new(bytes))
-                            .map_err(|e| {
-                                PyRuntimeError::new_err(format!("shard {i} header: {e}"))
-                            })?;
+                    let header = scx_format_io::shard::ShardHeader::read_from(
+                        &mut std::io::Cursor::new(bytes),
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(format!("shard {i} header: {e}")))?;
                     total_rows += header.n_major as usize;
                     total_nnz += header.nnz as usize;
                     // Resolve the decode sidecar so Scx1 indices/values decode on the

@@ -12,8 +12,8 @@ use std::path::Path;
 use std::process::Command;
 
 use hdf5::types::VarLenUnicode;
-use scx_format::reader::ScxReader;
-use scx_format::section::SectionType;
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::SectionType;
 
 fn vlu(s: &str) -> VarLenUnicode {
     s.parse::<VarLenUnicode>().expect("valid VarLenUnicode")

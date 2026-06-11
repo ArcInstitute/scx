@@ -27,7 +27,7 @@ use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use scx_format::ScxReader;
+use scx_format_io::ScxReader;
 
 use crate::convert::{
     coo_record_batch_to_scipy, csr_to_scipy, filter_coo_obsp_by_kept_rows,
@@ -462,7 +462,7 @@ pub struct ScxLazyObsmMapping {
 pub(crate) struct BackedObsmConfig {
     pub(crate) path: std::path::PathBuf,
     pub(crate) cache_shards: usize,
-    pub(crate) shared_catalog: Arc<scx_format::FullCatalog>,
+    pub(crate) shared_catalog: Arc<scx_format_io::FullCatalog>,
     /// User-visible row i → global file row (deletion vectors). `None` =
     /// identity. `obs_filter` composition is intentionally excluded
     /// (the backed-obsm path falls back to eager under `obs_filter`).
@@ -519,7 +519,7 @@ impl ScxLazyObsmMapping {
                     ScxReader::open_with_shared_catalog(&cfg.path, Arc::clone(&cfg.shared_catalog))
                         .map_err(to_pyerr)?;
                 let backed = Arc::new(
-                    scx_format::BackedDenseReader::new_obsm(r, key, cfg.cache_shards)
+                    scx_format_io::BackedDenseReader::new_obsm(r, key, cfg.cache_shards)
                         .map_err(to_pyerr)?,
                 );
                 let ds = match &cfg.kept_to_global {

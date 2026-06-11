@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use arrow::array::Array;
 use scx_engine::QueryPipeline;
-use scx_format::reader::ScxReader;
+use scx_format_io::reader::ScxReader;
 
 pub fn run_benchmark(
     file: &Path,

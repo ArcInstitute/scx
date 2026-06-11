@@ -116,7 +116,7 @@ pub(crate) fn pandas_to_record_batch(
         .next()
         .ok_or_else(|| PyRuntimeError::new_err("Arrow IPC contains no batches"))?
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    scx_format::downcast_large_types(&batch).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    scx_format_io::downcast_large_types(&batch).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Build an Arrow RecordBatch from an obsm/varm value, skipping the

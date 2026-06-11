@@ -2,13 +2,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::encode_one_shard;
-use scx_format::error::ScxError;
-use scx_format::header::FileHeader;
-use scx_format::modality::ModalityType;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::{PreEncodedSection, ScxWriter};
+use scx_format_io::encode_one_shard;
+use scx_format_io::error::ScxError;
+use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityType;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::{PreEncodedSection, ScxWriter};
 use scx_sparse::canonicalize_csr;
 
 use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
@@ -29,7 +29,7 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes, BuildOutcome, ConversionPredicateIndexOptions,
     SkipReason,
 };
-use scx_format::bitmap::BitmapShard;
+use scx_format_io::bitmap::BitmapShard;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
@@ -327,16 +327,16 @@ fn build_and_write_bitmap_for_shard(
 
 /// Detection-bitmap generation policy.
 ///
-/// Re-exported from [`scx_format::BitmapPolicy`] so callers that depend
+/// Re-exported from [`scx_format_io::BitmapPolicy`] so callers that depend
 /// on `scx-convert` (CLI, pyscx with hdf5) can name it without an
 /// extra `scx_format` import. The actual definition lives in
 /// `scx-format` so the CPU-only pyscx build (which doesn't pull in
 /// `scx-convert`) can still drive bitmap generation from its in-memory
 /// write path.
-pub use scx_format::BitmapPolicy;
-/// Re-exported from [`scx_format::CscPolicy`] so callers depending only on
+pub use scx_format_io::BitmapPolicy;
+/// Re-exported from [`scx_format_io::CscPolicy`] so callers depending only on
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
-pub use scx_format::CscPolicy;
+pub use scx_format_io::CscPolicy;
 
 impl Default for ConvertOptions {
     fn default() -> Self {
@@ -1952,7 +1952,7 @@ fn write_csc_shards_from_csr(
         values,
     );
     // Shared transpose-and-write loop (single-modality → modality_id None).
-    scx_format::csc_sidecar::write_csc_sidecar(
+    scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
         n_obs,
@@ -1960,7 +1960,7 @@ fn write_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
     )?;
     Ok(())

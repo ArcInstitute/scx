@@ -5,7 +5,7 @@
 //! error message is centralized here.
 
 use crate::error::AccelError;
-use scx_format::ColumnShardSource;
+use scx_format_io::ColumnShardSource;
 
 /// Caller-requested column format. There is intentionally no `Auto`
 /// variant — CSC dispatch is explicit-opt-in by design.
@@ -62,7 +62,7 @@ pub fn require_csc<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scx_format::Result as ScxResult;
+    use scx_format_io::Result as ScxResult;
     use scx_sparse::ScxCsc;
     use std::ops::Range;
 

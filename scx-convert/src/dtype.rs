@@ -4,7 +4,7 @@
 // module adds the codec auto-selection policy on top.
 
 use scx_codec::{CodecError, CodecId, ValueEncoding};
-use scx_format::{select_codec, select_codec_for_modality, ModalityType};
+use scx_format_io::{select_codec, select_codec_for_modality, ModalityType};
 
 pub use scx_codec::value_encoding::{
     detect_value_encoding as detect_value_encoding_only, values_to_raw_bytes,

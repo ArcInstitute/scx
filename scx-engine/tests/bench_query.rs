@@ -13,8 +13,8 @@ use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{build_indexes, QueryPipeline};
-use scx_format::header::{FileHeader, MAGIC};
-use scx_format::writer::ScxWriter;
+use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::writer::ScxWriter;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -98,7 +98,7 @@ fn n_genes_for_row(i: usize) -> i32 {
 fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
     FileHeader {
         magic: MAGIC,
-        format_version: scx_format::CURRENT_FORMAT_VERSION,
+        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
         header_length: 256,
         flags: 0,
         n_obs,
@@ -187,7 +187,7 @@ fn shard_data(n_rows: usize, n_vars: usize, row_offset: usize) -> (Vec<u64>, Vec
 
 /// Write the benchmark fixture file with predicate index and per-shard column stats.
 fn write_bench_file(dir: &TempDir) -> PathBuf {
-    use scx_format::catalog::{column_name_hash, ColumnStat};
+    use scx_format_io::catalog::{column_name_hash, ColumnStat};
     use std::collections::BTreeSet;
 
     let path = dir.path().join("bench_query.scx");

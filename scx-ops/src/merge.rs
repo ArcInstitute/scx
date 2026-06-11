@@ -5,12 +5,12 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format::codec_select::select_codec;
-use scx_format::header::FileHeader;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
-use scx_format::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::codec_select::select_codec;
+use scx_format_io::header::FileHeader;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
+use scx_format_io::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
@@ -197,7 +197,7 @@ pub fn merge_with_options(
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
-        format_version: scx_format::rewrite_output_format_version(&input_format_versions, 1),
+        format_version: scx_format_io::rewrite_output_format_version(&input_format_versions, 1),
         n_obs: total_n_obs,
         n_vars,
         shard_target_rows: first_header.shard_target_rows,
@@ -420,7 +420,7 @@ pub fn merge_with_options(
     for layer_name in &layer_names {
         // Determine this layer's value encoding from its first shard header
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format::catalog::FullCatalogEntry> = readers[0]
+        let layer_shard_entries: Vec<&scx_format_io::catalog::FullCatalogEntry> = readers[0]
             .catalog()
             .entries
             .iter()
@@ -459,7 +459,7 @@ pub fn merge_with_options(
         // (see `merge_multimodal` below). No `read_layer` call — peak
         // memory is one input shard plus the in-flight output shard.
         for (file_idx, reader) in readers.iter().enumerate() {
-            let mut input_shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+            let mut input_shards: Vec<&scx_format_io::catalog::FullCatalogEntry> = reader
                 .catalog()
                 .entries
                 .iter()
@@ -676,7 +676,7 @@ fn merge_multimodal(
     let table = readers[0]
         .modality_table()
         .ok_or_else(|| {
-            scx_format::ScxError::InvalidCatalog(
+            scx_format_io::ScxError::InvalidCatalog(
                 "merge_multimodal: input has no modality table".to_string(),
             )
         })?
@@ -710,7 +710,7 @@ fn merge_multimodal(
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
     let out_header = FileHeader {
-        format_version: scx_format::rewrite_output_format_version(&input_format_versions, 2),
+        format_version: scx_format_io::rewrite_output_format_version(&input_format_versions, 2),
         n_obs: total_n_obs,
         n_vars: max_n_vars,
         shard_target_rows: first_header.shard_target_rows,
@@ -1103,8 +1103,8 @@ fn merge_multimodal(
 /// Two `None`s also match (both inputs single-modality). Mixed
 /// `Some` / `None` does not match.
 fn modality_tables_match(
-    a: Option<&scx_format::ModalityTable>,
-    b: Option<&scx_format::ModalityTable>,
+    a: Option<&scx_format_io::ModalityTable>,
+    b: Option<&scx_format_io::ModalityTable>,
 ) -> bool {
     match (a, b) {
         (None, None) => true,
@@ -1335,10 +1335,10 @@ fn schema_field_diff(a: &arrow::datatypes::Schema, b: &arrow::datatypes::Schema)
 fn dense_mapping_first_entry<'a>(
     per_input_entry: &'a (
         usize,
-        Vec<&scx_format::catalog::FullCatalogEntry>,
-        Option<&scx_format::catalog::FullCatalogEntry>,
+        Vec<&scx_format_io::catalog::FullCatalogEntry>,
+        Option<&scx_format_io::catalog::FullCatalogEntry>,
     ),
-) -> &'a scx_format::catalog::FullCatalogEntry {
+) -> &'a scx_format_io::catalog::FullCatalogEntry {
     if let Some(legacy) = per_input_entry.2 {
         return legacy;
     }
@@ -1367,8 +1367,8 @@ fn validate_dense_mapping_schemas(
     source_readers: &[ScxReader],
     per_input: &[(
         usize,
-        Vec<&scx_format::catalog::FullCatalogEntry>,
-        Option<&scx_format::catalog::FullCatalogEntry>,
+        Vec<&scx_format_io::catalog::FullCatalogEntry>,
+        Option<&scx_format_io::catalog::FullCatalogEntry>,
     )],
 ) -> Result<()> {
     if per_input.len() < 2 {
@@ -1518,13 +1518,13 @@ fn merge_global_dense_mapping_sharded(
         // For varm, source_readers == &readers[..1] (input 0 only).
         let mut per_input: Vec<(
             usize,
-            Vec<&scx_format::catalog::FullCatalogEntry>,
-            Option<&scx_format::catalog::FullCatalogEntry>,
+            Vec<&scx_format_io::catalog::FullCatalogEntry>,
+            Option<&scx_format_io::catalog::FullCatalogEntry>,
         )> = Vec::with_capacity(source_readers.len());
         let shard_name_prefix = format!("{prefix_slash}{key}_shard_");
         let legacy_name = format!("{prefix_slash}{key}");
         for (idx, reader) in source_readers.iter().enumerate() {
-            let shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+            let shards: Vec<&scx_format_io::catalog::FullCatalogEntry> = reader
                 .catalog()
                 .entries
                 .iter()
@@ -1676,11 +1676,11 @@ fn merge_per_modality_dense_mapping_sharded(
         let legacy_name = format!("{key_prefix}{key}");
         let mut per_input: Vec<(
             usize,
-            Vec<&scx_format::catalog::FullCatalogEntry>,
-            Option<&scx_format::catalog::FullCatalogEntry>,
+            Vec<&scx_format_io::catalog::FullCatalogEntry>,
+            Option<&scx_format_io::catalog::FullCatalogEntry>,
         )> = Vec::with_capacity(source_readers.len());
         for (idx, reader) in source_readers.iter().enumerate() {
-            let shards: Vec<&scx_format::catalog::FullCatalogEntry> = reader
+            let shards: Vec<&scx_format_io::catalog::FullCatalogEntry> = reader
                 .catalog()
                 .entries
                 .iter()
@@ -1845,7 +1845,7 @@ fn combine_uns_for_merge(
     for r in readers {
         match r.read_uns() {
             Ok(v) => per_input.push(Some(v)),
-            Err(scx_format::ScxError::SectionNotFound(_)) => per_input.push(None),
+            Err(scx_format_io::ScxError::SectionNotFound(_)) => per_input.push(None),
             Err(e) => return Err(e.into()),
         }
     }

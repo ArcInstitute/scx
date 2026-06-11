@@ -26,12 +26,12 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format::error::ScxError;
-use scx_format::header::FileHeader;
-use scx_format::modality::ModalityType;
-use scx_format::provenance::ProvenanceEntry;
-use scx_format::section::SectionType;
-use scx_format::writer::ScxWriter;
+use scx_format_io::error::ScxError;
+use scx_format_io::header::FileHeader;
+use scx_format_io::modality::ModalityType;
+use scx_format_io::provenance::ProvenanceEntry;
+use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
 
 use super::csc_stream::open_csc_streaming;
 use super::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
@@ -881,7 +881,7 @@ fn write_modality_csc_shards_from_csr(
         indices.to_vec(),
         data.to_vec(),
     );
-    scx_format::csc_sidecar::write_csc_sidecar(
+    scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
         n_obs,
@@ -889,7 +889,7 @@ fn write_modality_csc_shards_from_csr(
         value_encoding,
         codec_id,
         csc_cols_per_shard,
-        scx_format::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         Some(modality_id),
     )?;
     Ok(())

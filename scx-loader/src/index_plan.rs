@@ -25,7 +25,7 @@ use std::thread;
 
 use arrow::record_batch::RecordBatch;
 use crossbeam_channel::{bounded, Receiver};
-use scx_format::{BackedCsrReader, ScxReader};
+use scx_format_io::{BackedCsrReader, ScxReader};
 use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -133,7 +133,7 @@ pub struct IndexPlanLoader {
     /// Always populated — `BackedCsrReader::enable_metrics` is called in
     /// [`Self::new`] so the iter's profile log and the consumer-side
     /// snapshot accessor have a stable handle.
-    cache_metrics: Arc<scx_format::CacheMetrics>,
+    cache_metrics: Arc<scx_format_io::CacheMetrics>,
     /// Per-component memory breakdown produced by the auto-tune at
     /// construction. Surfaced through `IndexPlanDataset.memory_budget()` for
     /// production sizing.
@@ -432,7 +432,7 @@ impl IndexPlanLoader {
     /// (hits / misses / evictions / bytes_inserted / duplicate_waiters).
     /// Always populated; cloning the `Arc` lets callers sample without
     /// touching the cache lock.
-    pub fn cache_metrics(&self) -> Arc<scx_format::CacheMetrics> {
+    pub fn cache_metrics(&self) -> Arc<scx_format_io::CacheMetrics> {
         Arc::clone(&self.cache_metrics)
     }
 
@@ -603,13 +603,13 @@ impl IndexPlanLoader {
         while start < requests.len() {
             let row = requests[start].row;
             let shard_idx = self.backed.index().shard_for_row(row).ok_or_else(|| {
-                scx_format::ScxError::Io(std::io::Error::other(format!(
+                scx_format_io::ScxError::Io(std::io::Error::other(format!(
                     "row index {row} is not covered by any shard (n_obs={})",
                     self.n_obs()
                 )))
             })?;
             let (s_start, s_end) = self.backed.index().shard_range(shard_idx).ok_or(
-                scx_format::ScxError::ShardIndexOutOfBounds {
+                scx_format_io::ScxError::ShardIndexOutOfBounds {
                     index: shard_idx,
                     count: self.backed.index().n_shards(),
                 },
@@ -627,15 +627,15 @@ impl IndexPlanLoader {
                 let lo = *shard
                     .indptr
                     .get(local)
-                    .ok_or(scx_format::ScxError::InconsistentCsr)?
+                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
                     as usize;
                 let hi = *shard
                     .indptr
                     .get(local + 1)
-                    .ok_or(scx_format::ScxError::InconsistentCsr)?
+                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
                     as usize;
                 if hi < lo || hi > shard.indices.len() || hi > shard.data.len() {
-                    return Err(scx_format::ScxError::InconsistentCsr.into());
+                    return Err(scx_format_io::ScxError::InconsistentCsr.into());
                 }
                 let idx = &shard.indices[lo..hi];
                 let data = &shard.data[lo..hi];
@@ -718,7 +718,7 @@ impl IndexPlanLoader {
 /// Per-plan in-flight state: the plan itself plus one `spawn_blocking` join
 /// handle per shard scheduled for prefetch (cached / in-flight shards are
 /// filtered out by the iter pre-check before this Vec is built).
-type ShardJoin = JoinHandle<scx_format::Result<Arc<ScxCsr>>>;
+type ShardJoin = JoinHandle<scx_format_io::Result<Arc<ScxCsr>>>;
 
 struct InFlight {
     plan: Vec<(u64, u64)>,
@@ -1016,8 +1016,8 @@ mod tests {
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use scx_codec::{CodecId, ValueEncoding};
-    use scx_format::header::{FileHeader, MAGIC};
-    use scx_format::writer::ScxWriter;
+    use scx_format_io::header::{FileHeader, MAGIC};
+    use scx_format_io::writer::ScxWriter;
 
     /// Build a minimal multi-shard `.scx` file. Each row `r` has a single
     /// non-zero at column `r % n_vars` with value `((r + 1) & 0xFF) as u8`,
@@ -1036,7 +1036,7 @@ mod tests {
 
         let header = FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,
@@ -1536,7 +1536,7 @@ mod tests {
 
         let header = FileHeader {
             magic: MAGIC,
-            format_version: scx_format::CURRENT_FORMAT_VERSION,
+            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
             header_length: 256,
             flags: 0,
             n_obs: n_obs as u64,

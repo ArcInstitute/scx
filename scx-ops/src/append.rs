@@ -7,17 +7,17 @@ use std::path::Path;
 use arrow::array::RecordBatch;
 use scx_codec::{CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
-use scx_format::catalog::{FullCatalog, FullCatalogEntry};
-use scx_format::checksum::{blake3_hash, blake3_truncated_64};
-use scx_format::compute_shard_stats;
-use scx_format::provenance::{Provenance, ProvenanceEntry};
-use scx_format::reader::ScxReader;
-use scx_format::section::{write_alignment_padding, SectionType};
-use scx_format::shard::{
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
+use scx_format_io::checksum::{blake3_hash, blake3_truncated_64};
+use scx_format_io::compute_shard_stats;
+use scx_format_io::provenance::{Provenance, ProvenanceEntry};
+use scx_format_io::reader::ScxReader;
+use scx_format_io::section::{write_alignment_padding, SectionType};
+use scx_format_io::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
     SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
-use scx_format::writer::ScxWriter;
+use scx_format_io::writer::ScxWriter;
 
 use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
@@ -301,7 +301,7 @@ pub fn append_from_reader_with_index_options(
     // into the (possibly v3) base. Gate the file's format_version on the lower
     // of base and source — never claim v3 unless both already guarantee it.
     let feature_floor = if prep.header.n_modalities > 0 { 2 } else { 1 };
-    prep.header.format_version = scx_format::rewrite_output_format_version(
+    prep.header.format_version = scx_format_io::rewrite_output_format_version(
         &[prep.header.format_version, source.header().format_version],
         feature_floor,
     );
@@ -543,7 +543,7 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, InPl
 /// both legacy single-section [`SectionType::ObsMetadata`] files and
 /// Phase 2 row-sharded [`SectionType::ObsMetadataShard`] files. The
 /// sharded path concatenates shards in `shard_idx` order, matching
-/// what [`scx_format::ScxReader::read_obs`] returns at query time —
+/// what [`scx_format_io::ScxReader::read_obs`] returns at query time —
 /// but goes through the lock-held file handle instead of the mmap
 /// `ScxReader` because the append path already holds the write lock
 /// and can't open a second reader concurrently. Used by `append`
@@ -590,7 +590,7 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
                 format!("{} contains no batches", entry.name),
             ))
         })??;
-        batches.push(scx_format::upcast_to_large_types(&batch).map_err(OpsError::Format)?);
+        batches.push(scx_format_io::upcast_to_large_types(&batch).map_err(OpsError::Format)?);
     }
     let wide_schema = batches[0].schema();
     let concatenated =
@@ -598,7 +598,7 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
     // Narrow back to `Utf8` / `Binary` for columns whose combined
     // offsets fit; columns above `i32::MAX` stay wide so the >2 GB
     // append case still reads cleanly.
-    let narrowed = scx_format::downcast_large_types(&concatenated).map_err(OpsError::Format)?;
+    let narrowed = scx_format_io::downcast_large_types(&concatenated).map_err(OpsError::Format)?;
     // Strip per-shard schema metadata so the schema matches what
     // `ScxReader::read_obs` returns at query time.
     let narrowed_schema = narrowed.schema();
@@ -626,7 +626,7 @@ fn read_existing_arrow_ipc_section(
     section_name: &str,
 ) -> Result<RecordBatch> {
     let entry = old_catalog.get(section_name).ok_or_else(|| {
-        OpsError::Format(scx_format::ScxError::SectionNotFound(
+        OpsError::Format(scx_format_io::ScxError::SectionNotFound(
             section_name.to_string(),
         ))
     })?;
@@ -642,7 +642,7 @@ fn read_existing_arrow_ipc_section(
             format!("{section_name} section contains no batches"),
         ))
     })??;
-    scx_format::downcast_large_types(&batch).map_err(OpsError::Format)
+    scx_format_io::downcast_large_types(&batch).map_err(OpsError::Format)
 }
 
 /// Compare two obs batches by column count and per-column (name, effective
@@ -710,9 +710,11 @@ fn write_csr_chunk(
     let shard_nnz = *shard_indptr.last().unwrap_or(&0);
 
     let shard_codec = match codec_selection {
-        CodecSelection::Auto => {
-            scx_format::select_codec_for_modality(shard_values, value_encoding, prep.modality_type)
-        }
+        CodecSelection::Auto => scx_format_io::select_codec_for_modality(
+            shard_values,
+            value_encoding,
+            prep.modality_type,
+        ),
         CodecSelection::Explicit(c) => c,
     };
 
@@ -804,7 +806,7 @@ fn write_csr_chunk(
     let stats = compute_shard_stats(
         shard_values,
         value_encoding,
-        scx_format::MajorAxis::Row,
+        scx_format_io::MajorAxis::Row,
         global_row_start,
         shard_rows as u64,
         prep.target_n_vars,
@@ -1047,7 +1049,8 @@ fn finalize_append(
                         "ObsMetadataShard contains no batches",
                     ))
                 })??;
-                let batch = scx_format::downcast_large_types(&batch).map_err(OpsError::Format)?;
+                let batch =
+                    scx_format_io::downcast_large_types(&batch).map_err(OpsError::Format)?;
                 let n = batch.num_rows() as u64;
                 b.push_shard(&batch, row_offset).map_err(OpsError::Engine)?;
                 row_offset += n;
@@ -1106,7 +1109,7 @@ fn finalize_append(
     // assembled catalog entries (old + new CSR shards) further below — append
     // does not write CSR shards through a fresh `ScxWriter`, so the writer's
     // bulk setter can't reach them.
-    let mut per_shard_obs_stats: Option<Vec<Vec<scx_format::catalog::ColumnStat>>> = None;
+    let mut per_shard_obs_stats: Option<Vec<Vec<scx_format_io::catalog::ColumnStat>>> = None;
     let index_result = if let Some(builder) = obs_index_builder {
         // Per-output-shard `(row_start, row_end)` for the full obs:
         // existing CSR shards (modality_id == 0) sorted by row_start,
@@ -1196,7 +1199,7 @@ fn finalize_append(
                 predicate_index_section_entries.push(entry)
             }
             _ => {
-                return Err(OpsError::Format(scx_format::ScxError::InvalidCatalog(
+                return Err(OpsError::Format(scx_format_io::ScxError::InvalidCatalog(
                     format!(
                         "finalize_append: unexpected section type {:?} written by adopted writer",
                         entry.section_type
@@ -1348,12 +1351,12 @@ fn finalize_append(
     // shards. `assign_csr_shard_column_stats` addresses modality-0 CSR shards by
     // `row_start` order, matching the `shard_row_ranges` the index was built on.
     if let Some(per_shard) = per_shard_obs_stats {
-        scx_format::assign_csr_shard_column_stats(&mut new_entries, per_shard)?;
+        scx_format_io::assign_csr_shard_column_stats(&mut new_entries, per_shard)?;
     }
 
     let new_manifest_sequence = prep.header.manifest_sequence + 1;
     let new_catalog = FullCatalog {
-        catalog_version: scx_format::CURRENT_CATALOG_VERSION,
+        catalog_version: scx_format_io::CURRENT_CATALOG_VERSION,
         manifest_sequence: new_manifest_sequence,
         prev_catalog_offset: prep.old_catalog_offset,
         n_obs: new_n_obs,
@@ -1379,8 +1382,8 @@ fn finalize_append(
             // comment above).
             for info in table.entries.iter_mut() {
                 info.n_csc_shards = 0;
-                info.flags = scx_format::ModalityFlags::from_bits_truncate(
-                    info.flags.bits() & !scx_format::ModalityFlags::HAS_CSC,
+                info.flags = scx_format_io::ModalityFlags::from_bits_truncate(
+                    info.flags.bits() & !scx_format_io::ModalityFlags::HAS_CSC,
                 );
             }
 

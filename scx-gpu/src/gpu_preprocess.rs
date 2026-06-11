@@ -36,8 +36,8 @@
 use cudarc::driver::safe::{CudaSlice, CudaView, CudaViewMut, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
-use scx_format::{concatenate_csr, ShardSource};
-use scx_sparse::ScxCsr;
+use scx_format_io::ShardSource;
+use scx_sparse::{concatenate_csr, ScxCsr};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -799,7 +799,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }

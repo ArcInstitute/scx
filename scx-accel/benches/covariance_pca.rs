@@ -19,7 +19,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use scx_accel::covariance_pca;
-use scx_format::shard_source::ShardSource;
+use scx_format_io::shard_source::ShardSource;
 use scx_sparse::ScxCsr;
 
 /// Minimal in-memory multi-shard CSR source for benchmarking.
@@ -39,7 +39,7 @@ impl ShardSource for InMemoryShards {
     fn n_vars(&self) -> usize {
         self.n_vars
     }
-    fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
         Ok(self.shards[shard_idx].clone())
     }
 }

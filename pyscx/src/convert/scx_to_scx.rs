@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 use std::sync::Arc;
 
 use scx_codec::CodecId;
-use scx_format::section::SectionType;
-use scx_format::{ModalityType, ProvenanceEntry, ScxReader, ScxWriter};
+use scx_format_io::section::SectionType;
+use scx_format_io::{ModalityType, ProvenanceEntry, ScxReader, ScxWriter};
 
 use crate::to_pyerr;
 
@@ -30,7 +30,7 @@ use super::*;
 ///   wrapper's user-visible shard boundaries, calls
 ///   `wrapper[start:end]` to materialise each shard as a scipy CSR
 ///   (deletions and column projection already applied by the
-///   wrapper), then hands it to [`scx_format::encode_one_shard`]
+///   wrapper), then hands it to [`scx_format_io::encode_one_shard`]
 ///   plus [`ScxWriter::write_preencoded_shard`].
 ///
 /// `shard_size_overridden` reflects whether the caller passed
@@ -46,7 +46,7 @@ pub(crate) fn route_scx_backed_to_scx(
     out_path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_policy: scx_format::CscPolicy,
+    csc_policy: scx_format_io::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
     shard_size_overridden: bool,
@@ -165,7 +165,7 @@ pub(crate) fn route_scx_backed_to_scx(
     }
 
     // Write obs/var first.
-    py.detach(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format_io::ScxError> {
         writer.write_obs(&ov.obs)?;
         writer.write_var(&ov.var)?;
         Ok(())
@@ -187,7 +187,7 @@ pub(crate) fn route_scx_backed_to_scx(
         // enforced above, so we can write at the global modality
         // (current_modality_id == 0).
         let csr_shards = src_reader.catalog().csr_shards_sorted();
-        py.detach(|| -> Result<(), scx_format::ScxError> {
+        py.detach(|| -> Result<(), scx_format_io::ScxError> {
             for entry in csr_shards {
                 let bytes = src_reader.read_raw_shard_bytes(entry)?;
                 writer.copy_section_verbatim(entry, bytes)?;
@@ -209,7 +209,7 @@ pub(crate) fn route_scx_backed_to_scx(
             let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
                 py.detach(|| {
-                    scx_format::encode_one_shard(
+                    scx_format_io::encode_one_shard(
                         indptr,
                         indices,
                         data,
@@ -249,7 +249,7 @@ pub(crate) fn route_scx_backed_to_scx(
     // varp are emitted as row-sharded sections so the on-disk layout
     // matches what the streaming pipeline produces (readers handle
     // both sharded and legacy single-section layouts transparently).
-    py.detach(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format_io::ScxError> {
         for (k, b) in &ov.obsm {
             for_each_dense_shard(
                 b,
@@ -344,7 +344,7 @@ pub(crate) fn route_scx_lazy_to_scx(
     out_path: &str,
     explicit_codec: Option<CodecId>,
     shard_target_rows: u32,
-    csc_policy: scx_format::CscPolicy,
+    csc_policy: scx_format_io::CscPolicy,
     csc_cols_per_shard: usize,
     uns_format_parsed: UnsFormat,
 ) -> PyResult<()> {
@@ -373,7 +373,7 @@ pub(crate) fn route_scx_lazy_to_scx(
     let src_codec: Option<CodecId> = src_header_meta.and_then(|(c, _)| c);
     let src_format_version: u16 = src_header_meta
         .map(|(_, v)| v)
-        .unwrap_or(scx_format::CURRENT_FORMAT_VERSION);
+        .unwrap_or(scx_format_io::CURRENT_FORMAT_VERSION);
     let out_codec = explicit_codec.or(src_codec).unwrap_or(CodecId::Zstd);
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
     let n_vars_u32 = u32::try_from(n_vars)
@@ -399,7 +399,7 @@ pub(crate) fn route_scx_lazy_to_scx(
 
     let ov = extract_scx_overrides(py, adata, uns_format_parsed)?;
 
-    py.detach(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format_io::ScxError> {
         writer.write_obs(&ov.obs)?;
         writer.write_var(&ov.var)?;
         Ok(())
@@ -419,7 +419,7 @@ pub(crate) fn route_scx_lazy_to_scx(
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
         let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
             py.detach(|| {
-                scx_format::encode_one_shard(
+                scx_format_io::encode_one_shard(
                     indptr,
                     indices,
                     data,
@@ -451,7 +451,7 @@ pub(crate) fn route_scx_lazy_to_scx(
         index_dtype,
     )?;
 
-    py.detach(|| -> Result<(), scx_format::ScxError> {
+    py.detach(|| -> Result<(), scx_format_io::ScxError> {
         for (k, b) in &ov.obsm {
             for_each_dense_shard(
                 b,
@@ -640,7 +640,7 @@ pub(crate) fn stream_write_layers(
             let shard_obj = layer.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
                 py.detach(|| {
-                    scx_format::encode_one_shard(
+                    scx_format_io::encode_one_shard(
                         indptr,
                         indices,
                         data,
@@ -732,9 +732,9 @@ pub(crate) fn for_each_dense_shard<F>(
     batch: &RecordBatch,
     shard_target_rows: u32,
     mut f: F,
-) -> std::result::Result<(), scx_format::ScxError>
+) -> std::result::Result<(), scx_format_io::ScxError>
 where
-    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format_io::ScxError>,
 {
     let n_rows = batch.num_rows();
     let n_total = n_rows as u64;
@@ -764,15 +764,15 @@ pub(crate) fn for_each_coo_shard<F>(
     batch: &RecordBatch,
     shard_target_rows: u32,
     mut f: F,
-) -> std::result::Result<(), scx_format::ScxError>
+) -> std::result::Result<(), scx_format_io::ScxError>
 where
-    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format::ScxError>,
+    F: FnMut(u32, u64, u64, u64, &RecordBatch) -> std::result::Result<(), scx_format_io::ScxError>,
 {
     use arrow::array::{Array, Float32Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
     let invalid = |msg: String| {
-        scx_format::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+        scx_format_io::ScxError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
     };
 
     // Width-generic: accept both v1 (Int32) and v2 (Int64) row/col columns,
@@ -890,7 +890,7 @@ where
                 ))),
             ],
         )
-        .map_err(scx_format::ScxError::Arrow)?;
+        .map_err(scx_format_io::ScxError::Arrow)?;
         f(
             shard_idx as u32,
             row_start as u64,

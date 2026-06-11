@@ -11,7 +11,7 @@ pub fn run_rollback(file: &Path, to_seq: Option<u64>) -> Result<(), Box<dyn std:
         None => {
             scx_ops::rollback(file)?;
             // Read back the new header to report the sequence number
-            let reader = scx_format::reader::ScxReader::open(file)?;
+            let reader = scx_format_io::reader::ScxReader::open(file)?;
             let seq = reader.header().manifest_sequence;
             println!(
                 "Rolled back {} to manifest sequence {}",

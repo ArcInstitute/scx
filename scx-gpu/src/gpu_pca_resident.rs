@@ -28,7 +28,7 @@ use cudarc::cublas::sys as cbs;
 use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use crate::cublas::{gpu_sgemv, CublasHandle};
 use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
@@ -494,7 +494,7 @@ mod tests {
     use crate::math_policy::GpuPcaTuning;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use scx_format::ShardSource;
+    use scx_format_io::ShardSource;
     use scx_sparse::ScxCsr;
 
     struct InMemorySource {
@@ -513,7 +513,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }

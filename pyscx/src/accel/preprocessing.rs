@@ -47,7 +47,7 @@ pub(crate) fn clear_gpu_normalize_marker(adata: &Bound<'_, PyAny>) -> PyResult<(
 #[cfg(feature = "gpu")]
 #[pyclass(name = "ScxGpuNormalizeMarker", module = "pyscx")]
 pub struct ScxGpuNormalizeMarker {
-    backed: Arc<scx_format::BackedCsrReader>,
+    backed: Arc<scx_format_io::BackedCsrReader>,
     kept_to_global: Option<Arc<Vec<u64>>>,
     col_projection: Option<Arc<Vec<u32>>>,
     target_sum: f64,
@@ -774,7 +774,7 @@ fn scx_csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<B
 #[cfg(feature = "gpu")]
 struct GpuShardSource {
     source: crate::lazy_transform::LazyShardSource,
-    backed: Arc<scx_format::BackedCsrReader>,
+    backed: Arc<scx_format_io::BackedCsrReader>,
     kept_to_global: Option<Arc<Vec<u64>>>,
     col_projection: Option<Arc<Vec<u32>>>,
     n_obs: usize,

@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use scx_format::modality::ModalityType;
+use scx_format_io::modality::ModalityType;
 
 /// One conversion-time warning. New variants land alongside the
 /// phase that emits them; the default `log::warn!` backend prints

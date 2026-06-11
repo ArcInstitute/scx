@@ -6,7 +6,7 @@
 //! [`transforms`](GpuMatrixSource::transforms) so a downstream kernel can detect
 //! a double-application mismatch.
 
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
@@ -92,7 +92,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[idx].clone())
         }
     }

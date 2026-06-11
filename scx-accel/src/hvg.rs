@@ -6,7 +6,7 @@
 //! raw backed data and lazy-transformed data without materialization.
 
 use crate::error::Result;
-use scx_format::ShardSource;
+use scx_format_io::ShardSource;
 
 /// Per-gene mean and variance statistics.
 #[derive(Debug, Clone)]
@@ -499,7 +499,7 @@ mod tests {
         fn n_vars(&self) -> usize {
             self.n_vars
         }
-        fn read_shard(&self, shard_idx: usize) -> scx_format::Result<ScxCsr> {
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
             Ok(self.shards[shard_idx].clone())
         }
     }
