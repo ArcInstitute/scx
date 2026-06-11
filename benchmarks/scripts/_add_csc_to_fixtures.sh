@@ -1,8 +1,8 @@
 #!/bin/bash
 # Add CSC sidecars to existing SCX bench fixtures via `scx build-csc`.
-# Used to prepare fixtures for the G4.3 bench (`SCX_GPU_DE_V3=1` exercises
-# the v3 CSC-direct path when a CSC sidecar is present; without CSC, v3
-# falls back to CSR-direct atomicAdd).
+# Used to prepare fixtures for the G4.3 bench: GPU DE exercises the v3
+# CSC-direct path when a CSC sidecar is present; without CSC it falls back
+# to CSR-direct atomicAdd.
 #
 # Atomic rename pattern: build into <fixture>.csc.tmp, then `mv` over the
 # original. Other concurrent bench runs are unaffected because the SCX

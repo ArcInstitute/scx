@@ -1010,7 +1010,7 @@ hard gate failure via the existing absolute-floor machinery.
 
 | Gate metric | Benchmark module | What it catches |
 |------------|------------------|-----------------|
-| `de_route_csc_direct` | `accel_de` (pdex_ref GPU) | CSC sidecar + `SCX_GPU_DE_V3=1` active, yet a non-CSC route ran. Gated on `pbmc3k`, `tabula_sapiens_100k`, and `census_1m`. |
+| `de_route_csc_direct` | `accel_de` (pdex_ref GPU) | CSC sidecar present (v3 is the unconditional default GPU DE route), yet a non-CSC route ran. Gated on `pbmc3k`, `tabula_sapiens_100k`, and `census_1m`. |
 | `wilcoxon_route_gpu_correct` | `accel_de` (Wilcoxon GPU) | `device="gpu"` requested but a `cpu_*` route ran. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `csc_dispatch_correct` | `bench_csc_dispatch` | A `_csc`-labelled variant ran a non-CSC route (or vice versa). Gated on `tabula_sapiens_100k` for `qc_metrics`, `hvg`, `de`, and `pdex_ref` CSC variants. |
 | `hvg_route_gpu_correct` | `accel_hvg` | GPU HVG dispatch silently fell back to CPU. Gated on `pbmc3k`. |
@@ -1028,10 +1028,10 @@ Each gate metric is `1.0` when the expected route ran (or wasn't applicable —
 e.g. no GPU host), `0.0` on a silent fallback. All GPU benchmark modules also
 emit `gpu_dispatch_route` (the stable wire identifier, e.g. `gpu_csc_v3`) and
 `gpu_dispatch_fallback` (e.g. `no_csc_sidecar`) in `runs[].extra` for
-diagnostics. Benchmark provenance (`provenance.py`) captures the route-
-affecting env vars `SCX_GPU_DE_V2`, `SCX_GPU_DE_V3`, and
-`SCX_GPU_DE_V3_TRACE` so a result can always be attributed to its dispatch
-configuration.
+diagnostics. Benchmark provenance (`provenance.py`) records each run's actual
+dispatch route (read back from `adata.uns["scx_accel"]`) so a result can always
+be attributed to the kernel that ran — GPU DE v3 is the unconditional default,
+so there are no longer any route-selecting env gates to record.
 
 **End-to-end residency benchmark (`accel_pipeline`).** The per-op accel
 benchmarks above time one stage at a time; `accel_pipeline` times the whole

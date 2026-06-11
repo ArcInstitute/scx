@@ -4,7 +4,7 @@
 > [GitHub Releases](https://github.com/ArcInstitute/scx/releases); PyPI + conda
 > planned at public release.
 
-A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files**, **fastest reads at census scale** (1.4× faster than Zarr on 1M cells, up to 7× with parallel decode, up to 3.2× parallel write scaling), **4-44× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
+A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files** (vs uncompressed h5ad), **fastest reads at census scale** (1.5× faster than Zarr on 1M cells, up to 7× with parallel decode, up to 3.2× parallel write scaling), **up to 10× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
 
 **Python** — works with scanpy, scVI, and any scverse tool:
 
@@ -60,7 +60,7 @@ skill via [`AGENTS.md`](AGENTS.md).
 
 ## Main features
 
-- **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.4× faster than Zarr, and produces a file ~1.2–1.7× smaller than gzipped h5ad (4–5× smaller than anndata's default uncompressed h5ad). Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
+- **Fast at every scale** — on 1M cells SCX is **17× faster** than the gzipped h5ad most researchers ship, 1.5× faster than Zarr, and produces a file 4–5× smaller than anndata's default uncompressed h5ad. Single file, BLAKE3-checksummed, mmap-friendly, and HPC-safe: no `HDF5_USE_FILE_LOCKING=FALSE` workaround on NFS / Lustre / GPFS.
 - **Scales on CPU and GPU** — shard-level parallelism via rayon delivers up to **7× read** and **3.2× write** scaling. The GPU path (rapids-singlecell for PCA · kNN · UMAP · preprocessing, cuGraph for Leiden, plus native CUDA kernels for HVG · DE · Harmony) gives **3.8× end-to-end** on PCA → kNN → UMAP → Leiden at 1M cells; the training loader hits **1,405 batches/s** — 82× faster than TileDB-SOMA-ML.
 - **Atlas-scale memory footprint** — backed mode + `MADV_DONTNEED` streaming. A full 1M-cell preprocess-to-cluster pipeline (open → QC → normalize → log1p → HVG → PCA → kNN → UMAP → Leiden) runs at **~11 GB peak RSS** vs ~22 GB materialised (51% less; lazy preprocessing alone peaks at ~3.5 GB). Backed mode lets you open a 10M-cell atlas without allocating the full matrix.
 - **Rust-native analysis accelerators** — drop-in replacements for `sc.pp.*` / `sc.tl.*`: PCA, kNN, UMAP, Leiden, differential expression, pseudobulk, and [Harmony2 batch integration](https://www.biorxiv.org/content/10.64898/2026.03.16.711825v1). Same scanpy-shaped API, 3–40× faster; every op has a `device="auto"` switch that picks GPU when available.
@@ -747,7 +747,7 @@ Headline numbers at Census 1M (CELLxGENE Census, 1M cells):
 
 | Area | SCX | Next best | SCX advantage |
 |------|-----|-----------|---------------|
-| File size vs gzip h5ad | 2.35 GB | 11.4 GB | **4.8× smaller** |
+| File size vs uncompressed h5ad | 2.35 GB | 11.4 GB | **4.8× smaller** |
 | Read (full load to AnnData) | **2.74 s** | 3.99 s (Zarr lz4) | **1.5× faster** |
 | Column projection (2K HVGs) | **3.53 s** | 7.24 s (Zarr lz4) | **2.0× faster** |
 | Parallel read (32 threads) | **3.0 s** | — (no other format scales) | **6.1× vs 1 thread** |

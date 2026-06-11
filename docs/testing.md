@@ -177,28 +177,31 @@ Helper utilities in `validation_helpers.py`: `max_abs_error`, `max_rel_error`, `
 **Location**: `benchmarks/scripts/`
 **Results**: `benchmarks/results/`
 
+Compression, read, write, query, and file-ops benchmarks run through the
+comprehensive suite (`benchmarks/comprehensive/scripts/run_parallel.py
+--benchmarks compression read_full read_selective write ...`), not standalone
+scripts — see [Running Benchmarks](#running-benchmarks) below. The standalone
+scripts under `benchmarks/scripts/` cover the training loader, bindings, and
+GPU/analysis paths:
+
 | Script | Purpose |
 |--------|---------|
-| `benchmark_all.py` | Runs all baseline benchmarks together |
-| `benchmark_compression.py` | Compression ratio vs h5ad (target: < 60%) |
-| `benchmark_read.py` | Read performance (scx vs h5ad) |
-| `benchmark_write.py` | h5ad → scx conversion speed (MB/s) |
-| `benchmark_auto_codec.py` | Auto-codec selection performance |
-| `benchmark_parallel_read.py` | Parallel shard decode scaling (1-8 threads) |
-| `benchmark_compressed_h5ad.py` | SCX vs gzip/lzf-compressed h5ad |
-| `benchmark_ops.py` | File operations (append, compact, delete, merge) |
-| `benchmark_query.py` | Query engine: shard skip rate, latency, pushdown |
 | `benchmark_loader.py` | Training loader throughput, SOMA comparison |
-| `benchmark_gpu_scvi.py` | scVI GPU utilization on 10M-cell dataset |
-| `benchmark_cli.py` | CLI operation timing |
 | `benchmark_python_bindings.py` | Python bindings performance |
+| `benchmark_cli.py` | CLI operation timing |
 | `benchmark_bpcells.R` | BPCells R comparison |
+| `benchmark_harmony.py` | Harmony2 batch-integration throughput |
+| `benchmark_lisi.py` | LISI batch/cell-type mixing metric |
+| `benchmark_gpu_pca.py` | GPU PCA throughput |
+| `benchmark_gpu_knn.py` | GPU kNN throughput |
+| `benchmark_gpu_umap.py` | GPU UMAP throughput |
+| `benchmark_gpu_pipeline.py` | End-to-end GPU PCA → kNN → UMAP → Leiden |
+| `benchmark_gpu_preprocess.py` | GPU normalize/log1p preprocessing |
+| `benchmark_gpu_decode.py` | GPU codec decode throughput |
+| `benchmark_gpu_scvi.py` | scVI GPU utilization on 10M-cell dataset |
 | `download_datasets.sh` | Fetches test data (PBMC 3K, Tabula Sapiens, CELLxGENE Census, Smart-seq2) |
 | `setup_cloud_test_data.sh` | Set up cloud test data in GCS bucket |
-| `run_benchmarks_slurm.sh` | SLURM job script for HPC benchmarks |
 | `submit_benchmarks.py` | Submit and manage benchmark SLURM jobs |
-| `benchmark_madvise_rss.py` | MADV_DONTNEED RSS impact: peak RSS during streaming aggregation (orchestrator) |
-| `benchmark_madvise_rss_worker.py` | Subprocess worker for RSS measurement (samples /proc/self/statm) |
 
 ### Running Benchmarks
 
@@ -294,7 +297,9 @@ The macro is defined per-module (e.g., `cusparse.rs`, `cusolver.rs`, `gpu_pca.rs
 
 ```bash
 # GPU analysis benchmarks (PCA, kNN, UMAP throughput)
-.venv/bin/python benchmarks/scripts/benchmark_gpu_analysis.py
+.venv/bin/python benchmarks/scripts/benchmark_gpu_pca.py
+.venv/bin/python benchmarks/scripts/benchmark_gpu_knn.py
+.venv/bin/python benchmarks/scripts/benchmark_gpu_umap.py
 
 # GPU preprocessing benchmarks
 .venv/bin/python benchmarks/scripts/benchmark_gpu_preprocess.py

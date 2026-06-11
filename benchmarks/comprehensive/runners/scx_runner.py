@@ -91,8 +91,8 @@ class ScxRunner(FormatRunner):
         self.codec_per_modality = codec_per_modality
         # G4.3: when True, also write a CSC sidecar (gene-major shards)
         # at convert time. Required for `pdex_ref_gpu_streaming` to
-        # exercise the v3 CSC-direct path under `SCX_GPU_DE_V3=1`;
-        # default off to preserve back-compat with pre-G4.3 bench fixtures.
+        # exercise the CSC-direct code path; default off to preserve
+        # back-compat with pre-G4.3 bench fixtures.
         # Toggle via the `SCX_BENCH_WITH_CSC=1` env var picked up by
         # the gate orchestrator (`gate_candidate.py`) and forwarded here.
         self.with_csc = with_csc

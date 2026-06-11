@@ -1,7 +1,9 @@
 #!/bin/bash
-# Three-way G4.3 bench: v1 (default), v2 (G4.1), v3 (CSC-first / CSR-fallback).
-# Submitted as a single orchestrator SLURM job that runs sequentially —
-# the orchestrator itself submits per-bench-row child SLURM jobs.
+# G4.3 bench: GPU DE v3 (CSC-first / CSR-fallback) — now the unconditional
+# default route (the former v1/v2/v3 gate sweep collapsed to one run when the
+# SCX_GPU_DE_V2/SCX_GPU_DE_V3 gates were removed). Submitted as a single
+# orchestrator SLURM job that runs sequentially — the orchestrator itself
+# submits per-bench-row child SLURM jobs.
 #
 # Per-fixture CSC status (built by `_add_csc_to_fixtures.sh`):
 #   pbmc3k_auto.scx       → has CSC (v3 exercises CSC-direct)
@@ -48,9 +50,7 @@ run_one () {
     echo "=== ${label} exit=$? ==="
 }
 
-run_one "v1_default"
-run_one "v2_on"    SCX_GPU_DE_V2=1
-run_one "v3_on"    SCX_GPU_DE_V3=1
+run_one "v3_default"
 
 echo
-echo "=== all three configs done ==="
+echo "=== done ==="

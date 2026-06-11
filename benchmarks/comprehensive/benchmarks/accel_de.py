@@ -195,8 +195,8 @@ def _run_pyscx_pdex_ref_gpu(adata: Any, groupby: str, reference: str) -> Any:
     CSC sidecar), route through ``pyscx.open(scx_path)`` so the dataset
     arrives as a ``ScxBackedSparseDataset`` with ``backed_csc=Some(...)``.
     That makes pyscx's dispatch route to ``pdex_ref_gpu(GpuDeShardInput::Backed
-    { csc: Some(...), .. })``, which under ``SCX_GPU_DE_V3=1`` exercises the
-    v3 CSC-direct kernels (the path we actually want to bench). The
+    { csc: Some(...), .. })``, which exercises the v3 CSC-direct kernels (the
+    path we actually want to bench; v3 is the unconditional default). The
     in-memory scipy CSR fallback routes through ``pdex_ref_gpu(Csr)`` →
     v3 CSR-fallback, which is NOT the path G4.3 is trying to measure.
     """
@@ -303,8 +303,8 @@ def _ensure_scx_csc_fixture(adata: Any, dataset_name: str) -> Path | None:
     ``pyscx.open(scx_path)`` → ``ScxBackedSparseDataset`` with
     ``backed_csc=Some(...)``. With only the h5ad-loaded scipy CSR in
     memory, pyscx routes to the in-memory `pdex_ref_gpu(Csr)` arm
-    which has no CSC reader, and v3 dispatch always falls back to
-    the CSR-direct path even when SCX_GPU_DE_V3=1.
+    which has no CSC reader, so v3 dispatch always falls back to
+    the CSR-direct path.
 
     Returns the path on success or None if pyscx is missing or the
     conversion failed. Cached on disk under

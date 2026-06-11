@@ -5,26 +5,17 @@ wilcoxon_rank_sum_gpu_chunked_v3_csc`, recorded as `gpu_csc_v3`) on a backed
 SCX file with a CSC sidecar, cross-checking numerics against the CPU path and
 asserting the recorded route is the CSC-direct one.
 
-The v3 routes are gated by `SCX_GPU_DE_V3`. That flag is read once per process
-via an `OnceLock`, so this module sets it at import time (before pyscx runs any
-DE) and is intended to run in its own process — which is how the Chimera GPU
-test harness invokes GPU test files (isolated, see the gpu-pytest-isolation
-note). If the flag wasn't active in this process (e.g. another DE ran first in
-a shared session and locked v3 off), the route assertion is skipped while the
-numerical parity check still runs.
+GPU DE v3 is the unconditional default route (the former `SCX_GPU_DE_V3` gate
+was removed), so a backed SCX file with a CSC sidecar always takes the
+`gpu_csc_v3` route — the assertion below proves it.
 
 Skipped cleanly when `pyscx.accel.gpu_available()` is `False`.
 """
 
 from __future__ import annotations
 
-import os
-
-# Must be set before the first DE call locks in the OnceLock read.
-os.environ.setdefault("SCX_GPU_DE_V3", "1")
-
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
+import numpy as np
+import pytest
 
 import anndata as ad  # noqa: E402
 
@@ -99,8 +90,7 @@ def _run_parity(tmp_path, reference) -> None:
     _compare(_result_to_gene_dict(cpu), _result_to_gene_dict(gpu))
 
     route = _route(gpu)
-    if route != "gpu_csc_v3":
-        pytest.skip(f"SCX_GPU_DE_V3 not active in this process (route={route!r})")
+    assert route == "gpu_csc_v3", f"expected CSC-direct route, got {route!r}"
 
 
 def test_rank_genes_groups_gpu_csc_parity_one_vs_rest(tmp_path) -> None:

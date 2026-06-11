@@ -1043,6 +1043,32 @@ exhaustion, invalid magic bytes, and unsupported format versions.
 
 ---
 
+## Environment variables
+
+The canonical list of `SCX_*` environment variables read by the workspace.
+Every entry below is read in Rust code; feature-area docs (e.g.
+[gpu-setup.md](gpu-setup.md), [sharding.md](sharding.md)) link here rather than
+re-describe them. All are optional — defaults apply when unset.
+
+| Variable | Crate | Default | Effect |
+|----------|-------|---------|--------|
+| `SCX_FORCE_NATIVE_GPU` | `pyscx` | unset | Any non-empty, non-`0` value pins the surviving native GPU kernels instead of routing in-VRAM ops to rapids-singlecell. |
+| `SCX_DISABLE_RAPIDS` | `pyscx` | unset | Any non-empty, non-`0` value treats rapids-singlecell as unavailable, forcing the CPU fallback (testing). |
+| `SCX_PCA_COV_MEMORY_BUDGET` | `scx-accel` | `2 GiB` | Bytes; caps concurrent `n_vars × n_vars` f64 covariance-PCA accumulators (worker count). |
+| `SCX_CSC_AUTO_OBS_THRESHOLD` | `scx-format` | `50000` | `CscPolicy::Auto` builds a CSC sidecar only when `n_obs ≥` this. |
+| `SCX_CSC_AUTO_VARS_THRESHOLD` | `scx-format` | `5000` | `CscPolicy::Auto` builds a CSC sidecar only when `n_vars ≥` this. |
+| `SCX_GPU_DE_GENE_CHUNK_SIZE` | `scx-gpu` | VRAM heuristic | Overrides the streaming GPU-DE gene-chunk size (rounded to a multiple of 64, min 64). |
+| `SCX_CUVS_TRUST_LAYOUT` | `scx-gpu` | unset | `=1` downgrades a cuVS version/layout-compatibility mismatch from a hard error to a warning (kNN results may be wrong). |
+| `SCX_DISABLE_CUDA_GRAPHS` | `scx-gpu` | unset | `=1`/`true` bypasses CUDA-graph capture at every call site. |
+| `SCX_GPU_PROFILE` | `scx-gpu` | unset | Any non-empty, non-`0` value emits GPU profiling output. |
+| `SCX_LOADER_PROFILE` | `scx-loader` | unset | `=1`/`true` emits ML-loader memory-budget profiling on drop. |
+
+Benchmark-harness shell/Python variables (`SCX_WORK_DIR`, `SCX_DATA_DIR`,
+`SCX_BENCH_HIGH_MEM_PARTITION`) are consumed by `benchmarks/` scripts, not by
+the Rust crates — see [benchmarks/README.md](../benchmarks/README.md).
+
+---
+
 ## Further Reading
 
 - [format.md](format.md) — Binary format reference: header, catalogs, CSR shards, fragment/manifest, checksums

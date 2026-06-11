@@ -44,9 +44,7 @@ use crate::{AccelError, Result};
 /// Stamp the planned execution info onto a `pdex_ref` GPU result and emit a
 /// structured route log line. The route is decided up front by
 /// [`plan_de_route`] (the single source of truth) so the stamped route always
-/// matches the kernel branch that actually ran. Replaces the old
-/// `SCX_GPU_DE_V3_TRACE` stderr trace as the primary signal (the trace
-/// survives as a debug-only fallback inside the v3 drivers).
+/// matches the kernel branch that actually ran.
 fn finish_pdex(
     result: Result<PdexRefResult>,
     mut info: AccelExecutionInfo,
@@ -865,15 +863,6 @@ fn pdex_ref_gpu_chunked_v3_csr(
         ));
     }
 
-    // One-shot dispatch trace for bench validation. Gated on a separate
-    // env var so it doesn't fire in unit tests or production. Sets
-    // SCX_GPU_DE_V3_DISPATCH=v3-csr in the process env as a parallel
-    // signal that callers (bench harness) can read post-call if they
-    // can't capture stderr.
-    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
-        eprintln!("[scx-accel/pdex_ref] v3 dispatch route: csr-direct (no CSC sidecar)");
-    }
-
     let n_groups = group_names.len();
     let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
     let ref_cells = &group_indices[reference];
@@ -1207,12 +1196,6 @@ fn pdex_ref_gpu_chunked_v3_csc(
         return Err(AccelError::InvalidInput(
             "gene_chunk_size must be > 0".to_string(),
         ));
-    }
-
-    // One-shot dispatch trace for bench validation. See the matching
-    // trace in `pdex_ref_gpu_chunked_v3_csr`.
-    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
-        eprintln!("[scx-accel/pdex_ref] v3 dispatch route: csc-direct (CSC sidecar present)");
     }
 
     let n_groups = group_names.len();
@@ -1921,9 +1904,6 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
     tie_correct: bool,
     source: &mut dyn GpuMatrixSource,
 ) -> Result<DiffExpResult> {
-    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
-        eprintln!("[scx-accel/wilcoxon] v3 dispatch route: csc-direct (CSC sidecar present)");
-    }
     let prep = prepare_wilcoxon_v3(dev, n_obs, groups, group_names, reference)?;
     let WilcoxonV3Prep {
         cell_to_group_dev,
@@ -2041,9 +2021,6 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
     tie_correct: bool,
     source: &mut dyn GpuMatrixSource,
 ) -> Result<DiffExpResult> {
-    if std::env::var("SCX_GPU_DE_V3_TRACE").is_ok() {
-        eprintln!("[scx-accel/wilcoxon] v3 dispatch route: csr-direct (no CSC sidecar)");
-    }
     let prep = prepare_wilcoxon_v3(dev, n_obs, groups, group_names, reference)?;
     let WilcoxonV3Prep {
         cell_to_group_dev,

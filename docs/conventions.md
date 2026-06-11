@@ -95,8 +95,8 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   implying CUDA was missing. New planner-driven GPU routes MUST register an
   `AccelRoute` variant and a dispatch arm — no silent fallbacks. The route
   surfaces to Python on `adata.uns["scx_accel"]`, and any performance claim
-  must cite the recorded route. `SCX_GPU_DE_V3_TRACE` is a debug-only fallback,
-  not the signal.
+  must cite the recorded route (the planner-stamped route is the signal — the
+  former ad-hoc stderr trace was removed).
 
 ## Parallel streaming reader (scx-convert)
 

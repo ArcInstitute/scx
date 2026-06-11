@@ -45,7 +45,6 @@ nvidia-smi -L || true
 echo "=== rebuilding pyscx (release, gpu) ==="
 ( cd pyscx && maturin develop --release --features gpu )
 
-export SCX_GPU_DE_V3=1
 OUT="${REPO_ROOT}/benchmarks/comprehensive/results/route_gate_verify_${SLURM_JOB_ID:-local}"
 echo "=== running route-gate driver → ${OUT} ==="
 python benchmarks/comprehensive/scripts/_route_gate_verify_driver.py "${OUT}"
