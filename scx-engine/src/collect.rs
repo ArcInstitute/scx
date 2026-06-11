@@ -630,7 +630,7 @@ fn materialize_filtered_obs(
             .map(|(bi, locals)| {
                 let (shard_idx, _, _) = by_start[*bi];
                 let batch = reader.read_obs_shard(shard_idx)?;
-                let take_indices = UInt32Array::from(locals.clone());
+                let take_indices = UInt32Array::from_iter_values(locals.iter().copied());
                 let columns: Vec<_> = batch
                     .columns()
                     .iter()

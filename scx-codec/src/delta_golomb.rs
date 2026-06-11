@@ -8,7 +8,7 @@ use std::io::Cursor;
 
 use crate::bitstream::{BitReader, BitStreamError, BitWriter};
 use crate::dispatch::CodecError;
-use crate::median::floor_median_u64;
+use crate::median::floor_median_u64_inplace;
 use crate::rice::MAX_RICE_K;
 
 /// Compute the Rice parameter k from the median of delta values.
@@ -44,8 +44,10 @@ pub fn delta_golomb_encode(indptr: &[u64]) -> Result<Vec<u8>, CodecError> {
         return Ok(output);
     }
 
-    // Compute deltas with monotonicity check.
-    let deltas: Vec<u64> = indptr
+    // Compute deltas with monotonicity check. This buffer is a throwaway scratch
+    // for the median only; the encode loop below recomputes deltas from `indptr`
+    // in order, so the median selection may reorder it in place.
+    let mut deltas: Vec<u64> = indptr
         .windows(2)
         .map(|w| {
             if w[1] < w[0] {
@@ -59,15 +61,17 @@ pub fn delta_golomb_encode(indptr: &[u64]) -> Result<Vec<u8>, CodecError> {
         .collect::<Result<_, _>>()?;
 
     // Compute Rice parameter k from floor median of deltas
-    let median = floor_median_u64(&deltas);
+    let median = floor_median_u64_inplace(&mut deltas);
     let k = compute_k(median);
 
     // Write k as 1 byte
     output.push(k);
 
-    // Rice-encode all deltas in a single stream
+    // Rice-encode all deltas in a single stream. Monotonicity was validated when
+    // `deltas` was built above, so recomputing in original order is safe.
     let mut writer = BitWriter::new();
-    for &d in &deltas {
+    for w in indptr.windows(2) {
+        let d = w[1] - w[0];
         let q = d >> k;
         let r = d & ((1u64 << k) - 1);
         writer.write_unary(q);
