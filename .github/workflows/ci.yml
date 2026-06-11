@@ -53,6 +53,23 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+  dedup-guard:
+    name: I-ORG-1 dedup guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # T5.11: every FileHeader must be built via FileHeader::new_single_modality(...)
+      # or FileHeader { .., ..Default::default() }. The `reserved: [0u8; 112]` field
+      # initializer is the fingerprint of a hand-spelled full literal; the only
+      # legitimate occurrences live in scx-format/src/header.rs (Default + read_from).
+      - name: No hand-spelled FileHeader literals
+        run: |
+          if grep -rn --include='*.rs' 'reserved: \[0u8; 112\]' . \
+               | grep -v 'scx-format/src/header.rs'; then
+            echo "::error::Hand-spelled FileHeader literal found — use FileHeader::new_single_modality(...) or FileHeader { .., ..Default::default() }."
+            exit 1
+          fi
+
   feature-check:
     name: Feature matrix (cargo check)
     runs-on: ubuntu-latest

@@ -1,5 +1,5 @@
 use super::*;
-use crate::header::{CURRENT_FORMAT_VERSION, MAGIC};
+use crate::header::CURRENT_FORMAT_VERSION;
 use crate::provenance::ProvenanceEntry;
 use crate::shard::SHARD_HEADER_SIZE;
 use crate::writer::ScxWriter;
@@ -21,35 +21,7 @@ fn open_missing_file_error_includes_path() {
 }
 
 fn sample_header(n_obs: u64, n_vars: u64, nnz: u64) -> FileHeader {
-    FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: 0,
-        index_dtype: 0, // u16
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    FileHeader::new_single_modality(n_obs, n_vars, nnz, 16384, 0, 0)
 }
 
 fn sample_obs(n: usize) -> RecordBatch {
@@ -242,35 +214,7 @@ fn test_sharded_obsm_round_trip() {
 
     let n_obs: usize = 9;
     let n_vars: usize = 4;
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 3,
-        codec_id: 0,
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 3, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
     writer.write_obs(&sample_obs(n_obs)).unwrap();
     writer.write_var(&sample_var(n_vars)).unwrap();
@@ -368,35 +312,7 @@ fn build_obsm_test_writer(
     n_vars: usize,
     shard_rows: u32,
 ) -> ScxWriter {
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: shard_rows,
-        codec_id: 0,
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, shard_rows, 0, 0);
     let mut writer = ScxWriter::new(path, header).unwrap();
     writer.write_obs(&sample_obs(n_obs)).unwrap();
     writer.write_var(&sample_var(n_vars)).unwrap();

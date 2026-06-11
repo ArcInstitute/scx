@@ -24,7 +24,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use proptest::prelude::*;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION, MAGIC};
+use scx_format_io::header::FileHeader;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
@@ -75,35 +75,7 @@ fn sample_shard(n_rows: usize, n_vars: usize) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
 }
 
 fn make_header(n_obs: u64, n_vars: u64) -> FileHeader {
-    FileHeader {
-        magic: MAGIC,
-        format_version: CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs,
-        n_vars,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: 0,
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    }
+    FileHeader::new_single_modality(n_obs, n_vars, 0, 16384, 0, 0)
 }
 
 fn write_seed(path: &std::path::Path, n_obs: usize, n_vars: usize) {

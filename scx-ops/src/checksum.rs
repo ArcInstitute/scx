@@ -126,37 +126,18 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    use scx_format_io::header::{CURRENT_FORMAT_VERSION, MAGIC};
-
     fn scratch_header() -> FileHeader {
         FileHeader {
-            magic: MAGIC,
-            format_version: CURRENT_FORMAT_VERSION,
-            header_length: HEADER_SIZE as u16,
-            flags: 0,
             n_obs: 10,
             n_vars: 20,
             nnz: 30,
             n_csr_shards: 1,
-            n_csc_shards: 0,
             shard_target_rows: 16384,
-            codec_id: 0,
-            index_dtype: 0,
-            endian: 0,
-            reserved_padding: 0,
             root_catalog_offset: HEADER_SIZE as u64,
-            root_catalog_length: 0,
             full_catalog_offset: 4352,
-            full_catalog_length: 0,
             manifest_sequence: 1,
-            prev_catalog_offset: 0,
             file_checksum: 0xDEAD,
-            front_catalog_offset: 0,
-            front_catalog_length: 0,
-            n_modalities: 0,
-            modality_table_offset: 0,
-            modality_table_length: 0,
-            reserved: [0u8; 112],
+            ..Default::default()
         }
     }
 

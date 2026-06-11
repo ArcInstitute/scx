@@ -1356,35 +1356,7 @@ mod streaming_tests {
     use std::sync::Arc;
 
     fn test_header(n_obs: u64) -> FileHeader {
-        FileHeader {
-            magic: scx_format_io::MAGIC,
-            format_version: scx_format_io::CURRENT_FORMAT_VERSION,
-            header_length: 256,
-            flags: 0,
-            n_obs,
-            n_vars: 4,
-            nnz: 0,
-            n_csr_shards: 0,
-            n_csc_shards: 0,
-            shard_target_rows: 4,
-            codec_id: 0,
-            index_dtype: 0,
-            endian: 0,
-            reserved_padding: 0,
-            root_catalog_offset: 0,
-            root_catalog_length: 0,
-            full_catalog_offset: 0,
-            full_catalog_length: 0,
-            manifest_sequence: 1,
-            prev_catalog_offset: 0,
-            file_checksum: 0,
-            front_catalog_offset: 0,
-            front_catalog_length: 0,
-            n_modalities: 0,
-            modality_table_offset: 0,
-            modality_table_length: 0,
-            reserved: [0u8; 112],
-        }
+        FileHeader::new_single_modality(n_obs, 4, 0, 4, 0, 0)
     }
 
     fn utf8_batch(col: &str, vals: &[String]) -> RecordBatch {

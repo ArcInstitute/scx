@@ -776,7 +776,7 @@ fn test_finite_ties_and_nan_group_ordered_by_index() {
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format_io::header::{FileHeader, MAGIC};
+use scx_format_io::header::FileHeader;
 use scx_format_io::{BackedCsrReader, ScxReader, ScxWriter};
 use std::path::Path;
 use std::sync::Arc as StdArc;
@@ -806,35 +806,7 @@ fn write_multi_shard_csr(
     dense: &[u8],
     n_shards: usize,
 ) -> std::io::Result<()> {
-    let header = FileHeader {
-        magic: MAGIC,
-        format_version: scx_format_io::CURRENT_FORMAT_VERSION,
-        header_length: 256,
-        flags: 0,
-        n_obs: n_obs as u64,
-        n_vars: n_vars as u64,
-        nnz: 0,
-        n_csr_shards: 0,
-        n_csc_shards: 0,
-        shard_target_rows: 16384,
-        codec_id: 0,
-        index_dtype: 0,
-        endian: 0,
-        reserved_padding: 0,
-        root_catalog_offset: 0,
-        root_catalog_length: 0,
-        full_catalog_offset: 0,
-        full_catalog_length: 0,
-        manifest_sequence: 1,
-        prev_catalog_offset: 0,
-        file_checksum: 0,
-        front_catalog_offset: 0,
-        front_catalog_length: 0,
-        n_modalities: 0,
-        modality_table_offset: 0,
-        modality_table_length: 0,
-        reserved: [0u8; 112],
-    };
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 16384, 0, 0);
     let mut writer = ScxWriter::new(path, header).unwrap();
 
     let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
