@@ -9,11 +9,11 @@
 use hdf5::types::VarLenUnicode;
 use ndarray::s;
 
-use super::detect::MatrixFormat;
-use super::h5ad_read::read_i64_dataset;
-use super::pipeline::ConvertError;
-use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
-use super::warnings::{ConvertWarning, WarningSink};
+use super::read::read_i64_dataset;
+use crate::detect::MatrixFormat;
+use crate::pipeline::ConvertError;
+use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
+use crate::warnings::{ConvertWarning, WarningSink};
 
 /// A single shard's worth of CSR rows read from an h5ad file.
 ///
@@ -370,7 +370,7 @@ pub(crate) fn read_slice_i32(
     start: usize,
     end: usize,
 ) -> Result<Vec<i32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
@@ -454,7 +454,7 @@ pub(crate) fn read_slice_f32(
     start: usize,
     end: usize,
 ) -> Result<Vec<f32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {

@@ -4,7 +4,7 @@
 //
 // 1. **In-memory** ([`MaterializedCsrStream`]): when the budget arithmetic
 //    allows, load the full CSC, run the existing
-//    [`crate::csc_transpose::csc_to_csr`] scatter, and yield CSR shards
+//    [`super::csc_transpose::csc_to_csr`] scatter, and yield CSR shards
 //    from the materialised buffers.
 // 2. **External-memory** ([`CscToCsrExternalTransposer`]): for files that
 //    don't fit in `memory_budget`, do a single column-chunk pass writing
@@ -18,11 +18,11 @@ use std::path::PathBuf;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 
-use super::h5ad_read::{read_i64_dataset, read_x_matrix_at};
-use super::h5ad_stream::{read_slice_f32, read_slice_i32};
-use super::pipeline::{ConvertError, ConvertOptions};
-use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
-use super::warnings::WarningSink;
+use super::read::{read_i64_dataset, read_x_matrix_at};
+use super::stream::{read_slice_f32, read_slice_i32};
+use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
+use crate::warnings::WarningSink;
 
 /// Open a CSC-on-disk matrix as a [`CsrShardStream`]. Picks the
 /// in-memory or external-memory route based on
@@ -138,7 +138,7 @@ impl MaterializedCsrStream {
         // drop_explicit_zeros. Reuses the bulk-path code so the
         // in-memory CSC route is byte-identical to `h5ad_to_scx`.
         let (indptr, indices, data, n_obs, n_vars) =
-            read_x_matrix_at(file, path, super::detect::MatrixFormat::Csc)?;
+            read_x_matrix_at(file, path, crate::detect::MatrixFormat::Csc)?;
         Ok(MaterializedCsrStream {
             n_obs: n_obs as u64,
             n_vars: n_vars as u64,

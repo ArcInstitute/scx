@@ -30,12 +30,12 @@ use scx_format_io::error::ScxError;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
-use super::h5ad_write::{
+use super::write::{
     scan_nullable_columns, write_dataframe_group_at, write_dataframe_group_streaming,
     write_obsm_entry_at, write_uns_entries_at,
 };
-use super::pipeline::{ConvertError, ConvertOptions};
-use super::warnings::{ConvertWarning, WarningSink};
+use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::warnings::{ConvertWarning, WarningSink};
 
 /// Write obs into `parent` under `name="obs"`. Routes to the streaming
 /// path when the source has `ObsMetadataShard` sections, else falls back
@@ -48,7 +48,7 @@ use super::warnings::{ConvertWarning, WarningSink};
 /// symmetrically (and match the `/X` streaming path's filtered row
 /// count). Pre-task-6a, this fallback ignored the mask — a latent
 /// row-count mismatch with `/X` when DVs were active on a legacy file.
-pub(super) fn write_obs_streaming_or_eager(
+pub(crate) fn write_obs_streaming_or_eager(
     parent: &hdf5::Group,
     reader: &ScxReader,
     keep_mask_opt: Option<&[bool]>,
@@ -104,7 +104,7 @@ pub(super) fn write_obs_streaming_or_eager(
 
 /// Var counterpart of `write_obs_streaming_or_eager`. Deletion vectors
 /// never apply on the var axis.
-pub(super) fn write_var_streaming_or_eager(
+pub(crate) fn write_var_streaming_or_eager(
     parent: &hdf5::Group,
     reader: &ScxReader,
     sink: &mut WarningSink,
@@ -146,7 +146,7 @@ pub(super) fn write_var_streaming_or_eager(
 /// Filter a `RecordBatch` by a global keep mask. Used by the legacy
 /// obs path and by obsm writers so eager / streaming branches honour
 /// the deletion-vector filter symmetrically.
-pub(super) fn filter_record_batch_by_mask(
+pub(crate) fn filter_record_batch_by_mask(
     batch: &arrow::array::RecordBatch,
     mask: &[bool],
 ) -> Result<arrow::array::RecordBatch, ConvertError> {
@@ -257,16 +257,16 @@ pub fn write_scx_to_h5ad_streaming(
 
     // /raw (DV-filtered on the obs axis like /X). Read eagerly; shared
     // with the eager exporter.
-    crate::h5ad_write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
+    super::write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
 
     // obsp / varp pairwise matrices (COO → csr_matrix groups). Read eagerly,
     // mirroring obsm/varm above. obsp filters both axes by the obs keep mask;
     // varp (var axis) is never obs-deleted. Shared with the eager exporter.
     if let Ok(obsp) = reader.read_all_obsp() {
-        crate::h5ad_write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
+        super::write::write_pairwise_group(&root, "obsp", &obsp, keep_mask.as_deref())?;
     }
     if let Ok(varp) = reader.read_all_varp() {
-        crate::h5ad_write::write_pairwise_group(&root, "varp", &varp, None)?;
+        super::write::write_pairwise_group(&root, "varp", &varp, None)?;
     }
 
     Ok(())
@@ -285,7 +285,7 @@ pub fn write_scx_to_h5ad_streaming(
 /// thread. The HDF5 writer side stays single-threaded; output is
 /// byte-identical to the sequential path.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn stream_csr_to_group_at(
+pub(crate) fn stream_csr_to_group_at(
     parent: &hdf5::Group,
     name: &str,
     reader: &ScxReader,
@@ -797,7 +797,7 @@ struct DecodedShard {
 
 /// Iterate every layer attached to `modality_id` and stream-write
 /// each one under `parent/layers/{layer_name}`.
-pub(super) fn stream_layers_at(
+pub(crate) fn stream_layers_at(
     parent: &hdf5::Group,
     reader: &ScxReader,
     modality_id: u8,
@@ -1003,7 +1003,7 @@ fn precompute_total_nnz(
     }
 }
 
-pub(super) fn build_keep_mask(reader: &ScxReader) -> Result<Option<Vec<bool>>, ConvertError> {
+pub(crate) fn build_keep_mask(reader: &ScxReader) -> Result<Option<Vec<bool>>, ConvertError> {
     if !reader.header().has_deletion_vectors() {
         return Ok(None);
     }

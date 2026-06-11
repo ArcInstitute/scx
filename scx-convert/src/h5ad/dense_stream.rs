@@ -14,9 +14,9 @@
 
 use ndarray::s;
 
-use super::pipeline::{ConvertError, ConvertOptions};
-use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
-use super::warnings::WarningSink;
+use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
+use crate::warnings::WarningSink;
 
 /// Streaming reader over an h5ad dense matrix dataset. Open via
 /// [`open_dense_streaming`] or [`open_dense_layer_streaming`], then

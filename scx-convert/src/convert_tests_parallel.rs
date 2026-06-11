@@ -416,8 +416,8 @@ fn parallel_per_worker_bytes_atac_higher_density() {
 /// expected formula and does not depend on `modality_type`.
 #[test]
 fn parallel_per_worker_bytes_dense_uses_dense_formula() {
-    use super::dense_stream::open_dense_streaming;
     use super::stream::IndexedCsrShardStream;
+    use crate::h5ad::dense_stream::open_dense_streaming;
     use scx_format_io::modality::ModalityType;
 
     let dir = tempfile::tempdir().unwrap();
@@ -452,9 +452,9 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
 /// sequential `next_csr_shard` partition.
 #[test]
 fn dense_max_slab_rows_clamps_partition() {
-    use super::dense_stream::open_dense_streaming;
     use super::pipeline::compute_shard_row_ranges;
     use super::stream::IndexedCsrShardStream;
+    use crate::h5ad::dense_stream::open_dense_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("dense.h5ad");
@@ -655,8 +655,8 @@ fn parallel_export_with_deletion_vectors_byte_identical() {
 
 #[test]
 fn parallel_export_h5mu_byte_identical() {
-    use super::mudata_pipeline::h5mu_to_scx;
-    use super::mudata_write::scx_to_h5mu_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use crate::h5mu::write::scx_to_h5mu_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -805,7 +805,7 @@ fn per_shard_export_bytes_matches_payload_layout() {
     // documents — payload (nnz×8) + indptr ((n_rows+1)×8) +
     // scratch (nnz×8). Anchors the budget arithmetic against
     // accidental regressions.
-    use super::h5ad_stream_write::per_shard_export_bytes_for_test;
+    use crate::h5ad::stream_write::per_shard_export_bytes_for_test;
     use scx_format_io::catalog::ShardStats;
     let stats = ShardStats {
         row_start: 0,

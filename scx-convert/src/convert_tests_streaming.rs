@@ -723,7 +723,7 @@ fn streaming_through_trait_object() {
     // once through the inherent `next_shard` (which the in-tree
     // pipeline uses today) and once through `next_csr_shard` on the
     // trait — and asserts every emitted shard matches.
-    use super::h5ad_stream::open_x_streaming;
+    use crate::h5ad::stream::open_x_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("rt.h5ad");
@@ -1036,8 +1036,8 @@ fn phase1_streaming_dense_memory_budget_caps_slab() {
     // With `memory_budget` set so the per-row dense cost forces
     // `max_slab_rows < shard_target_rows`, the first emitted shard
     // must have `n_rows < shard_target_rows`.
-    use super::dense_stream::open_dense_streaming;
     use super::stream::CsrShardStream;
+    use crate::h5ad::dense_stream::open_dense_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("budget.h5ad");
@@ -1419,7 +1419,7 @@ fn phase2_streaming_csc_budget_too_small_actionable_error() {
 
 #[test]
 fn phase3_streaming_h5mu_round_trip_matches_bulk() {
-    use super::mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
+    use crate::h5mu::pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("phase3.h5mu");
     create_test_h5mu(&h5mu, 20, 8, 4);
@@ -1460,7 +1460,7 @@ fn phase3_streaming_h5mu_per_modality_codec_routing() {
     // path samples up to 16 KiB of values per modality before picking
     // — enough for any fixture small enough to fit in the bulk path
     // for comparison.
-    use super::mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
+    use crate::h5mu::pipeline::{h5mu_to_scx, h5mu_to_scx_streaming};
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("codec.h5mu");
     create_test_h5mu(&h5mu, 20, 8, 4);
@@ -1503,7 +1503,7 @@ fn phase3_streaming_h5mu_dense_modality_non_f32_dtype() {
     // two-modality h5mu where the second modality's X is dense f64
     // (`encoding-type=array`) and confirm the streaming pipeline
     // converts it without erroring on the sample step.
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("dense_f64.h5mu");
     create_test_h5mu_with_dense_f64_modality(&h5mu, 6, 4, 3);
@@ -1527,7 +1527,7 @@ fn phase3_streaming_h5mu_dense_modality_non_f32_dtype() {
 
 #[test]
 fn phase3_streaming_h5mu_modality_filter() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("filter.h5mu");
     create_test_h5mu(&h5mu, 8, 5, 3);
@@ -1548,7 +1548,7 @@ fn phase3_streaming_h5mu_modality_filter() {
 
 #[test]
 fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("unknown.h5mu");
     create_test_h5mu(&h5mu, 6, 3, 2);
@@ -1573,8 +1573,8 @@ fn phase3_streaming_h5mu_modality_filter_unknown_errors() {
 /// dropped) and the error must point users to the non-streaming path.
 #[test]
 fn streaming_h5mu_csc_always_rejected() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
     use super::pipeline::CscPolicy;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("cite.h5mu");
@@ -1602,8 +1602,8 @@ fn streaming_h5mu_csc_always_rejected() {
 /// (set → run → restore) and must not share these vars with other tests.
 #[test]
 fn streaming_h5mu_csc_auto_warns_and_skips() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
     use super::pipeline::CscPolicy;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
 
     std::env::set_var("SCX_CSC_AUTO_OBS_THRESHOLD", "0");
     std::env::set_var("SCX_CSC_AUTO_VARS_THRESHOLD", "0");
@@ -1642,7 +1642,7 @@ fn streaming_h5mu_csc_auto_warns_and_skips() {
 
 #[test]
 fn phase3_streaming_h5mu_modality_types_override() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("types.h5mu");
     create_test_h5mu(&h5mu, 8, 4, 2);
@@ -1689,7 +1689,7 @@ fn phase3_streaming_h5mu_modality_types_override() {
 
 #[test]
 fn phase3_streaming_h5mu_non_aligned_obs_errors() {
-    use super::mudata_pipeline::h5mu_to_scx_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
     let dir = tempfile::tempdir().unwrap();
     let h5mu = dir.path().join("misaligned.h5mu");
     // Build an h5mu by hand where outer obs has n_obs=8 but

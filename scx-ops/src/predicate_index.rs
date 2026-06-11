@@ -80,7 +80,7 @@ pub fn user_wants_index(options: &ConversionPredicateIndexOptions) -> bool {
 
 /// Flatten the requested columns / preset into a single `Vec<String>`
 /// for the multimodal-skip warning. Mirrors
-/// `scx_convert::mudata_pipeline::emit_multimodal_index_skip_warning`
+/// `scx_convert::h5mu::pipeline::emit_multimodal_index_skip_warning`
 /// so the user sees the same payload regardless of the rewrite op that
 /// triggered the skip.
 pub fn requested_columns(options: &ConversionPredicateIndexOptions) -> Vec<String> {

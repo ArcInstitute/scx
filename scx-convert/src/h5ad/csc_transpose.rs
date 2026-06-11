@@ -1,6 +1,6 @@
 // CSC → CSR streaming scatter transpose
 
-use super::pipeline::ConvertError;
+use crate::pipeline::ConvertError;
 
 /// Transpose a CSC sparse matrix to CSR format.
 ///

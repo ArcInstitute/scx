@@ -27,8 +27,8 @@ fn vlu(s: &str) -> VarLenUnicode {
 
 use scx_format_io::reader::ScxReader;
 
-use super::pipeline::ConvertError;
-use super::warnings::{ConvertWarning, WarningSink};
+use crate::pipeline::ConvertError;
+use crate::warnings::{ConvertWarning, WarningSink};
 use crate::CATEGORICAL_ORDERED_KEY;
 
 /// Resolve a categorical column's pandas `ordered` bit from the Arrow
@@ -56,7 +56,7 @@ pub fn write_scx_to_h5ad(
     // shared streaming-or-eager dispatcher which applies the same
     // global keep mask. Pre-fix, this path silently dropped DV
     // semantics — both /X and obs were written unfiltered.
-    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    let keep_mask = super::stream_write::build_keep_mask(&reader)?;
 
     // Read the full CSR matrix (DV-filtered when active)
     let csr = reader.read_all_csr_shards_filtered()?;
@@ -78,13 +78,8 @@ pub fn write_scx_to_h5ad(
     // sources both flow through one code path and the DV keep mask
     // is honored.
     let root = file.as_group()?;
-    crate::h5ad_stream_write::write_obs_streaming_or_eager(
-        &root,
-        &reader,
-        keep_mask.as_deref(),
-        sink,
-    )?;
-    crate::h5ad_stream_write::write_var_streaming_or_eager(&root, &reader, sink)?;
+    super::stream_write::write_obs_streaming_or_eager(&root, &reader, keep_mask.as_deref(), sink)?;
+    super::stream_write::write_var_streaming_or_eager(&root, &reader, sink)?;
 
     // Write obsm (DV-filtered when active — obs-axis rows must match
     // /X and /obs).
@@ -93,9 +88,7 @@ pub fn write_scx_to_h5ad(
             let obsm_group = file.create_group("obsm")?;
             for (name, batch) in &obsm_map {
                 let filtered = match keep_mask.as_deref() {
-                    Some(mask) => {
-                        crate::h5ad_stream_write::filter_record_batch_by_mask(batch, mask)?
-                    }
+                    Some(mask) => super::stream_write::filter_record_batch_by_mask(batch, mask)?,
                     None => batch.clone(),
                 };
                 write_obsm_entry(&obsm_group, name, &filtered)?;
@@ -149,7 +142,7 @@ pub fn write_scx_to_h5ad(
 /// h5ad if the SCX file carries a raw matrix. Raw shares X's obs axis,
 /// so the same deletion-vector keep mask is applied to its rows. Shared
 /// by the eager and streaming SCX→h5ad export paths.
-pub(super) fn write_raw_to_h5ad(
+pub(crate) fn write_raw_to_h5ad(
     root: &hdf5::Group,
     reader: &ScxReader,
     keep_mask: Option<&[bool]>,
@@ -216,7 +209,7 @@ fn write_sparse_group(
 // per-modality blocks under `/mod/{name}/…` can reuse the same
 // emitters as `/X`, `/obs`, `/var`, `/obsm/…`, `/uns/…`.
 
-pub(super) fn write_sparse_group_at(
+pub(crate) fn write_sparse_group_at(
     parent: &hdf5::Group,
     name: &str,
     indptr: &[i64],
@@ -229,7 +222,7 @@ pub(super) fn write_sparse_group_at(
     write_sparse_arrays(&group, indptr, indices, data, n_obs, n_vars)
 }
 
-pub(super) fn write_dataframe_group_at(
+pub(crate) fn write_dataframe_group_at(
     parent: &hdf5::Group,
     name: &str,
     batch: &arrow::array::RecordBatch,
@@ -325,7 +318,7 @@ fn write_dataframe_body(
     Ok(())
 }
 
-pub(super) fn write_obsm_entry_at(
+pub(crate) fn write_obsm_entry_at(
     obsm_group: &hdf5::Group,
     name: &str,
     batch: &arrow::array::RecordBatch,
@@ -333,7 +326,7 @@ pub(super) fn write_obsm_entry_at(
     write_obsm_entry(obsm_group, name, batch)
 }
 
-pub(super) fn write_uns_entries_at(
+pub(crate) fn write_uns_entries_at(
     group: &hdf5::Group,
     value: &serde_json::Value,
 ) -> Result<(), ConvertError> {
@@ -496,7 +489,7 @@ fn coo_batch_to_csr(batch: &RecordBatch, keep: Option<&[bool]>) -> Result<CooCsr
 /// `csr_matrix` subgroup per key). `keep` filters both axes by the obs
 /// keep-mask (pass `Some` for `obsp` under deletion vectors, `None` for
 /// `varp`, which lives on the var axis and is never obs-deleted).
-pub(super) fn write_pairwise_group(
+pub(crate) fn write_pairwise_group(
     parent: &hdf5::Group,
     group_name: &str,
     entries: &HashMap<String, RecordBatch>,
@@ -959,7 +952,7 @@ fn write_obsm_entry(
 /// null-presence signal cannot be derived from the static schema (Arrow
 /// field nullability is set unconditionally by pandas → Arrow). The cost
 /// is one extra decode pass over the metadata-only shards.
-pub(super) fn scan_nullable_columns<I>(
+pub(crate) fn scan_nullable_columns<I>(
     shards: I,
     schema: &Schema,
 ) -> Result<Vec<bool>, ConvertError>
@@ -1021,11 +1014,11 @@ where
 /// `i` is written with anndata's `nullable-integer` /
 /// `nullable-string-array` group encoding (it contains nulls); otherwise
 /// it is written as a plain dataset. Computed up front by
-/// [`crate::h5ad_stream_write::scan_nullable_columns`] because the HDF5
+/// [`super::stream_write::scan_nullable_columns`] because the HDF5
 /// datasets must be allocated before any shard is seen. Float columns
 /// ignore this flag (always plain datasets with `NaN` at nulls).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn write_dataframe_group_streaming<I>(
+pub(crate) fn write_dataframe_group_streaming<I>(
     parent: &hdf5::Group,
     name: &str,
     schema: &Schema,

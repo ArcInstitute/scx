@@ -24,14 +24,14 @@ use hdf5::types::VarLenUnicode;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
-use super::h5ad_stream_write::{
+use crate::h5ad::stream_write::{
     stream_csr_to_group_at, stream_layers_at, write_obs_streaming_or_eager,
 };
-use super::h5ad_write::{
+use crate::h5ad::write::{
     write_dataframe_group_at, write_obsm_entry_at, write_sparse_group_at, write_uns_entries_at,
 };
-use super::pipeline::{ConvertError, ConvertOptions};
-use super::warnings::WarningSink;
+use crate::pipeline::{ConvertError, ConvertOptions};
+use crate::warnings::WarningSink;
 
 fn vlu(s: &str) -> VarLenUnicode {
     s.parse().unwrap_or_else(|_| "".parse().unwrap())
@@ -59,7 +59,7 @@ pub fn scx_to_h5mu(
     // dropped DVs on both legs — the per-modality eager CSR reader
     // does *not* filter internally, contrary to what the prior
     // "preserves prior behavior" comment claimed.
-    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
     write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref(), sink)?;
 
     // Per-modality blocks under /mod/{name}.
@@ -101,7 +101,7 @@ pub fn scx_to_h5mu(
 /// Streaming SCX → h5mu (Phase 8). Bounds peak RSS to one shard's
 /// worth of CSR per matrix written. Iterates each modality, streams
 /// `/mod/{name}/X` plus all `/mod/{name}/layers/{layer}` via the
-/// shard-by-shard writer in [`crate::h5ad_stream_write`]. Reuses the
+/// shard-by-shard writer in [`crate::h5ad::stream_write`]. Reuses the
 /// existing materialising metadata helpers verbatim.
 pub fn scx_to_h5mu_streaming(
     scx_path: &Path,
@@ -119,7 +119,7 @@ pub fn scx_to_h5mu_streaming(
 
     let file = hdf5::File::create(h5mu_path)?;
     let root = file.as_group()?;
-    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
     write_h5mu_root_attrs_and_global_blocks(&reader, &file, &root, keep_mask.as_deref(), sink)?;
 
     let mod_group = root.create_group("mod")?;
@@ -210,7 +210,7 @@ fn write_h5mu_root_attrs_and_global_blocks(
                 if let Ok(batch) = reader.read_obsm(key) {
                     let filtered = match keep_mask_opt {
                         Some(mask) => {
-                            crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                            crate::h5ad::stream_write::filter_record_batch_by_mask(&batch, mask)?
                         }
                         None => batch,
                     };
@@ -283,7 +283,7 @@ fn write_h5mu_per_modality_non_x_blocks(
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
                 let filtered = match keep_mask_opt {
                     Some(mask) => {
-                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                        crate::h5ad::stream_write::filter_record_batch_by_mask(&batch, mask)?
                     }
                     None => batch,
                 };
@@ -318,7 +318,7 @@ pub fn scx_modality_to_h5ad(
     // Mirror the streaming entry point: honor DVs symmetrically on
     // /X and obs via `read_all_csr_shards_for_filtered` + the shared
     // streaming-or-eager obs dispatcher.
-    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
 
     let csr = reader.read_all_csr_shards_for_filtered(modality_id)?;
     write_sparse_group_at(
@@ -370,7 +370,7 @@ pub fn scx_modality_to_h5ad_streaming(
     let file = hdf5::File::create(h5ad_path)?;
     let root = file.as_group()?;
 
-    let keep_mask = crate::h5ad_stream_write::build_keep_mask(&reader)?;
+    let keep_mask = crate::h5ad::stream_write::build_keep_mask(&reader)?;
 
     stream_csr_to_group_at(
         &root,
@@ -437,7 +437,7 @@ fn write_modality_to_h5ad_non_x_blocks(
             if let Ok(batch) = reader.read_obsm_for(modality_id, &key) {
                 let filtered = match keep_mask_opt {
                     Some(mask) => {
-                        crate::h5ad_stream_write::filter_record_batch_by_mask(&batch, mask)?
+                        crate::h5ad::stream_write::filter_record_batch_by_mask(&batch, mask)?
                     }
                     None => batch,
                 };

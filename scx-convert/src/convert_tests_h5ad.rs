@@ -1139,7 +1139,7 @@ fn test_format_detection() {
 /// CSR shard counts. Per-modality reads return non-empty data.
 #[test]
 fn test_h5mu_round_trip() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_path = dir.path().join("cite.h5mu");
@@ -1190,7 +1190,7 @@ fn test_h5mu_round_trip() {
 /// Zstd, even though the underlying byte distribution is similar.
 #[test]
 fn test_h5mu_per_modality_codec_routing() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
     use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1254,8 +1254,8 @@ fn test_h5mu_per_modality_codec_routing() {
 /// per-modality shapes and that the outer obs is preserved.
 #[test]
 fn test_scx_to_h5mu_round_trip() {
-    use super::mudata_pipeline::h5mu_to_scx;
-    use super::mudata_write::scx_to_h5mu;
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use crate::h5mu::write::scx_to_h5mu;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -1286,8 +1286,8 @@ fn test_scx_to_h5mu_round_trip() {
 /// modality.
 #[test]
 fn test_modality_extract_to_h5ad() {
-    use super::mudata_pipeline::h5mu_to_scx;
-    use super::mudata_write::scx_modality_to_h5ad;
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use crate::h5mu::write::scx_modality_to_h5ad;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -1313,7 +1313,7 @@ fn test_modality_extract_to_h5ad() {
 /// we verify the underlying accessors (which `run_info` formats).
 #[test]
 fn test_info_modality_table_exposed() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_path = dir.path().join("cite.h5mu");
@@ -1342,7 +1342,7 @@ fn test_info_modality_table_exposed() {
 /// merge.
 #[test]
 fn test_merge_multimodal_mismatch_raises() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_a = dir.path().join("a.h5mu");
@@ -1378,7 +1378,7 @@ fn test_merge_multimodal_mismatch_raises() {
 /// — assert the positive path.
 #[test]
 fn test_merge_multimodal_match_still_unsupported() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_a = dir.path().join("a.h5mu");
@@ -1414,7 +1414,7 @@ fn test_merge_multimodal_match_still_unsupported() {
 /// `_unsupported` suffix); assert the positive path.
 #[test]
 fn test_compact_multimodal_unsupported() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -1445,7 +1445,7 @@ fn test_compact_multimodal_unsupported() {
 /// counts went up while the adt modality is untouched.
 #[test]
 fn test_append_for_modality_updates_table() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
     use scx_format_io::section::SectionType;
 
     let dir = tempfile::tempdir().unwrap();

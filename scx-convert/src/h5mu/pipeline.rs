@@ -33,15 +33,15 @@ use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 
-use super::csc_stream::open_csc_streaming;
-use super::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
-use super::detect::{detect_matrix_format_at, MatrixFormat};
-use super::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
-use super::h5ad_read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
-use super::h5ad_stream::{open_x_streaming, read_slice_f32};
-use super::pipeline::{ConvertError, ConvertOptions, CscPolicy};
-use super::stream::CsrShardStream;
-use super::warnings::{ConvertWarning, WarningSink};
+use crate::detect::{detect_matrix_format_at, MatrixFormat};
+use crate::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
+use crate::h5ad::csc_stream::open_csc_streaming;
+use crate::h5ad::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
+use crate::h5ad::read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
+use crate::h5ad::stream::{open_x_streaming, read_slice_f32};
+use crate::pipeline::{ConvertError, ConvertOptions, CscPolicy};
+use crate::stream::CsrShardStream;
+use crate::warnings::{ConvertWarning, WarningSink};
 
 /// Detect whether an HDF5 file is an h5mu file (has `/mod` group).
 pub fn is_h5mu_file(file: &hdf5::File) -> bool {
@@ -72,7 +72,7 @@ fn emit_multimodal_index_skip_warning(opts: &ConvertOptions, sink: &mut WarningS
 /// `opts.modality_types` if the caller supplied an explicit
 /// override; otherwise fall back to
 /// [`infer_modality_type_from_name`] and emit a
-/// [`super::warnings::ConvertWarning::ModalityTypeInferred`] so the
+/// [`crate::warnings::ConvertWarning::ModalityTypeInferred`] so the
 /// inference is visible in provenance and the CLI summary.
 pub(crate) fn resolve_modality_type(
     name: &str,
@@ -217,7 +217,7 @@ pub fn h5mu_to_scx(
 
     // Outer uns (global) → write as the global uns blob.
     if file.group("uns").is_ok() {
-        let uns = super::h5ad_read::read_uns(&file, opts.strict_uns, sink)?;
+        let uns = crate::h5ad::read::read_uns(&file, opts.strict_uns, sink)?;
         writer.write_uns(&uns)?;
     }
 
@@ -346,7 +346,7 @@ pub fn h5mu_to_scx(
 /// Unlike [`h5mu_to_scx`], this path never materialises a full
 /// modality's CSR in RAM. It composes the Phase 1/2 streaming
 /// readers (CSR / dense / CSC) per modality and drives the shared
-/// [`super::pipeline::streaming_writer_coordinator`] inside a
+/// [`crate::pipeline::streaming_writer_coordinator`] inside a
 /// [`ScxWriter::with_modality`] scope so per-shard catalog entries
 /// are stamped with the right modality id.
 ///
@@ -520,7 +520,7 @@ pub fn h5mu_to_scx_streaming(
         }
     }
     if file.group("uns").is_ok() {
-        let uns = super::h5ad_read::read_uns(&file, opts.strict_uns, sink)?;
+        let uns = crate::h5ad::read::read_uns(&file, opts.strict_uns, sink)?;
         writer.write_uns(&uns)?;
     }
 
@@ -586,7 +586,7 @@ pub fn h5mu_to_scx_streaming(
         let modality_id_for_closure = modality_id;
         let section_prefix = format!("{mname}_x_shard");
         writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
-            super::pipeline::run_streaming_writer_coordinator(
+            crate::pipeline::run_streaming_writer_coordinator(
                 x_reader.as_mut(),
                 w,
                 opts,
@@ -677,7 +677,7 @@ pub fn h5mu_to_scx_streaming(
                 let layer_index_dtype: u8 = if layer_n_vars <= 65535 { 0 } else { 1 };
                 let prefix = format!("{mname}_{layer_name}_shard");
                 writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
-                    super::pipeline::run_streaming_writer_coordinator(
+                    crate::pipeline::run_streaming_writer_coordinator(
                         layer_reader.as_mut(),
                         w,
                         opts,
@@ -710,7 +710,7 @@ pub fn h5mu_to_scx_streaming(
         .as_secs() as i64;
     let modality_names_for_json: Vec<&String> =
         modality_meta.iter().map(|(name, _, _)| name).collect();
-    let resolved_reader_threads = super::pipeline::resolve_reader_threads(opts);
+    let resolved_reader_threads = crate::pipeline::resolve_reader_threads(opts);
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -741,7 +741,7 @@ fn open_layer_streaming_at(
     file: &hdf5::File,
     group_path: &str,
     sink: &mut WarningSink,
-) -> Result<super::h5ad_stream::XStreamReader, ConvertError> {
+) -> Result<crate::h5ad::stream::XStreamReader, ConvertError> {
     open_x_streaming(file, group_path, MatrixFormat::Csr, sink)
 }
 
