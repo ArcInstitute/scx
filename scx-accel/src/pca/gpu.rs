@@ -28,7 +28,6 @@ use crate::error::{AccelError, Result};
 /// * `seed` — Random seed for reproducibility
 /// * `qr_method` — Householder (default, always-stable) or CholeskyQR2 (opt-in,
 ///   faster but fails with `CuSolverError` on non-SPD Gram matrices)
-#[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 pub fn randomized_pca_gpu<S: ShardSource + Sync>(
     device_id: usize,
@@ -79,13 +78,11 @@ pub fn randomized_pca_gpu<S: ShardSource + Sync>(
 /// Check whether a GPU is available for GPU-accelerated PCA.
 ///
 /// Returns `true` if at least one CUDA device is found.
-#[cfg(feature = "gpu")]
 pub fn gpu_available() -> bool {
     scx_gpu::GpuDevice::count().is_ok_and(|n| n > 0)
 }
 
 /// GPU device information returned by [`gpu_info`].
-#[cfg(feature = "gpu")]
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
     /// Human-readable device name (e.g. "NVIDIA A100-SXM4-80GB").
@@ -99,7 +96,6 @@ pub struct GpuInfo {
 /// Query GPU device information for device 0.
 ///
 /// Returns `None` if no GPU is available or CUDA initialization fails.
-#[cfg(feature = "gpu")]
 pub fn gpu_info() -> Option<GpuInfo> {
     let count = scx_gpu::GpuDevice::count().ok()?;
     if count == 0 {
