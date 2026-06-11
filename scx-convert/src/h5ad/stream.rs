@@ -9,7 +9,7 @@
 use hdf5::types::VarLenUnicode;
 use ndarray::s;
 
-use super::read::read_i64_dataset;
+use super::read::{read_i64_dataset, read_shape_2d};
 use crate::detect::MatrixFormat;
 use crate::pipeline::ConvertError;
 use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
@@ -75,15 +75,7 @@ pub fn open_x_streaming(
 
     let group = file.group(group_path)?;
 
-    let shape: Vec<i64> = group.attr("shape")?.read_1d()?.to_vec();
-    if shape.len() != 2 {
-        return Err(ConvertError::Other(format!(
-            "expected 2D shape attr on '{group_path}', got {}-D",
-            shape.len()
-        )));
-    }
-    let n_obs = shape[0] as usize;
-    let n_vars = shape[1] as usize;
+    let (n_obs, n_vars) = read_shape_2d(&group, group_path)?;
 
     // Best-effort encoding-type sanity check. Newer h5ad files set
     // this attribute; older files omit it — in that case we trust the

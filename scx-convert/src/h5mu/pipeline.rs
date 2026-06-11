@@ -675,7 +675,15 @@ pub fn h5mu_to_scx_streaming(
                     }
                 };
                 let layer_index_dtype: u8 = if layer_n_vars <= 65535 { 0 } else { 1 };
-                let prefix = format!("{mname}_{layer_name}_shard");
+                // Must match `ScxWriter::write_layer_csr_shard_for`'s naming
+                // (`layer/{mname}/{layer_name}/shard_{idx}`): the coordinator
+                // appends `_{shard_idx}`, and both
+                // `layer_csr_shards_for_modality` (needle `/{layer_name}/`) and
+                // `layer_names_for` (prefix `layer/…/shard_`) parse that scheme.
+                // A plain `{mname}_{layer_name}_shard` prefix made
+                // streaming-written per-modality layers invisible to
+                // `read_layer_for` / `layer_names_for`.
+                let prefix = format!("layer/{mname}/{layer_name}/shard");
                 writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
                     crate::pipeline::run_streaming_writer_coordinator(
                         layer_reader.as_mut(),

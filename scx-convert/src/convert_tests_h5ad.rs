@@ -330,6 +330,103 @@ fn test_eager_skips_layer_with_mismatched_shape() {
     assert_eq!(layer_shards, 0, "mismatched layer must not be written");
 }
 
+// A layer stored column-major (CSC) but missing its `encoding-type`
+// attribute must be auto-detected from its shape and read as the correct
+// cells×genes matrix — the same protection `/X` and `/raw/X` already have.
+// The former inline layer reader defaulted to CSR whenever the attr was
+// absent and would mis-ingest (or error on) such a layer; routing
+// `read_layer_entry` through `detect_matrix_format_at` + `read_x_matrix_at`
+// closes that gap.
+#[test]
+fn test_eager_layer_csc_without_encoding_type_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("layer_csc.h5ad");
+    let scx = dir.path().join("layer_csc.scx");
+
+    let n_obs = 6usize;
+    let n_vars = 4usize;
+    create_test_h5ad(&path, n_obs, n_vars, "csr", false);
+
+    // Known non-square dense matrix (n_obs != n_vars so the CSC-vs-CSR
+    // indptr-length discrimination is unambiguous).
+    #[rustfmt::skip]
+    let dense: Vec<f32> = vec![
+        1.0, 0.0, 2.0, 0.0,
+        0.0, 3.0, 0.0, 4.0,
+        5.0, 0.0, 0.0, 6.0,
+        0.0, 0.0, 7.0, 0.0,
+        8.0, 9.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 10.0,
+    ];
+
+    // Build the CSR of `dense`, then transpose to CSC arrays for
+    // column-major on-disk storage (mirrors the working `"csc"` X fixture).
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for row in 0..n_obs {
+        for col in 0..n_vars {
+            let v = dense[row * n_vars + col];
+            if v != 0.0 {
+                indices.push(col as i32);
+                data.push(v);
+            }
+        }
+        indptr.push(data.len() as i64);
+    }
+    let (csc_indptr, csc_indices, csc_data) = csr_to_csc(&indptr, &indices, &data, n_obs, n_vars);
+
+    {
+        let file = hdf5::File::open_rw(&path).unwrap();
+        let layers = file.create_group("layers").unwrap();
+        let lyr = layers.create_group("spliced").unwrap();
+        lyr.new_dataset::<i64>()
+            .shape([csc_indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&csc_indptr)
+            .unwrap();
+        lyr.new_dataset::<i32>()
+            .shape([csc_indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&csc_indices)
+            .unwrap();
+        lyr.new_dataset::<f32>()
+            .shape([csc_data.len()])
+            .create("data")
+            .unwrap()
+            .write(&csc_data)
+            .unwrap();
+        // Deliberately NO encoding-type attr — force shape inference.
+        lyr.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&path, &scx, &opts, &mut sink).unwrap();
+
+    assert_eq!(
+        sink.counts().get("layer_skipped").copied().unwrap_or(0),
+        0,
+        "CSC layer should be ingested, not skipped"
+    );
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let csr = reader.read_layer("spliced").unwrap();
+    assert_eq!(csr.shape, (n_obs, n_vars));
+    assert_eq!(
+        csr.to_dense().unwrap(),
+        dense,
+        "CSC layer must decode to the original cells×genes matrix"
+    );
+}
+
 #[test]
 fn test_uns_skip_non_serializable() {
     let dir = tempfile::tempdir().unwrap();
