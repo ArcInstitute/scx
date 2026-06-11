@@ -96,8 +96,21 @@ pub use mudata_write::{
 pub mod mtx_pipeline;
 pub use scx_mtx::MtxOrientation;
 
+// Integration tests, split by subject (T5.6). All are gated on `hdf5` and stay
+// crate-root submodules (white-box access to crate internals via `super::`);
+// `convert_tests_common` holds shared fixtures/helpers + re-exported imports.
 #[cfg(all(test, feature = "hdf5"))]
-mod tests;
+mod convert_tests_common;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_dataframe;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_h5ad;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_index_export;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_parallel;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_streaming;
 
 #[cfg(test)]
 mod mtx_tests;

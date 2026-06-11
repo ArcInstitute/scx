@@ -82,6 +82,7 @@ See **[docs/conventions.md](docs/conventions.md)** for the full ruleset. Highlig
 - **Checksums**: BLAKE3 everywhere (truncated-64 per shard, full-256 for catalog).
 - **Writer**: temp file → `fsync` → `rename`; sections start at offset 4352.
 - **pyscx**: `Bound<'py, T>` API, `i64/i32/f32` matches scipy.
+- **Tests**: small inline `#[cfg(test)] mod tests` is fine; extract large ones to a sibling `*_tests.rs` via `#[cfg(test)] #[path = "…_tests.rs"] mod tests;` (keeps white-box `super::*` access). See [docs/conventions.md](docs/conventions.md).
 
 ## Known Risks and Pitfalls
 
