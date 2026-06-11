@@ -34,6 +34,35 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
 - `finish()`: write full catalog at EOF → pwrite root catalog at 256 →
   pwrite header at 0 → fsync → rename.
 
+## Test Organization
+
+- Small inline `#[cfg(test)] mod tests { … }` blocks are fine and preferred for
+  modest test code — keep them in the production file.
+- When a trailing inline test module grows large (rule of thumb: ~800+ test LOC,
+  or it pushes the production file well past readability), extract it to a sibling
+  `<file>_tests.rs` and include it white-box:
+
+  ```rust
+  #[cfg(test)]
+  #[path = "foo_tests.rs"]
+  mod tests;
+  ```
+
+  This keeps the tests a child of the parent module, so `use super::*` retains
+  private-item access — unlike a `tests/` integration crate, which only sees the
+  public API. Preserve any feature `cfg` (e.g. `#[cfg(all(test, feature = "gpu"))]`)
+  on the `mod tests;` include.
+- For a module with several interspersed `#[cfg(test)]` test submodules,
+  consolidate them into one `<file>_tests.rs`; submodules that gain a nesting
+  level rewrite `use super::X` → `use super::super::X` (see
+  `scx-engine/src/index_tests.rs`).
+- `#[cfg(test)]` instrumentation embedded *inside production functions* (e.g. the
+  parallel-coordinator in-flight counters in `scx-convert/src/pipeline.rs`) stays
+  in place — it is conditional compilation of production flow, not unit tests.
+- For a very large single-file test suite, split by subject into sibling modules
+  sharing a `*_common` fixtures module (see `scx-convert`'s `convert_tests_*`),
+  kept as crate submodules to preserve `super::` access to crate internals.
+
 ## Python Bindings (pyscx)
 
 - PyO3 with `Bound<'py, T>` API (not deprecated `&PyAny`).
