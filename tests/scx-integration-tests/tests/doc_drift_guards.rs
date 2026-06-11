@@ -153,7 +153,7 @@ fn no_debug_assert_in_hot_paths() {
         ("scx-codec", "rice.rs"),
         ("scx-codec", "delta_golomb.rs"),
         ("scx-gpu", "gpu_shard_source.rs"),
-        ("scx-accel", "diffexp.rs"),
+        ("scx-accel", "diffexp/cpu.rs"),
     ];
     let root = workspace_root();
     let mut offenders = Vec::new();

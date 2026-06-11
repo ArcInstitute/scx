@@ -11,8 +11,6 @@
 
 pub mod csc;
 pub mod diffexp;
-#[cfg(feature = "gpu")]
-pub mod diffexp_gpu;
 pub mod error;
 pub mod eval_metrics;
 #[cfg(feature = "gpu")]
@@ -77,7 +75,7 @@ pub use umap::{compute_umap, UmapResult};
 
 // GPU-accelerated variants (behind "gpu" feature)
 #[cfg(feature = "gpu")]
-pub use diffexp_gpu::{
+pub use diffexp::{
     pdex_ref_gpu, pdex_ref_gpu_dense, wilcoxon_rank_sum_gpu, wilcoxon_rank_sum_gpu_dense,
     GpuDeShardInput,
 };

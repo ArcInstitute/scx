@@ -15,7 +15,7 @@
 //! Same shape as [`crate::csc::wilcoxon::wilcoxon_rank_sum_streaming_csc`];
 //! the only difference is the per-chunk kernel call and the merge logic.
 
-use crate::diffexp::{
+use crate::diffexp::cpu::{
     empty_pdex_result, merge_pdex_chunk_into, pdex_ref, recompute_pdex_fdrs, PdexRefResult,
 };
 use crate::error::{AccelError, Result};
@@ -284,9 +284,9 @@ mod tests {
         .expect("CPU streaming pdex_ref failed");
 
         // GPU v3 CSC-direct path (v3 is the unconditional default).
-        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
+        let gpu_res = crate::diffexp::pdex_ref_gpu(
             0,
-            crate::diffexp_gpu::GpuDeShardInput::Backed {
+            crate::diffexp::GpuDeShardInput::Backed {
                 csr: &csr_reader,
                 csc: Some(&csc_reader),
             },
@@ -407,9 +407,9 @@ mod tests {
         .expect("CPU streaming pdex_ref failed");
 
         // GPU v3 CSR-direct fallback (csc_reader = None; v3 is the default).
-        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
+        let gpu_res = crate::diffexp::pdex_ref_gpu(
             0,
-            crate::diffexp_gpu::GpuDeShardInput::Backed {
+            crate::diffexp::GpuDeShardInput::Backed {
                 csr: &csr_reader,
                 csc: None,
             },
@@ -514,9 +514,9 @@ mod tests {
         // sequence runs over the backed multi-shard reader.
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
-        let gpu_res = crate::diffexp_gpu::pdex_ref_gpu(
+        let gpu_res = crate::diffexp::pdex_ref_gpu(
             0,
-            crate::diffexp_gpu::GpuDeShardInput::Backed {
+            crate::diffexp::GpuDeShardInput::Backed {
                 csr: &csr_reader_gpu,
                 csc: None,
             },
@@ -617,9 +617,9 @@ mod tests {
         // is always the v1 dense-chunk driver — no v2/v3/CSC override needed).
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
-        let gpu_res = crate::diffexp_gpu::wilcoxon_rank_sum_gpu(
+        let gpu_res = crate::diffexp::wilcoxon_rank_sum_gpu(
             0,
-            crate::diffexp_gpu::GpuDeShardInput::Backed {
+            crate::diffexp::GpuDeShardInput::Backed {
                 csr: &csr_reader_gpu,
                 csc: None,
             },

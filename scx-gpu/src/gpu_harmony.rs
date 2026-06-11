@@ -4,7 +4,7 @@
 //! device-resident `CudaSlice<f32>` buffers. Callers own the memory and
 //! the orchestration loop — see [`scx_accel::harmony_integrate_gpu`].
 //!
-//! Layout contracts (match `scx-accel/src/harmony.rs` CPU code):
+//! Layout contracts (match `scx-accel/src/harmony/cpu.rs` CPU code):
 //! - `Z_*` matrices: `(d x N)` column-major (`Z[t, i] = flat[i*d + t]`).
 //! - `Y`: `(d x K)` column-major.
 //! - `R`, `dist`, `O`, `E`: row-major (row-major stride = last dim).

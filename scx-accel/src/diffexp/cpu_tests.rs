@@ -308,7 +308,7 @@ fn test_logfc_log_transformed() {
 /// `(total_gene_sum[var] − group_gene_sums[g][var]) / n2`; this recomputes it
 /// the old way (`Σ_{gg≠g} group_gene_sums[gg][var] / n2`) and asserts the
 /// resulting logFC matches across a many-group fixture. The same algebra now
-/// backs the GPU host-side logFC pass in `diffexp_gpu.rs`.
+/// backs the GPU host-side logFC pass in `diffexp/gpu.rs`.
 #[test]
 fn test_one_vs_rest_logfc_matches_bruteforce_restsum() {
     let n_groups = 10usize;

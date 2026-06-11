@@ -4,8 +4,8 @@
 //! (CUB), batched searchsorted, on-device tie-term computation, and normal-tail
 //! p-value via `erfc`. These primitives are the building blocks for the
 //! high-level `pdex_ref_gpu_*` / `wilcoxon_rank_sum_*_gpu` entry points that
-//! live in `scx-accel/src/diffexp.rs` under `#[cfg(feature = "gpu")]` — see
-//! the CPU path in the same file for the parity oracle.
+//! live in `scx-accel/src/diffexp/gpu.rs` under `#[cfg(feature = "gpu")]` — see
+//! `scx-accel/src/diffexp/cpu.rs` for the parity oracle.
 //!
 //! All kernels share a single PTX module (`diffexp.ptx`, compiled by
 //! `scx-gpu/build.rs` from `kernels/diffexp.cu`).

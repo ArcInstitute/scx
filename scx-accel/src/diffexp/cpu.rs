@@ -1456,5 +1456,5 @@ pub(crate) fn recompute_pdex_fdrs(result: &mut PdexRefResult) {
 }
 
 #[cfg(test)]
-#[path = "diffexp_tests.rs"]
+#[path = "cpu_tests.rs"]
 mod tests;

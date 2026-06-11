@@ -229,7 +229,7 @@ pub enum InputLayout {
 /// This is the **single source of truth** for the route. Both the GPU
 /// `pdex_ref` and Wilcoxon (`rank_genes_groups`) dispatch sites `match` on the
 /// returned [`AccelRoute`] to select the kernel (via
-/// [`plan_de_route_from_source`] in `diffexp_gpu.rs`), and the pyscx CPU
+/// [`plan_de_route_from_source`] in `diffexp/gpu.rs`), and the pyscx CPU
 /// dispatch sites stamp the returned info directly — so the recorded route
 /// always matches the code that ran, and the whole decision matrix is testable
 /// without a GPU.
