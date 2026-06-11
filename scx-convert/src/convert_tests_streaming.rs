@@ -1454,6 +1454,108 @@ fn phase3_streaming_h5mu_round_trip_matches_bulk() {
 }
 
 #[test]
+fn bulk_h5mu_per_modality_layer_round_trips() {
+    // Regression (PR #239): per-modality layers live at
+    // `mod/<modality>/layers/<name>`. The bulk h5mu pipeline ingests them
+    // via `read_layers_at`, whose `read_layer_entry` must resolve the full
+    // parent path — not a hardcoded root `layers/<name>`. Before the fix,
+    // `detect_matrix_format_at("layers/spliced")` missed the root group, so
+    // the per-modality layer was skipped (or, given a stray root `/layers`,
+    // read from the wrong group). After the fix it round-trips to the
+    // original matrix under the correct modality.
+    //
+    // (The h5mu *streaming* path has its own inline per-modality layer loop,
+    // untouched by this PR, and is exercised elsewhere.)
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu = dir.path().join("layer.h5mu");
+
+    let n_obs = 5usize;
+    let rna_n_vars = 3usize;
+    create_test_h5mu(&h5mu, n_obs, rna_n_vars, 2);
+
+    // Known CSR layer matrix for the rna modality (n_obs × rna_n_vars).
+    #[rustfmt::skip]
+    let dense: Vec<f32> = vec![
+        1.0, 0.0, 2.0,
+        0.0, 3.0, 0.0,
+        0.0, 0.0, 4.0,
+        5.0, 6.0, 0.0,
+        0.0, 7.0, 0.0,
+    ];
+    let mut indptr = vec![0i64];
+    let mut indices: Vec<i32> = Vec::new();
+    let mut data: Vec<f32> = Vec::new();
+    for row in 0..n_obs {
+        for col in 0..rna_n_vars {
+            let v = dense[row * rna_n_vars + col];
+            if v != 0.0 {
+                indices.push(col as i32);
+                data.push(v);
+            }
+        }
+        indptr.push(data.len() as i64);
+    }
+
+    // Attach `mod/rna/layers/spliced` (CSR) to the existing modality.
+    {
+        let file = hdf5::File::open_rw(&h5mu).unwrap();
+        let rna = file.group("mod/rna").unwrap();
+        let layers = rna.create_group("layers").unwrap();
+        let lyr = layers.create_group("spliced").unwrap();
+        lyr.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        lyr.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        lyr.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        lyr.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        lyr.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, rna_n_vars as i64])
+            .unwrap();
+    }
+
+    let opts = streaming_opts(8);
+    let scx_bulk = dir.path().join("bulk.scx");
+    let mut sink = WarningSink::log();
+    h5mu_to_scx(&h5mu, &scx_bulk, &opts, &mut sink).unwrap();
+
+    assert_eq!(
+        sink.counts().get("layer_skipped").copied().unwrap_or(0),
+        0,
+        "per-modality layer must be ingested, not skipped"
+    );
+    let reader = ScxReader::open(&scx_bulk).unwrap();
+    let rna_id = reader.modality_id("rna").expect("rna modality present");
+    let csr = reader.read_layer_for(rna_id, "spliced").unwrap();
+    assert_eq!(csr.shape, (n_obs, rna_n_vars), "layer shape");
+    assert_eq!(
+        csr.to_dense().unwrap(),
+        dense,
+        "per-modality layer must decode to the original matrix"
+    );
+}
+
+#[test]
 fn phase3_streaming_h5mu_per_modality_codec_routing() {
     // Per-modality codec choices made by `select_codec_for_modality`
     // must match between the bulk and streaming paths. The streaming

@@ -193,7 +193,13 @@ pub(crate) fn read_shape_2d(
             shape.len()
         )));
     }
-    Ok((shape[0] as usize, shape[1] as usize))
+    // `try_from` (not `as usize`) so a negative/corrupt dimension fails
+    // loud instead of wrapping to a huge length downstream.
+    let to_dim = |v: i64| {
+        usize::try_from(v)
+            .map_err(|_| ConvertError::Other(format!("invalid shape dimension {v} on '{path}'")))
+    };
+    Ok((to_dim(shape[0])?, to_dim(shape[1])?))
 }
 
 /// Read a sparse matrix group (CSR or CSC) and return as CSR.
@@ -287,196 +293,138 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
     Ok((csr.indptr, csr.indices, csr.data, n_obs, n_vars))
 }
 
-/// Per-target conversion policy for [`read_dataset_as`].
-///
-/// The three former typed readers (`read_i64_dataset` / `read_i32_dataset`
-/// / `read_f32_dataset`) shared an identical dtype-dispatch skeleton and
-/// differed only in how each *source* value maps onto the *target* type.
-/// That per-target rule now lives here: every integer width except `u64`
-/// is widened losslessly to `i64` and routed through [`Self::from_i64`];
-/// `u64` (the one width that can exceed `i64::MAX`) goes through
-/// [`Self::from_u64`]; floats go through [`Self::from_f64`] (rejected by
-/// the integer targets). The contract per impl is byte-for-byte the same
-/// as the readers it replaces.
-pub(crate) trait HdfNumericTarget: Sized {
-    /// Name used in `UnsupportedDtype` / `IndexOverflow` messages.
-    const NAME: &'static str;
-    /// Convert a signed source value (all integer widths except `u64`).
-    fn from_i64(v: i64, path: &str, src: &'static str) -> Result<Self, ConvertError>;
-    /// Convert an unsigned 64-bit source value.
-    fn from_u64(v: u64, path: &str, src: &'static str) -> Result<Self, ConvertError>;
-    /// Convert a floating-point source value.
-    fn from_f64(v: f64, path: &str, src: &'static str) -> Result<Self, ConvertError>;
-}
+// Whole-dataset typed readers. Each reads an HDF5 1-D dataset of any
+// numeric width and converts to the target type in bulk: same-width
+// sources are taken verbatim (`to_vec`), widening / float casts are
+// infallible, and narrowing integer casts do a single overflow scan
+// followed by an infallible (vectorizable) cast. This is the same per-arm
+// shape as the streaming `read_slice_{i32,f32}` twins in `stream.rs`; the
+// `.into_iter().map(|v| v as T).collect()` casts vectorize, which a
+// per-element `Result`-returning closure would defeat on the large CSR
+// `data` / `indices` arrays.
 
-#[inline]
-fn index_overflow<T>(
-    path: &str,
-    src: &'static str,
-    target: &'static str,
-    value: impl std::fmt::Display,
-) -> Result<T, ConvertError> {
-    Err(ConvertError::IndexOverflow {
-        path: path.to_string(),
-        source_dtype: src,
-        target,
-        value: value.to_string(),
-    })
-}
-
-#[inline]
-fn float_rejected<T>(path: &str, target: &'static str) -> Result<T, ConvertError> {
-    Err(ConvertError::UnsupportedDtype(format!(
-        "dataset '{path}': float dtype cannot be read as {target}"
-    )))
-}
-
-impl HdfNumericTarget for i64 {
-    const NAME: &'static str = "i64";
-    fn from_i64(v: i64, _path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        // Every signed/narrow-unsigned source widens losslessly to i64.
-        Ok(v)
-    }
-    fn from_u64(v: u64, path: &str, src: &'static str) -> Result<Self, ConvertError> {
-        // u64 > i64::MAX would silently truncate CSR `indptr` — fail loud.
-        if v > i64::MAX as u64 {
-            return index_overflow(path, src, "i64", v);
-        }
-        Ok(v as i64)
-    }
-    fn from_f64(_v: f64, path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        float_rejected(path, "i64")
-    }
-}
-
-impl HdfNumericTarget for i32 {
-    const NAME: &'static str = "i32";
-    fn from_i64(v: i64, path: &str, src: &'static str) -> Result<Self, ConvertError> {
-        // Narrow widths (i8/i16/u8/u16) always fit; i64/u32 are range-checked.
-        if v < i32::MIN as i64 || v > i32::MAX as i64 {
-            return index_overflow(path, src, "i32", v);
-        }
-        Ok(v as i32)
-    }
-    fn from_u64(v: u64, path: &str, src: &'static str) -> Result<Self, ConvertError> {
-        if v > i32::MAX as u64 {
-            return index_overflow(path, src, "i32", v);
-        }
-        Ok(v as i32)
-    }
-    fn from_f64(_v: f64, path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        float_rejected(path, "i32")
-    }
-}
-
-impl HdfNumericTarget for f32 {
-    const NAME: &'static str = "f32";
-    fn from_i64(v: i64, _path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        // Casts from i64 may lose precision above 2^24 — documented behaviour.
-        Ok(v as f32)
-    }
-    fn from_u64(v: u64, _path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        Ok(v as f32)
-    }
-    fn from_f64(v: f64, _path: &str, _src: &'static str) -> Result<Self, ConvertError> {
-        // f32 source arrives widened to f64; the f32→f64→f32 round-trip is
-        // lossless (incl. NaN/Inf), so f32 output is unchanged.
-        Ok(v as f32)
-    }
-}
-
-/// Read an HDF5 1-D dataset and convert every element to `T`, applying
-/// `T`'s [`HdfNumericTarget`] policy. The dtype-dispatch skeleton lives
-/// here once; per-target overflow / float-rejection rules live in the
-/// trait impls. Replaces the former `read_{i64,i32,f32}_dataset` trio
-/// (kept below as thin wrappers for call-site stability).
-pub(crate) fn read_dataset_as<T: HdfNumericTarget>(
-    ds: &hdf5::Dataset,
-) -> Result<Vec<T>, ConvertError> {
+/// Read a dataset as `Vec<i64>` (CSR `indptr`). Accepts every integer
+/// width; `u64` values exceeding `i64::MAX` fail with
+/// [`ConvertError::IndexOverflow`] (silent truncation would corrupt the
+/// CSR layout). Float source dtypes are rejected.
+pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
     use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
         ConvertError::UnsupportedDtype(format!(
-            "dataset '{path}': dtype {desc:?} cannot be read as {}",
-            T::NAME
+            "dataset '{path}': dtype {desc:?} cannot be read as i64"
         ))
     })?;
-    let src = dt.name();
+    macro_rules! widen {
+        ($t:ty) => {{
+            Ok(ds.read_1d::<$t>()?.into_iter().map(i64::from).collect())
+        }};
+    }
     match dt {
-        HdfNumericDtype::I8 => ds
-            .read_1d::<i8>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::I16 => ds
-            .read_1d::<i16>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::I32 => ds
-            .read_1d::<i32>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::I64 => ds
-            .read_1d::<i64>()?
-            .into_iter()
-            .map(|v| T::from_i64(v, &path, src))
-            .collect(),
-        HdfNumericDtype::U8 => ds
-            .read_1d::<u8>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::U16 => ds
-            .read_1d::<u16>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::U32 => ds
-            .read_1d::<u32>()?
-            .into_iter()
-            .map(|v| T::from_i64(i64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::U64 => ds
-            .read_1d::<u64>()?
-            .into_iter()
-            .map(|v| T::from_u64(v, &path, src))
-            .collect(),
-        HdfNumericDtype::F32 => ds
-            .read_1d::<f32>()?
-            .into_iter()
-            .map(|v| T::from_f64(f64::from(v), &path, src))
-            .collect(),
-        HdfNumericDtype::F64 => ds
-            .read_1d::<f64>()?
-            .into_iter()
-            .map(|v| T::from_f64(v, &path, src))
-            .collect(),
+        HdfNumericDtype::I8 => widen!(i8),
+        HdfNumericDtype::I16 => widen!(i16),
+        HdfNumericDtype::I32 => widen!(i32),
+        HdfNumericDtype::I64 => Ok(ds.read_1d::<i64>()?.to_vec()),
+        HdfNumericDtype::U8 => widen!(u8),
+        HdfNumericDtype::U16 => widen!(u16),
+        HdfNumericDtype::U32 => widen!(u32),
+        HdfNumericDtype::U64 => {
+            let data: Vec<u64> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data.iter().find(|&&v| v > i64::MAX as u64) {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i64",
+                    value: v.to_string(),
+                });
+            }
+            Ok(data.into_iter().map(|v| v as i64).collect())
+        }
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
+            format!("dataset '{path}': float dtype {desc:?} cannot be read as i64"),
+        )),
     }
 }
 
-/// Read a dataset as `Vec<i64>` (CSR `indptr`). `u64` values exceeding
-/// `i64::MAX` fail with [`ConvertError::IndexOverflow`]; float source
-/// dtypes are rejected. Thin wrapper over [`read_dataset_as`].
-pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
-    read_dataset_as::<i64>(ds)
-}
-
-/// Read a dataset as `Vec<i32>` (CSR `indices`). Narrowing casts from
-/// `i64` / `u32` / `u64` are range-checked (overflow →
-/// [`ConvertError::IndexOverflow`]); floats are rejected. Thin wrapper
-/// over [`read_dataset_as`].
+/// Read a dataset as `Vec<i32>` (CSR `indices`). Narrow widths widen
+/// losslessly; narrowing casts from `i64` / `u32` / `u64` are range-checked
+/// (overflow → [`ConvertError::IndexOverflow`]). Float source dtypes are
+/// rejected.
 pub(crate) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertError> {
-    read_dataset_as::<i32>(ds)
+    use crate::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as i32"
+        ))
+    })?;
+    macro_rules! widen {
+        ($t:ty) => {{
+            Ok(ds.read_1d::<$t>()?.into_iter().map(i32::from).collect())
+        }};
+    }
+    // One bulk overflow scan, then an infallible vectorizable cast.
+    macro_rules! checked {
+        ($t:ty, $oob:expr) => {{
+            let data: Vec<$t> = ds.read_1d()?.to_vec();
+            if let Some(&v) = data.iter().find($oob) {
+                return Err(ConvertError::IndexOverflow {
+                    path,
+                    source_dtype: dt.name(),
+                    target: "i32",
+                    value: v.to_string(),
+                });
+            }
+            Ok(data.into_iter().map(|v| v as i32).collect())
+        }};
+    }
+    match dt {
+        HdfNumericDtype::I8 => widen!(i8),
+        HdfNumericDtype::I16 => widen!(i16),
+        HdfNumericDtype::I32 => Ok(ds.read_1d::<i32>()?.to_vec()),
+        HdfNumericDtype::I64 => checked!(i64, |&&v| v < i32::MIN as i64 || v > i32::MAX as i64),
+        HdfNumericDtype::U8 => widen!(u8),
+        HdfNumericDtype::U16 => widen!(u16),
+        HdfNumericDtype::U32 => checked!(u32, |&&v| v > i32::MAX as u32),
+        HdfNumericDtype::U64 => checked!(u64, |&&v| v > i32::MAX as u64),
+        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
+            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
+        )),
+    }
 }
 
-/// Read a dataset as `Vec<f32>` (CSR `data`). Accepts every numeric
-/// width; `i64` / `u64` casts may lose precision above 2^24 (documented
-/// behaviour). Thin wrapper over [`read_dataset_as`].
+/// Read a dataset as `Vec<f32>` (CSR `data`). Accepts every numeric width.
+/// `i64` / `u64` casts may lose precision above 2^24, and `f64` sources
+/// truncate to `f32` (e.g. `f64::MAX → f32::INFINITY`); `NaN` / `Inf` are
+/// preserved. All casts are infallible and vectorizable.
 pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertError> {
-    read_dataset_as::<f32>(ds)
+    use crate::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
+    macro_rules! cast {
+        ($t:ty) => {{
+            ds.read_1d::<$t>()?.into_iter().map(|v| v as f32).collect()
+        }};
+    }
+    Ok(match dt {
+        HdfNumericDtype::F32 => ds.read_1d::<f32>()?.to_vec(),
+        HdfNumericDtype::F64 => cast!(f64),
+        HdfNumericDtype::I8 => cast!(i8),
+        HdfNumericDtype::I16 => cast!(i16),
+        HdfNumericDtype::I32 => cast!(i32),
+        HdfNumericDtype::I64 => cast!(i64),
+        HdfNumericDtype::U8 => cast!(u8),
+        HdfNumericDtype::U16 => cast!(u16),
+        HdfNumericDtype::U32 => cast!(u32),
+        HdfNumericDtype::U64 => cast!(u64),
+    })
 }
 
 /// Read a DataFrame group (obs or var) from an h5ad file as an Arrow RecordBatch.
@@ -1854,7 +1802,7 @@ pub fn read_layers_at(
     };
     let member_names = layers_group.member_names()?;
     for name in &member_names {
-        match read_layer_entry(file, name, sink) {
+        match read_layer_entry(file, path, name, sink) {
             Ok(data) => {
                 result.insert(name.clone(), data);
             }
@@ -1871,6 +1819,7 @@ pub fn read_layers_at(
 
 fn read_layer_entry(
     file: &hdf5::File,
+    parent_path: &str,
     name: &str,
     sink: &mut WarningSink,
 ) -> Result<CsrArrays, ConvertError> {
@@ -1880,13 +1829,20 @@ fn read_layer_entry(
     // (from shape, not just an explicit `encoding-type` attr),
     // `canonicalize_csr`, and the indptr-length validation, instead of a
     // private inline encoding-type read.
-    let path = format!("layers/{name}");
+    //
+    // `parent_path` is the layer group the caller opened — `"layers"` for
+    // single-modality, but `"mod/<modality>/layers"` for an h5mu file's
+    // per-modality layers. It MUST be threaded through (not hardcoded to
+    // `layers/{name}`): `detect_matrix_format_at` / `read_x_matrix_at` do
+    // absolute `file.group(path)` lookups, so a hardcoded path would read
+    // per-modality layers from the wrong (root) group.
+    let path = format!("{parent_path}/{name}");
     let format = detect_matrix_format_at(file, &path, sink)?;
     read_x_matrix_at(file, &path, format)
 }
 
 #[cfg(test)]
-mod read_dataset_as_tests {
+mod numeric_reader_tests {
     use super::*;
 
     /// Write a 1-D dataset of element type `T` at `/d` in a fresh temp
@@ -1907,14 +1863,14 @@ mod read_dataset_as_tests {
     #[test]
     fn i64_widens_every_integer_width() {
         let (_d, f) = ds_file::<u32>(&[0u32, 1, 4_000_000_000]);
-        let got = read_dataset_as::<i64>(&f.dataset("d").unwrap()).unwrap();
+        let got = read_i64_dataset(&f.dataset("d").unwrap()).unwrap();
         assert_eq!(got, vec![0i64, 1, 4_000_000_000]);
     }
 
     #[test]
     fn i64_rejects_u64_over_i64_max() {
         let (_d, f) = ds_file::<u64>(&[1u64, u64::MAX]);
-        let err = read_dataset_as::<i64>(&f.dataset("d").unwrap()).unwrap_err();
+        let err = read_i64_dataset(&f.dataset("d").unwrap()).unwrap_err();
         assert!(matches!(
             err,
             ConvertError::IndexOverflow { target: "i64", .. }
@@ -1925,11 +1881,11 @@ mod read_dataset_as_tests {
     fn int_targets_reject_float_source() {
         let (_d, f) = ds_file::<f32>(&[1.0f32, 2.0]);
         assert!(matches!(
-            read_dataset_as::<i64>(&f.dataset("d").unwrap()).unwrap_err(),
+            read_i64_dataset(&f.dataset("d").unwrap()).unwrap_err(),
             ConvertError::UnsupportedDtype(_)
         ));
         assert!(matches!(
-            read_dataset_as::<i32>(&f.dataset("d").unwrap()).unwrap_err(),
+            read_i32_dataset(&f.dataset("d").unwrap()).unwrap_err(),
             ConvertError::UnsupportedDtype(_)
         ));
     }
@@ -1939,13 +1895,13 @@ mod read_dataset_as_tests {
         // In-range i64 source succeeds (incl. negatives).
         let (_d, f) = ds_file::<i64>(&[-5i64, 100, i32::MAX as i64]);
         assert_eq!(
-            read_dataset_as::<i32>(&f.dataset("d").unwrap()).unwrap(),
+            read_i32_dataset(&f.dataset("d").unwrap()).unwrap(),
             vec![-5i32, 100, i32::MAX]
         );
         // Out-of-range i64 overflows.
         let (_d2, f2) = ds_file::<i64>(&[(i32::MAX as i64) + 1]);
         assert!(matches!(
-            read_dataset_as::<i32>(&f2.dataset("d").unwrap()).unwrap_err(),
+            read_i32_dataset(&f2.dataset("d").unwrap()).unwrap_err(),
             ConvertError::IndexOverflow { target: "i32", .. }
         ));
     }
@@ -1954,7 +1910,7 @@ mod read_dataset_as_tests {
     fn i32_rejects_u32_over_i32_max() {
         let (_d, f) = ds_file::<u32>(&[u32::MAX]);
         assert!(matches!(
-            read_dataset_as::<i32>(&f.dataset("d").unwrap()).unwrap_err(),
+            read_i32_dataset(&f.dataset("d").unwrap()).unwrap_err(),
             ConvertError::IndexOverflow {
                 target: "i32",
                 source_dtype: "u32",
@@ -1967,12 +1923,12 @@ mod read_dataset_as_tests {
     fn f32_accepts_every_numeric_width() {
         let (_d, f) = ds_file::<f64>(&[1.5f64, -2.25, 0.0]);
         assert_eq!(
-            read_dataset_as::<f32>(&f.dataset("d").unwrap()).unwrap(),
+            read_f32_dataset(&f.dataset("d").unwrap()).unwrap(),
             vec![1.5f32, -2.25, 0.0]
         );
         let (_d2, f2) = ds_file::<i64>(&[7i64, -8]);
         assert_eq!(
-            read_dataset_as::<f32>(&f2.dataset("d").unwrap()).unwrap(),
+            read_f32_dataset(&f2.dataset("d").unwrap()).unwrap(),
             vec![7.0f32, -8.0]
         );
     }
