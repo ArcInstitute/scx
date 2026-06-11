@@ -6,30 +6,20 @@
 mod direction;
 pub use direction::determine_convert_direction;
 
-#[cfg(feature = "hdf5")]
-mod csc_stream;
-#[cfg(feature = "hdf5")]
-mod csc_transpose;
-#[cfg(feature = "hdf5")]
-mod dense_stream;
+// Per-format ingest/export submodule directories (T5.9): `h5ad/` owns the
+// AnnData reader/writer/stream files plus the dense/CSC stream helpers and the
+// CSC→CSR transpose; `h5mu/` owns the MuData pipeline + writer. The public
+// surface is re-exported below at the unchanged `scx_convert::*` paths.
 #[cfg(feature = "hdf5")]
 mod detect;
 #[cfg(feature = "hdf5")]
 mod dtype;
 #[cfg(feature = "hdf5")]
-mod h5ad_read;
+mod h5ad;
 #[cfg(feature = "hdf5")]
-mod h5ad_stream;
-#[cfg(feature = "hdf5")]
-mod h5ad_stream_write;
-#[cfg(feature = "hdf5")]
-mod h5ad_write;
+mod h5mu;
 #[cfg(feature = "hdf5")]
 mod hdf_dtype;
-#[cfg(feature = "hdf5")]
-mod mudata_pipeline;
-#[cfg(feature = "hdf5")]
-mod mudata_write;
 #[cfg(feature = "hdf5")]
 mod tenx_read;
 
@@ -40,14 +30,16 @@ mod stream;
 mod warnings;
 
 #[cfg(feature = "hdf5")]
-pub use csc_stream::{open_csc_layer_streaming, open_csc_streaming};
+pub use h5ad::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
 #[cfg(feature = "hdf5")]
-pub use dense_stream::{open_dense_layer_streaming, open_dense_streaming, DenseXStreamReader};
+pub use h5ad::dense_stream::{
+    open_dense_layer_streaming, open_dense_streaming, DenseXStreamReader,
+};
 #[cfg(feature = "hdf5")]
-pub use h5ad_stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
+pub use h5ad::stream::{open_layer_streaming, open_x_streaming, CsrShardSlice, XStreamReader};
 
 #[cfg(feature = "hdf5")]
-pub use h5ad_read::{
+pub use h5ad::read::{
     read_dataframe_group, read_h5ad_metadata_from_path, read_h5ad_x_shape,
     read_h5ad_x_shape_from_path, read_uns, H5adMetadataParts,
 };
@@ -86,10 +78,10 @@ pub use pipeline::{
 };
 
 #[cfg(feature = "hdf5")]
-pub use mudata_pipeline::{h5mu_to_scx, h5mu_to_scx_streaming, is_h5mu_file};
+pub use h5mu::pipeline::{h5mu_to_scx, h5mu_to_scx_streaming, is_h5mu_file};
 
 #[cfg(feature = "hdf5")]
-pub use mudata_write::{
+pub use h5mu::write::{
     scx_modality_to_h5ad, scx_modality_to_h5ad_streaming, scx_to_h5mu, scx_to_h5mu_streaming,
 };
 

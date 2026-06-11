@@ -1,6 +1,6 @@
 // Per-shard CSR validation and normalisation helpers shared by the
 // in-memory pyscx converter (`pyscx::anndata`) and the streaming
-// converter (`scx_convert::h5ad_stream`). Centralising them here
+// converter (`scx_convert::h5ad::stream`). Centralising them here
 // keeps the canonical pre-encode normalisation identical across
 // both paths.
 
@@ -159,8 +159,8 @@ pub fn shard_nnz_bounds(
 ///
 /// Single source of truth for the per-shard rebase performed by every
 /// ingest path (the two eager `pipeline.rs` sites, the two streaming
-/// `h5ad_stream.rs` readers, and the materialized-CSC
-/// `csc_stream.rs` reader). Folding them here closed review findings
+/// `h5ad/stream.rs` readers, and the materialized-CSC
+/// `h5ad/csc_stream.rs` reader). Folding them here closed review findings
 /// C5 (missing monotonicity guard) and C6 (the eager sites previously
 /// skipped the column-bound check).
 pub fn rebase_csr_shard(

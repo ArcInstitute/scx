@@ -17,7 +17,7 @@ fn write_dataframe_group_honors_pandas_index_metadata_unnamed() {
         "__index_level_0__",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
         .unwrap();
     drop(file);
 
@@ -63,7 +63,7 @@ fn write_dataframe_group_honors_pandas_index_metadata_named() {
         "gene_symbols",
         &["MIR1302-2HG", "FAM138A"],
     );
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
         .unwrap();
     drop(file);
 
@@ -122,7 +122,7 @@ fn write_dataframe_group_no_pandas_metadata_fallback() {
     let symbols = Arc::new(StringArray::from(vec!["GENE_A", "GENE_B"]));
     let gene_ids = Arc::new(StringArray::from(vec!["ENSG1", "ENSG2"]));
     let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![symbols, gene_ids]).unwrap();
-    crate::h5ad_write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
+    crate::h5ad::write::write_dataframe_group_at(&root, "var", &batch, &mut WarningSink::log())
         .unwrap();
     drop(file);
 
@@ -154,7 +154,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     // pandas index), `read_dataframe_group` must still read the real
     // values from the `_index` dataset — not synthesise blank
     // strings, which is what the pre-fix fallback did.
-    use super::h5ad_read::read_dataframe_group;
+    use crate::h5ad::read::read_dataframe_group;
 
     let dir = tempfile::tempdir().unwrap();
     let h5_path = dir.path().join("idx_only.h5");
@@ -208,7 +208,7 @@ fn read_dataframe_group_index_only_recovers_values() {
     // `__index_level_0__` in the Arrow schema, and the schema gains a
     // `pandas` metadata envelope so consumers like
     // `pyscx.open(...).to_anndata()` and
-    // `scx-convert/src/h5ad_write.rs::write_dataframe_body` identify
+    // `scx-convert/src/h5ad/write.rs::write_dataframe_body` identify
     // the index automatically.
     assert_eq!(batch.num_columns(), 1, "expected single index column");
     assert_eq!(batch.schema().field(0).name(), "__index_level_0__");
@@ -239,7 +239,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_unnamed() {
     // `read_dataframe_group` silently dropped the index. Post-fix, the
     // schema must include `__index_level_0__` AND stamp the pandas
     // metadata envelope so consumers find the index.
-    use super::h5ad_read::read_dataframe_group;
+    use crate::h5ad::read::read_dataframe_group;
 
     let dir = tempfile::tempdir().unwrap();
     let h5_path = dir.path().join("var_unnamed.h5");
@@ -339,7 +339,7 @@ fn read_dataframe_group_attaches_pandas_index_metadata_named() {
     // B1-2026-05-20 named-index shape: `_index = "gene_symbols"`. The
     // reader must NOT rename to `__index_level_0__`; the field keeps
     // its original name and the pandas metadata points at it.
-    use super::h5ad_read::read_dataframe_group;
+    use crate::h5ad::read::read_dataframe_group;
 
     let dir = tempfile::tempdir().unwrap();
     let h5_path = dir.path().join("var_named.h5");
@@ -698,9 +698,9 @@ mod streaming_obs_hdf5 {
     use scx_format_io::header::{HEADER_SIZE, MAGIC};
     use scx_format_io::{FileHeader, ScxReader, ScxWriter};
 
-    use crate::h5ad_read::read_dataframe_group;
-    use crate::h5ad_stream_write::write_scx_to_h5ad_streaming;
-    use crate::h5ad_write::{
+    use crate::h5ad::read::read_dataframe_group;
+    use crate::h5ad::stream_write::write_scx_to_h5ad_streaming;
+    use crate::h5ad::write::{
         write_dataframe_group_at, write_dataframe_group_streaming, write_scx_to_h5ad,
     };
     use crate::pipeline::ConvertOptions;
@@ -1313,7 +1313,7 @@ mod streaming_obs_hdf5 {
     /// per-modality (mudata convention).
     #[test]
     fn test_streaming_obs_round_trip_sharded_to_h5mu() {
-        use crate::mudata_write::scx_to_h5mu_streaming;
+        use crate::h5mu::write::scx_to_h5mu_streaming;
         use scx_format_io::modality::ModalityType;
 
         let dir = tempfile::tempdir().unwrap();

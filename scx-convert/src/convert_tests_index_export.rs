@@ -199,7 +199,7 @@ fn convert_with_forced_missing_var_column_errors() {
 /// behaviour without breaking expectations silently.
 #[test]
 fn convert_h5mu_with_index_obs_emits_skip_warning() {
-    use super::mudata_pipeline::h5mu_to_scx;
+    use crate::h5mu::pipeline::h5mu_to_scx;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_path = dir.path().join("input.h5mu");
@@ -445,8 +445,8 @@ fn test_h5ad_csr_to_scx_to_h5ad_streaming_round_trip() {
 /// export streams per-modality `/X` and produces a valid output.
 #[test]
 fn test_scx_to_h5mu_streaming_round_trip() {
-    use super::mudata_pipeline::h5mu_to_scx;
-    use super::mudata_write::scx_to_h5mu_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use crate::h5mu::write::scx_to_h5mu_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -470,7 +470,7 @@ fn test_scx_to_h5mu_streaming_round_trip() {
 
     // Cross-check streaming vs. materialising writer on the same SCX.
     let h5mu_mat = dir.path().join("out_mat.h5mu");
-    super::mudata_write::scx_to_h5mu(&scx_path, &h5mu_mat, &mut WarningSink::log()).unwrap();
+    crate::h5mu::write::scx_to_h5mu(&scx_path, &h5mu_mat, &mut WarningSink::log()).unwrap();
     let mat_file = hdf5::File::open(&h5mu_mat).unwrap();
     let stream_rna_data: Vec<f32> = file
         .dataset("mod/rna/X/data")
@@ -630,8 +630,8 @@ fn test_h5ad_streaming_with_deletion_vectors() {
 /// Streaming variant of `test_modality_extract_to_h5ad`.
 #[test]
 fn test_modality_extract_to_h5ad_streaming() {
-    use super::mudata_pipeline::h5mu_to_scx;
-    use super::mudata_write::scx_modality_to_h5ad_streaming;
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use crate::h5mu::write::scx_modality_to_h5ad_streaming;
 
     let dir = tempfile::tempdir().unwrap();
     let h5mu_in = dir.path().join("in.h5mu");
@@ -660,8 +660,8 @@ fn test_modality_extract_to_h5ad_streaming() {
 /// datasets) which anndata reads natively.
 #[test]
 fn test_boolean_round_trip_via_streaming_export() {
-    use super::h5ad_read::read_dataframe_group;
     use super::pipeline::scx_to_h5ad_streaming;
+    use crate::h5ad::read::read_dataframe_group;
     use arrow::array::BooleanArray;
 
     let dir = tempfile::tempdir().unwrap();
@@ -736,8 +736,8 @@ fn test_boolean_round_trip_via_streaming_export() {
 /// group (`codes` + `categories` datasets), which has no such cap.
 #[test]
 fn test_categorical_wide_round_trip() {
-    use super::h5ad_read::read_dataframe_group;
     use super::pipeline::scx_to_h5ad_streaming;
+    use crate::h5ad::read::read_dataframe_group;
     use arrow::array::DictionaryArray;
     use arrow::datatypes::Int32Type;
 

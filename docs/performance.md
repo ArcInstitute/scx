@@ -182,7 +182,7 @@ Peak RSS bound: one shard's worth of CSR per matrix written
 always-resident kept-row indptr (`(n_obs_kept + 1) × 8` bytes — same
 floor the ingestion side carries). When the source SCX file carries
 `ObsMetadataShard` / `VarMetadataShard` sections, obs and var also
-stream through `h5ad_write::write_dataframe_group_streaming` (pre-
+stream through `h5ad::write::write_dataframe_group_streaming` (pre-
 allocated HDF5 datasets per column, hyperslab writes per shard,
 single-pass running global dictionary for categoricals) so the bound
 covers metadata too — atlas-scale obs no longer materialises during

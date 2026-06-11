@@ -11,9 +11,9 @@ use hdf5::types::TypeDescriptor;
 use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
-use super::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat};
-use super::pipeline::ConvertError;
-use super::warnings::{ConvertWarning, WarningSink};
+use crate::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat};
+use crate::pipeline::ConvertError;
+use crate::warnings::{ConvertWarning, WarningSink};
 use crate::CATEGORICAL_ORDERED_KEY;
 
 /// CSR matrix arrays + shape: (indptr, indices, data, n_obs, n_vars)
@@ -275,8 +275,8 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
 /// `i64::MAX` fail with [`ConvertError::IndexOverflow`] — silent
 /// truncation of CSR `indptr` would corrupt the on-disk sparse layout.
 /// Float source dtypes are rejected.
-pub(super) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
@@ -316,8 +316,8 @@ pub(super) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertEr
 /// against the i32 range — overflow returns
 /// [`ConvertError::IndexOverflow`] so CSR `indices` corruption is
 /// surfaced loudly. Float source dtypes are rejected.
-pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+pub(crate) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertError> {
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
@@ -380,8 +380,8 @@ pub(super) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
 /// signed and unsigned integers and `f64` to `f32`. Casts from `i64`
 /// and `u64` may lose precision for values above 2^24 — documented
 /// behaviour, not a regression.
-pub(super) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertError> {
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
@@ -592,7 +592,7 @@ pub fn read_dataframe_group(
     // anndata convention, so the loop above never visited it — yet
     // downstream consumers (`scx_format_io::pandas_index_columns`, used
     // by `pyscx.open(...).to_anndata()` and by
-    // `scx-convert/src/h5ad_write.rs::write_dataframe_body`) rely on
+    // `scx-convert/src/h5ad/write.rs::write_dataframe_body`) rely on
     // the resulting schema's `pandas` metadata envelope to identify
     // which column is the index. Without this block, obs_names /
     // var_names silently default to integer-positional strings.
@@ -600,7 +600,7 @@ pub fn read_dataframe_group(
     // Rename the literal `_index` (anndata's on-disk sentinel for an
     // unnamed pandas index) to `__index_level_0__` (pyarrow's
     // canonical name). The inverse rename lives in
-    // `scx-convert/src/h5ad_write.rs::write_dataframe_body`'s
+    // `scx-convert/src/h5ad/write.rs::write_dataframe_body`'s
     // `Some("__index_level_0__") => "_index"` arm — together they
     // round-trip an unnamed pandas index byte-equivalent through SCX.
     let mut injected_index_field_name: Option<String> = None;
@@ -686,7 +686,7 @@ fn read_column_to_arrow(
     ds: &hdf5::Dataset,
     name: &str,
 ) -> Result<(Field, ArrayRef), ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
 
     // Check for categorical encoding
     let is_categorical = ds
@@ -918,7 +918,7 @@ fn read_nullable_integer_group(
     int_group: &hdf5::Group,
     name: &str,
 ) -> Result<(Field, ArrayRef), ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
 
     let values_ds = int_group.dataset("values")?;
     let mask = read_bool_or_u8(&int_group.dataset("mask")?)?;
@@ -1031,7 +1031,7 @@ fn read_nullable_float_group(
     float_group: &hdf5::Group,
     name: &str,
 ) -> Result<(Field, ArrayRef), ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
 
     let values_ds = float_group.dataset("values")?;
     let mask = read_bool_or_u8(&float_group.dataset("mask")?)?;
@@ -1375,7 +1375,7 @@ pub fn read_dense_mapping_shard(
     let n_cols = shape[1];
 
     // Hyperslab read of the row range; widen to f32 if necessary.
-    use crate::dense_stream::{read_dense_slab_f32, DenseDtype};
+    use super::dense_stream::{read_dense_slab_f32, DenseDtype};
     let desc = ds.dtype()?.to_descriptor()?;
     let dtype = DenseDtype::from_descriptor(&desc).map_err(|_| {
         ConvertError::UnsupportedDtype(format!(
@@ -1490,7 +1490,7 @@ pub fn read_sparse_mapping_shard(
     row_start: usize,
     row_end: usize,
 ) -> Result<RecordBatch, ConvertError> {
-    use crate::h5ad_stream::{read_slice_f32, read_slice_i32};
+    use super::stream::{read_slice_f32, read_slice_i32};
 
     let parent = file.group(group_path)?;
     let sub = parent.group(&info.name)?;

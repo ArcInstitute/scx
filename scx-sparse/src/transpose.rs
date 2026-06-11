@@ -34,7 +34,7 @@ pub enum TransposeError {
 ///   2. Prefix-sum → CSC indptr
 ///   3. Scatter CSR entries into CSC positions
 ///
-/// This is the inverse of `csc_to_csr()` in scx-cli/src/convert/csc_transpose.rs.
+/// This is the inverse of `csc_to_csr()` in scx-convert/src/h5ad/csc_transpose.rs.
 pub fn csr_to_csc(csr: &ScxCsr) -> CscArrays {
     let (n_rows, n_cols) = csr.shape;
     let nnz = csr.nnz();

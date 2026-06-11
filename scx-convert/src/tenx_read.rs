@@ -4,8 +4,8 @@ use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
-use super::h5ad_read::{read_f32_dataset, read_i32_dataset, read_i64_dataset};
 use super::pipeline::ConvertError;
+use crate::h5ad::read::{read_f32_dataset, read_i32_dataset, read_i64_dataset};
 
 pub struct TenXData {
     pub indptr: Vec<i64>,

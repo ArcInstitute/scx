@@ -22,7 +22,7 @@ pub(crate) use scx_codec::{CodecId, ValueEncoding};
 
 pub(crate) use scx_format_io::reader::ScxReader;
 
-pub(crate) use super::csc_transpose::csc_to_csr;
+pub(crate) use crate::h5ad::csc_transpose::csc_to_csr;
 
 pub(crate) use super::detect::{
     detect_input_format, detect_matrix_format, InputFormat, MatrixFormat,
@@ -40,9 +40,9 @@ pub(crate) use super::stream::{CsrShardStream, StreamedCsrShard};
 
 pub(crate) use super::warnings::WarningSink;
 
-pub(crate) use super::h5ad_read::read_x_matrix;
+pub(crate) use crate::h5ad::read::read_x_matrix;
 
-pub(crate) use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
+pub(crate) use crate::h5ad::stream::{open_layer_streaming, open_x_streaming};
 
 pub(crate) use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
 
@@ -600,7 +600,7 @@ pub(crate) fn create_test_h5mu(path: &Path, n_obs: usize, rna_n_vars: usize, adt
 /// Like [`create_test_h5mu`] but writes a second modality
 /// `dense_adt` whose `/X` is a 2D dense **f64** dataset with
 /// `encoding-type="array"`. Exercises the dense-non-f32 sampling
-/// path in `mudata_pipeline::sample_modality_values`.
+/// path in `h5mu::pipeline::sample_modality_values`.
 #[cfg(test)]
 pub(crate) fn create_test_h5mu_with_dense_f64_modality(
     path: &Path,
@@ -734,7 +734,7 @@ pub(crate) fn create_test_h5mu_with_dense_f64_modality(
 /// (indptr, indices, values) in their full-matrix layout. Re-bases
 /// the per-shard local indptr to a global running total.
 pub(crate) fn drain_streaming(
-    reader: &mut super::h5ad_stream::XStreamReader,
+    reader: &mut crate::h5ad::stream::XStreamReader,
     target_rows: usize,
 ) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
     let n_obs = reader.n_obs;

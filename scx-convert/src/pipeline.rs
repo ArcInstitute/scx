@@ -11,19 +11,19 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::{PreEncodedSection, ScxWriter};
 use scx_sparse::canonicalize_csr;
 
-use super::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
-use super::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
 use super::dtype::{detect_value_encoding, values_to_raw_bytes};
-use super::h5ad_read::{
-    list_dense_mapping_shapes, list_sparse_mapping_shapes, read_dataframe_group,
-    read_dense_mapping_shard, read_layers, read_sparse_mapping_shard, read_uns, read_x_matrix,
-};
-use super::h5ad_stream::{open_layer_streaming, open_x_streaming};
-use super::h5ad_write::write_scx_to_h5ad;
 use super::stream::CsrShardStream;
 use super::tenx_read::read_tenx_h5;
 use super::warnings::{ConvertWarning, WarningSink};
+use crate::h5ad::csc_stream::{open_csc_layer_streaming, open_csc_streaming};
+use crate::h5ad::dense_stream::{open_dense_layer_streaming, open_dense_streaming};
+use crate::h5ad::read::{
+    list_dense_mapping_shapes, list_sparse_mapping_shapes, read_dataframe_group,
+    read_dense_mapping_shard, read_layers, read_sparse_mapping_shard, read_uns, read_x_matrix,
+};
+use crate::h5ad::stream::{open_layer_streaming, open_x_streaming};
+use crate::h5ad::write::write_scx_to_h5ad;
 use arrow::record_batch::RecordBatch;
 use scx_engine::{
     build_and_write_conversion_predicate_indexes, BuildOutcome, ConversionPredicateIndexOptions,
@@ -895,7 +895,7 @@ pub fn scx_to_h5ad_streaming(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    crate::h5ad_stream_write::write_scx_to_h5ad_streaming(scx_path, h5ad_path, opts, sink)
+    crate::h5ad::stream_write::write_scx_to_h5ad_streaming(scx_path, h5ad_path, opts, sink)
 }
 
 /// Override hooks for [`h5ad_to_scx_streaming`]. Each `Some(...)`
@@ -923,7 +923,7 @@ pub struct StreamingOverrides {
 }
 
 /// Streaming h5ad → SCX conversion. Reads the input one shard's worth
-/// of rows at a time via [`super::h5ad_stream::XStreamReader`] so peak
+/// of rows at a time via [`crate::h5ad::stream::XStreamReader`] so peak
 /// memory is bounded by `shard_target_rows × n_vars × density × ~16
 /// bytes` plus the always-resident indptr (`(n_obs + 1) × 8 bytes`).
 ///
@@ -1096,7 +1096,7 @@ pub fn h5ad_to_scx_streaming(
     // an open failure (dense/CSC layer, malformed encoding, shape
     // mismatch with X) is logged and skipped, mirroring the
     // non-streaming `read_layers` warn-and-continue behaviour
-    // (scx-convert/src/h5ad_read.rs). Once a layer's shards start
+    // (scx-convert/src/h5ad/read.rs). Once a layer's shards start
     // writing, a mid-stream shard error aborts — leaving a
     // half-written layer in the SCX file would be worse than failing
     // loudly. Width-dependent encoding values are recomputed per
@@ -2016,7 +2016,7 @@ fn ingest_raw_if_present(
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let Some(((indptr, indices, data, raw_n_obs, raw_n_vars), raw_var)) =
-        crate::h5ad_read::read_raw_group(file, sink)?
+        crate::h5ad::read::read_raw_group(file, sink)?
     else {
         return Ok(());
     };

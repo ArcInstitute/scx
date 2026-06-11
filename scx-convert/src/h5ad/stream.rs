@@ -9,11 +9,11 @@
 use hdf5::types::VarLenUnicode;
 use ndarray::s;
 
-use super::detect::MatrixFormat;
-use super::h5ad_read::read_i64_dataset;
-use super::pipeline::ConvertError;
-use super::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
-use super::warnings::{ConvertWarning, WarningSink};
+use super::read::read_i64_dataset;
+use crate::detect::MatrixFormat;
+use crate::pipeline::ConvertError;
+use crate::stream::{CsrShardStream, IndexedCsrShardStream, StreamedCsrShard};
+use crate::warnings::{ConvertWarning, WarningSink};
 
 /// A single shard's worth of CSR rows read from an h5ad file.
 ///
@@ -359,7 +359,7 @@ impl IndexedCsrShardStream for XStreamReader {
     }
 }
 
-/// Slice-read variant of `read_i32_dataset` from `h5ad_read.rs`.
+/// Slice-read variant of `read_i32_dataset` from `read.rs`.
 /// Accepts every integer width; widens narrow source values and
 /// range-checks narrowing casts (`i64` / `u32` / `u64`). Overflow
 /// returns [`ConvertError::IndexOverflow`] — silent truncation of CSR
@@ -370,7 +370,7 @@ pub(crate) fn read_slice_i32(
     start: usize,
     end: usize,
 ) -> Result<Vec<i32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
@@ -445,7 +445,7 @@ pub(crate) fn read_slice_i32(
     }
 }
 
-/// Slice-read variant of `read_f32_dataset` from `h5ad_read.rs`.
+/// Slice-read variant of `read_f32_dataset` from `read.rs`.
 /// Accepts every numeric width; casts signed and unsigned integers
 /// and `f64` to `f32`. Casts from `i64` / `u64` may lose precision
 /// for values above 2^24 — documented behaviour.
@@ -454,7 +454,7 @@ pub(crate) fn read_slice_f32(
     start: usize,
     end: usize,
 ) -> Result<Vec<f32>, ConvertError> {
-    use super::hdf_dtype::HdfNumericDtype;
+    use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
     let desc = ds.dtype()?.to_descriptor()?;
     let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
