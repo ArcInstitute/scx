@@ -34,7 +34,6 @@ use crate::error::Result;
 /// Falls back to the CPU implementation if GPU initialization fails; callers
 /// who need strict GPU-only execution should check [`crate::gpu_available`]
 /// first.
-#[cfg(feature = "gpu")]
 pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
     source: &S,
     device: &str,
@@ -58,7 +57,6 @@ pub fn streaming_mean_var_with_device<S: ShardSource + Sync>(
 ///
 /// Only available with `feature = "gpu"`. See
 /// [`streaming_mean_var_with_device`] for semantics.
-#[cfg(feature = "gpu")]
 pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
     source: &S,
     clip_val: &[f64],
@@ -83,10 +81,9 @@ pub fn streaming_clip_square_sum_with_device<S: ShardSource + Sync>(
 /// Forwards to the CPU implementation for `device = "cpu"`; for `device = "gpu"`
 /// drives [`scx_gpu::gpu_streaming_mean_var_batched`] and finalises the
 /// per-batch and global Bessel-corrected statistics on the host (identical
-/// formula to the CPU function — see lines 176-207 above).
+/// formula to the CPU function — see [`streaming_mean_var_batched`](super::cpu::streaming_mean_var_batched)).
 ///
 /// Falls back to the CPU implementation if GPU initialization fails.
-#[cfg(feature = "gpu")]
 pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     source: &S,
     cell_batch: &[i32],
@@ -156,7 +153,6 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
 ///
 /// Only available with `feature = "gpu"`. See
 /// [`streaming_mean_var_batched_with_device`] for semantics.
-#[cfg(feature = "gpu")]
 pub fn streaming_clip_square_sum_batched_with_device<S: ShardSource + Sync>(
     source: &S,
     cell_batch: &[i32],
