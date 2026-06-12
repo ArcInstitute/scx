@@ -30,6 +30,12 @@ pub enum ConvertWarning {
     /// survives, but column order and per-column categorical dtypes are not
     /// restored on read. Surfaces the structure loss so it is never silent.
     FlattenedUnsDataframe { key: String },
+    /// A `uns` entry stored as a scipy-sparse matrix (`encoding-type` ==
+    /// `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a
+    /// nested dict of `data` / `indices` / `indptr` arrays rather than
+    /// reconstructed as a sparse matrix — the sparse type tag is not
+    /// restored on read. Surfaces the type loss so it is never silent.
+    FlattenedUnsSparse { key: String, format: String },
     /// A column requested via `--index-preset` was missing from the
     /// source DataFrame. Emitted for partial preset/file mismatch only —
     /// when EVERY preset column is missing, the convert layer batches
@@ -172,6 +178,7 @@ impl ConvertWarning {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
             Self::FlattenedUnsDataframe { .. } => "flattened_uns_dataframe",
+            Self::FlattenedUnsSparse { .. } => "flattened_uns_sparse",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
             Self::UnsupportedIndexColumn { .. } => "unsupported_index_column",
@@ -229,6 +236,13 @@ impl fmt::Display for ConvertWarning {
                  dict (per-column values + `_index`) but not reconstructed as a \
                  DataFrame — column order and per-column categorical dtypes are not \
                  restored on read."
+            ),
+            Self::FlattenedUnsSparse { key, format } => write!(
+                f,
+                "uns['{key}'] is a scipy-sparse {format}; its data/indices/indptr \
+                 arrays were preserved as a nested dict but the sparse type is not \
+                 reconstructed on read — it comes back as a dict. Rebuild with e.g. \
+                 scipy.sparse.{format}((data, indices, indptr), shape=shape)."
             ),
             Self::DroppedRaw { raw_n_vars } => write!(
                 f,

@@ -2145,9 +2145,16 @@ fn write_uns_value(
                     .write(&data)?;
             }
         }
-        serde_json::Value::Object(_) => {
-            let subgroup = group.create_group(name)?;
-            write_uns_entries(&subgroup, value)?;
+        serde_json::Value::Object(map) => {
+            // A tagged `__scx_type__` envelope (emitted by `read_uns_entry`'s
+            // `uns_ndarray_envelope` for NaN/Inf-carrying floats and rank ≥ 3
+            // arrays) decodes back to a native HDF5 dataset. Anything else —
+            // a plain dict, or a pyscx-only envelope (recarray / tuple /
+            // pandas.*) — falls through to the generic subgroup recursion.
+            if !try_write_uns_envelope(group, name, map)? {
+                let subgroup = group.create_group(name)?;
+                write_uns_entries(&subgroup, value)?;
+            }
         }
         serde_json::Value::Null => {
             // anndata represents a Python `None` uns value as an `h5py.Empty`
@@ -2168,6 +2175,171 @@ fn write_uns_value(
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.1.0"))?;
         }
+    }
+    Ok(())
+}
+
+/// Decode a tagged `__scx_type__` `uns` envelope back to a native HDF5
+/// dataset. Handles the numeric `ndarray` (`encoding == "base64le"`) and
+/// `scalar` envelopes emitted by `read_uns_entry::uns_ndarray_envelope`
+/// (the inverse of pyscx's `encode_ndarray_tagged` / `encode_np_scalar_tagged`).
+/// Returns `Ok(false)` for a non-envelope object or any other tag/encoding so
+/// the caller falls back to the generic subgroup recursion (no regression for
+/// pyscx-only `json` / `recarray` / `tuple` / `pandas.*` envelopes).
+fn try_write_uns_envelope(
+    group: &hdf5::Group,
+    name: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<bool, ConvertError> {
+    let tag = match map
+        .get(crate::h5ad::read::SCX_UNS_TYPE_KEY)
+        .and_then(|v| v.as_str())
+    {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    let (dtype, shape): (&str, Vec<usize>) = match tag {
+        "ndarray" => {
+            if map.get("encoding").and_then(|v| v.as_str()) != Some("base64le") {
+                return Ok(false); // json-encoded string/object array — not ours
+            }
+            let dtype = match map.get("dtype").and_then(|v| v.as_str()) {
+                Some(d) => d,
+                None => return Ok(false),
+            };
+            // Strict: every dimension must be a valid non-negative integer.
+            // A `null` / negative / fractional dim would otherwise be silently
+            // dropped, producing a wrong-rank dataset with reinterpreted bytes.
+            // Fall back to the generic subgroup write instead (preserves the
+            // raw envelope, never corrupts).
+            let shape: Vec<usize> = match map.get("shape").and_then(|v| v.as_array()) {
+                Some(a) => match a
+                    .iter()
+                    .map(|v| v.as_u64().map(|n| n as usize))
+                    .collect::<Option<Vec<usize>>>()
+                {
+                    Some(s) => s,
+                    None => return Ok(false),
+                },
+                None => return Ok(false),
+            };
+            (dtype, shape)
+        }
+        // A `scalar` envelope is a 0-d value (empty shape).
+        "scalar" => match map.get("dtype").and_then(|v| v.as_str()) {
+            Some(d) => (d, Vec::new()),
+            None => return Ok(false),
+        },
+        _ => return Ok(false),
+    };
+
+    let b64 = match map.get("data").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(b) => b,
+        // Corrupt base64 — fall back rather than abort the whole export.
+        Err(_) => return Ok(false),
+    };
+
+    // Returns false (→ generic fallback) for any dtype/order/itemsize we can't
+    // faithfully decode; Err only on a genuine HDF5 write failure.
+    write_uns_envelope_dataset(group, name, dtype, &shape, &bytes)
+}
+
+/// Reinterpret little-endian `bytes` as `dtype` and write a native HDF5
+/// dataset of the given `shape` (empty `shape` → a 0-d scalar). Inverse of
+/// the `to_le_bytes` packing in `uns_ndarray_envelope`.
+///
+/// Returns `Ok(true)` when the dataset was written, `Ok(false)` when the
+/// envelope can't be faithfully decoded (unsupported byte order / dtype /
+/// itemsize, or a byte count that isn't a multiple of itemsize) so the caller
+/// falls back to writing the raw envelope as a subgroup — never aborting the
+/// export and never reinterpreting bytes at the wrong width. `Err` is reserved
+/// for a genuine HDF5 write failure.
+fn write_uns_envelope_dataset(
+    group: &hdf5::Group,
+    name: &str,
+    dtype: &str,
+    shape: &[usize],
+    bytes: &[u8],
+) -> Result<bool, ConvertError> {
+    // numpy `dtype.str`: byte-order char, kind char, then itemsize.
+    let mut chars = dtype.chars();
+    let order = chars.next();
+    let kind = chars.next();
+    let itemsize: usize = chars.as_str().parse().unwrap_or(0);
+    // We only emit little-endian (`<`) or single-byte (`|`); `=` is native
+    // (LE on supported hosts). Anything else (e.g. a big-endian `>f4` from a
+    // pyscx-tagged AnnData uns) falls back to the generic subgroup write rather
+    // than risking a byte-swapped misread or aborting the export.
+    if !matches!(order, Some('<') | Some('|') | Some('=')) {
+        return Ok(false);
+    }
+
+    macro_rules! emit {
+        ($t:ty, $w:expr, $conv:expr) => {{
+            let chunks = bytes.chunks_exact($w);
+            if !chunks.remainder().is_empty() {
+                // Truncated / corrupt payload — fall back instead of writing a
+                // dataset from a partial buffer.
+                return Ok(false);
+            }
+            let vals: Vec<$t> = chunks.map($conv).collect();
+            write_typed_uns_dataset::<$t>(group, name, shape, vals)?;
+            Ok(true)
+        }};
+    }
+
+    match (kind, itemsize) {
+        (Some('f'), 2) => emit!(half::f16, 2, |c: &[u8]| half::f16::from_le_bytes([
+            c[0], c[1]
+        ])),
+        (Some('f'), 4) => emit!(f32, 4, |c: &[u8]| f32::from_le_bytes(c.try_into().unwrap())),
+        (Some('f'), 8) => emit!(f64, 8, |c: &[u8]| f64::from_le_bytes(c.try_into().unwrap())),
+        (Some('i'), 1) => emit!(i8, 1, |c: &[u8]| c[0] as i8),
+        (Some('i'), 2) => emit!(i16, 2, |c: &[u8]| i16::from_le_bytes(c.try_into().unwrap())),
+        (Some('i'), 4) => emit!(i32, 4, |c: &[u8]| i32::from_le_bytes(c.try_into().unwrap())),
+        (Some('i'), 8) => emit!(i64, 8, |c: &[u8]| i64::from_le_bytes(c.try_into().unwrap())),
+        (Some('u'), 1) => emit!(u8, 1, |c: &[u8]| c[0]),
+        (Some('u'), 2) => emit!(u16, 2, |c: &[u8]| u16::from_le_bytes(c.try_into().unwrap())),
+        (Some('u'), 4) => emit!(u32, 4, |c: &[u8]| u32::from_le_bytes(c.try_into().unwrap())),
+        (Some('u'), 8) => emit!(u64, 8, |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap())),
+        (Some('b'), 1) => emit!(bool, 1, |c: &[u8]| c[0] != 0),
+        // Unsupported kind/itemsize (datetime, complex, …) — fall back.
+        _ => Ok(false),
+    }
+}
+
+/// Write `vals` as a 0-d scalar (empty `shape`) or an N-D HDF5 dataset.
+fn write_typed_uns_dataset<T: hdf5::H5Type>(
+    group: &hdf5::Group,
+    name: &str,
+    shape: &[usize],
+    vals: Vec<T>,
+) -> Result<(), ConvertError> {
+    if shape.is_empty() {
+        if vals.len() != 1 {
+            return Err(ConvertError::Other(format!(
+                "uns envelope '{name}': scalar expected 1 element, got {}",
+                vals.len()
+            )));
+        }
+        group
+            .new_dataset::<T>()
+            .shape(())
+            .create(name)?
+            .write_scalar(&vals[0])?;
+    } else {
+        let arr = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(shape), vals)
+            .map_err(|e| ConvertError::Other(format!("uns envelope '{name}': shape: {e}")))?;
+        group
+            .new_dataset::<T>()
+            .shape(shape)
+            .create(name)?
+            .write(&arr)?;
     }
     Ok(())
 }
@@ -2299,6 +2471,75 @@ mod pairwise_tests {
         assert!(
             err.to_string().contains("out of bounds"),
             "expected out-of-bounds error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod uns_envelope_tests {
+    use super::*;
+
+    /// A malformed or non-decodable `__scx_type__` envelope must fall back to
+    /// the generic subgroup write (preserving the raw fields) rather than
+    /// aborting the whole h5ad export — Antigravity #1 (bad shape) + Codex P2
+    /// (unsupported byte order). `write_uns_value` must return `Ok` and create
+    /// a subgroup for each case.
+    #[test]
+    fn malformed_envelopes_fall_back_to_subgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = hdf5::File::create(dir.path().join("t.h5")).unwrap();
+        let uns = file.create_group("uns").unwrap();
+
+        let env = |extra: &[(&str, serde_json::Value)]| {
+            let mut m = serde_json::Map::new();
+            m.insert("__scx_type__".into(), "ndarray".into());
+            m.insert("encoding".into(), "base64le".into());
+            m.insert("dtype".into(), "<f8".into());
+            m.insert("shape".into(), serde_json::json!([2]));
+            m.insert("data".into(), serde_json::json!("AAAAAAAA8D8AAAAAAAAAQA==")); // [1.0, 2.0]
+            for (k, v) in extra {
+                m.insert((*k).into(), v.clone());
+            }
+            serde_json::Value::Object(m)
+        };
+
+        // (1) missing `data` → fallback.
+        let mut no_data = env(&[]);
+        no_data.as_object_mut().unwrap().remove("data");
+        write_uns_value(&uns, "no_data", &no_data).unwrap();
+
+        // (2) non-integer shape dim → fallback (no wrong-rank dataset).
+        write_uns_value(
+            &uns,
+            "bad_shape",
+            &env(&[("shape", serde_json::json!([2, null]))]),
+        )
+        .unwrap();
+
+        // (3) big-endian byte order → fallback (no abort, no byte-swap misread).
+        write_uns_value(&uns, "big_endian", &env(&[("dtype", ">f8".into())])).unwrap();
+
+        // Each fell back to a subgroup that preserved the raw envelope fields.
+        for key in ["no_data", "bad_shape", "big_endian"] {
+            let g = uns
+                .group(key)
+                .unwrap_or_else(|_| panic!("'{key}' should fall back to a subgroup"));
+            assert!(
+                g.dataset("dtype").is_ok(),
+                "'{key}' fallback should preserve the raw envelope fields"
+            );
+        }
+
+        // A well-formed little-endian envelope still writes a real dataset
+        // (not a subgroup), confirming the fallback is scoped to the bad cases.
+        write_uns_value(&uns, "good", &env(&[])).unwrap();
+        assert!(
+            uns.dataset("good").is_ok(),
+            "valid envelope should write a dataset"
+        );
+        assert!(
+            uns.group("good").is_err(),
+            "valid envelope must not be a subgroup"
         );
     }
 }

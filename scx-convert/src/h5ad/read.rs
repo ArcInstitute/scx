@@ -280,13 +280,19 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
     let n_obs = shape[0];
     let n_vars = shape[1];
 
-    // Read 2D dataset as ndarray then flatten to Vec<f32>.
-    // ndarray 0.16 renamed `into_raw_vec` → `into_raw_vec_and_offset`,
-    // which returns `(Vec<T>, Option<usize>)`. The offset is `None`
-    // here because `read_2d` returns an owned, contiguous Array2 that
-    // hasn't been view-sliced.
-    let nd: ndarray::Array2<f32> = ds.read_2d()?;
-    let (flat, _offset) = nd.into_raw_vec_and_offset();
+    // Read the whole matrix as a row-major `Vec<f32>` via the shared
+    // dtype-aware slab reader (rows `[0, n_obs)`), so the eager path
+    // dispatches every on-disk dtype — including f16 → f32 — exactly like
+    // the streaming path, rather than relying on libhdf5's build-dependent
+    // implicit conversion to `f32` (the original B5 failure mode).
+    use super::dense_stream::{read_dense_slab_f32, DenseDtype};
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dtype = DenseDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dense matrix '{dataset_name}': dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
+    let flat: Vec<f32> = read_dense_slab_f32(&ds, dtype, 0, n_obs)?;
     let csr = scx_sparse::dense_to_csr(&flat, n_obs, n_vars)
         .map_err(|e| ConvertError::Other(format!("CSR conversion error: {e}")))?;
 
@@ -341,9 +347,11 @@ pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertEr
             }
             Ok(data.into_iter().map(|v| v as i64).collect())
         }
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
-            format!("dataset '{path}': float dtype {desc:?} cannot be read as i64"),
-        )),
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            Err(ConvertError::UnsupportedDtype(format!(
+                "dataset '{path}': float dtype {desc:?} cannot be read as i64"
+            )))
+        }
     }
 }
 
@@ -389,9 +397,11 @@ pub(crate) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
         HdfNumericDtype::U16 => widen!(u16),
         HdfNumericDtype::U32 => checked!(u32, |&&v| v > i32::MAX as u32),
         HdfNumericDtype::U64 => checked!(u64, |&&v| v > i32::MAX as u64),
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
-            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
-        )),
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            Err(ConvertError::UnsupportedDtype(format!(
+                "dataset '{path}': float dtype {desc:?} cannot be read as i32"
+            )))
+        }
     }
 }
 
@@ -414,6 +424,12 @@ pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertEr
         }};
     }
     Ok(match dt {
+        // `half::f16` has no `as f32` cast; widen via `to_f32()`.
+        HdfNumericDtype::F16 => ds
+            .read_1d::<half::f16>()?
+            .into_iter()
+            .map(|v| v.to_f32())
+            .collect(),
         HdfNumericDtype::F32 => ds.read_1d::<f32>()?.to_vec(),
         HdfNumericDtype::F64 => cast!(f64),
         HdfNumericDtype::I8 => cast!(i8),
@@ -453,6 +469,12 @@ pub(crate) fn read_f64_dataset(ds: &hdf5::Dataset) -> Result<Vec<f64>, ConvertEr
     Ok(match dt {
         HdfNumericDtype::F64 => ds.read_1d::<f64>()?.to_vec(),
         HdfNumericDtype::F32 => cast!(f32),
+        // `half::f16` has no `as f64` cast; widen via `to_f64()`.
+        HdfNumericDtype::F16 => ds
+            .read_1d::<half::f16>()?
+            .into_iter()
+            .map(|v| v.to_f64())
+            .collect(),
         HdfNumericDtype::I8 => cast!(i8),
         HdfNumericDtype::I16 => cast!(i16),
         HdfNumericDtype::I32 => cast!(i32),
@@ -917,6 +939,19 @@ fn read_column_to_arrow(
             ));
             Ok((Field::new(name, DataType::Int64, true), array))
         }
+        // float16 columns widen to f32 (anndata stores f16 to save space;
+        // scx's value encoding is f32 anyway). `half::f16` has no `as f32`.
+        HdfNumericDtype::F16 => {
+            let data: Vec<f32> = ds
+                .read_1d::<half::f16>()?
+                .into_iter()
+                .map(|v| v.to_f32())
+                .collect();
+            Ok((
+                Field::new(name, DataType::Float32, true),
+                Arc::new(Float32Array::from(data)),
+            ))
+        }
         HdfNumericDtype::F32 => {
             let data: Vec<f32> = ds.read_1d()?.to_vec();
             Ok((
@@ -1116,7 +1151,7 @@ fn read_nullable_integer_group(
                 Arc::new(Int64Array::from(opt)),
             )
         }
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
             return Err(ConvertError::UnsupportedDtype(format!(
                 "nullable-integer '{name}': values dtype is float ({}); expected integer",
                 dt.name()
@@ -1173,6 +1208,26 @@ fn read_nullable_float_group(
             Field::new(name, DataType::Float64, true),
             Arc::new(Float64Array::from(opt_vec!(f64))),
         ),
+        // float16 widens to f32 (scx's value encoding is f32 anyway).
+        HdfNumericDtype::F16 => {
+            let values: Vec<half::f16> = values_ds.read_1d()?.to_vec();
+            if values.len() != mask.len() {
+                return Err(ConvertError::Other(format!(
+                    "nullable-float '{name}': values len {} != mask len {}",
+                    values.len(),
+                    mask.len()
+                )));
+            }
+            let opt = values
+                .iter()
+                .zip(mask.iter())
+                .map(|(v, m)| if *m { None } else { Some(v.to_f32()) })
+                .collect::<Vec<Option<f32>>>();
+            (
+                Field::new(name, DataType::Float32, true),
+                Arc::new(Float32Array::from(opt)),
+            )
+        }
         other => {
             return Err(ConvertError::UnsupportedDtype(format!(
                 "nullable-float '{name}': values dtype is {}; expected float",
@@ -1427,13 +1482,19 @@ pub struct DenseMappingInfo {
     pub n_rows: usize,
 }
 
-/// Walk `<group_path>` in `file` and return each member's name + shape.
-/// Members that are not 2D datasets are skipped silently. Missing group →
-/// empty vec.
+/// Walk `<group_path>` in `file` and return the name and row count of every
+/// *readable* member. A member is readable only if it is a 2D dataset whose
+/// dtype the dense slab reader accepts (`DenseDtype::from_descriptor`, which
+/// now includes float16 widened to f32). Members that are not datasets
+/// (DataFrame / sparse-matrix subgroups), not 2D, or have an unreadable dtype
+/// are excluded here so [`write_dense_mapping_section`] can surface them as a
+/// `SkippedObsm` warning rather than silently dropping or aborting. A missing
+/// group yields an empty vec.
 pub fn list_dense_mapping_shapes(
     file: &hdf5::File,
     group_path: &str,
 ) -> Result<Vec<DenseMappingInfo>, ConvertError> {
+    use super::dense_stream::DenseDtype;
     let mut result = Vec::new();
     let group = match file.group(group_path) {
         Ok(g) => g,
@@ -1447,6 +1508,19 @@ pub fn list_dense_mapping_shapes(
         };
         let shape = ds.shape();
         if shape.len() != 2 {
+            continue;
+        }
+        // Exclude datasets whose dtype the slab reader can't widen to f32
+        // (bool / compound / string). Including them would make
+        // `read_dense_mapping_shard` error mid-stream and abort the whole
+        // conversion; instead they fall through to the warn-on-drop path.
+        let readable = ds
+            .dtype()
+            .and_then(|t| t.to_descriptor())
+            .ok()
+            .map(|desc| DenseDtype::from_descriptor(&desc).is_ok())
+            .unwrap_or(false);
+        if !readable {
             continue;
         }
         result.push(DenseMappingInfo {
@@ -1697,6 +1771,155 @@ fn compound_unsupported_msg(n_fields: usize) -> String {
     )
 }
 
+/// Sentinel key for the tagged `uns` envelope. Must match pyscx's
+/// `__scx_type__` envelope (`pyscx/src/convert/uns.rs`) so the existing
+/// `pyscx.to_anndata` decoder reconstructs the array. Shared with the
+/// scx → h5ad writer (`write.rs::try_write_uns_envelope`) so the read and
+/// write sides can't drift on the literal.
+pub(crate) const SCX_UNS_TYPE_KEY: &str = "__scx_type__";
+
+/// Build a tagged `ndarray` / `scalar` `uns` envelope for a numeric HDF5
+/// dataset, storing the raw little-endian bytes as base64. Used for `uns`
+/// values that plain JSON cannot represent: float scalars/arrays containing
+/// NaN/Inf (B6) and arrays of rank ≥ 3 (B7). The envelope is byte-identical
+/// to pyscx's `encode_ndarray_tagged` / `encode_np_scalar_tagged`, so the
+/// existing `pyscx.to_anndata` decoder reconstructs the numpy array and the
+/// scx → h5ad writer (`write_uns_value`) rebuilds the HDF5 dataset.
+fn uns_ndarray_envelope(
+    ds: &hdf5::Dataset,
+    desc: &TypeDescriptor,
+    shape: &[usize],
+) -> Result<serde_json::Value, ConvertError> {
+    use base64::Engine;
+    use hdf5::types::{FloatSize, IntSize};
+
+    // numpy `dtype.str` label + flattened little-endian raw bytes (C order).
+    // `to_le_bytes` makes the byte stream portable regardless of host order,
+    // matching the `<…` / `|…` byte-order prefix in the dtype label.
+    let (dtype_str, bytes): (&str, Vec<u8>) = match desc {
+        TypeDescriptor::Float(FloatSize::U8) => (
+            "<f8",
+            ds.read_raw::<f64>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Float(FloatSize::U4) => (
+            "<f4",
+            ds.read_raw::<f32>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Float(FloatSize::U2) => (
+            "<f2",
+            ds.read_raw::<half::f16>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Integer(IntSize::U1) => (
+            "|i1",
+            ds.read_raw::<i8>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Integer(IntSize::U2) => (
+            "<i2",
+            ds.read_raw::<i16>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Integer(IntSize::U4) => (
+            "<i4",
+            ds.read_raw::<i32>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Integer(IntSize::U8) => (
+            "<i8",
+            ds.read_raw::<i64>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        // `read_raw::<u8>()` already returns a `Vec<u8>` — no extra copy.
+        TypeDescriptor::Unsigned(IntSize::U1) => ("|u1", ds.read_raw::<u8>()?),
+        TypeDescriptor::Unsigned(IntSize::U2) => (
+            "<u2",
+            ds.read_raw::<u16>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Unsigned(IntSize::U4) => (
+            "<u4",
+            ds.read_raw::<u32>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        TypeDescriptor::Unsigned(IntSize::U8) => (
+            "<u8",
+            ds.read_raw::<u64>()?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        // numpy stores bool as 1 byte (`|b1`); HDF5 hands us `bool`.
+        TypeDescriptor::Boolean => (
+            "|b1",
+            ds.read_raw::<bool>()?
+                .iter()
+                .map(|&b| u8::from(b))
+                .collect(),
+        ),
+        _ => {
+            return Err(ConvertError::Other(format!(
+                "uns: cannot encode dtype {desc:?} as a tagged ndarray envelope"
+            )));
+        }
+    };
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mut env = serde_json::Map::new();
+    if shape.is_empty() {
+        // 0-d scalar envelope (matches `encode_np_scalar_tagged`).
+        env.insert(
+            SCX_UNS_TYPE_KEY.to_string(),
+            serde_json::Value::String("scalar".to_string()),
+        );
+        env.insert(
+            "dtype".to_string(),
+            serde_json::Value::String(dtype_str.to_string()),
+        );
+        env.insert("data".to_string(), serde_json::Value::String(b64));
+    } else {
+        let shape_json: Vec<serde_json::Value> = shape
+            .iter()
+            .map(|s| serde_json::Value::Number((*s as u64).into()))
+            .collect();
+        env.insert(
+            SCX_UNS_TYPE_KEY.to_string(),
+            serde_json::Value::String("ndarray".to_string()),
+        );
+        env.insert(
+            "dtype".to_string(),
+            serde_json::Value::String(dtype_str.to_string()),
+        );
+        env.insert("shape".to_string(), serde_json::Value::Array(shape_json));
+        env.insert(
+            "encoding".to_string(),
+            serde_json::Value::String("base64le".to_string()),
+        );
+        env.insert("data".to_string(), serde_json::Value::String(b64));
+    }
+    Ok(serde_json::Value::Object(env))
+}
+
 fn read_uns_entry(
     group: &hdf5::Group,
     name: &str,
@@ -1740,9 +1963,21 @@ fn read_uns_entry(
                     let v: u64 = ds.read_scalar()?;
                     Ok(serde_json::Value::Number(v.into()))
                 }
+                // f16 routes straight to the `half`-based envelope: the
+                // implicit f16→f64 HDF5 read is build-dependent (the original
+                // B5 failure mode), and the envelope preserves the f16 dtype.
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
+                }
                 TypeDescriptor::Float(_) => {
                     let v: f64 = ds.read_scalar()?;
-                    Ok(serde_json::json!(v))
+                    if v.is_finite() {
+                        Ok(serde_json::json!(v))
+                    } else {
+                        // B6: NaN/Inf can't be a JSON number — preserve via a
+                        // tagged base64 envelope instead of silently → null.
+                        uns_ndarray_envelope(&ds, &desc, &shape)
+                    }
                 }
                 TypeDescriptor::Boolean => {
                     let v: bool = ds.read_scalar()?;
@@ -1776,9 +2011,20 @@ fn read_uns_entry(
                     let data: Vec<u64> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
                 }
+                // f16 → envelope (build-dependent implicit f16→f64 read; the
+                // envelope also preserves the f16 dtype).
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
+                }
                 TypeDescriptor::Float(_) => {
                     let data: Vec<f64> = ds.read_1d()?.to_vec();
-                    Ok(serde_json::json!(data))
+                    if data.iter().all(|v| v.is_finite()) {
+                        Ok(serde_json::json!(data))
+                    } else {
+                        // B6: a 1-D float array carrying NaN/Inf round-trips
+                        // via the tagged envelope (preserving exact dtype too).
+                        uns_ndarray_envelope(&ds, &desc, &shape)
+                    }
                 }
                 TypeDescriptor::Boolean => {
                     let data: Vec<bool> = ds.read_1d()?.to_vec();
@@ -1819,13 +2065,20 @@ fn read_uns_entry(
                         .collect();
                     Ok(serde_json::json!(rows))
                 }
+                // f16 → envelope (build-dependent implicit f16→f64 read; the
+                // envelope also preserves the f16 dtype).
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
+                }
                 TypeDescriptor::Float(_) => {
-                    let rows: Vec<Vec<f64>> = ds
-                        .read_2d::<f64>()?
-                        .outer_iter()
-                        .map(|r| r.to_vec())
-                        .collect();
-                    Ok(serde_json::json!(rows))
+                    let arr = ds.read_2d::<f64>()?;
+                    if arr.iter().all(|v| v.is_finite()) {
+                        let rows: Vec<Vec<f64>> = arr.outer_iter().map(|r| r.to_vec()).collect();
+                        Ok(serde_json::json!(rows))
+                    } else {
+                        // B6: a 2-D float array carrying NaN/Inf → tagged envelope.
+                        uns_ndarray_envelope(&ds, &desc, &shape)
+                    }
                 }
                 TypeDescriptor::Boolean => {
                     let rows: Vec<Vec<bool>> = ds
@@ -1841,9 +2094,19 @@ fn read_uns_entry(
             };
         }
 
-        return Err(ConvertError::Other(format!(
-            "unsupported uns dataset shape: {shape:?}"
-        )));
+        // B7: arrays of rank ≥ 3 have no 1-D/2-D JSON form above. Numeric ones
+        // round-trip via the tagged base64 envelope (which also carries the
+        // exact dtype + shape and preserves NaN/Inf); genuinely unrepresentable
+        // dtypes (compound / string N-D) still warn-and-skip.
+        return match &desc {
+            TypeDescriptor::Integer(_)
+            | TypeDescriptor::Unsigned(_)
+            | TypeDescriptor::Float(_)
+            | TypeDescriptor::Boolean => uns_ndarray_envelope(&ds, &desc, &shape),
+            _ => Err(ConvertError::Other(format!(
+                "unsupported uns dataset shape: {shape:?}"
+            ))),
+        };
     }
 
     // Try reading as subgroup → recurse
@@ -1863,6 +2126,14 @@ fn read_uns_entry(
         if enc == "dataframe" {
             sink.emit(ConvertWarning::FlattenedUnsDataframe {
                 key: name.to_string(),
+            });
+        } else if matches!(enc.as_str(), "csr_matrix" | "csc_matrix" | "coo_matrix") {
+            // B8: a scipy-sparse matrix in uns. The generic recurse below
+            // preserves its data/indices/indptr arrays as a nested dict, but
+            // the sparse type tag is lost — surface that so it is never silent.
+            sink.emit(ConvertWarning::FlattenedUnsSparse {
+                key: name.to_string(),
+                format: enc.clone(),
             });
         }
 

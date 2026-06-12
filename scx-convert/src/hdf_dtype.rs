@@ -13,6 +13,7 @@ use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HdfNumericDtype {
+    F16,
     F32,
     F64,
     I8,
@@ -32,6 +33,7 @@ impl HdfNumericDtype {
     /// attach dataset context.
     pub(crate) fn from_descriptor(desc: &TypeDescriptor) -> Result<Self, ConvertError> {
         Ok(match desc {
+            TypeDescriptor::Float(FloatSize::U2) => Self::F16,
             TypeDescriptor::Float(FloatSize::U4) => Self::F32,
             TypeDescriptor::Float(FloatSize::U8) => Self::F64,
             TypeDescriptor::Integer(IntSize::U1) => Self::I8,
@@ -50,7 +52,7 @@ impl HdfNumericDtype {
         match self {
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F64 | Self::I64 | Self::U64 => 8,
-            Self::I16 | Self::U16 => 2,
+            Self::F16 | Self::I16 | Self::U16 => 2,
             Self::I8 | Self::U8 => 1,
         }
     }
@@ -59,6 +61,7 @@ impl HdfNumericDtype {
     // attach a source-dtype tag to `ConvertError::IndexOverflow`.
     pub(crate) fn name(&self) -> &'static str {
         match self {
+            Self::F16 => "f16",
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::I8 => "i8",
@@ -81,6 +84,12 @@ mod tests {
     #[test]
     fn from_descriptor_round_trips_every_supported_width() {
         let cases = [
+            (
+                TypeDescriptor::Float(FloatSize::U2),
+                HdfNumericDtype::F16,
+                "f16",
+                2,
+            ),
             (
                 TypeDescriptor::Float(FloatSize::U4),
                 HdfNumericDtype::F32,

@@ -933,18 +933,20 @@ fn phase1_streaming_inferred_encoding_emits_warning() {
 
 #[test]
 fn phase1_streaming_strict_uns_errors_on_unsupported_key() {
-    // Build an h5ad with an unsupported `uns/bad3d` entry (3D
-    // dataset). Lenient: convert succeeds + SkippedUnsKey warning.
-    // Strict: convert returns ConvertError.
+    // Build an h5ad with an unsupported `uns/bad3d` entry. Numeric N-D
+    // arrays now round-trip via the tagged envelope (B7), so the fixture is
+    // a non-numeric (string) 3-D array, which is still unrepresentable.
+    // Lenient: convert succeeds + SkippedUnsKey warning. Strict: ConvertError.
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("bad_uns.h5ad");
     create_test_h5ad(&h5ad, 4, 3, "csr", false);
     {
         let file = hdf5::File::open_rw(&h5ad).unwrap();
         let uns = file.create_group("uns").unwrap();
-        // 3D dataset → read_uns_entry rejects shape.len() == 3.
-        let nd = ndarray::Array3::<f32>::zeros((2, 2, 2));
-        uns.new_dataset::<f32>()
+        // 3-D *string* dataset → read_uns_entry's N-D arm rejects non-numeric
+        // dtypes (numeric N-D is now preserved via the envelope).
+        let nd = ndarray::Array3::<VarLenUnicode>::from_elem((2, 2, 2), vlu("x"));
+        uns.new_dataset::<VarLenUnicode>()
             .shape([2, 2, 2])
             .create("bad3d")
             .unwrap()
