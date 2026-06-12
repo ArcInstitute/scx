@@ -300,6 +300,26 @@ pub fn harmony_integrate(
 
     uns.set_item("harmony", info)?;
 
+    // Stamp the canonical route envelope on adata.uns["scx_accel"]["harmony_integrate"]
+    // so users can prove GPU-vs-CPU dispatch the same way PCA / kNN / UMAP do.
+    // Harmony's GPU path is native (cuBLAS + custom kernels, no rapids dependency)
+    // and operates on a dense embedding, so the route pair is GpuDense / CpuDense.
+    // `gpu_eligible = true` because there is no input-layout restriction; the
+    // planner resolves the actual route from the device intent + GPU availability,
+    // matching the dispatch branch above (GPU branch runs iff resolve_device
+    // returned a CUDA id, i.e. device="gpu"/"gpu:N" or "auto" with a GPU present).
+    super::route::write_accel_route(
+        py,
+        adata,
+        "harmony_integrate",
+        &super::route::simple_exec_info(
+            device,
+            true,
+            scx_accel::AccelRoute::GpuDense,
+            scx_accel::AccelRoute::CpuDense,
+        ),
+    )?;
+
     Ok(())
 }
 

@@ -1745,6 +1745,10 @@ Results:
 - `adata.uns["harmony"]` — dict with `params`, `converged`, `n_iterations`,
   `objective_harmony` (per-iteration objective curve), and `backend`
   (`"scx-accel-cpu"` or `"scx-gpu"`).
+- `adata.uns["scx_accel"]["harmony_integrate"]` — the canonical route envelope
+  shared with PCA / kNN / UMAP (`route` ∈ `gpu_dense` / `cpu_dense`,
+  `fallback_reason`), so you can prove GPU-vs-CPU dispatch the same way as the
+  other accelerator ops. See [docs/api.md § Accelerator route metadata](../docs/api.md#accelerator-route-metadata).
 
 **Numerical parity** against R `harmony` v2.x on the validation fixtures
 in `benchmarks/results/harmony/reference/`: mean per-PC Pearson r is
