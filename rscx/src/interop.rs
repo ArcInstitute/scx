@@ -1456,20 +1456,7 @@ fn from_seurat_multi_assay(
 /// so multimodal SCX files written from Seurat / MAE / MuData carry
 /// consistent `ModalityType` tags.
 fn infer_modality_type_from_name(name: &str) -> scx_format_io::ModalityType {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("atac") || lower.contains("peak") {
-        scx_format_io::ModalityType::Atac
-    } else if lower.contains("adt") || lower.contains("protein") || lower.contains("antibody") {
-        scx_format_io::ModalityType::Protein
-    } else if lower.contains("spatial") {
-        scx_format_io::ModalityType::Spatial
-    } else if lower.contains("methyl") {
-        scx_format_io::ModalityType::Methylation
-    } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
-        scx_format_io::ModalityType::Rna
-    } else {
-        scx_format_io::ModalityType::Custom
-    }
+    scx_format_io::ModalityType::infer_from_name(name)
 }
 
 // ─── Phase I.1: multimodal to_seurat / Phase I.2: MAE bindings ──────────────

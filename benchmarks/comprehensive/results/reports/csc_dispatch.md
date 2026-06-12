@@ -57,7 +57,7 @@ already confirms the CSC path is reachable on a small fixture.
 
 ## Implementation issue uncovered during the run
 
-- **u16 → u32 sizing fix** (`pyscx/src/anndata.rs::from_anndata_impl`).
+- **u16 → u32 sizing fix** (`pyscx/src/convert/::from_anndata_impl`).
   The file header's `index_dtype` byte was set from `n_vars` only.
   CSC shards encode global *row* indices, so when `n_obs > 65 535`
   and CSC is requested the writer hit

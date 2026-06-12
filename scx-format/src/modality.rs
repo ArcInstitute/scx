@@ -68,6 +68,34 @@ impl ModalityType {
             _ => None,
         }
     }
+
+    /// Heuristically map a modality name to a `ModalityType`. Used when the
+    /// caller has not supplied an explicit override; the recognised tokens
+    /// follow the conventions adopted by scverse / 10x for CITE-seq and
+    /// multiome files. This is the single source of truth shared by the
+    /// h5mu conversion pipeline and the `pyscx` / `rscx` bindings — callers
+    /// that fall through to it should record the inference (e.g.
+    /// `ConvertWarning::ModalityTypeInferred`) so it is visible in provenance.
+    pub fn infer_from_name(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("atac") || lower.contains("peak") || lower.contains("accessibility") {
+            Self::Atac
+        } else if lower.contains("adt")
+            || lower.contains("protein")
+            || lower.contains("antibody")
+            || lower.contains("prot")
+        {
+            Self::Protein
+        } else if lower.contains("spatial") {
+            Self::Spatial
+        } else if lower.contains("methyl") {
+            Self::Methylation
+        } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
+            Self::Rna
+        } else {
+            Self::Custom
+        }
+    }
 }
 
 /// Per-modality flag bits stored in `ModalityInfo.flags`. Provides
@@ -435,6 +463,31 @@ mod tests {
             Err(ScxError::UnsupportedSectionVersion { .. })
         ));
         assert!(ModalityTable::check_version(MODALITY_TABLE_VERSION).is_ok());
+    }
+
+    #[test]
+    fn infer_from_name_maps_known_tokens() {
+        use ModalityType::*;
+        // ATAC (incl. the `accessibility` token the old pyscx/rscx copies lacked)
+        assert_eq!(ModalityType::infer_from_name("atac"), Atac);
+        assert_eq!(ModalityType::infer_from_name("ATAC"), Atac);
+        assert_eq!(ModalityType::infer_from_name("peaks"), Atac);
+        assert_eq!(ModalityType::infer_from_name("accessibility"), Atac);
+        // Protein (incl. the `prot` token the old copies lacked)
+        assert_eq!(ModalityType::infer_from_name("adt"), Protein);
+        assert_eq!(ModalityType::infer_from_name("protein"), Protein);
+        assert_eq!(ModalityType::infer_from_name("antibody_capture"), Protein);
+        assert_eq!(ModalityType::infer_from_name("prot"), Protein);
+        // Spatial / Methylation
+        assert_eq!(ModalityType::infer_from_name("spatial"), Spatial);
+        assert_eq!(ModalityType::infer_from_name("methylation"), Methylation);
+        // RNA
+        assert_eq!(ModalityType::infer_from_name("rna"), Rna);
+        assert_eq!(ModalityType::infer_from_name("gex"), Rna);
+        assert_eq!(ModalityType::infer_from_name("gene_expression"), Rna);
+        // Unrecognised → Custom
+        assert_eq!(ModalityType::infer_from_name("mystery_assay"), Custom);
+        assert_eq!(ModalityType::infer_from_name(""), Custom);
     }
 
     fn sample_info(name: &str, mtype: ModalityType, n_vars: u64) -> ModalityInfo {

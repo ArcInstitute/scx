@@ -485,7 +485,7 @@ The returned `anndata.AnnData` is fully populated:
 > the materialised value. Lookups via `__contains__` and key iteration
 > stay catalog-only (no I/O). Mutations are in-memory and never write
 > back to disk. The bridges keep a sibling `Arc<ScxReader>` alive so
-> the returned AnnData stays usable after the source `PyExperiment`
+> the returned AnnData stays usable after the source `Experiment`
 > drops. Pass `eager=True` to substitute a plain `dict` and fully
 > detach the AnnData from the SCX file handle — required when you
 > intend to close the experiment, hand the AnnData to a subprocess,

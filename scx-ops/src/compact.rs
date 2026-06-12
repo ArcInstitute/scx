@@ -1323,28 +1323,9 @@ fn build_keep_mask(
     if dv.total_deleted() == 0 {
         return None;
     }
-
-    let mut mask = vec![true; n_obs];
-
-    // Map shard_id (sort-order index from shards_sorted()) to deletion bitmaps.
-    // This is consistent with delete.rs which uses the same sort-order index.
-    let shards = catalog.shards_sorted();
-    for (shard_idx, shard_entry) in shards.iter().enumerate() {
-        if let Some(ref stats) = shard_entry.stats {
-            let shard_idx = shard_idx as u32;
-
-            if let Some(bitmap) = dv.shards.get(&shard_idx) {
-                for local_row in bitmap.iter() {
-                    let global_row = stats.row_start + local_row as u64;
-                    if (global_row as usize) < n_obs {
-                        mask[global_row as usize] = false;
-                    }
-                }
-            }
-        }
-    }
-
-    Some(mask)
+    // Shared mask construction (sort-order shard index → global rows via
+    // `stats.row_start`); see `DeletionVectors::build_keep_mask`.
+    Some(dv.build_keep_mask(n_obs, catalog))
 }
 
 #[cfg(test)]

@@ -1043,33 +1043,16 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
 /// where `kept_to_global[i]` is the global (file-level) row index for
 /// user-visible row `i`.
 pub(crate) fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<u64>>> {
-    let dv_opt = reader.read_deletion_vectors().map_err(to_pyerr)?;
-    let dv = match dv_opt {
-        Some(dv) if dv.total_deleted() > 0 => dv,
-        _ => return Ok(None),
+    // Reuse the shared obs-indexed keep mask, then compress to the global row
+    // indices of the surviving rows (same source of truth as the reader CSR
+    // filter, `scx compact`, and the streaming export).
+    let keep = match reader.deletion_keep_mask().map_err(to_pyerr)? {
+        Some(keep) => keep,
+        None => return Ok(None),
     };
 
-    let n_obs = reader.n_obs() as usize;
-    let shards = reader.catalog().shards_sorted();
-
-    // Build a deleted-rows set
-    let mut deleted = vec![false; n_obs];
-    for (shard_idx, shard_entry) in shards.iter().enumerate() {
-        if let Some(ref stats) = shard_entry.stats {
-            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                for local_row in bitmap.iter() {
-                    let global_row = stats.row_start + local_row as u64;
-                    if (global_row as usize) < n_obs {
-                        deleted[global_row as usize] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Build mapping: user-visible row i → global row
-    let kept: Vec<u64> = (0..n_obs)
-        .filter(|&i| !deleted[i])
+    let kept: Vec<u64> = (0..keep.len())
+        .filter(|&i| keep[i])
         .map(|i| i as u64)
         .collect();
 
@@ -1085,29 +1068,13 @@ pub(crate) fn filter_obs_by_deletion_vectors(
     reader: &ScxReader,
     obs: arrow::array::RecordBatch,
 ) -> PyResult<arrow::array::RecordBatch> {
-    let dv_opt = reader.read_deletion_vectors().map_err(to_pyerr)?;
-    let dv = match dv_opt {
-        Some(dv) if dv.total_deleted() > 0 => dv,
-        _ => return Ok(obs), // No deletions — return as-is
+    // Shared obs-indexed keep mask (same logic as the reader CSR filter,
+    // `scx compact`, and the streaming export); see
+    // `ScxReader::deletion_keep_mask`.
+    let keep = match reader.deletion_keep_mask().map_err(to_pyerr)? {
+        Some(keep) => keep,
+        None => return Ok(obs), // No deletions — return as-is
     };
-
-    let n_obs = obs.num_rows();
-    let shards = reader.catalog().shards_sorted();
-
-    // Build keep mask (same logic as reader.read_all_csr_shards_filtered)
-    let mut keep = vec![true; n_obs];
-    for (shard_idx, shard_entry) in shards.iter().enumerate() {
-        if let Some(ref stats) = shard_entry.stats {
-            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                for local_row in bitmap.iter() {
-                    let global_row = stats.row_start + local_row as u64;
-                    if (global_row as usize) < n_obs {
-                        keep[global_row as usize] = false;
-                    }
-                }
-            }
-        }
-    }
 
     let bool_array = arrow::array::BooleanArray::from(keep);
     arrow::compute::filter_record_batch(&obs, &bool_array)

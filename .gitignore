@@ -1,5 +1,6 @@
 # Environment
 .env
+.claude/plans/
 
 # Docs build artifacts
 docs/_build/

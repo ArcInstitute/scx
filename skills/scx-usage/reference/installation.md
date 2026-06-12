@@ -30,7 +30,7 @@ python -m venv .venv
 source .venv/bin/activate   # or: . .venv/bin/activate
 # Download the wheel for your Python version + architecture from GitHub Releases:
 # https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags).
-# Replace <version> with the release you downloaded (e.g. 0.7.0).
+# Replace <version> with the release you downloaded (e.g. 0.7.1).
 pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
@@ -272,7 +272,7 @@ x86_64 and arm64, glibc ≥ 2.35. Bundles hdf5 + cloud; libhdf5 statically linke
 
 ```bash
 # Set VERSION to the latest release — see the Releases page above.
-VERSION=0.7.0
+VERSION=0.7.1
 TARGET=x86_64-unknown-linux-gnu   # or: aarch64-unknown-linux-gnu
 gh release download "scx-cli-v${VERSION}" -R ArcInstitute/scx \
   -p "scx-cli-${VERSION}-${TARGET}.tar.gz"

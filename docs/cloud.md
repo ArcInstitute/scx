@@ -364,13 +364,13 @@ exp.shard_count    # 120
 ```
 
 `open_cloud` auto-detects the layout (exploded / cloud-ready packed / plain
-packed) and returns a `PyCloudExperiment` whose metadata accessors require only
+packed) and returns a `CloudExperiment` whose metadata accessors require only
 the header + catalog. Use this to decide what to pull before paying for the
 bytes.
 
 ### Cloud-native query
 
-`PyCloudExperiment.query()` now returns a `PyQueryPipeline` wired
+`CloudExperiment.query()` now returns a `PyQueryPipeline` wired
 over the cloud `SectionReader`, so a selective read can resolve
 without `scx pull`-ing the whole file first:
 
@@ -591,7 +591,7 @@ underlying tokio runtime fans out `parallelism` async tasks; see
 | S3 403 with valid keys | Region mismatch | Set `AWS_REGION` to the bucket's region |
 | `pull` slow, CPU idle | Few shards, low `parallelism` | Raise `parallelism`, or re-shard the source (smaller shards at write time) |
 | `pull` slow, CPU at 100% | Decompression-bound, not I/O-bound | Already saturating — use a larger instance or a different codec (Zstd is slower than Scx1) |
-| High request bill | Too many tiny shards, many exploratory `open_cloud` calls | Increase shard size on write; cache `PyCloudExperiment` handles |
+| High request bill | Too many tiny shards, many exploratory `open_cloud` calls | Increase shard size on write; cache `CloudExperiment` handles |
 | Credentials picked up from wrong source | Shell has stale env vars + instance profile | Unset `AWS_*` / `GOOGLE_APPLICATION_CREDENTIALS` to force the instance credential path |
 
 ## End-to-end example

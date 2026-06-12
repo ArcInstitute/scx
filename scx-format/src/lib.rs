@@ -41,7 +41,7 @@ pub use csc_policy::{
     auto_obs_threshold, auto_vars_threshold, CscPolicy, AUTO_CSC_OBS_THRESHOLD,
     AUTO_CSC_VARS_THRESHOLD,
 };
-pub use error::{validate_allocation, Result, ScxError};
+pub use error::{validate_allocation, Result, ScxError, ScxErrorClass};
 pub use header::{
     rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
 };

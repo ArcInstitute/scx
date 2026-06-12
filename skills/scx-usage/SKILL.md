@@ -32,7 +32,7 @@ directory):
 ```bash
 # Download the wheel for your Python version + arch (x86_64 / aarch64) from
 # GitHub Releases: https://github.com/ArcInstitute/scx/releases (pyscx-v* tags).
-# Replace <version> with the release you downloaded (e.g. 0.7.0).
+# Replace <version> with the release you downloaded (e.g. 0.7.1).
 pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
@@ -207,7 +207,7 @@ downstream scanpy is unchanged.
 Native GPU paths survive for streaming/randomized PCA (>VRAM), HVG
 `seurat_v3`, Leiden, DE, and Harmony. If rapids is absent, GPU ops fall
 back to CPU with `FallbackReason::NoRapids`. `to_gpu_anndata()` on a
-`PyExperiment` provides a minimal-copy on-device handoff (shard decode →
+`Experiment` provides a minimal-copy on-device handoff (shard decode →
 GPU → `cupyx.sparse.csr_matrix`). Env vars: `SCX_FORCE_NATIVE_GPU=1`
 pins surviving native GPU paths; `SCX_DISABLE_RAPIDS=1` forces the
 no-rapids CPU fallback for testing.

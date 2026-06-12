@@ -2721,6 +2721,29 @@ impl ScxReader {
         Ok(Some(dv))
     }
 
+    /// Build the obs-indexed keep mask (`true` = retained) implied by this
+    /// file's deletion vectors, or `None` when the file has no deletion
+    /// vectors or nothing is deleted.
+    ///
+    /// This is the single entry point that the reader's CSR filter, the
+    /// h5ad/h5mu streaming export, `scx compact`, and the `pyscx` obs filter
+    /// all share, so the row-keep semantics stay identical everywhere. The
+    /// mask construction itself lives in
+    /// [`crate::DeletionVectors::build_keep_mask`].
+    pub fn deletion_keep_mask(&self) -> Result<Option<Vec<bool>>> {
+        if !self.header.has_deletion_vectors() {
+            return Ok(None);
+        }
+        let dv = match self.read_deletion_vectors()? {
+            Some(dv) if dv.total_deleted() > 0 => dv,
+            _ => return Ok(None),
+        };
+        Ok(Some(dv.build_keep_mask(
+            self.n_obs() as usize,
+            &self.full_catalog,
+        )))
+    }
+
     /// Read all CSR shards with deletion vectors applied.
     /// Deleted rows are excluded from the returned ScxCsr.
     /// If no deletion vectors are present, returns the same result as `read_all_csr_shards()`.
@@ -2758,30 +2781,12 @@ impl ScxReader {
     /// so the input CSR must share X's row count.
     #[cfg(feature = "deletion-vectors")]
     fn filter_csr_rows_by_deletion_vectors(&self, csr: ScxCsr) -> Result<ScxCsr> {
-        let dv_opt = self.read_deletion_vectors()?;
-
-        let dv = match dv_opt {
-            Some(dv) if dv.total_deleted() > 0 => dv,
-            _ => return Ok(csr),
+        // The keep mask is obs-indexed; the input CSR (X or a layer) shares
+        // X's row count, so the mask aligns with its rows.
+        let keep = match self.deletion_keep_mask()? {
+            Some(keep) => keep,
+            None => return Ok(csr),
         };
-
-        // Build a keep mask from deletion vectors
-        let n_obs = csr.shape.0;
-        let shards = self.full_catalog.shards_sorted();
-
-        let mut keep = vec![true; n_obs];
-        for (shard_idx, shard_entry) in shards.iter().enumerate() {
-            if let Some(ref stats) = shard_entry.stats {
-                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                    for local_row in bitmap.iter() {
-                        let global_row = stats.row_start + local_row as u64;
-                        if (global_row as usize) < n_obs {
-                            keep[global_row as usize] = false;
-                        }
-                    }
-                }
-            }
-        }
 
         // Filter CSR rows
         let mut new_indptr = vec![0i64];

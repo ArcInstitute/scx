@@ -99,7 +99,7 @@ adt = mu.mod["adt"]
 rna_only = reader.to_anndata()      # raises on multimodal — use to_mudata
 ```
 
-`PyExperiment.modality_info(modality_id)` returns the per-modality
+`Experiment.modality_info(modality_id)` returns the per-modality
 record (`{name, modality_type, default_codec_id, n_vars, nnz, …}`)
 useful for introspection and writer-symmetry checks.
 
@@ -283,7 +283,7 @@ are resolved.
 
 | Operation | Status | Notes |
 |---|---|---|
-| `pyscx.from_mudata` / `PyExperiment.to_mudata` | Supported | — |
+| `pyscx.from_mudata` / `Experiment.to_mudata` | Supported | — |
 | `pyscx.from_h5mu(path, out, ...)` (path-based, streaming) | Supported | `modalities=` / `modality_types=` kwargs |
 | `to_mudata(backed=True)` | Supported | Local files only; cloud variant pending |
 | `to_anndata(modality=…, backed=True)` | Supported | — |

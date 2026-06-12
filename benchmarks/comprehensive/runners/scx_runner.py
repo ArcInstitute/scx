@@ -723,7 +723,7 @@ class ScxRunner(FormatRunner):
     def cloud_obs_columns(self, cloud_url: str) -> set[str]:
         """Return the obs column set on a cloud-staged ``.scxd`` fixture.
 
-        ``PyCloudExperiment`` (the result of ``pyscx.open_cloud``) does not
+        ``CloudExperiment`` (the result of ``pyscx.open_cloud``) does not
         expose obs schema introspection — only metadata counters
         (n_obs, n_vars, nnz, shard_count). Fully reading obs would require
         a full ``pyscx.pull``, which defeats the purpose of a cheap schema

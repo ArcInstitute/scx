@@ -50,20 +50,7 @@ fn import_mudata(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
 /// invoked from Python. Maps a modality name to a `ModalityType`
 /// based on common naming conventions for CITE-seq / multiome.
 fn infer_modality_type(name: &str) -> ModalityType {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("atac") || lower.contains("peak") {
-        ModalityType::Atac
-    } else if lower.contains("adt") || lower.contains("protein") || lower.contains("antibody") {
-        ModalityType::Protein
-    } else if lower.contains("spatial") {
-        ModalityType::Spatial
-    } else if lower.contains("methyl") {
-        ModalityType::Methylation
-    } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
-        ModalityType::Rna
-    } else {
-        ModalityType::Custom
-    }
+    ModalityType::infer_from_name(name)
 }
 
 /// Materialise an SCX file as a `mudata.MuData` whose

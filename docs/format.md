@@ -983,7 +983,7 @@ including graceful `flock()` fallback on NFS/Lustre/GPFS.
 Per-shard gene-detection sidecars stored as Roaring Bitmap sections
 (`bitmap_shard`, type 6). Written by `scx convert --bitmap auto|always`
 (and the pyscx `bitmap="..."` kwarg) and consumed by
-`PyExperiment.detection_counts` / `cells_expressing`. The file header
+`Experiment.detection_counts` / `cells_expressing`. The file header
 flag bit 1 `has_bitmap` is flipped on `ScxWriter::finish()` whenever any
 `bitmap_shard` was emitted; per-modality `ModalityFlags::HAS_BITMAP`
 mirrors it for v2 files.
