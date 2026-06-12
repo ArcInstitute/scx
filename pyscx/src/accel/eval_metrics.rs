@@ -1713,16 +1713,23 @@ pub fn normalized_mutual_info(
     Ok(py.detach(|| scx_accel::normalized_mutual_info(&a, &b)))
 }
 
-/// Adjusted Rand Index, rescaled to [0, 1] via `(ARI + 1) / 2`.
+/// Adjusted Rand Index.
 ///
-/// This matches cell-eval's convention for the ARI clustering agreement
-/// metric. For the raw sklearn ARI (in [-0.5, 1]), use
-/// `(2 * adjusted_rand_index(a, b)) - 1`.
+/// By default (`rescaled=False`) this matches
+/// `sklearn.metrics.adjusted_rand_score(labels_a, labels_b)` exactly — range
+/// `[-0.5, 1]`, consistent with `normalized_mutual_info` / `adjusted_mutual_info`
+/// in this module. Pass `rescaled=True` for cell-eval's clustering-agreement
+/// convention `(ARI + 1) / 2` in `[0, 1]`.
+///
+/// Labels may be integer codes, strings, or pandas categoricals (factorized
+/// internally; see `normalized_mutual_info`).
 #[pyfunction]
+#[pyo3(signature = (labels_a, labels_b, rescaled=false))]
 pub fn adjusted_rand_index(
     py: Python<'_>,
     labels_a: &Bound<'_, PyAny>,
     labels_b: &Bound<'_, PyAny>,
+    rescaled: bool,
 ) -> PyResult<f64> {
     let a = extract_u32_labels(py, labels_a)?;
     let b = extract_u32_labels(py, labels_b)?;
@@ -1733,5 +1740,11 @@ pub fn adjusted_rand_index(
             b.len()
         )));
     }
-    Ok(py.detach(|| scx_accel::adjusted_rand_index_rescaled(&a, &b)))
+    Ok(py.detach(|| {
+        if rescaled {
+            scx_accel::adjusted_rand_index_rescaled(&a, &b)
+        } else {
+            scx_accel::adjusted_rand_index(&a, &b)
+        }
+    }))
 }

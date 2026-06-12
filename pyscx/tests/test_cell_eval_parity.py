@@ -798,14 +798,16 @@ class TestClusteringAgreementParity:
         sk_nmi = normalized_mutual_info_score(labels_a, labels_b)
         np.testing.assert_allclose(scx_nmi, sk_nmi, atol=1e-10, err_msg="NMI mismatch")
 
-        # ARI — cell-eval uses (ARI + 1) / 2 rescaling
+        # ARI — default matches sklearn exactly (like NMI/AMI above).
         scx_ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)
         sk_ari = adjusted_rand_score(labels_a, labels_b)
-        ce_ari_rescaled = (sk_ari + 1) / 2
         np.testing.assert_allclose(
-            scx_ari, ce_ari_rescaled, atol=1e-10,
-            err_msg=f"ARI mismatch (with cell-eval rescaling): SCX={scx_ari} vs (sklearn+1)/2={ce_ari_rescaled}",
+            scx_ari, sk_ari, atol=1e-10,
+            err_msg=f"ARI mismatch vs sklearn: SCX={scx_ari} vs sklearn={sk_ari}",
         )
+        # rescaled=True gives cell-eval's (ARI + 1) / 2.
+        scx_ari_rescaled = pyscx.accel.adjusted_rand_index(labels_a, labels_b, rescaled=True)
+        np.testing.assert_allclose(scx_ari_rescaled, (sk_ari + 1) / 2, atol=1e-10)
 
     def test_clustering_scoring_string_categorical_labels(self):
         """F5: AMI/NMI/ARI accept string / categorical labels (factorized
@@ -831,7 +833,7 @@ class TestClusteringAgreementParity:
             scx_nmi, normalized_mutual_info_score(labels_a, labels_b), atol=1e-10
         )
         np.testing.assert_allclose(
-            scx_ari, (adjusted_rand_score(labels_a, labels_b) + 1) / 2, atol=1e-10
+            scx_ari, adjusted_rand_score(labels_a, labels_b), atol=1e-10
         )
 
         # Identical string labels → perfect agreement.
