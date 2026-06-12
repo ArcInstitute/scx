@@ -807,6 +807,49 @@ class TestClusteringAgreementParity:
             err_msg=f"ARI mismatch (with cell-eval rescaling): SCX={scx_ari} vs (sklearn+1)/2={ce_ari_rescaled}",
         )
 
+    def test_clustering_scoring_string_categorical_labels(self):
+        """F5: AMI/NMI/ARI accept string / categorical labels (factorized
+        internally like sklearn), not just integer codes."""
+        import pandas as pd
+
+        rng = np.random.default_rng(7)
+        cell_types = np.array(["T cell", "B cell", "NK cell", "Mono"])
+        clusters = np.array(["c0", "c1", "c2", "c3", "c4"])
+        labels_a = cell_types[rng.integers(0, len(cell_types), size=200)].tolist()
+        labels_b = clusters[rng.integers(0, len(clusters), size=200)].tolist()
+
+        # String labels must no longer raise (was: invalid literal for int()).
+        scx_ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
+        scx_nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
+        scx_ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)
+
+        # Match sklearn on the same raw string labels.
+        np.testing.assert_allclose(
+            scx_ami, adjusted_mutual_info_score(labels_a, labels_b), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            scx_nmi, normalized_mutual_info_score(labels_a, labels_b), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            scx_ari, (adjusted_rand_score(labels_a, labels_b) + 1) / 2, atol=1e-10
+        )
+
+        # Identical string labels → perfect agreement.
+        np.testing.assert_allclose(
+            pyscx.accel.adjusted_rand_index(labels_a, labels_a), 1.0, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            pyscx.accel.normalized_mutual_info(labels_a, labels_a), 1.0, atol=1e-10
+        )
+
+        # A pandas Categorical gives the same result as its string form.
+        cat_a = pd.Categorical(labels_a)
+        np.testing.assert_allclose(
+            pyscx.accel.adjusted_rand_index(cat_a, labels_b),
+            scx_ari,
+            atol=1e-10,
+        )
+
 
 # =============================================================================
 # DE result format bridge parity
