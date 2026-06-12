@@ -661,7 +661,27 @@ enum Commands {
     },
 }
 
+/// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` at startup, so writing to a
+/// closed pipe (`scx info file.scx | head`, `| less` then `q`) returns `EPIPE`,
+/// which the `println!`/`print!` machinery turns into a panic + backtrace hint
+/// on stderr (report E3). Resetting to `SIG_DFL` makes the process terminate
+/// silently on a broken pipe — exit status 141 (128 + SIGPIPE), the same as
+/// every standard Unix filter. No-op on non-Unix targets.
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and called once
+    // before any threads are spawned; restoring the default disposition has no
+    // memory-safety implications.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() {
+    reset_sigpipe();
+
     // Initialize the `log` sink. Default severity is `info`; override with
     // `RUST_LOG=scx=debug`, `RUST_LOG=scx_loader=warn`, etc.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

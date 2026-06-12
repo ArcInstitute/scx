@@ -114,6 +114,22 @@ def test_missing_h5ad_input_raises_filenotfound(tmp_dir):
         pyscx.from_h5ad("/no/such/input.h5ad", str(tmp_dir / "out.scx"))
 
 
+@pytest.mark.skipif(
+    not hasattr(pyscx, "from_h5ad"), reason="pyscx built without the hdf5 feature"
+)
+def test_non_hdf5_h5ad_input_raises_valueerror(tmp_dir):
+    # Report E1: an existing-but-not-HDF5 input must raise a clean ValueError
+    # naming the file and the expected format, not a raw RuntimeError that
+    # leaks libhdf5 internals ("H5Fopen(): ... file signature not found").
+    bad = tmp_dir / "not_hdf5.h5ad"
+    bad.write_bytes(b"this is plainly not an HDF5 file\n" * 16)
+    with pytest.raises(ValueError) as ei:
+        pyscx.from_h5ad(str(bad), str(tmp_dir / "out.scx"))
+    msg = str(ei.value)
+    assert "not a valid HDF5/h5ad file" in msg
+    assert str(bad) in msg
+
+
 def test_obs_keys_getter_surfaces_corrupt_file(tmp_dir):
     # A fully corrupt file fails to open; but a getter on a successfully
     # opened-yet-unreadable section must raise, not silently return [].

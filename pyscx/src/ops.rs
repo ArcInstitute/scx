@@ -7,7 +7,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use numpy::PyReadonlyArray1;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -732,15 +732,36 @@ pub fn merge(
 /// Convert an obs/var input (pandas `DataFrame` or pyarrow `Table`) to an
 /// Arrow `RecordBatch`. A `Table` is routed through `to_pandas()` so the
 /// shared `pandas_to_record_batch` IPC path handles both.
-fn obs_var_to_record_batch(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+fn obs_var_to_record_batch(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    param: &str,
+) -> PyResult<RecordBatch> {
     let pa = py.import("pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     if obj.is_instance(&table_cls)? {
         let df = obj.call_method0("to_pandas")?;
-        convert::pandas_to_record_batch(py, &df)
-    } else {
-        convert::pandas_to_record_batch(py, obj)
+        return convert::pandas_to_record_batch(py, &df);
     }
+    // Require a pandas DataFrame. Without this guard a dict (a natural thing to
+    // try) falls through to `pyarrow.Table.from_pandas` and surfaces an opaque
+    // `AttributeError: 'dict' object has no attribute 'columns'` deep inside
+    // pyarrow, with no mention of `modify_metadata`, the parameter, or the
+    // expected type (report E2).
+    let pd = py.import("pandas")?;
+    let df_cls = pd.getattr("DataFrame")?;
+    if !obj.is_instance(&df_cls)? {
+        let got = obj
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| "object".to_string());
+        return Err(PyTypeError::new_err(format!(
+            "modify_metadata({param}=...) expects a pandas DataFrame (got {got}); \
+             wrap your columns with pd.DataFrame({{...}})."
+        )));
+    }
+    convert::pandas_to_record_batch(py, obj)
 }
 
 /// Convert a `dict[str, ndarray]` (obsm/varm) into the named dense
@@ -864,11 +885,11 @@ pub fn modify_metadata(
         None => None,
     };
     let obs_batch = match obs {
-        Some(o) => Some(obs_var_to_record_batch(py, o)?),
+        Some(o) => Some(obs_var_to_record_batch(py, o, "obs")?),
         None => None,
     };
     let var_batch = match var {
-        Some(v) => Some(obs_var_to_record_batch(py, v)?),
+        Some(v) => Some(obs_var_to_record_batch(py, v, "var")?),
         None => None,
     };
     let obsm_batches = match obsm {
