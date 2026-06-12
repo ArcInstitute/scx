@@ -32,6 +32,34 @@ test_that("scx_pca_matrix returns finite embeddings + loadings of the right shap
   expect_true(all(res$variance_ratio >= 0))
 })
 
+test_that("scx_pflog1ppf returns embeddings + a per-cell baseline matching the reference", {
+  counts <- make_counts()
+  # PFlog1pPF requires raw counts with positive cell depth; drop empty cells.
+  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
+  cc <- 1.0
+  res <- scx_pflog1ppf(counts, c = cc, n_components = 10L, seed = 0L)
+
+  expect_type(res, "list")
+  expect_named(res, c("embeddings", "loadings", "variance_explained",
+                      "variance_ratio", "n_components", "baseline"))
+  expect_equal(nrow(res$embeddings), ncol(counts)) # cells
+  expect_equal(ncol(res$embeddings), 10L)
+  expect_equal(nrow(res$loadings), nrow(counts))   # genes
+  expect_true(all(is.finite(res$embeddings)))
+  expect_true(all(res$variance_ratio >= 0))
+
+  # Baseline is rotation/sign-free, so check it exactly against the reference:
+  # baseline_i = -(1/D) * sum_j log(x_ij/s_i + c).
+  expect_equal(length(res$baseline), ncol(counts))
+  expect_true(all(is.finite(res$baseline)))
+  Xc <- as.matrix(counts)                 # genes x cells
+  depth <- colSums(Xc)
+  L <- log(t(Xc) / depth + cc)            # cells x genes
+  ref_baseline <- -rowMeans(L)
+  # unname: rowMeans carries cell names; the Rust path returns a plain vector.
+  expect_equal(unname(res$baseline), unname(ref_baseline), tolerance = 1e-4)
+})
+
 test_that("scx_highly_variable_genes selects n_top genes with finite normalized variance", {
   counts <- make_counts(n_genes = 50L)
   df <- scx_highly_variable_genes(counts, n_top_genes = 15L)
