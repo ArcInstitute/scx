@@ -43,7 +43,7 @@ PyPI / crates.io). Set `VERSION` to the latest release tag.
 
 ```bash
 # Pick the latest release version (see the Releases page above):
-VERSION=0.7.0
+VERSION=0.7.1
 
 # Python bindings — download the wheel matching your Python from GitHub Releases
 # (pyscx-v* tags); Linux x86_64 and aarch64, CPython 3.11–3.14. See

@@ -18,7 +18,7 @@ BitmapShard (6)        — Per-shard detection bitmap sidecar (gene →
                          local-row roaring bitmaps; `SCXB` magic).
                          Written by `scx convert --bitmap auto|always`
                          and the pyscx `bitmap="..."` kwarg; consumed
-                         by `PyExperiment.detection_counts` /
+                         by `Experiment.detection_counts` /
                          `cells_expressing`. See
                          [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 LayerCsrShard (7)      — Alternative expression layers
@@ -53,7 +53,7 @@ ObsMetadataShard (24)  — Row-sharded obs Arrow IPC. Produced by merge,
 VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24).
 ```
 
-## ScxReader (`scx-format/src/reader.rs`)
+## ScxReader (`scx-format-io/src/reader.rs`)
 
 - `open(path)` — Open and validate file (mmap-based, validates magic/version/minimum size)
 - `header()`, `root_catalog()`, `catalog()` — Access file metadata
@@ -90,7 +90,7 @@ VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24).
 - `read_shard_header()` / `read_raw_shard_bytes()` / `read_shard_from_entry()` — Low-level shard access
 - `mmap()` — Direct mmap access to the underlying file
 
-## ScxWriter (`scx-format/src/writer.rs`)
+## ScxWriter (`scx-format-io/src/writer.rs`)
 
 - `new(path, header)` — Create writer (writes to temp file)
 - `write_obs(batch)`/`write_var(batch)` — Arrow IPC metadata
@@ -358,9 +358,9 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `BitmapSkipped { reason }` | Detection bitmap auto policy | `--bitmap auto` rejected emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
 | `DroppedObsp { name, reason }` | h5ad ingest (obsp/varp routing) and `scx merge` (multimodal) | A pairwise `obsp`/`varp` matrix could not be preserved: on ingest, a CSC or otherwise unsupported pairwise layout is dropped (CSR is stored directly; a **dense** pairwise matrix is preserved as nonzero COO, not dropped); on `scx merge`, `obsp` axis semantics don't compose. Default-dropped with a warning. |
 | `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
-| `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `PyExperiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
+| `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes }` | `Experiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. |
 | `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
-| `DroppedRaw { raw_n_vars }` | `PyExperiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
+| `DroppedRaw { raw_n_vars }` | `Experiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. |
 
 ## Round-trip fidelity
 
@@ -408,7 +408,7 @@ yet write raw.
 
 ## Memory budgets
 
-`MemoryBudget::parse(s)` (`scx-format/src/mem.rs`) is the shared parser
+`MemoryBudget::parse(s)` (`scx-format-io/src/mem.rs`) is the shared parser
 behind `--memory-budget` and `build-csc --memory-limit` (CLI) and the
 `memory_budget=` kwarg on `from_h5ad` / `from_h5mu`. It caps dense row
 slabs in the h5ad streaming reader, CSC external-transpose buffers when
@@ -485,8 +485,8 @@ Index presets:
 gene → local-row roaring bitmaps. Auto policy requires sparse X,
 `n_vars ≤ 1_000_000`, and an estimated bitmap size ≤ 15 % of the
 encoded CSR; ATAC modalities are always-on under `auto`. Consumed by
-`PyExperiment.detection_counts(axis="var", modality=...)` and
-`PyExperiment.cells_expressing(gene, modality=...)`; the backed reader
+`Experiment.detection_counts(axis="var", modality=...)` and
+`Experiment.cells_expressing(gene, modality=...)`; the backed reader
 falls back to a CSR scan when sidecars are absent. The wire format is
 specified in [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 
@@ -539,7 +539,7 @@ following `params_json` fields:
 | `lazy_transforms` | `list[{"name","params"}]` | only for `x_source="lazy"`; per-row factor / row-sum vectors are summarised by length |
 | `csc_dropped` | `bool` | source had a CSC sidecar that was dropped |
 
-Read the chain via `PyExperiment.provenance()` — each entry is a
+Read the chain via `Experiment.provenance()` — each entry is a
 dict with `params_json` as a raw JSON string (parse with
 `json.loads`).
 
@@ -547,7 +547,7 @@ The full transform list is also surfaced on the wrapper itself via
 `ScxLazyTransformedDataset.transforms_repr() → list[{"name","params"}]`,
 which the writer uses to build the `lazy_transforms` payload.
 
-## BackedCsrReader (`scx-format/src/backed.rs`)
+## BackedCsrReader (`scx-format-io/src/backed.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
 - `read_rows(start, end)` → `ScxCsr` — Decode and concatenate rows from relevant shards
@@ -562,7 +562,7 @@ which the writer uses to build the `lazy_transforms` payload.
 - `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
 - Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
 
-## ShardSource Trait (`scx-format/src/shard_source.rs`)
+## ShardSource Trait (`scx-format-io/src/shard_source.rs`)
 
 A uniform interface for streaming CSR data shard-by-shard, enabling algorithms like PCA to process data without materializing the full matrix. Defined in `scx-format`, available to both `scx-accel` and `pyscx`.
 
@@ -589,7 +589,7 @@ pub trait ShardSource {
 
 **Design note:** The trait is defined in `scx-format` (not `scx-accel`) so that `pyscx`'s `LazyShardSource` can implement it without creating a dependency on `scx-accel`. PCA functions in `scx-accel` are generic (`<S: ShardSource>`) rather than using `&dyn ShardSource` to allow monomorphization.
 
-## BackedCscReader (`scx-format/src/backed.rs`)
+## BackedCscReader (`scx-format-io/src/backed.rs`)
 
 Column-major counterpart to `BackedCsrReader`. Streams CSC sidecar
 shards from disk with an LRU shard cache, parallel to the CSR side.
@@ -603,7 +603,7 @@ shards from disk with an LRU shard cache, parallel to the CSR side.
 - `read_csc_columns_subset(cols)` → `ScxCsc` — Gather columns from a sorted unique `&[u32]`; contiguous runs share a single decode
 - `enable_metrics()` / `metrics()` — Per-call hits / misses / decoded-bytes counters
 
-## ColumnShardSource Trait (`scx-format/src/shard_source.rs`)
+## ColumnShardSource Trait (`scx-format-io/src/shard_source.rs`)
 
 Sibling to `ShardSource` for column-major streaming. Defined in
 `scx-format` so consumers in `scx-accel` and `pyscx` can take the

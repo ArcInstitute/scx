@@ -578,7 +578,7 @@ GitHub-Release-wheel-vs-source guidance aimed at agents, see
 
 ```bash
 # Set to the latest release version — see https://github.com/ArcInstitute/scx/releases
-VERSION=0.7.0
+VERSION=0.7.1
 # Pick the matching target for your platform:
 #   linux x86_64 → x86_64-unknown-linux-gnu
 #   linux arm64  → aarch64-unknown-linux-gnu
@@ -762,7 +762,7 @@ Full benchmark suite in [`docs/performance.md`](docs/performance.md): compressio
 
 ## Architecture
 
-SCX is a Rust workspace with 15 crates:
+SCX is a Rust workspace with 16 crates:
 
 | Crate | Purpose |
 |-------|---------|

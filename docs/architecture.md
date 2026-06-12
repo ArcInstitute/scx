@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 15 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
+The workspace contains 16 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -274,7 +274,7 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                    CREATION                                    CONSUMPTION
  ─────────────────────────────────────────   ──────────────────────────────────────
 
- scx-sparse/src/transpose.rs                scx-format/src/backed.rs
+ scx-sparse/src/transpose.rs                scx-format-io/src/backed.rs
  ┌──────────────────────────────────┐        ┌─────────────────────────────────┐
  │ streaming_csr_to_csc_iter_with   │        │ BackedCscIndex                  │
  │ _cap()                           │        │   shard_ranges: Vec<(col_start, │
@@ -284,7 +284,7 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
  └────────────┬─────────────────────┘        └────────────┬────────────────────┘
               │                                           │
               ▼                                           ▼
- scx-format/src/writer.rs                   ┌─────────────────────────────────┐
+ scx-format-io/src/writer.rs                   ┌─────────────────────────────────┐
  ┌──────────────────────────────────┐        │ BackedCscReader                 │
  │ ScxWriter::write_csc_shard()    │        │   reader: ScxReader             │
  │   section_type = CscShard(5)    │        │   index:  BackedCscIndex        │
@@ -309,13 +309,13 @@ Pass `--csc-cols-per-shard 0` for no cap (single CSC shard).
                                             └─────────────────────────────────┘
 ```
 
-**`BackedCscIndex`** (`scx-format/src/backed.rs`): A sorted vector of
+**`BackedCscIndex`** (`scx-format-io/src/backed.rs`): A sorted vector of
 `(col_start, col_end, sorted_shard_idx)` ranges built from the catalog at
 construction time. Provides O(log n) column lookups via `partition_point`:
 `shard_for_col(col)` for single-column lookups and
 `shards_for_col_range(c_lo, c_hi)` for range queries.
 
-**`BackedCscReader`** (`scx-format/src/backed.rs`): The primary CSC consumer.
+**`BackedCscReader`** (`scx-format-io/src/backed.rs`): The primary CSC consumer.
 Wraps an `ScxReader` + `BackedCscIndex` + a count-only LRU cache for decoded
 `ScxCsc` shards (simpler than the CSR reader's byte-budgeted / singleflight
 cache — CSC analytical workloads access shards in column-range order with
@@ -323,7 +323,7 @@ limited reuse). Key method: `read_csc_columns(col_range)` skips non-overlapping
 shards, `col_slice`s partial-overlap shards post-decode, and concatenates
 results. Implements `ColumnShardSource`.
 
-**`ColumnShardSource`** (`scx-format/src/shard_source.rs`): The trait that
+**`ColumnShardSource`** (`scx-format-io/src/shard_source.rs`): The trait that
 abstracts CSC access. Both `BackedCscReader` (raw on-disk) and pyscx's
 `LazyShardSource` (transform-aware) implement it. All `scx-accel` CSC kernels
 are generic over this trait — no concrete type dependency.
@@ -403,7 +403,7 @@ via PyO3's buffer protocol.
 
 ## Reader/Writer Architecture
 
-### Writer (`scx-format/src/writer.rs`)
+### Writer (`scx-format-io/src/writer.rs`)
 
 Uses an **atomic rename** strategy for crash safety:
 
@@ -417,7 +417,7 @@ Uses an **atomic rename** strategy for crash safety:
 7. rename() temp → final path  (atomic commit point)
 ```
 
-### Reader (`scx-format/src/reader.rs`)
+### Reader (`scx-format-io/src/reader.rs`)
 
 Opens a file via `mmap` and validates magic/version/checksums:
 
@@ -556,11 +556,11 @@ how catalog sections are fetched. Two implementations ship today:
 
 | Reader | Section fetch | Construction |
 | --- | --- | --- |
-| `ScxReader` (`scx-format`) | mmap / `pread` over a local `.scx` file | `QueryPipeline::open(path)` |
+| `ScxReader` (`scx-format-io`) | mmap / `pread` over a local `.scx` file | `QueryPipeline::open(path)` |
 | `CloudSectionReader` (`scx-cloud`) | `object_store` range reads over `gs://` / `s3://` / `az://` / exploded `.scxd/` directories | `QueryPipeline::from_reader(reader)` |
 
-`PyExperiment.query()` opens a local mmap-backed pipeline;
-`PyCloudExperiment.query()` opens a cloud-backed pipeline (see
+`Experiment.query()` opens a local mmap-backed pipeline;
+`CloudExperiment.query()` opens a cloud-backed pipeline (see
 [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query)).
 Both share the same predicate planning, shard pruning, gene
 projection, and decoding code paths — only the bytes-by-section
@@ -669,7 +669,7 @@ Built with PyO3 + maturin. Exposes two main interfaces:
 import pyscx
 
 # Read
-exp = pyscx.open("experiment.scx")    # → PyExperiment (lazy handle)
+exp = pyscx.open("experiment.scx")    # → Experiment (lazy handle)
 adata = exp.to_anndata()              # → AnnData (zero-copy CSR + Arrow→pandas)
 
 # Write
@@ -986,7 +986,7 @@ PCA, and kNN, while streaming/randomized PCA and codec decode remain native.
       │                 SCX_DISABLE_RAPIDS=1 forces no-rapids fallback
       ▼
   to_gpu_anndata()      Minimal-copy device handoff:
-      │                 PyExperiment → GPU-resident AnnData
+      │                 Experiment → GPU-resident AnnData
       │                 X as cupyx.scipy.sparse.csr_matrix
       ▼
   GPU PCA               Two paths:
