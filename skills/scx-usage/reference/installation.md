@@ -242,6 +242,13 @@ unset VIRTUAL_ENV    # when using conda for the build
   `nvidia-smi` and `pyscx.accel.gpu_info()`.
 - **Missing cuVS/cuGraph:** kNN and Leiden fall back to CPU even with GPU
   PCA/UMAP. See `docs/gpu-setup.md` (conda path recommended).
+- **Missing `rapids-singlecell`:** in-VRAM PCA/kNN/UMAP/preprocess route to
+  rapids-singlecell and **silently CPU-fall-back** when it's absent — a plain
+  `.venv` rarely has it. **Check existing conda envs before assuming `.venv` or
+  creating a new one:** `conda env list`, then
+  `conda list -n <env> | grep -iE 'rapids-singlecell|cupy'`, and run from the
+  env that already has it. The maturin editable `.so` is shared across envs
+  (each has a `pyscx.pth`), so one `--features gpu` build serves every env.
 - Pin `device="cpu"` on Leiden when label stability matters — GPU Leiden
   differs from `leidenalg` by design.
 

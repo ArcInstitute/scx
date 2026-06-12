@@ -53,10 +53,27 @@ export PATH="$(pwd)/.venv/bin:$PATH"
 cd pyscx && ../.venv/bin/maturin develop --release && cd ..
 ```
 
-Use the repo `.venv/` only — not system Python. Source builds need
+Use the repo `.venv/` only for *building* — not system Python. Source builds need
 `libhdf5-dev` on Linux for h5ad ingest. Cloud is **not** in the default dev
 build — pass `--features cloud` when you need `open_cloud()`. Rebuild after
 branch switches or feature changes (`--features gpu`, etc.).
+
+> **Before running, check existing conda envs for the deps your task needs —
+> don't assume `.venv`, and don't create a new env without first looking.**
+> Task-specific dependencies often live in only one environment: GPU analysis
+> needs `rapids-singlecell` (+ `cupy`/`cugraph`/`cuml`), multimodal needs
+> `mudata`, HVG `seurat_v3` needs `skmisc`, SLAF benchmarks need their own env,
+> etc. A plain pip/uv `.venv` usually has none of these. List the available
+> environments and inspect what they actually carry, then run from the one that
+> already has what the task requires:
+> ```bash
+> conda env list
+> conda list -n <env> | grep -iE 'rapids-singlecell|cupy|cugraph|mudata|scikit-misc|scanpy'
+> ```
+> The maturin editable `.so` is shared across environments (each carries a
+> `pyscx.pth` pointing at the repo), so a single `--features gpu` build is
+> importable from whichever env you select — you almost never need a *new* env,
+> just the right *existing* one.
 
 **Sanity check after any install:**
 
@@ -230,11 +247,19 @@ back to CPU with `FallbackReason::NoRapids`.
 > `.venv`s typically don't have `rapids-singlecell`, so `device="gpu"` there
 > silently CPU-falls-back. The maturin editable `.so` is shared across envs, so
 > the working setup is: build pyscx once with `--features gpu`, then run from the
-> conda env that has rapids-singlecell. Verified GPU is real and fast — PCA was
-> ~22× CPU and bit-identical on 1 M cells, with route metadata correctly naming
-> the backend. **Always confirm via `adata.uns["scx_accel"][op]["route"]`**
-> (`rapids_singlecell_gpu` / `gpu_csr` / `cpu_*`), since silent fallback is the
-> common failure — except `harmony_integrate`, which stamps no route metadata.
+> conda env that *already* has rapids-singlecell — **check before assuming or
+> creating one**:
+> ```bash
+> conda env list
+> # pick the env whose list includes rapids-singlecell (it pulls cupy/cugraph/cuml):
+> conda list -n <env> | grep -iE 'rapids-singlecell|cupy|cugraph'
+> conda run -n <env> python -c "import pyscx, rapids_singlecell; print('ok')"
+> ```
+> Verified GPU is real and fast — PCA was ~22× CPU and bit-identical on 1 M
+> cells, with route metadata correctly naming the backend. **Always confirm via
+> `adata.uns["scx_accel"][op]["route"]`** (`rapids_singlecell_gpu` / `gpu_csr` /
+> `cpu_*`), since silent fallback is the common failure — except
+> `harmony_integrate`, which stamps no route metadata.
 
 `to_gpu_anndata()` on an `Experiment` returns a GPU-resident AnnData
 (`X` = `cupyx.scipy.sparse.csr_matrix`). It records the path in
