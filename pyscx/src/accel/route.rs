@@ -122,6 +122,14 @@ pub(crate) fn simple_exec_info(
     )
 }
 
+/// Build the execution info for a CPU-only op that has no GPU kernel at all
+/// (gene-set scoring). `gpu_eligible=false` records `UserForcedCpu` for
+/// `device="cpu"`, `NoCuda` when no GPU is present, and `UnsupportedInputLayout`
+/// for an explicit GPU request on a GPU host — there is no GPU score_genes path.
+pub(crate) fn cpu_only_exec_info(device: &str) -> AccelExecutionInfo {
+    simple_exec_info(device, false, AccelRoute::CpuCsr, AccelRoute::CpuCsr)
+}
+
 /// Build the execution info for an op that can hand in-VRAM GPU compute to
 /// rapids-singlecell (ACC-RUST-OPT-V4 Phase 1) via [`plan_rapids_route`].
 /// `rapids_available` comes from the import probe, `fits_vram` from the VRAM

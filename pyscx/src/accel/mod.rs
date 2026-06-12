@@ -36,5 +36,6 @@ pub mod pseudobulk;
 #[cfg(feature = "gpu")]
 pub mod rapids;
 pub mod route;
+pub mod score_genes;
 pub mod umap;
 pub mod util;

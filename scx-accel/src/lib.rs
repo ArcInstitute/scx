@@ -15,6 +15,7 @@ pub mod error;
 pub mod eval_metrics;
 #[cfg(feature = "gpu")]
 pub mod fused;
+pub mod gene_score;
 pub mod harmony;
 pub mod hvg;
 pub mod leiden;
@@ -48,6 +49,7 @@ pub use eval_metrics::{
     knockdown::{compute_control_baseline, compute_knockdown_efficiency, compute_log_deviation},
     DistanceMetric,
 };
+pub use gene_score::{score_genes, ScoreMethod};
 pub use harmony::{harmony_integrate, BatchCovariate, HarmonyConfig, HarmonyResult};
 pub use hvg::{
     streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
