@@ -320,26 +320,21 @@ pub fn append_from_reader_with_index_options(
         return Ok(PredicateIndexBuildSummary::skipped());
     }
 
-    // Detect global per-append invariants from the first source shard header.
-    let first_sh = source.read_shard_header(&source_csr_entries[0])?;
-    let value_encoding = ValueEncoding::from_u8(first_sh.value_encoding)
-        .ok_or(OpsError::UnknownValueEncoding(first_sh.value_encoding))?;
     let target_index_dtype = prep.header_index_dtype;
 
-    // Validate that every source shard agrees on value_encoding and that
-    // n_minor matches target_n_vars (otherwise re-encoding may still work,
-    // but the raw-copy fast path is unsafe — handled inline below).
+    // Each source shard carries its own `value_encoding`: the auto-codec
+    // selects it per shard from that shard's value distribution, so a
+    // multi-shard source legitimately mixes encodings (e.g. shard 0 Zstd,
+    // shard 1 Scx1). We therefore preserve each shard's encoding individually
+    // in the per-shard loop below rather than forcing a single global one.
+    // Validate every shard's encoding, the n_minor bound, and the row total
+    // up front — fail fast before any disk mutation so an invalid encoding on
+    // a later shard can't leave a partial write / orphaned bytes behind.
     let mut total_source_rows: u64 = 0;
     for entry in &source_csr_entries {
         let sh = source.read_shard_header(entry)?;
-        if sh.value_encoding != first_sh.value_encoding {
-            return Err(OpsError::ShapeMismatch {
-                detail: format!(
-                    "source shard '{}' value_encoding {} differs from first shard's {}",
-                    entry.name, sh.value_encoding, first_sh.value_encoding
-                ),
-            });
-        }
+        ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
         if (sh.n_minor as u64) > prep.target_n_vars {
             return Err(OpsError::IndexOutOfBounds {
                 index: sh.n_minor.saturating_sub(1),
@@ -388,6 +383,11 @@ pub fn append_from_reader_with_index_options(
 
     for entry in &source_csr_entries {
         let sh = source.read_shard_header(entry)?;
+        // Preserve this shard's own value encoding (sources may mix encodings
+        // across shards under the auto-codec). Used by both the raw-copy fast
+        // path and the decode/re-encode path below.
+        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
         let shard_rows = sh.n_major as usize;
         if shard_rows == 0 {
             continue;
