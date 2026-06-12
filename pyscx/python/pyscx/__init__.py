@@ -49,6 +49,11 @@ def _pflog1ppf_reconstruct(adata, baseline_key="pflog1ppf_baseline"):
     can equivalently be streamed through ``TrainingDataset`` with its transform
     mode off (precompute-once / train-many-epochs).
 
+    .. note::
+       This materializes the **entire** dense ``Z`` (``O(n_obs * n_vars)``
+       memory). For atlas-scale data prefer the streaming training loader or the
+       out-of-core ``store="pca"`` embedding instead of reconstructing in full.
+
     Parameters
     ----------
     adata

@@ -138,10 +138,20 @@ impl LoaderConfig {
                 reason: "target_sum must be > 0.0".to_string(),
             });
         }
-        if self.pflog1ppf && (self.pflog1ppf_c <= 0.0 || self.pflog1ppf_c.is_nan()) {
+        if self.pflog1ppf
+            && (self.pflog1ppf_c <= 0.0
+                || self.pflog1ppf_c.is_nan()
+                || self.pflog1ppf_c.is_infinite())
+        {
             return Err(LoaderError::ConfigError {
-                reason: "pflog1ppf_c must be > 0.0".to_string(),
+                reason: "pflog1ppf_c must be positive and finite".to_string(),
             });
+        }
+        if self.pflog1ppf && (self.normalize || self.log1p) {
+            log::warn!(
+                "pflog1ppf=true takes precedence; normalize/log1p flags are ignored \
+                 (pflog1ppf is itself a normalization)"
+            );
         }
         if self.max_memory_mb < 64 {
             return Err(LoaderError::ConfigError {

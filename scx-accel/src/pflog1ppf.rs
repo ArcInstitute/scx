@@ -64,6 +64,38 @@ pub struct PFlog1pPF {
     pub n_vars: usize,
 }
 
+impl PFlog1pPF {
+    /// Construct from a precomputed `baseline`, validating its invariants:
+    /// `baseline.len() == n_obs`, `c` positive and finite, and `n_vars > 0`
+    /// (the centering denominator). Returns [`AccelError::ShapeError`] /
+    /// [`AccelError::InvalidInput`] on violation rather than constructing an
+    /// inconsistent value.
+    pub fn new(baseline: Vec<f64>, c: f64, n_obs: usize, n_vars: usize) -> Result<Self> {
+        if c <= 0.0 || c.is_nan() || c.is_infinite() {
+            return Err(AccelError::InvalidInput(format!(
+                "PFlog1pPF shift c must be positive and finite, got {c}"
+            )));
+        }
+        if n_vars == 0 {
+            return Err(AccelError::InvalidInput(
+                "PFlog1pPF requires n_vars > 0 for centering".into(),
+            ));
+        }
+        if baseline.len() != n_obs {
+            return Err(AccelError::ShapeError(format!(
+                "PFlog1pPF baseline has length {} but n_obs={n_obs}",
+                baseline.len()
+            )));
+        }
+        Ok(Self {
+            baseline,
+            c,
+            n_obs,
+            n_vars,
+        })
+    }
+}
+
 /// Per-cell raw count depth `s_i = Σ_j x_ij`, streamed shard-by-shard.
 ///
 /// `source` must carry **raw counts** (this is the depth used to form
@@ -106,9 +138,9 @@ pub fn pflog1ppf_baseline<S: ShardSource>(
     cell_depths: &[f64],
     c: f64,
 ) -> Result<Vec<f64>> {
-    if c <= 0.0 || c.is_nan() {
+    if c <= 0.0 || c.is_nan() || c.is_infinite() {
         return Err(AccelError::InvalidInput(format!(
-            "PFlog1pPF shift c must be positive, got {c}"
+            "PFlog1pPF shift c must be positive and finite, got {c}"
         )));
     }
     let n_obs = source.n_obs();
@@ -131,6 +163,12 @@ pub fn pflog1ppf_baseline<S: ShardSource>(
         let csr = source.read_shard(shard_idx)?;
         ensure_finite(&csr.data)?;
         let rows = csr.n_rows();
+        if row_base + rows > n_obs {
+            return Err(AccelError::ShapeError(format!(
+                "PFlog1pPF: shard {shard_idx} has {rows} rows, exceeding n_obs={n_obs} \
+                 at row_base={row_base}"
+            )));
+        }
         for r in 0..rows {
             let cell = row_base + r;
             let depth = cell_depths[cell];

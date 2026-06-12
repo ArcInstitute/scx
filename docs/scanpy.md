@@ -1884,8 +1884,8 @@ adata.obs["pflog1ppf_baseline"]    # per-cell baseline (always written)
 
 # Precompute-once / train-many: stream the transform to a compact SCX file
 # (sparse `delta` + `baseline` obs column), then reconstruct exact dense rows.
-pyscx.accel.pflog1ppf(adata, store="dense", out="pbmc_pflogpf.scx")  # store_repr="delta_baseline"
-re = pyscx.open("pbmc_pflogpf.scx").to_anndata()
+pyscx.accel.pflog1ppf(adata, store="dense", out="pbmc_pflog1ppf.scx")  # store_repr="delta_baseline"
+re = pyscx.open("pbmc_pflog1ppf.scx").to_anndata()
 Z = pyscx.accel.pflog1ppf_reconstruct(re)   # exact dense Z = delta + baseline[:, None]
 ```
 

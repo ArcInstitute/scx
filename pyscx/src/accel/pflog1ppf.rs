@@ -99,9 +99,9 @@ pub fn pflog1ppf(
     dense_max_elems: usize,
     device: &str,
 ) -> PyResult<()> {
-    if c <= 0.0 || c.is_nan() {
+    if c <= 0.0 || c.is_nan() || c.is_infinite() {
         return Err(PyValueError::new_err(format!(
-            "pflog1ppf: shift c must be positive, got {c}"
+            "pflog1ppf: shift c must be positive and finite, got {c}"
         )));
     }
     let (want_pca, want_dense) = match store {
@@ -297,6 +297,11 @@ fn delta_from_raw_csr(raw: &ScxCsr, c: f64) -> PyResult<ScxCsr> {
         let start = delta.indptr[r] as usize;
         let end = delta.indptr[r + 1] as usize;
         for v in &mut delta.data[start..end] {
+            if !v.is_finite() {
+                return Err(PyValueError::new_err(format!(
+                    "pflog1ppf: non-finite count {v} at cell {r}; counts must be finite"
+                )));
+            }
             if (*v as f64) < 0.0 {
                 return Err(PyValueError::new_err(format!(
                     "pflog1ppf: negative count {v} at cell {r}; counts must be non-negative"
@@ -630,6 +635,13 @@ fn write_pflog1ppf_x_shards<S: ShardSource>(
             .read_shard(i)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let rows = csr.n_rows();
+        if global_row + rows as u64 > baseline.len() as u64 {
+            return Err(PyRuntimeError::new_err(format!(
+                "pflog1ppf: shard {i} has {rows} rows, exceeding baseline length {} \
+                 at global_row={global_row}",
+                baseline.len()
+            )));
+        }
         let mut r0 = 0usize;
         while r0 < rows {
             let r1 = (r0 + window).min(rows);

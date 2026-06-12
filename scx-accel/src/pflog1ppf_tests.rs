@@ -461,3 +461,73 @@ fn pca_invariant_across_shards() {
         assert!((a - b).abs() <= 1e-6, "variance {a} != {b}");
     }
 }
+
+/// Zero-centered PCA reconstruction with a non-unit shift `c ≠ 1`, guarding
+/// the `c` plumbing through baseline + delta + the offset SpMM.
+#[test]
+fn pca_centered_reconstructs_with_general_c() {
+    let rows = vec![
+        vec![0.0f32, 1.0, 3.0, 0.0],
+        vec![2.0, 0.0, 0.0, 5.0],
+        vec![1.0, 1.0, 1.0, 1.0],
+        vec![4.0, 2.0, 0.0, 1.0],
+        vec![0.0, 0.0, 6.0, 2.0],
+        vec![3.0, 3.0, 1.0, 0.0],
+    ];
+    let n_vars = 4;
+    let c = 0.5;
+    let raw = raw_source_from_shards(&[&rows], n_vars);
+    let depths = pflog1ppf_cell_depths(&raw).unwrap();
+    let baseline = pflog1ppf_baseline(&raw, &depths, c).unwrap();
+
+    let delta = delta_source_from_shards(&[&rows], n_vars, c);
+    let res = pflog1ppf_pca(&delta, &baseline, 4, 0, 4, true, 11).unwrap();
+
+    let recon = matmul(&res.embeddings, &res.components, 6, 4, n_vars);
+    let expected = column_center(&reference_dense(&rows, c));
+    for (r_row, e_row) in recon.iter().zip(expected.iter()) {
+        for (&r, &e) in r_row.iter().zip(e_row.iter()) {
+            assert!((r - e).abs() <= 1e-4, "general-c centered recon {r} != {e}");
+        }
+    }
+}
+
+// --- ensure_finite + defensive shape guards --------------------------------
+
+#[test]
+fn ensure_finite_rejects_nan_and_inf() {
+    // `ensure_finite` is private to the parent module (in scope via `super::*`).
+    assert!(ensure_finite(&[1.0, 2.0, 3.0]).is_ok());
+    assert!(ensure_finite(&[1.0, f32::NAN, 3.0]).is_err());
+    assert!(ensure_finite(&[1.0, f32::INFINITY]).is_err());
+    assert!(ensure_finite(&[f32::NEG_INFINITY]).is_err());
+}
+
+#[test]
+fn rejects_non_finite_c() {
+    let rows = fixture();
+    let raw = raw_source_from_shards(&[&rows], 4);
+    let depths = pflog1ppf_cell_depths(&raw).unwrap();
+    assert!(pflog1ppf_baseline(&raw, &depths, f64::INFINITY).is_err());
+    assert!(pflog1ppf_baseline(&raw, &depths, f64::NAN).is_err());
+}
+
+/// A malformed source whose shard rows exceed the declared `n_obs` must return
+/// a clean `ShapeError`, not panic on out-of-bounds `cell_depths` indexing.
+#[test]
+fn baseline_rejects_shard_rows_exceeding_n_obs() {
+    // Source declares n_obs=2 but serves a 3-row shard.
+    let rows = vec![
+        vec![1.0f32, 1.0, 1.0, 1.0],
+        vec![2.0, 0.0, 1.0, 0.0],
+        vec![0.0, 3.0, 0.0, 1.0],
+    ];
+    let bad = MultiShardSource {
+        shards: vec![csr_from_dense(&rows)],
+        n_obs: 2,
+        n_vars: 4,
+    };
+    let depths = vec![4.0, 3.0]; // length matches declared n_obs
+    let err = pflog1ppf_baseline(&bad, &depths, 1.0);
+    assert!(matches!(err, Err(AccelError::ShapeError(_))));
+}

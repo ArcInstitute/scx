@@ -233,6 +233,11 @@ fn delta_from_raw_csr(raw: &ScxCsr, c: f64) -> Result<ScxCsr> {
         let start = delta.indptr[r] as usize;
         let end = delta.indptr[r + 1] as usize;
         for v in &mut delta.data[start..end] {
+            if !v.is_finite() {
+                return Err(Error::Other(format!(
+                    "pflog1ppf: non-finite count {v} at cell {r}; counts must be finite"
+                )));
+            }
             if (*v as f64) < 0.0 {
                 return Err(Error::Other(format!(
                     "pflog1ppf: negative count {v} at cell {r}; counts must be non-negative"
@@ -276,9 +281,9 @@ fn scx_pflog1ppf_matrix(
     if n_components < 1 {
         return Err(Error::Other("n_components must be >= 1".into()));
     }
-    if c <= 0.0 || c.is_nan() {
+    if c <= 0.0 || c.is_nan() || c.is_infinite() {
         return Err(Error::Other(format!(
-            "pflog1ppf: shift c must be positive, got {c}"
+            "pflog1ppf: shift c must be positive and finite, got {c}"
         )));
     }
     let raw = dgc_genes_by_cells_to_csr(&counts)?;

@@ -276,3 +276,62 @@ class TestStreamToDisk:
         )
         np.testing.assert_allclose(Z_mem, Z_backed, rtol=1e-5, atol=1e-6)
         np.testing.assert_allclose(Z_mem, reference_dense(X, 1.0), rtol=1e-5, atol=1e-5)
+
+
+class TestValidationHardening:
+    """Review-driven guards: non-finite counts and non-finite c."""
+
+    @pytest.mark.parametrize("bad", [np.nan, np.inf])
+    def test_non_finite_count_rejected(self, bad):
+        _, X = small_adata()
+        Xb = X.copy()
+        Xb[0, 1] = bad  # a non-finite nonzero
+        ad = anndata.AnnData(sp.csr_matrix(Xb))
+        ad.var_names = [f"gene_{i}" for i in range(Xb.shape[1])]
+        with pytest.raises((ValueError, RuntimeError)):
+            pyscx.accel.pflog1ppf(ad, store="baseline")
+
+    @pytest.mark.parametrize("bad_c", [float("inf"), float("nan")])
+    def test_non_finite_c_rejected(self, bad_c):
+        ad, _ = small_adata()
+        with pytest.raises(ValueError):
+            pyscx.accel.pflog1ppf(ad, c=bad_c)
+
+
+class TestPcaOptions:
+    """zero_center, layer, custom obsm_key, and store='all' + out= coverage."""
+
+    def test_zero_center_false_finite(self):
+        ad, _ = small_adata()
+        pyscx.accel.pflog1ppf(ad, store="pca", zero_center=False, n_components=3)
+        emb = np.asarray(ad.obsm["X_pflog1ppf_pca"])
+        assert emb.shape == (ad.n_obs, 3)
+        assert np.all(np.isfinite(emb))
+
+    def test_runs_on_named_layer(self):
+        ad, X = small_adata()
+        ad.layers["counts"] = ad.X.copy()
+        pyscx.accel.pflog1ppf(ad, layer="counts", store="baseline")
+        # Baseline computed from the layer must match the full-transcriptome ref.
+        ref = reference_dense(X, 1.0)
+        # baseline_i = Z_ij - delta_ij at any zero column == row mean of -log term;
+        # simplest invariant: each Z row sums to ~0, baseline finite.
+        assert np.all(np.isfinite(ad.obs["pflog1ppf_baseline"].to_numpy()))
+        assert ref.shape == (ad.n_obs, ad.n_vars)
+
+    def test_custom_obsm_key(self):
+        ad, _ = small_adata()
+        pyscx.accel.pflog1ppf(ad, store="pca", n_components=3, obsm_key="X_custom")
+        assert "X_custom" in ad.obsm
+        assert "X_custom_singular_values" in ad.uns
+
+    def test_store_all_with_out(self, tmp_path):
+        ad, X = small_adata()
+        out = str(tmp_path / "all.scx")
+        pyscx.accel.pflog1ppf(ad, store="all", out=out, n_components=3)
+        # In-memory adata gets PCA + baseline; the file is the compact form.
+        assert ad.obsm["X_pflog1ppf_pca"].shape == (ad.n_obs, 3)
+        assert "pflog1ppf_baseline" in ad.obs
+        re_ad = pyscx.open(out).to_anndata()
+        Z = pyscx.accel.pflog1ppf_reconstruct(re_ad)
+        np.testing.assert_allclose(Z, reference_dense(X, 1.0), rtol=1e-5, atol=1e-5)

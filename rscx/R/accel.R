@@ -80,16 +80,22 @@ scx_pca <- function(object, assay = NULL, layer = "data", features = NULL,
 #' `reduction.name` reduction and the per-cell baseline to
 #' `object$pflog1ppf_baseline`. This is the **in-memory** R path; the
 #' streaming / atlas-scale out-of-core path is `pyscx`-only.
+#'
+#' Unlike [scx_pca], this does **not** accept a `features` argument: PFlog1pPF's
+#' per-cell depth `s_i` and centering denominator `D` are defined over the full
+#' transcriptome, so subsetting to variable features before the transform would
+#' silently change the statistic (and the stored `baseline`). The transform and
+#' its PCA are always computed over the full counts layer.
 #' @export
-scx_pflog1ppf <- function(object, assay = NULL, layer = "counts", features = NULL,
+scx_pflog1ppf <- function(object, assay = NULL, layer = "counts",
                           c = 1.0, n_components = 50L, zero_center = TRUE,
                           n_oversamples = 10L, n_power_iterations = 2L, seed = 0L,
-                          reduction.name = "pflogpf", reduction.key = "PFLOGPF_") {
+                          reduction.name = "pflog1ppf", reduction.key = "PFLOG1PPF_") {
   if (.is_seurat(object)) {
     if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
-    if (is.null(features)) features <- SeuratObject::VariableFeatures(object)
+    # No feature subsetting: PFlog1pPF depth/centering must span the full
+    # transcriptome (see @describeIn note above).
     mat <- .scx_layer_matrix(object, assay, layer)
-    if (length(features) > 0L) mat <- mat[features, , drop = FALSE]
   } else {
     mat <- methods::as(object, "CsparseMatrix")
   }

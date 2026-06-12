@@ -519,9 +519,12 @@ fn streaming_spmm_transpose_offset<S: ShardSource>(
 /// centered `Z`) and `None` for the uncentered second-moment sum. Both divide
 /// by `n_obs − 1` to match [`total_variance_from_col_sq`]'s convention.
 ///
-/// Centered: with `μ_j = colmean_delta_j + b̄`, `C_j = n_obs · colmean_delta_j`,
-/// `Σ_j Σ_i (delta_ij + b_i − μ_j)²` expands (using `Σ_j delta_ij = −D·b_i`) to
-/// `S_dd − D·B2 + n_obs·Σμ² − 2·Σ_j μ_j C_j − 2·n_obs·b̄·Σ_j μ_j`.
+/// Centered: with `μ_j = colmean_delta_j + b̄`, `Σ_j Σ_i (delta_ij + b_i − μ_j)²`
+/// expands (using `Σ_j delta_ij = −D·b_i`) to
+/// `S_dd − D·B2 + n_obs·Σμ² − 2·Σ_j μ_j·C_j − 2·n_obs·b̄·Σ_j μ_j` with
+/// `C_j = n_obs·colmean_delta_j`. Since `colmean_delta_j = μ_j − b̄`, the two
+/// cross terms collapse to `2·n_obs·Σμ²`, leaving the closed form
+/// `S_dd − D·B2 − n_obs·Σμ²`.
 fn pflog1ppf_total_variance(
     col_sum_sq_delta: &[f64],
     colmean_delta: Option<&[f64]>,
@@ -540,15 +543,12 @@ fn pflog1ppf_total_variance(
             let baseline_mean = baseline.iter().sum::<f64>() / (n_obs as f64).max(1.0);
             let n = n_obs as f64;
             let mut m2 = 0.0f64; // Σ_j μ_j²
-            let mut sm = 0.0f64; // Σ_j μ_j
-            let mut cross_dmu = 0.0f64; // Σ_j μ_j · C_j
             for &cdj in cd {
                 let mu = cdj + baseline_mean;
                 m2 += mu * mu;
-                sm += mu;
-                cross_dmu += mu * (n * cdj);
             }
-            let tss = s_dd - d * b2 + n * m2 - 2.0 * cross_dmu - 2.0 * n * baseline_mean * sm;
+            // Cross terms cancel to −n·Σμ² (see doc comment): TSS = S_dd − D·B2 − n·Σμ².
+            let tss = s_dd - d * b2 - n * m2;
             (tss / denom).max(0.0)
         }
     }
@@ -2122,5 +2122,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `pflog1ppf_total_variance` (both branches) must match a brute-force dense
+    /// computation of `Σ Z² / (n−1)` (uncentered) and `Σ (Z − colmean)² / (n−1)`
+    /// (centered) for the exact `Z = delta + baseline·1ᵀ`. Guards the simplified
+    /// centered closed form `S_dd − D·B2 − n·Σμ²`.
+    #[test]
+    fn pflog1ppf_total_variance_matches_dense() {
+        // Arbitrary dense `delta`; baseline must be the true PFlog1pPF baseline
+        // (`b_i = −(1/D) Σ_j delta_ij`) — the closed form relies on that identity.
+        let delta = [
+            [0.10f64, -0.30, 0.50, 0.20],
+            [-0.40, 0.10, 0.00, 0.60],
+            [0.25, 0.25, -0.15, -0.05],
+            [0.70, -0.20, 0.10, -0.30],
+            [-0.10, 0.40, -0.50, 0.30],
+        ];
+        let n_obs = delta.len();
+        let n_vars = delta[0].len();
+        let d = n_vars as f64;
+        let baseline: Vec<f64> = delta
+            .iter()
+            .map(|row| -row.iter().sum::<f64>() / d)
+            .collect();
+
+        // Column stats fed to the kernel.
+        let mut col_sum_sq = vec![0.0f64; n_vars];
+        let mut col_mean = vec![0.0f64; n_vars];
+        for row in &delta {
+            for (j, &v) in row.iter().enumerate() {
+                col_sum_sq[j] += v * v;
+                col_mean[j] += v;
+            }
+        }
+        for m in &mut col_mean {
+            *m /= n_obs as f64;
+        }
+        let denom = (n_obs as f64 - 1.0).max(1.0);
+
+        // Brute-force Z = delta + baseline.
+        let z: Vec<Vec<f64>> = delta
+            .iter()
+            .enumerate()
+            .map(|(i, row)| row.iter().map(|&v| v + baseline[i]).collect())
+            .collect();
+
+        // Uncentered: Σ Z² / (n−1).
+        let ss_uncentered: f64 = z.iter().flat_map(|r| r.iter().map(|&v| v * v)).sum();
+        let got_uncentered = pflog1ppf_total_variance(&col_sum_sq, None, &baseline, n_obs, n_vars);
+        assert!(
+            (got_uncentered - ss_uncentered / denom).abs() < 1e-9,
+            "uncentered {got_uncentered} != {}",
+            ss_uncentered / denom
+        );
+
+        // Centered: subtract per-column mean of Z, then Σ²/(n−1).
+        let mut zmu = vec![0.0f64; n_vars];
+        for row in &z {
+            for (j, &v) in row.iter().enumerate() {
+                zmu[j] += v;
+            }
+        }
+        for m in &mut zmu {
+            *m /= n_obs as f64;
+        }
+        let ss_centered: f64 = z
+            .iter()
+            .flat_map(|r| r.iter().enumerate().map(|(j, &v)| (v - zmu[j]).powi(2)))
+            .sum();
+        let got_centered =
+            pflog1ppf_total_variance(&col_sum_sq, Some(&col_mean), &baseline, n_obs, n_vars);
+        assert!(
+            (got_centered - ss_centered / denom).abs() < 1e-9,
+            "centered {got_centered} != {}",
+            ss_centered / denom
+        );
     }
 }

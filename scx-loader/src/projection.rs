@@ -189,6 +189,9 @@ impl HvgProjection {
         // Merge-scan: two pointers over sorted csr_indices and gene_indices.
         let mut gi = 0;
         for (&col_idx, &value) in csr_indices.iter().zip(csr_data.iter()) {
+            if col_idx < 0 {
+                continue;
+            }
             let col = col_idx as u32;
             while gi < self.gene_indices.len() && self.gene_indices[gi] < col {
                 gi += 1;

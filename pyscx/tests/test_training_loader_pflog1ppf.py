@@ -102,3 +102,19 @@ class TestLoaderPFlog1pPF:
     def test_invalid_c_raises(self, scx_path):
         with pytest.raises(RuntimeError, match="pflog1ppf_c"):
             pyscx.TrainingDataset(scx_path, pflog1ppf=True, pflog1ppf_c=0.0)
+
+    def test_index_plan_dataset_pflog1ppf(self, scx_path, synthetic_adata):
+        # Plan-driven (paired) loader honors pflog1ppf=True: both the perturbed
+        # and control rows of each pair match the full-transcriptome reference.
+        full = reference_dense(_dense_X(synthetic_adata), 1.0)
+        ds = pyscx.IndexPlanDataset(scx_path, pflog1ppf=True)
+        plans = [[(0, 1), (2, 3)], [(4, 5), (6, 7)]]
+        seen = 0
+        for batch in ds.iter_with_plans(iter(plans)):
+            Xp = np.asarray(batch["X"], dtype=np.float64)
+            Xc = np.asarray(batch["X_paired"], dtype=np.float64)
+            for row, (p, c) in enumerate((int(a), int(b)) for a, b in batch["pairs"]):
+                np.testing.assert_allclose(Xp[row], full[p], rtol=1e-4, atol=1e-4)
+                np.testing.assert_allclose(Xc[row], full[c], rtol=1e-4, atol=1e-4)
+                seen += 1
+        assert seen == 4
