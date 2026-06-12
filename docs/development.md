@@ -141,6 +141,13 @@ export PATH="$(pwd)/.venv/bin:$PATH"
 # default feature set includes `hdf5`, so `pyscx.from_h5ad` / `to_h5ad`
 # / `from_h5mu` / `to_h5mu` are available out of the box (requires
 # `libhdf5-dev` system headers).
+#
+# IMPORTANT: maturin's `--features` REPLACES this default set — it is NOT
+# additive. Whenever you pass `--features`, re-list `hdf5` explicitly
+# (e.g. `--features hdf5,gpu`), or the four h5ad/h5mu wrappers will raise
+# `NotImplementedError`. Because the editable `.so` is shared across every
+# env pointing at this checkout, an hdf5-less rebuild in one env silently
+# disables h5ad I/O in all of them.
 cd pyscx && ../.venv/bin/maturin develop && cd ..
 
 # CPU-only / no-libhdf5 build (the four h5ad/h5mu wrappers still import
@@ -149,13 +156,13 @@ cd pyscx && ../.venv/bin/maturin develop --no-default-features \
     --features pyo3/extension-module && cd ..
 
 # With cloud support
-cd pyscx && ../.venv/bin/maturin develop --features cloud && cd ..
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,cloud && cd ..
 
 # With GPU support (requires CUDA toolkit)
-cd pyscx && ../.venv/bin/maturin develop --features gpu && cd ..
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,gpu && cd ..
 
 # With both
-cd pyscx && ../.venv/bin/maturin develop --features cloud,gpu && cd ..
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,cloud,gpu && cd ..
 
 # Run Python tests
 cd pyscx && ../.venv/bin/pytest tests/ -v && cd ..
@@ -229,6 +236,8 @@ combinations that are not covered by the default workspace build:
 | `scx-cli --features cloud` | Cloud-only CLI build |
 | `scx-cli --features hdf5,cloud` | HDF5 + cloud CLI build |
 | `scx-accel --features gpu` | GPU accelerator build (cudarc stubs, no CUDA required) |
+| `pyscx --features gpu` | Python GPU bindings (rapids-absent lane) |
+| `pyscx --features hdf5,gpu` | Python GPU bindings + h5ad I/O (the documented GPU build combo) |
 | `pyscx --features cloud` | Python cloud bindings |
 
 ## Workspace Structure

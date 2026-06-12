@@ -99,6 +99,13 @@ jobs:
           # Phase 2.2 GPU gate (needs hardware CI does not have).
           - flags: "-p pyscx --features gpu"
             name: "pyscx --features gpu"
+          # pyscx hdf5 + gpu — the documented GPU build combo (report F2).
+          # maturin's `--features` REPLACES the pyproject default set (which
+          # includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
+          # this guards that the combo compiles + clippy-checks so the h5ad I/O
+          # path can't silently regress under a GPU build.
+          - flags: "-p pyscx --features hdf5,gpu"
+            name: "pyscx --features hdf5,gpu"
           # pyscx cloud — covered by the python job; also check standalone
           - flags: "-p pyscx --features cloud"
             name: "pyscx --features cloud"

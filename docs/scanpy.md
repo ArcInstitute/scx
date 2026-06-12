@@ -1225,6 +1225,16 @@ All accelerators that support GPU expose a `device` parameter:
 - `device="gpu"` — force GPU (raises error if unavailable)
 - `device="gpu:1"` — select a specific GPU on multi-GPU systems
 
+> **Seeing the route at op start / diagnosing a slow GPU op.** Each accelerator
+> logs its resolved route the moment it starts, at INFO — enable it with
+> `import logging; logging.basicConfig(level=logging.INFO)` (or
+> `logging.getLogger("pyscx.accel").setLevel(logging.INFO)`). On **backed /
+> atlas-scale** input the streaming GPU path (`highly_variable_genes`,
+> streaming PCA) is **CPU-decode-bound** — the GPU can sit near 0% util while
+> shards decode; this is expected, not a hang. An explicit `device="gpu"` request
+> that silently lands on CPU emits a `UserWarning` naming the `fallback_reason`.
+> See the "slow GPU op / is it hung?" entry in [docs/gpu-setup.md § Troubleshooting](gpu-setup.md#troubleshooting).
+
 > **GPU is fastest only when the input layout matches the op.** For
 > `pdex_ref` the column-major CSC-direct GPU route is the high-performance
 > path, and it requires a *backed* SCX file with a CSC sidecar

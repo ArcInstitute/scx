@@ -21,7 +21,7 @@ cargo build --features cloud
 cargo test --workspace --features cloud
 
 # Python bindings
-cd pyscx && ../.venv/bin/maturin develop --features cloud
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,cloud
 
 # CLI
 cargo install --path scx-cli --features cloud

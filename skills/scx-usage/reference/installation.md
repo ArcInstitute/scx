@@ -72,7 +72,7 @@ Notes on extras:
   instance metadata (`docs/cloud.md`) — SCX does not ship custom auth code.
 - **`[gpu]`** installs CuPy but **does not** magically enable GPU kernels.
   Pre-built wheels are CPU-only; you still need a source build with
-  `maturin develop --features gpu`.
+  `maturin develop --features hdf5,gpu`.
 - **`[mudata]`** is for in-memory `mudata.MuData` objects (`from_mudata`,
   `Experiment.to_mudata()`). File-based h5mu ingest/export (`from_h5mu`,
   `to_h5mu`) is covered by the base wheel's HDF5 support — no `[mudata]`
@@ -126,20 +126,23 @@ Default `[tool.maturin] features` is `["pyo3/extension-module", "hdf5"]`, so a
 normal `maturin develop` enables the h5ad/h5mu entry points. Pre-built wheels use
 `hdf5-static` instead (no system lib needed).
 
-**Feature builds from source:**
+**Feature builds from source:** maturin's `--features` flag **replaces** the
+default set (which includes `hdf5`) — it is not additive — so every command that
+adds `cloud`/`gpu` re-lists `hdf5` too. Drop it and `from_h5ad`/`to_h5ad` raise
+`NotImplementedError`.
 
 ```bash
 cd pyscx
 ../.venv/bin/maturin develop --release                      # default: hdf5 on
-../.venv/bin/maturin develop --release --features cloud     # + cloud I/O (NOT in dev default)
-../.venv/bin/maturin develop --release --features gpu       # + CUDA accel (needs toolkit)
-../.venv/bin/maturin develop --release --features cloud,gpu # full stack
+../.venv/bin/maturin develop --release --features hdf5,cloud     # + cloud I/O (NOT in dev default)
+../.venv/bin/maturin develop --release --features hdf5,gpu       # + CUDA accel (needs toolkit)
+../.venv/bin/maturin develop --release --features hdf5,cloud,gpu # full stack
 ../.venv/bin/maturin develop --no-default-features \
     --features pyo3/extension-module                        # no hdf5 (from_h5ad raises)
 ```
 
 Cloud is compiled into pre-built wheels but **not** into the default dev build —
-source installs that need `open_cloud()` must pass `--features cloud`.
+source installs that need `open_cloud()` must pass `--features hdf5,cloud`.
 
 GPU builds need a CUDA toolkit (≥ 12.0) and a compatible driver. For kNN/Leiden
 GPU paths you also want RAPIDS (cuVS, cuGraph). Conda is usually easier than pip
@@ -206,7 +209,7 @@ Your build lacks HDF5 support.
 ### `AttributeError: module 'pyscx' has no attribute 'open_cloud'`
 
 Built without the cloud Rust feature. On source installs run
-`maturin develop --features cloud`. Pre-built wheels include cloud by default.
+`maturin develop --features hdf5,cloud`. Pre-built wheels include cloud by default.
 
 ### "Failed to set rpath for libpyscx.so"
 
@@ -236,8 +239,8 @@ unset VIRTUAL_ENV    # when using conda for the build
 ### GPU ops feel slow / `gpu_available()` is False
 
 - **Pre-built wheel:** GPU kernels are not shipped — rebuild from source with
-  `maturin develop --release --features gpu`.
-- **Source without GPU feature:** same rebuild with `--features gpu`.
+  `maturin develop --release --features hdf5,gpu`.
+- **Source without GPU feature:** same rebuild with `--features hdf5,gpu`.
 - **GPU build but no CUDA device:** ops **silently fall back to CPU**. Check
   `nvidia-smi` and `pyscx.accel.gpu_info()`.
 - **Missing cuVS/cuGraph:** kNN and Leiden fall back to CPU even with GPU

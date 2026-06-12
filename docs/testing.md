@@ -22,8 +22,8 @@
 
 **Location**: `pyscx/tests/`
 **Run**: `cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v`
-**With cloud**: `../.venv/bin/maturin develop --features cloud && ../.venv/bin/pytest tests/ -v`
-**With GPU**: `../.venv/bin/maturin develop --features gpu && ../.venv/bin/pytest tests/ -v`
+**With cloud**: `../.venv/bin/maturin develop --features hdf5,cloud && ../.venv/bin/pytest tests/ -v`
+**With GPU**: `../.venv/bin/maturin develop --features hdf5,gpu && ../.venv/bin/pytest tests/ -v`
 
 | Test file | Purpose |
 |-----------|---------|
@@ -266,7 +266,7 @@ for the full gate table and workflow.
 cargo test -p scx-gpu --features bench
 
 # Python-level GPU accelerator tests
-cd pyscx && ../.venv/bin/maturin develop --features gpu && \
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,gpu && \
   ../.venv/bin/pytest tests/test_accel.py -v -k "gpu"
 ```
 

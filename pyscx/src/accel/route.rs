@@ -9,11 +9,14 @@
 //! serialise that info into `adata.uns["scx_accel"][op]` so users and
 //! benchmarks can see exactly which route ran and why any fallback happened.
 
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_accel::route::{
     plan_de_route, plan_hvg_route, plan_simple_gpu_route, AccelExecutionInfo, AccelRoute,
-    DeviceRequest, InputLayout,
+    DeviceRequest, FallbackReason, InputLayout,
 };
 
 /// Serialise an [`AccelExecutionInfo`] into a Python dict. `Option` fields map
@@ -215,4 +218,174 @@ pub(crate) fn copy_accel_route(
         scx_accel.set_item(to_op, route)?;
     }
     Ok(())
+}
+
+/// Whether a planned route warrants a default-visible GPU→CPU fallback
+/// `UserWarning`. Pure (no Python) so it can be unit-tested.
+///
+/// True only when the user **explicitly** asked for a GPU (`"gpu"` / `"gpu:N"`,
+/// not `"auto"` — `auto`→CPU on a CPU host is expected), the planned route is a
+/// CPU route, and the reason is a GPU-was-unusable reason. `NoRapids` is excluded
+/// (the rapids path already emits its own richer one-shot warning via
+/// [`super::rapids`]); `UserForcedCpu` / `None` / `NoCscSidecar` (still a GPU
+/// route) are not fallbacks worth warning about. Note `resolve_device` already
+/// hard-errors an explicit `device="gpu"` when no CUDA GPU is present, so in
+/// practice this fires for GPU-present-but-unsupported-layout/-dimensions cases.
+fn should_warn_gpu_fallback(device: &str, info: &AccelExecutionInfo) -> bool {
+    // Negative match (forward-compatible): a *new* `FallbackReason` variant
+    // added to `scx-accel` warns by default rather than silently passing
+    // through. The excluded reasons are the non-fallbacks: `None` (took the
+    // GPU), `UserForcedCpu` (the user asked for CPU), `NoRapids` (the rapids
+    // path emits its own richer one-shot warning), and `NoCscSidecar` (still a
+    // GPU route — CSR-direct instead of CSC-direct).
+    device.starts_with("gpu")
+        && !info.route.is_gpu()
+        && !matches!(
+            info.fallback_reason,
+            FallbackReason::None
+                | FallbackReason::UserForcedCpu
+                | FallbackReason::NoRapids
+                | FallbackReason::NoCscSidecar
+        )
+}
+
+/// One-shot-per-`(op, reason)` registry for the fallback warning, so a loop of
+/// per-gene/per-batch calls doesn't flood the user with duplicates.
+static FALLBACK_WARNED: OnceLock<Mutex<HashSet<(&'static str, &'static str)>>> = OnceLock::new();
+
+/// Announce the resolved accelerator route at the dispatch point.
+///
+/// - Emits an INFO log (`target: "pyscx.accel"`) naming the route, requested
+///   device, and fallback reason — visible when the user raises the `pyscx`
+///   logger to INFO (`logging.basicConfig(level=logging.INFO)`); silent
+///   otherwise.
+/// - Emits a one-shot `UserWarning` (always visible) when an explicit
+///   `device="gpu"` request silently lands on a CPU route — so a misconfigured
+///   GPU environment is surfaced rather than only stamped into
+///   `uns["scx_accel"]`.
+///
+/// Call this *before* the heavy dispatch so the route is known at op start (the
+/// long-running backed/atlas-scale path otherwise gives no in-flight signal —
+/// see report P1). The route-at-start guarantee therefore holds for the ops
+/// that plan their route from `(device, gpu_eligible)` up front — HVG, PCA,
+/// UMAP, Leiden, kNN. **DE is the exception**: its route is decided inside
+/// `scx-accel` during compute (CSC-sidecar detection, etc.), so DE announces on
+/// completion — the warning still fires, just not at start.
+pub(crate) fn announce_route(
+    py: Python<'_>,
+    op: &'static str,
+    device: &str,
+    info: &AccelExecutionInfo,
+) {
+    log::info!(
+        target: "pyscx.accel",
+        "{op}: route={} device={} fallback={}",
+        info.route.as_str(),
+        device,
+        info.fallback_reason.as_str(),
+    );
+    if !should_warn_gpu_fallback(device, info) {
+        return;
+    }
+    let reason = info.fallback_reason.as_str();
+    {
+        let set = FALLBACK_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        // `op` is always a static literal at every dispatch site, so the
+        // registry key avoids a per-call `String` allocation.
+        if !guard.insert((op, reason)) {
+            return; // already warned for this (op, reason) this process
+        }
+    }
+    let hint = match info.fallback_reason {
+        FallbackReason::NoCuda => {
+            "no CUDA GPU was detected — build with `--features hdf5,gpu` and ensure a GPU is \
+             visible (CUDA_VISIBLE_DEVICES)"
+        }
+        FallbackReason::UnsupportedInputLayout => "this op has no GPU kernel for the input layout",
+        FallbackReason::UnsupportedDimensions => {
+            "the input dimensions exceed the GPU path's supported limit"
+        }
+        FallbackReason::PerfPolicy => "a performance policy selected CPU",
+        _ => "see adata.uns[\"scx_accel\"] for details",
+    };
+    let msg = format!(
+        "pyscx.accel.{op}(device=\"{device}\"): GPU was requested but the op ran on CPU \
+         (route={}, fallback_reason=\"{reason}\") — {hint}. The final route is recorded in \
+         adata.uns[\"scx_accel\"][\"{op}\"].",
+        info.route.as_str(),
+    );
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_warn_gpu_fallback;
+    use scx_accel::route::{AccelExecutionInfo, AccelRoute, FallbackReason};
+
+    fn info(route: AccelRoute, reason: FallbackReason) -> AccelExecutionInfo {
+        AccelExecutionInfo::new(route, reason)
+    }
+
+    #[test]
+    fn warns_explicit_gpu_request_landing_on_cpu() {
+        assert!(should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::NoCuda)
+        ));
+        assert!(should_warn_gpu_fallback(
+            "gpu:1",
+            &info(AccelRoute::CpuCsr, FallbackReason::UnsupportedInputLayout)
+        ));
+        assert!(should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsc, FallbackReason::UnsupportedDimensions)
+        ));
+        assert!(should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::PerfPolicy)
+        ));
+    }
+
+    #[test]
+    fn no_warn_for_auto_or_cpu_requests() {
+        // `auto`→CPU on a CPU host is expected, not a misconfiguration.
+        assert!(!should_warn_gpu_fallback(
+            "auto",
+            &info(AccelRoute::CpuCsr, FallbackReason::NoCuda)
+        ));
+        assert!(!should_warn_gpu_fallback(
+            "cpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::UserForcedCpu)
+        ));
+    }
+
+    #[test]
+    fn no_warn_for_gpu_route_or_benign_reasons() {
+        // Took the GPU as asked.
+        assert!(!should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::GpuCsr, FallbackReason::None)
+        ));
+        // CPU route but not a GPU-unusable reason.
+        assert!(!should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::UserForcedCpu)
+        ));
+        // NoRapids has its own dedicated one-shot warning (super::rapids).
+        assert!(!should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::CpuCsr, FallbackReason::NoRapids)
+        ));
+        // NoCscSidecar still runs on the GPU (CSR-direct), so no warning.
+        assert!(!should_warn_gpu_fallback(
+            "gpu",
+            &info(AccelRoute::GpuCsrV3, FallbackReason::NoCscSidecar)
+        ));
+    }
 }

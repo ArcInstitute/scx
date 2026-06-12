@@ -123,17 +123,14 @@ pub fn neighbors(
     // the PCA embedding never leaves the device. The no-rapids CPU fallback
     // (route `cpu_*` + `fallback_reason="no_rapids"`) is stamped in the rapids
     // interception above, so this stamp covers only the genuine CPU runs.
-    super::route::write_accel_route(
-        py,
-        adata,
-        "neighbors",
-        &super::route::simple_exec_info(
-            device,
-            false,
-            scx_accel::AccelRoute::GpuCsr,
-            scx_accel::AccelRoute::CpuCsr,
-        ),
-    )?;
+    let info = super::route::simple_exec_info(
+        device,
+        false,
+        scx_accel::AccelRoute::GpuCsr,
+        scx_accel::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, "neighbors", device, &info);
+    super::route::write_accel_route(py, adata, "neighbors", &info)?;
 
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;

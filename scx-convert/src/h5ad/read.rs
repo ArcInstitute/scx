@@ -427,6 +427,88 @@ pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertEr
     })
 }
 
+/// Read a dataset as `Vec<f64>` (full-precision numeric categorical
+/// categories). Accepts every numeric width; integer widths widen, `f32`
+/// promotes losslessly. Used by [`read_categorical_values`] so float-keyed
+/// categoricals preserve `f64` precision on the round-trip.
+///
+/// Note: an `i64` / `u64` source with magnitude above 2^53 loses integer
+/// precision in the `as f64` cast. This is only reached for *float-typed*
+/// `categories` datasets, so an integer source here would be unusual; integer
+/// categories take [`read_i64_dataset`] instead (which range-checks `u64`).
+pub(crate) fn read_f64_dataset(ds: &hdf5::Dataset) -> Result<Vec<f64>, ConvertError> {
+    use crate::hdf_dtype::HdfNumericDtype;
+    let path = ds.name();
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dt = HdfNumericDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dataset '{path}': dtype {desc:?} cannot be read as f64"
+        ))
+    })?;
+    macro_rules! cast {
+        ($t:ty) => {{
+            ds.read_1d::<$t>()?.into_iter().map(|v| v as f64).collect()
+        }};
+    }
+    Ok(match dt {
+        HdfNumericDtype::F64 => ds.read_1d::<f64>()?.to_vec(),
+        HdfNumericDtype::F32 => cast!(f32),
+        HdfNumericDtype::I8 => cast!(i8),
+        HdfNumericDtype::I16 => cast!(i16),
+        HdfNumericDtype::I32 => cast!(i32),
+        HdfNumericDtype::I64 => cast!(i64),
+        HdfNumericDtype::U8 => cast!(u8),
+        HdfNumericDtype::U16 => cast!(u16),
+        HdfNumericDtype::U32 => cast!(u32),
+        HdfNumericDtype::U64 => cast!(u64),
+    })
+}
+
+/// Read a categorical `categories` payload into an Arrow values array,
+/// dispatching on the on-disk dtype. anndata categoricals are usually
+/// string-keyed, but integer- and float-keyed categoricals are valid
+/// pandas/anndata (integer cluster labels, dose levels). Reading them as
+/// `VarLenUnicode` previously failed with "no conversion paths found",
+/// dropping the whole column; we now branch on the category dtype:
+/// strings → `Utf8`, integer/unsigned → `Int64`, float → `Float64`. The
+/// returned `DataType` becomes the dictionary value type so the SCX → h5ad
+/// writer can re-emit a `categories` dataset of the right class. Integer
+/// categories normalize to `Int64` via [`read_i64_dataset`], which *errors*
+/// (rather than wrapping) on a `u64` category above `i64::MAX` — realistic
+/// category values (cluster labels) stay far below this.
+fn read_categorical_values(cats_ds: &hdf5::Dataset) -> Result<(ArrayRef, DataType), ConvertError> {
+    let desc = cats_ds.dtype()?.to_descriptor()?;
+    match desc {
+        TypeDescriptor::Integer(_) | TypeDescriptor::Unsigned(_) => {
+            let cats = read_i64_dataset(cats_ds)?;
+            Ok((Arc::new(Int64Array::from(cats)), DataType::Int64))
+        }
+        TypeDescriptor::Float(_) => {
+            let cats = read_f64_dataset(cats_ds)?;
+            Ok((Arc::new(Float64Array::from(cats)), DataType::Float64))
+        }
+        // String (var/fixed, unicode/ascii) categories — the common case.
+        // Reading as `VarLenUnicode` matches the var-length unicode categories
+        // anndata emits.
+        TypeDescriptor::VarLenUnicode
+        | TypeDescriptor::VarLenAscii
+        | TypeDescriptor::FixedUnicode(_)
+        | TypeDescriptor::FixedAscii(_) => {
+            let cats_raw: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
+            let cats: Vec<String> = cats_raw.into_iter().map(|s| s.to_string()).collect();
+            let values = StringArray::from(cats);
+            Ok((Arc::new(values), DataType::Utf8))
+        }
+        // Anything else (Boolean, Enum, Compound, …) is not a categorical
+        // category payload we can represent; surface a structured error
+        // rather than letting a blind `VarLenUnicode` read emit a raw,
+        // opaque HDF5 "no conversion paths found".
+        other => Err(ConvertError::UnsupportedDtype(format!(
+            "categorical category dtype {other:?}"
+        ))),
+    }
+}
+
 /// Read a DataFrame group (obs or var) from an h5ad file as an Arrow RecordBatch.
 ///
 /// Columns that cannot be read (unsupported encoding-type, read error) are
@@ -866,8 +948,7 @@ fn read_categorical_group(
     let codes: Vec<i32> = read_i32_dataset(&codes_ds)?;
 
     let cats_ds = cat_group.dataset("categories")?;
-    let cats_raw: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
-    let categories: Vec<String> = cats_raw.iter().map(|s| s.to_string()).collect();
+    let (values, value_dtype) = read_categorical_values(&cats_ds)?;
 
     let keys = Int32Array::from(
         codes
@@ -875,8 +956,7 @@ fn read_categorical_group(
             .map(|&c| if c < 0 { None } else { Some(c) })
             .collect::<Vec<Option<i32>>>(),
     );
-    let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, values)?;
 
     // Carry the pandas `ordered` bit (anndata stores it as a scalar bool
     // attribute on the categorical group) in Arrow field metadata so the
@@ -888,7 +968,7 @@ fn read_categorical_group(
         .unwrap_or(false);
     let field = Field::new(
         name,
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_dtype)),
         true,
     )
     .with_metadata(HashMap::from([(
@@ -1154,17 +1234,20 @@ fn read_categorical_column(
     // Read the integer codes
     let codes: Vec<i32> = read_i32_dataset(ds)?;
 
-    // Try to find categories: first check "categories" attribute on the dataset
-    let categories: Vec<String> = if let Ok(cats_attr) = ds.attr("categories") {
-        // Categories stored as attribute
+    // Try to find categories: first check "categories" attribute on the
+    // dataset (always string), then the old-style `__categories/<name>`
+    // dataset (string / integer / float via `read_categorical_values`).
+    let (values, value_dtype): (ArrayRef, DataType) = if let Ok(cats_attr) = ds.attr("categories") {
+        // Categories stored as attribute (legacy form — string only).
         let cats: Vec<hdf5::types::VarLenUnicode> = cats_attr.read_1d()?.to_vec();
-        cats.iter().map(|s| s.to_string()).collect()
+        let cats: Vec<String> = cats.into_iter().map(|s| s.to_string()).collect();
+        let arr = StringArray::from(cats);
+        (Arc::new(arr), DataType::Utf8)
     } else if let Ok(cats_ds) = group.dataset(&format!("__categories/{name}")) {
-        // Old-style: categories in __categories subgroup
-        let cats: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
-        cats.iter().map(|s| s.to_string()).collect()
+        // Old-style: categories in __categories subgroup.
+        read_categorical_values(&cats_ds)?
     } else {
-        // Fallback: treat codes as strings
+        // Fallback: no categories found — surface the raw integer codes.
         return Ok((
             Field::new(name, DataType::Int32, true),
             Arc::new(Int32Array::from(codes)),
@@ -1179,8 +1262,7 @@ fn read_categorical_column(
             .map(|&c| if c < 0 { None } else { Some(c) })
             .collect::<Vec<Option<i32>>>(),
     );
-    let values = StringArray::from(categories.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values))?;
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, values)?;
 
     // Carry the `ordered` bit (legacy attr-form stores it on the dataset)
     // in Arrow field metadata; absent → false (pandas default).
@@ -1191,7 +1273,7 @@ fn read_categorical_column(
         .unwrap_or(false);
     let field = Field::new(
         name,
-        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value_dtype)),
         true,
     )
     .with_metadata(HashMap::from([(
@@ -1604,6 +1686,17 @@ pub fn read_uns(
     Ok(serde_json::Value::Object(map))
 }
 
+/// Short, actionable reason for skipping a compound/structured uns array
+/// (replaces a ~1 KB `CompoundType { fields: [..] }` Debug dump). The data
+/// is not preserved — scanpy DE tables must be exported separately.
+fn compound_unsupported_msg(n_fields: usize) -> String {
+    format!(
+        "compound/structured array with {n_fields} fields — not preserved (common source: scanpy \
+         rank_genes_groups); export DE results separately (sc.get.rank_genes_groups_df → \
+         CSV/Parquet) before converting"
+    )
+}
+
 fn read_uns_entry(
     group: &hdf5::Group,
     name: &str,
@@ -1612,8 +1705,29 @@ fn read_uns_entry(
 ) -> Result<serde_json::Value, ConvertError> {
     // Try reading as dataset first
     if let Ok(ds) = group.dataset(name) {
+        // anndata encodes a Python `None` uns value as an `h5py.Empty`
+        // dataset — an HDF5 null dataspace (0 elements), tagged
+        // `encoding-type="null"`. Reading it as a scalar previously yielded
+        // a bogus `0.0` (e.g. `uns['log1p']['base']`, which scanpy feeds to
+        // `log(x)/log(base)` → `-inf`). Map it back to JSON null so it
+        // round-trips as Python `None`.
+        if ds.space().map(|s| s.is_null()).unwrap_or(false) {
+            return Ok(serde_json::Value::Null);
+        }
+
         let desc = ds.dtype()?.to_descriptor()?;
         let shape = ds.shape();
+
+        // Compound / structured arrays (e.g. scanpy `rank_genes_groups`,
+        // stored as a recarray with one field per cluster) are not
+        // representable in SCX's uns JSON. Surface a short, actionable
+        // reason rather than dumping the full `CompoundType { fields: [..] }`
+        // (~1 KB) into the warning. The key is still skipped/warned.
+        if let TypeDescriptor::Compound(ct) = &desc {
+            return Err(ConvertError::Other(compound_unsupported_msg(
+                ct.fields.len(),
+            )));
+        }
 
         // Scalar
         if shape.is_empty() || (shape.len() == 1 && shape[0] == 1) {
