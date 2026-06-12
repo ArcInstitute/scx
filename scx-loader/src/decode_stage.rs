@@ -27,7 +27,7 @@ use crate::error::{LoaderError, Result};
 use crate::io_stage::ShardGroup;
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
-use crate::projection::{scatter_row_full, HvgProjection};
+use crate::projection::{pflog1ppf_row_full, scatter_row_full, HvgProjection};
 use crate::shuffle::RowShuffler;
 
 // ---------------------------------------------------------------------------
@@ -133,6 +133,9 @@ fn fill_batch_parallel(
     normalize: bool,
     log1p: bool,
     target_sum: f64,
+    pflog1ppf: bool,
+    pflog1ppf_c: f64,
+    n_vars: usize,
     n_output_genes: usize,
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<f32>> {
@@ -156,6 +159,33 @@ fn fill_batch_parallel(
             .zip(batch_cell_indices.par_iter())
             .try_for_each(|(output_row, &global_cell_idx)| -> Result<()> {
                 let (csr_indices, csr_data) = group_index.get_row(global_cell_idx, group)?;
+
+                if pflog1ppf {
+                    // PFlog1pPF needs the FULL pre-projection row to compute
+                    // depth s_i and the centering denominator D = n_vars, so it
+                    // dispatches here (at scatter time) rather than via the
+                    // post-scatter `apply_dense_transforms`. It IS the
+                    // normalization — normalize/log1p are not applied.
+                    match projection {
+                        Some(proj) => proj.scatter_pflog1ppf_row(
+                            csr_indices,
+                            csr_data,
+                            pflog1ppf_c,
+                            n_vars,
+                            output_row,
+                        ),
+                        None => {
+                            pflog1ppf_row_full(
+                                csr_indices,
+                                csr_data,
+                                pflog1ppf_c,
+                                n_vars,
+                                output_row,
+                            )?;
+                        }
+                    }
+                    return Ok(());
+                }
 
                 // Scatter CSR row into dense output row (with or without projection)
                 match projection {
@@ -474,6 +504,9 @@ pub fn decode_stage(
                 config.normalize,
                 config.log1p,
                 config.target_sum,
+                config.pflog1ppf,
+                config.pflog1ppf_c,
+                n_vars as usize,
                 n_output_genes,
                 pool,
             )?;
@@ -685,6 +718,9 @@ mod tests {
             false,
             false,
             0.0,
+            false,
+            1.0,
+            n_genes,
             n_genes,
             &test_pool(),
         )
@@ -722,6 +758,9 @@ mod tests {
             false,
             false,
             0.0,
+            false,
+            1.0,
+            10,
             n_output,
             &test_pool(),
         )
@@ -762,6 +801,9 @@ mod tests {
             false,
             false,
             0.0,
+            false,
+            1.0,
+            n_genes,
             n_genes,
             &test_pool(),
         )
@@ -798,6 +840,9 @@ mod tests {
             true,
             true,
             target_sum,
+            false,
+            1.0,
+            n_genes,
             n_genes,
             &test_pool(),
         )
@@ -1260,6 +1305,151 @@ mod tests {
                         "global_cell={global_idx} col={col}: zero value should stay ~0 after fused, got {v}"
                     );
                 }
+            }
+        }
+    }
+
+    // ---- PFlog1pPF loader mode -------------------------------------------
+
+    /// Reconstruct the full dense row produced by `make_shard_data` for a given
+    /// global cell index: two nonzeros at cols `(g*2)%n_vars` / `(g*2+1)%n_vars`
+    /// with values `g+1` / `g+2`.
+    fn make_shard_full_row(global: usize, n_vars: usize) -> Vec<f64> {
+        let mut row = vec![0.0f64; n_vars];
+        row[(global * 2) % n_vars] = (global + 1) as f64;
+        row[(global * 2 + 1) % n_vars] = (global + 2) as f64;
+        row
+    }
+
+    /// Spec §11.1 exact reference for one row.
+    fn pflog1ppf_reference_row(full: &[f64], c: f64) -> Vec<f64> {
+        let depth: f64 = full.iter().sum();
+        let logs: Vec<f64> = full.iter().map(|&v| (v / depth + c).ln()).collect();
+        let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+        logs.iter().map(|&l| l - mean).collect()
+    }
+
+    #[test]
+    fn test_decode_pflog1ppf_no_projection() {
+        let n_vars = 10;
+        let shard = make_shard_data(4, n_vars, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let c = 1.0;
+        let config = LoaderConfig {
+            batch_size: 10,
+            pflog1ppf: true,
+            pflog1ppf_c: c,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(4);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+        let handle = std::thread::spawn(move || {
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                None,
+                &obs,
+                0,
+                &test_pool(),
+            )
+        });
+        let batch = batch_rx.recv().unwrap();
+        handle.join().unwrap().unwrap();
+
+        for (row_pos, &global_idx) in batch.cell_indices.iter().enumerate() {
+            let full = make_shard_full_row(global_idx as usize, n_vars);
+            let expected = pflog1ppf_reference_row(&full, c);
+            let row = &batch.x[row_pos * n_vars..(row_pos + 1) * n_vars];
+            // Exact-transform match.
+            for (col, (&got, &want)) in row.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got as f64 - want).abs() <= 1e-5,
+                    "cell {global_idx} col {col}: got {got}, want {want}"
+                );
+            }
+            // Centering property: row sums to ~0.
+            let s: f64 = row.iter().map(|&v| v as f64).sum();
+            assert!(s.abs() <= 1e-5, "cell {global_idx} row sum {s} not ~0");
+            // Original-zero columns share the per-row baseline.
+            let col0 = (global_idx as usize * 2) % n_vars;
+            let col1 = (global_idx as usize * 2 + 1) % n_vars;
+            let baseline = row[(0..n_vars).find(|c| *c != col0 && *c != col1).unwrap()];
+            for (col, &val) in row.iter().enumerate() {
+                if col != col0 && col != col1 {
+                    assert!((val - baseline).abs() <= 1e-6, "zero col {col} != baseline");
+                }
+            }
+        }
+    }
+
+    /// 🔴 End-to-end projection regression (review item A): with an HVG panel,
+    /// the loader's PFlog1pPF output must equal the corresponding columns of
+    /// FULL-transcriptome PFlog1pPF (depth & D over all genes), NOT panel-local.
+    #[test]
+    fn test_decode_pflog1ppf_projection_uses_full_transcriptome() {
+        let n_vars = 10;
+        let shard = make_shard_data(5, n_vars, 0, None);
+        let group = ShardGroup {
+            shards: vec![shard],
+        };
+        let c = 1.0;
+        let panel: Vec<u32> = vec![0, 1, 2, 3]; // strict subset of 10 genes
+        let proj = HvgProjection::new(panel.clone());
+        let n_output = proj.n_output_cols();
+
+        let config = LoaderConfig {
+            batch_size: 10,
+            pflog1ppf: true,
+            pflog1ppf_c: c,
+            obs_columns: Vec::new(),
+            ..LoaderConfig::default()
+        };
+
+        let (io_tx, io_rx) = tokio::sync::mpsc::channel(4);
+        let (batch_tx, batch_rx) = crossbeam_channel::bounded(4);
+        let obs = make_obs(5);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
+            io_tx.send(group).await.unwrap();
+        });
+        let handle = std::thread::spawn(move || {
+            decode_stage(
+                io_rx,
+                batch_tx,
+                &config,
+                n_vars as u64,
+                Some(proj),
+                &obs,
+                0,
+                &test_pool(),
+            )
+        });
+        let batch = batch_rx.recv().unwrap();
+        handle.join().unwrap().unwrap();
+
+        assert_eq!(batch.x_shape.1, n_output);
+        for (row_pos, &global_idx) in batch.cell_indices.iter().enumerate() {
+            let full = make_shard_full_row(global_idx as usize, n_vars);
+            let full_ref = pflog1ppf_reference_row(&full, c); // depth & D over ALL 10 genes
+            let row = &batch.x[row_pos * n_output..(row_pos + 1) * n_output];
+            for (pos, &g) in panel.iter().enumerate() {
+                assert!(
+                    (row[pos] as f64 - full_ref[g as usize]).abs() <= 1e-5,
+                    "cell {global_idx} panel pos {pos} (gene {g}): got {}, want {} (full-transcriptome)",
+                    row[pos],
+                    full_ref[g as usize]
+                );
             }
         }
     }

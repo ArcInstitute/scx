@@ -47,33 +47,63 @@ Conda is the easiest way to get a working GPU environment because it resolves
 the full CUDA + RAPIDS dependency tree and matches library versions to your
 driver automatically.
 
+> **The GPU-built pyscx and `rapids-singlecell` must live in the *same*
+> environment.** This is the most common GPU-setup mistake: people build
+> `pyscx --features gpu` into a pip/uv `.venv` that has no `rapids-singlecell`,
+> run on a GPU node, and get a **mostly-CPU** pipeline — in-VRAM ops
+> (PCA/kNN/UMAP/preprocess) route to rapids-singlecell when present and
+> *silently CPU-fall-back* (`FallbackReason::NoRapids`) when absent. Build into,
+> and run from, the **one** conda env that has both. The recipe below produces
+> exactly that env.
+
+> **Already have GPU conda environments? Check them before creating a new one.**
+> A suitable env may already exist. List them and inspect what they carry —
+> reuse the one that already has `rapids-singlecell` rather than building another:
+> ```bash
+> conda env list
+> conda list -n <env> | grep -iE 'rapids-singlecell|cupy|cugraph'
+> conda run -n <env> python -c "import pyscx, rapids_singlecell; print('ok')"
+> ```
+> Because a `maturin develop` editable install drops a `pyscx.pth` pointing at
+> the repo, the compiled `.so` is shared across environments — one
+> `--features gpu` build is importable from every env that has the `.pth`.
+
 ```bash
 # 1. Create a dedicated environment
 conda create -n scx-gpu python=3.13
 conda activate scx-gpu
 
-# 2. Install RAPIDS packages — pin cuda-version to match your driver
+# 2. Install RAPIDS + the rapids-singlecell analysis backend — pin cuda-version
+#    to match your driver.
 #    Check your driver's max CUDA version:  nvidia-smi
 #    Driver 535.x → cuda-version=12.2
 #    Driver 550.x → cuda-version=12.4
 #    Driver 560.x → cuda-version=12.6
 conda install -c rapidsai -c conda-forge \
-    cuvs cugraph cuda-version=12.2
+    cuvs cugraph cuml rapids-singlecell cuda-version=12.2
 
 # 3. Install Python dependencies
 pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
 
-# 4. Build pyscx with GPU support
+# 4. Build pyscx with GPU support — INTO this env (rapids-singlecell must be
+#    importable from the same interpreter that imports pyscx)
 cd pyscx && maturin develop --release --features gpu
 
-# 5. Verify
-python -c "import pyscx; print('GPU available:', pyscx.accel.gpu_available())"
+# 5. Verify — both halves must be present, not just the GPU build
+python -c "import pyscx; print('GPU build:', pyscx.accel.gpu_available())"
+python -c "import rapids_singlecell as rsc; print('rapids-singlecell:', rsc.__version__)"
 ```
 
 **Why conda?** pip-installed RAPIDS packages may pull CUDA 12.9+ runtime
 libraries that are incompatible with older drivers (e.g., driver 535 supports
 CUDA ≤ 12.2). Conda pins `cuda-version` and resolves compatible builds for
 cuVS, cuGraph, RAFT, and RMM together.
+
+After setup, **confirm the GPU path actually engages** at runtime via the route
+metadata — `adata.uns["scx_accel"][op]["route"]` should read
+`rapids_singlecell_gpu` (or `gpu_csr` for native paths), not `cpu_*`. A `cpu_*`
+route with `fallback_reason="NoRapids"` means pyscx and rapids-singlecell are
+not in the same environment.
 
 ## Option B: system CUDA Toolkit (no RAPIDS)
 
@@ -204,11 +234,14 @@ conda activate scx-gpu-analysis
 cd pyscx && maturin develop --release --features gpu && cd ..
 ```
 
-rapids-singlecell itself is **not** pinned in that spec and must be installed
-**manually on a GPU node**, because it cannot be resolved reproducibly by conda
-or a pip extra (it is CUDA-arch + RAPIDS-version coupled; `>=0.12` ships CUDA
-kernels built with `-arch=native`, which needs a GPU visible at build time so
-nvcc resolves `sm_90` on H100):
+For most users the simplest route is the conda-forge package, as in
+[Option A](#option-a-conda-recommended) above —
+`conda install -c rapidsai -c conda-forge rapids-singlecell` pulls a pre-built
+backend that needs no GPU at install time. The slim benchmark spec below instead
+leaves rapids-singlecell **unpinned** and installs it **manually on a GPU node**,
+because that path resolves it against a specific pinned RAPIDS/CUDA-arch stack
+(`>=0.12` source builds with `-arch=native` need a GPU visible so nvcc resolves
+`sm_90` on H100):
 
 ```bash
 # Inside an sbatch/srun GPU allocation, in the scx-gpu-analysis env,

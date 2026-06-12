@@ -73,6 +73,33 @@ pub(crate) fn convert_to_pyerr(e: scx_convert::ConvertError) -> PyErr {
     }
 }
 
+/// Like [`convert_to_pyerr`] but with the input path in scope, so an existing
+/// but non-HDF5 input (libhdf5 "file signature not found" / "unable to open
+/// file") is reported as a clean `ValueError` naming the file and the expected
+/// format, instead of leaking the raw libhdf5 `RuntimeError` (report E1). The
+/// missing-file case is handled by the existence pre-check in the caller and
+/// surfaces as `FileNotFoundError`.
+#[cfg(feature = "hdf5")]
+pub(crate) fn convert_to_pyerr_with_path(e: scx_convert::ConvertError, path: &str) -> PyErr {
+    use scx_convert::ConvertError;
+    if let ConvertError::Hdf5(ref h5) = e {
+        let msg = h5.to_string();
+        // This substring match is coupled to libhdf5's
+        // error wording and could silently stop matching on a libhdf5 bump,
+        // reverting to the opaque RuntimeError below. The fallback is graceful
+        // (never wrong, just less friendly). The durable fix is a structured
+        // signature-mismatch kind on `ConvertError::Hdf5` upstream in
+        // scx-convert; until then, keep both known phrasings here.
+        if msg.contains("file signature not found") || msg.contains("unable to open file") {
+            return PyValueError::new_err(format!(
+                "'{path}' is not a valid HDF5/h5ad file ({msg}). \
+                 Expected an .h5ad file written by anndata.",
+            ));
+        }
+    }
+    convert_to_pyerr(e)
+}
+
 /// Open an SCX file and return an `Experiment` handle.
 ///
 /// Args:
@@ -493,10 +520,10 @@ fn from_h5ad(
         py.detach(|| {
             scx_convert::h5ad_to_scx_streaming(&input, &output, &opts, &overrides, &mut sink)
         })
-        .map_err(convert_to_pyerr)?;
+        .map_err(|e| convert_to_pyerr_with_path(e, path))?;
     } else {
         py.detach(|| scx_convert::h5ad_to_scx(&input, &output, &opts, &mut sink))
-            .map_err(convert_to_pyerr)?;
+            .map_err(|e| convert_to_pyerr_with_path(e, path))?;
     }
     convert::emit_python_warnings(py, &sink)?;
     Ok(())
@@ -964,6 +991,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_filtering(&accel_module)?;
     register_hvg(&accel_module)?;
     register_score_genes(&accel_module)?;
+    register_pflog1ppf(&accel_module)?;
     register_col_aggs(&accel_module)?;
     register_eval_metrics(&accel_module)?;
     m.add_submodule(&accel_module)?;
@@ -1138,6 +1166,11 @@ fn register_hvg(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_score_genes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::score_genes::score_genes, m)?)?;
+    Ok(())
+}
+
+fn register_pflog1ppf(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(accel::pflog1ppf::pflog1ppf, m)?)?;
     Ok(())
 }
 

@@ -1248,6 +1248,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
+| `pflog1ppf`              | ✓   | —   | — (no scanpy equivalent)                                             | `c`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
@@ -1255,7 +1256,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
-| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`                           | —                                              |
+| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | —   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format` |
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format` |
 
@@ -1346,6 +1347,24 @@ contiguous gene columns instead of decoding and projecting every row.
   GPU-fast. So a CSC sidecar makes Wilcoxon GPU-fast too.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
+
+> **Which `(device, prefer_format)` selects `gpu_csc_v3`?** `device` and
+> `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
+> by the *route planner*, **not** by `prefer_format="csc"`:
+>
+> - **GPU-fast DE:** keep the **default `prefer_format="csr"`** and pass
+>   `device="gpu"` (or `"auto"`). When the backed file has a CSC sidecar the
+>   planner routes to `gpu_csc_v3` automatically; without one it uses
+>   `gpu_csr_v3`. This is the intended GPU-fast entry point.
+> - `prefer_format="csc"` selects the **CPU** column-major streaming path
+>   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
+>   it runs on CPU; combining it with an explicit `device="gpu"` raises a
+>   `RuntimeError` that points you back to the default `prefer_format="csr"` +
+>   `device="gpu"` for GPU CSC-direct.
+>
+> In short: do **not** reach for `prefer_format="csc"` to get GPU speed — it is
+> the CPU path. A CSC *sidecar on the file* (built at conversion) is what makes
+> the default-`csr` GPU call fast.
 
 To make a file GPU-fast for DE, build the sidecar at conversion time:
 `pyscx.from_anndata(adata, path, csc="auto")` (built automatically once the
@@ -1655,7 +1674,7 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `resolution` | 1.0 | Resolution parameter γ — higher values yield more communities |
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
-| `n_iterations` | 2 | Outer iterations: 2 matches the leidenalg package default; raise to e.g. 100 on the cuGraph path for tighter modularity convergence (rapids-singlecell's default). |
+| `n_iterations` | 2 | **Unit differs by backend.** Rust-native (CPU): leidenalg-style outer iterations (default 2 is plenty — each is a full multilevel cycle). cuGraph (GPU): maps to cuGraph's `max_iter` (a *coarsening-pass* count). The leidenalg default of 2 would starve cuGraph's coarsening and produce a degenerate, over-partitioned result, so the cuGraph path uses cuGraph's own default of **100** whenever `n_iterations <= 2` (including the `-1`/`0` convergence sentinels); only values `> 2` are forwarded verbatim. The effective cap is recorded in `uns["leiden"]["params"]["max_iter"]`. |
 | `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
 | `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
 | `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
@@ -1745,6 +1764,10 @@ Results:
 - `adata.uns["harmony"]` — dict with `params`, `converged`, `n_iterations`,
   `objective_harmony` (per-iteration objective curve), and `backend`
   (`"scx-accel-cpu"` or `"scx-gpu"`).
+- `adata.uns["scx_accel"]["harmony_integrate"]` — the canonical route envelope
+  shared with PCA / kNN / UMAP (`route` ∈ `gpu_dense` / `cpu_dense`,
+  `fallback_reason`), so you can prove GPU-vs-CPU dispatch the same way as the
+  other accelerator ops. See [docs/api.md § Accelerator route metadata](../docs/api.md#accelerator-route-metadata).
 
 **Numerical parity** against R `harmony` v2.x on the validation fixtures
 in `benchmarks/results/harmony/reference/`: mean per-PC Pearson r is
@@ -1791,17 +1814,25 @@ print(adata.obs["lisi_batch"].describe())
 | `key` | (required) | `obs` column with the categorical label to score. |
 | `basis` | `"X_pca"` | `obsm` key for the embedding to compute neighbourhoods over. |
 | `perplexity` | `30.0` | Gaussian-kernel target perplexity (t-SNE-style bandwidth search). |
-| `n_neighbors` | `None` | k for the exact kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `n_neighbors` | `None` | k for the kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `approximate_knn` | `False` | Use HNSW approximate kNN instead of the exact O(N²) sweep. ~10× faster at N ≳ 100k, with ~0.01–0.05 mean-LISI drift. |
 
 Returns a `numpy.ndarray` of length N and also writes the values to
 `adata.obs[f"lisi_{key}"]`.
 
-The implementation uses an exact brute-force kNN (per-row squared-norm
-expansion + per-cell top-k heap) to stay numerically in lockstep with
-the R `lisi` reference. On D1–D4 it is **~10× faster** than
+By default the implementation uses an exact brute-force kNN (per-row
+squared-norm expansion + per-cell top-k heap) to stay numerically in
+lockstep with the R `lisi` reference. On D1–D4 it is **~10× faster** than
 R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
-Brute-force kNN is O(N²·d); at census scale (D5+) you'd want to pair
-this with an HNSW-approximate kNN step instead.
+Brute-force kNN is O(N²·d); above ~50k cells the exact path logs a hint
+to set `approximate_knn=True`, which swaps in an HNSW kNN for an
+order-of-magnitude speed-up at census scale (D5+) at the cost of small
+numerical drift (~0.01–0.05 on mean LISI).
+
+```python
+# Census-scale: avoid the O(N²) exact sweep.
+lisi = pyscx.accel.compute_lisi(adata, "batch", approximate_knn=True)
+```
 
 ### Gene-set scoring (`pyscx.accel.score_genes`)
 
@@ -1847,6 +1878,58 @@ pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z"
 > (or an explicit `gene_pool`) not present in `adata.var_names` are dropped with
 > a `UserWarning`. Use `layer=` to score a named layer instead of `X`. CPU-only —
 > `device` is accepted for API symmetry but there is no GPU kernel.
+
+### PFlog1pPF normalization (`pyscx.accel.pflog1ppf`)
+
+PFlog1pPF (a.k.a. the **shifted centered-log-ratio** transform, Booeshaghi et
+al. 2026) is a depth-normalizing, variance-stabilizing transform with **no
+direct scanpy function**. Per cell, counts become within-cell proportions,
+are shifted by a pseudocount `c` (default `1`), log-transformed, and then
+centered by subtracting the within-cell mean:
+
+```
+z_ij = log(x_ij / s_i + c) − (1/D) Σ_k log(x_ik / s_i + c)
+```
+
+The exact output is **dense** (zeros map to a per-cell baseline), so a naïve
+materialization is `O(N·D)`. The accelerator avoids that by exploiting the
+decomposition `Z = delta + baseline·1ᵀ`, where `delta` is exactly the lazy
+`normalize_total(target_sum=1/c) → log1p` chain (sparse, same pattern as `X`)
+and `baseline_i = −(1/D) Σ_j delta_ij` is one float per cell. So the out-of-core
+PCA never densifies, and a compact on-disk form stores only `delta` + `baseline`.
+
+Operates on **raw counts** — run it on the raw-count `X`, not a normalized
+layer. Streams shard-by-shard, so it runs identically on in-memory, backed, and
+lazy `X` (a lazy `X` that already carries transforms is rejected).
+
+```python
+import pyscx
+
+adata = pyscx.open("pbmc.scx").to_anndata(backed=True)
+
+# Headline path: out-of-core baseline-aware PCA embedding.
+pyscx.accel.pflog1ppf(adata, c=1.0, store="pca", n_components=50)
+adata.obsm["X_pflog1ppf_pca"]      # cells × n_components
+adata.obs["pflog1ppf_baseline"]    # per-cell baseline (always written)
+
+# Precompute-once / train-many: stream the transform to a compact SCX file
+# (sparse `delta` + `baseline` obs column), then reconstruct exact dense rows.
+pyscx.accel.pflog1ppf(adata, store="dense", out="pbmc_pflog1ppf.scx")  # store_repr="delta_baseline"
+re = pyscx.open("pbmc_pflog1ppf.scx").to_anndata()
+Z = pyscx.accel.pflog1ppf_reconstruct(re)   # exact dense Z = delta + baseline[:, None]
+```
+
+> **Representations & codecs.** `store_repr="delta_baseline"` (default) is the
+> compact `O(M)` form — the `delta` layer is written as a sparse CSR with
+> **Pcodec** float values (the natural codec for log-ratios) and `baseline`
+> rides in `obs`; reconstruct with `pyscx.accel.pflog1ppf_reconstruct` (or feed
+> the file to `TrainingDataset` with its transform mode off). `store_repr="dense"`
+> writes the literal full-density `Z` as a CSR with **forced Zstd** values and a
+> small default `shard_size` (peak RAM per shard ≈ `2·shard_rows·n_vars·4 B`),
+> for downstream tools that need a plain dense layer — it is `O(N·D)` on disk, so
+> prefer the compact default at atlas scale. Without `out=`, `store="dense"`
+> materializes into `adata.layers[layer_out]` guarded by `dense_max_elems`.
+> CPU-only — `device` is accepted for API symmetry but there is no GPU kernel.
 
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 

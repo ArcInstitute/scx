@@ -68,6 +68,8 @@ class IndexPlanDataset:
         normalize: bool | None = None,
         log1p: bool | None = None,
         target_sum: float | None = None,
+        pflog1ppf: bool | None = None,
+        pflog1ppf_c: float | None = None,
         cache_shards: int | None = None,
         sort_by_shard: bool | None = None,
         lookahead: int | None = None,

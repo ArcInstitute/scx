@@ -32,6 +32,93 @@ test_that("scx_pca_matrix returns finite embeddings + loadings of the right shap
   expect_true(all(res$variance_ratio >= 0))
 })
 
+test_that("scx_pflog1ppf returns embeddings + a per-cell baseline matching the reference", {
+  counts <- make_counts()
+  # PFlog1pPF requires raw counts with positive cell depth; drop empty cells.
+  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
+  cc <- 1.0
+  res <- scx_pflog1ppf(counts, c = cc, n_components = 10L, seed = 0L)
+
+  expect_type(res, "list")
+  expect_named(res, c("embeddings", "loadings", "variance_explained",
+                      "variance_ratio", "n_components", "baseline"))
+  expect_equal(nrow(res$embeddings), ncol(counts)) # cells
+  expect_equal(ncol(res$embeddings), 10L)
+  expect_equal(nrow(res$loadings), nrow(counts))   # genes
+  expect_true(all(is.finite(res$embeddings)))
+  expect_true(all(res$variance_ratio >= 0))
+
+  # Baseline is rotation/sign-free, so check it exactly against the reference:
+  # baseline_i = -(1/D) * sum_j log(x_ij/s_i + c).
+  expect_equal(length(res$baseline), ncol(counts))
+  expect_true(all(is.finite(res$baseline)))
+  Xc <- as.matrix(counts)                 # genes x cells
+  depth <- colSums(Xc)
+  L <- log(t(Xc) / depth + cc)            # cells x genes
+  ref_baseline <- -rowMeans(L)
+  # unname: rowMeans carries cell names; the Rust path returns a plain vector.
+  expect_equal(unname(res$baseline), unname(ref_baseline), tolerance = 1e-4)
+})
+
+test_that("scx_pflog1ppf baseline matches the reference for c != 1", {
+  counts <- make_counts()
+  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
+  cc <- 0.5
+  res <- scx_pflog1ppf(counts, c = cc, n_components = 8L, seed = 0L)
+  expect_true(all(is.finite(res$embeddings)))
+
+  # For c != 1 the reference must use the log1p(x/(c*s)) form (the log(x/s + c)
+  # shortcut only matches at c = 1, since the two differ by the constant log(c)
+  # which cancels under centering only when c = 1 in that specific expansion).
+  Xc <- as.matrix(counts)                 # genes x cells
+  depth <- colSums(Xc)
+  delta <- log1p(t(Xc) / (cc * depth))    # cells x genes
+  # Centering denominator D = number of genes = nrow(Xc); rowMeans over the
+  # cells x genes delta divides by exactly that.
+  ref_baseline <- -rowMeans(delta)
+  expect_equal(unname(res$baseline), unname(ref_baseline), tolerance = 1e-4)
+})
+
+test_that("scx_pflog1ppf rejects invalid c and empty cells", {
+  counts <- make_counts()
+  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
+  expect_error(scx_pflog1ppf(counts, c = 0))
+  expect_error(scx_pflog1ppf(counts, c = -1))
+  expect_error(scx_pflog1ppf(counts, c = Inf))
+
+  # An empty cell (zero column in the genes x cells matrix) has undefined depth.
+  empty <- make_counts(n_genes = 10L, n_cells = 5L)
+  empty[, 1] <- 0
+  empty <- methods::as(empty, "CsparseMatrix")
+  expect_error(scx_pflog1ppf(empty, c = 1))
+})
+
+test_that("scx_pflog1ppf Seurat path writes reduction + baseline, ignores features", {
+  skip_if_not_installed("Seurat")
+  skip_if_not_installed("SeuratObject")
+
+  counts <- make_counts(n_genes = 30L, n_cells = 60L)
+  counts <- counts[, Matrix::colSums(counts) > 0, drop = FALSE]
+  obj <- SeuratObject::CreateSeuratObject(counts = counts)
+
+  obj <- scx_pflog1ppf(obj, c = 1, n_components = 5L, seed = 0L)
+  expect_true("pflog1ppf" %in% names(obj@reductions))
+  emb <- SeuratObject::Embeddings(obj[["pflog1ppf"]])
+  expect_equal(nrow(emb), ncol(counts))
+  expect_equal(ncol(emb), 5L)
+  expect_true("pflog1ppf_baseline" %in% colnames(obj@meta.data))
+
+  # Regression for fix #7: setting VariableFeatures must NOT change the
+  # full-transcriptome baseline (no feature subsetting in PFlog1pPF).
+  SeuratObject::VariableFeatures(obj) <- rownames(counts)[1:5]
+  obj2 <- scx_pflog1ppf(obj, c = 1, n_components = 5L, seed = 0L)
+  expect_equal(
+    unname(obj2$pflog1ppf_baseline),
+    unname(obj$pflog1ppf_baseline),
+    tolerance = 1e-6
+  )
+})
+
 test_that("scx_highly_variable_genes selects n_top genes with finite normalized variance", {
   counts <- make_counts(n_genes = 50L)
   df <- scx_highly_variable_genes(counts, n_top_genes = 15L)

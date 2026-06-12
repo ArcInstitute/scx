@@ -39,8 +39,16 @@ use super::gpu::resolve_device;
 ///     random_state: Random seed for reproducibility (default: 0)
 ///     n_iterations: Maximum optimization iterations; 2 runs two outer passes
 ///         (matching leidenalg package default), -1 for until convergence (default: 2).
-///         On the cuGraph path this can safely be raised — rapids-singlecell
-///         defaults to 100 and convergence is cheap; see docs/scanpy.md.
+///         **The unit differs by backend.** On the Rust-native (CPU) path this
+///         is a leidenalg-style outer iteration (each a full multilevel
+///         local-move/refine/aggregate cycle), so the default of 2 is plenty.
+///         On the cuGraph (GPU) path the value maps to cuGraph's `max_iter`,
+///         which counts *coarsening passes* — a much finer unit. Forwarding the
+///         leidenalg default of 2 there starves coarsening and yields a
+///         degenerate, over-partitioned result, so the cuGraph path instead
+///         uses cuGraph's own default of **100** whenever `n_iterations <= 2`
+///         (including the `-1`/`0` convergence sentinels); only values `> 2` are
+///         forwarded verbatim as the cuGraph pass-cap. See docs/scanpy.md.
 ///     device: Device selection — "auto" (default), "cpu", "gpu", or "gpu:N".
 ///     parallel: Run the Rust-native Leiden in parallel mode (conflict-free
 ///         graph coloring). Default `False`. **Ignored on the cuGraph path**
@@ -314,14 +322,28 @@ fn try_cugraph_leiden(
         from_cudf_kwargs.set_item("renumber", true)?;
         graph.call_method("from_cudf_edgelist", (&edge_df,), Some(&from_cudf_kwargs))?;
 
-        // Run Leiden
+        // Run Leiden.
+        //
+        // cuGraph's `max_iter` counts *coarsening passes* (each pass = one
+        // round of local moving + graph contraction), NOT leidenalg-style
+        // outer iterations. The pyscx default (`n_iterations=2`, a leidenalg
+        // unit) and the convergence sentinels (`<= 0`) would starve cuGraph's
+        // coarsening and leave a degenerate, over-partitioned result — e.g.
+        // ~116k singleton-ish communities on a 1M-node kNN graph instead of
+        // the expected few dozen (user-report B4). Map the small leidenalg-style
+        // default to cuGraph's own default (100), and only forward an explicit
+        // pass-cap when the caller raised `n_iterations` above the default.
+        const CUGRAPH_DEFAULT_MAX_ITER: i64 = 100;
+        let cugraph_max_iter = if max_iter > 2 {
+            max_iter
+        } else {
+            CUGRAPH_DEFAULT_MAX_ITER
+        };
         let leiden_kwargs = PyDict::new(py);
         leiden_kwargs.set_item("resolution", resolution)?;
         leiden_kwargs.set_item("random_state", random_state as i32)?;
         leiden_kwargs.set_item("theta", theta)?;
-        if max_iter > 0 {
-            leiden_kwargs.set_item("max_iter", max_iter)?;
-        }
+        leiden_kwargs.set_item("max_iter", cugraph_max_iter)?;
 
         let leiden_result = cugraph.call_method("leiden", (&graph,), Some(&leiden_kwargs))?;
 
@@ -360,6 +382,9 @@ fn try_cugraph_leiden(
         params_dict.set_item("resolution", resolution)?;
         params_dict.set_item("random_state", random_state)?;
         params_dict.set_item("n_iterations", max_iter)?;
+        // The effective coarsening-pass cap actually handed to cuGraph (may
+        // differ from `n_iterations` — see the CUGRAPH_DEFAULT_MAX_ITER note).
+        params_dict.set_item("max_iter", cugraph_max_iter)?;
         params_dict.set_item("theta", theta)?;
         params_dict.set_item("device", device)?;
         params_dict.set_item("gpu_id", gpu_id)?;

@@ -130,6 +130,22 @@ class TestHarmonyDevice:
         )
         assert adata.uns["harmony"]["backend"] == "scx-accel-cpu"
 
+    def test_stamps_scx_accel_route(self, harmony_adata):
+        """F15: harmony_integrate must record the same scx_accel route envelope
+        as PCA / kNN / UMAP so GPU-vs-CPU dispatch is verifiable, not None."""
+        import pyscx
+
+        adata = harmony_adata
+        pyscx.accel.harmony_integrate(
+            adata, "batch", device="cpu", max_iter=2, random_state=0
+        )
+        assert "scx_accel" in adata.uns
+        assert "harmony_integrate" in adata.uns["scx_accel"]
+        route = adata.uns["scx_accel"]["harmony_integrate"]
+        # device="cpu" → CpuDense path, recorded as a user-forced CPU fallback.
+        assert route["route"] == "cpu_dense"
+        assert route["fallback_reason"] == "user_forced_cpu"
+
 
 class TestHarmonyErrors:
     """Informative error surface for common misuse."""

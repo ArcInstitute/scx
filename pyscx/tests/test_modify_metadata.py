@@ -55,6 +55,27 @@ def test_modify_metadata_obs_wrong_shape_raises(synthetic_adata, scx_from_adata)
         pyscx.modify_metadata(path, obs=bad_obs)
 
 
+def test_modify_metadata_obs_dict_raises_typeerror(synthetic_adata, scx_from_adata):
+    # Report E2: passing a column->values dict (a natural thing to try) instead
+    # of a pandas DataFrame must raise a clear TypeError naming modify_metadata,
+    # the parameter, and the fix — not an opaque pyarrow AttributeError.
+    path = scx_from_adata(synthetic_adata)
+    with pytest.raises(TypeError) as ei:
+        pyscx.modify_metadata(path, obs={"qc_status": [1, 2, 3]})
+    msg = str(ei.value)
+    assert "modify_metadata(obs=...)" in msg
+    assert "pandas DataFrame" in msg
+    assert "dict" in msg
+
+
+def test_modify_metadata_var_dict_raises_typeerror(synthetic_adata, scx_from_adata):
+    # Same guard on the `var` parameter.
+    path = scx_from_adata(synthetic_adata)
+    with pytest.raises(TypeError) as ei:
+        pyscx.modify_metadata(path, var={"gene_flag": [0, 1]})
+    assert "modify_metadata(var=...)" in str(ei.value)
+
+
 def test_modify_metadata_obs_index_rebuild(synthetic_adata, scx_from_adata):
     path = scx_from_adata(synthetic_adata)
     n = synthetic_adata.n_obs

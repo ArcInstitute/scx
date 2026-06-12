@@ -148,6 +148,40 @@ def pca(
 
 
 # ---------------------------------------------------------------------------
+# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Writes in
+# place; `pflog1ppf_reconstruct` is a pure-Python companion exposed on this
+# submodule (and at top level) by `pyscx/__init__.py`.
+# ---------------------------------------------------------------------------
+
+
+def pflog1ppf(
+    adata: Any,
+    c: float = 1.0,
+    layer: str | None = None,
+    *,
+    store: str = "pca",
+    n_components: int = 50,
+    n_oversamples: int = 10,
+    n_power_iterations: int = 2,
+    zero_center: bool = True,
+    random_state: int = 0,
+    obsm_key: str = "X_pflog1ppf_pca",
+    baseline_key: str = "pflog1ppf_baseline",
+    layer_out: str | None = None,
+    out: str | None = None,
+    store_repr: str = "delta_baseline",
+    shard_size: int | None = None,
+    dense_max_elems: int = 200_000_000,
+    device: str = "auto",
+) -> None: ...
+
+
+def pflog1ppf_reconstruct(
+    adata: Any, baseline_key: str = "pflog1ppf_baseline"
+) -> Any: ...
+
+
+# ---------------------------------------------------------------------------
 # Graph / embedding / integration ops
 # ---------------------------------------------------------------------------
 
@@ -218,6 +252,7 @@ def compute_lisi(
     basis: str = "X_pca",
     perplexity: float = 30.0,
     n_neighbors: int | None = None,
+    approximate_knn: bool = False,
 ) -> Any: ...
 
 

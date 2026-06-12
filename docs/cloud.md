@@ -29,7 +29,13 @@ cargo install --path scx-cli --features cloud
 
 Without this flag, `pyscx.pull`, `pyscx.push`, `pyscx.open_cloud`, and the
 `scx pull` / `scx push` / `scx cloud-optimize` / `scx explode` / `scx pack`
-subcommands are not available.
+subcommands are not available. On a non-cloud CLI build, invoking one of these
+fails with `error: unrecognized subcommand 'pull'` preceded by a hint —
+`note: \`pull\` is a cloud subcommand and is not compiled into this build.
+Rebuild with \`--features cloud\` …` — so a feature-gated command is
+distinguishable from a typo. The prebuilt release CLI is built `--features
+hdf5-static` (not `cloud`); build/install with `--features cloud` (or
+`hdf5,cloud`) to get the cloud subcommands.
 
 ## Supported providers and URL schemes
 

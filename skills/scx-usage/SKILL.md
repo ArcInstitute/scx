@@ -53,10 +53,27 @@ export PATH="$(pwd)/.venv/bin:$PATH"
 cd pyscx && ../.venv/bin/maturin develop --release && cd ..
 ```
 
-Use the repo `.venv/` only — not system Python. Source builds need
+Use the repo `.venv/` only for *building* — not system Python. Source builds need
 `libhdf5-dev` on Linux for h5ad ingest. Cloud is **not** in the default dev
 build — pass `--features cloud` when you need `open_cloud()`. Rebuild after
 branch switches or feature changes (`--features gpu`, etc.).
+
+> **Before running, check existing conda envs for the deps your task needs —
+> don't assume `.venv`, and don't create a new env without first looking.**
+> Task-specific dependencies often live in only one environment: GPU analysis
+> needs `rapids-singlecell` (+ `cupy`/`cugraph`/`cuml`), multimodal needs
+> `mudata`, HVG `seurat_v3` needs `skmisc`, SLAF benchmarks need their own env,
+> etc. A plain pip/uv `.venv` usually has none of these. List the available
+> environments and inspect what they actually carry, then run from the one that
+> already has what the task requires:
+> ```bash
+> conda env list
+> conda list -n <env> | grep -iE 'rapids-singlecell|cupy|cugraph|mudata|scikit-misc|scanpy'
+> ```
+> The maturin editable `.so` is shared across environments (each carries a
+> `pyscx.pth` pointing at the repo), so a single `--features gpu` build is
+> importable from whichever env you select — you almost never need a *new* env,
+> just the right *existing* one.
 
 **Sanity check after any install:**
 
@@ -120,9 +137,12 @@ Most-used kwargs (shared across ingest entry points):
   `prefer_format="csc"` accel paths + the CSC-direct `gpu_csc_v3` DE route; two-pass,
   transient disk ~2× output). `"auto"` builds it only when the dataset is large
   enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
-  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To *use* the CSC
-  DE route, call `rank_genes_groups`/`pdex_ref` with `device="auto"` —
-  `device="gpu"` together with `prefer_format="csc"` raises in v0.7.1.
+  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To get the
+  **GPU-fast** CSC-direct DE route (`gpu_csc_v3`), call `rank_genes_groups`/`pdex_ref`
+  with the **default `prefer_format="csr"`** and `device="gpu"` (or `"auto"`) on a
+  file that has the sidecar — the planner picks `gpu_csc_v3` automatically.
+  `prefer_format="csc"` is the **CPU** column-major path (no GPU kernel);
+  combining it with `device="gpu"` raises.
 - `memory_budget="4G"` (bare bytes or a binary-prefixed size: `K`/`M`/`G`/`T`
   or `KiB`/`MiB`/`GiB`/`TiB`, powers of 1024; decimal `KB`/`MB`/`GB`/`TB`
   rejected), `strict_uns=True`, `shard_size`. See `reference/conversion.md` for the rest
@@ -230,11 +250,19 @@ back to CPU with `FallbackReason::NoRapids`.
 > `.venv`s typically don't have `rapids-singlecell`, so `device="gpu"` there
 > silently CPU-falls-back. The maturin editable `.so` is shared across envs, so
 > the working setup is: build pyscx once with `--features gpu`, then run from the
-> conda env that has rapids-singlecell. Verified GPU is real and fast — PCA was
-> ~22× CPU and bit-identical on 1 M cells, with route metadata correctly naming
-> the backend. **Always confirm via `adata.uns["scx_accel"][op]["route"]`**
-> (`rapids_singlecell_gpu` / `gpu_csr` / `cpu_*`), since silent fallback is the
-> common failure — except `harmony_integrate`, which stamps no route metadata.
+> conda env that *already* has rapids-singlecell — **check before assuming or
+> creating one**:
+> ```bash
+> conda env list
+> # pick the env whose list includes rapids-singlecell (it pulls cupy/cugraph/cuml):
+> conda list -n <env> | grep -iE 'rapids-singlecell|cupy|cugraph'
+> conda run -n <env> python -c "import pyscx, rapids_singlecell; print('ok')"
+> ```
+> Verified GPU is real and fast — PCA was ~22× CPU and bit-identical on 1 M
+> cells, with route metadata correctly naming the backend. **Always confirm via
+> `adata.uns["scx_accel"][op]["route"]`** (`rapids_singlecell_gpu` / `gpu_csr` /
+> `cpu_*`), since silent fallback is the common failure — except
+> `harmony_integrate`, which stamps no route metadata.
 
 `to_gpu_anndata()` on an `Experiment` returns a GPU-resident AnnData
 (`X` = `cupyx.scipy.sparse.csr_matrix`). It records the path in
@@ -268,11 +296,11 @@ only when the filtered result fits in RAM, else switch to
 - **`highly_variable_genes(flavor="seurat_v3")` expects raw counts.** Run it
   before `normalize_total`/`log1p`, or stash `adata.layers["counts"]` and pass
   `layer="counts"`. Otherwise → statistically wrong HVGs + a warning.
-- **`leiden(device="cpu")` for label stability.** The GPU (cuGraph) path can
-  return a *vastly different cluster count*, not just relabeled clusters — on a
-  1 M-cell graph at `resolution=1.0` it gave 116k clusters vs 29 on CPU. Pin CPU
-  whenever downstream cares about cluster identity (DE, annotation transfer);
-  treat GPU Leiden as a deliberate experiment only.
+- **`leiden(device="cpu")` for label stability.** GPU (cuGraph) and CPU now give
+  comparable cluster *counts* (the old `n_iterations`→`max_iter` unit bug that
+  produced ~116k degenerate clusters is fixed), but their labels still differ by
+  design (ARI ≈ 0.72, not 1.0). Pin CPU whenever downstream cares about exact
+  cluster identity (DE, annotation transfer).
 - `accel.subset_obs` with an integer array becomes a boolean mask — **order not
   preserved, duplicates collapsed** (unlike NumPy fancy indexing).
 
@@ -343,6 +371,6 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.
 - GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing. Build pyscx `--features gpu` once, then **run from the conda env that has rapids** (a plain `.venv` usually doesn't).
-- CSC-direct DE: `rank_genes_groups`/`pdex_ref` with `device="auto"` (a `csc=` sidecar must exist) — **`device="gpu"` + `prefer_format="csc"` raises**.
-- CLI predicate: `scx query <file> <filter>` takes the filter **positionally** (not `--filter`, unlike `scx subset`/`delete`); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
-- `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; subsample to evaluate integration.
+- GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="csr"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
+- CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter` (matching `scx subset`/`delete`); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
+- `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; pass `approximate_knn=True` for an HNSW kNN (~10× faster, small drift) or subsample to evaluate integration.

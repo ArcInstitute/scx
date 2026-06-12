@@ -91,9 +91,10 @@ def test_inmemory_seurat_v3_batch_key_does_not_raise(
     assert not [
         w for w in caught if "scanpy.pp.highly_variable_genes" in str(w.message)
     ]
-    # The singular batch was caught and named (per-batch tolerance).
+    # The singular batch was caught and surfaced in the coalesced summary
+    # warning (per-batch tolerance; F10 dedup).
     assert [
-        w for w in caught if "skmisc.loess fit failed on batch" in str(w.message)
+        w for w in caught if "skmisc.loess fit failed on" in str(w.message)
     ], "expected the per-batch singularity to be caught and warned, not raised"
     assert "highly_variable" in adata.var.columns
     assert int(adata.var["highly_variable"].sum()) == 10

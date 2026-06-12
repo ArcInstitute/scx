@@ -83,15 +83,26 @@ produced when you apply lazy `normalize_total`/`log1p`.
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
 (default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
-convert). For CSC-direct DE, **pass `device="auto"` (or `"cpu"`), not
-`device="gpu"`**: `rank_genes_groups`/`pdex_ref` called with both `device="gpu"`
-*and* `prefer_format="csc"` raise `RuntimeError: device='gpu' with
-prefer_format='csc' is not supported in v1; use device='cpu' or device='auto' for
-CSC dispatch.` (verified v0.7.1). With a sidecar present, `device="auto"` selects
-the CSC-direct driver (`gpu_csc_v3`); without one it uses `gpu_csr_v3`. Always
-confirm the backend that actually ran via `adata.uns["scx_accel"][op]["route"]`
-(`harmony_integrate` is the exception — it stamps no route metadata, so you
-can't tell GPU from CPU there).
+convert).
+
+**How to get GPU CSC-direct DE (`gpu_csc_v3`).** `prefer_format` and `device`
+are two *different* axes, and the GPU CSC-direct route is selected by the
+planner, **not** by `prefer_format="csc"`:
+
+- For **GPU-fast** DE, keep the **default `prefer_format="csr"`** and pass
+  `device="gpu"` (or `"auto"`). When the file has a CSC sidecar the planner
+  routes `rank_genes_groups`/`pdex_ref` to `gpu_csc_v3` automatically; without a
+  sidecar it uses `gpu_csr_v3`.
+- `prefer_format="csc"` selects the **CPU** column-major streaming path
+  (`cpu_csc`); it has no GPU kernel. With `device="auto"` it silently runs on
+  CPU; with an explicit `device="gpu"` it raises a `RuntimeError` explaining
+  that `prefer_format='csc'` is the CPU path and that GPU CSC-direct comes from
+  the default `prefer_format='csr'` + `device='gpu'`.
+
+Always confirm the backend that actually ran via
+`adata.uns["scx_accel"][op]["route"]` — `gpu_csc_v3` (GPU CSC-direct),
+`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc` / `cpu_csr`. All accel ops stamp
+this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
 - `normalize_total(adata, target_sum=10000.0)` — on backed/lazy, appends a transform; on scipy CSR delegates to `sc.pp.normalize_total`.
@@ -106,7 +117,7 @@ can't tell GPU from CPU there).
 - `pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — in-VRAM data routes to `rsc.pp.pca` (rapids-singlecell); >VRAM data uses native randomized SVD with streaming shards. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. **PCA rejects CSC.**
 - `neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — CPU HNSW; GPU routes to `rsc.pp.neighbors` (rapids-singlecell). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — GPU routes to `rsc.tl.umap` (rapids-singlecell); CPU falls back to scanpy. Writes `obsm["X_umap"]`.
-- `leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto")` — reads `obsp["connectivities"]`. **Pin `device="cpu"`** — the GPU (cuGraph) path doesn't just relabel clusters, it can return a *wildly different cluster count*: on a 1 M-cell graph at `resolution=1.0` GPU Leiden produced **116,179 clusters vs 29 on CPU** (ARI ≈ 0.0002). Use GPU Leiden only as a deliberate experiment, never when downstream cares about cluster identity (DE, annotation transfer). Writes `obs[key_added]` (categorical) + `uns["leiden"]`.
+- `leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=2, device="auto")` — reads `obsp["connectivities"]`. `n_iterations` is a leidenalg-style outer-iteration unit on CPU; on the cuGraph (GPU) path values `<= 2` (incl. `-1`/`0` sentinels) map to cuGraph's `max_iter=100` (forwarding the bare leidenalg default of 2 used to starve cuGraph coarsening into a degenerate ~116k-cluster partition — fixed). With that fix, GPU and CPU give comparable cluster counts (e.g. 48 vs 53 on 1 M cells, ARI ≈ 0.72). **Still prefer `device="cpu"` when downstream cares about exact cluster identity** (DE, annotation transfer) — the two backends differ in label stability by design, so they won't match exactly. Effective GPU cap recorded in `uns["leiden"]["params"]["max_iter"]`. Writes `obs[key_added]` (categorical) + `uns["leiden"]`.
 
 **DE / perturbation:**
 - `rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — parallel Wilcoxon + BH. Writes `uns["rank_genes_groups"]` (or returns a DataFrame when `stratify_by` set).
@@ -121,7 +132,7 @@ can't tell GPU from CPU there).
 
 **Integration / metrics:**
 - `harmony_integrate(adata, key, *, basis="X_pca", adjusted_basis=None, ..., random_state=0, device="auto")` — Rust Harmony2. `key` is one obs column or a list. Writes corrected embedding to `obsm[adjusted_basis or basis]` + `uns["harmony"]`. Param names match `scanpy.external.pp.harmony_integrate`.
-- `compute_lisi(adata, key, *, basis="X_pca", perplexity=30.0, n_neighbors=None) -> np.ndarray` — Local Inverse Simpson Index (iLISI batch-mixing / cLISI label-purity); also writes `obs[f"lisi_{key}"]`. Higher iLISI = better batch mixing — useful pre/post `harmony_integrate` (e.g. 3.2 → 6.0 on a 116-batch census file confirms integration worked). **Slow at scale:** the default is *exact* kNN, which is O(N²) and ran ~44 min per call on 1 M cells. It warns about this and suggests `approximate_knn`, but no such kwarg is exposed today — budget for it, or evaluate integration on a subsample.
+- `compute_lisi(adata, key, *, basis="X_pca", perplexity=30.0, n_neighbors=None, approximate_knn=False) -> np.ndarray` — Local Inverse Simpson Index (iLISI batch-mixing / cLISI label-purity); also writes `obs[f"lisi_{key}"]`. Higher iLISI = better batch mixing — useful pre/post `harmony_integrate` (e.g. 3.2 → 6.0 on a 116-batch census file confirms integration worked). **Slow at scale by default:** exact kNN is O(N²) and ran ~44 min per call on 1 M cells (the exact path logs a hint above ~50k cells). Pass `approximate_knn=True` to swap in an HNSW kNN — ~10× faster at N≳100k with small drift (~0.01–0.05 mean LISI) — for atlas-scale runs; the default stays exact for byte-for-byte R `lisi` parity.
 
 **Streaming column stats** (on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`; honor `col_projection` / deletion vector):
 - `col_sums(dataset, prefer_format="csr") -> f64[]`, `col_nnz -> i64[]`, `col_min`, `col_max`, `col_var`.
