@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -46,6 +47,14 @@ from benchmarks.comprehensive.scripts.validation_helpers import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+# Cap pydeseq2's loky worker pool for the pseudobulk DE checks. Without a cap,
+# pydeseq2's DefaultInference forks one Python-interpreter worker per core
+# (~300 MB RSS each), which OOM-kills the validation job on many-core nodes.
+# pyscx.accel.pseudobulk_dex already derives this from SLURM_CPUS_PER_TASK by
+# default; we pass it explicitly so the cap is deterministic regardless of how
+# the worker env is propagated, and never exceeds 8.
+_PSEUDOBULK_N_CPUS = min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +463,7 @@ def check_pseudobulk_dex(adata_raw) -> ValidationCheck:
             test_col="cell_type",
             reference=reference,
             min_cells_per_group=5,
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
     except Exception as e:
         return ValidationCheck(
@@ -521,6 +531,7 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
             stratify_by=["batch"],
             min_cells_per_group=3,
             min_cells_per_stratum=10,
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
 
         # Manual per-stratum loop
@@ -537,6 +548,7 @@ def check_pseudobulk_dex_stratified(adata_raw) -> ValidationCheck:
                     test_col="cell_type",
                     reference=reference,
                     min_cells_per_group=3,
+                    n_cpus=_PSEUDOBULK_N_CPUS,
                 )
                 if res is not None and len(res) > 0:
                     res["stratum"] = stratum

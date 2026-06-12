@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +58,12 @@ try:
     _HAS_PYSCX = True
 except ImportError:
     pass
+
+# Cap pydeseq2's loky worker pool in the pseudobulk variant. Without it,
+# DefaultInference forks one Python-interpreter worker per core (~300 MB each),
+# OOM-killing the job on many-core nodes. pyscx.accel.pseudobulk_dex derives
+# this from SLURM_CPUS_PER_TASK by default; passed explicitly for determinism.
+_PSEUDOBULK_N_CPUS = min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
 
 # Per-dataset cache for the converted CSC-equipped SCX file. Keyed by
 # `(dataset.name, csc_cols_per_shard)`.
@@ -243,6 +250,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             reference,
             prefer_format="csc",
             gene_indices=gene_indices,
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
     else:
         pyscx.accel.pseudobulk_dex(
@@ -251,6 +259,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             "_bench_cond",
             reference,
             prefer_format="csr",
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
 
 

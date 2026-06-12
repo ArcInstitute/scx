@@ -8,6 +8,92 @@ use crate::backed::ScxBackedSparseDataset;
 
 use super::de::extract_strata;
 
+/// Resolve a safe worker cap for pydeseq2's loky inference backend.
+///
+/// Precedence: explicit `n_cpus` (if `> 0`) → `SLURM_CPUS_PER_TASK` →
+/// `OMP_NUM_THREADS` → `min(available_parallelism, 8)`. Always `>= 1`.
+///
+/// pydeseq2's `DefaultInference` defaults to `n_cpus=None`, which spawns one
+/// loky worker process per core. Each worker is a full Python interpreter
+/// (~300 MB RSS once numba/scipy are imported), so on a 192-core node the
+/// pool alone needs ~58 GB and OOM-kills the job even for tiny inputs.
+fn resolve_deseq_n_cpus(n_cpus: Option<usize>) -> usize {
+    resolve_deseq_n_cpus_impl(
+        n_cpus,
+        std::env::var("SLURM_CPUS_PER_TASK").ok(),
+        std::env::var("OMP_NUM_THREADS").ok(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
+}
+
+/// Pure core of [`resolve_deseq_n_cpus`] — env/probe values are passed in so
+/// the precedence logic is testable without mutating process state.
+fn resolve_deseq_n_cpus_impl(
+    n_cpus: Option<usize>,
+    slurm_cpus: Option<String>,
+    omp_threads: Option<String>,
+    available_parallelism: usize,
+) -> usize {
+    if let Some(n) = n_cpus {
+        if n > 0 {
+            return n;
+        }
+    }
+    for v in [slurm_cpus, omp_threads].into_iter().flatten() {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    available_parallelism.clamp(1, 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_deseq_n_cpus_impl;
+
+    #[test]
+    fn explicit_n_cpus_wins_over_env_and_probe() {
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(Some(3), Some("64".into()), Some("64".into()), 192),
+            3
+        );
+    }
+
+    #[test]
+    fn slurm_cpus_takes_precedence_over_omp() {
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(None, Some("4".into()), Some("64".into()), 192),
+            4
+        );
+    }
+
+    #[test]
+    fn omp_used_when_slurm_absent() {
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(None, None, Some("6".into()), 192),
+            6
+        );
+    }
+
+    #[test]
+    fn falls_back_to_probe_clamped_to_8() {
+        // Explicit 0 and unparseable/zero env are all ignored.
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(Some(0), Some("0".into()), None, 192),
+            8
+        );
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(None, Some("x".into()), None, 4),
+            4
+        );
+        assert_eq!(resolve_deseq_n_cpus_impl(None, None, None, 1), 1);
+    }
+}
+
 /// Pseudobulk differential expression via Rust aggregation + pydeseq2.
 ///
 /// Aggregates single-cell counts into pseudobulk samples by grouping cells
@@ -22,12 +108,18 @@ use super::de::extract_strata;
 ///     design: DESeq2 design formula (default: auto-generated as "~ test_col")
 ///     aggr_method: "sum" (default) or "mean"
 ///     min_cells_per_group: Skip groups with fewer cells (default: 10)
+///     n_cpus: Worker cap for pydeseq2's parallel inference. `None` (default)
+///         resolves a safe bound from the environment (`SLURM_CPUS_PER_TASK`,
+///         then `OMP_NUM_THREADS`) and otherwise falls back to
+///         `min(available_parallelism, 8)`. This prevents pydeseq2's loky
+///         backend from forking one worker process per core on many-core
+///         hosts (each a full Python interpreter), which OOMs the job.
 ///
 /// Returns:
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None))]
+#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
@@ -42,6 +134,7 @@ pub fn pseudobulk_dex(
     min_cells_per_stratum: usize,
     prefer_format: &str,
     gene_indices: Option<Vec<u32>>,
+    n_cpus: Option<usize>,
 ) -> PyResult<Py<PyAny>> {
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
@@ -98,6 +191,7 @@ pub fn pseudobulk_dex(
                 50,   // unused since stratify_by=None
                 prefer_format,
                 gene_indices.clone(),
+                n_cpus,
             ) {
                 Ok(result_obj) => {
                     let result_df = result_obj.bind(py);
@@ -437,6 +531,55 @@ pub fn pseudobulk_dex(
     // Run DESeq2 per contrast and collect results.
     let mut all_results: Vec<Bound<'_, PyAny>> = Vec::new();
 
+    // Bound every thread/process pool pydeseq2 can spin up. Three multipliers
+    // stack on a many-core host (192 cores on a Chimera node) and OOM the job:
+    //   1. loky/joblib worker processes (one per core) — capped via
+    //      `DefaultInference(n_cpus=...)` below;
+    //   2. numba parallel threads, inside each worker *and* the main process;
+    //   3. the BLAS pool (OpenMP / MKL / OpenBLAS).
+    // `n_cpus` only governs (1); (2) and (3) read their own env vars, so we
+    // cap those too. The loky workers are spawned later (at `.deseq2()` /
+    // `.summary()`) and inherit this env, so the cap reaches each worker's
+    // numba/BLAS pools — that per-worker explosion was the residual OOM.
+    let resolved_n_cpus = resolve_deseq_n_cpus(n_cpus);
+    {
+        let cap = resolved_n_cpus.to_string();
+        for var in [
+            "NUMBA_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+        ] {
+            // setdefault semantics: never override an explicit operator setting.
+            if std::env::var_os(var).is_none() {
+                std::env::set_var(var, &cap);
+            }
+        }
+        // Best-effort: rein in numba in *this* process too. The env var only
+        // binds freshly-spawned workers; the main interpreter may already have
+        // imported numba (via scanpy / pydeseq2), so reduce its live pool.
+        if let Ok(numba) = py.import("numba") {
+            let _ = numba.call_method1("set_num_threads", (resolved_n_cpus,));
+        }
+    }
+    let inference = py
+        .import("pydeseq2.default_inference")
+        .map_err(|_| {
+            PyRuntimeError::new_err(
+                "pydeseq2.default_inference module not found. Ensure pydeseq2 is properly installed.\n\
+                 Install with: pip install pydeseq2",
+            )
+        })?
+        .call_method(
+            "DefaultInference",
+            (),
+            Some(&{
+                let kw = PyDict::new(py);
+                kw.set_item("n_cpus", resolved_n_cpus)?;
+                kw
+            }),
+        )?;
+
     // Create DeseqDataSet.
     let dds = pydeseq2.call_method(
         "DeseqDataSet",
@@ -446,6 +589,7 @@ pub fn pseudobulk_dex(
             kw.set_item("counts", &counts_df)?;
             kw.set_item("metadata", &metadata_df)?;
             kw.set_item("design", &_design_str)?;
+            kw.set_item("inference", &inference)?;
             kw
         }),
     )?;
@@ -454,7 +598,11 @@ pub fn pseudobulk_dex(
     dds.call_method0("deseq2")?;
 
     for target in &target_levels {
-        // Create DeseqStats for this contrast.
+        // Create DeseqStats for this contrast. `DeseqStats` builds its OWN
+        // inference if none is passed — and that default is `n_cpus=None`,
+        // which re-forks one loky worker per core for the Wald tests and
+        // OOM-kills the job (the DeseqDataSet `inference=` above only covers
+        // size-factor/dispersion/LFC fitting). Reuse the capped inference.
         let stat = pydeseq2_stats.call_method(
             "DeseqStats",
             (&dds,),
@@ -463,6 +611,7 @@ pub fn pseudobulk_dex(
                 let contrast =
                     pyo3::types::PyList::new(py, [test_col, target.as_str(), reference])?;
                 kw.set_item("contrast", contrast)?;
+                kw.set_item("inference", &inference)?;
                 kw
             }),
         )?;
