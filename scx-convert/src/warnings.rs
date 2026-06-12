@@ -237,6 +237,21 @@ impl fmt::Display for ConvertWarning {
                  deletion-vectors-active file) cannot reproduce raw's obs-axis filtering. \
                  The on-disk raw sections are preserved."
             ),
+            Self::EagerAssemblyMemoryHigh {
+                estimated_bytes,
+                budget_bytes,
+            } => {
+                let gib = 1024.0 * 1024.0 * 1024.0;
+                let est_gb = *estimated_bytes as f64 / gib;
+                let budget_gb = *budget_bytes as f64 / gib;
+                write!(
+                    f,
+                    "estimated host assembly ~{est_gb:.1} GB exceeds the {budget_gb:.1} GB \
+                     budget; proceeding (peak host RSS may be high). Pass a smaller \
+                     var_names / obs_filter subset, open with backed=True, or raise \
+                     memory_budget to reduce it."
+                )
+            }
             other => write!(f, "{other:?}"),
         }
     }
@@ -372,6 +387,24 @@ mod tests {
         assert!(rendered.contains(", ..."), "{rendered}");
         assert!(rendered.contains("Drop --index-preset"), "{rendered}");
         assert!(rendered.contains("--index-obs"), "{rendered}");
+    }
+
+    #[test]
+    fn eager_assembly_memory_high_display_is_human_readable() {
+        // Report E4: the warning must read as a sentence with GiB figures and
+        // actionable advice, not a `{:?}`-formatted struct with raw byte counts.
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 25_239_799_332,
+            budget_bytes: 8_589_934_592,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("23.5 GB"), "{rendered}");
+        assert!(rendered.contains("8.0 GB"), "{rendered}");
+        assert!(rendered.contains("proceeding"), "{rendered}");
+        assert!(rendered.contains("backed=True"), "{rendered}");
+        // Must NOT leak the debug struct shape.
+        assert!(!rendered.contains("EagerAssemblyMemoryHigh"), "{rendered}");
+        assert!(!rendered.contains("estimated_bytes"), "{rendered}");
     }
 
     #[test]

@@ -335,10 +335,10 @@ pub fn from_h5mu_impl(
     let mut sink = scx_convert::WarningSink::log();
     if stream {
         py.detach(|| scx_convert::h5mu_to_scx_streaming(&input, &output, &opts, &mut sink))
-            .map_err(crate::convert_to_pyerr)?;
+            .map_err(|e| crate::convert_to_pyerr_with_path(e, path))?;
     } else {
         py.detach(|| scx_convert::h5mu_to_scx(&input, &output, &opts, &mut sink))
-            .map_err(crate::convert_to_pyerr)?;
+            .map_err(|e| crate::convert_to_pyerr_with_path(e, path))?;
     }
     crate::convert::emit_python_warnings(py, &sink)?;
     Ok(())

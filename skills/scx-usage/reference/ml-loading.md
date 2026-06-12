@@ -36,7 +36,7 @@ ds.close()
 | Argument | Default | Notes |
 |---|---|---|
 | `path` | — | Path to `.scx`. |
-| `batch_size` | `1024` | Auto-tuned downward if `max_memory_mb` exceeded. |
+| `batch_size` | `1024` | Auto-tuned downward only if an **explicit** `max_memory_mb` is exceeded; the adaptive default budget preserves it. |
 | `hvg_indices` | `None` | `np.ndarray[uint32]` of gene indices; `None` = all genes. |
 | `obs_columns` | `[]` | Obs column names included in each batch. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in one CSR row scan). |
@@ -45,7 +45,7 @@ ds.close()
 | `shard_group_size` | `8` | Shards per I/O group (sequential reads within a group). |
 | `prefetch_batches` | `4` | Ring buffer depth. |
 | `seed` | `42` | Deterministic shuffle via `(seed, epoch)`. |
-| `max_memory_mb` | `512` | Budget; auto-tunes `shard_group_size`/`prefetch_batches`/`batch_size`. |
+| `max_memory_mb` | adaptive (≥512) | Omit → adaptive budget scales to fit a full-width file (floor 512 MB, cap 4096 MB), so the requested `batch_size` survives. Pass a value → hard ceiling that auto-tunes `shard_group_size`/`prefetch_batches`/`batch_size` down. |
 | `modality` | `None` | For multimodal v2 files; ignored on single-modality. |
 
 **Properties:** `n_obs`, `n_vars`, `n_output_genes` (HVG count if projected else

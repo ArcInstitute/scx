@@ -3475,6 +3475,7 @@ dependencies = [
  "half",
  "hdf5-metno",
  "indicatif",
+ "libc",
  "log",
  "ndarray",
  "ndarray-npy",

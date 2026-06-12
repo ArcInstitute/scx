@@ -1256,7 +1256,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
-| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`                           | —                                              |
+| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | —   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format` |
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format` |
 
@@ -1347,6 +1347,24 @@ contiguous gene columns instead of decoding and projecting every row.
   GPU-fast. So a CSC sidecar makes Wilcoxon GPU-fast too.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
+
+> **Which `(device, prefer_format)` selects `gpu_csc_v3`?** `device` and
+> `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
+> by the *route planner*, **not** by `prefer_format="csc"`:
+>
+> - **GPU-fast DE:** keep the **default `prefer_format="csr"`** and pass
+>   `device="gpu"` (or `"auto"`). When the backed file has a CSC sidecar the
+>   planner routes to `gpu_csc_v3` automatically; without one it uses
+>   `gpu_csr_v3`. This is the intended GPU-fast entry point.
+> - `prefer_format="csc"` selects the **CPU** column-major streaming path
+>   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
+>   it runs on CPU; combining it with an explicit `device="gpu"` raises a
+>   `RuntimeError` that points you back to the default `prefer_format="csr"` +
+>   `device="gpu"` for GPU CSC-direct.
+>
+> In short: do **not** reach for `prefer_format="csc"` to get GPU speed — it is
+> the CPU path. A CSC *sidecar on the file* (built at conversion) is what makes
+> the default-`csr` GPU call fast.
 
 To make a file GPU-fast for DE, build the sidecar at conversion time:
 `pyscx.from_anndata(adata, path, csc="auto")` (built automatically once the
@@ -1656,7 +1674,7 @@ pyscx.accel.leiden(adata, resolution=1.0)
 | `resolution` | 1.0 | Resolution parameter γ — higher values yield more communities |
 | `key_added` | `"leiden"` | Key in `adata.obs` for community labels |
 | `random_state` | 0 | Random seed for reproducibility |
-| `n_iterations` | 2 | Outer iterations: 2 matches the leidenalg package default; raise to e.g. 100 on the cuGraph path for tighter modularity convergence (rapids-singlecell's default). |
+| `n_iterations` | 2 | **Unit differs by backend.** Rust-native (CPU): leidenalg-style outer iterations (default 2 is plenty — each is a full multilevel cycle). cuGraph (GPU): maps to cuGraph's `max_iter` (a *coarsening-pass* count). The leidenalg default of 2 would starve cuGraph's coarsening and produce a degenerate, over-partitioned result, so the cuGraph path uses cuGraph's own default of **100** whenever `n_iterations <= 2` (including the `-1`/`0` convergence sentinels); only values `> 2` are forwarded verbatim. The effective cap is recorded in `uns["leiden"]["params"]["max_iter"]`. |
 | `parallel` | `False` | Run the **Rust-native** Leiden in conflict-free batched mode. `False` (default) matches C++ leidenalg sequential moving. **Ignored on the cuGraph path** (warns when `True`). |
 | `device` | `"auto"` | `"auto"` (cuGraph if available, else Rust-native), `"cpu"` (Rust-native), `"gpu"` / `"gpu:N"` (cuGraph on CUDA device 0 or N — `gpu:N` pins via `cupy.cuda.Device(N)`). |
 | `theta` | 1.0 | cuGraph-only resolution scaling knob (forwarded to `cugraph.leiden(theta=...)`). **Ignored on the Rust-native path** (warns when non-default). |
@@ -1746,6 +1764,10 @@ Results:
 - `adata.uns["harmony"]` — dict with `params`, `converged`, `n_iterations`,
   `objective_harmony` (per-iteration objective curve), and `backend`
   (`"scx-accel-cpu"` or `"scx-gpu"`).
+- `adata.uns["scx_accel"]["harmony_integrate"]` — the canonical route envelope
+  shared with PCA / kNN / UMAP (`route` ∈ `gpu_dense` / `cpu_dense`,
+  `fallback_reason`), so you can prove GPU-vs-CPU dispatch the same way as the
+  other accelerator ops. See [docs/api.md § Accelerator route metadata](../docs/api.md#accelerator-route-metadata).
 
 **Numerical parity** against R `harmony` v2.x on the validation fixtures
 in `benchmarks/results/harmony/reference/`: mean per-PC Pearson r is
@@ -1792,17 +1814,25 @@ print(adata.obs["lisi_batch"].describe())
 | `key` | (required) | `obs` column with the categorical label to score. |
 | `basis` | `"X_pca"` | `obsm` key for the embedding to compute neighbourhoods over. |
 | `perplexity` | `30.0` | Gaussian-kernel target perplexity (t-SNE-style bandwidth search). |
-| `n_neighbors` | `None` | k for the exact kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `n_neighbors` | `None` | k for the kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `approximate_knn` | `False` | Use HNSW approximate kNN instead of the exact O(N²) sweep. ~10× faster at N ≳ 100k, with ~0.01–0.05 mean-LISI drift. |
 
 Returns a `numpy.ndarray` of length N and also writes the values to
 `adata.obs[f"lisi_{key}"]`.
 
-The implementation uses an exact brute-force kNN (per-row squared-norm
-expansion + per-cell top-k heap) to stay numerically in lockstep with
-the R `lisi` reference. On D1–D4 it is **~10× faster** than
+By default the implementation uses an exact brute-force kNN (per-row
+squared-norm expansion + per-cell top-k heap) to stay numerically in
+lockstep with the R `lisi` reference. On D1–D4 it is **~10× faster** than
 R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
-Brute-force kNN is O(N²·d); at census scale (D5+) you'd want to pair
-this with an HNSW-approximate kNN step instead.
+Brute-force kNN is O(N²·d); above ~50k cells the exact path logs a hint
+to set `approximate_knn=True`, which swaps in an HNSW kNN for an
+order-of-magnitude speed-up at census scale (D5+) at the cost of small
+numerical drift (~0.01–0.05 on mean LISI).
+
+```python
+# Census-scale: avoid the O(N²) exact sweep.
+lisi = pyscx.accel.compute_lisi(adata, "batch", approximate_knn=True)
+```
 
 ### Gene-set scoring (`pyscx.accel.score_genes`)
 

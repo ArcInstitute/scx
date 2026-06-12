@@ -271,3 +271,50 @@ def test_ari_vs_scanpy_leiden_cpu(adata_with_neighbors):
         np.asarray(adata_sc.obs["leiden"]),
     )
     assert ari >= 0.40, f"ARI {ari:.3f} below 0.40 floor"
+
+
+@gpu_only
+def test_gpu_leiden_not_degenerate(adata_with_neighbors):
+    """cuGraph Leiden must not return a degenerate (near-singleton) partition.
+
+    Regression for user-report B4: `device="gpu"` forwarded the leidenalg-style
+    `n_iterations` default (2) straight to cuGraph's `max_iter` (a *coarsening-
+    pass* count, default 100), starving coarsening and producing ~116k
+    singleton-ish clusters on 1M cells vs the CPU path's few dozen (ARI 0.0002).
+
+    The fix maps the small leidenalg default to cuGraph's own default (100), so
+    the GPU partition should be comparable to the CPU one — not a blow-up. The
+    band is deliberately generous: the two backends differ in label stability
+    (documented), so this guards against *degeneracy*, not exact agreement.
+    """
+    import pyscx
+    from sklearn.metrics import adjusted_rand_score
+
+    n_obs = adata_with_neighbors.n_obs
+
+    adata_cpu = adata_with_neighbors.copy()
+    pyscx.accel.leiden(adata_cpu, resolution=1.0, device="cpu", random_state=0)
+    cpu_n = int(adata_cpu.uns["leiden"]["n_communities"])
+
+    adata_gpu = adata_with_neighbors.copy()
+    pyscx.accel.leiden(adata_gpu, resolution=1.0, device="gpu", random_state=0)
+    gpu_n = int(adata_gpu.uns["leiden"]["n_communities"])
+
+    # The effective cuGraph pass-cap is recorded and defaults to 100 (not the
+    # leidenalg-style n_iterations default of 2).
+    assert adata_gpu.uns["leiden"]["params"]["max_iter"] == 100
+
+    # Primary guard: not near-singleton, and within a generous multiplicative
+    # band of the CPU count (catches the ~4000× B4 blow-up decisively).
+    assert 0 < gpu_n < 0.5 * n_obs, f"GPU Leiden degenerate: {gpu_n} clusters / {n_obs} cells"
+    assert gpu_n <= 5 * max(cpu_n, 2), (
+        f"GPU Leiden over-partitioned: {gpu_n} clusters vs CPU's {cpu_n}"
+    )
+
+    # Soft structural-agreement check — far above the degenerate ARI 0.0002,
+    # well below an exact-match expectation (label stability differs by design).
+    ari = adjusted_rand_score(
+        np.asarray(adata_cpu.obs["leiden"]),
+        np.asarray(adata_gpu.obs["leiden"]),
+    )
+    assert ari >= 0.10, f"GPU-vs-CPU ARI {ari:.4f} suspiciously low (degenerate?)"

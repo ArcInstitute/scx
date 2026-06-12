@@ -470,8 +470,14 @@ enum Commands {
     Query {
         /// SCX file path or cloud URL (e.g. `gs://bucket/atlas.scxd/`)
         source: String,
-        /// Obs predicate expression
-        filter: String,
+        /// Obs predicate expression (positional). Alternatively pass it via
+        /// `--filter` to match `scx subset` / `scx delete`. Provide one form,
+        /// not both.
+        filter: Option<String>,
+        /// Obs predicate expression (flag form, consistent with
+        /// `scx subset` / `scx delete`).
+        #[arg(long = "filter", value_name = "EXPR", conflicts_with = "filter")]
+        filter_flag: Option<String>,
         /// Print matching cell count only
         #[arg(long)]
         count: bool,
@@ -655,12 +661,66 @@ enum Commands {
     },
 }
 
+/// Restore the default `SIGPIPE` disposition (`SIG_DFL`).
+///
+/// The Rust runtime sets `SIGPIPE` to `SIG_IGN` at startup, so writing to a
+/// closed pipe (`scx info file.scx | head`, `| less` then `q`) returns `EPIPE`,
+/// which the `println!`/`print!` machinery turns into a panic + backtrace hint
+/// on stderr (report E3). Resetting to `SIG_DFL` makes the process terminate
+/// silently on a broken pipe — exit status 141 (128 + SIGPIPE), the same as
+/// every standard Unix filter. No-op on non-Unix targets.
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and called once
+    // before any threads are spawned; restoring the default disposition has no
+    // memory-safety implications.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Cloud subcommands gated behind `--features cloud`. Listed here (rather than
+/// derived) so a build *without* the cloud feature can still recognise them and
+/// emit a helpful hint instead of clap's bare "unrecognized subcommand" — the
+/// discoverability gap from report D3.
+#[cfg(not(feature = "cloud"))]
+const CLOUD_SUBCOMMANDS: &[&str] = &["pull", "push", "explode", "pack", "cloud-optimize"];
+
+/// Parse the CLI. On a non-cloud build, an attempt to invoke a cloud subcommand
+/// (`scx pull …`) fails clap's subcommand match; before deferring to clap's
+/// normal error/exit, print a one-line hint that the command exists but needs a
+/// `--features cloud` build, so the user can tell it apart from a typo (D3).
+fn parse_cli_or_exit() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            #[cfg(not(feature = "cloud"))]
+            if e.kind() == clap::error::ErrorKind::InvalidSubcommand {
+                // No global options precede the subcommand, so argv[1] is the
+                // offending token.
+                if let Some(sub) = std::env::args().nth(1) {
+                    if CLOUD_SUBCOMMANDS.contains(&sub.as_str()) {
+                        eprintln!(
+                            "note: `{sub}` is a cloud subcommand and is not compiled into this \
+                             build. Rebuild with `--features cloud` (or install the cloud-enabled \
+                             binary) to use it."
+                        );
+                    }
+                }
+            }
+            e.exit();
+        }
+    }
+}
+
 fn main() {
+    reset_sigpipe();
+
     // Initialize the `log` sink. Default severity is `info`; override with
     // `RUST_LOG=scx=debug`, `RUST_LOG=scx_loader=warn`, etc.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
+    let cli = parse_cli_or_exit();
 
     let result = match cli.command {
         Commands::Convert {
@@ -881,6 +941,7 @@ fn main() {
         Commands::Query {
             source,
             filter,
+            filter_flag,
             count,
             output,
             select_genes,
@@ -889,18 +950,32 @@ fn main() {
             limit,
             json,
             explain,
-        } => query::run_query(
-            &source,
-            &filter,
-            count,
-            output.as_deref(),
-            select_genes.as_deref(),
-            normalize,
-            log1p,
-            limit,
-            json,
-            explain,
-        ),
+        } => {
+            // The predicate may be given positionally (back-compat) or via
+            // `--filter` (consistent with `scx subset` / `scx delete`). clap's
+            // `conflicts_with` rejects supplying both; handle the "neither"
+            // case here with an actionable message naming both spellings.
+            match filter.or(filter_flag) {
+                Some(predicate) => query::run_query(
+                    &source,
+                    &predicate,
+                    count,
+                    output.as_deref(),
+                    select_genes.as_deref(),
+                    normalize,
+                    log1p,
+                    limit,
+                    json,
+                    explain,
+                ),
+                None => Err("scx query: missing obs predicate.\n\
+                     Pass it positionally:  scx query <SOURCE> \"<EXPR>\"\n\
+                     or via the flag:        scx query <SOURCE> --filter \"<EXPR>\"\n\
+                     (the --filter spelling matches `scx subset` / `scx delete`).\n\
+                     Example: scx query atlas.scx \"disease == 'normal'\" --count"
+                    .into()),
+            }
+        }
         Commands::Benchmark {
             file,
             compare_h5ad,

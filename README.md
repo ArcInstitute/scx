@@ -736,7 +736,7 @@ adata = result.to_anndata()
 ```bash
 scx info experiment.scx                  # file metadata
 scx validate experiment.scx              # verify checksums
-scx query experiment.scx "tissue == 'lung'" --count
+scx query experiment.scx --filter "tissue == 'lung'" --count   # or positionally: scx query experiment.scx "tissue == 'lung'"
 scx append atlas.scx --input batch2.scx
 scx merge batch1.scx batch2.scx --output atlas.scx
 ```

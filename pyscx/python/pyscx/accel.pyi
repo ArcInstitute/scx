@@ -252,6 +252,7 @@ def compute_lisi(
     basis: str = "X_pca",
     perplexity: float = 30.0,
     n_neighbors: int | None = None,
+    approximate_knn: bool = False,
 ) -> Any: ...
 
 

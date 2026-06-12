@@ -149,6 +149,66 @@ class TestMultiEpoch:
         assert epoch1_indices != epoch2_indices
 
 
+@pytest.fixture
+def wide_scx_path(tmp_path):
+    """A full-width-ish file whose decoded-shard cache alone exceeds the old
+    512 MB fixed default, so the budget logic must engage (P3)."""
+    import anndata as ad
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars, nnz_per_cell = 100, 20_000, 1_000
+    rows, cols, vals = [], [], []
+    for r in range(n_obs):
+        c = rng.choice(n_vars, size=nnz_per_cell, replace=False)
+        rows.extend([r] * nnz_per_cell)
+        cols.extend(c.tolist())
+        vals.extend((rng.integers(1, 50, size=nnz_per_cell)).tolist())
+    X = sp.csr_matrix(
+        (np.array(vals, dtype=np.float32), (rows, cols)),
+        shape=(n_obs, n_vars),
+    )
+    adata = ad.AnnData(X=X)
+    path = str(tmp_path / "wide.scx")
+    pyscx.from_anndata(adata, path)
+    return path
+
+
+class TestAdaptiveMemoryBudget:
+    """P3: the default budget must fit a full-width file without silently
+    shrinking the requested batch_size, while an explicit budget stays a
+    hard ceiling."""
+
+    def test_default_budget_preserves_batch_size(self, wide_scx_path):
+        # No explicit max_memory_mb → adaptive: the requested batch_size must
+        # survive and the budget must not be flagged exceeded.
+        ds = pyscx.TrainingDataset(
+            wide_scx_path, batch_size=512, normalize=True, log1p=True
+        )
+        mb = ds.memory_budget()
+        assert ds.effective_batch_size == 512, (
+            f"default budget should keep batch_size=512, got "
+            f"{ds.effective_batch_size} (budget={mb})"
+        )
+        assert mb["batch_size"] == 512
+        assert not mb["budget_exceeded"], f"default budget should fit: {mb}"
+
+    def test_explicit_budget_is_hard_ceiling(self, wide_scx_path):
+        # An explicit (too-small) budget must still behave as before: a hard
+        # ceiling that auto-tunes the batch_size down rather than being raised.
+        ds = pyscx.TrainingDataset(
+            wide_scx_path,
+            batch_size=512,
+            normalize=True,
+            log1p=True,
+            max_memory_mb=512,
+        )
+        assert ds.effective_batch_size < 512, (
+            "explicit max_memory_mb=512 should remain a hard ceiling and shrink "
+            f"the batch, got {ds.effective_batch_size}"
+        )
+
+
 def _forked_worker(scx_path_str):
     """Worker function for fork detection test."""
     try:

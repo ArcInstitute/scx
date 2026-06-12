@@ -81,6 +81,15 @@ pub struct LoaderConfig {
     /// Memory budget in MB (default: 512).
     /// Pipeline auto-tunes shard_group_size and prefetch_batches to fit.
     pub max_memory_mb: usize,
+    /// When `true`, treat `max_memory_mb` as a *floor* rather than a hard
+    /// ceiling: [`TrainingPipeline::new`] raises the effective budget to fit
+    /// the file's requested configuration (so a full-width ~33k-gene file does
+    /// not silently shrink `batch_size` or trip the shuffle-quality warning),
+    /// clamped to [`ADAPTIVE_BUDGET_CAP_MB`]. Set by the Python bindings when
+    /// the caller does **not** pass an explicit `max_memory_mb`; an explicit
+    /// budget keeps `false` so the hard-ceiling auto-tune (and its warnings)
+    /// behave exactly as before. Default `false`.
+    pub auto_memory_budget: bool,
     /// Phase H.1: optional modality filter.
     ///
     /// `None` = legacy global / single-modality behaviour: load every CSR
@@ -110,10 +119,19 @@ impl Default for LoaderConfig {
             pflog1ppf_c: 1.0,
             seed: 42,
             max_memory_mb: 512,
+            auto_memory_budget: false,
             modality_id: None,
         }
     }
 }
+
+/// Upper bound for the adaptive default memory budget (see
+/// [`LoaderConfig::auto_memory_budget`]). A full-width single-cell file held in
+/// one CSR shard needs roughly 1–1.5 GB (decoded-shard cache + mmap-resident
+/// file + per-batch buffer); this cap covers the common full-width case while
+/// still letting genuinely huge files fall back to the hard-ceiling auto-tune
+/// (with its protective warnings) instead of silently reserving unbounded RAM.
+pub const ADAPTIVE_BUDGET_CAP_MB: usize = 4096;
 
 impl LoaderConfig {
     /// Validate the configuration, returning `ConfigError` for invalid settings.
@@ -423,6 +441,45 @@ fn estimate_memory(
     breakdown.total_bytes.saturating_add(file_size_bytes)
 }
 
+/// Adaptive default budget (MB) for [`LoaderConfig::auto_memory_budget`].
+///
+/// Returns the memory the **requested** configuration needs (the same model
+/// [`compute_memory_budget`] auto-tunes against) rounded up to whole MB with
+/// ~12 % headroom, clamped to `[floor_mb, ADAPTIVE_BUDGET_CAP_MB]`. Because the
+/// floor is the lower clamp bound this never lowers the budget — a small file
+/// whose need is below `floor_mb` keeps `floor_mb`, while a full-width file is
+/// raised just enough to fit without the auto-tune shrinking `batch_size` /
+/// `shard_group_size`. A need above the cap is clamped to the cap, leaving the
+/// hard-ceiling auto-tune (and its warnings) to handle genuinely huge files.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_budget_mb(
+    floor_mb: usize,
+    shard_group_size: usize,
+    prefetch_batches: usize,
+    batch_size: usize,
+    n_output_genes: usize,
+    shard_target_rows: usize,
+    avg_nnz_per_cell: f64,
+    file_size_bytes: usize,
+) -> usize {
+    let requested_need = estimate_memory(
+        shard_group_size,
+        prefetch_batches,
+        batch_size,
+        n_output_genes,
+        shard_target_rows,
+        avg_nnz_per_cell,
+        file_size_bytes,
+    );
+    let need_mb = requested_need.div_ceil(1024 * 1024);
+    let with_headroom = need_mb.saturating_add(need_mb / 8);
+    // `clamp` panics if min > max. Today the auto path always supplies
+    // floor_mb = the 512 MB default (< cap), but guard defensively against a
+    // caller that sets `auto_memory_budget` with a budget above the cap so a
+    // misconfiguration never panics the interpreter.
+    with_headroom.clamp(floor_mb, ADAPTIVE_BUDGET_CAP_MB.max(floor_mb))
+}
+
 // ---------------------------------------------------------------------------
 // E1: TrainingPipeline — triple-buffered pipeline coordinator
 // ---------------------------------------------------------------------------
@@ -563,8 +620,55 @@ impl TrainingPipeline {
             0.0
         };
 
+        // A shard group can never span more shards than the file holds. Clamp
+        // the requested group to the shard count so (a) the decoded-shard cache
+        // estimate is accurate for single-/few-shard files (otherwise a
+        // 1-shard file is costed as if 8 shards were resident) and (b) the
+        // shuffle-quality warning doesn't fire spuriously when the *data*, not
+        // memory, caps the group below the threshold.
+        config.shard_group_size = config.shard_group_size.min(n_csr_shards.max(1));
+
         // Compute memory budget and auto-tune parameters
         let file_size_bytes = reader.mmap().len();
+
+        // Adaptive default budget: when the caller did not pin `max_memory_mb`,
+        // raise the effective budget to fit the requested configuration so a
+        // full-width file doesn't silently shrink `batch_size` (P3). The floor
+        // is the configured default (small files are unchanged); the ceiling is
+        // `ADAPTIVE_BUDGET_CAP_MB` (genuinely huge files still fall through to
+        // the hard-ceiling auto-tune + warnings rather than reserving unbounded
+        // RAM). Only ever raises, never lowers.
+        if config.auto_memory_budget {
+            let n_output_genes = match &config.hvg_indices {
+                Some(hvg) => hvg.len(),
+                None => n_vars as usize,
+            };
+            let adaptive_mb = adaptive_budget_mb(
+                config.max_memory_mb,
+                config.shard_group_size,
+                config.prefetch_batches,
+                config.batch_size,
+                n_output_genes,
+                shard_target_rows as usize,
+                avg_nnz_per_cell,
+                file_size_bytes,
+            );
+            if adaptive_mb > config.max_memory_mb {
+                log::info!(
+                    "loader auto-budget: raised max_memory_mb {} -> {} MB to fit the \
+                     requested configuration (batch_size={}, shard_group_size={}, \
+                     n_output_genes={}) without shrinking the batch. Pass an explicit \
+                     max_memory_mb to pin a hard ceiling instead.",
+                    config.max_memory_mb,
+                    adaptive_mb,
+                    config.batch_size,
+                    config.shard_group_size,
+                    n_output_genes,
+                );
+                config.max_memory_mb = adaptive_mb;
+            }
+        }
+
         let memory_budget = compute_memory_budget(
             &config,
             n_vars,
@@ -1336,6 +1440,121 @@ mod tests {
             "prefetch_batches should be at minimum 2"
         );
         assert!(budget.batch_size <= 1024, "batch_size should be reduced");
+    }
+
+    #[test]
+    fn test_adaptive_budget_keeps_floor_for_small_file() {
+        // A tiny file needs far less than the 512 MB floor → budget unchanged,
+        // so small-file behaviour is identical to the fixed default.
+        let mb = adaptive_budget_mb(
+            512,         /* floor */
+            1,           /* shard_group_size */
+            4,           /* prefetch */
+            64,          /* batch_size */
+            100,         /* n_output_genes */
+            1024,        /* shard_target_rows */
+            5.0,         /* avg_nnz_per_cell */
+            1024 * 1024, /* 1 MB file */
+        );
+        assert_eq!(mb, 512, "small file should keep the 512 MB floor");
+    }
+
+    #[test]
+    fn test_adaptive_budget_raises_for_full_width_single_shard() {
+        // The P3 scenario: ~33.5k-gene file in a single shard at batch_size=512.
+        // The fixed 512 MB default cannot fit it (the decoded-shard cache alone
+        // exceeds 512 MB), so the adaptive budget must raise above the floor —
+        // and at the raised budget the auto-tune must NOT shrink batch_size or
+        // flag budget_exceeded.
+        let n_genes = 33_538usize;
+        let shard_target_rows = 16_384usize;
+        let avg_nnz = 2_246.0f64;
+        let file_size = 280 * 1024 * 1024usize;
+        let mb = adaptive_budget_mb(
+            512,
+            1,
+            4,
+            512,
+            n_genes,
+            shard_target_rows,
+            avg_nnz,
+            file_size,
+        );
+        assert!(
+            mb > 512,
+            "full-width file should raise above the 512 MB floor (got {mb})"
+        );
+        assert!(
+            mb <= ADAPTIVE_BUDGET_CAP_MB,
+            "must stay within the cap (got {mb})"
+        );
+
+        let config = LoaderConfig {
+            batch_size: 512,
+            shard_group_size: 1,
+            max_memory_mb: mb,
+            ..LoaderConfig::default()
+        };
+        let budget = compute_memory_budget(
+            &config,
+            n_genes as u64,
+            shard_target_rows as u32,
+            avg_nnz,
+            file_size,
+        );
+        assert_eq!(
+            budget.batch_size, 512,
+            "raised budget should preserve the requested batch_size"
+        );
+        assert!(
+            !budget.budget_exceeded,
+            "raised budget should fit without exceeding"
+        );
+        assert!(
+            !budget.shuffle_quality_degraded,
+            "single-shard group=1 should not be flagged as degraded"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_budget_clamps_huge_file_to_cap() {
+        // A fully dense huge shard needs many GB; the adaptive budget clamps to
+        // the cap so we never silently reserve unbounded RAM — the hard-ceiling
+        // auto-tune + warnings take over above the cap.
+        let mb = adaptive_budget_mb(
+            512,
+            8,
+            4,
+            1024,
+            33_538,                 /* n_output_genes */
+            16_384,                 /* shard_target_rows */
+            33_538.0,               /* fully dense: avg_nnz == n_genes */
+            2 * 1024 * 1024 * 1024, /* 2 GB file */
+        );
+        assert_eq!(
+            mb, ADAPTIVE_BUDGET_CAP_MB,
+            "huge need should clamp to the cap"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_budget_floor_above_cap_does_not_panic() {
+        // PR #247 review: a floor above ADAPTIVE_BUDGET_CAP_MB must not panic the
+        // `clamp` (min > max). The floor wins as the effective budget.
+        let mb = adaptive_budget_mb(
+            ADAPTIVE_BUDGET_CAP_MB + 4096, /* floor far above the cap */
+            8,
+            4,
+            1024,
+            30_000,
+            16_384,
+            10.0,
+            0,
+        );
+        assert!(
+            mb >= ADAPTIVE_BUDGET_CAP_MB + 4096,
+            "floor above the cap must be honored (no panic), got {mb}"
+        );
     }
 
     #[test]

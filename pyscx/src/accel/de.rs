@@ -217,8 +217,12 @@ fn run_rank_genes_groups_inner(
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
             return Err(PyRuntimeError::new_err(
-                "device='gpu' with prefer_format='csc' is not supported in v1; \
-                 use device='cpu' for CSC dispatch or prefer_format='csr' for GPU.",
+                "prefer_format='csc' selects the CPU column-major path and has no \
+                 GPU kernel, so it cannot be combined with device='gpu'. For GPU \
+                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
+                 planner routes to gpu_csc_v3 automatically. For the CPU column-major \
+                 path, use device='cpu'.",
             ));
         }
         // CSC dispatch: works on both backed and lazy datasets via
@@ -678,8 +682,12 @@ pub fn rank_genes_groups(
     let gpu_device_id = if prefer_format == "csc" {
         if device.starts_with("gpu") {
             return Err(PyRuntimeError::new_err(
-                "device='gpu' with prefer_format='csc' is not supported in v1; \
-                 use device='cpu' or device='auto' for CSC dispatch.",
+                "prefer_format='csc' selects the CPU column-major path and has no \
+                 GPU kernel, so it cannot be combined with device='gpu'. For GPU \
+                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
+                 planner routes to gpu_csc_v3 automatically. For the CPU column-major \
+                 path, use device='cpu'.",
             ));
         }
         None
@@ -1219,8 +1227,12 @@ fn run_pdex_ref_inner(
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
             return Err(PyRuntimeError::new_err(
-                "device='gpu' with prefer_format='csc' is not supported in v1; \
-                 use device='cpu' for CSC dispatch or prefer_format='csr' for GPU.",
+                "prefer_format='csc' selects the CPU column-major path and has no \
+                 GPU kernel, so it cannot be combined with device='gpu'. For GPU \
+                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
+                 planner routes to gpu_csc_v3 automatically. For the CPU column-major \
+                 path, use device='cpu'.",
             ));
         }
         let chunk_size = gene_chunk_size.unwrap_or(500);
@@ -1688,8 +1700,12 @@ pub fn pdex_ref(
     let gpu_device_id = if prefer_format == "csc" {
         if device.starts_with("gpu") {
             return Err(PyRuntimeError::new_err(
-                "device='gpu' with prefer_format='csc' is not supported in v1; \
-                 use device='cpu' or device='auto' for CSC dispatch.",
+                "prefer_format='csc' selects the CPU column-major path and has no \
+                 GPU kernel, so it cannot be combined with device='gpu'. For GPU \
+                 CSC-direct DE (route gpu_csc_v3), keep the default prefer_format='csr' \
+                 with device='gpu' (or 'auto'): when the file has a CSC sidecar the \
+                 planner routes to gpu_csc_v3 automatically. For the CPU column-major \
+                 path, use device='cpu'.",
             ));
         }
         None

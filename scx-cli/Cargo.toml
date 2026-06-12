@@ -60,6 +60,11 @@ half = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Reset the SIGPIPE disposition to SIG_DFL at startup so `scx ... | head`
+# exits cleanly instead of panicking on a broken stdout pipe (report E3).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 flate2 = "1"
