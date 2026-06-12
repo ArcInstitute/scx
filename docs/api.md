@@ -1125,8 +1125,8 @@ the repr onto `Experiment.info() -> str`.
   otherwise.
 - `to_gpu_anndata()` — Minimal-copy on-device handoff: decodes shards, transfers to the GPU, and returns a GPU-resident AnnData whose `X` is a `cupyx.scipy.sparse.csr_matrix`. The returned object is suitable for direct use with rapids-singlecell (`rsc.pp.*`, `rsc.tl.*`) without additional host↔device copies. Requires `cupy` and a CUDA-capable GPU. Records its `transfer_mode` and real `bytes_uploaded` on `uns["scx_accel"]["to_gpu_anndata"]` — `scx_device_decode_gpu` (Scx1 sidecar shards decoded fully in VRAM, including dense ≥128-nnz rows via the BitPacker4x kernel; only indptr uploaded), `scx_device_handoff_streamed` (some shard host-bounced because it is not an Scx1 sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard), or `scx_device_handoff` (host-assembled filtered/projected/multimodal input). See **Accelerator route metadata** below.
 - `info() -> str` — One-line codec / shard / format-version internals (kept off the AnnData-style `repr`).
-- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`, `layer_names`.
-- AnnData-style key accessors (callable **methods**, matching `adata.obs_keys()` etc. — not properties): `obs_keys()`, `var_keys()`, `obsm_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column).
+- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`.
+- List-returning accessors — callable **methods** (not properties): `layer_names()`, and the AnnData-style key accessors `obs_keys()`, `var_keys()`, `obsm_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column).
 
 ### `uns` serialization
 

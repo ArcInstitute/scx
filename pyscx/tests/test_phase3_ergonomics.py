@@ -58,8 +58,9 @@ def test_key_accessors(synthetic_adata, tmp_dir):
     assert set(exp.var_keys()) >= {"gene_id", "highly_variable"}
     assert exp.obsm_keys() == ["X_pca"]
     assert set(exp.uns_keys()) >= {"species", "version"}
-    # layer_names stays a property (anndata has no layer_names() method).
-    assert "raw" in exp.layer_names
+    # layer_names() is a callable method too, consistent with the *_keys() family (F7).
+    assert callable(exp.layer_names)
+    assert "raw" in exp.layer_names()
 
 
 def test_info_carries_internals(synthetic_adata, tmp_dir):

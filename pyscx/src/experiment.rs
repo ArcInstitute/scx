@@ -327,8 +327,11 @@ impl PyExperiment {
         self.reader.header().index_dtype
     }
 
-    /// List of layer names in the file.
-    #[getter]
+    /// Names of the layers in the file.
+    ///
+    /// Callable method (`exp.layer_names()`), consistent with the
+    /// `obs_keys()` / `var_keys()` / `obsm_keys()` / `varm_keys()` /
+    /// `uns_keys()` accessor family (F7).
     fn layer_names(&self) -> Vec<String> {
         self.reader.layer_names()
     }

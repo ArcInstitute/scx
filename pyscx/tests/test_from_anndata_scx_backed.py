@@ -292,14 +292,14 @@ def test_layers_round_trip_through_streaming_rewrite(tmp_dir):
     adata = _adata_with_layers(n_obs=64, n_vars=20, n_layers=2)
     src = str(tmp_dir / "src_layers.scx")
     pyscx.from_anndata(adata, src)
-    assert sorted(pyscx.open(src).layer_names) == ["layer_0", "layer_1"]
+    assert sorted(pyscx.open(src).layer_names()) == ["layer_0", "layer_1"]
 
     backed = pyscx.open(src).to_anndata(backed=True)
     dst = str(tmp_dir / "dst_layers.scx")
     pyscx.from_anndata(backed, dst)
 
     out = pyscx.open(dst)
-    assert sorted(out.layer_names) == ["layer_0", "layer_1"]
+    assert sorted(out.layer_names()) == ["layer_0", "layer_1"]
     out_ad = out.to_anndata()
     src_ad = pyscx.open(src).to_anndata()
     for name in ["layer_0", "layer_1"]:
