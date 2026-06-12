@@ -137,9 +137,12 @@ Most-used kwargs (shared across ingest entry points):
   `prefer_format="csc"` accel paths + the CSC-direct `gpu_csc_v3` DE route; two-pass,
   transient disk ~2× output). `"auto"` builds it only when the dataset is large
   enough to benefit (`n_obs ≥ 50000` and `n_vars ≥ 5000`, env-tunable via
-  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To *use* the CSC
-  DE route, call `rank_genes_groups`/`pdex_ref` with `device="auto"` —
-  `device="gpu"` together with `prefer_format="csc"` raises in v0.7.1.
+  `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`). To get the
+  **GPU-fast** CSC-direct DE route (`gpu_csc_v3`), call `rank_genes_groups`/`pdex_ref`
+  with the **default `prefer_format="csr"`** and `device="gpu"` (or `"auto"`) on a
+  file that has the sidecar — the planner picks `gpu_csc_v3` automatically.
+  `prefer_format="csc"` is the **CPU** column-major path (no GPU kernel);
+  combining it with `device="gpu"` raises.
 - `memory_budget="4G"` (bare bytes or a binary-prefixed size: `K`/`M`/`G`/`T`
   or `KiB`/`MiB`/`GiB`/`TiB`, powers of 1024; decimal `KB`/`MB`/`GB`/`TB`
   rejected), `strict_uns=True`, `shard_size`. See `reference/conversion.md` for the rest
@@ -368,6 +371,6 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
 - Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.
 - GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing. Build pyscx `--features gpu` once, then **run from the conda env that has rapids** (a plain `.venv` usually doesn't).
-- CSC-direct DE: `rank_genes_groups`/`pdex_ref` with `device="auto"` (a `csc=` sidecar must exist) — **`device="gpu"` + `prefer_format="csc"` raises**.
-- CLI predicate: `scx query <file> <filter>` takes the filter **positionally** (not `--filter`, unlike `scx subset`/`delete`); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
-- `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; subsample to evaluate integration.
+- GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="csr"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
+- CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter` (matching `scx subset`/`delete`); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
+- `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; pass `approximate_knn=True` for an HNSW kNN (~10× faster, small drift) or subsample to evaluate integration.

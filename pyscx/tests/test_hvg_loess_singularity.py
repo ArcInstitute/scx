@@ -464,3 +464,51 @@ def test_non_value_error_propagates_instead_of_warning(
         "non-ValueError leaked into the singularity-warning path; got: "
         + "; ".join(str(w.message) for w in sing)
     )
+
+
+def test_loess_record_preserves_existing_uns_hvg(
+    synthetic_adata, scx_from_adata, monkeypatch
+):
+    """PR #247 review: recording loess failures must MERGE into an existing
+    adata.uns["hvg"] dict (e.g. metadata a prior scanpy HVG run wrote), not
+    clobber it."""
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "hvg_loess_preserve.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    # Seed pre-existing hvg metadata (as scanpy.pp.highly_variable_genes would).
+    adata.uns["hvg"] = {"flavor": "seurat_v3_prior", "sentinel": 123}
+    _patch_loess_to_raise_on_first_batch(monkeypatch)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=10, flavor="seurat_v3", batch_key="batch", device="cpu"
+        )
+
+    # Sibling keys survive; the failure detail is added alongside them.
+    assert adata.uns["hvg"]["flavor"] == "seurat_v3_prior"
+    assert adata.uns["hvg"]["sentinel"] == 123
+    assert len(adata.uns["hvg"]["loess_failed_batches"]) == 1
+
+
+def test_clean_rerun_clears_stale_loess_failed_batches(
+    synthetic_adata, scx_from_adata
+):
+    """PR #247 review: a successful seurat_v3 run must overwrite a stale
+    loess_failed_batches left on a reused AnnData by an earlier failed run,
+    so downstream diagnostics don't report phantom failures."""
+    import pyscx
+
+    path = scx_from_adata(synthetic_adata, "hvg_loess_stale.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    # Simulate a stale entry from a prior failed run.
+    adata.uns["hvg"] = {"loess_failed_batches": [[0, 5], [1, 7]]}
+
+    # Clean run (no loess patch) — every batch fits.
+    pyscx.accel.highly_variable_genes(
+        adata, n_top_genes=10, flavor="seurat_v3", batch_key="batch", device="cpu"
+    )
+
+    # Stale failures cleared; the key reflects the current (clean) run.
+    assert list(adata.uns["hvg"]["loess_failed_batches"]) == []

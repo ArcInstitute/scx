@@ -606,18 +606,34 @@ fn emit_hvg_loess_singularity_warning(
     Ok(())
 }
 
-/// Record the full per-batch loess-failure detail on
+/// Record the per-batch loess-failure detail on
 /// `adata.uns["hvg"]["loess_failed_batches"]` as a list of `[batch_idx, n_cells]`
 /// pairs (the summary UserWarning only names the first failure). Mirrors scanpy
-/// storing HVG metadata under `uns["hvg"]`; the native seurat_v3 path does not
-/// otherwise populate that key, so a fresh dict is written.
+/// storing HVG metadata under `uns["hvg"]`.
+///
+/// Called **once per batched seurat_v3 run**, with `failed` possibly empty.
+/// Two invariants this guarantees:
+/// - **Merge, don't clobber:** reuse any pre-existing `uns["hvg"]` dict (e.g.
+///   metadata a prior `scanpy.pp.highly_variable_genes` wrote) and only set the
+///   `loess_failed_batches` key, so sibling metadata survives.
+/// - **No stale failures:** the key is rewritten every run to the *current*
+///   list, so a clean rerun of the same `AnnData` overwrites a stale list from
+///   an earlier failed run (writing `[]` when no batch failed) rather than
+///   leaving downstream diagnostics reporting phantom failures.
 fn record_hvg_loess_failed_batches(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
     failed: &[(usize, usize, String)],
 ) -> PyResult<()> {
     let uns = adata.getattr("uns")?;
-    let hvg_dict = PyDict::new(py);
+    let hvg_dict = match uns.get_item("hvg") {
+        // Present and a dict → merge into it; present but not a dict (unexpected)
+        // → replace with a fresh dict; absent → fresh dict.
+        Ok(existing) => existing
+            .cast_into::<PyDict>()
+            .unwrap_or_else(|_| PyDict::new(py)),
+        Err(_) => PyDict::new(py),
+    };
     let failed_list = pyo3::types::PyList::empty(py);
     for (idx, n, _err) in failed {
         failed_list.append(pyo3::types::PyList::new(py, [*idx, *n])?)?;
@@ -857,10 +873,16 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     // (user-report F10) — a high-cardinality batch_key can fail dozens of
     // batches, and one verbatim warning each buries the signal. The full
     // per-batch list is recorded on adata.uns["hvg"]["loess_failed_batches"]
-    // for callers who want the complete detail. Emitted before the
-    // all-failed check below so the diagnostic survives even that error.
+    // for callers who want the complete detail.
+    //
+    // Record unconditionally: writing the current list every
+    // run — `[]` when nothing failed — clears any stale `loess_failed_batches`
+    // left on a reused AnnData by an earlier failed run, and merges into (rather
+    // than clobbers) any pre-existing uns["hvg"]. The summary warning stays
+    // guarded by a non-empty list, and is emitted before the all-failed check
+    // below so the diagnostic survives even that error.
+    record_hvg_loess_failed_batches(py, adata, &loess_failed)?;
     if !loess_failed.is_empty() {
-        record_hvg_loess_failed_batches(py, adata, &loess_failed)?;
         emit_hvg_loess_singularity_warning(py, &loess_failed, n_batches_actual)?;
     }
 

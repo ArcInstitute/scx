@@ -473,7 +473,11 @@ fn adaptive_budget_mb(
     );
     let need_mb = requested_need.div_ceil(1024 * 1024);
     let with_headroom = need_mb.saturating_add(need_mb / 8);
-    with_headroom.clamp(floor_mb, ADAPTIVE_BUDGET_CAP_MB)
+    // `clamp` panics if min > max. Today the auto path always supplies
+    // floor_mb = the 512 MB default (< cap), but guard defensively against a
+    // caller that sets `auto_memory_budget` with a budget above the cap so a
+    // misconfiguration never panics the interpreter.
+    with_headroom.clamp(floor_mb, ADAPTIVE_BUDGET_CAP_MB.max(floor_mb))
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1534,26 @@ mod tests {
         assert_eq!(
             mb, ADAPTIVE_BUDGET_CAP_MB,
             "huge need should clamp to the cap"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_budget_floor_above_cap_does_not_panic() {
+        // PR #247 review: a floor above ADAPTIVE_BUDGET_CAP_MB must not panic the
+        // `clamp` (min > max). The floor wins as the effective budget.
+        let mb = adaptive_budget_mb(
+            ADAPTIVE_BUDGET_CAP_MB + 4096, /* floor far above the cap */
+            8,
+            4,
+            1024,
+            30_000,
+            16_384,
+            10.0,
+            0,
+        );
+        assert!(
+            mb >= ADAPTIVE_BUDGET_CAP_MB + 4096,
+            "floor above the cap must be honored (no panic), got {mb}"
         );
     }
 

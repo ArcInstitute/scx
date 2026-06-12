@@ -84,6 +84,12 @@ pub(crate) fn convert_to_pyerr_with_path(e: scx_convert::ConvertError, path: &st
     use scx_convert::ConvertError;
     if let ConvertError::Hdf5(ref h5) = e {
         let msg = h5.to_string();
+        // This substring match is coupled to libhdf5's
+        // error wording and could silently stop matching on a libhdf5 bump,
+        // reverting to the opaque RuntimeError below. The fallback is graceful
+        // (never wrong, just less friendly). The durable fix is a structured
+        // signature-mismatch kind on `ConvertError::Hdf5` upstream in
+        // scx-convert; until then, keep both known phrasings here.
         if msg.contains("file signature not found") || msg.contains("unable to open file") {
             return PyValueError::new_err(format!(
                 "'{path}' is not a valid HDF5/h5ad file ({msg}). \
