@@ -190,6 +190,9 @@ struct PlanAndMask {
     shard_infos: Vec<ShardInfo>,
     effective_gene_indices: Option<Vec<u32>>,
     n_output_cols: usize,
+    /// Restores the caller's requested gene order on the materialized output
+    /// (F4). `None` when the request was already ascending-unique.
+    reorder: Option<ColumnReorder>,
     skipped_shards: usize,
     total_shards: usize,
     candidate_shard_rows: usize,
@@ -257,6 +260,32 @@ fn range_overlaps_any(rs: u64, re: u64, sorted: &[(u64, u64)]) -> bool {
     sorted.get(i).is_some_and(|(s, _)| *s < re)
 }
 
+/// Maps the engine's sorted-projection column layout to the caller's requested
+/// gene order (F4). The decode merge-scan requires an ascending gene set, but
+/// the *output* columns should follow the order the caller passed to
+/// `select_genes`. Present only when those differ.
+struct ColumnReorder {
+    /// `sorted_to_output[k]` = output column index for the gene at sorted
+    /// position `k`. Used to relabel decoded CSR column indices in place.
+    sorted_to_output: Vec<u32>,
+    /// `output_to_sorted[j]` = sorted position of output column `j`. Used as
+    /// arrow `take` indices to reorder the projected `var` rows.
+    output_to_sorted: Vec<u32>,
+}
+
+/// Resolved gene-column projection: the ascending index set fed to the decode
+/// path, the output column count, and the optional reorder back to the
+/// caller's requested order.
+struct GeneProjection {
+    /// Sorted, unique gene indices for `decode_shard_projected` / `project_var`
+    /// (unchanged fast path). `None` = no projection (all genes).
+    decode_indices: Option<Vec<u32>>,
+    n_output_cols: usize,
+    /// `None` when the request was already ascending-unique (output == decode
+    /// order) — the common case, byte-identical to the pre-F4 behavior.
+    reorder: Option<ColumnReorder>,
+}
+
 /// Resolve the effective gene-column projection (explicit gene indices
 /// intersected with any var predicates) and the resulting output column count.
 /// Operates on already-read var metadata — no obs/X shard decode. Shared by the
@@ -265,7 +294,7 @@ fn resolve_gene_projection(
     plan: &ExecutionPlan,
     var_batch: &RecordBatch,
     n_vars: usize,
-) -> Result<(Option<Vec<u32>>, usize)> {
+) -> Result<GeneProjection> {
     let mut effective_gene_indices = plan.gene_indices.clone();
 
     if !plan.var_predicates.is_empty() {
@@ -303,16 +332,54 @@ fn resolve_gene_projection(
         });
     }
 
-    // Sort gene indices for consistent projection
-    if let Some(ref mut gi) = effective_gene_indices {
-        gi.sort_unstable();
-        gi.dedup();
-    }
+    // F4: preserve the caller's requested gene order. The decode merge-scan
+    // needs an ascending unique set, but output columns should follow the
+    // requested order. Build both and a reorder that maps sorted-column
+    // positions to output positions; the reorder is `None` (and the path is
+    // byte-identical to pre-F4) when the request is already ascending-unique.
+    let Some(output_genes) = effective_gene_indices else {
+        return Ok(GeneProjection {
+            decode_indices: None,
+            n_output_cols: n_vars,
+            reorder: None,
+        });
+    };
 
-    let n_output_cols = effective_gene_indices
-        .as_ref()
-        .map_or(n_vars, |gi| gi.len());
-    Ok((effective_gene_indices, n_output_cols))
+    // Dedup preserving first-occurrence order (duplicates collapse, matching
+    // the documented limitation).
+    let mut seen = std::collections::HashSet::new();
+    let output_genes: Vec<u32> = output_genes
+        .into_iter()
+        .filter(|g| seen.insert(*g))
+        .collect();
+
+    let mut sorted = output_genes.clone();
+    sorted.sort_unstable(); // already unique (deduped above)
+    let n_output_cols = output_genes.len();
+
+    let reorder = if output_genes == sorted {
+        None
+    } else {
+        let mut sorted_to_output = vec![0u32; sorted.len()];
+        let mut output_to_sorted = vec![0u32; output_genes.len()];
+        for (j, &g) in output_genes.iter().enumerate() {
+            let k = sorted
+                .binary_search(&g)
+                .expect("output gene must be present in its own sorted set");
+            sorted_to_output[k] = j as u32;
+            output_to_sorted[j] = k as u32;
+        }
+        Some(ColumnReorder {
+            sorted_to_output,
+            output_to_sorted,
+        })
+    };
+
+    Ok(GeneProjection {
+        decode_indices: Some(sorted),
+        n_output_cols,
+        reorder,
+    })
 }
 
 /// Cheap half of query execution: catalog pruning + obs/var predicate
@@ -352,8 +419,11 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
     // every shard skipped. Var is still read (cheap) for the output schema.
     if plan.candidate_shards.is_empty() {
         let var_batch = reader.read_var()?;
-        let (effective_gene_indices, n_output_cols) =
-            resolve_gene_projection(&plan, &var_batch, n_vars)?;
+        let GeneProjection {
+            decode_indices: effective_gene_indices,
+            n_output_cols,
+            reorder,
+        } = resolve_gene_projection(&plan, &var_batch, n_vars)?;
         // The empty result still needs the obs schema. On the row-sharded path
         // `materialize_filtered_obs` derives it from a single shard (bounded);
         // on the legacy single-section path there are NO obs shards, so we must
@@ -372,6 +442,7 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
             shard_infos: Vec::new(),
             effective_gene_indices,
             n_output_cols,
+            reorder,
             skipped_shards, // == total_shards (no shard survived)
             total_shards,
             candidate_shard_rows, // == 0
@@ -540,8 +611,11 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
 
     // Step 6: Handle var predicates and gene projection (assembled via trait impl)
     let var_batch = reader.read_var()?;
-    let (effective_gene_indices, n_output_cols) =
-        resolve_gene_projection(&plan, &var_batch, n_vars)?;
+    let GeneProjection {
+        decode_indices: effective_gene_indices,
+        n_output_cols,
+        reorder,
+    } = resolve_gene_projection(&plan, &var_batch, n_vars)?;
 
     // Pre-limit Level-2 match count, computed from the keep masks alone — no
     // X decode required (CLI2/CLI6). Equals `csr.n_rows()` post-materialise.
@@ -558,6 +632,7 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         shard_infos,
         effective_gene_indices,
         n_output_cols,
+        reorder,
         skipped_shards,
         total_shards,
         candidate_shard_rows,
@@ -669,6 +744,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
         shard_infos,
         effective_gene_indices,
         n_output_cols,
+        reorder,
         skipped_shards,
         total_shards,
         candidate_shard_rows,
@@ -825,11 +901,34 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
         materialize_filtered_obs(reader, &obs_shard_ranges, &matching_global_rows)?
     };
 
-    // Step 11b: Filter var metadata to projected genes
+    // Step 11b: Filter var metadata to projected genes (in ascending order;
+    // Step 11c restores the requested order).
     let filtered_var = if let Some(ref gi) = effective_gene_indices {
         project_var(&var_batch, gi)?
     } else {
         var_batch
+    };
+
+    // Step 11c: Restore the caller's requested gene order (F4). Decode +
+    // `project_var` produce columns in ascending gene-index order; relabel the
+    // CSR column indices and reorder the var rows to the requested order. The
+    // reorder is `None` (skipped) when the request was already ascending-unique,
+    // so the common path is unchanged. Per-row CSR indices may become
+    // non-ascending here — correct for terminal output and matches anndata's
+    // `adata[:, names]`; scipy tolerates unsorted indices.
+    let filtered_var = if let Some(ref reorder) = reorder {
+        for idx in csr.indices.iter_mut() {
+            *idx = reorder.sorted_to_output[*idx as usize] as i32;
+        }
+        let take_idx = UInt32Array::from(reorder.output_to_sorted.clone());
+        let columns: Vec<_> = filtered_var
+            .columns()
+            .iter()
+            .map(|col| compute::take(col.as_ref(), &take_idx, None))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        RecordBatch::try_new(filtered_var.schema(), columns)?
+    } else {
+        filtered_var
     };
 
     // Step 12: Return QueryResult
@@ -1044,6 +1143,69 @@ mod tests {
         assert_eq!(gene_ids.value(0), "gene_0");
         assert_eq!(gene_ids.value(1), "gene_3");
         assert_eq!(gene_ids.value(2), "gene_7");
+    }
+
+    #[test]
+    fn collect_gene_projection_preserves_requested_order() {
+        // F4: select_genes must return columns in the caller's requested order,
+        // not ascending index order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 10);
+
+        let requested = vec![7u32, 3, 0];
+        let proj = QueryPipeline::open(&path)
+            .unwrap()
+            .select_genes(requested.clone())
+            .collect()
+            .unwrap();
+        assert_eq!(proj.x.n_cols(), 3);
+        assert_eq!(proj.var.num_rows(), 3);
+
+        // var rows follow the requested order.
+        let gene_ids = proj
+            .var
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(gene_ids.value(0), "gene_7");
+        assert_eq!(gene_ids.value(1), "gene_3");
+        assert_eq!(gene_ids.value(2), "gene_0");
+
+        // X columns match: projected column j equals full column requested[j].
+        let full = QueryPipeline::open(&path).unwrap().collect().unwrap();
+        let dense_full = full.x.to_dense().unwrap(); // row-major, 12×10
+        let dense_proj = proj.x.to_dense().unwrap(); // row-major, 12×3
+        for r in 0..12 {
+            for (j, &g) in requested.iter().enumerate() {
+                assert_eq!(
+                    dense_proj[r * 3 + j],
+                    dense_full[r * 10 + g as usize],
+                    "row {r} col {j} (gene {g})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collect_gene_projection_ascending_unchanged() {
+        // An already-ascending-unique request takes the no-reorder fast path and
+        // is byte-identical to selecting the same sorted set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 10);
+        let a = QueryPipeline::open(&path)
+            .unwrap()
+            .select_genes(vec![0, 3, 7])
+            .collect()
+            .unwrap();
+        assert_eq!(a.x.to_dense().unwrap(), {
+            let b = QueryPipeline::open(&path)
+                .unwrap()
+                .select_genes(vec![0, 3, 7])
+                .collect()
+                .unwrap();
+            b.x.to_dense().unwrap()
+        });
     }
 
     #[test]

@@ -2,13 +2,22 @@
 //
 // Wraps scx-engine::QueryPipeline and QueryResult for Python.
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use scx_engine::pipeline::{QueryPipeline, QueryResult};
 use scx_engine::EngineError;
 
 use crate::convert;
+
+/// A gene selector accepted by [`PyQueryPipeline::select_genes`]: either a
+/// positional integer index or a gene name resolved against `var`. The derive
+/// tries `Index` (int) first, then `Name` (str).
+#[derive(FromPyObject)]
+enum GeneRef {
+    Index(u32),
+    Name(String),
+}
 
 // ---------------------------------------------------------------------------
 // Error conversion
@@ -129,15 +138,45 @@ impl PyQueryPipeline {
         Ok(slf)
     }
 
-    /// Select specific gene indices for projection.
+    /// Select specific genes for projection, by integer index or gene name
+    /// (or a mix). The output columns follow the requested order, matching
+    /// `adata[:, gene_list]`; duplicates collapse to first occurrence. Names
+    /// are resolved against `var` (raises `KeyError` if not found).
     /// Returns self for method chaining (finding 9.5).
     ///
     /// Example:
     ///     pipeline.select_genes([0, 1, 2, 100, 200]).collect()
-    fn select_genes(slf: Bound<'_, Self>, indices: Vec<u32>) -> PyResult<Bound<'_, Self>> {
+    ///     pipeline.select_genes(["MS4A1", "CD79A", "CD3D"]).collect()
+    fn select_genes(slf: Bound<'_, Self>, genes: Vec<GeneRef>) -> PyResult<Bound<'_, Self>> {
         {
             let mut inner = slf.borrow_mut();
             let p = inner.take_pipeline()?;
+            // Read var only when at least one name needs resolving.
+            let var_batch = if genes.iter().any(|g| matches!(g, GeneRef::Name(_))) {
+                Some(p.reader().read_var().map_err(engine_to_pyerr)?)
+            } else {
+                None
+            };
+            let mut indices: Vec<u32> = Vec::with_capacity(genes.len());
+            for g in genes {
+                match g {
+                    GeneRef::Index(i) => indices.push(i),
+                    GeneRef::Name(name) => {
+                        let vb = var_batch.as_ref().expect("var read when names present");
+                        match crate::experiment::lookup_gene_in_batch(vb, &name) {
+                            Some(idx) => indices.push(idx),
+                            None => {
+                                // p is untouched (select_genes not yet called);
+                                // restore it so the pipeline stays usable.
+                                inner.put_pipeline(p);
+                                return Err(PyKeyError::new_err(format!(
+                                    "gene name '{name}' not found in var index"
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
             let p = p.select_genes(indices);
             inner.put_pipeline(p);
         }
