@@ -49,6 +49,7 @@ def rank_genes_groups_df(
     rankby_abs: bool = False,
     tie_correct: bool = False,
     device: str = "auto",
+    output: str = "polars",
 ) -> Any: ...
 
 
@@ -92,6 +93,7 @@ def pdex_ref(
     gene_chunk_size: int | None = None,
     prefer_format: PreferFormat = "csr",
     device: str = "auto",
+    output: str = "polars",
 ) -> Any: ...
 
 

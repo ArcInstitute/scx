@@ -798,13 +798,58 @@ class TestClusteringAgreementParity:
         sk_nmi = normalized_mutual_info_score(labels_a, labels_b)
         np.testing.assert_allclose(scx_nmi, sk_nmi, atol=1e-10, err_msg="NMI mismatch")
 
-        # ARI — cell-eval uses (ARI + 1) / 2 rescaling
+        # ARI — default matches sklearn exactly (like NMI/AMI above).
         scx_ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)
         sk_ari = adjusted_rand_score(labels_a, labels_b)
-        ce_ari_rescaled = (sk_ari + 1) / 2
         np.testing.assert_allclose(
-            scx_ari, ce_ari_rescaled, atol=1e-10,
-            err_msg=f"ARI mismatch (with cell-eval rescaling): SCX={scx_ari} vs (sklearn+1)/2={ce_ari_rescaled}",
+            scx_ari, sk_ari, atol=1e-10,
+            err_msg=f"ARI mismatch vs sklearn: SCX={scx_ari} vs sklearn={sk_ari}",
+        )
+        # rescaled=True gives cell-eval's (ARI + 1) / 2.
+        scx_ari_rescaled = pyscx.accel.adjusted_rand_index(labels_a, labels_b, rescaled=True)
+        np.testing.assert_allclose(scx_ari_rescaled, (sk_ari + 1) / 2, atol=1e-10)
+
+    def test_clustering_scoring_string_categorical_labels(self):
+        """F5: AMI/NMI/ARI accept string / categorical labels (factorized
+        internally like sklearn), not just integer codes."""
+        import pandas as pd
+
+        rng = np.random.default_rng(7)
+        cell_types = np.array(["T cell", "B cell", "NK cell", "Mono"])
+        clusters = np.array(["c0", "c1", "c2", "c3", "c4"])
+        labels_a = cell_types[rng.integers(0, len(cell_types), size=200)].tolist()
+        labels_b = clusters[rng.integers(0, len(clusters), size=200)].tolist()
+
+        # String labels must no longer raise (was: invalid literal for int()).
+        scx_ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
+        scx_nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
+        scx_ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)
+
+        # Match sklearn on the same raw string labels.
+        np.testing.assert_allclose(
+            scx_ami, adjusted_mutual_info_score(labels_a, labels_b), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            scx_nmi, normalized_mutual_info_score(labels_a, labels_b), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            scx_ari, adjusted_rand_score(labels_a, labels_b), atol=1e-10
+        )
+
+        # Identical string labels → perfect agreement.
+        np.testing.assert_allclose(
+            pyscx.accel.adjusted_rand_index(labels_a, labels_a), 1.0, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            pyscx.accel.normalized_mutual_info(labels_a, labels_a), 1.0, atol=1e-10
+        )
+
+        # A pandas Categorical gives the same result as its string form.
+        cat_a = pd.Categorical(labels_a)
+        np.testing.assert_allclose(
+            pyscx.accel.adjusted_rand_index(cat_a, labels_b),
+            scx_ari,
+            atol=1e-10,
         )
 
 
@@ -836,6 +881,33 @@ class TestDEBridgeParity:
         assert df["feature"].dtype == pl.Utf8
         for col in ["fold_change", "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change"]:
             assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
+
+    def test_de_dataframe_output_pandas(self):
+        """F6: rank_genes_groups_df supports output='pandas' — a pandas
+        DataFrame with identical columns/values to the polars default."""
+        import pandas as pd
+
+        adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
+
+        df_pl = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control", output="polars",
+        )
+        df_pd = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control", output="pandas",
+        )
+        assert isinstance(df_pd, pd.DataFrame)
+        # Same column names + order.
+        assert list(df_pd.columns) == list(df_pl.columns)
+        # Values identical to the polars result.
+        pd.testing.assert_frame_equal(
+            df_pd.reset_index(drop=True),
+            df_pl.to_pandas().reset_index(drop=True),
+        )
+        # Unknown output value is rejected.
+        with pytest.raises(ValueError):
+            pyscx.accel.rank_genes_groups_df(
+                adata_real, "perturbation", reference="control", output="bogus",
+            )
 
     def test_de_bridge_feeds_cell_eval_metrics(self):
         """Verify DE bridge output can be consumed by cell-eval DE metrics.

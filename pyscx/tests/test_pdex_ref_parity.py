@@ -305,3 +305,26 @@ def test_pdex_ref_cpu_unsorted_scipy_csr_matches_sorted():
         "has_sorted_indices flipped to True after pdex_ref. Check that "
         "the dispatch site passes `in_place=false`."
     )
+
+
+def test_pdex_ref_output_pandas():
+    """F6: pdex_ref supports output='pandas' — a pandas DataFrame with
+    identical columns/values to the polars default; bad output errors."""
+    import pandas as pd
+
+    adata = _make_adata()
+
+    df_pl = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="polars")
+    df_pd = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="pandas")
+
+    assert isinstance(df_pd, pd.DataFrame)
+    # Same column names + order.
+    assert list(df_pd.columns) == list(df_pl.columns)
+    # Values identical to the polars result.
+    pd.testing.assert_frame_equal(
+        df_pd.reset_index(drop=True),
+        df_pl.to_pandas().reset_index(drop=True),
+    )
+    # Unknown output value is rejected.
+    with pytest.raises(ValueError):
+        pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="bogus")

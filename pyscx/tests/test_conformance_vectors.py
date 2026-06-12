@@ -61,7 +61,11 @@ def test_conformance_single_modality_opens(name):
     sidecar = _load_sidecar(name)
     path = REF_DIR / f"{name}.scx"
     exp = pyscx.open(str(path))
-    assert exp.n_obs == sidecar["header"]["n_obs"], f"{name}: n_obs"
+    # The sidecar records the on-disk header (physical) row count; `n_obs` now
+    # reports the logical (live) count after deletions (B3), so compare the
+    # header against `n_obs_physical`. They're equal for fixtures without
+    # deletion vectors.
+    assert exp.n_obs_physical == sidecar["header"]["n_obs"], f"{name}: n_obs"
     assert exp.n_vars == sidecar["header"]["n_vars"], f"{name}: n_vars"
 
 
@@ -126,7 +130,9 @@ def test_conformance_multimodal_modalities_listed(name):
     assert len(modality_entries) == 1, (
         f"{name}: expected exactly one ModalityTable section, got {len(modality_entries)}"
     )
-    assert exp.n_obs == sidecar["header"]["n_obs"], f"{name}: n_obs"
+    # Header records the physical row count; compare against `n_obs_physical`
+    # (equal to `n_obs` for fixtures without deletion vectors). See B3.
+    assert exp.n_obs_physical == sidecar["header"]["n_obs"], f"{name}: n_obs"
 
 
 def test_conformance_manifest_hashes():

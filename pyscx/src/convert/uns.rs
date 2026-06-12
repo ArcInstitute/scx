@@ -390,12 +390,9 @@ pub(crate) fn encode_ndarray_tagged<'py>(
             Ok(serde_json::Value::Object(env))
         }
         "V" => {
-            // Structured ndarray (recarray-like). Save descr + raw bytes.
+            // Structured ndarray (recarray-like). Save descr + data.
             let descr_py = dtype.getattr("descr")?;
             let descr_json = pytuple_descr_to_json(&descr_py, key_path)?;
-            let bytes = ndarray_bytes_le(obj, key_path)?;
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             let mut env = serde_json::Map::new();
             env.insert(
                 SCX_TYPE_KEY.to_string(),
@@ -403,11 +400,38 @@ pub(crate) fn encode_ndarray_tagged<'py>(
             );
             env.insert("descr".to_string(), descr_json);
             env.insert("shape".to_string(), serde_json::Value::Array(shape_json));
-            env.insert(
-                "encoding".to_string(),
-                serde_json::Value::String("base64le".to_string()),
-            );
-            env.insert("data".to_string(), serde_json::Value::String(b64));
+            if structured_has_object_field(&dtype)? {
+                // Object fields can't go through `tobytes()` — that serializes
+                // 8-byte CPython object *pointers*, not the strings, silently
+                // destroying the data on disk (e.g. scanpy's
+                // `rank_genes_groups["names"]`). Serialize each field's values
+                // as a JSON list instead (one envelope for the whole array,
+                // covering mixed object/numeric structured dtypes).
+                let names: Vec<String> = dtype.getattr("names")?.extract()?;
+                let mut fields_map = serde_json::Map::new();
+                for name in &names {
+                    let sub = obj.get_item(name.as_str())?;
+                    let lst = sub.call_method0("tolist")?;
+                    let val = pylist_to_json_leaf(&lst, &format!("{key_path}.{name}"))?;
+                    fields_map.insert(name.clone(), val);
+                }
+                env.insert(
+                    "encoding".to_string(),
+                    serde_json::Value::String("fields_json".to_string()),
+                );
+                env.insert("fields".to_string(), serde_json::Value::Object(fields_map));
+            } else {
+                // All-numeric / fixed-width string structured dtype: the raw
+                // little-endian byte buffer round-trips faithfully.
+                let bytes = ndarray_bytes_le(obj, key_path)?;
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                env.insert(
+                    "encoding".to_string(),
+                    serde_json::Value::String("base64le".to_string()),
+                );
+                env.insert("data".to_string(), serde_json::Value::String(b64));
+            }
             Ok(serde_json::Value::Object(env))
         }
         other => Err(PyValueError::new_err(format!(
@@ -450,6 +474,73 @@ pub(crate) fn pylist_to_string_json_array<'py>(
     let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
     Err(PyValueError::new_err(format!(
         "uns at {key_path}: object/string ndarray element must be str or None, got {type_name}"
+    )))
+}
+
+/// True if any top-level field of a structured (`kind == "V"`) numpy dtype is
+/// object-kind (`"O"`). Such fields cannot be serialized via `tobytes()` (it
+/// writes object pointers, not data), so the encoder routes them through the
+/// per-field JSON path instead.
+pub(crate) fn structured_has_object_field(dtype: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let names = dtype.getattr("names")?;
+    if names.is_none() {
+        return Ok(false);
+    }
+    let names: Vec<String> = names.extract()?;
+    for name in names {
+        let sub = dtype.get_item(name.as_str())?;
+        let kind: String = sub.getattr("kind")?.extract()?;
+        if kind == "O" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Walk a Python list (output of `ndarray.tolist()`, possibly nested) into a
+/// JSON tree, accepting str / bool / int / float / None / bytes leaves. Used
+/// to serialize the fields of an object-bearing structured array, where leaves
+/// may be strings *or* numbers (mixed object/numeric structured dtypes).
+pub(crate) fn pylist_to_json_leaf<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+) -> PyResult<serde_json::Value> {
+    if let Ok(lst) = obj.cast::<PyList>() {
+        let mut arr = Vec::with_capacity(lst.len());
+        for (i, item) in lst.iter().enumerate() {
+            arr.push(pylist_to_json_leaf(&item, &format!("{key_path}[{i}]"))?);
+        }
+        return Ok(serde_json::Value::Array(arr));
+    }
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(s) = obj.cast::<PyString>() {
+        return Ok(serde_json::Value::String(s.extract()?));
+    }
+    // PyBool must precede the int branch: bool is a subclass of int in Python.
+    if let Ok(b) = obj.cast::<PyBool>() {
+        return Ok(serde_json::Value::Bool(b.is_true()));
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Ok(serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null));
+    }
+    if let Ok(by) = obj.cast::<PyBytes>() {
+        let s = std::str::from_utf8(by.as_bytes()).map_err(|_| {
+            PyValueError::new_err(format!(
+                "uns at {key_path}: bytes element in structured field is not valid UTF-8"
+            ))
+        })?;
+        return Ok(serde_json::Value::String(s.to_string()));
+    }
+    let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
+    Err(PyValueError::new_err(format!(
+        "uns at {key_path}: structured-field element must be str/int/float/bool/None, got {type_name}"
     )))
 }
 
@@ -748,7 +839,9 @@ pub(crate) fn envelope_required_keys(tag: &str) -> Option<&'static [&'static str
         "ndarray" => Some(&["dtype", "shape", "encoding", "data"]),
         "scalar" => Some(&["dtype", "data"]),
         "tuple" => Some(&["data"]),
-        "recarray" => Some(&["descr", "shape", "data"]),
+        // Both recarray encodings carry descr+shape; the payload key differs
+        // ("data" for base64le, "fields" for fields_json), so it isn't required.
+        "recarray" => Some(&["descr", "shape"]),
         "categorical" => Some(&["categories", "codes", "ordered"]),
         "pandas.Index" => Some(&["data", "name"]),
         "pandas.Series" => Some(&["data", "name"]),
@@ -921,15 +1014,72 @@ pub(crate) fn decode_recarray_envelope<'py>(
     map: &serde_json::Map<String, serde_json::Value>,
     ctx: &mut UnsReadCtx<'py>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let descr = require_value_json(map, "descr")?;
     let shape = extract_shape_json(map)?;
-    let pybytes = decode_base64_bytes_json(ctx.py, map)?;
-    let np = &ctx.np;
-    let dtype = build_structured_dtype_from_json(np, descr)?;
-    let arr = np.call_method1("frombuffer", (pybytes, dtype))?;
-    let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
-    let reshaped = arr.call_method1("reshape", (shape_tup,))?;
-    reshaped.call_method0("copy")
+    // `encoding` defaults to "base64le" so files written before the object-field
+    // fix still decode through the original raw-bytes path.
+    let encoding: String = map
+        .get("encoding")
+        .and_then(|v| v.as_str())
+        .unwrap_or("base64le")
+        .to_owned();
+    match encoding.as_str() {
+        "base64le" => {
+            let descr = require_value_json(map, "descr")?;
+            let pybytes = decode_base64_bytes_json(ctx.py, map)?;
+            let np = &ctx.np;
+            let dtype = build_structured_dtype_from_json(np, descr)?;
+            let arr = np.call_method1("frombuffer", (pybytes, dtype))?;
+            let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
+            let reshaped = arr.call_method1("reshape", (shape_tup,))?;
+            reshaped.call_method0("copy")
+        }
+        "fields_json" => {
+            // Per-field JSON form (object-bearing structured arrays). Decode
+            // each field's JSON to Python first (json_to_py borrows ctx
+            // mutably), then assign column-wise into an empty structured array.
+            let fields_val = require_value_json(map, "fields")?;
+            let fields_map = match fields_val {
+                serde_json::Value::Object(m) => m,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "uns recarray: 'fields' is not an object",
+                    ))
+                }
+            };
+            let mut field_pys: Vec<(String, Bound<'py, PyAny>)> =
+                Vec::with_capacity(fields_map.len());
+            for (name, v) in fields_map {
+                let py_val = json_to_py(v, ctx)?;
+                field_pys.push((name.clone(), py_val));
+            }
+            let descr = require_value_json(map, "descr")?;
+            let np = &ctx.np;
+            let dtype = build_structured_dtype_from_json(np, descr)?;
+            let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
+            let out = np.call_method1("empty", (&shape_tup, &dtype))?;
+            for (name, py_val) in &field_pys {
+                // Assign the decoded JSON value straight into the field: numpy
+                // coerces the nested list to the field's own dtype — including
+                // object, fixed-width string, numeric, AND subarray fields
+                // (`dtype=[('s','f4',(3,))]`). Going via `np.array(py_val,
+                // sub_dtype)` instead re-expanded subarray dims (an extra axis)
+                // and raised a broadcast error on assignment.
+                //
+                // Float note: encode maps non-finite values to JSON `null`
+                // (JSON has no NaN/Inf), which decodes to Python `None`; numpy
+                // stores `None` as `nan` in a float field, so NaN round-trips
+                // as nan, but Inf degrades to nan. Only the rare mixed
+                // object+float structured `uns` case is affected (the fast
+                // `base64le` path, used when no field is object-dtype,
+                // preserves non-finite bits exactly).
+                out.set_item(name.as_str(), py_val)?;
+            }
+            Ok(out)
+        }
+        other => Err(PyValueError::new_err(format!(
+            "uns recarray envelope: unknown encoding '{other}'"
+        ))),
+    }
 }
 
 /// Rebuild a structured `np.dtype` from a descr JSON tree (a list of

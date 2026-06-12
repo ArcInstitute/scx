@@ -31,8 +31,11 @@ pub fn run_info(
         fmt_num(header.nnz),
     );
 
-    // Codec name
-    let codec_name = codec_id_name(header.codec_id);
+    // Codec: summarize across ALL CSR shards. The codec is chosen per shard
+    // (auto-routing legitimately mixes Scx1/Zstd), so the file-level
+    // `header.codec_id` default is not necessarily what was applied to the
+    // data — printing it alone reported "none" for Scx1-compressed files.
+    let codec_name = summarize_csr_codec(&reader)?;
 
     // Index dtype
     let index_dtype = match header.index_dtype {
@@ -283,13 +286,49 @@ fn summarize_csr_value_encoding(reader: &ScxReader) -> Result<String, Box<dyn st
     })
 }
 
+/// Summarize the codec across **all** CSR shards.
+///
+/// The codec is selected per shard — `auto`-routing legitimately mixes
+/// `Scx1`/`Zstd` across shards — so the file-level `header.codec_id` default
+/// is not necessarily what was applied to the data (e.g. it reads `none` for a
+/// file whose shards are all `Scx1`). Returns the single name when uniform,
+/// `mixed (a, b)` when shards differ (names in codec-id order), or `n/a` when
+/// there are no CSR shards.
+fn summarize_csr_codec(reader: &ScxReader) -> Result<String, Box<dyn std::error::Error>> {
+    let csr_shards = reader.catalog().shards(SectionType::CsrShard);
+    if csr_shards.is_empty() {
+        return Ok("n/a".to_string());
+    }
+
+    let mut ids: Vec<u8> = csr_shards
+        .iter()
+        .map(|e| reader.read_shard_header(e).map(|h| h.codec_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.sort_unstable();
+    ids.dedup();
+
+    Ok(match ids.as_slice() {
+        [one] => codec_id_name(*one).to_string(),
+        many => format!(
+            "mixed ({})",
+            many.iter()
+                .map(|&b| codec_id_name(b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    })
+}
+
 /// Print all info as JSON.
 fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error::Error>> {
     let header = reader.header();
     let catalog = reader.catalog();
     let file_size = std::fs::metadata(path)?.len();
 
-    let codec_name = codec_id_name(header.codec_id);
+    // `codec` reflects what shards actually use; `codec_default` keeps the raw
+    // file-level header default for debugging.
+    let codec_name = summarize_csr_codec(reader)?;
+    let codec_default = codec_id_name(header.codec_id);
 
     let mut sections = Vec::new();
     for entry in &catalog.entries {
@@ -310,6 +349,7 @@ fn print_json(path: &Path, reader: &ScxReader) -> Result<(), Box<dyn std::error:
         "n_csc_shards": header.n_csc_shards,
         "has_csc": header.has_csc(),
         "codec": codec_name,
+        "codec_default": codec_default,
         "index_dtype": if header.index_dtype == 0 { "u16" } else { "u32" },
         "shard_target_rows": header.shard_target_rows,
         "manifest_sequence": header.manifest_sequence,
@@ -690,5 +730,70 @@ mod tests {
         // write_test_file writes a single uint8 shard (values < 256).
         let reader = ScxReader::open(write_test_file(&dir, 6, 5)).unwrap();
         assert_eq!(summarize_csr_value_encoding(&reader).unwrap(), "uint8");
+    }
+
+    /// Write a 2-shard file whose shards use different codecs: shard 0 `None`,
+    /// shard 1 `Zstd`.
+    fn write_mixed_codec_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("mixed_codec.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(4, 5)).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+
+        let vals = ValueEncoding::Uint16
+            .encode_f32_batch(&[300.0, 400.0, 500.0, 600.0])
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &vals,
+                CodecId::None,
+                ValueEncoding::Uint16,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 2, 4],
+                &[0, 1, 0, 1],
+                &vals,
+                CodecId::Zstd,
+                ValueEncoding::Uint16,
+                2,
+            )
+            .unwrap();
+
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_summarize_codec_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader = ScxReader::open(write_mixed_codec_file(&dir)).unwrap();
+        // Names in codec-id order: None=0, Zstd=2.
+        assert_eq!(summarize_csr_codec(&reader).unwrap(), "mixed (none, zstd)");
+    }
+
+    #[test]
+    fn test_summarize_codec_uniform() {
+        let dir = tempfile::tempdir().unwrap();
+        // write_test_file writes a single shard with CodecId::None.
+        let reader = ScxReader::open(write_test_file(&dir, 6, 5)).unwrap();
+        assert_eq!(summarize_csr_codec(&reader).unwrap(), "none");
+    }
+
+    #[test]
+    fn test_summarize_codec_no_shards() {
+        // A file with obs/var but no CSR shards → "n/a" (no shard to inspect).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_shards.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(4, 5)).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+        writer.finish().unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(summarize_csr_codec(&reader).unwrap(), "n/a");
     }
 }

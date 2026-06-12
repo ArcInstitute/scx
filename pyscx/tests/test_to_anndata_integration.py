@@ -488,6 +488,14 @@ def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
         "names": np.array(
             [("g0", "g1"), ("g2", "g0")], dtype=[("A", "U4"), ("B", "U4")]
         ),
+        # Object-dtype structured array — the actual shape of scanpy's
+        # `rank_genes_groups["names"]`. Regression for B1: the encoder used to
+        # `tobytes()` these, serializing object pointers and destroying the
+        # strings on disk (silent data loss; reopen then raised ValueError).
+        "names_obj": np.array(
+            list(zip(["GENEA", "GENEB"], ["GENEC", "GENED"])),
+            dtype=[("0", "O"), ("1", "O")],
+        ),
         "pvals": np.array([1e-3, 1e-2], dtype=np.float32),
     }
     adata = _adata_with_uns({
@@ -521,6 +529,38 @@ def test_from_anndata_uns_numpy_arrays_roundtrip(tmp_dir):
     assert isinstance(pvals, np.ndarray)
     assert pvals.dtype == np.float32
     assert np.allclose(pvals, [1e-3, 1e-2])
+
+    names_obj = out.uns["rank_genes_groups"]["names_obj"]
+    assert isinstance(names_obj, np.ndarray)
+    assert names_obj.dtype.names == ("0", "1")
+    assert names_obj.dtype["0"] == np.dtype("O")
+    assert names_obj["0"][0] == "GENEA" and names_obj["1"][0] == "GENEC"
+    assert names_obj["0"][1] == "GENEB" and names_obj["1"][1] == "GENED"
+
+
+def test_from_anndata_uns_structured_object_with_subarray_field(tmp_dir):
+    """PR #242 review (Codex P2): an object-bearing structured uns array with a
+    *shaped* numeric subarray field must round-trip — the `fields_json` decode
+    previously re-expanded the subarray dims and raised a broadcast error on read.
+    Also confirms NaN in a numeric field returns as nan."""
+    import pyscx
+
+    rec = np.zeros(2, dtype=[("name", "O"), ("score", "f4", (3,))])
+    rec["name"] = ["GENEA", "GENEB"]
+    rec["score"] = [[1.0, 2.0, np.nan], [4.0, 5.0, 6.0]]
+    adata = _adata_with_uns({"rgg_sub": rec})
+
+    path = str(tmp_dir / "uns_subarray.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata().uns["rgg_sub"]
+
+    assert isinstance(out, np.ndarray)
+    assert out.dtype.names == ("name", "score")
+    assert out.dtype["score"].shape == (3,)
+    assert list(out["name"]) == ["GENEA", "GENEB"]
+    assert np.array_equal(out["score"][1], np.array([4.0, 5.0, 6.0], dtype="f4"))
+    # NaN survives (JSON null → None → nan in a float field).
+    assert out["score"][0][0] == 1.0 and np.isnan(out["score"][0][2])
 
 
 def test_from_anndata_uns_numpy_scalars_roundtrip(tmp_dir):

@@ -3,8 +3,10 @@
 // Extracted from the former pyscx/src/anndata.rs (T5.7).
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::{Field, Schema};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -116,7 +118,73 @@ pub(crate) fn pandas_to_record_batch(
         .next()
         .ok_or_else(|| PyRuntimeError::new_err("Arrow IPC contains no batches"))?
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    scx_format_io::downcast_large_types(&batch).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    let batch = scx_format_io::downcast_large_types(&batch)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // `pyarrow.Table.from_pandas` drops the pandas `ordered` flag of categorical
+    // columns. Re-stamp the `scx.categorical.ordered` field metadata the read
+    // path (`interop::ordered_categorical_columns`) looks for, mirroring the
+    // h5ad ingest path (`scx-convert::h5ad::read::read_categorical_group`).
+    let ordered = ordered_categorical_columns_from_df(df)?;
+    if ordered.is_empty() {
+        return Ok(batch);
+    }
+    stamp_ordered_categorical_metadata(&batch, &ordered)
+}
+
+/// Names of columns in a pandas DataFrame that are ordered categoricals
+/// (`dtype == "category"` and `series.cat.ordered`). Used to re-attach the
+/// ordered flag that `pyarrow.Table.from_pandas` discards.
+fn ordered_categorical_columns_from_df(df: &Bound<'_, PyAny>) -> PyResult<HashSet<String>> {
+    let mut out = HashSet::new();
+    let columns = df.getattr("columns")?;
+    for col in columns.try_iter()? {
+        let col = col?;
+        let Ok(name) = col.extract::<String>() else {
+            continue; // non-string column label — cannot be an obs/var field name
+        };
+        let series = df.get_item(&col)?;
+        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        if dtype_name != "category" {
+            continue;
+        }
+        let ordered: bool = series.getattr("cat")?.getattr("ordered")?.extract()?;
+        if ordered {
+            out.insert(name);
+        }
+    }
+    Ok(out)
+}
+
+/// Return a copy of `batch` with `scx.categorical.ordered = "true"` stamped on
+/// the field metadata of every column named in `ordered`.
+fn stamp_ordered_categorical_metadata(
+    batch: &RecordBatch,
+    ordered: &HashSet<String>,
+) -> PyResult<RecordBatch> {
+    let schema = batch.schema();
+    let new_fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if ordered.contains(f.name()) {
+                let mut md = f.metadata().clone();
+                md.insert(
+                    scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+                    "true".to_string(),
+                );
+                Arc::new(f.as_ref().clone().with_metadata(md))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, batch.columns().to_vec())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Build an Arrow RecordBatch from an obsm/varm value, skipping the

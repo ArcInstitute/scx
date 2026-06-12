@@ -401,9 +401,11 @@ enum Commands {
     Merge {
         /// Input SCX files to merge (at least 2)
         inputs: Vec<PathBuf>,
-        /// Output path for merged file
+        /// Output path for merged file. Required, and passed as a flag (not a
+        /// positional argument) because `inputs` is variadic — a trailing path
+        /// would otherwise be read as another input.
         #[arg(long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Rebuild the CSC sidecar on the merged output (drops +
         /// re-emits via `scx build-csc`). Without this flag, merge
         /// drops any input CSC sidecars with a warning.
@@ -840,20 +842,42 @@ fn main() {
             assume_identical_var,
             assume_identical_obs,
             uns_policy,
-        } => merge::run_merge(
-            &inputs,
-            &output,
-            rebuild_csc,
-            csc_cols_per_shard,
-            &csc_memory_limit,
-            parse_index_columns(index_obs.as_deref()),
-            parse_index_columns(index_var.as_deref()),
-            index_preset.filter(|s| !s.trim().is_empty()),
-            index_auto_threshold,
-            assume_identical_var,
-            assume_identical_obs,
-            uns_policy,
-        ),
+        } => match output {
+            Some(output) => merge::run_merge(
+                &inputs,
+                &output,
+                rebuild_csc,
+                csc_cols_per_shard,
+                &csc_memory_limit,
+                parse_index_columns(index_obs.as_deref()),
+                parse_index_columns(index_var.as_deref()),
+                index_preset.filter(|s| !s.trim().is_empty()),
+                index_auto_threshold,
+                assume_identical_var,
+                assume_identical_obs,
+                uns_policy,
+            ),
+            // Unlike `scx convert`, the merged output is passed via `--output`,
+            // not positionally — `inputs` is variadic, so a trailing path is
+            // read as another input. Name the flag explicitly so users coming
+            // from `convert`'s positional output aren't left guessing.
+            None => Err(format!(
+                "scx merge: missing required --output <PATH>.\n\
+                 The merged file is written via the --output flag (not a positional \
+                 argument like `scx convert`), because inputs are variadic.\n\
+                 Example: scx merge {} --output merged.scx",
+                if inputs.is_empty() {
+                    "a.scx b.scx".to_string()
+                } else {
+                    inputs
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            )
+            .into()),
+        },
         Commands::Query {
             source,
             filter,

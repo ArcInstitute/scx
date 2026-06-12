@@ -875,29 +875,55 @@ fn write_de_to_adata(
     Ok(())
 }
 
-/// Convert a DiffExpResult into a polars DataFrame matching cell-eval's
-/// `DEResults` schema.
+/// Build a DataFrame of the given `columns` in `column_order`, as either a
+/// polars or a pandas DataFrame depending on `output`.
 ///
-/// Output columns:
-///   - `target` (Utf8): group/perturbation name
-///   - `feature` (Utf8): gene name
-///   - `fold_change` (Float64): 2^(log2_fold_change) — linear fold change
-///   - `p_value` (Float64): raw p-value
-///   - `fdr` (Float64): BH-adjusted p-value
-///   - `log2_fold_change` (Float64): log2 fold change
-///   - `abs_log2_fold_change` (Float64): |log2_fold_change|
+/// `output="polars"` (default) requires polars; `output="pandas"` builds a
+/// pandas DataFrame directly and does **not** import polars, so pandas-only
+/// callers can use the DE DataFrame helpers without installing polars. Column
+/// schema is identical across both.
+fn build_de_dataframe<'py>(
+    py: Python<'py>,
+    columns: &Bound<'py, PyDict>,
+    column_order: &[&str],
+    output: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let order = pyo3::types::PyList::new(py, column_order)?;
+    match output {
+        "polars" => {
+            let pl = py.import("polars").map_err(|_| {
+                PyRuntimeError::new_err(
+                    "output='polars' requires polars. Install it \
+                     (pip install 'pyscx[eval]' or pip install polars), \
+                     or pass output='pandas'.",
+                )
+            })?;
+            let df = pl.call_method1("DataFrame", (columns,))?;
+            // Enforce column order regardless of dict iteration / constructor.
+            df.call_method1("select", (order,))
+        }
+        "pandas" => {
+            let pd = py.import("pandas").map_err(|_| {
+                PyRuntimeError::new_err("output='pandas' requires pandas (pip install pandas).")
+            })?;
+            let df = pd.call_method1("DataFrame", (columns,))?;
+            // `df[[col, ...]]` selects and orders columns deterministically.
+            df.get_item(order)
+        }
+        other => Err(PyValueError::new_err(format!(
+            "Invalid output={other:?}; expected 'polars' or 'pandas'"
+        ))),
+    }
+}
+
+/// Convert a DiffExpResult into a DataFrame matching cell-eval's `DEResults`
+/// schema, as polars or pandas per `output`.
 fn de_result_to_cell_eval_dataframe<'py>(
     py: Python<'py>,
     result: &scx_accel::DiffExpResult,
     n_genes: Option<usize>,
+    output: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pl = py.import("polars").map_err(|_| {
-        PyRuntimeError::new_err(
-            "polars is required for rank_genes_groups_df(). \
-             Install it: pip install 'pyscx[eval]'  (or: pip install polars)",
-        )
-    })?;
-
     // Pre-compute total row count for capacity pre-allocation.
     let total_rows: usize = result
         .group_names
@@ -943,8 +969,8 @@ fn de_result_to_cell_eval_dataframe<'py>(
         }
     }
 
-    // Build polars DataFrame from column vectors with explicit column order
-    // matching cell-eval's DEResults schema.
+    // Build column vectors into a dict; `build_de_dataframe` constructs the
+    // polars/pandas frame and enforces the cell-eval DEResults column order.
     let dict = PyDict::new(py);
     dict.set_item("target", targets)?;
     dict.set_item("feature", features)?;
@@ -954,12 +980,10 @@ fn de_result_to_cell_eval_dataframe<'py>(
     dict.set_item("log2_fold_change", log2_fcs)?;
     dict.set_item("abs_log2_fold_change", abs_log2_fcs)?;
 
-    let df = pl.call_method1("DataFrame", (dict,))?;
-    // Enforce column order to match cell-eval's DEResults schema, regardless
-    // of dict iteration order or polars constructor behavior.
-    let column_order = pyo3::types::PyList::new(
+    build_de_dataframe(
         py,
-        [
+        &dict,
+        &[
             "target",
             "feature",
             "fold_change",
@@ -968,9 +992,8 @@ fn de_result_to_cell_eval_dataframe<'py>(
             "log2_fold_change",
             "abs_log2_fold_change",
         ],
-    )?;
-    let df = df.call_method1("select", (column_order,))?;
-    Ok(df)
+        output,
+    )
 }
 
 /// Run Wilcoxon rank-sum DE and return results as a polars DataFrame in
@@ -1000,12 +1023,19 @@ fn de_result_to_cell_eval_dataframe<'py>(
 ///         uses 500 internally for sparse/backed inputs)
 ///     rankby_abs: Sort genes by |score| instead of signed score (default: False)
 ///     tie_correct: Apply tie correction in the Wilcoxon test (default: False)
+///     output: Return type — `"polars"` (default) or `"pandas"`. The columns are
+///         identical either way; `"pandas"` builds a pandas DataFrame directly and
+///         does not require polars. (A polars result also supports `.to_pandas()`.)
+///         The cell-eval columns map to scanpy's `rank_genes_groups_df` roughly as
+///         `feature→names`, `log2_fold_change→logfoldchanges`, `p_value→pvals`,
+///         `fdr→pvals_adj`, `target→group`.
 ///
 /// Example:
 ///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
 ///     # de_df is a polars DataFrame with cell-eval columns
+///     pdf = pyscx.accel.rank_genes_groups_df(adata, "perturbation", output="pandas")
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto"))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto", output="polars"))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups_df(
     py: Python<'_>,
@@ -1017,7 +1047,13 @@ pub fn rank_genes_groups_df(
     rankby_abs: bool,
     tie_correct: bool,
     device: &str,
+    output: &str,
 ) -> PyResult<Py<PyAny>> {
+    if !matches!(output, "polars" | "pandas") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid output={output:?}; expected 'polars' or 'pandas'"
+        )));
+    }
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
@@ -1046,7 +1082,7 @@ pub fn rank_genes_groups_df(
     // already complete (route + reason) from the single planner.
     super::route::write_accel_route(py, adata, "rank_genes_groups_df", &result.exec_info)?;
 
-    let df = de_result_to_cell_eval_dataframe(py, &result, n_genes)?;
+    let df = de_result_to_cell_eval_dataframe(py, &result, n_genes, output)?;
     Ok(df.unbind())
 }
 
@@ -1494,14 +1530,8 @@ fn run_pdex_ref_inner(
 fn pdex_ref_result_to_dataframe<'py>(
     py: Python<'py>,
     result: &scx_accel::PdexRefResult,
+    output: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pl = py.import("polars").map_err(|_| {
-        PyRuntimeError::new_err(
-            "polars is required for pdex_ref(). Install it: \
-             pip install 'pyscx[eval]'  (or: pip install polars)",
-        )
-    })?;
-
     let n_genes = result.feature_names.len();
     let n_test = result.group_names.len();
     let total_rows = n_genes * n_test;
@@ -1554,10 +1584,10 @@ fn pdex_ref_result_to_dataframe<'py>(
     dict.set_item("statistic", statistics)?;
     dict.set_item("fdr", fdrs)?;
 
-    let df = pl.call_method1("DataFrame", (dict,))?;
-    let column_order = pyo3::types::PyList::new(
+    build_de_dataframe(
         py,
-        [
+        &dict,
+        &[
             "target",
             "feature",
             "target_mean",
@@ -1571,9 +1601,8 @@ fn pdex_ref_result_to_dataframe<'py>(
             "statistic",
             "fdr",
         ],
-    )?;
-    let df = df.call_method1("select", (column_order,))?;
-    Ok(df)
+        output,
+    )
 }
 
 /// pdex `mode="ref"` differential expression on an SCX-backed or in-memory
@@ -1603,6 +1632,9 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///         fold_change and percent_change. Default 0.0.
 ///     gene_chunk_size: Genes per chunk for sparse/backed streaming
 ///         (default: 500). Ignored for dense input.
+///     output: Return type — `"polars"` (default) or `"pandas"`. Columns are
+///         identical either way; `"pandas"` builds a pandas DataFrame directly and
+///         does not require polars. (A polars result also supports `.to_pandas()`.)
 ///
 /// The accelerator execution route is recorded on
 /// ``adata.uns["scx_accel"]["pdex_ref"]`` (keys: ``route``,
@@ -1612,7 +1644,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto"))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -1625,6 +1657,7 @@ pub fn pdex_ref(
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
     device: &str,
+    output: &str,
 ) -> PyResult<Py<PyAny>> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
@@ -1634,6 +1667,11 @@ pub fn pdex_ref(
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
+    if !matches!(output, "polars" | "pandas") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid output={output:?}; expected 'polars' or 'pandas'"
         )));
     }
     let resolved = super::gpu::resolve_device(device)?;
@@ -1675,6 +1713,6 @@ pub fn pdex_ref(
     // `result.exec_info` is already complete (route + reason) from the single
     // planner — CPU sites via `cpu_exec_info`, GPU routes inside scx-accel.
     super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
-    let df = pdex_ref_result_to_dataframe(py, &result)?;
+    let df = pdex_ref_result_to_dataframe(py, &result, output)?;
     Ok(df.unbind())
 }

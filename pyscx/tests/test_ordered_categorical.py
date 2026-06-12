@@ -93,3 +93,23 @@ def test_ordered_categorical_via_to_anndata(tmp_dir, backed):
     assert out.obs["phase"].cat.ordered is True
     assert list(out.obs["phase"].cat.categories) == ["G1", "S", "G2M"]
     assert out.obs["batch"].cat.ordered is False
+
+
+@pytest.mark.parametrize("backed", [False, True])
+def test_ordered_categorical_from_anndata(tmp_dir, backed):
+    """B2 regression: the in-memory `from_anndata` write path must also persist
+    the ordered flag. Previously `pandas_to_record_batch` went through
+    `pyarrow.Table.from_pandas`, which drops the pandas `ordered` bit, so the
+    read path correctly found no metadata and returned the factor unordered."""
+    import anndata  # noqa: F401
+
+    import pyscx
+
+    src = _adata_with_ordered(12)
+    scx_path = str(tmp_dir / "ordered_from_anndata.scx")
+    pyscx.from_anndata(src, scx_path)
+
+    out = pyscx.open(scx_path).to_anndata(backed=backed)
+    assert out.obs["phase"].cat.ordered is True
+    assert list(out.obs["phase"].cat.categories) == ["G1", "S", "G2M"]
+    assert out.obs["batch"].cat.ordered is False

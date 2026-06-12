@@ -1628,17 +1628,42 @@ pub fn clustering_agreement<'py>(
 
 /// Convert a Python list/array of integer labels to Vec<u32>.
 ///
-/// Accepts pandas categorical codes, numpy integer arrays, or plain Python
-/// lists. Negative codes are rejected (pandas uses -1 for NA).
+/// Extract cluster labels as contiguous `u32` codes.
+///
+/// Accepts integer arrays / pandas categorical codes / plain Python lists
+/// directly, and — like sklearn's `adjusted_rand_score` & friends — also
+/// accepts **string / categorical / object** labels, which are factorized to
+/// integer codes via `pandas.factorize`. ARI/NMI/AMI depend only on the
+/// partition each label vector induces (and each vector is factorized
+/// independently), so this is exact. Negative codes are rejected (pandas uses
+/// `-1` for NA).
 fn extract_u32_labels(py: Python<'_>, labels: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
     let np = py.import("numpy")?;
-    let arr = np
-        .call_method1("asarray", (labels,))?
-        .call_method1("astype", ("int64",))?;
-    let vec: Vec<i64> = arr.call_method0("tolist")?.extract()?;
+    let arr = np.call_method1("asarray", (labels,))?;
+    let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+
+    // Integer / unsigned / bool labels: use the codes as-is (preserves exact
+    // values and the NA-code check below). Everything else — object, string,
+    // unicode, datetime, float — is factorized to contiguous integer codes,
+    // mirroring `factorize_obs_column` in harmony.rs / lisi.rs.
+    let codes = if matches!(kind.as_str(), "i" | "u" | "b") {
+        arr.call_method1("astype", ("int64",))?
+    } else {
+        let pd = py.import("pandas")?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("sort", false)?;
+        // factorize(arr, sort=False) -> (codes, uniques); codes are int64
+        // with -1 for NaN/NA, rejected by the guard below. Pass the numpy
+        // `arr` (not the raw `labels`, which may be a list — pandas warns on
+        // non-ndarray/Series/Index inputs).
+        let tup = pd.call_method("factorize", (&arr,), Some(&kwargs))?;
+        tup.get_item(0)?.call_method1("astype", ("int64",))?
+    };
+
+    let vec: Vec<i64> = codes.call_method0("tolist")?.extract()?;
     if vec.iter().any(|&c| c < 0) {
         return Err(PyValueError::new_err(
-            "label array contains negative values (NA codes); drop or fill them before calling",
+            "label array contains negative values / NA codes; drop or fill missing labels before calling",
         ));
     }
     Ok(vec.iter().map(|&c| c as u32).collect())
@@ -1688,16 +1713,24 @@ pub fn normalized_mutual_info(
     Ok(py.detach(|| scx_accel::normalized_mutual_info(&a, &b)))
 }
 
-/// Adjusted Rand Index, rescaled to [0, 1] via `(ARI + 1) / 2`.
+/// Adjusted Rand Index.
 ///
-/// This matches cell-eval's convention for the ARI clustering agreement
-/// metric. For the raw sklearn ARI (in [-0.5, 1]), use
-/// `(2 * adjusted_rand_index(a, b)) - 1`.
+/// By default (`rescaled=False`) this matches
+/// `sklearn.metrics.adjusted_rand_score(labels_a, labels_b)` exactly: `1.0` for
+/// identical clusterings, `~0` for random labelings, and negative for
+/// worse-than-random — consistent with `normalized_mutual_info` /
+/// `adjusted_mutual_info` in this module. Pass `rescaled=True` for cell-eval's
+/// clustering-agreement convention `(ARI + 1) / 2` in `[0, 1]`.
+///
+/// Labels may be integer codes, strings, or pandas categoricals (factorized
+/// internally; see `normalized_mutual_info`).
 #[pyfunction]
+#[pyo3(signature = (labels_a, labels_b, rescaled=false))]
 pub fn adjusted_rand_index(
     py: Python<'_>,
     labels_a: &Bound<'_, PyAny>,
     labels_b: &Bound<'_, PyAny>,
+    rescaled: bool,
 ) -> PyResult<f64> {
     let a = extract_u32_labels(py, labels_a)?;
     let b = extract_u32_labels(py, labels_b)?;
@@ -1708,5 +1741,11 @@ pub fn adjusted_rand_index(
             b.len()
         )));
     }
-    Ok(py.detach(|| scx_accel::adjusted_rand_index_rescaled(&a, &b)))
+    Ok(py.detach(|| {
+        if rescaled {
+            scx_accel::adjusted_rand_index_rescaled(&a, &b)
+        } else {
+            scx_accel::adjusted_rand_index(&a, &b)
+        }
+    }))
 }

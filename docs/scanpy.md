@@ -2159,7 +2159,8 @@ cell-eval's `(ARI+1)/2` rescaling):
 ```python
 ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
 nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
-ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)  # rescaled
+ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)  # sklearn ARI (negative = worse than random)
+ari01 = pyscx.accel.adjusted_rand_index(labels_a, labels_b, rescaled=True)  # cell-eval (ARI+1)/2, [0, 1]
 ```
 
 #### DE result format bridge (`pyscx.accel.rank_genes_groups_df`)
@@ -2702,8 +2703,8 @@ print(exp)           # AnnData-style repr:
 print(exp.n_obs)     # 10000
 print(exp.n_vars)    # 33694
 print(exp.nnz)       # 5234891
-print(exp.obs_keys)  # ['cell_type', 'sample']
-print(exp.layer_names)  # ["raw_counts", "spliced"]
+print(exp.obs_keys())  # ['cell_type', 'sample'] — callable, like adata.obs_keys()
+print(exp.layer_names())  # ["raw_counts", "spliced"] — callable method too
 print(exp.info())    # codec / shard / format-version internals
 
 # Validate checksums

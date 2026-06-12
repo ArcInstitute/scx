@@ -52,6 +52,61 @@ def test_select_genes(query_adata, scx_from_adata):
     assert result.n_obs == 120  # all cells
 
 
+def test_select_genes_preserves_order_and_names(query_adata, scx_from_adata):
+    """F4: select_genes returns columns in the requested order (not sorted),
+    accepts gene names and mixed int/str, raises KeyError on unknown names, and
+    collapses duplicates to first occurrence."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "order.scx")
+    ref = query_adata.X.toarray()  # 120 × 40 reference
+
+    # Non-ascending integer request → requested order preserved.
+    req = [7, 3, 0, 20]
+    adata = pyscx.open(path).query().select_genes(req).collect().to_anndata()
+    assert list(adata.var["gene_id"]) == [f"gene_{i}" for i in req]
+    assert np.array_equal(adata.X.toarray(), ref[:, req])
+
+    # Gene names in a custom order.
+    names = ["gene_5", "gene_2", "gene_30"]
+    a2 = pyscx.open(path).query().select_genes(names).collect().to_anndata()
+    assert list(a2.var["gene_id"]) == names
+    assert np.array_equal(a2.X.toarray(), ref[:, [5, 2, 30]])
+
+    # Mixed int + name, order preserved.
+    a3 = pyscx.open(path).query().select_genes([1, "gene_9", 4]).collect().to_anndata()
+    assert list(a3.var["gene_id"]) == ["gene_1", "gene_9", "gene_4"]
+    assert np.array_equal(a3.X.toarray(), ref[:, [1, 9, 4]])
+
+    # Unknown name → KeyError (eager, at select_genes).
+    with pytest.raises(KeyError):
+        pyscx.open(path).query().select_genes(["not_a_gene"])
+
+    # Duplicates collapse to first occurrence.
+    a4 = pyscx.open(path).query().select_genes([3, 3, 1]).collect().to_anndata()
+    assert list(a4.var["gene_id"]) == ["gene_3", "gene_1"]
+
+    # Empty selection → 0-gene result (no error).
+    a5 = pyscx.open(path).query().select_genes([]).collect().to_anndata()
+    assert a5.n_vars == 0 and a5.n_obs == 120
+
+
+def test_select_genes_accepts_numpy_int_selectors(query_adata, scx_from_adata):
+    """PR #242 review: numpy integer scalars (a `np.array([...])` or a list of
+    numpy ints) resolve as indices, not falling through to the name path."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "npidx.scx")
+    ref = query_adata.X.toarray()
+    req = [7, 3, 0]
+
+    a_arr = pyscx.open(path).query().select_genes(np.array(req)).collect().to_anndata()
+    a_list = pyscx.open(path).query().select_genes([np.int64(i) for i in req]).collect().to_anndata()
+    for a in (a_arr, a_list):
+        assert list(a.var["gene_id"]) == [f"gene_{i}" for i in req]
+        assert np.array_equal(a.X.toarray(), ref[:, req])
+
+
 def test_normalize_log1p(query_adata, scx_from_adata):
     """with_normalize + with_log1p produces transformed values matching scanpy."""
     import pyscx

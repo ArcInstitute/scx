@@ -127,6 +127,35 @@ def test_mark_deleted_indices(query_adata, scx_from_adata):
     assert adata.n_obs == original_n - len(indices_to_delete)
 
 
+def test_n_obs_reflects_deletions(query_adata, scx_from_adata):
+    """B3: after mark_deleted, `n_obs` and the repr report the LOGICAL (live)
+    count, consistent with `to_anndata().n_obs` / `query().count()`;
+    `n_obs_physical` preserves the raw, pre-deletion header count."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "del_nobs.scx")
+    exp0 = pyscx.open(path)
+    physical = exp0.n_obs
+    # No deletions yet: logical == physical.
+    assert not exp0.has_deletions
+    assert exp0.n_obs_physical == physical
+
+    indices_to_delete = [0, 5, 10, 42]
+    pyscx.mark_deleted(path, indices_to_delete)
+    n_deleted = len(indices_to_delete)
+    logical = physical - n_deleted
+
+    exp = pyscx.open(path)
+    assert exp.has_deletions
+    assert exp.n_obs_physical == physical               # raw header count
+    assert exp.n_obs == logical                          # now logical
+    assert exp.n_obs == exp.query().count()              # matches engine
+    assert exp.n_obs == exp.to_anndata().n_obs           # matches materialization
+    # The AnnData-style repr header reports the logical count, not the physical.
+    assert f"= {logical} ×" in repr(exp)
+    assert f"= {physical} ×" not in repr(exp)
+
+
 def test_mark_deleted_rejects_oob_index(query_adata, scx_from_adata):
     """mark_deleted() rejects positive cell indices >= n_obs."""
     import pyscx
