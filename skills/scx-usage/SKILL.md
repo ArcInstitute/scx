@@ -268,11 +268,11 @@ only when the filtered result fits in RAM, else switch to
 - **`highly_variable_genes(flavor="seurat_v3")` expects raw counts.** Run it
   before `normalize_total`/`log1p`, or stash `adata.layers["counts"]` and pass
   `layer="counts"`. Otherwise → statistically wrong HVGs + a warning.
-- **`leiden(device="cpu")` for label stability.** The GPU (cuGraph) path can
-  return a *vastly different cluster count*, not just relabeled clusters — on a
-  1 M-cell graph at `resolution=1.0` it gave 116k clusters vs 29 on CPU. Pin CPU
-  whenever downstream cares about cluster identity (DE, annotation transfer);
-  treat GPU Leiden as a deliberate experiment only.
+- **`leiden(device="cpu")` for label stability.** GPU (cuGraph) and CPU now give
+  comparable cluster *counts* (the old `n_iterations`→`max_iter` unit bug that
+  produced ~116k degenerate clusters is fixed), but their labels still differ by
+  design (ARI ≈ 0.72, not 1.0). Pin CPU whenever downstream cares about exact
+  cluster identity (DE, annotation transfer).
 - `accel.subset_obs` with an integer array becomes a boolean mask — **order not
   preserved, duplicates collapsed** (unlike NumPy fancy indexing).
 
