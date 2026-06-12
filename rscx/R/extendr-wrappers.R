@@ -134,6 +134,18 @@ scx_pca_matrix <- function(counts, n_components, zero_center,
         as.numeric(seed))
 }
 
+scx_pflog1ppf_matrix <- function(counts, c, n_components, zero_center,
+                                 n_oversamples, n_power_iterations, seed) {
+  .Call(wrap__scx_pflog1ppf_matrix,
+        counts,
+        as.numeric(c),
+        as.integer(n_components),
+        as.logical(zero_center),
+        as.integer(n_oversamples),
+        as.integer(n_power_iterations),
+        as.numeric(seed))
+}
+
 scx_knn_matrix <- function(embeddings, n_neighbors,
                            ef_construction, ef_search, seed) {
   .Call(wrap__scx_knn_matrix,

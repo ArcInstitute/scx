@@ -36,7 +36,7 @@ use crate::decode_stage::extract_obs_columns;
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
-use crate::projection::{scatter_row_full, HvgProjection};
+use crate::projection::{pflog1ppf_row_full, scatter_row_full, HvgProjection};
 
 /// One paired batch produced by `IndexPlanLoader`.
 ///
@@ -650,21 +650,26 @@ impl IndexPlanLoader {
             start = end;
         }
 
-        for i in 0..n_pairs {
-            let p_out = &mut x[i * n_cols..][..n_cols];
-            apply_dense_transforms(
-                p_out,
-                self.config.normalize,
-                self.config.log1p,
-                self.config.target_sum,
-            );
-            let c_out = &mut x_paired[i * n_cols..][..n_cols];
-            apply_dense_transforms(
-                c_out,
-                self.config.normalize,
-                self.config.log1p,
-                self.config.target_sum,
-            );
+        // PFlog1pPF is applied at scatter time (it needs the full pre-projection
+        // row for depth/baseline — see `scatter_pair_request`), so the
+        // post-scatter normalize/log1p dispatch is skipped in that mode.
+        if !self.config.pflog1ppf {
+            for i in 0..n_pairs {
+                let p_out = &mut x[i * n_cols..][..n_cols];
+                apply_dense_transforms(
+                    p_out,
+                    self.config.normalize,
+                    self.config.log1p,
+                    self.config.target_sum,
+                );
+                let c_out = &mut x_paired[i * n_cols..][..n_cols];
+                apply_dense_transforms(
+                    c_out,
+                    self.config.normalize,
+                    self.config.log1p,
+                    self.config.target_sum,
+                );
+            }
         }
 
         Ok(PairedDenseGather {
@@ -688,9 +693,21 @@ impl IndexPlanLoader {
             PairSide::Perturbed => &mut x[request.pair_idx * n_cols..][..n_cols],
             PairSide::Control => &mut x_paired[request.pair_idx * n_cols..][..n_cols],
         };
-        match self.hvg_projection.as_ref() {
-            Some(hvg) => hvg.scatter_row(idx, data, out),
-            None => scatter_row_full(idx, data, out)?,
+        if self.config.pflog1ppf {
+            // Depth/D over the FULL transcriptome (`idx`/`data` is the full row);
+            // each output slot is written by exactly one request, so the scatter
+            // fully produces the final PFlog1pPF row (delta + baseline).
+            let n_vars_full = self.backed.n_vars();
+            let c = self.config.pflog1ppf_c;
+            match self.hvg_projection.as_ref() {
+                Some(hvg) => hvg.scatter_pflog1ppf_row(idx, data, c, n_vars_full, out),
+                None => pflog1ppf_row_full(idx, data, c, n_vars_full, out)?,
+            }
+        } else {
+            match self.hvg_projection.as_ref() {
+                Some(hvg) => hvg.scatter_row(idx, data, out),
+                None => scatter_row_full(idx, data, out)?,
+            }
         }
         Ok(())
     }

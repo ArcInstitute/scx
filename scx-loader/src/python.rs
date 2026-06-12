@@ -88,6 +88,15 @@ impl TrainingDataset {
     ///     normalize: Apply total-count normalization (default: True).
     ///     log1p: Apply log1p transformation (default: True).
     ///     target_sum: Normalization target sum (default: 1e4).
+    ///     pflog1ppf: Apply PFlog1pPF / shifted-CLR normalization
+    ///         (Booeshaghi et al. 2026) instead of normalize/log1p
+    ///         (default: False). PFlog1pPF is itself a normalization, so it is
+    ///         mutually exclusive with `normalize`/`log1p`: when True it takes
+    ///         precedence and those flags are ignored. Depth and the centering
+    ///         denominator are computed over the full transcriptome even under
+    ///         `hvg_indices` projection.
+    ///     pflog1ppf_c: PFlog1pPF shift / pseudocount `c` (default: 1.0; only
+    ///         used when `pflog1ppf=True`).
     ///     shard_group_size: Shards per I/O group (default: 8).
     ///     prefetch_batches: Ring buffer depth (default: 4).
     ///     seed: RNG seed for reproducibility (default: 42).
@@ -108,6 +117,8 @@ impl TrainingDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
+        pflog1ppf=None,
+        pflog1ppf_c=None,
         shard_group_size=None,
         prefetch_batches=None,
         seed=None,
@@ -123,6 +134,8 @@ impl TrainingDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
+        pflog1ppf: Option<bool>,
+        pflog1ppf_c: Option<f64>,
         shard_group_size: Option<usize>,
         prefetch_batches: Option<usize>,
         seed: Option<u64>,
@@ -146,6 +159,8 @@ impl TrainingDataset {
             normalize: normalize.unwrap_or(defaults.normalize),
             log1p: log1p.unwrap_or(defaults.log1p),
             target_sum: target_sum.unwrap_or(defaults.target_sum),
+            pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
+            pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
             seed: seed.unwrap_or(defaults.seed),
             max_memory_mb: max_memory_mb.unwrap_or(defaults.max_memory_mb),
             modality_id,
@@ -337,12 +352,13 @@ impl MultimodalTrainingDataset {
     ///         `{"X": {name: ndarray}, "obs": {...}, "cell_indices": ...}`.
     ///         If False, yield a tuple `(X_0, X_1, …)` aligned with
     ///         `modalities` order.
-    ///     normalize, log1p, target_sum, shard_group_size,
-    ///     prefetch_batches, seed, max_memory_mb: see
-    ///     `TrainingDataset` for semantics. `max_memory_mb` is
-    ///     divided across modalities proportionally to per-modality
-    ///     nnz (modalities with denser X get a larger share of the
-    ///     memory budget).
+    ///     normalize, log1p, target_sum, pflog1ppf, pflog1ppf_c,
+    ///     shard_group_size, prefetch_batches, seed, max_memory_mb: see
+    ///     `TrainingDataset` for semantics — applied to every modality
+    ///     uniformly. `pflog1ppf` (RNA-appropriate) replaces normalize/log1p
+    ///     when set. `max_memory_mb` is divided across modalities
+    ///     proportionally to per-modality nnz (modalities with denser X get a
+    ///     larger share of the memory budget).
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -355,6 +371,8 @@ impl MultimodalTrainingDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
+        pflog1ppf=None,
+        pflog1ppf_c=None,
         shard_group_size=None,
         prefetch_batches=None,
         seed=None,
@@ -370,6 +388,8 @@ impl MultimodalTrainingDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
+        pflog1ppf: Option<bool>,
+        pflog1ppf_c: Option<f64>,
         shard_group_size: Option<usize>,
         prefetch_batches: Option<usize>,
         seed: Option<u64>,
@@ -442,6 +462,8 @@ impl MultimodalTrainingDataset {
                 normalize: normalize.unwrap_or(defaults.normalize),
                 log1p: log1p.unwrap_or(defaults.log1p),
                 target_sum: target_sum.unwrap_or(defaults.target_sum),
+                pflog1ppf: pflog1ppf.unwrap_or(defaults.pflog1ppf),
+                pflog1ppf_c: pflog1ppf_c.unwrap_or(defaults.pflog1ppf_c),
                 seed: seed.unwrap_or(defaults.seed),
                 max_memory_mb: modality_mb,
                 modality_id: Some(mid),
@@ -697,6 +719,14 @@ impl IndexPlanDataset {
     ///         `normalize`; all four (normalize, log1p) combinations are
     ///         honoured, matching `TrainingDataset` semantics.
     ///     target_sum: Normalization target sum (default: 1e4).
+    ///     pflog1ppf: Apply PFlog1pPF / shifted-CLR normalization
+    ///         (Booeshaghi et al. 2026) instead of normalize/log1p
+    ///         (default: False). Mutually exclusive with `normalize`/`log1p`
+    ///         (takes precedence when True). Depth and the centering
+    ///         denominator are over the full transcriptome even under
+    ///         `hvg_indices` projection. See `TrainingDataset` for semantics.
+    ///     pflog1ppf_c: PFlog1pPF shift / pseudocount `c` (default: 1.0; only
+    ///         used when `pflog1ppf=True`).
     ///     cache_shards: LRU shard cache count cap (default: 128). Must be
     ///         >= 1. Auto-tuned downward to fit `max_memory_mb`; check the
     ///         resolved value via `effective_cache_shards()`. The cache also
@@ -726,6 +756,8 @@ impl IndexPlanDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
+        pflog1ppf=None,
+        pflog1ppf_c=None,
         cache_shards=None,
         sort_by_shard=None,
         lookahead=None,
@@ -739,6 +771,8 @@ impl IndexPlanDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
+        pflog1ppf: Option<bool>,
+        pflog1ppf_c: Option<f64>,
         cache_shards: Option<usize>,
         sort_by_shard: Option<bool>,
         lookahead: Option<usize>,
@@ -760,6 +794,12 @@ impl IndexPlanDataset {
         }
         if let Some(v) = target_sum {
             config.target_sum = v;
+        }
+        if let Some(v) = pflog1ppf {
+            config.pflog1ppf = v;
+        }
+        if let Some(v) = pflog1ppf_c {
+            config.pflog1ppf_c = v;
         }
         if let Some(v) = max_memory_mb {
             config.max_memory_mb = v;

@@ -94,6 +94,32 @@ pub fn apply_dense_transforms(row: &mut [f32], normalize: bool, log1p: bool, tar
     }
 }
 
+/// Per-cell PFlog1pPF depth and baseline from a sparse CSR row's stored values.
+///
+/// PFlog1pPF (Booeshaghi et al. 2026) is the shifted centered-log-ratio
+/// transform `z_ij = log1p(x_ij/(c·s_i)) − (1/D)·Σ_k log1p(x_ik/(c·s_i))`. The
+/// `delta = log1p(x/(c·s))` part is sparse (zeros stay zero) and the per-cell
+/// `baseline = −(1/D)·Σ delta` is the value every original zero collapses to.
+///
+/// **Critical**: `csr_data` MUST be the **full pre-projection** row and `n_vars`
+/// the **full** feature count `D`. Computing depth/`D` over an HVG-projected
+/// subset is a different statistic that silently diverges from the analysis
+/// path (`scx_accel::pflog1ppf_*`, which use full `s_i` and full `D`).
+///
+/// Returns `None` for a non-positive depth (empty cell) or `n_vars == 0` —
+/// callers leave the output row zeroed (mirrors [`normalize_dense_row`]'s
+/// `if row_sum > 0.0` guard). Accumulates in `f64`.
+#[inline]
+pub fn pflog1ppf_depth_baseline(csr_data: &[f32], c: f64, n_vars: usize) -> Option<(f64, f64)> {
+    let depth: f64 = csr_data.iter().map(|&v| v as f64).sum();
+    if depth <= 0.0 || n_vars == 0 {
+        return None;
+    }
+    let inv = 1.0 / (c * depth);
+    let sum_delta: f64 = csr_data.iter().map(|&v| (v as f64 * inv).ln_1p()).sum();
+    Some((depth, -sum_delta / n_vars as f64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
