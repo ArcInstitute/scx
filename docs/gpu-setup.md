@@ -446,6 +446,39 @@ cargo clean -p scx-gpu
 cd pyscx && maturin develop --release --features hdf5,gpu
 ```
 
+### A GPU op runs for minutes with no output / the GPU shows ~0% util — is it hung?
+
+Usually **not hung** — it is the expected behavior of the streaming, out-of-VRAM
+GPU path on **backed / atlas-scale** input. Ops like `highly_variable_genes`
+(`flavor="seurat_v3"`) and streaming PCA decode the SCX shards on the **CPU**
+(many threads → high `%CPU`) and feed batches to the GPU kernel; on a
+1M-cell / billion-nnz backed matrix the CPU-side decode dominates, so the GPU
+can sit near 0% utilization for the bulk of the run while real work proceeds.
+
+To see the chosen route the instant an op starts — so you can tell "GPU route,
+decode-bound" from "hung" — raise the `pyscx` logger to INFO:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)          # or:
+logging.getLogger("pyscx.accel").setLevel(logging.INFO)
+
+import pyscx
+adata = pyscx.open("census_1m.scx").to_anndata(backed=True)
+pyscx.accel.highly_variable_genes(adata, flavor="seurat_v3", device="gpu")
+# INFO pyscx.accel: highly_variable_genes: route=gpu_csr device=gpu fallback=none
+# INFO pyscx.accel: highly_variable_genes: seurat_v3 over 1000000×61497 on gpu —
+#                   streaming mean/var; large/backed input is CPU-decode-bound
+#                   (GPU may show low utilization), not hung
+```
+
+The final route is also recorded in `adata.uns["scx_accel"]["<op>"]` (`route`,
+`fallback_reason`) after the call returns. If an explicit `device="gpu"` request
+silently lands on CPU (e.g. the input layout has no GPU kernel), pyscx now emits
+a `UserWarning` naming the `fallback_reason` rather than failing silently. (A
+`device="gpu"` request on a host with no CUDA GPU still errors up front; `"auto"`
+falls back to CPU quietly by design.)
+
 ### `pyscx.accel.gpu_available()` returns `False`
 
 Possible causes:

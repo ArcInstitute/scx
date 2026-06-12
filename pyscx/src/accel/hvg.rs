@@ -187,12 +187,9 @@ pub fn highly_variable_genes<'py>(
         };
         // Route: gpu_csc_v3 (GPU reduce) or cpu_csc — the planner reads
         // gpu_available() internally, so a no-GPU host records cpu_csc.
-        super::route::write_accel_route(
-            py,
-            adata,
-            "highly_variable_genes",
-            &super::route::hvg_exec_info(device, seurat_v3_family, true),
-        )?;
+        let info = super::route::hvg_exec_info(device, seurat_v3_family, true);
+        super::route::announce_route(py, "highly_variable_genes", device, &info);
+        super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
         return hvg_seurat_v3_csc(py, adata, n_top_genes, span, subset, flavor, csc_device_id);
     }
     let resolved = super::gpu::resolve_device(device)?;
@@ -327,12 +324,9 @@ pub fn highly_variable_genes<'py>(
         && layer.is_none()
         && backed_x_has_csc_sidecar(&x)
     {
-        super::route::write_accel_route(
-            py,
-            adata,
-            "highly_variable_genes",
-            &super::route::hvg_exec_info(device, true, true),
-        )?;
+        let info = super::route::hvg_exec_info(device, true, true);
+        super::route::announce_route(py, "highly_variable_genes", device, &info);
+        super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
         return hvg_seurat_v3_csc(
             py,
             adata,
@@ -360,12 +354,9 @@ pub fn highly_variable_genes<'py>(
     // the recorded `gpu_csr` route always reflects the code that ran. If a
     // silent GPU→CPU runtime fallback is ever added, stamp *after* dispatch on
     // the branch that ran (see umap.rs) or this gate will false-pass.
-    super::route::write_accel_route(
-        py,
-        adata,
-        "highly_variable_genes",
-        &super::route::hvg_exec_info(device, seurat_v3_family, false),
-    )?;
+    let info = super::route::hvg_exec_info(device, seurat_v3_family, false);
+    super::route::announce_route(py, "highly_variable_genes", device, &info);
+    super::route::write_accel_route(py, adata, "highly_variable_genes", &info)?;
 
     // ── Try SCX backed dataset ──────────────────────────────────────────
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
@@ -689,6 +680,24 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     flavor: &str,
     _device_id: Option<usize>,
 ) -> PyResult<()> {
+    // Route-at-start visibility (report P1): the streaming mean/var passes below
+    // run inside `py.detach`, and on backed / atlas-scale input the CPU-bound
+    // shard decode dominates while the GPU waits — so a multi-minute run shows
+    // no output and ~0% GPU util, which reads as a hang. Log the shape + device
+    // at op start (INFO; enable via `logging.basicConfig(level=logging.INFO)`)
+    // so the user can tell "GPU route, decode-bound" from "hung".
+    #[cfg(feature = "gpu")]
+    let on_gpu = _device_id.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let on_gpu = false;
+    log::info!(
+        target: "pyscx.accel",
+        "highly_variable_genes: {flavor} over {n_obs}\u{00d7}{n_vars} on {} — streaming \
+         mean/var; large/backed input is CPU-decode-bound (GPU may show low utilization), \
+         not hung",
+        if on_gpu { "gpu" } else { "cpu" },
+    );
+
     // ── 1. Determine batches ────────────────────────────────────────────
     let batches: Vec<Vec<usize>> = match batch_key {
         Some(bk) => {

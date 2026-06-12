@@ -158,17 +158,14 @@ pub fn umap(
         );
         if cuml_ok.is_ok() {
             // cuML UMAP ran on GPU: record the GPU dense route.
-            super::route::write_accel_route(
-                py,
-                adata,
-                "umap",
-                &super::route::simple_exec_info(
-                    device,
-                    true,
-                    scx_accel::AccelRoute::GpuDense,
-                    scx_accel::AccelRoute::CpuDense,
-                ),
-            )?;
+            let info = super::route::simple_exec_info(
+                device,
+                true,
+                scx_accel::AccelRoute::GpuDense,
+                scx_accel::AccelRoute::CpuDense,
+            );
+            super::route::announce_route(py, "umap", device, &info);
+            super::route::write_accel_route(py, adata, "umap", &info)?;
             return Ok(());
         }
         // cuML unavailable — fall through to CPU with a warning.
@@ -212,17 +209,14 @@ pub fn umap(
     // CPU ran (either device=cpu/no-CUDA, or both GPU paths failed at runtime).
     // gpu_eligible=false forces the cpu_dense route with an appropriate reason
     // (this site is reached only when CPU actually ran).
-    super::route::write_accel_route(
-        py,
-        adata,
-        "umap",
-        &super::route::simple_exec_info(
-            device,
-            false,
-            scx_accel::AccelRoute::GpuDense,
-            scx_accel::AccelRoute::CpuDense,
-        ),
-    )?;
+    let info = super::route::simple_exec_info(
+        device,
+        false,
+        scx_accel::AccelRoute::GpuDense,
+        scx_accel::AccelRoute::CpuDense,
+    );
+    super::route::announce_route(py, "umap", device, &info);
+    super::route::write_accel_route(py, adata, "umap", &info)?;
 
     Ok(())
 }

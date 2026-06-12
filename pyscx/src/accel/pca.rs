@@ -336,6 +336,7 @@ fn stamp_pca_route(
         info.spmm_policy = spmm_policy;
         info.graph_replay = graph_replay;
     }
+    super::route::announce_route(py, "pca", device, &info);
     super::route::write_accel_route(py, adata, "pca", &info)
 }
 
