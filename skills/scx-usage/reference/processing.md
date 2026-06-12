@@ -83,9 +83,15 @@ produced when you apply lazy `normalize_total`/`log1p`.
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
 (default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
-convert). GPU `pdex_ref` is "GPU-fast" only with a CSC sidecar (`gpu_csc_v3`
-route, now the default); without one it falls back to `gpu_csr_v3` — confirm via
-`adata.uns["scx_accel"][op]["route"]`.
+convert). For CSC-direct DE, **pass `device="auto"` (or `"cpu"`), not
+`device="gpu"`**: `rank_genes_groups`/`pdex_ref` called with both `device="gpu"`
+*and* `prefer_format="csc"` raise `RuntimeError: device='gpu' with
+prefer_format='csc' is not supported in v1; use device='cpu' or device='auto' for
+CSC dispatch.` (verified v0.7.1). With a sidecar present, `device="auto"` selects
+the CSC-direct driver (`gpu_csc_v3`); without one it uses `gpu_csr_v3`. Always
+confirm the backend that actually ran via `adata.uns["scx_accel"][op]["route"]`
+(`harmony_integrate` is the exception — it stamps no route metadata, so you
+can't tell GPU from CPU there).
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
 - `normalize_total(adata, target_sum=10000.0)` — on backed/lazy, appends a transform; on scipy CSR delegates to `sc.pp.normalize_total`.
@@ -100,12 +106,12 @@ route, now the default); without one it falls back to `gpu_csr_v3` — confirm v
 - `pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto")` — in-VRAM data routes to `rsc.pp.pca` (rapids-singlecell); >VRAM data uses native randomized SVD with streaming shards. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`. **PCA rejects CSC.**
 - `neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — CPU HNSW; GPU routes to `rsc.pp.neighbors` (rapids-singlecell). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `umap(adata, n_components=2, n_epochs=200, min_dist=0.1, spread=1.0, negative_sample_rate=5, learning_rate=1.0, random_state=0, device="auto")` — GPU routes to `rsc.tl.umap` (rapids-singlecell); CPU falls back to scanpy. Writes `obsm["X_umap"]`.
-- `leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto")` — reads `obsp["connectivities"]`. **Pin `device="cpu"` for label stability** (GPU Leiden diverges from `leidenalg`; documented). Writes `obs[key_added]` (categorical) + `uns["leiden"]`.
+- `leiden(adata, resolution=1.0, key_added="leiden", random_state=0, n_iterations=-1, device="auto")` — reads `obsp["connectivities"]`. **Pin `device="cpu"`** — the GPU (cuGraph) path doesn't just relabel clusters, it can return a *wildly different cluster count*: on a 1 M-cell graph at `resolution=1.0` GPU Leiden produced **116,179 clusters vs 29 on CPU** (ARI ≈ 0.0002). Use GPU Leiden only as a deliberate experiment, never when downstream cares about cluster identity (DE, annotation transfer). Writes `obs[key_added]` (categorical) + `uns["leiden"]`.
 
 **DE / perturbation:**
 - `rank_genes_groups(adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, log_transformed=False, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr")` — parallel Wilcoxon + BH. Writes `uns["rank_genes_groups"]` (or returns a DataFrame when `stratify_by` set).
 - `rank_genes_groups_df(...) -> polars.DataFrame` — same Wilcoxon in cell-eval's `DEResults` schema.
-- `pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") -> polars.DataFrame` — perturbation-screen DE (Mann–Whitney U + pseudobulk geometric-mean LFC vs one reference group). CSC-direct GPU driver (`gpu_csc_v3`) is the default when a CSC sidecar is present; without one falls back to `gpu_csr_v3`.
+- `pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars") -> polars.DataFrame` — perturbation-screen DE (Mann–Whitney U + pseudobulk geometric-mean LFC vs one reference group). With a CSC sidecar, `device="auto"` selects the CSC-direct driver (`gpu_csc_v3`); without one it uses `gpu_csr_v3`. **Do not combine `device="gpu"` with `prefer_format="csc"` — it raises (use `device="auto"`).** `output="pandas"` returns a pandas frame instead of polars.
 - `pseudobulk_dex(adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None) -> DataFrame` — streaming pseudobulk + pydeseq2 (optional dep). CSC needs a gene subset.
 - `pseudobulk_means(adata, groupby, min_cells_per_group=1) -> (ndarray[P,G] f64, group_names)`.
 - `perturbation_metrics(adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1) -> dict` — `{pearson_delta, mse, mae, mse_delta, mae_delta}`.
@@ -115,7 +121,7 @@ route, now the default); without one it falls back to `gpu_csr_v3` — confirm v
 
 **Integration / metrics:**
 - `harmony_integrate(adata, key, *, basis="X_pca", adjusted_basis=None, ..., random_state=0, device="auto")` — Rust Harmony2. `key` is one obs column or a list. Writes corrected embedding to `obsm[adjusted_basis or basis]` + `uns["harmony"]`. Param names match `scanpy.external.pp.harmony_integrate`.
-- `compute_lisi(adata, key, *, basis="X_pca", perplexity=30.0, n_neighbors=None) -> np.ndarray` — Local Inverse Simpson Index; also writes `obs[f"lisi_{key}"]`.
+- `compute_lisi(adata, key, *, basis="X_pca", perplexity=30.0, n_neighbors=None) -> np.ndarray` — Local Inverse Simpson Index (iLISI batch-mixing / cLISI label-purity); also writes `obs[f"lisi_{key}"]`. Higher iLISI = better batch mixing — useful pre/post `harmony_integrate` (e.g. 3.2 → 6.0 on a 116-batch census file confirms integration worked). **Slow at scale:** the default is *exact* kNN, which is O(N²) and ran ~44 min per call on 1 M cells. It warns about this and suggests `approximate_knn`, but no such kwarg is exposed today — budget for it, or evaluate integration on a subsample.
 
 **Streaming column stats** (on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`; honor `col_projection` / deletion vector):
 - `col_sums(dataset, prefer_format="csr") -> f64[]`, `col_nnz -> i64[]`, `col_min`, `col_max`, `col_var`.
