@@ -555,12 +555,20 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
     }
 }
 
-/// Emit a UserWarning when `skmisc.loess.fit()` raises on a single batch.
+/// Emit a single summary UserWarning for all batches whose `skmisc.loess.fit()`
+/// raised a singularity `ValueError`.
 ///
-/// Names the failing batch (index + cell count) and the upstream error string.
-/// The failing batch is then excluded from the per-batch normalised-variance
+/// `failed` is `(batch_idx, batch_n, error_string)` per failing batch, in
+/// iteration order; `n_total` is the total batch count. A high-cardinality
+/// `batch_key` (e.g. a per-dataset id) can produce dozens of tiny, singular
+/// batches — emitting one warning each buries the signal under verbatim
+/// copies (user-report F10). Instead we coalesce into one warning that reports
+/// the failed/total count and a representative first failure (index + cell
+/// count + the upstream error string), then lists the remedies. The full
+/// per-batch index/size detail is preserved on `adata.uns` by the caller.
+///
+/// Each failing batch is excluded from the per-batch normalised-variance
 /// ranking — semantics identical to a batch with too few non-constant genes.
-///
 /// Remedies are ordered by what actually helps the per-batch case: the
 /// singularity is driven by small / near-collinear batches, so dropping or
 /// coarsening `batch_key` is the effective fix. `filter_genes(min_cells=10)`
@@ -568,26 +576,54 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
 /// batch's log-mean / log-variance regression well-conditioned.
 fn emit_hvg_loess_singularity_warning(
     py: Python<'_>,
-    batch_idx: usize,
-    batch_n: usize,
-    err: &PyErr,
+    failed: &[(usize, usize, String)],
+    n_total: usize,
 ) -> PyResult<()> {
+    if failed.is_empty() {
+        return Ok(());
+    }
     let warnings = py.import("warnings")?;
+    let (first_idx, first_n, first_err) = &failed[0];
     let msg = format!(
         "highly_variable_genes(flavor=\"seurat_v3\"): skmisc.loess fit failed on \
-         batch index {batch_idx} (n={batch_n} cells) — {err}. This batch will be \
-         excluded from the per-batch HVG ranking; other batches proceed normally. \
+         {n_failed} of {n_total} batches — these batches are excluded from the \
+         per-batch HVG ranking; the remaining {n_valid} proceed normally. First \
+         failure: batch index {first_idx} (n={first_n} cells) — {first_err}. \
          Common causes: very small batches, near-collinear log-mean / log-variance, \
-         or many zero-variance genes within this batch. To avoid this, prefer \
+         or many zero-variance genes within a batch. To avoid this, prefer \
          dropping or coarsening batch_key (a high-cardinality key such as a \
          per-dataset id produces many tiny, singular batches); or switch to \
          flavor=\"seurat\" post-normalize. Note pyscx.accel.filter_genes(min_cells=10) \
-         only helps the no-batch_key global fit, not the per-batch singularity."
+         only helps the no-batch_key global fit, not the per-batch singularity. \
+         (Full per-batch detail is recorded in adata.uns[\"hvg\"][\"loess_failed_batches\"].)",
+        n_failed = failed.len(),
+        n_valid = n_total.saturating_sub(failed.len()),
     );
     warnings.call_method1(
         "warn",
         (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
     )?;
+    Ok(())
+}
+
+/// Record the full per-batch loess-failure detail on
+/// `adata.uns["hvg"]["loess_failed_batches"]` as a list of `[batch_idx, n_cells]`
+/// pairs (the summary UserWarning only names the first failure). Mirrors scanpy
+/// storing HVG metadata under `uns["hvg"]`; the native seurat_v3 path does not
+/// otherwise populate that key, so a fresh dict is written.
+fn record_hvg_loess_failed_batches(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    failed: &[(usize, usize, String)],
+) -> PyResult<()> {
+    let uns = adata.getattr("uns")?;
+    let hvg_dict = PyDict::new(py);
+    let failed_list = pyo3::types::PyList::empty(py);
+    for (idx, n, _err) in failed {
+        failed_list.append(pyo3::types::PyList::new(py, [*idx, *n])?)?;
+    }
+    hvg_dict.set_item("loess_failed_batches", failed_list)?;
+    uns.set_item("hvg", hvg_dict)?;
     Ok(())
 }
 
@@ -710,6 +746,11 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
     // cross-batch mean and median-rank aggregations below — the contract
     // the UserWarning text promises.
     let mut batch_failed = vec![false; n_batches_actual];
+    // Collected `(batch_idx, batch_n, error_string)` for batches whose loess
+    // fit raised a singularity `ValueError`. Coalesced into a single summary
+    // UserWarning after the loop (user-report F10) instead of one warning per
+    // failing batch — a high-cardinality batch_key can fail dozens of batches.
+    let mut loess_failed: Vec<(usize, usize, String)> = Vec::new();
 
     // Hoist the loess import out of the per-batch closure so a missing
     // or broken `skmisc.loess` fails fast with its real type
@@ -776,15 +817,16 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
                     // Singular / under-determined LOESS — `skmisc.loess`
                     // raises `ValueError` ("There are other near
                     // singularities…") on Census-style degenerate
-                    // batches. Warn naming the batch and mark it failed
-                    // so step 5 and the rank step exclude it from
-                    // per-batch and cross-batch aggregation. We cannot
-                    // rely on `estimat_var == 0` to opt out — a
+                    // batches. Record the batch and mark it failed so
+                    // step 5 and the rank step exclude it from per-batch
+                    // and cross-batch aggregation; a single coalesced
+                    // summary warning is emitted after the loop. We
+                    // cannot rely on `estimat_var == 0` to opt out — a
                     // successful loess fit can legitimately produce zero
                     // entries, and downstream `reg_std_sq = 10^0 = 1` so
                     // a zero `estimat_var` would still pass the
                     // `reg_std_sq > 0` guard.
-                    emit_hvg_loess_singularity_warning(py, b, batch_n, &e)?;
+                    loess_failed.push((b, batch_n, e.to_string()));
                     batch_failed[b] = true;
                 }
                 Err(e) => {
@@ -811,15 +853,27 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
         batch_estimat_vars.push(estimat_var);
     }
 
+    // Coalesce per-batch loess singularities into ONE summary UserWarning
+    // (user-report F10) — a high-cardinality batch_key can fail dozens of
+    // batches, and one verbatim warning each buries the signal. The full
+    // per-batch list is recorded on adata.uns["hvg"]["loess_failed_batches"]
+    // for callers who want the complete detail. Emitted before the
+    // all-failed check below so the diagnostic survives even that error.
+    if !loess_failed.is_empty() {
+        record_hvg_loess_failed_batches(py, adata, &loess_failed)?;
+        emit_hvg_loess_singularity_warning(py, &loess_failed, n_batches_actual)?;
+    }
+
     // Surviving batches (per-batch loess fit succeeded). If all batches
     // failed there's nothing to rank against and dividing by zero in the
     // cross-batch average below would silently produce NaN HVGs — raise
-    // so the user sees the per-batch UserWarnings as the cause.
+    // so the user sees the summary UserWarning as the cause.
     let n_valid_batches = batch_failed.iter().filter(|&&f| !f).count();
     if n_valid_batches == 0 {
         return Err(PyRuntimeError::new_err(format!(
             "highly_variable_genes(flavor=\"seurat_v3\"): all {n_batches_actual} \
-             batches failed skmisc.loess fitting; see prior UserWarnings for \
+             batches failed skmisc.loess fitting; see the preceding summary \
+             UserWarning (and adata.uns[\"hvg\"][\"loess_failed_batches\"]) for \
              per-batch causes."
         )));
     }

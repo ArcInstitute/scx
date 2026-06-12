@@ -8,13 +8,18 @@ near-collinear log-mean / log-variance trigger a `ValueError` from
 Pre-fix: the exception propagated as an uncaught traceback, killing the
 whole HVG call.
 
-Post-fix: the exception is caught per-batch; a `UserWarning` is emitted
-naming the failing batch and its cell count; an internal `batch_failed`
+Post-fix: the exception is caught per-batch; an internal `batch_failed`
 flag is set so the batch is skipped in step 5's normalised-variance
 computation and in both the cross-batch mean and the median-rank
 aggregation. Other batches proceed normally. If *every* batch fails,
 the call raises `RuntimeError` rather than silently returning NaN-ranked
 HVGs.
+
+Per user-report F10, the per-batch failures are coalesced into a *single*
+summary `UserWarning` (reporting the failed/total count + a representative
+first failure) rather than one verbatim warning per failing batch — a
+high-cardinality `batch_key` can fail dozens of batches. The full per-batch
+list is recorded on `adata.uns["hvg"]["loess_failed_batches"]`.
 
 These tests use monkey-patching to deterministically force a singular
 LOESS on a single batch — synthesising data that *reliably* singularises
@@ -90,6 +95,79 @@ def _patch_loess_to_raise_runtime_error_on_first_batch(monkeypatch):
             return getattr(self._inner, name)
 
     monkeypatch.setattr(loess_mod, "loess", RuntimeFailingLoess)
+
+
+def _patch_loess_to_raise_on_first_two_batches(monkeypatch):
+    """Force the first two `skmisc.loess.loess(...).fit()` calls to raise
+    `ValueError`, then behave normally — exercises the F10 multi-failure
+    flood (more than one failing batch, but not all).
+    """
+    import skmisc.loess as loess_mod
+
+    real_loess = loess_mod.loess
+    state = {"n_calls": 0}
+
+    class FailingLoess:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_loess(*args, **kwargs)
+
+        def __getattr__(self, name):
+            if name == "fit":
+                state["n_calls"] += 1
+                if state["n_calls"] <= 2:
+                    def _raise():
+                        raise ValueError(
+                            "b'There are other near singularities as well. "
+                            "0.22764'"
+                        )
+
+                    return _raise
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(loess_mod, "loess", FailingLoess)
+    return state
+
+
+def test_loess_singularity_flood_coalesced_to_single_warning(
+    synthetic_adata, scx_from_adata, monkeypatch
+):
+    """F10: multiple failing batches must produce ONE summary warning (not
+    one per batch), reporting the failed/total count, with the full
+    per-batch list recorded on adata.uns["hvg"]["loess_failed_batches"].
+    """
+    import pyscx
+
+    n_batches = len(synthetic_adata.obs["batch"].cat.categories)
+    assert n_batches >= 3, "fixture must have ≥3 batches to fail 2 and survive ≥1"
+
+    path = scx_from_adata(synthetic_adata, "hvg_loess_flood.scx")
+    adata = pyscx.open(path).to_anndata(backed=True)
+    _patch_loess_to_raise_on_first_two_batches(monkeypatch)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pyscx.accel.highly_variable_genes(
+            adata,
+            n_top_genes=10,
+            flavor="seurat_v3",
+            batch_key="batch",
+            device="cpu",
+        )
+
+    sing = [
+        w for w in caught if "skmisc.loess fit failed on" in str(w.message)
+    ]
+    assert len(sing) == 1, (
+        "two failing batches must coalesce to ONE warning; got "
+        f"{len(sing)}: " + "; ".join(str(w.message) for w in sing)
+    )
+    msg = str(sing[0].message)
+    assert f"2 of {n_batches} batches" in msg, msg
+    # Full per-batch detail recorded on uns.
+    failed = adata.uns["hvg"]["loess_failed_batches"]
+    assert len(failed) == 2, f"expected 2 recorded failed batches, got {failed!r}"
+    # HVG still completes from the surviving batch(es).
+    assert int(adata.var["highly_variable"].sum()) == 10
 
 
 def _patch_loess_to_always_raise(monkeypatch):
@@ -168,10 +246,10 @@ def test_loess_singularity_emits_warning_naming_batch(
     singular_warnings = [
         w
         for w in caught
-        if "skmisc.loess fit failed on batch" in str(w.message)
+        if "skmisc.loess fit failed on" in str(w.message)
     ]
-    assert singular_warnings, (
-        "No LOESS-singularity warning emitted; got: "
+    assert len(singular_warnings) == 1, (
+        "Expected exactly one coalesced LOESS-singularity warning; got: "
         + "; ".join(str(w.message) for w in caught)
     )
     msg = str(singular_warnings[0].message)
@@ -180,6 +258,9 @@ def test_loess_singularity_emits_warning_naming_batch(
     # Verify the upstream error string is echoed so the user can correlate
     # the warning with a specific cause.
     assert "near singularities" in msg
+    # The full per-batch detail is recorded on adata.uns.
+    failed = adata.uns["hvg"]["loess_failed_batches"]
+    assert len(failed) == 1
 
 
 def test_loess_singularity_does_not_block_other_batches(
@@ -248,9 +329,11 @@ def test_failed_batch_excluded_matches_surviving_batches(
     sing = [
         str(w.message)
         for w in caught
-        if "skmisc.loess fit failed on batch" in str(w.message)
+        if "skmisc.loess fit failed on" in str(w.message)
     ]
     assert len(sing) == 1, f"expected 1 singularity warning, got: {sing!r}"
+    # Only one batch fails here, so the summary's "First failure: batch
+    # index N" names it directly.
     m = re.search(r"batch index (\d+)", sing[0])
     assert m is not None, f"warning missing batch index: {sing[0]!r}"
     failed_batch_id = int(m.group(1))
@@ -325,16 +408,19 @@ def test_all_batches_failed_raises(
                 device="cpu",
             )
 
-    # Every batch should have surfaced its per-batch singularity warning
-    # before the all-failed error is raised.
+    # A single coalesced summary warning should surface before the
+    # all-failed error is raised — reporting that every batch failed.
     sing = [
         w
         for w in caught
-        if "skmisc.loess fit failed on batch" in str(w.message)
+        if "skmisc.loess fit failed on" in str(w.message)
     ]
-    assert len(sing) == n_batches, (
-        f"expected {n_batches} per-batch warnings, got {len(sing)}: "
+    assert len(sing) == 1, (
+        f"expected 1 coalesced summary warning, got {len(sing)}: "
         + "; ".join(str(w.message) for w in sing)
+    )
+    assert f"{n_batches} of {n_batches} batches" in str(sing[0].message), (
+        f"summary should report all {n_batches} batches failed: {sing[0].message}"
     )
 
 
@@ -372,7 +458,7 @@ def test_non_value_error_propagates_instead_of_warning(
     # The narrowed catch must NOT have surfaced this as a singularity.
     sing = [
         w for w in caught
-        if "skmisc.loess fit failed on batch" in str(w.message)
+        if "skmisc.loess fit failed on" in str(w.message)
     ]
     assert not sing, (
         "non-ValueError leaked into the singularity-warning path; got: "
