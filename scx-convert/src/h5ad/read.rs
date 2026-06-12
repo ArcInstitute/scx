@@ -341,9 +341,11 @@ pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertEr
             }
             Ok(data.into_iter().map(|v| v as i64).collect())
         }
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
-            format!("dataset '{path}': float dtype {desc:?} cannot be read as i64"),
-        )),
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            Err(ConvertError::UnsupportedDtype(format!(
+                "dataset '{path}': float dtype {desc:?} cannot be read as i64"
+            )))
+        }
     }
 }
 
@@ -389,9 +391,11 @@ pub(crate) fn read_i32_dataset(ds: &hdf5::Dataset) -> Result<Vec<i32>, ConvertEr
         HdfNumericDtype::U16 => widen!(u16),
         HdfNumericDtype::U32 => checked!(u32, |&&v| v > i32::MAX as u32),
         HdfNumericDtype::U64 => checked!(u64, |&&v| v > i32::MAX as u64),
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
-            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
-        )),
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            Err(ConvertError::UnsupportedDtype(format!(
+                "dataset '{path}': float dtype {desc:?} cannot be read as i32"
+            )))
+        }
     }
 }
 
@@ -414,6 +418,12 @@ pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertEr
         }};
     }
     Ok(match dt {
+        // `half::f16` has no `as f32` cast; widen via `to_f32()`.
+        HdfNumericDtype::F16 => ds
+            .read_1d::<half::f16>()?
+            .into_iter()
+            .map(|v| v.to_f32())
+            .collect(),
         HdfNumericDtype::F32 => ds.read_1d::<f32>()?.to_vec(),
         HdfNumericDtype::F64 => cast!(f64),
         HdfNumericDtype::I8 => cast!(i8),
@@ -453,6 +463,12 @@ pub(crate) fn read_f64_dataset(ds: &hdf5::Dataset) -> Result<Vec<f64>, ConvertEr
     Ok(match dt {
         HdfNumericDtype::F64 => ds.read_1d::<f64>()?.to_vec(),
         HdfNumericDtype::F32 => cast!(f32),
+        // `half::f16` has no `as f64` cast; widen via `to_f64()`.
+        HdfNumericDtype::F16 => ds
+            .read_1d::<half::f16>()?
+            .into_iter()
+            .map(|v| v.to_f64())
+            .collect(),
         HdfNumericDtype::I8 => cast!(i8),
         HdfNumericDtype::I16 => cast!(i16),
         HdfNumericDtype::I32 => cast!(i32),
@@ -917,6 +933,19 @@ fn read_column_to_arrow(
             ));
             Ok((Field::new(name, DataType::Int64, true), array))
         }
+        // float16 columns widen to f32 (anndata stores f16 to save space;
+        // scx's value encoding is f32 anyway). `half::f16` has no `as f32`.
+        HdfNumericDtype::F16 => {
+            let data: Vec<f32> = ds
+                .read_1d::<half::f16>()?
+                .into_iter()
+                .map(|v| v.to_f32())
+                .collect();
+            Ok((
+                Field::new(name, DataType::Float32, true),
+                Arc::new(Float32Array::from(data)),
+            ))
+        }
         HdfNumericDtype::F32 => {
             let data: Vec<f32> = ds.read_1d()?.to_vec();
             Ok((
@@ -1116,7 +1145,7 @@ fn read_nullable_integer_group(
                 Arc::new(Int64Array::from(opt)),
             )
         }
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
             return Err(ConvertError::UnsupportedDtype(format!(
                 "nullable-integer '{name}': values dtype is float ({}); expected integer",
                 dt.name()
@@ -1173,6 +1202,26 @@ fn read_nullable_float_group(
             Field::new(name, DataType::Float64, true),
             Arc::new(Float64Array::from(opt_vec!(f64))),
         ),
+        // float16 widens to f32 (scx's value encoding is f32 anyway).
+        HdfNumericDtype::F16 => {
+            let values: Vec<half::f16> = values_ds.read_1d()?.to_vec();
+            if values.len() != mask.len() {
+                return Err(ConvertError::Other(format!(
+                    "nullable-float '{name}': values len {} != mask len {}",
+                    values.len(),
+                    mask.len()
+                )));
+            }
+            let opt = values
+                .iter()
+                .zip(mask.iter())
+                .map(|(v, m)| if *m { None } else { Some(v.to_f32()) })
+                .collect::<Vec<Option<f32>>>();
+            (
+                Field::new(name, DataType::Float32, true),
+                Arc::new(Float32Array::from(opt)),
+            )
+        }
         other => {
             return Err(ConvertError::UnsupportedDtype(format!(
                 "nullable-float '{name}': values dtype is {}; expected float",
@@ -1427,13 +1476,19 @@ pub struct DenseMappingInfo {
     pub n_rows: usize,
 }
 
-/// Walk `<group_path>` in `file` and return each member's name + shape.
-/// Members that are not 2D datasets are skipped silently. Missing group →
-/// empty vec.
+/// Walk `<group_path>` in `file` and return the name and row count of every
+/// *readable* member. A member is readable only if it is a 2D dataset whose
+/// dtype the dense slab reader accepts (`DenseDtype::from_descriptor`, which
+/// now includes float16 widened to f32). Members that are not datasets
+/// (DataFrame / sparse-matrix subgroups), not 2D, or have an unreadable dtype
+/// are excluded here so [`write_dense_mapping_section`] can surface them as a
+/// `SkippedObsm` warning rather than silently dropping or aborting. A missing
+/// group yields an empty vec.
 pub fn list_dense_mapping_shapes(
     file: &hdf5::File,
     group_path: &str,
 ) -> Result<Vec<DenseMappingInfo>, ConvertError> {
+    use super::dense_stream::DenseDtype;
     let mut result = Vec::new();
     let group = match file.group(group_path) {
         Ok(g) => g,
@@ -1447,6 +1502,19 @@ pub fn list_dense_mapping_shapes(
         };
         let shape = ds.shape();
         if shape.len() != 2 {
+            continue;
+        }
+        // Exclude datasets whose dtype the slab reader can't widen to f32
+        // (bool / compound / string). Including them would make
+        // `read_dense_mapping_shard` error mid-stream and abort the whole
+        // conversion; instead they fall through to the warn-on-drop path.
+        let readable = ds
+            .dtype()
+            .and_then(|t| t.to_descriptor())
+            .ok()
+            .map(|desc| DenseDtype::from_descriptor(&desc).is_ok())
+            .unwrap_or(false);
+        if !readable {
             continue;
         }
         result.push(DenseMappingInfo {

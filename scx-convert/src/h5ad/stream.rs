@@ -431,9 +431,11 @@ pub(crate) fn read_slice_i32(
             }
             Ok(data.into_iter().map(|v| v as i32).collect())
         }
-        HdfNumericDtype::F32 | HdfNumericDtype::F64 => Err(ConvertError::UnsupportedDtype(
-            format!("dataset '{path}': float dtype {desc:?} cannot be read as i32"),
-        )),
+        HdfNumericDtype::F16 | HdfNumericDtype::F32 | HdfNumericDtype::F64 => {
+            Err(ConvertError::UnsupportedDtype(format!(
+                "dataset '{path}': float dtype {desc:?} cannot be read as i32"
+            )))
+        }
     }
 }
 
@@ -462,6 +464,13 @@ pub(crate) fn read_slice_f32(
         }};
     }
     Ok(match dt {
+        HdfNumericDtype::F16 => {
+            // `half::f16` has no `as f32` cast; widen via `to_f32()`.
+            let (data, _) = ds
+                .read_slice_1d::<half::f16, _>(sel)?
+                .into_raw_vec_and_offset();
+            data.into_iter().map(|v| v.to_f32()).collect()
+        }
         HdfNumericDtype::F32 => {
             let (data, _) = ds.read_slice_1d::<f32, _>(sel)?.into_raw_vec_and_offset();
             data

@@ -58,7 +58,9 @@ indicatif = "0.17"
 # 0.9.0 fixed the `H5Pget_fapl_direct` feature-gate mismatch that
 # blocked builds against conda-forge `hdf5=1.12.*=nompi*`. Only used
 # for h5ad conversion; fallback path is a Python subprocess via h5py.
-hdf5 = { package = "hdf5-metno", version = "0.9.4" }
+# `f16` enables the `H5Type` impl for `half::f16` so the converter can
+# upcast float16 obsm/varm/X/columns to f32 instead of aborting.
+hdf5 = { package = "hdf5-metno", version = "0.9.4", features = ["f16"] }
 
 half = "2"
 base64 = "0.22"

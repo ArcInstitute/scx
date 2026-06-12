@@ -1868,3 +1868,182 @@ fn none_uns_scalar_round_trips_as_null() {
         "nested uns['log1p']['base']=None corrupted: {uns:?}"
     );
 }
+
+/// B4 + B5: DataFrame-valued and sparse-valued obsm members are warned
+/// (`SkippedObsm`) instead of silently dropped, a float16 obsm dataset is
+/// upcast to f32 instead of aborting the whole conversion, and plain dense
+/// obsm still round-trips. All on the default (disk-streaming) convert path.
+#[test]
+fn test_obsm_dataframe_sparse_warn_and_f16_upcast() {
+    use half::f16;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("obsm_edge.h5ad");
+    let scx_path = dir.path().join("obsm_edge.scx");
+    let h5ad_out = dir.path().join("obsm_edge_out.h5ad");
+
+    let n_obs = 20;
+    let n_vars = 15;
+    // include_extras=true creates a plain f32 obsm/X_pca we expect to survive.
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", true);
+
+    // f16 values chosen to be exactly representable (multiples of 0.5), so the
+    // f16 → f32 upcast is bit-exact and we can assert equality.
+    let f16_cols = 3usize;
+    let f16_vals_f32: Vec<f32> = (0..n_obs * f16_cols).map(|i| i as f32 * 0.5).collect();
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let obsm = file.group("obsm").unwrap();
+
+        // (B5) float16 dense obsm.
+        let f16_vals: Vec<f16> = f16_vals_f32.iter().map(|&v| f16::from_f32(v)).collect();
+        let nd = ndarray::Array2::from_shape_vec((n_obs, f16_cols), f16_vals).unwrap();
+        obsm.new_dataset::<f16>()
+            .shape([n_obs, f16_cols])
+            .create("X_f16")
+            .unwrap()
+            .write(&nd)
+            .unwrap();
+
+        // (B4) DataFrame-encoded obsm (an HDF5 group, not a 2D dataset).
+        let df = obsm.create_group("df_embed").unwrap();
+        let enc = vlu("dataframe");
+        df.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&enc)
+            .unwrap();
+        let col: Vec<f32> = (0..n_obs).map(|i| i as f32).collect();
+        df.new_dataset::<f32>()
+            .shape([n_obs])
+            .create("d1")
+            .unwrap()
+            .write(&col)
+            .unwrap();
+
+        // (B4) sparse-matrix-valued obsm (CSR subgroup under /obsm).
+        let sp = obsm.create_group("sparse_obsm").unwrap();
+        let enc = vlu("csr_matrix");
+        sp.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&enc)
+            .unwrap();
+        let indptr: Vec<i64> = (0..=n_obs as i64).collect(); // one nnz per row
+        let indices: Vec<i32> = vec![0; n_obs];
+        let data: Vec<f32> = vec![1.0; n_obs];
+        sp.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        sp.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        sp.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        let shape = [n_obs as i64, 4i64];
+        sp.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&shape)
+            .unwrap();
+    }
+
+    // h5ad → scx must SUCCEED (B5: no fatal abort) and warn for the two
+    // unconvertible obsm members (B4).
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+    assert_eq!(
+        sink.counts().get("skipped_obsm").copied(),
+        Some(2),
+        "expected SkippedObsm for df_embed + sparse_obsm; counts: {:?}",
+        sink.counts()
+    );
+
+    // scx → h5ad and inspect the surviving obsm.
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let out_obsm = out.group("obsm").unwrap();
+    let members = out_obsm.member_names().unwrap();
+    assert!(
+        members.iter().any(|m| m == "X_pca"),
+        "plain dense obsm dropped: {members:?}"
+    );
+    assert!(
+        members.iter().any(|m| m == "X_f16"),
+        "f16 obsm not preserved: {members:?}"
+    );
+    assert!(
+        !members
+            .iter()
+            .any(|m| m == "df_embed" || m == "sparse_obsm"),
+        "unconvertible obsm unexpectedly present: {members:?}"
+    );
+
+    // f16 → f32 values are bit-exact for the chosen inputs.
+    let got: ndarray::Array2<f32> = out_obsm.dataset("X_f16").unwrap().read_2d().unwrap();
+    let (gv, _) = got.into_raw_vec_and_offset();
+    assert_eq!(gv, f16_vals_f32, "f16 obsm values corrupted on upcast");
+}
+
+/// B5 (column twin): a float16 obs column is upcast to f32 and preserved
+/// rather than warn-skipped.
+#[test]
+fn test_obs_float16_column_upcasts_to_f32() {
+    use half::f16;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("obs_f16.h5ad");
+    let scx_path = dir.path().join("obs_f16.scx");
+    let h5ad_out = dir.path().join("obs_f16_out.h5ad");
+
+    let n_obs = 12;
+    let n_vars = 5;
+    create_test_h5ad(&h5ad_path, n_obs, n_vars, "csr", false);
+
+    let vals_f32: Vec<f32> = (0..n_obs).map(|i| i as f32 * 0.25).collect();
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let obs = file.group("obs").unwrap();
+        let vals: Vec<f16> = vals_f32.iter().map(|&v| f16::from_f32(v)).collect();
+        obs.new_dataset::<f16>()
+            .shape([n_obs])
+            .create("score_f16")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+    assert_eq!(
+        sink.counts().get("skipped_column").copied().unwrap_or(0),
+        0,
+        "f16 obs column should be upcast, not skipped; counts: {:?}",
+        sink.counts()
+    );
+
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let got: Vec<f32> = out
+        .group("obs")
+        .unwrap()
+        .dataset("score_f16")
+        .unwrap()
+        .read_1d::<f32>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(got, vals_f32, "f16 obs column corrupted on upcast");
+}

@@ -66,6 +66,13 @@ pub(crate) fn read_dense_slab_f32(
         }};
     }
     let slab: Vec<f32> = match dtype {
+        DenseDtype::F16 => {
+            // `half::f16` has no `as f32` cast; widen via `to_f32()`.
+            let (data, _) = ds
+                .read_slice_2d::<half::f16, _>(sel)?
+                .into_raw_vec_and_offset();
+            data.into_iter().map(|v| v.to_f32()).collect()
+        }
         DenseDtype::F32 => {
             let (data, _) = ds.read_slice_2d::<f32, _>(sel)?.into_raw_vec_and_offset();
             data

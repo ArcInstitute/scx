@@ -655,6 +655,7 @@ pub fn h5ad_to_scx(
         "obsm",
         opts.shard_target_rows,
         DenseMappingKind::Obsm,
+        sink,
     )?;
     write_dense_mapping_section(
         &file,
@@ -663,6 +664,7 @@ pub fn h5ad_to_scx(
         "varm",
         opts.shard_target_rows,
         DenseMappingKind::Varm,
+        sink,
     )?;
     write_sparse_mapping_section(
         &file,
@@ -1049,6 +1051,7 @@ pub fn h5ad_to_scx_streaming(
         "obsm",
         opts.shard_target_rows,
         DenseMappingKind::Obsm,
+        sink,
     )?;
     write_dense_mapping_section(
         &file,
@@ -1057,6 +1060,7 @@ pub fn h5ad_to_scx_streaming(
         "varm",
         opts.shard_target_rows,
         DenseMappingKind::Varm,
+        sink,
     )?;
     write_sparse_mapping_section(
         &file,
@@ -2129,6 +2133,7 @@ fn write_dense_mapping_section(
     group_path: &str,
     shard_target_rows: u32,
     kind: DenseMappingKind,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let emit = |w: &mut ScxWriter,
                 name: &str,
@@ -2179,8 +2184,34 @@ fn write_dense_mapping_section(
         return Ok(());
     }
 
-    // Disk-streaming path. Skip silently when the group is missing.
+    // Disk-streaming path. Missing group → nothing to do.
     let infos = list_dense_mapping_shapes(file, group_path)?;
+
+    // Surface every member `list_dense_mapping_shapes` could not handle as
+    // a `SkippedObsm` warning so the loss is visible from Python and counted
+    // in provenance instead of being silently swallowed (B4) or aborting the
+    // whole conversion on an unreadable dtype (B5 residual). Handled members
+    // are exactly the readable 2D dense datasets returned above; anything
+    // else is a DataFrame subgroup, a sparse-matrix subgroup, a non-2D
+    // dataset, or an unsupported-dtype dataset. Mirrors the `DroppedObsp`
+    // classification in `write_sparse_mapping_section`.
+    if let Ok(group) = file.group(group_path) {
+        use std::collections::HashSet;
+        let handled: HashSet<&str> = infos.iter().map(|i| i.name.as_str()).collect();
+        for name in group.member_names()? {
+            if name.starts_with("__") || handled.contains(name.as_str()) {
+                continue;
+            }
+            sink.emit(ConvertWarning::SkippedObsm {
+                name: format!("{group_path}/{name}"),
+                reason: "not a 2D dense numeric dataset (DataFrame-valued, \
+                         sparse-matrix-valued, non-2D, or unsupported dtype) \
+                         — dense obsm/varm only"
+                    .to_string(),
+            });
+        }
+    }
+
     for info in &infos {
         let n_total = info.n_rows as u64;
         // Zero-row dense mappings: emit a single empty shard so the key

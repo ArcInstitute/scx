@@ -1580,6 +1580,7 @@ checksum = "1698f197367c277fac6c3a35ad12397941b57f7554778d925ceb54c3fe754723"
 dependencies = [
  "ascii",
  "cfg-if",
+ "half",
  "hdf5-metno-sys",
  "libc",
 ]
