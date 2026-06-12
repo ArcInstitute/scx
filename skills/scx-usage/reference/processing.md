@@ -83,15 +83,26 @@ produced when you apply lazy `normalize_total`/`log1p`.
 All write to standard AnnData slots, so downstream scanpy works unchanged. Most
 take `device="auto"|"cpu"|"gpu"|"gpu:N"`. Several take `prefer_format="csr"`
 (default) or `"csc"` (requires a CSC sidecar from `csc="auto"|"always"` at
-convert). For CSC-direct DE, **pass `device="auto"` (or `"cpu"`), not
-`device="gpu"`**: `rank_genes_groups`/`pdex_ref` called with both `device="gpu"`
-*and* `prefer_format="csc"` raise `RuntimeError: device='gpu' with
-prefer_format='csc' is not supported in v1; use device='cpu' or device='auto' for
-CSC dispatch.` (verified v0.7.1). With a sidecar present, `device="auto"` selects
-the CSC-direct driver (`gpu_csc_v3`); without one it uses `gpu_csr_v3`. Always
-confirm the backend that actually ran via `adata.uns["scx_accel"][op]["route"]`
-(`harmony_integrate` is the exception — it stamps no route metadata, so you
-can't tell GPU from CPU there).
+convert).
+
+**How to get GPU CSC-direct DE (`gpu_csc_v3`).** `prefer_format` and `device`
+are two *different* axes, and the GPU CSC-direct route is selected by the
+planner, **not** by `prefer_format="csc"`:
+
+- For **GPU-fast** DE, keep the **default `prefer_format="csr"`** and pass
+  `device="gpu"` (or `"auto"`). When the file has a CSC sidecar the planner
+  routes `rank_genes_groups`/`pdex_ref` to `gpu_csc_v3` automatically; without a
+  sidecar it uses `gpu_csr_v3`.
+- `prefer_format="csc"` selects the **CPU** column-major streaming path
+  (`cpu_csc`); it has no GPU kernel. With `device="auto"` it silently runs on
+  CPU; with an explicit `device="gpu"` it raises a `RuntimeError` explaining
+  that `prefer_format='csc'` is the CPU path and that GPU CSC-direct comes from
+  the default `prefer_format='csr'` + `device='gpu'`.
+
+Always confirm the backend that actually ran via
+`adata.uns["scx_accel"][op]["route"]` — `gpu_csc_v3` (GPU CSC-direct),
+`gpu_csr_v3` (GPU, no sidecar), or `cpu_csc` / `cpu_csr`. All accel ops stamp
+this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 
 **Preprocessing / QC (non-materializing on backed/lazy):**
 - `normalize_total(adata, target_sum=10000.0)` — on backed/lazy, appends a transform; on scipy CSR delegates to `sc.pp.normalize_total`.

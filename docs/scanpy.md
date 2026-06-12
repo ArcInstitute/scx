@@ -1347,6 +1347,24 @@ contiguous gene columns instead of decoding and projecting every row.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
 
+> **Which `(device, prefer_format)` selects `gpu_csc_v3`?** `device` and
+> `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
+> by the *route planner*, **not** by `prefer_format="csc"`:
+>
+> - **GPU-fast DE:** keep the **default `prefer_format="csr"`** and pass
+>   `device="gpu"` (or `"auto"`). When the backed file has a CSC sidecar the
+>   planner routes to `gpu_csc_v3` automatically; without one it uses
+>   `gpu_csr_v3`. This is the intended GPU-fast entry point.
+> - `prefer_format="csc"` selects the **CPU** column-major streaming path
+>   (`cpu_csc`) — there is no GPU kernel behind that knob. With `device="auto"`
+>   it runs on CPU; combining it with an explicit `device="gpu"` raises a
+>   `RuntimeError` that points you back to the default `prefer_format="csr"` +
+>   `device="gpu"` for GPU CSC-direct.
+>
+> In short: do **not** reach for `prefer_format="csc"` to get GPU speed — it is
+> the CPU path. A CSC *sidecar on the file* (built at conversion) is what makes
+> the default-`csr` GPU call fast.
+
 To make a file GPU-fast for DE, build the sidecar at conversion time:
 `pyscx.from_anndata(adata, path, csc="auto")` (built automatically once the
 dataset clears the size thresholds) or `csc="always"`, `scx convert --csc=auto`,

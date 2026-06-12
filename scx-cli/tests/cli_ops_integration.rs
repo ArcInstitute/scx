@@ -883,3 +883,41 @@ fn test_query_limit() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Wrote 2 cells"));
 }
+
+// ---------------------------------------------------------------------------
+// D3: a cloud subcommand on a non-cloud build hints at `--features cloud`
+// rather than leaving the user with a bare "unrecognized subcommand".
+// ---------------------------------------------------------------------------
+
+#[cfg(not(feature = "cloud"))]
+#[test]
+fn test_cloud_subcommand_hint_on_non_cloud_build() {
+    let output = scx_cli()
+        .arg("pull")
+        .arg("gs://b/x.scxd")
+        .arg("out.scx")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "pull should fail on a non-cloud build"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cloud subcommand") && stderr.contains("--features cloud"),
+        "expected a cloud-feature hint, got stderr: {stderr}"
+    );
+}
+
+#[cfg(not(feature = "cloud"))]
+#[test]
+fn test_unknown_subcommand_has_no_cloud_hint() {
+    // A genuine typo must NOT get the cloud hint (it isn't a cloud command).
+    let output = scx_cli().arg("flibble").output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cloud subcommand"),
+        "a non-cloud typo should not get the cloud hint, got: {stderr}"
+    );
+}

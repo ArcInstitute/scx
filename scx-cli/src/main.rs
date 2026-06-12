@@ -679,6 +679,40 @@ fn reset_sigpipe() {
     }
 }
 
+/// Cloud subcommands gated behind `--features cloud`. Listed here (rather than
+/// derived) so a build *without* the cloud feature can still recognise them and
+/// emit a helpful hint instead of clap's bare "unrecognized subcommand" — the
+/// discoverability gap from report D3.
+#[cfg(not(feature = "cloud"))]
+const CLOUD_SUBCOMMANDS: &[&str] = &["pull", "push", "explode", "pack", "cloud-optimize"];
+
+/// Parse the CLI. On a non-cloud build, an attempt to invoke a cloud subcommand
+/// (`scx pull …`) fails clap's subcommand match; before deferring to clap's
+/// normal error/exit, print a one-line hint that the command exists but needs a
+/// `--features cloud` build, so the user can tell it apart from a typo (D3).
+fn parse_cli_or_exit() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            #[cfg(not(feature = "cloud"))]
+            if e.kind() == clap::error::ErrorKind::InvalidSubcommand {
+                // No global options precede the subcommand, so argv[1] is the
+                // offending token.
+                if let Some(sub) = std::env::args().nth(1) {
+                    if CLOUD_SUBCOMMANDS.contains(&sub.as_str()) {
+                        eprintln!(
+                            "note: `{sub}` is a cloud subcommand and is not compiled into this \
+                             build. Rebuild with `--features cloud` (or install the cloud-enabled \
+                             binary) to use it."
+                        );
+                    }
+                }
+            }
+            e.exit();
+        }
+    }
+}
+
 fn main() {
     reset_sigpipe();
 
@@ -686,7 +720,7 @@ fn main() {
     // `RUST_LOG=scx=debug`, `RUST_LOG=scx_loader=warn`, etc.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let cli = Cli::parse();
+    let cli = parse_cli_or_exit();
 
     let result = match cli.command {
         Commands::Convert {
