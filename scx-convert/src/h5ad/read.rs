@@ -280,13 +280,19 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
     let n_obs = shape[0];
     let n_vars = shape[1];
 
-    // Read 2D dataset as ndarray then flatten to Vec<f32>.
-    // ndarray 0.16 renamed `into_raw_vec` → `into_raw_vec_and_offset`,
-    // which returns `(Vec<T>, Option<usize>)`. The offset is `None`
-    // here because `read_2d` returns an owned, contiguous Array2 that
-    // hasn't been view-sliced.
-    let nd: ndarray::Array2<f32> = ds.read_2d()?;
-    let (flat, _offset) = nd.into_raw_vec_and_offset();
+    // Read the whole matrix as a row-major `Vec<f32>` via the shared
+    // dtype-aware slab reader (rows `[0, n_obs)`), so the eager path
+    // dispatches every on-disk dtype — including f16 → f32 — exactly like
+    // the streaming path, rather than relying on libhdf5's build-dependent
+    // implicit conversion to `f32` (the original B5 failure mode).
+    use super::dense_stream::{read_dense_slab_f32, DenseDtype};
+    let desc = ds.dtype()?.to_descriptor()?;
+    let dtype = DenseDtype::from_descriptor(&desc).map_err(|_| {
+        ConvertError::UnsupportedDtype(format!(
+            "dense matrix '{dataset_name}': dtype {desc:?} cannot be read as f32"
+        ))
+    })?;
+    let flat: Vec<f32> = read_dense_slab_f32(&ds, dtype, 0, n_obs)?;
     let csr = scx_sparse::dense_to_csr(&flat, n_obs, n_vars)
         .map_err(|e| ConvertError::Other(format!("CSR conversion error: {e}")))?;
 
@@ -1767,8 +1773,10 @@ fn compound_unsupported_msg(n_fields: usize) -> String {
 
 /// Sentinel key for the tagged `uns` envelope. Must match pyscx's
 /// `__scx_type__` envelope (`pyscx/src/convert/uns.rs`) so the existing
-/// `pyscx.to_anndata` decoder reconstructs the array.
-const SCX_UNS_TYPE_KEY: &str = "__scx_type__";
+/// `pyscx.to_anndata` decoder reconstructs the array. Shared with the
+/// scx → h5ad writer (`write.rs::try_write_uns_envelope`) so the read and
+/// write sides can't drift on the literal.
+pub(crate) const SCX_UNS_TYPE_KEY: &str = "__scx_type__";
 
 /// Build a tagged `ndarray` / `scalar` `uns` envelope for a numeric HDF5
 /// dataset, storing the raw little-endian bytes as base64. Used for `uns`
@@ -1838,7 +1846,8 @@ fn uns_ndarray_envelope(
                 .flat_map(|v| v.to_le_bytes())
                 .collect(),
         ),
-        TypeDescriptor::Unsigned(IntSize::U1) => ("|u1", ds.read_raw::<u8>()?.to_vec()),
+        // `read_raw::<u8>()` already returns a `Vec<u8>` — no extra copy.
+        TypeDescriptor::Unsigned(IntSize::U1) => ("|u1", ds.read_raw::<u8>()?),
         TypeDescriptor::Unsigned(IntSize::U2) => (
             "<u2",
             ds.read_raw::<u16>()?
@@ -1954,6 +1963,12 @@ fn read_uns_entry(
                     let v: u64 = ds.read_scalar()?;
                     Ok(serde_json::Value::Number(v.into()))
                 }
+                // f16 routes straight to the `half`-based envelope: the
+                // implicit f16→f64 HDF5 read is build-dependent (the original
+                // B5 failure mode), and the envelope preserves the f16 dtype.
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
+                }
                 TypeDescriptor::Float(_) => {
                     let v: f64 = ds.read_scalar()?;
                     if v.is_finite() {
@@ -1995,6 +2010,11 @@ fn read_uns_entry(
                 TypeDescriptor::Unsigned(_) => {
                     let data: Vec<u64> = ds.read_1d()?.to_vec();
                     Ok(serde_json::json!(data))
+                }
+                // f16 → envelope (build-dependent implicit f16→f64 read; the
+                // envelope also preserves the f16 dtype).
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
                 }
                 TypeDescriptor::Float(_) => {
                     let data: Vec<f64> = ds.read_1d()?.to_vec();
@@ -2044,6 +2064,11 @@ fn read_uns_entry(
                         .map(|r| r.to_vec())
                         .collect();
                     Ok(serde_json::json!(rows))
+                }
+                // f16 → envelope (build-dependent implicit f16→f64 read; the
+                // envelope also preserves the f16 dtype).
+                TypeDescriptor::Float(hdf5::types::FloatSize::U2) => {
+                    uns_ndarray_envelope(&ds, &desc, &shape)
                 }
                 TypeDescriptor::Float(_) => {
                     let arr = ds.read_2d::<f64>()?;

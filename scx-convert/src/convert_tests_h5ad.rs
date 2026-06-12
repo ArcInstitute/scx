@@ -2266,3 +2266,94 @@ fn uns_sparse_matrix_emits_warning() {
         .to_vec();
     assert_eq!(recovered, vec![1.0, 2.0, 3.0], "sparse data arrays lost");
 }
+
+/// B6 (2-D path): a 2-D float `uns` array carrying NaN/Inf round-trips with
+/// exact shape + non-finite values via the envelope (exercises the 2-D arm,
+/// not just the scalar/1-D arms covered above).
+#[test]
+fn uns_2d_nonfinite_float_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("naninf2d.h5ad");
+    let scx_path = dir.path().join("naninf2d.scx");
+    let h5ad_out = dir.path().join("naninf2d_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+    let m = ndarray::Array2::<f64>::from_shape_vec(
+        (2, 3),
+        vec![1.0, f64::NAN, 3.0, f64::INFINITY, -2.0, f64::NEG_INFINITY],
+    )
+    .unwrap();
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        uns.new_dataset::<f64>()
+            .shape([2, 3])
+            .create("m2d")
+            .unwrap()
+            .write(&m)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let got: ndarray::ArrayD<f64> = out
+        .group("uns")
+        .unwrap()
+        .dataset("m2d")
+        .unwrap()
+        .read_dyn()
+        .unwrap();
+    assert_eq!(got.shape(), &[2, 3], "2-D shape lost");
+    assert_eq!(got[[0, 0]], 1.0);
+    assert!(got[[0, 1]].is_nan(), "NaN lost");
+    assert_eq!(got[[0, 2]], 3.0);
+    assert!(got[[1, 0]].is_infinite() && got[[1, 0]] > 0.0, "+Inf lost");
+    assert_eq!(got[[1, 1]], -2.0);
+    assert!(got[[1, 2]].is_infinite() && got[[1, 2]] < 0.0, "-Inf lost");
+}
+
+/// B1 (review fix): a half-precision `uns` array routes through the envelope
+/// (not the build-dependent implicit f16→f64 read) and round-trips with its
+/// `<f2` dtype and a NaN element intact.
+#[test]
+fn uns_f16_array_round_trips() {
+    use half::f16;
+    use hdf5::types::{FloatSize, TypeDescriptor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("unsf16.h5ad");
+    let scx_path = dir.path().join("unsf16.scx");
+    let h5ad_out = dir.path().join("unsf16_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+    let vals: Vec<f16> = vec![f16::from_f32(1.5), f16::NAN, f16::from_f32(-3.0)];
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        uns.new_dataset::<f16>()
+            .shape([vals.len()])
+            .create("h16")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let ds = out.group("uns").unwrap().dataset("h16").unwrap();
+    assert_eq!(
+        ds.dtype().unwrap().to_descriptor().unwrap(),
+        TypeDescriptor::Float(FloatSize::U2),
+        "f16 uns array width not preserved"
+    );
+    let got: Vec<f16> = ds.read_1d::<f16>().unwrap().to_vec();
+    assert_eq!(got[0].to_f32(), 1.5);
+    assert!(got[1].is_nan(), "f16 NaN lost");
+    assert_eq!(got[2].to_f32(), -3.0);
+}
