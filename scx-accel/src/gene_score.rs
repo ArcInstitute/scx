@@ -7,7 +7,8 @@
 //! * [`ScoreMethod::Control`] — scanpy `score_genes`: per-cell
 //!   `mean(gene_list) − mean(control)`, where the control set is sampled from
 //!   expression-matched bins. Binning + control selection are Rust-native and
-//!   deterministic given `random_state`, but do **not** bit-match numpy's RNG —
+//!   use a fixed `ChaCha8` stream seeded by `random_state` — deterministic and
+//!   reproducible across `rand` version bumps, but **not** numpy-RNG-compatible,
 //!   so the chosen control genes differ from scanpy even though the algorithm
 //!   is the same.
 //! * [`ScoreMethod::Mean`] — per-cell mean over `gene_list` (no control set).
@@ -26,9 +27,9 @@
 
 use crate::error::{AccelError, Result};
 use crate::hvg::streaming_mean_var;
-use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 use scx_format_io::ShardSource;
 
 /// Gene-set scoring method. See the module docs for definitions.
@@ -122,7 +123,8 @@ fn streaming_weighted_row_sums<S: ShardSource>(
 /// (seeded by `random_state`), the scored genes are removed (scanpy
 /// `ctrl_as_ref=True`), and the result is unioned across bins.
 ///
-/// Deterministic given `random_state`, but not numpy-RNG-compatible.
+/// Uses a fixed `ChaCha8` stream seeded by `random_state`: deterministic and
+/// stable across `rand` version bumps, but not numpy-RNG-compatible.
 fn select_control_genes(
     means: &[f64],
     gene_list: &[u32],
@@ -191,7 +193,7 @@ fn select_control_genes(
     }
 
     let gene_list_set: BTreeSet<u32> = gene_list.iter().copied().collect();
-    let mut rng = StdRng::seed_from_u64(random_state);
+    let mut rng = ChaCha8Rng::seed_from_u64(random_state);
     let mut control: BTreeSet<u32> = BTreeSet::new();
 
     for bin in cut_bins {
@@ -219,7 +221,11 @@ fn select_control_genes(
 /// `gene_list` and `gene_pool` are 0-based column (var) indices; `gene_pool` is
 /// only consulted by [`ScoreMethod::Control`] (the universe genes are binned
 /// into). Callers should de-duplicate `gene_list` (duplicates inflate the `1/k`
-/// normalization).
+/// normalization) and `gene_pool` (duplicates skew bin membership / sampling).
+///
+/// Contract asymmetry: `gene_list` indices are hard-checked against `n_vars`
+/// (out-of-range is an error), but out-of-range `gene_pool` indices are silently
+/// filtered (they cannot be binned). Pass a pool that fits `0..n_vars`.
 pub fn score_genes<S: ShardSource>(
     source: &S,
     gene_list: &[u32],
@@ -268,10 +274,14 @@ pub fn score_genes<S: ShardSource>(
                 let std = stats.variances[gi].sqrt();
                 if std > 0.0 {
                     let inv = 1.0 / std;
-                    w[gi] = inv;
-                    offset += stats.means[gi] * inv;
+                    // A subnormal-but-nonzero std can make 1/std overflow to +Inf,
+                    // which would poison the weighted sums with NaN/Inf; skip it.
+                    if inv.is_finite() {
+                        w[gi] = inv;
+                        offset += stats.means[gi] * inv;
+                    }
                 }
-                // std == 0 (constant gene) → z ≡ 0; contributes nothing.
+                // std == 0 (or non-finite inv) → z ≡ 0; contributes nothing.
             }
             let sqrt_k = k_list.sqrt();
             let out = streaming_weighted_row_sums(source, std::slice::from_ref(&w))?;

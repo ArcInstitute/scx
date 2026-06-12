@@ -133,6 +133,35 @@ class TestGeneResolution:
         with pytest.raises(ValueError, match="unknown method"):
             pyscx.accel.score_genes(adata, GENES, method="bogus")
 
+    def test_duplicate_gene_pool_is_finite_and_deterministic(self, synthetic_adata):
+        # An explicit gene_pool with duplicates must be de-duplicated internally
+        # (duplicates would skew control-gene sampling). Scores stay finite and
+        # reproducible, and match the same pool passed without duplicates.
+        pool = [f"gene_{i}" for i in range(30)]
+        pool_dup = pool + pool[:10]  # 10 duplicates
+        a = synthetic_adata.copy()
+        b = synthetic_adata.copy()
+        pyscx.accel.score_genes(
+            a, GENES, method="control", gene_pool=pool, n_bins=10, random_state=5
+        )
+        pyscx.accel.score_genes(
+            b, GENES, method="control", gene_pool=pool_dup, n_bins=10, random_state=5
+        )
+        assert np.all(np.isfinite(b.obs["score"].to_numpy()))
+        np.testing.assert_array_equal(a.obs["score"].to_numpy(), b.obs["score"].to_numpy())
+
+    def test_mostly_unresolved_gene_pool_warns(self, synthetic_adata):
+        adata = synthetic_adata.copy()
+        # Only 1 of 5 pool genes exists → >50% unresolved → one-shot warning.
+        with pytest.warns(UserWarning, match="gene_pool"):
+            pyscx.accel.score_genes(
+                adata,
+                GENES,
+                method="control",
+                gene_pool=["gene_0", "NOPE_1", "NOPE_2", "NOPE_3", "NOPE_4"],
+                n_bins=5,
+            )
+
 
 class TestLayer:
     def test_scores_from_layer(self, synthetic_adata):

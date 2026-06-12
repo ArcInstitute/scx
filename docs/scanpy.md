@@ -1839,13 +1839,14 @@ pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z"
 
 > **Divergence from scanpy.** The `control` method replicates scanpy's
 > rank-binning + control-gene sampling algorithm, but the sampler is
-> Rust-native and seeded independently of numpy, so the *specific* control
-> genes (and therefore the absolute scores) differ from `sc.tl.score_genes`.
-> The score is deterministic for a fixed `random_state` and rank-correlates
-> near-perfectly with scanpy in practice. Genes in `gene_list` not present in
-> `adata.var_names` are dropped with a `UserWarning`. Use `layer=` to score a
-> named layer instead of `X`. CPU-only — `device` is accepted for API symmetry
-> but there is no GPU kernel.
+> Rust-native (a fixed `ChaCha8` stream seeded by `random_state`, reproducible
+> across `rand` upgrades) and seeded independently of numpy, so the *specific*
+> control genes (and therefore the absolute scores) differ from
+> `sc.tl.score_genes`. The score is deterministic for a fixed `random_state` and
+> rank-correlates near-perfectly with scanpy in practice. Genes in `gene_list`
+> (or an explicit `gene_pool`) not present in `adata.var_names` are dropped with
+> a `UserWarning`. Use `layer=` to score a named layer instead of `X`. CPU-only —
+> `device` is accepted for API symmetry but there is no GPU kernel.
 
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 

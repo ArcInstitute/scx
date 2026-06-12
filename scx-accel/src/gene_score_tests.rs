@@ -136,6 +136,20 @@ fn zscore_constant_gene_contributes_zero() {
 }
 
 #[test]
+fn zscore_near_constant_gene_stays_finite() {
+    // Gene 1 has a tiny but nonzero spread; 1/std must not overflow the score.
+    // (The finite-inv guard covers the subnormal-std overflow edge.)
+    let rows = vec![
+        vec![1.0, 1.000_000_1_f32],
+        vec![3.0, 1.000_000_2_f32],
+        vec![2.0, 1.000_000_1_f32],
+    ];
+    let src = source_from_dense_shards(&[&rows], 2);
+    let scores = score_genes(&src, &[0, 1], &[], &ScoreMethod::Zscore).unwrap();
+    assert!(scores.iter().all(|s| s.is_finite()), "scores: {scores:?}");
+}
+
+#[test]
 fn control_score_is_list_minus_control_mean() {
     // Construct so binning is predictable: 6 genes with distinct means.
     // gene_list = {0}; with a large ctrl_size every pool gene in gene 0's bin

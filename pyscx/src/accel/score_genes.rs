@@ -82,17 +82,19 @@ pub fn score_genes<'py>(
     let var = adata.getattr("var")?;
     let var_index = var.getattr("index")?;
     let var_names: Vec<String> = var_index.call_method0("tolist")?.extract()?;
-    let mut name_to_idx: HashMap<String, u32> = HashMap::with_capacity(var_names.len());
+    // Borrow keys from `var_names` (which outlives this function) — no per-gene
+    // String allocation.
+    let mut name_to_idx: HashMap<&str, u32> = HashMap::with_capacity(var_names.len());
     for (i, name) in var_names.iter().enumerate() {
         // First occurrence wins for duplicate var names (matches pandas .loc).
-        name_to_idx.entry(name.clone()).or_insert(i as u32);
+        name_to_idx.entry(name.as_str()).or_insert(i as u32);
     }
 
     let mut seen: HashSet<u32> = HashSet::new();
     let mut gene_list_idx: Vec<u32> = Vec::with_capacity(gene_list.len());
     let mut missing: Vec<String> = Vec::new();
     for g in &gene_list {
-        match name_to_idx.get(g) {
+        match name_to_idx.get(g.as_str()) {
             Some(&idx) => {
                 if seen.insert(idx) {
                     gene_list_idx.push(idx);
@@ -123,10 +125,31 @@ pub fn score_genes<'py>(
     }
 
     let gene_pool_idx: Vec<u32> = match gene_pool {
-        Some(pool) => pool
-            .iter()
-            .filter_map(|g| name_to_idx.get(g).copied())
-            .collect(),
+        Some(pool) => {
+            // De-duplicate resolved indices: a duplicate pool gene would be
+            // binned twice in select_control_genes and skew control sampling.
+            let mut seen_pool: HashSet<u32> = HashSet::new();
+            let resolved: Vec<u32> = pool
+                .iter()
+                .filter_map(|g| name_to_idx.get(g.as_str()).copied())
+                .filter(|&idx| seen_pool.insert(idx))
+                .collect();
+            // An explicit pool that mostly fails to resolve usually means
+            // wrong/typo'd symbols — surface it (gene_list already warns).
+            if !pool.is_empty() && resolved.len() * 2 < pool.len() {
+                let warnings = py.import("warnings")?;
+                warnings.call_method1(
+                    "warn",
+                    (format!(
+                        "score_genes: only {} of {} genes in gene_pool resolved against \
+                         var_names; check that gene_pool uses the same identifiers as adata.var_names",
+                        resolved.len(),
+                        pool.len()
+                    ),),
+                )?;
+            }
+            resolved
+        }
         None => (0..var_names.len() as u32).collect(),
     };
 
