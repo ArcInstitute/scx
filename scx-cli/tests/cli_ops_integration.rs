@@ -634,6 +634,33 @@ fn test_merge_single_file_error() {
 }
 
 #[test]
+fn test_merge_missing_output_names_flag() {
+    // A user copying `scx convert`'s positional-output habit types
+    // `scx merge a b out` — `out` is swallowed as a third input and --output
+    // is missing. The error must name --output and explain it's a flag.
+    let dir = tempfile::tempdir().unwrap();
+    let file1 = write_test_file(&dir, "m1.scx", 8, 10);
+    let file2 = write_test_file(&dir, "m2.scx", 6, 10);
+    let out = dir.path().join("out.scx");
+
+    let output = scx_cli()
+        .args([
+            "merge",
+            file1.to_str().unwrap(),
+            file2.to_str().unwrap(),
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--output"),
+        "error must name --output: {stderr}"
+    );
+}
+
+#[test]
 fn test_compact_output_exists_no_force() {
     let dir = tempfile::tempdir().unwrap();
     let input = write_test_file(&dir, "compact_input.scx", 8, 10);

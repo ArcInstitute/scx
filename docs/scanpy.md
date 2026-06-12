@@ -2702,7 +2702,7 @@ print(exp)           # AnnData-style repr:
 print(exp.n_obs)     # 10000
 print(exp.n_vars)    # 33694
 print(exp.nnz)       # 5234891
-print(exp.obs_keys)  # ['cell_type', 'sample']
+print(exp.obs_keys())  # ['cell_type', 'sample'] — callable, like adata.obs_keys()
 print(exp.layer_names)  # ["raw_counts", "spliced"]
 print(exp.info())    # codec / shard / format-version internals
 

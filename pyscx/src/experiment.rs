@@ -224,11 +224,39 @@ pub(crate) fn format_anndata_repr(
     out
 }
 
+impl PyExperiment {
+    /// Live (non-deleted) row count: physical `n_obs` minus the deletion-vector
+    /// popcount. Best-effort — falls back to the physical count when the file
+    /// has no deletion vectors or the deletion section can't be read, so it
+    /// never panics (the `n_obs` getter and repr must always render).
+    fn logical_n_obs(&self) -> u64 {
+        let physical = self.reader.n_obs();
+        if !self.reader.header().has_deletion_vectors() {
+            return physical;
+        }
+        match self.reader.read_deletion_vectors() {
+            Ok(Some(dv)) => physical.saturating_sub(dv.total_deleted()),
+            _ => physical,
+        }
+    }
+}
+
 #[pymethods]
 impl PyExperiment {
-    /// Number of observations (cells).
+    /// Number of observations (cells), reflecting **live** rows — i.e. the
+    /// physical row count minus any deletion-vector entries. Matches
+    /// `to_anndata().n_obs` and `query().count()` after `mark_deleted`. See
+    /// [`Self::n_obs_physical`] for the raw, pre-deletion header count.
     #[getter]
     fn n_obs(&self) -> u64 {
+        self.logical_n_obs()
+    }
+
+    /// Physical (pre-deletion) row count straight from the file header. Equals
+    /// [`Self::n_obs`] when the file has no deletion vectors; larger when rows
+    /// have been logically deleted via `mark_deleted` (until `compact`).
+    #[getter]
+    fn n_obs_physical(&self) -> u64 {
         self.reader.n_obs()
     }
 
@@ -308,7 +336,9 @@ impl PyExperiment {
     /// Column names in `obs` (the cell metadata), excluding the pandas
     /// index column. Pure Arrow IPC footer read — no batch decode.
     /// Raises if the obs section cannot be read (e.g. corrupt file).
-    #[getter]
+    ///
+    /// Callable method (e.g. `exp.obs_keys()`) to match AnnData's
+    /// `adata.obs_keys()`, not a property.
     fn obs_keys(&self) -> PyResult<Vec<String>> {
         let schema = self.reader.read_obs_schema_physical().map_err(to_pyerr)?;
         Ok(schema_data_columns(Some(schema)))
@@ -317,27 +347,29 @@ impl PyExperiment {
     /// Column names in `var` (the gene metadata), excluding the pandas
     /// index column. Pure Arrow IPC footer read — no batch decode.
     /// Raises if the var section cannot be read (e.g. corrupt file).
-    #[getter]
+    ///
+    /// Callable method (e.g. `exp.var_keys()`) to match AnnData's
+    /// `adata.var_keys()`, not a property.
     fn var_keys(&self) -> PyResult<Vec<String>> {
         let schema = self.reader.read_var_schema_physical().map_err(to_pyerr)?;
         Ok(schema_data_columns(Some(schema)))
     }
 
     /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan.
-    #[getter]
+    /// Callable method (`exp.obsm_keys()`) to match AnnData.
     fn obsm_keys(&self) -> Vec<String> {
         self.reader.list_obsm()
     }
 
     /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
-    #[getter]
+    /// Callable method (`exp.varm_keys()`) to match AnnData.
     fn varm_keys(&self) -> Vec<String> {
         self.reader.list_varm()
     }
 
     /// Top-level keys of the unstructured `uns` mapping. Reads the small
     /// `uns` JSON section but not any matrix payload.
-    #[getter]
+    /// Callable method (`exp.uns_keys()`) to match AnnData.
     fn uns_keys(&self) -> Vec<String> {
         match self.reader.read_uns() {
             Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
@@ -1072,7 +1104,7 @@ impl PyExperiment {
         // `var_keys` getters surface the error loudly instead).
         format_anndata_repr(
             "Experiment",
-            self.reader.n_obs(),
+            self.logical_n_obs(),
             self.reader.n_vars(),
             &[
                 (

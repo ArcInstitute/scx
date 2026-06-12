@@ -49,12 +49,16 @@ def test_key_accessors(synthetic_adata, tmp_dir):
     path = str(tmp_dir / "x.scx")
     pyscx.write(synthetic_adata, path)
     exp = pyscx.open(path)
+    # The *_keys accessors are callable methods, matching anndata's
+    # `adata.obs_keys()` (not properties).
+    assert callable(exp.obs_keys)
     # obs/var keys exclude the pandas index column.
-    assert set(exp.obs_keys) >= {"cell_id", "batch"}
-    assert "_index" not in exp.obs_keys and "__index_level_0__" not in exp.obs_keys
-    assert set(exp.var_keys) >= {"gene_id", "highly_variable"}
-    assert exp.obsm_keys == ["X_pca"]
-    assert set(exp.uns_keys) >= {"species", "version"}
+    assert set(exp.obs_keys()) >= {"cell_id", "batch"}
+    assert "_index" not in exp.obs_keys() and "__index_level_0__" not in exp.obs_keys()
+    assert set(exp.var_keys()) >= {"gene_id", "highly_variable"}
+    assert exp.obsm_keys() == ["X_pca"]
+    assert set(exp.uns_keys()) >= {"species", "version"}
+    # layer_names stays a property (anndata has no layer_names() method).
     assert "raw" in exp.layer_names
 
 
@@ -125,7 +129,7 @@ def test_obs_keys_getter_surfaces_corrupt_file(tmp_dir):
     )
     path = str(tmp_dir / "ok.scx")
     pyscx.write(adata, path)
-    assert pyscx.open(path).obs_keys == ["grp"]
+    assert pyscx.open(path).obs_keys() == ["grp"]
 
 
 def test_corrupt_file_raises_valueerror(tmp_dir):
