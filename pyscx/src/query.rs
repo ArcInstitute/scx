@@ -11,12 +11,36 @@ use scx_engine::EngineError;
 use crate::convert;
 
 /// A gene selector accepted by [`PyQueryPipeline::select_genes`]: either a
-/// positional integer index or a gene name resolved against `var`. The derive
-/// tries `Index` (int) first, then `Name` (str).
-#[derive(FromPyObject)]
+/// positional integer index or a gene name resolved against `var`.
 enum GeneRef {
     Index(u32),
     Name(String),
+}
+
+/// Parse one `select_genes` element into a [`GeneRef`].
+///
+/// Integer-like first via `__index__`, so numpy integer scalars (from a
+/// `np.array([...])` / `list(np.array(...))` selector) resolve as indices
+/// instead of falling through to the name path with a confusing `KeyError`.
+/// Python `str` has no `__index__`, so gene names are unaffected.
+fn parse_gene_ref(obj: &Bound<'_, PyAny>) -> PyResult<GeneRef> {
+    if let Ok(idx) = obj.call_method0("__index__") {
+        let v: i64 = idx.extract()?;
+        if !(0..=u32::MAX as i64).contains(&v) {
+            return Err(PyValueError::new_err(format!(
+                "gene index {v} out of range (expected 0..={})",
+                u32::MAX
+            )));
+        }
+        return Ok(GeneRef::Index(v as u32));
+    }
+    if let Ok(name) = obj.extract::<String>() {
+        return Ok(GeneRef::Name(name));
+    }
+    Err(PyValueError::new_err(
+        "select_genes entries must be integer indices (including numpy ints) \
+         or gene-name strings",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +171,15 @@ impl PyQueryPipeline {
     /// Example:
     ///     pipeline.select_genes([0, 1, 2, 100, 200]).collect()
     ///     pipeline.select_genes(["MS4A1", "CD79A", "CD3D"]).collect()
-    fn select_genes(slf: Bound<'_, Self>, genes: Vec<GeneRef>) -> PyResult<Bound<'_, Self>> {
+    fn select_genes<'py>(
+        slf: Bound<'py, Self>,
+        genes: Vec<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, Self>> {
+        // Parse each selector (int index — incl. numpy ints — or gene name).
+        let genes: Vec<GeneRef> = genes
+            .iter()
+            .map(parse_gene_ref)
+            .collect::<PyResult<Vec<_>>>()?;
         {
             let mut inner = slf.borrow_mut();
             let p = inner.take_pipeline()?;

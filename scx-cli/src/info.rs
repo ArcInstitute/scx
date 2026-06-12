@@ -783,4 +783,17 @@ mod tests {
         let reader = ScxReader::open(write_test_file(&dir, 6, 5)).unwrap();
         assert_eq!(summarize_csr_codec(&reader).unwrap(), "none");
     }
+
+    #[test]
+    fn test_summarize_codec_no_shards() {
+        // A file with obs/var but no CSR shards → "n/a" (no shard to inspect).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_shards.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(4, 5)).unwrap();
+        writer.write_obs(&sample_obs(4)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+        writer.finish().unwrap();
+        let reader = ScxReader::open(&path).unwrap();
+        assert_eq!(summarize_csr_codec(&reader).unwrap(), "n/a");
+    }
 }

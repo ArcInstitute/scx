@@ -86,6 +86,26 @@ def test_select_genes_preserves_order_and_names(query_adata, scx_from_adata):
     a4 = pyscx.open(path).query().select_genes([3, 3, 1]).collect().to_anndata()
     assert list(a4.var["gene_id"]) == ["gene_3", "gene_1"]
 
+    # Empty selection → 0-gene result (no error).
+    a5 = pyscx.open(path).query().select_genes([]).collect().to_anndata()
+    assert a5.n_vars == 0 and a5.n_obs == 120
+
+
+def test_select_genes_accepts_numpy_int_selectors(query_adata, scx_from_adata):
+    """PR #242 review: numpy integer scalars (a `np.array([...])` or a list of
+    numpy ints) resolve as indices, not falling through to the name path."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "npidx.scx")
+    ref = query_adata.X.toarray()
+    req = [7, 3, 0]
+
+    a_arr = pyscx.open(path).query().select_genes(np.array(req)).collect().to_anndata()
+    a_list = pyscx.open(path).query().select_genes([np.int64(i) for i in req]).collect().to_anndata()
+    for a in (a_arr, a_list):
+        assert list(a.var["gene_id"]) == [f"gene_{i}" for i in req]
+        assert np.array_equal(a.X.toarray(), ref[:, req])
+
 
 def test_normalize_log1p(query_adata, scx_from_adata):
     """with_normalize + with_log1p produces transformed values matching scanpy."""

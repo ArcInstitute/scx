@@ -1058,9 +1058,21 @@ pub(crate) fn decode_recarray_envelope<'py>(
             let shape_tup = pyo3::types::PyTuple::new(ctx.py, shape.iter().map(|s| *s as i64))?;
             let out = np.call_method1("empty", (&shape_tup, &dtype))?;
             for (name, py_val) in &field_pys {
-                let sub_dtype = dtype.get_item(name.as_str())?;
-                let field_arr = np.call_method1("array", (py_val, sub_dtype))?;
-                out.set_item(name.as_str(), field_arr)?;
+                // Assign the decoded JSON value straight into the field: numpy
+                // coerces the nested list to the field's own dtype — including
+                // object, fixed-width string, numeric, AND subarray fields
+                // (`dtype=[('s','f4',(3,))]`). Going via `np.array(py_val,
+                // sub_dtype)` instead re-expanded subarray dims (an extra axis)
+                // and raised a broadcast error on assignment.
+                //
+                // Float note: encode maps non-finite values to JSON `null`
+                // (JSON has no NaN/Inf), which decodes to Python `None`; numpy
+                // stores `None` as `nan` in a float field, so NaN round-trips
+                // as nan, but Inf degrades to nan. Only the rare mixed
+                // object+float structured `uns` case is affected (the fast
+                // `base64le` path, used when no field is object-dtype,
+                // preserves non-finite bits exactly).
+                out.set_item(name.as_str(), py_val)?;
             }
             Ok(out)
         }

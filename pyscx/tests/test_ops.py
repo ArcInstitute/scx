@@ -154,6 +154,9 @@ def test_n_obs_reflects_deletions(query_adata, scx_from_adata):
     # The AnnData-style repr header reports the logical count, not the physical.
     assert f"= {logical} ×" in repr(exp)
     assert f"= {physical} ×" not in repr(exp)
+
+
+def test_mark_deleted_rejects_oob_index(query_adata, scx_from_adata):
     """mark_deleted() rejects positive cell indices >= n_obs."""
     import pyscx
 

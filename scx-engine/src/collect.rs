@@ -1189,23 +1189,52 @@ mod tests {
 
     #[test]
     fn collect_gene_projection_ascending_unchanged() {
-        // An already-ascending-unique request takes the no-reorder fast path and
-        // is byte-identical to selecting the same sorted set.
+        // An already-ascending-unique request takes the no-reorder fast path:
+        // output columns are exactly the requested genes, in order, matching the
+        // corresponding columns of the full (unprojected) matrix.
         let dir = tempfile::tempdir().unwrap();
         let path = write_test_file(&dir, 12, 10);
-        let a = QueryPipeline::open(&path)
+        let requested = vec![0u32, 3, 7];
+        let proj = QueryPipeline::open(&path)
             .unwrap()
-            .select_genes(vec![0, 3, 7])
+            .select_genes(requested.clone())
             .collect()
             .unwrap();
-        assert_eq!(a.x.to_dense().unwrap(), {
-            let b = QueryPipeline::open(&path)
-                .unwrap()
-                .select_genes(vec![0, 3, 7])
-                .collect()
-                .unwrap();
-            b.x.to_dense().unwrap()
-        });
+        assert_eq!(proj.x.n_cols(), 3);
+
+        let full = QueryPipeline::open(&path).unwrap().collect().unwrap();
+        let dense_full = full.x.to_dense().unwrap(); // 12×10
+        let dense_proj = proj.x.to_dense().unwrap(); // 12×3
+        for r in 0..12 {
+            for (j, &g) in requested.iter().enumerate() {
+                assert_eq!(dense_proj[r * 3 + j], dense_full[r * 10 + g as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn collect_gene_projection_order_with_var_predicate() {
+        // PR #242 review: select_genes order must survive intersection with a
+        // var predicate that drops one of the requested genes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 10);
+        let result = QueryPipeline::open(&path)
+            .unwrap()
+            .select_genes(vec![7, 3, 0]) // non-ascending
+            .filter_var("gene_id != 'gene_3'")
+            .unwrap()
+            .collect()
+            .unwrap();
+        // gene_3 removed; the survivors keep the requested order [7, 0].
+        assert_eq!(result.x.n_cols(), 2);
+        let gene_ids = result
+            .var
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(gene_ids.value(0), "gene_7");
+        assert_eq!(gene_ids.value(1), "gene_0");
     }
 
     #[test]

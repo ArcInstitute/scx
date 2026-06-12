@@ -1716,10 +1716,11 @@ pub fn normalized_mutual_info(
 /// Adjusted Rand Index.
 ///
 /// By default (`rescaled=False`) this matches
-/// `sklearn.metrics.adjusted_rand_score(labels_a, labels_b)` exactly — range
-/// `[-0.5, 1]`, consistent with `normalized_mutual_info` / `adjusted_mutual_info`
-/// in this module. Pass `rescaled=True` for cell-eval's clustering-agreement
-/// convention `(ARI + 1) / 2` in `[0, 1]`.
+/// `sklearn.metrics.adjusted_rand_score(labels_a, labels_b)` exactly: `1.0` for
+/// identical clusterings, `~0` for random labelings, and negative for
+/// worse-than-random — consistent with `normalized_mutual_info` /
+/// `adjusted_mutual_info` in this module. Pass `rescaled=True` for cell-eval's
+/// clustering-agreement convention `(ARI + 1) / 2` in `[0, 1]`.
 ///
 /// Labels may be integer codes, strings, or pandas categoricals (factorized
 /// internally; see `normalized_mutual_info`).

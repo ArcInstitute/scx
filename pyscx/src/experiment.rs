@@ -20,12 +20,21 @@ use crate::to_pyerr;
 pub struct PyExperiment {
     reader: ScxReader,
     pub(crate) path: PathBuf,
+    /// Memoized deletion-vector popcount (live-count complement). Computed once
+    /// on the first `n_obs`/repr access for deletion-bearing files so repeated
+    /// access doesn't re-decode the deletion section. `OnceLock` keeps the
+    /// pyclass `Send + Sync`.
+    n_deleted: std::sync::OnceLock<u64>,
 }
 
 impl PyExperiment {
     /// Construct from an already-opened ScxReader and its path (Rust-only).
     pub fn new(reader: ScxReader, path: PathBuf) -> Self {
-        Self { reader, path }
+        Self {
+            reader,
+            path,
+            n_deleted: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -234,10 +243,17 @@ impl PyExperiment {
         if !self.reader.header().has_deletion_vectors() {
             return physical;
         }
-        match self.reader.read_deletion_vectors() {
-            Ok(Some(dv)) => physical.saturating_sub(dv.total_deleted()),
-            _ => physical,
-        }
+        // Decode the deletion section at most once per Experiment (best-effort:
+        // a failed read memoizes 0, matching the pre-cache physical fallback).
+        let deleted = *self.n_deleted.get_or_init(|| {
+            self.reader
+                .read_deletion_vectors()
+                .ok()
+                .flatten()
+                .map(|dv| dv.total_deleted())
+                .unwrap_or(0)
+        });
+        physical.saturating_sub(deleted)
     }
 }
 

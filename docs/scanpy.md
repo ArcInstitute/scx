@@ -2159,7 +2159,7 @@ cell-eval's `(ARI+1)/2` rescaling):
 ```python
 ami = pyscx.accel.adjusted_mutual_info(labels_a, labels_b)
 nmi = pyscx.accel.normalized_mutual_info(labels_a, labels_b)
-ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)  # sklearn ARI, [-0.5, 1]
+ari = pyscx.accel.adjusted_rand_index(labels_a, labels_b)  # sklearn ARI (negative = worse than random)
 ari01 = pyscx.accel.adjusted_rand_index(labels_a, labels_b, rescaled=True)  # cell-eval (ARI+1)/2, [0, 1]
 ```
 
