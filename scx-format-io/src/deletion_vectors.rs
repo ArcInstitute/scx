@@ -203,6 +203,71 @@ impl Default for DeletionVectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FullCatalog, FullCatalogEntry, SectionType, ShardStats};
+
+    /// Build a minimal CSR-shard catalog entry spanning `[row_start, row_end)`.
+    fn csr_shard(name: &str, row_start: u64, row_end: u64) -> FullCatalogEntry {
+        FullCatalogEntry {
+            name: name.to_string(),
+            offset: 0,
+            length: 0,
+            section_type: SectionType::CsrShard,
+            checksum: [0u8; 32],
+            modality_id: 0,
+            stats: Some(ShardStats {
+                row_start,
+                row_end,
+                col_start: 0,
+                col_end: 0,
+                nnz: 0,
+                value_min: 0,
+                value_max: 0,
+                value_sum: 0,
+                n_indexed_columns: 0,
+                column_stats: Vec::new(),
+            }),
+        }
+    }
+
+    fn catalog_with(entries: Vec<FullCatalogEntry>, n_obs: u64) -> FullCatalog {
+        FullCatalog {
+            catalog_version: crate::CURRENT_CATALOG_VERSION,
+            manifest_sequence: 1,
+            prev_catalog_offset: 0,
+            n_obs,
+            entries,
+            data_generation: 0,
+            csc_build_generation: 0,
+        }
+    }
+
+    #[test]
+    fn build_keep_mask_translates_local_rows_to_global() {
+        // Two CSR shards: shard 0 = rows [0,3), shard 1 = rows [3,5). n_obs = 5.
+        let catalog = catalog_with(
+            vec![csr_shard("X_shard_0", 0, 3), csr_shard("X_shard_1", 3, 5)],
+            5,
+        );
+
+        let mut dv = DeletionVectors::new();
+        // shard 0 deletes local row 1 (global 1) and an out-of-range local row
+        // 99 (global 99, must be ignored by the bounds guard).
+        let mut bm0 = RoaringBitmap::new();
+        bm0.insert(1);
+        bm0.insert(99);
+        dv.shards.insert(0, bm0);
+        // shard 1 deletes local row 0 (global 3).
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(0);
+        dv.shards.insert(1, bm1);
+        // A bitmap for a non-existent shard id must be ignored.
+        let mut bm9 = RoaringBitmap::new();
+        bm9.insert(0);
+        dv.shards.insert(9, bm9);
+
+        let keep = dv.build_keep_mask(5, &catalog);
+        assert_eq!(keep, vec![true, false, true, false, true]);
+    }
 
     /// F5: an unknown `dv_version` on the wire must be rejected (it used to be
     /// read and ignored, so a future v2 layout would have been misparsed).

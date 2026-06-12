@@ -164,22 +164,54 @@ impl ScxError {
     /// Classify this error into a coarse [`ScxErrorClass`]. Used by the
     /// `pyscx` / `rscx` bindings so the variant→category decision lives in
     /// one place instead of being re-spelled per binding.
+    ///
+    /// The match is intentionally exhaustive (no wildcard arm) so adding a
+    /// new [`ScxError`] variant is a compile error here until it is given a
+    /// class. Guiding principle: malformed/unreadable on-disk data is
+    /// [`ScxErrorClass::CorruptFile`]; bad caller input or a writer-side
+    /// inconsistency is [`ScxErrorClass::Validation`]; wrapped lower-level
+    /// errors and genuine runtime failures are [`ScxErrorClass::Other`].
     pub fn class(&self) -> ScxErrorClass {
         match self {
+            // Bad input / internally inconsistent data (not file corruption).
             ScxError::InconsistentCsr
             | ScxError::NVarsOverflow(_)
             | ScxError::BlockRowsOverflow(_)
             | ScxError::BlockNnzOverflow(_)
-            | ScxError::StaleCscSidecar { .. } => ScxErrorClass::Validation,
+            | ScxError::StaleCscSidecar { .. }
+            | ScxError::ColumnStatsOverflow(_)
+            | ScxError::ObsLayoutConflict { .. } => ScxErrorClass::Validation,
+            // File is corrupt or was written by an incompatible/newer SCX:
+            // bad magic/version/endian/checksum/catalog, an unknown on-disk
+            // codec / value-encoding / section / shard-type byte, or an
+            // out-of-bounds offset/index read from a malformed structure.
             ScxError::InvalidMagic
             | ScxError::InvalidShardMagic
             | ScxError::UnsupportedVersion
             | ScxError::UnsupportedEndian
             | ScxError::UnsupportedSectionVersion { .. }
             | ScxError::ChecksumMismatch { .. }
-            | ScxError::InvalidCatalog(_) => ScxErrorClass::CorruptFile,
+            | ScxError::InvalidCatalog(_)
+            | ScxError::UnknownCodec(_)
+            | ScxError::UnknownValueEncoding(_)
+            | ScxError::RootCatalogTooLarge(_)
+            | ScxError::UnknownSectionType(_)
+            | ScxError::SectionNotFound(_)
+            | ScxError::ShardIndexOutOfBounds { .. }
+            | ScxError::BitmapGeneIdOutOfRange { .. }
+            | ScxError::InvalidShardType { .. }
+            | ScxError::EmptyIndptr
+            | ScxError::SectionOutOfBounds { .. }
+            | ScxError::AllocationTooLarge { .. }
+            | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
-            _ => ScxErrorClass::Other,
+            // Wrapped lower-level errors and genuine runtime failures.
+            ScxError::WriterAlreadyFinished
+            | ScxError::CscTranspose(_)
+            | ScxError::Csr(_)
+            | ScxError::Codec(_)
+            | ScxError::Json(_)
+            | ScxError::Arrow(_) => ScxErrorClass::Other,
         }
     }
 }
@@ -267,6 +299,91 @@ mod tests {
             ScxError::InvalidCatalog("bad".into()).class(),
             ScxErrorClass::CorruptFile
         );
+        // Validation: writer-side limits / inconsistencies.
+        assert_eq!(
+            ScxError::ColumnStatsOverflow(256).class(),
+            ScxErrorClass::Validation
+        );
+        assert_eq!(
+            ScxError::ObsLayoutConflict {
+                attempted: "sharded",
+                existing: "single",
+                single_kind: "ObsMetadata",
+                sharded_kind: "ObsMetadataShard",
+            }
+            .class(),
+            ScxErrorClass::Validation
+        );
+
+        // CorruptFile: malformed/unreadable on-disk data (previously Other,
+        // now surfaced as ValueError rather than RuntimeError in pyscx).
+        assert_eq!(
+            ScxError::UnknownCodec(99).class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnknownValueEncoding(7).class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::RootCatalogTooLarge(99999).class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnknownSectionType(200).class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::SectionNotFound("X".into()).class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::ShardIndexOutOfBounds { index: 5, count: 2 }.class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::BitmapGeneIdOutOfRange {
+                gene_id: 9,
+                n_vars: 4,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::InvalidShardType {
+                expected: 1,
+                got: 9,
+                section_type: 2,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(ScxError::EmptyIndptr.class(), ScxErrorClass::CorruptFile);
+        assert_eq!(
+            ScxError::SectionOutOfBounds {
+                offset: 10,
+                length: 999,
+                file_size: 100,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::AllocationTooLarge {
+                requested: 1 << 40,
+                available: 16,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::ColumnStatsShardCountMismatch {
+                got: 3,
+                expected: 4
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
 
         // Io forwards the kind
         assert_eq!(
@@ -278,11 +395,14 @@ mod tests {
             ScxErrorClass::Io(ErrorKind::PermissionDenied)
         );
 
-        // Other catch-all
+        // Other: wrapped lower-level errors and genuine runtime failures.
         assert_eq!(
             ScxError::WriterAlreadyFinished.class(),
             ScxErrorClass::Other
         );
-        assert_eq!(ScxError::UnknownCodec(99).class(), ScxErrorClass::Other);
+        assert_eq!(
+            ScxError::CscTranspose("boom".into()).class(),
+            ScxErrorClass::Other
+        );
     }
 }

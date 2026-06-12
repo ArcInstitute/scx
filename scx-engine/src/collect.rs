@@ -489,7 +489,12 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         legacy_obs = Some(obs_batch);
     }
 
-    // Step 4: Apply deletion vectors — exclude deleted cells
+    // Step 4: Apply deletion vectors — exclude deleted cells.
+    // This is the same shard-idx→global-row translation as
+    // `DeletionVectors::build_keep_mask`, but deliberately folded in place
+    // into the running `obs_mask` (which already carries the predicate
+    // filter) rather than calling the shared helper: building a fresh mask
+    // would cost a second `n_obs` allocation and discard the predicate work.
     if let Some(ref dv) = plan.deletion_vectors {
         for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
             if let Some(ref stats) = shard_entry.stats {

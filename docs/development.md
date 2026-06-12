@@ -237,7 +237,7 @@ combinations that are not covered by the default workspace build:
 
 | Scope | Crates |
 |-------|--------|
-| **`members`** (all) | scx-format, scx-codec, scx-sparse, scx-cli, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-mtx, scx-accel, pyscx, rscx, tests/scx-integration-tests |
+| **`members`** (all) | scx-format, scx-format-io, scx-codec, scx-sparse, scx-cli, scx-convert, scx-ops, scx-engine, scx-loader, scx-cloud, scx-gpu, scx-mtx, scx-accel, pyscx, rscx, tests/scx-integration-tests |
 | **`default-members`** | All except `rscx` (R toolchain dependency) |
 
 `scx-gpu` is deliberately included in `default-members` because `cudarc`

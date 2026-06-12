@@ -8,14 +8,14 @@ runtimes are involved, and how it all stays safe.
 
 | Component | Threading model | Key crate(s) |
 |-----------|----------------|---------------|
-| **Shard decode** (read) | Rayon data parallelism + SIMD BitPacker4x | `scx-format` (opt-in), `scx-engine` |
+| **Shard decode** (read) | Rayon data parallelism + SIMD BitPacker4x | `scx-format-io` (opt-in), `scx-engine` |
 | **Query engine** | Rayon `par_iter` over shards | `scx-engine` |
 | **Training loader** | Triple-buffered pipeline (tokio + rayon + std::thread) | `scx-loader` |
 | **Cloud I/O** | Tokio async tasks | `scx-cloud` |
 | **File mutations** | Advisory `flock()` via `fs4` | `scx-ops` |
 | **GPU decode** | CUDA kernel parallelism | `scx-gpu` |
 | **Shard encoding** (write) | Rayon `par_iter` over shard boundaries | `pyscx` |
-| **File writing** (I/O) | Sequential (atomic rename) | `scx-format` |
+| **File writing** (I/O) | Sequential (atomic rename) | `scx-format-io` |
 
 ## Parallel shard decode
 
@@ -23,7 +23,7 @@ SCX's sharded layout (see [`docs/sharding.md`](sharding.md)) makes parallelism
 natural: each shard is independently decompressible with its own header, codec,
 and checksum.
 
-### scx-format (opt-in `parallel` feature)
+### scx-format-io (opt-in `parallel` feature)
 
 `ScxReader::read_all_csr_shards()` and `ScxReader::read_layer()` use rayon's
 `par_iter()` to decode shards concurrently via `assemble_shards_parallel()`.
@@ -41,7 +41,7 @@ parallel = ["rayon"]
 
 Without the feature flag, the same functions fall back to sequential decode.
 This lets downstream crates (e.g., `scx-engine`) always get parallelism while
-keeping `scx-format` lightweight for single-shard use cases.
+keeping `scx-format-io` lightweight for single-shard use cases.
 
 ### scx-engine (always parallel)
 
