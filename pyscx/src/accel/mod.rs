@@ -31,6 +31,7 @@ pub mod leiden;
 pub mod lisi;
 pub mod neighbors;
 pub mod pca;
+pub mod pflog1ppf;
 pub mod preprocessing;
 pub mod pseudobulk;
 #[cfg(feature = "gpu")]

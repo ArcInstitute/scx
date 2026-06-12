@@ -432,6 +432,207 @@ pub fn randomized_pca<S: ShardSource>(
     build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
 }
 
+// ---------------------------------------------------------------------------
+// PFlog1pPF — baseline-aware randomized PCA
+// ---------------------------------------------------------------------------
+
+/// Streaming forward SpMM with a per-row baseline offset:
+/// `Y = (delta + baseline·1ᵀ − 1·μᵀ) @ M`.
+///
+/// Reuses [`streaming_spmm_forward`] for the `delta@M − 1⊗(μᵀM)` part (the
+/// column-centering rank-1 term, when `means` is `Some`), then adds the
+/// row-baseline rank-1 term `baseline_i · colsum(M)_j`. `delta` is whatever
+/// `source` streams (the lazy `NormalizeTotal→Log1p` source for PFlog1pPF).
+fn streaming_spmm_forward_offset<S: ShardSource>(
+    source: &S,
+    m_data: &[f64],
+    k: usize,
+    means: Option<&[f64]>,
+    baseline: &[f64],
+) -> Result<Vec<f64>> {
+    let (n_obs, n_vars) = source.shape();
+    debug_assert_eq!(m_data.len(), n_vars * k);
+    debug_assert_eq!(baseline.len(), n_obs);
+
+    let mut y = streaming_spmm_forward(source, m_data, k, means)?;
+
+    // colsum(M)_j = Σ_v M[v, j]
+    let mut colsum_m = vec![0.0f64; k];
+    for v in 0..n_vars {
+        let row = &m_data[v * k..(v + 1) * k];
+        for (acc, &mv) in colsum_m.iter_mut().zip(row.iter()) {
+            *acc += mv;
+        }
+    }
+    // Y[i, j] += baseline_i · colsum(M)_j
+    for (i, &b) in baseline.iter().enumerate() {
+        let y_row = &mut y[i * k..(i + 1) * k];
+        for (yv, &cm) in y_row.iter_mut().zip(colsum_m.iter()) {
+            *yv += b * cm;
+        }
+    }
+    Ok(y)
+}
+
+/// Streaming transpose SpMM with a per-row baseline offset:
+/// `B = (delta + baseline·1ᵀ − 1·μᵀ)ᵀ @ Q`.
+///
+/// Reuses [`streaming_spmm_transpose`] for the `deltaᵀQ − μ·(1ᵀQ)` part, then
+/// adds the row-baseline rank-1 term `1 ⊗ (baselineᵀ Q)` to every variable row.
+fn streaming_spmm_transpose_offset<S: ShardSource>(
+    source: &S,
+    q: &Mat<f64>,
+    means: Option<&[f64]>,
+    baseline: &[f64],
+) -> Result<Vec<f64>> {
+    let (n_obs, n_vars) = source.shape();
+    let k = q.ncols();
+    debug_assert_eq!(q.nrows(), n_obs);
+    debug_assert_eq!(baseline.len(), n_obs);
+
+    let mut z = streaming_spmm_transpose(source, q, means)?;
+
+    // bq_j = Σ_i baseline_i · Q[i, j]
+    let mut bq = vec![0.0f64; k];
+    for (i, &b) in baseline.iter().enumerate() {
+        if b == 0.0 {
+            continue;
+        }
+        for (j, slot) in bq.iter_mut().enumerate() {
+            *slot += b * q[(i, j)];
+        }
+    }
+    // B[v, j] += bq_j for every variable row v
+    for v in 0..n_vars {
+        let z_row = &mut z[v * k..(v + 1) * k];
+        for (zv, &bqj) in z_row.iter_mut().zip(bq.iter()) {
+            *zv += bqj;
+        }
+    }
+    Ok(z)
+}
+
+/// Total variance of the exact PFlog1pPF matrix `Z = delta + baseline·1ᵀ`,
+/// computed in closed form from the `delta` column statistics + baseline.
+///
+/// `colmean_delta` is `Some` for the column-centered case (the variance of the
+/// centered `Z`) and `None` for the uncentered second-moment sum. Both divide
+/// by `n_obs − 1` to match [`total_variance_from_col_sq`]'s convention.
+///
+/// Centered: with `μ_j = colmean_delta_j + b̄`, `C_j = n_obs · colmean_delta_j`,
+/// `Σ_j Σ_i (delta_ij + b_i − μ_j)²` expands (using `Σ_j delta_ij = −D·b_i`) to
+/// `S_dd − D·B2 + n_obs·Σμ² − 2·Σ_j μ_j C_j − 2·n_obs·b̄·Σ_j μ_j`.
+fn pflog1ppf_total_variance(
+    col_sum_sq_delta: &[f64],
+    colmean_delta: Option<&[f64]>,
+    baseline: &[f64],
+    n_obs: usize,
+    n_vars: usize,
+) -> f64 {
+    let s_dd: f64 = col_sum_sq_delta.iter().sum();
+    let b2: f64 = baseline.iter().map(|&b| b * b).sum();
+    let denom = (n_obs as f64 - 1.0).max(1.0);
+    let d = n_vars as f64;
+    match colmean_delta {
+        // Uncentered: Σ Z² = S_dd − D·B2 (the cross term 2Σδb = −2D·B2 cancels D·B2).
+        None => ((s_dd - d * b2) / denom).max(0.0),
+        Some(cd) => {
+            let baseline_mean = baseline.iter().sum::<f64>() / (n_obs as f64).max(1.0);
+            let n = n_obs as f64;
+            let mut m2 = 0.0f64; // Σ_j μ_j²
+            let mut sm = 0.0f64; // Σ_j μ_j
+            let mut cross_dmu = 0.0f64; // Σ_j μ_j · C_j
+            for &cdj in cd {
+                let mu = cdj + baseline_mean;
+                m2 += mu * mu;
+                sm += mu;
+                cross_dmu += mu * (n * cdj);
+            }
+            let tss = s_dd - d * b2 + n * m2 - 2.0 * cross_dmu - 2.0 * n * baseline_mean * sm;
+            (tss / denom).max(0.0)
+        }
+    }
+}
+
+/// Exact PFlog1pPF randomized PCA, streaming the `delta` source out-of-core.
+///
+/// `delta_source` streams the sparse `delta` shards (the lazy
+/// `NormalizeTotal{target_sum=1/c} → Log1p` source); `baseline` is the per-cell
+/// offset from [`crate::pflog1ppf::pflog1ppf_baseline`]. The randomized SVD is
+/// driven exactly as [`randomized_pca`] but over the implicit dense
+/// `Z = delta + baseline·1ᵀ`: each SpMM pass folds the row-baseline rank-1 term
+/// alongside the existing column-centering rank-1 term, so `Z` is never
+/// materialized.
+///
+/// When `zero_center` is set the column mean is `μ_j = colmean(delta)_j + mean(baseline)`
+/// — it **must** include the baseline, or centering is wrong.
+///
+/// # Pass budget
+///
+/// Out-of-core cost is 1 column-stats pass + 2 passes per power iteration
+/// (forward + transpose) + 1 final transpose. Each pass re-streams `delta_source`,
+/// which recomputes `normalize→log1p` per pass; with a non-caching source this is
+/// decode-bound (acceptable for randomized PCA).
+#[allow(clippy::too_many_arguments)]
+pub fn pflog1ppf_pca<S: ShardSource>(
+    delta_source: &S,
+    baseline: &[f64],
+    n_components: usize,
+    n_oversamples: usize,
+    n_power_iterations: usize,
+    zero_center: bool,
+    seed: u64,
+) -> Result<PcaResult> {
+    let (n_obs, n_vars) = delta_source.shape();
+    validate_inputs(n_obs, n_vars, n_components)?;
+    if baseline.len() != n_obs {
+        return Err(AccelError::ShapeError(format!(
+            "baseline has length {} but delta_source reports n_obs={n_obs}",
+            baseline.len()
+        )));
+    }
+    warn_if_cache_undersized(delta_source, "pflog1ppf_pca");
+
+    let k = (n_components + n_oversamples).min(n_vars).min(n_obs);
+
+    // Column means + sum-of-squares of `delta` (one pass). The column mean of Z
+    // adds mean(baseline) uniformly to colmean(delta).
+    let (colmean_delta, col_sum_sq_delta) = delta_source.col_means_and_sum_sq(zero_center)?;
+    let baseline_mean = baseline.iter().sum::<f64>() / (n_obs as f64).max(1.0);
+    let means: Option<Vec<f64>> = colmean_delta
+        .as_ref()
+        .map(|cd| cd.iter().map(|&m| m + baseline_mean).collect());
+    let means_ref = means.as_deref();
+
+    let omega = random_gaussian(n_vars, k, seed);
+    let y = streaming_spmm_forward_offset(delta_source, &omega, k, means_ref, baseline)?;
+    let mut q = qr_thin_q_row_major(&y, n_obs, k);
+
+    for _ in 0..n_power_iterations {
+        let b = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline)?;
+        if n_power_iterations > 2 {
+            let q_b = qr_thin_q_row_major(&b, n_vars, k);
+            let q_b_rm = mat_to_row_major_buf(&q_b);
+            let y = streaming_spmm_forward_offset(delta_source, &q_b_rm, k, means_ref, baseline)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        } else {
+            let y = streaming_spmm_forward_offset(delta_source, &b, k, means_ref, baseline)?;
+            q = qr_thin_q_row_major(&y, n_obs, k);
+        }
+    }
+
+    let b_rm = streaming_spmm_transpose_offset(delta_source, &q, means_ref, baseline)?;
+    let total_var = pflog1ppf_total_variance(
+        &col_sum_sq_delta,
+        colmean_delta.as_deref(),
+        baseline,
+        n_obs,
+        n_vars,
+    );
+    let b_view = MatRef::from_row_major_slice(&b_rm, n_vars, k);
+    build_pca_result(&q, &b_view, &means, n_components, n_obs, n_vars, total_var)
+}
+
 /// Compute randomized PCA from an in-memory ScxCsr matrix.
 ///
 /// Convenience wrapper for testing and small datasets.
