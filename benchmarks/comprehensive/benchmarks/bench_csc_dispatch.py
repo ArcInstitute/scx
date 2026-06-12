@@ -46,6 +46,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     QUERY_N_HVGS,
     RANDOM_SEED,
+    pseudobulk_n_cpus_cap,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
 
@@ -57,6 +58,12 @@ try:
     _HAS_PYSCX = True
 except ImportError:
     pass
+
+# Cap pydeseq2's loky worker pool in the pseudobulk variant. Without it,
+# DefaultInference forks one Python-interpreter worker per core (~300 MB each),
+# OOM-killing the job on many-core nodes. pyscx.accel.pseudobulk_dex derives
+# this from SLURM_CPUS_PER_TASK by default; passed explicitly for determinism.
+_PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 
 # Per-dataset cache for the converted CSC-equipped SCX file. Keyed by
 # `(dataset.name, csc_cols_per_shard)`.
@@ -243,6 +250,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             reference,
             prefer_format="csc",
             gene_indices=gene_indices,
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
     else:
         pyscx.accel.pseudobulk_dex(
@@ -251,6 +259,7 @@ def _run_pseudobulk(adata: Any, prefer: str) -> None:
             "_bench_cond",
             reference,
             prefer_format="csr",
+            n_cpus=_PSEUDOBULK_N_CPUS,
         )
 
 

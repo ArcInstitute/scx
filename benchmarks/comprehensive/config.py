@@ -712,6 +712,18 @@ def get_formats(
     return out
 
 
+def pseudobulk_n_cpus_cap() -> int:
+    """Bounded pydeseq2 worker cap for the pseudobulk DE benchmark paths.
+
+    The ``correctness`` and ``bench_csc_dispatch`` benches pass this explicitly
+    to ``pyscx.accel.pseudobulk_dex(n_cpus=...)`` for determinism. Capped at 8
+    so a large SLURM allocation never spawns one loky worker (~300 MB Python
+    interpreter) per core and OOM-kills the job. Mirrors the env-derived default
+    baked into ``pseudobulk_dex`` itself.
+    """
+    return min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark Constants
 # ---------------------------------------------------------------------------
@@ -1152,6 +1164,17 @@ def estimate_time_minutes(
         # round-trip — UMAP/Leiden/DE pipelines dominate at scale.
         # Empirical: pbmc3k <30 min; tabula_sapiens_100k ~80-120 min.
         slope_minutes_per_million = 240
+    elif benchmark == "fragment_ops":
+        # append + delete + compact + rollback, each repeated n_runs times.
+        # append decodes+re-encodes the full input and compact rewrites the
+        # whole file, so wall time scales ~linearly with nnz; the default
+        # 8 min/M is too tight at census scale. Size generously so census_1m
+        # gets ~2 h and census_5m scales up. (At ≤100K the op is well under the
+        # 15-min base, so the small gated datasets — pbmc3k/pbmc10k/smartseq2 —
+        # are unaffected.) NB: the census failures observed in the 2026-06-11
+        # gate were a per-shard value_encoding bug in pyscx.append (fixed in
+        # scx-ops), not a time-limit; this slope is forward-looking headroom.
+        slope_minutes_per_million = 120
     elif benchmark == "roundtrip":
         # Two full reads (anndata.read_h5ad + pyscx.open(...).to_anndata())
         # plus a CSR diff. Bounded by anndata's h5ad parse on the source

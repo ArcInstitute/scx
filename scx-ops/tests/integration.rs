@@ -2705,6 +2705,76 @@ fn test_streaming_append_matches_bulk_append() {
     assert_eq!(obs_a.num_rows(), obs_b.num_rows());
 }
 
+/// Regression: a source file whose shards carry *different* value encodings
+/// (legal — the auto-codec selects `value_encoding` per shard from that
+/// shard's value distribution, so multi-shard census files routinely mix
+/// e.g. Scx1 and Zstd) must append cleanly. `append_from_reader` previously
+/// derived one encoding from the first shard and rejected any shard that
+/// differed with a `ShapeMismatch` ("value_encoding N differs from first
+/// shard's M"), which broke `pyscx.append` / fragment_ops on census-scale
+/// inputs. Each shard's own encoding must be preserved instead.
+#[test]
+fn test_streaming_append_mixed_value_encoding_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "mixed_enc_target.scx", 4, 4, 1);
+
+    // Build a 2-shard source by hand: shard 0 Uint8, shard 1 Uint16 (values
+    // > 255 to justify the wider encoding), both over n_vars = 4.
+    let src_path = dir.path().join("mixed_enc_source.scx");
+    let header = sample_header(4, 4);
+    let mut w = ScxWriter::new(&src_path, header).unwrap();
+    w.write_obs(&sample_obs(4)).unwrap();
+    w.write_var(&sample_var(4)).unwrap();
+    // shard 0 — rows 0..2, Uint8.
+    w.write_csr_shard(
+        &[0u64, 1, 2],
+        &[0u32, 1],
+        &[7u8, 9u8],
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    // shard 1 — rows 2..4, Uint16.
+    let mut v1 = Vec::new();
+    v1.extend_from_slice(&300u16.to_le_bytes());
+    v1.extend_from_slice(&1000u16.to_le_bytes());
+    w.write_csr_shard(
+        &[0u64, 1, 2],
+        &[2u32, 3],
+        &v1,
+        CodecId::None,
+        ValueEncoding::Uint16,
+        2,
+    )
+    .unwrap();
+    w.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1710000000,
+        action: "convert".to_string(),
+        tool: "test".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: vec![],
+    }])
+    .unwrap();
+    w.finish().unwrap();
+
+    let src_reader = ScxReader::open(&src_path).unwrap();
+    // Must NOT error on the heterogeneous encodings.
+    scx_ops::append_from_reader(&target, &src_reader, &AppendOptions::default(), 0).unwrap();
+    drop(src_reader);
+
+    let reader = ScxReader::open(&target).unwrap();
+    assert_eq!(reader.n_obs(), 8); // 4 target + 4 source
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 8);
+    // The Uint16-shard values must survive the append (round-trip fidelity).
+    let data: Vec<i64> = csr.data.iter().map(|&v| v as i64).collect();
+    assert!(
+        data.contains(&300) && data.contains(&1000),
+        "Uint16-shard values must survive append: {data:?}"
+    );
+}
+
 /// Multi-shard source must round-trip into the target with correct global
 /// row offsets and shard count.
 #[test]

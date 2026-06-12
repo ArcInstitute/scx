@@ -79,6 +79,7 @@ def pseudobulk_dex(
     min_cells_per_stratum: int = 50,
     prefer_format: PreferFormat = "csr",
     gene_indices: list[int] | None = None,
+    n_cpus: int | None = None,
 ) -> Any: ...
 
 
