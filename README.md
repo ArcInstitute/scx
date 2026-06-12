@@ -496,7 +496,7 @@ uv pip install maturin numpy scipy pyarrow anndata
 cd pyscx && ../.venv/bin/maturin develop --release
 
 # With cloud support (S3/GCS/Azure):
-cd pyscx && ../.venv/bin/maturin develop --release --features cloud
+cd pyscx && ../.venv/bin/maturin develop --release --features hdf5,cloud
 ```
 
 #### GPU acceleration
@@ -518,7 +518,7 @@ conda install -c rapidsai -c conda-forge rapids-singlecell cugraph cuda-version=
 
 # Install Python deps + build pyscx with GPU support
 pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
-cd pyscx && maturin develop --release --features gpu
+cd pyscx && maturin develop --release --features hdf5,gpu
 ```
 
 **Option B: system CUDA Toolkit** — for native-only GPU ops (HVG, DE, Harmony, Leiden via cuGraph):
@@ -538,7 +538,7 @@ nvcc --version  # should print CUDA 12.x
 # 3. Build pyscx with GPU support
 uv venv .venv
 uv pip install maturin numpy scipy pyarrow anndata
-cd pyscx && ../.venv/bin/maturin develop --release --features gpu
+cd pyscx && ../.venv/bin/maturin develop --release --features hdf5,gpu
 ```
 
 Without rapids-singlecell, PCA/kNN/UMAP will fall back to CPU.

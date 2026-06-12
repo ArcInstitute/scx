@@ -159,7 +159,7 @@ The `^{}` dereferences the tag to the underlying commit; tagging a tag produces 
 Full details live in `docs/development.md`. The bits that come up often:
 
 - **Always use `.venv/`** (uv-managed) for Python work — never system Python or `pip`.
-- **`pyscx` features:** `hdf5` (h5ad/h5mu ingest), `hdf5-static` (bundles libhdf5 for wheel builds), `cloud`, `gpu`. Build with e.g. `maturin develop --features cloud,gpu`.
+- **`pyscx` features:** `hdf5` (h5ad/h5mu ingest), `hdf5-static` (bundles libhdf5 for wheel builds), `cloud`, `gpu`. Build with e.g. `maturin develop --features hdf5,cloud,gpu`.
 - **`scx-cli` features:** `hdf5`, `hdf5-static`, `cloud`. The release workflow uses `hdf5-static` so downloaded binaries have no system libhdf5 requirement.
 - **GPU:** `scx-gpu` compiles without CUDA installed; runtime falls back to CPU when no GPU is present. CI's `build-cpu-only` job pins this contract.
 - **GDS** (GPUDirect Storage) needs local NVMe + nvidia-fs + ext4/XFS; always has a CPU fallback.

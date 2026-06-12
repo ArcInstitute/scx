@@ -41,7 +41,7 @@ cargo test --workspace --features cloud
 cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v
 
 # Python bindings with cloud or GPU:
-cd pyscx && ../.venv/bin/maturin develop --features cloud,gpu && ../.venv/bin/pytest tests/ -v
+cd pyscx && ../.venv/bin/maturin develop --features hdf5,cloud,gpu && ../.venv/bin/pytest tests/ -v
 
 # R bindings:
 cd rscx && R CMD INSTALL .

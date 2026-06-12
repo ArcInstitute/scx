@@ -41,6 +41,14 @@ every CUDA Toolkit 12.x install, so no new runtime library path or env-var
 setup is required — any working `scx-gpu` env from prior releases continues
 to work out of the box.
 
+> **Build note — always keep `hdf5` in `--features`.** maturin's `--features`
+> flag **replaces** the `[tool.maturin]` default feature set (which includes
+> `hdf5`); it is *not* additive. Every build command below uses
+> `--features hdf5,gpu` for this reason. If you drop `hdf5` (e.g.
+> `--features gpu`), `pyscx.from_h5ad` / `to_h5ad` raise `NotImplementedError`
+> — and because the editable `.so` is shared across every env pointing at the
+> checkout, that one rebuild disables h5ad I/O for all of them.
+
 ## Option A: conda (recommended)
 
 Conda is the easiest way to get a working GPU environment because it resolves
@@ -87,7 +95,7 @@ pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
 
 # 4. Build pyscx with GPU support — INTO this env (rapids-singlecell must be
 #    importable from the same interpreter that imports pyscx)
-cd pyscx && maturin develop --release --features gpu
+cd pyscx && maturin develop --release --features hdf5,gpu
 
 # 5. Verify — both halves must be present, not just the GPU build
 python -c "import pyscx; print('GPU build:', pyscx.accel.gpu_available())"
@@ -147,7 +155,7 @@ nvcc --version
 # Create venv and build
 uv venv .venv
 uv pip install maturin numpy scipy pyarrow anndata
-cd pyscx && ../.venv/bin/maturin develop --release --features gpu
+cd pyscx && ../.venv/bin/maturin develop --release --features hdf5,gpu
 ```
 
 ## Option C: container
@@ -188,7 +196,7 @@ apt update && apt install -y python3 python3-pip curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
 pip install maturin numpy scipy pyarrow anndata
-cd pyscx && maturin develop --release --features gpu
+cd pyscx && maturin develop --release --features hdf5,gpu
 ```
 
 ### Apptainer / Singularity (HPC)
@@ -231,7 +239,7 @@ A dedicated, slimmer environment spec is published at
 ```bash
 conda env create -f benchmarks/comprehensive/envs/scx-gpu-analysis.yml
 conda activate scx-gpu-analysis
-cd pyscx && maturin develop --release --features gpu && cd ..
+cd pyscx && maturin develop --release --features hdf5,gpu && cd ..
 ```
 
 For most users the simplest route is the conda-forge package, as in
@@ -334,7 +342,7 @@ export PATH="${CONDA_PREFIX}/bin:$PATH"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
 cd /path/to/scx
-cd pyscx && maturin develop --release --features gpu && cd ..
+cd pyscx && maturin develop --release --features hdf5,gpu && cd ..
 
 python my_analysis.py
 ```
@@ -353,7 +361,7 @@ module load python/3.12
 nvcc --version
 
 cd /path/to/scx
-cd pyscx && maturin develop --release --features gpu && cd ..
+cd pyscx && maturin develop --release --features hdf5,gpu && cd ..
 
 python my_analysis.py
 ```
@@ -435,7 +443,7 @@ module load cuda/12.2
 
 # Then rebuild
 cargo clean -p scx-gpu
-cd pyscx && maturin develop --release --features gpu
+cd pyscx && maturin develop --release --features hdf5,gpu
 ```
 
 ### `pyscx.accel.gpu_available()` returns `False`

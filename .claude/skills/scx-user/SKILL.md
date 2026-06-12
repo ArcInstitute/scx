@@ -306,7 +306,7 @@ export PATH=\$SCX_REPO/.venv/bin:\$PATH
 
 # Pyscx must be built with GPU support; do it inside the job so the active
 # .venv/ matches the active GPU/driver.
-( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features gpu )
+( cd "\$SCX_REPO/pyscx" && ../.venv/bin/maturin develop --release --features hdf5,gpu )
 
 ( cd "\$SCX_REPO" && cargo build --release -p scx-cli --features hdf5 )
 "\$SCX_REPO/target/release/scx" convert \\
