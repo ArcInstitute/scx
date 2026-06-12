@@ -98,24 +98,7 @@ pub(crate) fn resolve_modality_type(
 /// emit a [`crate::ConvertWarning::ModalityTypeInferred`] so the
 /// inference is visible in provenance.
 pub(crate) fn infer_modality_type_from_name(name: &str) -> ModalityType {
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("atac") || lower.contains("peak") || lower.contains("accessibility") {
-        ModalityType::Atac
-    } else if lower.contains("adt")
-        || lower.contains("protein")
-        || lower.contains("antibody")
-        || lower.contains("prot")
-    {
-        ModalityType::Protein
-    } else if lower.contains("spatial") {
-        ModalityType::Spatial
-    } else if lower.contains("methyl") {
-        ModalityType::Methylation
-    } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
-        ModalityType::Rna
-    } else {
-        ModalityType::Custom
-    }
+    ModalityType::infer_from_name(name)
 }
 
 /// Convert an h5mu file to a multimodal SCX v2 file.

@@ -1085,29 +1085,13 @@ pub(crate) fn filter_obs_by_deletion_vectors(
     reader: &ScxReader,
     obs: arrow::array::RecordBatch,
 ) -> PyResult<arrow::array::RecordBatch> {
-    let dv_opt = reader.read_deletion_vectors().map_err(to_pyerr)?;
-    let dv = match dv_opt {
-        Some(dv) if dv.total_deleted() > 0 => dv,
-        _ => return Ok(obs), // No deletions — return as-is
+    // Shared obs-indexed keep mask (same logic as the reader CSR filter,
+    // `scx compact`, and the streaming export); see
+    // `ScxReader::deletion_keep_mask`.
+    let keep = match reader.deletion_keep_mask().map_err(to_pyerr)? {
+        Some(keep) => keep,
+        None => return Ok(obs), // No deletions — return as-is
     };
-
-    let n_obs = obs.num_rows();
-    let shards = reader.catalog().shards_sorted();
-
-    // Build keep mask (same logic as reader.read_all_csr_shards_filtered)
-    let mut keep = vec![true; n_obs];
-    for (shard_idx, shard_entry) in shards.iter().enumerate() {
-        if let Some(ref stats) = shard_entry.stats {
-            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                for local_row in bitmap.iter() {
-                    let global_row = stats.row_start + local_row as u64;
-                    if (global_row as usize) < n_obs {
-                        keep[global_row as usize] = false;
-                    }
-                }
-            }
-        }
-    }
 
     let bool_array = arrow::array::BooleanArray::from(keep);
     arrow::compute::filter_record_batch(&obs, &bool_array)

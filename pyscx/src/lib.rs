@@ -20,49 +20,34 @@ use pyo3::prelude::*;
 
 use experiment::PyExperiment;
 use query::{PyQueryPipeline, PyQueryResult};
-use scx_format_io::ScxError;
+use scx_format_io::{ScxError, ScxErrorClass};
 
 /// Convert an ScxError into the most appropriate Python exception.
 ///
 /// User-input format errors → ValueError; missing files → FileNotFoundError;
 /// permission errors → PermissionError; everything else → RuntimeError.
 pub(crate) fn to_pyerr(e: ScxError) -> PyErr {
+    use std::io::ErrorKind;
     let msg = e.to_string();
-    match &e {
-        ScxError::InconsistentCsr
-        | ScxError::NVarsOverflow(_)
-        | ScxError::BlockRowsOverflow(_)
-        | ScxError::BlockNnzOverflow(_) => PyValueError::new_err(msg),
-        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
-            PyFileNotFoundError::new_err(msg)
-        }
-        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied => {
-            PyPermissionError::new_err(msg)
-        }
-        // A truncated / too-short file is a corruption signal, not a
-        // transient runtime failure — surface it as ValueError.
-        ScxError::Io(io_err) if io_err.kind() == std::io::ErrorKind::UnexpectedEof => {
-            PyValueError::new_err(format!(
-                "{msg} — the file appears truncated or is not a valid SCX file"
-            ))
-        }
+    match e.class() {
+        // Bad input / inconsistent data (incl. the stale-sidecar error, whose
+        // message already names the fix `scx build-csc` / `--rebuild-csc`).
+        ScxErrorClass::Validation => PyValueError::new_err(msg),
         // File looks corrupt or was written by an incompatible/newer SCX.
         // ValueError (not RuntimeError) so callers can distinguish a bad
         // file from a transient runtime failure.
-        ScxError::InvalidMagic
-        | ScxError::InvalidShardMagic
-        | ScxError::UnsupportedVersion
-        | ScxError::UnsupportedEndian
-        | ScxError::UnsupportedSectionVersion { .. }
-        | ScxError::ChecksumMismatch { .. }
-        | ScxError::InvalidCatalog(_) => PyValueError::new_err(format!(
+        ScxErrorClass::CorruptFile => PyValueError::new_err(format!(
             "{msg} — the file appears corrupt or was written by an incompatible \
              SCX version; re-run conversion to regenerate it"
         )),
-        // The stale-sidecar error message already names the fix
-        // (`scx build-csc` / `--rebuild-csc`); surface it as a ValueError.
-        ScxError::StaleCscSidecar { .. } => PyValueError::new_err(msg),
-        _ => PyRuntimeError::new_err(msg),
+        ScxErrorClass::Io(ErrorKind::NotFound) => PyFileNotFoundError::new_err(msg),
+        ScxErrorClass::Io(ErrorKind::PermissionDenied) => PyPermissionError::new_err(msg),
+        // A truncated / too-short file is a corruption signal, not a
+        // transient runtime failure — surface it as ValueError.
+        ScxErrorClass::Io(ErrorKind::UnexpectedEof) => PyValueError::new_err(format!(
+            "{msg} — the file appears truncated or is not a valid SCX file"
+        )),
+        ScxErrorClass::Io(_) | ScxErrorClass::Other => PyRuntimeError::new_err(msg),
     }
 }
 

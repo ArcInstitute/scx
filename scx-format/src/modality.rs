@@ -68,6 +68,34 @@ impl ModalityType {
             _ => None,
         }
     }
+
+    /// Heuristically map a modality name to a `ModalityType`. Used when the
+    /// caller has not supplied an explicit override; the recognised tokens
+    /// follow the conventions adopted by scverse / 10x for CITE-seq and
+    /// multiome files. This is the single source of truth shared by the
+    /// h5mu conversion pipeline and the `pyscx` / `rscx` bindings — callers
+    /// that fall through to it should record the inference (e.g.
+    /// `ConvertWarning::ModalityTypeInferred`) so it is visible in provenance.
+    pub fn infer_from_name(name: &str) -> Self {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains("atac") || lower.contains("peak") || lower.contains("accessibility") {
+            Self::Atac
+        } else if lower.contains("adt")
+            || lower.contains("protein")
+            || lower.contains("antibody")
+            || lower.contains("prot")
+        {
+            Self::Protein
+        } else if lower.contains("spatial") {
+            Self::Spatial
+        } else if lower.contains("methyl") {
+            Self::Methylation
+        } else if lower == "rna" || lower == "gex" || lower.contains("expression") {
+            Self::Rna
+        } else {
+            Self::Custom
+        }
+    }
 }
 
 /// Per-modality flag bits stored in `ModalityInfo.flags`. Provides

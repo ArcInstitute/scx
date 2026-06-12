@@ -152,6 +152,36 @@ impl DeletionVectors {
         self.shards.values().map(|bm| bm.len()).sum()
     }
 
+    /// Build a per-row keep mask of length `n_obs` (`true` = retained) by
+    /// translating each shard's local deletion bitmap to global rows.
+    ///
+    /// The shard order is the CSR sort order from
+    /// [`crate::FullCatalog::shards_sorted`], and local rows map to global
+    /// rows via the per-shard `stats.row_start`. This is the single source
+    /// of truth for deletion-vector row filtering shared by the reader,
+    /// the h5ad/h5mu streaming export, `scx compact`, and the `pyscx`
+    /// obs filter — keeping all of them byte-for-byte consistent.
+    ///
+    /// No early-out for an empty deletion set: callers that want to skip the
+    /// allocation when nothing is deleted should check
+    /// [`Self::total_deleted`] (or [`crate::ScxReader::deletion_keep_mask`]).
+    pub fn build_keep_mask(&self, n_obs: usize, catalog: &crate::FullCatalog) -> Vec<bool> {
+        let mut keep = vec![true; n_obs];
+        for (shard_idx, entry) in catalog.shards_sorted().iter().enumerate() {
+            if let Some(stats) = entry.stats.as_ref() {
+                if let Some(bitmap) = self.shards.get(&(shard_idx as u32)) {
+                    for local_row in bitmap.iter() {
+                        let global_row = stats.row_start + local_row as u64;
+                        if (global_row as usize) < n_obs {
+                            keep[global_row as usize] = false;
+                        }
+                    }
+                }
+            }
+        }
+        keep
+    }
+
     /// Merge another DeletionVectors into this one.
     /// For matching shard_ids, bitmaps are OR-merged. New shard_ids are inserted.
     pub fn merge(&mut self, other: &DeletionVectors) {

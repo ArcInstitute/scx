@@ -133,6 +133,57 @@ pub enum ScxError {
     },
 }
 
+/// Coarse semantic category of an [`ScxError`], used by the language
+/// bindings to choose how to surface an error without each binding
+/// re-matching every `ScxError` variant.
+///
+/// The categories intentionally collapse many variants into a handful of
+/// buckets that map cleanly onto host-language error conventions
+/// (e.g. Python `ValueError` / `FileNotFoundError` / `RuntimeError`).
+/// Message wording remains the binding's responsibility — this only
+/// decides the *kind* of failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScxErrorClass {
+    /// Bad user input or internally inconsistent data (not a file-format
+    /// corruption signal): inconsistent CSR, overflowing dimensions, a
+    /// stale CSC sidecar.
+    Validation,
+    /// The file is corrupt or was written by an incompatible/newer SCX:
+    /// bad magic, unsupported version/endianness/section version, checksum
+    /// mismatch, or an invalid catalog.
+    CorruptFile,
+    /// An underlying I/O failure; forwards the [`std::io::ErrorKind`] so the
+    /// binding can distinguish missing-file / permission / truncation cases.
+    Io(std::io::ErrorKind),
+    /// Anything not covered above; bindings should treat as a generic
+    /// runtime failure.
+    Other,
+}
+
+impl ScxError {
+    /// Classify this error into a coarse [`ScxErrorClass`]. Used by the
+    /// `pyscx` / `rscx` bindings so the variant→category decision lives in
+    /// one place instead of being re-spelled per binding.
+    pub fn class(&self) -> ScxErrorClass {
+        match self {
+            ScxError::InconsistentCsr
+            | ScxError::NVarsOverflow(_)
+            | ScxError::BlockRowsOverflow(_)
+            | ScxError::BlockNnzOverflow(_)
+            | ScxError::StaleCscSidecar { .. } => ScxErrorClass::Validation,
+            ScxError::InvalidMagic
+            | ScxError::InvalidShardMagic
+            | ScxError::UnsupportedVersion
+            | ScxError::UnsupportedEndian
+            | ScxError::UnsupportedSectionVersion { .. }
+            | ScxError::ChecksumMismatch { .. }
+            | ScxError::InvalidCatalog(_) => ScxErrorClass::CorruptFile,
+            ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
+            _ => ScxErrorClass::Other,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ScxError>;
 
 /// Validate that a requested allocation does not exceed the remaining
@@ -150,4 +201,88 @@ pub fn validate_allocation(requested: usize, section_remaining: usize) -> Result
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn class_buckets_variants_as_expected() {
+        // Validation
+        assert_eq!(ScxError::InconsistentCsr.class(), ScxErrorClass::Validation);
+        assert_eq!(
+            ScxError::NVarsOverflow(1 << 33).class(),
+            ScxErrorClass::Validation
+        );
+        assert_eq!(
+            ScxError::BlockRowsOverflow(70000).class(),
+            ScxErrorClass::Validation
+        );
+        assert_eq!(
+            ScxError::BlockNnzOverflow(1 << 33).class(),
+            ScxErrorClass::Validation
+        );
+        assert_eq!(
+            ScxError::StaleCscSidecar {
+                built_generation: 1,
+                data_generation: 2,
+            }
+            .class(),
+            ScxErrorClass::Validation
+        );
+
+        // CorruptFile
+        assert_eq!(ScxError::InvalidMagic.class(), ScxErrorClass::CorruptFile);
+        assert_eq!(
+            ScxError::InvalidShardMagic.class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnsupportedVersion.class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnsupportedEndian.class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnsupportedSectionVersion {
+                section: "catalog",
+                found: 9,
+                expected: 1,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::ChecksumMismatch {
+                section: "X".into(),
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::InvalidCatalog("bad".into()).class(),
+            ScxErrorClass::CorruptFile
+        );
+
+        // Io forwards the kind
+        assert_eq!(
+            ScxError::Io(std::io::Error::from(ErrorKind::NotFound)).class(),
+            ScxErrorClass::Io(ErrorKind::NotFound)
+        );
+        assert_eq!(
+            ScxError::Io(std::io::Error::from(ErrorKind::PermissionDenied)).class(),
+            ScxErrorClass::Io(ErrorKind::PermissionDenied)
+        );
+
+        // Other catch-all
+        assert_eq!(
+            ScxError::WriterAlreadyFinished.class(),
+            ScxErrorClass::Other
+        );
+        assert_eq!(ScxError::UnknownCodec(99).class(), ScxErrorClass::Other);
+    }
 }

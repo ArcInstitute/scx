@@ -1004,34 +1004,9 @@ fn precompute_total_nnz(
 }
 
 pub(crate) fn build_keep_mask(reader: &ScxReader) -> Result<Option<Vec<bool>>, ConvertError> {
-    if !reader.header().has_deletion_vectors() {
-        return Ok(None);
-    }
-    let dv = match reader.read_deletion_vectors()? {
-        Some(dv) if dv.total_deleted() > 0 => dv,
-        _ => return Ok(None),
-    };
-
-    // Mirror `filter_csr_rows_by_deletion_vectors` (`reader.rs:1429`):
-    // shard order = `shards_sorted()` (CSR), local rows from the
-    // deletion-vector bitmap are translated to global rows via
-    // `stats.row_start`.
-    let n_obs = reader.n_obs() as usize;
-    let shards = reader.catalog().shards_sorted();
-    let mut keep = vec![true; n_obs];
-    for (shard_idx, entry) in shards.iter().enumerate() {
-        if let Some(stats) = entry.stats.as_ref() {
-            if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                for local_row in bitmap.iter() {
-                    let global_row = stats.row_start + local_row as u64;
-                    if (global_row as usize) < n_obs {
-                        keep[global_row as usize] = false;
-                    }
-                }
-            }
-        }
-    }
-    Ok(Some(keep))
+    // Shared with the reader CSR filter, `scx compact`, and the pyscx obs
+    // filter: see `ScxReader::deletion_keep_mask`.
+    Ok(reader.deletion_keep_mask()?)
 }
 
 fn create_csr_triplet(
