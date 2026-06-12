@@ -880,6 +880,33 @@ class TestDEBridgeParity:
         for col in ["fold_change", "p_value", "fdr", "log2_fold_change", "abs_log2_fold_change"]:
             assert df[col].dtype == pl.Float64, f"{col} should be Float64, got {df[col].dtype}"
 
+    def test_de_dataframe_output_pandas(self):
+        """F6: rank_genes_groups_df supports output='pandas' — a pandas
+        DataFrame with identical columns/values to the polars default."""
+        import pandas as pd
+
+        adata_real, _ = _make_cell_eval_adata(n_obs=200, n_vars=50, n_perts=4)
+
+        df_pl = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control", output="polars",
+        )
+        df_pd = pyscx.accel.rank_genes_groups_df(
+            adata_real, "perturbation", reference="control", output="pandas",
+        )
+        assert isinstance(df_pd, pd.DataFrame)
+        # Same column names + order.
+        assert list(df_pd.columns) == list(df_pl.columns)
+        # Values identical to the polars result.
+        pd.testing.assert_frame_equal(
+            df_pd.reset_index(drop=True),
+            df_pl.to_pandas().reset_index(drop=True),
+        )
+        # Unknown output value is rejected.
+        with pytest.raises(ValueError):
+            pyscx.accel.rank_genes_groups_df(
+                adata_real, "perturbation", reference="control", output="bogus",
+            )
+
     def test_de_bridge_feeds_cell_eval_metrics(self):
         """Verify DE bridge output can be consumed by cell-eval DE metrics.
 
