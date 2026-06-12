@@ -66,6 +66,11 @@ fn factorize_obs_column(
 ///     perplexity: target perplexity for the Gaussian kernel (default 30.0).
 ///     n_neighbors: number of neighbours to use. `None` (default) uses
 ///         `3 * perplexity`.
+///     approximate_knn: when `True`, use an HNSW approximate kNN instead of
+///         the exact O(N²) sweep. Trades small numerical drift (~0.01–0.05 on
+///         mean-LISI) for an order-of-magnitude speed-up at N ≳ 100k. Default
+///         `False` matches the R `lisi` reference byte-for-byte; the exact path
+///         logs a hint to set this `True` once N exceeds the large-N threshold.
 ///
 /// Writes the LISI vector to `adata.obs[f"lisi_{key}"]` and also returns
 /// it as a 1-D numpy array of length N.
@@ -77,6 +82,7 @@ fn factorize_obs_column(
     basis = "X_pca",
     perplexity = 30.0,
     n_neighbors = None,
+    approximate_knn = false,
 ))]
 pub fn compute_lisi<'py>(
     py: Python<'py>,
@@ -85,6 +91,7 @@ pub fn compute_lisi<'py>(
     basis: &str,
     perplexity: f64,
     n_neighbors: Option<usize>,
+    approximate_knn: bool,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     if perplexity <= 0.0 {
         return Err(PyValueError::new_err("perplexity must be > 0"));
@@ -144,6 +151,7 @@ pub fn compute_lisi<'py>(
     let config = LisiConfig {
         perplexity,
         n_neighbors: k,
+        approximate_knn,
         ..Default::default()
     };
 

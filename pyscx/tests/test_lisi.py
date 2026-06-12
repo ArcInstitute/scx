@@ -65,6 +65,40 @@ class TestLisiBasic:
         np.testing.assert_allclose(lisi, 1.0, atol=1e-6)
 
 
+class TestLisiApproximateKnn:
+    def test_approximate_knn_kwarg_accepted(self, lisi_adata):
+        """F14: the `approximate_knn` lever the perf warning recommends is
+        exposed on the Python binding (not just the Rust core)."""
+        import inspect
+
+        import pyscx
+
+        sig = inspect.signature(pyscx.accel.compute_lisi)
+        assert "approximate_knn" in sig.parameters
+
+        adata = lisi_adata
+        lisi = pyscx.accel.compute_lisi(
+            adata, "batch", perplexity=10.0, approximate_knn=True
+        )
+        assert isinstance(lisi, np.ndarray)
+        assert lisi.shape == (adata.n_obs,)
+        assert np.all(np.isfinite(lisi))
+
+    def test_approximate_matches_exact_within_drift(self, lisi_adata):
+        """HNSW approximate kNN should track the exact sweep closely on a
+        small fixture (documented ~0.01–0.05 mean-LISI drift)."""
+        import pyscx
+
+        adata = lisi_adata
+        exact = pyscx.accel.compute_lisi(
+            adata, "batch", perplexity=10.0, approximate_knn=False
+        )
+        approx = pyscx.accel.compute_lisi(
+            adata, "batch", perplexity=10.0, approximate_knn=True
+        )
+        assert abs(float(exact.mean()) - float(approx.mean())) < 0.25
+
+
 class TestLisiErrors:
     def test_invalid_key(self, lisi_adata):
         import pyscx

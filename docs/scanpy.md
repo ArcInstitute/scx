@@ -1255,7 +1255,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
-| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`                           | —                                              |
+| `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | —   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format` |
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format` |
 
@@ -1791,17 +1791,25 @@ print(adata.obs["lisi_batch"].describe())
 | `key` | (required) | `obs` column with the categorical label to score. |
 | `basis` | `"X_pca"` | `obsm` key for the embedding to compute neighbourhoods over. |
 | `perplexity` | `30.0` | Gaussian-kernel target perplexity (t-SNE-style bandwidth search). |
-| `n_neighbors` | `None` | k for the exact kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `n_neighbors` | `None` | k for the kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `approximate_knn` | `False` | Use HNSW approximate kNN instead of the exact O(N²) sweep. ~10× faster at N ≳ 100k, with ~0.01–0.05 mean-LISI drift. |
 
 Returns a `numpy.ndarray` of length N and also writes the values to
 `adata.obs[f"lisi_{key}"]`.
 
-The implementation uses an exact brute-force kNN (per-row squared-norm
-expansion + per-cell top-k heap) to stay numerically in lockstep with
-the R `lisi` reference. On D1–D4 it is **~10× faster** than
+By default the implementation uses an exact brute-force kNN (per-row
+squared-norm expansion + per-cell top-k heap) to stay numerically in
+lockstep with the R `lisi` reference. On D1–D4 it is **~10× faster** than
 R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
-Brute-force kNN is O(N²·d); at census scale (D5+) you'd want to pair
-this with an HNSW-approximate kNN step instead.
+Brute-force kNN is O(N²·d); above ~50k cells the exact path logs a hint
+to set `approximate_knn=True`, which swaps in an HNSW kNN for an
+order-of-magnitude speed-up at census scale (D5+) at the cost of small
+numerical drift (~0.01–0.05 on mean LISI).
+
+```python
+# Census-scale: avoid the O(N²) exact sweep.
+lisi = pyscx.accel.compute_lisi(adata, "batch", approximate_knn=True)
+```
 
 ### Gene-set scoring (`pyscx.accel.score_genes`)
 
