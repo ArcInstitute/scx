@@ -3540,6 +3540,7 @@ name = "scx-convert"
 version = "0.8.1"
 dependencies = [
  "arrow",
+ "base64",
  "byteorder",
  "chrono",
  "crossbeam-channel",

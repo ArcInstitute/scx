@@ -2047,3 +2047,222 @@ fn test_obs_float16_column_upcasts_to_f32() {
         .to_vec();
     assert_eq!(got, vals_f32, "f16 obs column corrupted on upcast");
 }
+
+/// B6: `uns` float scalars/arrays containing NaN/Inf round-trip exactly
+/// (via the tagged base64 envelope) instead of silently degrading to
+/// `null`/`0.0`; the source dtype width is preserved too.
+#[test]
+fn uns_nonfinite_floats_round_trip() {
+    use hdf5::types::{FloatSize, TypeDescriptor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("naninf.h5ad");
+    let scx_path = dir.path().join("naninf.scx");
+    let h5ad_out = dir.path().join("naninf_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    let arr_f64 = vec![1.0_f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0];
+    let arr_f32 = vec![1.5_f32, f32::NAN, -3.25];
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        uns.new_dataset::<f64>()
+            .shape(())
+            .create("inf_scalar")
+            .unwrap()
+            .write_scalar(&f64::INFINITY)
+            .unwrap();
+        uns.new_dataset::<f64>()
+            .shape(())
+            .create("nan_scalar")
+            .unwrap()
+            .write_scalar(&f64::NAN)
+            .unwrap();
+        uns.new_dataset::<f64>()
+            .shape([arr_f64.len()])
+            .create("naninf_1d")
+            .unwrap()
+            .write(&arr_f64)
+            .unwrap();
+        uns.new_dataset::<f32>()
+            .shape([arr_f32.len()])
+            .create("naninf_f32")
+            .unwrap()
+            .write(&arr_f32)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+
+    let inf: f64 = uns.dataset("inf_scalar").unwrap().read_scalar().unwrap();
+    assert!(inf.is_infinite() && inf > 0.0, "inf scalar lost: {inf}");
+    let nan: f64 = uns.dataset("nan_scalar").unwrap().read_scalar().unwrap();
+    assert!(nan.is_nan(), "nan scalar lost: {nan}");
+
+    let got: Vec<f64> = uns
+        .dataset("naninf_1d")
+        .unwrap()
+        .read_1d::<f64>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(got.len(), arr_f64.len());
+    assert_eq!(got[0], 1.0);
+    assert!(got[1].is_nan(), "elem 1 should be NaN: {got:?}");
+    assert!(got[2].is_infinite() && got[2] > 0.0, "elem 2 +Inf: {got:?}");
+    assert!(got[3].is_infinite() && got[3] < 0.0, "elem 3 -Inf: {got:?}");
+    assert_eq!(got[4], 2.0);
+
+    // f32 source keeps its width (envelope carries the exact dtype).
+    let f32_ds = uns.dataset("naninf_f32").unwrap();
+    assert_eq!(
+        f32_ds.dtype().unwrap().to_descriptor().unwrap(),
+        TypeDescriptor::Float(FloatSize::U4),
+        "f32 uns array width not preserved"
+    );
+    let got_f32: Vec<f32> = f32_ds.read_1d::<f32>().unwrap().to_vec();
+    assert_eq!(got_f32[0], 1.5);
+    assert!(got_f32[1].is_nan());
+    assert_eq!(got_f32[2], -3.25);
+}
+
+/// B7: a 3-D `uns` array (no 1-D/2-D JSON form) round-trips with exact
+/// shape and values via the tagged envelope, instead of being dropped.
+#[test]
+fn uns_3d_arrays_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("nd.h5ad");
+    let scx_path = dir.path().join("nd.scx");
+    let h5ad_out = dir.path().join("nd_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    let i64_3d = ndarray::Array::from_shape_vec((2, 3, 4), (0..24i64).collect::<Vec<_>>()).unwrap();
+    let f64_3d = ndarray::Array::from_shape_vec(
+        (2, 2, 2),
+        (0..8).map(|i| i as f64 * 0.5).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        uns.new_dataset::<i64>()
+            .shape([2, 3, 4])
+            .create("arr_3d_i64")
+            .unwrap()
+            .write(&i64_3d)
+            .unwrap();
+        uns.new_dataset::<f64>()
+            .shape([2, 2, 2])
+            .create("arr_3d_f64")
+            .unwrap()
+            .write(&f64_3d)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+    assert_eq!(
+        sink.counts().get("skipped_uns_key").copied().unwrap_or(0),
+        0,
+        "3-D uns arrays should be preserved, not skipped: {:?}",
+        sink.counts()
+    );
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+
+    let got_i: ndarray::ArrayD<i64> = uns.dataset("arr_3d_i64").unwrap().read_dyn().unwrap();
+    assert_eq!(got_i.shape(), &[2, 3, 4], "3-D int shape lost");
+    assert_eq!(got_i, i64_3d.into_dyn(), "3-D int values garbled");
+
+    let got_f: ndarray::ArrayD<f64> = uns.dataset("arr_3d_f64").unwrap().read_dyn().unwrap();
+    assert_eq!(got_f.shape(), &[2, 2, 2], "3-D float shape lost");
+    assert_eq!(got_f, f64_3d.into_dyn(), "3-D float values garbled");
+}
+
+/// B8: a scipy-sparse matrix in `uns` (encoding-type="csr_matrix") emits a
+/// `FlattenedUnsSparse` warning (no longer silent); its arrays still survive
+/// as a dict.
+#[test]
+fn uns_sparse_matrix_emits_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("sp.h5ad");
+    let scx_path = dir.path().join("sp.scx");
+    let h5ad_out = dir.path().join("sp_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        let sp = uns.create_group("sparse_uns").unwrap();
+        sp.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        let indptr: Vec<i32> = vec![0, 1, 2, 2, 3];
+        let indices: Vec<i32> = vec![0, 2, 1];
+        let data: Vec<f64> = vec![1.0, 2.0, 3.0];
+        sp.new_dataset::<i32>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        sp.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        sp.new_dataset::<f64>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        let shape = [4i64, 3i64];
+        sp.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&shape)
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let mut sink = WarningSink::log();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut sink).unwrap();
+    assert_eq!(
+        sink.counts()
+            .get("flattened_uns_sparse")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "scipy-sparse uns should emit one FlattenedUnsSparse warning: {:?}",
+        sink.counts()
+    );
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    // The component arrays still survive (as a plain dict / subgroup).
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let recovered: Vec<f64> = out
+        .group("uns")
+        .unwrap()
+        .group("sparse_uns")
+        .unwrap()
+        .dataset("data")
+        .unwrap()
+        .read_1d::<f64>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(recovered, vec![1.0, 2.0, 3.0], "sparse data arrays lost");
+}
