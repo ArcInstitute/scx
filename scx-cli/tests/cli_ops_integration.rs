@@ -339,6 +339,83 @@ fn test_query_count() {
     assert_eq!(stdout.trim(), "4");
 }
 
+// F9: `scx query` accepts the obs predicate via `--filter` (consistent with
+// `scx subset` / `scx delete`), in addition to the positional form. Both
+// spellings must produce identical results.
+#[test]
+fn test_query_count_filter_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "query_filter_flag.scx", 12, 10);
+
+    let output = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--filter",
+            "cell_type == 'T cell'",
+            "--count",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "query --filter --count failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "4",
+        "--filter must match the positional form"
+    );
+}
+
+// F9: omitting the predicate entirely yields an actionable error that names
+// both the positional and `--filter` spellings (not an opaque clap usage dump).
+#[test]
+fn test_query_missing_filter_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "query_no_filter.scx", 12, 10);
+
+    let output = scx_cli()
+        .args(["query", path.to_str().unwrap(), "--count"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "query with no predicate must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--filter") && stderr.contains("missing obs predicate"),
+        "error must name both spellings, got: {stderr}"
+    );
+}
+
+// F9: supplying the predicate both positionally and via `--filter` is rejected
+// by clap (`conflicts_with`).
+#[test]
+fn test_query_both_filter_forms_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "query_both_filters.scx", 12, 10);
+
+    let output = scx_cli()
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "cell_type == 'T cell'",
+            "--filter",
+            "cell_type == 'B cell'",
+            "--count",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "supplying both positional and --filter must fail"
+    );
+}
+
 // CLI6 regression: `--count` reports the true match count and is NOT capped
 // by `--limit` (which is output-only). Previously `--count --limit 1` printed
 // `min(matched, 1) = 1`.

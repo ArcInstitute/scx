@@ -470,8 +470,14 @@ enum Commands {
     Query {
         /// SCX file path or cloud URL (e.g. `gs://bucket/atlas.scxd/`)
         source: String,
-        /// Obs predicate expression
-        filter: String,
+        /// Obs predicate expression (positional). Alternatively pass it via
+        /// `--filter` to match `scx subset` / `scx delete`. Provide one form,
+        /// not both.
+        filter: Option<String>,
+        /// Obs predicate expression (flag form, consistent with
+        /// `scx subset` / `scx delete`).
+        #[arg(long = "filter", value_name = "EXPR", conflicts_with = "filter")]
+        filter_flag: Option<String>,
         /// Print matching cell count only
         #[arg(long)]
         count: bool,
@@ -881,6 +887,7 @@ fn main() {
         Commands::Query {
             source,
             filter,
+            filter_flag,
             count,
             output,
             select_genes,
@@ -889,18 +896,32 @@ fn main() {
             limit,
             json,
             explain,
-        } => query::run_query(
-            &source,
-            &filter,
-            count,
-            output.as_deref(),
-            select_genes.as_deref(),
-            normalize,
-            log1p,
-            limit,
-            json,
-            explain,
-        ),
+        } => {
+            // The predicate may be given positionally (back-compat) or via
+            // `--filter` (consistent with `scx subset` / `scx delete`). clap's
+            // `conflicts_with` rejects supplying both; handle the "neither"
+            // case here with an actionable message naming both spellings.
+            match filter.or(filter_flag) {
+                Some(predicate) => query::run_query(
+                    &source,
+                    &predicate,
+                    count,
+                    output.as_deref(),
+                    select_genes.as_deref(),
+                    normalize,
+                    log1p,
+                    limit,
+                    json,
+                    explain,
+                ),
+                None => Err("scx query: missing obs predicate.\n\
+                     Pass it positionally:  scx query <SOURCE> \"<EXPR>\"\n\
+                     or via the flag:        scx query <SOURCE> --filter \"<EXPR>\"\n\
+                     (the --filter spelling matches `scx subset` / `scx delete`).\n\
+                     Example: scx query atlas.scx \"disease == 'normal'\" --count"
+                    .into()),
+            }
+        }
         Commands::Benchmark {
             file,
             compare_h5ad,
