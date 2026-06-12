@@ -62,6 +62,20 @@ pub struct LoaderConfig {
     pub log1p: bool,
     /// Normalization target sum (default: 1e4).
     pub target_sum: f64,
+    /// Apply PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026)
+    /// instead of normalize/log1p (default: false).
+    ///
+    /// PFlog1pPF is itself a normalization, so it is **mutually exclusive**
+    /// with `normalize`/`log1p`: when `true` it takes precedence and those
+    /// flags are ignored. Per cell it computes
+    /// `z_ij = log1p(x_ij/(c·s_i)) − (1/D)·Σ_k log1p(x_ik/(c·s_i))`, where the
+    /// depth `s_i` and centering denominator `D` are over the **full
+    /// transcriptome** (not the HVG-projected panel — see
+    /// [`crate::projection::HvgProjection::scatter_pflog1ppf_row`]).
+    pub pflog1ppf: bool,
+    /// PFlog1pPF shift / pseudocount `c` (default: 1.0; only used when
+    /// `pflog1ppf` is true).
+    pub pflog1ppf_c: f64,
     /// RNG seed for reproducibility.
     pub seed: u64,
     /// Memory budget in MB (default: 512).
@@ -101,6 +115,8 @@ impl Default for LoaderConfig {
             normalize: true,
             log1p: true,
             target_sum: 1e4,
+            pflog1ppf: false,
+            pflog1ppf_c: 1.0,
             seed: 42,
             max_memory_mb: 512,
             auto_memory_budget: false,
@@ -139,6 +155,21 @@ impl LoaderConfig {
             return Err(LoaderError::ConfigError {
                 reason: "target_sum must be > 0.0".to_string(),
             });
+        }
+        if self.pflog1ppf
+            && (self.pflog1ppf_c <= 0.0
+                || self.pflog1ppf_c.is_nan()
+                || self.pflog1ppf_c.is_infinite())
+        {
+            return Err(LoaderError::ConfigError {
+                reason: "pflog1ppf_c must be positive and finite".to_string(),
+            });
+        }
+        if self.pflog1ppf && (self.normalize || self.log1p) {
+            log::warn!(
+                "pflog1ppf=true takes precedence; normalize/log1p flags are ignored \
+                 (pflog1ppf is itself a normalization)"
+            );
         }
         if self.max_memory_mb < 64 {
             return Err(LoaderError::ConfigError {

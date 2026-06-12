@@ -1248,6 +1248,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
+| `pflog1ppf`              | ✓   | —   | — (no scanpy equivalent)                                             | `c`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
@@ -1877,6 +1878,58 @@ pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z"
 > (or an explicit `gene_pool`) not present in `adata.var_names` are dropped with
 > a `UserWarning`. Use `layer=` to score a named layer instead of `X`. CPU-only —
 > `device` is accepted for API symmetry but there is no GPU kernel.
+
+### PFlog1pPF normalization (`pyscx.accel.pflog1ppf`)
+
+PFlog1pPF (a.k.a. the **shifted centered-log-ratio** transform, Booeshaghi et
+al. 2026) is a depth-normalizing, variance-stabilizing transform with **no
+direct scanpy function**. Per cell, counts become within-cell proportions,
+are shifted by a pseudocount `c` (default `1`), log-transformed, and then
+centered by subtracting the within-cell mean:
+
+```
+z_ij = log(x_ij / s_i + c) − (1/D) Σ_k log(x_ik / s_i + c)
+```
+
+The exact output is **dense** (zeros map to a per-cell baseline), so a naïve
+materialization is `O(N·D)`. The accelerator avoids that by exploiting the
+decomposition `Z = delta + baseline·1ᵀ`, where `delta` is exactly the lazy
+`normalize_total(target_sum=1/c) → log1p` chain (sparse, same pattern as `X`)
+and `baseline_i = −(1/D) Σ_j delta_ij` is one float per cell. So the out-of-core
+PCA never densifies, and a compact on-disk form stores only `delta` + `baseline`.
+
+Operates on **raw counts** — run it on the raw-count `X`, not a normalized
+layer. Streams shard-by-shard, so it runs identically on in-memory, backed, and
+lazy `X` (a lazy `X` that already carries transforms is rejected).
+
+```python
+import pyscx
+
+adata = pyscx.open("pbmc.scx").to_anndata(backed=True)
+
+# Headline path: out-of-core baseline-aware PCA embedding.
+pyscx.accel.pflog1ppf(adata, c=1.0, store="pca", n_components=50)
+adata.obsm["X_pflog1ppf_pca"]      # cells × n_components
+adata.obs["pflog1ppf_baseline"]    # per-cell baseline (always written)
+
+# Precompute-once / train-many: stream the transform to a compact SCX file
+# (sparse `delta` + `baseline` obs column), then reconstruct exact dense rows.
+pyscx.accel.pflog1ppf(adata, store="dense", out="pbmc_pflog1ppf.scx")  # store_repr="delta_baseline"
+re = pyscx.open("pbmc_pflog1ppf.scx").to_anndata()
+Z = pyscx.accel.pflog1ppf_reconstruct(re)   # exact dense Z = delta + baseline[:, None]
+```
+
+> **Representations & codecs.** `store_repr="delta_baseline"` (default) is the
+> compact `O(M)` form — the `delta` layer is written as a sparse CSR with
+> **Pcodec** float values (the natural codec for log-ratios) and `baseline`
+> rides in `obs`; reconstruct with `pyscx.accel.pflog1ppf_reconstruct` (or feed
+> the file to `TrainingDataset` with its transform mode off). `store_repr="dense"`
+> writes the literal full-density `Z` as a CSR with **forced Zstd** values and a
+> small default `shard_size` (peak RAM per shard ≈ `2·shard_rows·n_vars·4 B`),
+> for downstream tools that need a plain dense layer — it is `O(N·D)` on disk, so
+> prefer the compact default at atlas scale. Without `out=`, `store="dense"`
+> materializes into `adata.layers[layer_out]` guarded by `dense_max_elems`.
+> CPU-only — `device` is accepted for API symmetry but there is no GPU kernel.
 
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 

@@ -68,6 +68,58 @@ scx_pca <- function(object, assay = NULL, layer = "data", features = NULL,
   invisible(object)
 }
 
+#' @describeIn scx-accelerators PFlog1pPF / shifted-CLR normalization
+#'   (Booeshaghi et al. 2026) returning a baseline-aware PCA embedding.
+#' @param c Shift / pseudocount (default `1` for PFlog1pPF).
+#'
+#' Operates on **raw counts** (hence `layer = "counts"`), not log-normalized
+#' data: counts are converted to within-cell proportions, shifted by `c`,
+#' log-transformed, then centered within each cell. The exact transform is
+#' dense but decomposes into a sparse `delta` plus a per-cell `baseline`, so
+#' PCA never densifies. For a `Seurat` object the embedding is written to the
+#' `reduction.name` reduction and the per-cell baseline to
+#' `object$pflog1ppf_baseline`. This is the **in-memory** R path; the
+#' streaming / atlas-scale out-of-core path is `pyscx`-only.
+#'
+#' Unlike [scx_pca], this does **not** accept a `features` argument: PFlog1pPF's
+#' per-cell depth `s_i` and centering denominator `D` are defined over the full
+#' transcriptome, so subsetting to variable features before the transform would
+#' silently change the statistic (and the stored `baseline`). The transform and
+#' its PCA are always computed over the full counts layer.
+#' @export
+scx_pflog1ppf <- function(object, assay = NULL, layer = "counts",
+                          c = 1.0, n_components = 50L, zero_center = TRUE,
+                          n_oversamples = 10L, n_power_iterations = 2L, seed = 0L,
+                          reduction.name = "pflog1ppf", reduction.key = "PFLOG1PPF_") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    # No feature subsetting: PFlog1pPF depth/centering must span the full
+    # transcriptome (see @describeIn note above).
+    mat <- .scx_layer_matrix(object, assay, layer)
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+  }
+
+  res <- scx_pflog1ppf_matrix(mat, c, n_components, zero_center,
+                              n_oversamples, n_power_iterations, seed)
+  if (!.is_seurat(object)) return(res)
+
+  rownames(res$embeddings) <- colnames(mat)
+  colnames(res$embeddings) <- paste0(reduction.key, seq_len(ncol(res$embeddings)))
+  rownames(res$loadings) <- rownames(mat)
+  colnames(res$loadings) <- colnames(res$embeddings)
+  red <- Seurat::CreateDimReducObject(
+    embeddings = res$embeddings,
+    loadings = res$loadings,
+    stdev = sqrt(res$variance_explained),
+    key = reduction.key,
+    assay = assay
+  )
+  object[[reduction.name]] <- red
+  object$pflog1ppf_baseline <- res$baseline
+  invisible(object)
+}
+
 #' @describeIn scx-accelerators kNN graph (HNSW) from an embedding.
 #' @param reduction Input reduction (default `"pca"`).
 #' @param dims Reduction dimensions to use (default `1:30`).
