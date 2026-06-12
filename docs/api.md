@@ -1528,7 +1528,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 | `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
 | `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
 | `seed` | `42` | RNG seed for reproducibility. Deterministic shuffle via `(seed, epoch)`. |
-| `max_memory_mb` | `512` | Memory budget. Pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` to fit. |
+| `max_memory_mb` | adaptive (≥512) | Memory budget. **When omitted**, the budget is *adaptive*: it scales up to fit the file's requested configuration (so a full-width ~33k-gene file keeps its requested `batch_size` instead of silently shrinking), floored at 512 MB and capped at 4096 MB. Pass an explicit value to pin a **hard ceiling** — then the pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` down to fit (the prior behaviour). |
 | `modality` | `None` | For multimodal v2 files: name of the modality to load (e.g. `"rna"`). Ignored on single-modality files. |
 
 **Properties**

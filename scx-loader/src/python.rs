@@ -91,7 +91,13 @@ impl TrainingDataset {
     ///     shard_group_size: Shards per I/O group (default: 8).
     ///     prefetch_batches: Ring buffer depth (default: 4).
     ///     seed: RNG seed for reproducibility (default: 42).
-    ///     max_memory_mb: Memory budget in MB (default: 512).
+    ///     max_memory_mb: Memory budget in MB. When omitted (None) the budget
+    ///         is adaptive: it scales up to fit the file's requested
+    ///         configuration (floored at 512 MB, capped at 4096 MB) so a
+    ///         full-width ~33k-gene file keeps its requested `batch_size`
+    ///         instead of silently shrinking it. Pass an explicit value to pin
+    ///         a hard ceiling — the pipeline then auto-tunes `shard_group_size`,
+    ///         `prefetch_batches`, and `batch_size` down to fit it.
     ///     modality: Phase H.1 — name of the modality to load on a
     ///         multimodal v2 file. On a single-modality file this is
     ///         ignored. On a multimodal file with no `modality`
@@ -148,6 +154,10 @@ impl TrainingDataset {
             target_sum: target_sum.unwrap_or(defaults.target_sum),
             seed: seed.unwrap_or(defaults.seed),
             max_memory_mb: max_memory_mb.unwrap_or(defaults.max_memory_mb),
+            // No explicit budget → adaptive (treat the default as a floor and
+            // raise to fit a full-width file). An explicit budget is a hard
+            // ceiling (preserves the auto-tune-down + warning behaviour).
+            auto_memory_budget: max_memory_mb.is_none(),
             modality_id,
         };
 
@@ -339,10 +349,12 @@ impl MultimodalTrainingDataset {
     ///         `modalities` order.
     ///     normalize, log1p, target_sum, shard_group_size,
     ///     prefetch_batches, seed, max_memory_mb: see
-    ///     `TrainingDataset` for semantics. `max_memory_mb` is
+    ///     `TrainingDataset` for semantics. An explicit `max_memory_mb` is
     ///     divided across modalities proportionally to per-modality
     ///     nnz (modalities with denser X get a larger share of the
-    ///     memory budget).
+    ///     memory budget). When omitted, each modality's per-modality share
+    ///     becomes an adaptive floor (raised to fit that modality's full-width
+    ///     configuration), matching `TrainingDataset`'s default behaviour.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -444,6 +456,10 @@ impl MultimodalTrainingDataset {
                 target_sum: target_sum.unwrap_or(defaults.target_sum),
                 seed: seed.unwrap_or(defaults.seed),
                 max_memory_mb: modality_mb,
+                // No explicit total budget → adaptive per-modality floor:
+                // each modality's pipeline raises to fit its own full-width
+                // configuration rather than shrinking the batch.
+                auto_memory_budget: max_memory_mb.is_none(),
                 modality_id: Some(mid),
             };
             let pipeline = TrainingPipeline::new(path, config)
