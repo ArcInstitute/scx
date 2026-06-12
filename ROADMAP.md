@@ -202,7 +202,7 @@ and parallel shard decode (highest-impact fixes from earlier benchmarks).
 - [x] `pyscx.merge` `shard_target_rows` kwarg for override
 - [x] Predicate indexes built incrementally from shard stream during merge
 - [x] `pyscx.from_anndata` `force_legacy_metadata` / `memory_budget` / `shard_target_rows` kwargs
-- [x] `PyExperiment.to_anndata` `memory_budget` kwarg with `EagerAssemblyMemoryHigh` warning
+- [x] `Experiment.to_anndata` `memory_budget` kwarg with `EagerAssemblyMemoryHigh` warning
 - [x] Append writes new obs as `ObsMetadataShard` sections (no rewrite of existing obs)
 - [x] Advisory `flock()` for concurrent append safety
 - [x] Python API: `scx.open("file.scx", mode="append")`
@@ -385,7 +385,7 @@ header flag (bit 7) is wired through writers and readers.
 - [x] Detection bitmap layer. Per-shard
   gene → local-row roaring bitmap sidecars (`SCXB` wire format,
   `BitmapShard` section id 6) emitted by `scx convert --bitmap
-  auto|always` and consumed by `PyExperiment.detection_counts` /
+  auto|always` and consumed by `Experiment.detection_counts` /
   `cells_expressing`. Auto policy: sparse X, `n_vars ≤ 1_000_000`,
   bitmap size ≤ 15 % of encoded CSR (ATAC always-on). `has_bitmap`
   header flag and per-modality `ModalityFlags::HAS_BITMAP` are wired

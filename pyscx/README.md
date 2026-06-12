@@ -115,7 +115,7 @@ caller to rebuild with `--features hdf5`. Other paths are unaffected.
   reference; backed-mode compatibility table. **Start here for everyday
   analysis recipes.**
 - **[../docs/api.md](../docs/api.md)** — full API reference for the
-  Rust seam and the Python surface (`PyExperiment`, `from_h5ad`,
+  Rust seam and the Python surface (`Experiment`, `from_h5ad`,
   `from_anndata`, query pipeline kwargs, `TrainingPipeline`).
 - **[../docs/multimodal.md](../docs/multimodal.md)** — CITE-seq / 10x
   Multiome / TEA-seq layout, `from_mudata` / `to_mudata`,

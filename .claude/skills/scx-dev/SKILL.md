@@ -26,7 +26,7 @@ A unified `vX.Y.Z` tag triggers **nothing**. Always tag with both prefixes when 
 
 Two conventions coexist; pick based on what changed:
 
-- **Synchronized minor (e.g. v0.3.0, v0.4.0):** bump *all 14 workspace members* to the same version — 12 lib crates (`scx-format`, `scx-codec`, `scx-sparse`, `scx-cli`, `scx-convert`, `scx-ops`, `scx-engine`, `scx-loader`, `scx-cloud`, `scx-gpu`, `scx-mtx`, `scx-accel`), plus `pyscx` and `rscx`. The integration-test crate at `tests/scx-integration-tests/` stays at `0.0.0` (`publish = false`).
+- **Synchronized minor (e.g. v0.3.0, v0.4.0):** bump *all 15 workspace members* to the same version — 13 lib crates (`scx-format`, `scx-format-io`, `scx-codec`, `scx-sparse`, `scx-cli`, `scx-convert`, `scx-ops`, `scx-engine`, `scx-loader`, `scx-cloud`, `scx-gpu`, `scx-mtx`, `scx-accel`), plus `pyscx` and `rscx`. The integration-test crate at `tests/scx-integration-tests/` stays at `0.0.0` (`publish = false`).
 - **pyscx-only patch (e.g. v0.3.1 → v0.3.2):** bump only `pyscx/Cargo.toml` + `pyscx/pyproject.toml`. pyscx may drift ahead of the rest between minor releases.
 
 Files touched on a synchronized bump:
@@ -35,7 +35,7 @@ Files touched on a synchronized bump:
 - `rscx/DESCRIPTION` (`Version: ...`)
 - `Cargo.lock` (regenerate with `cargo update --workspace --offline`)
 
-Fast bump: `for d in scx-format scx-codec scx-sparse scx-cli scx-convert scx-ops scx-engine scx-loader scx-cloud scx-gpu scx-mtx scx-accel rscx; do sed -i 's/^version = "OLD"$/version = "NEW"/' "$d/Cargo.toml"; done` then handle pyscx and the pyproject/DESCRIPTION files explicitly (their old version may differ).
+Fast bump: `for d in scx-format scx-format-io scx-codec scx-sparse scx-cli scx-convert scx-ops scx-engine scx-loader scx-cloud scx-gpu scx-mtx scx-accel rscx; do sed -i 's/^version = "OLD"$/version = "NEW"/' "$d/Cargo.toml"; done` then handle pyscx and the pyproject/DESCRIPTION files explicitly (their old version may differ).
 
 ### Pre-release verification
 

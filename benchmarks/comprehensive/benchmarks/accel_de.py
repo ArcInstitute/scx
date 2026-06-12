@@ -229,7 +229,7 @@ def _as_scx_backed_if_available(adata: Any) -> Any:
         return None
     try:
         import pyscx
-        # `pyscx.open()` returns a `PyExperiment`. To get an AnnData
+        # `pyscx.open()` returns an `Experiment`. To get an AnnData
         # whose `.X` is `ScxBackedSparseDataset` (with `backed_csc=Some(...)`
         # set when the file has a CSC sidecar), we have to go through
         # `Experiment.to_anndata(backed=True)`. Without `backed=True` we
