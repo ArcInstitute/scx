@@ -1247,6 +1247,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
+| `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
@@ -1801,6 +1802,50 @@ the R `lisi` reference. On D1–D4 it is **~10× faster** than
 R `lisi::compute_lisi` with mean-LISI agreement within 0.8–2.4 %.
 Brute-force kNN is O(N²·d); at census scale (D5+) you'd want to pair
 this with an HNSW-approximate kNN step instead.
+
+### Gene-set scoring (`pyscx.accel.score_genes`)
+
+CPU-native equivalent of `sc.tl.score_genes` — a per-cell score for a gene
+signature, written to `adata.obs[score_name]`. Streams shard-by-shard, so it
+runs identically on in-memory, backed, and lazy `X` with bounded memory.
+
+Three methods via `method=`:
+
+| `method`    | Score per cell                                                   | Notes |
+|-------------|------------------------------------------------------------------|-------|
+| `"control"` | `mean(gene_list) − mean(control)` (default; scanpy `score_genes`)| Control genes sampled from expression-matched bins. |
+| `"mean"`    | `mean(gene_list)`                                                | Fastest; no control set, ignores `gene_pool`/`ctrl_size`/`n_bins`. |
+| `"zscore"`  | `Σ (xᵍ − meanᵍ)/stdᵍ / √k` over the set                          | decoupler [`mt.zscore`](https://decoupler.readthedocs.io/en/latest/api/generated/decoupler.mt.zscore.html); per-gene std uses ddof=1. |
+
+```python
+import pyscx
+
+adata = pyscx.open("pbmc.scx").to_anndata(backed=True)
+
+# scanpy-style control scoring (default method)
+pyscx.accel.score_genes(
+    adata,
+    ["CD3D", "CD3E", "CD8A", "GZMB"],   # gene_list (symbols, resolved vs var_names)
+    ctrl_size=50,
+    n_bins=25,
+    score_name="t_cell_score",
+)
+adata.obs["t_cell_score"]   # per-cell signature score
+
+# lightweight alternatives when score_genes' control sampling is too slow
+pyscx.accel.score_genes(adata, marker_genes, method="mean",   score_name="sig_mean")
+pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z")
+```
+
+> **Divergence from scanpy.** The `control` method replicates scanpy's
+> rank-binning + control-gene sampling algorithm, but the sampler is
+> Rust-native and seeded independently of numpy, so the *specific* control
+> genes (and therefore the absolute scores) differ from `sc.tl.score_genes`.
+> The score is deterministic for a fixed `random_state` and rank-correlates
+> near-perfectly with scanpy in practice. Genes in `gene_list` not present in
+> `adata.var_names` are dropped with a `UserWarning`. Use `layer=` to score a
+> named layer instead of `X`. CPU-only — `device` is accepted for API symmetry
+> but there is no GPU kernel.
 
 ### Differential Expression (`pyscx.accel.rank_genes_groups`)
 

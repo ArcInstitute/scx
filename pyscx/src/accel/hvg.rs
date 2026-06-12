@@ -596,7 +596,7 @@ fn emit_hvg_loess_singularity_warning(
 /// Per-batch filtering is handled downstream via the `cell_batch` array passed
 /// to the batched streaming kernels, so this always builds the whole-dataset
 /// source (the previous `batch_indices` branch was unused).
-fn build_shard_source(
+pub(super) fn build_shard_source(
     reader: &Arc<scx_format_io::BackedCsrReader>,
     transforms: &[Transform],
     kept_to_global: &Option<Arc<Vec<u64>>>,
