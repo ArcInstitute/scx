@@ -186,3 +186,93 @@ class TestRouteMetadata:
         ad, _ = small_adata()
         pyscx.accel.pflog1ppf(ad, store="pca", n_components=3)
         assert ad.uns["scx_accel"]["pflog1ppf"]["route"] == "cpu_csr"
+
+
+# CodecId numeric values (scx-codec/src/dispatch.rs): Zstd=2, Pcodec=4.
+_CODEC_ZSTD = 2
+_CODEC_PCODEC = 4
+
+
+class TestStreamToDisk:
+    """Phase 4c — `out=` streams the materialized transform to a new SCX file."""
+
+    def test_delta_baseline_roundtrip(self, tmp_path):
+        ad, X = small_adata()
+        out = str(tmp_path / "compact.scx")
+        pyscx.accel.pflog1ppf(ad, store="dense", out=out, store_repr="delta_baseline")
+
+        exp = pyscx.open(out)
+        # Compact form: X is the sparse delta layer (Pcodec), baseline in obs.
+        assert exp.codec_id == _CODEC_PCODEC
+        re_ad = exp.to_anndata()
+        assert "pflog1ppf_baseline" in re_ad.obs
+
+        Z = pyscx.accel.pflog1ppf_reconstruct(re_ad)
+        ref = reference_dense(X, 1.0)
+        np.testing.assert_allclose(Z, ref, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(Z.sum(axis=1), np.zeros(ad.n_obs), atol=1e-4)
+
+    def test_delta_baseline_custom_c(self, tmp_path):
+        ad, X = small_adata()
+        out = str(tmp_path / "compact_c.scx")
+        pyscx.accel.pflog1ppf(ad, c=0.5, store="dense", out=out)  # default repr
+        re_ad = pyscx.open(out).to_anndata()
+        Z = pyscx.accel.pflog1ppf_reconstruct(re_ad)
+        np.testing.assert_allclose(Z, reference_dense(X, 0.5), rtol=1e-5, atol=1e-5)
+
+    def test_dense_roundtrip_multishard(self, tmp_path):
+        ad, X = small_adata()
+        out = str(tmp_path / "dense.scx")
+        # Tiny shard_size exercises the re-chunking / multi-shard path (6 rows / 2).
+        pyscx.accel.pflog1ppf(
+            ad, store="dense", out=out, store_repr="dense", shard_size=2
+        )
+        exp = pyscx.open(out)
+        assert exp.codec_id == _CODEC_ZSTD
+        assert exp.shard_count > 1
+        re_ad = exp.to_anndata()
+        Z = np.asarray(re_ad.X.toarray() if hasattr(re_ad.X, "toarray") else re_ad.X)
+        np.testing.assert_allclose(Z, reference_dense(X, 1.0), rtol=1e-5, atol=1e-5)
+
+    def test_disk_path_bypasses_size_guard(self, tmp_path):
+        ad, X = small_adata()
+        out = str(tmp_path / "bypass.scx")
+        # 6×4 = 24 elements; a guard of 10 rejects the in-memory layer but the
+        # streamed-to-disk path has no such guard.
+        pyscx.accel.pflog1ppf(ad, store="dense", out=out, dense_max_elems=10)
+        re_ad = pyscx.open(out).to_anndata()
+        Z = pyscx.accel.pflog1ppf_reconstruct(re_ad)
+        np.testing.assert_allclose(Z, reference_dense(X, 1.0), rtol=1e-5, atol=1e-5)
+        # Same guard still bites without out=.
+        with pytest.raises(RuntimeError):
+            pyscx.accel.pflog1ppf(ad.copy(), store="dense", dense_max_elems=10)
+
+    def test_out_requires_dense_store(self, tmp_path):
+        ad, _ = small_adata()
+        out = str(tmp_path / "nope.scx")
+        with pytest.raises(ValueError):
+            pyscx.accel.pflog1ppf(ad, store="pca", out=out)
+
+    def test_bad_store_repr_raises(self, tmp_path):
+        ad, _ = small_adata()
+        out = str(tmp_path / "nope.scx")
+        with pytest.raises(ValueError):
+            pyscx.accel.pflog1ppf(ad, store="dense", out=out, store_repr="bogus")
+
+    def test_backed_matches_inmemory_on_disk(self, tmp_path, scx_from_adata):
+        ad, X = small_adata()
+        src = scx_from_adata(ad, "pflog1ppf_src.scx")
+
+        out_mem = str(tmp_path / "from_mem.scx")
+        pyscx.accel.pflog1ppf(ad.copy(), store="dense", out=out_mem)
+
+        backed = pyscx.open(src).to_anndata(backed=True)
+        out_backed = str(tmp_path / "from_backed.scx")
+        pyscx.accel.pflog1ppf(backed, store="dense", out=out_backed)
+
+        Z_mem = pyscx.accel.pflog1ppf_reconstruct(pyscx.open(out_mem).to_anndata())
+        Z_backed = pyscx.accel.pflog1ppf_reconstruct(
+            pyscx.open(out_backed).to_anndata()
+        )
+        np.testing.assert_allclose(Z_mem, Z_backed, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(Z_mem, reference_dense(X, 1.0), rtol=1e-5, atol=1e-5)
