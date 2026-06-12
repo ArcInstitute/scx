@@ -86,14 +86,21 @@ that drops or transforms something also emits a structured warning — see
 [docs/api.md § Conversion warnings](api.md#conversion-warnings-convertwarning).
 Headlines:
 
-- **Preserved:** obs/var columns + dtypes, ordered categoricals, `obsm`/`varm`
-  embeddings, layers, `obsp`/`varp` (as float32 CSR), `adata.raw`
-  ([docs/api.md § `adata.raw`](api.md#adataraw)), most `uns` entries.
+- **Preserved:** obs/var columns + dtypes, ordered categoricals (including
+  **integer- and float-keyed** categoricals — e.g. integer cluster labels or
+  dose levels), `obsm`/`varm` embeddings, layers, `obsp`/`varp` (as float32 CSR),
+  `adata.raw` ([docs/api.md § `adata.raw`](api.md#adataraw)), most `uns` entries
+  including `None` scalars (round-trip as Python `None`, e.g.
+  `uns['log1p']['base']`).
 - **Lossy / transformed (warns):** `X` and `obsp`/`varp` float64 → float32;
   a dense `obsp`/`varp` is re-emitted as sparse (values identical).
 - **Dropped (warns):** CSC/unsupported `obsp`/`varp`, pickled `uns` objects,
   obs/var columns with an unsupported dtype, `uns` pandas DataFrames (kept as a
-  nested dict + a `FlattenedUnsDataframe` warning, not silently flattened).
+  nested dict + a `FlattenedUnsDataframe` warning, not silently flattened), and
+  **compound/structured `uns` arrays** — notably scanpy's `rank_genes_groups`
+  (stored as a per-cluster recarray). Export DE results separately before
+  converting (`sc.get.rank_genes_groups_df(...)` → CSV/Parquet); the skip emits a
+  short `SkippedUnsKey` warning naming the key.
 
 ## scanpy-divergence gotchas
 

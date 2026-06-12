@@ -1611,3 +1611,260 @@ fn test_append_for_modality_updates_table() {
         .collect();
     assert!(new_shards.len() as u32 >= rna_post.n_csr_shards);
 }
+
+/// Report B1: integer- and float-keyed categorical obs columns (valid
+/// pandas/anndata — e.g. integer cluster labels, dose levels) were
+/// previously dropped with `categorical group: HDF5 error: no conversion
+/// paths found` because the reader assumed string categories. They must
+/// now round-trip h5ad → scx → h5ad with the category dtype preserved.
+#[test]
+fn numeric_categorical_columns_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("numcat.h5ad");
+    let scx_path = dir.path().join("numcat.scx");
+    let h5ad_out = dir.path().join("numcat_out.h5ad");
+
+    let n_obs = 9;
+    create_test_h5ad(&h5ad_path, n_obs, 4, "csr", false);
+
+    // Modern anndata categorical *group* form (encoding-version 0.2.0):
+    // a subgroup with `codes` + a numeric `categories` dataset.
+    let int_cats: Vec<i64> = vec![10, 20, 30];
+    let float_cats: Vec<f64> = vec![0.1, 0.5, 0.9];
+    let codes: Vec<i32> = (0..n_obs).map(|i| (i % 3) as i32).collect();
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let obs = file.group("obs").unwrap();
+        for (name, write_cats) in [
+            ("int_cat", true), // integer categories
+            ("lvl", false),    // float categories
+        ] {
+            let g = obs.create_group(name).unwrap();
+            g.new_dataset::<i32>()
+                .shape([n_obs])
+                .create("codes")
+                .unwrap()
+                .write(&codes)
+                .unwrap();
+            if write_cats {
+                g.new_dataset::<i64>()
+                    .shape([int_cats.len()])
+                    .create("categories")
+                    .unwrap()
+                    .write(&int_cats)
+                    .unwrap();
+            } else {
+                g.new_dataset::<f64>()
+                    .shape([float_cats.len()])
+                    .create("categories")
+                    .unwrap()
+                    .write(&float_cats)
+                    .unwrap();
+            }
+            g.new_attr::<VarLenUnicode>()
+                .create("encoding-type")
+                .unwrap()
+                .write_scalar(&vlu("categorical"))
+                .unwrap();
+            g.new_attr::<VarLenUnicode>()
+                .create("encoding-version")
+                .unwrap()
+                .write_scalar(&vlu("0.2.0"))
+                .unwrap();
+            g.new_attr::<bool>()
+                .create("ordered")
+                .unwrap()
+                .write_scalar(&false)
+                .unwrap();
+        }
+    }
+
+    // No warnings expected: both columns must convert, not be skipped.
+    use std::sync::{Arc, Mutex};
+    let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let w = Arc::clone(&warnings);
+    let mut sink = WarningSink::with_handler(move |x| w.lock().unwrap().push(format!("{x:?}")));
+    h5ad_to_scx(&h5ad_path, &scx_path, &ConvertOptions::default(), &mut sink).unwrap();
+    let warns = warnings.lock().unwrap().join("\n");
+    assert!(
+        !warns.contains("int_cat") && !warns.contains("\"lvl\""),
+        "numeric categoricals were skipped: {warns}"
+    );
+
+    // scx stores the dictionaries with their numeric value type.
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    let schema = obs.schema();
+    let int_col = obs.column(schema.index_of("int_cat").unwrap());
+    let lvl_col = obs.column(schema.index_of("lvl").unwrap());
+    assert!(
+        matches!(int_col.data_type(), DataType::Dictionary(k, v)
+            if **k == DataType::Int32 && **v == DataType::Int64),
+        "int_cat should be Dictionary(Int32, Int64), got {:?}",
+        int_col.data_type()
+    );
+    assert!(
+        matches!(lvl_col.data_type(), DataType::Dictionary(k, v)
+            if **k == DataType::Int32 && **v == DataType::Float64),
+        "lvl should be Dictionary(Int32, Float64), got {:?}",
+        lvl_col.data_type()
+    );
+
+    // h5ad export re-emits numeric `categories` datasets with matching values.
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let out_obs = out.group("obs").unwrap();
+
+    let out_int_cats: Vec<i64> = out_obs
+        .group("int_cat")
+        .unwrap()
+        .dataset("categories")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        out_int_cats, int_cats,
+        "int categories drifted on round-trip"
+    );
+
+    let out_float_cats: Vec<f64> = out_obs
+        .group("lvl")
+        .unwrap()
+        .dataset("categories")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(out_float_cats, float_cats, "float categories drifted");
+
+    // Codes preserved too (so the decoded values match the source).
+    let out_codes: Vec<i32> = out_obs
+        .group("int_cat")
+        .unwrap()
+        .dataset("codes")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(out_codes, codes, "codes drifted on round-trip");
+}
+
+/// Report B2 / E1: scanpy `rank_genes_groups` is stored as an HDF5
+/// *compound* (structured) array. It is not preserved, but the skip
+/// warning must be a short actionable line — not a ~1 KB
+/// `CompoundType { fields: [..] }` Debug dump.
+#[test]
+fn compound_uns_array_emits_short_actionable_warning() {
+    // A 2-field compound row mimics a `rank_genes_groups` recarray with
+    // two cluster groups.
+    #[repr(C)]
+    #[derive(hdf5::H5Type, Clone, Copy)]
+    struct RggRow {
+        cl0: f32,
+        cl1: f32,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("rgg.h5ad");
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file
+            .group("uns")
+            .unwrap_or_else(|_| file.create_group("uns").unwrap());
+        let rgg = uns.create_group("rank_genes_groups").unwrap();
+        let rows = vec![RggRow { cl0: 1.0, cl1: 2.0 }, RggRow { cl0: 3.0, cl1: 4.0 }];
+        rgg.new_dataset::<RggRow>()
+            .shape([rows.len()])
+            .create("scores")
+            .unwrap()
+            .write(&rows)
+            .unwrap();
+    }
+
+    use std::sync::{Arc, Mutex};
+    let warnings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let w = Arc::clone(&warnings);
+    let mut sink = WarningSink::with_handler(move |x| w.lock().unwrap().push(format!("{x:?}")));
+    let file = hdf5::File::open(&h5ad_path).unwrap();
+    crate::h5ad::read::read_uns(&file, false, &mut sink).unwrap();
+    let joined = warnings.lock().unwrap().join("\n");
+
+    assert!(
+        joined.contains("compound/structured array with 2 fields"),
+        "expected a short compound message, got: {joined}"
+    );
+    assert!(
+        joined.contains("rank_genes_groups"),
+        "message should mention rank_genes_groups: {joined}"
+    );
+    // The noisy ~1 KB dump must be gone.
+    assert!(
+        !joined.contains("CompoundField") && !joined.contains("fields: ["),
+        "compound type dump leaked into the warning: {joined}"
+    );
+}
+
+/// Report B3: a Python `None` uns scalar (anndata writes it as an
+/// `h5py.Empty` null-dataspace dataset) previously round-tripped as a
+/// bogus float `0.0` — silently corrupting e.g. `uns['log1p']['base']`,
+/// which scanpy feeds to `log(x)/log(base)` → `-inf`. It must now
+/// round-trip as JSON null (→ Python `None`), at the top level and nested.
+#[test]
+fn none_uns_scalar_round_trips_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("none.h5ad");
+    let scx_path = dir.path().join("none.scx");
+    let h5ad_out = dir.path().join("none_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    // Write anndata's null encoding: a null-dataspace (h5py.Empty) dataset
+    // tagged encoding-type="null", at top level and nested under `log1p`.
+    let write_null = |g: &hdf5::Group, name: &str| {
+        let ds = g
+            .new_dataset::<f32>()
+            .shape(hdf5::Extents::null())
+            .create(name)
+            .unwrap();
+        ds.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("null"))
+            .unwrap();
+    };
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file
+            .group("uns")
+            .unwrap_or_else(|_| file.create_group("uns").unwrap());
+        write_null(&uns, "none_scalar");
+        let log1p = uns.create_group("log1p").unwrap();
+        write_null(&log1p, "base");
+    }
+
+    h5ad_to_scx(
+        &h5ad_path,
+        &scx_path,
+        &ConvertOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    // Read the round-tripped uns and confirm the nulls survived (NOT 0.0).
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = crate::h5ad::read::read_uns(&out, false, &mut WarningSink::log()).unwrap();
+
+    assert_eq!(
+        uns.get("none_scalar"),
+        Some(&serde_json::Value::Null),
+        "top-level None coerced/lost: {uns:?}"
+    );
+    assert_eq!(
+        uns.get("log1p").and_then(|l| l.get("base")),
+        Some(&serde_json::Value::Null),
+        "nested uns['log1p']['base']=None corrupted: {uns:?}"
+    );
+}

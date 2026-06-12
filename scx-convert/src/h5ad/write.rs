@@ -8,8 +8,8 @@ use arrow::array::{
     Int64Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{
-    DataType, Field, Int16Type, Int32Type, Int64Type, Int8Type, Schema, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
@@ -513,52 +513,25 @@ fn downcast_err(name: &str, expected: &str) -> ConvertError {
     ))
 }
 
-/// Extract codes (promoted to i32, -1 for null) and string
-/// categories from a categorical column. Handles all integer key
-/// widths Arrow / pandas uses (Int8/16/32/64, UInt8/16/32/64). The
-/// SCX → h5ad writer emits i32 codes uniformly so anndata's reader
+/// Extract categorical codes promoted to i32 (-1 for null). Handles all
+/// integer key widths Arrow / pandas uses (Int8/16/32/64, UInt8/16/32/64).
+/// The SCX → h5ad writer emits i32 codes uniformly so anndata's reader
 /// doesn't need to dispatch on key width.
-fn dict_codes_and_categories_i32(
-    array: &dyn Array,
-    name: &str,
-) -> Result<(Vec<i32>, Vec<VarLenUnicode>), ConvertError> {
-    macro_rules! extract {
+fn dict_codes_i32(array: &dyn Array, name: &str) -> Result<Vec<i32>, ConvertError> {
+    macro_rules! codes {
         ($t:ty, $label:literal) => {{
             let dict = array
                 .as_any()
                 .downcast_ref::<DictionaryArray<$t>>()
                 .ok_or_else(|| downcast_err(name, $label))?;
-            let codes: Vec<i32> = dict
+            Ok(dict
                 .keys()
                 .iter()
                 .map(|v| match v {
                     Some(k) => k as i32,
                     None => -1,
                 })
-                .collect();
-            // Categories may be narrow (`Utf8`) or wide (`LargeUtf8`);
-            // dispatch on the value type like the streaming sibling
-            // `dict_local_codes_and_string_values`.
-            let cats: Vec<VarLenUnicode> = match dict.values().data_type() {
-                DataType::Utf8 => {
-                    let values_arr = dict.values().as_string::<i32>();
-                    (0..values_arr.len())
-                        .map(|i| vlu(values_arr.value(i)))
-                        .collect()
-                }
-                DataType::LargeUtf8 => {
-                    let values_arr = dict.values().as_string::<i64>();
-                    (0..values_arr.len())
-                        .map(|i| vlu(values_arr.value(i)))
-                        .collect()
-                }
-                other => {
-                    return Err(ConvertError::Other(format!(
-                        "column '{name}': unsupported dictionary value type {other:?}"
-                    )));
-                }
-            };
-            Ok::<_, ConvertError>((codes, cats))
+                .collect())
         }};
     }
     let key_type = match array.data_type() {
@@ -571,18 +544,74 @@ fn dict_codes_and_categories_i32(
         }
     };
     match key_type {
-        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, _>"),
-        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, _>"),
-        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, _>"),
-        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, _>"),
-        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, _>"),
-        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, _>"),
-        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, _>"),
-        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, _>"),
+        DataType::Int8 => codes!(Int8Type, "Dictionary<Int8, _>"),
+        DataType::Int16 => codes!(Int16Type, "Dictionary<Int16, _>"),
+        DataType::Int32 => codes!(Int32Type, "Dictionary<Int32, _>"),
+        DataType::Int64 => codes!(Int64Type, "Dictionary<Int64, _>"),
+        DataType::UInt8 => codes!(UInt8Type, "Dictionary<UInt8, _>"),
+        DataType::UInt16 => codes!(UInt16Type, "Dictionary<UInt16, _>"),
+        DataType::UInt32 => codes!(UInt32Type, "Dictionary<UInt32, _>"),
+        DataType::UInt64 => codes!(UInt64Type, "Dictionary<UInt64, _>"),
         other => Err(ConvertError::Other(format!(
             "column '{name}': unsupported categorical key type {other:?}"
         ))),
     }
+}
+
+/// Categorical category payload, carrying the source value class so the
+/// h5ad writer emits a `categories` dataset of the matching HDF5 dtype.
+/// String categories are the common case; integer/float categories let
+/// numeric-keyed categoricals (integer cluster labels, dose levels)
+/// round-trip instead of being dropped.
+enum CatValues {
+    Str(Vec<VarLenUnicode>),
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+}
+
+/// Extract a categorical's category values, dispatching on the dictionary
+/// value type (independent of the key width). Integer/unsigned widths
+/// normalize to `i64`, floats to `f64`. Categories never carry nulls (the
+/// codes carry NA via `-1`), so `value(i)` is always valid.
+fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, ConvertError> {
+    let values = array.as_any_dictionary().values();
+    macro_rules! ints {
+        ($t:ty) => {{
+            let a = values.as_primitive::<$t>();
+            CatValues::Int((0..a.len()).map(|i| a.value(i) as i64).collect())
+        }};
+    }
+    macro_rules! floats {
+        ($t:ty) => {{
+            let a = values.as_primitive::<$t>();
+            CatValues::Float((0..a.len()).map(|i| a.value(i) as f64).collect())
+        }};
+    }
+    Ok(match values.data_type() {
+        DataType::Utf8 => {
+            let a = values.as_string::<i32>();
+            CatValues::Str((0..a.len()).map(|i| vlu(a.value(i))).collect())
+        }
+        DataType::LargeUtf8 => {
+            let a = values.as_string::<i64>();
+            CatValues::Str((0..a.len()).map(|i| vlu(a.value(i))).collect())
+        }
+        DataType::Int8 => ints!(Int8Type),
+        DataType::Int16 => ints!(Int16Type),
+        DataType::Int32 => ints!(Int32Type),
+        DataType::Int64 => ints!(Int64Type),
+        DataType::UInt8 => ints!(UInt8Type),
+        DataType::UInt16 => ints!(UInt16Type),
+        DataType::UInt32 => ints!(UInt32Type),
+        DataType::UInt64 => ints!(UInt64Type),
+        DataType::Float32 => floats!(Float32Type),
+        DataType::Float64 => floats!(Float64Type),
+        other => {
+            return Err(ConvertError::Other(format!(
+                "column '{name}': unsupported dictionary value type {other:?}"
+            )));
+        }
+    })
 }
 
 /// Collect a `Utf8` / `LargeUtf8` string column into `(values, mask)`:
@@ -785,9 +814,7 @@ fn write_column_to_hdf5(
                 .create("encoding-version")?
                 .write_scalar(&vlu("0.1.0"))?;
         }
-        DataType::Dictionary(_key_type, value_type)
-            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
-        {
+        DataType::Dictionary(_key_type, _value_type) => {
             // Modern anndata categorical (encoding-version 0.2.0):
             // write as a group with `codes` + `categories` as
             // separate datasets, NOT as a `categories` attribute on
@@ -801,7 +828,24 @@ fn write_column_to_hdf5(
             // categories, Int16 for <32K, Int32 above). We promote
             // every input to i32 on disk so the SCX → h5ad output
             // is uniform; anndata reads any width on the round-trip.
-            let (codes, cats) = dict_codes_and_categories_i32(array, name)?;
+            //
+            // Categories keep their source class (string / integer /
+            // float): anndata reconstructs a `pd.Categorical` from a
+            // numeric `categories` dataset, so integer-/float-keyed
+            // categoricals round-trip instead of being dropped.
+            // Extract categories *before* creating the group so an
+            // unsupported value type leaves no partial group behind.
+            let cats = match dict_category_values(array, name) {
+                Ok(c) => c,
+                Err(_) => {
+                    sink.emit(ConvertWarning::UnsupportedExportColumn {
+                        column: format!("{df_name}/{name}"),
+                        dtype: format!("{dtype:?}"),
+                    });
+                    return Ok(false);
+                }
+            };
+            let codes = dict_codes_i32(array, name)?;
 
             let cat_group = group.create_group(name)?;
             cat_group
@@ -809,11 +853,29 @@ fn write_column_to_hdf5(
                 .shape([codes.len()])
                 .create("codes")?
                 .write(&codes)?;
-            cat_group
-                .new_dataset::<VarLenUnicode>()
-                .shape([cats.len()])
-                .create("categories")?
-                .write(&cats)?;
+            match cats {
+                CatValues::Str(cats) => {
+                    cat_group
+                        .new_dataset::<VarLenUnicode>()
+                        .shape([cats.len()])
+                        .create("categories")?
+                        .write(&cats)?;
+                }
+                CatValues::Int(cats) => {
+                    cat_group
+                        .new_dataset::<i64>()
+                        .shape([cats.len()])
+                        .create("categories")?
+                        .write(&cats)?;
+                }
+                CatValues::Float(cats) => {
+                    cat_group
+                        .new_dataset::<f64>()
+                        .shape([cats.len()])
+                        .create("categories")?
+                        .write(&cats)?;
+                }
+            }
 
             cat_group
                 .new_attr::<VarLenUnicode>()
@@ -2003,7 +2065,25 @@ fn write_uns_value(
             let subgroup = group.create_group(name)?;
             write_uns_entries(&subgroup, value)?;
         }
-        serde_json::Value::Null => {}
+        serde_json::Value::Null => {
+            // anndata represents a Python `None` uns value as an `h5py.Empty`
+            // dataset: an HDF5 null dataspace (0 elements) tagged
+            // `encoding-type="null"`. Emit the same encoding so the value
+            // round-trips as `None` rather than being silently dropped (and
+            // read back as a bogus `0.0`, which breaks e.g. scanpy's
+            // `uns['log1p']['base']`). Matches the null-dataspace detection
+            // in `read_uns_entry`.
+            let ds = group
+                .new_dataset::<f32>()
+                .shape(hdf5::Extents::null())
+                .create(name)?;
+            ds.new_attr::<VarLenUnicode>()
+                .create("encoding-type")?
+                .write_scalar(&vlu("null"))?;
+            ds.new_attr::<VarLenUnicode>()
+                .create("encoding-version")?
+                .write_scalar(&vlu("0.1.0"))?;
+        }
     }
     Ok(())
 }
