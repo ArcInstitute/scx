@@ -169,6 +169,19 @@ fn run_rust_leiden(
         0 // 0 means use default (run until convergence)
     };
 
+    // Rust-native Leiden runs on CPU (device=cpu, or auto/gpu resolved to CPU
+    // because no CUDA device was visible). gpu_eligible=false forces the
+    // cpu_csr route; this fn only runs CPU. Announce the route + any GPU→CPU
+    // fallback warning *before* the (potentially long) compute so the user
+    // sees it at op start, not after the run (report P1).
+    let info = super::route::simple_exec_info(
+        device,
+        false,
+        scx_accel::AccelRoute::GpuCsr,
+        scx_accel::AccelRoute::CpuCsr,
+    );
+    super::route::announce_route(py, "leiden", device, &info);
+
     // Run Rust-native Leiden — releases the GIL for the compute-heavy part.
     let result = py
         .detach(|| {
@@ -216,16 +229,6 @@ fn run_rust_leiden(
     let uns = adata.getattr("uns")?;
     uns.set_item(key_added, leiden_dict)?;
 
-    // Rust-native Leiden ran on CPU (device=cpu, or auto/gpu resolved to CPU
-    // because no CUDA device was visible). gpu_eligible=false forces the
-    // cpu_csr route with an appropriate reason — this fn only runs CPU.
-    let info = super::route::simple_exec_info(
-        device,
-        false,
-        scx_accel::AccelRoute::GpuCsr,
-        scx_accel::AccelRoute::CpuCsr,
-    );
-    super::route::announce_route(py, "leiden", device, &info);
     super::route::write_accel_route(py, adata, "leiden", &info)?;
 
     Ok(())

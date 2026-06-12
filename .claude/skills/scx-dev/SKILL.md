@@ -60,8 +60,9 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 **Python bindings** (always via `../.venv/bin/`, never system Python):
 
 - [ ] `cd pyscx && ../.venv/bin/maturin develop && ../.venv/bin/pytest tests/ -v`
-- [ ] Same with `--features cloud` if cloud touched
-- [ ] Same with `--features gpu` if GPU touched
+- [ ] Same with `--features hdf5,cloud` if cloud touched
+- [ ] Same with `--features hdf5,gpu` if GPU touched
+- [ ] (`--features` REPLACES the pyproject default set, which includes `hdf5` — always re-list `hdf5`, else `from_h5ad`/`to_h5ad` break)
 
 **R bindings** (when rscx changed):
 

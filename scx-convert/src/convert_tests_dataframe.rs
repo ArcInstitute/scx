@@ -689,10 +689,10 @@ mod streaming_obs_hdf5 {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
-        Int64Array, LargeStringArray, RecordBatch, StringArray,
+        Array, ArrayRef, AsArray, BooleanArray, DictionaryArray, Float32Array, Float64Array,
+        Int32Array, Int64Array, Int8Array, LargeStringArray, RecordBatch, StringArray,
     };
-    use arrow::datatypes::{DataType, Field, Int32Type, Int8Type, Schema};
+    use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Int8Type, Schema};
 
     use scx_codec::{CodecId, ValueEncoding};
     use scx_format_io::{FileHeader, ScxReader, ScxWriter};
@@ -866,6 +866,221 @@ mod streaming_obs_hdf5 {
             // logical values column-by-column, not dictionary codes.
             compare_columns_logical(s, e, col_name);
         }
+    }
+
+    /// Build an obs shard with two **numeric** categorical columns whose
+    /// per-shard vocabularies are disjoint (so the streaming exporter's running
+    /// global dictionary must unify them): `cluster` (`Dictionary<Int8, Int64>`,
+    /// integer cluster labels) and `dose` (`Dictionary<Int8, Float64>`, float
+    /// dose levels). Returns the batch plus the expected per-row logical values
+    /// for cross-checking the round-trip.
+    fn obs_shard_batch_numcat(
+        start_row: usize,
+        n: usize,
+        shard_idx: u32,
+    ) -> (RecordBatch, Vec<i64>, Vec<f64>) {
+        let cell_ids: Vec<String> = (start_row..start_row + n)
+            .map(|i| format!("cell_{i:06}"))
+            .collect();
+        let int_vocab: Vec<i64> = match shard_idx {
+            0 => vec![10, 20],
+            1 => vec![30, 40],
+            2 => vec![10, 50],
+            _ => vec![20],
+        };
+        let float_vocab: Vec<f64> = match shard_idx {
+            0 => vec![0.1, 0.5],
+            1 => vec![0.9, 0.25],
+            2 => vec![0.1, 0.75],
+            _ => vec![0.5],
+        };
+        let int_keys: Vec<i8> = (0..n).map(|i| (i % int_vocab.len()) as i8).collect();
+        let float_keys: Vec<i8> = (0..n).map(|i| (i % float_vocab.len()) as i8).collect();
+        let expected_int: Vec<i64> = int_keys.iter().map(|&k| int_vocab[k as usize]).collect();
+        let expected_float: Vec<f64> = float_keys
+            .iter()
+            .map(|&k| float_vocab[k as usize])
+            .collect();
+
+        let cluster = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(int_keys),
+            Arc::new(Int64Array::from(int_vocab)),
+        )
+        .unwrap();
+        let dose = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(float_keys),
+            Arc::new(Float64Array::from(float_vocab)),
+        )
+        .unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new(
+                "cluster",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64)),
+                false,
+            ),
+            Field::new(
+                "dose",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Float64)),
+                false,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                Arc::new(cluster) as ArrayRef,
+                Arc::new(dose) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        (batch, expected_int, expected_float)
+    }
+
+    /// Decode a `Dictionary<_, Int64>` column to its per-row `i64` values
+    /// (no nulls in the fixture).
+    fn decode_dict_i64(arr: &ArrayRef) -> Vec<i64> {
+        let d = arr.as_any_dictionary();
+        let vals = d.values().as_primitive::<Int64Type>();
+        d.normalized_keys().iter().map(|&k| vals.value(k)).collect()
+    }
+
+    /// Decode a `Dictionary<_, Float64>` column to its per-row `f64` values.
+    fn decode_dict_f64(arr: &ArrayRef) -> Vec<f64> {
+        let d = arr.as_any_dictionary();
+        let vals = d.values().as_primitive::<Float64Type>();
+        d.normalized_keys().iter().map(|&k| vals.value(k)).collect()
+    }
+
+    /// Report PR #249 (Codex review): numeric (int/float) categoricals were
+    /// preserved by the *eager* exporter but still dropped on the **streaming**
+    /// (sharded obs/var) path. This asserts they now round-trip there too:
+    /// the streamed `categories` datasets are numeric (not strings), the global
+    /// vocabulary unifies the disjoint per-shard dicts, and per-row logical
+    /// values match the source and the eager baseline.
+    #[test]
+    fn test_streaming_obs_numeric_categorical_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let scx_path = dir.path().join("numcat_sharded.scx");
+        let h5ad_stream = dir.path().join("stream.h5ad");
+        let h5ad_eager = dir.path().join("eager.h5ad");
+
+        // 4 shards × 50 rows, disjoint numeric vocabularies per shard.
+        let n_shards = 4u32;
+        let rows_per_shard = 50u64;
+        let n_obs = u64::from(n_shards) * rows_per_shard;
+        let mut expected_int: Vec<i64> = Vec::new();
+        let mut expected_float: Vec<f64> = Vec::new();
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            for shard_idx in 0..n_shards {
+                let row_start = u64::from(shard_idx) * rows_per_shard;
+                let (batch, exp_i, exp_f) =
+                    obs_shard_batch_numcat(row_start as usize, rows_per_shard as usize, shard_idx);
+                writer
+                    .write_obs_shard(shard_idx, row_start, rows_per_shard, n_obs, &batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows_per_shard);
+                expected_int.extend(exp_i);
+                expected_float.extend(exp_f);
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(
+            reader.obs_metadata_shard_count(),
+            4,
+            "fixture must be sharded"
+        );
+        assert_eq!(reader.n_obs(), n_obs);
+
+        let opts = ConvertOptions::default();
+        write_scx_to_h5ad_streaming(&scx_path, &h5ad_stream, &opts, &mut WarningSink::log())
+            .unwrap();
+        write_scx_to_h5ad(&scx_path, &h5ad_eager, &mut WarningSink::log()).unwrap();
+
+        // On-disk: the streamed `categories` datasets must be numeric — reading
+        // them as i64/f64 fails if the streaming path fell back to strings (or
+        // dropped the column, in which case the group is absent).
+        let sf = hdf5::File::open(&h5ad_stream).unwrap();
+        let obs = sf.group("obs").unwrap();
+        let int_cats: Vec<i64> = obs
+            .group("cluster")
+            .unwrap()
+            .dataset("categories")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        let float_cats: Vec<f64> = obs
+            .group("dose")
+            .unwrap()
+            .dataset("categories")
+            .unwrap()
+            .read_1d()
+            .unwrap()
+            .to_vec();
+        // Global union across the disjoint per-shard vocabularies.
+        let int_set: std::collections::HashSet<i64> = int_cats.iter().copied().collect();
+        assert_eq!(
+            int_set,
+            std::collections::HashSet::from([10, 20, 30, 40, 50]),
+            "cluster categories must unify across shards"
+        );
+        let float_set: std::collections::HashSet<u64> =
+            float_cats.iter().map(|f| f.to_bits()).collect();
+        let want_float: std::collections::HashSet<u64> = [0.1f64, 0.5, 0.9, 0.25, 0.75]
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        assert_eq!(
+            float_set, want_float,
+            "dose categories must unify across shards"
+        );
+
+        // Per-row logical values match the source and the eager baseline.
+        let stream_obs = read_dataframe_group(&sf, "obs", &mut WarningSink::log()).unwrap();
+        let ef = hdf5::File::open(&h5ad_eager).unwrap();
+        let eager_obs = read_dataframe_group(&ef, "obs", &mut WarningSink::log()).unwrap();
+
+        let s_cluster = stream_obs.column(stream_obs.schema().index_of("cluster").unwrap());
+        let s_dose = stream_obs.column(stream_obs.schema().index_of("dose").unwrap());
+        assert!(
+            matches!(s_cluster.data_type(), DataType::Dictionary(_, v) if **v == DataType::Int64),
+            "cluster should round-trip as Dictionary(_, Int64), got {:?}",
+            s_cluster.data_type()
+        );
+        assert!(
+            matches!(s_dose.data_type(), DataType::Dictionary(_, v) if **v == DataType::Float64),
+            "dose should round-trip as Dictionary(_, Float64), got {:?}",
+            s_dose.data_type()
+        );
+        assert_eq!(
+            decode_dict_i64(s_cluster),
+            expected_int,
+            "cluster values (streaming)"
+        );
+        assert_eq!(
+            decode_dict_f64(s_dose),
+            expected_float,
+            "dose values (streaming)"
+        );
+
+        let e_cluster = eager_obs.column(eager_obs.schema().index_of("cluster").unwrap());
+        let e_dose = eager_obs.column(eager_obs.schema().index_of("dose").unwrap());
+        assert_eq!(
+            decode_dict_i64(e_cluster),
+            expected_int,
+            "cluster values (eager parity)"
+        );
+        assert_eq!(
+            decode_dict_f64(e_dose),
+            expected_float,
+            "dose values (eager parity)"
+        );
     }
 
     /// Streaming export when the entry point is called on a legacy

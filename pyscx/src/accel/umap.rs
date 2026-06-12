@@ -183,7 +183,19 @@ pub fn umap(
     // Suppress unused variable warning when gpu feature is not enabled
     let _ = _device;
 
-    // CPU path (default or fallback) — release GIL for the computation
+    // CPU path (default or fallback). gpu_eligible=false forces the cpu_dense
+    // route; this site is reached only when CPU actually runs. Announce the
+    // route + any GPU→CPU fallback warning *before* the (potentially long)
+    // compute so the user sees it at op start, not after the run (report P1).
+    let info = super::route::simple_exec_info(
+        device,
+        false,
+        scx_accel::AccelRoute::GpuDense,
+        scx_accel::AccelRoute::CpuDense,
+    );
+    super::route::announce_route(py, "umap", device, &info);
+
+    // Release the GIL for the computation.
     let result = py
         .detach(|| {
             scx_accel::compute_umap(
@@ -206,16 +218,6 @@ pub fn umap(
     // Write results to adata.obsm["X_umap"]
     write_umap_to_adata(py, adata, &result)?;
     write_umap_backend(py, adata, "scx-accel-cpu")?;
-    // CPU ran (either device=cpu/no-CUDA, or both GPU paths failed at runtime).
-    // gpu_eligible=false forces the cpu_dense route with an appropriate reason
-    // (this site is reached only when CPU actually ran).
-    let info = super::route::simple_exec_info(
-        device,
-        false,
-        scx_accel::AccelRoute::GpuDense,
-        scx_accel::AccelRoute::CpuDense,
-    );
-    super::route::announce_route(py, "umap", device, &info);
     super::route::write_accel_route(py, adata, "umap", &info)?;
 
     Ok(())

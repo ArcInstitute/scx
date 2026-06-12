@@ -431,6 +431,11 @@ pub(crate) fn read_f32_dataset(ds: &hdf5::Dataset) -> Result<Vec<f32>, ConvertEr
 /// categories). Accepts every numeric width; integer widths widen, `f32`
 /// promotes losslessly. Used by [`read_categorical_values`] so float-keyed
 /// categoricals preserve `f64` precision on the round-trip.
+///
+/// Note: an `i64` / `u64` source with magnitude above 2^53 loses integer
+/// precision in the `as f64` cast. This is only reached for *float-typed*
+/// `categories` datasets, so an integer source here would be unusual; integer
+/// categories take [`read_i64_dataset`] instead (which range-checks `u64`).
 pub(crate) fn read_f64_dataset(ds: &hdf5::Dataset) -> Result<Vec<f64>, ConvertError> {
     use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
@@ -467,7 +472,10 @@ pub(crate) fn read_f64_dataset(ds: &hdf5::Dataset) -> Result<Vec<f64>, ConvertEr
 /// dropping the whole column; we now branch on the category dtype:
 /// strings → `Utf8`, integer/unsigned → `Int64`, float → `Float64`. The
 /// returned `DataType` becomes the dictionary value type so the SCX → h5ad
-/// writer can re-emit a `categories` dataset of the right class.
+/// writer can re-emit a `categories` dataset of the right class. Integer
+/// categories normalize to `Int64` via [`read_i64_dataset`], which *errors*
+/// (rather than wrapping) on a `u64` category above `i64::MAX` — realistic
+/// category values (cluster labels) stay far below this.
 fn read_categorical_values(cats_ds: &hdf5::Dataset) -> Result<(ArrayRef, DataType), ConvertError> {
     let desc = cats_ds.dtype()?.to_descriptor()?;
     match desc {
@@ -479,15 +487,25 @@ fn read_categorical_values(cats_ds: &hdf5::Dataset) -> Result<(ArrayRef, DataTyp
             let cats = read_f64_dataset(cats_ds)?;
             Ok((Arc::new(Float64Array::from(cats)), DataType::Float64))
         }
-        _ => {
-            // String (var/fixed, unicode/ascii) categories — the common case.
-            // Reading as `VarLenUnicode` matches the prior behavior for the
-            // var-length unicode categories anndata emits.
+        // String (var/fixed, unicode/ascii) categories — the common case.
+        // Reading as `VarLenUnicode` matches the var-length unicode categories
+        // anndata emits.
+        TypeDescriptor::VarLenUnicode
+        | TypeDescriptor::VarLenAscii
+        | TypeDescriptor::FixedUnicode(_)
+        | TypeDescriptor::FixedAscii(_) => {
             let cats_raw: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
-            let cats: Vec<String> = cats_raw.iter().map(|s| s.to_string()).collect();
-            let values = StringArray::from(cats.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            let cats: Vec<String> = cats_raw.into_iter().map(|s| s.to_string()).collect();
+            let values = StringArray::from(cats);
             Ok((Arc::new(values), DataType::Utf8))
         }
+        // Anything else (Boolean, Enum, Compound, …) is not a categorical
+        // category payload we can represent; surface a structured error
+        // rather than letting a blind `VarLenUnicode` read emit a raw,
+        // opaque HDF5 "no conversion paths found".
+        other => Err(ConvertError::UnsupportedDtype(format!(
+            "categorical category dtype {other:?}"
+        ))),
     }
 }
 
@@ -1222,8 +1240,8 @@ fn read_categorical_column(
     let (values, value_dtype): (ArrayRef, DataType) = if let Ok(cats_attr) = ds.attr("categories") {
         // Categories stored as attribute (legacy form — string only).
         let cats: Vec<hdf5::types::VarLenUnicode> = cats_attr.read_1d()?.to_vec();
-        let cats: Vec<String> = cats.iter().map(|s| s.to_string()).collect();
-        let arr = StringArray::from(cats.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let cats: Vec<String> = cats.into_iter().map(|s| s.to_string()).collect();
+        let arr = StringArray::from(cats);
         (Arc::new(arr), DataType::Utf8)
     } else if let Ok(cats_ds) = group.dataset(&format!("__categories/{name}")) {
         // Old-style: categories in __categories subgroup.
@@ -1673,9 +1691,9 @@ pub fn read_uns(
 /// is not preserved — scanpy DE tables must be exported separately.
 fn compound_unsupported_msg(n_fields: usize) -> String {
     format!(
-        "compound/structured array with {n_fields} fields (e.g. scanpy rank_genes_groups) — \
-         not preserved; export DE results separately (sc.get.rank_genes_groups_df → CSV/Parquet) \
-         before converting"
+        "compound/structured array with {n_fields} fields — not preserved (common source: scanpy \
+         rank_genes_groups); export DE results separately (sc.get.rank_genes_groups_df → \
+         CSV/Parquet) before converting"
     )
 }
 

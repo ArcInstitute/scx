@@ -236,6 +236,8 @@ combinations that are not covered by the default workspace build:
 | `scx-cli --features cloud` | Cloud-only CLI build |
 | `scx-cli --features hdf5,cloud` | HDF5 + cloud CLI build |
 | `scx-accel --features gpu` | GPU accelerator build (cudarc stubs, no CUDA required) |
+| `pyscx --features gpu` | Python GPU bindings (rapids-absent lane) |
+| `pyscx --features hdf5,gpu` | Python GPU bindings + h5ad I/O (the documented GPU build combo) |
 | `pyscx --features cloud` | Python cloud bindings |
 
 ## Workspace Structure

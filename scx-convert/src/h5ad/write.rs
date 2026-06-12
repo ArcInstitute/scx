@@ -574,27 +574,39 @@ enum CatValues {
 /// normalize to `i64`, floats to `f64`. Categories never carry nulls (the
 /// codes carry NA via `-1`), so `value(i)` is always valid.
 fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, ConvertError> {
-    let values = array.as_any_dictionary().values();
+    // `as_any_dictionary` panics on a non-dictionary array; callers only reach
+    // here inside a `Dictionary(_, _)` match arm, but use the fallible form so
+    // a wrong call surfaces a structured error instead of a panic.
+    let dict = array.as_any_dictionary_opt().ok_or_else(|| {
+        ConvertError::Other(format!(
+            "column '{name}': expected Dictionary, got {:?}",
+            array.data_type()
+        ))
+    })?;
+    let values = dict.values();
+    // Categories never carry nulls (the codes carry NA via `-1`). Iterate the
+    // backing buffer / string array directly rather than the bounds-checked
+    // `value(i)`.
     macro_rules! ints {
         ($t:ty) => {{
             let a = values.as_primitive::<$t>();
-            CatValues::Int((0..a.len()).map(|i| a.value(i) as i64).collect())
+            CatValues::Int(a.values().iter().map(|&v| v as i64).collect())
         }};
     }
     macro_rules! floats {
         ($t:ty) => {{
             let a = values.as_primitive::<$t>();
-            CatValues::Float((0..a.len()).map(|i| a.value(i) as f64).collect())
+            CatValues::Float(a.values().iter().map(|&v| v as f64).collect())
         }};
     }
     Ok(match values.data_type() {
         DataType::Utf8 => {
             let a = values.as_string::<i32>();
-            CatValues::Str((0..a.len()).map(|i| vlu(a.value(i))).collect())
+            CatValues::Str(a.iter().map(|v| vlu(v.unwrap_or(""))).collect())
         }
         DataType::LargeUtf8 => {
             let a = values.as_string::<i64>();
-            CatValues::Str((0..a.len()).map(|i| vlu(a.value(i))).collect())
+            CatValues::Str(a.iter().map(|v| vlu(v.unwrap_or(""))).collect())
         }
         DataType::Int8 => ints!(Int8Type),
         DataType::Int16 => ints!(Int16Type),
@@ -612,6 +624,79 @@ fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, Conv
             )));
         }
     })
+}
+
+/// Whether the streaming/eager categorical writers can preserve a
+/// dictionary with this value type. Mirrors the dtypes [`dict_category_values`]
+/// handles (string + every integer / unsigned / float width); anything else
+/// (e.g. `Dictionary(_, Boolean)`) takes the warn-and-skip path.
+fn is_supported_cat_value_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+/// Cross-shard global categorical accumulator for the streaming exporter.
+/// One variant per category value class (matching [`CatValues`]); the `dict`
+/// maps a category to its global code and `order` preserves insertion order
+/// for the final `categories` dataset. Floats are deduped by bit pattern
+/// (`f64::to_bits`) — categorical category values are exact (cluster labels,
+/// dose levels), and pandas does not emit `NaN` categories.
+enum CatAccum {
+    Str {
+        dict: HashMap<String, i32>,
+        order: Vec<String>,
+    },
+    Int {
+        dict: HashMap<i64, i32>,
+        order: Vec<i64>,
+    },
+    Float {
+        dict: HashMap<u64, i32>,
+        order: Vec<f64>,
+    },
+}
+
+impl CatAccum {
+    /// Pick the accumulator variant for a dictionary value type. The caller
+    /// only reaches this for types accepted by [`is_supported_cat_value_type`];
+    /// non-numeric, non-string types fall back to `Str` (unreachable in
+    /// practice).
+    fn new(value_type: &DataType) -> Self {
+        match value_type {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => CatAccum::Int {
+                dict: HashMap::new(),
+                order: Vec::new(),
+            },
+            DataType::Float32 | DataType::Float64 => CatAccum::Float {
+                dict: HashMap::new(),
+                order: Vec::new(),
+            },
+            _ => CatAccum::Str {
+                dict: HashMap::new(),
+                order: Vec::new(),
+            },
+        }
+    }
 }
 
 /// Collect a `Utf8` / `LargeUtf8` string column into `(values, mask)`:
@@ -833,19 +918,30 @@ fn write_column_to_hdf5(
             // float): anndata reconstructs a `pd.Categorical` from a
             // numeric `categories` dataset, so integer-/float-keyed
             // categoricals round-trip instead of being dropped.
-            // Extract categories *before* creating the group so an
-            // unsupported value type leaves no partial group behind.
-            let cats = match dict_category_values(array, name) {
-                Ok(c) => c,
-                Err(_) => {
+            // Extract categories + codes *before* creating the group so an
+            // unsupported value type OR key width leaves no partial group
+            // behind. Both fall through to the same warn-and-skip (an
+            // unsupported key type previously aborted the whole export via
+            // `?` — now it skips the column like an unsupported value type),
+            // and the warning carries the underlying error so a dropped
+            // column is debuggable.
+            macro_rules! skip_unsupported {
+                ($e:expr) => {{
                     sink.emit(ConvertWarning::UnsupportedExportColumn {
                         column: format!("{df_name}/{name}"),
-                        dtype: format!("{dtype:?}"),
+                        dtype: format!("{dtype:?} ({})", $e),
                     });
                     return Ok(false);
-                }
+                }};
+            }
+            let cats = match dict_category_values(array, name) {
+                Ok(c) => c,
+                Err(e) => skip_unsupported!(e),
             };
-            let codes = dict_codes_i32(array, name)?;
+            let codes = match dict_codes_i32(array, name) {
+                Ok(c) => c,
+                Err(e) => skip_unsupported!(e),
+            };
 
             let cat_group = group.create_group(name)?;
             cat_group
@@ -1377,10 +1473,13 @@ enum ColumnStreamWriter {
         group: hdf5::Group,
         codes_ds: hdf5::Dataset,
         offset: usize,
-        // `dict` keys come from the per-shard dictionary values; the
-        // insertion order is preserved by walking `cat_order` at finalize.
-        dict: HashMap<String, i32>,
-        cat_order: Vec<String>,
+        // Cross-shard global category vocabulary. The variant (string /
+        // integer / float) is fixed at writer creation from the column's
+        // dictionary value type; `append_shard_to_column` folds each shard's
+        // local categories in (insertion order preserved), and
+        // `finalize_column_writer` writes a `categories` dataset of the
+        // matching HDF5 dtype.
+        accum: CatAccum,
         // pandas `ordered` bit, resolved from the source field metadata
         // ([`CATEGORICAL_ORDERED_KEY`]) at writer creation and emitted at
         // finalize (the `Field` is gone by then).
@@ -1540,9 +1639,7 @@ fn create_column_writer(
                 offset: 0,
             })
         }
-        DataType::Dictionary(_, value_type)
-            if matches!(value_type.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
-        {
+        DataType::Dictionary(_, value_type) if is_supported_cat_value_type(value_type.as_ref()) => {
             let cat_group = group.create_group(on_disk_name)?;
             let codes_ds = cat_group
                 .new_dataset::<i32>()
@@ -1552,8 +1649,7 @@ fn create_column_writer(
                 group: cat_group,
                 codes_ds,
                 offset: 0,
-                dict: HashMap::new(),
-                cat_order: Vec::new(),
+                accum: CatAccum::new(value_type.as_ref()),
                 ordered: field_ordered(field),
             })
         }
@@ -1720,50 +1816,82 @@ fn append_shard_to_column(
         ColumnStreamWriter::Categorical {
             codes_ds,
             offset,
-            dict,
-            cat_order,
+            accum,
             ..
         } => {
-            let (local_codes, local_values) = dict_local_codes_and_string_values(array, name)?;
+            let local_codes = dict_codes_i32(array, name)?;
+            let local_values = dict_category_values(array, name)?;
+
             // C10: intern only the dictionary values actually referenced by
             // `kept_local` rows, so categories present only in
             // deletion-dropped rows don't enter the global vocabulary. The
             // local→global map is filled lazily as kept codes are visited.
-            let mut local_to_global: Vec<Option<i32>> = vec![None; local_values.len()];
-            let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
-            for &i in kept_local {
-                let lc = local_codes[i];
-                if lc < 0 {
-                    kept_codes.push(-1);
-                    continue;
-                }
-                let lc_idx = lc as usize;
-                let g = match local_to_global[lc_idx] {
-                    Some(g) => g,
-                    None => {
-                        let v = &local_values[lc_idx];
-                        let g = match dict.get(v) {
-                            Some(&g) => g,
+            // `key`/`store` adapt the shared remap to the value class: the
+            // dedup-map key (`String` / `i64` / `u64`-bits) and the stored
+            // category order value. Cardinality is capped at i32::MAX
+            // (defensive — real categoricals stay well below).
+            macro_rules! remap {
+                ($vals:expr, $dict:expr, $order:expr, $key:expr, $store:expr) => {{
+                    let vals = $vals;
+                    let mut local_to_global: Vec<Option<i32>> = vec![None; vals.len()];
+                    let mut kept_codes: Vec<i32> = Vec::with_capacity(kept_local.len());
+                    for &i in kept_local {
+                        let lc = local_codes[i];
+                        if lc < 0 {
+                            kept_codes.push(-1);
+                            continue;
+                        }
+                        let lc_idx = lc as usize;
+                        let g = match local_to_global[lc_idx] {
+                            Some(g) => g,
                             None => {
-                                // Cap at i32::MAX. Practical categorical
-                                // cardinalities (cell_type, donor_id) stay
-                                // well below this; saturating is defensive.
-                                let g: i32 = cat_order.len().try_into().map_err(|_| {
-                                    ConvertError::Other(format!(
-                                        "column '{name}': categorical cardinality exceeds i32::MAX"
-                                    ))
-                                })?;
-                                dict.insert(v.clone(), g);
-                                cat_order.push(v.clone());
+                                let v = &vals[lc_idx];
+                                let k = $key(v);
+                                let g = match $dict.get(&k) {
+                                    Some(&g) => g,
+                                    None => {
+                                        let g: i32 = $order.len().try_into().map_err(|_| {
+                                            ConvertError::Other(format!(
+                                                "column '{name}': categorical cardinality exceeds i32::MAX"
+                                            ))
+                                        })?;
+                                        $dict.insert(k, g);
+                                        $order.push($store(v));
+                                        g
+                                    }
+                                };
+                                local_to_global[lc_idx] = Some(g);
                                 g
                             }
                         };
-                        local_to_global[lc_idx] = Some(g);
-                        g
+                        kept_codes.push(g);
                     }
-                };
-                kept_codes.push(g);
+                    kept_codes
+                }};
             }
+
+            let kept_codes = match (&mut *accum, local_values) {
+                (CatAccum::Str { dict, order }, CatValues::Str(vals)) => {
+                    let svals: Vec<String> = vals.iter().map(|v| v.as_str().to_string()).collect();
+                    remap!(svals, dict, order, |v: &String| v.clone(), |v: &String| v
+                        .clone())
+                }
+                (CatAccum::Int { dict, order }, CatValues::Int(vals)) => {
+                    remap!(vals, dict, order, |v: &i64| *v, |v: &i64| *v)
+                }
+                (CatAccum::Float { dict, order }, CatValues::Float(vals)) => {
+                    remap!(vals, dict, order, |v: &f64| v.to_bits(), |v: &f64| *v)
+                }
+                _ => {
+                    // The accumulator variant is fixed from the column's
+                    // declared value type at writer creation; every shard
+                    // must present the same class. A mismatch means a
+                    // malformed file (shards disagree on dtype).
+                    return Err(ConvertError::Other(format!(
+                        "column '{name}': categorical value type changed across shards"
+                    )));
+                }
+            };
             codes_ds.write_slice(
                 ArrayView1::from(kept_codes.as_slice()),
                 ndarray::s![*offset..*offset + kept_codes.len()],
@@ -1872,17 +2000,39 @@ fn append_shard_to_column(
 fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertError> {
     if let ColumnStreamWriter::Categorical {
         group,
-        cat_order,
+        accum,
         ordered,
         ..
     } = writer
     {
-        let cats: Vec<VarLenUnicode> = cat_order.iter().map(|s| vlu(s)).collect();
-        group
-            .new_dataset::<VarLenUnicode>()
-            .shape([cats.len()])
-            .create("categories")?
-            .write(&cats)?;
+        // Emit the `categories` dataset with the dtype matching the source
+        // category class so numeric-keyed categoricals round-trip (anndata
+        // reconstructs the numeric `pd.Categorical`); strings stay
+        // `VarLenUnicode`.
+        match accum {
+            CatAccum::Str { order, .. } => {
+                let cats: Vec<VarLenUnicode> = order.iter().map(|s| vlu(s)).collect();
+                group
+                    .new_dataset::<VarLenUnicode>()
+                    .shape([cats.len()])
+                    .create("categories")?
+                    .write(&cats)?;
+            }
+            CatAccum::Int { order, .. } => {
+                group
+                    .new_dataset::<i64>()
+                    .shape([order.len()])
+                    .create("categories")?
+                    .write(order.as_slice())?;
+            }
+            CatAccum::Float { order, .. } => {
+                group
+                    .new_dataset::<f64>()
+                    .shape([order.len()])
+                    .create("categories")?
+                    .write(order.as_slice())?;
+            }
+        }
         group
             .new_attr::<VarLenUnicode>()
             .create("encoding-type")?
@@ -1897,72 +2047,6 @@ fn finalize_column_writer(writer: &ColumnStreamWriter) -> Result<(), ConvertErro
             .write_scalar(ordered)?;
     }
     Ok(())
-}
-
-/// Streaming counterpart of [`dict_codes_and_categories_i32`]: extracts
-/// local codes (promoted to i32, -1 for null) and the local dictionary
-/// values as owned `Vec<String>` so callers can fold values into a
-/// running global dictionary across shards. Accepts both
-/// `Dictionary(_, Utf8)` and `Dictionary(_, LargeUtf8)` value types so
-/// shard runtime arrays match whatever the per-shard downcast left.
-fn dict_local_codes_and_string_values(
-    array: &dyn Array,
-    name: &str,
-) -> Result<(Vec<i32>, Vec<String>), ConvertError> {
-    macro_rules! extract {
-        ($t:ty, $label:literal) => {{
-            let dict = array
-                .as_any()
-                .downcast_ref::<DictionaryArray<$t>>()
-                .ok_or_else(|| downcast_err(name, $label))?;
-            let codes: Vec<i32> = dict
-                .keys()
-                .iter()
-                .map(|v| match v {
-                    Some(k) => k as i32,
-                    None => -1,
-                })
-                .collect();
-            let values: Vec<String> = match dict.values().data_type() {
-                DataType::Utf8 => {
-                    let arr = dict.values().as_string::<i32>();
-                    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
-                }
-                DataType::LargeUtf8 => {
-                    let arr = dict.values().as_string::<i64>();
-                    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
-                }
-                other => {
-                    return Err(ConvertError::Other(format!(
-                        "column '{name}': unsupported dictionary value type {other:?}"
-                    )));
-                }
-            };
-            Ok::<_, ConvertError>((codes, values))
-        }};
-    }
-    let key_type = match array.data_type() {
-        DataType::Dictionary(k, _) => k.as_ref(),
-        _ => {
-            return Err(ConvertError::Other(format!(
-                "column '{name}': expected Dictionary, got {:?}",
-                array.data_type()
-            )));
-        }
-    };
-    match key_type {
-        DataType::Int8 => extract!(Int8Type, "Dictionary<Int8, _>"),
-        DataType::Int16 => extract!(Int16Type, "Dictionary<Int16, _>"),
-        DataType::Int32 => extract!(Int32Type, "Dictionary<Int32, _>"),
-        DataType::Int64 => extract!(Int64Type, "Dictionary<Int64, _>"),
-        DataType::UInt8 => extract!(UInt8Type, "Dictionary<UInt8, _>"),
-        DataType::UInt16 => extract!(UInt16Type, "Dictionary<UInt16, _>"),
-        DataType::UInt32 => extract!(UInt32Type, "Dictionary<UInt32, _>"),
-        DataType::UInt64 => extract!(UInt64Type, "Dictionary<UInt64, _>"),
-        other => Err(ConvertError::Other(format!(
-            "column '{name}': unsupported categorical key type {other:?}"
-        ))),
-    }
 }
 
 fn write_uns_entries(group: &hdf5::Group, value: &serde_json::Value) -> Result<(), ConvertError> {

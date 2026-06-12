@@ -240,7 +240,7 @@ unset VIRTUAL_ENV    # when using conda for the build
 
 - **Pre-built wheel:** GPU kernels are not shipped — rebuild from source with
   `maturin develop --release --features hdf5,gpu`.
-- **Source without GPU feature:** same rebuild with `--features gpu`.
+- **Source without GPU feature:** same rebuild with `--features hdf5,gpu`.
 - **GPU build but no CUDA device:** ops **silently fall back to CPU**. Check
   `nvidia-smi` and `pyscx.accel.gpu_info()`.
 - **Missing cuVS/cuGraph:** kNN and Leiden fall back to CPU even with GPU
