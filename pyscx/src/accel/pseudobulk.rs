@@ -8,10 +8,17 @@ use crate::backed::ScxBackedSparseDataset;
 
 use super::de::extract_strata;
 
+/// Upper bound for the env-derived / auto-probed worker count. An explicit
+/// `n_cpus` argument bypasses this so callers can opt into larger pools.
+const DESEQ_DEFAULT_MAX_CPUS: usize = 8;
+
 /// Resolve a safe worker cap for pydeseq2's loky inference backend.
 ///
-/// Precedence: explicit `n_cpus` (if `> 0`) → `SLURM_CPUS_PER_TASK` →
-/// `OMP_NUM_THREADS` → `min(available_parallelism, 8)`. Always `>= 1`.
+/// Precedence: explicit `n_cpus` (if `> 0`, used verbatim — the opt-in to a
+/// larger pool) → `SLURM_CPUS_PER_TASK` → `OMP_NUM_THREADS` →
+/// `available_parallelism`. Every non-explicit source is clamped to
+/// `[1, DESEQ_DEFAULT_MAX_CPUS]`, so a large SLURM allocation does not silently
+/// re-create the OOM below.
 ///
 /// pydeseq2's `DefaultInference` defaults to `n_cpus=None`, which spawns one
 /// loky worker process per core. Each worker is a full Python interpreter
@@ -44,11 +51,11 @@ fn resolve_deseq_n_cpus_impl(
     for v in [slurm_cpus, omp_threads].into_iter().flatten() {
         if let Ok(n) = v.trim().parse::<usize>() {
             if n > 0 {
-                return n;
+                return n.clamp(1, DESEQ_DEFAULT_MAX_CPUS);
             }
         }
     }
-    available_parallelism.clamp(1, 8)
+    available_parallelism.clamp(1, DESEQ_DEFAULT_MAX_CPUS)
 }
 
 #[cfg(test)]
@@ -91,6 +98,25 @@ mod tests {
             4
         );
         assert_eq!(resolve_deseq_n_cpus_impl(None, None, None, 1), 1);
+    }
+
+    #[test]
+    fn env_derived_values_clamp_to_max() {
+        // A large SLURM/OMP allocation must not re-create the loky OOM.
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(None, Some("192".into()), None, 4),
+            8
+        );
+        assert_eq!(
+            resolve_deseq_n_cpus_impl(None, None, Some("64".into()), 4),
+            8
+        );
+    }
+
+    #[test]
+    fn explicit_n_cpus_is_not_clamped() {
+        // Explicit value is the opt-in to a larger pool.
+        assert_eq!(resolve_deseq_n_cpus_impl(Some(64), None, None, 4), 64);
     }
 }
 
@@ -544,20 +570,33 @@ pub fn pseudobulk_dex(
     let resolved_n_cpus = resolve_deseq_n_cpus(n_cpus);
     {
         let cap = resolved_n_cpus.to_string();
+        // `n_cpus` (via DefaultInference below) only bounds the loky *process*
+        // count; numba and the BLAS pool (OpenMP/MKL/OpenBLAS) read their own
+        // env vars. Set them through Python's `os.environ` under the GIL — never
+        // raw `std::env::set_var`, which races with `getenv` in background
+        // BLAS/OpenMP threads (and is `unsafe` on edition 2024). `setdefault`
+        // is a no-op when the operator already set a value, and CPython's
+        // `os.environ` calls `putenv`, so freshly-spawned loky workers inherit
+        // the cap.
+        //
+        // NB: this is process-sticky — the first `pseudobulk_dex` call's cap
+        // persists for the process lifetime and cannot be raised later via this
+        // API. Acceptable for OOM avoidance; pass a larger explicit `n_cpus`
+        // (and pre-set these env vars yourself) if you need a bigger pool.
+        let os_environ = py.import("os")?.getattr("environ")?;
         for var in [
             "NUMBA_NUM_THREADS",
             "OMP_NUM_THREADS",
             "OPENBLAS_NUM_THREADS",
             "MKL_NUM_THREADS",
         ] {
-            // setdefault semantics: never override an explicit operator setting.
-            if std::env::var_os(var).is_none() {
-                std::env::set_var(var, &cap);
-            }
+            os_environ.call_method1("setdefault", (var, cap.as_str()))?;
         }
         // Best-effort: rein in numba in *this* process too. The env var only
         // binds freshly-spawned workers; the main interpreter may already have
-        // imported numba (via scanpy / pydeseq2), so reduce its live pool.
+        // imported numba (via scanpy / pydeseq2), so reduce its live pool. A
+        // BLAS pool already sized in the parent is not shrunk, but the loky
+        // workers (which inherit the env) are the actual OOM driver.
         if let Ok(numba) = py.import("numba") {
             let _ = numba.call_method1("set_num_threads", (resolved_n_cpus,));
         }

@@ -327,11 +327,14 @@ pub fn append_from_reader_with_index_options(
     // multi-shard source legitimately mixes encodings (e.g. shard 0 Zstd,
     // shard 1 Scx1). We therefore preserve each shard's encoding individually
     // in the per-shard loop below rather than forcing a single global one.
-    // Validate only the n_minor bound and the row total here; the per-shard
-    // `ValueEncoding::from_u8` resolution doubles as the unknown-encoding check.
+    // Validate every shard's encoding, the n_minor bound, and the row total
+    // up front — fail fast before any disk mutation so an invalid encoding on
+    // a later shard can't leave a partial write / orphaned bytes behind.
     let mut total_source_rows: u64 = 0;
     for entry in &source_csr_entries {
         let sh = source.read_shard_header(entry)?;
+        ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?;
         if (sh.n_minor as u64) > prep.target_n_vars {
             return Err(OpsError::IndexOutOfBounds {
                 index: sh.n_minor.saturating_sub(1),

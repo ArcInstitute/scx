@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +46,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
     QUERY_N_HVGS,
     RANDOM_SEED,
+    pseudobulk_n_cpus_cap,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
 
@@ -63,7 +63,7 @@ except ImportError:
 # DefaultInference forks one Python-interpreter worker per core (~300 MB each),
 # OOM-killing the job on many-core nodes. pyscx.accel.pseudobulk_dex derives
 # this from SLURM_CPUS_PER_TASK by default; passed explicitly for determinism.
-_PSEUDOBULK_N_CPUS = min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
+_PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 
 # Per-dataset cache for the converted CSC-equipped SCX file. Keyed by
 # `(dataset.name, csc_cols_per_shard)`.

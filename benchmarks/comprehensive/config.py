@@ -712,6 +712,18 @@ def get_formats(
     return out
 
 
+def pseudobulk_n_cpus_cap() -> int:
+    """Bounded pydeseq2 worker cap for the pseudobulk DE benchmark paths.
+
+    The ``correctness`` and ``bench_csc_dispatch`` benches pass this explicitly
+    to ``pyscx.accel.pseudobulk_dex(n_cpus=...)`` for determinism. Capped at 8
+    so a large SLURM allocation never spawns one loky worker (~300 MB Python
+    interpreter) per core and OOM-kills the job. Mirrors the env-derived default
+    baked into ``pseudobulk_dex`` itself.
+    """
+    return min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark Constants
 # ---------------------------------------------------------------------------

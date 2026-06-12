@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -45,6 +44,7 @@ from benchmarks.comprehensive.scripts.validation_helpers import (  # noqa: E402
     to_dense,
     write_validation_json,
 )
+from benchmarks.comprehensive.config import pseudobulk_n_cpus_cap  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # pyscx.accel.pseudobulk_dex already derives this from SLURM_CPUS_PER_TASK by
 # default; we pass it explicitly so the cap is deterministic regardless of how
 # the worker env is propagated, and never exceeds 8.
-_PSEUDOBULK_N_CPUS = min(int(os.environ.get("SLURM_CPUS_PER_TASK") or 4), 8)
+_PSEUDOBULK_N_CPUS = pseudobulk_n_cpus_cap()
 
 
 # ---------------------------------------------------------------------------
