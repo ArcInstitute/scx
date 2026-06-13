@@ -341,12 +341,14 @@ pub(super) fn aggregate_pseudobulk(
 ///     backend: DE engine — "pydeseq2" (default) or "nb_glm" (Rust-native
 ///         negative-binomial GLM, no pydeseq2 dependency). Both emit the same
 ///         column schema.
+///     nbglm_options: Optional dict of NB-GLM tuning knobs (only used when
+///         backend="nb_glm"; see pyscx.accel.nb_glm). Ignored for pydeseq2.
 ///
 /// Returns:
 ///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
 ///     lfcSE, stat, pvalue, padj, target, reference
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2"))]
+#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2", nbglm_options=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pseudobulk_dex(
     py: Python<'_>,
@@ -363,6 +365,7 @@ pub fn pseudobulk_dex(
     gene_indices: Option<Vec<u32>>,
     n_cpus: Option<usize>,
     backend: &str,
+    nbglm_options: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
@@ -373,6 +376,18 @@ pub fn pseudobulk_dex(
         return Err(PyValueError::new_err(format!(
             "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"
         )));
+    }
+    // The NB-GLM backend wants replicates as rows of ONE design (place the
+    // replicate column in `groupby`), which is incompatible with the per-stratum
+    // recursion below — each stratum would yield one sample per condition and the
+    // fit would degenerate. Reject the combination with actionable guidance.
+    if backend == "nb_glm" && stratify_by.is_some() {
+        return Err(PyValueError::new_err(
+            "pseudobulk_dex(backend=\"nb_glm\") does not support stratify_by: NB-GLM \
+             treats replicates as rows of a single design, so put the replicate column \
+             (batch/donor/well) directly in `groupby`, or use pyscx.accel.pdex_nb_glm \
+             (which merges groupby + stratify_by for you).",
+        ));
     }
 
     // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
@@ -428,6 +443,7 @@ pub fn pseudobulk_dex(
                 gene_indices.clone(),
                 n_cpus,
                 backend,
+                nbglm_options,
             ) {
                 Ok(result_obj) => {
                     let result_df = result_obj.bind(py);
@@ -505,13 +521,8 @@ pub fn pseudobulk_dex(
     // assemble the same PyDESeq2-style pandas schema the pydeseq2 path returns.
     if backend == "nb_glm" {
         let test_col_idx = groupby.iter().position(|c| c == test_col).unwrap();
-        let df = super::nb_glm::fit_targets_pandas(
-            py,
-            &result,
-            test_col_idx,
-            reference,
-            &scx_accel::NbGlmOptions::default(),
-        )?;
+        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, nbglm_options)?;
+        let df = super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts)?;
         return Ok(df.unbind());
     }
 

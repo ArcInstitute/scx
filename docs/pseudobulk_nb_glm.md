@@ -164,6 +164,13 @@ Then, across genes:
    non-PD information (after a small ridge) yields conservative output
    (`pvalue = 1`, `stat = 0`, `lfcSE = ∞`) rather than a spurious call.
 
+> **BH scope.** In `pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")` each
+> non-reference target is fit independently, so the `padj` / `fdr` column is BH
+> corrected **per target** (within that contrast's gene set), not globally across
+> all target × gene rows. This matches `pdex_ref` and cell-eval's per-target
+> convention; if you need a global correction, re-adjust the pooled `p_value`
+> column yourself.
+
 ### Contrasts
 
 The Rust API and `accel.nb_glm` take a numeric contrast:

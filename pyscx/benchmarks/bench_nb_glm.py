@@ -105,7 +105,8 @@ def _spearman(a: np.ndarray, b: np.ndarray) -> float | None:
     mask = np.isfinite(a) & np.isfinite(b)
     if mask.sum() < 3:
         return None
-    return float(spearmanr(a[mask], b[mask]).statistic)
+    # Index [0] (not `.statistic`) for SciPy < 1.10 backward compatibility.
+    return float(spearmanr(a[mask], b[mask])[0])
 
 
 def bench_size(n_perts, n_donors, n_genes, cells_per, reps, use_pydeseq2) -> dict:
@@ -183,7 +184,7 @@ def bench_direct_fitter(n_genes=20_000, n_samples=20, n_features=3, reps=3) -> d
     }
 
 
-def generate_report(sizes_rows: list[dict], fitter_row: dict) -> str:
+def generate_report(sizes_rows: list[dict], fitter_rows: list[dict]) -> str:
     sysinfo = {
         "platform": platform.platform(),
         "processor": platform.processor() or "unknown",
@@ -218,11 +219,14 @@ def generate_report(sizes_rows: list[dict], fitter_row: dict) -> str:
         "",
         "## Pure-fitter throughput (`accel.nb_glm`, pre-aggregated)",
         "",
-        f"- {fitter_row['n_genes']} genes × {fitter_row['n_samples']} samples × "
-        f"{fitter_row['n_features']} features: **{fitter_row['fit_s']:.3f} s** "
-        f"(~{fitter_row['genes_per_sec']:,} genes/sec)",
-        "",
     ]
+    for f in fitter_rows:
+        lines.append(
+            f"- {f['n_genes']} genes × {f['n_samples']} samples × "
+            f"{f['n_features']} features: **{f['fit_s']:.3f} s** "
+            f"(~{f['genes_per_sec']:,} genes/sec)"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -247,13 +251,17 @@ def main() -> None:
     for sz in sizes:
         print(f"size {sz} ...", flush=True)
         rows.append(bench_size(*sz, reps=args.reps, use_pydeseq2=use_pydeseq2))
-    fitter_row = bench_direct_fitter(reps=args.reps)
+
+    # Pure-fitter throughput: a small "typical pseudobulk" point plus the spec's
+    # key perf target (30k × 200 × 5, §15) for a directly comparable number.
+    fitter_dims = [(20_000, 20, 3)] if args.smoke else [(20_000, 20, 3), (30_000, 200, 5)]
+    fitter_rows = [bench_direct_fitter(*d, reps=args.reps) for d in fitter_dims]
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    md = generate_report(rows, fitter_row)
+    md = generate_report(rows, fitter_rows)
     (RESULTS_DIR / f"{args.out_name}.md").write_text(md)
     (RESULTS_DIR / f"{args.out_name}.json").write_text(
-        json.dumps({"pseudobulk_dex": rows, "direct_fitter": fitter_row}, indent=2)
+        json.dumps({"pseudobulk_dex": rows, "direct_fitter": fitter_rows}, indent=2)
     )
     print(md)
     print(f"\nWrote {RESULTS_DIR / (args.out_name + '.md')} and .json")

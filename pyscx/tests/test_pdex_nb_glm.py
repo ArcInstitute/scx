@@ -161,7 +161,8 @@ def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
     merged = nb.merge(ref, on=key, suffixes=("_nb", "_ref"))
     assert len(merged) == 3 * adata.n_vars
 
-    rho_lfc = spearmanr(merged["log2_fold_change_nb"], merged["log2_fold_change_ref"]).statistic
-    rho_fdr = spearmanr(merged["fdr_nb"], merged["fdr_ref"]).statistic
+    # Index [0] (not `.statistic`) for SciPy < 1.10 backward compatibility.
+    rho_lfc = spearmanr(merged["log2_fold_change_nb"], merged["log2_fold_change_ref"])[0]
+    rho_fdr = spearmanr(merged["fdr_nb"], merged["fdr_ref"])[0]
     assert rho_lfc >= 0.95, f"log2fc Spearman {rho_lfc} < 0.95"
     assert rho_fdr >= 0.95, f"fdr Spearman {rho_fdr} < 0.95"

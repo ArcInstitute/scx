@@ -54,7 +54,14 @@ pub(crate) fn moments_dispersion(
     if mean <= 0.0 {
         return opts.min_disp;
     }
-    let var = (sum_sq / n - mean * mean).max(0.0);
+    // Sample variance (n−1 denominator). The classical method-of-moments NB
+    // dispersion estimator uses s², which is materially less biased than the
+    // population variance at the small sample counts of pseudobulk (4–20).
+    let var = if n > 1.0 {
+        ((sum_sq - n * mean * mean) / (n - 1.0)).max(0.0)
+    } else {
+        0.0
+    };
     let alpha0 = (var - mean) / (mean * mean);
     alpha0.clamp(opts.min_disp, opts.max_disp)
 }
@@ -72,6 +79,7 @@ fn m_stats(
     let a = MatRef::from_row_major_slice(&xtwx, n_features, n_features);
     let (log_det, inv) = match a.llt(Side::Lower) {
         Ok(llt) => {
+            // M = L Lᵀ ⇒ det(M) = det(L)² ⇒ log det = 2·Σ log|L_ii|.
             let l = llt.L();
             let mut ld = 0.0;
             for i in 0..n_features {
@@ -80,6 +88,9 @@ fn m_stats(
             (2.0 * ld, llt.inverse())
         }
         Err(_) => {
+            // M = P L U ⇒ |det(M)| = |det(U)| ⇒ log|det| = Σ log|U_ii| (the
+            // permutation sign doesn't affect the magnitude we need here; hence
+            // the single `ld`, vs the `2·ld` of the Cholesky branch above).
             let lu = a.partial_piv_lu();
             let u = lu.U();
             let mut ld = 0.0;
@@ -153,7 +164,13 @@ pub(crate) fn cox_reid_grad(
     let w = weights(mu, alpha);
     let m_inv = match m_stats(design, &w, n_samples, n_features, ridge) {
         Some((_, inv)) => inv,
-        None => return 0.0,
+        // A non-finite `XᵀWX` (effectively unreachable: ridge > 0 keeps M PD and
+        // the eta/alpha clamps bound `mu`/`W`) must NOT read as a zero gradient —
+        // the Illinois root-finder would mistake that for the optimum and stop at
+        // an arbitrary alpha. Return a positive sentinel instead so it pushes
+        // toward larger dispersion (more conservative inference); `|1.0| ≫ 1e-8`
+        // guarantees it never satisfies the convergence test.
+        None => return 1.0,
     };
     // dlogdet/dalpha = Σ_s (−W_s²) · h_s ; dlogdet/dt = α · that.
     let mut dlogdet_dalpha = 0.0;
@@ -301,6 +318,10 @@ pub(crate) fn fit_dispersion(
 /// Fit the parametric mean→dispersion trend `alpha_trend(mu_bar) = a0 + a1/mu_bar`
 /// via a gamma-family GLM (identity link, weight `1/fit²`) over valid genes
 /// (spec §7.6). Returns `None` if too few usable genes.
+///
+/// v1 does **not** iteratively trim outlier genes between refits (DESeq2 drops
+/// genes >10× / <1e-4 off the trend and refits). This is a deliberate v1
+/// simplification — see `GPU-NB-GLM-SPEC.md` §22.4 — not an oversight.
 pub(crate) fn fit_dispersion_trend(
     base_mean: &[f64],
     alpha_mle: &[f64],

@@ -103,11 +103,30 @@ def test_nb_glm_gene_names_passthrough():
 
 
 def test_nb_glm_too_few_samples_errors():
-    # 2 samples, 2 design columns ⇒ no residual df.
+    # 2 samples, 2 design columns ⇒ no residual df. AccelError → RuntimeError.
     counts = np.array([[10, 20], [30, 40]], dtype=np.float64)
     design = np.array([[1, 0], [1, 1]], dtype=np.float64)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         pyscx.accel.nb_glm(counts, design, contrast=1)
+
+
+def test_nb_glm_input_validation_errors():
+    counts, design = _pseudobulk_fixture()  # 6 samples × 5 genes, design [6 × 2]
+    # gene_names length mismatch.
+    with pytest.raises(ValueError):
+        pyscx.accel.nb_glm(counts, design, contrast=1, gene_names=["a", "b"])
+    # invalid counts_axis.
+    with pytest.raises(ValueError):
+        pyscx.accel.nb_glm(counts, design, contrast=1, counts_axis="genes")
+    # contrast weight-vector length != n_features (2).
+    with pytest.raises(ValueError):
+        pyscx.accel.nb_glm(counts, design, contrast=[1.0, 0.0, 0.0])
+    # contrast coefficient index out of range.
+    with pytest.raises(ValueError):
+        pyscx.accel.nb_glm(counts, design, contrast=5)
+    # unknown options key fails loudly.
+    with pytest.raises(ValueError):
+        pyscx.accel.nb_glm(counts, design, contrast=1, options={"max_outer_iter": 5})
 
 
 def test_nb_glm_options_dict():

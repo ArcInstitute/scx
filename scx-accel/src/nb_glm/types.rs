@@ -45,7 +45,11 @@ pub struct NbGlmOptions {
     // --- Outer loop (spec §3.2) ---
     /// Maximum outer (mean ↔ dispersion) alternations per gene.
     pub max_outer_iters: usize,
-    /// Relative convergence tolerance for the outer loop.
+    /// Relative convergence tolerance for the outer mean↔dispersion alternation
+    /// (on the dispersion `alpha`). `1e-4` (dispersion to ~4 significant figures)
+    /// is ample — LFC and Wald p-values are insensitive to `alpha` far below
+    /// this — and is reliably reachable within `max_outer_iters` for a coupled
+    /// fixed point, unlike a needlessly tight `1e-6`.
     pub outer_tol: f64,
 
     // --- Inference / outputs ---
@@ -77,7 +81,7 @@ impl Default for NbGlmOptions {
             shrink_dispersion: true,
 
             max_outer_iters: 10,
-            outer_tol: 1e-6,
+            outer_tol: 1e-4,
 
             compute_wald: true,
             compute_bh: true,

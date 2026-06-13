@@ -9,6 +9,7 @@
 //!
 //! `pseudobulk_dex(backend="nb_glm")` also routes through [`fit_targets_pandas`].
 
+use std::collections::HashMap;
 use std::f64::consts::LN_2;
 
 use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
@@ -25,7 +26,7 @@ use super::pseudobulk::aggregate_pseudobulk;
 fn dense2d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
     let np = py.import("numpy")?;
     let a = np.call_method1("asarray", (obj,))?;
-    let a = a.call_method1("astype", ("float64",))?;
+    let a = super::util::astype_no_copy(py, &a, "float64")?; // no copy if already f64
     let a = np.call_method1("ascontiguousarray", (a,))?;
     let ro: PyReadonlyArray2<'_, f64> = a
         .extract()
@@ -43,7 +44,7 @@ fn dense2d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, us
 fn dense1d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     let np = py.import("numpy")?;
     let a = np.call_method1("asarray", (obj,))?;
-    let a = a.call_method1("astype", ("float64",))?;
+    let a = super::util::astype_no_copy(py, &a, "float64")?; // no copy if already f64
     let a = np.call_method1("ascontiguousarray", (a,))?;
     let ro: PyReadonlyArray1<'_, f64> = a
         .extract()
@@ -54,14 +55,94 @@ fn dense1d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
         .to_vec())
 }
 
-/// Parse an optional options dict onto `NbGlmOptions::default()`. Unknown keys
-/// are left at their defaults; recognised keys mirror the Rust field names.
+/// Drop cells in under-populated strata before aggregation. A "stratum" is a
+/// unique combination of the `stratify_by` columns; one with fewer than
+/// `min_cells_per_stratum` total cells cannot form a reliable pseudobulk
+/// replicate. Returns the original `adata` (no copy) when nothing is dropped,
+/// else a subset copy.
+fn filter_sparse_strata<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    strat: &[String],
+    min_cells_per_stratum: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    if min_cells_per_stratum == 0 || strat.is_empty() {
+        return Ok(adata.clone());
+    }
+    let obs = adata.getattr("obs")?;
+    let mut cols: Vec<Vec<String>> = Vec::with_capacity(strat.len());
+    for c in strat {
+        let labels: Vec<String> = obs
+            .get_item(c.as_str())?
+            .call_method1("astype", ("str",))?
+            .call_method0("tolist")?
+            .extract()?;
+        cols.push(labels);
+    }
+    let n = cols.first().map(|v| v.len()).unwrap_or(0);
+    // Composite per-cell stratum key (\u{1} separator can't collide with labels).
+    let keys: Vec<String> = (0..n)
+        .map(|i| {
+            cols.iter()
+                .map(|c| c[i].as_str())
+                .collect::<Vec<_>>()
+                .join("\u{1}")
+        })
+        .collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for k in &keys {
+        *counts.entry(k.as_str()).or_insert(0) += 1;
+    }
+    let keep: Vec<bool> = keys
+        .iter()
+        .map(|k| counts[k.as_str()] >= min_cells_per_stratum)
+        .collect();
+    if keep.iter().all(|&b| b) {
+        return Ok(adata.clone());
+    }
+    let mask = py.import("numpy")?.call_method1("array", (keep,))?;
+    adata.get_item(&mask)?.call_method0("copy")
+}
+
+/// Recognised keys for the options dict (mirror `NbGlmOptions` field names).
+const NBGLM_OPTION_KEYS: &[&str] = &[
+    "dispersion",
+    "min_disp",
+    "max_disp",
+    "min_mu",
+    "eta_min",
+    "eta_max",
+    "beta_ridge",
+    "max_irls_iters",
+    "irls_tol",
+    "disp_newton_iters",
+    "max_outer_iters",
+    "outer_tol",
+    "fit_dispersion_trend",
+    "shrink_dispersion",
+];
+
+/// Parse an optional options dict onto `NbGlmOptions::default()`. Recognised keys
+/// mirror the Rust field names; an **unrecognised key raises** `ValueError` so a
+/// typo (`max_outer_iter` vs `max_outer_iters`) fails loudly instead of silently
+/// no-opping.
 pub(super) fn nbglm_options_from_dict(
     _py: Python<'_>,
     dict: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<NbGlmOptions> {
     let mut o = NbGlmOptions::default();
     let Some(d) = dict else { return Ok(o) };
+
+    // Reject unknown keys up front (loud misconfiguration).
+    for key in d.keys() {
+        let k: String = key.extract()?;
+        if !NBGLM_OPTION_KEYS.contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "unknown nb_glm option {k:?}; valid keys: {NBGLM_OPTION_KEYS:?}"
+            )));
+        }
+    }
+
     if let Some(v) = d.get_item("dispersion")? {
         let s: String = v.extract()?;
         o.dispersion = match s.as_str() {
@@ -82,14 +163,32 @@ pub(super) fn nbglm_options_from_dict(
     if let Some(v) = d.get_item("max_disp")? {
         o.max_disp = v.extract()?;
     }
+    if let Some(v) = d.get_item("min_mu")? {
+        o.min_mu = v.extract()?;
+    }
+    if let Some(v) = d.get_item("eta_min")? {
+        o.eta_min = v.extract()?;
+    }
+    if let Some(v) = d.get_item("eta_max")? {
+        o.eta_max = v.extract()?;
+    }
+    if let Some(v) = d.get_item("beta_ridge")? {
+        o.beta_ridge = v.extract()?;
+    }
     if let Some(v) = d.get_item("max_irls_iters")? {
         o.max_irls_iters = v.extract()?;
     }
     if let Some(v) = d.get_item("irls_tol")? {
         o.irls_tol = v.extract()?;
     }
+    if let Some(v) = d.get_item("disp_newton_iters")? {
+        o.disp_newton_iters = v.extract()?;
+    }
     if let Some(v) = d.get_item("max_outer_iters")? {
         o.max_outer_iters = v.extract()?;
+    }
+    if let Some(v) = d.get_item("outer_tol")? {
+        o.outer_tol = v.extract()?;
     }
     if let Some(v) = d.get_item("fit_dispersion_trend")? {
         o.fit_dispersion_trend = v.extract()?;
@@ -210,7 +309,11 @@ pub(super) fn fit_targets_nbglm(
         for (s, &g) in sub.iter().enumerate() {
             design[s * 2] = 1.0;
             design[s * 2 + 1] = if cond[g] == target.as_str() { 1.0 } else { 0.0 };
-            for j in 0..n_vars {
+        }
+        // Transpose group-major `counts` → gene-major `cg`; inner loop over `s`
+        // writes `cg` contiguously (stride 1) for cache-friendly stores.
+        for j in 0..n_vars {
+            for (s, &g) in sub.iter().enumerate() {
                 cg[j * n_sub + s] = result.counts[g * n_vars + j];
             }
         }
@@ -251,7 +354,10 @@ pub(super) fn fit_targets_pandas<'py>(
     let fits = fit_targets_nbglm(py, result, cond_col_idx, reference, options)?;
     if fits.is_empty() {
         return Err(PyRuntimeError::new_err(
-            "NB-GLM produced no fittable contrasts (all targets lacked replicates)",
+            "NB-GLM produced no fittable contrasts: every target had < 2 pseudobulk \
+             replicates per condition. A pseudobulk NB-GLM needs replicates — include a \
+             batch/donor/well column in `groupby`. For no-replicate layouts use \
+             de_method=\"pdex_ref\" or \"wilcoxon\" (per-cell tests).",
         ));
     }
     let n_vars = result.n_vars;
@@ -470,8 +576,6 @@ pub fn pdex_nb_glm(
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
 ) -> PyResult<Py<PyAny>> {
-    let _ = (min_cells_per_stratum, gene_chunk_size); // accepted for API symmetry (v1)
-
     // Replicate guard (§4.4): a pseudobulk NB-GLM needs ≥2 samples per condition.
     let strat = match &stratify_by {
         Some(s) if !s.is_empty() => s.clone(),
@@ -485,15 +589,31 @@ pub fn pdex_nb_glm(
         }
     };
 
+    // `pdex_nb_glm` fits all genes (gene-parallel, no gene subset), so the CSC
+    // sidecar path — which requires a gene projection — does not apply.
+    if prefer_format != "csr" {
+        return Err(PyValueError::new_err(format!(
+            "pdex_nb_glm only supports prefer_format=\"csr\" (it fits every gene; there \
+             is no gene-subset path for the column-major CSC sidecar). Got {prefer_format:?}."
+        )));
+    }
+
+    // `gene_chunk_size` is reserved for a future out-of-core fit; v1 holds all
+    // genes in memory. Warn rather than silently ignore a caller-set value.
+    if gene_chunk_size.is_some() {
+        py.import("warnings")?.call_method1(
+            "warn",
+            (
+                "pdex_nb_glm: gene_chunk_size is not implemented in v1 (all genes are \
+              fit in memory) and is ignored.",
+            ),
+        )?;
+    }
+
     // NB-GLM needs raw counts; refuse log1p-normalized input.
     let is_log1p = match is_log1p {
         Some(b) => b,
-        None => {
-            let uns = adata.getattr("uns")?;
-            uns.call_method1("__contains__", ("log1p",))?
-                .extract::<bool>()
-                .unwrap_or(false)
-        }
+        None => adata.getattr("uns")?.contains("log1p").unwrap_or(false),
     };
     if is_log1p {
         return Err(PyValueError::new_err(
@@ -502,11 +622,12 @@ pub fn pdex_nb_glm(
              de_method=\"pdex_ref\"/\"wilcoxon\".",
         ));
     }
-    if !matches!(prefer_format, "csr" | "csc") {
-        return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
-        )));
-    }
+
+    // Drop whole strata (unique stratify_by combinations) with too few total
+    // cells before aggregation — a sparse donor/batch cannot form a reliable
+    // pseudobulk replicate. (`min_cells_per_group` still filters each
+    // condition×stratum combo afterward.)
+    let working = filter_sparse_strata(py, adata, &strat, min_cells_per_stratum)?;
 
     // Aggregate by [groupby, *stratify_by]: each condition×stratum combo is one
     // pseudobulk replicate. groupby is column 0 of the resulting group labels.
@@ -516,7 +637,7 @@ pub fn pdex_nb_glm(
 
     let result = aggregate_pseudobulk(
         py,
-        adata,
+        &working,
         &combined,
         prefer_format,
         None,
@@ -567,7 +688,11 @@ pub fn pdex_nb_glm(
             let lfc = r.log2_fold_change[j];
             log2_fcs.push(lfc);
             abs_log2_fcs.push(lfc.abs());
-            fold_changes.push(if lfc.is_finite() { lfc.exp2() } else { lfc });
+            fold_changes.push(if lfc.is_finite() {
+                lfc.exp2()
+            } else {
+                f64::NAN
+            });
             p_values.push(r.p_value[j]);
             fdrs.push(r.p_adj[j]);
         }

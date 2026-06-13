@@ -139,7 +139,11 @@ pub fn pseudobulk_nb_glm(
             let mut n_outer = 1u32;
             let mut at_low = false;
             let mut at_high = false;
+            // Moments (single pass) is trivially "outer-converged"; the Cox–Reid
+            // path must reach the tolerance break to count as converged.
+            let mut outer_converged = true;
             if options.dispersion != DispersionMethod::Moments {
+                outer_converged = false;
                 for _ in 0..options.max_outer_iters {
                     let df = fit_dispersion(
                         row,
@@ -167,9 +171,19 @@ pub fn pseudobulk_nb_glm(
                         &options,
                     );
                     n_outer += 1;
-                    let rel_a = (alpha - prev_alpha).abs() / (prev_alpha.abs() + 1e-30);
-                    let rel_d = (fit.deviance - prev_dev).abs() / (prev_dev.abs() + 1e-8);
-                    if rel_a < options.outer_tol && rel_d < options.outer_tol {
+                    // The outer loop alternates dispersion (α) and mean (β); the
+                    // inner IRLS already drives β to `irls_tol` for the current α,
+                    // so the alternation has converged once α stops moving. (The
+                    // deviance moves *with* α, so an extra rel-deviance test would
+                    // just over-tighten the criterion.)
+                    let _ = prev_dev;
+                    // atol+rtol form: the `+ 1.0` floor means a near-Poisson
+                    // dispersion (alpha ≈ 0, where alpha barely affects the
+                    // variance) converges on an *absolute* change rather than
+                    // chasing relative precision against a denominator ~1e-8.
+                    let rel_a = (alpha - prev_alpha).abs() / (prev_alpha.abs() + 1.0);
+                    if rel_a < options.outer_tol {
+                        outer_converged = true;
                         break;
                     }
                 }
@@ -180,7 +194,9 @@ pub fn pseudobulk_nb_glm(
                 fisher: fit.fisher,
                 alpha,
                 base_mean,
-                converged: fit.converged,
+                // Report converged only if both the inner IRLS and the outer
+                // mean↔dispersion alternation reached tolerance.
+                converged: fit.converged && outer_converged,
                 n_iter: n_outer,
                 at_low,
                 at_high,
@@ -287,9 +303,10 @@ pub fn pseudobulk_nb_glm(
         .map(|g| {
             let st = &final_states[g];
             if st.all_zero {
+                // Conservative, matching the non-converged Wald path (spec §7.7).
                 return wald::WaldOut {
                     log2_fold_change: 0.0,
-                    standard_error: f64::NAN,
+                    standard_error: f64::INFINITY,
                     wald_stat: 0.0,
                     p_value: 1.0,
                 };
