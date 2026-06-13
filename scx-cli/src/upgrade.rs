@@ -5,7 +5,6 @@
 
 use std::path::Path;
 
-use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
@@ -111,9 +110,8 @@ fn rewrite_with_current_version(
     // Re-write CSR shards (per-shard codec)
     for shard_entry in &csr_entries {
         let sh = reader.read_shard_header(shard_entry)?;
-        let ve = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+        let ve = crate::shard_utils::decode_value_encoding(sh.value_encoding)?;
+        let ci = crate::shard_utils::decode_codec_id(sh.codec_id)?;
 
         let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
@@ -139,9 +137,8 @@ fn rewrite_with_current_version(
 
     for csc_entry in &csc_entries {
         let sh = reader.read_shard_header(csc_entry)?;
-        let ve = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+        let ve = crate::shard_utils::decode_value_encoding(sh.value_encoding)?;
+        let ci = crate::shard_utils::decode_codec_id(sh.codec_id)?;
 
         let (indptr, indices, data) = reader.read_shard_from_entry(csc_entry)?;
         let col_start = csc_entry

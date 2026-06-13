@@ -1157,6 +1157,36 @@ impl FullCatalog {
         });
         shards
     }
+
+    /// Return dense-mapping (obsm/varm) shard entries for a given
+    /// `(section_type, modality_id, name_prefix)`, sorted by `row_start`.
+    /// Entries without stats are placed at the end.
+    ///
+    /// Unlike the CSR/CSC/layer helpers, the caller supplies the already
+    /// formatted `name_prefix` (e.g. `obsm/X_pca_shard_`) because dense
+    /// mappings are keyed by a runtime axis prefix plus the user's key.
+    pub fn dense_mapping_shards_sorted(
+        &self,
+        section_type: SectionType,
+        modality_id: u8,
+        name_prefix: &str,
+    ) -> Vec<&FullCatalogEntry> {
+        let mut shards: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.section_type == section_type
+                    && e.modality_id == modality_id
+                    && e.name.starts_with(name_prefix)
+            })
+            .collect();
+        shards.sort_by_key(|e| {
+            e.stats
+                .as_ref()
+                .map_or(u64::MAX, |s| s.major_start(section_type))
+        });
+        shards
+    }
 }
 
 #[cfg(test)]

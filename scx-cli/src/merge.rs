@@ -31,30 +31,11 @@ pub fn run_merge(
 
     // Validate all inputs exist
     for p in inputs {
-        if !p.exists() {
-            return Err(format!("input file does not exist: {}", p.display()).into());
-        }
+        crate::cli_utils::validate_scx_file(p)?;
     }
 
-    // Validate n_vars consistency
-    let first_reader = ScxReader::open(&inputs[0])?;
-    let expected_n_vars = first_reader.header().n_vars;
-    drop(first_reader);
-
-    for p in &inputs[1..] {
-        let reader = ScxReader::open(p)?;
-        let n_vars = reader.header().n_vars;
-        if n_vars != expected_n_vars {
-            return Err(format!(
-                "n_vars mismatch: {} has {} vars, {} has {} vars",
-                inputs[0].display(),
-                expected_n_vars,
-                p.display(),
-                n_vars
-            )
-            .into());
-        }
-    }
+    // Validate n_vars consistency across all inputs
+    crate::cli_utils::validate_all_same_n_vars(inputs)?;
 
     // Show progress spinner
     let pb = ProgressBar::new_spinner();
