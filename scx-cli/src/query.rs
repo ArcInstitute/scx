@@ -334,26 +334,8 @@ pub fn parse_gene_indices(path: &Path) -> Result<Vec<u32>, Box<dyn std::error::E
 
 /// Detect the ValueEncoding from the first CSR shard of an SCX file.
 fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    use scx_format_io::section::SectionType;
-    use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
-
     let reader = ScxReader::open(path)?;
-    let csr_entries = reader.catalog().shards(SectionType::CsrShard);
-
-    if let Some(first) = csr_entries.first() {
-        let bytes = reader.section_bytes(first)?;
-        if bytes.len() >= SHARD_HEADER_SIZE {
-            let sh =
-                ShardHeader::read_from(&mut std::io::Cursor::new(&bytes[..SHARD_HEADER_SIZE]))?;
-            ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or_else(|| format!("unknown value encoding: {}", sh.value_encoding).into())
-        } else {
-            Err("CSR shard too small to read header".into())
-        }
-    } else {
-        // Default for files with no shards
-        Ok(ValueEncoding::Uint16)
-    }
+    crate::shard_utils::detect_first_value_encoding(&reader)
 }
 
 /// Detect the ValueEncoding from the first CSR shard of a local
@@ -407,8 +389,7 @@ fn detect_value_encoding_from_dir(dir: &Path) -> Result<ValueEncoding, Box<dyn s
     let mut buf = [0u8; SHARD_HEADER_SIZE];
     f.read_exact(&mut buf)?;
     let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&buf[..]))?;
-    ValueEncoding::from_u8(sh.value_encoding)
-        .ok_or_else(|| format!("unknown value encoding: {}", sh.value_encoding).into())
+    crate::shard_utils::decode_value_encoding(sh.value_encoding)
 }
 
 /// Write a QueryResult to a new SCX file.

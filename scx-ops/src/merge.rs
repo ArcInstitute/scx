@@ -1524,16 +1524,11 @@ fn merge_global_dense_mapping_sharded(
         let shard_name_prefix = format!("{prefix_slash}{key}_shard_");
         let legacy_name = format!("{prefix_slash}{key}");
         for (idx, reader) in source_readers.iter().enumerate() {
-            let shards: Vec<&scx_format_io::catalog::FullCatalogEntry> = reader
-                .catalog()
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.section_type == shard_type
-                        && e.modality_id == 0
-                        && e.name.starts_with(&shard_name_prefix)
-                })
-                .collect();
+            // Already sorted by row_start by the catalog helper.
+            let shards =
+                reader
+                    .catalog()
+                    .dense_mapping_shards_sorted(shard_type, 0, &shard_name_prefix);
             let legacy = if shards.is_empty() {
                 reader.catalog().entries.iter().find(|e| {
                     e.section_type == legacy_type && e.modality_id == 0 && e.name == legacy_name
@@ -1584,9 +1579,8 @@ fn merge_global_dense_mapping_sharded(
                 cumulative_rows += n;
                 out_shard_idx += 1;
             } else {
-                let mut sorted = shards.clone();
-                sorted.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-                for shard_entry in sorted {
+                // `shards` is already sorted by row_start (catalog helper).
+                for &shard_entry in shards {
                     let batch = reader
                         .read_dense_mapping_entry(shard_entry)
                         .map_err(OpsError::Format)?;
@@ -1680,16 +1674,12 @@ fn merge_per_modality_dense_mapping_sharded(
             Option<&scx_format_io::catalog::FullCatalogEntry>,
         )> = Vec::with_capacity(source_readers.len());
         for (idx, reader) in source_readers.iter().enumerate() {
-            let shards: Vec<&scx_format_io::catalog::FullCatalogEntry> = reader
-                .catalog()
-                .entries
-                .iter()
-                .filter(|e| {
-                    e.section_type == shard_type
-                        && e.modality_id == modality_id
-                        && e.name.starts_with(&shard_name_prefix)
-                })
-                .collect();
+            // Already sorted by row_start by the catalog helper.
+            let shards = reader.catalog().dense_mapping_shards_sorted(
+                shard_type,
+                modality_id,
+                &shard_name_prefix,
+            );
             let legacy = if shards.is_empty() {
                 reader.catalog().entries.iter().find(|e| {
                     e.section_type == legacy_type
@@ -1740,9 +1730,8 @@ fn merge_per_modality_dense_mapping_sharded(
                 cumulative_rows += n;
                 out_shard_idx += 1;
             } else {
-                let mut sorted = shards.clone();
-                sorted.sort_by_key(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start));
-                for shard_entry in sorted {
+                // `shards` is already sorted by row_start (catalog helper).
+                for &shard_entry in shards {
                     let batch = reader
                         .read_dense_mapping_entry(shard_entry)
                         .map_err(OpsError::Format)?;

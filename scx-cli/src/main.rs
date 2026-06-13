@@ -5,6 +5,7 @@ use std::process;
 
 mod append;
 mod benchmark;
+mod cli_utils;
 mod compact;
 mod index_warnings;
 use scx_convert as convert;
@@ -17,6 +18,7 @@ mod optimize;
 mod query;
 mod rollback;
 mod set_uns;
+mod shard_utils;
 mod subset;
 mod upgrade;
 mod validate;

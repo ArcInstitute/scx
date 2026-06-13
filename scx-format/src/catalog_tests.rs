@@ -717,6 +717,56 @@ fn full_catalog_shards_sorted() {
     assert!(starts.windows(2).all(|w| w[0] <= w[1]));
 }
 
+#[test]
+fn dense_mapping_shards_sorted_filters_and_sorts() {
+    // Three obsm shards for key "X_pca" (out of order), plus a shard for
+    // a different key and a different modality that must be excluded.
+    let mk = |name: &str, modality_id: u8, row_start: u64| {
+        let mut s = sample_stats();
+        s.row_start = row_start;
+        FullCatalogEntry {
+            name: name.to_string(),
+            offset: 4352,
+            length: 50_000,
+            section_type: SectionType::ObsmEmbeddingShard,
+            checksum: [0u8; 32],
+            modality_id,
+            stats: Some(s),
+        }
+    };
+    let catalog = FullCatalog {
+        catalog_version: CURRENT_CATALOG_VERSION,
+        manifest_sequence: 0,
+        prev_catalog_offset: 0,
+        n_obs: 100,
+        entries: vec![
+            mk("obsm/X_pca_shard_2", 0, 200),
+            mk("obsm/X_pca_shard_0", 0, 0),
+            mk("obsm/X_pca_shard_1", 0, 100),
+            mk("obsm/X_umap_shard_0", 0, 0), // different key
+            mk("obsm/X_pca_shard_0", 1, 0),  // different modality
+        ],
+        data_generation: 0,
+        csc_build_generation: 0,
+    };
+
+    let sorted = catalog.dense_mapping_shards_sorted(
+        SectionType::ObsmEmbeddingShard,
+        0,
+        "obsm/X_pca_shard_",
+    );
+    let names: Vec<&str> = sorted.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "obsm/X_pca_shard_0",
+            "obsm/X_pca_shard_1",
+            "obsm/X_pca_shard_2"
+        ],
+        "only modality-0 X_pca shards, sorted by row_start"
+    );
+}
+
 /// 4-shard CSC layout with non-uniform column sizes.
 /// Confirm csc_shards_for_col_range returns exactly the overlapping
 /// subset for various queries, and that it sorts the result by
