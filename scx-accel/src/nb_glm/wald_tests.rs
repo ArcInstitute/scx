@@ -29,7 +29,11 @@ fn wald_hand_checked() {
     let beta = vec![10.0_f64.ln(), 0.5];
     let fisher = vec![4.0, 0.0, 0.0, 16.0];
     let c = contrast_vector(&NbGlmContrast::Coefficient { index: 1 }, 2);
-    let out = wald_stat(&beta, &fisher, 2, &c);
+    let (out, cov) = wald_stat(&beta, &fisher, 2, &c);
+    assert!(
+        cov.is_some(),
+        "covariance should be returned on a PD fisher"
+    );
     close(out.standard_error, 0.25, 1e-12, 1e-12);
     close(out.wald_stat, 2.0, 1e-12, 1e-12);
     close(out.p_value, 0.045_500_263_896_358_4, 1e-9, 1e-12);
@@ -47,7 +51,7 @@ fn ill_conditioned_is_conservative() {
     let beta = vec![1.0, 1.0];
     let fisher = vec![1.0, 1.0, 1.0, 1.0];
     let c = contrast_vector(&NbGlmContrast::Coefficient { index: 1 }, 2);
-    let out = wald_stat(&beta, &fisher, 2, &c);
+    let (out, _cov) = wald_stat(&beta, &fisher, 2, &c);
     assert_eq!(out.p_value, 1.0);
     assert_eq!(out.wald_stat, 0.0);
     assert!(out.standard_error.is_infinite());

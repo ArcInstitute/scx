@@ -58,20 +58,30 @@ fn invert(fisher: &[f64], n: usize) -> Option<Vec<f64>> {
 /// Compute the Wald statistics for contrast `c` on a single gene (spec §7.7).
 /// `log2_fold_change = (c·beta)/ln2` is always reported; the SE/stat/p degrade
 /// conservatively when the covariance is unusable.
-pub(crate) fn wald_stat(beta: &[f64], fisher: &[f64], n_features: usize, c: &[f64]) -> WaldOut {
+///
+/// Also returns the contrast covariance `cov(beta) = (XᵀWX + ridge)⁻¹` (row-major
+/// `n_features²`) when the Fisher information inverts, or `None` when it does not.
+/// The Cook's-distance pass reuses this inverse (`mod.rs`), avoiding a second
+/// per-gene matrix inversion.
+pub(crate) fn wald_stat(
+    beta: &[f64],
+    fisher: &[f64],
+    n_features: usize,
+    c: &[f64],
+) -> (WaldOut, Option<Vec<f64>>) {
     let effect: f64 = c.iter().zip(beta.iter()).map(|(&ci, &bi)| ci * bi).sum();
     let log2_fold_change = effect / std::f64::consts::LN_2;
 
+    let conservative = WaldOut {
+        log2_fold_change,
+        standard_error: f64::INFINITY,
+        wald_stat: 0.0,
+        p_value: 1.0,
+    };
+
     let cov = match invert(fisher, n_features) {
         Some(cov) => cov,
-        None => {
-            return WaldOut {
-                log2_fold_change,
-                standard_error: f64::INFINITY,
-                wald_stat: 0.0,
-                p_value: 1.0,
-            }
-        }
+        None => return (conservative, None),
     };
 
     // var = cᵀ cov c
@@ -85,23 +95,23 @@ pub(crate) fn wald_stat(beta: &[f64], fisher: &[f64], n_features: usize, c: &[f6
     }
 
     if !(var.is_finite() && var > 0.0) {
-        return WaldOut {
-            log2_fold_change,
-            standard_error: f64::INFINITY,
-            wald_stat: 0.0,
-            p_value: 1.0,
-        };
+        // The covariance is still valid for leverage even if this contrast's
+        // variance degenerates, so return it for the Cook's pass.
+        return (conservative, Some(cov));
     }
 
     let se = var.sqrt();
     let stat = effect / se;
     let p = (2.0 * normal_sf(stat.abs())).clamp(0.0, 1.0);
-    WaldOut {
-        log2_fold_change,
-        standard_error: se,
-        wald_stat: stat,
-        p_value: p,
-    }
+    (
+        WaldOut {
+            log2_fold_change,
+            standard_error: se,
+            wald_stat: stat,
+            p_value: p,
+        },
+        Some(cov),
+    )
 }
 
 #[cfg(test)]

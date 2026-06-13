@@ -101,7 +101,9 @@ fn estimate_prior_var_has_floor() {
     let log_targets = vec![0.0; 10];
     let alpha_mle = vec![1.0; 10]; // ln(1) - 0 = 0 residual
     let valid = vec![true; 10];
-    let pv = estimate_prior_var(&log_targets, &alpha_mle, &valid);
+    // m=6, p=2 ⇒ trigamma((m−p)/2)=trigamma(2)>0; with MAD=0 the prior var floors
+    // at MIN_PRIOR_VAR rather than going negative.
+    let pv = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2);
     assert!(pv >= MIN_PRIOR_VAR - 1e-12);
 }
 

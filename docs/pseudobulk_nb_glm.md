@@ -6,15 +6,15 @@ DESeq2-style workflows at Perturb-seq scale. It lets you stay on the Rust
 acceleration path after pseudobulk aggregation instead of handing off to
 pydeseq2.
 
-> **DESeq2-*style*, not DESeq2-*identical*.** v1 implements the DESeq2 *core* —
+> **DESeq2-*style*, not DESeq2-*identical*.** SCX implements the DESeq2 *core* —
 > IRLS / Fisher scoring for the mean coefficients, a Cox–Reid adjusted
 > profile-likelihood dispersion estimate, a parametric mean→dispersion **trend
-> fit**, and **empirical-Bayes dispersion shrinkage** — but it does **not**
-> reproduce DESeq2 bit-for-bit. It omits Cook's-distance outlier handling,
-> independent filtering, and apeglm/ashr LFC shrinkage (those are v2). The bar is
-> **ranking / effect-sign / significance parity**, not numerical equality. If you
-> need exact DESeq2 behaviour, keep using PyDESeq2 (`backend="pydeseq2"`, the
-> default).
+> fit**, **empirical-Bayes dispersion shrinkage**, and (default-on) DESeq2
+> **Cook's-distance outlier filtering** and **base-mean independent filtering** —
+> but it does **not** reproduce DESeq2 bit-for-bit. It still omits apeglm/ashr LFC
+> shrinkage. The bar is **ranking / effect-sign / significance parity**, not
+> numerical equality. If you need exact DESeq2 behaviour, keep using PyDESeq2
+> (`backend="pydeseq2"`, the default).
 
 ## When to use it
 
@@ -63,7 +63,7 @@ df = pyscx.accel.nb_glm(
     counts_axis="samples_by_genes",
 )
 # columns: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
-#          dispersion, converged, n_iter
+#          dispersion, cooks, converged, n_iter
 ```
 
 ### 2. `pyscx.accel.pdex_nb_glm` — cell-eval / pdex path (from AnnData)
@@ -160,9 +160,31 @@ Then, across genes:
 
 7. **Wald inference** — the contrast effect `c·beta`, SE `√(cᵀ·cov·c)` from the
    Fisher inverse, Wald statistic, two-sided p-value, and `log2FoldChange =
-   effect / ln 2`. Benjamini–Hochberg adjusts across genes. Ill-conditioned /
-   non-PD information (after a small ridge) yields conservative output
-   (`pvalue = 1`, `stat = 0`, `lfcSE = ∞`) rather than a spurious call.
+   effect / ln 2`. Ill-conditioned / non-PD information (after a small ridge)
+   yields conservative output (`pvalue = 1`, `stat = 0`, `lfcSE = ∞`) rather than
+   a spurious call.
+
+8. **Cook's-distance outlier filtering** (DESeq2 default, on) — per gene, the
+   maximum Cook's distance over samples is computed from the leverage (reusing the
+   Wald covariance) and the Pearson residual. Genes whose max Cook's distance
+   exceeds `qf(0.99, p, m−p)` (the F-quantile cutoff; override via `cooks_cutoff`)
+   have their `pvalue` **and** `padj` set to `NaN`. Only applied when the residual
+   df `m − p ≥ 3` (smaller designs can't localize an outlier). The maximum Cook's
+   distance is reported in the `cooks` column. `log2FoldChange`/`lfcSE`/`stat` are
+   still reported for flagged genes. There is no count replacement (that needs ≥ 7
+   replicates and is out of scope).
+
+9. **Independent filtering** (DESeq2 default, on) — a base-mean cutoff is chosen to
+   maximize the number of rejections (genefilter algorithm: a quantile grid, lowess
+   smoothing, and the 1-SE rule), and genes below it have **only** their `padj` set
+   to `NaN`. Benjamini–Hochberg is then computed over the retained genes. When the
+   filter is uninformative (e.g. near-uniform base means) it is a no-op and every
+   gene keeps a finite `padj`.
+
+Both filtering steps are on by default to match DESeq2; set
+`cooks_filtering=False` / `independent_filtering=False` to disable them. Genes with
+`NaN` `padj`/`fdr` are treated as not-significant by downstream consumers (cell-eval
+thresholds `fdr < 0.05`).
 
 > **BH scope.** In `pdex_nb_glm` / `pseudobulk_dex(backend="nb_glm")` each
 > non-reference target is fit independently, so the `padj` / `fdr` column is BH
@@ -200,6 +222,10 @@ dict; unspecified keys keep their defaults:
 | `max_irls_iters` | `100` | IRLS iteration cap (converges in ~5–15) |
 | `irls_tol` | `1e-8` | Relative-deviance convergence tolerance |
 | `max_outer_iters` | `10` | Mean ↔ dispersion outer-loop cap |
+| `cooks_filtering` | `True` | Apply DESeq2 Cook's-distance outlier filtering (`pvalue`/`padj` → NaN) |
+| `cooks_cutoff` | `None` | Cook's cutoff; `None` ⇒ `qf(0.99, p, m−p)` |
+| `independent_filtering` | `True` | Apply base-mean independent filtering (`padj` → NaN below the cutoff) |
+| `independent_filter_alpha` | `0.1` | Significance level independent filtering optimizes rejections at |
 
 ## Diagnostics
 
@@ -213,6 +239,10 @@ dict; unspecified keys keep their defaults:
 - Genes that hit a dispersion clamp, fail to converge, or are all-zero
   (`pvalue = 1`, `dispersion = NaN`, `log2FoldChange = 0`) are counted in internal
   diagnostics.
+- Cook's-distance outliers, the number of independent-filtered genes, the chosen
+  base-mean threshold, and the Cook's cutoff used are recorded in internal
+  diagnostics; the per-gene maximum Cook's distance is surfaced in the `cooks`
+  column of `accel.nb_glm`.
 
 ## Performance
 

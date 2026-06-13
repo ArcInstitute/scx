@@ -42,6 +42,22 @@ pub struct NbGlmOptions {
     /// Apply empirical-Bayes dispersion shrinkage toward the trend.
     pub shrink_dispersion: bool,
 
+    // --- Results-stage filtering (DESeq2 `results()` defaults; spec §19, v2) ---
+    /// Apply Cook's-distance outlier filtering: genes whose max Cook's distance
+    /// exceeds the cutoff have their `p_value`/`p_adj` set to NaN (DESeq2 default
+    /// on). Only applied when the residual df `n_samples − n_features ≥ 3`.
+    pub cooks_filtering: bool,
+    /// Cook's-distance cutoff. `None` ⇒ the DESeq2 default `qf(0.99, p, m−p)`
+    /// (the 0.99 quantile of the F distribution).
+    pub cooks_cutoff: Option<f64>,
+    /// Apply independent filtering: choose a base-mean cutoff that maximizes the
+    /// number of rejections, and set `p_adj` (only) to NaN for genes below it
+    /// (DESeq2 default on).
+    pub independent_filtering: bool,
+    /// Significance level at which independent filtering optimizes the number of
+    /// rejections (DESeq2 default `0.1`).
+    pub independent_filter_alpha: f64,
+
     // --- Outer loop (spec §3.2) ---
     /// Maximum outer (mean ↔ dispersion) alternations per gene.
     pub max_outer_iters: usize,
@@ -79,6 +95,11 @@ impl Default for NbGlmOptions {
             disp_newton_iters: 25,
             fit_dispersion_trend: true,
             shrink_dispersion: true,
+
+            cooks_filtering: true,
+            cooks_cutoff: None,
+            independent_filtering: true,
+            independent_filter_alpha: 0.1,
 
             max_outer_iters: 10,
             outer_tol: 1e-4,
@@ -143,6 +164,15 @@ pub struct NbGlmDiagnostics {
     pub n_boundary_dispersion_high: usize,
     /// Genes that did not converge within `max_outer_iters`.
     pub n_nonconverged: usize,
+    /// Genes flagged as Cook's-distance outliers (`p_value`/`p_adj` → NaN).
+    pub n_cooks_outliers: usize,
+    /// Genes removed by independent filtering (`p_adj` → NaN).
+    pub n_independent_filtered: usize,
+    /// Base-mean cutoff chosen by independent filtering, if it ran.
+    pub independent_filter_threshold: Option<f64>,
+    /// Cook's-distance cutoff actually used (`None` if filtering was off or the
+    /// residual df was too small to apply it).
+    pub cooks_cutoff: Option<f64>,
     /// Fitted mean→dispersion trend, if `fit_dispersion_trend`.
     pub dispersion_trend: Option<DispersionTrend>,
     /// Empirical-Bayes prior variance (log scale), if shrinkage ran.
@@ -175,8 +205,11 @@ pub struct NbGlmResult {
     pub wald_stat: Vec<f64>,
     /// Two-sided Wald p-values.
     pub p_value: Vec<f64>,
-    /// Benjamini–Hochberg adjusted p-values.
+    /// Benjamini–Hochberg adjusted p-values. NaN for genes removed by Cook's or
+    /// independent filtering (DESeq2 semantics).
     pub p_adj: Vec<f64>,
+    /// Maximum Cook's distance per gene (NaN for all-zero / un-computable genes).
+    pub cooks: Vec<f64>,
     /// Normalized mean per gene (base mean).
     pub base_mean: Vec<f64>,
     /// Per-gene convergence flags.

@@ -124,6 +124,108 @@ fn cox_reid_objective_decomposition() {
 }
 
 #[test]
+fn trigamma_known_value_and_finite_difference() {
+    // ψ′(1) = π²/6.
+    close(
+        trigamma(1.0),
+        std::f64::consts::PI * std::f64::consts::PI / 6.0,
+        0.0,
+        1e-9,
+    );
+    // ψ′(x) = d/dx ψ(x): central difference at a few points.
+    for &x in &[0.4_f64, 1.7, 5.0, 50.0, 1e3] {
+        let h = 1e-5 * x;
+        let fd = (digamma(x + h) - digamma(x - h)) / (2.0 * h);
+        close(trigamma(x), fd, 1e-5, 1e-9);
+    }
+}
+
+#[test]
+fn incomplete_beta_known_values() {
+    // Symmetric: I_{0.5}(a, a) = 0.5.
+    close(incomplete_beta(2.0, 2.0, 0.5), 0.5, 0.0, 1e-12);
+    close(incomplete_beta(5.0, 5.0, 0.5), 0.5, 0.0, 1e-12);
+    // I_x(1, 1) = x (uniform CDF).
+    close(incomplete_beta(1.0, 1.0, 0.3), 0.3, 0.0, 1e-12);
+    // Boundaries.
+    assert_eq!(incomplete_beta(2.0, 3.0, 0.0), 0.0);
+    assert_eq!(incomplete_beta(2.0, 3.0, 1.0), 1.0);
+}
+
+#[test]
+fn f_quantile_matches_r_qf() {
+    // Reference values from R `qf(0.99, d1, d2)`.
+    let cases = [
+        (1.0_f64, 10.0_f64, 10.044_29_f64),
+        (2.0, 10.0, 7.559_43),
+        (2.0, 4.0, 18.000_00),
+        (3.0, 5.0, 12.059_92),
+        (5.0, 30.0, 3.699_64),
+    ];
+    for &(d1, d2, q) in &cases {
+        let got = f_quantile(0.99, d1, d2);
+        close(got, q, 1e-3, 1e-3);
+        // Round-trip: the CDF at the quantile recovers p.
+        close(f_cdf(got, d1, d2), 0.99, 0.0, 1e-6);
+    }
+}
+
+#[test]
+fn lowess_recovers_linear_exactly() {
+    // Local-linear LOWESS returns the line exactly on linear data, any span.
+    let x: Vec<f64> = (0..10).map(|i| i as f64).collect();
+    let y: Vec<f64> = x.iter().map(|&xi| 2.0 * xi + 1.0).collect();
+    let yhat = lowess(&x, &y, 0.3, 3);
+    for i in 0..x.len() {
+        close(yhat[i], y[i], 0.0, 1e-9);
+    }
+}
+
+#[test]
+fn lowess_downweights_outlier() {
+    // A mildly-noisy linear trend with one large spike. The noise keeps the
+    // median absolute residual positive (so robustness engages — exactly like R,
+    // which disables robustness when >half the points fit perfectly), and the
+    // robustness iterations must then pull the smoothed value at the spike
+    // substantially back toward the underlying line vs the non-robust (iter=0) fit.
+    let x: Vec<f64> = (0..21).map(|i| i as f64).collect();
+    let mut y: Vec<f64> = x
+        .iter()
+        .enumerate()
+        .map(|(i, &xi)| xi + if i % 2 == 0 { 0.3 } else { -0.3 })
+        .collect();
+    y[10] = 100.0; // outlier at x=10 (true value ~10)
+    let yhat0 = lowess(&x, &y, 0.3, 0); // no robustness
+    let yhat3 = lowess(&x, &y, 0.3, 3); // 3 robustness iterations
+    assert!(
+        yhat3[10] < yhat0[10] - 5.0,
+        "robustness should downweight the outlier: iter0={} iter3={}",
+        yhat0[10],
+        yhat3[10]
+    );
+    assert!(
+        yhat3[10] < 30.0,
+        "smoothed spike should be well below the raw value 100, got {}",
+        yhat3[10]
+    );
+    // Endpoints (no outlier nearby) stay close to the line.
+    close(yhat3[0], 0.0, 0.0, 2.0);
+    close(yhat3[20], 20.0, 0.0, 2.0);
+}
+
+#[test]
+fn lowess_flat_input_stays_flat() {
+    // A constant numRej-like curve must smooth to (near-)constant so the
+    // independent-filtering 1-SE rule keeps the smallest cutoff (no-op).
+    let x: Vec<f64> = (0..50).map(|i| i as f64).collect();
+    let y = vec![42.0_f64; 50];
+    let yhat = lowess(&x, &y, 0.2, 3);
+    for &v in &yhat {
+        close(v, 42.0, 0.0, 1e-9);
+    }
+}
+
+#[test]
 fn clamp_helpers() {
     assert_eq!(clamp_eta(100.0, -30.0, 30.0), 30.0);
     assert_eq!(clamp_eta(-100.0, -30.0, 30.0), -30.0);
