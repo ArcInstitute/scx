@@ -60,7 +60,8 @@ pub use hvg::{
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use lisi::{compute_lisi, LisiConfig, LisiResult};
 pub use nb_glm::{
-    DispersionMethod, DispersionTrend, NbGlmContrast, NbGlmDiagnostics, NbGlmOptions, NbGlmResult,
+    pseudobulk_nb_glm, DispersionMethod, DispersionTrend, NbGlmContrast, NbGlmDiagnostics,
+    NbGlmOptions, NbGlmResult,
 };
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{

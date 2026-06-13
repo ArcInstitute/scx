@@ -13,8 +13,6 @@ pub use cpu::{
     wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming, DiffExpResult, PdexRefResult,
 };
 // Shared inference helpers reused by the NB-GLM Wald + BH steps (spec §7.7–7.8).
-// First consumed outside tests by the Phase-2 NB-GLM Wald code; allow until then.
-#[allow(unused_imports)]
 pub(crate) use cpu::{benjamini_hochberg, normal_sf};
 #[cfg(feature = "gpu")]
 pub use gpu::{
