@@ -120,165 +120,22 @@ mod tests {
     }
 }
 
-/// Pseudobulk differential expression via Rust aggregation + pydeseq2.
-///
-/// Aggregates single-cell counts into pseudobulk samples by grouping cells
-/// according to metadata columns (e.g., `["perturbation", "donor"]`), then
-/// uses `pydeseq2` for negative binomial GLM testing.
-///
-/// Args:
-///     adata: AnnData object with X and obs columns for groupby
-///     groupby: List of obs column names to group by (e.g., ["perturbation", "donor"])
-///     test_col: Column in groupby that contains the condition to test
-///     reference: Reference level in test_col (e.g., "control")
-///     design: DESeq2 design formula (default: auto-generated as "~ test_col")
-///     aggr_method: "sum" (default) or "mean"
-///     min_cells_per_group: Skip groups with fewer cells (default: 10)
-///     n_cpus: Worker cap for pydeseq2's parallel inference. `None` (default)
-///         resolves a safe bound from the environment (`SLURM_CPUS_PER_TASK`,
-///         then `OMP_NUM_THREADS`) and otherwise falls back to
-///         `min(available_parallelism, 8)`. This prevents pydeseq2's loky
-///         backend from forking one worker process per core on many-core
-///         hosts (each a full Python interpreter), which OOMs the job.
-///
-/// Returns:
-///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
-///     lfcSE, stat, pvalue, padj, target, reference
-#[pyfunction]
-#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None))]
-#[allow(clippy::too_many_arguments)]
-pub fn pseudobulk_dex(
+/// Aggregate single-cell counts into pseudobulk samples, dispatching across the
+/// CSC-sidecar / backed-CSR / in-memory-scipy-CSR layouts. Shared by
+/// [`pseudobulk_dex`] and the NB-GLM bindings (`super::nb_glm`).
+pub(super) fn aggregate_pseudobulk(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    groupby: Vec<String>,
-    test_col: &str,
-    reference: &str,
-    design: Option<&str>,
-    aggr_method: &str,
-    min_cells_per_group: usize,
-    stratify_by: Option<Vec<String>>,
-    min_cells_per_stratum: usize,
+    groupby: &[String],
     prefer_format: &str,
-    gene_indices: Option<Vec<u32>>,
-    n_cpus: Option<usize>,
-) -> PyResult<Py<PyAny>> {
-    if !matches!(prefer_format, "csr" | "csc") {
-        return Err(PyValueError::new_err(format!(
-            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
-        )));
-    }
-
-    // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
-    // Pseudobulk aggregation + pydeseq2 is CPU-only; the only dispatch choice is
-    // the gene-axis layout — cpu_csc when prefer_format="csc" (reads the
-    // gene-major sidecar), cpu_csr otherwise. Stamped on the top-level adata
-    // before the stratified branch (which recurses on discarded sub_adata
-    // copies). This is the route the CSC dispatch gate asserts.
-    let pb_route = if prefer_format == "csc" {
-        scx_accel::AccelRoute::CpuCsc
-    } else {
-        scx_accel::AccelRoute::CpuCsr
-    };
-    super::route::write_accel_route(
-        py,
-        adata,
-        "pseudobulk_dex",
-        &scx_accel::AccelExecutionInfo::new(pb_route, scx_accel::FallbackReason::None),
-    )?;
-
-    // --- Stratified path ---
-    if let Some(ref strat_cols) = stratify_by {
-        // Forbidden columns: test_col and all groupby columns.
-        let mut forbidden: Vec<&str> = groupby.iter().map(|s| s.as_str()).collect();
-        forbidden.push(test_col);
-        let (strata, masks) =
-            extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
-
-        let pd = py.import("pandas")?;
-        let warnings = py.import("warnings")?;
-        let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
-
-        for (stratum, mask) in strata.iter().zip(masks.iter()) {
-            // Subset adata by mask.
-            let sub_adata = adata.get_item(mask)?;
-            let sub_adata = sub_adata.call_method0("copy")?;
-
-            // Run pseudobulk_dex on the subset (recursive call without stratify).
-            match pseudobulk_dex(
-                py,
-                &sub_adata,
-                groupby.clone(),
-                test_col,
-                reference,
-                design,
-                aggr_method,
-                min_cells_per_group,
-                None, // no nested stratification
-                50,   // unused since stratify_by=None
-                prefer_format,
-                gene_indices.clone(),
-                n_cpus,
-            ) {
-                Ok(result_obj) => {
-                    let result_df = result_obj.bind(py);
-                    // Add stratum columns.
-                    for (j, col_name) in strat_cols.iter().enumerate() {
-                        result_df.set_item(col_name.as_str(), stratum.key[j].as_str())?;
-                    }
-                    all_frames.push(result_df.clone());
-                }
-                Err(e) => {
-                    let key_str = stratum.key.join(", ");
-                    let msg = format!("Pseudobulk DE failed for stratum [{}]: {}", key_str, e);
-                    warnings.call_method1("warn", (msg,))?;
-                }
-            }
-        }
-
-        if all_frames.is_empty() {
-            return Err(PyValueError::new_err(
-                "all strata failed during stratified pseudobulk DE analysis",
-            ));
-        }
-
-        let frame_list = pyo3::types::PyList::new(py, &all_frames)?;
-        let combined = pd.call_method(
-            "concat",
-            (frame_list,),
-            Some(&{
-                let kw = PyDict::new(py);
-                kw.set_item("ignore_index", true)?;
-                kw
-            }),
-        )?;
-
-        return Ok(combined.unbind());
-    }
-
-    // --- Non-stratified path (original behavior) ---
-    // Validate test_col is in groupby.
-    if !groupby.contains(&test_col.to_string()) {
-        return Err(PyRuntimeError::new_err(format!(
-            "test_col '{}' must be one of the groupby columns: {:?}",
-            test_col, groupby
-        )));
-    }
-
-    let method = match aggr_method {
-        "sum" => scx_accel::AggregationMethod::Sum,
-        "mean" => scx_accel::AggregationMethod::Mean,
-        _ => {
-            return Err(PyRuntimeError::new_err(format!(
-                "unsupported aggr_method '{}': use 'sum' or 'mean'",
-                aggr_method
-            )))
-        }
-    };
-
+    gene_indices: Option<&[u32]>,
+    method: scx_accel::AggregationMethod,
+    min_cells_per_group: usize,
+) -> PyResult<scx_accel::PseudobulkResult> {
     // Extract groupby columns from adata.obs.
     let obs = adata.getattr("obs")?;
     let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
-    for col_name in &groupby {
+    for col_name in groupby {
         let col = obs.get_item(col_name.as_str())?;
         let labels: Vec<String> = col
             .call_method1("astype", ("str",))?
@@ -301,14 +158,14 @@ pub fn pseudobulk_dex(
         // Resolve the gene subset: explicit `gene_indices` kwarg takes
         // precedence; otherwise fall back to the dataset's
         // `col_projection` if set.
-        let resolved_indices: Vec<u32> = if let Some(gi) = &gene_indices {
+        let resolved_indices: Vec<u32> = if let Some(gi) = gene_indices {
             if gi.is_empty() {
                 return Err(PyRuntimeError::new_err(
                     "prefer_format='csc' requires non-empty gene_indices, \
                      or a column projection on adata.X (e.g. via X[:, var_mask])",
                 ));
             }
-            gi.clone()
+            gi.to_vec()
         } else if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
             match backed.col_projection() {
                 Some(cols) => cols.to_vec(),
@@ -366,7 +223,7 @@ pub fn pseudobulk_dex(
                 &cell_to_group,
                 n_groups,
                 group_labels,
-                &groupby,
+                groupby,
                 &projected_gene_names,
                 &resolved_indices,
                 method,
@@ -388,7 +245,7 @@ pub fn pseudobulk_dex(
                 &cell_to_group,
                 n_groups,
                 group_labels,
-                &groupby,
+                groupby,
                 &projected_gene_names,
                 &resolved_indices,
                 method,
@@ -402,7 +259,7 @@ pub fn pseudobulk_dex(
         scx_accel::pseudobulk_aggregate(
             &backed.backed,
             &obs_groups,
-            &groupby,
+            groupby,
             &gene_names,
             method,
             min_cells_per_group,
@@ -449,7 +306,7 @@ pub fn pseudobulk_dex(
         scx_accel::pseudobulk_aggregate_inmemory(
             &csr,
             &obs_groups,
-            &groupby,
+            groupby,
             &gene_names,
             method,
             min_cells_per_group,
@@ -457,10 +314,216 @@ pub fn pseudobulk_dex(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     };
 
+    Ok(result)
+}
+
+/// Pseudobulk differential expression via Rust aggregation + pydeseq2.
+///
+/// Aggregates single-cell counts into pseudobulk samples by grouping cells
+/// according to metadata columns (e.g., `["perturbation", "donor"]`), then
+/// uses `pydeseq2` for negative binomial GLM testing.
+///
+/// Args:
+///     adata: AnnData object with X and obs columns for groupby
+///     groupby: List of obs column names to group by (e.g., ["perturbation", "donor"])
+///     test_col: Column in groupby that contains the condition to test
+///     reference: Reference level in test_col (e.g., "control")
+///     design: DESeq2 design formula (default: auto-generated as "~ test_col")
+///     aggr_method: "sum" (default) or "mean"
+///     min_cells_per_group: Skip groups with fewer cells (default: 10)
+///     n_cpus: Worker cap for pydeseq2's parallel inference. `None` (default)
+///         resolves a safe bound from the environment (`SLURM_CPUS_PER_TASK`,
+///         then `OMP_NUM_THREADS`) and otherwise falls back to
+///         `min(available_parallelism, 8)`. This prevents pydeseq2's loky
+///         backend from forking one worker process per core on many-core
+///         hosts (each a full Python interpreter), which OOMs the job.
+///
+///     backend: DE engine — "pydeseq2" (default) or "nb_glm" (Rust-native
+///         negative-binomial GLM, no pydeseq2 dependency). Both emit the same
+///         column schema.
+///     nbglm_options: Optional dict of NB-GLM tuning knobs (only used when
+///         backend="nb_glm"; see pyscx.accel.nb_glm). Ignored for pydeseq2.
+///
+/// Returns:
+///     pandas DataFrame with columns: gene, baseMean, log2FoldChange,
+///     lfcSE, stat, pvalue, padj, target, reference
+#[pyfunction]
+#[pyo3(signature = (adata, groupby, test_col, reference, design=None, aggr_method="sum", min_cells_per_group=10, stratify_by=None, min_cells_per_stratum=50, prefer_format="csr", gene_indices=None, n_cpus=None, backend="pydeseq2", nbglm_options=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn pseudobulk_dex(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    groupby: Vec<String>,
+    test_col: &str,
+    reference: &str,
+    design: Option<&str>,
+    aggr_method: &str,
+    min_cells_per_group: usize,
+    stratify_by: Option<Vec<String>>,
+    min_cells_per_stratum: usize,
+    prefer_format: &str,
+    gene_indices: Option<Vec<u32>>,
+    n_cpus: Option<usize>,
+    backend: &str,
+    nbglm_options: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    if !matches!(prefer_format, "csr" | "csc") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
+        )));
+    }
+    if !matches!(backend, "pydeseq2" | "nb_glm") {
+        return Err(PyValueError::new_err(format!(
+            "Invalid backend={backend:?}; expected 'pydeseq2' or 'nb_glm'"
+        )));
+    }
+    // The NB-GLM backend wants replicates as rows of ONE design (place the
+    // replicate column in `groupby`), which is incompatible with the per-stratum
+    // recursion below — each stratum would yield one sample per condition and the
+    // fit would degenerate. Reject the combination with actionable guidance.
+    if backend == "nb_glm" && stratify_by.is_some() {
+        return Err(PyValueError::new_err(
+            "pseudobulk_dex(backend=\"nb_glm\") does not support stratify_by: NB-GLM \
+             treats replicates as rows of a single design, so put the replicate column \
+             (batch/donor/well) directly in `groupby`, or use pyscx.accel.pdex_nb_glm \
+             (which merges groupby + stratify_by for you).",
+        ));
+    }
+
+    // Record the planned route on adata.uns["scx_accel"]["pseudobulk_dex"].
+    // Pseudobulk aggregation + pydeseq2 is CPU-only; the only dispatch choice is
+    // the gene-axis layout — cpu_csc when prefer_format="csc" (reads the
+    // gene-major sidecar), cpu_csr otherwise. Stamped on the top-level adata
+    // before the stratified branch (which recurses on discarded sub_adata
+    // copies). This is the route the CSC dispatch gate asserts.
+    let pb_route = if backend == "nb_glm" {
+        scx_accel::AccelRoute::CpuNbGlm
+    } else if prefer_format == "csc" {
+        scx_accel::AccelRoute::CpuCsc
+    } else {
+        scx_accel::AccelRoute::CpuCsr
+    };
+    super::route::write_accel_route(
+        py,
+        adata,
+        "pseudobulk_dex",
+        &scx_accel::AccelExecutionInfo::new(pb_route, scx_accel::FallbackReason::None),
+    )?;
+
+    // --- Stratified path ---
+    if let Some(ref strat_cols) = stratify_by {
+        // Forbidden columns: test_col and all groupby columns.
+        let mut forbidden: Vec<&str> = groupby.iter().map(|s| s.as_str()).collect();
+        forbidden.push(test_col);
+        let (strata, masks) =
+            extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
+
+        let pd = py.import("pandas")?;
+        let warnings = py.import("warnings")?;
+        let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
+
+        for (stratum, mask) in strata.iter().zip(masks.iter()) {
+            // Subset adata by mask.
+            let sub_adata = adata.get_item(mask)?;
+            let sub_adata = sub_adata.call_method0("copy")?;
+
+            // Run pseudobulk_dex on the subset (recursive call without stratify).
+            match pseudobulk_dex(
+                py,
+                &sub_adata,
+                groupby.clone(),
+                test_col,
+                reference,
+                design,
+                aggr_method,
+                min_cells_per_group,
+                None, // no nested stratification
+                50,   // unused since stratify_by=None
+                prefer_format,
+                gene_indices.clone(),
+                n_cpus,
+                backend,
+                nbglm_options,
+            ) {
+                Ok(result_obj) => {
+                    let result_df = result_obj.bind(py);
+                    // Add stratum columns.
+                    for (j, col_name) in strat_cols.iter().enumerate() {
+                        result_df.set_item(col_name.as_str(), stratum.key[j].as_str())?;
+                    }
+                    all_frames.push(result_df.clone());
+                }
+                Err(e) => {
+                    let key_str = stratum.key.join(", ");
+                    let msg = format!("Pseudobulk DE failed for stratum [{}]: {}", key_str, e);
+                    warnings.call_method1("warn", (msg,))?;
+                }
+            }
+        }
+
+        if all_frames.is_empty() {
+            return Err(PyValueError::new_err(
+                "all strata failed during stratified pseudobulk DE analysis",
+            ));
+        }
+
+        let frame_list = pyo3::types::PyList::new(py, &all_frames)?;
+        let combined = pd.call_method(
+            "concat",
+            (frame_list,),
+            Some(&{
+                let kw = PyDict::new(py);
+                kw.set_item("ignore_index", true)?;
+                kw
+            }),
+        )?;
+
+        return Ok(combined.unbind());
+    }
+
+    // --- Non-stratified path (original behavior) ---
+    // Validate test_col is in groupby.
+    if !groupby.contains(&test_col.to_string()) {
+        return Err(PyRuntimeError::new_err(format!(
+            "test_col '{}' must be one of the groupby columns: {:?}",
+            test_col, groupby
+        )));
+    }
+
+    let method = match aggr_method {
+        "sum" => scx_accel::AggregationMethod::Sum,
+        "mean" => scx_accel::AggregationMethod::Mean,
+        _ => {
+            return Err(PyRuntimeError::new_err(format!(
+                "unsupported aggr_method '{}': use 'sum' or 'mean'",
+                aggr_method
+            )))
+        }
+    };
+
+    let result = aggregate_pseudobulk(
+        py,
+        adata,
+        &groupby,
+        prefer_format,
+        gene_indices.as_deref(),
+        method,
+        min_cells_per_group,
+    )?;
+
     if result.n_groups == 0 {
         return Err(PyRuntimeError::new_err(
             "no groups passed the min_cells_per_group filter",
         ));
+    }
+
+    // NB-GLM backend: fit the Rust-native negative-binomial GLM per contrast and
+    // assemble the same PyDESeq2-style pandas schema the pydeseq2 path returns.
+    if backend == "nb_glm" {
+        let test_col_idx = groupby.iter().position(|c| c == test_col).unwrap();
+        let nb_opts = super::nb_glm::nbglm_options_from_dict(py, nbglm_options)?;
+        let df = super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts)?;
+        return Ok(df.unbind());
     }
 
     // Build counts DataFrame and metadata DataFrame for pydeseq2.

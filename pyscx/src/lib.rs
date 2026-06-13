@@ -1131,6 +1131,8 @@ fn register_de(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn register_pseudobulk(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(accel::pseudobulk::pseudobulk_dex, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::nb_glm::nb_glm, m)?)?;
+    m.add_function(wrap_pyfunction!(accel::nb_glm::pdex_nb_glm, m)?)?;
     Ok(())
 }
 

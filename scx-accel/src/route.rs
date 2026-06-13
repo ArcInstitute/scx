@@ -41,6 +41,9 @@ pub enum AccelRoute {
     CpuCsr,
     /// CPU, CSC (column-major / gene-major) input.
     CpuCsc,
+    /// CPU, native pseudobulk negative-binomial GLM (IRLS + Cox–Reid dispersion).
+    /// A first-class native CPU route — never a rapids fallback (no `NoRapids`).
+    CpuNbGlm,
     /// GPU, dense input. The route id for GPU UMAP (its native CUDA / cuML SGD
     /// runs on a dense embedding). Not a DE route — dense-host DE densifies to
     /// CSR and reports [`GpuCsrV3`](AccelRoute::GpuCsrV3).
@@ -73,6 +76,7 @@ impl AccelRoute {
             AccelRoute::CpuDense => "cpu_dense",
             AccelRoute::CpuCsr => "cpu_csr",
             AccelRoute::CpuCsc => "cpu_csc",
+            AccelRoute::CpuNbGlm => "cpu_nb_glm",
             AccelRoute::GpuDense => "gpu_dense",
             AccelRoute::GpuCsr => "gpu_csr",
             AccelRoute::GpuCsrV3 => "gpu_csr_v3",

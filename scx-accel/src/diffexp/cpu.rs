@@ -549,7 +549,7 @@ fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
 /// implementation used for |z| > 8.
 ///
 /// Identity: sf(z) = 0.5 · erfc(z / √2).
-fn normal_sf(z: f64) -> f64 {
+pub(crate) fn normal_sf(z: f64) -> f64 {
     0.5 * libm::erfc(z / std::f64::consts::SQRT_2)
 }
 

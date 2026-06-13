@@ -29,6 +29,7 @@ pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod lisi;
+pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
 pub mod pflog1ppf;
