@@ -23,6 +23,9 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
 /// returning that shared value. Opens each file once. The first input is
 /// the reference; any mismatch reports both paths and counts.
 pub fn validate_all_same_n_vars(paths: &[PathBuf]) -> CliResult<u64> {
+    if paths.is_empty() {
+        return Err("no input files provided".into());
+    }
     let first_reader = ScxReader::open(&paths[0])?;
     let expected_n_vars = first_reader.header().n_vars;
     drop(first_reader);
@@ -42,4 +45,15 @@ pub fn validate_all_same_n_vars(paths: &[PathBuf]) -> CliResult<u64> {
         }
     }
     Ok(expected_n_vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_all_same_n_vars_empty_is_err_not_panic() {
+        let err = validate_all_same_n_vars(&[]).unwrap_err();
+        assert!(err.to_string().contains("no input files provided"));
+    }
 }

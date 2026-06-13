@@ -1210,6 +1210,17 @@ mod tests {
         assert_eq!(header.n_obs, 1, "filter should keep exactly one cell");
         assert_eq!(header.n_vars, 5, "rna has 5 vars in the fixture");
         assert!(!reader.is_multimodal(), "output is single-modality v2");
+
+        // The filter path (is_pure_extract == false) must record a
+        // `subset` provenance action, mirroring the pure path's
+        // `modality_extract` (see test_extract_modality_prefers_modality_uns).
+        let prov = reader
+            .read_provenance()
+            .expect("subset must write a provenance entry");
+        assert!(
+            prov.operations.iter().any(|e| e.action == "subset"),
+            "filter path must record a `subset` provenance action"
+        );
     }
 
     /// Phase 6: `scx subset --modality NAME --genes ...` extracts the
