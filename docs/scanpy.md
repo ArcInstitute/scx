@@ -2013,6 +2013,7 @@ print(result.sort_values("padj").head(20))
 | `design` | `"~ test_col"` | DESeq2 design formula (auto-generated if not specified) |
 | `aggr_method` | `"sum"` | Aggregation method: `"sum"` or `"mean"` |
 | `min_cells_per_group` | 10 | Groups with fewer cells are excluded |
+| `backend` | `"pydeseq2"` | DE engine: `"pydeseq2"` or `"nb_glm"` (Rust-native NB-GLM, no pydeseq2 dependency — see [§ NB-GLM backend](#nb-glm-backend-rust-native-pseudobulk-de)). Both emit the same column schema. |
 
 ### Stratified Differential Expression
 
@@ -2071,7 +2072,58 @@ not collide with `groupby` or `test_col`.
 
 > [!NOTE]
 > `pydeseq2` is an **optional** runtime dependency. Install with
-> `pip install pydeseq2` before calling `pseudobulk_dex()`.
+> `pip install pydeseq2` before calling `pseudobulk_dex()` with the default
+> `backend="pydeseq2"`. The `backend="nb_glm"` path (below) has **no** pydeseq2
+> dependency.
+
+### NB-GLM backend (Rust-native pseudobulk DE)
+
+SCX includes a CPU, `f64`, dependency-free **negative-binomial GLM** that
+implements the DESeq2 *core* (IRLS / Fisher scoring + Cox–Reid dispersion +
+parametric trend fit + empirical-Bayes shrinkage + Wald inference). It is a
+DESeq2-*style* — **not** DESeq2-*identical* — estimator: the bar is ranking /
+effect-sign / significance parity, not bit-for-bit numerics. Keep PyDESeq2 when
+you need exact DESeq2 behaviour. There is **no GPU path** (no `device=` argument).
+
+Three entry points, all CPU-only:
+
+```python
+import pyscx
+
+# 1. pseudobulk_dex with backend="nb_glm" — same pandas schema as pydeseq2.
+df = pyscx.accel.pseudobulk_dex(
+    adata, groupby=["perturbation", "donor"],
+    test_col="perturbation", reference="control",
+    backend="nb_glm",                       # no pydeseq2 needed
+)
+
+# 2. pdex_nb_glm — cell-eval/pdex polars schema, from an AnnData.
+df = pyscx.accel.pdex_nb_glm(
+    adata, "perturbation", "control",
+    stratify_by=["donor"],                  # forms pseudobulk REPLICATES (required)
+)
+# columns: target, feature, fold_change, p_value, fdr, log2_fold_change,
+#          abs_log2_fold_change  (byte-compatible with pdex_ref / rank_genes_groups_df)
+
+# 3. accel.nb_glm — direct, on an already-pseudobulked matrix + numeric design.
+df = pyscx.accel.nb_glm(counts, design, contrast=1)
+# columns: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
+#          dispersion, converged, n_iter
+```
+
+> [!IMPORTANT]
+> **Replicate requirement.** A pseudobulk NB-GLM needs **≥ 2 pseudobulk samples
+> per condition** to estimate dispersion. `pdex_nb_glm` forms one sample per
+> `(perturbation × stratum)`, so a `stratify_by` spanning ≥ 2 strata (batch /
+> donor / well / replicate) is **required** — it errors with a clear message
+> (pointing to `pdex_ref` / `rank_genes_groups`) when absent. cell-eval's default
+> one-profile-per-perturbation layout has no replicates and is **not** a valid
+> NB-GLM input.
+
+The route is recorded as `route="cpu_nb_glm"` on
+`adata.uns["scx_accel"]["pseudobulk_dex"]` / `["pdex_nb_glm"]`. Full guide,
+options, and algorithm details:
+[docs/pseudobulk_nb_glm.md](pseudobulk_nb_glm.md).
 
 ### Perturbation evaluation metrics (cell-eval / arc-bench parity)
 

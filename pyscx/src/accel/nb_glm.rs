@@ -313,10 +313,26 @@ pub(super) fn fit_targets_pandas<'py>(
     df.get_item(order)
 }
 
-/// Direct NB-GLM on already-pseudobulked matrices (DESeq2-replacement, §4.3).
+/// Fit a Rust-native negative-binomial GLM on an already-pseudobulked count
+/// matrix and test a contrast (a DESeq2 replacement). CPU-only, `f64` — there is
+/// no `device=` argument.
 ///
-/// Returns a pandas DataFrame: `gene, baseMean, log2FoldChange, lfcSE, stat,
-/// pvalue, padj, dispersion, converged, n_iter`. CPU-only (no `device=`).
+/// `counts` is `[n_samples × n_genes]` (default) or `[n_genes × n_samples]` per
+/// `counts_axis`; `design` is `[n_samples × n_features]` and full column rank.
+/// `size_factors=None` computes DESeq2 median-ratio factors. `contrast` is an
+/// integer coefficient index, a weight vector, or `None` (the last coefficient,
+/// DESeq2 convention). `options` is an optional dict overriding `NbGlmOptions`
+/// fields (`dispersion`, `min_disp`, `max_disp`, `max_irls_iters`, `irls_tol`,
+/// `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`).
+///
+/// Returns a pandas DataFrame with PyDESeq2-style columns: `gene, baseMean,
+/// log2FoldChange, lfcSE, stat, pvalue, padj, dispersion, converged, n_iter`
+/// (`lfcSE` is on the log2 scale).
+///
+/// Results are DESeq2-*style*, not DESeq2-*identical*: v1 implements IRLS +
+/// Cox–Reid dispersion + trend/shrinkage but omits Cook's-distance outliers,
+/// independent filtering, and apeglm LFC shrinkage. Use PyDESeq2 when exact
+/// DESeq2 numerics are required. See docs/pseudobulk_nb_glm.md.
 #[pyfunction]
 #[pyo3(signature = (counts, design, size_factors=None, contrast=None, gene_names=None, sample_names=None, options=None, counts_axis="samples_by_genes"))]
 #[allow(clippy::too_many_arguments)]
@@ -421,13 +437,23 @@ pub fn nb_glm(
     Ok(df.get_item(order)?.unbind())
 }
 
-/// Pseudobulk NB-GLM DE for the cell-eval/pdex consumer (§4.4).
+/// Pseudobulk NB-GLM differential expression for the cell-eval/pdex consumer.
 ///
-/// Aggregates `groupby × stratify_by` pseudobulk replicates, fits one NB-GLM per
-/// non-reference perturbation vs `reference`, and returns the cell-eval/pdex
-/// **polars** schema (`target, feature, fold_change, p_value, fdr,
-/// log2_fold_change, abs_log2_fold_change`). A stratifier is **required**: with
-/// one profile per perturbation the dispersion is unidentifiable.
+/// Aggregates `groupby × stratify_by` pseudobulk **replicates** from `adata`,
+/// fits one Rust-native NB-GLM per non-reference perturbation vs `reference`, and
+/// returns the cell-eval `DEResults` **polars** schema (`target, feature,
+/// fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change`) — the same
+/// schema as `rank_genes_groups_df` / `pdex_ref`, so it drops into `cell_eval`
+/// unchanged. CPU-only (no `device=`); records `route="cpu_nb_glm"` on
+/// `adata.uns["scx_accel"]["pdex_nb_glm"]`.
+///
+/// A pseudobulk NB-GLM needs ≥ 2 samples per condition to estimate dispersion, so
+/// `stratify_by` (a batch/donor/well/replicate obs column spanning ≥ 2 strata) is
+/// **required** — `pdex_nb_glm` raises a `ValueError` pointing to `pdex_ref` /
+/// `rank_genes_groups` when it is absent. NB-GLM needs **raw counts**: log1p
+/// input (auto-detected via `adata.uns["log1p"]`, or `is_log1p=True`) is
+/// rejected. DESeq2-*style*, not DESeq2-*identical*. See
+/// docs/pseudobulk_nb_glm.md.
 #[pyfunction]
 #[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr"))]
 #[allow(clippy::too_many_arguments)]

@@ -57,6 +57,7 @@ quickstart
 migrating-from-h5ad
 training
 scanpy
+pseudobulk_nb_glm
 gpu-setup
 cloud
 operations
