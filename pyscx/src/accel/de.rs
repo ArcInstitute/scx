@@ -891,7 +891,7 @@ fn write_de_to_adata(
 /// pandas DataFrame directly and does **not** import polars, so pandas-only
 /// callers can use the DE DataFrame helpers without installing polars. Column
 /// schema is identical across both.
-fn build_de_dataframe<'py>(
+pub(super) fn build_de_dataframe<'py>(
     py: Python<'py>,
     columns: &Bound<'py, PyDict>,
     column_order: &[&str],
