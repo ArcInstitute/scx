@@ -422,3 +422,187 @@ fn moments_only_method_runs() {
     assert!(res.diagnostics.dispersion_trend.is_none());
     assert!(res.log2_fold_change[0] > 0.5);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 stress tests (spec §16): robustness on adversarial inputs. These
+// assert the fitter never panics and never leaks NaN/Inf into fitted output
+// (degrading conservatively instead) — not specific numeric values.
+// ---------------------------------------------------------------------------
+
+/// A near-rank-deficient (highly collinear, not exactly singular) design must
+/// stay stable: either a finite fit (the ridge keeps `XᵀWX` invertible) or a
+/// conservative `pvalue=1, stat=0, lfcSE=inf` — never a panic or a NaN log2FC.
+#[test]
+fn near_rank_deficient_design_is_stable() {
+    // 6 samples × 3 features: col 2 ≈ col 1 + tiny perturbation (condition number
+    // ~1e6) — collinear but not identical, so QR rank passes but the information
+    // matrix is ill-conditioned.
+    let n_samples = 6;
+    let n_features = 3;
+    let mut design = Vec::with_capacity(n_samples * n_features);
+    for s in 0..n_samples {
+        let t = if s >= 3 { 1.0 } else { 0.0 };
+        let eps = (s as f64) * 1e-6; // breaks exact collinearity
+        design.extend_from_slice(&[1.0, t, t + eps]);
+    }
+    let rows = vec![
+        vec![10.0, 12.0, 9.0, 20.0, 22.0, 19.0],
+        vec![5.0, 6.0, 4.0, 5.0, 7.0, 6.0],
+    ];
+    let (counts, n_genes, _) = gene_major(&rows);
+    let sf = vec![1.0; n_samples];
+    let res = pseudobulk_nb_glm(
+        &counts,
+        n_genes,
+        n_samples,
+        &design,
+        n_features,
+        Some(&sf),
+        NbGlmContrast::Coefficient { index: 1 },
+        NbGlmOptions::default(),
+    );
+    // Validation may accept (near-singular passes the rank check) — if so, every
+    // fitted gene must have a finite log2FC and a p-value in [0, 1].
+    if let Ok(res) = res {
+        for (g, &lfc) in res.log2_fold_change.iter().enumerate() {
+            assert!(lfc.is_finite(), "gene {g} log2FC must be finite, got {lfc}");
+            let p = res.p_value[g];
+            assert!((0.0..=1.0).contains(&p), "gene {g} p={p} out of range");
+        }
+    }
+    // If it errors instead, that is also acceptable (a typed AccelError) — the
+    // only unacceptable outcome is a panic, which would fail the test above.
+}
+
+/// The replicate floor: exactly 2 pseudobulk samples per condition (n_samples =
+/// n_features + 2) must fit with finite output and the correct effect sign.
+#[test]
+fn minimum_two_replicates_per_condition() {
+    let (design, n_samples, nf) = design_two_condition(2, 2); // 4 samples, 2 features
+    let rows = vec![
+        vec![10.0, 11.0, 21.0, 19.0], // up in treated
+        vec![20.0, 22.0, 9.0, 11.0],  // down in treated
+        vec![15.0, 14.0, 15.0, 16.0], // flat
+    ];
+    let (counts, n_genes, _) = gene_major(&rows);
+    let sf = vec![1.0; n_samples];
+    let res = pseudobulk_nb_glm(
+        &counts,
+        n_genes,
+        n_samples,
+        &design,
+        nf,
+        Some(&sf),
+        NbGlmContrast::Coefficient { index: 1 },
+        NbGlmOptions::default(),
+    )
+    .expect("2 replicates per condition should fit");
+    for v in res.log2_fold_change.iter().chain(res.p_value.iter()) {
+        assert!(v.is_finite());
+    }
+    assert!(
+        res.log2_fold_change[0] > 0.3,
+        "gene 0 up: {}",
+        res.log2_fold_change[0]
+    );
+    assert!(
+        res.log2_fold_change[1] < -0.3,
+        "gene 1 down: {}",
+        res.log2_fold_change[1]
+    );
+}
+
+/// Heavily imbalanced condition group sizes (8 control vs 2 treated) must fit
+/// with finite output, correct sign, and be deterministic across runs.
+#[test]
+fn imbalanced_group_sizes() {
+    let (design, n_samples, nf) = design_two_condition(8, 2);
+    let rows = vec![
+        // 8 control then 2 treated; gene up ~2x in treated.
+        vec![10.0, 11.0, 9.0, 12.0, 10.0, 8.0, 11.0, 9.0, 21.0, 19.0],
+        vec![15.0, 14.0, 16.0, 15.0, 14.0, 16.0, 15.0, 15.0, 15.0, 14.0], // flat
+    ];
+    let (counts, n_genes, _) = gene_major(&rows);
+    let sf = vec![1.0; n_samples];
+    let run = || {
+        pseudobulk_nb_glm(
+            &counts,
+            n_genes,
+            n_samples,
+            &design,
+            nf,
+            Some(&sf),
+            NbGlmContrast::Coefficient { index: 1 },
+            NbGlmOptions::default(),
+        )
+        .expect("fit")
+    };
+    let a = run();
+    let b = run();
+    assert_eq!(a.log2_fold_change, b.log2_fold_change);
+    assert_eq!(a.p_value, b.p_value);
+    for v in a.log2_fold_change.iter().chain(a.p_value.iter()) {
+        assert!(v.is_finite());
+    }
+    assert!(
+        a.log2_fold_change[0] > 0.4,
+        "gene 0 up: {}",
+        a.log2_fold_change[0]
+    );
+    assert!(
+        a.log2_fold_change[1].abs() < 0.3,
+        "gene 1 flat: {}",
+        a.log2_fold_change[1]
+    );
+}
+
+/// Genes spanning a huge count dynamic range (~1 to ~1e6) in a single fit must
+/// produce no NaN/Inf and finite, non-negative dispersions.
+#[test]
+fn extreme_count_dynamic_range() {
+    let (design, n_samples, nf) = design_two_condition(3, 3);
+    let rows = vec![
+        vec![1.0, 0.0, 2.0, 1.0, 2.0, 1.0],            // ~unit counts
+        vec![100.0, 110.0, 90.0, 200.0, 210.0, 195.0], // mid, up
+        vec![
+            1_000_000.0,
+            1_050_000.0,
+            980_000.0,
+            990_000.0,
+            1_010_000.0,
+            1_001_000.0,
+        ], // huge, flat
+    ];
+    let (counts, n_genes, _) = gene_major(&rows);
+    let sf = vec![1.0; n_samples];
+    let res = pseudobulk_nb_glm(
+        &counts,
+        n_genes,
+        n_samples,
+        &design,
+        nf,
+        Some(&sf),
+        NbGlmContrast::Coefficient { index: 1 },
+        NbGlmOptions::default(),
+    )
+    .expect("fit");
+    for v in res
+        .log2_fold_change
+        .iter()
+        .chain(res.p_value.iter())
+        .chain(res.standard_error.iter())
+    {
+        assert!(!v.is_nan(), "no NaN in fitted output");
+    }
+    for &a in &res.dispersion {
+        assert!(
+            a.is_finite() && a >= 0.0,
+            "dispersion {a} must be finite & non-negative"
+        );
+    }
+    assert!(
+        res.log2_fold_change[1] > 0.4,
+        "mid gene up: {}",
+        res.log2_fold_change[1]
+    );
+}

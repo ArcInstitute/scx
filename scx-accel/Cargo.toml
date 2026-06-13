@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "randomized_pca_inmemory"
 harness = false
+
+[[bench]]
+name = "nb_glm"
+harness = false
