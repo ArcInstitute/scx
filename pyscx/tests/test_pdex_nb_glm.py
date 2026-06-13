@@ -116,6 +116,7 @@ def test_pdex_nb_glm_rejects_log1p():
 
 
 def test_pdex_nb_glm_stamps_route():
+    pytest.importorskip("polars")  # pdex_nb_glm emits the polars cell-eval schema
     adata = _perturb_adata()
     pyscx.accel.pdex_nb_glm(
         adata, "perturbation", REFERENCE, stratify_by=["donor"], min_cells_per_group=1
