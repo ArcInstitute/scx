@@ -20,6 +20,7 @@ pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod lisi;
+pub mod nb_glm;
 pub mod neighbors;
 pub mod pca;
 pub mod pflog1ppf;
@@ -58,6 +59,9 @@ pub use hvg::{
 };
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use lisi::{compute_lisi, LisiConfig, LisiResult};
+pub use nb_glm::{
+    DispersionMethod, DispersionTrend, NbGlmContrast, NbGlmDiagnostics, NbGlmOptions, NbGlmResult,
+};
 pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
     covariance_pca, covariance_pca_inmemory, pflog1ppf_pca, randomized_pca,
