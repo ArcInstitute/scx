@@ -27,21 +27,21 @@ pub fn run_subset(
     // single-modality v2 file containing just the chosen modality's
     // CSR + var, with the file's global obs.
     if let Some(name) = modality {
+        // Pure modality extraction keeps its stricter guards: dry-run is
+        // unsupported and --output is mandatory. Combined with
+        // --filter / --genes the predicate path allows --dry-run and only
+        // requires --output when actually writing.
         if filter.is_none() && gene_file.is_none() {
             if dry_run {
                 return Err("--dry-run is not supported for `--modality NAME` extraction".into());
             }
-            let out_path = output.ok_or("--output is required for `--modality NAME` extraction")?;
-            return extract_modality(input, out_path, name, shard_size, codec);
-        }
-        // Phase 6: --modality combined with --filter / --genes. Extract
-        // the modality, apply the row predicate against the global
-        // obs, apply optional gene selection, then write a
-        // single-modality v2 SCX.
-        if !dry_run && output.is_none() {
+            if output.is_none() {
+                return Err("--output is required for `--modality NAME` extraction".into());
+            }
+        } else if !dry_run && output.is_none() {
             return Err("--output is required (or use --dry-run)".into());
         }
-        return extract_modality_with_filter(
+        return extract_modality(
             input,
             output,
             name,
@@ -384,104 +384,19 @@ fn write_csr_shards_auto(
     Ok(())
 }
 
-/// Phase F.4: extract a single modality from a multimodal SCX file
-/// to a new single-modality v2 file. Cells (obs) are global across
-/// modalities, so the output's obs matches the input's obs.
-fn extract_modality(
-    input: &Path,
-    output: &Path,
-    modality_name: &str,
-    shard_size: u32,
-    codec: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let reader = ScxReader::open(input)?;
-    if !reader.is_multimodal() {
-        return Err(format!(
-            "input file is single-modality; `--modality {modality_name}` is not applicable"
-        )
-        .into());
-    }
-    let modality_id = reader.modality_id(modality_name).ok_or_else(|| {
-        format!(
-            "input file does not have a modality named '{modality_name}'; \
-             run `scx info {}` to list modalities",
-            input.display()
-        )
-    })?;
-    let info = reader
-        .modality_info(modality_id)
-        .expect("modality_id resolved above");
-
-    let n_obs = reader.header().n_obs;
-    let n_vars = info.n_vars;
-
-    let explicit_codec = scx_codec::CodecId::parse_cli(codec)?;
-    let modality_type = info.modality_type;
-
-    let csr = reader.read_all_csr_shards_for(modality_id)?;
-    let var = reader.read_var_for(modality_id)?;
-    let obs = reader.read_obs()?;
-    // PR #68: preserve metadata when extracting a single modality.
-    // Per-modality `uns/{name}` wins; fall back to the file-wide
-    // `uns` so a multimodal file with only one of the two still
-    // round-trips its annotations through `extract`.
-    let uns = reader
-        .read_uns_for(modality_id)
-        .ok()
-        .or_else(|| reader.read_uns().ok());
-
-    let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
-    let header = FileHeader::new_single_modality(n_obs, n_vars, 0, shard_size, 0, index_dtype);
-
-    let mut writer = ScxWriter::new(output, header)?;
-    writer.write_obs(&obs)?;
-    writer.write_var(&var)?;
-
-    write_csr_shards_auto(
-        &mut writer,
-        &csr.indptr,
-        &csr.indices,
-        &csr.data,
-        n_vars as u32,
-        shard_size,
-        index_dtype,
-        explicit_codec,
-        modality_type,
-    )?;
-
-    // PR #68: preserve uns + provenance — `write_subset_scx` does this
-    // for filter/gene-index subsets; the modality-extraction path was
-    // dropping them silently.
-    if let Some(uns_data) = &uns {
-        writer.write_uns(uns_data)?;
-    }
-    writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        action: "modality_extract".to_string(),
-        tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
-        params_json: serde_json::json!({ "modality": modality_name }).to_string(),
-        input_checksums: vec![],
-    }])?;
-
-    writer.finish()?;
-    println!(
-        "Extracted modality '{modality_name}' ({n_vars} vars) from {} to {}",
-        input.display(),
-        output.display()
-    );
-    Ok(())
-}
-
-/// Phase 6: `scx subset --modality NAME --filter ... --genes ...`.
-/// Extract one modality from a multimodal SCX file and apply the row
-/// predicate / gene projection in a single pass.  Output is a
-/// single-modality v2 SCX whose obs is the modality-aligned (global)
-/// obs filtered by the predicate.
+/// `scx subset --modality NAME [--filter ... --genes ...]`.
+///
+/// Extract a single modality from a multimodal SCX file into a new
+/// single-modality v2 file, optionally applying a row predicate and/or
+/// gene projection in the same pass. Cells (obs) are global across
+/// modalities, so without a filter the output's obs matches the input's.
+///
+/// With neither `--filter` nor `--genes` this is a pure modality
+/// extraction and records a `modality_extract` provenance action; with
+/// either, it applies the row mask / gene projection and records a
+/// `subset` action with the predicate and gene parameters.
 #[allow(clippy::too_many_arguments)]
-fn extract_modality_with_filter(
+fn extract_modality(
     input: &Path,
     output: Option<&Path>,
     modality_name: &str,
@@ -495,6 +410,10 @@ fn extract_modality_with_filter(
     csc_memory_limit: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::Array;
+
+    // No filter and no gene list → pure modality extraction. Drives the
+    // provenance action and the stdout summary below.
+    let is_pure_extract = filter.is_none() && gene_file.is_none();
 
     let reader = ScxReader::open(input)?;
     if !reader.is_multimodal() {
@@ -618,15 +537,17 @@ fn extract_modality_with_filter(
         var
     };
 
-    println!(
-        "Subset (modality '{}'): {}/{} cells, {}/{} genes, {} nnz",
-        modality_name,
-        projected_csr.n_rows(),
-        n_obs_global,
-        projected_csr.n_cols(),
-        n_vars,
-        projected_csr.indptr.last().copied().unwrap_or(0),
-    );
+    if !is_pure_extract {
+        println!(
+            "Subset (modality '{}'): {}/{} cells, {}/{} genes, {} nnz",
+            modality_name,
+            projected_csr.n_rows(),
+            n_obs_global,
+            projected_csr.n_cols(),
+            n_vars,
+            projected_csr.indptr.last().copied().unwrap_or(0),
+        );
+    }
 
     if dry_run {
         println!("(dry run — no output written)");
@@ -667,24 +588,42 @@ fn extract_modality_with_filter(
         writer.write_uns(u)?;
     }
 
-    let params = serde_json::json!({
-        "modality": modality_name,
-        "filter": filter,
-        "n_genes": gene_indices.as_ref().map(|g| g.len()),
-    });
+    let (action, params) = if is_pure_extract {
+        (
+            "modality_extract",
+            serde_json::json!({ "modality": modality_name }),
+        )
+    } else {
+        (
+            "subset",
+            serde_json::json!({
+                "modality": modality_name,
+                "filter": filter,
+                "n_genes": gene_indices.as_ref().map(|g| g.len()),
+            }),
+        )
+    };
     writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
-        action: "subset".to_string(),
+        action: action.to_string(),
         tool: format!("scx-cli {}", env!("CARGO_PKG_VERSION")),
         params_json: params.to_string(),
         input_checksums: vec![],
     }])?;
 
     writer.finish()?;
-    println!("Wrote {}", output.display());
+    if is_pure_extract {
+        println!(
+            "Extracted modality '{modality_name}' ({n_vars} vars) from {} to {}",
+            input.display(),
+            output.display()
+        );
+    } else {
+        println!("Wrote {}", output.display());
+    }
 
     if rebuild_csc {
         scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
@@ -1169,7 +1108,20 @@ mod tests {
         let input = write_multimodal_test_file(&dir, Some(global), Some(rna));
 
         let output = dir.path().join("extracted_rna.scx");
-        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+        extract_modality(
+            &input,
+            Some(output.as_path()),
+            "rna",
+            None,
+            None,
+            false,
+            10000,
+            "none",
+            false,
+            5000,
+            "4G",
+        )
+        .unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
 
@@ -1203,7 +1155,20 @@ mod tests {
         let input = write_multimodal_test_file(&dir, Some(global), None);
 
         let output = dir.path().join("extracted_rna_global.scx");
-        extract_modality(&input, &output, "rna", 10000, "none").unwrap();
+        extract_modality(
+            &input,
+            Some(output.as_path()),
+            "rna",
+            None,
+            None,
+            false,
+            10000,
+            "none",
+            false,
+            5000,
+            "4G",
+        )
+        .unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         let roundtrip = reader.read_uns().unwrap();
@@ -1245,6 +1210,17 @@ mod tests {
         assert_eq!(header.n_obs, 1, "filter should keep exactly one cell");
         assert_eq!(header.n_vars, 5, "rna has 5 vars in the fixture");
         assert!(!reader.is_multimodal(), "output is single-modality v2");
+
+        // The filter path (is_pure_extract == false) must record a
+        // `subset` provenance action, mirroring the pure path's
+        // `modality_extract` (see test_extract_modality_prefers_modality_uns).
+        let prov = reader
+            .read_provenance()
+            .expect("subset must write a provenance entry");
+        assert!(
+            prov.operations.iter().any(|e| e.action == "subset"),
+            "filter path must record a `subset` provenance action"
+        );
     }
 
     /// Phase 6: `scx subset --modality NAME --genes ...` extracts the

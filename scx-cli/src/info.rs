@@ -267,12 +267,8 @@ fn summarize_csr_value_encoding(reader: &ScxReader) -> Result<String, Box<dyn st
 
     // Distinct encoding bytes, sorted ascending (= enum width order:
     // u8, u16, u32, f32, f16).
-    let mut encs: Vec<u8> = csr_shards
-        .iter()
-        .map(|e| reader.read_shard_header(e).map(|h| h.value_encoding))
-        .collect::<Result<Vec<_>, _>>()?;
-    encs.sort_unstable();
-    encs.dedup();
+    let encs =
+        crate::shard_utils::distinct_sorted_shard_field(reader, &csr_shards, |h| h.value_encoding)?;
 
     Ok(match encs.as_slice() {
         [one] => value_encoding_name(*one).to_string(),
@@ -300,12 +296,7 @@ fn summarize_csr_codec(reader: &ScxReader) -> Result<String, Box<dyn std::error:
         return Ok("n/a".to_string());
     }
 
-    let mut ids: Vec<u8> = csr_shards
-        .iter()
-        .map(|e| reader.read_shard_header(e).map(|h| h.codec_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    ids.sort_unstable();
-    ids.dedup();
+    let ids = crate::shard_utils::distinct_sorted_shard_field(reader, &csr_shards, |h| h.codec_id)?;
 
     Ok(match ids.as_slice() {
         [one] => codec_id_name(*one).to_string(),

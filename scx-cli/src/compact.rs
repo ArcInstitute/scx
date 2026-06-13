@@ -23,9 +23,7 @@ pub fn run_compact(
     reshape_obs: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate input exists
-    if !input.exists() {
-        return Err(format!("input file does not exist: {}", input.display()).into());
-    }
+    crate::cli_utils::validate_scx_file(input)?;
 
     // Check output
     if output.exists() && !force {
