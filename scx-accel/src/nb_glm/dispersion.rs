@@ -12,7 +12,7 @@ use faer::linalg::solvers::DenseSolveCore;
 use faer::{MatRef, Side};
 
 use super::irls::{assemble_xtwx, solve_spd};
-use super::math::{cox_reid_dispersion_gradient, cox_reid_objective, nb_irls_weight};
+use super::math::{cox_reid_dispersion_gradient, cox_reid_objective, nb_irls_weight, trigamma};
 use super::types::{DispersionTrend, NbGlmOptions};
 
 /// Minimum empirical-Bayes prior variance on `log(alpha)` (DESeq2 uses 0.25).
@@ -315,33 +315,20 @@ pub(crate) fn fit_dispersion(
     }
 }
 
-/// Fit the parametric mean→dispersion trend `alpha_trend(mu_bar) = a0 + a1/mu_bar`
-/// via a gamma-family GLM (identity link, weight `1/fit²`) over valid genes
-/// (spec §7.6). Returns `None` if too few usable genes.
-///
-/// v1 does **not** iteratively trim outlier genes between refits (DESeq2 drops
-/// genes >10× / <1e-4 off the trend and refits). This is a deliberate v1
-/// simplification — see `GPU-NB-GLM-SPEC.md` §22.4 — not an oversight.
-pub(crate) fn fit_dispersion_trend(
+/// One gamma-family GLM fit (identity link, weight `1/fit²`) for the trend
+/// `alpha_trend(mu_bar) = a0 + a1/mu_bar` over the given gene indices. Returns
+/// `(a0, a1)`, or `None` if the fit is non-finite / under-determined.
+fn solve_gamma_glm(
+    keep: &[usize],
     base_mean: &[f64],
     alpha_mle: &[f64],
-    valid: &[bool],
     opts: &NbGlmOptions,
-) -> Option<DispersionTrend> {
-    // Usable genes: valid fit, positive base mean and dispersion.
-    let idx: Vec<usize> = (0..alpha_mle.len())
-        .filter(|&g| {
-            valid[g] && base_mean[g] > 0.0 && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0
-        })
-        .collect();
-    if idx.len() < 3 {
+) -> Option<(f64, f64)> {
+    if keep.len() < 3 {
         return None;
     }
-
-    // Design rows [1, 1/mu_bar]; response alpha_mle. Identity-link gamma IRLS:
-    // working response is just the response, weights 1/fit². Iterate a few times.
-    let inv_mu: Vec<f64> = idx.iter().map(|&g| 1.0 / base_mean[g]).collect();
-    let resp: Vec<f64> = idx.iter().map(|&g| alpha_mle[g]).collect();
+    let inv_mu: Vec<f64> = keep.iter().map(|&g| 1.0 / base_mean[g]).collect();
+    let resp: Vec<f64> = keep.iter().map(|&g| alpha_mle[g]).collect();
 
     // Init: a0 = median dispersion, a1 = 0.
     let mut sorted = resp.clone();
@@ -353,7 +340,7 @@ pub(crate) fn fit_dispersion_trend(
         // Weighted 2×2 normal equations for [a0, a1] with weight 1/fit².
         let mut xtwx = [0.0_f64; 4]; // row-major 2×2
         let mut xtwz = [0.0_f64; 2];
-        for i in 0..idx.len() {
+        for i in 0..keep.len() {
             let x0 = 1.0;
             let x1 = inv_mu[i];
             let fit = (a0 + a1 * x1).max(opts.min_disp);
@@ -384,15 +371,92 @@ pub(crate) fn fit_dispersion_trend(
         }
     }
 
-    if !a0.is_finite() || !a1.is_finite() {
+    if a0.is_finite() && a1.is_finite() {
+        Some((a0, a1))
+    } else {
+        None
+    }
+}
+
+/// Fit the parametric mean→dispersion trend `alpha_trend(mu_bar) = a0 + a1/mu_bar`
+/// via a gamma-family GLM (identity link, weight `1/fit²`) over valid genes
+/// (spec §7.6). Returns `None` if too few usable genes.
+///
+/// Mirrors DESeq2's `parametricDispersionFit` outlier-trim loop: refit the gamma
+/// GLM, then drop genes whose ratio `dispGeneEst/trend` falls outside `(1e-4, 15)`
+/// and refit, until the coefficients converge or 10 iterations elapse. If too few
+/// genes survive a trim, the last good fit is kept (returning `None` would regress
+/// the shrinkage target to a global median).
+pub(crate) fn fit_dispersion_trend(
+    base_mean: &[f64],
+    alpha_mle: &[f64],
+    valid: &[bool],
+    opts: &NbGlmOptions,
+) -> Option<DispersionTrend> {
+    // Usable genes: valid fit, positive base mean and dispersion.
+    let mut keep: Vec<usize> = (0..alpha_mle.len())
+        .filter(|&g| {
+            valid[g] && base_mean[g] > 0.0 && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0
+        })
+        .collect();
+    if keep.len() < 3 {
         return None;
     }
-    Some(DispersionTrend { a0, a1 })
+
+    let mut last: Option<(f64, f64)> = None;
+    for _ in 0..10 {
+        // A failed refit on a later (trimmed) iteration must not discard the
+        // previous good fit — fall back to it rather than regressing the
+        // shrinkage target to a global median. (First iteration: `last` is
+        // `None`, so this correctly yields "no trend".)
+        let (a0, a1) = match solve_gamma_glm(&keep, base_mean, alpha_mle, opts) {
+            Some(fit) => fit,
+            None => return last.map(|(a0, a1)| DispersionTrend { a0, a1 }),
+        };
+        // Coefficient-relative convergence vs the previous trim's fit.
+        if let Some((pa0, pa1)) = last {
+            let rel = ((a0 - pa0) / (pa0.abs() + 1e-30))
+                .abs()
+                .max(((a1 - pa1) / (pa1.abs() + 1e-30)).abs());
+            if rel < 1e-3 {
+                return Some(DispersionTrend { a0, a1 });
+            }
+        }
+        last = Some((a0, a1));
+        // Trim: keep genes whose dispersion is within (1e-4, 15)× the trend.
+        let new_keep: Vec<usize> = keep
+            .iter()
+            .copied()
+            .filter(|&g| {
+                let trend = (a0 + a1 / base_mean[g]).max(opts.min_disp);
+                let ratio = alpha_mle[g] / trend;
+                ratio > 1e-4 && ratio < 15.0
+            })
+            .collect();
+        if new_keep.len() < 3 {
+            // Too few survive the trim: keep the last good fit.
+            return Some(DispersionTrend { a0, a1 });
+        }
+        keep = new_keep;
+    }
+    last.map(|(a0, a1)| DispersionTrend { a0, a1 })
 }
 
 /// Robust empirical-Bayes prior variance of `log(alpha)` about a per-gene target
 /// (trend value or global median), via the MAD of log-residuals (spec §7.6).
-pub(crate) fn estimate_prior_var(log_targets: &[f64], alpha_mle: &[f64], valid: &[bool]) -> f64 {
+///
+/// Mirrors DESeq2's `estimateDispersionsPriorVar`: from the squared scaled MAD of
+/// the log-residuals it subtracts `trigamma((m−p)/2)`, the expected sampling
+/// variance of a per-gene log-dispersion MLE, so the prior reflects only the true
+/// between-gene dispersion scatter rather than estimation noise. Floored at
+/// [`MIN_PRIOR_VAR`].
+pub(crate) fn estimate_prior_var(
+    log_targets: &[f64],
+    alpha_mle: &[f64],
+    valid: &[bool],
+    n_samples: usize,
+    n_features: usize,
+) -> f64 {
     let mut resid: Vec<f64> = (0..alpha_mle.len())
         .filter(|&g| valid[g] && alpha_mle[g].is_finite() && alpha_mle[g] > 0.0)
         .map(|g| alpha_mle[g].ln() - log_targets[g])
@@ -406,7 +470,12 @@ pub(crate) fn estimate_prior_var(log_targets: &[f64], alpha_mle: &[f64], valid: 
     abs_dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mad = abs_dev[abs_dev.len() / 2];
     let sigma = 1.4826 * mad;
-    (sigma * sigma).max(MIN_PRIOR_VAR)
+    let expected_sampling_var = if n_samples > n_features {
+        trigamma((n_samples - n_features) as f64 / 2.0)
+    } else {
+        0.0
+    };
+    (sigma * sigma - expected_sampling_var).max(MIN_PRIOR_VAR)
 }
 
 #[cfg(test)]

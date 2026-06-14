@@ -120,6 +120,10 @@ const NBGLM_OPTION_KEYS: &[&str] = &[
     "outer_tol",
     "fit_dispersion_trend",
     "shrink_dispersion",
+    "cooks_filtering",
+    "cooks_cutoff",
+    "independent_filtering",
+    "independent_filter_alpha",
 ];
 
 /// Parse an optional options dict onto `NbGlmOptions::default()`. Recognised keys
@@ -195,6 +199,23 @@ pub(super) fn nbglm_options_from_dict(
     }
     if let Some(v) = d.get_item("shrink_dispersion")? {
         o.shrink_dispersion = v.extract()?;
+    }
+    if let Some(v) = d.get_item("cooks_filtering")? {
+        o.cooks_filtering = v.extract()?;
+    }
+    if let Some(v) = d.get_item("cooks_cutoff")? {
+        // `None` keeps the DESeq2 default `qf(0.99, p, m−p)`; a float overrides it.
+        o.cooks_cutoff = if v.is_none() {
+            None
+        } else {
+            Some(v.extract()?)
+        };
+    }
+    if let Some(v) = d.get_item("independent_filtering")? {
+        o.independent_filtering = v.extract()?;
+    }
+    if let Some(v) = d.get_item("independent_filter_alpha")? {
+        o.independent_filter_alpha = v.extract()?;
     }
     Ok(o)
 }
@@ -435,10 +456,12 @@ pub(super) fn fit_targets_pandas<'py>(
 /// log2FoldChange, lfcSE, stat, pvalue, padj, dispersion, converged, n_iter`
 /// (`lfcSE` is on the log2 scale).
 ///
-/// Results are DESeq2-*style*, not DESeq2-*identical*: v1 implements IRLS +
-/// Cox–Reid dispersion + trend/shrinkage but omits Cook's-distance outliers,
-/// independent filtering, and apeglm LFC shrinkage. Use PyDESeq2 when exact
-/// DESeq2 numerics are required. See docs/pseudobulk_nb_glm.md.
+/// Results are DESeq2-*style*, not DESeq2-*identical*: it implements IRLS +
+/// Cox–Reid dispersion + trend/shrinkage, plus DESeq2-default Cook's-distance
+/// outlier filtering and base-mean independent filtering (both on by default;
+/// the `cooks` column reports the max Cook's distance per gene). It still omits
+/// apeglm LFC shrinkage. Use PyDESeq2 when exact DESeq2 numerics are required.
+/// See docs/pseudobulk_nb_glm.md.
 #[pyfunction]
 #[pyo3(signature = (counts, design, size_factors=None, contrast=None, gene_names=None, sample_names=None, options=None, counts_axis="samples_by_genes"))]
 #[allow(clippy::too_many_arguments)]
@@ -520,6 +543,7 @@ pub fn nb_glm(
     dict.set_item("pvalue", res.p_value)?;
     dict.set_item("padj", res.p_adj)?;
     dict.set_item("dispersion", res.dispersion)?;
+    dict.set_item("cooks", res.cooks)?;
     dict.set_item("converged", res.converged)?;
     dict.set_item("n_iter", res.n_iter)?;
 
@@ -536,6 +560,7 @@ pub fn nb_glm(
             "pvalue",
             "padj",
             "dispersion",
+            "cooks",
             "converged",
             "n_iter",
         ],

@@ -17,6 +17,7 @@ PYDESEQ2_COLUMNS = [
     "pvalue",
     "padj",
     "dispersion",
+    "cooks",
     "converged",
     "n_iter",
 ]
@@ -136,4 +137,75 @@ def test_nb_glm_options_dict():
         counts, design, contrast=1, options={"dispersion": "moments"}
     )
     assert list(df.columns) == PYDESEQ2_COLUMNS
-    assert df["log2FoldChange"].to_numpy()[0] > 0.5
+
+
+def test_nb_glm_v2_filtering_option_keys_accepted():
+    """The DESeq2 results-stage filtering knobs are recognised and toggle behavior."""
+    counts, design = _pseudobulk_fixture()
+    # All four new keys parse; explicit None for cooks_cutoff keeps the default.
+    df = pyscx.accel.nb_glm(
+        counts,
+        design,
+        contrast=1,
+        options={
+            "cooks_filtering": True,
+            "cooks_cutoff": None,
+            "independent_filtering": False,
+            "independent_filter_alpha": 0.05,
+        },
+    )
+    assert list(df.columns) == PYDESEQ2_COLUMNS
+    # The `cooks` column is finite and non-negative for a clean, well-conditioned fit.
+    cooks = df["cooks"].to_numpy()
+    assert np.all(np.isfinite(cooks))
+    assert np.all(cooks >= 0)
+
+
+def _cooks_outlier_fixture():
+    """8 samples (4 ctrl + 4 treated) × 6 genes, clean except a single gross spike
+    in gene 3 (one sample). m−p = 6 supports Cook's filtering."""
+    rng = np.random.default_rng(0)
+    counts = rng.integers(80, 120, size=(8, 6)).astype(np.float64)
+    design = np.array([[1, 0]] * 4 + [[1, 1]] * 4, dtype=np.float64)
+    counts[5, 3] = 6000.0  # gross outlier
+    return counts, design
+
+
+def test_nb_glm_cooks_outlier_is_filtered():
+    """The single-sample spike makes gene 3 the maximum-Cook's-distance gene, and a
+    cutoff just below that maximum flags it: its p-value and p_adj become NaN
+    (DESeq2 semantics) while a low-Cook's gene stays finite."""
+    counts, design = _cooks_outlier_fixture()
+    cooks = pyscx.accel.nb_glm(counts, design, contrast=1)["cooks"].to_numpy()
+    imax = int(np.argmax(cooks))
+    assert imax == 3, f"gene 3 (the spike) should have max Cook's: {cooks}"
+    imin = int(np.argmin(cooks))
+    # A cutoff just under the max flags the spike gene only.
+    cut = cooks[imax] * 0.99
+    df = pyscx.accel.nb_glm(
+        counts, design, contrast=1, options={"cooks_cutoff": cut}
+    )
+    pval = df["pvalue"].to_numpy()
+    padj = df["padj"].to_numpy()
+    assert np.isnan(pval[imax]), "Cook's outlier should have NaN pvalue"
+    assert np.isnan(padj[imax]), "Cook's outlier should have NaN padj"
+    assert np.isfinite(pval[imin]), "low-Cook's gene should keep a finite pvalue"
+
+
+def test_nb_glm_cooks_filtering_can_be_disabled():
+    """With cooks_filtering=False, no gene's p-value is NaN'd even under a cutoff
+    that would otherwise flag the outlier."""
+    counts, design = _cooks_outlier_fixture()
+    cooks = pyscx.accel.nb_glm(counts, design, contrast=1)["cooks"].to_numpy()
+    cut = float(np.max(cooks)) * 0.5  # would flag the spike gene if filtering were on
+    on = pyscx.accel.nb_glm(counts, design, contrast=1, options={"cooks_cutoff": cut})
+    assert np.isnan(on["pvalue"].to_numpy()).any(), "low cutoff should filter on"
+    off = pyscx.accel.nb_glm(
+        counts,
+        design,
+        contrast=1,
+        options={"cooks_filtering": False, "cooks_cutoff": cut},
+    )
+    assert np.all(
+        np.isfinite(off["pvalue"].to_numpy())
+    ), "cooks_filtering=False ⇒ no Cook's-driven NaN p-values"

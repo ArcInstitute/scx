@@ -15,6 +15,7 @@ pub mod math;
 pub mod types;
 
 mod dispersion;
+mod filtering;
 mod irls;
 mod size_factors;
 mod validate;
@@ -26,7 +27,6 @@ pub use types::{
 
 use rayon::prelude::*;
 
-use crate::diffexp::benjamini_hochberg;
 use crate::error::Result;
 use dispersion::{
     estimate_prior_var, fit_dispersion, fit_dispersion_trend, moments_dispersion, DispPrior,
@@ -215,121 +215,177 @@ pub fn pseudobulk_nb_glm(
     // --- Cross-gene dispersion trend + empirical-Bayes shrinkage (CoxReidShrunk). ---
     let mut dispersion_trend = None;
     let mut dispersion_prior_var = None;
-    let final_states: Vec<GeneState> =
-        if options.dispersion == DispersionMethod::CoxReidShrunk && options.shrink_dispersion {
-            let trend = if options.fit_dispersion_trend {
-                fit_dispersion_trend(&base_means, &alpha_mle, &valid, &options)
-            } else {
-                None
-            };
-            // Per-gene log target: trend value, else global median of valid MLEs.
-            let log_targets: Vec<f64> = match &trend {
-                Some(t) => base_means
-                    .iter()
-                    .map(|&mu| t.eval(mu).max(options.min_disp).ln())
-                    .collect(),
-                None => {
-                    let mut valid_alphas: Vec<f64> = (0..n_genes)
-                        .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
-                        .map(|g| alpha_mle[g])
-                        .collect();
-                    let median = if valid_alphas.is_empty() {
-                        options.min_disp
-                    } else {
-                        valid_alphas
-                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        valid_alphas[valid_alphas.len() / 2]
-                    };
-                    vec![median.max(options.min_disp).ln(); n_genes]
-                }
-            };
-            let prior_var = estimate_prior_var(&log_targets, &alpha_mle, &valid);
-            dispersion_trend = trend;
-            dispersion_prior_var = Some(prior_var);
-
-            (0..n_genes)
-                .into_par_iter()
-                .map(|g| {
-                    if mle[g].all_zero {
-                        return mle[g].clone();
-                    }
-                    let row = row_of(g);
-                    let prior = DispPrior {
-                        log_alpha_trend: log_targets[g],
-                        sigma_lr2: prior_var,
-                    };
-                    let df = fit_dispersion(
-                        row,
-                        &mle[g].mu,
-                        design_row_major,
-                        n_samples,
-                        n_features,
-                        mle[g].alpha,
-                        Some(&prior),
-                        &options,
-                    );
-                    // Refit beta once at the shrunken dispersion (§7.6 step 4).
-                    let fit = irls::fit_gene_irls(
-                        row,
-                        design_row_major,
-                        &log_sf,
-                        n_samples,
-                        n_features,
-                        df.alpha,
-                        &mle[g].beta,
-                        &options,
-                    );
-                    GeneState {
-                        beta: fit.beta,
-                        mu: fit.mu,
-                        fisher: fit.fisher,
-                        alpha: df.alpha,
-                        base_mean: mle[g].base_mean,
-                        converged: mle[g].converged && fit.converged,
-                        n_iter: mle[g].n_iter,
-                        at_low: df.at_low,
-                        at_high: df.at_high,
-                        all_zero: false,
-                    }
-                })
-                .collect()
+    let final_states: Vec<GeneState> = if options.dispersion == DispersionMethod::CoxReidShrunk
+        && options.shrink_dispersion
+    {
+        let trend = if options.fit_dispersion_trend {
+            fit_dispersion_trend(&base_means, &alpha_mle, &valid, &options)
         } else {
-            mle.clone()
+            None
         };
+        // Per-gene log target: trend value, else global median of valid MLEs.
+        let log_targets: Vec<f64> = match &trend {
+            Some(t) => base_means
+                .iter()
+                .map(|&mu| t.eval(mu).max(options.min_disp).ln())
+                .collect(),
+            None => {
+                let mut valid_alphas: Vec<f64> = (0..n_genes)
+                    .filter(|&g| valid[g] && alpha_mle[g] > 0.0)
+                    .map(|g| alpha_mle[g])
+                    .collect();
+                let median = if valid_alphas.is_empty() {
+                    options.min_disp
+                } else {
+                    valid_alphas
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    valid_alphas[valid_alphas.len() / 2]
+                };
+                vec![median.max(options.min_disp).ln(); n_genes]
+            }
+        };
+        let prior_var = estimate_prior_var(&log_targets, &alpha_mle, &valid, n_samples, n_features);
+        dispersion_trend = trend;
+        dispersion_prior_var = Some(prior_var);
 
-    // --- Wald inference (gene-parallel). ---
-    let wald_out: Vec<wald::WaldOut> = (0..n_genes)
+        (0..n_genes)
+            .into_par_iter()
+            .map(|g| {
+                if mle[g].all_zero {
+                    return mle[g].clone();
+                }
+                let row = row_of(g);
+                let prior = DispPrior {
+                    log_alpha_trend: log_targets[g],
+                    sigma_lr2: prior_var,
+                };
+                let df = fit_dispersion(
+                    row,
+                    &mle[g].mu,
+                    design_row_major,
+                    n_samples,
+                    n_features,
+                    mle[g].alpha,
+                    Some(&prior),
+                    &options,
+                );
+                // Refit beta once at the shrunken dispersion (§7.6 step 4).
+                let fit = irls::fit_gene_irls(
+                    row,
+                    design_row_major,
+                    &log_sf,
+                    n_samples,
+                    n_features,
+                    df.alpha,
+                    &mle[g].beta,
+                    &options,
+                );
+                GeneState {
+                    beta: fit.beta,
+                    mu: fit.mu,
+                    fisher: fit.fisher,
+                    alpha: df.alpha,
+                    base_mean: mle[g].base_mean,
+                    converged: mle[g].converged && fit.converged,
+                    n_iter: mle[g].n_iter,
+                    at_low: df.at_low,
+                    at_high: df.at_high,
+                    all_zero: false,
+                }
+            })
+            .collect()
+    } else {
+        mle.clone()
+    };
+
+    // --- Wald inference + Cook's distance (gene-parallel). ---
+    // Cook's reuses the contrast covariance `wald_stat` already inverts (the
+    // ridged Fisher inverse), so it costs only the per-sample leverage forms.
+    let wald_out: Vec<(wald::WaldOut, f64)> = (0..n_genes)
         .into_par_iter()
         .map(|g| {
             let st = &final_states[g];
             if st.all_zero {
                 // Conservative, matching the non-converged Wald path (spec §7.7).
-                return wald::WaldOut {
+                let w = wald::WaldOut {
                     log2_fold_change: 0.0,
                     standard_error: f64::INFINITY,
                     wald_stat: 0.0,
                     p_value: 1.0,
                 };
+                return (w, f64::NAN);
             }
             if !options.compute_wald {
                 let effect: f64 = c.iter().zip(st.beta.iter()).map(|(&ci, &bi)| ci * bi).sum();
-                return wald::WaldOut {
+                let w = wald::WaldOut {
                     log2_fold_change: effect / std::f64::consts::LN_2,
                     standard_error: f64::NAN,
                     wald_stat: f64::NAN,
                     p_value: f64::NAN,
                 };
+                return (w, f64::NAN);
             }
-            wald::wald_stat(&st.beta, &st.fisher, n_features, &c)
+            let (w, cov) = wald::wald_stat(&st.beta, &st.fisher, n_features, &c);
+            let cooks = match &cov {
+                Some(cov) => filtering::cooks_distance(
+                    cov,
+                    &st.mu,
+                    design_row_major,
+                    row_of(g),
+                    st.alpha,
+                    n_samples,
+                    n_features,
+                ),
+                None => f64::NAN,
+            };
+            (w, cooks)
         })
         .collect();
 
-    // --- BH on the calling thread (§7.8). ---
-    let p_value: Vec<f64> = wald_out.iter().map(|w| w.p_value).collect();
-    let p_adj = if options.compute_bh && options.compute_wald {
-        benjamini_hochberg(&p_value)
+    let cooks: Vec<f64> = wald_out.iter().map(|(_, c)| *c).collect();
+    let p_value_raw: Vec<f64> = wald_out.iter().map(|(w, _)| w.p_value).collect();
+
+    // --- Cook's-distance outlier filtering (DESeq2 `results()` default). ---
+    // Genes whose max Cook's distance exceeds the cutoff have their p-value (and
+    // hence p_adj) set to NaN. Applied only when the residual df supports it
+    // (DESeq2 requires m − p ≥ 3); log2FC / SE / stat are still reported.
+    let residual_df = n_samples.saturating_sub(n_features);
+    let cooks_cut = if options.compute_wald && options.cooks_filtering && residual_df >= 3 {
+        Some(
+            options
+                .cooks_cutoff
+                .unwrap_or_else(|| filtering::cooks_cutoff(n_features, residual_df)),
+        )
     } else {
+        None
+    };
+    let mut p_value = p_value_raw;
+    let mut n_cooks_outliers = 0usize;
+    if let Some(cut) = cooks_cut {
+        for g in 0..n_genes {
+            // `cooks[g] > cut` filters genuine outliers including +∞ (maximal
+            // leverage); `NaN > cut` is false so un-assessable genes (no cov /
+            // `compute_wald=false`) are left alone.
+            if !final_states[g].all_zero && cooks[g] > cut {
+                p_value[g] = f64::NAN;
+                n_cooks_outliers += 1;
+            }
+        }
+    }
+
+    // --- Multiple-testing correction: independent filtering (default) or masked BH. ---
+    let mut n_independent_filtered = 0usize;
+    let mut independent_filter_threshold = None;
+    let p_adj = if !(options.compute_bh && options.compute_wald) {
         vec![f64::NAN; n_genes]
+    } else if options.independent_filtering {
+        let (adj, thr, n_filtered) =
+            filtering::independent_filter(&base_means, &p_value, options.independent_filter_alpha);
+        n_independent_filtered = n_filtered;
+        independent_filter_threshold = thr;
+        adj
+    } else {
+        filtering::benjamini_hochberg_masked(&p_value)
     };
 
     // --- Assemble result + diagnostics. ---
@@ -353,9 +409,9 @@ pub fn pseudobulk_nb_glm(
     };
 
     let dispersion: Vec<f64> = final_states.iter().map(|s| s.alpha).collect();
-    let log2_fold_change: Vec<f64> = wald_out.iter().map(|w| w.log2_fold_change).collect();
-    let standard_error: Vec<f64> = wald_out.iter().map(|w| w.standard_error).collect();
-    let wald_stat: Vec<f64> = wald_out.iter().map(|w| w.wald_stat).collect();
+    let log2_fold_change: Vec<f64> = wald_out.iter().map(|(w, _)| w.log2_fold_change).collect();
+    let standard_error: Vec<f64> = wald_out.iter().map(|(w, _)| w.standard_error).collect();
+    let wald_stat: Vec<f64> = wald_out.iter().map(|(w, _)| w.wald_stat).collect();
     let converged: Vec<bool> = final_states.iter().map(|s| s.converged).collect();
     let n_iter: Vec<u32> = final_states.iter().map(|s| s.n_iter).collect();
 
@@ -379,6 +435,10 @@ pub fn pseudobulk_nb_glm(
         n_boundary_dispersion_low,
         n_boundary_dispersion_high,
         n_nonconverged,
+        n_cooks_outliers,
+        n_independent_filtered,
+        independent_filter_threshold,
+        cooks_cutoff: cooks_cut,
         dispersion_trend,
         dispersion_prior_var,
         elapsed_fit_ms: Some(start.elapsed().as_secs_f64() * 1e3),
@@ -397,6 +457,7 @@ pub fn pseudobulk_nb_glm(
         wald_stat,
         p_value,
         p_adj,
+        cooks,
         base_mean: base_means,
         converged,
         n_iter,
