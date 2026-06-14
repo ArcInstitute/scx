@@ -1158,13 +1158,17 @@ pub async fn pull_filtered(
     // Write header
     let mut new_header = header;
     new_header.n_obs = shard_total_rows;
-    new_header.n_csr_shards = downloaded_shards as u32;
-    // pull_filtered drops CSC sidecars: the filter changes the row
-    // layout, so any input CSC `indices` arrays would reference stale
-    // rows. The catalog filter loop (around line 642) excludes
-    // CscShard entries; clear the header count + flag to match.
-    new_header.n_csc_shards = 0;
-    new_header.clear_csc();
+    // Recompute shard counts, nnz, and has_* flags from the retained
+    // catalog entries. Selective pull is shard-granular (whole shards are
+    // kept), so each retained shard's stats.nnz is already correct and the
+    // sum is the true subset nnz. This subsumes the manual n_csr_shards /
+    // n_csc_shards / clear_csc bookkeeping below and, crucially, replaces
+    // the stale full-source `nnz` that `header` carried in (otherwise
+    // `scx info` reports the full dataset's nnz on a pulled subset).
+    // pull_filtered drops CSC sidecars (the catalog filter loop excludes
+    // CscShard entries), so sync correctly reports n_csc_shards = 0 and
+    // clears the CSC flag.
+    new_header.sync_from_catalog(&new_full_catalog);
     // Phase G.1c: point at the rewritten modality table (or zero if
     // the source had no modality table).
     new_header.modality_table_offset = modality_table_offset_new;

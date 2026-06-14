@@ -137,6 +137,103 @@ fn convert_stream_h5ad_to_scx() {
     assert_eq!(hdr.n_csc_shards, 0, "no CSC sidecar without --csc always");
 }
 
+/// Regression: the streaming converter must name the single-modality X
+/// CSR section `X_shard_{idx}` (uppercase). A lowercase `x_shard_0` is
+/// tolerated by the reader (it resolves shards by `SectionType`, not name)
+/// but makes `scx explode` / `scx push` reject every converted file — the
+/// entire cloud-publish path. Asserting the on-disk catalog name catches
+/// the regression without needing the `cloud` feature.
+#[test]
+fn convert_stream_names_x_shard_uppercase() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    create_test_h5ad(&h5ad, 64, 12);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let status = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--stream=true",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx convert --stream failed to spawn");
+    assert!(status.success(), "scx convert --stream exited {status}");
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let names: Vec<&str> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(!names.is_empty(), "expected at least one CSR shard");
+    for n in &names {
+        assert!(
+            n.starts_with("X_shard_"),
+            "single-modality CSR shard must be named X_shard_N (uppercase), got {n:?}"
+        );
+    }
+}
+
+/// Regression (end-to-end): a streamed-convert output must `explode`
+/// cleanly into an `.scxd` directory with an `X/NNNNNN.shard` payload.
+/// Before the fix the converter emitted `x_shard_0` and explode/push
+/// rejected it with "invalid CsrShard name". Gated on `cloud` because
+/// `scx explode` only exists in a cloud build.
+#[cfg(feature = "cloud")]
+#[test]
+fn convert_stream_output_explodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx_path = dir.path().join("out.scx");
+    let scxd_path = dir.path().join("out.scxd");
+    create_test_h5ad(&h5ad, 64, 12);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let status = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5ad",
+            "--to",
+            "scx",
+            "--stream=true",
+            h5ad.to_str().unwrap(),
+            scx_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx convert --stream failed to spawn");
+    assert!(status.success(), "scx convert --stream exited {status}");
+
+    let status = Command::new(scx_bin)
+        .args([
+            "explode",
+            scx_path.to_str().unwrap(),
+            scxd_path.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx explode failed to spawn");
+    assert!(
+        status.success(),
+        "scx explode of a streamed-convert output exited {status}"
+    );
+    assert!(
+        scxd_path.join("X/000000.shard").is_file(),
+        "explode must emit X/000000.shard, dir contents: {:?}",
+        std::fs::read_dir(scxd_path.join("X")).map(|rd| rd
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect::<Vec<_>>())
+    );
+}
+
 #[test]
 fn convert_stream_csc_always_emits_sidecar() {
     let dir = tempfile::tempdir().unwrap();

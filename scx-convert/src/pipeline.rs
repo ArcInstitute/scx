@@ -1030,7 +1030,13 @@ pub fn h5ad_to_scx_streaming(
         n_vars_u32,
         SectionType::CsrShard,
         ModalityType::Rna,
-        "x_shard",
+        // Canonical single-modality CSR shard name is `X_shard_{idx}`
+        // (writer.rs::write_csr_shard, catalog_view, and the explode/push
+        // name->path mapper all expect uppercase). The coordinator appends
+        // `_{idx}` to this prefix. A lowercase prefix produced `x_shard_0`,
+        // which the reader tolerated (it resolves shards by SectionType, not
+        // name) but `scx explode`/`scx push` rejected.
+        "X_shard",
         sink,
     )?;
     drop(x_reader);

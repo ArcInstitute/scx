@@ -567,7 +567,16 @@ pub fn h5mu_to_scx_streaming(
         }
 
         let modality_id_for_closure = modality_id;
-        let section_prefix = format!("{mname}_x_shard");
+        // Canonical per-modality CSR shard name is `X/{mname}/shard_{idx}`
+        // (writer.rs::write_csr_shard_for and the explode/push name->path
+        // mapper both expect this layout; the in-memory h5mu path below uses
+        // it via write_csr_shard_for). The coordinator appends `_{idx}` to
+        // this prefix. The old `{mname}_x_shard` prefix produced
+        // `{mname}_x_shard_0`, which the reader tolerated (it resolves shards
+        // by SectionType + modality_id, not name) but `scx explode`/`scx push`
+        // rejected, since it matches neither the per-modality nor the legacy
+        // single-modality name pattern.
+        let section_prefix = format!("X/{mname}/shard");
         writer.with_modality::<_, _, ConvertError>(modality_id_for_closure, |w| {
             crate::pipeline::run_streaming_writer_coordinator(
                 x_reader.as_mut(),
