@@ -194,7 +194,7 @@ fn lookup_string_in_column(
 /// Field names of an Arrow schema, dropping the pandas index column(s)
 /// so the result mirrors `adata.obs.columns` / `adata.var.columns`
 /// rather than including the `_index` / `__index_level_0__` field.
-fn schema_data_columns(schema: Option<arrow::datatypes::Schema>) -> Vec<String> {
+pub(crate) fn schema_data_columns(schema: Option<arrow::datatypes::Schema>) -> Vec<String> {
     let Some(schema) = schema else {
         return Vec::new();
     };
@@ -280,6 +280,13 @@ impl PyExperiment {
     #[getter]
     fn n_vars(&self) -> u64 {
         self.reader.n_vars()
+    }
+
+    /// `(n_obs, n_vars)` — mirrors `anndata.AnnData.shape`. `n_obs` is the
+    /// logical (post-deletion) row count.
+    #[getter]
+    fn shape(&self) -> (u64, u64) {
+        (self.logical_n_obs(), self.reader.n_vars())
     }
 
     /// Total number of non-zero entries.

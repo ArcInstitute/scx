@@ -953,30 +953,25 @@ fn main() {
             json,
             explain,
         } => {
-            // The predicate may be given positionally (back-compat) or via
-            // `--filter` (consistent with `scx subset` / `scx delete`). clap's
-            // `conflicts_with` rejects supplying both; handle the "neither"
-            // case here with an actionable message naming both spellings.
-            match filter.or(filter_flag) {
-                Some(predicate) => query::run_query(
-                    &source,
-                    &predicate,
-                    count,
-                    output.as_deref(),
-                    select_genes.as_deref(),
-                    normalize,
-                    log1p,
-                    limit,
-                    json,
-                    explain,
-                ),
-                None => Err("scx query: missing obs predicate.\n\
-                     Pass it positionally:  scx query <SOURCE> \"<EXPR>\"\n\
-                     or via the flag:        scx query <SOURCE> --filter \"<EXPR>\"\n\
-                     (the --filter spelling matches `scx subset` / `scx delete`).\n\
-                     Example: scx query atlas.scx \"disease == 'normal'\" --count"
-                    .into()),
-            }
+            // The predicate is optional and may be given positionally
+            // (back-compat) or via `--filter` (consistent with `scx subset` /
+            // `scx delete`). clap's `conflicts_with` rejects supplying both.
+            // With neither, the query runs over all cells — matching pyscx
+            // `query()` semantics — so gene-only projections / transforms /
+            // `--count` / `--output` work without inventing a tautological
+            // predicate.
+            query::run_query(
+                &source,
+                filter.or(filter_flag).as_deref(),
+                count,
+                output.as_deref(),
+                select_genes.as_deref(),
+                normalize,
+                log1p,
+                limit,
+                json,
+                explain,
+            )
         }
         Commands::Benchmark {
             file,

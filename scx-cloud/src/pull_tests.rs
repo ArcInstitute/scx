@@ -801,11 +801,19 @@ async fn test_pull_filtered_shard_mode_includes_extra_cells() {
     // Predicate matches 50 cells, but shard-granular mode returns all 100
     // (both full shards).
     assert_eq!(stats.matching_cells, 50);
+    // `output_cells` reports the cells actually WRITTEN (all rows of the
+    // retained shards), distinct from `matching_cells` (F2). For a
+    // shard-granular pull that straddles the type boundary this is the
+    // full 100, strictly greater than the 50 matches.
+    assert_eq!(stats.output_cells, 100);
+    assert!(stats.output_cells > stats.matching_cells);
 
     let reader = ScxReader::open(&output).unwrap();
     // n_obs should be ALL cells from downloaded shards (100), not just
     // the 50 matching ones — that's the shard-granular contract.
     assert_eq!(reader.n_obs(), 100);
+    // `output_cells` must equal the output file's actual row count.
+    assert_eq!(stats.output_cells, reader.n_obs());
 }
 
 /// Regression: `pull_filtered` must recompute the output header `nnz` for

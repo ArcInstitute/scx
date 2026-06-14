@@ -5,13 +5,27 @@
 
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use scx_engine::QueryPipeline;
 
 use crate::query::PyQueryPipeline;
+
+/// Map a `scx_cloud::CloudError` to the most appropriate Python exception.
+///
+/// A missing/wrong path (`CatalogNotFound`) becomes `FileNotFoundError`
+/// with the actionable ".scxd/ vs .scx" message instead of a raw,
+/// percent-encoded object_store 404. Everything else (auth, network,
+/// timeouts) stays a verbose `RuntimeError` — those messages are worth
+/// surfacing in full.
+fn cloud_to_pyerr(e: scx_cloud::CloudError) -> PyErr {
+    match e {
+        scx_cloud::CloudError::CatalogNotFound(_) => PyFileNotFoundError::new_err(e.to_string()),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
 
 /// Build the tokio runtime that backs a long-lived `CloudReader`.
 ///
@@ -257,6 +271,37 @@ impl PyCloudExperiment {
         self.reader.n_vars()
     }
 
+    /// `(n_obs, n_vars)` — mirrors `anndata.AnnData.shape` and the local
+    /// `Experiment.shape`. Header-only, no network I/O.
+    #[getter]
+    fn shape(&self) -> (u64, u64) {
+        (self.reader.n_obs(), self.reader.n_vars())
+    }
+
+    /// Column names in `obs` (cell metadata), excluding the pandas index —
+    /// the vocabulary accepted by `query().filter_obs(...)`. Mirrors the
+    /// local `Experiment.obs_keys()`.
+    ///
+    /// I/O cost: unlike the local footer-only read, the cloud path fetches
+    /// and assembles the full obs section to derive its schema. The result
+    /// is cached on this handle, so repeat calls (and a later `.query()`
+    /// over obs) are free.
+    fn obs_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let schema = py
+            .detach(|| self.rt.block_on(self.reader.read_obs_schema()))
+            .map_err(cloud_to_pyerr)?;
+        Ok(crate::experiment::schema_data_columns(Some(schema)))
+    }
+
+    /// Column names in `var` (gene metadata), excluding the pandas index.
+    /// Mirror of [`Self::obs_keys`]; same cloud I/O caveat.
+    fn var_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let schema = py
+            .detach(|| self.rt.block_on(self.reader.read_var_schema()))
+            .map_err(cloud_to_pyerr)?;
+        Ok(crate::experiment::schema_data_columns(Some(schema)))
+    }
+
     #[getter]
     fn nnz(&self) -> u64 {
         self.reader.nnz()
@@ -331,7 +376,7 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
     let url = url.to_string();
     let reader = py
         .detach(|| rt.block_on(scx_cloud::open_cloud(&url)))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(cloud_to_pyerr)?;
 
     Ok(PyCloudExperiment {
         reader: Arc::new(reader),
@@ -370,7 +415,7 @@ pub fn read_cloud<'py>(
     let url_s = url.to_string();
     let reader = py
         .detach(|| rt.block_on(scx_cloud::open_cloud(&url_s)))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        .map_err(cloud_to_pyerr)?;
     let reader = Arc::new(reader);
     let rt = Arc::new(rt);
 

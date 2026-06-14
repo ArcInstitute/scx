@@ -442,6 +442,28 @@ fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
 }
 
+/// Whether an `object_store` error means "the object isn't there".
+///
+/// Covers both the canonical `NotFound` variant (remote stores like GCS/S3)
+/// and the `LocalFileSystem` case, which surfaces a missing file as a
+/// `Generic` error wrapping a `std::io::Error` of kind `NotFound` (e.g.
+/// `UnableToCanonicalize`). Used to decide layout fallback and, ultimately,
+/// to emit the actionable `CatalogNotFound` instead of leaking a raw 404 /
+/// canonicalize error — while leaving auth/network errors verbose.
+fn is_missing_object(e: &object_store::Error) -> bool {
+    // Remote stores (GCS/S3/Azure) report a missing object as the canonical
+    // `NotFound` variant.
+    if matches!(e, object_store::Error::NotFound { .. }) {
+        return true;
+    }
+    // `LocalFileSystem` reports a missing file as a `Generic` wrapping
+    // `UnableToCanonicalize` → a `std::io::Error` of kind `NotFound`, which
+    // object_store does not surface through `Error::source()`. Match on the
+    // Debug form's `kind: NotFound` token — a Rust enum-variant name, so
+    // locale-invariant (unlike the OS message in the Display form).
+    format!("{e:?}").contains("kind: NotFound")
+}
+
 /// Open an SCX file or directory from cloud/local storage.
 ///
 /// Detects the layout automatically:
@@ -449,7 +471,17 @@ fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
 ///   - Otherwise → packed file (auto-detects cloud-ready vs not)
 pub async fn open_cloud(url: &str) -> Result<CloudReader> {
     let location = crate::backend::parse_location(url)?;
-    let backend: Arc<dyn ObjectStore> = Arc::from(crate::backend::create_backend(&location).await?);
+    // For a missing LOCAL path, backend creation itself fails (the
+    // `LocalFileSystem` prefix can't be canonicalized) before any GET — map
+    // that to the actionable `CatalogNotFound` too. Remote backends build
+    // lazily, so their missing-object error surfaces at the GETs below.
+    let backend: Arc<dyn ObjectStore> = match crate::backend::create_backend(&location).await {
+        Ok(b) => Arc::from(b),
+        Err(CloudError::ObjectStore(e)) if is_missing_object(&e) => {
+            return Err(CloudError::CatalogNotFound(url.to_string()));
+        }
+        Err(e) => return Err(e),
+    };
 
     // Try exploded layout first: look for _catalog.bin
     let catalog_path = {
@@ -486,9 +518,10 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             })
         }
         Err(e) => {
-            // Only fall through to packed-file path for NotFound errors.
-            // Auth, network, and other errors should propagate immediately.
-            if !matches!(e, object_store::Error::NotFound { .. }) {
+            // Only fall through to packed-file path when `_catalog.bin` is
+            // simply absent (so this isn't an exploded dir). Auth, network,
+            // and other errors should propagate immediately.
+            if !is_missing_object(&e) {
                 return Err(CloudError::ObjectStore(e));
             }
 
@@ -510,7 +543,19 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
             };
 
             let first_chunk_size = (HEADER_SIZE + 4096) as u64;
-            let data = backend.get_range(&file_path, 0..first_chunk_size).await?;
+            // Neither the exploded `_catalog.bin` nor (here) the packed
+            // file resolved. A `NotFound` at this point means the path
+            // points at no SCX data at all — emit the actionable
+            // `CatalogNotFound` rather than leaking the raw object_store
+            // 404 (which is percent-encoded and dumps the provider's XML).
+            // Auth/network/other errors still propagate verbatim.
+            let data = match backend.get_range(&file_path, 0..first_chunk_size).await {
+                Ok(d) => d,
+                Err(e) if is_missing_object(&e) => {
+                    return Err(CloudError::CatalogNotFound(url.to_string()));
+                }
+                Err(e) => return Err(CloudError::ObjectStore(e)),
+            };
             let first_bytes = data.to_vec();
 
             if first_bytes.len() < HEADER_SIZE {
@@ -721,6 +766,22 @@ mod tests {
         let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
         assert_eq!(reader.n_obs(), 100);
         assert_eq!(reader.n_vars(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_open_missing_path_returns_catalog_not_found() {
+        // A path that resolves to neither an exploded .scxd/ (`_catalog.bin`)
+        // nor a packed .scx must surface the actionable `CatalogNotFound`,
+        // not a raw object_store NotFound (E1).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.scx");
+        // `CloudReader` (the Ok type) isn't Debug, so match rather than
+        // `unwrap_err()`.
+        match open_cloud(&missing.to_string_lossy()).await {
+            Err(CloudError::CatalogNotFound(_)) => {}
+            Err(other) => panic!("expected CatalogNotFound, got {other:?}"),
+            Ok(_) => panic!("expected CatalogNotFound, got Ok"),
+        }
     }
 
     #[tokio::test]

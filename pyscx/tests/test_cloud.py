@@ -253,6 +253,34 @@ class TestCloudReader:
             assert exp_exploded.n_vars == exp_packed.n_vars
             assert exp_exploded.shard_count == exp_packed.shard_count
 
+    def test_open_cloud_shape_and_keys(self):
+        """D1: CloudExperiment exposes `.shape` and obs/var column accessors
+        so users can discover the filter_obs vocabulary without collecting."""
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "test.scx")
+            _create_test_scx(scx_path, n_obs=120, n_vars=30)
+            exploded_dir = os.path.join(tmpdir, "test.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            assert exp.shape == (exp.n_obs, exp.n_vars) == (120, 30)
+            assert "cell_type" in exp.obs_keys()
+            assert "gene_id" in exp.var_keys()
+            # Pandas index column is excluded, mirroring adata.obs.columns.
+            assert "_index" not in exp.obs_keys()
+
+    def test_open_cloud_missing_path_raises_filenotfound(self):
+        """E1: a missing/wrong cloud path raises FileNotFoundError with an
+        actionable message, not a raw object_store 404."""
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = os.path.join(tmpdir, "does_not_exist.scxd")
+            with pytest.raises(FileNotFoundError, match="no SCX data found"):
+                pyscx.open_cloud(missing)
+
 
 class TestCloudQuery:
     """Phase 7: pyscx.open_cloud(...).query().filter_obs(...).collect()

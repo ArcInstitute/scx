@@ -33,14 +33,27 @@ pub fn run_pull(
             scx_cloud::FilterMode::Shard => "shard-granular",
             scx_cloud::FilterMode::Exact => "exact",
         };
+        // Report the cells WRITTEN distinctly from the cells MATCHING the
+        // filter. Shard-granular pull retains whole shards, so the output
+        // file contains every row of each retained shard — typically far
+        // more than the rows matching the predicate. Conflating the two
+        // (the old "{matching_cells} cells") surprised users who got a
+        // much larger file than the match count implied.
+        let granularity_note = if matches!(stats.filter_mode, scx_cloud::FilterMode::Shard) {
+            " — shard-granular, rows not cell-filtered"
+        } else {
+            ""
+        };
         println!(
-            "Selective pull ({}) {} → {} ({}/{} shards, {} cells, {:.1} MB downloaded, {:.1} MB saved)",
+            "Selective pull ({}) {} → {} ({}/{} shards; {} cells written, {} match the filter{}; {:.1} MB downloaded, {:.1} MB saved)",
             mode_label,
             source,
             dest.display(),
             stats.downloaded_shards,
             stats.total_shards,
+            stats.output_cells,
             stats.matching_cells,
+            granularity_note,
             stats.bytes_downloaded as f64 / 1_000_000.0,
             stats.bytes_saved as f64 / 1_000_000.0,
         );

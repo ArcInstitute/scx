@@ -12,7 +12,7 @@ pub enum CloudError {
     #[error("Invalid cloud URL: {0}")]
     InvalidUrl(String),
 
-    #[error("Catalog not found at {0} — is this a valid .scxd directory?")]
+    #[error("no SCX data found at {0} — expected an exploded .scxd/ directory (with _catalog.bin) or a packed .scx file. Check the path and credentials, or run `scx push` / `scx explode` to publish one.")]
     CatalogNotFound(String),
 
     #[error("Section not found: {0}")]
