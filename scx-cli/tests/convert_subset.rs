@@ -154,3 +154,60 @@ fn subset_extract_modality_from_h5mu() {
     let csr = out.read_all_csr_shards().unwrap();
     assert_eq!(csr.shape, (10, 25));
 }
+
+/// Regression: the *streaming* h5mu converter must name per-modality X
+/// CSR sections `X/{modality}/shard_{idx}` (matching the in-memory path's
+/// `write_csr_shard_for` and the explode/push name->path mapper). It
+/// previously emitted `{modality}_x_shard_0`, which the reader tolerated
+/// (it resolves shards by `SectionType` + `modality_id`, not name) but
+/// which `scx explode` / `scx push` rejected — breaking cloud publish for
+/// any streamed multimodal conversion. Gated on `cloud` for `scx explode`.
+#[cfg(feature = "cloud")]
+#[test]
+fn convert_stream_h5mu_output_explodes_per_modality() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_in = dir.path().join("in.h5mu");
+    let scx_in = dir.path().join("multi.scx");
+    let scxd_out = dir.path().join("multi.scxd");
+    create_test_h5mu(&h5mu_in, 10, 25, 6);
+
+    let scx_bin = env!("CARGO_BIN_EXE_scx");
+    let status = Command::new(scx_bin)
+        .args([
+            "convert",
+            "--from",
+            "h5mu",
+            "--to",
+            "scx",
+            "--stream=true",
+            h5mu_in.to_str().unwrap(),
+            scx_in.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx convert --from h5mu --stream failed to spawn");
+    assert!(
+        status.success(),
+        "scx convert h5mu→scx --stream exited {status}"
+    );
+
+    let status = Command::new(scx_bin)
+        .args([
+            "explode",
+            scx_in.to_str().unwrap(),
+            scxd_out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scx explode failed to spawn");
+    assert!(
+        status.success(),
+        "scx explode of a streamed h5mu convert output exited {status}"
+    );
+    for modality in ["rna", "adt"] {
+        assert!(
+            scxd_out
+                .join(format!("X/{modality}/000000.shard"))
+                .is_file(),
+            "explode must emit X/{modality}/000000.shard"
+        );
+    }
+}

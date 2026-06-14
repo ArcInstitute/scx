@@ -808,6 +808,99 @@ async fn test_pull_filtered_shard_mode_includes_extra_cells() {
     assert_eq!(reader.n_obs(), 100);
 }
 
+/// Regression: `pull_filtered` must recompute the output header `nnz` for
+/// the retained shard subset. It previously carried the full source
+/// dataset's `nnz` verbatim, so `scx info` on a pulled subset reported the
+/// whole-dataset nnz. Uses a clean type→shard split so only ONE of two
+/// shards is downloaded, making the correct subset nnz strictly less than
+/// the full nnz (a stale full-nnz value would fail the assertions).
+#[tokio::test]
+async fn test_pull_filtered_recomputes_subset_nnz() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("split.scx");
+    let n_obs = 100;
+    let n_vars = 20;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    // Clean split: cells 0..49 = typeA (shard 0), 50..99 = typeB (shard 1).
+    let types: Vec<String> = (0..n_obs)
+        .map(|i| if i < 50 { "typeA" } else { "typeB" }.to_string())
+        .collect();
+    let obs_schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, false),
+    ]);
+    let obs_batch = arrow::array::RecordBatch::try_new(
+        Arc::new(obs_schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs_batch).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let rows_per_shard = 50;
+    let mut row_offset = 0;
+    while row_offset < n_obs {
+        let shard_rows = std::cmp::min(rows_per_shard, n_obs - row_offset);
+        let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_offset as u64,
+            )
+            .unwrap();
+        row_offset += shard_rows;
+    }
+    writer.finish().unwrap();
+
+    // Full-dataset nnz from the unfiltered source, for the < assertion.
+    let full_nnz = ScxReader::open(&path).unwrap().header().nnz;
+    assert!(full_nnz > 0);
+
+    let exploded_dir = dir.path().join("split.scxd");
+    crate::explode::explode(&path, &exploded_dir).unwrap();
+    let source = exploded_dir.to_string_lossy().to_string();
+
+    let output = dir.path().join("split_filtered.scx");
+    let stats = pull_filtered(
+        &source,
+        &output,
+        "cell_type == 'typeA'",
+        PullOptions::default(),
+    )
+    .await
+    .unwrap();
+    // typeA lives only in shard 0 → exactly one shard downloaded.
+    assert_eq!(stats.downloaded_shards, 1);
+
+    let reader = ScxReader::open(&output).unwrap();
+    let actual_nnz = reader.read_all_csr_shards().unwrap().data.len() as u64;
+    assert_eq!(
+        reader.header().nnz,
+        actual_nnz,
+        "header nnz must equal the materialized subset nnz"
+    );
+    assert!(
+        reader.header().nnz < full_nnz,
+        "subset nnz ({}) must be strictly less than full nnz ({full_nnz}); \
+         a stale full-dataset nnz would equal it",
+        reader.header().nnz
+    );
+}
+
 /// Exact filter mode should return an error (not yet implemented).
 #[tokio::test]
 async fn test_pull_filtered_exact_mode_errors() {
