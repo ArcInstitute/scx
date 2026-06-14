@@ -16,6 +16,14 @@ pydeseq2.
 > numerical equality. If you need exact DESeq2 behaviour, keep using PyDESeq2
 > (`backend="pydeseq2"`, the default).
 
+> **Behavior change.** Cook's-distance outlier filtering and base-mean
+> independent filtering are **on by default** (matching DESeq2 `results()`). Versus
+> the first NB-GLM release, `accel.nb_glm` / `pdex_nb_glm` /
+> `pseudobulk_dex(backend="nb_glm")` can now emit `NaN` in `padj` (and `fdr`) — and,
+> for Cook's outliers, in `pvalue` — for outlier and low-base-mean genes. Set
+> `cooks_filtering=False` and/or `independent_filtering=False` to restore the
+> unfiltered behavior.
+
 ## When to use it
 
 Pseudobulk NB-GLM is the right tool when you have **biological replicates** —

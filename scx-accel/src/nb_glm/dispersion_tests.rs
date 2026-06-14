@@ -96,6 +96,46 @@ fn shrinkage_pulls_toward_target_and_respects_prior_strength() {
 }
 
 #[test]
+fn trend_fit_trims_dispersion_outliers() {
+    // Known trend alpha = a0 + a1/mu_bar for most genes, plus a few gross
+    // dispersion outliers (1000× the trend). The DESeq2-style trim loop must drop
+    // them so the recovered coefficients stay close to truth.
+    let (a0, a1) = (0.1, 2.0);
+    let n = 200;
+    let base_mean: Vec<f64> = (0..n).map(|i| 5.0 + (i as f64) * 2.5).collect();
+    let mut alpha_mle: Vec<f64> = base_mean.iter().map(|&m| a0 + a1 / m).collect();
+    for &g in &[10usize, 50, 120, 175] {
+        alpha_mle[g] = (a0 + a1 / base_mean[g]) * 1000.0; // ≫ 15× ⇒ must be trimmed
+    }
+    let valid = vec![true; n];
+    let opts = NbGlmOptions::default();
+    let trend = fit_dispersion_trend(&base_mean, &alpha_mle, &valid, &opts).expect("trend");
+    close(trend.a0, a0, 5e-2, 1e-2);
+    close(trend.a1, a1, 5e-2, 1e-2);
+}
+
+#[test]
+fn estimate_prior_var_subtracts_sampling_variance() {
+    // Non-zero scatter in the log-residuals: more of the expected sampling variance
+    // `trigamma((m−p)/2)` is subtracted at small residual df than at large df, so
+    // the prior variance is strictly smaller there (and both stay above the floor).
+    let n = 60;
+    let log_targets = vec![0.0; n];
+    let alpha_mle: Vec<f64> = (0..n).map(|i| ((i as f64 - 30.0) * 0.1).exp()).collect();
+    let valid = vec![true; n];
+    let pv_small = estimate_prior_var(&log_targets, &alpha_mle, &valid, 6, 2); // trigamma(2)≈0.645
+    let pv_large = estimate_prior_var(&log_targets, &alpha_mle, &valid, 200, 2); // trigamma(99)≈0.005
+    assert!(
+        pv_large > pv_small,
+        "smaller residual df subtracts more sampling variance: small={pv_small} large={pv_large}"
+    );
+    assert!(
+        pv_small > MIN_PRIOR_VAR,
+        "the scatter should clear the floor so the subtraction is observable: {pv_small}"
+    );
+}
+
+#[test]
 fn estimate_prior_var_has_floor() {
     // Identical residuals ⇒ MAD = 0 ⇒ falls back to the minimum prior var.
     let log_targets = vec![0.0; 10];

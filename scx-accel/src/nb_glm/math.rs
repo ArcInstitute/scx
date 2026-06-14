@@ -88,7 +88,7 @@ pub fn digamma(mut x: f64) -> f64 {
 }
 
 /// Trigamma (ψ′) function, `d²/dx² lgamma(x)` = `dψ/dx`, for `x > 0`. Recurrence
-/// `ψ′(x) = ψ′(x+1) + 1/x²` up to `x ≥ 6`, then the standard asymptotic series.
+/// `ψ′(x) = ψ′(x+1) + 1/x²` up to `x ≥ 10`, then the standard asymptotic series.
 /// Mirrors [`digamma`]; needed for the DESeq2 dispersion-prior variance term
 /// `trigamma((m−p)/2)` (the expected sampling variance of a log-dispersion MLE).
 pub fn trigamma(mut x: f64) -> f64 {

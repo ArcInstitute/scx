@@ -53,17 +53,23 @@ pub(crate) fn cooks_distance(
             q += row[j] * mij_xj;
         }
         let h = w_s * q;
-        if !(h.is_finite()) {
+        if !h.is_finite() {
             continue;
         }
-        if h >= 1.0 {
+        // h ≥ 1 — or 1−h underflowing to 0 in f64 — is maximal leverage, a
+        // definite outlier; flag it rather than letting `1/(1−h)²` skip it.
+        let one_minus_h = 1.0 - h;
+        if one_minus_h <= 0.0 {
             return f64::INFINITY;
         }
         let resid = counts_row[s] - mu_s;
         let pearson2 = resid * resid / var;
-        let one_minus_h = 1.0 - h;
         let d = (pearson2 / p) * (h / (one_minus_h * one_minus_h));
-        if d.is_finite() && d > max_d {
+        // An overflowed (non-finite) Cook's distance is also an extreme outlier.
+        if !d.is_finite() {
+            return f64::INFINITY;
+        }
+        if d > max_d {
             max_d = d;
         }
     }
@@ -89,7 +95,9 @@ pub(crate) fn benjamini_hochberg_masked(pvals: &[f64]) -> Vec<f64> {
 }
 
 /// Type-7 (R default) quantile of an ascending-sorted slice at `q ∈ [0, 1]`.
+/// `q` is clamped to `[0, 1]` so an out-of-range value can't index out of bounds.
 fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
+    let q = q.clamp(0.0, 1.0);
     let n = sorted.len();
     if n == 0 {
         return f64::NAN;
@@ -118,6 +126,9 @@ const N_THETA: usize = 50;
 /// "1-SE rule", which favors the smallest cutoff). Genes below the chosen base-mean
 /// cutoff get `p_adj = NaN`; BH is recomputed over the retained set. Genes with a
 /// NaN `p_value` (e.g. Cook's outliers) stay NaN throughout.
+///
+/// Matches genefilter on the 1-SE rule: the RMSE is over `numRej > 0` points only,
+/// and `max(numRej) <= 10` short-circuits to no filtering.
 ///
 /// Returns `(p_adj, base_mean_threshold, n_filtered)`. Degrades to plain masked BH
 /// (no filtering) when too few genes are eligible or no cutoff improves on retaining
@@ -169,16 +180,32 @@ pub(crate) fn independent_filter(
         return (benjamini_hochberg_masked(p_value), None, 0);
     }
 
+    // genefilter short-circuit: with very few rejections the optimum is noise —
+    // keep all genes (DESeq2 `if (max(numRej) <= 10) j <- 1`).
+    let max_rej = num_rej.iter().copied().fold(0.0_f64, f64::max);
+    if max_rej <= 10.0 {
+        return (benjamini_hochberg_masked(p_value), None, 0);
+    }
+
     // Smooth and apply the 1-SE rule: first theta within one RMSE of the max.
+    // The RMSE is taken over the points with positive rejections only (genefilter:
+    // `residual <- numRej[numRej>0] - lo.fit$y[numRej>0]`), so the zero-rejection
+    // tail doesn't deflate it.
     let smoothed = lowess(&thetas, &num_rej, 0.2, 3);
     let max_s = smoothed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let rmse = (num_rej
-        .iter()
-        .zip(&smoothed)
-        .map(|(&y, &yh)| (y - yh) * (y - yh))
-        .sum::<f64>()
-        / N_THETA as f64)
-        .sqrt();
+    let (mut sse, mut cnt) = (0.0_f64, 0usize);
+    for (k, &y) in num_rej.iter().enumerate() {
+        if y > 0.0 {
+            let r = y - smoothed[k];
+            sse += r * r;
+            cnt += 1;
+        }
+    }
+    let rmse = if cnt > 0 {
+        (sse / cnt as f64).sqrt()
+    } else {
+        0.0
+    };
     let thresh = max_s - rmse;
     let j = smoothed.iter().position(|&v| v >= thresh).unwrap_or(0);
     let chosen_theta = thetas[j];

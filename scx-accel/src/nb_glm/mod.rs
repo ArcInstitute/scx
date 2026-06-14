@@ -363,7 +363,10 @@ pub fn pseudobulk_nb_glm(
     let mut n_cooks_outliers = 0usize;
     if let Some(cut) = cooks_cut {
         for g in 0..n_genes {
-            if !final_states[g].all_zero && cooks[g].is_finite() && cooks[g] > cut {
+            // `cooks[g] > cut` filters genuine outliers including +∞ (maximal
+            // leverage); `NaN > cut` is false so un-assessable genes (no cov /
+            // `compute_wald=false`) are left alone.
+            if !final_states[g].all_zero && cooks[g] > cut {
                 p_value[g] = f64::NAN;
                 n_cooks_outliers += 1;
             }

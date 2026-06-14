@@ -405,7 +405,14 @@ pub(crate) fn fit_dispersion_trend(
 
     let mut last: Option<(f64, f64)> = None;
     for _ in 0..10 {
-        let (a0, a1) = solve_gamma_glm(&keep, base_mean, alpha_mle, opts)?;
+        // A failed refit on a later (trimmed) iteration must not discard the
+        // previous good fit — fall back to it rather than regressing the
+        // shrinkage target to a global median. (First iteration: `last` is
+        // `None`, so this correctly yields "no trend".)
+        let (a0, a1) = match solve_gamma_glm(&keep, base_mean, alpha_mle, opts) {
+            Some(fit) => fit,
+            None => return last.map(|(a0, a1)| DispersionTrend { a0, a1 }),
+        };
         // Coefficient-relative convergence vs the previous trim's fit.
         if let Some((pa0, pa1)) = last {
             let rel = ((a0 - pa0) / (pa0.abs() + 1e-30))
