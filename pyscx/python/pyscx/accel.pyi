@@ -248,7 +248,7 @@ def harmony_integrate(
     key: Any,
     *,
     basis: str = "X_pca",
-    adjusted_basis: str | None = None,
+    adjusted_basis: str | None = "X_pca_harmony",
     n_clusters: int | None = None,
     theta: Any | None = None,
     sigma: float = 0.1,

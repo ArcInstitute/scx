@@ -1376,6 +1376,18 @@ contiguous gene columns instead of decoding and projecting every row.
 > the CPU path. A CSC *sidecar on the file* (built at conversion) is what makes
 > the default-`csr` GPU call fast.
 
+> **The CSC sidecar lives on disk — only a *backed* AnnData carries it.** The
+> sidecar is reachable for GPU DE only through a backed dataset
+> (`exp.to_anndata(backed=True)`, whose `X` is a `ScxBackedSparseDataset`). If you
+> **materialize** with the plain `exp.to_anndata()`, `X` becomes an in-memory
+> scipy CSR with no link back to the file, so GPU DE silently takes the slower
+> `gpu_csr_v3` route (`fallback_reason == "no_csc_sidecar"`) **even though
+> `exp.has_csc` is `True`**. Reach for `to_anndata(backed=True)` whenever you want
+> the `gpu_csc_v3` fast route. As a guard, pyscx emits a one-time `UserWarning`
+> when `device="gpu"` DE runs on an `X` that was materialized from a file with a
+> CSC sidecar (it stamps `adata.uns["scx_source_has_csc_sidecar"] = True` at
+> materialization to detect exactly this case).
+
 To make a file GPU-fast for DE, build the sidecar at conversion time:
 `pyscx.from_anndata(adata, path, csc="auto")` (built automatically once the
 dataset clears the size thresholds) or `csc="always"`, `scx convert --csc=auto`,
@@ -1737,19 +1749,20 @@ sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch")
 # PCA first — Harmony corrects the PCA embedding, not the raw matrix.
 pyscx.accel.pca(adata, n_comps=30)
 
-# Default: overwrite adata.obsm["X_pca"] with the corrected embedding.
+# Default (scanpy-compatible): write the corrected embedding to a new
+# obsm key "X_pca_harmony" and leave the raw "X_pca" intact.
 pyscx.accel.harmony_integrate(adata, "batch")
 
-# Or keep the raw PCA and write the corrected embedding to a new obsm key:
+# Or overwrite the input embedding in place:
 pyscx.accel.harmony_integrate(
-    adata, "batch", adjusted_basis="X_pca_harmony"
+    adata, "batch", adjusted_basis="X_pca"
 )
 
 # Multi-covariate integration (e.g., donor + assay):
 pyscx.accel.harmony_integrate(adata, ["donor_id", "assay"])
 
 # Downstream scanpy works on the corrected embedding just like raw PCA:
-pyscx.accel.neighbors(adata, use_rep="X_pca")
+pyscx.accel.neighbors(adata, use_rep="X_pca_harmony")
 pyscx.accel.umap(adata)
 pyscx.accel.leiden(adata)
 ```
@@ -1758,7 +1771,7 @@ pyscx.accel.leiden(adata)
 |-----------|---------|-------------|
 | `key` | (required) | `obs` column name, or list of column names, for the batch covariate(s). Each is factorised via `pandas.factorize(sort=False)`. |
 | `basis` | `"X_pca"` | `obsm` key holding the input embedding. |
-| `adjusted_basis` | `None` | `obsm` key for the corrected embedding. `None` overwrites `basis` in place (scanpy-compatible default). |
+| `adjusted_basis` | `"X_pca_harmony"` | `obsm` key for the corrected embedding. Default writes a **new** key, preserving `basis` (scanpy-compatible). Pass `adjusted_basis=basis` (e.g. `"X_pca"`) to overwrite in place. |
 | `n_clusters` | `None` | Soft cluster count K. `None` → `min(N/30, 100)`, clamped to `[2, N/2]`. |
 | `theta` | `2.0` | Diversity-penalty strength. Scalar broadcasts to every covariate. |
 | `sigma` | `0.1` | Gaussian bandwidth for soft assignments. |
@@ -1770,7 +1783,8 @@ pyscx.accel.leiden(adata)
 
 Results:
 
-- `adata.obsm[adjusted_basis or basis]` — corrected embedding (N × d, f32).
+- `adata.obsm[adjusted_basis]` — corrected embedding (N × d, f32); default key
+  `"X_pca_harmony"`, leaving `basis` (`"X_pca"`) intact.
 - `adata.uns["harmony"]` — dict with `params`, `converged`, `n_iterations`,
   `objective_harmony` (per-iteration objective curve), and `backend`
   (`"scx-accel-cpu"` or `"scx-gpu"`).
@@ -2683,16 +2697,16 @@ sc.pp.log1p(adata)
 sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="batch")
 
 pyscx.accel.pca(adata, n_comps=30)
-pyscx.accel.harmony_integrate(adata, "batch")  # overwrites obsm["X_pca"]
+pyscx.accel.harmony_integrate(adata, "batch")  # writes obsm["X_pca_harmony"], keeps "X_pca"
 
 # Use corrected embedding for downstream:
-pyscx.accel.neighbors(adata, use_rep="X_pca")
+pyscx.accel.neighbors(adata, use_rep="X_pca_harmony")
 pyscx.accel.umap(adata)
 pyscx.accel.leiden(adata)
 
-# QC: batch mixing before / after
-adata.obsm["X_pca_raw"] = adata.obsm["X_pca"]  # (not actually raw after overwrite — use adjusted_basis if you need both)
-lisi = pyscx.accel.compute_lisi(adata, "batch")
+# QC: batch mixing before / after — both embeddings are available by default
+lisi_pre = pyscx.accel.compute_lisi(adata, "batch", basis="X_pca")
+lisi = pyscx.accel.compute_lisi(adata, "batch", basis="X_pca_harmony")
 print(f"mean LISI batch = {lisi.mean():.2f}  (ideal: ≈ n_batches)")
 ```
 

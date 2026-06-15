@@ -31,9 +31,11 @@ class TestHarmonyBasic:
         pyscx.accel.harmony_integrate(
             adata, "batch", max_iter=2, random_state=0
         )
-        assert adata.obsm["X_pca"].shape == input_shape
+        # Default writes a new key matching the input shape.
+        assert "X_pca_harmony" in adata.obsm
+        assert adata.obsm["X_pca_harmony"].shape == input_shape
 
-    def test_overwrites_basis_in_place(self, harmony_adata):
+    def test_default_writes_x_pca_harmony_preserves_input(self, harmony_adata):
         import pyscx
 
         adata = harmony_adata
@@ -41,9 +43,23 @@ class TestHarmonyBasic:
         pyscx.accel.harmony_integrate(
             adata, "batch", max_iter=2, random_state=0
         )
-        # Default behaviour: write back to "X_pca" (scanpy-compatible).
+        # Default behaviour (scanpy-compatible): write the corrected embedding
+        # to a new "X_pca_harmony" key and leave "X_pca" untouched.
+        assert "X_pca_harmony" in adata.obsm
+        np.testing.assert_array_equal(adata.obsm["X_pca"], original)
+        # Corrected embedding differs from the input.
+        assert not np.allclose(adata.obsm["X_pca_harmony"], original)
+
+    def test_adjusted_basis_in_place_overwrites(self, harmony_adata):
+        import pyscx
+
+        adata = harmony_adata
+        original = adata.obsm["X_pca"].copy()
+        # Explicit in-place: pass adjusted_basis=basis.
+        pyscx.accel.harmony_integrate(
+            adata, "batch", adjusted_basis="X_pca", max_iter=2, random_state=0
+        )
         assert "X_pca" in adata.obsm
-        # Values should differ after correction.
         assert not np.allclose(adata.obsm["X_pca"], original)
 
     def test_adjusted_basis_preserves_original(self, harmony_adata):

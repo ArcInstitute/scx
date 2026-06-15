@@ -452,6 +452,54 @@ class TestPcaNeighborsUmapRapids:
         assert adata.obsm["X_umap"].shape == (100, 2)
         assert np.isfinite(adata.obsm["X_umap"]).all()
 
+    def test_all_zero_genes_raise_scx_hint(self):
+        """F11: rapids PCA rejects all-zero genes. The fused GPU pipeline must
+        translate rapids' bare ValueError into an scx-level message pointing at
+        `filter_genes(min_cells=1)`, then succeed once the genes are filtered.
+        """
+        import anndata
+        import pyscx
+
+        rng = np.random.default_rng(0)
+        n_obs, n_vars = 120, 40
+        dense = rng.integers(0, 50, size=(n_obs, n_vars)).astype(np.float32)
+        # Force the last 8 genes to zero across all cells.
+        dense[:, -8:] = 0.0
+        adata = anndata.AnnData(X=sp.csr_matrix(dense))
+        pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+        pyscx.accel.log1p(adata, device="gpu")
+
+        with pytest.raises(ValueError, match=r"filter_genes\(adata, min_cells=1\)"):
+            pyscx.accel.pca_neighbors_umap(
+                adata, n_comps=10, n_neighbors=15, n_components=2, device="gpu"
+            )
+
+        # After filtering the all-zero genes, the fused pipeline runs cleanly.
+        pyscx.accel.filter_genes(adata, min_cells=1)
+        assert adata.n_vars == n_vars - 8
+        pyscx.accel.pca_neighbors_umap(
+            adata, n_comps=10, n_neighbors=15, n_components=2, device="gpu"
+        )
+        assert adata.obsm["X_umap"].shape == (n_obs, 2)
+
+    def test_pca_all_zero_genes_raise_scx_hint(self):
+        """F11: the standalone `pca(device="gpu")` rapids path shares the same
+        translation — an all-zero-gene matrix raises the scx hint, not the raw
+        rapids ValueError.
+        """
+        import anndata
+        import pyscx
+
+        rng = np.random.default_rng(1)
+        dense = rng.integers(0, 50, size=(80, 30)).astype(np.float32)
+        dense[:, -5:] = 0.0
+        adata = anndata.AnnData(X=sp.csr_matrix(dense))
+        pyscx.accel.normalize_total(adata, target_sum=1e4, device="gpu")
+        pyscx.accel.log1p(adata, device="gpu")
+
+        with pytest.raises(ValueError, match=r"filter_genes\(adata, min_cells=1\)"):
+            pyscx.accel.pca(adata, n_comps=10, device="gpu")
+
     def test_large_n_neighbors_completes(self):
         """Large `n_neighbors` must complete without error and produce a valid
         embedding. The old `FUZZY_MAX_K` per-row scratch cap (and the fused
