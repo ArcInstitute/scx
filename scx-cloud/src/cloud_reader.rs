@@ -1112,6 +1112,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_provenance_matches_local() {
+        use scx_format_io::provenance::ProvenanceEntry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(6, 5)).unwrap();
+        writer.write_obs(&sample_obs(6)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(6, 5);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1_710_000_000,
+                action: "convert".to_string(),
+                tool: "scx-test".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+
+        let local = scx_format_io::ScxReader::open(&path).unwrap();
+        let local_prov = local.read_provenance().unwrap();
+
+        let exploded = dir.path().join("prov.scxd");
+        crate::explode::explode(&path, &exploded).unwrap();
+
+        for src in [
+            path.to_string_lossy().to_string(),
+            exploded.to_string_lossy().to_string(),
+        ] {
+            let reader = open_cloud(&src).await.unwrap();
+            let prov = reader
+                .read_provenance()
+                .await
+                .unwrap()
+                .expect("cloud provenance present");
+            assert_eq!(
+                prov.operations.len(),
+                local_prov.operations.len(),
+                "src {src}"
+            );
+            assert_eq!(prov.operations[0].action, "convert", "src {src}");
+            assert_eq!(
+                prov.operations[0].tool, local_prov.operations[0].tool,
+                "src {src}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_read_obs_from_exploded() {
         let dir = tempfile::tempdir().unwrap();
         let input = write_test_file(&dir, 100, 50);

@@ -95,8 +95,12 @@ fn run_info_cloud(source: &str, json_output: bool, history: bool) -> CliResult<(
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let reader = rt.block_on(scx_cloud::open_cloud(source))?;
-    let model = rt.block_on(collect_cloud(&reader))?;
+    // One runtime entry: open and collect in the same async block so the
+    // reader stays scoped to it and we don't pay the block_on round-trip twice.
+    let model = rt.block_on(async {
+        let reader = scx_cloud::open_cloud(source).await?;
+        collect_cloud(&reader).await
+    })?;
     if json_output {
         render_json(&model)
     } else {
@@ -174,10 +178,13 @@ async fn collect_cloud(reader: &scx_cloud::CloudReader) -> CliResult<InfoModel> 
         Some(file_size.saturating_sub(live_bytes(&header, &catalog)))
     };
 
+    // Soft sections degrade the same way as the local path (`collect_local`):
+    // a malformed modality-table / deletion-vector / provenance section drops
+    // to `None` rather than aborting the whole report.
     Ok(InfoModel {
-        modality_table: reader.modality_table().await?,
-        deletion_vectors: reader.read_deletion_vectors().await?,
-        provenance: reader.read_provenance().await?,
+        modality_table: reader.modality_table().await.ok().flatten(),
+        deletion_vectors: reader.read_deletion_vectors().await.ok().flatten(),
+        provenance: reader.read_provenance().await.ok().flatten(),
         header,
         catalog,
         distinct_codec_ids,
@@ -236,8 +243,15 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
     // Line 4: manifest sequence
     println!("Manifest: sequence {}", header.manifest_sequence);
 
-    // Line 5: file size
-    println!("File size: {}", human_size(model.file_size));
+    // Line 5: file size. For an exploded directory there is no single file —
+    // this is the summed live bytes (no padding / per-object overhead), so
+    // label it to avoid a mismatch against `du` / `gsutil du`. (`orphaned` is
+    // `None` exactly for exploded inputs.)
+    if model.orphaned.is_none() {
+        println!("File size: {} (live bytes)", human_size(model.file_size));
+    } else {
+        println!("File size: {}", human_size(model.file_size));
+    }
 
     // Line 6: orphaned bytes — file size minus live regions. Repeated
     // in-place edits (`scx set-uns` / `modify-metadata`, `append`) leave
