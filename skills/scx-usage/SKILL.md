@@ -261,8 +261,8 @@ back to CPU with `FallbackReason::NoRapids`.
 > Verified GPU is real and fast — PCA was ~22× CPU and bit-identical on 1 M
 > cells, with route metadata correctly naming the backend. **Always confirm via
 > `adata.uns["scx_accel"][op]["route"]`** (`rapids_singlecell_gpu` / `gpu_csr` /
-> `cpu_*`), since silent fallback is the common failure — except
-> `harmony_integrate`, which stamps no route metadata.
+> `cpu_*`), since silent fallback is the common failure. `harmony_integrate`
+> stamps the same envelope (`gpu_dense` / `cpu_dense`).
 
 `to_gpu_anndata()` on an `Experiment` returns a GPU-resident AnnData
 (`X` = `cupyx.scipy.sparse.csr_matrix`). It records the path in

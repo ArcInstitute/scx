@@ -474,6 +474,13 @@ class TestPcaNeighborsUmapRapids:
                 adata, n_comps=10, n_neighbors=15, n_components=2, device="gpu"
             )
 
+        # The translated error must leave X host-resident (not stranded as a cupy
+        # matrix), so the recovery path below works — the run/run_fused error path
+        # restores the host AnnData even on failure.
+        assert sp.issparse(adata.X) and not str(type(adata.X)).startswith(
+            "<class 'cupy"
+        )
+
         # After filtering the all-zero genes, the fused pipeline runs cleanly.
         pyscx.accel.filter_genes(adata, min_cells=1)
         assert adata.n_vars == n_vars - 8

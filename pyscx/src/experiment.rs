@@ -644,10 +644,16 @@ impl PyExperiment {
             // the DE op can point the user at `to_anndata(backed=True)` (which
             // preserves the sidecar and engages gpu_csc_v3). See
             // `accel::route::warn_materialized_csc_sidecar`.
+            //
+            // Authoritative for the file just opened: set the hint when this file
+            // has a sidecar, and *remove* any stale flag inherited from a prior
+            // round-trip when it does not — so a sidecar-less file can never carry
+            // a leftover `True` that would trigger a misleading warning.
+            let uns = adata.getattr("uns")?;
             if self.has_csc() {
-                adata
-                    .getattr("uns")?
-                    .set_item("scx_source_has_csc_sidecar", true)?;
+                uns.set_item("scx_source_has_csc_sidecar", true)?;
+            } else if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
+                let _ = uns.del_item("scx_source_has_csc_sidecar");
             }
             Ok(adata)
         }

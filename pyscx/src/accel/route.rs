@@ -326,9 +326,9 @@ pub(crate) fn announce_route(
 /// One-shot-per-op registry for the materialized-CSC-sidecar warning (F10).
 static MATERIALIZED_CSC_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
-/// Warn once when an explicit `device="gpu"` DE request lands on the CSR-direct
-/// route *because the input was materialized*, even though the source file had
-/// an on-disk CSC sidecar (report F10).
+/// Warn once when a GPU-eligible DE request lands on the CSR-direct route
+/// *because the input was materialized*, even though the source file had an
+/// on-disk CSC sidecar (report F10).
 ///
 /// `NoCscSidecar` on a GPU route is normally not worth warning about (most files
 /// have no sidecar, and CSR-direct is still a valid GPU route — see
@@ -340,6 +340,12 @@ static MATERIALIZED_CSC_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLoc
 /// file has a sidecar; we key off that hint so the warning fires only for the
 /// materialized-from-a-CSC-file case (a backed input on a sidecar-less file takes
 /// the same route but carries no hint, so it stays silent).
+///
+/// Both `device="gpu"`/`"gpu:N"` and the default `device="auto"` qualify — `auto`
+/// is the more common path and equally loses the fast route here. The
+/// `info.route.is_gpu()` guard means an `auto` request that resolved to a CPU
+/// route (no GPU host) never warns, so widening to `auto` only adds the
+/// genuinely-on-GPU-but-slow case.
 pub(crate) fn warn_materialized_csc_sidecar(
     py: Python<'_>,
     op: &'static str,
@@ -347,7 +353,9 @@ pub(crate) fn warn_materialized_csc_sidecar(
     adata: &Bound<'_, PyAny>,
     info: &AccelExecutionInfo,
 ) {
-    if !device.starts_with("gpu") {
+    // Any non-CPU request that actually ran on a GPU route qualifies (explicit
+    // gpu / gpu:N / auto). `device="cpu"` never reaches a GPU route anyway.
+    if device == "cpu" {
         return;
     }
     if !info.route.is_gpu() || !matches!(info.fallback_reason, FallbackReason::NoCscSidecar) {

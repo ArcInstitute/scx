@@ -226,6 +226,11 @@ pub(crate) fn run(
         // matrix instead of a stranded cupy one. Evaluate both eagerly so the
         // restore side effect always runs; the original op error takes precedence.
         let restored = restore_host_anndata(py, adata, gpu_id);
+        if let Err(ref e) = restored {
+            // `Result::and` drops this when the op itself errored; log it so a
+            // restore failure isn't fully silent in the both-failed case.
+            log::warn!(target: "pyscx.accel", "{op}: restore_host_anndata failed after dispatch: {e}");
+        }
         result.and(restored)?;
     } else {
         result?;
@@ -295,6 +300,9 @@ pub(crate) fn run_fused(
         // See `run`: restore host on success *and* failure so a translated PCA
         // error (F11) leaves `adata.X` host-resident for the recovery path.
         let restored = restore_host_anndata(py, adata, gpu_id);
+        if let Err(ref e) = restored {
+            log::warn!(target: "pyscx.accel", "fused pipeline: restore_host_anndata failed after dispatch: {e}");
+        }
         result.and(restored)?;
     } else {
         result?;
