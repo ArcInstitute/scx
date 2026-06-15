@@ -1067,6 +1067,17 @@ pub fn from_anndata_impl(
     // `UnsFormat::Tagged` (default), payloads are wrapped in `__scx_type__`
     // envelopes so dtype/shape/NaN/Inf round-trip losslessly.
     let uns = adata.getattr("uns")?;
+    // Drop the transient F10 provenance hint (`scx_source_has_csc_sidecar`,
+    // stamped by `Experiment.to_anndata` on a materialized CSC file) so it never
+    // persists into the on-disk file — it describes the in-memory materialization,
+    // not the data. Shallow-copy so the caller's `adata.uns` is left untouched.
+    let uns = if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
+        let copy = py.import("builtins")?.call_method1("dict", (&uns,))?;
+        copy.del_item("scx_source_has_csc_sidecar")?;
+        copy
+    } else {
+        uns
+    };
     let uns_len: usize = uns.call_method0("__len__")?.extract()?;
     let uns_json: Option<serde_json::Value> = if uns_len > 0 {
         let np_generic = np.getattr("generic")?;

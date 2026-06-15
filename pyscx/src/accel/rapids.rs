@@ -16,6 +16,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -217,9 +218,22 @@ pub(crate) fn run(
     call: impl FnOnce(Python<'_>, &Bound<'_, PyAny>) -> PyResult<()>,
 ) -> PyResult<()> {
     let transfer_mode = ensure_gpu_anndata(py, adata, gpu_id)?;
-    with_device(py, gpu_id, || call(py, adata))?;
+    let result = with_device(py, gpu_id, || call(py, adata));
     if transfer_mode == "anndata_to_gpu" {
-        restore_host_anndata(py, adata, gpu_id)?;
+        // Restore host on success *and* failure: a translated error (e.g. the
+        // F11 zero-expression PCA hint) must leave `adata.X` host-resident so the
+        // recovery path (`filter_genes(min_cells=1)` → re-run) works on a CPU
+        // matrix instead of a stranded cupy one. Evaluate both eagerly so the
+        // restore side effect always runs; the original op error takes precedence.
+        let restored = restore_host_anndata(py, adata, gpu_id);
+        if let Err(ref e) = restored {
+            // `Result::and` drops this when the op itself errored; log it so a
+            // restore failure isn't fully silent in the both-failed case.
+            log::warn!(target: "pyscx.accel", "{op}: restore_host_anndata failed after dispatch: {e}");
+        }
+        result.and(restored)?;
+    } else {
+        result?;
     }
     stamp(py, adata, op, gpu_id, transfer_mode)
 }
@@ -246,12 +260,12 @@ pub(crate) fn run_fused(
     umap: Option<(usize, f64, f64, usize, usize, f64)>,
 ) -> PyResult<()> {
     let transfer_mode = ensure_gpu_anndata(py, adata, gpu_id)?;
-    with_device(py, gpu_id, || {
+    let result = with_device(py, gpu_id, || {
         let kw = PyDict::new(py);
         kw.set_item("n_comps", n_comps)?;
         kw.set_item("zero_center", zero_center)?;
         kw.set_item("random_state", random_state)?;
-        rsc_fn(py, "pp", "pca")?.call((adata,), Some(&kw))?;
+        call_rsc_pca(py, adata, &kw)?;
 
         let kw = PyDict::new(py);
         kw.set_item("n_neighbors", n_neighbors)?;
@@ -280,10 +294,18 @@ pub(crate) fn run_fused(
             rsc_fn(py, "tl", "umap")?.call((adata,), Some(&kw))?;
         }
         Ok(())
-    })?;
+    });
 
     if transfer_mode == "anndata_to_gpu" {
-        restore_host_anndata(py, adata, gpu_id)?;
+        // See `run`: restore host on success *and* failure so a translated PCA
+        // error (F11) leaves `adata.X` host-resident for the recovery path.
+        let restored = restore_host_anndata(py, adata, gpu_id);
+        if let Err(ref e) = restored {
+            log::warn!(target: "pyscx.accel", "fused pipeline: restore_host_anndata failed after dispatch: {e}");
+        }
+        result.and(restored)?;
+    } else {
+        result?;
     }
 
     stamp(py, adata, "pca", gpu_id, transfer_mode)?;
@@ -307,6 +329,41 @@ pub(crate) fn rsc_fn<'py>(
     py.import("rapids_singlecell")?
         .getattr(submodule)?
         .getattr(func)
+}
+
+/// Call `rsc.pp.pca` on the (GPU-resident) `adata`, translating rapids'
+/// all-zero-gene rejection into an actionable scx-level message (report F11).
+///
+/// rapids-singlecell raises a bare `ValueError: There are genes with zero
+/// expression. Please remove them before running PCA.` when any gene is zero
+/// across all cells. SCX's CPU PCA tolerates such genes, so a user moving a raw
+/// (unfiltered) matrix to `device="gpu"` hits an opaque rapids error with no
+/// scx-side hint. We catch that specific case and re-raise pointing at
+/// `filter_genes(min_cells=1)`; any other error propagates unchanged. Shared by
+/// the standalone `pca` op and the fused `pca_neighbors[_umap]` pipeline so the
+/// translation lives in exactly one place.
+pub(crate) fn call_rsc_pca(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    kw: &Bound<'_, PyDict>,
+) -> PyResult<()> {
+    rsc_fn(py, "pp", "pca")?
+        .call((adata,), Some(kw))
+        .map(|_| ())
+        .map_err(|err| {
+            if err.is_instance_of::<PyValueError>(py) && err.to_string().contains("zero expression")
+            {
+                PyValueError::new_err(format!(
+                    "GPU PCA (rapids-singlecell) rejects genes with zero expression across all \
+                     cells, unlike the CPU PCA path. Drop all-zero genes first — e.g. \
+                     `pyscx.accel.filter_genes(adata, min_cells=1)`, or select highly-variable \
+                     genes with `pyscx.accel.highly_variable_genes(...)` — then retry the GPU \
+                     pipeline. (underlying rapids error: {err})"
+                ))
+            } else {
+                err
+            }
+        })
 }
 
 /// Convenience: a fresh kwargs dict.

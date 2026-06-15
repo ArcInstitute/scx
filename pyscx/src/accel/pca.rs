@@ -426,7 +426,7 @@ pub fn pca(
                         // are native-SVD-solver internals with no rapids analogue
                         // (rapids picks its own svd_solver) — intentionally not
                         // forwarded.
-                        super::rapids::rsc_fn(py, "pp", "pca")?.call((adata,), Some(&kw))?;
+                        super::rapids::call_rsc_pca(py, adata, &kw)?;
                         Ok(())
                     })?;
                     return Ok(());

@@ -376,3 +376,44 @@ def test_normalize_total_lazy_csc_unavailable(small_adata, tmp_path):
     pyscx.accel.normalize_total(a_csc)
     with pytest.raises(RuntimeError, match="CSC"):
         pyscx.accel.col_sums(a_csc.X, prefer_format="csc")
+
+
+# ---------------------------------------------------------------------------
+# F10: materialized-vs-backed CSC sidecar hint (report SCX-USER-REPORT-2026-06-15
+# §F10). `Experiment.to_anndata()` (non-backed) stamps a uns hint when the source
+# file carries a CSC sidecar, so GPU DE can warn that it fell back to gpu_csr_v3
+# because the sidecar was dropped at materialization. The warning itself needs a
+# GPU; here we assert the deterministic CPU-side stamping contract.
+# ---------------------------------------------------------------------------
+
+_F10_HINT = "scx_source_has_csc_sidecar"
+
+
+def test_materialized_csc_file_stamps_sidecar_hint(small_adata, tmp_path):
+    """Non-backed to_anndata() on a CSC-equipped file stamps the F10 hint."""
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(tmp_path / "csc.scx"), csc="always")
+    exp = pyscx.open(str(tmp_path / "csc.scx"))
+    assert exp.has_csc
+    mat = exp.to_anndata()  # materialized → in-memory CSR, sidecar dropped
+    assert mat.uns.get(_F10_HINT) is True
+
+
+def test_backed_csc_file_does_not_stamp_hint(small_adata, tmp_path):
+    """Backed AnnData carries the real sidecar (gpu_csc_v3), so no hint/warning."""
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(tmp_path / "csc.scx"), csc="always")
+    bk = pyscx.open(str(tmp_path / "csc.scx")).to_anndata(backed=True)
+    assert _F10_HINT not in bk.uns
+
+
+def test_sidecar_less_file_does_not_stamp_hint(small_adata, tmp_path):
+    """A file without a CSC sidecar legitimately uses CSR-direct — never warn."""
+    import pyscx
+
+    pyscx.from_anndata(small_adata, str(tmp_path / "nocsc.scx"), csc="off")
+    exp = pyscx.open(str(tmp_path / "nocsc.scx"))
+    assert not exp.has_csc
+    assert _F10_HINT not in exp.to_anndata().uns

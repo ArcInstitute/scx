@@ -2,8 +2,8 @@
 //!
 //! Reads PCA embeddings from `adata.obsm[basis]`, factorizes batch labels
 //! from `adata.obs[key]`, runs the Rust Harmony2 core, and writes corrected
-//! embeddings back to `adata.obsm[adjusted_basis or basis]` with metadata
-//! at `adata.uns["harmony"]`.
+//! embeddings to `adata.obsm[adjusted_basis]` (default "X_pca_harmony",
+//! preserving the input `basis`) with metadata at `adata.uns["harmony"]`.
 
 use numpy::{PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -18,7 +18,8 @@ use super::gpu::resolve_device;
 ///
 /// Mirrors `scanpy.external.pp.harmony_integrate()` — corrects batch effects
 /// in `adata.obsm[basis]` via iterative soft clustering + ridge regression
-/// and writes the corrected embeddings back in place (or to `adjusted_basis`).
+/// and writes the corrected embeddings to `adjusted_basis` (a new obsm key),
+/// preserving the input `basis`.
 ///
 /// Args:
 ///     adata: AnnData with PCA embeddings at `adata.obsm[basis]`.
@@ -26,8 +27,9 @@ use super::gpu::resolve_device;
 ///         variable(s). Each column is factorized to contiguous integer
 ///         labels internally.
 ///     basis: obsm key holding the input embeddings (default "X_pca").
-///     adjusted_basis: obsm key for the corrected embeddings. None overwrites
-///         `basis` in place (scanpy-compatible default).
+///     adjusted_basis: obsm key for the corrected embeddings (default
+///         "X_pca_harmony", matching scanpy — preserves the input `basis`).
+///         Pass `adjusted_basis=basis` (e.g. "X_pca") to overwrite in place.
 ///     n_clusters: K (default min(N/30, 100), clamped to [2, N/2]).
 ///     theta: Diversity penalty per covariate (scalar broadcasts; default 2.0).
 ///     sigma: Soft assignment kernel bandwidth (default 0.1).
@@ -53,7 +55,7 @@ use super::gpu::resolve_device;
     key,
     *,
     basis = "X_pca",
-    adjusted_basis = None,
+    adjusted_basis = "X_pca_harmony",
     n_clusters = None,
     theta = None,
     sigma = 0.1,

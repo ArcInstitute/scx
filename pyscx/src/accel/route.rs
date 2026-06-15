@@ -323,6 +323,76 @@ pub(crate) fn announce_route(
     }
 }
 
+/// One-shot-per-op registry for the materialized-CSC-sidecar warning (F10).
+static MATERIALIZED_CSC_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+
+/// Warn once when a GPU-eligible DE request lands on the CSR-direct route
+/// *because the input was materialized*, even though the source file had an
+/// on-disk CSC sidecar (report F10).
+///
+/// `NoCscSidecar` on a GPU route is normally not worth warning about (most files
+/// have no sidecar, and CSR-direct is still a valid GPU route — see
+/// [`should_warn_gpu_fallback`]). The narrow trap this catches is: the user built
+/// a CSC sidecar *specifically* for GPU-fast DE, then reached for the obvious
+/// `exp.to_anndata()` (in-memory CSR) instead of `to_anndata(backed=True)`, and
+/// silently lost the `gpu_csc_v3` route. The non-backed `Experiment.to_anndata`
+/// path stamps `adata.uns["scx_source_has_csc_sidecar"] = True` when the source
+/// file has a sidecar; we key off that hint so the warning fires only for the
+/// materialized-from-a-CSC-file case (a backed input on a sidecar-less file takes
+/// the same route but carries no hint, so it stays silent).
+///
+/// Both `device="gpu"`/`"gpu:N"` and the default `device="auto"` qualify — `auto`
+/// is the more common path and equally loses the fast route here. The
+/// `info.route.is_gpu()` guard means an `auto` request that resolved to a CPU
+/// route (no GPU host) never warns, so widening to `auto` only adds the
+/// genuinely-on-GPU-but-slow case.
+pub(crate) fn warn_materialized_csc_sidecar(
+    py: Python<'_>,
+    op: &'static str,
+    device: &str,
+    adata: &Bound<'_, PyAny>,
+    info: &AccelExecutionInfo,
+) {
+    // Any non-CPU request that actually ran on a GPU route qualifies (explicit
+    // gpu / gpu:N / auto). `device="cpu"` never reaches a GPU route anyway.
+    if device == "cpu" {
+        return;
+    }
+    if !info.route.is_gpu() || !matches!(info.fallback_reason, FallbackReason::NoCscSidecar) {
+        return;
+    }
+    // Only when the *source file* actually had a CSC sidecar (stamped at
+    // materialization by `Experiment.to_anndata`). Absent hint → stay silent.
+    let had_sidecar = adata
+        .getattr("uns")
+        .and_then(|uns| uns.call_method1("get", ("scx_source_has_csc_sidecar",)))
+        .map(|v| v.is_truthy().unwrap_or(false))
+        .unwrap_or(false);
+    if !had_sidecar {
+        return;
+    }
+    {
+        let set = MATERIALIZED_CSC_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.insert(op) {
+            return; // already warned for this op this process
+        }
+    }
+    let msg = format!(
+        "pyscx.accel.{op}(device=\"gpu\"): the source file has a CSC sidecar, but X was \
+         materialized to an in-memory CSR via to_anndata(), so GPU DE took the slower \
+         gpu_csr_v3 route (fallback_reason=\"no_csc_sidecar\"). Re-open with \
+         to_anndata(backed=True) to engage the gpu_csc_v3 fast route. The final route is \
+         recorded in adata.uns[\"scx_accel\"][\"{op}\"]."
+    );
+    if let Ok(warnings) = py.import("warnings") {
+        let _ = warnings.call_method1(
+            "warn",
+            (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::should_warn_gpu_fallback;

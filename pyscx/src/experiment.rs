@@ -625,7 +625,7 @@ impl PyExperiment {
                 eager,
             )
         } else {
-            convert::to_anndata_filtered(
+            let adata = convert::to_anndata_filtered(
                 py,
                 &self.path,
                 &self.reader,
@@ -637,7 +637,25 @@ impl PyExperiment {
                 eager,
                 memory_budget_bytes,
                 false,
-            )
+            )?;
+            // F10: a materialized (in-memory CSR) AnnData drops the on-disk CSC
+            // sidecar, so a later GPU DE call silently falls back to the slower
+            // gpu_csr_v3 route. Stamp a hint when the source file has a sidecar so
+            // the DE op can point the user at `to_anndata(backed=True)` (which
+            // preserves the sidecar and engages gpu_csc_v3). See
+            // `accel::route::warn_materialized_csc_sidecar`.
+            //
+            // Authoritative for the file just opened: set the hint when this file
+            // has a sidecar, and *remove* any stale flag inherited from a prior
+            // round-trip when it does not — so a sidecar-less file can never carry
+            // a leftover `True` that would trigger a misleading warning.
+            let uns = adata.getattr("uns")?;
+            if self.has_csc() {
+                uns.set_item("scx_source_has_csc_sidecar", true)?;
+            } else if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
+                let _ = uns.del_item("scx_source_has_csc_sidecar");
+            }
+            Ok(adata)
         }
     }
 

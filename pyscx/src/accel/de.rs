@@ -785,6 +785,13 @@ pub fn rank_genes_groups(
         rgg.set_item("scx_accel_route", result.exec_info.route.as_str())?;
     }
     super::route::announce_route(py, "rank_genes_groups", device, &result.exec_info);
+    super::route::warn_materialized_csc_sidecar(
+        py,
+        "rank_genes_groups",
+        device,
+        adata,
+        &result.exec_info,
+    );
     super::route::write_accel_route(py, adata, "rank_genes_groups", &result.exec_info)?;
 
     Ok(py.None())
@@ -1290,6 +1297,13 @@ pub fn rank_genes_groups_df(
     // polars DataFrame carries no metadata of its own. `result.exec_info` is
     // already complete (route + reason) from the single planner.
     super::route::announce_route(py, "rank_genes_groups_df", device, &result.exec_info);
+    super::route::warn_materialized_csc_sidecar(
+        py,
+        "rank_genes_groups_df",
+        device,
+        adata,
+        &result.exec_info,
+    );
     super::route::write_accel_route(py, adata, "rank_genes_groups_df", &result.exec_info)?;
 
     let df = de_result_to_cell_eval_dataframe(py, &result, n_genes, output)?;
@@ -1931,6 +1945,7 @@ pub fn pdex_ref(
     // `result.exec_info` is already complete (route + reason) from the single
     // planner — CPU sites via `cpu_exec_info`, GPU routes inside scx-accel.
     super::route::announce_route(py, "pdex_ref", device, &result.exec_info);
+    super::route::warn_materialized_csc_sidecar(py, "pdex_ref", device, adata, &result.exec_info);
     super::route::write_accel_route(py, adata, "pdex_ref", &result.exec_info)?;
     let df = pdex_ref_result_to_dataframe(py, &result, output)?;
     Ok(df.unbind())
