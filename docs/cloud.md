@@ -391,10 +391,11 @@ exp.var_keys()     # ['feature_name', 'feature_type', ...]
 ```
 
 Caveat: unlike the local `Experiment.obs_keys()` (an Arrow IPC
-footer-only read), the **cloud** accessors fetch and assemble the full
-obs/var section to derive its schema. The assembled batch is cached on the
-handle, so repeat calls — and a subsequent `.query()` that reads obs — are
-free.
+footer-only read), the **cloud** accessors read obs/var data to derive the
+schema. For a sharded obs (atlas scale) `obs_keys()` reads only the *first*
+shard — all shards share one schema — so it stays cheap; for a
+single-section obs/var it reads that one section, cached on the handle (so a
+subsequent `.query()` that reads obs is free).
 
 ### Cloud-native query
 

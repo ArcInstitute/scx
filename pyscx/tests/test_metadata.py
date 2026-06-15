@@ -84,6 +84,17 @@ def test_experiment_repr(synthetic_adata, tmp_dir):
     assert "codec" in exp.info()
 
 
+def test_experiment_shape(synthetic_adata, tmp_dir):
+    """D1: Experiment.shape mirrors anndata.AnnData.shape == (n_obs, n_vars)."""
+    import pyscx
+
+    path = str(tmp_dir / "shape.scx")
+    pyscx.from_anndata(synthetic_adata, path)
+    exp = pyscx.open(path)
+
+    assert exp.shape == (exp.n_obs, exp.n_vars) == (100, 50)
+
+
 def test_validate(synthetic_adata, tmp_dir):
     """PyExperiment.validate() returns section results."""
     import pyscx

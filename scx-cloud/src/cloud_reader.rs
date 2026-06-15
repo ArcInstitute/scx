@@ -447,21 +447,34 @@ fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
 /// Covers both the canonical `NotFound` variant (remote stores like GCS/S3)
 /// and the `LocalFileSystem` case, which surfaces a missing file as a
 /// `Generic` error wrapping a `std::io::Error` of kind `NotFound` (e.g.
-/// `UnableToCanonicalize`). Used to decide layout fallback and, ultimately,
-/// to emit the actionable `CatalogNotFound` instead of leaking a raw 404 /
-/// canonicalize error — while leaving auth/network errors verbose.
+/// `UnableToCanonicalize`) — detected by walking the error source chain.
+/// Used to decide layout fallback and, ultimately, to emit the actionable
+/// `CatalogNotFound` instead of leaking a raw 404 / canonicalize error —
+/// while leaving auth/network errors verbose.
 fn is_missing_object(e: &object_store::Error) -> bool {
     // Remote stores (GCS/S3/Azure) report a missing object as the canonical
     // `NotFound` variant.
     if matches!(e, object_store::Error::NotFound { .. }) {
         return true;
     }
-    // `LocalFileSystem` reports a missing file as a `Generic` wrapping
-    // `UnableToCanonicalize` → a `std::io::Error` of kind `NotFound`, which
-    // object_store does not surface through `Error::source()`. Match on the
-    // Debug form's `kind: NotFound` token — a Rust enum-variant name, so
-    // locale-invariant (unlike the OS message in the Display form).
-    format!("{e:?}").contains("kind: NotFound")
+    // `LocalFileSystem` reports a missing file as a `Generic` wrapping (e.g.)
+    // `UnableToCanonicalize`, which carries a `std::io::Error` of kind
+    // `NotFound`. Walk the source chain and downcast to `io::Error`.
+    if let object_store::Error::Generic { source, .. } = e {
+        let mut current: &(dyn std::error::Error + 'static) = source.as_ref();
+        loop {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                if io.kind() == std::io::ErrorKind::NotFound {
+                    return true;
+                }
+            }
+            match current.source() {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+    }
+    false
 }
 
 /// Open an SCX file or directory from cloud/local storage.

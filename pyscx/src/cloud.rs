@@ -282,19 +282,33 @@ impl PyCloudExperiment {
     /// the vocabulary accepted by `query().filter_obs(...)`. Mirrors the
     /// local `Experiment.obs_keys()`.
     ///
-    /// I/O cost: unlike the local footer-only read, the cloud path fetches
-    /// and assembles the full obs section to derive its schema. The result
-    /// is cached on this handle, so repeat calls (and a later `.query()`
-    /// over obs) are free.
+    /// I/O cost: unlike the local footer-only read, the cloud path must read
+    /// obs data to derive the schema. For a sharded obs this reads only the
+    /// FIRST shard (all shards share one schema), avoiding an atlas-scale
+    /// assemble of every shard; for a single-section obs it reads that one
+    /// section (cached on the handle, so a later `.query()` over obs is free).
     fn obs_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let schema = py
-            .detach(|| self.rt.block_on(self.reader.read_obs_schema()))
+            .detach(|| {
+                self.rt.block_on(async {
+                    if self.reader.obs_metadata_shard_count() > 0 {
+                        self.reader
+                            .read_obs_shard(0)
+                            .await
+                            .map(|b| b.schema().as_ref().clone())
+                    } else {
+                        self.reader.read_obs_schema().await
+                    }
+                })
+            })
             .map_err(cloud_to_pyerr)?;
         Ok(crate::experiment::schema_data_columns(Some(schema)))
     }
 
     /// Column names in `var` (gene metadata), excluding the pandas index.
-    /// Mirror of [`Self::obs_keys`]; same cloud I/O caveat.
+    /// Mirror of [`Self::obs_keys`]. `var` is gene-axis (small — tens of
+    /// thousands of rows) and rarely sharded, so this reads/assembles the
+    /// var section directly; the assembled batch is cached on the handle.
     fn var_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let schema = py
             .detach(|| self.rt.block_on(self.reader.read_var_schema()))
