@@ -250,6 +250,53 @@ impl GpuDevice {
             .synchronize()
             .map_err(|e| GpuError::CudaError(format!("stream synchronize: {e}")))
     }
+
+    /// Release this process's reserved-but-unused VRAM from the CUDA default
+    /// async memory pool back to the driver.
+    ///
+    /// cudarc 0.19's default stream allocates via `cuMemAllocAsync` and frees
+    /// via `cuMemFreeAsync` on pool-capable GPUs ([`CudaContext::has_async_alloc`]).
+    /// Freed allocations return to the *async pool*, which retains the
+    /// high-water-mark physical pages for the whole process — and a synchronous
+    /// `cudaMalloc` allocator (cupy / RMM / rapids-singlecell) cannot draw from
+    /// those pages. So after a large native op (or one that OOMs), the pool can
+    /// hold tens of GB that a subsequent rapids op then fails to allocate
+    /// (report B9). Trimming the pool to 0 returns that VRAM to the driver.
+    ///
+    /// Synchronizes first so the queued `cuMemFreeAsync`s have completed (and
+    /// thus count as "unused"); `cuMemPoolTrimTo` only frees memory **not
+    /// currently in use**, so live allocations (e.g. a `to_gpu_anndata` handoff
+    /// cuPy still references) are untouched. No-op when the device has no async
+    /// memory pool.
+    pub fn reclaim_memory_pool(&self) -> Result<(), GpuError> {
+        if !self.ctx.has_async_alloc() {
+            return Ok(());
+        }
+        self.synchronize()?;
+        // SAFETY: `ordinal` is this context's device ordinal, so `device::get`
+        // returns a valid CUdevice; `get_default_mem_pool` returns the driver-
+        // owned default pool for it; `trim_to` only releases unused memory.
+        unsafe {
+            let dev = cudarc::driver::result::device::get(self.ctx.ordinal() as i32)
+                .map_err(|e| GpuError::CudaError(format!("cuDeviceGet failed: {e}")))?;
+            let pool = cudarc::driver::result::device::get_default_mem_pool(dev).map_err(|e| {
+                GpuError::CudaError(format!("cuDeviceGetDefaultMemPool failed: {e}"))
+            })?;
+            cudarc::driver::result::mem_pool::trim_to(pool, 0)
+                .map_err(|e| GpuError::CudaError(format!("cuMemPoolTrimTo failed: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GpuDevice {
+    /// Return reserved async-pool VRAM to the driver when the per-op device is
+    /// dropped — on both the success and error/OOM paths — so one op cannot
+    /// strand VRAM for the rest of the process (report B9). Best-effort: a
+    /// failed trim is non-fatal and must never panic in `Drop`.
+    fn drop(&mut self) {
+        let _ = self.reclaim_memory_pool();
+    }
 }
 
 #[cfg(test)]

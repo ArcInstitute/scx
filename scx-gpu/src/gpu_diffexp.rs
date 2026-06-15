@@ -857,20 +857,19 @@ pub fn gpu_de_pseudobulk_csr_direct(
 /// `mode_id` encoding matches [`gpu_de_pseudobulk_all_groups`] (0=identity,
 /// 1=expm1, 2=log1p, 3=identity).
 ///
-/// Shared memory: `n_groups × blockDim.x × sizeof(double)` per block.
-///
-/// The wrapper chooses `blockDim.x` and per-function SMEM opt-in to fit the
-/// requested usage:
-/// * `n_groups × 128 × 8 ≤ 48 KB` (i.e. `n_groups ≤ 48`): launch with
-///   `bx=128`, no opt-in.
-/// * `n_groups × 128 × 8 ≤ device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
-///   (~100 KB on H100): launch with `bx=128`, opt into >48 KB via
-///   `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`.
-/// * Otherwise: halve `bx` to 64 and re-check; on H100 this lifts the
-///   ceiling to roughly `n_groups ≤ 200`.
-/// * Beyond that the call returns `GpuError::KernelLaunchFailed` rather
-///   than triggering a runtime CUDA error. Real workloads in this regime
-///   would need an algorithmic restructure (per-group tiling).
+/// Adaptive accumulation (no `n_groups` ceiling):
+/// * **SMEM-staged** (`csc_shard_pseudobulk_kernel`) — `n_groups × blockDim.x ×
+///   8` bytes of shared memory, tree-reduced (fast, atomic-free, deterministic).
+///   The wrapper picks the largest `bx ∈ {128, 64, 32}` whose SMEM fits the
+///   device opt-in limit (opting into >48 KB via
+///   `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`). On
+///   H100 `bx=32` admits ~900 groups (covers census×cell_type).
+/// * **Global-atomic** (`csc_shard_pseudobulk_global_kernel`) — used when no
+///   `bx` fits (many groups, e.g. perturb-seq guide-level DE). No per-group
+///   SMEM; `atomicAdd` into global `sums`, scaling to any `n_groups`. f64
+///   atomicAdd makes summation order run-to-run nondeterministic (as on the
+///   CSR-direct path). `SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC=1` forces this path
+///   for testing.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_de_pseudobulk_csc_direct(
     dev: &GpuDevice,
@@ -901,54 +900,70 @@ pub fn gpu_de_pseudobulk_csc_direct(
     );
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
-    let func = module
-        .load_function("csc_shard_pseudobulk_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
 
-    // Adaptive SMEM policy. Prefer bx=128; drop to 64 if SMEM at 128 doesn't
-    // fit even after opt-in. Treat 48 KB as the default ceiling — that's the
-    // documented per-block default on every CUDA-capable arch we care about
-    // (H100 / A100 / consumer Ada) and matches `CU_DEVICE_ATTRIBUTE_MAX_
-    // SHARED_MEMORY_PER_BLOCK`.
+    // Adaptive accumulation strategy.
+    //
+    // The SMEM-staged `csc_shard_pseudobulk_kernel` keeps `n_groups × blockDim.x`
+    // f64 per-group partials in shared memory and tree-reduces them — fast and
+    // *deterministic* (no atomics), but its `n_groups × blockDim.x × 8` SMEM
+    // footprint hits the per-block hardware ceiling beyond a few hundred groups.
+    // Pick the largest `bx ∈ {128, 64, 32}` whose SMEM fits the device opt-in
+    // limit (48 KB default; ~228 KB opt-in on H100 — `bx=32` admits ~900 groups,
+    // covering census×cell_type). When none fit (many groups, e.g. perturb-seq
+    // guide-level DE), fall to `csc_shard_pseudobulk_global_kernel`, which uses
+    // global `atomicAdd` with no per-group SMEM and scales to any `n_groups`;
+    // atomic contention is naturally low in that regime. `n_groups` is constant
+    // across a DE op, so every shard launch takes the same path.
     const DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
     let opt_in_limit = dev
         .max_dynamic_shared_mem_per_block()
         .unwrap_or(DEFAULT_SMEM_LIMIT);
     let elem_bytes = std::mem::size_of::<f64>();
 
-    let mut bx: u32 = 128;
-    let mut required = n_groups * bx as usize * elem_bytes;
-    if required > opt_in_limit {
-        bx = 64;
-        required = n_groups * bx as usize * elem_bytes;
-    }
-    if required > opt_in_limit {
-        return Err(GpuError::KernelLaunchFailed(format!(
-            "csc_shard_pseudobulk: n_groups={n_groups} exceeds SMEM budget \
-             ({} bytes at bx=64, device opt-in limit {opt_in_limit} bytes); \
-             use the CSR fallback (the GPU CSR-direct path routes here through \
-             pdex_ref_gpu when the CSC sidecar is absent)",
-            required
-        )));
-    }
-    // Opt into >48 KB on this function when required. The call is per-function
-    // sticky (no per-launch reset needed) but idempotent — safe to call each
-    // launch with the same value. Only call when actually exceeding the
-    // default to avoid making the function less flexible on devices that
-    // can't opt-in.
-    if required > DEFAULT_SMEM_LIMIT {
-        func.set_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            required as i32,
-        )
-        .map_err(|e| {
-            GpuError::KernelLaunchFailed(format!(
-                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={required}) on \
-                 csc_shard_pseudobulk_kernel failed: {e}"
-            ))
-        })?;
-    }
-    let shared_mem_bytes = required as u32;
+    // Test-only escape hatch to exercise the global-atomic path on a small
+    // fixture regardless of `n_groups`.
+    let force_atomic = std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some();
+    let smem_bx = if force_atomic {
+        None
+    } else {
+        [128u32, 64, 32]
+            .into_iter()
+            .find(|&bx| n_groups * bx as usize * elem_bytes <= opt_in_limit)
+    };
+
+    let (func, bx, shared_mem_bytes) = match smem_bx {
+        Some(bx) => {
+            let func = module
+                .load_function("csc_shard_pseudobulk_kernel")
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}"))
+                })?;
+            let required = n_groups * bx as usize * elem_bytes;
+            // Opt into >48 KB when required (per-function sticky + idempotent).
+            if required > DEFAULT_SMEM_LIMIT {
+                func.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    required as i32,
+                )
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!(
+                        "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={required}) on \
+                         csc_shard_pseudobulk_kernel failed: {e}"
+                    ))
+                })?;
+            }
+            (func, bx, required as u32)
+        }
+        None => {
+            let func = module
+                .load_function("csc_shard_pseudobulk_global_kernel")
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_global_kernel: {e}"))
+                })?;
+            (func, 128u32, 0u32)
+        }
+    };
+
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
         block_dim: (bx, 1, 1),
@@ -961,6 +976,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
     let chunk_size_i32 = chunk_size as i32;
     let n_groups_i32 = n_groups as i32;
 
+    // Both kernels share the same parameter list.
     unsafe {
         dev.stream()
             .launch_builder(&func)
@@ -977,7 +993,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
             .arg(&mode_id)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk launch: {e}")))?;
 
     Ok(())
 }

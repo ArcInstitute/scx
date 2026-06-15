@@ -752,6 +752,134 @@ fn test_gpu_de_pseudobulk_all_modes() {
     }
 }
 
+/// CSC-direct pseudobulk parity across both accumulation paths: the
+/// SMEM-staged kernel (small `n_groups`) and the global-atomic kernel
+/// (`n_groups` past the SMEM ceiling, ~900 on H100 — naturally selected, no env
+/// override). Both must match a host f64 reference for all 4 mode transforms.
+#[test]
+fn test_gpu_de_csc_pseudobulk_smem_and_atomic_parity() {
+    let dev = require_gpu!();
+
+    // Deterministic synthetic CSC over `n_obs` cells × `n_cols` genes, with a
+    // cell→group map (some cells mapped to -1 to exercise the skip). Returns
+    // GPU sums for `mode_id`, validated against a host reference inside.
+    let run = |n_obs: usize, n_cols: usize, n_groups: usize, mode_id: i32| {
+        // cell → group: balanced round-robin; every 7th cell is unassigned (-1).
+        let cell_to_group: Vec<i32> = (0..n_obs)
+            .map(|c| {
+                if c % 7 == 0 {
+                    -1
+                } else {
+                    (c % n_groups) as i32
+                }
+            })
+            .collect();
+
+        // Column-major CSC: cell c is nonzero in gene g iff (c + g) % 3 == 0.
+        let mut state: u64 = 0xC5C0FFEE ^ (mode_id as u64);
+        let mut next_uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0
+        };
+        let mut col_indptr: Vec<i64> = Vec::with_capacity(n_cols + 1);
+        let mut row_indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        col_indptr.push(0);
+        for g in 0..n_cols {
+            for c in 0..n_obs {
+                if (c + g) % 3 == 0 {
+                    row_indices.push(c as i32);
+                    data.push(next_uniform() as f32);
+                }
+            }
+            col_indptr.push(row_indices.len() as i64);
+        }
+
+        let d_col_indptr = dev.htod_copy(&col_indptr).unwrap();
+        let d_row_indices = dev.htod_copy(&row_indices).unwrap();
+        let d_data = dev.htod_copy(&data).unwrap();
+        let d_cell_to_group = dev.htod_copy(&cell_to_group).unwrap();
+
+        let view = csc_view_fixture(&d_col_indptr, &d_row_indices, &d_data, n_obs, n_cols);
+        let mut d_sums = dev.alloc_zeros::<f64>(n_groups * n_cols).unwrap();
+        gpu_de_pseudobulk_csc_direct(
+            &dev,
+            &view,
+            &d_cell_to_group,
+            &mut d_sums,
+            0,
+            n_cols,
+            n_cols,
+            n_groups,
+            mode_id,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        let gpu_sums = dev.dtoh_copy(&d_sums).unwrap();
+
+        // Host reference: per (group, gene) sum pre(value) over column nonzeros
+        // whose cell maps into [0, n_groups).
+        let host_pre = |x: f32, mode_id: i32| -> f64 {
+            let xd = x as f64;
+            match mode_id {
+                0 | 3 => xd,
+                1 => xd.exp_m1(),
+                2 => xd.ln_1p(),
+                _ => xd,
+            }
+        };
+        let mut host = vec![0.0f64; n_groups * n_cols];
+        for g in 0..n_cols {
+            let s = col_indptr[g] as usize;
+            let e = col_indptr[g + 1] as usize;
+            for k in s..e {
+                let cell = row_indices[k] as usize;
+                let grp = cell_to_group[cell];
+                if grp >= 0 && (grp as usize) < n_groups {
+                    host[grp as usize * n_cols + g] += host_pre(data[k], mode_id);
+                }
+            }
+        }
+        for (i, (&h, &gpu)) in host.iter().zip(gpu_sums.iter()).enumerate() {
+            let diff = (h - gpu).abs();
+            let denom = h.abs().max(1.0);
+            assert!(
+                diff < 1e-9 || diff / denom < 1e-12,
+                "n_groups={n_groups} mode={mode_id} idx={i}: host={h} gpu={gpu} |Δ|={diff}"
+            );
+        }
+    };
+
+    for mode_id in 0..4i32 {
+        // Small n_groups → SMEM-staged path (bx=128).
+        run(40, 5, 3, mode_id);
+        // Large n_groups (> ~900 SMEM ceiling) → global-atomic path, selected
+        // by the wrapper without the env override.
+        run(2000, 4, 1000, mode_id);
+    }
+}
+
+/// Build a `GpuCscShardView` spanning columns `[0, n_cols)` from device buffers
+/// for a single-shard test fixture.
+fn csc_view_fixture<'a>(
+    col_indptr: &'a CudaSlice<i64>,
+    row_indices: &'a CudaSlice<i32>,
+    data: &'a CudaSlice<f32>,
+    n_obs: usize,
+    n_cols: usize,
+) -> GpuCscShardView<'a> {
+    GpuCscShardView {
+        col_indptr: col_indptr.slice(..col_indptr.len()),
+        row_indices: row_indices.slice(..row_indices.len()),
+        data: data.slice(..data.len()),
+        col_start: 0,
+        col_end: n_cols,
+        n_obs,
+    }
+}
+
 /// G2 regression: `ensure_*_capacity` only allocates on initial grow and
 /// on size increase; same / smaller requests are no-ops. The chunk loops
 /// in the pdex_ref / Wilcoxon GPU drivers rely on

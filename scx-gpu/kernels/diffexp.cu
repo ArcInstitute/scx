@@ -362,6 +362,58 @@ extern "C" __global__ void csc_shard_pseudobulk_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// G4 v3 (CSC-direct, many-groups): global-atomic pseudobulk fold over a CSC
+// shard. Same one-block-per-gene structure and arguments as
+// `csc_shard_pseudobulk_kernel`, but with NO shared-memory per-group
+// accumulator — threads `atomicAdd` directly into the global
+// `sums[group × chunk_size + gene_local]`.
+//
+// This lifts the `n_groups` ceiling of the SMEM-staged kernel (whose
+// `n_groups × blockDim.x × sizeof(double)` shared-memory footprint exceeds the
+// per-block hardware limit beyond ~900 groups on H100). The host wrapper
+// selects this kernel when no `blockDim.x ∈ {128,64,32}` lets the SMEM variant
+// fit; that regime has *many* groups, where per-(group,gene) atomic contention
+// is naturally low (one block per gene; within a block only same-group cells of
+// that gene contend). Mirrors `csr_shard_pseudobulk_kernel`.
+//
+// Cross-shard accumulation is identical to the SMEM/CSR kernels: `sums` MUST be
+// pre-zeroed before the FIRST shard, and per-shard launches are serialized on
+// the device stream. NOTE: f64 `atomicAdd` makes the summation order
+// run-to-run nondeterministic (matching the CSR-direct path), unlike the
+// deterministic tree-reduce of `csc_shard_pseudobulk_kernel`.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void csc_shard_pseudobulk_global_kernel(
+    const long long* __restrict__ col_indptr,     // [n_cols_in_shard + 1]
+    const int*       __restrict__ row_indices,    // [nnz] global row indices
+    const float*     __restrict__ data,           // [nnz]
+    const int*       __restrict__ cell_to_group,  // [n_obs], -1 if not in any group
+    double*          __restrict__ sums,           // [n_groups × chunk_size]
+    int n_cols_in_shard,
+    int shard_col_start,
+    int c0,
+    int chunk_size,
+    int n_groups,
+    int mode_id
+) {
+    int gene_local = blockIdx.x;
+    if (gene_local >= chunk_size) return;
+    int gene_global = c0 + gene_local;
+    int col_in_shard = gene_global - shard_col_start;
+    if (col_in_shard < 0 || col_in_shard >= n_cols_in_shard) return;
+
+    long long start = col_indptr[col_in_shard];
+    long long end   = col_indptr[col_in_shard + 1];
+    for (long long e = start + threadIdx.x; e < end; e += blockDim.x) {
+        int cell = row_indices[e];
+        int g = cell_to_group[cell];
+        if (g >= 0 && g < n_groups) {
+            atomicAdd(&sums[(long long)g * (long long)chunk_size + (long long)gene_local],
+                      apply_pre_transform(data[e], mode_id));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // G4 v3 (CSC-direct, post code-review #6): scatter one CSC shard's nonzeros
 // into a gene-major pool slab using combined cell_to_group + cell_to_pos
 // tables instead of K+1 per-pool `cell_to_pool` tables. Collapses
