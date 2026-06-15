@@ -154,8 +154,29 @@ fn row_major_to_rmatrix(data: &[f64], n_rows: usize, n_cols: usize) -> Result<Ro
 /// @return list(`embeddings` = cells × n_components, `loadings` =
 ///   genes × n_components, `variance_explained`, `variance_ratio`,
 ///   `n_components`).
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3/B7):
+/// a fallible `#[extendr]` fn would otherwise `unwrap()`-panic in extendr
+/// 0.8.0, masking the real message behind "User function panicked".
 #[extendr]
 fn scx_pca_matrix(
+    counts: Robj,
+    n_components: i32,
+    zero_center: bool,
+    n_oversamples: i32,
+    n_power_iterations: i32,
+    seed: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_pca_matrix_impl(
+        counts,
+        n_components,
+        zero_center,
+        n_oversamples,
+        n_power_iterations,
+        seed,
+    ))
+}
+
+fn scx_pca_matrix_impl(
     counts: Robj,
     n_components: i32,
     zero_center: bool,
@@ -268,8 +289,29 @@ fn delta_from_raw_csr(raw: &ScxCsr, c: f64) -> Result<ScxCsr> {
 /// @return list(`embeddings` = cells × n_components, `loadings` =
 ///   genes × n_components, `variance_explained`, `variance_ratio`,
 ///   `n_components`, `baseline` = per-cell length-`n_cells` vector).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_pflog1ppf_matrix(
+    counts: Robj,
+    c: f64,
+    n_components: i32,
+    zero_center: bool,
+    n_oversamples: i32,
+    n_power_iterations: i32,
+    seed: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_pflog1ppf_matrix_impl(
+        counts,
+        c,
+        n_components,
+        zero_center,
+        n_oversamples,
+        n_power_iterations,
+        seed,
+    ))
+}
+
+fn scx_pflog1ppf_matrix_impl(
     counts: Robj,
     c: f64,
     n_components: i32,
@@ -344,8 +386,25 @@ fn scx_pflog1ppf_matrix(
 ///   `distances` (cells × k) matrices, plus the connectivity CSR
 ///   (`conn_indptr`, 0-based `conn_indices`, `conn_data`)) ready to hand to
 ///   [`scx_umap_graph`] / [`scx_leiden_graph`].
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_knn_matrix(
+    embeddings: RMatrix<f64>,
+    n_neighbors: i32,
+    ef_construction: i32,
+    ef_search: i32,
+    seed: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_knn_matrix_impl(
+        embeddings,
+        n_neighbors,
+        ef_construction,
+        ef_search,
+        seed,
+    ))
+}
+
+fn scx_knn_matrix_impl(
     embeddings: RMatrix<f64>,
     n_neighbors: i32,
     ef_construction: i32,
@@ -404,9 +463,39 @@ fn scx_knn_matrix(
 ///   Standard UMAP hyperparameters.
 ///
 /// @return list(`embeddings` = cells × n_components matrix).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 #[allow(clippy::too_many_arguments)]
 fn scx_umap_graph(
+    conn_indptr: Vec<f64>,
+    conn_indices: Vec<i32>,
+    conn_data: Vec<f64>,
+    n_obs: i32,
+    n_components: i32,
+    n_epochs: i32,
+    min_dist: f64,
+    spread: f64,
+    negative_sample_rate: i32,
+    learning_rate: f64,
+    seed: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_umap_graph_impl(
+        conn_indptr,
+        conn_indices,
+        conn_data,
+        n_obs,
+        n_components,
+        n_epochs,
+        min_dist,
+        spread,
+        negative_sample_rate,
+        learning_rate,
+        seed,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_umap_graph_impl(
     conn_indptr: Vec<f64>,
     conn_indices: Vec<i32>,
     conn_data: Vec<f64>,
@@ -454,8 +543,29 @@ fn scx_umap_graph(
 ///
 /// @return list(`membership` = 1-based integer cluster label per cell,
 ///   `modularity`, `n_communities`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_leiden_graph(
+    indptr: Vec<f64>,
+    indices: Vec<i32>,
+    weights: Vec<f64>,
+    n_nodes: i32,
+    resolution: f64,
+    seed: f64,
+    max_iterations: i32,
+) -> Robj {
+    crate::util::throw_on_err(scx_leiden_graph_impl(
+        indptr,
+        indices,
+        weights,
+        n_nodes,
+        resolution,
+        seed,
+        max_iterations,
+    ))
+}
+
+fn scx_leiden_graph_impl(
     indptr: Vec<f64>,
     indices: Vec<i32>,
     weights: Vec<f64>,
@@ -509,8 +619,29 @@ fn scx_leiden_graph(
 ///
 /// @return list(`group_names`, and per-group lists `names`, `scores`,
 ///   `pvals`, `pvals_adj`, `logfoldchanges`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
 fn scx_rank_genes(
+    counts: Robj,
+    gene_names: Strings,
+    groups: Strings,
+    reference: Nullable<String>,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_rank_genes_impl(
+        counts,
+        gene_names,
+        groups,
+        reference,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+    ))
+}
+
+fn scx_rank_genes_impl(
     counts: Robj,
     gene_names: Strings,
     groups: Strings,
@@ -610,16 +741,19 @@ fn scx_rank_genes(
 ///
 /// @param counts A **genes × cells** raw-counts `dgCMatrix`.
 /// @return list(`means`, `variances`) — vectors of length `n_genes`.
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
-fn scx_hvg_mean_var(counts: Robj) -> Result<Robj> {
-    let csr = dgc_genes_by_cells_to_csr(&counts)?;
-    let source = SingleShardSource { csr: &csr };
-    let stats =
-        streaming_mean_var(&source).map_err(|e| Error::Other(format!("hvg pass 1: {e}")))?;
-    let means = stats.means;
-    let variances = stats.variances;
-    R!("list(means = {{means}}, variances = {{variances}})")
-        .map_err(|e| Error::Other(e.to_string()))
+fn scx_hvg_mean_var(counts: Robj) -> Robj {
+    crate::util::throw_on_err((|| -> Result<Robj> {
+        let csr = dgc_genes_by_cells_to_csr(&counts)?;
+        let source = SingleShardSource { csr: &csr };
+        let stats =
+            streaming_mean_var(&source).map_err(|e| Error::Other(format!("hvg pass 1: {e}")))?;
+        let means = stats.means;
+        let variances = stats.variances;
+        R!("list(means = {{means}}, variances = {{variances}})")
+            .map_err(|e| Error::Other(e.to_string()))
+    })())
 }
 
 /// HVG pass 2: per-gene clipped sum and clipped sum-of-squares.
@@ -631,21 +765,24 @@ fn scx_hvg_mean_var(counts: Robj) -> Result<Robj> {
 ///   here because `clip_val = reg_std * sqrt(N) + mean` stays far below f32's
 ///   range for count data.
 /// @return list(`counts_sum`, `sq_counts_sum`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
 #[extendr]
-fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Result<Robj> {
-    let csr = dgc_genes_by_cells_to_csr(&counts)?;
-    if clip_val.len() != csr.n_cols() {
-        return Err(Error::Other(format!(
-            "clip_val length {} != n_genes {}",
-            clip_val.len(),
-            csr.n_cols()
-        )));
-    }
-    let source = SingleShardSource { csr: &csr };
-    let (counts_sum, sq_counts_sum) = streaming_clip_square_sum(&source, &clip_val)
-        .map_err(|e| Error::Other(format!("hvg pass 2: {e}")))?;
-    R!("list(counts_sum = {{counts_sum}}, sq_counts_sum = {{sq_counts_sum}})")
-        .map_err(|e| Error::Other(e.to_string()))
+fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Robj {
+    crate::util::throw_on_err((|| -> Result<Robj> {
+        let csr = dgc_genes_by_cells_to_csr(&counts)?;
+        if clip_val.len() != csr.n_cols() {
+            return Err(Error::Other(format!(
+                "clip_val length {} != n_genes {}",
+                clip_val.len(),
+                csr.n_cols()
+            )));
+        }
+        let source = SingleShardSource { csr: &csr };
+        let (counts_sum, sq_counts_sum) = streaming_clip_square_sum(&source, &clip_val)
+            .map_err(|e| Error::Other(format!("hvg pass 2: {e}")))?;
+        R!("list(counts_sum = {{counts_sum}}, sq_counts_sum = {{sq_counts_sum}})")
+            .map_err(|e| Error::Other(e.to_string()))
+    })())
 }
 
 extendr_module! {

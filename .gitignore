@@ -17,6 +17,7 @@ learn/
 .antigravitycli/
 .claude/*.lock
 data/*.h5ad
+pyscx/data/*.h5ad
 *.proptest-regressions
 external-repos/
 benchmarks/logs/

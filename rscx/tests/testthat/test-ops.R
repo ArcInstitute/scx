@@ -19,6 +19,18 @@ test_that("scx_validate errors on invalid path", {
   expect_error(scx_validate("/nonexistent/path.scx"))
 })
 
+# B3: fallible ops free functions must raise a clean R stop() carrying the real
+# message, not the opaque "User function panicked" from extendr's unwrap()-panic.
+test_that("scx ops raise clean errors (not Rust panics) on a bad file", {
+  for (fn in list(
+    function() scx_validate("/nonexistent/path.scx"),
+    function() scx_info("/nonexistent/path.scx")
+  )) {
+    msg <- tryCatch(fn(), error = function(e) conditionMessage(e))
+    expect_false(grepl("panicked", msg, fixed = TRUE))
+  }
+})
+
 test_that("scx_delete marks cells as deleted", {
   path <- skip_if_no_fixture()
   tmp <- tempfile(fileext = ".scx")

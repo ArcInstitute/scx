@@ -32,6 +32,63 @@ impl std::fmt::Debug for ScxExperiment {
 }
 
 impl ScxExperiment {
+    /// Fallible body of `new` (kept off the `#[extendr]` surface so the public
+    /// constructor can return `Robj` + `throw_on_err`; see B3).
+    fn open_impl(path: &str) -> Result<Self> {
+        let path_buf = PathBuf::from(path);
+        let reader = ScxReader::open(&path_buf)
+            .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
+        Ok(Self {
+            reader,
+            path: path_buf,
+        })
+    }
+
+    /// Fallible body of `obs` (see B3 / `throw_on_err`).
+    fn obs_impl(&self) -> Result<Robj> {
+        let batch = self
+            .reader
+            .read_obs()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        interop::record_batch_to_dataframe(&batch)
+    }
+
+    /// Fallible body of `var` (see B3 / `throw_on_err`).
+    fn var_impl(&self) -> Result<Robj> {
+        let batch = self
+            .reader
+            .read_var()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        interop::record_batch_to_dataframe(&batch)
+    }
+
+    /// Fallible body of `x_matrix` (see B3 / `throw_on_err`).
+    fn x_matrix_impl(&self) -> Result<Robj> {
+        let csr = self
+            .reader
+            .read_all_csr_shards()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        interop::csr_to_dgcmatrix(&csr)
+    }
+
+    /// Fallible body of `layer` (see B3 / `throw_on_err`).
+    fn layer_impl(&self, name: &str) -> Result<Robj> {
+        let csr = self
+            .reader
+            .read_layer(name)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        interop::csr_to_dgcmatrix(&csr)
+    }
+
+    /// Fallible body of `query` (see B3 / `throw_on_err`).
+    fn query_impl(&self) -> Result<RQueryPipeline> {
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
+        RQueryPipeline::from_path(path)
+    }
+
     /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
     /// public method can return `Robj` + `throw_on_err`; see B7).
     fn to_seurat_impl(&self) -> Result<Robj> {
@@ -70,14 +127,18 @@ impl ScxExperiment {
 #[extendr]
 impl ScxExperiment {
     /// Open an SCX file. Returns a lazy handle (no data read yet).
-    fn new(path: &str) -> Result<Self> {
-        let path_buf = PathBuf::from(path);
-        let reader = ScxReader::open(&path_buf)
-            .map_err(|e| Error::Other(format!("failed to open SCX file '{}': {}", path, e)))?;
-        Ok(Self {
-            reader,
-            path: path_buf,
-        })
+    ///
+    /// Returns `Robj` (not `Result`) and throws a clean R error via
+    /// `throw_on_err` on failure: a fallible `#[extendr]` constructor would
+    /// otherwise `unwrap()`-panic in extendr 0.8.0, masking the real message
+    /// (e.g. an unsupported format version) behind "User function panicked".
+    /// See B3.
+    // Returns `Robj` (the externalptr wrapping `Self`) rather than `Self` so the
+    // open error can be thrown cleanly via `throw_on_err`; the `new` name is the
+    // extendr constructor convention the R wrapper depends on.
+    #[allow(clippy::new_ret_no_self)]
+    fn new(path: &str) -> Robj {
+        crate::util::throw_on_err(Self::open_impl(path))
     }
 
     /// Number of observations (cells).
@@ -107,21 +168,16 @@ impl ScxExperiment {
     /// Categorical/dictionary columns → R factors.
     /// String columns → R character vectors.
     /// Numeric columns → R double vectors.
-    fn obs(&self) -> Result<Robj> {
-        let batch = self
-            .reader
-            .read_obs()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        interop::record_batch_to_dataframe(&batch)
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn obs(&self) -> Robj {
+        crate::util::throw_on_err(self.obs_impl())
     }
 
     /// Read var metadata as an R data.frame.
-    fn var(&self) -> Result<Robj> {
-        let batch = self
-            .reader
-            .read_var()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        interop::record_batch_to_dataframe(&batch)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn var(&self) -> Robj {
+        crate::util::throw_on_err(self.var_impl())
     }
 
     /// Read the X matrix as a dgCMatrix (Matrix package sparse matrix).
@@ -136,21 +192,17 @@ impl ScxExperiment {
     ///
     /// The resulting dgCMatrix has dimensions (n_obs × n_vars),
     /// same as the original CSR orientation (cells as rows, genes as columns).
-    fn x_matrix(&self) -> Result<Robj> {
-        let csr = self
-            .reader
-            .read_all_csr_shards()
-            .map_err(|e| Error::Other(e.to_string()))?;
-        interop::csr_to_dgcmatrix(&csr)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn x_matrix(&self) -> Robj {
+        crate::util::throw_on_err(self.x_matrix_impl())
     }
 
     /// Read a named layer as dgCMatrix.
-    fn layer(&self, name: &str) -> Result<Robj> {
-        let csr = self
-            .reader
-            .read_layer(name)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        interop::csr_to_dgcmatrix(&csr)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn layer(&self, name: &str) -> Robj {
+        crate::util::throw_on_err(self.layer_impl(name))
     }
 
     /// List available layer names.
@@ -160,12 +212,10 @@ impl ScxExperiment {
 
     /// Start a query pipeline. Returns an RQueryPipeline.
     /// Re-opens the file (QueryPipeline::open creates its own ScxReader).
-    fn query(&self) -> Result<RQueryPipeline> {
-        let path = self
-            .path
-            .to_str()
-            .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
-        RQueryPipeline::from_path(path)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn query(&self) -> Robj {
+        crate::util::throw_on_err(self.query_impl())
     }
 
     /// Phase I.1: True if this file has a registered modality table.

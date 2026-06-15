@@ -40,8 +40,26 @@ fn factorize_chars(labels: &[String]) -> (Vec<u32>, usize) {
 ///   `ceil(3 * perplexity)`.
 ///
 /// @return Numeric vector of length N with LISI values.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err`: a fallible
+/// `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0, masking
+/// the real message behind "User function panicked". See B3/B7.
 #[extendr]
 fn scx_compute_lisi(
+    embeddings: RMatrix<f64>,
+    labels: Strings,
+    perplexity: f64,
+    n_neighbors: Nullable<i32>,
+) -> Robj {
+    crate::util::throw_on_err(scx_compute_lisi_impl(
+        embeddings,
+        labels,
+        perplexity,
+        n_neighbors,
+    ))
+}
+
+fn scx_compute_lisi_impl(
     embeddings: RMatrix<f64>,
     labels: Strings,
     perplexity: f64,
