@@ -537,6 +537,9 @@ _BENCHMARK_DOMAIN_MAP: dict[str, str] = {
     "accel_leiden": "accelerator",
     "accel_preprocess": "accelerator",
     "accel_hvg": "accelerator",
+    "accel_pipeline": "accelerator",
+    "accel_to_gpu_anndata": "accelerator",
+    "accel_format_pipeline": "accelerator",
 }
 
 

@@ -194,16 +194,25 @@ impl RQueryResult {
 
     /// Convert to a Seurat v5 object.
     /// Consumes the inner data — requires Seurat >= 5.0.0.
-    fn to_seurat(&mut self) -> Result<Robj> {
-        let r = self.take_result()?;
-        crate::interop::to_seurat_v5(&r)
+    ///
+    /// Returns `Robj` (not `Result`) and throws a clean R error via
+    /// `throw_on_err` on failure: a fallible `#[extendr]` method would
+    /// otherwise `unwrap()`-panic in extendr 0.8.0, masking the real message
+    /// (missing-`Seurat` etc.) behind "User function panicked". See B7.
+    fn to_seurat(&mut self) -> Robj {
+        crate::util::throw_on_err(
+            self.take_result()
+                .and_then(|r| crate::interop::to_seurat_v5(&r)),
+        )
     }
 
     /// Convert to a SingleCellExperiment object.
     /// Consumes the inner data — requires SingleCellExperiment package.
-    fn to_sce(&mut self) -> Result<Robj> {
-        let r = self.take_result()?;
-        crate::interop::to_sce(&r)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see
+    /// `to_seurat` above and B7).
+    fn to_sce(&mut self) -> Robj {
+        crate::util::throw_on_err(self.take_result().and_then(|r| crate::interop::to_sce(&r)))
     }
 
     /// Read obs metadata as an R data.frame from the query result.

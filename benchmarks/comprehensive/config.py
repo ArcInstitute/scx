@@ -691,6 +691,13 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(accel_to_gpu_anndata_variants())
     except ImportError:
         pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_format_pipeline import (
+            accel_format_pipeline_variants,
+        )
+        out.extend(accel_format_pipeline_variants())
+    except ImportError:
+        pass
     return out
 
 

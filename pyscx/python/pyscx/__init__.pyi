@@ -1,8 +1,9 @@
 """Type stubs for the parts of `pyscx` that benefit most from static typing.
 
-This file is intentionally narrow — currently it stubs `IndexPlanDataset`
-and its iterator, since those are the most error-prone callers will run
-into (kwarg-heavy constructor, plan iterator protocol, batch dict schema).
+This file is intentionally narrow — currently it stubs `TrainingDataset`,
+`IndexPlanDataset`, and its iterator, since those are the most error-prone
+callers will run into (kwarg-heavy constructor, plan iterator protocol,
+batch dict schema).
 
 Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 `Any` to type-checkers until / unless someone needs more coverage.
@@ -116,6 +117,66 @@ class IndexPlanDataset:
         `iter_with_plans` in production."""
         ...
 
+    def __repr__(self) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# TrainingDataset
+# ---------------------------------------------------------------------------
+
+
+class _TrainingBatchDict(TypedDict):
+    X: np.ndarray  # [B, n_output_genes] float32 — dense expression
+    obs: dict[str, np.ndarray | _CategoricalObs]
+    cell_indices: np.ndarray  # [B] int64 — global row indices
+
+
+class TrainingDataset:
+    """High-throughput sequential streaming dataset for ML training.
+
+    Each ``for batch in dataset:`` loop is one epoch; shards are reshuffled
+    between epochs. Sibling to ``IndexPlanDataset`` (which drives batch
+    composition from a plan iterator).
+
+    IMPORTANT — transforms are ON by default: ``normalize`` and ``log1p``
+    both default to ``True``, so batches are total-count normalized
+    (``target_sum=1e4``) and ``log1p``-transformed even though the file
+    stores raw counts. The yielded ``X`` is log-normalized, **not** raw
+    counts. Count-likelihood models (scVI, scANVI, count autoencoders) need
+    raw counts — pass ``normalize=False, log1p=False``.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        batch_size: int | None = None,
+        hvg_indices: np.ndarray | None = None,
+        obs_columns: list[str] | None = None,
+        normalize: bool | None = None,  # default True — see class docstring
+        log1p: bool | None = None,  # default True — see class docstring
+        target_sum: float | None = None,
+        pflog1ppf: bool | None = None,
+        pflog1ppf_c: float | None = None,
+        shard_group_size: int | None = None,
+        prefetch_batches: int | None = None,
+        seed: int | None = None,
+        max_memory_mb: int | None = None,
+        modality: str | None = None,
+    ) -> None: ...
+
+    @property
+    def n_obs(self) -> int: ...
+    @property
+    def n_vars(self) -> int: ...
+    @property
+    def n_output_genes(self) -> int: ...
+    @property
+    def effective_batch_size(self) -> int: ...
+
+    def __iter__(self) -> "TrainingDataset": ...
+    def __next__(self) -> _TrainingBatchDict: ...
+    def memory_budget(self) -> dict[str, Any]: ...
+    def close(self) -> None: ...
     def __repr__(self) -> str: ...
 
 
