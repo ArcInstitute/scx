@@ -123,6 +123,15 @@ impl RQueryPipeline {
         let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
         Ok(RQueryResult::from_result(result))
     }
+
+    /// Convenience: execute the pipeline and return the number of matching
+    /// cells, mirroring pyscx's `query().count()`. The pipeline is consumed.
+    /// Returns f64 (R has no i64) to stay safe past 2^31 cells.
+    fn count(&mut self) -> Result<Robj> {
+        let p = self.take_inner()?;
+        let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
+        Ok(Robj::from(result.x.n_rows() as f64))
+    }
 }
 
 // ---------------------------------------------------------------------------

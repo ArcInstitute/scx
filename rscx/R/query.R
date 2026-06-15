@@ -88,3 +88,16 @@ limit <- function(pipeline, n) {
 collect <- function(pipeline) {
   pipeline$collect()
 }
+
+#' Count matching cells without materializing the result
+#'
+#' Convenience wrapper mirroring pyscx's \code{query().count()}: executes the
+#' pipeline and returns just the number of matching cells. Consumes the
+#' pipeline (like \code{collect()}).
+#'
+#' @param pipeline An RQueryPipeline object.
+#' @return The number of matching cells (numeric).
+#' @export
+count <- function(pipeline) {
+  pipeline$count()
+}

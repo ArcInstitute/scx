@@ -1192,10 +1192,18 @@ network reads).
 
 - `n_obs` `→ int` — Number of observations (cells)
 - `n_vars` `→ int` — Number of variables (genes)
+- `shape` `→ tuple[int, int]` — `(n_obs, n_vars)`
 - `nnz` `→ int` — Total non-zero entries
 - `shard_count` `→ int` — Number of CSR shards in the file
 - `format_version` `→ int` — SCX format version
 - `codec_id` `→ int` — Default codec ID
+- `obs_keys() → list[str]` / `var_keys() → list[str]` — column names (one range read each)
+- `is_multimodal() → bool` / `n_modalities() → int` / `modality_names() → list[str]` /
+  `modality_id(name) → int | None` / `modality_info(id) → dict | None` — modality discovery,
+  mirroring the local `Experiment` (the modality table is fetched once at open). On a
+  single-modality file `is_multimodal()` is `False` and `modality_names()` is empty.
+- `to_mudata()` — raises: cloud per-modality reads aren't supported yet; `pyscx.pull()` the file
+  locally and open it with `pyscx.open(...).to_mudata()`.
 - `query() → PyQueryPipeline` — Start a lazy cloud query. Backed by
   the same `QueryPipeline` as `pyscx.open(...).query()`, wired over a
   `CloudReader`-backed `SectionReader`. Predicate pushdown uses the
@@ -1220,6 +1228,32 @@ network reads).
   Deferred follow-ons: `CloudQueryOptions` (parallelism,
   max-inflight bytes, cache-dir, retry policy) and a batched async section
   fetcher (current cloud reads block per shard from the rayon worker).
+
+### Per-surface capability matrix
+
+The three handle surfaces — local `pyscx.Experiment`, `pyscx.CloudExperiment`,
+and rscx `ScxExperiment` — overlap but are not identical. This table shows where
+each capability lives so you don't have to rediscover it per surface. "via
+query" means the method isn't on the handle directly; reach it through
+`query().collect()` (the result object) instead.
+
+| Capability                       | `Experiment` (local) | `CloudExperiment`        | rscx `ScxExperiment` |
+| -------------------------------- | -------------------- | ------------------------ | -------------------- |
+| `n_obs` / `n_vars` / `nnz`       | ✓                    | ✓                        | ✓ (`$n_obs()` …)     |
+| `shape`                          | ✓                    | ✓                        | — (use `n_obs`/`n_vars`) |
+| `obs_keys()` / `var_keys()`      | ✓                    | ✓                        | — (`$obs()` / `$var()` data.frames) |
+| `is_multimodal()` / `modality_names()` | ✓              | ✓                        | ✓                    |
+| `to_anndata()` / extraction      | ✓                    | via query / `read_cloud` | via `query() …$collect()` |
+| `to_mudata()` (multimodal)       | ✓                    | — (pull locally)         | `$to_mae()` / `$to_seurat()` |
+| `detection_counts()` / `cells_expressing()` | ✓        | — (pull locally)         | —                    |
+| `query()` builder                | ✓                    | ✓                        | ✓ (`scx_query()`)    |
+| query `.count()`                 | ✓                    | ✓                        | ✓ (`count()`)        |
+| `provenance()`                   | ✓                    | —                        | —                    |
+
+Extraction off a query result is symmetric: pyscx `result.to_anndata()` /
+`.to_csr()`; rscx `result$to_dgcmatrix()` / `$to_sce()` / `$to_seurat()` /
+`as(result, "SingleCellExperiment")` (rscx adds S3/S4 generics — `dim()`,
+`as.matrix()`, `as.data.frame()`, `as(res, "dgCMatrix")` — over the `$`-methods).
 
 ### pyscx.accel — Rust-Native Accelerators
 

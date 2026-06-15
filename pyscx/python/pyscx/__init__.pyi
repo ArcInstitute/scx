@@ -178,6 +178,24 @@ class Experiment:
 
     def query(self) -> Any: ...
     def provenance(self) -> list[dict[str, Any]]: ...
+
+    def detection_counts(self, axis: str = "var", modality: str | None = None) -> Any:
+        """Per-gene detection counts for ALL genes (numpy int64, length n_vars).
+
+        The first argument is ``axis`` (only ``"var"`` is supported), NOT a
+        gene list — this returns the whole per-gene array. For the cells
+        expressing one specific gene, use ``cells_expressing(gene)``.
+        """
+        ...
+
+    def cells_expressing(self, gene: int | str, modality: str | None = None) -> Any:
+        """Global row indices of cells expressing ``gene`` (numpy uint32).
+
+        ``gene`` is an integer index or a var name. Companion to
+        ``detection_counts`` (which returns the per-gene array for all genes).
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
