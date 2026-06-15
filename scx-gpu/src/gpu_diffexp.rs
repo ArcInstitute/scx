@@ -1729,6 +1729,118 @@ pub fn default_gpu_de_gene_chunk_size(dev: &GpuDevice, n_obs: usize, n_pool_max:
     ((raw / 64).max(1)) * 64
 }
 
+/// Default fraction of free VRAM the per-chunk DE working set may occupy.
+///
+/// The per-target-group pool slabs (`n_test × chunk × n_g_max` f32) dominate
+/// that working set, so the gene chunk is clamped to keep the whole set under
+/// this fraction. The remaining headroom covers fixed device buffers (indptr,
+/// cell→group/pos tables, cuSPARSE/cuBLAS handles) and allocator fragmentation.
+const GPU_DE_MEM_BUDGET_FRAC: f64 = 0.6;
+
+/// Lowest gene chunk the budget clamp will fall to before declaring the
+/// per-chunk working set un-fittable (caller then surfaces a clear error).
+pub const GPU_DE_MIN_GENE_CHUNK: usize = 32;
+
+/// Read the per-chunk DE VRAM budget fraction, honouring the
+/// `SCX_GPU_DE_MEM_BUDGET_FRAC` env override. Values outside `(0, 0.95)` (or
+/// unparseable) fall back to [`GPU_DE_MEM_BUDGET_FRAC`].
+fn gpu_de_mem_budget_frac() -> f64 {
+    std::env::var("SCX_GPU_DE_MEM_BUDGET_FRAC")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f < 0.95)
+        .unwrap_or(GPU_DE_MEM_BUDGET_FRAC)
+}
+
+/// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
+/// chunk-linear allocations of the v3 drivers (`GpuDeChunkScratch::new` + the
+/// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the slab grow
+/// rounding so this is an upper bound, not an under-count.
+///
+/// - `n_pool_max` — base `slab` + ping-pong `aux` capacity (f32, ×2 terms)
+/// - `n_ref`      — `ref_slab` (f32)
+/// - `n_g_max`    — `group_slab` (f32) **and** the dominant `per_tg_pool_slabs`
+///   (f32, ×`n_test`)
+/// - `n_test`     — per-test-group `per_tg_pool_slabs` count and the `u/p/tie`
+///   f64 staging buffers (×3)
+/// - `n_slots`    — pseudobulk `sums` (f64)
+pub fn gpu_de_per_gene_scratch_bytes(
+    n_pool_max: usize,
+    n_ref: usize,
+    n_g_max: usize,
+    n_test: usize,
+    n_slots: usize,
+) -> usize {
+    let p2 = |x: usize| x.max(1).next_power_of_two();
+    // f32 (4 bytes): slab + aux + ref_slab + group_slab + per_tg_pool (×n_test).
+    let f32_elems = n_pool_max
+        .saturating_add(n_pool_max)
+        .saturating_add(p2(n_ref))
+        .saturating_add(p2(n_g_max))
+        .saturating_add(n_test.saturating_mul(p2(n_g_max)));
+    // f64 (8 bytes): sums + 3×per-group (u/p/tie) + 3 per-gene scalars
+    // (tie_term/u_or_rank/p_values).
+    let f64_elems = p2(n_slots)
+        .saturating_add(3usize.saturating_mul(p2(n_test)))
+        .saturating_add(3);
+    f32_elems
+        .saturating_mul(4)
+        .saturating_add(f64_elems.saturating_mul(8))
+}
+
+/// Pure budget clamp (no device access — unit-testable).
+///
+/// Returns `(chunk, fits)`: the largest gene chunk ≤ `requested` whose
+/// per-chunk scratch (`per_gene_bytes` × chunk) fits `free_bytes × frac`,
+/// floored at [`GPU_DE_MIN_GENE_CHUNK`]. `fits` is false only when even the
+/// floor chunk exceeds the budget — the caller should then surface a clear
+/// dimension-naming error rather than let the allocation OOM.
+fn clamp_chunk_for_budget(
+    requested: usize,
+    per_gene_bytes: usize,
+    free_bytes: usize,
+    frac: f64,
+) -> (usize, bool) {
+    let requested = requested.max(1);
+    let per_gene_bytes = per_gene_bytes.max(1);
+    let budget = (free_bytes as f64 * frac) as usize;
+    let max_chunk = (budget / per_gene_bytes).max(1);
+    if max_chunk >= requested {
+        (requested, true)
+    } else if max_chunk >= GPU_DE_MIN_GENE_CHUNK {
+        (max_chunk, true)
+    } else {
+        (GPU_DE_MIN_GENE_CHUNK, false)
+    }
+}
+
+/// Clamp a requested gene chunk so the per-chunk DE working set fits a budget
+/// fraction of free VRAM. Never increases `requested`. When free memory can't
+/// be queried, returns `(requested, true)` (don't clamp what we can't measure).
+///
+/// See [`clamp_chunk_for_budget`] / [`gpu_de_per_gene_scratch_bytes`]. Bounds
+/// every chunk-linear scratch allocation (dominated by `per_tg_pool_slabs`),
+/// closing the census-scale OOM where a user `gene_chunk_size` (or the auto
+/// sizer) ignored the `n_test × n_g_max` term.
+pub fn gpu_de_budget_gene_chunk(
+    dev: &GpuDevice,
+    requested: usize,
+    per_gene_bytes: usize,
+) -> (usize, bool) {
+    let Ok((free_bytes, _total)) = dev.free_memory() else {
+        return (requested.max(1), true);
+    };
+    if free_bytes == 0 {
+        return (requested.max(1), true);
+    }
+    clamp_chunk_for_budget(
+        requested,
+        per_gene_bytes,
+        free_bytes,
+        gpu_de_mem_budget_frac(),
+    )
+}
+
 #[cfg(test)]
 #[path = "gpu_diffexp_tests.rs"]
 mod tests;
