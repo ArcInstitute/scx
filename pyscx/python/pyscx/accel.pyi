@@ -148,9 +148,11 @@ def pca(
 
 
 # ---------------------------------------------------------------------------
-# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Writes in
-# place; `pflog1ppf_reconstruct` is a pure-Python companion exposed on this
-# submodule (and at top level) by `pyscx/__init__.py`.
+# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Default
+# `store="pca"` writes a baseline-aware PCA embedding to `adata.obsm[obsm_key]`
+# and leaves `X` as raw counts (it does NOT transform `X` in place — pass
+# `store="dense"` for the matrix). `pflog1ppf_reconstruct` is a pure-Python
+# companion exposed on this submodule (and at top level) by `pyscx/__init__.py`.
 # ---------------------------------------------------------------------------
 
 

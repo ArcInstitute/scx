@@ -1912,6 +1912,20 @@ Operates on **raw counts** — run it on the raw-count `X`, not a normalized
 layer. Streams shard-by-shard, so it runs identically on in-memory, backed, and
 lazy `X` (a lazy `X` that already carries transforms is rejected).
 
+> **Default is a PCA embedding, not an in-place `X` transform.** Unlike
+> `normalize_total` / `log1p` (which overwrite `adata.X`), `pflog1ppf` defaults
+> to `store="pca"`: it writes a baseline-aware PCA embedding to
+> `adata.obsm[obsm_key]` (plus the per-cell baseline to `adata.obs[baseline_key]`)
+> and **leaves `X` as raw counts**. To get the normalized matrix itself, pass
+> `store="dense"` (with `out=<path.scx>` for data too large to densify in memory).
+
+| `store`            | writes                                                          | transforms `X`? |
+| ------------------ | --------------------------------------------------------------- | --------------- |
+| `"pca"` (default)  | `obsm[obsm_key]` + `uns[f"{obsm_key}_singular_values"]`, `obs[baseline_key]` | no |
+| `"baseline"`       | `obs[baseline_key]` only                                        | no              |
+| `"dense"`          | `layers[layer_out]` (or a new SCX file via `out=`)              | no (a layer/file) |
+| `"all"`            | both the `"pca"` and `"dense"` outputs                          | no              |
+
 ```python
 import pyscx
 
