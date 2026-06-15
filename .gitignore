@@ -78,6 +78,10 @@ dist/
 pyscx/target/
 *.whl
 
+# rscx
+rscx/src/rust_target/release/build/
+rscx/src/rust_target/release/deps/
+
 # IDE
 .idea/
 .vscode/
@@ -103,3 +107,4 @@ benchmarks/results/
 # R
 **/.fingerprint/
 *.o
+
