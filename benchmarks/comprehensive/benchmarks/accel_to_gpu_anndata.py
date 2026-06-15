@@ -178,7 +178,6 @@ def _prepare_sidecar_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, int
                 opt_bin,
                 "optimize",
                 str(fixture),
-                "--output",
                 str(scx_path),
                 "--codec",
                 "scx1",

@@ -280,6 +280,14 @@ mod tests {
             ScxErrorClass::CorruptFile
         );
         assert_eq!(
+            ScxError::UnsupportedFormatVersion {
+                found: 99,
+                max_supported: 3,
+            }
+            .class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
             ScxError::UnsupportedEndian.class(),
             ScxErrorClass::CorruptFile
         );

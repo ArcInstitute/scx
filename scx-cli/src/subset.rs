@@ -28,18 +28,18 @@ pub fn run_subset(
     // CSR + var, with the file's global obs.
     if let Some(name) = modality {
         // Pure modality extraction keeps its stricter guards: dry-run is
-        // unsupported and --output is mandatory. Combined with
+        // unsupported and the output path is mandatory. Combined with
         // --filter / --genes the predicate path allows --dry-run and only
-        // requires --output when actually writing.
+        // requires the output path when actually writing.
         if filter.is_none() && gene_file.is_none() {
             if dry_run {
                 return Err("--dry-run is not supported for `--modality NAME` extraction".into());
             }
             if output.is_none() {
-                return Err("--output is required for `--modality NAME` extraction".into());
+                return Err("an output path is required for `--modality NAME` extraction".into());
             }
         } else if !dry_run && output.is_none() {
-            return Err("--output is required (or use --dry-run)".into());
+            return Err("an output path is required (or use --dry-run)".into());
         }
         return extract_modality(
             input,
@@ -61,9 +61,9 @@ pub fn run_subset(
         return Err("At least one of --filter or --genes is required".into());
     }
 
-    // 2. If not dry-run, --output is required
+    // 2. If not dry-run, the output path is required
     if !dry_run && output.is_none() {
-        return Err("--output is required (or use --dry-run)".into());
+        return Err("an output path is required (or use --dry-run)".into());
     }
 
     // 3. Build query pipeline (single file open for all operations)
@@ -885,7 +885,13 @@ mod tests {
         );
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
-        assert!(msg.contains("--output"));
+        // Output is now a positional arg — the message must not tell users to
+        // pass the removed `--output` flag (PR #260 review).
+        assert!(
+            msg.contains("an output path is required"),
+            "expected positional-output wording, got: {msg}"
+        );
+        assert!(!msg.contains("--output"));
     }
 
     #[test]

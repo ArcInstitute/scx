@@ -171,7 +171,7 @@ Other commands:
 - `scx append <target> <source> [--codec ...] [--shard-size N] [--index-* ...]`.
 - `scx delete <file> --filter <expr> [--dry-run]`.
 - `scx compact <input> <output> [--force] [--index-* ...]`.
-- `scx optimize <input> --output <path> [--force]` — in-place upgrade (single-modality): re-encode + canonicalize CSR shards to add decode sidecars and stamp `format_version=3` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`). Use to make a sidecar-less file GPU-device-decode-fast without a full reconvert.
+- `scx optimize <input> <output> [--force]` — in-place upgrade (single-modality): re-encode + canonicalize CSR shards to add decode sidecars and stamp `format_version=3` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`). Use to make a sidecar-less file GPU-device-decode-fast without a full reconvert.
 - `scx merge <f1> <f2> [...] --output <path> [--index-* ...]`.
 - `scx rollback <file> [--to-seq N]`.
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — `--memory-limit` takes the same size forms as `--memory-budget` (`K`/`M`/`G`/`T`, `KiB`/`MiB`/`GiB`/`TiB`; decimals rejected).

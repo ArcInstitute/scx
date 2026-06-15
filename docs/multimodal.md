@@ -33,7 +33,7 @@ Stick with single-modality SCX (the v1-shape file with the legacy
   case).
 - You need to interop with v1-only consumers (older `cell-load-scx` /
   `state-scx` wheel pins). v2 is one-way: v2 readers transparently
-  open v1 files, but v1 readers reject v2 files with `UnsupportedVersion`.
+  open v1 files, but v1 readers reject v2 files with `UnsupportedFormatVersion`.
 
 A v2 file that registers no modality table behaves exactly like a v1
 file on the v2 read path; multimodal is opt-in at write time.

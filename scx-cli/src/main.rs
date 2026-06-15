@@ -278,8 +278,7 @@ enum Commands {
     Optimize {
         /// SCX file to optimize
         input: PathBuf,
-        /// Output path for the optimized file
-        #[arg(long)]
+        /// Output path for the optimized file (may equal <INPUT> for in-place)
         output: PathBuf,
         /// Overwrite output if it exists
         #[arg(long)]

@@ -124,7 +124,7 @@ historical file size.
 
 ## Optimize
 
-`scx optimize <input> --output <out>` upgrades an existing **single-modality**
+`scx optimize <input> <output>` upgrades an existing **single-modality**
 file in place: it decodes → `canonicalize_csr` → re-encodes every CSR-backed
 shard (`X`, layers, and obs×obs `obsp` CSR graphs), so the output carries
 [decode-metadata sidecars](format.md#42-decode-metadata-sidecar) and legitimately
