@@ -1432,7 +1432,7 @@ the analysis op. So the layout choice matters as much as the device flag:
 - **Upgrade a sidecar-less file in place with `scx optimize`.** A pre-v3 or
   reconverted-without-sidecars file (Scx1 counts but no `decode/*` sections) does
   not need a full reconvert to become device-decode-fast — run
-  `scx optimize in.scx --output out.scx`. It re-encodes + canonicalizes every CSR
+  `scx optimize in.scx out.scx`. It re-encodes + canonicalizes every CSR
   shard so decode sidecars are emitted and the file is stamped `format_version=3`,
   preserving rows / obs / var / obsm / uns / indexes (see
   [operations.md § Optimize](operations.md#optimize)). Only Scx1 integer shards

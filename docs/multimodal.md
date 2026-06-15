@@ -33,7 +33,7 @@ Stick with single-modality SCX (the v1-shape file with the legacy
   case).
 - You need to interop with v1-only consumers (older `cell-load-scx` /
   `state-scx` wheel pins). v2 is one-way: v2 readers transparently
-  open v1 files, but v1 readers reject v2 files with `UnsupportedVersion`.
+  open v1 files, but v1 readers reject v2 files with `UnsupportedFormatVersion`.
 
 A v2 file that registers no modality table behaves exactly like a v1
 file on the v2 read path; multimodal is opt-in at write time.
@@ -246,12 +246,12 @@ scx validate citeseq.scx    # ModalityTable checksum + cross-check;
                             # accepts partial per-modality CSC sidecars
 
 # Mutating ops (per-modality routing)
-scx append citeseq.scx --input new_rna_cells.scx --modality rna   # preserves ADT's CSC
-scx subset citeseq.scx --modality rna --output rna_only.scx
-scx subset citeseq.scx --modality rna --filter "cell_type == 'T cell'" \
-    --genes hvg.txt --output rna_tcells.scx                       # filter + projection
+scx append citeseq.scx new_rna_cells.scx --modality rna          # preserves ADT's CSC
+scx subset citeseq.scx rna_only.scx --modality rna
+scx subset citeseq.scx rna_tcells.scx --modality rna \
+    --filter "cell_type == 'T cell'" --genes hvg.txt             # filter + projection
 scx merge cite1.scx cite2.scx --output cite_merged.scx            # multimodal merge
-scx compact cite_merged.scx --output cite_compacted.scx           # multimodal compact
+scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact
 ```
 
 Python equivalent for the export direction:

@@ -33,7 +33,7 @@ To restore:
 scx build-csc experiment.scx experiment_with_csc.scx
 
 # Or pass --rebuild-csc to the mutating operation
-scx compact experiment.scx --output compacted.scx --rebuild-csc
+scx compact experiment.scx compacted.scx --rebuild-csc
 ```
 
 The Python wrappers do not expose a standalone `build_csc` function — use
@@ -124,7 +124,7 @@ historical file size.
 
 ## Optimize
 
-`scx optimize <input> --output <out>` upgrades an existing **single-modality**
+`scx optimize <input> <output>` upgrades an existing **single-modality**
 file in place: it decodes → `canonicalize_csr` → re-encodes every CSR-backed
 shard (`X`, layers, and obs×obs `obsp` CSR graphs), so the output carries
 [decode-metadata sidecars](format.md#42-decode-metadata-sidecar) and legitimately

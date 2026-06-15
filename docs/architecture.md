@@ -798,10 +798,10 @@ scx query experiment.scx "cell_type == 'T cell'" --count
 scx query experiment.scx "tissue == 'lung'" --output subset.scx --normalize 1e4 --log1p
 
 # File operations
-scx append atlas.scx --input new_batch.scx
+scx append atlas.scx new_batch.scx
 scx delete experiment.scx --filter "is_doublet == True" --dry-run
-scx compact experiment.scx --output compacted.scx
-scx optimize experiment.scx --output optimized.scx   # add decode sidecars + upgrade to v3
+scx compact experiment.scx compacted.scx
+scx optimize experiment.scx optimized.scx   # add decode sidecars + upgrade to v3
 scx rollback experiment.scx --to-seq 3
 scx merge batch1.scx batch2.scx batch3.scx --output atlas.scx
 

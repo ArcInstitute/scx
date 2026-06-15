@@ -9,6 +9,9 @@ pub enum ScxError {
     #[error("unsupported format version")]
     UnsupportedVersion,
 
+    #[error("unsupported format version: found {found}, this build supports 1..={max_supported}")]
+    UnsupportedFormatVersion { found: u16, max_supported: u16 },
+
     #[error("unsupported endianness (only little-endian is supported)")]
     UnsupportedEndian,
 
@@ -188,6 +191,7 @@ impl ScxError {
             ScxError::InvalidMagic
             | ScxError::InvalidShardMagic
             | ScxError::UnsupportedVersion
+            | ScxError::UnsupportedFormatVersion { .. }
             | ScxError::UnsupportedEndian
             | ScxError::UnsupportedSectionVersion { .. }
             | ScxError::ChecksumMismatch { .. }
@@ -273,6 +277,14 @@ mod tests {
         );
         assert_eq!(
             ScxError::UnsupportedVersion.class(),
+            ScxErrorClass::CorruptFile
+        );
+        assert_eq!(
+            ScxError::UnsupportedFormatVersion {
+                found: 99,
+                max_supported: 3,
+            }
+            .class(),
             ScxErrorClass::CorruptFile
         );
         assert_eq!(

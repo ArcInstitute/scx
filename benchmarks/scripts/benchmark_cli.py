@@ -198,7 +198,7 @@ def bench_append(binary, dataset, tmpdir):
 
         _, _, elapsed = run_scx(binary, [
             "append", str(target),
-            "--input", str(source),
+            str(source),
         ])
         times_ms.append(elapsed * 1000)
 
@@ -282,7 +282,7 @@ def bench_compact(binary, dataset, tmpdir):
         # 3 appends
         for _ in range(3):
             run_scx(binary, [
-                "append", str(target), "--input", str(source),
+                "append", str(target), str(source),
             ])
 
         # 1 delete
@@ -298,7 +298,7 @@ def bench_compact(binary, dataset, tmpdir):
 
         _, _, elapsed = run_scx(binary, [
             "compact", str(target),
-            "--output", str(output),
+            str(output),
         ])
         times_ms.append(elapsed * 1000)
         output_sizes.append(output.stat().st_size)

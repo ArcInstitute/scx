@@ -296,8 +296,8 @@ scx convert --from h5mu in.h5mu --to scx out.scx          # h5mu → SCX (stream
 scx convert --to h5ad out.scx out.h5ad --modality rna     # SCX → h5ad (streaming by default)
 scx convert --to h5mu out.scx out.h5mu                    # SCX → h5mu (streaming by default)
 scx convert --to h5ad out.scx out.h5ad --stream=false     # opt-out: materialising path
-scx append target.scx --input new.scx --modality rna
-scx subset in.scx --modality rna --output rna_only.scx
+scx append target.scx new.scx --modality rna
+scx subset in.scx rna_only.scx --modality rna
 ```
 
 ## Codec Selection (`scx-format/src/codec_select.rs`)
@@ -1797,14 +1797,14 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 - `scx benchmark <file> [--compare-h5ad <path>] [--runs N] [--json]`
 
 ### File operations
-- `scx append <target> --input <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Streaming append (reads source one shard at a time). `--index-*` rebuilds predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+- `scx append <target> <source> [--codec auto|none|scx1|zstd|lz4|pcodec] [--shard-size N] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Streaming append (reads source one shard at a time). `--index-*` rebuilds predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
 - `scx delete <file> --filter <expr> [--dry-run]`
-- `scx compact <input> --output <path> [--force] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Rewrite reclaiming space; `--index-*` rebuilds the predicate index against the compacted output.
-- `scx optimize <input> --output <path> [--force] [--codec {auto|scx1}]` — In-place upgrade (single-modality): re-encode + canonicalize every CSR shard so the output gains decode sidecars and `format_version=3`, preserving row layout / obs / var / obsm / uns / indexes / deletion vectors. `--codec scx1` forces Scx1 on every integer shard so all shards carry a decode sidecar (default `auto` leaves high-median shards as sidecar-less Zstd). Drops the CSC sidecar (rerun `scx build-csc`). `--output` may equal `<input>` (atomic rename). See [docs/operations.md § Optimize](operations.md#optimize).
+- `scx compact <input> <output> [--force] [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Rewrite reclaiming space; `--index-*` rebuilds the predicate index against the compacted output.
+- `scx optimize <input> <output> [--force] [--codec {auto|scx1}]` — In-place upgrade (single-modality): re-encode + canonicalize every CSR shard so the output gains decode sidecars and `format_version=3`, preserving row layout / obs / var / obsm / uns / indexes / deletion vectors. `--codec scx1` forces Scx1 on every integer shard so all shards carry a decode sidecar (default `auto` leaves high-median shards as sidecar-less Zstd). Drops the CSC sidecar (rerun `scx build-csc`). `<output>` may equal `<input>` (atomic rename). See [docs/operations.md § Optimize](operations.md#optimize).
 - `scx rollback <file> [--to-seq N]`
 - `scx merge <file1> <file2> [<...>] --output <path> [--index-obs CSV] [--index-var CSV] [--index-preset NAME] [--index-auto-threshold N]` — Merge multiple files; `--index-*` rebuilds the predicate index against the merged output (without it, pushdown regresses to a full obs scan on the merged file).
 - `scx query <input> (--filter <expr> | <filter>) [--count] [--output <path>] [--select-genes <path>] [--normalize N] [--log1p] [--limit N] [--json]` — the obs predicate may be given via `--filter` (consistent with `scx subset` / `scx delete`) or positionally (back-compat); supply one form, not both. `<input>` accepts a local `.scx` file path, an exploded `.scxd/` directory, or a cloud URL (`gs://`, `s3://`, `az://`, `file://`). For cloud inputs the query is served via the `SectionReader` cloud path with no `scx pull` step. See [docs/cloud.md § Cloud-native query](cloud.md#cloud-native-query).
-- `scx subset <input> [--output <path>] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file
+- `scx subset <input> [output] [--filter <expr>] [--genes <path>] [--dry-run] [--shard-size N] [--codec auto|none|scx1|zstd|lz4|pcodec]` — Extract a subset of cells and/or genes into a new SCX file (`output` is optional with `--dry-run`)
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — Build CSC (column-major) shards from existing CSR data. `--memory-limit` accepts the same size forms as `--memory-budget` (see [Memory budgets](#memory-budgets)).
 - `scx upgrade <input> [output] [--in-place]` — Upgrade an SCX file to the latest format version
 

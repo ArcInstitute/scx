@@ -446,7 +446,7 @@ duplicate matrix values. Current writers emit it only for Scx1 integer
 sidecar size is no more than 25% of the source shard section length. Consumers
 MUST treat the sidecar as an optimization and fall back to normal shard decode
 when it is absent. An existing sidecar-less file can gain sidecars without a full
-reconvert via `scx optimize <in> --output <out>`, which re-encodes + canonicalizes
+reconvert via `scx optimize <in> <out>`, which re-encodes + canonicalizes
 every CSR shard and stamps `format_version=3` (see
 [operations.md § Optimize](operations.md#optimize)).
 
@@ -1138,7 +1138,7 @@ modality table — never compute it from `header.n_vars`.
 ### 13.5 Compatibility
 
 v1 readers reject v2 files at open time
-(`format_version > CURRENT_FORMAT_VERSION` → `UnsupportedVersion`).
+(`format_version > CURRENT_FORMAT_VERSION` → `UnsupportedFormatVersion`).
 v2 readers accept v1 files (every entry materialises with
 `modality_id = 0`; `n_modalities` stays 0). This is one-way: adopting
 v2 means re-pinning consumer wheels (`pyscx`, `cell-load-scx`,

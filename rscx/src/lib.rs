@@ -125,7 +125,11 @@ impl ScxExperiment {
     /// Start a query pipeline. Returns an RQueryPipeline.
     /// Re-opens the file (QueryPipeline::open creates its own ScxReader).
     fn query(&self) -> Result<RQueryPipeline> {
-        RQueryPipeline::from_path(self.path.to_str().unwrap_or(""))
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
+        RQueryPipeline::from_path(path)
     }
 
     /// Phase I.1: True if this file has a registered modality table.

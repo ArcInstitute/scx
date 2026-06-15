@@ -72,17 +72,17 @@ scx convert /path/to/filtered_feature_bc_matrix/ experiment.scx --shard-size 200
 
 ```bash
 # Append new cells (uses default shard size for new shards)
-scx append atlas.scx --input new_batch.scx
+scx append atlas.scx new_batch.scx
 
 # Custom shard size for appended shards
-scx append atlas.scx --input new_batch.scx --shard-size 5000
+scx append atlas.scx new_batch.scx --shard-size 5000
 ```
 
 ### Subsetting with shard size control
 
 ```bash
 # Extract T cells with a custom shard size in the output file
-scx subset experiment.scx --output t_cells.scx \
+scx subset experiment.scx t_cells.scx \
     --filter "cell_type == 'T cell'" --shard-size 8000
 ```
 
@@ -102,7 +102,7 @@ After multiple appends, files may contain many small shards. Compaction merges
 them into optimally-sized shards matching `shard_target_rows`:
 
 ```bash
-scx compact experiment.scx --output compacted.scx
+scx compact experiment.scx compacted.scx
 ```
 
 ### Merging (re-sharding)

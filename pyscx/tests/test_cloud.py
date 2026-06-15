@@ -413,3 +413,87 @@ class TestCloudQuery:
 
             assert cloud_result.total_shards == local_result.total_shards
             assert cloud_result.skipped_shards == local_result.skipped_shards
+
+
+def _create_multimodal_scx(path: str):
+    """Build a tiny CITE-seq (rna + adt) multimodal .scx via from_mudata."""
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, rna_n_vars, adt_n_vars = 24, 40, 8
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, rna_n_vars)).astype(np.float32))
+    )
+    rna.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    adt = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, adt_n_vars)).astype(np.float32))
+    )
+    adt.var_names = [f"a{i}" for i in range(adt_n_vars)]
+    mu = mudata.MuData({"rna": rna, "adt": adt})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+    pyscx.from_mudata(mu, path)
+
+
+class TestCloudMultimodalDiscoverability:
+    """B5: a multimodal file opened via open_cloud must expose its
+    modalities (is_multimodal / modality_names / modality_info) instead
+    of silently projecting to the primary (rna) modality."""
+
+    def test_open_cloud_exposes_modalities(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded_dir = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            assert exp.is_multimodal is True
+            assert exp.n_modalities == 2
+            assert set(exp.modality_names) == {"rna", "adt"}
+
+            # Parity with the local Experiment accessors.
+            local = pyscx.open(scx_path)
+            assert exp.modality_names == local.modality_names
+            for name in ("rna", "adt"):
+                mid = exp.modality_id(name)
+                assert mid == local.modality_id(name)
+                info = exp.modality_info(mid)
+                assert info["name"] == name
+                assert info["n_vars"] == local.modality_info(mid)["n_vars"]
+                assert info["nnz"] == local.modality_info(mid)["nnz"]
+
+            # Multimodality is visible in the repr (not silently hidden).
+            assert "multimodal" in repr(exp)
+
+    def test_open_cloud_single_modality_not_multimodal(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "single.scx")
+            _create_test_scx(scx_path, n_obs=40, n_vars=20)
+            exploded_dir = os.path.join(tmpdir, "single.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            assert exp.is_multimodal is False
+            assert exp.n_modalities == 0
+            assert exp.modality_names == []
+            assert exp.modality_id("rna") is None
+            assert exp.modality_info(1) is None
+
+    def test_cloud_to_mudata_raises_pull_locally(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded_dir = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            exp = pyscx.open_cloud(exploded_dir)
+            with pytest.raises(RuntimeError, match="pull the file locally"):
+                exp.to_mudata()

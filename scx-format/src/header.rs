@@ -289,7 +289,10 @@ impl FileHeader {
 
         let format_version = r.read_u16::<LittleEndian>()?;
         if format_version == 0 || format_version > CURRENT_FORMAT_VERSION {
-            return Err(ScxError::UnsupportedVersion);
+            return Err(ScxError::UnsupportedFormatVersion {
+                found: format_version,
+                max_supported: CURRENT_FORMAT_VERSION,
+            });
         }
 
         let header_length = r.read_u16::<LittleEndian>()?;
@@ -868,7 +871,15 @@ mod tests {
 
         let mut cursor = Cursor::new(&buf);
         let err = FileHeader::read_from(&mut cursor).unwrap_err();
-        assert!(matches!(err, ScxError::UnsupportedVersion));
+        assert!(matches!(
+            err,
+            ScxError::UnsupportedFormatVersion { found, max_supported }
+                if found == CURRENT_FORMAT_VERSION + 1 && max_supported == CURRENT_FORMAT_VERSION
+        ));
+        // The message names both the found and supported versions (B3).
+        let msg = err.to_string();
+        assert!(msg.contains(&(CURRENT_FORMAT_VERSION + 1).to_string()));
+        assert!(msg.contains(&CURRENT_FORMAT_VERSION.to_string()));
     }
 
     /// v2 reader on a v1 header buffer: parses cleanly with

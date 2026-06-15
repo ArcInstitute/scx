@@ -127,11 +127,10 @@ fn subset_extract_modality_from_h5mu() {
     let status = Command::new(scx_bin)
         .args([
             "subset",
+            scx_in.to_str().unwrap(),
+            scx_out.to_str().unwrap(),
             "--modality",
             "rna",
-            "--output",
-            scx_out.to_str().unwrap(),
-            scx_in.to_str().unwrap(),
         ])
         .status()
         .expect("scx subset failed to spawn");

@@ -142,12 +142,7 @@ fn test_lifecycle_append_delete_compact() {
 
     // Append
     let output = scx_cli()
-        .args([
-            "append",
-            target.to_str().unwrap(),
-            "--input",
-            source.to_str().unwrap(),
-        ])
+        .args(["append", target.to_str().unwrap(), source.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -201,7 +196,6 @@ fn test_lifecycle_append_delete_compact() {
         .args([
             "compact",
             target.to_str().unwrap(),
-            "--output",
             compacted.to_str().unwrap(),
         ])
         .output()
@@ -240,12 +234,7 @@ fn test_rollback_lifecycle() {
 
     // Append
     let output = scx_cli()
-        .args([
-            "append",
-            target.to_str().unwrap(),
-            "--input",
-            source.to_str().unwrap(),
-        ])
+        .args(["append", target.to_str().unwrap(), source.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -592,17 +581,36 @@ fn test_append_mismatched_nvars() {
     let source = write_test_file(&dir, "source_mismatch.scx", 4, 20);
 
     let output = scx_cli()
-        .args([
-            "append",
-            target.to_str().unwrap(),
-            "--input",
-            source.to_str().unwrap(),
-        ])
+        .args(["append", target.to_str().unwrap(), source.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("n_vars mismatch"));
+}
+
+#[test]
+fn test_cli_append_positional_source() {
+    // B2: `scx append <target> <source>` (positional source) must actually
+    // append. Before the F1 fix the source was a `--input` flag, so a bare
+    // positional was dropped and the append silently no-op'd.
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "pos_target.scx", 8, 10);
+    let source = write_test_file(&dir, "pos_source.scx", 4, 10);
+
+    let output = scx_cli()
+        .args(["append", target.to_str().unwrap(), source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "positional append failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Target grew from 8 → 12 cells.
+    let reader = ScxReader::open(&target).unwrap();
+    assert_eq!(reader.n_obs(), 12, "appended cell count must be 8 + 4");
 }
 
 #[test]
@@ -618,7 +626,6 @@ fn test_cli_append_honors_codec_zstd() {
         .args([
             "append",
             target.to_str().unwrap(),
-            "--input",
             source.to_str().unwrap(),
             "--codec",
             "zstd",
@@ -657,7 +664,6 @@ fn test_append_rejects_zero_shard_size() {
         .args([
             "append",
             target.to_str().unwrap(),
-            "--input",
             source.to_str().unwrap(),
             "--shard-size",
             "0",
@@ -752,7 +758,6 @@ fn test_compact_output_exists_no_force() {
         .args([
             "compact",
             input.to_str().unwrap(),
-            "--output",
             output_path.to_str().unwrap(),
         ])
         .output()
@@ -774,7 +779,6 @@ fn test_compact_output_exists_with_force() {
         .args([
             "compact",
             input.to_str().unwrap(),
-            "--output",
             output_path.to_str().unwrap(),
             "--force",
         ])
