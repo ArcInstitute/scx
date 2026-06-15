@@ -1089,11 +1089,29 @@ fn extract_rank_genes_groups_df<'py>(
         let g_pvals = read_f64("pvals", g)?;
         let g_padj = read_f64("pvals_adj", g)?;
         let full = g_names.len();
+        // The five fields are read independently; a malformed / hand-edited
+        // `uns` with mismatched lengths would otherwise index out of bounds
+        // (a Rust panic that crashes the interpreter). Fail cleanly instead.
+        if g_scores.len() != full
+            || g_lfc.len() != full
+            || g_pvals.len() != full
+            || g_padj.len() != full
+        {
+            return Err(PyValueError::new_err(format!(
+                "malformed adata.uns[{key:?}] for group {g:?}: field lengths differ \
+                 (names={full}, scores={}, logfoldchanges={}, pvals={}, pvals_adj={})",
+                g_scores.len(),
+                g_lfc.len(),
+                g_pvals.len(),
+                g_padj.len()
+            )));
+        }
         let n = n_genes.unwrap_or(full).min(full);
         for i in 0..n {
             // scanpy-style row filters (only applied when set). Positive
             // comparisons mean NaN rows fail the predicate and are dropped,
-            // matching scanpy's `df[df[col] < cutoff]` semantics.
+            // matching scanpy's `df[df[col] < cutoff]` semantics
+            // (scanpy/get/get.py uses strict `<` / `>` / `<`).
             let keep = pval_cutoff.is_none_or(|c| g_padj[i] < c)
                 && log2fc_min.is_none_or(|m| g_lfc[i] > m)
                 && log2fc_max.is_none_or(|m| g_lfc[i] < m);
@@ -1159,19 +1177,25 @@ fn extract_rank_genes_groups_df<'py>(
 /// (`names, scores, logfoldchanges, pvals, pvals_adj`), with a leading `group`
 /// column when `group` is a list. Optional scanpy filters `pval_cutoff` /
 /// `log2fc_min` / `log2fc_max` apply. (`gene_symbols=` var-name remapping is not
-/// supported yet.) Pass either `groupby=` or `group=`, not both.
+/// supported yet.) Pass either `groupby=` or `group=`, not both. To extract
+/// **all** groups, pass the list of names
+/// (`group=list(adata.uns[key]["names"].dtype.names)`); `group=None` routes to
+/// the compute path.
 ///
 /// Args:
 ///     adata: AnnData object with X and obs[groupby]
 ///     groupby: obs column to group cells by (compute mode)
 ///     reference: Group to compare against (default: "rest" = 1-vs-rest)
-///     n_genes: Number of top genes per group (default: all genes)
+///     n_genes: Number of top genes per group (default: all genes). In extract
+///         mode this is a pyscx extension (scanpy's extractor has no `n_genes`):
+///         it truncates to top-N *before* the `pval_cutoff` / `log2fc_*` filters.
 ///     gene_chunk_size: Genes per chunk for streaming DE (default: None → 500
 ///         internally for sparse/backed inputs)
 ///     rankby_abs: Sort genes by |score| instead of signed score (default: False)
 ///     tie_correct: Apply tie correction in the Wilcoxon test (default: False)
 ///     output: `"polars"` (default) or `"pandas"`. Identical columns either way;
 ///         `"pandas"` does not require polars.
+///     device: compute-mode only; ignored in extract (`group=`) mode.
 ///     group: extraction mode — a group name (str) or list of names to pull from
 ///         `adata.uns[key]`.
 ///     key: uns key to extract from (default: `"rank_genes_groups"`).

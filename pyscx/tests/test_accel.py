@@ -675,6 +675,20 @@ class TestRankGenesGroupsDfExtract:
         with pytest.raises(ValueError, match="available"):
             pyscx.accel.rank_genes_groups_df(adata, group="ZZ")
 
+    def test_extract_malformed_uns_length_mismatch_errors(self, synthetic_adata):
+        """A hand-edited uns with mismatched field lengths errors, not panics."""
+        import numpy as np
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        # Truncate one field's structured array so its length diverges from
+        # `names` — a clean ValueError must replace the Rust index panic.
+        rgg = adata.uns["rank_genes_groups"]
+        rgg["scores"] = np.asarray(rgg["scores"])[:-1].copy()
+        with pytest.raises(ValueError, match="field lengths differ"):
+            pyscx.accel.rank_genes_groups_df(adata, group="A")
+
     def test_neither_group_nor_groupby_errors(self, synthetic_adata):
         import pyscx
 

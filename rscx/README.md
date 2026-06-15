@@ -119,12 +119,15 @@ sce <- as(res, "SingleCellExperiment")# when SingleCellExperiment is installed
 ```
 
 The query builder also has `count()` — a one-liner to get just the matching
-cell count without materializing the result:
+cell count without decoding the expression matrix (plan + obs-mask only):
 
 ```r
 n <- scx_open("experiment.scx") |> scx_query() |>
   filter_obs("tissue == 'lung'") |> count()
 ```
+
+If both `rscx` and `dplyr` are attached, `count` is masked — use
+`rscx::count()` / `dplyr::count()` to disambiguate.
 
 > **Note:** an `RQueryResult` is consumed by the first extraction call, so call
 > one of the above once per `collect()`.

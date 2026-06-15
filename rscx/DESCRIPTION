@@ -13,6 +13,7 @@ Depends: R (>= 4.2.0)
 Imports: Matrix, methods
 Suggests:
     Seurat (>= 5.0.0),
+    SeuratObject (>= 5.0.0),
     SingleCellExperiment,
     SummarizedExperiment,
     S4Vectors,

@@ -33,10 +33,12 @@ as.matrix.RQueryResult <- function(x, ...) {
 #' Coerce a query result's cell metadata to a data.frame
 #'
 #' @param x An \code{RQueryResult} (from \code{collect()}).
+#' @param row.names,optional Accepted for S3 consistency with the
+#'   \code{base::as.data.frame} generic; ignored (obs already has row names).
 #' @param ... Unused.
 #' @return A \code{data.frame} of obs (cell) metadata.
 #' @export
-as.data.frame.RQueryResult <- function(x, ...) {
+as.data.frame.RQueryResult <- function(x, row.names = NULL, optional = FALSE, ...) {
   x$obs()
 }
 

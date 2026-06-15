@@ -124,13 +124,18 @@ impl RQueryPipeline {
         Ok(RQueryResult::from_result(result))
     }
 
-    /// Convenience: execute the pipeline and return the number of matching
-    /// cells, mirroring pyscx's `query().count()`. The pipeline is consumed.
-    /// Returns f64 (R has no i64) to stay safe past 2^31 cells.
-    fn count(&mut self) -> Result<Robj> {
-        let p = self.take_inner()?;
-        let result = p.collect().map_err(|e| Error::Other(e.to_string()))?;
-        Ok(Robj::from(result.x.n_rows() as f64))
+    /// Count matching cells without decoding the matrix — runs only the
+    /// plan + obs-mask half (no CSR shard payload is decoded), mirroring
+    /// pyscx's `query().count()`. Returns the true Level-2 match count (any
+    /// `limit()` is intentionally *not* applied) and does **not** consume the
+    /// pipeline. Returns f64 (R has no i64) to stay safe past 2^31 cells.
+    fn count(&self) -> Result<Robj> {
+        let p = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::Other("pipeline already consumed".into()))?;
+        let c = p.count().map_err(|e| Error::Other(e.to_string()))?;
+        Ok(Robj::from(c.matched_rows as f64))
     }
 }
 
