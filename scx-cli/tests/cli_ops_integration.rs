@@ -370,10 +370,11 @@ fn test_query_count_filter_flag() {
     );
 }
 
-// F9: omitting the predicate entirely yields an actionable error that names
-// both the positional and `--filter` spellings (not an opaque clap usage dump).
+// F1 (2026-06-14): omitting the predicate entirely is now valid — the query
+// runs over all cells, mirroring pyscx `query()` with no `filter_obs`. (This
+// supersedes the earlier F9 behaviour, which rejected a missing predicate.)
 #[test]
-fn test_query_missing_filter_errors() {
+fn test_query_no_filter_counts_all() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_test_file(&dir, "query_no_filter.scx", 12, 10);
 
@@ -382,13 +383,15 @@ fn test_query_missing_filter_errors() {
         .output()
         .unwrap();
     assert!(
-        !output.status.success(),
-        "query with no predicate must fail"
+        output.status.success(),
+        "query with no predicate must succeed (counts all cells): {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--filter") && stderr.contains("missing obs predicate"),
-        "error must name both spellings, got: {stderr}"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "12",
+        "no predicate must count all cells, got: {stdout}"
     );
 }
 

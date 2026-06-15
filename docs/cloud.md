@@ -365,6 +365,7 @@ last (atomic-publish semantics). No intermediate local directory is created.
 exp = pyscx.open_cloud("gs://bucket/atlas.scxd/")
 exp.n_obs          # 1_200_000
 exp.n_vars         # 36_601
+exp.shape          # (1_200_000, 36_601)  — mirrors anndata.AnnData.shape
 exp.nnz            # 3_400_000_000
 exp.shard_count    # 120
 ```
@@ -373,6 +374,28 @@ exp.shard_count    # 120
 packed) and returns a `CloudExperiment` whose metadata accessors require only
 the header + catalog. Use this to decide what to pull before paying for the
 bytes.
+
+If the URL points at neither an exploded `.scxd/` directory (with
+`_catalog.bin`) nor a packed `.scx` file, `open_cloud` raises
+`FileNotFoundError` with an actionable message rather than a raw
+provider 404 — a common cause is pointing at a packed `.scx` path that
+hasn't been published with `scx push` / `scx explode`.
+
+**Schema discovery.** To learn which columns `filter_obs(...)` accepts
+without materializing rows, use `obs_keys()` / `var_keys()` (and the
+`.shape` above):
+
+```python
+exp.obs_keys()     # ['cell_type', 'tissue', 'disease', 'donor_id', ...]
+exp.var_keys()     # ['feature_name', 'feature_type', ...]
+```
+
+Caveat: unlike the local `Experiment.obs_keys()` (an Arrow IPC
+footer-only read), the **cloud** accessors read obs/var data to derive the
+schema. For a sharded obs (atlas scale) `obs_keys()` reads only the *first*
+shard — all shards share one schema — so it stays cheap; for a
+single-section obs/var it reads that one section, cached on the handle (so a
+subsequent `.query()` that reads obs is free).
 
 ### Cloud-native query
 

@@ -316,6 +316,82 @@ fn test_cli_validate_fails_on_corruption() {
     assert!(stdout.contains("FAIL"));
 }
 
+/// F1: `scx query` runs without an obs predicate. `--count` with no
+/// `--filter` reports the total cell count (mirrors pyscx `query().count()`),
+/// rather than erroring with "missing obs predicate".
+#[test]
+fn test_cli_query_count_without_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "cli_query_nofilter.scx", 6, 10, 2, true);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args(["query", path.to_str().unwrap(), "--count"])
+        .output()
+        .expect("failed to run scx-cli query");
+    assert!(
+        output.status.success(),
+        "query --count without --filter must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "6",
+        "expected total cell count, got {stdout:?}"
+    );
+}
+
+/// F1: the motivating use case — a pure gene-projection query with no obs
+/// predicate. `--select-genes` + `--output` (no `--filter`) writes all cells
+/// with only the selected genes.
+#[test]
+fn test_cli_query_select_genes_without_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "cli_query_proj.scx", 6, 10, 2, true);
+    let genes = dir.path().join("genes.txt");
+    std::fs::write(&genes, "0\n1\n2\n").unwrap();
+    let out = dir.path().join("proj.scx");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "query",
+            path.to_str().unwrap(),
+            "--select-genes",
+            genes.to_str().unwrap(),
+            "--output",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run scx-cli query");
+    assert!(
+        output.status.success(),
+        "query --select-genes without --filter must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reader = scx_format_io::reader::ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 6, "all cells retained");
+    assert_eq!(reader.header().n_vars, 3, "only selected genes");
+}
+
+/// F1: `--explain` with no obs predicate labels the filter as
+/// "(none — all cells)" rather than printing an empty/garbage expression.
+#[test]
+fn test_cli_query_explain_without_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "cli_query_explain.scx", 6, 10, 2, true);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args(["query", path.to_str().unwrap(), "--count", "--explain"])
+        .output()
+        .expect("failed to run scx-cli query");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("obs filter: (none — all cells)"),
+        "explain must label the absent predicate, got: {stderr}"
+    );
+}
+
 /// Test validate --verbose prints checksums.
 #[test]
 fn test_cli_validate_verbose() {

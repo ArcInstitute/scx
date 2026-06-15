@@ -690,7 +690,14 @@ pub struct PullFilteredStats {
     pub total_shards: usize,
     pub downloaded_shards: usize,
     pub skipped_shards: usize,
+    /// Cells matching the filter predicate. For shard-granular pulls this
+    /// is NOT the number of cells written — whole shards are retained, so
+    /// the output also contains non-matching rows. See `output_cells`.
     pub matching_cells: u64,
+    /// Cells actually written to the output file: the sum of all rows in
+    /// the retained shards (>= `matching_cells` for shard-granular pulls,
+    /// since whole shards are kept and not cell-filtered).
+    pub output_cells: u64,
     pub bytes_downloaded: u64,
     pub bytes_saved: u64,
     pub elapsed: std::time::Duration,
@@ -1216,6 +1223,7 @@ pub async fn pull_filtered(
         downloaded_shards,
         skipped_shards,
         matching_cells,
+        output_cells: shard_total_rows,
         bytes_downloaded: total_bytes_downloaded,
         bytes_saved,
         elapsed,

@@ -66,7 +66,7 @@ fn format_level2_eliminations(candidate_shard_rows: usize, matched_rows: usize) 
 #[allow(clippy::too_many_arguments)]
 pub fn run_query(
     source: &str,
-    filter: &str,
+    filter: Option<&str>,
     count: bool,
     output: Option<&Path>,
     select_genes: Option<&Path>,
@@ -83,7 +83,12 @@ pub fn run_query(
     let mut pipeline = opened.pipeline;
     #[cfg(feature = "cloud")]
     let _rt_guard = opened.runtime; // kept alive for the pipeline's lifetime
-    pipeline = pipeline.filter_obs(filter)?;
+
+    // No predicate => query over all cells (mirrors pyscx `query()` with no
+    // `filter_obs`). The engine already supports an empty predicate set.
+    if let Some(f) = filter {
+        pipeline = pipeline.filter_obs(f)?;
+    }
 
     if let Some(gene_file) = select_genes {
         let indices = parse_gene_indices(gene_file)?;
@@ -112,7 +117,7 @@ pub fn run_query(
         if explain {
             eprintln!("Query plan (explain):");
             eprintln!("  source: {source}");
-            eprintln!("  obs filter: {filter}");
+            eprintln!("  obs filter: {}", filter.unwrap_or("(none — all cells)"));
             eprintln!("  total shards: {}", c.total_shards);
             eprintln!(
                 "  Level 1 (catalog-stats) eliminated: {}/{}",
@@ -179,7 +184,7 @@ pub fn run_query(
     if explain {
         eprintln!("Query plan (explain):");
         eprintln!("  source: {source}");
-        eprintln!("  obs filter: {filter}");
+        eprintln!("  obs filter: {}", filter.unwrap_or("(none — all cells)"));
         eprintln!("  total shards: {}", result.total_shards);
         eprintln!(
             "  Level 1 (catalog-stats) eliminated: {}/{}",
