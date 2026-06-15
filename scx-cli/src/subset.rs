@@ -141,7 +141,10 @@ pub fn run_subset(
         );
     }
     if has_obsm {
-        eprintln!("Warning: obsm embeddings dropped (per-cell data cannot be subset)");
+        eprintln!(
+            "Warning: obsm/obsp embeddings dropped (not yet re-indexed on subset — \
+             recompute downstream, or keep the full dataset and subset in Python)"
+        );
     }
     if has_obs_pred_idx || has_var_pred_idx {
         eprintln!("Warning: predicate indices dropped (invalid after subsetting)");

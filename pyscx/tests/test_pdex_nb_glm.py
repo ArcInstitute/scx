@@ -98,6 +98,10 @@ def test_pdex_nb_glm_requires_stratifier():
         pyscx.accel.pdex_nb_glm(adata, "perturbation", REFERENCE)
     with pytest.raises(ValueError, match="stratify_by"):
         pyscx.accel.pdex_nb_glm(adata, "perturbation", REFERENCE, stratify_by=[])
+    # A bare string (not a list) gets a clear message, not the opaque PyO3
+    # "Can't extract 'str' to 'Vec'" type error.
+    with pytest.raises(ValueError, match="list of obs column"):
+        pyscx.accel.pdex_nb_glm(adata, "perturbation", REFERENCE, stratify_by="donor")
 
 
 def test_pdex_nb_glm_rejects_log1p():

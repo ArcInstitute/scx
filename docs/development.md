@@ -184,6 +184,13 @@ cd rscx && R CMD INSTALL . && cd ..
 cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
 ```
 
+> **Conda R:** if R came from conda, build from an **activated** env
+> (`conda activate <env>`), or put `$CONDA_PREFIX/bin` on `PATH`. R's `Makeconf`
+> references the conda C compiler (e.g. `x86_64-conda-linux-gnu-cc`), which is
+> only on `PATH` when the env is active — otherwise the link step fails with
+> `x86_64-conda-linux-gnu-cc: not found`. Invoking the interpreter by full path
+> (`<env>/bin/R CMD INSTALL rscx/`) without activating is **not** enough.
+
 `rscx` is excluded from `default-members` because:
 - The R toolchain and extendr are not always available (CI, Rust-only dev)
 - Build it explicitly: `cargo build -p rscx`

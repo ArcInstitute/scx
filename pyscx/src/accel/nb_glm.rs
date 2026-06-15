@@ -579,9 +579,11 @@ pub fn nb_glm(
 /// `adata.uns["scx_accel"]["pdex_nb_glm"]`.
 ///
 /// A pseudobulk NB-GLM needs ≥ 2 samples per condition to estimate dispersion, so
-/// `stratify_by` (a batch/donor/well/replicate obs column spanning ≥ 2 strata) is
-/// **required** — `pdex_nb_glm` raises a `ValueError` pointing to `pdex_ref` /
-/// `rank_genes_groups` when it is absent. NB-GLM needs **raw counts**: log1p
+/// `stratify_by` (a **list** of batch/donor/well/replicate obs columns, e.g.
+/// `["donor"]`, jointly spanning ≥ 2 strata) is **required** — `pdex_nb_glm`
+/// raises a `ValueError` pointing to `pdex_ref` / `rank_genes_groups` when it is
+/// absent. Pass a list even for a single column; a bare string is rejected with a
+/// clear error. NB-GLM needs **raw counts**: log1p
 /// input (auto-detected via `adata.uns["log1p"]`, or `is_log1p=True`) is
 /// rejected. DESeq2-*style*, not DESeq2-*identical*. See
 /// docs/pseudobulk_nb_glm.md.
@@ -593,7 +595,7 @@ pub fn pdex_nb_glm(
     adata: &Bound<'_, PyAny>,
     groupby: &str,
     reference: &str,
-    stratify_by: Option<Vec<String>>,
+    stratify_by: Option<&Bound<'_, PyAny>>,
     min_cells_per_group: usize,
     min_cells_per_stratum: usize,
     is_log1p: Option<bool>,
@@ -601,6 +603,18 @@ pub fn pdex_nb_glm(
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
 ) -> PyResult<Py<PyAny>> {
+    // `stratify_by` is list-only; turn the opaque PyO3 `Can't extract 'str' to
+    // 'Vec'` into an actionable message when a bare string slips through.
+    let stratify_by: Option<Vec<String>> = match stratify_by {
+        None => None,
+        Some(obj) => Some(obj.extract::<Vec<String>>().map_err(|_| {
+            PyValueError::new_err(
+                "stratify_by must be a list of obs column names \
+                 (e.g. stratify_by=[\"donor\"]), not a bare string",
+            )
+        })?),
+    };
+
     // Replicate guard (§4.4): a pseudobulk NB-GLM needs ≥2 samples per condition.
     let strat = match &stratify_by {
         Some(s) if !s.is_empty() => s.clone(),

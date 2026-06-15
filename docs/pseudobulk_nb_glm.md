@@ -79,7 +79,8 @@ df = pyscx.accel.nb_glm(
 Builds pseudobulk **replicates** straight from an AnnData and emits the
 **cell-eval/pdex polars schema**, so it is a drop-in DE method for
 [`cell-eval`](https://github.com/arcinstitute/cell-eval). A **stratifier is
-required** (it forms the replicates).
+required** (it forms the replicates), passed as a **list** of obs column names —
+e.g. `stratify_by=["donor"]`; a bare string is rejected with a clear error.
 
 ```python
 df = pyscx.accel.pdex_nb_glm(

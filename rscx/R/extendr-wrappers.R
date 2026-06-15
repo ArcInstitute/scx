@@ -49,6 +49,7 @@ RQueryPipeline$.wrap <- function(ptr) {
   self$with_log1p <- function() RQueryPipeline$.wrap(.Call(wrap__RQueryPipeline__with_log1p, self$.ptr))
   self$limit <- function(n) RQueryPipeline$.wrap(.Call(wrap__RQueryPipeline__limit, self$.ptr, as.integer(n)))
   self$collect <- function() RQueryResult$.wrap(.Call(wrap__RQueryPipeline__collect, self$.ptr))
+  self$count <- function() .Call(wrap__RQueryPipeline__count, self$.ptr)
   class(self) <- "RQueryPipeline"
   self
 }

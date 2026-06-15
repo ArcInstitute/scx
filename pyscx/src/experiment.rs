@@ -1058,13 +1058,16 @@ impl PyExperiment {
         }
     }
 
-    /// Phase 5b: per-gene detection counts (number of cells where
-    /// each gene is expressed).
+    /// Per-gene detection counts for **all** genes — `axis="var"` only.
     ///
-    /// Only `axis="var"` is supported in the first cut (per-cell
-    /// detection counts would require a transpose). On multimodal
-    /// files, pass `modality=` to select a specific modality;
-    /// otherwise the global X (modality_id = 0) is used.
+    /// The first argument is `axis` (a string), **not** a gene list: this
+    /// returns the full per-gene array (one count per `var`). For the cells
+    /// expressing a *specific* gene, use the companion
+    /// `cells_expressing(gene)` instead.
+    ///
+    /// Only `axis="var"` is supported (per-cell detection counts would require
+    /// a transpose). On multimodal files, pass `modality=` to select a
+    /// specific modality; otherwise the global X (modality_id = 0) is used.
     ///
     /// Fast path: when bitmap sidecars are present for every CSR
     /// shard, this is O(roaring-cardinality). Otherwise the call

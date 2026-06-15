@@ -42,7 +42,7 @@ def rank_genes_groups(
 
 def rank_genes_groups_df(
     adata: Any,
-    groupby: str,
+    groupby: str | None = None,
     reference: str = "rest",
     n_genes: int | None = None,
     gene_chunk_size: int | None = None,
@@ -50,7 +50,26 @@ def rank_genes_groups_df(
     tie_correct: bool = False,
     device: str = "auto",
     output: str = "polars",
-) -> Any: ...
+    *,
+    group: str | list[str] | None = None,
+    key: str = "rank_genes_groups",
+    pval_cutoff: float | None = None,
+    log2fc_min: float | None = None,
+    log2fc_max: float | None = None,
+) -> Any:
+    """DE DataFrame in two modes (pass one).
+
+    ``groupby=`` re-runs Wilcoxon and returns cell-eval ``DEResults`` columns.
+    ``group=`` is the scanpy ``sc.get.rank_genes_groups_df`` alias: extracts the
+    precomputed ``adata.uns[key]`` (no recompute) and returns scanpy's columns
+    (``names, scores, logfoldchanges, pvals, pvals_adj``; a leading ``group``
+    column when ``group`` is a list). ``pval_cutoff``/``log2fc_min``/
+    ``log2fc_max`` are scanpy-style row filters for the extraction path.
+    ``n_genes`` is a pyscx extension (scanpy's extractor has none): top-N before
+    the filters. ``device`` is ignored in extract mode. To extract all groups,
+    pass ``group=list(adata.uns[key]["names"].dtype.names)``.
+    """
+    ...
 
 
 def highly_variable_genes(
@@ -148,9 +167,11 @@ def pca(
 
 
 # ---------------------------------------------------------------------------
-# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Writes in
-# place; `pflog1ppf_reconstruct` is a pure-Python companion exposed on this
-# submodule (and at top level) by `pyscx/__init__.py`.
+# PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026). Default
+# `store="pca"` writes a baseline-aware PCA embedding to `adata.obsm[obsm_key]`
+# and leaves `X` as raw counts (it does NOT transform `X` in place — pass
+# `store="dense"` for the matrix). `pflog1ppf_reconstruct` is a pure-Python
+# companion exposed on this submodule (and at top level) by `pyscx/__init__.py`.
 # ---------------------------------------------------------------------------
 
 

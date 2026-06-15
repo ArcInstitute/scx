@@ -33,6 +33,13 @@ cd scx
 R CMD INSTALL rscx/
 ```
 
+> **Using conda R?** Build from an **activated** conda env
+> (`conda activate <env>`) — or add `$CONDA_PREFIX/bin` to `PATH`. R's
+> `Makeconf` points at the conda C compiler (e.g. `x86_64-conda-linux-gnu-cc`),
+> which is only on `PATH` when the env is active; otherwise the link step fails
+> with `x86_64-conda-linux-gnu-cc: not found`. Running `<env>/bin/R CMD INSTALL`
+> by full path without activating does **not** fix it.
+
 ### Pre-built binaries (no Rust needed)
 
 ```r
@@ -83,6 +90,47 @@ scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")
 scx_info("experiment.scx")
 scx_validate("experiment.scx")
 ```
+
+## Getting data out of a query
+
+`collect()` returns an `RQueryResult`. Because it is an extendr object, its
+extraction API is a set of `$`-methods (not S3 generics), so `methods()` won't
+list them — they are:
+
+| Method | Returns |
+| --- | --- |
+| `res$to_dgcmatrix()` | `Matrix::dgCMatrix` (cells × genes) |
+| `res$to_sce()` | `SingleCellExperiment` (needs the package) |
+| `res$to_seurat()` | `Seurat` v5 object (needs the package) |
+| `res$obs()` / `res$var()` | cell / gene metadata `data.frame` |
+| `res$n_obs()` / `res$n_vars()` / `res$nnz()` | dimensions (numeric) |
+
+For convenience, thin S3/S4 generics are also registered over `RQueryResult`,
+so the idiomatic R verbs work too:
+
+```r
+res <- scx_open("experiment.scx") |> scx_query() |> collect()
+
+dim(res)                              # c(n_obs, n_vars)
+m   <- as.matrix(res)                 # dense base matrix
+df  <- as.data.frame(res)             # obs (cell) metadata
+dgc <- as(res, "dgCMatrix")           # sparse matrix
+sce <- as(res, "SingleCellExperiment")# when SingleCellExperiment is installed
+```
+
+The query builder also has `count()` — a one-liner to get just the matching
+cell count without decoding the expression matrix (plan + obs-mask only):
+
+```r
+n <- scx_open("experiment.scx") |> scx_query() |>
+  filter_obs("tissue == 'lung'") |> count()
+```
+
+If both `rscx` and `dplyr` are attached, `count` is masked — use
+`rscx::count()` / `dplyr::count()` to disambiguate.
+
+> **Note:** an `RQueryResult` is consumed by the first extraction call, so call
+> one of the above once per `collect()`.
 
 ## Build Notes
 

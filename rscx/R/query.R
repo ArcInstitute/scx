@@ -88,3 +88,21 @@ limit <- function(pipeline, n) {
 collect <- function(pipeline) {
   pipeline$collect()
 }
+
+#' Count matching cells without decoding the matrix
+#'
+#' Convenience wrapper mirroring pyscx's \code{query().count()}: runs only the
+#' plan + obs-mask half of the pipeline (no expression-matrix shards are
+#' decoded) and returns the number of matching cells. Returns the true match
+#' count (any \code{limit()} is not applied) and does \emph{not} consume the
+#' pipeline.
+#'
+#' Note: if both \pkg{rscx} and \pkg{dplyr} are attached, \code{count} is
+#' masked — use \code{rscx::count()} / \code{dplyr::count()} to disambiguate.
+#'
+#' @param pipeline An RQueryPipeline object.
+#' @return The number of matching cells (numeric).
+#' @export
+count <- function(pipeline) {
+  pipeline$count()
+}

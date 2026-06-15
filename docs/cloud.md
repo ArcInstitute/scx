@@ -359,6 +359,19 @@ scx push atlas.scx gs://bucket/atlas.scxd/ --parallelism 16
 Uploads every section as its own object in parallel and uploads `_catalog.bin`
 last (atomic-publish semantics). No intermediate local directory is created.
 
+**Verify an uploaded file.** Both `scx info` and `scx query` accept the cloud
+URL directly (no `scx pull` needed), so the natural post-push sanity check is:
+
+```bash
+scx info gs://bucket/atlas.scxd/              # catalog summary over range reads
+scx query gs://bucket/atlas.scxd/ --count     # total cell count
+scx query gs://bucket/atlas.scxd/ "cell_type == 'T cell'" --count --explain
+```
+
+`scx info <url>` reads only the header + catalog (and per-shard headers for the
+codec summary), so it is cheap; `scx query --count` confirms the obs schema and
+predicate pushdown resolve end-to-end.
+
 ### `open_cloud` — metadata-only handle
 
 ```python

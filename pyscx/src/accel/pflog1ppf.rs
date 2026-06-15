@@ -1,5 +1,11 @@
 //! PFlog1pPF / shifted-CLR normalization — Booeshaghi et al. 2026 (CPU-native).
 //!
+//! **Default (`store="pca"`): computes a baseline-aware PCA embedding into
+//! `adata.obsm[obsm_key]` and leaves `X` as raw counts** — unlike
+//! `normalize_total` / `log1p`, this does **not** transform `X` in place. Pass
+//! `store="dense"` (with `out=<path.scx>` for large data) to materialize the
+//! normalized matrix itself.
+//!
 //! The exact transform `Z = delta + baseline·1ᵀ` is dense, but it decomposes
 //! into a sparse `delta` (= the lazy `NormalizeTotal{1/c}→Log1p` chain) plus a
 //! per-cell `baseline`. This binding:

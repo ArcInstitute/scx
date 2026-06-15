@@ -1005,16 +1005,164 @@ fn de_result_to_cell_eval_dataframe<'py>(
     )
 }
 
-/// Run Wilcoxon rank-sum DE and return results as a polars DataFrame in
-/// cell-eval's `DEResults` format.
+/// Extract a scanpy-style DE DataFrame from a precomputed
+/// `adata.uns[key]` (the `sc.get.rank_genes_groups_df` alias). Reads the
+/// scanpy-format structured arrays written by `rank_genes_groups`; never
+/// recomputes. Returns scanpy's columns (`names, scores, logfoldchanges,
+/// pvals, pvals_adj`), with a leading `group` column when `group` is a list.
+#[allow(clippy::too_many_arguments)]
+fn extract_rank_genes_groups_df<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    group: &Bound<'py, PyAny>,
+    key: &str,
+    n_genes: Option<usize>,
+    pval_cutoff: Option<f64>,
+    log2fc_min: Option<f64>,
+    log2fc_max: Option<f64>,
+    output: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    // `group` is a single name (no `group` column, matching scanpy) or a list
+    // of names (with a `group` column).
+    let (groups, multi): (Vec<String>, bool) = if let Ok(s) = group.extract::<String>() {
+        (vec![s], false)
+    } else if let Ok(v) = group.extract::<Vec<String>>() {
+        if v.is_empty() {
+            return Err(PyValueError::new_err(
+                "group must be a non-empty group name (str) or list of names",
+            ));
+        }
+        (v, true)
+    } else {
+        return Err(PyValueError::new_err(
+            "group must be a group name (str) or a list of group names",
+        ));
+    };
+
+    let rgg = adata.getattr("uns")?.get_item(key).map_err(|_| {
+        PyValueError::new_err(format!(
+            "adata.uns[{key:?}] not found — run pyscx.accel.rank_genes_groups(adata, groupby=...) \
+             to populate it, or pass groupby= to compute DE here"
+        ))
+    })?;
+
+    // Available group names are the structured-array field names of `names`.
+    let names_arr = rgg.get_item("names")?;
+    let available: Vec<String> = names_arr
+        .getattr("dtype")?
+        .getattr("names")?
+        .extract()
+        .unwrap_or_default();
+    for g in &groups {
+        if !available.contains(g) {
+            return Err(PyValueError::new_err(format!(
+                "group {g:?} not in adata.uns[{key:?}]; available: {available:?}"
+            )));
+        }
+    }
+
+    // Read one structured-array field for one group → Vec, via `.tolist()`.
+    let read_str = |field: &str, g: &str| -> PyResult<Vec<String>> {
+        rgg.get_item(field)?
+            .get_item(g)?
+            .call_method0("tolist")?
+            .extract()
+    };
+    let read_f64 = |field: &str, g: &str| -> PyResult<Vec<f64>> {
+        rgg.get_item(field)?
+            .get_item(g)?
+            .call_method0("tolist")?
+            .extract()
+    };
+
+    let mut col_group: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut scores: Vec<f64> = Vec::new();
+    let mut logfoldchanges: Vec<f64> = Vec::new();
+    let mut pvals: Vec<f64> = Vec::new();
+    let mut pvals_adj: Vec<f64> = Vec::new();
+
+    for g in &groups {
+        let g_names = read_str("names", g)?;
+        let g_scores = read_f64("scores", g)?;
+        let g_lfc = read_f64("logfoldchanges", g)?;
+        let g_pvals = read_f64("pvals", g)?;
+        let g_padj = read_f64("pvals_adj", g)?;
+        let full = g_names.len();
+        // The five fields are read independently; a malformed / hand-edited
+        // `uns` with mismatched lengths would otherwise index out of bounds
+        // (a Rust panic that crashes the interpreter). Fail cleanly instead.
+        if g_scores.len() != full
+            || g_lfc.len() != full
+            || g_pvals.len() != full
+            || g_padj.len() != full
+        {
+            return Err(PyValueError::new_err(format!(
+                "malformed adata.uns[{key:?}] for group {g:?}: field lengths differ \
+                 (names={full}, scores={}, logfoldchanges={}, pvals={}, pvals_adj={})",
+                g_scores.len(),
+                g_lfc.len(),
+                g_pvals.len(),
+                g_padj.len()
+            )));
+        }
+        let n = n_genes.unwrap_or(full).min(full);
+        for i in 0..n {
+            // scanpy-style row filters (only applied when set). Positive
+            // comparisons mean NaN rows fail the predicate and are dropped,
+            // matching scanpy's `df[df[col] < cutoff]` semantics
+            // (scanpy/get/get.py uses strict `<` / `>` / `<`).
+            let keep = pval_cutoff.is_none_or(|c| g_padj[i] < c)
+                && log2fc_min.is_none_or(|m| g_lfc[i] > m)
+                && log2fc_max.is_none_or(|m| g_lfc[i] < m);
+            if !keep {
+                continue;
+            }
+            if multi {
+                col_group.push(g.clone());
+            }
+            names.push(g_names[i].clone());
+            scores.push(g_scores[i]);
+            logfoldchanges.push(g_lfc[i]);
+            pvals.push(g_pvals[i]);
+            pvals_adj.push(g_padj[i]);
+        }
+    }
+
+    let dict = PyDict::new(py);
+    if multi {
+        dict.set_item("group", col_group)?;
+    }
+    dict.set_item("names", names)?;
+    dict.set_item("scores", scores)?;
+    dict.set_item("logfoldchanges", logfoldchanges)?;
+    dict.set_item("pvals", pvals)?;
+    dict.set_item("pvals_adj", pvals_adj)?;
+
+    let column_order: &[&str] = if multi {
+        &[
+            "group",
+            "names",
+            "scores",
+            "logfoldchanges",
+            "pvals",
+            "pvals_adj",
+        ]
+    } else {
+        &["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]
+    };
+    build_de_dataframe(py, &dict, column_order, output)
+}
+
+/// Differential-expression DataFrame — **two modes**, selected by which kwarg
+/// you pass.
 ///
-/// This is the format bridge between SCX's Wilcoxon DE and cell-eval's DE
-/// metric pipeline. The returned DataFrame can be fed directly into
-/// `cell_eval.data.DEResults` or `cell_eval.data.DEComparison`. The polars
-/// DataFrame carries no metadata; the accelerator execution route is recorded
-/// on `adata.uns["scx_accel"]["rank_genes_groups_df"]` instead.
-///
-/// Output columns:
+/// **Compute (`groupby=`)** — re-runs Wilcoxon rank-sum DE and returns a polars
+/// (or pandas) DataFrame in cell-eval's `DEResults` format. This is the format
+/// bridge between SCX's Wilcoxon DE and cell-eval's DE metric pipeline; the
+/// frame can be fed directly into `cell_eval.data.DEResults` /
+/// `cell_eval.data.DEComparison`. The accelerator execution route is recorded
+/// on `adata.uns["scx_accel"]["rank_genes_groups_df"]`. Columns:
 ///   - `target` (str): perturbation/group name
 ///   - `feature` (str): gene name
 ///   - `fold_change` (f64): linear fold change (2^log2FC)
@@ -1023,33 +1171,48 @@ fn de_result_to_cell_eval_dataframe<'py>(
 ///   - `log2_fold_change` (f64): log2 fold change
 ///   - `abs_log2_fold_change` (f64): |log2FC|
 ///
+/// **Extract (`group=`)** — the scanpy `sc.get.rank_genes_groups_df` alias: does
+/// **not** recompute; reads the precomputed `adata.uns[key]` (written by
+/// `pyscx.accel.rank_genes_groups`) and returns scanpy's native columns
+/// (`names, scores, logfoldchanges, pvals, pvals_adj`), with a leading `group`
+/// column when `group` is a list. Optional scanpy filters `pval_cutoff` /
+/// `log2fc_min` / `log2fc_max` apply. (`gene_symbols=` var-name remapping is not
+/// supported yet.) Pass either `groupby=` or `group=`, not both. To extract
+/// **all** groups, pass the list of names
+/// (`group=list(adata.uns[key]["names"].dtype.names)`); `group=None` routes to
+/// the compute path.
+///
 /// Args:
 ///     adata: AnnData object with X and obs[groupby]
-///     groupby: Column in adata.obs to group cells by
-///     reference: Group name to compare against (default: "rest" = 1-vs-rest)
-///     n_genes: Number of top genes to report per group (default: all genes)
-///     gene_chunk_size: Genes per chunk for streaming DE (default: None, which
-///         uses 500 internally for sparse/backed inputs)
+///     groupby: obs column to group cells by (compute mode)
+///     reference: Group to compare against (default: "rest" = 1-vs-rest)
+///     n_genes: Number of top genes per group (default: all genes). In extract
+///         mode this is a pyscx extension (scanpy's extractor has no `n_genes`):
+///         it truncates to top-N *before* the `pval_cutoff` / `log2fc_*` filters.
+///     gene_chunk_size: Genes per chunk for streaming DE (default: None → 500
+///         internally for sparse/backed inputs)
 ///     rankby_abs: Sort genes by |score| instead of signed score (default: False)
 ///     tie_correct: Apply tie correction in the Wilcoxon test (default: False)
-///     output: Return type — `"polars"` (default) or `"pandas"`. The columns are
-///         identical either way; `"pandas"` builds a pandas DataFrame directly and
-///         does not require polars. (A polars result also supports `.to_pandas()`.)
-///         The cell-eval columns map to scanpy's `rank_genes_groups_df` roughly as
-///         `feature→names`, `log2_fold_change→logfoldchanges`, `p_value→pvals`,
-///         `fdr→pvals_adj`, `target→group`.
+///     output: `"polars"` (default) or `"pandas"`. Identical columns either way;
+///         `"pandas"` does not require polars.
+///     device: compute-mode only; ignored in extract (`group=`) mode.
+///     group: extraction mode — a group name (str) or list of names to pull from
+///         `adata.uns[key]`.
+///     key: uns key to extract from (default: `"rank_genes_groups"`).
+///     pval_cutoff / log2fc_min / log2fc_max: scanpy-style row filters (extraction
+///         mode only): keep rows with `pvals_adj < pval_cutoff`,
+///         `logfoldchanges > log2fc_min`, `logfoldchanges < log2fc_max`.
 ///
 /// Example:
-///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")
-///     # de_df is a polars DataFrame with cell-eval columns
-///     pdf = pyscx.accel.rank_genes_groups_df(adata, "perturbation", output="pandas")
+///     de_df = pyscx.accel.rank_genes_groups_df(adata, "perturbation")  # compute
+///     ex = pyscx.accel.rank_genes_groups_df(adata, group="0")          # extract (scanpy-style)
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto", output="polars"))]
+#[pyo3(signature = (adata, groupby=None, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=false, tie_correct=false, device="auto", output="polars", *, group=None, key="rank_genes_groups", pval_cutoff=None, log2fc_min=None, log2fc_max=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups_df(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
-    groupby: &str,
+    groupby: Option<&str>,
     reference: &str,
     n_genes: Option<usize>,
     gene_chunk_size: Option<usize>,
@@ -1057,12 +1220,49 @@ pub fn rank_genes_groups_df(
     tie_correct: bool,
     device: &str,
     output: &str,
+    group: Option<&Bound<'_, PyAny>>,
+    key: &str,
+    pval_cutoff: Option<f64>,
+    log2fc_min: Option<f64>,
+    log2fc_max: Option<f64>,
 ) -> PyResult<Py<PyAny>> {
     if !matches!(output, "polars" | "pandas") {
         return Err(PyValueError::new_err(format!(
             "Invalid output={output:?}; expected 'polars' or 'pandas'"
         )));
     }
+
+    // Extraction mode (scanpy `sc.get.rank_genes_groups_df` alias): when
+    // `group=` is given, read precomputed results from `adata.uns[key]` instead
+    // of recomputing. Mutually exclusive with the compute path's `groupby=`.
+    if let Some(group) = group {
+        if groupby.is_some() {
+            return Err(PyValueError::new_err(
+                "pass either groupby= (compute DE) or group= (extract precomputed \
+                 adata.uns[...]), not both",
+            ));
+        }
+        let df = extract_rank_genes_groups_df(
+            py,
+            adata,
+            group,
+            key,
+            n_genes,
+            pval_cutoff,
+            log2fc_min,
+            log2fc_max,
+            output,
+        )?;
+        return Ok(df.unbind());
+    }
+
+    let groupby = groupby.ok_or_else(|| {
+        PyValueError::new_err(
+            "rank_genes_groups_df needs groupby= (to compute DE) or group= (to extract \
+             precomputed adata.uns[\"rank_genes_groups\"]); got neither",
+        )
+    })?;
+
     let resolved = super::gpu::resolve_device(device)?;
     #[cfg(feature = "gpu")]
     let gpu_device_id = resolved.gpu_id();
