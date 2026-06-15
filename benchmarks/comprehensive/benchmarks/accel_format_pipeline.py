@@ -199,8 +199,15 @@ def _run_rapids_pipeline(adata: Any, n_comps: int, n_neighbors: int, seed: int) 
         adata = adata[:, adata.var["highly_variable"].values].copy()
     except Exception:
         # seurat_v3 can reject lognorm input on some versions — fall back to the
-        # default flavor (same fallback as `load_preprocessed`).
-        rsc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
+        # default flavor (same fallback as `load_preprocessed`). Guard `subset`
+        # for the same older-rapids case as the seurat_v3 branch above, so the
+        # two fallbacks are symmetric (a `subset`-less rapids won't re-raise an
+        # uncaught TypeError here).
+        try:
+            rsc.pp.highly_variable_genes(adata, n_top_genes=n_top, subset=True)
+        except TypeError:
+            rsc.pp.highly_variable_genes(adata, n_top_genes=n_top)
+            adata = adata[:, adata.var["highly_variable"].values].copy()
 
     n_comps_eff = min(n_comps, adata.n_vars - 1, adata.n_obs - 1)
     rsc.pp.pca(adata, n_comps=n_comps_eff, random_state=seed)
@@ -291,7 +298,23 @@ def run(
                 )
                 return None
         elif key == _SCX_AUTO_KEY:
-            scx_path = _prepare_scx_auto(dataset, tmpdir)
+            # The scx_auto prep does a full h5ad read + `pyscx.from_anndata`
+            # conversion before the guarded warmup/timed block, so a
+            # missing-source / conversion / OOM error here would escape the
+            # worker (failed array task / missing JSON). Mirror the devdecode
+            # guard: turn any prep failure into a typed skip stub.
+            try:
+                scx_path = _prepare_scx_auto(dataset, tmpdir)
+            except Exception as exc:  # noqa: BLE001 — convert any prep failure to a skip
+                logger.warning("scx_auto fixture prep failed for %s: %s", dataset.name, exc)
+                write_missing_result(
+                    benchmark="accel_format_pipeline",
+                    format_key=key,
+                    dataset=dataset.name,
+                    missing_reason="fixture_prep_failed",
+                    notes=f"scx_auto conversion failed: {type(exc).__name__}: {exc}",
+                )
+                return None
 
         def _load() -> tuple[Any, dict[str, Any]]:
             if key == _H5AD_KEY:

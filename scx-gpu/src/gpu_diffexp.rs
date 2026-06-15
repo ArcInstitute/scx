@@ -27,6 +27,8 @@
 //! sizes internally. Tested on census-scale fixtures (n_pool ≈ 1M) where the
 //! multi-tile path engages ~7 merge passes per chunk.
 
+use std::sync::OnceLock;
+
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
@@ -922,7 +924,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
 
     // Test-only escape hatch to exercise the global-atomic path on a small
     // fixture regardless of `n_groups`.
-    let force_atomic = std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some();
+    let force_atomic = gpu_de_force_atomic_pseudobulk();
     let smem_bx = if force_atomic {
         None
     } else {
@@ -1761,11 +1763,28 @@ pub const GPU_DE_MIN_GENE_CHUNK: usize = 32;
 /// `SCX_GPU_DE_MEM_BUDGET_FRAC` env override. Values outside `(0, 0.95)` (or
 /// unparseable) fall back to [`GPU_DE_MEM_BUDGET_FRAC`].
 fn gpu_de_mem_budget_frac() -> f64 {
-    std::env::var("SCX_GPU_DE_MEM_BUDGET_FRAC")
-        .ok()
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|f| *f > 0.0 && *f < 0.95)
-        .unwrap_or(GPU_DE_MEM_BUDGET_FRAC)
+    // Cache the parsed env var: read once per process (it's an environment knob,
+    // not expected to change mid-run) to avoid taking the `std::env` global lock
+    // on the DE hot path.
+    static FRAC: OnceLock<f64> = OnceLock::new();
+    *FRAC.get_or_init(|| {
+        std::env::var("SCX_GPU_DE_MEM_BUDGET_FRAC")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f < 0.95)
+            .unwrap_or(GPU_DE_MEM_BUDGET_FRAC)
+    })
+}
+
+/// Whether the test-only `SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC` override forces the
+/// global-atomic CSC pseudobulk path. Cached on first read (this is called per
+/// shard per chunk on the DE hot path, so a per-call `std::env` lock would be
+/// wasteful). The override must therefore be set **before** the first DE op in
+/// the process; production never sets it, and the parity test selects the atomic
+/// path via `n_groups` rather than this flag.
+fn gpu_de_force_atomic_pseudobulk() -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some())
 }
 
 /// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
@@ -1780,6 +1799,13 @@ fn gpu_de_mem_budget_frac() -> f64 {
 /// - `n_test`     — per-test-group `per_tg_pool_slabs` count and the `u/p/tie`
 ///   f64 staging buffers (×3)
 /// - `n_slots`    — pseudobulk `sums` (f64)
+///
+/// Every term here is genuinely **chunk-linear** — i.e. it is allocated as
+/// `chunk_max × <this>` by the corresponding `GpuDeChunkScratch::ensure_*_capacity`
+/// call (`u/p/tie_per_group` are `[n_test × chunk_max]` via `ensure_per_group_capacity`;
+/// `sums` is `[n_slots × chunk_max]` via `ensure_sums_capacity`; the `+3` covers the
+/// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
+/// so multiplying this whole value by the chunk size is correct, not an over-count.
 pub fn gpu_de_per_gene_scratch_bytes(
     n_pool_max: usize,
     n_ref: usize,

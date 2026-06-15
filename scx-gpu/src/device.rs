@@ -268,6 +268,14 @@ impl GpuDevice {
     /// currently in use**, so live allocations (e.g. a `to_gpu_anndata` handoff
     /// cuPy still references) are untouched. No-op when the device has no async
     /// memory pool.
+    ///
+    /// Invoked from [`Drop`], i.e. once per `GpuDevice` lifetime. This assumes
+    /// the established usage pattern — **one `GpuDevice` per accelerator op**,
+    /// never cached across many small ops — so the trim runs at op boundaries.
+    /// A caller that holds a `GpuDevice` across a hot loop of tiny ops would
+    /// instead pay a full device `synchronize()` + lose the async pool's
+    /// allocation caching on every drop; cache the matrices/handles, not the
+    /// device, in that case.
     pub fn reclaim_memory_pool(&self) -> Result<(), GpuError> {
         if !self.ctx.has_async_alloc() {
             return Ok(());

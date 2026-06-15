@@ -11,7 +11,7 @@ Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, Tuple, TypedDict
 
 import numpy as np
@@ -64,7 +64,7 @@ class IndexPlanDataset:
         self,
         path: str,
         *,
-        hvg_indices: np.ndarray | None = None,
+        hvg_indices: Sequence[int] | np.ndarray | None = None,
         obs_columns: list[str] | None = None,
         normalize: bool | None = None,
         log1p: bool | None = None,
@@ -150,7 +150,7 @@ class TrainingDataset:
         self,
         path: str,
         batch_size: int | None = None,
-        hvg_indices: np.ndarray | None = None,
+        hvg_indices: Sequence[int] | np.ndarray | None = None,
         obs_columns: list[str] | None = None,
         normalize: bool | None = None,  # default True — see class docstring
         log1p: bool | None = None,  # default True — see class docstring

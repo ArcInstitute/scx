@@ -14,6 +14,14 @@ use extendr_api::prelude::*;
 /// a plain `Robj` and route through this helper, which calls `Rf_error` via
 /// `throw_r_error` so R sees a normal `stop()` carrying the actual message.
 /// See B3 / B7 in the 2026-06-15 user report.
+///
+/// **Call only at the top `#[extendr]` boundary** (directly in the wrapped
+/// method body, as the returned value). On the error path `throw_r_error`
+/// invokes `Rf_error`, which `longjmp`s out to R's nearest context — skipping
+/// every Rust destructor between here and the `.Call` entry. Invoking it deeper
+/// in the stack (with live `CudaSlice`s, file handles, `Box`es, or other RAII
+/// guards on the frames it jumps over) would leak or corrupt them. Keep the
+/// fallible work in a `-> Result` inner fn and only pass its result here.
 pub(crate) fn throw_on_err<T: Into<Robj>>(r: Result<T>) -> Robj {
     match r {
         Ok(v) => v.into(),
