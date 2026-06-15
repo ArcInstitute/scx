@@ -407,3 +407,60 @@ fn test_cli_validate_verbose() {
     assert!(stdout.contains("expected:"));
     assert!(stdout.contains("computed:"));
 }
+
+/// `scx info` on an exploded `.scxd/` directory produces the same report as
+/// on the packed file, except the (legitimately different) File-size and
+/// Orphaned-bytes lines. Exercises the B1 cloud/exploded info path end-to-end
+/// through the binary (explode → info <dir>).
+#[cfg(feature = "cloud")]
+#[test]
+fn test_cli_info_on_exploded_directory_matches_packed() {
+    let dir = tempfile::tempdir().unwrap();
+    let packed = write_test_file(&dir, "exp_info.scx", 6, 10, 2, true);
+    let exploded = dir.path().join("exp_info.scxd");
+
+    // Explode via the binary.
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
+        .args([
+            "explode",
+            packed.to_str().unwrap(),
+            exploded.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run scx-cli explode");
+    assert!(status.success(), "explode failed");
+
+    let run_info = |target: &str| -> String {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_scx"))
+            .args(["info", target])
+            .output()
+            .expect("failed to run scx-cli info");
+        assert!(
+            output.status.success(),
+            "info failed on {target}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // Lines that legitimately differ between packed and exploded inputs.
+    let is_volatile =
+        |line: &str| line.starts_with("File size:") || line.starts_with("Orphaned bytes:");
+    let normalize = |s: String| -> Vec<String> {
+        s.lines()
+            .filter(|l| !is_volatile(l))
+            .map(|l| l.to_string())
+            .collect()
+    };
+
+    let packed_out = normalize(run_info(packed.to_str().unwrap()));
+    let exploded_out = normalize(run_info(exploded.to_str().unwrap()));
+    assert_eq!(
+        packed_out, exploded_out,
+        "exploded `scx info` must match packed output (modulo file-size/orphaned lines)"
+    );
+
+    // The exploded report must still carry the substantive content.
+    assert!(exploded_out.iter().any(|l| l.contains("cells x")));
+    assert!(exploded_out.iter().any(|l| l.starts_with("Sections:")));
+}

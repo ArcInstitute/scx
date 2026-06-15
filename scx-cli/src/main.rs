@@ -6,6 +6,7 @@ use std::process;
 mod append;
 mod benchmark;
 mod cli_utils;
+mod cloud_url;
 mod compact;
 mod index_warnings;
 use scx_convert as convert;
@@ -185,12 +186,12 @@ enum Commands {
     },
     /// Display SCX file information
     Info {
-        /// SCX file to inspect
-        file: PathBuf,
+        /// SCX file, exploded `.scxd/` directory, or cloud URL (gs://, s3://, …) to inspect
+        source: String,
         /// Output all info as JSON
         #[arg(long)]
         json: bool,
-        /// Show manifest version history
+        /// Show manifest version history (local packed files only)
         #[arg(long)]
         history: bool,
     },
@@ -783,10 +784,10 @@ fn main() {
             )
         }
         Commands::Info {
-            file,
+            source,
             json,
             history,
-        } => info::run_info(&file, json, history),
+        } => info::run_info(&source, json, history),
         Commands::Validate {
             file,
             verbose,

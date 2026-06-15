@@ -1427,6 +1427,12 @@ impl ScxWriter {
             )?;
         }
 
+        // Per-modality bookkeeping: mirror `write_csr_shard_for` /
+        // `write_csc_shard_for` so the modality table `finish()` emits carries
+        // non-zero `nnz`/`n_csr_shards`/`n_csc_shards`/`has_csc`. No-op outside
+        // a `with_modality` scope (single-modality files). See
+        // `record_modality_shard`.
+        self.record_modality_shard(section.section_type, section.nnz);
         match section.section_type {
             SectionType::CsrShard => {
                 self.csr_shard_count += 1;
@@ -1513,6 +1519,8 @@ impl ScxWriter {
             stats: src_entry.stats.clone(),
         });
 
+        // Per-modality bookkeeping — see `write_preencoded_shard`.
+        self.record_modality_shard(src_entry.section_type, nnz);
         match src_entry.section_type {
             SectionType::CsrShard => {
                 self.csr_shard_count += 1;
@@ -1699,6 +1707,38 @@ impl ScxWriter {
                 ScxError::InvalidCatalog(format!("modality_id {modality_id} not registered"))
             })?;
         Ok(format!("var/{mname}"))
+    }
+
+    /// Accumulate per-modality shard stats on the registered `ModalityInfo`
+    /// for the current `with_modality` scope, flushed to the modality table at
+    /// `finish()`. No-op when `current_modality_id == 0` (outside any
+    /// `with_modality` scope — i.e. single-modality files, which carry no
+    /// modality table); the `> 0` guard also avoids the `0 - 1` index
+    /// underflow. CSC bumps the `has_csc` flag but not `nnz` (CSC mirrors the
+    /// same entries as CSR — adding would double-count). Used by the
+    /// pre-encoded (`write_preencoded_shard`) and verbatim-copy
+    /// (`copy_section_verbatim`) paths, which only ever carry CSR/CSC shards;
+    /// other section types are ignored.
+    fn record_modality_shard(&mut self, section_type: SectionType, nnz: u64) {
+        if self.current_modality_id == 0 {
+            return;
+        }
+        if let Some(info) = self
+            .modalities
+            .get_mut((self.current_modality_id - 1) as usize)
+        {
+            match section_type {
+                SectionType::CsrShard => {
+                    info.n_csr_shards += 1;
+                    info.nnz += nnz;
+                }
+                SectionType::CscShard => {
+                    info.n_csc_shards += 1;
+                    info.flags.set_csc();
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Per-modality `write_csr_shard`. Section names are

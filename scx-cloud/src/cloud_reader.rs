@@ -411,6 +411,169 @@ impl CloudReader {
             .map_err(CloudError::from)?;
         Ok(Some(dv))
     }
+
+    /// Whether the source is an exploded `.scxd/` directory (each section a
+    /// separate object) rather than a packed `.scx` file. `scx info` uses
+    /// this to report live-bytes (not a single file size) and to suppress the
+    /// "Orphaned bytes" line, which is meaningless for an exploded directory.
+    pub fn is_exploded(&self) -> bool {
+        matches!(self.layout, ReaderLayout::Exploded(_))
+    }
+
+    /// Total byte footprint of the source.
+    ///
+    /// Packed: the object size via a single `HEAD`. Exploded: the summed live
+    /// bytes (`SECTIONS_START_OFFSET` + full-catalog length + Σ section
+    /// lengths), since there is no single file to stat — this matches the
+    /// "live" region `scx info` uses for its orphaned-bytes accounting.
+    pub async fn object_size(&self) -> Result<u64> {
+        match &self.layout {
+            ReaderLayout::Packed(file_path) => {
+                let meta = self
+                    .backend
+                    .head(file_path)
+                    .await
+                    .map_err(|e| CloudError::from_store_error(e, file_path))?;
+                Ok(meta.size)
+            }
+            ReaderLayout::Exploded(_) => {
+                let section_bytes: u64 = self.catalog.entries.iter().map(|e| e.length).sum();
+                Ok(scx_format_io::SECTIONS_START_OFFSET
+                    + self.header.full_catalog_length
+                    + section_bytes)
+            }
+        }
+    }
+
+    /// The parsed modality table, if the file is multimodal.
+    ///
+    /// `None` when `n_modalities == 0`. Reads the `ModalityTable` section
+    /// (catalog-entry driven, so it works for both packed and exploded
+    /// layouts) and parses it identically to the local `ScxReader` path.
+    pub async fn modality_table(&self) -> Result<Option<scx_format_io::modality::ModalityTable>> {
+        if self.header.n_modalities == 0 {
+            return Ok(None);
+        }
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::ModalityTable)
+            .cloned();
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let bytes = self.read_section_for_entry(&entry).await?;
+        let table = scx_format_io::modality::ModalityTable::read_from(
+            &mut Cursor::new(&bytes),
+            bytes.len(),
+        )
+        .map_err(CloudError::from)?;
+        Ok(Some(table))
+    }
+
+    /// Provenance operations, if present.
+    pub async fn read_provenance(&self) -> Result<Option<scx_format_io::Provenance>> {
+        let entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::Provenance)
+            .cloned();
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let bytes = self.read_section_for_entry(&entry).await?;
+        let prov = scx_format_io::Provenance::read_from(&mut Cursor::new(&bytes), bytes.len())
+            .map_err(CloudError::from)?;
+        Ok(Some(prov))
+    }
+
+    /// Distinct codec ids and value encodings across **all** CSR shards,
+    /// each sorted ascending. Mirrors the local
+    /// `distinct_sorted_shard_field` summary `scx info` prints, but range-reads
+    /// only each shard's 76-byte header over the network (in parallel). Empty
+    /// vecs when there are no CSR shards.
+    pub async fn csr_shard_field_summaries(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let shards: Vec<FullCatalogEntry> = self
+            .catalog
+            .shards(SectionType::CsrShard)
+            .into_iter()
+            .cloned()
+            .collect();
+        if shards.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let headers: Vec<(u8, u8)> = futures::stream::iter(shards.into_iter().map(|entry| {
+            let this = &self;
+            async move {
+                let hdr = this.read_shard_header(&entry).await?;
+                Ok::<(u8, u8), CloudError>((hdr.codec_id, hdr.value_encoding))
+            }
+        }))
+        .buffer_unordered(METADATA_SHARD_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+        let mut codecs: Vec<u8> = headers.iter().map(|(c, _)| *c).collect();
+        let mut encs: Vec<u8> = headers.iter().map(|(_, e)| *e).collect();
+        codecs.sort_unstable();
+        codecs.dedup();
+        encs.sort_unstable();
+        encs.dedup();
+        Ok((codecs, encs))
+    }
+
+    /// Range-read and parse a single shard's 76-byte header.
+    async fn read_shard_header(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<scx_format_io::shard::ShardHeader> {
+        use scx_format_io::shard::SHARD_HEADER_SIZE;
+        let len = SHARD_HEADER_SIZE as u64;
+        let bytes = match &self.layout {
+            ReaderLayout::Exploded(location) => {
+                let make_path = crate::pull::build_path_fn(location);
+                let rel_path =
+                    section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
+                        CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    })?;
+                let obj_path = make_path(&rel_path);
+                crate::pull::get_range_with_retry(self.backend.as_ref(), &obj_path, 0..len).await?
+            }
+            ReaderLayout::Packed(file_path) => {
+                let end = entry.offset.checked_add(len).ok_or_else(|| {
+                    CloudError::CatalogOffsetOverflow {
+                        name: entry.name.clone(),
+                        offset: entry.offset,
+                        length: entry.length,
+                    }
+                })?;
+                crate::pull::get_range_with_retry(
+                    self.backend.as_ref(),
+                    file_path,
+                    entry.offset..end,
+                )
+                .await?
+            }
+        };
+        if (bytes.len() as u64) < len {
+            return Err(CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "shard '{}' header truncated: got {} bytes, need {}",
+                    entry.name,
+                    bytes.len(),
+                    SHARD_HEADER_SIZE
+                ),
+            )));
+        }
+        scx_format_io::shard::ShardHeader::read_from(&mut Cursor::new(&bytes))
+            .map_err(CloudError::from)
+    }
 }
 
 /// Decode just the schema from an Arrow IPC file's footer.
@@ -794,6 +957,217 @@ mod tests {
             Err(CloudError::CatalogNotFound(_)) => {}
             Err(other) => panic!("expected CatalogNotFound, got {other:?}"),
             Ok(_) => panic!("expected CatalogNotFound, got Ok"),
+        }
+    }
+
+    /// Write a two-modality (rna + adt) file so the modality-table cloud path
+    /// has something to parse, with distinct per-modality shard counts/nnz.
+    fn write_multimodal_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use scx_format_io::modality::ModalityType;
+        let path = dir.path().join("multimodal.scx");
+        let header = sample_header(20, 50);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(20)).unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let adt_id = writer
+            .add_modality(
+                "adt",
+                ModalityType::Protein,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &sample_var(50)).unwrap();
+        writer.write_var_for(adt_id, &sample_var(50)).unwrap();
+        writer.set_modality_n_vars(rna_id, 50).unwrap();
+        writer.set_modality_n_vars(adt_id, 50).unwrap();
+
+        let (indptr, indices, values) = sample_shard_data(20, 50);
+        writer
+            .write_csr_shard_for(
+                rna_id,
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let (indptr2, indices2, values2) = sample_shard_data(10, 50);
+        writer
+            .write_csr_shard_for(
+                adt_id,
+                &indptr2,
+                &indices2,
+                &values2,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn object_size_packed_matches_file_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50);
+        let expected = std::fs::metadata(&input).unwrap().len();
+
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+        assert!(!reader.is_exploded());
+        assert_eq!(reader.object_size().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn object_size_exploded_reports_live_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50);
+        let exploded = dir.path().join("test.scxd");
+        crate::explode::explode(&input, &exploded).unwrap();
+
+        let reader = open_cloud(&exploded.to_string_lossy()).await.unwrap();
+        assert!(reader.is_exploded());
+        let section_bytes: u64 = reader.catalog().entries.iter().map(|e| e.length).sum();
+        let expected = scx_format_io::SECTIONS_START_OFFSET
+            + reader.header().full_catalog_length
+            + section_bytes;
+        assert_eq!(reader.object_size().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn csr_shard_summaries_match_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50); // 2 shards, None/Uint8
+        let exploded = dir.path().join("test.scxd");
+        crate::explode::explode(&input, &exploded).unwrap();
+
+        for src in [
+            input.to_string_lossy().to_string(),
+            exploded.to_string_lossy().to_string(),
+        ] {
+            let reader = open_cloud(&src).await.unwrap();
+            let (codecs, encs) = reader.csr_shard_field_summaries().await.unwrap();
+            assert_eq!(codecs, vec![CodecId::None as u8], "codecs for {src}");
+            assert_eq!(
+                encs,
+                vec![ValueEncoding::Uint8 as u8],
+                "encodings for {src}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modality_table_matches_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_multimodal_file(&dir);
+        let local = scx_format_io::ScxReader::open(&input).unwrap();
+        let local_table = local.modality_table().expect("local modality table");
+
+        let exploded = dir.path().join("multimodal.scxd");
+        crate::explode::explode(&input, &exploded).unwrap();
+
+        for src in [
+            input.to_string_lossy().to_string(),
+            exploded.to_string_lossy().to_string(),
+        ] {
+            let reader = open_cloud(&src).await.unwrap();
+            let table = reader
+                .modality_table()
+                .await
+                .unwrap()
+                .expect("cloud modality table");
+            assert_eq!(table.entries.len(), 2, "src {src}");
+            for (got, want) in table.entries.iter().zip(local_table.entries.iter()) {
+                assert_eq!(got.name, want.name, "src {src}");
+                assert_eq!(got.nnz, want.nnz, "nnz for {} ({src})", got.name);
+                assert_eq!(
+                    got.n_csr_shards, want.n_csr_shards,
+                    "csr for {} ({src})",
+                    got.name
+                );
+                assert!(got.nnz > 0, "modality {} nnz should be populated", got.name);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_modality_file_has_no_modality_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 100, 50);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+        assert!(reader.modality_table().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_provenance_matches_local() {
+        use scx_format_io::provenance::ProvenanceEntry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prov.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(6, 5)).unwrap();
+        writer.write_obs(&sample_obs(6)).unwrap();
+        writer.write_var(&sample_var(5)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(6, 5);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer
+            .write_provenance(vec![ProvenanceEntry {
+                timestamp: 1_710_000_000,
+                action: "convert".to_string(),
+                tool: "scx-test".to_string(),
+                params_json: "{}".to_string(),
+                input_checksums: vec![],
+            }])
+            .unwrap();
+        writer.finish().unwrap();
+
+        let local = scx_format_io::ScxReader::open(&path).unwrap();
+        let local_prov = local.read_provenance().unwrap();
+
+        let exploded = dir.path().join("prov.scxd");
+        crate::explode::explode(&path, &exploded).unwrap();
+
+        for src in [
+            path.to_string_lossy().to_string(),
+            exploded.to_string_lossy().to_string(),
+        ] {
+            let reader = open_cloud(&src).await.unwrap();
+            let prov = reader
+                .read_provenance()
+                .await
+                .unwrap()
+                .expect("cloud provenance present");
+            assert_eq!(
+                prov.operations.len(),
+                local_prov.operations.len(),
+                "src {src}"
+            );
+            assert_eq!(prov.operations[0].action, "convert", "src {src}");
+            assert_eq!(
+                prov.operations[0].tool, local_prov.operations[0].tool,
+                "src {src}"
+            );
         }
     }
 
