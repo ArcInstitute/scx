@@ -2480,3 +2480,131 @@ fn preencoded_csc_shard_increments_csc_count() {
         "header has_csc flag should be set after writing a CSC shard"
     );
 }
+
+/// B4 regression: per-modality `nnz` / `n_csr_shards` must accumulate on the
+/// modality table when CSR shards are written via the parallel
+/// (`write_preencoded_shard`) and byte-passthrough (`copy_section_verbatim`)
+/// paths inside a `with_modality` scope — these are the paths the streaming
+/// h5mu convert / SCX→SCX rewrite use. Before the fix the modality table
+/// reported `nnz 0` / `csr 0` for every modality even though the file totals
+/// were correct.
+#[test]
+fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
+    use crate::reader::ScxReader;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // --- Build a source single-modality file to copy a shard from verbatim ---
+    let src_path = dir.path().join("source.scx");
+    let mut src_header = sample_header();
+    src_header.n_obs = 3;
+    src_header.n_vars = 50;
+    src_header.nnz = 0;
+    let mut src_writer = ScxWriter::new(&src_path, src_header).unwrap();
+    src_writer.write_obs(&sample_obs()).unwrap();
+    src_writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    let src_nnz = *indptr.last().unwrap();
+    src_writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let src_final = src_writer.finish().unwrap();
+    let src_reader = ScxReader::open(&src_final).unwrap();
+    let src_entry = src_reader.catalog().shards_sorted()[0].clone();
+    let src_bytes = src_reader
+        .read_raw_shard_bytes(&src_entry)
+        .unwrap()
+        .to_vec();
+
+    // --- Build a target multimodal file ---
+    let target_path = dir.path().join("multimodal.scx");
+    let mut writer = ScxWriter::new(&target_path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var()).unwrap();
+    writer.write_var_for(adt_id, &sample_var()).unwrap();
+    writer.set_modality_n_vars(rna_id, 50).unwrap();
+    writer.set_modality_n_vars(adt_id, 50).unwrap();
+
+    // rna: parallel/pre-encoded path.
+    let f32_vals: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+    let pre = crate::encoder::encode_one_shard(
+        &indptr,
+        &indices,
+        &f32_vals,
+        Some(CodecId::None),
+        0,
+        50,
+        0,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X/rna/shard_0".to_string(),
+    )
+    .unwrap();
+    let pre_nnz = pre.nnz;
+    writer
+        .with_modality::<_, _, ScxError>(rna_id, |w| w.write_preencoded_shard(pre))
+        .unwrap();
+
+    // adt: byte-passthrough / verbatim copy path.
+    writer
+        .with_modality::<_, _, ScxError>(adt_id, |w| {
+            w.copy_section_verbatim(&src_entry, &src_bytes)
+        })
+        .unwrap();
+
+    let final_path = writer.finish().unwrap();
+
+    // --- Verify per-modality stats are populated (not zero) ---
+    let reader = ScxReader::open(&final_path).unwrap();
+    let rna_info = reader.modality_info(rna_id).unwrap();
+    assert_eq!(rna_info.name, "rna");
+    assert_eq!(
+        rna_info.n_csr_shards, 1,
+        "rna preencoded CSR shard must count toward n_csr_shards"
+    );
+    assert_eq!(
+        rna_info.nnz, pre_nnz,
+        "rna per-modality nnz must equal the preencoded shard nnz"
+    );
+
+    let adt_info = reader.modality_info(adt_id).unwrap();
+    assert_eq!(adt_info.name, "adt");
+    assert_eq!(
+        adt_info.n_csr_shards, 1,
+        "adt verbatim-copied CSR shard must count toward n_csr_shards"
+    );
+    assert_eq!(
+        adt_info.nnz, src_nnz,
+        "adt per-modality nnz must equal the copied shard nnz"
+    );
+
+    // Per-modality totals reconcile with the file-level total.
+    assert_eq!(rna_info.nnz + adt_info.nnz, reader.header().nnz);
+    assert_eq!(pre_nnz, src_nnz, "both shards carry the same sample nnz");
+}

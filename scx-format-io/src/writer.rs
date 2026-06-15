@@ -1431,6 +1431,21 @@ impl ScxWriter {
             SectionType::CsrShard => {
                 self.csr_shard_count += 1;
                 self.total_nnz += section.nnz;
+                // Mirror `write_csr_shard_for`'s per-modality bookkeeping so
+                // the modality table `finish()` emits carries non-zero
+                // `nnz`/`n_csr_shards`. The multimodal convert path wraps
+                // these writes in `with_modality`, so `current_modality_id`
+                // names the owning modality (0 ⇒ single-modality file with
+                // no modality table — skip to avoid the `0 - 1` underflow).
+                if self.current_modality_id > 0 {
+                    if let Some(info) = self
+                        .modalities
+                        .get_mut((self.current_modality_id - 1) as usize)
+                    {
+                        info.n_csr_shards += 1;
+                        info.nnz += section.nnz;
+                    }
+                }
             }
             SectionType::CscShard => {
                 // CSC shards count toward `n_csc_shards` so that
@@ -1443,6 +1458,15 @@ impl ScxWriter {
                 // Don't add to total_nnz: CSC shards mirror the same
                 // values as CSR shards (different layout, same
                 // entries). Adding here would double-count nnz.
+                if self.current_modality_id > 0 {
+                    if let Some(info) = self
+                        .modalities
+                        .get_mut((self.current_modality_id - 1) as usize)
+                    {
+                        info.n_csc_shards += 1;
+                        info.flags.set_csc();
+                    }
+                }
             }
             // `RawCsrShard` (and metadata sections) deliberately bump no
             // counter: raw must not perturb the main matrix's
@@ -1517,11 +1541,30 @@ impl ScxWriter {
             SectionType::CsrShard => {
                 self.csr_shard_count += 1;
                 self.total_nnz += nnz;
+                // Per-modality bookkeeping — see `write_preencoded_shard`.
+                if self.current_modality_id > 0 {
+                    if let Some(info) = self
+                        .modalities
+                        .get_mut((self.current_modality_id - 1) as usize)
+                    {
+                        info.n_csr_shards += 1;
+                        info.nnz += nnz;
+                    }
+                }
             }
             SectionType::CscShard => {
                 self.csc_shard_count += 1;
                 // Don't double-count nnz — CSC mirrors CSR (see
                 // `write_preencoded_shard`).
+                if self.current_modality_id > 0 {
+                    if let Some(info) = self
+                        .modalities
+                        .get_mut((self.current_modality_id - 1) as usize)
+                    {
+                        info.n_csc_shards += 1;
+                        info.flags.set_csc();
+                    }
+                }
             }
             // Raw sections bump no counter here — see the note in
             // `write_preencoded_shard`. A future raw-aware verbatim copy
