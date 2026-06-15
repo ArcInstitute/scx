@@ -918,6 +918,21 @@ fn pdex_ref_gpu_chunked_v3_csr(
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_pos: {e}")))?;
 
     let n_pool_max = n_ref.max(n_g_max).max(1);
+    let n_test = test_groups.len();
+    // Clamp the gene chunk so the whole per-chunk working set — dominated by the
+    // `n_test × chunk × n_g_max` per-target-group pool slabs — fits a budget
+    // fraction of free VRAM. Closes the census-scale OOM (B8): the `chunk_size`
+    // passed in (user-set or auto) ignored the per-target-group term, so a large
+    // `n_test × n_g_max` overflowed VRAM regardless of `gene_chunk_size`.
+    let chunk_size = clamp_chunk_to_de_budget(
+        dev,
+        chunk_size,
+        n_pool_max,
+        n_ref,
+        n_g_max,
+        n_test,
+        n_groups_for_means,
+    )?;
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
@@ -932,7 +947,6 @@ fn pdex_ref_gpu_chunked_v3_csr(
     scratch
         .ensure_aux_capacity(dev, chunk_size * n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
-    let n_test = test_groups.len();
     scratch
         .ensure_per_group_capacity(dev, n_test.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_group: {e}")))?;
@@ -1248,6 +1262,19 @@ fn pdex_ref_gpu_chunked_v3_csc(
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 alloc cell_to_pos: {e}")))?;
 
     let n_pool_max = n_ref.max(n_g_max).max(1);
+    let n_test = test_groups.len();
+    // See the CSR driver: clamp the gene chunk so the per-target-group pool
+    // slabs (the dominant `n_test × chunk × n_g_max` allocation) fit a budget
+    // fraction of free VRAM (B8).
+    let chunk_size = clamp_chunk_to_de_budget(
+        dev,
+        chunk_size,
+        n_pool_max,
+        n_ref,
+        n_g_max,
+        n_test,
+        n_groups_for_means,
+    )?;
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
@@ -1262,7 +1289,6 @@ fn pdex_ref_gpu_chunked_v3_csc(
     scratch
         .ensure_aux_capacity(dev, chunk_size * n_pool_max)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure aux: {e}")))?;
-    let n_test = test_groups.len();
     scratch
         .ensure_per_group_capacity(dev, n_test.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 ensure per_group: {e}")))?;
@@ -1686,6 +1712,18 @@ where
         .max()
         .unwrap_or(0);
 
+    // Clamp the gene chunk so the per-target-group pool slabs (the dominant
+    // `n_test × chunk × n_g_max` allocation) fit a budget fraction of free VRAM
+    // (B8). `pool_len` is the ref/pool capacity; `n_slots` sizes the f64 sums.
+    let chunk_size = clamp_chunk_to_de_budget(
+        dev,
+        chunk_size,
+        pool_len.max(1),
+        pool_len.max(1),
+        n_g_max,
+        n_test,
+        n_slots.max(1),
+    )?;
     let mut scratch = scx_gpu::GpuDeChunkScratch::new(dev, n_obs, chunk_size, pool_len.max(1))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE scratch alloc failed: {e}")))?;
     scratch
@@ -2130,6 +2168,43 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
 
 fn open_device(device_id: usize) -> Result<GpuDevice> {
     GpuDevice::new(device_id).map_err(|e| AccelError::LinAlg(format!("GPU init failed: {e}")))
+}
+
+/// Clamp `requested_chunk` so the per-chunk GPU DE working set — dominated by
+/// the per-target-group pool slabs (`n_test × chunk × n_g_max` f32) — fits a
+/// budget fraction of free VRAM. Logs when it clamps; errors with an
+/// actionable, dimension-naming message when even the minimum chunk can't fit,
+/// rather than letting `per_tg_pool_slabs` OOM with a raw CUDA error (B8).
+fn clamp_chunk_to_de_budget(
+    dev: &GpuDevice,
+    requested_chunk: usize,
+    n_pool_max: usize,
+    n_ref: usize,
+    n_g_max: usize,
+    n_test: usize,
+    n_slots: usize,
+) -> Result<usize> {
+    let per_gene =
+        scx_gpu::gpu_de_per_gene_scratch_bytes(n_pool_max, n_ref, n_g_max, n_test, n_slots);
+    let (chunk, fits) = scx_gpu::gpu_de_budget_gene_chunk(dev, requested_chunk, per_gene);
+    if !fits {
+        return Err(AccelError::LinAlg(format!(
+            "GPU DE per-target-group working set exceeds GPU memory even at the \
+             minimum gene chunk ({min}): {n_test} test groups × up to {n_g_max} \
+             cells in the largest group. Subset to highly-variable genes before \
+             GPU DE (the practical fix at census scale), use fewer/coarser \
+             groups, or run device=\"cpu\".",
+            min = scx_gpu::GPU_DE_MIN_GENE_CHUNK,
+        )));
+    }
+    if chunk < requested_chunk {
+        log::warn!(
+            "GPU DE: clamped gene chunk {requested_chunk} → {chunk} to fit the \
+             per-target-group VRAM budget (n_test={n_test}, n_g_max={n_g_max}, \
+             ~{per_gene} B/gene)"
+        );
+    }
+    Ok(chunk)
 }
 
 fn resolve_chunk_size(dev: &GpuDevice, n_obs: usize, user: Option<usize>, n_vars: usize) -> usize {

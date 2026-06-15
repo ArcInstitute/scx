@@ -31,6 +31,42 @@ impl std::fmt::Debug for ScxExperiment {
     }
 }
 
+impl ScxExperiment {
+    /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
+    /// public method can return `Robj` + `throw_on_err`; see B7).
+    fn to_seurat_impl(&self) -> Result<Robj> {
+        if self.reader.is_multimodal() {
+            interop::to_seurat_multimodal(&self.reader)
+        } else {
+            // Reuse the existing single-modality path by
+            // materialising a QueryResult-equivalent in-memory
+            // structure. Read X / obs / var directly.
+            let csr = self
+                .reader
+                .read_all_csr_shards()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let obs = self
+                .reader
+                .read_obs()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let var = self
+                .reader
+                .read_var()
+                .map_err(|e| Error::Other(e.to_string()))?;
+            let result = QueryResult {
+                x: csr,
+                obs,
+                var,
+                skipped_shards: 0,
+                total_shards: 0,
+                candidate_shard_rows: 0,
+                matched_rows: 0,
+            };
+            interop::to_seurat_v5(&result)
+        }
+    }
+}
+
 #[extendr]
 impl ScxExperiment {
     /// Open an SCX file. Returns a lazy handle (no data read yet).
@@ -153,43 +189,23 @@ impl ScxExperiment {
     /// `RQueryResult$to_seurat()` shape). On a multi-modality file,
     /// returns a Seurat v5 object with one assay per modality, all
     /// sharing the global obs as their meta.data.
-    fn to_seurat(&self) -> Result<Robj> {
-        if self.reader.is_multimodal() {
-            interop::to_seurat_multimodal(&self.reader)
-        } else {
-            // Reuse the existing single-modality path by
-            // materialising a QueryResult-equivalent in-memory
-            // structure. Read X / obs / var directly.
-            let csr = self
-                .reader
-                .read_all_csr_shards()
-                .map_err(|e| Error::Other(e.to_string()))?;
-            let obs = self
-                .reader
-                .read_obs()
-                .map_err(|e| Error::Other(e.to_string()))?;
-            let var = self
-                .reader
-                .read_var()
-                .map_err(|e| Error::Other(e.to_string()))?;
-            let result = QueryResult {
-                x: csr,
-                obs,
-                var,
-                skipped_shards: 0,
-                total_shards: 0,
-                candidate_shard_rows: 0,
-                matched_rows: 0,
-            };
-            interop::to_seurat_v5(&result)
-        }
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` on
+    /// failure (e.g. missing `Seurat`) rather than `unwrap()`-panicking in
+    /// extendr 0.8.0, which masks the message behind "User function
+    /// panicked". See B7.
+    fn to_seurat(&self) -> Robj {
+        util::throw_on_err(self.to_seurat_impl())
     }
 
     /// Phase I.2: build a Bioconductor `MultiAssayExperiment` from
     /// this SCX file. Single-modality files raise — use
     /// `RQueryResult$to_sce()` for those.
-    fn to_mae(&self) -> Result<Robj> {
-        interop::to_mae(&self.reader)
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see
+    /// `to_seurat` above and B7).
+    fn to_mae(&self) -> Robj {
+        util::throw_on_err(interop::to_mae(&self.reader))
     }
 }
 

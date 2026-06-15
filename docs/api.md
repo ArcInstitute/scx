@@ -1525,6 +1525,8 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 
 Pure-Python PyTorch Lightning DataModule wrapping `TrainingDataset` for scVI model training. Requires `lightning` or `pytorch_lightning`.
 
+> **scVI needs raw counts.** `normalize`/`log1p` default to `True` (inherited from `TrainingDataset`), so batches are log-normalized by default. scVI and other count-likelihood models require raw integer counts — construct with `ScxDataModule(..., normalize=False, log1p=False)`.
+
 - `ScxDataModule(scx_path, batch_size=1024, hvg_indices=None, normalize=True, log1p=True, target_sum=1e4, seed=42, **kwargs)` — Creates a PyTorch Lightning `LightningDataModule`.
   - `scx_path` — Path to the `.scx` file.
   - `batch_size` — Mini-batch size (default: 1024).
@@ -1553,6 +1555,13 @@ High-throughput sequential streaming dataset. Wraps the triple-buffered
 Rust pipeline (tokio I/O → rayon decode → Python/GPU). Each `for batch in dataset:`
 loop is one epoch; shards are reshuffled between epochs for training randomization.
 
+> **Transforms are ON by default.** `normalize` **and** `log1p` both default to
+> `True`, so batches are total-count normalized (`target_sum=1e4`) and
+> `log1p`-transformed even though the file stores raw counts — the yielded `X` is
+> log-normalized, **not** raw counts. Count-likelihood models (scVI, scANVI,
+> count autoencoders, NB/ZINB decoders) need raw counts: pass
+> `normalize=False, log1p=False`.
+
 **Constructor kwargs**
 
 | Argument | Default | Notes |
@@ -1561,9 +1570,11 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded. |
 | `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch. |
-| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). |
-| `log1p` | `True` | Apply `log1p` after normalize. |
+| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). **On by default** — set `normalize=False` (with `log1p=False`) for raw-count output. |
+| `log1p` | `True` | Apply `log1p` after normalize. **On by default** — set `log1p=False` for raw-count output. |
 | `target_sum` | `1e4` | Normalization target sum. |
+| `pflog1ppf` | `False` | Apply PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026) instead of `normalize`/`log1p`. Mutually exclusive with them — when `True` it takes precedence and those flags are ignored. |
+| `pflog1ppf_c` | `1.0` | PFlog1pPF shift / pseudocount `c`. Only used when `pflog1ppf=True`. |
 | `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
 | `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
 | `seed` | `42` | RNG seed for reproducibility. Deterministic shuffle via `(seed, epoch)`. |

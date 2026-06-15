@@ -103,6 +103,15 @@ class ScxDataModule:
     Wraps ``pyscx.TrainingDataset`` in a PyTorch ``DataLoader`` compatible
     with scVI's training loop.
 
+    .. warning::
+
+        ``normalize`` and ``log1p`` default to ``True`` (inherited from
+        ``TrainingDataset``), so batches are log-normalized by default. **scVI
+        and other count-likelihood models require raw integer counts** — pass
+        ``normalize=False, log1p=False`` so the loader streams raw counts. The
+        on-by-default transforms are kept here only for parity with
+        ``TrainingDataset``; they are *not* the right default for scVI.
+
     Parameters
     ----------
     scx_path : str
@@ -112,9 +121,11 @@ class ScxDataModule:
     hvg_indices : array-like or None
         Gene indices for HVG projection. None = all genes.
     normalize : bool
-        Apply total-count normalization (default True).
+        Apply total-count normalization (default True). Set ``False`` for
+        raw-count output (required by scVI — see the warning above).
     log1p : bool
-        Apply log1p transformation (default True).
+        Apply log1p transformation (default True). Set ``False`` for
+        raw-count output (required by scVI — see the warning above).
     target_sum : float
         Normalization target sum (default 1e4).
     seed : int

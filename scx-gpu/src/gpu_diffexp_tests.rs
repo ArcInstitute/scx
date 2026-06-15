@@ -42,6 +42,74 @@ fn test_default_chunk_size_respects_env() {
     }
 }
 
+#[test]
+fn test_per_gene_scratch_bytes_dominated_by_per_tg_pool() {
+    // The per-target-group pool (n_test × next_pow2(n_g_max) f32) should
+    // dominate the per-gene cost. n_g_max=10_000 → next_pow2 = 16_384.
+    let n_test = 40;
+    let n_g_max = 10_000;
+    let bytes = gpu_de_per_gene_scratch_bytes(
+        /* n_pool_max */ 16_000,
+        /* n_ref */ 16_000,
+        n_g_max,
+        n_test,
+        /* n_slots */ n_test + 1,
+    );
+    // Lower bound: just the per-tg pool term (n_test × 16384 × 4 bytes).
+    let per_tg = n_test * 16_384 * 4;
+    assert!(
+        bytes >= per_tg,
+        "per-gene bytes {bytes} should cover the per-tg pool floor {per_tg}"
+    );
+    // And it must be the dominant term (> half the total).
+    assert!(
+        bytes < 2 * per_tg,
+        "per-tg pool should dominate; got {bytes}"
+    );
+}
+
+#[test]
+fn test_clamp_chunk_for_budget() {
+    // Reproduce the B8 scenario: requested 4000-gene chunk, large per-tg pool,
+    // and a partially-occupied GPU whose free VRAM the full chunk would blow
+    // past (the report OOM'd because the backed reader / shard decode / index
+    // tables already held VRAM, so free ≪ 80 GB).
+    let per_gene = gpu_de_per_gene_scratch_bytes(16_000, 16_000, 10_000, 40, 41);
+    let free = 8 * 1024 * 1024 * 1024usize; // 8 GB free at DE time
+
+    // 4000 × per_gene at frac=0.6 of 8 GB does not fit → clamps below 4000,
+    // but stays well above the floor (fits=true).
+    let (chunk, fits) = clamp_chunk_for_budget(4000, per_gene, free, 0.6);
+    assert!(fits, "should still fit at a reduced chunk with 8 GB free");
+    assert!(
+        chunk < 4000,
+        "expected clamp below requested 4000, got {chunk}"
+    );
+    assert!(
+        chunk >= GPU_DE_MIN_GENE_CHUNK,
+        "clamped chunk {chunk} below the floor"
+    );
+    // The clamped chunk's working set must fit the budget.
+    assert!((chunk * per_gene) as f64 <= free as f64 * 0.6);
+
+    // Ample free VRAM → no clamp, returns the requested chunk unchanged.
+    let big_free = 80 * 1024 * 1024 * 1024usize;
+    let (chunk2, fits2) = clamp_chunk_for_budget(4000, per_gene, big_free, 0.6);
+    assert!(fits2);
+    assert_eq!(chunk2, 4000, "ample VRAM should leave the chunk unclamped");
+
+    // Pathological: per-tg pool so large even the floor chunk can't fit on a
+    // tiny device → fits=false (caller surfaces a clear error).
+    let huge_per_gene = gpu_de_per_gene_scratch_bytes(0, 0, 4_000_000, 200, 201);
+    let small_free = 4 * 1024 * 1024 * 1024usize; // 4 GB
+    let (chunk3, fits3) = clamp_chunk_for_budget(4000, huge_per_gene, small_free, 0.6);
+    assert!(
+        !fits3,
+        "floor chunk should not fit; per_gene={huge_per_gene}"
+    );
+    assert_eq!(chunk3, GPU_DE_MIN_GENE_CHUNK);
+}
+
 fn cpu_sort_ascending(row: &mut [f32]) {
     row.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 }
@@ -681,6 +749,134 @@ fn test_gpu_de_pseudobulk_all_modes() {
                 );
             }
         }
+    }
+}
+
+/// CSC-direct pseudobulk parity across both accumulation paths: the
+/// SMEM-staged kernel (small `n_groups`) and the global-atomic kernel
+/// (`n_groups` past the SMEM ceiling, ~900 on H100 — naturally selected, no env
+/// override). Both must match a host f64 reference for all 4 mode transforms.
+#[test]
+fn test_gpu_de_csc_pseudobulk_smem_and_atomic_parity() {
+    let dev = require_gpu!();
+
+    // Deterministic synthetic CSC over `n_obs` cells × `n_cols` genes, with a
+    // cell→group map (some cells mapped to -1 to exercise the skip). Returns
+    // GPU sums for `mode_id`, validated against a host reference inside.
+    let run = |n_obs: usize, n_cols: usize, n_groups: usize, mode_id: i32| {
+        // cell → group: balanced round-robin; every 7th cell is unassigned (-1).
+        let cell_to_group: Vec<i32> = (0..n_obs)
+            .map(|c| {
+                if c % 7 == 0 {
+                    -1
+                } else {
+                    (c % n_groups) as i32
+                }
+            })
+            .collect();
+
+        // Column-major CSC: cell c is nonzero in gene g iff (c + g) % 3 == 0.
+        let mut state: u64 = 0xC5C0FFEE ^ (mode_id as u64);
+        let mut next_uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0
+        };
+        let mut col_indptr: Vec<i64> = Vec::with_capacity(n_cols + 1);
+        let mut row_indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        col_indptr.push(0);
+        for g in 0..n_cols {
+            for c in 0..n_obs {
+                if (c + g) % 3 == 0 {
+                    row_indices.push(c as i32);
+                    data.push(next_uniform() as f32);
+                }
+            }
+            col_indptr.push(row_indices.len() as i64);
+        }
+
+        let d_col_indptr = dev.htod_copy(&col_indptr).unwrap();
+        let d_row_indices = dev.htod_copy(&row_indices).unwrap();
+        let d_data = dev.htod_copy(&data).unwrap();
+        let d_cell_to_group = dev.htod_copy(&cell_to_group).unwrap();
+
+        let view = csc_view_fixture(&d_col_indptr, &d_row_indices, &d_data, n_obs, n_cols);
+        let mut d_sums = dev.alloc_zeros::<f64>(n_groups * n_cols).unwrap();
+        gpu_de_pseudobulk_csc_direct(
+            &dev,
+            &view,
+            &d_cell_to_group,
+            &mut d_sums,
+            0,
+            n_cols,
+            n_cols,
+            n_groups,
+            mode_id,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        let gpu_sums = dev.dtoh_copy(&d_sums).unwrap();
+
+        // Host reference: per (group, gene) sum pre(value) over column nonzeros
+        // whose cell maps into [0, n_groups).
+        let host_pre = |x: f32, mode_id: i32| -> f64 {
+            let xd = x as f64;
+            match mode_id {
+                0 | 3 => xd,
+                1 => xd.exp_m1(),
+                2 => xd.ln_1p(),
+                _ => xd,
+            }
+        };
+        let mut host = vec![0.0f64; n_groups * n_cols];
+        for g in 0..n_cols {
+            let s = col_indptr[g] as usize;
+            let e = col_indptr[g + 1] as usize;
+            for k in s..e {
+                let cell = row_indices[k] as usize;
+                let grp = cell_to_group[cell];
+                if grp >= 0 && (grp as usize) < n_groups {
+                    host[grp as usize * n_cols + g] += host_pre(data[k], mode_id);
+                }
+            }
+        }
+        for (i, (&h, &gpu)) in host.iter().zip(gpu_sums.iter()).enumerate() {
+            let diff = (h - gpu).abs();
+            let denom = h.abs().max(1.0);
+            assert!(
+                diff < 1e-9 || diff / denom < 1e-12,
+                "n_groups={n_groups} mode={mode_id} idx={i}: host={h} gpu={gpu} |Δ|={diff}"
+            );
+        }
+    };
+
+    for mode_id in 0..4i32 {
+        // Small n_groups → SMEM-staged path (bx=128).
+        run(40, 5, 3, mode_id);
+        // Large n_groups (> ~900 SMEM ceiling) → global-atomic path, selected
+        // by the wrapper without the env override.
+        run(2000, 4, 1000, mode_id);
+    }
+}
+
+/// Build a `GpuCscShardView` spanning columns `[0, n_cols)` from device buffers
+/// for a single-shard test fixture.
+fn csc_view_fixture<'a>(
+    col_indptr: &'a CudaSlice<i64>,
+    row_indices: &'a CudaSlice<i32>,
+    data: &'a CudaSlice<f32>,
+    n_obs: usize,
+    n_cols: usize,
+) -> GpuCscShardView<'a> {
+    GpuCscShardView {
+        col_indptr: col_indptr.slice(..col_indptr.len()),
+        row_indices: row_indices.slice(..row_indices.len()),
+        data: data.slice(..data.len()),
+        col_start: 0,
+        col_end: n_cols,
+        n_obs,
     }
 }
 

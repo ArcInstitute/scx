@@ -37,6 +37,30 @@ use crate::pipeline::{LoaderConfig, TrainingPipeline};
 /// Wraps the Rust `TrainingPipeline` and exposes it as a Python iterator.
 /// Each call to `__next__` returns a dict `{"X": ndarray, "obs": {...}, "cell_indices": ndarray}`.
 ///
+/// # Default transforms (IMPORTANT)
+///
+/// **`normalize` and `log1p` both default to `True`** — by default every batch
+/// is total-count normalized (`target_sum=1e4`) and `log1p`-transformed, even
+/// though the SCX file stores raw counts. The yielded `X` is therefore
+/// log-normalized, **not** raw counts.
+///
+/// Count-likelihood models (scVI, scANVI, count autoencoders, NB/ZINB
+/// decoders) require **raw integer counts** — pass
+/// `normalize=False, log1p=False` to disable both transforms and stream raw
+/// counts through unchanged:
+///
+/// ```python
+/// # log-normalized batches (default — for models that expect lognorm input)
+/// ds = pyscx.TrainingDataset("counts.scx", batch_size=256)
+///
+/// # raw counts (for scVI / count-based likelihoods)
+/// ds = pyscx.TrainingDataset("counts.scx", batch_size=256,
+///                            normalize=False, log1p=False)
+/// ```
+///
+/// See the `normalize` / `log1p` / `target_sum` / `pflog1ppf` constructor args
+/// below for the full normalization surface.
+///
 /// # Fork safety
 ///
 /// `TrainingDataset` is fork-safe under PyTorch
@@ -86,7 +110,12 @@ impl TrainingDataset {
     ///     hvg_indices: Gene indices for HVG projection. None = all genes.
     ///     obs_columns: Obs metadata column names to include in each batch.
     ///     normalize: Apply total-count normalization (default: True).
-    ///     log1p: Apply log1p transformation (default: True).
+    ///         NOTE: this is **on by default** — batches are normalized even
+    ///         though the file stores raw counts. Pass `normalize=False`
+    ///         (with `log1p=False`) for raw-count output (scVI / count
+    ///         likelihoods). See "Default transforms" on the class docstring.
+    ///     log1p: Apply log1p transformation (default: True). On by default;
+    ///         pass `log1p=False` to disable. See `normalize`.
     ///     target_sum: Normalization target sum (default: 1e4).
     ///     pflog1ppf: Apply PFlog1pPF / shifted-CLR normalization
     ///         (Booeshaghi et al. 2026) instead of normalize/log1p

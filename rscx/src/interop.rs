@@ -429,6 +429,27 @@ fn set_dgc_dimnames(dgc: Robj, obs: &RecordBatch, var: &RecordBatch) -> Result<R
     }
 }
 
+/// Guard an optional (`Suggests`) R package before a conversion that needs it.
+///
+/// `R_tryEval` (the engine behind `R!`) does **not** capture the message from
+/// an in-R `stop()` — it returns the failing *expression*, not the condition —
+/// so the `if (!requireNamespace(...)) stop(...)` lines inside the construction
+/// blocks below produce a useless `Err`. Checking presence here, from Rust,
+/// lets us return a controlled, actionable message that `throw_on_err` then
+/// surfaces to R as a clean `stop()`. The in-R `stop()` backstops this for any
+/// path that doesn't call the guard. See B7 in the 2026-06-15 user report.
+fn require_r_package(pkg: &str, missing_msg: &str) -> Result<()> {
+    let available = R!("requireNamespace({{pkg}}, quietly = TRUE)")
+        .map_err(|e| Error::Other(format!("requireNamespace({pkg}) check failed: {e}")))?
+        .as_bool()
+        .unwrap_or(false);
+    if available {
+        Ok(())
+    } else {
+        Err(Error::Other(missing_msg.to_string()))
+    }
+}
+
 /// Create a Seurat v5 object from SCX query results.
 ///
 /// ScxCsr → dgCMatrix (CSR→CSC, cells × genes) → t(dgCMatrix) (genes × cells).
@@ -442,6 +463,11 @@ fn set_dgc_dimnames(dgc: Robj, obs: &RecordBatch, var: &RecordBatch) -> Result<R
 ///
 /// Requires: Seurat >= 5.0.0 (listed in Suggests)
 pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
+    require_r_package(
+        "Seurat",
+        "Seurat >= 5.0.0 is required for to_seurat() but is not installed; \
+         install it (install.packages(\"Seurat\")) and retry",
+    )?;
     let dgc = csr_to_dgcmatrix(&result.x)?;
     let dgc = set_dgc_dimnames(dgc, &result.obs, &result.var)?;
     let obs_df = record_batch_to_dataframe(&result.obs)?;
@@ -489,6 +515,11 @@ pub fn to_seurat_v5(result: &QueryResult) -> Result<Robj> {
 ///
 /// Requires: SingleCellExperiment (listed in Suggests)
 pub fn to_sce(result: &QueryResult) -> Result<Robj> {
+    require_r_package(
+        "SingleCellExperiment",
+        "SingleCellExperiment is required for to_sce() but is not installed; \
+         install it (BiocManager::install(\"SingleCellExperiment\")) and retry",
+    )?;
     let dgc = csr_to_dgcmatrix(&result.x)?;
     let dgc = set_dgc_dimnames(dgc, &result.obs, &result.var)?;
     let obs_df = record_batch_to_dataframe(&result.obs)?;
@@ -1472,6 +1503,11 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
                 .into(),
         ));
     }
+    require_r_package(
+        "Seurat",
+        "Seurat >= 5.0.0 is required for to_seurat() but is not installed; \
+         install it (install.packages(\"Seurat\")) and retry",
+    )?;
     let modality_names: Vec<String> = reader
         .modality_names()
         .iter()
@@ -1834,6 +1870,16 @@ pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
             "to_mae: file is multimodal but the modality table is empty".into(),
         ));
     }
+    require_r_package(
+        "SingleCellExperiment",
+        "SingleCellExperiment is required for to_mae() but is not installed; \
+         install it (BiocManager::install(\"SingleCellExperiment\")) and retry",
+    )?;
+    require_r_package(
+        "MultiAssayExperiment",
+        "MultiAssayExperiment is required for to_mae() but is not installed; \
+         install it (BiocManager::install(\"MultiAssayExperiment\")) and retry",
+    )?;
     let obs_batch = reader
         .read_obs()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;

@@ -691,6 +691,13 @@ def accel_formats() -> list[FormatVariant]:
         out.extend(accel_to_gpu_anndata_variants())
     except ImportError:
         pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_format_pipeline import (
+            accel_format_pipeline_variants,
+        )
+        out.extend(accel_format_pipeline_variants())
+    except ImportError:
+        pass
     return out
 
 
@@ -974,12 +981,15 @@ def estimate_memory_gb(
         # buffer is `n_obs × gene_chunk_size`; HVG keeps loess working
         # arrays. Size roughly like accel_hvg.
         peak_mb = max(base_mb, dense_mb * 0.5)
-    elif benchmark == "accel_pipeline":
+    elif benchmark in ("accel_pipeline", "accel_format_pipeline"):
         # End-to-end PCA→kNN→UMAP: holds the preprocessed AnnData + scanpy
         # reference embedding/connectivities + per-run copies, plus the PCA
         # sparse/GPU buffers and the kNN/UMAP graphs simultaneously (the union
         # of accel_pca + accel_knn + accel_umap working sets). Size like the
-        # PCA/DE chunked-buffer tier.
+        # PCA/DE chunked-buffer tier. `accel_format_pipeline` runs the same full
+        # RAPIDS pipeline per variant plus a fresh load-to-GPU (and a one-shot
+        # scx_auto conversion in prep), so it sits in the same tier — sizing it
+        # on the generic `accel_*` estimate (dense_mb × 0.1) under-budgets it.
         peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("accel_umap", "accel_leiden"):
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
@@ -1123,6 +1133,11 @@ def estimate_time_minutes(
         # rather than the 15-min fall-through, which would time out the
         # `pyscx_cpu` variant on the larger tiers.
         "accel_pipeline":        210,
+        # Same full RAPIDS pipeline per variant as accel_pipeline, plus a fresh
+        # load-to-GPU and a one-shot scx_auto conversion during fixture prep;
+        # budget like accel_pipeline + headroom so the larger tiers don't hit
+        # the 15-min fall-through default.
+        "accel_format_pipeline": 240,
         # PR G1 — pdex_ref + Wilcoxon rank_genes_groups. Per-variant
         # work is bounded by the rank-test + sort × n_genes inner loop;
         # the GPU path's BlockRadixSort caps the per-gene pool at 8192

@@ -509,6 +509,31 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: to_gpu_anndata_decode_correct
     min: 1.0
+
+  # --- Storage-format → GPU pipeline: SCX device-decode route floor ---
+  # `accel_format_pipeline` compares `scx + rapids-singlecell` vs
+  # `h5ad + rapids-singlecell`; the SCX device-decode variant must hit the
+  # in-VRAM decode path (transfer_mode == scx_device_decode_gpu), not silently
+  # host-bounce. `check_absolute_floors` evaluates floors against the *candidate*
+  # snapshot (baseline-independent) and skips any triple the candidate didn't run
+  # (no `raw/<triple>.json`). So these are inert on CPU gates (the variant is
+  # GPU-gated and never scheduled there). They are DEFERRED, not active: this is a
+  # brand-new benchmark + metric, and a partial GPU run that writes a
+  # `write_missing_result` stub creates the raw file with no metric → a spurious
+  # missing-metric violation. Re-enable (uncomment) together with the first clean
+  # `scx-bench-gpu` baseline that carries `scx_format_pipeline_devdecode_route`,
+  # so the device-decode route is gated only once a known-good capture exists.
+  # Timing/speedup stays informational — rapids version drift must not fail the build.
+  # - benchmark: accel_format_pipeline
+  #   format: accel_format_pipeline__scx_devdecode_rapids_gpu
+  #   dataset: pbmc3k
+  #   metric: scx_format_pipeline_devdecode_route
+  #   min: 1.0
+  # - benchmark: accel_format_pipeline
+  #   format: accel_format_pipeline__scx_devdecode_rapids_gpu
+  #   dataset: tabula_sapiens_100k
+  #   metric: scx_format_pipeline_devdecode_route
+  #   min: 1.0
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k

@@ -62,6 +62,116 @@ def _build_gpu_table(store: ResultStore) -> TableBlock | TextBlock:
     )
 
 
+def _median_peak_rss_mb(row) -> float | None:
+    """Median ``peak_rss_mb`` across a row's runs (ResultRow has no accessor)."""
+    import statistics
+
+    vals = [
+        r.get("peak_rss_mb")
+        for r in row.runs
+        if isinstance(r.get("peak_rss_mb"), (int, float)) and r.get("peak_rss_mb")
+    ]
+    return float(statistics.median(vals)) if vals else None
+
+
+def _build_format_pipeline_table(store: ResultStore) -> TableBlock | TextBlock:
+    """SCX vs h5ad feeding an identical rapids-singlecell GPU pipeline.
+
+    One row per dataset comparing the three ``accel_format_pipeline`` variants.
+    The same rapids engine runs in every cell — only the load-to-GPU path
+    differs — so ``load_to_gpu_s`` and host peak RSS are the discriminating
+    columns; end-to-end wall is shown for context.
+    """
+    h5ad_key = "accel_format_pipeline__h5ad_rapids_gpu"
+    dev_key = "accel_format_pipeline__scx_devdecode_rapids_gpu"
+    auto_key = "accel_format_pipeline__scx_auto_rapids_gpu"
+
+    by_dataset: dict[str, dict[str, object]] = {}
+    for row in store.by_benchmark("accel_format_pipeline"):
+        if row.missing_reason is not None:
+            continue
+        by_dataset.setdefault(row.dataset, {})[row.format] = row
+
+    if not by_dataset:
+        return TextBlock(
+            "*No `scx + rapids-singlecell` vs `h5ad + rapids-singlecell` results "
+            "in the comprehensive harness yet. This GPU pipeline comparison "
+            "populates on the next full GPU capture (`scx-bench-gpu`).*"
+        )
+
+    def _load_s(row) -> float | None:
+        return row.metadata.get("load_to_gpu_s") if row is not None else None
+
+    headers = [
+        "Dataset",
+        "h5ad load→GPU (s)",
+        "SCX devdecode load→GPU (s)",
+        "SCX auto load→GPU (s)",
+        "Load speedup (h5ad ÷ devdecode)",
+        "End-to-end wall h5ad / devdecode (s)",
+        "Host peak RSS h5ad / devdecode (MB)",
+        "devdecode transfer_mode",
+    ]
+    rows: list[list[str]] = []
+    for ds in sorted(by_dataset):
+        variants = by_dataset[ds]
+        h5ad = variants.get(h5ad_key)
+        dev = variants.get(dev_key)
+        auto = variants.get(auto_key)
+
+        h5ad_load = _load_s(h5ad)
+        dev_load = _load_s(dev)
+        auto_load = _load_s(auto)
+
+        speedup = (
+            f"{h5ad_load / dev_load:.2f}×"
+            if h5ad_load and dev_load
+            else "—"
+        )
+
+        def _f(v: float | None, fmt: str = "{:.3f}") -> str:
+            return fmt.format(v) if isinstance(v, (int, float)) else "—"
+
+        wall_pair = f"{_f(h5ad.median_wall_s if h5ad else None)} / {_f(dev.median_wall_s if dev else None)}"
+        rss_pair = (
+            f"{_f(_median_peak_rss_mb(h5ad) if h5ad else None, '{:.0f}')} / "
+            f"{_f(_median_peak_rss_mb(dev) if dev else None, '{:.0f}')}"
+        )
+        transfer = (dev.metadata.get("transfer_mode") if dev else None) or "—"
+
+        rows.append([
+            ds,
+            _f(h5ad_load),
+            _f(dev_load),
+            _f(auto_load),
+            speedup,
+            wall_pair,
+            rss_pair,
+            str(transfer),
+        ])
+
+    # Cite the first available source path for provenance.
+    src_path = None
+    for variants in by_dataset.values():
+        for row in variants.values():
+            src_path = row.source.path
+            break
+        if src_path:
+            break
+
+    return TableBlock(
+        headers=headers,
+        rows=rows,
+        caption=(
+            "Storage format → GPU pipeline: SCX vs h5ad, both feeding an "
+            "identical rapids-singlecell pipeline (normalize → log1p → HVG → "
+            "PCA → neighbors → UMAP). Load-to-GPU is the discriminating "
+            "column; host RSS is process-level context."
+        ),
+        source=SourceRef(kind=SourceKind.raw_json, path=src_path),
+    )
+
+
 def build(store: ResultStore) -> Chapter:
     c = Chapter(title="Accelerators (PCA, kNN, UMAP, Leiden)")
 
@@ -130,6 +240,46 @@ def build(store: ResultStore) -> Chapter:
                 "diagnostic fallback are never selected."
             ),
             tables.accelerator_gpu_vs_rapids_comparison_table(),
+        ],
+    ))
+
+    # ── Storage format → GPU pipeline (SCX vs h5ad + rapids-singlecell) ──
+    c.sections.append(Section(
+        title="Storage format → GPU pipeline (SCX vs h5ad + rapids-singlecell)",
+        blocks=[
+            TextBlock(
+                "Holding the GPU engine constant (**rapids-singlecell**) and "
+                "varying only the **storage format**, this measures the "
+                "end-to-end workflow of loading a stored dataset onto the GPU "
+                "and running an identical pipeline (normalize → log1p → HVG → "
+                "PCA → neighbors → UMAP). The two formats differ only in the "
+                "load-to-GPU path: SCX `to_gpu_anndata(device=\"gpu\")` decodes "
+                "Scx1 count shards **directly in VRAM** (only the indptr is "
+                "uploaded), whereas h5ad must host-decompress with `read_h5ad` "
+                "then transfer the full matrix host→device via "
+                "`rsc.get.anndata_to_GPU`. The pipeline portion is ~equal "
+                "across formats by construction, so the SCX advantage shows up "
+                "in **load-to-GPU time**. Host peak RSS is process-level and at "
+                "these scales is dominated by the shared rapids pipeline working "
+                "set that runs after the load step, so it does not isolate the "
+                "load-path difference — it is reported for context, not as a "
+                "discriminating column."
+            ),
+            _build_format_pipeline_table(store),
+            TextBlock(
+                "The `scx_devdecode` variant forces Scx1-coded shards "
+                "(`scx convert --codec scx1` / `scx optimize --codec scx1`), so "
+                "every shard carries a decode sidecar and the matrix decodes in "
+                "VRAM — only the per-shard indptr crosses the bus. The realistic "
+                "`scx_auto` variant uses the default auto-codec: at small scale "
+                "its low-median counts also select Scx1 (device-decode), but at "
+                "census scale higher-median shards route to Zstd, which carries "
+                "no decode sidecar and host-streams (`transfer_mode = "
+                "scx_device_handoff_streamed`), forfeiting the load advantage. "
+                "The device-decode moat therefore requires Scx1 shards; the "
+                "`scx_auto` column shows the default-codec behaviour an unaware "
+                "user would get."
+            ),
         ],
     ))
 

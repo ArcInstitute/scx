@@ -27,6 +27,8 @@
 //! sizes internally. Tested on census-scale fixtures (n_pool ≈ 1M) where the
 //! multi-tile path engages ~7 merge passes per chunk.
 
+use std::sync::OnceLock;
+
 use cudarc::driver::safe::{CudaSlice, LaunchConfig};
 use cudarc::driver::PushKernelArg;
 
@@ -857,20 +859,19 @@ pub fn gpu_de_pseudobulk_csr_direct(
 /// `mode_id` encoding matches [`gpu_de_pseudobulk_all_groups`] (0=identity,
 /// 1=expm1, 2=log1p, 3=identity).
 ///
-/// Shared memory: `n_groups × blockDim.x × sizeof(double)` per block.
-///
-/// The wrapper chooses `blockDim.x` and per-function SMEM opt-in to fit the
-/// requested usage:
-/// * `n_groups × 128 × 8 ≤ 48 KB` (i.e. `n_groups ≤ 48`): launch with
-///   `bx=128`, no opt-in.
-/// * `n_groups × 128 × 8 ≤ device's `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`
-///   (~100 KB on H100): launch with `bx=128`, opt into >48 KB via
-///   `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`.
-/// * Otherwise: halve `bx` to 64 and re-check; on H100 this lifts the
-///   ceiling to roughly `n_groups ≤ 200`.
-/// * Beyond that the call returns `GpuError::KernelLaunchFailed` rather
-///   than triggering a runtime CUDA error. Real workloads in this regime
-///   would need an algorithmic restructure (per-group tiling).
+/// Adaptive accumulation (no `n_groups` ceiling):
+/// * **SMEM-staged** (`csc_shard_pseudobulk_kernel`) — `n_groups × blockDim.x ×
+///   8` bytes of shared memory, tree-reduced (fast, atomic-free, deterministic).
+///   The wrapper picks the largest `bx ∈ {128, 64, 32}` whose SMEM fits the
+///   device opt-in limit (opting into >48 KB via
+///   `set_attribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, …)`). On
+///   H100 `bx=32` admits ~900 groups (covers census×cell_type).
+/// * **Global-atomic** (`csc_shard_pseudobulk_global_kernel`) — used when no
+///   `bx` fits (many groups, e.g. perturb-seq guide-level DE). No per-group
+///   SMEM; `atomicAdd` into global `sums`, scaling to any `n_groups`. f64
+///   atomicAdd makes summation order run-to-run nondeterministic (as on the
+///   CSR-direct path). `SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC=1` forces this path
+///   for testing.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_de_pseudobulk_csc_direct(
     dev: &GpuDevice,
@@ -901,54 +902,70 @@ pub fn gpu_de_pseudobulk_csc_direct(
     );
 
     let module = dev.load_module_cached(DIFFEXP_PTX)?;
-    let func = module
-        .load_function("csc_shard_pseudobulk_kernel")
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
 
-    // Adaptive SMEM policy. Prefer bx=128; drop to 64 if SMEM at 128 doesn't
-    // fit even after opt-in. Treat 48 KB as the default ceiling — that's the
-    // documented per-block default on every CUDA-capable arch we care about
-    // (H100 / A100 / consumer Ada) and matches `CU_DEVICE_ATTRIBUTE_MAX_
-    // SHARED_MEMORY_PER_BLOCK`.
+    // Adaptive accumulation strategy.
+    //
+    // The SMEM-staged `csc_shard_pseudobulk_kernel` keeps `n_groups × blockDim.x`
+    // f64 per-group partials in shared memory and tree-reduces them — fast and
+    // *deterministic* (no atomics), but its `n_groups × blockDim.x × 8` SMEM
+    // footprint hits the per-block hardware ceiling beyond a few hundred groups.
+    // Pick the largest `bx ∈ {128, 64, 32}` whose SMEM fits the device opt-in
+    // limit (48 KB default; ~228 KB opt-in on H100 — `bx=32` admits ~900 groups,
+    // covering census×cell_type). When none fit (many groups, e.g. perturb-seq
+    // guide-level DE), fall to `csc_shard_pseudobulk_global_kernel`, which uses
+    // global `atomicAdd` with no per-group SMEM and scales to any `n_groups`;
+    // atomic contention is naturally low in that regime. `n_groups` is constant
+    // across a DE op, so every shard launch takes the same path.
     const DEFAULT_SMEM_LIMIT: usize = 48 * 1024;
     let opt_in_limit = dev
         .max_dynamic_shared_mem_per_block()
         .unwrap_or(DEFAULT_SMEM_LIMIT);
     let elem_bytes = std::mem::size_of::<f64>();
 
-    let mut bx: u32 = 128;
-    let mut required = n_groups * bx as usize * elem_bytes;
-    if required > opt_in_limit {
-        bx = 64;
-        required = n_groups * bx as usize * elem_bytes;
-    }
-    if required > opt_in_limit {
-        return Err(GpuError::KernelLaunchFailed(format!(
-            "csc_shard_pseudobulk: n_groups={n_groups} exceeds SMEM budget \
-             ({} bytes at bx=64, device opt-in limit {opt_in_limit} bytes); \
-             use the CSR fallback (the GPU CSR-direct path routes here through \
-             pdex_ref_gpu when the CSC sidecar is absent)",
-            required
-        )));
-    }
-    // Opt into >48 KB on this function when required. The call is per-function
-    // sticky (no per-launch reset needed) but idempotent — safe to call each
-    // launch with the same value. Only call when actually exceeding the
-    // default to avoid making the function less flexible on devices that
-    // can't opt-in.
-    if required > DEFAULT_SMEM_LIMIT {
-        func.set_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            required as i32,
-        )
-        .map_err(|e| {
-            GpuError::KernelLaunchFailed(format!(
-                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={required}) on \
-                 csc_shard_pseudobulk_kernel failed: {e}"
-            ))
-        })?;
-    }
-    let shared_mem_bytes = required as u32;
+    // Test-only escape hatch to exercise the global-atomic path on a small
+    // fixture regardless of `n_groups`.
+    let force_atomic = gpu_de_force_atomic_pseudobulk();
+    let smem_bx = if force_atomic {
+        None
+    } else {
+        [128u32, 64, 32]
+            .into_iter()
+            .find(|&bx| n_groups * bx as usize * elem_bytes <= opt_in_limit)
+    };
+
+    let (func, bx, shared_mem_bytes) = match smem_bx {
+        Some(bx) => {
+            let func = module
+                .load_function("csc_shard_pseudobulk_kernel")
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}"))
+                })?;
+            let required = n_groups * bx as usize * elem_bytes;
+            // Opt into >48 KB when required (per-function sticky + idempotent).
+            if required > DEFAULT_SMEM_LIMIT {
+                func.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    required as i32,
+                )
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!(
+                        "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES={required}) on \
+                         csc_shard_pseudobulk_kernel failed: {e}"
+                    ))
+                })?;
+            }
+            (func, bx, required as u32)
+        }
+        None => {
+            let func = module
+                .load_function("csc_shard_pseudobulk_global_kernel")
+                .map_err(|e| {
+                    GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_global_kernel: {e}"))
+                })?;
+            (func, 128u32, 0u32)
+        }
+    };
+
     let cfg = LaunchConfig {
         grid_dim: (chunk_size as u32, 1, 1),
         block_dim: (bx, 1, 1),
@@ -961,6 +978,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
     let chunk_size_i32 = chunk_size as i32;
     let n_groups_i32 = n_groups as i32;
 
+    // Both kernels share the same parameter list.
     unsafe {
         dev.stream()
             .launch_builder(&func)
@@ -977,7 +995,7 @@ pub fn gpu_de_pseudobulk_csc_direct(
             .arg(&mode_id)
             .launch(cfg)
     }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk_kernel: {e}")))?;
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_shard_pseudobulk launch: {e}")))?;
 
     Ok(())
 }
@@ -1727,6 +1745,142 @@ pub fn default_gpu_de_gene_chunk_size(dev: &GpuDevice, n_obs: usize, n_pool_max:
     let budget = (free_bytes as f64 * 0.18) as usize;
     let raw = budget.max(per_gene_bytes) / per_gene_bytes;
     ((raw / 64).max(1)) * 64
+}
+
+/// Default fraction of free VRAM the per-chunk DE working set may occupy.
+///
+/// The per-target-group pool slabs (`n_test × chunk × n_g_max` f32) dominate
+/// that working set, so the gene chunk is clamped to keep the whole set under
+/// this fraction. The remaining headroom covers fixed device buffers (indptr,
+/// cell→group/pos tables, cuSPARSE/cuBLAS handles) and allocator fragmentation.
+const GPU_DE_MEM_BUDGET_FRAC: f64 = 0.6;
+
+/// Lowest gene chunk the budget clamp will fall to before declaring the
+/// per-chunk working set un-fittable (caller then surfaces a clear error).
+pub const GPU_DE_MIN_GENE_CHUNK: usize = 32;
+
+/// Read the per-chunk DE VRAM budget fraction, honouring the
+/// `SCX_GPU_DE_MEM_BUDGET_FRAC` env override. Values outside `(0, 0.95)` (or
+/// unparseable) fall back to [`GPU_DE_MEM_BUDGET_FRAC`].
+fn gpu_de_mem_budget_frac() -> f64 {
+    // Cache the parsed env var: read once per process (it's an environment knob,
+    // not expected to change mid-run) to avoid taking the `std::env` global lock
+    // on the DE hot path.
+    static FRAC: OnceLock<f64> = OnceLock::new();
+    *FRAC.get_or_init(|| {
+        std::env::var("SCX_GPU_DE_MEM_BUDGET_FRAC")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f < 0.95)
+            .unwrap_or(GPU_DE_MEM_BUDGET_FRAC)
+    })
+}
+
+/// Whether the test-only `SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC` override forces the
+/// global-atomic CSC pseudobulk path. Cached on first read (this is called per
+/// shard per chunk on the DE hot path, so a per-call `std::env` lock would be
+/// wasteful). The override must therefore be set **before** the first DE op in
+/// the process; production never sets it, and the parity test selects the atomic
+/// path via `n_groups` rather than this flag.
+fn gpu_de_force_atomic_pseudobulk() -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| std::env::var_os("SCX_GPU_DE_PSEUDOBULK_FORCE_ATOMIC").is_some())
+}
+
+/// Device-scratch bytes consumed *per gene column* of a DE chunk, matching the
+/// chunk-linear allocations of the v3 drivers (`GpuDeChunkScratch::new` + the
+/// `ensure_*_capacity` grow calls). `next_power_of_two` mirrors the slab grow
+/// rounding so this is an upper bound, not an under-count.
+///
+/// - `n_pool_max` — base `slab` + ping-pong `aux` capacity (f32, ×2 terms)
+/// - `n_ref`      — `ref_slab` (f32)
+/// - `n_g_max`    — `group_slab` (f32) **and** the dominant `per_tg_pool_slabs`
+///   (f32, ×`n_test`)
+/// - `n_test`     — per-test-group `per_tg_pool_slabs` count and the `u/p/tie`
+///   f64 staging buffers (×3)
+/// - `n_slots`    — pseudobulk `sums` (f64)
+///
+/// Every term here is genuinely **chunk-linear** — i.e. it is allocated as
+/// `chunk_max × <this>` by the corresponding `GpuDeChunkScratch::ensure_*_capacity`
+/// call (`u/p/tie_per_group` are `[n_test × chunk_max]` via `ensure_per_group_capacity`;
+/// `sums` is `[n_slots × chunk_max]` via `ensure_sums_capacity`; the `+3` covers the
+/// `[chunk_max]` `tie_term`/`u_or_rank`/`p_values` scalars). None is a per-op constant,
+/// so multiplying this whole value by the chunk size is correct, not an over-count.
+pub fn gpu_de_per_gene_scratch_bytes(
+    n_pool_max: usize,
+    n_ref: usize,
+    n_g_max: usize,
+    n_test: usize,
+    n_slots: usize,
+) -> usize {
+    let p2 = |x: usize| x.max(1).next_power_of_two();
+    // f32 (4 bytes): slab + aux + ref_slab + group_slab + per_tg_pool (×n_test).
+    let f32_elems = n_pool_max
+        .saturating_add(n_pool_max)
+        .saturating_add(p2(n_ref))
+        .saturating_add(p2(n_g_max))
+        .saturating_add(n_test.saturating_mul(p2(n_g_max)));
+    // f64 (8 bytes): sums + 3×per-group (u/p/tie) + 3 per-gene scalars
+    // (tie_term/u_or_rank/p_values).
+    let f64_elems = p2(n_slots)
+        .saturating_add(3usize.saturating_mul(p2(n_test)))
+        .saturating_add(3);
+    f32_elems
+        .saturating_mul(4)
+        .saturating_add(f64_elems.saturating_mul(8))
+}
+
+/// Pure budget clamp (no device access — unit-testable).
+///
+/// Returns `(chunk, fits)`: the largest gene chunk ≤ `requested` whose
+/// per-chunk scratch (`per_gene_bytes` × chunk) fits `free_bytes × frac`,
+/// floored at [`GPU_DE_MIN_GENE_CHUNK`]. `fits` is false only when even the
+/// floor chunk exceeds the budget — the caller should then surface a clear
+/// dimension-naming error rather than let the allocation OOM.
+fn clamp_chunk_for_budget(
+    requested: usize,
+    per_gene_bytes: usize,
+    free_bytes: usize,
+    frac: f64,
+) -> (usize, bool) {
+    let requested = requested.max(1);
+    let per_gene_bytes = per_gene_bytes.max(1);
+    let budget = (free_bytes as f64 * frac) as usize;
+    let max_chunk = (budget / per_gene_bytes).max(1);
+    if max_chunk >= requested {
+        (requested, true)
+    } else if max_chunk >= GPU_DE_MIN_GENE_CHUNK {
+        (max_chunk, true)
+    } else {
+        (GPU_DE_MIN_GENE_CHUNK, false)
+    }
+}
+
+/// Clamp a requested gene chunk so the per-chunk DE working set fits a budget
+/// fraction of free VRAM. Never increases `requested`. When free memory can't
+/// be queried, returns `(requested, true)` (don't clamp what we can't measure).
+///
+/// See [`clamp_chunk_for_budget`] / [`gpu_de_per_gene_scratch_bytes`]. Bounds
+/// every chunk-linear scratch allocation (dominated by `per_tg_pool_slabs`),
+/// closing the census-scale OOM where a user `gene_chunk_size` (or the auto
+/// sizer) ignored the `n_test × n_g_max` term.
+pub fn gpu_de_budget_gene_chunk(
+    dev: &GpuDevice,
+    requested: usize,
+    per_gene_bytes: usize,
+) -> (usize, bool) {
+    let Ok((free_bytes, _total)) = dev.free_memory() else {
+        return (requested.max(1), true);
+    };
+    if free_bytes == 0 {
+        return (requested.max(1), true);
+    }
+    clamp_chunk_for_budget(
+        requested,
+        per_gene_bytes,
+        free_bytes,
+        gpu_de_mem_budget_frac(),
+    )
 }
 
 #[cfg(test)]

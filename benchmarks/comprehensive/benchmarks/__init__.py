@@ -81,6 +81,11 @@ ALL_BENCHMARKS: list[str] = [
     # Self-converts the count h5ad to Scx1 and asserts the decode runs
     # fully in VRAM (transfer_mode=scx_device_decode_gpu).
     "accel_to_gpu_anndata",
+    # Storage-format → GPU pipeline: `scx + rapids-singlecell` vs
+    # `h5ad + rapids-singlecell`. Holds the rapids engine constant and varies
+    # the load-to-GPU path (to_gpu_anndata device-decode vs read_h5ad +
+    # anndata_to_GPU host bounce). See accel_format_pipeline.py.
+    "accel_format_pipeline",
     # CSC dispatch sweep (Phase L.3): qc_metrics / HVG / DE /
     # pseudobulk × {csr, csc} on a CSC-equipped fixture.
     "bench_csc_dispatch",
