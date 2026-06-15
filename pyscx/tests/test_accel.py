@@ -600,6 +600,105 @@ class TestRankGenesGroups:
         assert len(rgg["names"].dtype.names) >= 2
 
 
+class TestRankGenesGroupsDfExtract:
+    """F6: rank_genes_groups_df(group=...) — scanpy sc.get.rank_genes_groups_df alias."""
+
+    SCANPY_COLS = ["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]
+
+    @staticmethod
+    def _cols(df):
+        # Works for both polars and pandas frames.
+        return list(df.columns)
+
+    def test_extract_single_group_scanpy_columns(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        df = pyscx.accel.rank_genes_groups_df(adata, group="A", output="pandas")
+
+        # Single str group → scanpy columns, no leading `group` column.
+        assert self._cols(df) == self.SCANPY_COLS
+        assert len(df) == adata.n_vars
+
+        # Values match the precomputed structured array for group A.
+        rgg = adata.uns["rank_genes_groups"]
+        assert list(df["names"]) == list(rgg["names"]["A"])
+        np.testing.assert_allclose(df["pvals_adj"], rgg["pvals_adj"]["A"])
+        np.testing.assert_allclose(df["logfoldchanges"], rgg["logfoldchanges"]["A"])
+
+    def test_extract_multi_group_has_group_column(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        df = pyscx.accel.rank_genes_groups_df(
+            adata, group=["A", "B"], output="pandas"
+        )
+
+        assert self._cols(df) == ["group"] + self.SCANPY_COLS
+        assert len(df) == 2 * adata.n_vars
+        assert set(df["group"]) == {"A", "B"}
+
+    def test_extract_pval_cutoff_filters_rows(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        full = pyscx.accel.rank_genes_groups_df(adata, group="A", output="pandas")
+        filtered = pyscx.accel.rank_genes_groups_df(
+            adata, group="A", pval_cutoff=0.5, output="pandas"
+        )
+        assert len(filtered) <= len(full)
+        assert np.all(filtered["pvals_adj"] < 0.5)
+
+    def test_extract_group_and_groupby_both_errors(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        with pytest.raises(ValueError, match="not both"):
+            pyscx.accel.rank_genes_groups_df(adata, groupby="batch", group="A")
+
+    def test_extract_missing_uns_errors(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()  # no rank_genes_groups run
+        with pytest.raises(ValueError, match="not found"):
+            pyscx.accel.rank_genes_groups_df(adata, group="A")
+
+    def test_extract_unknown_group_errors(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata, "batch")
+        with pytest.raises(ValueError, match="available"):
+            pyscx.accel.rank_genes_groups_df(adata, group="ZZ")
+
+    def test_neither_group_nor_groupby_errors(self, synthetic_adata):
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        with pytest.raises(ValueError, match="got neither"):
+            pyscx.accel.rank_genes_groups_df(adata)
+
+    def test_compute_path_unchanged(self, synthetic_adata):
+        """Positional groupby still recomputes and returns cell-eval columns."""
+        import pyscx
+
+        adata = synthetic_adata.copy()
+        df = pyscx.accel.rank_genes_groups_df(adata, "batch", output="pandas")
+        assert list(df.columns) == [
+            "target",
+            "feature",
+            "fold_change",
+            "p_value",
+            "fdr",
+            "log2_fold_change",
+            "abs_log2_fold_change",
+        ]
+
+
 class TestStreamingDE:
     """Test streaming gene-chunked differential expression from backed SCX."""
 

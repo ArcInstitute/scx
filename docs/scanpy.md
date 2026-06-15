@@ -2385,6 +2385,14 @@ df = pyscx.accel.rank_genes_groups_df(
 Useful when you want SCX's faster Wilcoxon but cell-eval's DE metrics
 downstream (overlap@N, precision@N, pr_auc, etc.).
 
+> **`group=` is the scanpy extractor alias.** Calling it the scanpy way —
+> `pyscx.accel.rank_genes_groups_df(adata, group="0")` — does **not** recompute;
+> it extracts the precomputed `adata.uns["rank_genes_groups"]` and returns
+> scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`), a
+> drop-in for `sc.get.rank_genes_groups_df`. Use `groupby=` to recompute (cell-eval
+> columns), `group=` to extract (scanpy columns); pass one, not both. The scanpy
+> filters `pval_cutoff` / `log2fc_min` / `log2fc_max` apply to the `group=` path.
+
 
 The accelerators write to the same AnnData slots as scanpy, so they are
 fully interchangeable. You can mix and match:

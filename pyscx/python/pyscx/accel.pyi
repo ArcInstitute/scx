@@ -42,7 +42,7 @@ def rank_genes_groups(
 
 def rank_genes_groups_df(
     adata: Any,
-    groupby: str,
+    groupby: str | None = None,
     reference: str = "rest",
     n_genes: int | None = None,
     gene_chunk_size: int | None = None,
@@ -50,7 +50,23 @@ def rank_genes_groups_df(
     tie_correct: bool = False,
     device: str = "auto",
     output: str = "polars",
-) -> Any: ...
+    *,
+    group: str | list[str] | None = None,
+    key: str = "rank_genes_groups",
+    pval_cutoff: float | None = None,
+    log2fc_min: float | None = None,
+    log2fc_max: float | None = None,
+) -> Any:
+    """DE DataFrame in two modes (pass one).
+
+    ``groupby=`` re-runs Wilcoxon and returns cell-eval ``DEResults`` columns.
+    ``group=`` is the scanpy ``sc.get.rank_genes_groups_df`` alias: extracts the
+    precomputed ``adata.uns[key]`` (no recompute) and returns scanpy's columns
+    (``names, scores, logfoldchanges, pvals, pvals_adj``; a leading ``group``
+    column when ``group`` is a list). ``pval_cutoff``/``log2fc_min``/
+    ``log2fc_max`` are scanpy-style row filters for the extraction path.
+    """
+    ...
 
 
 def highly_variable_genes(
