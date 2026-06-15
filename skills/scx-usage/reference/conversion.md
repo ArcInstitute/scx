@@ -167,10 +167,10 @@ scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
 Other commands:
 - `scx info <file> [--json] [--history]` — metadata; multimodal shows a per-modality table with a `has_csc` column.
 - `scx validate <file> [--verbose]` — verifies BLAKE3 checksums section-by-section.
-- `scx subset <input> [--output P] [--filter EXPR] [--genes PATH] [--dry-run] [--shard-size N] [--codec ...]`.
-- `scx append <target> --input <source> [--codec ...] [--shard-size N] [--index-* ...]`.
+- `scx subset <input> [output] [--filter EXPR] [--genes PATH] [--dry-run] [--shard-size N] [--codec ...]` (`output` optional with `--dry-run`).
+- `scx append <target> <source> [--codec ...] [--shard-size N] [--index-* ...]`.
 - `scx delete <file> --filter <expr> [--dry-run]`.
-- `scx compact <input> --output <path> [--force] [--index-* ...]`.
+- `scx compact <input> <output> [--force] [--index-* ...]`.
 - `scx optimize <input> --output <path> [--force]` — in-place upgrade (single-modality): re-encode + canonicalize CSR shards to add decode sidecars and stamp `format_version=3` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`). Use to make a sidecar-less file GPU-device-decode-fast without a full reconvert.
 - `scx merge <f1> <f2> [...] --output <path> [--index-* ...]`.
 - `scx rollback <file> [--to-seq N]`.

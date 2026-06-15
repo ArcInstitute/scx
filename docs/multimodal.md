@@ -246,12 +246,12 @@ scx validate citeseq.scx    # ModalityTable checksum + cross-check;
                             # accepts partial per-modality CSC sidecars
 
 # Mutating ops (per-modality routing)
-scx append citeseq.scx --input new_rna_cells.scx --modality rna   # preserves ADT's CSC
-scx subset citeseq.scx --modality rna --output rna_only.scx
-scx subset citeseq.scx --modality rna --filter "cell_type == 'T cell'" \
-    --genes hvg.txt --output rna_tcells.scx                       # filter + projection
+scx append citeseq.scx new_rna_cells.scx --modality rna          # preserves ADT's CSC
+scx subset citeseq.scx rna_only.scx --modality rna
+scx subset citeseq.scx rna_tcells.scx --modality rna \
+    --filter "cell_type == 'T cell'" --genes hvg.txt             # filter + projection
 scx merge cite1.scx cite2.scx --output cite_merged.scx            # multimodal merge
-scx compact cite_merged.scx --output cite_compacted.scx           # multimodal compact
+scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact
 ```
 
 Python equivalent for the export direction:

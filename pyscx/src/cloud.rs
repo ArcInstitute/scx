@@ -257,6 +257,11 @@ pub struct PyCloudExperiment {
     // `CloudSectionReader` constructed from `.query()` stays valid for
     // as long as that pipeline lives.
     rt: Arc<tokio::runtime::Runtime>,
+    // Parsed modality table, fetched once at open (a small section).
+    // `None` for single-modality / v1 files. Mirrors how the local
+    // `Experiment` caches its modality table so the per-modality
+    // accessors don't re-range-read on every call (B5).
+    modalities: Option<scx_format_io::modality::ModalityTable>,
 }
 
 #[pymethods]
@@ -336,16 +341,109 @@ impl PyCloudExperiment {
         self.reader.header().codec_id
     }
 
+    /// True if this file is multimodal (v2 with `n_modalities > 0`).
+    /// Mirrors the local `Experiment.is_multimodal`. The modality table
+    /// is fetched once at open, so this is free.
+    #[getter]
+    fn is_multimodal(&self) -> bool {
+        self.modalities.is_some()
+    }
+
+    /// Number of registered modalities (0 for v1 / single-modality files).
+    #[getter]
+    fn n_modalities(&self) -> u32 {
+        self.modalities
+            .as_ref()
+            .map(|t| t.entries.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Ordered list of modality names (empty for single-modality files).
+    /// Position in the list maps 1:1 to the 1-based modality_id
+    /// (`names[i] -> modality_id = i + 1`). Mirrors the local
+    /// `Experiment.modality_names`.
+    #[getter]
+    fn modality_names(&self) -> Vec<String> {
+        self.modalities
+            .as_ref()
+            .map(|t| t.entries.iter().map(|e| e.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Resolve a modality name to its 1-based `modality_id`. Returns
+    /// `None` for unknown names or single-modality files.
+    fn modality_id(&self, name: &str) -> Option<u8> {
+        self.modalities.as_ref().and_then(|t| t.id_of(name))
+    }
+
+    /// Per-modality information block for the given 1-based `modality_id`.
+    /// Returns a dict with the on-disk fields of `ModalityInfo` (same
+    /// shape as the local `Experiment.modality_info`).
+    fn modality_info<'py>(
+        &self,
+        py: Python<'py>,
+        modality_id: u8,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let table = match &self.modalities {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let info = match modality_id
+            .checked_sub(1)
+            .and_then(|idx| table.entries.get(idx as usize))
+        {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let d = PyDict::new(py);
+        d.set_item("name", &info.name)?;
+        d.set_item("modality_type", info.modality_type as u8)?;
+        d.set_item("default_codec_id", info.default_codec_id)?;
+        d.set_item("default_value_encoding", info.default_value_encoding)?;
+        d.set_item("n_vars", info.n_vars)?;
+        d.set_item("nnz", info.nnz)?;
+        d.set_item("n_csr_shards", info.n_csr_shards)?;
+        d.set_item("n_csc_shards", info.n_csc_shards)?;
+        d.set_item("flags", info.flags.bits())?;
+        Ok(Some(d))
+    }
+
+    /// Materialise a multimodal file as `mudata.MuData`.
+    ///
+    /// Not yet supported over the cloud path: cloud multimodal reads
+    /// would need per-modality section routing that the cloud query
+    /// pipeline does not implement. Pull the file locally first (B5).
+    #[pyo3(signature = (backed=false, cache_shards=4))]
+    fn to_mudata(&self, backed: bool, cache_shards: usize) -> PyResult<()> {
+        let _ = (backed, cache_shards);
+        Err(PyRuntimeError::new_err(
+            "to_mudata() over the cloud path is not yet supported; \
+             pull the file locally (`scx pull <url> <dir>`) and open it \
+             with `pyscx.open(...).to_mudata()`",
+        ))
+    }
+
     fn __repr__(&self) -> String {
         // No key lines: listing obs/var/obsm/uns keys would require
         // network range reads, so the cloud repr stays to the cheap
         // header line. Use `.query()` / `read_cloud()` to materialise.
-        crate::experiment::format_anndata_repr(
+        let mut repr = crate::experiment::format_anndata_repr(
             "CloudExperiment",
             self.reader.n_obs(),
             self.reader.n_vars(),
             &[],
-        )
+        );
+        // Surface multimodality so the other modalities aren't silently
+        // invisible — `shape`/`n_vars` reflect the primary modality (B5).
+        if let Some(table) = &self.modalities {
+            let names: Vec<&str> = table.entries.iter().map(|e| e.name.as_str()).collect();
+            repr.push_str(&format!(
+                "\n    multimodal: {} modalities [{}]",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        repr
     }
 
     /// Open a lazy query pipeline backed by this cloud experiment.
@@ -388,13 +486,24 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
 
     // Release the GIL during blocking cloud I/O (finding 9.3).
     let url = url.to_string();
-    let reader = py
-        .detach(|| rt.block_on(scx_cloud::open_cloud(&url)))
+    let (reader, modalities) = py
+        .detach(|| {
+            rt.block_on(async {
+                let reader = scx_cloud::open_cloud(&url).await?;
+                // Fetch the modality table up front (small section, works
+                // for packed + exploded) so multimodal files are
+                // discoverable instead of silently projecting to the
+                // primary modality (B5).
+                let modalities = reader.modality_table().await?;
+                Ok::<_, scx_cloud::CloudError>((reader, modalities))
+            })
+        })
         .map_err(cloud_to_pyerr)?;
 
     Ok(PyCloudExperiment {
         reader: Arc::new(reader),
         rt: Arc::new(rt),
+        modalities,
     })
 }
 

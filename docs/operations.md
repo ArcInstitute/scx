@@ -33,7 +33,7 @@ To restore:
 scx build-csc experiment.scx experiment_with_csc.scx
 
 # Or pass --rebuild-csc to the mutating operation
-scx compact experiment.scx --output compacted.scx --rebuild-csc
+scx compact experiment.scx compacted.scx --rebuild-csc
 ```
 
 The Python wrappers do not expose a standalone `build_csc` function — use

@@ -473,10 +473,10 @@ fn test_18_4_bad_version() {
     data[5] = 0;
     std::fs::write(&path, &data).unwrap();
 
-    let result = ScxReader::open(&path);
+    let err = ScxReader::open(&path).err().expect("expected open to fail");
     assert!(
-        matches!(&result, Err(ScxError::UnsupportedVersion)),
-        "expected UnsupportedVersion error"
+        matches!(&err, ScxError::UnsupportedFormatVersion { found: 99, .. }),
+        "expected UnsupportedFormatVersion error, got {err}"
     );
 }
 

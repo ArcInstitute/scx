@@ -211,8 +211,7 @@ enum Commands {
         /// Target SCX file to append to
         target: PathBuf,
         /// Source SCX file containing cells to append
-        #[arg(long)]
-        input: PathBuf,
+        source: PathBuf,
         /// Modality name to append into. Required on multimodal target
         /// files (`scx info` shows the modality table). Optional on
         /// single-modality files — defaults to the global / primary
@@ -297,7 +296,6 @@ enum Commands {
         /// SCX file to compact
         input: PathBuf,
         /// Output path for compacted file
-        #[arg(long)]
         output: PathBuf,
         /// Overwrite output if it exists
         #[arg(long)]
@@ -611,8 +609,7 @@ enum Commands {
     Subset {
         /// Input SCX file
         input: PathBuf,
-        /// Output SCX file path
-        #[arg(long)]
+        /// Output SCX file path (optional with --dry-run)
         output: Option<PathBuf>,
         /// Obs predicate expression to filter cells
         #[arg(long)]
@@ -804,7 +801,7 @@ fn main() {
         },
         Commands::Append {
             target,
-            input,
+            source,
             modality,
             codec,
             shard_size,
@@ -817,7 +814,7 @@ fn main() {
             index_auto_threshold,
         } => append::run_append(
             &target,
-            &input,
+            &source,
             modality.as_deref(),
             &codec,
             shard_size,
