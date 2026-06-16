@@ -1105,6 +1105,25 @@ pub fn from_seurat(
     codec: Option<&str>,
     csc: Option<bool>,
     csc_cols_per_shard: Option<i32>,
+) -> Robj {
+    // Returns `Robj` and throws a clean R error via `throw_on_err`: a fallible
+    // `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0, masking
+    // the real message behind "User function panicked". See B3/B7.
+    crate::util::throw_on_err(from_seurat_impl(
+        seurat_obj,
+        output_path,
+        codec,
+        csc,
+        csc_cols_per_shard,
+    ))
+}
+
+fn from_seurat_impl(
+    seurat_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
 ) -> Result<()> {
     let explicit_codec = parse_codec_r(codec)?;
     let csc_always = csc.unwrap_or(false);
@@ -1219,6 +1238,23 @@ pub fn from_seurat(
 /// @export
 #[extendr]
 pub fn from_sce(
+    sce_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
+) -> Robj {
+    // Returns `Robj`, throws cleanly via `throw_on_err` (see `from_seurat`, B3/B7).
+    crate::util::throw_on_err(from_sce_impl(
+        sce_obj,
+        output_path,
+        codec,
+        csc,
+        csc_cols_per_shard,
+    ))
+}
+
+fn from_sce_impl(
     sce_obj: Robj,
     output_path: &str,
     codec: Option<&str>,
@@ -1606,6 +1642,23 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
 /// upfront via `intersectColumns()` or similar.
 #[extendr]
 pub fn from_mae(
+    mae_obj: Robj,
+    output_path: &str,
+    codec: Option<&str>,
+    csc: Option<bool>,
+    csc_cols_per_shard: Option<i32>,
+) -> Robj {
+    // Returns `Robj`, throws cleanly via `throw_on_err` (see `from_seurat`, B3/B7).
+    crate::util::throw_on_err(from_mae_impl(
+        mae_obj,
+        output_path,
+        codec,
+        csc,
+        csc_cols_per_shard,
+    ))
+}
+
+fn from_mae_impl(
     mae_obj: Robj,
     output_path: &str,
     codec: Option<&str>,

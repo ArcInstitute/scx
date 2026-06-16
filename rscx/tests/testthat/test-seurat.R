@@ -269,3 +269,19 @@ test_that("from_seurat preserves integer / logical / ordered-factor columns", {
   expect_identical(levels(md$stage), c("early", "mid", "late"))
   expect_true(is.numeric(md$qc_score) && !is.integer(md$qc_score))
 })
+
+# ---------------------------------------------------------------------------
+# B3: import functions raise clean R errors (not Rust panics) on bad input.
+# The bad-codec path errors in parse_codec_r() before any Seurat/SCE/MAE
+# package access, so it runs without those optional packages installed.
+# ---------------------------------------------------------------------------
+
+test_that("from_seurat/from_sce/from_mae raise clean errors (not panics) on bad codec", {
+  out <- tempfile(fileext = ".scx")
+  for (fn in list(from_seurat, from_sce, from_mae)) {
+    msg <- tryCatch(fn(NULL, out, codec = "bogus"),
+                    error = function(e) conditionMessage(e))
+    expect_false(grepl("panicked", msg, fixed = TRUE))
+    expect_match(msg, "Unknown codec")
+  }
+})
