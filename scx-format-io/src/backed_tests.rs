@@ -1541,3 +1541,70 @@ fn multimodal_fallback_does_not_mix_modalities() {
         "RNA modality has no cells expressing gene 3; got {rna_gene3:?}"
     );
 }
+
+/// Write a fixture `.scx` at an explicit path (peer of `write_test_file_and_open`
+/// that returns nothing — the caller opens its own reader(s)).
+fn write_fixture_at(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {
+    let total_nnz = n_obs * 2;
+    let header = sample_header(n_obs as u64, n_vars as u64, total_nnz as u64);
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let rows_per_shard = n_obs / n_shards;
+    for s in 0..n_shards {
+        let shard_rows = if s == n_shards - 1 {
+            n_obs - rows_per_shard * s
+        } else {
+            rows_per_shard
+        };
+        let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                (s * rows_per_shard) as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// Two readers backing distinct files share ONE `SharedShardCache` under a
+/// single count cap: keys are namespaced by `file_id`, and the budget is global
+/// across readers (Phase 1, SCX-DATA-LOADER §4.1).
+#[test]
+fn shared_shard_cache_spans_readers_under_one_budget() {
+    let dir = TempDir::new().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    let p1 = dir.path().join("f1.scx");
+    write_fixture_at(&p0, 64, 100, 4);
+    write_fixture_at(&p1, 64, 100, 4);
+
+    // One shared cache, count cap = 1 across BOTH readers.
+    let shared = SharedShardCache::new(1, usize::MAX);
+    let r0 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p0).unwrap(), 0, Arc::clone(&shared));
+    let r1 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p1).unwrap(), 1, Arc::clone(&shared));
+
+    // Warm (file 0, shard 0); keys are namespaced, so file 1 shard 0 is distinct.
+    let _ = r0.read_shard_cached_arc(0).unwrap();
+    assert!(r0.cache_contains(0));
+    assert!(!r1.cache_contains(0));
+
+    // Reading (file 1, shard 0) under a cap of 1 evicts (file 0, shard 0):
+    // proves the budget is shared, not per-reader.
+    let _ = r1.read_shard_cached_arc(0).unwrap();
+    assert!(r1.cache_contains(0));
+    assert!(
+        !r0.cache_contains(0),
+        "shared cap=1 must evict the other reader's shard"
+    );
+
+    // The count cap is the one shared cap, seen identically through either reader.
+    assert_eq!(r0.cache_capacity(), 1);
+    assert_eq!(r1.cache_capacity(), 1);
+}

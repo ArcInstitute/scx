@@ -6,6 +6,7 @@ pub mod index_plan;
 pub mod io_stage;
 pub mod normalize;
 pub mod pipeline;
+pub mod plan_engine;
 pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
@@ -21,6 +22,7 @@ pub use normalize::{
     apply_dense_transforms, fused_normalize_log1p_dense, log1p_dense_row, normalize_dense_row,
 };
 pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
+pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
 
