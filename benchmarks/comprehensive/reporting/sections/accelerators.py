@@ -36,6 +36,8 @@ def _build_gpu_table(store: ResultStore) -> TableBlock | TextBlock:
     rows_data: list[dict] = []
     for bench in gpu_benchmarks:
         for row in store.by_benchmark(bench):
+            if row.missing_reason is not None:
+                continue  # skip-with-stub rows (e.g. no_gpu) carry no timing
             sc = row.scenario
             is_gpu = (sc.device and "gpu" in sc.device.lower()) or row.format.endswith("_gpu")
             if is_gpu:
@@ -45,6 +47,8 @@ def _build_gpu_table(store: ResultStore) -> TableBlock | TextBlock:
                 if tail.endswith("_gpu"):
                     tail = tail[:-4]
                 op = bench.replace("accel_", "")
+                # Suppress the bare default-runner label ("pyscx") — it adds no
+                # information; only show a tail that names a distinct variant.
                 if tail and tail not in ("pyscx", "pyscx_gpu"):
                     op = f"{op} ({tail})"
                 rows_data.append({

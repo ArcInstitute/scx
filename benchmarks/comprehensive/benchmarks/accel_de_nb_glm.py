@@ -237,6 +237,9 @@ def run(
 
     if not requires_gpu:
         # ── CPU baseline + pdex_ref anchor ───────────────────────────────
+        # Warmup (discarded): first call pays one-time setup (rayon pool spin-up,
+        # allocator warm) that would otherwise inflate the first timed rep.
+        pyscx.accel.pdex_nb_glm(adata, device="cpu", **_KW)
         cpu_s, cpu_df = _median_wall(
             lambda: pyscx.accel.pdex_nb_glm(adata, device="cpu", **_KW), reps,
         )
@@ -263,6 +266,10 @@ def run(
 
     # ── GPU variant: route + CPU↔GPU concordance + pdex_ref + perf ───────
     os.environ["SCX_NBGLM_PROFILE"] = "1"
+    # Warmup (discarded, BEFORE the profiler reset): the first GPU call pays
+    # one-time kernel load / JIT / context setup that would otherwise inflate
+    # both the first timed rep's wall and the accumulated profiler fit_ms.
+    pyscx.accel.pdex_nb_glm(adata, device="gpu", **_KW)
     pyscx.accel.nb_glm_profile_reset()
     gpu_s, gpu_df = _median_wall(
         lambda: pyscx.accel.pdex_nb_glm(adata, device="gpu", **_KW), reps,
@@ -315,11 +322,15 @@ def run(
         prof.get("gpu_mle_fit", {}).get("ms", 0.0)
         + prof.get("gpu_shrink_fit", {}).get("ms", 0.0)
     )
+    # Count the genes actually FITTED (post any internal filtering), not
+    # adata.n_vars — the throughput must reflect the real kernel work, else it
+    # over-reports when pdex_nb_glm drops genes. n_genes = rows / n_targets.
     try:
-        n_targets = int(_to_pandas(gpu_df)["target"].nunique())
+        g = _to_pandas(gpu_df)
+        n_targets = int(g["target"].nunique())
+        n_genes = int(g["feature"].nunique())
     except Exception:
-        n_targets = 0
-    n_genes = int(adata.n_vars)
+        n_targets, n_genes = 0, 0
     # fit_ms accumulates across all `reps` GPU runs (profiler reset once), so
     # the work is n_targets·n_genes·reps fits over fit_ms milliseconds.
     extra["nb_glm_gpu_fit_genes_per_s"] = (

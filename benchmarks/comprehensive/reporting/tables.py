@@ -2050,13 +2050,22 @@ def _de_method_device(bench: str, fmt: str) -> tuple[str, str]:
     for suf in ("_gpu", "_cpu"):
         if core.endswith(suf):
             core = core[: -len(suf)]
+    # Key on (bench, core) so a bare core like "pyscx" can't collide across
+    # benchmarks (e.g. a future accel_de__pyscx_cpu vs accel_de_nb_glm__pyscx_cpu);
+    # fall back to the core-only key, then the raw core.
     label_map = {
+        ("accel_de", "scanpy_wilcoxon"): "scanpy Wilcoxon",
+        ("accel_de", "pyscx_wilcoxon"): "pyscx Wilcoxon",
+        ("accel_de", "pyscx_pdex_ref"): "pyscx pdex_ref",
+        ("accel_de_nb_glm", "pyscx"): "pyscx NB-GLM",
+    }
+    label = label_map.get((bench, core)) or {
         "scanpy_wilcoxon": "scanpy Wilcoxon",
         "pyscx_wilcoxon": "pyscx Wilcoxon",
         "pyscx_pdex_ref": "pyscx pdex_ref",
-        "pyscx": "pyscx NB-GLM",  # accel_de_nb_glm
-    }
-    return label_map.get(core, core or bench), device
+        "pyscx": "pyscx NB-GLM",
+    }.get(core, core or bench)
+    return label, device
 
 
 def _de_median_extra(row, metric: str) -> float | None:
@@ -2082,7 +2091,8 @@ def _de_peak_rss_mb(row) -> float | None:
     vals = [
         r.get("peak_rss_mb")
         for r in row.runs
-        if isinstance(r.get("peak_rss_mb"), (int, float)) and r.get("peak_rss_mb")
+        # `> 0` rather than truthiness so a legitimate 0.0 isn't silently dropped.
+        if isinstance(r.get("peak_rss_mb"), (int, float)) and r.get("peak_rss_mb") > 0
     ]
     return float(statistics.median(vals)) if vals else None
 
@@ -2144,6 +2154,9 @@ def de_nb_glm_gpu_table() -> TableBlock | TextBlock:
         if row.missing_reason is not None or not row.format.endswith("_gpu"):
             continue
         src_path = src_path or row.source.path
+        # Both wall times come from the GPU variant's runs[].extra (it times both
+        # devices on one fixture for an apples-to-apples ratio); gpu_s falls back
+        # to the row's top-level median_wall_s, which is the same timed GPU call.
         cpu_s = _de_median_extra(row, "nb_glm_cpu_wall_s")
         gpu_s = _de_median_extra(row, "nb_glm_gpu_wall_s")
         if gpu_s is None:
@@ -2178,8 +2191,13 @@ def de_nb_glm_gpu_table() -> TableBlock | TextBlock:
     return TableBlock(
         headers=headers, rows=rows, wide=True,
         caption="Pseudobulk NB-GLM CPU vs GPU — speedup is same-machine and "
-                "node-core-count dependent (surfaced, not gated); GPU-fit "
-                "genes/s is the node-independent kernel throughput.",
+                "node-core-count dependent (surfaced, not gated). It is also "
+                "CONSERVATIVE here: nb_glm_synth uses a moderate density (0.3) so "
+                "the correctness anchors have signal, which raises the shared "
+                "host-aggregation share and understates the GPU-fit win vs the "
+                "ultra-sparse regime — see the standalone bench_nb_glm.py --gpu "
+                "sweep for that. GPU-fit genes/s is the node-independent kernel "
+                "throughput.",
         source=SourceRef(kind=SourceKind.raw_json, path=src_path,
                          reason="accel_de_nb_glm__pyscx_gpu runs[].extra"),
     )

@@ -1028,10 +1028,22 @@ a 12-core node vs ~2× on a 32-core node for identical code), so a cross-node
 absolute ratio floor would be fragile. The speedup, GPU-fit throughput
 (`nb_glm_gpu_fit_genes_per_s`, the node-independent kernel quantity), and CPU↔GPU
 agreement render in the report's "Differential Expression (CPU + GPU)" section and
-are tracked by the relative regression check. `nb_glm_synth` is **not** in the
-`capture_baseline.py` tier lists (it has no on-disk h5ad) — exercise it explicitly:
-`run_parallel.py --benchmarks accel_de_nb_glm --datasets nb_glm_synth` (build pyscx
-`--features gpu`, orchestrate from `scx-bench`). The standalone
+are tracked by the relative regression check.
+
+> **⚠ The three NB-GLM floors are opt-in — a routine `gate_candidate.py --tier
+> {small,full,xl}` run does NOT exercise them.** `nb_glm_synth` is deliberately
+> **not** in any `capture_baseline.py` tier list (it is synthetic, with no on-disk
+> h5ad; adding it would schedule every *other* benchmark on it). The gate keys
+> absolute floors on whether the triple's result JSON exists
+> (`check_absolute_floors` → `_triple_was_run`), so when `nb_glm_synth` wasn't run
+> the three floors are **silently scoped out**, not failed — exactly the
+> `cell_eval_parity_perf` precedent. To actually exercise the GPU NB-GLM gate you
+> MUST run it explicitly:
+> `run_parallel.py --benchmarks accel_de_nb_glm --datasets nb_glm_synth` on a GPU
+> host (build pyscx `--features gpu`, orchestrate from `scx-bench`). Until that runs,
+> a GPU-route or precision regression in NB-GLM will not be caught by a tiered gate.
+
+The standalone
 `pyscx/benchmarks/bench_nb_glm.py --gpu` sweep (20/50/100 targets, per-phase
 `SCX_NBGLM_PROFILE` breakdown) is the regime-characterization dev tool and the
 source of the `nb_glm_gpu_fit_genes_per_s` baseline number; it is intentionally not
