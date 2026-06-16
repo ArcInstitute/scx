@@ -84,6 +84,7 @@ fn make_gpu_dev(gpu_device_id: Option<usize>) -> PyResult<NbGlmGpuDev> {
 /// erroring — the dominant (in-bounds) targets still take the GPU route.
 #[allow(clippy::too_many_arguments)]
 fn fit_one(
+    py: Python<'_>,
     gpu_dev: &NbGlmGpuDev,
     cg: &[f64],
     n_genes: usize,
@@ -98,6 +99,8 @@ fn fit_one(
     {
         if let Some(dev) = gpu_dev {
             if gpu_dims_ok(n_features, n_sub) {
+                // The `GpuDevice` handle is `!Send`, so we cannot release the GIL
+                // around the device fit; it is short (the fit runs on-device).
                 return scx_accel::gpu_pseudobulk_nb_glm(
                     dev,
                     cg,
@@ -116,16 +119,20 @@ fn fit_one(
     {
         let _ = gpu_dev;
     }
-    scx_accel::pseudobulk_nb_glm(
-        cg,
-        n_genes,
-        n_sub,
-        design,
-        n_features,
-        size_factors,
-        contrast,
-        options,
-    )
+    // The CPU fit is pure Rust (gene-parallel rayon) — release the GIL for its
+    // duration so other Python threads run, matching the sibling accel ops.
+    py.detach(|| {
+        scx_accel::pseudobulk_nb_glm(
+            cg,
+            n_genes,
+            n_sub,
+            design,
+            n_features,
+            size_factors,
+            contrast,
+            options,
+        )
+    })
 }
 
 /// Copy a 2-D array-like into a row-major `Vec<f64>` plus its `(rows, cols)`.
@@ -456,6 +463,7 @@ pub(super) fn fit_targets_nbglm(
         }
 
         match fit_one(
+            py,
             &gpu_dev,
             &cg,
             n_vars,
@@ -648,6 +656,7 @@ pub fn nb_glm(
     })?;
 
     let res = fit_one(
+        py,
         &gpu_dev,
         &counts_gene_major,
         n_genes,
@@ -829,6 +838,23 @@ pub fn pdex_nb_glm(
         ));
     }
 
+    // Resolve device + plan the route **before** the expensive aggregation, so an
+    // invalid `device=` string or `device="gpu"` on a CPU-only build / no-GPU host
+    // fails fast (rather than after a full pseudobulk pass). The per-target design
+    // is `[intercept, is_target]` (p=2 ≤ PMAX) so the kernel always supports the
+    // width → `gpu_eligible = true`; the per-target `n_sub` guard in `fit_one`
+    // silently routes any over-large target to CPU (the stamped GPU route below
+    // can therefore reflect a sweep that partially ran on CPU — see the note where
+    // it is written).
+    let resolved = super::gpu::resolve_device(device)?;
+    let info = super::route::nb_glm_exec_info(device, true);
+    super::route::announce_route(py, "pdex_nb_glm", device, &info);
+    let gpu_device_id = if info.route.is_gpu() {
+        resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+
     // Drop whole strata (unique stratify_by combinations) with too few total
     // cells before aggregation — a sparse donor/batch cannot form a reliable
     // pseudobulk replicate. (`min_cells_per_group` still filters each
@@ -859,20 +885,6 @@ pub fn pdex_nb_glm(
         ));
     }
 
-    // Resolve device + plan the route. The per-target design is `[intercept,
-    // is_target]` (p=2 ≤ PMAX), so the kernel always supports the width →
-    // `gpu_eligible = true`; the per-target `n_sub` guard in `fit_one` silently
-    // routes any over-large target to CPU. `resolve_device` hard-errors an
-    // explicit `device="gpu"` with no CUDA present.
-    let resolved = super::gpu::resolve_device(device)?;
-    let info = super::route::nb_glm_exec_info(device, true);
-    super::route::announce_route(py, "pdex_nb_glm", device, &info);
-    let gpu_device_id = if info.route.is_gpu() {
-        resolve_gpu_id(resolved)
-    } else {
-        None
-    };
-
     let options = nbglm_options_from_dict(py, nbglm_options)?;
     let fits = fit_targets_nbglm(py, &result, 0, reference, &options, gpu_device_id)?;
     if fits.is_empty() {
@@ -882,7 +894,11 @@ pub fn pdex_nb_glm(
         ));
     }
 
-    // Stamp the planned route on adata.uns["scx_accel"]["pdex_nb_glm"].
+    // Stamp the planned route on adata.uns["scx_accel"]["pdex_nb_glm"]. NOTE: a
+    // stamped `gpu_nb_glm_csr` reflects the *intended* route; an individual target
+    // whose pseudobulk has n_sub > GPU_NB_GLM_NSUB_MAX falls back to CPU inside
+    // `fit_one` (rare — n_sub is 2·replicates), so a GPU-stamped sweep may have run
+    // a few targets on CPU.
     super::route::write_accel_route(py, adata, "pdex_nb_glm", &info)?;
 
     // Flatten to the cell-eval/pdex column vectors.

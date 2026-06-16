@@ -449,7 +449,7 @@ extern "C" __global__ void nb_glm_fit_kernel(
 
     const double* y = &counts[(size_t)g * n_sub];
     double beta[NB_PMAX];
-    double mu[NB_PMAX > 0 ? NB_NSUB_MAX : 1];
+    double mu[NB_NSUB_MAX];
     double fisher[NB_PMAX * NB_PMAX];
 
     // All-zero gene -> fixed all-zero state (mod.rs GeneState::all_zero).

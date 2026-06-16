@@ -159,9 +159,8 @@ pub fn gpu_nb_glm_fit(
     let d_sf = dev.htod_copy(sf)?;
 
     // Pass-specific inputs. Unused pointers in a given mode are never
-    // dereferenced by the kernel, but must be valid device pointers — use a
-    // 1-element dummy buffer for those.
-    let dummy = dev.alloc_zeros::<f64>(1)?;
+    // dereferenced by the kernel, but must be valid device pointers — each arm
+    // allocates a 1-element placeholder buffer for the pointers it doesn't use.
     let (mode, prior_var, d_base_mean, d_beta_in, d_alpha_in, d_prior) = match pass {
         GpuNbGlmPass::Mle { base_mean } => {
             if base_mean.len() != n_genes {
@@ -209,7 +208,6 @@ pub fn gpu_nb_glm_fit(
             )
         }
     };
-    let _ = &dummy;
 
     // Outputs.
     let mut d_beta = dev.alloc_zeros::<f64>(n_genes * p)?;
