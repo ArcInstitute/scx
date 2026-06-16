@@ -540,6 +540,11 @@ _BENCHMARK_DOMAIN_MAP: dict[str, str] = {
     "accel_pipeline": "accelerator",
     "accel_to_gpu_anndata": "accelerator",
     "accel_format_pipeline": "accelerator",
+    # Differential expression accelerators — per-cell (Wilcoxon / pdex_ref) and
+    # pseudobulk NB-GLM. Without these the DE benchmarks never bind to the
+    # Accelerators chapter and never appear in the report.
+    "accel_de": "accelerator",
+    "accel_de_nb_glm": "accelerator",
 }
 
 

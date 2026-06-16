@@ -80,9 +80,12 @@ from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS  # noqa: E402
 BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 
 # Benchmarks that work from h5ad source and don't need pre-converted files.
-# cell_eval_parity_perf generates synthetic data in-process (no source
-# .h5ad on disk for pert_synth_*), so Phase A would fail — skip it.
-_NO_CONVERSION = {"write", "parallel_write_scaling", "cell_eval_parity_perf"}
+# cell_eval_parity_perf and accel_de_nb_glm generate synthetic data in-process
+# (no source .h5ad on disk for pert_synth_* / nb_glm_synth), so Phase A
+# conversion would fail — skip it for them.
+_NO_CONVERSION = {
+    "write", "parallel_write_scaling", "cell_eval_parity_perf", "accel_de_nb_glm",
+}
 
 # Benchmarks that operate on multimodal h5mu sources. They expect
 # `dataset.multimodal=True` and a multimodal-aware format runner; pairing

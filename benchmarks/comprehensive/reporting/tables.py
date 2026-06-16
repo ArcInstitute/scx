@@ -2024,6 +2024,209 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
                               "wall-time ratio (>1 = rapids faster) + accuracy")
 
 
+# ---------------------------------------------------------------------------
+# Differential expression (CPU + GPU): per-cell (accel_de) + NB-GLM
+# ---------------------------------------------------------------------------
+
+# Benchmark keys that carry DE results.
+_DE_BENCHMARKS = ["accel_de", "accel_de_nb_glm"]
+
+# Deterministic gate signals surfaced by de_route_correctness_table (1.0 = ✓).
+_DE_ROUTE_SIGNALS = [
+    "nb_glm_route_gpu_correct",
+    "nb_glm_cpu_gpu_concordant",
+    "nb_glm_pdex_ref_concordant",
+    "wilcoxon_route_gpu_correct",
+    "wilcoxon_route_csc_direct",
+    "de_route_csc_direct",
+]
+
+
+def _de_method_device(bench: str, fmt: str) -> tuple[str, str]:
+    """(human method label, device) from a DE format key."""
+    tail = fmt[len(bench) + 2:] if fmt.startswith(bench + "__") else fmt
+    device = "GPU" if tail.endswith("_gpu") else ("CPU" if tail.endswith("_cpu") else "—")
+    core = tail
+    for suf in ("_gpu", "_cpu"):
+        if core.endswith(suf):
+            core = core[: -len(suf)]
+    label_map = {
+        "scanpy_wilcoxon": "scanpy Wilcoxon",
+        "pyscx_wilcoxon": "pyscx Wilcoxon",
+        "pyscx_pdex_ref": "pyscx pdex_ref",
+        "pyscx": "pyscx NB-GLM",  # accel_de_nb_glm
+    }
+    return label_map.get(core, core or bench), device
+
+
+def _de_median_extra(row, metric: str) -> float | None:
+    """Median numeric ``runs[].extra[metric]`` across a row's runs."""
+    vals: list[float] = []
+    for r in row.runs:
+        v = (r.get("extra") or {}).get(metric)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            vals.append(float(v))
+    return statistics.median(vals) if vals else None
+
+
+def _de_first_extra(row, metric: str):
+    """First non-None ``runs[].extra[metric]`` (for string fields like route)."""
+    for r in row.runs:
+        v = (r.get("extra") or {}).get(metric)
+        if v is not None:
+            return v
+    return row.metadata.get(metric)
+
+
+def _de_peak_rss_mb(row) -> float | None:
+    vals = [
+        r.get("peak_rss_mb")
+        for r in row.runs
+        if isinstance(r.get("peak_rss_mb"), (int, float)) and r.get("peak_rss_mb")
+    ]
+    return float(statistics.median(vals)) if vals else None
+
+
+def de_performance_table() -> TableBlock | TextBlock:
+    """DE wall time + peak RSS per (method × dataset × device).
+
+    Pulls both per-cell DE (``accel_de__*``: scanpy/pyscx Wilcoxon, pdex_ref)
+    and pseudobulk NB-GLM (``accel_de_nb_glm__*``) rows.
+    """
+    store = get_store()
+    rows_data: list[tuple[str, str, str, float | None, float | None, str | None]] = []
+    for bench in _DE_BENCHMARKS:
+        for row in store.by_benchmark(bench):
+            if row.missing_reason is not None:
+                continue
+            method, device = _de_method_device(bench, row.format)
+            rows_data.append((
+                method, row.dataset, device,
+                row.median_wall_s, _de_peak_rss_mb(row), row.source.path,
+            ))
+
+    if not rows_data:
+        return TextBlock(
+            "_No DE results — run `accel_de` / `accel_de_nb_glm` "
+            "(CPU on any host; GPU on a `scx-bench-gpu` host)._"
+        )
+
+    headers = ["Method", "Dataset", "Device", "Median wall", "Peak RSS"]
+    rows: list[list[str]] = []
+    for method, ds, device, wall, rss, _ in sorted(
+        rows_data, key=lambda x: (x[0], x[1], x[2]),
+    ):
+        rows.append([
+            method, SHORT_NAMES.get(ds, ds), device,
+            _fmt_time(wall), _fmt_mem(rss),
+        ])
+    src_path = next((d[5] for d in rows_data if d[5]), None)
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption="Differential expression — wall time + peak RSS per method × dataset × device",
+        source=SourceRef(kind=SourceKind.raw_json, path=src_path,
+                         reason="accel_de / accel_de_nb_glm runs[].median_wall_s + peak_rss_mb"),
+    )
+
+
+def de_nb_glm_gpu_table() -> TableBlock | TextBlock:
+    """Pseudobulk NB-GLM CPU vs GPU: speedup, kernel throughput, CPU↔GPU agreement.
+
+    One row per dataset, from the ``accel_de_nb_glm__pyscx_gpu`` variant (which
+    runs both devices + the pdex_ref anchor). The end-to-end speedup is
+    same-machine and **node-core-count dependent** (surfaced, not gated); the
+    GPU-fit throughput is the node-independent kernel quantity.
+    """
+    store = get_store()
+    rows: list[list[str]] = []
+    src_path = None
+    for row in store.by_benchmark("accel_de_nb_glm"):
+        if row.missing_reason is not None or not row.format.endswith("_gpu"):
+            continue
+        src_path = src_path or row.source.path
+        cpu_s = _de_median_extra(row, "nb_glm_cpu_wall_s")
+        gpu_s = _de_median_extra(row, "nb_glm_gpu_wall_s")
+        if gpu_s is None:
+            gpu_s = row.median_wall_s
+        speedup = _de_median_extra(row, "nb_glm_gpu_speedup")
+        genes_per_s = _de_median_extra(row, "nb_glm_gpu_fit_genes_per_s")
+        rho = _de_median_extra(row, "nb_glm_cpu_gpu_log2fc_spearman")
+        max_rel = _de_median_extra(row, "nb_glm_cpu_gpu_max_rel_log2fc")
+        ref_ok = _de_median_extra(row, "nb_glm_pdex_ref_concordant")
+        route = _de_first_extra(row, "gpu_dispatch_route")
+        rows.append([
+            SHORT_NAMES.get(row.dataset, row.dataset),
+            _fmt_time(cpu_s), _fmt_time(gpu_s),
+            f"{speedup:.2f}×" if speedup is not None else "—",
+            f"{genes_per_s:,.0f}" if genes_per_s is not None else "—",
+            f"{rho:.4f}" if rho is not None else "—",
+            f"{max_rel:.2e}" if max_rel is not None else "—",
+            ("✓" if ref_ok and ref_ok >= 1.0 else "✗") if ref_ok is not None else "—",
+            f"`{route}`" if route else "—",
+        ])
+
+    if not rows:
+        return TextBlock(
+            "_No GPU NB-GLM results — run `accel_de_nb_glm` on a `scx-bench-gpu` "
+            "host (`--datasets nb_glm_synth`)._"
+        )
+
+    headers = [
+        "Dataset", "CPU", "GPU", "Speedup", "GPU-fit genes/s",
+        "ρ(log2FC) CPU↔GPU", "max rel log2FC", "vs pdex_ref", "Route",
+    ]
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption="Pseudobulk NB-GLM CPU vs GPU — speedup is same-machine and "
+                "node-core-count dependent (surfaced, not gated); GPU-fit "
+                "genes/s is the node-independent kernel throughput.",
+        source=SourceRef(kind=SourceKind.raw_json, path=src_path,
+                         reason="accel_de_nb_glm__pyscx_gpu runs[].extra"),
+    )
+
+
+def de_route_correctness_table() -> TableBlock | TextBlock:
+    """Deterministic DE route / correctness gate signals as ✓/✗ per variant×dataset.
+
+    Surfaces the binary signals the gate hard-floors (NB-GLM route + CPU↔GPU
+    concordance + pdex_ref anchor; per-cell Wilcoxon/pdex_ref route) so a reader
+    sees route health at a glance.
+    """
+    store = get_store()
+    rows: list[list[str]] = []
+    src_path = None
+    for bench in _DE_BENCHMARKS:
+        for row in store.by_benchmark(bench):
+            if row.missing_reason is not None:
+                continue
+            method, device = _de_method_device(bench, row.format)
+            for sig in _DE_ROUTE_SIGNALS:
+                val = _de_median_extra(row, sig)
+                if val is None:
+                    continue
+                src_path = src_path or row.source.path
+                rows.append([
+                    f"{method} ({device})", SHORT_NAMES.get(row.dataset, row.dataset),
+                    sig, "✓" if val >= 1.0 else "✗",
+                ])
+
+    if not rows:
+        return TextBlock(
+            "_No DE route/correctness signals — these populate from the GPU DE "
+            "variants (`accel_de` / `accel_de_nb_glm`) on a GPU host._"
+        )
+
+    headers = ["Variant", "Dataset", "Signal", "Result"]
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    return TableBlock(
+        headers=headers, rows=rows, wide=True,
+        caption="DE route + correctness gate signals (✓ = 1.0 = pass). "
+                "Hard-gated in thresholds.yaml on the GPU variants.",
+        source=SourceRef(kind=SourceKind.raw_json, path=src_path,
+                         reason="accel_de / accel_de_nb_glm runs[].extra route signals"),
+    )
+
+
 def cell_eval_correctness_summary_table() -> TableBlock | TextBlock:
     """Cell-eval / arc-bench correctness summary (before performance table).
 
