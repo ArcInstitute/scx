@@ -1,6 +1,6 @@
 [package]
 name = "scx-loader"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 description = "ML training data loader for SCX files"
 license.workspace = true

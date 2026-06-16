@@ -957,6 +957,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scx_loader::TrainingDataset>()?;
     m.add_class::<scx_loader::MultimodalTrainingDataset>()?;
     m.add_class::<scx_loader::IndexPlanDataset>()?;
+    m.add_class::<scx_loader::SparseCellSetDataset>()?;
     m.add_class::<backed::ScxBackedSparseDataset>()?;
     m.add_class::<backed::ScxBackedLayerDataset>()?;
     m.add_class::<backed::ScxBackedObsmDataset>()?;
