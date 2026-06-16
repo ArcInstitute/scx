@@ -6,10 +6,12 @@ pub mod index_plan;
 pub mod io_stage;
 pub mod normalize;
 pub mod pipeline;
+pub mod plan_engine;
 pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod shuffle;
+pub mod sparse_cellset;
 
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
@@ -21,8 +23,13 @@ pub use normalize::{
     apply_dense_transforms, fused_normalize_log1p_dense, log1p_dense_row, normalize_dense_row,
 };
 pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPipeline};
+pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
+pub use sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
 
 #[cfg(feature = "python")]
-pub use python::{IndexPlanDataset, MultimodalTrainingDataset, TrainingDataset};
+pub use python::{
+    IndexPlanDataset, MultimodalTrainingDataset, SparseCellSetBatchIter, SparseCellSetDataset,
+    TrainingDataset,
+};

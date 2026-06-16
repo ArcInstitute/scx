@@ -31,6 +31,8 @@ use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
 use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader, IterMetrics};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
+use crate::sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
+use scx_format_io::ScxReader;
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
 ///
@@ -1370,5 +1372,234 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: Batch) -> PyResult<Bound<'py, PyDi
     let cell_arr = PyArray1::from_vec(py, cell_indices_i64);
     dict.set_item("cell_indices", cell_arr)?;
 
+    Ok(dict)
+}
+
+// ---------------------------------------------------------------------------
+// SparseCellSetDataset — native sparse cell-set loader (SCX-DATA-LOADER §4)
+// ---------------------------------------------------------------------------
+
+/// Adapter: Python iterator of `(file_ids, rows, role_tags, set_offsets)`
+/// tuples → Rust `Iterator<Item = Result<SparseCellSetPlan>>`. Mirrors
+/// [`PyPlanIterator`]: `Py<PyAny>` is `Send`, and each `next` reacquires the
+/// GIL only for the `__next__` call.
+struct PySparseCellSetPlanIterator {
+    py_iter: Py<PyAny>,
+}
+
+impl Iterator for PySparseCellSetPlanIterator {
+    type Item = std::result::Result<SparseCellSetPlan, LoaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| {
+            let bound = self.py_iter.bind(py);
+            match bound.call_method0("__next__") {
+                Ok(obj) => match obj.extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>() {
+                    Ok((file_ids, rows, role_tags, set_offsets)) => Some(Ok(SparseCellSetPlan {
+                        file_ids,
+                        rows,
+                        role_tags,
+                        set_offsets,
+                    })),
+                    Err(e) => Some(Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "sparse plan extraction failed (expected a tuple \
+                             (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])): {e}"
+                        ),
+                    })),
+                },
+                Err(e) => {
+                    if e.is_instance_of::<PyStopIteration>(py) {
+                        None
+                    } else {
+                        Some(Err(LoaderError::ChannelError(format!(
+                            "plan iterator raised: {e}"
+                        ))))
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Plan-driven native sparse cell-set reader. Each plan item is one batch of
+/// cell sets (delimited by `set_offsets`); each yielded dict carries the
+/// SCX-DATA-LOADER §4.4 sparse contract. Sibling to `IndexPlanDataset` but
+/// emits sparse CSR (not dense pairs) and is multi-file.
+#[pyclass]
+pub struct SparseCellSetDataset {
+    loader: Arc<SparseCellSetLoader>,
+    default_lookahead: usize,
+    /// PID at construction — the shard cache / mmap state is not fork-safe, so
+    /// the dataset must be built post-fork in each worker (or `num_workers=0`).
+    creation_pid: u32,
+}
+
+#[pymethods]
+impl SparseCellSetDataset {
+    #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        paths,
+        cache_shards=None,
+        max_memory_mb=None,
+        lookahead=None,
+        remap_tables=None,
+        n_global_genes=None,
+        normalize=None,
+        log1p=None,
+        target_sum=None,
+    ))]
+    fn new(
+        paths: Vec<String>,
+        cache_shards: Option<usize>,
+        max_memory_mb: Option<usize>,
+        lookahead: Option<usize>,
+        remap_tables: Option<Vec<Vec<i32>>>,
+        n_global_genes: Option<usize>,
+        normalize: Option<bool>,
+        log1p: Option<bool>,
+        target_sum: Option<f64>,
+    ) -> PyResult<Self> {
+        if paths.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "SparseCellSetDataset requires at least one .scx path",
+            ));
+        }
+        let cache_shards = cache_shards.unwrap_or(128);
+        let lookahead = lookahead.unwrap_or(4);
+        let bytes_budget = max_memory_mb
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(usize::MAX);
+        let normalize = normalize.unwrap_or(false);
+        let log1p = log1p.unwrap_or(false);
+        let target_sum = target_sum.unwrap_or(1e4);
+
+        let mut readers = Vec::with_capacity(paths.len());
+        for p in &paths {
+            readers.push(
+                ScxReader::open(p)
+                    .map_err(|e| PyRuntimeError::new_err(format!("failed to open {p}: {e}")))?,
+            );
+        }
+
+        let loader = SparseCellSetLoader::new(
+            readers,
+            cache_shards,
+            bytes_budget,
+            lookahead,
+            remap_tables,
+            n_global_genes,
+            normalize,
+            log1p,
+            target_sum,
+        )
+        .map_err(loader_err_to_py)?;
+
+        Ok(Self {
+            loader,
+            default_lookahead: lookahead,
+            creation_pid: std::process::id(),
+        })
+    }
+
+    /// Number of `.scx` files (the `file_id` range).
+    #[getter]
+    fn n_files(&self) -> usize {
+        self.loader.n_files()
+    }
+
+    /// CSR column count of emitted batches (max per-file `n_vars`, or the
+    /// global vocab size when remap tables were supplied).
+    #[getter]
+    fn n_cols(&self) -> usize {
+        self.loader.n_cols()
+    }
+
+    /// Drive the loader from a Python iterable of batch plans, each a tuple
+    /// `(file_ids, rows, role_tags, set_offsets)`; return an iterator of
+    /// sparse batch dicts (the §4.4 contract).
+    #[pyo3(signature = (plans, lookahead=None))]
+    fn iter_with_plans(
+        &self,
+        plans: Py<PyAny>,
+        lookahead: Option<usize>,
+    ) -> PyResult<SparseCellSetBatchIter> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.SparseCellSetDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+        let lookahead = lookahead.unwrap_or(self.default_lookahead);
+
+        let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
+            Ok(plans.bind(py).call_method0("__iter__")?.unbind())
+        })?;
+
+        let plan_stream = PySparseCellSetPlanIterator { py_iter };
+        let inner = Arc::clone(&self.loader).iter_with_plans(plan_stream, lookahead);
+        Ok(SparseCellSetBatchIter { inner: Some(inner) })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SparseCellSetDataset(n_files={}, n_cols={})",
+            self.loader.n_files(),
+            self.loader.n_cols()
+        )
+    }
+}
+
+/// Python iterator wrapping the boxed engine iterator; converts each
+/// `SparseCellSetBatch` into the §4.4 dict.
+#[pyclass]
+pub struct SparseCellSetBatchIter {
+    inner: Option<Box<dyn Iterator<Item = crate::error::Result<SparseCellSetBatch>> + Send + Sync>>,
+}
+
+#[pymethods]
+impl SparseCellSetBatchIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        // Release the GIL for the prefetch await + gather so the plan-pull
+        // worker can call __next__ on the user iterator without contention.
+        let next = py.detach(|| inner.next());
+        match next {
+            Some(Ok(batch)) => Ok(Some(sparse_cellset_batch_to_dict(py, batch)?)),
+            Some(Err(e)) => Err(loader_err_to_py(e)),
+            None => {
+                self.inner = None;
+                Ok(None)
+            }
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SparseCellSetBatchIter(exhausted={})", self.inner.is_none())
+    }
+}
+
+/// Convert a `SparseCellSetBatch` into the §4.4 dict: `{indptr, indices, data,
+/// shape, cell_indices, file_ids, set_offsets, role_tags}`.
+fn sparse_cellset_batch_to_dict<'py>(
+    py: Python<'py>,
+    batch: SparseCellSetBatch,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("indptr", PyArray1::from_vec(py, batch.indptr))?;
+    dict.set_item("indices", PyArray1::from_vec(py, batch.indices))?;
+    dict.set_item("data", PyArray1::from_vec(py, batch.data))?;
+    dict.set_item("shape", PyTuple::new(py, [batch.shape.0, batch.shape.1])?)?;
+    dict.set_item("cell_indices", PyArray1::from_vec(py, batch.cell_indices))?;
+    dict.set_item("file_ids", PyArray1::from_vec(py, batch.file_ids))?;
+    dict.set_item("set_offsets", PyArray1::from_vec(py, batch.set_offsets))?;
+    dict.set_item("role_tags", PyArray1::from_vec(py, batch.role_tags))?;
     Ok(dict)
 }

@@ -120,6 +120,88 @@ class IndexPlanDataset:
     def __repr__(self) -> str: ...
 
 
+class _SparseCellSetBatchDict(TypedDict):
+    indptr: np.ndarray  # [total_rows + 1] int64 — CSR row offsets
+    indices: np.ndarray  # [nnz] int32 — gene ids (raw-local, or global if remapped)
+    data: np.ndarray  # [nnz] float32 — values (raw counts by default)
+    shape: tuple[int, int]  # (total_rows, n_cols)
+    cell_indices: np.ndarray  # [total_rows] uint64 — source row id, request order
+    file_ids: np.ndarray  # [total_rows] uint32 — source file_id per row
+    set_offsets: np.ndarray  # [n_sets + 1] int64 — row ranges delimiting each set
+    role_tags: np.ndarray  # [total_rows] int32 — per-row role tag
+
+
+class SparseCellSetBatchIter:
+    """Iterator returned by `SparseCellSetDataset.iter_with_plans`.
+
+    Yields sparse batch dicts (`_SparseCellSetBatchDict`-shaped) and raises
+    `StopIteration` when the plan stream ends.
+    """
+
+    def __iter__(self) -> "SparseCellSetBatchIter": ...
+    def __next__(self) -> _SparseCellSetBatchDict: ...
+    def __repr__(self) -> str: ...
+
+
+class SparseCellSetDataset:
+    """Native sparse cell-set reader (SCX-DATA-LOADER §4).
+
+    Multi-file: gathers role-tagged, variable-size cell-set *batches* as
+    sparse CSR through the shared prefetch engine, emitting the §4.4 batch
+    contract. Each plan item is one batch of cell sets, passed as a tuple
+    ``(file_ids, rows, role_tags, set_offsets)`` of arrays.
+
+    Output is raw-local CSR by default (the caller remaps to its global gene
+    vocab); pass per-file ``remap_tables`` to emit global-vocab CSR. Sibling
+    to `IndexPlanDataset`, but sparse (not dense pairs) and multi-file.
+    """
+
+    def __init__(
+        self,
+        paths: list[str],
+        *,
+        cache_shards: int | None = None,
+        max_memory_mb: int | None = None,
+        lookahead: int | None = None,
+        remap_tables: list[list[int]] | None = None,
+        n_global_genes: int | None = None,
+        normalize: bool | None = None,
+        log1p: bool | None = None,
+        target_sum: float | None = None,
+    ) -> None: ...
+
+    @property
+    def n_files(self) -> int: ...
+    @property
+    def n_cols(self) -> int: ...
+
+    def iter_with_plans(
+        self,
+        plans: Iterable[tuple[Sequence[int], Sequence[int], Sequence[int], Sequence[int]]],
+        lookahead: int | None = None,
+    ) -> SparseCellSetBatchIter:
+        """Drive the loader from a Python iterable of batch plans, each a
+        tuple ``(file_ids: u32[], rows: u64[], role_tags: i32[],
+        set_offsets: i64[])``. Returns an iterator of sparse batch dicts.
+
+        Per batch: ``file_ids``, ``rows``, and ``role_tags`` are parallel arrays
+        of length ``total_rows`` (one entry per cell). ``set_offsets`` has length
+        ``n_sets + 1`` and delimits each cell set as ``rows[set_offsets[s] :
+        set_offsets[s + 1]]``; on the common path every row of a set shares a
+        ``file_id``. Each ``file_id`` indexes into the constructor ``paths``.
+
+        Malformed plans raise rather than crash the worker: a ``file_id`` ≥
+        ``n_files`` or a non-monotonic / out-of-bounds ``set_offsets`` raises
+        ``RuntimeError``; an out-of-range ``row`` raises ``IndexError``.
+
+        ``lookahead=None`` uses the constructor default; ``0`` disables shard
+        prefetching; larger values trade RAM for I/O hiding.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 # ---------------------------------------------------------------------------
 # TrainingDataset
 # ---------------------------------------------------------------------------
@@ -254,6 +336,26 @@ class Experiment:
 
         ``gene`` is an integer index or a var name. Companion to
         ``detection_counts`` (which returns the per-gene array for all genes).
+        """
+        ...
+
+    def gather_rows_sparse(
+        self,
+        rows: Any,
+        modality: str | None = None,
+        cache_shards: int = 4,
+    ) -> Any:
+        """Gather ``rows`` as a ``scipy.sparse.csr_matrix`` in request order.
+
+        Synchronous sparse gather over the backed reader: each touched shard is
+        decoded once; no intermediate ``ScxCsr`` is allocated (zero-copy only at
+        the numpy handoff). ``rows`` (numpy ``uint64``) may contain duplicates
+        and need not be sorted. Returns raw-local gene indices (no global-vocab
+        remap). ``cache_shards`` bounds peak decoded-shard memory for the gather
+        (not a speedup knob — each shard is decoded once per call). A fresh
+        reader is opened per call (fork-safe; this is the eval / random-access
+        utility, not the training hot path). Out-of-range ids raise
+        ``IndexError``. Drop-in for the backed ``adata.X[rows]`` analysis path.
         """
         ...
 
