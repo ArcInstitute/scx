@@ -25,8 +25,16 @@ use scx_format_io::ScxReader;
 ///
 /// @param target Path to the target SCX file (will be modified in-place).
 /// @param input Path to the input SCX file to append from.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3): a
+/// fallible `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0,
+/// masking the real message behind "User function panicked".
 #[extendr]
-fn scx_append(target: &str, input: &str) -> Result<()> {
+fn scx_append(target: &str, input: &str) -> Robj {
+    crate::util::throw_on_err(scx_append_impl(target, input))
+}
+
+fn scx_append_impl(target: &str, input: &str) -> Result<()> {
     // Open input file
     let input_reader =
         ScxReader::open(input).map_err(|e| Error::Other(format!("failed to open input: {e}")))?;
@@ -122,8 +130,14 @@ fn scx_append(target: &str, input: &str) -> Result<()> {
 /// @param path Path to the SCX file.
 /// @param cell_indices Integer vector of 0-based cell indices to delete.
 /// @return Total number of deleted cells as numeric (f64 to avoid i32 overflow).
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
+fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Robj {
+    crate::util::throw_on_err(scx_delete_impl(path, cell_indices))
+}
+
+fn scx_delete_impl(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
     let indices: Vec<u64> = cell_indices
         .into_iter()
         .map(|i| {
@@ -148,8 +162,14 @@ fn scx_delete(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
 ///
 /// @param input Path to the input SCX file.
 /// @param output Path for the compacted output file.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_compact(input: &str, output: &str) -> Result<()> {
+fn scx_compact(input: &str, output: &str) -> Robj {
+    crate::util::throw_on_err(scx_compact_impl(input, output))
+}
+
+fn scx_compact_impl(input: &str, output: &str) -> Result<()> {
     scx_ops::compact(Path::new(input), Path::new(output)).map_err(|e| Error::Other(e.to_string()))
 }
 
@@ -165,8 +185,14 @@ fn scx_compact(input: &str, output: &str) -> Result<()> {
 ///
 /// @param path Path to the SCX file.
 /// @param to_seq Optional manifest sequence number (integer or NULL).
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_rollback(path: &str, to_seq: Nullable<i32>) -> Result<()> {
+fn scx_rollback(path: &str, to_seq: Nullable<i32>) -> Robj {
+    crate::util::throw_on_err(scx_rollback_impl(path, to_seq))
+}
+
+fn scx_rollback_impl(path: &str, to_seq: Nullable<i32>) -> Result<()> {
     let p = Path::new(path);
     match to_seq {
         Nullable::NotNull(seq) if seq >= 0 => {
@@ -186,8 +212,14 @@ fn scx_rollback(path: &str, to_seq: Nullable<i32>) -> Result<()> {
 ///
 /// @param inputs Character vector of input file paths.
 /// @param output Path for the merged output file.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_merge(inputs: Vec<String>, output: &str) -> Result<()> {
+fn scx_merge(inputs: Vec<String>, output: &str) -> Robj {
+    crate::util::throw_on_err(scx_merge_impl(inputs, output))
+}
+
+fn scx_merge_impl(inputs: Vec<String>, output: &str) -> Result<()> {
     if inputs.len() < 2 {
         return Err(Error::Other("merge requires at least 2 input files".into()));
     }
@@ -205,8 +237,14 @@ fn scx_merge(inputs: Vec<String>, output: &str) -> Result<()> {
 ///
 /// @param path Path to the SCX file.
 /// @return Named list with n_obs, n_vars, nnz, format_version, n_shards.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_info(path: &str) -> Result<Robj> {
+fn scx_info(path: &str) -> Robj {
+    crate::util::throw_on_err(scx_info_impl(path))
+}
+
+fn scx_info_impl(path: &str) -> Result<Robj> {
     let reader = ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
     // Extract to local variables for R!() interpolation
     let n_obs = reader.n_obs() as f64;
@@ -232,8 +270,14 @@ fn scx_info(path: &str) -> Result<Robj> {
 ///
 /// @param path Path to the SCX file.
 /// @return TRUE if all checksums pass.
+///
+/// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_validate(path: &str) -> Result<bool> {
+fn scx_validate(path: &str) -> Robj {
+    crate::util::throw_on_err(scx_validate_impl(path))
+}
+
+fn scx_validate_impl(path: &str) -> Result<bool> {
     let reader = ScxReader::open(path).map_err(|e| Error::Other(format!("failed to open: {e}")))?;
     let checks = reader.validate().map_err(|e| Error::Other(e.to_string()))?;
     let all_passed = checks.iter().all(|(_, ok)| *ok);

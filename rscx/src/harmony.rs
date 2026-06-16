@@ -41,9 +41,49 @@ use crate::util::factorize_chars;
 /// @return A named list: `$embeddings` (N × d numeric matrix in R's
 ///   column-major layout), `$converged` (logical), `$n_iterations`
 ///   (integer), `$n_clusters` (integer), `$objective` (numeric vector).
+/// Returns `Robj` and throws a clean R error via `throw_on_err`: a fallible
+/// `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0, masking
+/// the real message behind "User function panicked". See B3/B7.
 #[extendr]
 #[allow(clippy::too_many_arguments)]
 fn scx_harmony_integrate(
+    embeddings: RMatrix<f64>,
+    batch: Strings,
+    n_clusters: Nullable<i32>,
+    theta: f64,
+    sigma: f64,
+    lambda: Nullable<f64>,
+    alpha: f64,
+    max_iter: i32,
+    max_iter_kmeans: i32,
+    epsilon_harmony: f64,
+    epsilon_kmeans: f64,
+    block_size: f64,
+    batch_prop_cutoff: f64,
+    tau: f64,
+    random_state: i32,
+) -> Robj {
+    crate::util::throw_on_err(scx_harmony_integrate_impl(
+        embeddings,
+        batch,
+        n_clusters,
+        theta,
+        sigma,
+        lambda,
+        alpha,
+        max_iter,
+        max_iter_kmeans,
+        epsilon_harmony,
+        epsilon_kmeans,
+        block_size,
+        batch_prop_cutoff,
+        tau,
+        random_state,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_harmony_integrate_impl(
     embeddings: RMatrix<f64>,
     batch: Strings,
     n_clusters: Nullable<i32>,

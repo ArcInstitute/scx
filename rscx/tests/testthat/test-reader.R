@@ -52,3 +52,15 @@ test_that("layer_names returns character vector", {
 test_that("scx_open errors on non-existent file", {
   expect_error(scx_open("/nonexistent/path.scx"))
 })
+
+# B3: a failed open must surface a clean R stop() carrying the real message,
+# not the opaque "User function panicked: new" that extendr's unwrap()-panic
+# produced before the constructor was routed through util::throw_on_err.
+# This exercises the same new -> open_impl -> Err -> throw_on_err path as a
+# format-version skew (both are an Err out of ScxReader::open).
+test_that("scx_open raises a clean error (not a Rust panic) on a bad file", {
+  msg <- tryCatch(scx_open("/nonexistent/path.scx"),
+                  error = function(e) conditionMessage(e))
+  expect_false(grepl("panicked", msg, fixed = TRUE))
+  expect_match(msg, "failed to open SCX file")
+})

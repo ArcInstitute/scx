@@ -734,40 +734,6 @@ pub fn perturbation_metrics<'py>(
 // energy_distance
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Compute energy distance between real and predicted perturbation data.
-///
-/// For each perturbation, computes the energy distance (e-distance) between
-/// perturbation cells and control cells on both real and predicted sides,
-/// then returns the Pearson correlation of per-perturbation e-distances.
-///
-/// This is the most expensive cell-eval metric — O(N²) pairwise distances
-/// per perturbation. The Rust implementation avoids materializing N×N
-/// distance matrices (streaming accumulation), precomputes control
-/// self-distances once, and parallelizes across perturbations with rayon.
-///
-/// Args:
-///     adata_real: AnnData with real (ground truth) data
-///     adata_pred: AnnData with predicted data
-///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
-///     control: Label for control perturbation (default: "control")
-///     metric: Distance metric — "euclidean" (default), "l1", or "cosine"
-///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
-///     backend: Distance kernel backend — "auto" (default), "gemm", or "scalar".
-///         "auto" uses faer-backed gemm for euclidean/cosine and the scalar
-///         row-by-row path for L1. "gemm" forces the gemm path (errors on L1).
-///         "scalar" forces the scalar path (matches the historical implementation).
-///     dtype: Element precision for the dense kernel — "f32" (default) or "f64".
-///         Reductions always accumulate in f64; the dtype only controls the
-///         matmul / per-pair compute precision. f32 is ~1.5–2× faster on AVX2
-///         and matches f64 within atol=1e-4 on log-normalised inputs.
-///
-/// Returns:
-///     float — Pearson correlation of per-perturbation e-distances
-///
-/// Example:
-///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
-///     # corr ≈ 0.85 means real and predicted perturbation effects
-///     # have similar relative magnitudes
 /// Parse `backend` kwarg into `DistanceBackend`.
 fn parse_backend(backend: Option<&str>) -> PyResult<scx_accel::DistanceBackend> {
     match backend.map(|s| s.to_ascii_lowercase()).as_deref() {
@@ -966,6 +932,56 @@ fn run_energy_distance<'py>(
     }
 }
 
+/// Score a perturbation-effect prediction by the cell-eval energy-distance metric.
+///
+/// For each perturbation, computes the energy distance (e-distance) between
+/// perturbation cells and control cells — separately on the real and the
+/// predicted side — then returns the **Pearson correlation** of the
+/// per-perturbation real-vs-predicted e-distance vectors.
+///
+/// IMPORTANT — polarity: despite the name, the returned scalar is a
+/// *correlation*, not a distance. It lies in ``[-1.0, 1.0]`` where
+/// **1.0 = perfect prediction and higher is better** (the opposite of a raw
+/// distance, where lower is better). Use it directly as a score; do not invert
+/// it. The per-perturbation e-distances themselves (where smaller = more
+/// similar to control) are exposed via :func:`energy_distance_details`.
+///
+/// Returns ``nan`` when the correlation is undefined — i.e. when either side's
+/// e-distance vector has zero variance (e.g. a constant or control-broadcast
+/// predictor that gives every perturbation the same e-distance), or when there
+/// is only a single non-control perturbation.
+///
+/// This is the most expensive cell-eval metric — O(N²) pairwise distances
+/// per perturbation. The Rust implementation avoids materializing N×N
+/// distance matrices (streaming accumulation), precomputes control
+/// self-distances once, and parallelizes across perturbations with rayon.
+///
+/// Args:
+///     adata_real: AnnData with real (ground truth) data
+///     adata_pred: AnnData with predicted data
+///     pert_col: Column name in obs for perturbation labels (default: "perturbation")
+///     control: Label for control perturbation (default: "control")
+///     metric: Distance metric — "euclidean" (default), "l1", or "cosine"
+///     embed_key: If set, use adata.obsm[embed_key] instead of X (default: None)
+///     backend: Distance kernel backend — "auto" (default), "gemm", or "scalar".
+///         "auto" uses faer-backed gemm for euclidean/cosine and the scalar
+///         row-by-row path for L1. "gemm" forces the gemm path (errors on L1).
+///         "scalar" forces the scalar path (matches the historical implementation).
+///     dtype: Element precision for the dense kernel — "f32" (default) or "f64".
+///         Reductions always accumulate in f64; the dtype only controls the
+///         matmul / per-pair compute precision. f32 is ~1.5–2× faster on AVX2
+///         and matches f64 within atol=1e-4 on log-normalised inputs.
+///
+/// Returns:
+///     float — Pearson correlation of per-perturbation real-vs-predicted
+///     e-distances, in [-1.0, 1.0] (1.0 = perfect, higher = better; `nan` if
+///     either side's e-distance vector is constant). For the underlying
+///     per-perturbation e-distance vectors, use `energy_distance_details`.
+///
+/// Example:
+///     corr = pyscx.accel.energy_distance(adata_real, adata_pred)
+///     # corr ≈ 0.85 means real and predicted perturbation effects
+///     # have similar relative magnitudes (higher = better, 1.0 = perfect)
 #[pyfunction]
 #[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
 #[allow(clippy::too_many_arguments)]
@@ -988,19 +1004,30 @@ pub fn energy_distance<'py>(
 
 /// Compute energy distance with per-perturbation details.
 ///
-/// Same inputs and semantics as `energy_distance`, but returns the full
-/// per-perturbation e-distance vectors alongside the Pearson correlation.
+/// Same inputs, distance kernel, and `nan` behavior as `energy_distance` (see
+/// that function for the full argument reference), but returns the full
+/// per-perturbation e-distance vectors alongside the summary Pearson
+/// correlation.
+///
+/// The two scalar conventions differ — keep them straight:
+///   - `"correlation"` is the score returned by `energy_distance`: a Pearson
+///     correlation in [-1.0, 1.0] where **1.0 = perfect, higher = better**
+///     (`nan` if either side's e-distance vector is constant / zero-variance).
+///   - `"d_real"` / `"d_pred"` are raw **e-distances**: 0 = identical to
+///     control, larger = more perturbed (lower is *not* better — they are the
+///     per-perturbation effect magnitudes being compared, not a score).
 ///
 /// Returns:
 ///     dict with keys:
 ///     - `"correlation"`: float — Pearson correlation of real vs pred e-distances
+///       (1.0 = perfect, higher = better; `nan` on a constant predictor)
 ///     - `"d_real"`: dict[str, float] — per-perturbation e-distance on real side
 ///     - `"d_pred"`: dict[str, float] — per-perturbation e-distance on pred side
 ///     - `"pert_names"`: list[str] — perturbation names in order
 ///
 /// Example:
 ///     out = pyscx.accel.energy_distance_details(adata_real, adata_pred)
-///     # out["correlation"] ≈ 0.85
+///     # out["correlation"] ≈ 0.85   (higher = better, 1.0 = perfect)
 ///     # out["d_real"]["drug_A"] == 12.34
 #[pyfunction]
 #[pyo3(signature = (adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None))]
