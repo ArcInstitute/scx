@@ -184,9 +184,11 @@ fn engine_drop_mid_iteration_is_safe() {
     let dir = tempfile::tempdir().unwrap();
     let engine = two_file_engine(dir.path(), 8);
     let plans = vec![vec![(0u32, 1u64)], vec![(1, 2)], vec![(0, 3)], vec![(1, 4)]];
-    let mut it = engine.iter_with_plans(into_iter(plans), 2, rows_of, gather);
+    // lookahead 3 leaves several in-flight prefetch handles queued when dropped;
+    // Drop aborts them (M2) and detaches the pull worker — no deadlock, no leak.
+    let mut it = engine.iter_with_plans(into_iter(plans), 3, rows_of, gather);
     let _ = it.next();
-    drop(it); // pull worker detaches without deadlock
+    drop(it);
 }
 
 #[test]

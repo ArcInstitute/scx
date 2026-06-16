@@ -1156,13 +1156,21 @@ impl PyExperiment {
     /// Gather specific rows as a sparse `scipy.sparse.csr_matrix`, in the
     /// requested order.
     ///
-    /// A synchronous, zero-copy sparse gather over the backed reader's
-    /// `read_rows_with`: each touched shard is decoded once via the LRU cache,
-    /// and per-row `(indices, data)` slices are scattered into a request-order
-    /// CSR. `rows` may contain duplicates and need not be sorted; output rows
-    /// follow `rows` order. Returns raw-local gene indices (no global-vocab
-    /// remap). On multimodal files, pass `modality=`. `cache_shards` sizes the
-    /// decoded-shard LRU for this gather.
+    /// A synchronous sparse gather over the backed reader's `read_rows_with`:
+    /// each touched shard is decoded once, and per-row `(indices, data)` slices
+    /// are scattered into a request-order CSR. It allocates no intermediate
+    /// `ScxCsr` (the data is zero-copy only at the final numpy handoff — each
+    /// nnz is copied into the request-order buffers). `rows` may contain
+    /// duplicates and need not be sorted; output rows follow `rows` order.
+    /// Returns raw-local gene indices (no global-vocab remap). On multimodal
+    /// files, pass `modality=`.
+    ///
+    /// `cache_shards` bounds peak decoded-shard memory for this gather (it is
+    /// not a speedup knob: within a single call each shard is decoded exactly
+    /// once, so the LRU never serves a repeat hit). A fresh reader is opened
+    /// per call — intentional, so the method is fork-safe and stateless; this
+    /// is the eval / random-access utility, not the training hot path (use
+    /// `SparseCellSetDataset` for that).
     ///
     /// Out-of-range row ids raise `IndexError`. This is a drop-in for the
     /// backed `adata.X[rows]` analysis path and the random-access utility an

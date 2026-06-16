@@ -444,7 +444,10 @@ struct WeightedLruCache {
 
 impl WeightedLruCache {
     fn new(cache_shards: usize, bytes_budget: usize) -> Self {
-        let cap = NonZeroUsize::new(cache_shards).unwrap();
+        // Clamp to ≥1: `cache_shards` flows from user-facing Python constructors,
+        // and `NonZeroUsize::new(0)` would panic. A 1-shard cache is the minimum
+        // sensible budget (the byte budget still bounds memory independently).
+        let cap = NonZeroUsize::new(cache_shards.max(1)).unwrap();
         WeightedLruCache {
             inner: LruCache::new(cap),
             bytes_budget,
@@ -2837,7 +2840,8 @@ struct DenseCacheEntry {
 
 impl DenseLruCache {
     fn new(cache_shards: usize, bytes_budget: usize) -> Self {
-        let cap = NonZeroUsize::new(cache_shards).unwrap();
+        // Clamp to ≥1 — see `WeightedLruCache::new`; `NonZeroUsize::new(0)` panics.
+        let cap = NonZeroUsize::new(cache_shards.max(1)).unwrap();
         DenseLruCache {
             inner: LruCache::new(cap),
             bytes_budget,

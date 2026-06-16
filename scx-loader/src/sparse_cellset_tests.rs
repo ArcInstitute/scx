@@ -258,7 +258,103 @@ fn sparse_transforms_match_dense_reference() {
     crate::normalize::log1p_dense_row(&mut dense);
     let dense_nonzero = vec![dense[1], dense[4], dense[6]];
 
-    for (a, b) in sparse_data.iter().zip(dense_nonzero.iter()) {
-        assert!((a - b).abs() < 1e-6, "sparse {a} vs dense {b}");
-    }
+    // Delegating to the canonical dense helpers makes this bit-identical, not
+    // just within tolerance (SCX-DATA-LOADER §0).
+    assert_eq!(sparse_data, dense_nonzero);
+}
+
+/// Build a single-file loader over a small fixture for malformed-plan tests.
+fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("f0.scx");
+    write_fixture(&p0, 16, 8, 2);
+    SparseCellSetLoader::new(
+        vec![open(&p0)],
+        4,
+        usize::MAX,
+        2,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+    )
+    .unwrap()
+}
+
+/// Run one plan and return the first batch's `Result`.
+fn run_one(
+    loader: StdArc<SparseCellSetLoader>,
+    plan: SparseCellSetPlan,
+) -> Result<SparseCellSetBatch> {
+    loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn malformed_plan_file_id_out_of_range_returns_error_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = malformed_plan_loader(dir.path());
+    // file_id 9 but only 1 file.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 9],
+        rows: vec![1, 2],
+        role_tags: vec![0, 0],
+        set_offsets: vec![0, 2],
+    };
+    assert!(matches!(
+        run_one(loader, plan),
+        Err(LoaderError::ConfigError { .. })
+    ));
+}
+
+#[test]
+fn malformed_plan_set_offsets_out_of_bounds_returns_error_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = malformed_plan_loader(dir.path());
+    // set_offsets[1]=5 > total_rows=2 would panic the slice without validation.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0],
+        rows: vec![1, 2],
+        role_tags: vec![0, 0],
+        set_offsets: vec![0, 5],
+    };
+    assert!(matches!(
+        run_one(loader, plan),
+        Err(LoaderError::ConfigError { .. })
+    ));
+}
+
+#[test]
+fn malformed_plan_set_offsets_non_monotonic_returns_error_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = malformed_plan_loader(dir.path());
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0, 0],
+        rows: vec![1, 2, 3],
+        role_tags: vec![0, 0, 0],
+        set_offsets: vec![0, 2, 1], // decreasing
+    };
+    assert!(matches!(
+        run_one(loader, plan),
+        Err(LoaderError::ConfigError { .. })
+    ));
+}
+
+#[test]
+fn malformed_plan_row_out_of_range_raises_index_out_of_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = malformed_plan_loader(dir.path());
+    // Fixture has 16 rows; row 99 is out of range → IndexError on the PyO3 side.
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0, 0],
+        rows: vec![1, 99],
+        role_tags: vec![0, 0],
+        set_offsets: vec![0, 2],
+    };
+    assert!(matches!(
+        run_one(loader, plan),
+        Err(LoaderError::IndexOutOfRange { idx: 99, n_obs: 16 })
+    ));
 }

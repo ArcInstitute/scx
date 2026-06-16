@@ -184,6 +184,16 @@ class SparseCellSetDataset:
         tuple ``(file_ids: u32[], rows: u64[], role_tags: i32[],
         set_offsets: i64[])``. Returns an iterator of sparse batch dicts.
 
+        Per batch: ``file_ids``, ``rows``, and ``role_tags`` are parallel arrays
+        of length ``total_rows`` (one entry per cell). ``set_offsets`` has length
+        ``n_sets + 1`` and delimits each cell set as ``rows[set_offsets[s] :
+        set_offsets[s + 1]]``; on the common path every row of a set shares a
+        ``file_id``. Each ``file_id`` indexes into the constructor ``paths``.
+
+        Malformed plans raise rather than crash the worker: a ``file_id`` ≥
+        ``n_files`` or a non-monotonic / out-of-bounds ``set_offsets`` raises
+        ``RuntimeError``; an out-of-range ``row`` raises ``IndexError``.
+
         ``lookahead=None`` uses the constructor default; ``0`` disables shard
         prefetching; larger values trade RAM for I/O hiding.
         """
@@ -337,11 +347,15 @@ class Experiment:
     ) -> Any:
         """Gather ``rows`` as a ``scipy.sparse.csr_matrix`` in request order.
 
-        Zero-copy sparse gather over the backed reader: each touched shard is
-        decoded once. ``rows`` (numpy ``uint64``) may contain duplicates and
-        need not be sorted. Returns raw-local gene indices (no global-vocab
-        remap). Out-of-range ids raise ``IndexError``. Drop-in for the backed
-        ``adata.X[rows]`` analysis path.
+        Synchronous sparse gather over the backed reader: each touched shard is
+        decoded once; no intermediate ``ScxCsr`` is allocated (zero-copy only at
+        the numpy handoff). ``rows`` (numpy ``uint64``) may contain duplicates
+        and need not be sorted. Returns raw-local gene indices (no global-vocab
+        remap). ``cache_shards`` bounds peak decoded-shard memory for the gather
+        (not a speedup knob — each shard is decoded once per call). A fresh
+        reader is opened per call (fork-safe; this is the eval / random-access
+        utility, not the training hot path). Out-of-range ids raise
+        ``IndexError``. Drop-in for the backed ``adata.X[rows]`` analysis path.
         """
         ...
 

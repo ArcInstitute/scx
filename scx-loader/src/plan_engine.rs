@@ -249,7 +249,12 @@ where
         let handle = self.engine.runtime()?.handle().clone();
         let mut joins = Vec::new();
         for (fid, rs) in by_file {
-            let reader = &self.engine.readers[fid as usize];
+            // Prefetch is best-effort: an out-of-range `file_id` from an
+            // untrusted plan is skipped here (no panic) and surfaces as a
+            // clean error from `SparseCellSetLoader::gather`'s validation.
+            let Some(reader) = self.engine.readers.get(fid as usize) else {
+                continue;
+            };
             // shards_for_indices sorts + dedups internally.
             let shards = reader.index().shards_for_indices(&rs);
             for sidx in shards {
@@ -316,6 +321,17 @@ where
 
 impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
     fn drop(&mut self) {
+        // Abort every in-flight shard prefetch, mirroring `IndexPlanLoader::drop`.
+        // Without this, up to `lookahead` `spawn_blocking` decodes keep running on
+        // the shared runtime after the iterator is gone, holding blocking-pool
+        // threads and cache budget. state3 rebuilds the loader per worker per epoch
+        // (`IterableDataset::__iter__`), so short-lived iterators are the norm and
+        // the leak would accumulate.
+        for inflight in self.in_flight.drain(..) {
+            for handle in inflight.prefetches {
+                handle.abort();
+            }
+        }
         // Detach the pull worker: dropping `plan_rx` (on struct drop) makes its
         // next `send` fail, so the worker exits on its own. We don't join — a
         // worker parked in `send` would block us. Taking the handle here also

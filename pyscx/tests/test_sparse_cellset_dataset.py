@@ -103,6 +103,42 @@ def test_remap_emits_global_indices(synthetic_adata, tmp_dir):
     np.testing.assert_array_equal(np.sort(b["indices"]), np.sort(expected_global))
 
 
+# --- malformed plans surface as clean exceptions, not a worker crash -------
+
+
+def test_file_id_out_of_range_raises_runtimeerror(two_scx):
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    # file_id 9 but only 2 files.
+    bad = ([0, 9], [0, 1], [0, 0], [0, 2])
+    with pytest.raises(RuntimeError, match="file_id"):
+        list(ds.iter_with_plans(iter([bad])))
+
+
+def test_bad_set_offsets_raises_runtimeerror(two_scx):
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    # set_offsets[1] past total_rows would panic the slice without validation.
+    bad = ([0, 0], [0, 1], [0, 0], [0, 99])
+    with pytest.raises(RuntimeError, match="set_offsets"):
+        list(ds.iter_with_plans(iter([bad])))
+
+
+def test_row_out_of_range_raises_indexerror(two_scx):
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    n_obs = pyscx.open(p0).n_obs
+    bad = ([0, 0], [0, n_obs + 100], [0, 0], [0, 2])
+    with pytest.raises(IndexError):
+        list(ds.iter_with_plans(iter([bad])))
+
+
 # --- fork-safety -----------------------------------------------------------
 
 

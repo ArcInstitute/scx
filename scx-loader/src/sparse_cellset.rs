@@ -165,6 +165,46 @@ impl SparseCellSetLoader {
                 reason: "plan file_ids/rows/role_tags length mismatch".into(),
             });
         }
+
+        // Plans arrive straight from (untrusted) Python. Validate structure up
+        // front so a malformed plan returns a clean error instead of panicking
+        // on an unchecked slice/index deep in the gather (mirrors the sibling
+        // `IndexPlanLoader`, which validates row indices before reading).
+        let n_files = self.n_files();
+        for &fid in &plan.file_ids {
+            if fid as usize >= n_files {
+                return Err(LoaderError::ConfigError {
+                    reason: format!("plan file_id {fid} out of range (n_files={n_files})"),
+                });
+            }
+        }
+        // `set_offsets` must be non-decreasing and bounded by `total_rows`, so
+        // every `[lo..hi]` slice below is in range.
+        let mut prev: i64 = 0;
+        for (k, &off) in plan.set_offsets.iter().enumerate() {
+            if off < 0 || off as usize > total_rows {
+                return Err(LoaderError::ConfigError {
+                    reason: format!("plan set_offsets[{k}]={off} out of range [0, {total_rows}]"),
+                });
+            }
+            if k > 0 && off < prev {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "plan set_offsets must be non-decreasing (set_offsets[{k}]={off} < {prev})"
+                    ),
+                });
+            }
+            prev = off;
+        }
+        // Row indices must be in range for their file, surfaced as `IndexError`
+        // (consistent with `Experiment.gather_rows_sparse` and the pair loader).
+        for (&fid, &row) in plan.file_ids.iter().zip(plan.rows.iter()) {
+            let n_obs = engine.reader(fid).n_obs();
+            if row as usize >= n_obs {
+                return Err(LoaderError::IndexOutOfRange { idx: row, n_obs });
+            }
+        }
+
         let n_sets = plan.set_offsets.len().saturating_sub(1);
 
         let mut indptr: Vec<i64> = Vec::with_capacity(total_rows + 1);
@@ -296,24 +336,20 @@ fn remap_row(indices: &[i32], data: &[f32], local_to_global: &[i32]) -> (Vec<i32
     (out_idx, out_dat)
 }
 
-/// Value-only, zero-preserving sparse transforms on a row's `data`. Normalize
-/// scales by `target_sum / sum` (matching `normalize_dense_row`); `log1p` is
-/// `ln(1+x)` (matching `log1p_dense_row`). Zeros are untouched (absent), so the
-/// result equals the dense transform restricted to the stored nonzeros.
+/// Value-only, zero-preserving sparse transforms on a row's `data`, delegating
+/// to the canonical dense helpers so the result is **bit-identical** to the
+/// dense path on the stored nonzeros (SCX-DATA-LOADER §0). The dense transforms
+/// are zero-preserving (`0 * factor = 0`; `ln(1+0) = 0`) and `normalize` derives
+/// its scale from the row sum — which, over a sparse row's nonzeros, equals the
+/// full row sum since the absent zeros contribute nothing. `normalize` rounds
+/// `(v as f64 * factor) as f32` per element (not an f32 scale multiply), exactly
+/// as [`normalize_dense_row`]; `log1p` is `ln_1p`, exactly as [`log1p_dense_row`].
 fn apply_sparse_transforms(data: &mut [f32], normalize: bool, log1p: bool, target_sum: f64) {
     if normalize {
-        let sum: f64 = data.iter().map(|&v| v as f64).sum();
-        if sum > 0.0 {
-            let scale = (target_sum / sum) as f32;
-            for v in data.iter_mut() {
-                *v *= scale;
-            }
-        }
+        crate::normalize::normalize_dense_row(data, target_sum);
     }
     if log1p {
-        for v in data.iter_mut() {
-            *v = v.ln_1p();
-        }
+        crate::normalize::log1p_dense_row(data);
     }
 }
 
