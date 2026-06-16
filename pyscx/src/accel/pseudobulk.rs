@@ -522,7 +522,16 @@ pub fn pseudobulk_dex(
     if backend == "nb_glm" {
         let test_col_idx = groupby.iter().position(|c| c == test_col).unwrap();
         let nb_opts = super::nb_glm::nbglm_options_from_dict(py, nbglm_options)?;
-        let df = super::nb_glm::fit_targets_pandas(py, &result, test_col_idx, reference, &nb_opts)?;
+        // `pseudobulk_dex` has no `device=` kwarg; the NB-GLM backend runs on CPU
+        // here (the GPU path is reached via `pyscx.accel.pdex_nb_glm(device=…)`).
+        let df = super::nb_glm::fit_targets_pandas(
+            py,
+            &result,
+            test_col_idx,
+            reference,
+            &nb_opts,
+            None,
+        )?;
         return Ok(df.unbind());
     }
 

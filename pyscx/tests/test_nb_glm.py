@@ -209,3 +209,47 @@ def test_nb_glm_cooks_filtering_can_be_disabled():
     assert np.all(
         np.isfinite(off["pvalue"].to_numpy())
     ), "cooks_filtering=False ⇒ no Cook's-driven NaN p-values"
+
+
+def test_nb_glm_cpu_gpu_agreement():
+    """Stage-A GPU fit matches the CPU f64 reference on the small fixture.
+
+    Skips without a CUDA GPU; the GPU CI harness runs it on an H100. The CPU
+    fitter is the reference (no external one exists — pyDESeq2 OOMs).
+    """
+    if not pyscx.accel.gpu_available():
+        pytest.skip("no CUDA GPU available")
+    # A larger synthetic fixture exercises the kernel across many genes.
+    rng = np.random.default_rng(7)
+    n_samples, n_genes = 6, 300
+    base = rng.uniform(40, 120, size=n_genes)
+    lfc = rng.uniform(-1.0, 1.0, size=n_genes)
+    is_treat = np.array([0, 0, 0, 1, 1, 1], dtype=np.float64)
+    mu = base[None, :] * np.exp(np.outer(is_treat, lfc))
+    counts = rng.poisson(mu).astype(np.float64)
+    design = np.column_stack([np.ones(n_samples), is_treat])
+
+    cpu = pyscx.accel.nb_glm(counts, design, contrast=1, device="cpu")
+    gpu = pyscx.accel.nb_glm(counts, design, contrast=1, device="gpu")
+
+    c_lfc = cpu["log2FoldChange"].to_numpy()
+    g_lfc = gpu["log2FoldChange"].to_numpy()
+    finite = np.isfinite(c_lfc) & np.isfinite(g_lfc)
+    rel = np.abs(c_lfc[finite] - g_lfc[finite]) / (np.abs(c_lfc[finite]) + 1e-6)
+    # Bound set by nvcc --use_fast_math transcendentals (exp/log) + the Illinois
+    # root-find's slightly different GPU convergence path — measured worst-case
+    # ~1.5e-4 on this fixture. 2e-3 leaves margin without admitting a real
+    # divergence (ranking Spearman is 1.000 regardless — see the pdex test).
+    assert rel.max() <= 2e-3, f"max rel log2fc {rel.max()} > 2e-3"
+
+    # p-values: the fast-math log2fc noise (~1.5e-4) is amplified through the
+    # Wald normal-tail, so mid-range p-values diverge by ~2e-4 absolute
+    # (measured). Rank concordance is the meaningful guard; the elementwise
+    # tolerance is generous to tolerate that benign tail amplification.
+    spearmanr = pytest.importorskip("scipy.stats").spearmanr
+    c_p = cpu["pvalue"].to_numpy()
+    g_p = gpu["pvalue"].to_numpy()
+    pfin = np.isfinite(c_p) & np.isfinite(g_p)
+    rho_p = spearmanr(c_p[pfin], g_p[pfin])[0]
+    assert rho_p >= 0.999, f"p-value Spearman {rho_p} < 0.999"
+    assert np.allclose(c_p[pfin], g_p[pfin], rtol=5e-3, atol=5e-3)

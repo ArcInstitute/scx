@@ -107,3 +107,48 @@ fn independent_filter_too_few_genes_is_no_op() {
     assert_eq!(n_filtered, 0);
     assert!(p_adj.iter().all(|v| v.is_finite()));
 }
+
+#[test]
+fn independent_filter_is_thread_count_invariant() {
+    // The 50-cutoff BH sweep is rayon-parallel; assert the output is bit-identical
+    // regardless of pool size (order-preserving `collect`, integer rejection
+    // counts, deterministic downstream selection). Locks the "byte-identical"
+    // claim against a future order-dependent reduction.
+    let n = 3000;
+    let base_mean: Vec<f64> = (0..n)
+        .map(|i| 1.0 + (i as f64 * 0.013).sin().abs() * 800.0)
+        .collect();
+    // A signal: low p-values concentrated at high base mean → filtering helps.
+    let p_value: Vec<f64> = (0..n)
+        .map(|i| {
+            if base_mean[i] > 400.0 {
+                ((i * 7 + 1) % 50) as f64 / 5000.0
+            } else {
+                0.2 + ((i * 13 + 3) % 800) as f64 / 1000.0
+            }
+        })
+        .collect();
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| independent_filter(&base_mean, &p_value, 0.1))
+    };
+    let (adj1, thr1, nf1) = run(1);
+    let (adj8, thr8, nf8) = run(8);
+    assert_eq!(nf1, nf8, "n_filtered differs by thread count");
+    assert_eq!(
+        thr1.map(f64::to_bits),
+        thr8.map(f64::to_bits),
+        "threshold differs by thread count"
+    );
+    assert_eq!(adj1.len(), adj8.len());
+    for (i, (a, b)) in adj1.iter().zip(&adj8).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "p_adj[{i}] differs by thread count"
+        );
+    }
+}

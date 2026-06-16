@@ -7,6 +7,8 @@
 //! cutoff that maximizes rejections via the genefilter lowess + 1-SE rule. Both are
 //! default-on to match DESeq2; both degrade to no-ops when they cannot apply.
 
+use rayon::prelude::*;
+
 use super::math::{f_quantile, lowess, nb_irls_weight};
 use crate::diffexp::benjamini_hochberg;
 
@@ -167,8 +169,12 @@ pub(crate) fn independent_filter(
     let thetas: Vec<f64> = (0..N_THETA)
         .map(|k| 0.95 * k as f64 / (N_THETA as f64 - 1.0))
         .collect();
+    // Each cutoff's rejection count is an independent O(n log n) BH pass; the 50
+    // cutoffs are the dominant cost of the per-target multiple-testing phase
+    // (Stage B B0: `mtc`). They share only read-only state, so evaluate them in
+    // parallel. Result is identical to the serial sweep (no reduction order).
     let num_rej: Vec<f64> = thetas
-        .iter()
+        .par_iter()
         .map(|&t| count_rejections(quantile_sorted(&bm_sorted, t)) as f64)
         .collect();
 

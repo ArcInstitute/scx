@@ -59,10 +59,22 @@ fn main() {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let ptx_path = out_path.join(format!("{stem}.ptx"));
 
-            let status = std::process::Command::new("nvcc")
-                .arg("--ptx")
-                .arg("-O3")
-                .arg("--use_fast_math")
+            let mut cmd = std::process::Command::new("nvcc");
+            cmd.arg("--ptx").arg("-O3");
+            // `nb_glm` is a precision-sensitive `f64` fitter (Cox–Reid dispersion,
+            // digamma/trigamma, IRLS divisions). `--use_fast_math` implies
+            // `--prec-div=false --ftz=true`, which degrades exactly those f64
+            // divisions and is the mechanism behind its ~1.5e-4 CPU↔GPU agreement
+            // floor — so build it with precise division/sqrt and no flush-to-zero.
+            // The other kernels are `f32` throughput paths and keep fast-math.
+            if stem == "nb_glm" {
+                cmd.arg("--prec-div=true")
+                    .arg("--prec-sqrt=true")
+                    .arg("--ftz=false");
+            } else {
+                cmd.arg("--use_fast_math");
+            }
+            let status = cmd
                 .arg("-arch=compute_70") // PTX is forward-compatible (runs on sm_90)
                 .arg("-o")
                 .arg(&ptx_path)

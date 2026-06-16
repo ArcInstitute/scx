@@ -1,6 +1,7 @@
 //! Python bindings for the Rust-native pseudobulk NB-GLM (`scx_accel`).
 //!
-//! Two entry points (both CPU-only; no `device=` — spec §13):
+//! Two entry points (both accept `device="auto"|"cpu"|"gpu"|"gpu:N"`; the GPU
+//! path is the Stage-A host-fed dense fitter in `scx-gpu/kernels/nb_glm.cu`):
 //!   * [`nb_glm`] — direct DESeq2-replacement on already-pseudobulked matrices,
 //!     returning a pandas DataFrame with PyDESeq2-style column names.
 //!   * [`pdex_nb_glm`] — pseudobulk-from-AnnData with a replicate stratifier,
@@ -21,6 +22,118 @@ use scx_accel::{DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, Pseu
 
 use super::de::build_de_dataframe;
 use super::pseudobulk::aggregate_pseudobulk;
+
+/// Whether the problem dims fit the GPU kernel's register bounds (p ≤ PMAX,
+/// n_sub ≤ NSUB_MAX). Always `false` without the `gpu` feature.
+fn gpu_dims_ok(n_features: usize, n_samples: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        n_features <= scx_accel::GPU_NB_GLM_PMAX && n_samples <= scx_accel::GPU_NB_GLM_NSUB_MAX
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (n_features, n_samples);
+        false
+    }
+}
+
+/// Extract the GPU device id from a [`ResolvedDevice`] (always `None` without
+/// the `gpu` feature, where a GPU device cannot be resolved).
+fn resolve_gpu_id(resolved: super::gpu::ResolvedDevice) -> Option<usize> {
+    #[cfg(feature = "gpu")]
+    {
+        resolved.gpu_id()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = resolved;
+        None
+    }
+}
+
+/// A resolved GPU device for an NB-GLM op, held once and reused across a
+/// many-target loop (creating a CUDA context per target would be ruinous).
+/// Carries nothing without the `gpu` feature.
+#[cfg(feature = "gpu")]
+type NbGlmGpuDev = Option<scx_accel::GpuDevice>;
+#[cfg(not(feature = "gpu"))]
+type NbGlmGpuDev = Option<()>;
+
+/// Create the reusable [`NbGlmGpuDev`] for a resolved GPU device id. `None`
+/// device id (CPU) yields `None`. Errors only on CUDA context-creation failure.
+fn make_gpu_dev(gpu_device_id: Option<usize>) -> PyResult<NbGlmGpuDev> {
+    #[cfg(feature = "gpu")]
+    {
+        match gpu_device_id {
+            Some(id) => Ok(Some(scx_accel::GpuDevice::new(id).map_err(|e| {
+                PyRuntimeError::new_err(format!("GPU NB-GLM device init failed: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_device_id;
+        Ok(None)
+    }
+}
+
+/// Fit one pseudobulk NB-GLM on the GPU when `gpu_dev` is `Some` **and** the dims
+/// fit the kernel, else on the CPU. The per-fit dim guard means a single
+/// over-large target in a many-target sweep silently uses the CPU rather than
+/// erroring — the dominant (in-bounds) targets still take the GPU route.
+#[allow(clippy::too_many_arguments)]
+fn fit_one(
+    py: Python<'_>,
+    gpu_dev: &NbGlmGpuDev,
+    cg: &[f64],
+    n_genes: usize,
+    n_sub: usize,
+    design: &[f64],
+    n_features: usize,
+    size_factors: Option<&[f64]>,
+    contrast: NbGlmContrast,
+    options: NbGlmOptions,
+) -> Result<NbGlmResult, scx_accel::AccelError> {
+    #[cfg(feature = "gpu")]
+    {
+        if let Some(dev) = gpu_dev {
+            if gpu_dims_ok(n_features, n_sub) {
+                // The `GpuDevice` handle is `!Send`, so we cannot release the GIL
+                // around the device fit; it is short (the fit runs on-device).
+                return scx_accel::gpu_pseudobulk_nb_glm(
+                    dev,
+                    cg,
+                    n_genes,
+                    n_sub,
+                    design,
+                    n_features,
+                    size_factors,
+                    contrast,
+                    options,
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = gpu_dev;
+    }
+    // The CPU fit is pure Rust (gene-parallel rayon) — release the GIL for its
+    // duration so other Python threads run, matching the sibling accel ops.
+    py.detach(|| {
+        scx_accel::pseudobulk_nb_glm(
+            cg,
+            n_genes,
+            n_sub,
+            design,
+            n_features,
+            size_factors,
+            contrast,
+            options,
+        )
+    })
+}
 
 /// Copy a 2-D array-like into a row-major `Vec<f64>` plus its `(rows, cols)`.
 fn dense2d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
@@ -276,7 +389,9 @@ pub(super) fn fit_targets_nbglm(
     cond_col_idx: usize,
     reference: &str,
     options: &NbGlmOptions,
+    gpu_device_id: Option<usize>,
 ) -> PyResult<Vec<TargetFit>> {
+    let gpu_dev = make_gpu_dev(gpu_device_id)?;
     let n_groups = result.n_groups;
     let n_vars = result.n_vars;
     let cond: Vec<&str> = (0..n_groups)
@@ -301,6 +416,12 @@ pub(super) fn fit_targets_nbglm(
         )));
     }
 
+    // Per-target loop is **serial** by design: each fit is already gene-parallel
+    // (rayon) and the per-target host tail (MTC etc.) is parallelized internally.
+    // Parallelizing this outer loop was measured to *lower* the GPU/CPU speedup —
+    // it speeds the CPU baseline (whose fit overlaps across targets) far more than
+    // the GPU path (whose fit is off-CPU), and nests rayon. The GPU device handle
+    // is `!Sync` and must stay serial regardless.
     let warnings = py.import("warnings")?;
     let mut fits = Vec::with_capacity(targets.len());
     for target in &targets {
@@ -324,22 +445,26 @@ pub(super) fn fit_targets_nbglm(
             continue;
         }
 
-        // Gene-major counts [n_vars x n_sub] and design [n_sub x 2].
+        // Gene-major counts [n_vars × n_sub] and design [n_sub × 2].
         let mut cg = vec![0.0_f64; n_vars * n_sub];
         let mut design = vec![0.0_f64; n_sub * 2];
         for (s, &g) in sub.iter().enumerate() {
             design[s * 2] = 1.0;
             design[s * 2 + 1] = if cond[g] == target.as_str() { 1.0 } else { 0.0 };
         }
-        // Transpose group-major `counts` → gene-major `cg`; inner loop over `s`
-        // writes `cg` contiguously (stride 1) for cache-friendly stores.
-        for j in 0..n_vars {
-            for (s, &g) in sub.iter().enumerate() {
-                cg[j * n_sub + s] = result.counts[g * n_vars + j];
+        {
+            let _t =
+                scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Transpose);
+            for j in 0..n_vars {
+                for (s, &g) in sub.iter().enumerate() {
+                    cg[j * n_sub + s] = result.counts[g * n_vars + j];
+                }
             }
         }
 
-        match scx_accel::pseudobulk_nb_glm(
+        match fit_one(
+            py,
+            &gpu_dev,
             &cg,
             n_vars,
             n_sub,
@@ -371,8 +496,9 @@ pub(super) fn fit_targets_pandas<'py>(
     cond_col_idx: usize,
     reference: &str,
     options: &NbGlmOptions,
+    gpu_device_id: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let fits = fit_targets_nbglm(py, result, cond_col_idx, reference, options)?;
+    let fits = fit_targets_nbglm(py, result, cond_col_idx, reference, options, gpu_device_id)?;
     if fits.is_empty() {
         return Err(PyRuntimeError::new_err(
             "NB-GLM produced no fittable contrasts: every target had < 2 pseudobulk \
@@ -441,8 +567,10 @@ pub(super) fn fit_targets_pandas<'py>(
 }
 
 /// Fit a Rust-native negative-binomial GLM on an already-pseudobulked count
-/// matrix and test a contrast (a DESeq2 replacement). CPU-only, `f64` — there is
-/// no `device=` argument.
+/// matrix and test a contrast (a DESeq2 replacement). `f64` throughout;
+/// `device="auto"|"cpu"|"gpu"|"gpu:N"` selects CPU vs the Stage-A GPU fitter
+/// (the GPU path requires `n_features ≤ 8` and `n_samples ≤ 64`, else it falls
+/// back to CPU).
 ///
 /// `counts` is `[n_samples × n_genes]` (default) or `[n_genes × n_samples]` per
 /// `counts_axis`; `design` is `[n_samples × n_features]` and full column rank.
@@ -463,7 +591,7 @@ pub(super) fn fit_targets_pandas<'py>(
 /// apeglm LFC shrinkage. Use PyDESeq2 when exact DESeq2 numerics are required.
 /// See docs/pseudobulk_nb_glm.md.
 #[pyfunction]
-#[pyo3(signature = (counts, design, size_factors=None, contrast=None, gene_names=None, sample_names=None, options=None, counts_axis="samples_by_genes"))]
+#[pyo3(signature = (counts, design, size_factors=None, contrast=None, gene_names=None, sample_names=None, options=None, counts_axis="samples_by_genes", device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn nb_glm(
     py: Python<'_>,
@@ -475,6 +603,7 @@ pub fn nb_glm(
     sample_names: Option<Vec<String>>,
     options: Option<&Bound<'_, PyDict>>,
     counts_axis: &str,
+    device: &str,
 ) -> PyResult<Py<PyAny>> {
     let _ = sample_names; // accepted for API symmetry; output is per-gene
     let (counts_vec, r, c) = dense2d_f64(py, counts)?;
@@ -512,7 +641,23 @@ pub fn nb_glm(
     let options = nbglm_options_from_dict(py, options)?;
     let contrast = contrast_from_pyany(contrast, n_features)?;
 
-    let res = scx_accel::pseudobulk_nb_glm(
+    // Resolve device + plan the route. `nb_glm` operates on raw arrays (no
+    // AnnData), so there is no `uns` to stamp — but we still announce a silent
+    // GPU→CPU fallback so an explicit `device="gpu"` with over-large dims warns.
+    let resolved = super::gpu::resolve_device(device)?;
+    let gpu_device_id = resolve_gpu_id(resolved);
+    let gpu_eligible = gpu_dims_ok(n_features, n_samples);
+    let info = super::route::nb_glm_exec_info(device, gpu_eligible);
+    super::route::announce_route(py, "nb_glm", device, &info);
+    let gpu_dev = make_gpu_dev(if info.route.is_gpu() {
+        gpu_device_id
+    } else {
+        None
+    })?;
+
+    let res = fit_one(
+        py,
+        &gpu_dev,
         &counts_gene_major,
         n_genes,
         n_samples,
@@ -568,6 +713,35 @@ pub fn nb_glm(
     Ok(df.get_item(order)?.unbind())
 }
 
+/// Snapshot the NB-GLM per-phase wall-time profiler (Stage B0).
+///
+/// Returns a dict mapping each phase name (`transpose`, `cpu_mle_pass`,
+/// `cpu_shrink_pass`, `gpu_mle_fit`, `gpu_trend_prior`, `gpu_shrink_fit`,
+/// `wald_cooks`, `mtc`, `assembly`) to a `{ms, calls}` sub-dict. Accumulates
+/// only when the process was started with `SCX_NBGLM_PROFILE=1`; otherwise every
+/// bucket reads zero. Mirrors `gpu_profile_snapshot`. The `mtc` (multiple-testing
+/// correction: independent filter + BH) and `wald_cooks` buckets quantify the
+/// per-target host tail that bounds the GPU speedup (the GPU fit itself is a
+/// small fraction of wall on the many-target sweep).
+#[pyfunction]
+pub fn nb_glm_profile_snapshot(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    for stat in scx_accel::nb_glm::profile::snapshot() {
+        let d = PyDict::new(py);
+        d.set_item("ms", stat.ms)?;
+        d.set_item("calls", stat.calls)?;
+        dict.set_item(stat.name, d)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+/// Reset the NB-GLM per-phase profiler counters to zero (call between bench runs).
+#[pyfunction]
+pub fn nb_glm_profile_reset() -> PyResult<()> {
+    scx_accel::nb_glm::profile::reset();
+    Ok(())
+}
+
 /// Pseudobulk NB-GLM differential expression for the cell-eval/pdex consumer.
 ///
 /// Aggregates `groupby × stratify_by` pseudobulk **replicates** from `adata`,
@@ -575,8 +749,9 @@ pub fn nb_glm(
 /// returns the cell-eval `DEResults` **polars** schema (`target, feature,
 /// fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change`) — the same
 /// schema as `rank_genes_groups_df` / `pdex_ref`, so it drops into `cell_eval`
-/// unchanged. CPU-only (no `device=`); records `route="cpu_nb_glm"` on
-/// `adata.uns["scx_accel"]["pdex_nb_glm"]`.
+/// unchanged. `device="auto"|"cpu"|"gpu"|"gpu:N"` selects the fitter (GPU =
+/// Stage-A host-fed dense kernel); records the planned route on
+/// `adata.uns["scx_accel"]["pdex_nb_glm"]` (`gpu_nb_glm_csr` / `cpu_nb_glm`).
 ///
 /// A pseudobulk NB-GLM needs ≥ 2 samples per condition to estimate dispersion, so
 /// `stratify_by` (a **list** of batch/donor/well/replicate obs columns, e.g.
@@ -588,7 +763,7 @@ pub fn nb_glm(
 /// rejected. DESeq2-*style*, not DESeq2-*identical*. See
 /// docs/pseudobulk_nb_glm.md.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr"))]
+#[pyo3(signature = (adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_nb_glm(
     py: Python<'_>,
@@ -602,6 +777,7 @@ pub fn pdex_nb_glm(
     nbglm_options: Option<&Bound<'_, PyDict>>,
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
+    device: &str,
 ) -> PyResult<Py<PyAny>> {
     // `stratify_by` is list-only; turn the opaque PyO3 `Can't extract 'str' to
     // 'Vec'` into an actionable message when a bare string slips through.
@@ -662,6 +838,23 @@ pub fn pdex_nb_glm(
         ));
     }
 
+    // Resolve device + plan the route **before** the expensive aggregation, so an
+    // invalid `device=` string or `device="gpu"` on a CPU-only build / no-GPU host
+    // fails fast (rather than after a full pseudobulk pass). The per-target design
+    // is `[intercept, is_target]` (p=2 ≤ PMAX) so the kernel always supports the
+    // width → `gpu_eligible = true`; the per-target `n_sub` guard in `fit_one`
+    // silently routes any over-large target to CPU (the stamped GPU route below
+    // can therefore reflect a sweep that partially ran on CPU — see the note where
+    // it is written).
+    let resolved = super::gpu::resolve_device(device)?;
+    let info = super::route::nb_glm_exec_info(device, true);
+    super::route::announce_route(py, "pdex_nb_glm", device, &info);
+    let gpu_device_id = if info.route.is_gpu() {
+        resolve_gpu_id(resolved)
+    } else {
+        None
+    };
+
     // Drop whole strata (unique stratify_by combinations) with too few total
     // cells before aggregation — a sparse donor/batch cannot form a reliable
     // pseudobulk replicate. (`min_cells_per_group` still filters each
@@ -674,15 +867,18 @@ pub fn pdex_nb_glm(
     combined.push(groupby.to_string());
     combined.extend(strat.iter().cloned());
 
-    let result = aggregate_pseudobulk(
-        py,
-        &working,
-        &combined,
-        prefer_format,
-        None,
-        scx_accel::AggregationMethod::Sum,
-        min_cells_per_group,
-    )?;
+    let result = {
+        let _t = scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Aggregate);
+        aggregate_pseudobulk(
+            py,
+            &working,
+            &combined,
+            prefer_format,
+            None,
+            scx_accel::AggregationMethod::Sum,
+            min_cells_per_group,
+        )?
+    };
     if result.n_groups == 0 {
         return Err(PyRuntimeError::new_err(
             "no pseudobulk groups passed the min_cells_per_group filter",
@@ -690,7 +886,7 @@ pub fn pdex_nb_glm(
     }
 
     let options = nbglm_options_from_dict(py, nbglm_options)?;
-    let fits = fit_targets_nbglm(py, &result, 0, reference, &options)?;
+    let fits = fit_targets_nbglm(py, &result, 0, reference, &options, gpu_device_id)?;
     if fits.is_empty() {
         return Err(PyRuntimeError::new_err(
             "no perturbation had enough pseudobulk replicates to fit NB-GLM; \
@@ -698,18 +894,16 @@ pub fn pdex_nb_glm(
         ));
     }
 
-    // Stamp the route on adata.uns["scx_accel"]["pdex_nb_glm"].
-    super::route::write_accel_route(
-        py,
-        adata,
-        "pdex_nb_glm",
-        &scx_accel::AccelExecutionInfo::new(
-            scx_accel::AccelRoute::CpuNbGlm,
-            scx_accel::FallbackReason::None,
-        ),
-    )?;
+    // Stamp the planned route on adata.uns["scx_accel"]["pdex_nb_glm"]. NOTE: a
+    // stamped `gpu_nb_glm_csr` reflects the *intended* route; an individual target
+    // whose pseudobulk has n_sub > GPU_NB_GLM_NSUB_MAX falls back to CPU inside
+    // `fit_one` (rare — n_sub is 2·replicates), so a GPU-stamped sweep may have run
+    // a few targets on CPU.
+    super::route::write_accel_route(py, adata, "pdex_nb_glm", &info)?;
 
     // Flatten to the cell-eval/pdex column vectors.
+    let _flatten_timer =
+        scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Flatten);
     let n_vars = result.n_vars;
     let cap = fits.len() * n_vars;
     let mut targets = Vec::with_capacity(cap);
@@ -745,20 +939,24 @@ pub fn pdex_nb_glm(
     dict.set_item("fdr", fdrs)?;
     dict.set_item("log2_fold_change", log2_fcs)?;
     dict.set_item("abs_log2_fold_change", abs_log2_fcs)?;
+    drop(_flatten_timer);
 
-    let df = build_de_dataframe(
-        py,
-        &dict,
-        &[
-            "target",
-            "feature",
-            "fold_change",
-            "p_value",
-            "fdr",
-            "log2_fold_change",
-            "abs_log2_fold_change",
-        ],
-        "polars",
-    )?;
+    let df = {
+        let _t = scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Dataframe);
+        build_de_dataframe(
+            py,
+            &dict,
+            &[
+                "target",
+                "feature",
+                "fold_change",
+                "p_value",
+                "fdr",
+                "log2_fold_change",
+                "abs_log2_fold_change",
+            ],
+            "polars",
+        )?
+    };
     Ok(df.unbind())
 }
