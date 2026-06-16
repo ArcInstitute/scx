@@ -476,6 +476,54 @@ DATASETS: dict[str, DatasetConfig] = {
         approx_h5ad_mb=4_000, available=True, synthetic=True,
         synth_params={"n_obs": 1_000_000, "n_vars": 2_000, "n_perts": 50, "seed": 42},
     ),
+    # GPU pseudobulk NB-GLM DE fixtures (accel_de_nb_glm). Stratified sparse
+    # Perturb-seq: control + (n_perts-1) KOs × n_donors donors → each condition
+    # has n_donors≥2 replicates (pdex_nb_glm's stratifier guard). Generated
+    # in-process by _pert_synth.make_raw_counts_stratified; n_obs = cells_per ·
+    # n_perts · n_donors (cells_per≈60). n_sub per target = 2·n_donors = 6, the
+    # documented target regime.
+    #
+    # density=0.3 (~35% nonzero): an ultra-sparse single-cell density (~0.08)
+    # leaves the pseudobulk aggregate with too few counts/gene/block (~3) for the
+    # DE anchors to be defined — CPU↔GPU rank Spearman stays 1.0 (the kernels
+    # agree) but NB-GLM-vs-pdex_ref concordance is undefined on signal-free genes.
+    # Calibrated CPU-side: density 0.3 at cells_per≈60 gives min(Spearman) ≈ 0.98
+    # vs pdex_ref with comfortable margin over the 0.95 floor, while staying
+    # representative (aggregation does not dominate — the surfaced speedup stays
+    # well above 1×). The ultra-sparse regime's aggregation-aware speedup is
+    # characterized separately by the standalone bench_nb_glm.py --gpu dev tool.
+    #
+    # NOT added to capture_baseline TIERS (that would schedule every other
+    # benchmark on a fixture with no on-disk h5ad) — exercise via
+    # `run_parallel.py --benchmarks accel_de_nb_glm --datasets nb_glm_synth`,
+    # mirroring how cell_eval_parity_perf's pert_synth_* floors are run.
+    "nb_glm_synth_small": DatasetConfig(
+        id="NBG0", name="nb_glm_synth_small",
+        n_obs=3_600, n_vars=18_000,
+        protocol="synthetic (stratified Perturb-seq, raw counts)",
+        source="_pert_synth.make_raw_counts_stratified",
+        approx_h5ad_mb=40, available=True, synthetic=True,
+        synth_params={"n_obs": 3_600, "n_vars": 18_000, "n_perts": 20,
+                      "n_donors": 3, "density": 0.3, "seed": 42},
+    ),
+    "nb_glm_synth": DatasetConfig(
+        id="NBG1", name="nb_glm_synth",
+        n_obs=18_000, n_vars=18_000,
+        protocol="synthetic (stratified Perturb-seq, raw counts)",
+        source="_pert_synth.make_raw_counts_stratified",
+        approx_h5ad_mb=200, available=True, synthetic=True,
+        synth_params={"n_obs": 18_000, "n_vars": 18_000, "n_perts": 100,
+                      "n_donors": 3, "density": 0.3, "seed": 42},
+    ),
+    "nb_glm_synth_xl": DatasetConfig(
+        id="NBG2", name="nb_glm_synth_xl",
+        n_obs=45_000, n_vars=18_000,
+        protocol="synthetic (stratified Perturb-seq, raw counts)",
+        source="_pert_synth.make_raw_counts_stratified",
+        approx_h5ad_mb=500, available=True, synthetic=True,
+        synth_params={"n_obs": 45_000, "n_vars": 18_000, "n_perts": 250,
+                      "n_donors": 3, "density": 0.3, "seed": 42},
+    ),
     # Phase K — multimodal datasets sourced from 10x Genomics public
     # CITE-seq + Multiome libraries. Staged via
     # benchmarks/scripts/download_citeseq_pbmc.py and
@@ -675,6 +723,13 @@ def accel_formats() -> list[FormatVariant]:
             accel_de_variants,
         )
         out.extend(accel_de_variants())
+    except ImportError:
+        pass
+    try:
+        from benchmarks.comprehensive.benchmarks.accel_de_nb_glm import (
+            accel_de_nb_glm_variants,
+        )
+        out.extend(accel_de_nb_glm_variants())
     except ImportError:
         pass
     try:
@@ -975,6 +1030,13 @@ def estimate_memory_gb(
         # `bench_csc_dispatch` which has the same chunked dense buffer
         # shape on the CSR-DE path.
         peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark == "accel_de_nb_glm":
+        # Synthetic stratified fixture (~9K cells × 18K genes sparse) + the
+        # aggregated pseudobulk + a few result DataFrames. The GPU variant holds
+        # the CPU + GPU result frames simultaneously for the concordance merge.
+        # Bounded by the dense materialisation of the small fixture; size like
+        # accel_de's chunked-dense tier.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark == "bench_csc_dispatch":
         # CSC dispatch benchmark — peak RSS dominated by the operation
         # being run (qc / hvg / de / pseudobulk). DE chunked dense
@@ -1144,6 +1206,11 @@ def estimate_time_minutes(
         # cells, so large datasets short-circuit early. Reference
         # scanpy run dominates the CPU path on smaller datasets.
         "accel_de":               45,
+        # GPU NB-GLM: the GPU variant runs pdex_nb_glm gpu×reps + cpu×reps + a
+        # pdex_ref anchor. The CPU pdex_nb_glm path at the many-perturbation
+        # scale (100 perts × 18K genes) costs tens of seconds per call, so the
+        # CPU-baseline + concordance triple-run dominates. Generous base.
+        "accel_de_nb_glm":        60,
         # CSC dispatch sweep runs eight ops (qc/hvg/de/pseudobulk × csr/csc)
         # against a converted CSC-equipped fixture; one-shot conversion is
         # cached per dataset so the per-variant work is bounded by the op

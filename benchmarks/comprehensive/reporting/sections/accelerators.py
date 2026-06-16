@@ -28,14 +28,31 @@ def _build_gpu_table(store: ResultStore) -> TableBlock | TextBlock:
     gpu_benchmarks = [
         "accel_pca", "accel_knn", "accel_umap", "accel_leiden",
         "accel_preprocess", "accel_hvg",
+        # Differential expression — per-cell (Wilcoxon / pdex_ref) and
+        # pseudobulk NB-GLM. accel_de doesn't stamp scenario.device, so GPU
+        # rows are detected via the `_gpu`-suffixed format key below.
+        "accel_de", "accel_de_nb_glm",
     ]
     rows_data: list[dict] = []
     for bench in gpu_benchmarks:
         for row in store.by_benchmark(bench):
+            if row.missing_reason is not None:
+                continue  # skip-with-stub rows (e.g. no_gpu) carry no timing
             sc = row.scenario
-            if sc.device and "gpu" in sc.device.lower():
+            is_gpu = (sc.device and "gpu" in sc.device.lower()) or row.format.endswith("_gpu")
+            if is_gpu:
+                # Fold the variant tail (e.g. pyscx_pdex_ref) into the operation
+                # label so multiple GPU variants of one bench stay distinct.
+                tail = row.format[len(bench) + 2:] if row.format.startswith(bench + "__") else ""
+                if tail.endswith("_gpu"):
+                    tail = tail[:-4]
+                op = bench.replace("accel_", "")
+                # Suppress the bare default-runner label ("pyscx") — it adds no
+                # information; only show a tail that names a distinct variant.
+                if tail and tail not in ("pyscx", "pyscx_gpu"):
+                    op = f"{op} ({tail})"
                 rows_data.append({
-                    "operation": bench.replace("accel_", ""),
+                    "operation": op,
                     "dataset": row.dataset,
                     "gpu_wall_s": row.median_wall_s,
                     "source_path": row.source.path,
@@ -173,7 +190,7 @@ def _build_format_pipeline_table(store: ResultStore) -> TableBlock | TextBlock:
 
 
 def build(store: ResultStore) -> Chapter:
-    c = Chapter(title="Accelerators (PCA, kNN, UMAP, Leiden)")
+    c = Chapter(title="Accelerators (PCA, kNN, UMAP, Leiden, DE)")
 
     # ── Parity overview ──────────────────────────────────────────────
     c.sections.append(Section(
@@ -280,6 +297,29 @@ def build(store: ResultStore) -> Chapter:
                 "`scx_auto` column shows the default-codec behaviour an unaware "
                 "user would get."
             ),
+        ],
+    ))
+
+    # ── Differential expression (CPU + GPU) ─────────────────────────
+    c.sections.append(Section(
+        title="Differential Expression (CPU + GPU)",
+        blocks=[
+            TextBlock(
+                "Per-cell DE (scanpy/pyscx Wilcoxon `rank_genes_groups`, "
+                "`pdex_ref`) and pseudobulk negative-binomial GLM "
+                "(`pdex_nb_glm`, DESeq2-style), CPU vs GPU. The first table is "
+                "wall time per method × dataset × device; the second isolates "
+                "the GPU NB-GLM speedup, kernel throughput, and CPU↔GPU "
+                "numerical agreement; the third surfaces the deterministic "
+                "route / correctness gate signals at a glance. The NB-GLM "
+                "end-to-end speedup is **same-machine and node-core-count "
+                "dependent** (the un-accelerated host aggregation + CPU baseline "
+                "scale with cores), so it is surfaced here, not floored — only "
+                "the route + concordance signals are hard-gated."
+            ),
+            tables.de_performance_table(),
+            tables.de_nb_glm_gpu_table(),
+            tables.de_route_correctness_table(),
         ],
     ))
 

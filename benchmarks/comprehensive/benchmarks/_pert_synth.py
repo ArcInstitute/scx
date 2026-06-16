@@ -183,6 +183,94 @@ def make_raw_counts(
     return adata
 
 
+def _cache_dir_stratified(
+    n_obs: int, n_vars: int, n_perts: int, n_donors: int, density: float, seed: int,
+) -> Path:
+    dens = f"{density:g}".replace(".", "p")
+    return SYNTH_ROOT / f"pertstrat_{n_obs}_{n_vars}_{n_perts}_{n_donors}_{dens}_{seed}"
+
+
+def make_raw_counts_stratified(
+    n_obs: int,
+    n_vars: int = 18_000,
+    n_perts: int = 50,
+    n_donors: int = 3,
+    density: float = 0.08,
+    seed: int = 42,
+    *,
+    cache: bool = True,
+) -> ad.AnnData:
+    """Sparse raw-count Perturb-seq fixture with a replicate stratifier.
+
+    ``obs`` has ``"perturbation"`` (``"control"`` + ``n_perts - 1`` KOs) AND
+    ``"donor"`` (``n_donors`` levels), so every (perturbation × donor) cell block
+    is a pseudobulk replicate → each condition has ``n_donors`` ≥ 2 replicates,
+    satisfying ``pdex_nb_glm``'s stratifier guard.
+
+    The CSR ``X`` is realistically sparse (~``density`` nonzero) via low per-cell
+    Poisson means: the per-gene NB-GLM fit runs on the dense aggregated pseudobulk
+    (density-independent), while aggregation scales with nnz — a *dense* fixture
+    makes aggregation dominate and understates the GPU-fit speedup (the corrected
+    lesson from the Stage-B profiling). This is the same generator proven in
+    ``pyscx/benchmarks/bench_nb_glm.py::make_perturb_adata_sparse``, lifted here so
+    the comprehensive module and the standalone dev bench share one definition.
+
+    Disk-cached under ``$SCX_DATA_DIR/synthetic/pertstrat_…`` keyed by
+    ``(n_obs, n_vars, n_perts, n_donors, density, seed)``.
+    """
+    cells_per = max(1, n_obs // (n_perts * n_donors))
+    n_obs_actual = cells_per * n_perts * n_donors
+
+    if cache:
+        cdir = _cache_dir_stratified(
+            n_obs_actual, n_vars, n_perts, n_donors, density, seed
+        )
+        raw_path = cdir / "raw.h5ad"
+        if raw_path.exists():
+            return ad.read_h5ad(raw_path)
+
+    rng = np.random.default_rng(seed)
+    perts = ["control"] + [f"ko_{i}" for i in range(n_perts - 1)]
+    donors = [f"d{j}" for j in range(n_donors)]
+
+    # Per-cell mean chosen so P(count>0) ≈ density (Poisson: 1 - e^-mean).
+    mean_level = -np.log(max(1e-6, 1.0 - density))
+    base = rng.uniform(0.5 * mean_level, 1.5 * mean_level, size=n_vars)
+    ramp = np.linspace(-1.5, 1.5, n_vars)
+    effect: dict[str, np.ndarray] = {"control": np.ones(n_vars)}
+    for i, p in enumerate(perts[1:]):
+        scale = 0.5 + 0.5 * ((i % 3) + 1)  # vary effect strength per pert
+        sign = 1.0 if i % 2 == 0 else -1.0
+        effect[p] = 2.0 ** (sign * scale * ramp)
+    donor_factor = {d: rng.uniform(0.92, 1.08, size=n_vars) for d in donors}
+
+    blocks, pert_labels, donor_labels = [], [], []
+    for p in perts:
+        for d in donors:
+            mean = base * effect[p] * donor_factor[d]
+            blk = rng.poisson(mean[None, :], size=(cells_per, n_vars)).astype(np.float32)
+            blocks.append(sp.csr_matrix(blk))
+            pert_labels.extend([p] * cells_per)
+            donor_labels.extend([d] * cells_per)
+
+    x = sp.vstack(blocks).tocsr()
+    obs = pd.DataFrame(
+        {"perturbation": pert_labels, "donor": donor_labels},
+        index=[f"cell_{i}" for i in range(x.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_vars)])
+    adata = ad.AnnData(X=x, obs=obs, var=var)
+
+    if cache:
+        cdir = _cache_dir_stratified(
+            n_obs_actual, n_vars, n_perts, n_donors, density, seed
+        )
+        cdir.mkdir(parents=True, exist_ok=True)
+        adata.write_h5ad(cdir / "raw.h5ad", compression="gzip")
+
+    return adata
+
+
 def materialize_dataset(dataset_name: str, params: dict) -> Path:
     """Ensure the synthetic h5ad exists for ``dataset_name``.
 

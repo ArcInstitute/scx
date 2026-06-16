@@ -1012,10 +1012,44 @@ hard gate failure via the existing absolute-floor machinery.
 |------------|------------------|-----------------|
 | `de_route_csc_direct` | `accel_de` (pdex_ref GPU) | CSC sidecar present (v3 is the unconditional default GPU DE route), yet a non-CSC route ran. Gated on `pbmc3k`, `tabula_sapiens_100k`, and `census_1m`. |
 | `wilcoxon_route_gpu_correct` | `accel_de` (Wilcoxon GPU) | `device="gpu"` requested but a `cpu_*` route ran. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
+| `nb_glm_route_gpu_correct` | `accel_de_nb_glm` (pdex_nb_glm GPU) | `device="gpu"` requested but a `cpu_nb_glm` route ran. Gated on the synthetic `nb_glm_synth`. |
+| `nb_glm_cpu_gpu_concordant` | `accel_de_nb_glm` (pdex_nb_glm GPU) | CPU↔GPU log2FC Spearman < 0.999 OR max per-gene rel-log2FC > 2e-3 (the precise-`f64`, no-`--use_fast_math` agreement floor — catches a fast-math/precision regression). Gated on `nb_glm_synth`. |
+| `nb_glm_pdex_ref_concordant` | `accel_de_nb_glm` (pdex_nb_glm GPU) | NB-GLM vs `pdex_ref` (a different algorithm) Spearman < 0.95 on log2FC/FDR — the only non-self-referential anchor (pyDESeq2 OOMs in the correctness reference). Gated on `nb_glm_synth`. |
 | `csc_dispatch_correct` | `bench_csc_dispatch` | A `_csc`-labelled variant ran a non-CSC route (or vice versa). Gated on `tabula_sapiens_100k` for `qc_metrics`, `hvg`, `de`, and `pdex_ref` CSC variants. |
 | `hvg_route_gpu_correct` | `accel_hvg` | GPU HVG dispatch silently fell back to CPU. Gated on `pbmc3k`. |
 | `pca_route_gpu_correct` | `accel_pca` (native randomized variant `pyscx_gpu_rand_hh`) | The surviving native randomized GPU PCA route silently fell back to CPU. Gated on `pbmc3k` and `tabula_sapiens_100k`. |
 | `leiden_route_gpu_correct` | `accel_leiden` | GPU Leiden dispatch silently fell back to CPU. Gated on `pbmc3k`. |
+
+The GPU pseudobulk **NB-GLM** module (`accel_de_nb_glm`) hard-gates only the
+deterministic signals above; its end-to-end **speedup** is surfaced, not floored —
+it scales inversely with the GPU node's CPU core count (the un-accelerated host
+aggregation + the saturated multi-core CPU baseline both scale with cores: ~1.2× on
+a 12-core node vs ~2× on a 32-core node for identical code), so a cross-node
+absolute ratio floor would be fragile. The speedup, GPU-fit throughput
+(`nb_glm_gpu_fit_genes_per_s`, the node-independent kernel quantity), and CPU↔GPU
+agreement render in the report's "Differential Expression (CPU + GPU)" section and
+are tracked by the relative regression check.
+
+> **⚠ The three NB-GLM floors are opt-in — a routine `gate_candidate.py --tier
+> {small,full,xl}` run does NOT exercise them.** `nb_glm_synth` is deliberately
+> **not** in any `capture_baseline.py` tier list (it is synthetic, with no on-disk
+> h5ad; adding it would schedule every *other* benchmark on it). The gate keys
+> absolute floors on whether the triple's result JSON exists
+> (`check_absolute_floors` → `_triple_was_run`), so when `nb_glm_synth` wasn't run
+> the three floors are **silently scoped out**, not failed — exactly the
+> `cell_eval_parity_perf` precedent. To actually exercise the GPU NB-GLM gate you
+> MUST run it explicitly:
+> `run_parallel.py --benchmarks accel_de_nb_glm --datasets nb_glm_synth` on a GPU
+> host (build pyscx `--features gpu`, orchestrate from `scx-bench`). Until that runs,
+> a GPU-route or precision regression in NB-GLM will not be caught by a tiered gate.
+
+The standalone
+`pyscx/benchmarks/bench_nb_glm.py --gpu` sweep (20/50/100 targets, per-phase
+`SCX_NBGLM_PROFILE` breakdown) is the regime-characterization dev tool and the
+source of the `nb_glm_gpu_fit_genes_per_s` baseline number; it is intentionally not
+wired into `gate_candidate.py` (pyDESeq2 OOMs in the correctness reference). The
+Stage-C device-resident aggregation route (`gpu_nb_glm_csc`) and its
+`nb_glm_route_csc_direct` floor are reserved/deferred.
 
 The native in-VRAM kNN / UMAP / fused-pipeline route gates (`knn_route_gpu_correct`,
 `umap_route_gpu_correct`, `pipeline_route_gpu_correct`) were dropped in

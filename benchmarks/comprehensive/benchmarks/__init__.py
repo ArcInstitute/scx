@@ -77,6 +77,11 @@ ALL_BENCHMARKS: list[str] = [
     # the gate tracks speedup and CPU↔GPU parity. Variants live in
     # `benchmarks/comprehensive/benchmarks/accel_de.py`.
     "accel_de",
+    # GPU pseudobulk NB-GLM DE (route `gpu_nb_glm_csr`). Synthetic stratified
+    # Perturb-seq fixture (`_pert_synth.make_raw_counts_stratified`); CPU vs GPU
+    # with route correctness, CPU↔GPU concordance, and a pdex_ref anchor. Runs
+    # only on synthetic datasets (`nb_glm_synth`). See accel_de_nb_glm.py.
+    "accel_de_nb_glm",
     # ACC-RUST-OPT-V4 §4.4: to_gpu_anndata device-decode route + parity.
     # Self-converts the count h5ad to Scx1 and asserts the decode runs
     # fully in VRAM (transfer_mode=scx_device_decode_gpu).
