@@ -867,8 +867,10 @@ fn evaluate_node(
     // (AllNeighComms). The map keys are the candidate communities and the
     // values are `weight_to_comm`, so each candidate's diff is O(1) below
     // instead of re-scanning the neighbor list (O(deg) vs O(deg²) per node).
-    // Fresh per-node allocation mirrors the prior per-node HashSet — the
-    // `&RBPartition` shared borrow under `par_iter` rules out a reused buffer.
+    // One fresh per-node allocation, same as the prior per-node HashSet (the
+    // `&RBPartition` shared borrow under `par_iter` rules out a reused buffer).
+    // The map carries a heavier per-entry footprint than the old set and adds
+    // an O(d log d) sort below, but both are dwarfed by dropping the O(deg²) scan.
     let mut comm_weights: HashMap<usize, f64> = HashMap::new();
     for (neighbor, edge_w) in partition.graph.neighbors(node) {
         *comm_weights
