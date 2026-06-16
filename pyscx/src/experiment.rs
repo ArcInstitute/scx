@@ -42,10 +42,14 @@ impl PyExperiment {
 /// from a file path. `modality = None` → modality_id 0 (the unimodal /
 /// global X) on non-multimodal files; on multimodal files we require an
 /// explicit modality unless there is exactly one.
-fn open_backed_csr(path: &PathBuf, modality: Option<&str>) -> PyResult<BackedCsrReader> {
+fn open_backed_csr(
+    path: &PathBuf,
+    modality: Option<&str>,
+    cache_shards: usize,
+) -> PyResult<BackedCsrReader> {
     let opened = ScxReader::open(path).map_err(to_pyerr)?;
     if !opened.is_multimodal() {
-        return Ok(BackedCsrReader::new(opened, 4));
+        return Ok(BackedCsrReader::new(opened, cache_shards));
     }
     let modality_id = match modality {
         Some(name) => opened.modality_id(name).ok_or_else(|| {
@@ -65,7 +69,11 @@ fn open_backed_csr(path: &PathBuf, modality: Option<&str>) -> PyResult<BackedCsr
             }
         }
     };
-    Ok(BackedCsrReader::for_modality(opened, modality_id, 4))
+    Ok(BackedCsrReader::for_modality(
+        opened,
+        modality_id,
+        cache_shards,
+    ))
 }
 
 /// Resolve a gene name against the appropriate modality's `var`.
@@ -1104,7 +1112,7 @@ impl PyExperiment {
                 "detection_counts: only axis='var' is supported (got '{axis}')"
             )));
         }
-        let backed = open_backed_csr(&self.path, modality)?;
+        let backed = open_backed_csr(&self.path, modality, 4)?;
         let counts: Vec<i64> = py
             .detach(|| backed.gene_detection_counts())
             .map_err(to_pyerr)?
@@ -1126,7 +1134,7 @@ impl PyExperiment {
         gene: &Bound<'_, PyAny>,
         modality: Option<&str>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        let backed = open_backed_csr(&self.path, modality)?;
+        let backed = open_backed_csr(&self.path, modality, 4)?;
         // Resolve gene → gene_idx. Integer fast path; string falls
         // through to a var.index lookup.
         let gene_idx: u32 = if let Ok(idx) = gene.extract::<u32>() {
@@ -1143,6 +1151,73 @@ impl PyExperiment {
             .detach(|| backed.cells_expressing_gene(gene_idx))
             .map_err(to_pyerr)?;
         Ok(PyArray1::from_vec(py, rows))
+    }
+
+    /// Gather specific rows as a sparse `scipy.sparse.csr_matrix`, in the
+    /// requested order.
+    ///
+    /// A synchronous, zero-copy sparse gather over the backed reader's
+    /// `read_rows_with`: each touched shard is decoded once via the LRU cache,
+    /// and per-row `(indices, data)` slices are scattered into a request-order
+    /// CSR. `rows` may contain duplicates and need not be sorted; output rows
+    /// follow `rows` order. Returns raw-local gene indices (no global-vocab
+    /// remap). On multimodal files, pass `modality=`. `cache_shards` sizes the
+    /// decoded-shard LRU for this gather.
+    ///
+    /// Out-of-range row ids raise `IndexError`. This is a drop-in for the
+    /// backed `adata.X[rows]` analysis path and the random-access utility an
+    /// `IterableDataset` cannot serve.
+    #[pyo3(signature = (rows, modality = None, cache_shards = 4))]
+    fn gather_rows_sparse<'py>(
+        &self,
+        py: Python<'py>,
+        rows: PyReadonlyArray1<'_, u64>,
+        modality: Option<&str>,
+        cache_shards: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let rows = rows.as_slice()?;
+        let n_rows = rows.len();
+        let backed = open_backed_csr(&self.path, modality, cache_shards)?;
+        let n_vars = backed.n_vars();
+        let n_obs = backed.n_obs() as u64;
+
+        // Bounds-check up front so out-of-range ids surface as a clean
+        // IndexError rather than a generic read error from the gather loop.
+        if let Some(&bad) = rows.iter().find(|&&r| r >= n_obs) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "row index {bad} out of range for {n_obs} cells"
+            )));
+        }
+
+        // Scatter each row's CSR into its request position (GIL released).
+        let mut per_row: Vec<Option<(Vec<i32>, Vec<f32>)>> = (0..n_rows).map(|_| None).collect();
+        py.detach(|| {
+            backed.read_rows_with(rows, |orig_pos, indices, data| {
+                per_row[orig_pos] = Some((indices.to_vec(), data.to_vec()));
+                Ok(())
+            })
+        })
+        .map_err(to_pyerr)?;
+
+        // Assemble the CSR in request order.
+        let nnz: usize = per_row
+            .iter()
+            .map(|r| r.as_ref().map_or(0, |(idx, _)| idx.len()))
+            .sum();
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+        indptr.push(0);
+        let mut indices: Vec<i32> = Vec::with_capacity(nnz);
+        let mut data: Vec<f32> = Vec::with_capacity(nnz);
+        for row in &per_row {
+            if let Some((idx, val)) = row {
+                indices.extend_from_slice(idx);
+                data.extend_from_slice(val);
+            }
+            indptr.push(indices.len() as i64);
+        }
+
+        let csr = scx_sparse::ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
+        convert::csr_to_scipy(py, csr)
     }
 
     fn __repr__(&self) -> String {

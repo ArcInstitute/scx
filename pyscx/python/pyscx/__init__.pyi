@@ -257,6 +257,22 @@ class Experiment:
         """
         ...
 
+    def gather_rows_sparse(
+        self,
+        rows: Any,
+        modality: str | None = None,
+        cache_shards: int = 4,
+    ) -> Any:
+        """Gather ``rows`` as a ``scipy.sparse.csr_matrix`` in request order.
+
+        Zero-copy sparse gather over the backed reader: each touched shard is
+        decoded once. ``rows`` (numpy ``uint64``) may contain duplicates and
+        need not be sorted. Returns raw-local gene indices (no global-vocab
+        remap). Out-of-range ids raise ``IndexError``. Drop-in for the backed
+        ``adata.X[rows]`` analysis path.
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
