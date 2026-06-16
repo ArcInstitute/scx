@@ -11,6 +11,7 @@ pub mod projection;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod shuffle;
+pub mod sparse_cellset;
 
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
@@ -25,6 +26,10 @@ pub use pipeline::{compute_memory_budget, LoaderConfig, MemoryBudget, TrainingPi
 pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
+pub use sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
 
 #[cfg(feature = "python")]
-pub use python::{IndexPlanDataset, MultimodalTrainingDataset, TrainingDataset};
+pub use python::{
+    IndexPlanDataset, MultimodalTrainingDataset, SparseCellSetBatchIter, SparseCellSetDataset,
+    TrainingDataset,
+};
