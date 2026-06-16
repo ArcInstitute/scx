@@ -298,6 +298,47 @@ pub fn pseudobulk_nb_glm(
         mle.clone()
     };
 
+    Ok(assemble_result(
+        counts_gene_major,
+        n_genes,
+        n_samples,
+        design_row_major,
+        n_features,
+        &c,
+        &options,
+        &final_states,
+        alpha_mle,
+        base_means,
+        dispersion_trend,
+        dispersion_prior_var,
+        start,
+    ))
+}
+
+/// Post-fit tail shared by the CPU ([`pseudobulk_nb_glm`]) and GPU
+/// (`gpu::gpu_pseudobulk_nb_glm`) orchestrators: per-gene Wald inference +
+/// Cook's distance, Cook's-outlier filtering, multiple-testing correction, and
+/// result/diagnostics assembly. Pure function of the fitted `final_states`
+/// (plus the MLE dispersions / base means threaded through for the output
+/// fields) — gene-parallel where the CPU loop was, identical output.
+#[allow(clippy::too_many_arguments)]
+fn assemble_result(
+    counts_gene_major: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design_row_major: &[f64],
+    n_features: usize,
+    c: &[f64],
+    options: &NbGlmOptions,
+    final_states: &[GeneState],
+    alpha_mle: Vec<f64>,
+    base_means: Vec<f64>,
+    dispersion_trend: Option<DispersionTrend>,
+    dispersion_prior_var: Option<f64>,
+    start: std::time::Instant,
+) -> NbGlmResult {
+    let row_of = |g: usize| &counts_gene_major[g * n_samples..(g + 1) * n_samples];
+
     // --- Wald inference + Cook's distance (gene-parallel). ---
     // Cook's reuses the contrast covariance `wald_stat` already inverts (the
     // ridged Fisher inverse), so it costs only the per-sample leverage forms.
@@ -325,7 +366,7 @@ pub fn pseudobulk_nb_glm(
                 };
                 return (w, f64::NAN);
             }
-            let (w, cov) = wald::wald_stat(&st.beta, &st.fisher, n_features, &c);
+            let (w, cov) = wald::wald_stat(&st.beta, &st.fisher, n_features, c);
             let cooks = match &cov {
                 Some(cov) => filtering::cooks_distance(
                     cov,
@@ -445,7 +486,7 @@ pub fn pseudobulk_nb_glm(
         rayon_threads_used: Some(rayon::current_num_threads()),
     };
 
-    Ok(NbGlmResult {
+    NbGlmResult {
         n_genes,
         n_samples,
         n_features,
@@ -463,8 +504,13 @@ pub fn pseudobulk_nb_glm(
         n_iter,
         fitted_means,
         diagnostics,
-    })
+    }
 }
+
+#[cfg(feature = "gpu")]
+mod gpu;
+#[cfg(feature = "gpu")]
+pub use gpu::gpu_pseudobulk_nb_glm;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

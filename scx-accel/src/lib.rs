@@ -79,8 +79,8 @@ pub use pseudobulk::{
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
 pub use route::{
-    plan_de_route, plan_hvg_route, plan_simple_gpu_route, AccelExecutionInfo, AccelRoute,
-    DeviceRequest, FallbackReason, InputLayout,
+    plan_de_route, plan_hvg_route, plan_nb_glm_route, plan_simple_gpu_route, AccelExecutionInfo,
+    AccelRoute, DeviceRequest, FallbackReason, InputLayout,
 };
 pub use umap::{compute_umap, UmapResult};
 
@@ -100,6 +100,8 @@ pub use hvg::{
     streaming_mean_var_batched_with_device, streaming_mean_var_with_device,
 };
 #[cfg(feature = "gpu")]
+pub use nb_glm::gpu_pseudobulk_nb_glm;
+#[cfg(feature = "gpu")]
 pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]
 pub use pca::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};
@@ -115,3 +117,5 @@ pub use scx_gpu::{
     decode_csr_shards_to_device, decode_csr_shards_to_device_with_metadata, decode_shard_gpu,
     decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr, GpuCsrPointers,
 };
+#[cfg(feature = "gpu")]
+pub use scx_gpu::{GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX};

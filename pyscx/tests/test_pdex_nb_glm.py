@@ -122,12 +122,17 @@ def test_pdex_nb_glm_rejects_log1p():
 def test_pdex_nb_glm_stamps_route():
     pytest.importorskip("polars")  # pdex_nb_glm emits the polars cell-eval schema
     adata = _perturb_adata()
+    # Explicit device="cpu" is host-independent: route=cpu_nb_glm, the planner
+    # records the deliberate CPU choice as user_forced_cpu. (With the default
+    # device="auto", the reason is no_cuda on a CPU host but "none" on a GPU
+    # host, where it would instead route to gpu_nb_glm_csr.)
     pyscx.accel.pdex_nb_glm(
-        adata, "perturbation", REFERENCE, stratify_by=["donor"], min_cells_per_group=1
+        adata, "perturbation", REFERENCE, stratify_by=["donor"],
+        min_cells_per_group=1, device="cpu",
     )
     info = adata.uns["scx_accel"]["pdex_nb_glm"]
     assert info["route"] == "cpu_nb_glm"
-    assert info["fallback_reason"] == "none"
+    assert info["fallback_reason"] == "user_forced_cpu"
 
 
 def test_pseudobulk_dex_nbglm_backend():
@@ -170,3 +175,70 @@ def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
     rho_fdr = spearmanr(merged["fdr_nb"], merged["fdr_ref"])[0]
     assert rho_lfc >= 0.95, f"log2fc Spearman {rho_lfc} < 0.95"
     assert rho_fdr >= 0.95, f"fdr Spearman {rho_fdr} < 0.95"
+
+
+# --- GPU (Stage A) -----------------------------------------------------------
+#
+# No external reference exists (pyDESeq2 OOMs in the comprehensive bench — see
+# DE-GPU-ACC.md §10), so the CPU f64 fitter is the reference. These skip when no
+# CUDA GPU is present; the GPU CI harness (slurm_scx_gpu_tests.sh) runs them on
+# an H100.
+
+
+def test_pdex_nb_glm_gpu_route_stamped():
+    """device="gpu" on a GPU host records the gpu_nb_glm_csr route."""
+    pytest.importorskip("polars")
+    if not pyscx.accel.gpu_available():
+        pytest.skip("no CUDA GPU available")
+    adata = _perturb_adata()
+    pyscx.accel.pdex_nb_glm(
+        adata,
+        "perturbation",
+        REFERENCE,
+        stratify_by=["donor"],
+        min_cells_per_group=1,
+        device="gpu",
+    )
+    info = adata.uns["scx_accel"]["pdex_nb_glm"]
+    assert info["route"] == "gpu_nb_glm_csr", info
+    assert info["fallback_reason"] == "none"
+
+
+def test_pdex_nb_glm_cpu_gpu_agreement():
+    """GPU matches CPU within DE-GPU-ACC.md §10 relative tolerances + ranks."""
+    pytest.importorskip("polars")
+    spearmanr = pytest.importorskip("scipy.stats").spearmanr
+    if not pyscx.accel.gpu_available():
+        pytest.skip("no CUDA GPU available")
+    adata = _perturb_adata()
+
+    cpu = pyscx.accel.pdex_nb_glm(
+        adata, "perturbation", REFERENCE, stratify_by=["donor"],
+        min_cells_per_group=1, device="cpu",
+    ).to_pandas()
+    gpu = pyscx.accel.pdex_nb_glm(
+        adata, "perturbation", REFERENCE, stratify_by=["donor"],
+        min_cells_per_group=1, device="gpu",
+    ).to_pandas()
+
+    key = ["target", "feature"]
+    m = cpu.merge(gpu, on=key, suffixes=("_cpu", "_gpu"))
+    assert len(m) == 3 * adata.n_vars
+
+    # Rank concordance: the headline agreement metric.
+    rho = spearmanr(m["log2_fold_change_cpu"], m["log2_fold_change_gpu"])[0]
+    assert rho >= 0.999, f"CPU↔GPU log2fc Spearman {rho} < 0.999"
+
+    # Per-quantity relative tolerances.
+    finite = np.isfinite(m["log2_fold_change_cpu"]) & np.isfinite(m["log2_fold_change_gpu"])
+    rel_lfc = np.abs(
+        m["log2_fold_change_cpu"][finite] - m["log2_fold_change_gpu"][finite]
+    ) / (np.abs(m["log2_fold_change_cpu"][finite]) + 1e-6)
+    # 2e-3: nvcc --use_fast_math transcendentals set a ~1e-4 floor (ranking
+    # Spearman stays 1.000 — asserted above).
+    assert rel_lfc.max() <= 2e-3, f"max rel log2fc {rel_lfc.max()} > 2e-3"
+
+    pfin = np.isfinite(m["p_value_cpu"]) & np.isfinite(m["p_value_gpu"])
+    assert np.allclose(
+        m["p_value_cpu"][pfin], m["p_value_gpu"][pfin], rtol=1e-3, atol=1e-4
+    )

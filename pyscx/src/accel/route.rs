@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scx_accel::route::{
-    plan_de_route, plan_hvg_route, plan_simple_gpu_route, AccelExecutionInfo, AccelRoute,
-    DeviceRequest, FallbackReason, InputLayout,
+    plan_de_route, plan_hvg_route, plan_nb_glm_route, plan_simple_gpu_route, AccelExecutionInfo,
+    AccelRoute, DeviceRequest, FallbackReason, InputLayout,
 };
 
 /// Serialise an [`AccelExecutionInfo`] into a Python dict. `Option` fields map
@@ -123,6 +123,15 @@ pub(crate) fn simple_exec_info(
         gpu_route,
         cpu_route,
     )
+}
+
+/// Build the execution info for a pseudobulk NB-GLM dispatch via
+/// [`plan_nb_glm_route`]. `gpu_eligible` is `false` when the design width or
+/// sample count exceeds the kernel's register bounds (`scx_gpu::GPU_NB_GLM_PMAX`
+/// / `GPU_NB_GLM_NSUB_MAX`) — recorded as `UnsupportedDimensions`. Stage A is
+/// always CSR (host-fed dense); never a rapids fallback.
+pub(crate) fn nb_glm_exec_info(device: &str, gpu_eligible: bool) -> AccelExecutionInfo {
+    plan_nb_glm_route(device_request(device), gpu_available(), gpu_eligible)
 }
 
 /// Build the execution info for a CPU-only op that has no GPU kernel at all

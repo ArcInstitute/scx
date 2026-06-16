@@ -184,6 +184,89 @@ def bench_direct_fitter(n_genes=20_000, n_samples=20, n_features=3, reps=3) -> d
     }
 
 
+# (n_perts, n_donors, n_genes, cells_per_combo) for the GPU many-target sweep.
+# n_donors drives n_sub per target (= 2·n_donors: target reps + reference reps),
+# kept at 3 → n_sub=6, the DE-GPU-ACC.md target regime (n_sub ≈ 4–8). Many
+# perturbations × ~18k genes is where the CPU sweep costs minutes.
+GPU_SIZES = [
+    (20, 3, 18_000, 30),
+    (50, 3, 18_000, 30),
+    (100, 3, 18_000, 30),
+]
+GPU_SMOKE_SIZES = [(6, 3, 2_000, 20)]
+
+
+def bench_gpu_size(n_perts, n_donors, n_genes, cells_per, reps) -> dict:
+    """GPU-vs-CPU wall-time + ranking concordance + route check for the
+    many-target ``pdex_nb_glm`` sweep — the Stage-A go/no-go measurement
+    (DE-GPU-ACC.md §11). The CPU baseline is the **saturated multi-core** fit
+    (rayon over genes), not single-thread."""
+    adata = make_perturb_adata(n_perts, n_donors, n_genes, cells_per)
+
+    def run(dev, a):
+        return pyscx.accel.pdex_nb_glm(
+            a, "perturbation", REFERENCE, stratify_by=["donor"],
+            min_cells_per_group=1, device=dev,
+        )
+
+    cpu_s, cpu_df = _time(lambda: run("cpu", adata.copy()), reps)
+    gpu_s, gpu_df = _time(lambda: run("gpu", adata.copy()), reps)
+
+    # Route check (separate call so timing isn't perturbed by the uns write).
+    a = adata.copy()
+    run("gpu", a)
+    route = a.uns["scx_accel"]["pdex_nb_glm"]["route"]
+
+    rho = None
+    try:
+        merged = cpu_df.to_pandas().merge(
+            gpu_df.to_pandas(), on=["target", "feature"], suffixes=("_cpu", "_gpu")
+        )
+        if len(merged):
+            rho = _spearman(
+                merged["log2_fold_change_cpu"].to_numpy(),
+                merged["log2_fold_change_gpu"].to_numpy(),
+            )
+    except Exception:
+        pass
+
+    return {
+        "n_perts": n_perts,
+        "n_donors": n_donors,
+        "n_sub_per_target": 2 * n_donors,
+        "n_genes": n_genes,
+        "n_cells": int(adata.n_obs),
+        "cpu_s": round(cpu_s, 4),
+        "gpu_s": round(gpu_s, 4),
+        "speedup": round(cpu_s / gpu_s, 2) if gpu_s > 0 else None,
+        "rho_log2fc": rho,
+        "route": route,
+        "nb_glm_route_gpu_correct": 1.0 if route.startswith("gpu_nb_glm") else 0.0,
+    }
+
+
+def generate_gpu_report(rows: list[dict]) -> str:
+    lines = [
+        "## GPU vs CPU: pdex_nb_glm many-target sweep (Stage A)",
+        "",
+        "_CPU baseline = saturated multi-core (rayon). Speedup ≥ 2–3× greenlights"
+        " Stage B (DE-GPU-ACC.md §11/§13.5)._",
+        "",
+        "| perts | n_sub | genes | cells | cpu (s) | gpu (s) | speedup | ρ(log2FC) | route |",
+        "|------:|------:|------:|------:|--------:|--------:|--------:|----------:|:------|",
+    ]
+    for r in rows:
+        def fmt(v, nd=3):
+            return f"{v:.{nd}f}" if isinstance(v, (int, float)) else ("—" if v is None else str(v))
+        lines.append(
+            f"| {r['n_perts']} | {r['n_sub_per_target']} | {r['n_genes']} | {r['n_cells']} "
+            f"| {fmt(r['cpu_s'])} | {fmt(r['gpu_s'])} | {fmt(r['speedup'], 2)} "
+            f"| {fmt(r['rho_log2fc'])} | `{r['route']}` |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def generate_report(sizes_rows: list[dict], fitter_rows: list[dict]) -> str:
     sysinfo = {
         "platform": platform.platform(),
@@ -235,6 +318,12 @@ def main() -> None:
     ap.add_argument("--smoke", action="store_true", help="One tiny size only")
     ap.add_argument("--no-pydeseq2", action="store_true", help="Skip the PyDESeq2 comparison")
     ap.add_argument("--reps", type=int, default=3, help="Repeats per timing (median)")
+    ap.add_argument(
+        "--gpu",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Run the GPU-vs-CPU pdex_nb_glm sweep (auto: only when a GPU is present)",
+    )
     ap.add_argument("--out-name", default="nb_glm_benchmark")
     args = ap.parse_args()
 
@@ -257,11 +346,31 @@ def main() -> None:
     fitter_dims = [(20_000, 20, 3)] if args.smoke else [(20_000, 20, 3), (30_000, 200, 5)]
     fitter_rows = [bench_direct_fitter(*d, reps=args.reps) for d in fitter_dims]
 
+    # GPU-vs-CPU many-target sweep — the Stage-A go/no-go measurement.
+    run_gpu = args.gpu == "on" or (args.gpu == "auto" and pyscx.accel.gpu_available())
+    if args.gpu == "on" and not pyscx.accel.gpu_available():
+        print("WARNING: --gpu=on but no CUDA GPU detected; the GPU sweep will fall back to CPU.")
+    gpu_rows = []
+    if run_gpu:
+        try:
+            __import__("polars")  # pdex_nb_glm emits the polars cell-eval schema
+            gpu_sizes = GPU_SMOKE_SIZES if args.smoke else GPU_SIZES
+            for sz in gpu_sizes:
+                print(f"gpu size {sz} ...", flush=True)
+                gpu_rows.append(bench_gpu_size(*sz, reps=args.reps))
+        except ImportError:
+            print("polars not installed — skipping the GPU pdex_nb_glm sweep.")
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     md = generate_report(rows, fitter_rows)
+    if gpu_rows:
+        md = md + "\n" + generate_gpu_report(gpu_rows)
     (RESULTS_DIR / f"{args.out_name}.md").write_text(md)
     (RESULTS_DIR / f"{args.out_name}.json").write_text(
-        json.dumps({"pseudobulk_dex": rows, "direct_fitter": fitter_rows}, indent=2)
+        json.dumps(
+            {"pseudobulk_dex": rows, "direct_fitter": fitter_rows, "gpu_vs_cpu": gpu_rows},
+            indent=2,
+        )
     )
     print(md)
     print(f"\nWrote {RESULTS_DIR / (args.out_name + '.md')} and .json")

@@ -44,6 +44,13 @@ pub enum AccelRoute {
     /// CPU, native pseudobulk negative-binomial GLM (IRLS + Cox–Reid dispersion).
     /// A first-class native CPU route — never a rapids fallback (no `NoRapids`).
     CpuNbGlm,
+    /// GPU, pseudobulk NB-GLM, host-fed dense pseudobulk (Stage A). The host
+    /// aggregates the small `[n_genes × n_sub]` pseudobulk; the per-gene
+    /// IRLS ↔ Cox–Reid fit runs on the device (`scx-gpu/kernels/nb_glm.cu`).
+    GpuNbGlmCsr,
+    /// GPU, pseudobulk NB-GLM, device-resident column aggregation (Stage C,
+    /// reserved). Selected when a CSC sidecar feeds the on-device sum kernels.
+    GpuNbGlmCsc,
     /// GPU, dense input. The route id for GPU UMAP (its native CUDA / cuML SGD
     /// runs on a dense embedding). Not a DE route — dense-host DE densifies to
     /// CSR and reports [`GpuCsrV3`](AccelRoute::GpuCsrV3).
@@ -77,6 +84,8 @@ impl AccelRoute {
             AccelRoute::CpuCsr => "cpu_csr",
             AccelRoute::CpuCsc => "cpu_csc",
             AccelRoute::CpuNbGlm => "cpu_nb_glm",
+            AccelRoute::GpuNbGlmCsr => "gpu_nb_glm_csr",
+            AccelRoute::GpuNbGlmCsc => "gpu_nb_glm_csc",
             AccelRoute::GpuDense => "gpu_dense",
             AccelRoute::GpuCsr => "gpu_csr",
             AccelRoute::GpuCsrV3 => "gpu_csr_v3",
@@ -94,6 +103,8 @@ impl AccelRoute {
                 | AccelRoute::GpuCsr
                 | AccelRoute::GpuCsrV3
                 | AccelRoute::GpuCscV3
+                | AccelRoute::GpuNbGlmCsr
+                | AccelRoute::GpuNbGlmCsc
                 | AccelRoute::GpuDeviceResident
                 | AccelRoute::RapidsSinglecell
         )
@@ -297,6 +308,38 @@ pub fn plan_de_route(
 
     info.csc_available = Some(csc_available);
     info
+}
+
+/// Decide the pseudobulk NB-GLM execution route (Stage A).
+///
+/// Unlike [`plan_de_route`], NB-GLM has no per-layout GPU dispatch in Stage A:
+/// the host always aggregates the small dense pseudobulk and feeds the GPU
+/// fitter, so an eligible GPU request takes [`AccelRoute::GpuNbGlmCsr`].
+/// `gpu_eligible` is `false` when the design width (`n_features`) or sample
+/// count (`n_sub`) exceeds the kernel's register bounds
+/// (`scx_gpu::GPU_NB_GLM_PMAX` / `GPU_NB_GLM_NSUB_MAX`) — those record a CPU
+/// route with [`FallbackReason::UnsupportedDimensions`]. Never `NoRapids`:
+/// NB-GLM is a native path, not a rapids-routed op. ([`AccelRoute::GpuNbGlmCsc`]
+/// / CSC-direct device aggregation is reserved for Stage C.)
+pub fn plan_nb_glm_route(
+    device: DeviceRequest,
+    gpu_available: bool,
+    gpu_eligible: bool,
+) -> AccelExecutionInfo {
+    match device {
+        DeviceRequest::Cpu => {
+            AccelExecutionInfo::new(AccelRoute::CpuNbGlm, FallbackReason::UserForcedCpu)
+        }
+        DeviceRequest::Gpu | DeviceRequest::Auto => {
+            if !gpu_available {
+                AccelExecutionInfo::new(AccelRoute::CpuNbGlm, FallbackReason::NoCuda)
+            } else if !gpu_eligible {
+                AccelExecutionInfo::new(AccelRoute::CpuNbGlm, FallbackReason::UnsupportedDimensions)
+            } else {
+                AccelExecutionInfo::new(AccelRoute::GpuNbGlmCsr, FallbackReason::None)
+            }
+        }
+    }
 }
 
 /// Decide the highly-variable-genes (HVG) execution route.
@@ -598,6 +641,40 @@ mod tests {
             false,
         );
         assert_eq!(info.route, AccelRoute::GpuCsrV3);
+    }
+
+    #[test]
+    fn nb_glm_gpu_eligible_routes_to_gpu_csr() {
+        for device in [DeviceRequest::Gpu, DeviceRequest::Auto] {
+            let info = plan_nb_glm_route(device, true, true);
+            assert_eq!(info.route, AccelRoute::GpuNbGlmCsr);
+            assert!(info.route.is_gpu());
+            assert_eq!(info.fallback_reason, FallbackReason::None);
+        }
+    }
+
+    #[test]
+    fn nb_glm_forced_cpu_records_user_forced() {
+        let info = plan_nb_glm_route(DeviceRequest::Cpu, true, true);
+        assert_eq!(info.route, AccelRoute::CpuNbGlm);
+        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
+    }
+
+    #[test]
+    fn nb_glm_no_cuda_falls_back_to_cpu() {
+        let info = plan_nb_glm_route(DeviceRequest::Auto, false, true);
+        assert_eq!(info.route, AccelRoute::CpuNbGlm);
+        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
+    }
+
+    #[test]
+    fn nb_glm_ineligible_dims_fall_back_to_cpu() {
+        // p / n_sub beyond the kernel register bounds → CPU, not NoCuda.
+        let info = plan_nb_glm_route(DeviceRequest::Gpu, true, false);
+        assert_eq!(info.route, AccelRoute::CpuNbGlm);
+        assert_eq!(info.fallback_reason, FallbackReason::UnsupportedDimensions);
+        // NB-GLM is native — never a rapids fallback.
+        assert_ne!(info.fallback_reason, FallbackReason::NoRapids);
     }
 
     #[test]

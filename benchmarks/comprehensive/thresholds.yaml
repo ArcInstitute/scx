@@ -1256,3 +1256,19 @@ absolute_floors:
 #    we accept "no reference comparison at census scale" and gate
 #    only on the SCX side wall-time / RSS (a different metric than
 #    cell_eval_parity_perf measures today).
+#
+# 4. nb_glm_route_gpu_correct (GPU NB-GLM, Stage A)
+#    The GPU pseudobulk NB-GLM route (`gpu_nb_glm_csr`) lands with a
+#    route-correctness signal — `nb_glm_route_gpu_correct` (1.0 when a
+#    `gpu_nb_glm_*` route ran, 0.0 on a silent GPU→CPU drop), emitted in
+#    the JSON of the standalone `pyscx/benchmarks/bench_nb_glm.py --gpu`
+#    sweep. It is NOT wired as a comprehensive `absolute_floors` row:
+#    NB-GLM gating lives outside the comprehensive gate (pyDESeq2 OOMs
+#    in the correctness reference — see the "no cpu_nb_glm gate" note in
+#    GPU-NB-GLM-SPEC.md §22.6), and `pdex_nb_glm` needs a replicate
+#    stratifier the generic `accel_de` (groupby, reference) fixture does
+#    not supply. Route-correctness is therefore gated deterministically
+#    in pytest (`test_pdex_nb_glm_gpu_route_stamped`, run on the GPU
+#    harness) + the standalone bench signal. Promote to a comprehensive
+#    row once a dedicated stratified GPU NB-GLM bench variant is wired
+#    (mirroring `bench_csc_dispatch.py`).
