@@ -11,7 +11,7 @@
 //! Simplified for SCX: concrete `f64` types, single-partition single-layer,
 //! RB configuration model only, `AllNeighComms` strategy.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use rand::seq::SliceRandom;
@@ -589,12 +589,6 @@ impl RBPartition {
         if new_community == old_comm {
             return 0.0;
         }
-        if self.two_m == 0.0 {
-            return 0.0;
-        }
-
-        let k_i = self.node_strengths[node];
-        let self_weight = self.graph.self_loop_weight(node);
 
         let w_to_old = self.weight_to_comm(node, old_comm);
         let w_to_new = if new_community < self.grouping.group_count() {
@@ -602,6 +596,36 @@ impl RBPartition {
         } else {
             0.0
         };
+
+        self.diff_move_precomputed(node, new_community, w_to_old, w_to_new)
+    }
+
+    /// Quality delta for moving `node` to `new_community`, given the
+    /// already-computed edge weights from `node` to its current community
+    /// (`w_to_old`) and to `new_community` (`w_to_new`).
+    ///
+    /// This is the arithmetic core of [`diff_move`]; callers in the local-move
+    /// hot loops build a `community → weight` map in a single neighbor pass and
+    /// supply the two weights directly, avoiding the per-candidate
+    /// [`weight_to_comm`] re-scan (O(deg²) → O(deg) per node).
+    #[inline]
+    fn diff_move_precomputed(
+        &self,
+        node: usize,
+        new_community: usize,
+        w_to_old: f64,
+        w_to_new: f64,
+    ) -> f64 {
+        let old_comm = self.grouping.get_group(node);
+        if new_community == old_comm {
+            return 0.0;
+        }
+        if self.two_m == 0.0 {
+            return 0.0;
+        }
+
+        let k_i = self.node_strengths[node];
+        let self_weight = self.graph.self_loop_weight(node);
 
         let k_old = if old_comm < self.community_strengths.len() {
             self.community_strengths[old_comm]
@@ -839,29 +863,42 @@ fn evaluate_node(
 ) -> Option<ProposedMove> {
     let current_comm = partition.membership(node);
 
-    // Collect neighbor communities (AllNeighComms).
-    let mut comms = HashSet::new();
-    for (neighbor, _) in partition.graph.neighbors(node) {
-        comms.insert(partition.membership(neighbor));
+    // Accumulate edge weight to each neighbor community in a single pass
+    // (AllNeighComms). The map keys are the candidate communities and the
+    // values are `weight_to_comm`, so each candidate's diff is O(1) below
+    // instead of re-scanning the neighbor list (O(deg) vs O(deg²) per node).
+    // Fresh per-node allocation mirrors the prior per-node HashSet — the
+    // `&RBPartition` shared borrow under `par_iter` rules out a reused buffer.
+    let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+    for (neighbor, edge_w) in partition.graph.neighbors(node) {
+        *comm_weights
+            .entry(partition.membership(neighbor))
+            .or_insert(0.0) += edge_w;
     }
-    let candidates: Vec<usize> = comms.into_iter().collect();
+    let w_to_old = comm_weights.get(&current_comm).copied().unwrap_or(0.0);
+
+    // Deterministic candidate order so the map's internal ordering never leaks
+    // into the move sequence (stronger than the prior randomized-HashSet order).
+    let mut candidates: Vec<usize> = comm_weights.keys().copied().collect();
+    candidates.sort_unstable();
 
     let epsilon = 10.0 * f64::EPSILON;
     let mut best_comm = current_comm;
     let mut best_improv = epsilon;
 
     for &comm in &candidates {
-        let improv = partition.diff_move(node, comm);
+        let w_to_new = comm_weights.get(&comm).copied().unwrap_or(0.0);
+        let improv = partition.diff_move_precomputed(node, comm, w_to_old, w_to_new);
         if improv > best_improv {
             best_comm = comm;
             best_improv = improv;
         }
     }
 
-    // Consider moving to an empty community.
+    // Consider moving to an empty community (no members → w_to_new = 0).
     if let Some(ec) = empty_comm {
         if partition.group_size(current_comm) > 1 {
-            let improv = partition.diff_move(node, ec);
+            let improv = partition.diff_move_precomputed(node, ec, w_to_old, 0.0);
             if improv > best_improv {
                 best_comm = ec;
                 best_improv = improv;
@@ -1055,29 +1092,41 @@ impl LeidenOptimizer {
         let mut vertex_order: VecDeque<usize> = nodes.into();
 
         let epsilon = 10.0 * f64::EPSILON;
-        // Reuse HashSet across iterations to avoid heap fragmentation from
-        // repeated allocations (glibc never returns freed pages to the OS).
-        let mut comms = HashSet::new();
+        // Reuse the scratch map across iterations to avoid heap fragmentation
+        // from repeated allocations (glibc never returns freed pages to the OS).
+        let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+        let mut candidates: Vec<usize> = Vec::new();
 
         while let Some(v) = vertex_order.pop_front() {
             let v_comm = partition.membership(v);
 
-            // Collect neighbor communities (AllNeighComms, matching C++ lines 578-591).
-            comms.clear();
-            for (neighbor, _) in graph.neighbors(v) {
-                let nc = partition.membership(neighbor);
-                if nc != v_comm {
-                    comms.insert(nc);
-                }
+            // Accumulate edge weight to each neighbor community in a single pass
+            // (AllNeighComms, matching C++ lines 578-591). The map values are
+            // `weight_to_comm`, so each candidate's diff below is O(1) instead
+            // of a per-candidate neighbor re-scan (O(deg) vs O(deg²) per node).
+            comm_weights.clear();
+            for (neighbor, edge_w) in graph.neighbors(v) {
+                *comm_weights
+                    .entry(partition.membership(neighbor))
+                    .or_insert(0.0) += edge_w;
             }
+            let w_to_old = comm_weights.get(&v_comm).copied().unwrap_or(0.0);
+
+            // Deterministic candidate order so the map's internal ordering never
+            // leaks into the move sequence. The `v_comm` entry (if present) is a
+            // no-op: `diff_move_precomputed` returns 0 for new == old.
+            candidates.clear();
+            candidates.extend(comm_weights.keys().copied());
+            candidates.sort_unstable();
 
             let mut best_comm = v_comm;
             let mut best_improv = epsilon;
 
-            for comm in &comms {
-                let improv = partition.diff_move(v, *comm);
+            for &comm in &candidates {
+                let w_to_new = comm_weights.get(&comm).copied().unwrap_or(0.0);
+                let improv = partition.diff_move_precomputed(v, comm, w_to_old, w_to_new);
                 if improv > best_improv {
-                    best_comm = *comm;
+                    best_comm = comm;
                     best_improv = improv;
                 }
             }
@@ -1086,7 +1135,8 @@ impl LeidenOptimizer {
             // Uses get_empty_community() to reuse IDs instead of creating new ones.
             if self.config.consider_empty_community && partition.group_size(v_comm) > 1 {
                 let empty_comm = partition.get_empty_community();
-                let improv = partition.diff_move(v, empty_comm);
+                // Empty community has no members → w_to_new = 0.
+                let improv = partition.diff_move_precomputed(v, empty_comm, w_to_old, 0.0);
                 if improv > best_improv {
                     best_comm = empty_comm;
                     best_improv = improv;
@@ -1137,8 +1187,9 @@ impl LeidenOptimizer {
         let mut total_improv = 0.0;
         let mut vertex_order: Vec<usize> = (0..n).collect();
         vertex_order.shuffle(&mut self.rng);
-        // Reuse HashSet across iterations to avoid per-vertex heap allocation.
-        let mut comms = HashSet::new();
+        // Reuse scratch across iterations to avoid per-vertex heap allocation.
+        let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+        let mut candidates: Vec<usize> = Vec::new();
 
         for v in vertex_order {
             let v_comm = partition.membership(v);
@@ -1148,20 +1199,32 @@ impl LeidenOptimizer {
                 continue;
             }
 
-            // Collect constrained candidates (AllNeighComms within same constrained group).
+            // Single neighbor pass: accumulate full edge weight per community
+            // (matching `weight_to_comm` — computed over ALL neighbors), and
+            // collect the constrained candidate set (AllNeighComms within the
+            // same constrained group). The constraint filters which candidates
+            // are *considered*, not how the weights are computed.
             let v_constrained = constrained_membership[v];
-            comms.clear();
-            for (neighbor, _) in partition.graph.neighbors(v) {
+            comm_weights.clear();
+            candidates.clear();
+            for (neighbor, edge_w) in partition.graph.neighbors(v) {
+                let nc = partition.membership(neighbor);
+                *comm_weights.entry(nc).or_insert(0.0) += edge_w;
                 if constrained_membership[neighbor] == v_constrained {
-                    comms.insert(partition.membership(neighbor));
+                    candidates.push(nc);
                 }
             }
+            // Deterministic, deduplicated candidate order.
+            candidates.sort_unstable();
+            candidates.dedup();
+            let w_to_old = comm_weights.get(&v_comm).copied().unwrap_or(0.0);
 
             let mut best_comm = v_comm;
             let mut best_improv = 0.0;
 
-            for &comm in &comms {
-                let improv = partition.diff_move(v, comm);
+            for &comm in &candidates {
+                let w_to_new = comm_weights.get(&comm).copied().unwrap_or(0.0);
+                let improv = partition.diff_move_precomputed(v, comm, w_to_old, w_to_new);
                 if improv >= best_improv && comm != v_comm {
                     best_comm = comm;
                     best_improv = improv;
@@ -1477,6 +1540,111 @@ mod tests {
             "same seed should give same result"
         );
         assert!((r1.modularity - r2.modularity).abs() < 1e-12);
+    }
+
+    /// OPT-3.1: the `community → weight` map built in one neighbor pass (the
+    /// local-move hot loops) must reproduce `weight_to_comm`'s per-community
+    /// scan exactly. Guards the precomputed-weight path against drift.
+    #[test]
+    fn test_comm_weights_map_matches_weight_to_comm() {
+        let edges = vec![
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (1, 2, 1.0),
+            (2, 3, 0.5),
+            (3, 4, 1.0),
+            (3, 5, 1.0),
+            (4, 5, 1.0),
+        ];
+        let n = 6;
+        let (indptr, indices, data) = edges_to_csr(&edges, n);
+        let graph = LeidenGraph::from_csr(&indptr, &indices, &data, n);
+        let mut partition = RBPartition::new_singleton(graph, 1.0);
+
+        // Build a non-trivial assignment: communities {0,1,2} and {3,4,5}.
+        let c0 = partition.membership(0);
+        let c3 = partition.membership(3);
+        partition.move_node(1, c0);
+        partition.move_node(2, c0);
+        partition.move_node(4, c3);
+        partition.move_node(5, c3);
+
+        for node in 0..n {
+            // Replicate the production accumulation pass.
+            let mut comm_weights: HashMap<usize, f64> = HashMap::new();
+            for (neighbor, edge_w) in partition.graph.neighbors(node) {
+                *comm_weights
+                    .entry(partition.membership(neighbor))
+                    .or_insert(0.0) += edge_w;
+            }
+            // Every accumulated entry must equal the scanning implementation.
+            for (&comm, &w) in &comm_weights {
+                let scanned = partition.weight_to_comm(node, comm);
+                assert!(
+                    (w - scanned).abs() < 1e-12,
+                    "node {node} comm {comm}: map {w} != weight_to_comm {scanned}"
+                );
+            }
+            // And communities absent from the map carry zero weight.
+            for comm in [c0, c3] {
+                if !comm_weights.contains_key(&comm) {
+                    assert_eq!(partition.weight_to_comm(node, comm), 0.0);
+                }
+            }
+        }
+    }
+
+    /// OPT-3.1: lock the exact output labels on a fixed-seed fixture so the
+    /// sorted-candidate-order change is regression-guarded. Labels are
+    /// bit-identical to the pre-optimization output on this tie-free fixture.
+    #[test]
+    fn test_local_move_label_golden() {
+        let edges = vec![
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (1, 2, 1.0),
+            (2, 3, 0.5),
+            (3, 4, 1.0),
+            (3, 5, 1.0),
+            (4, 5, 1.0),
+        ];
+        let n = 6;
+        let (indptr, indices, data) = edges_to_csr(&edges, n);
+
+        let result = leiden(&indptr, &indices, &data, n, 1.0, 123, 0, false).unwrap();
+        assert_eq!(result.membership, vec![0, 0, 0, 1, 1, 1]);
+    }
+
+    /// OPT-3.1: exercise the parallel local-move path (`evaluate_node`, which
+    /// uses a fresh per-node weight map under `par_iter`). It must recover the
+    /// two-clique structure and be deterministic across runs.
+    #[test]
+    fn test_parallel_local_move_recovers_clusters() {
+        let edges = vec![
+            (0, 1, 1.0),
+            (0, 2, 1.0),
+            (1, 2, 1.0),
+            (3, 4, 1.0),
+            (3, 5, 1.0),
+            (4, 5, 1.0),
+            (2, 3, 0.01),
+        ];
+        let n = 6;
+        let (indptr, indices, data) = edges_to_csr(&edges, n);
+
+        let r1 = leiden(&indptr, &indices, &data, n, 1.0, 42, 0, true).unwrap();
+        let r2 = leiden(&indptr, &indices, &data, n, 1.0, 42, 0, true).unwrap();
+
+        assert_eq!(
+            r1.membership, r2.membership,
+            "parallel path must be deterministic"
+        );
+        assert_eq!(r1.n_communities, 2, "should recover 2 communities");
+        assert_eq!(r1.membership[0], r1.membership[1]);
+        assert_eq!(r1.membership[0], r1.membership[2]);
+        assert_eq!(r1.membership[3], r1.membership[4]);
+        assert_eq!(r1.membership[3], r1.membership[5]);
+        assert_ne!(r1.membership[0], r1.membership[3]);
     }
 
     #[test]
