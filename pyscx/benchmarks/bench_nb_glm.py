@@ -87,6 +87,53 @@ def make_perturb_adata(n_perts, n_donors, n_genes, cells_per, seed=0) -> ad.AnnD
     return ad.AnnData(X=x, obs=obs, var=var)
 
 
+def make_perturb_adata_sparse(
+    n_perts, n_donors, n_genes, cells_per, seed=0, density=0.08
+) -> ad.AnnData:
+    """Like `make_perturb_adata` but with a **sparse** CSR `X` at realistic
+    single-cell density (~5–10% nonzero), via low per-cell Poisson means.
+
+    Why this matters (Stage B B0 profiling): the dense `make_perturb_adata` makes
+    pseudobulk **aggregation** ~62% of `pdex_nb_glm` wall-time, which Amdahl-caps
+    the GPU-fit speedup at ~1.35× — an artifact of dense input. Real Perturb-seq is
+    sparse; the per-gene **fit** cost is independent of input density (it runs on
+    the dense aggregated pseudobulk), while aggregation scales with nnz. A sparse
+    fixture is the representative workload for the GPU-vs-CPU sweep."""
+    import scipy.sparse as sp
+
+    rng = np.random.default_rng(seed)
+    perts = [REFERENCE] + [f"ko_{i}" for i in range(n_perts - 1)]
+    donors = [f"d{j}" for j in range(n_donors)]
+
+    # Per-cell mean chosen so P(count>0) ≈ density (Poisson: 1 - e^-mean).
+    mean_level = -np.log(max(1e-6, 1.0 - density))
+    base = rng.uniform(0.5 * mean_level, 1.5 * mean_level, size=n_genes)
+    ramp = np.linspace(-1.5, 1.5, n_genes)
+    effect = {REFERENCE: np.ones(n_genes)}
+    for i, p in enumerate(perts[1:]):
+        scale = 0.5 + 0.5 * ((i % 3) + 1)
+        sign = 1.0 if i % 2 == 0 else -1.0
+        effect[p] = 2.0 ** (sign * scale * ramp)
+    donor_factor = {d: rng.uniform(0.92, 1.08, size=n_genes) for d in donors}
+
+    blocks, pert_labels, donor_labels = [], [], []
+    for p in perts:
+        for d in donors:
+            mean = base * effect[p] * donor_factor[d]
+            blk = rng.poisson(mean[None, :], size=(cells_per, n_genes)).astype(np.float32)
+            blocks.append(sp.csr_matrix(blk))
+            pert_labels.extend([p] * cells_per)
+            donor_labels.extend([d] * cells_per)
+
+    x = sp.vstack(blocks).tocsr()
+    obs = pd.DataFrame(
+        {"perturbation": pert_labels, "donor": donor_labels},
+        index=[f"cell_{i}" for i in range(x.shape[0])],
+    )
+    var = pd.DataFrame(index=[f"gene_{j}" for j in range(n_genes)])
+    return ad.AnnData(X=x, obs=obs, var=var)
+
+
 def _time(fn, reps: int) -> tuple[float, object]:
     """Median wall-clock over `reps` runs; returns (median_s, last_result)."""
     times, result = [], None
@@ -186,7 +233,7 @@ def bench_direct_fitter(n_genes=20_000, n_samples=20, n_features=3, reps=3) -> d
 
 # (n_perts, n_donors, n_genes, cells_per_combo) for the GPU many-target sweep.
 # n_donors drives n_sub per target (= 2·n_donors: target reps + reference reps),
-# kept at 3 → n_sub=6, the DE-GPU-ACC.md target regime (n_sub ≈ 4–8). Many
+# kept at 3 → n_sub=6, the target many-target regime (n_sub ≈ 4–8). Many
 # perturbations × ~18k genes is where the CPU sweep costs minutes.
 GPU_SIZES = [
     (20, 3, 18_000, 30),
@@ -198,10 +245,14 @@ GPU_SMOKE_SIZES = [(6, 3, 2_000, 20)]
 
 def bench_gpu_size(n_perts, n_donors, n_genes, cells_per, reps) -> dict:
     """GPU-vs-CPU wall-time + ranking concordance + route check for the
-    many-target ``pdex_nb_glm`` sweep — the Stage-A go/no-go measurement
-    (DE-GPU-ACC.md §11). The CPU baseline is the **saturated multi-core** fit
-    (rayon over genes), not single-thread."""
-    adata = make_perturb_adata(n_perts, n_donors, n_genes, cells_per)
+    many-target ``pdex_nb_glm`` sweep. The CPU baseline is the **saturated
+    multi-core** fit (rayon over genes), not single-thread.
+
+    Uses a **sparse** fixture (realistic ~8% density): the per-gene fit cost is
+    density-independent (it runs on the dense aggregated pseudobulk), while
+    aggregation scales with nnz, so a dense fixture would be aggregation-bound and
+    understate the GPU-fit speedup."""
+    adata = make_perturb_adata_sparse(n_perts, n_donors, n_genes, cells_per)
 
     def run(dev, a):
         return pyscx.accel.pdex_nb_glm(
@@ -209,8 +260,21 @@ def bench_gpu_size(n_perts, n_donors, n_genes, cells_per, reps) -> dict:
             min_cells_per_group=1, device=dev,
         )
 
-    cpu_s, cpu_df = _time(lambda: run("cpu", adata.copy()), reps)
-    gpu_s, gpu_df = _time(lambda: run("gpu", adata.copy()), reps)
+    # Per-phase profiles (populated only when SCX_NBGLM_PROFILE=1; harmless
+    # zeros otherwise). Reset before each path so the snapshot isolates that
+    # path's phases (the shared host-tail phases — wald_cooks/mtc/assembly —
+    # are what cap the GPU speedup, since the GPU fit is a small fraction of wall).
+    # NB: do NOT `adata.copy()` per rep — pdex_nb_glm only reads X/obs (it stamps
+    # uns, harmless to repeat), and a per-rep deep copy of the sparse matrix
+    # (~150MB) is a measurement artifact that inflates both paths' wall and
+    # deflates the ratio (Stage B B0 finding). Measure the real per-call cost.
+    def _profiled(dev):
+        pyscx.accel.nb_glm_profile_reset()
+        t, df = _time(lambda: run(dev, adata), reps)
+        return t, df, pyscx.accel.nb_glm_profile_snapshot()
+
+    cpu_s, cpu_df, cpu_prof = _profiled("cpu")
+    gpu_s, gpu_df, gpu_prof = _profiled("gpu")
 
     # Route check (separate call so timing isn't perturbed by the uns write).
     a = adata.copy()
@@ -242,15 +306,19 @@ def bench_gpu_size(n_perts, n_donors, n_genes, cells_per, reps) -> dict:
         "rho_log2fc": rho,
         "route": route,
         "nb_glm_route_gpu_correct": 1.0 if route.startswith("gpu_nb_glm") else 0.0,
+        # Per-phase ms over `reps` runs (SCX_NBGLM_PROFILE=1). The GPU profile's
+        # wald_cooks+mtc+assembly vs gpu_mle_fit+gpu_shrink_fit split is the
+        # Stage-B decision signal.
+        "cpu_profile_ms": {k: v["ms"] for k, v in cpu_prof.items()},
+        "gpu_profile_ms": {k: v["ms"] for k, v in gpu_prof.items()},
     }
 
 
 def generate_gpu_report(rows: list[dict]) -> str:
     lines = [
-        "## GPU vs CPU: pdex_nb_glm many-target sweep (Stage A)",
+        "## GPU vs CPU: pdex_nb_glm many-target sweep",
         "",
-        "_CPU baseline = saturated multi-core (rayon). Speedup ≥ 2–3× greenlights"
-        " Stage B (DE-GPU-ACC.md §11/§13.5)._",
+        "_CPU baseline = saturated multi-core (rayon), same machine._",
         "",
         "| perts | n_sub | genes | cells | cpu (s) | gpu (s) | speedup | ρ(log2FC) | route |",
         "|------:|------:|------:|------:|--------:|--------:|--------:|----------:|:------|",
@@ -263,6 +331,34 @@ def generate_gpu_report(rows: list[dict]) -> str:
             f"| {fmt(r['cpu_s'])} | {fmt(r['gpu_s'])} | {fmt(r['speedup'], 2)} "
             f"| {fmt(r['rho_log2fc'])} | `{r['route']}` |"
         )
+
+    # Per-phase breakdown (only meaningful under SCX_NBGLM_PROFILE=1). Surfaces
+    # whether the GPU path is fit-bound or host-tail-bound (the Stage-B lever).
+    phases = [
+        "transpose", "cpu_mle_pass", "cpu_shrink_pass", "gpu_mle_fit",
+        "gpu_trend_prior", "gpu_shrink_fit", "wald_cooks", "mtc", "assembly",
+    ]
+    if any(sum(r.get("gpu_profile_ms", {}).values()) > 0 for r in rows):
+        lines += [
+            "",
+            "### Per-phase wall-time (ms, summed over reps; SCX_NBGLM_PROFILE)",
+            "",
+            "GPU path:",
+            "",
+            "| perts | " + " | ".join(phases) + " |",
+            "|------:|" + "|".join(["---:"] * len(phases)) + "|",
+        ]
+        for r in rows:
+            prof = r.get("gpu_profile_ms", {})
+            cells = " | ".join(f"{prof.get(p, 0.0):.1f}" for p in phases)
+            lines.append(f"| {r['n_perts']} | {cells} |")
+        lines += ["", "CPU path:", "",
+                  "| perts | " + " | ".join(phases) + " |",
+                  "|------:|" + "|".join(["---:"] * len(phases)) + "|"]
+        for r in rows:
+            prof = r.get("cpu_profile_ms", {})
+            cells = " | ".join(f"{prof.get(p, 0.0):.1f}" for p in phases)
+            lines.append(f"| {r['n_perts']} | {cells} |")
     lines.append("")
     return "\n".join(lines)
 

@@ -5,8 +5,8 @@
 //! `scx_gpu::gpu_nb_glm_fit`. Every cross-gene step (dispersion trend, prior
 //! variance) and the post-fit tail (Wald, Cook's, filtering, BH, assembly) reuse
 //! the host code unchanged — see [`super::assemble_result`]. The output is the
-//! same [`NbGlmResult`] the CPU path produces, within the cross-validation
-//! tolerances in `DE-GPU-ACC.md` §10.
+//! same [`NbGlmResult`] the CPU path produces, within the per-quantity relative
+//! cross-validation tolerances (not bit-equality — see `gpu_tests.rs`).
 //!
 //! The fit is `f64` end-to-end (kernel + host), so GPU↔CPU agreement is bounded
 //! only by the ported special functions and the root-finder's convergence path,
@@ -22,9 +22,9 @@ use scx_gpu::{
 use super::dispersion::{estimate_prior_var, fit_dispersion_trend};
 use super::size_factors::median_ratio_size_factors;
 use super::validate::{validate_contrast, validate_inputs};
-use super::{assemble_result, wald, GeneState};
+use super::{assemble_result, profile, wald, GeneState};
 use crate::error::{AccelError, Result};
-use crate::nb_glm::{DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult};
+use crate::nb_glm::{DispersionMethod, DispersionTrend, NbGlmContrast, NbGlmOptions, NbGlmResult};
 
 /// Map `DispersionMethod` → the kernel's integer method tag.
 fn method_tag(m: DispersionMethod) -> i32 {
@@ -79,14 +79,29 @@ fn state_from_fit(
     }
 }
 
-/// GPU pseudobulk NB-GLM fit + contrast test. Signature mirrors
-/// [`super::pseudobulk_nb_glm`] with a leading [`GpuDevice`] handle.
+/// Opaque per-target GPU fit result: the fitted `GeneState`s plus the MLE
+/// dispersions / base means / trend / prior that [`finalize_nb_glm`] needs.
 ///
-/// Requires `n_features ≤ GPU_NB_GLM_PMAX` and `n_samples ≤ GPU_NB_GLM_NSUB_MAX`;
-/// the route planner gates these so larger inputs never reach here, but they are
-/// also checked defensively.
+/// Produced by [`gpu_nb_glm_fit_states`] (the serial device phase) and consumed
+/// by [`finalize_nb_glm`] (the parallelizable host tail). Splitting the fit from
+/// the tail lets a many-target sweep serialize the (one-device) GPU calls while
+/// running each target's host tail concurrently across cores (Stage B L1).
+pub struct NbGlmFitData {
+    pub(crate) final_states: Vec<GeneState>,
+    pub(crate) alpha_mle: Vec<f64>,
+    pub(crate) base_means: Vec<f64>,
+    pub(crate) dispersion_trend: Option<DispersionTrend>,
+    pub(crate) dispersion_prior_var: Option<f64>,
+    pub(crate) start: std::time::Instant,
+}
+
+/// GPU fit phase: per-gene MLE → cross-gene trend/prior → shrinkage refit,
+/// producing fitted [`GeneState`]s. This is the device-bound work (the GPU
+/// launches must be serialized on the single [`GpuDevice`]); the contrast test,
+/// Wald, Cook's, and multiple-testing correction are deferred to
+/// [`finalize_nb_glm`] so a many-target caller can run them in parallel.
 #[allow(clippy::too_many_arguments)]
-pub fn gpu_pseudobulk_nb_glm(
+pub fn gpu_nb_glm_fit_states(
     dev: &GpuDevice,
     counts_gene_major: &[f64],
     n_genes: usize,
@@ -94,9 +109,8 @@ pub fn gpu_pseudobulk_nb_glm(
     design_row_major: &[f64],
     n_features: usize,
     size_factors: Option<&[f64]>,
-    contrast: NbGlmContrast,
-    options: NbGlmOptions,
-) -> Result<NbGlmResult> {
+    options: &NbGlmOptions,
+) -> Result<NbGlmFitData> {
     let start = std::time::Instant::now();
 
     validate_inputs(
@@ -107,7 +121,6 @@ pub fn gpu_pseudobulk_nb_glm(
         n_features,
         size_factors,
     )?;
-    validate_contrast(&contrast, n_features)?;
 
     if n_features > GPU_NB_GLM_PMAX || n_samples > GPU_NB_GLM_NSUB_MAX {
         return Err(AccelError::InvalidInput(format!(
@@ -117,12 +130,12 @@ pub fn gpu_pseudobulk_nb_glm(
         )));
     }
 
+    let _sf_timer = profile::start(profile::Phase::SizeFactors);
     let sf: Vec<f64> = match size_factors {
         Some(s) => s.to_vec(),
         None => median_ratio_size_factors(counts_gene_major, n_genes, n_samples),
     };
     let log_sf: Vec<f64> = sf.iter().map(|v| v.ln()).collect();
-    let c = wald::contrast_vector(&contrast, n_features);
 
     let base_means: Vec<f64> = (0..n_genes)
         .map(|g| {
@@ -137,30 +150,36 @@ pub fn gpu_pseudobulk_nb_glm(
                 .all(|&y| y == 0.0)
         })
         .collect();
+    drop(_sf_timer);
 
-    let gopts = gpu_opts(&options);
+    let gopts = gpu_opts(options);
 
     // --- GPU pass 1: per-gene MLE (IRLS ↔ Cox–Reid). ---
-    let mle = gpu_nb_glm_fit(
-        dev,
-        counts_gene_major,
-        design_row_major,
-        &log_sf,
-        &sf,
-        n_genes,
-        n_samples,
-        n_features,
-        gopts,
-        GpuNbGlmPass::Mle {
-            base_mean: &base_means,
-        },
-    )
-    .map_err(|e| AccelError::LinAlg(format!("GPU NB-GLM MLE fit: {e}")))?;
+    let mle = {
+        let _t = profile::start(profile::Phase::GpuMleFit);
+        gpu_nb_glm_fit(
+            dev,
+            counts_gene_major,
+            design_row_major,
+            &log_sf,
+            &sf,
+            n_genes,
+            n_samples,
+            n_features,
+            gopts,
+            GpuNbGlmPass::Mle {
+                base_mean: &base_means,
+            },
+        )
+        .map_err(|e| AccelError::LinAlg(format!("GPU NB-GLM MLE fit: {e}")))?
+    };
 
+    let _recon_timer = profile::start(profile::Phase::Reconstruct);
     let alpha_mle: Vec<f64> = mle.alpha.clone();
     let mle_states: Vec<GeneState> = (0..n_genes)
         .map(|g| state_from_fit(&mle, g, n_samples, n_features, base_means[g], all_zero[g]))
         .collect();
+    drop(_recon_timer);
 
     // --- Cross-gene trend + empirical-Bayes shrinkage (host) + GPU refit. ---
     let mut dispersion_trend = None;
@@ -168,11 +187,12 @@ pub fn gpu_pseudobulk_nb_glm(
     let final_states: Vec<GeneState> = if options.dispersion == DispersionMethod::CoxReidShrunk
         && options.shrink_dispersion
     {
+        let _tp_timer = profile::start(profile::Phase::GpuTrendPrior);
         let valid: Vec<bool> = (0..n_genes)
             .map(|g| !all_zero[g] && alpha_mle[g].is_finite())
             .collect();
         let trend = if options.fit_dispersion_trend {
-            fit_dispersion_trend(&base_means, &alpha_mle, &valid, &options)
+            fit_dispersion_trend(&base_means, &alpha_mle, &valid, options)
         } else {
             None
         };
@@ -200,26 +220,30 @@ pub fn gpu_pseudobulk_nb_glm(
         let prior_var = estimate_prior_var(&log_targets, &alpha_mle, &valid, n_samples, n_features);
         dispersion_trend = trend;
         dispersion_prior_var = Some(prior_var);
+        drop(_tp_timer);
 
         // GPU pass 2: shrink dispersion against the prior + refit β.
-        let shr = gpu_nb_glm_fit(
-            dev,
-            counts_gene_major,
-            design_row_major,
-            &log_sf,
-            &sf,
-            n_genes,
-            n_samples,
-            n_features,
-            gopts,
-            GpuNbGlmPass::Shrink {
-                beta_in: &mle.beta,
-                alpha_in: &mle.alpha,
-                prior_log_target: &log_targets,
-                prior_var,
-            },
-        )
-        .map_err(|e| AccelError::LinAlg(format!("GPU NB-GLM shrink fit: {e}")))?;
+        let shr = {
+            let _t = profile::start(profile::Phase::GpuShrinkFit);
+            gpu_nb_glm_fit(
+                dev,
+                counts_gene_major,
+                design_row_major,
+                &log_sf,
+                &sf,
+                n_genes,
+                n_samples,
+                n_features,
+                gopts,
+                GpuNbGlmPass::Shrink {
+                    beta_in: &mle.beta,
+                    alpha_in: &mle.alpha,
+                    prior_log_target: &log_targets,
+                    prior_var,
+                },
+            )
+            .map_err(|e| AccelError::LinAlg(format!("GPU NB-GLM shrink fit: {e}")))?
+        };
 
         (0..n_genes)
             .map(|g| {
@@ -238,6 +262,33 @@ pub fn gpu_pseudobulk_nb_glm(
         mle_states
     };
 
+    Ok(NbGlmFitData {
+        final_states,
+        alpha_mle,
+        base_means,
+        dispersion_trend,
+        dispersion_prior_var,
+        start,
+    })
+}
+
+/// Host tail over a [`NbGlmFitData`]: contrast Wald inference + Cook's distance +
+/// independent filtering + BH + result assembly (all via the shared
+/// [`assemble_result`]). Pure host and free of device state, so a many-target
+/// caller runs this concurrently across targets while the GPU fits stay serial.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_nb_glm(
+    counts_gene_major: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design_row_major: &[f64],
+    n_features: usize,
+    contrast: NbGlmContrast,
+    options: &NbGlmOptions,
+    fit: NbGlmFitData,
+) -> Result<NbGlmResult> {
+    validate_contrast(&contrast, n_features)?;
+    let c = wald::contrast_vector(&contrast, n_features);
     Ok(assemble_result(
         counts_gene_major,
         n_genes,
@@ -245,14 +296,51 @@ pub fn gpu_pseudobulk_nb_glm(
         design_row_major,
         n_features,
         &c,
-        &options,
-        &final_states,
-        alpha_mle,
-        base_means,
-        dispersion_trend,
-        dispersion_prior_var,
-        start,
+        options,
+        &fit.final_states,
+        fit.alpha_mle,
+        fit.base_means,
+        fit.dispersion_trend,
+        fit.dispersion_prior_var,
+        fit.start,
     ))
+}
+
+/// GPU pseudobulk NB-GLM fit + contrast test. Convenience wrapper:
+/// [`gpu_nb_glm_fit_states`] then [`finalize_nb_glm`] (the many-target pyscx path
+/// calls those two directly so it can parallelize the finalize across targets).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_pseudobulk_nb_glm(
+    dev: &GpuDevice,
+    counts_gene_major: &[f64],
+    n_genes: usize,
+    n_samples: usize,
+    design_row_major: &[f64],
+    n_features: usize,
+    size_factors: Option<&[f64]>,
+    contrast: NbGlmContrast,
+    options: NbGlmOptions,
+) -> Result<NbGlmResult> {
+    let fit = gpu_nb_glm_fit_states(
+        dev,
+        counts_gene_major,
+        n_genes,
+        n_samples,
+        design_row_major,
+        n_features,
+        size_factors,
+        &options,
+    )?;
+    finalize_nb_glm(
+        counts_gene_major,
+        n_genes,
+        n_samples,
+        design_row_major,
+        n_features,
+        contrast,
+        &options,
+        fit,
+    )
 }
 
 #[cfg(test)]

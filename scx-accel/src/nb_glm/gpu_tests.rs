@@ -1,7 +1,7 @@
 //! CPU↔GPU parity tests for the GPU NB-GLM orchestrator.
 //!
-//! No external reference exists (pyDESeq2 OOMs in the comprehensive bench — see
-//! `DE-GPU-ACC.md` §10), so the CPU `f64` fitter is the reference. These assert
+//! No external reference exists (pyDESeq2 OOMs in the comprehensive correctness
+//! bench), so the CPU `f64` fitter is the reference. These assert
 //! per-quantity *relative* tolerances (not bit-equality): a ported special-
 //! function set + a safeguarded Illinois root-find diverge in convergence path
 //! from the CPU implementation. They skip gracefully when no CUDA device is
@@ -124,7 +124,7 @@ fn run_parity(method: DispersionMethod, n_sub: usize) {
         "log2fc Spearman {s_lfc} < 0.999 (method {method:?}, n_sub {n_sub})"
     );
 
-    // Per-quantity relative tolerances (DE-GPU-ACC.md §10).
+    // Per-quantity relative tolerances (log2fc tight; dispersion looser).
     let mut max_rel_lfc = 0.0_f64;
     let mut max_rel_disp = 0.0_f64;
     for g in 0..n_genes {

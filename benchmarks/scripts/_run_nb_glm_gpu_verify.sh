@@ -1,5 +1,5 @@
 #!/bin/bash
-# GPU verification for the Stage-A GPU pseudobulk NB-GLM (DE-GPU-ACC.md §11):
+# GPU verification for the GPU pseudobulk NB-GLM:
 #   1. scx-gpu kernel smoke + scx-accel CPU↔GPU parity (cargo, release).
 #   2. pyscx CPU↔GPU agreement + route-stamp pytest (native CUDA; no rapids).
 #   3. Stage-A speedup measurement (bench_nb_glm.py --gpu on).

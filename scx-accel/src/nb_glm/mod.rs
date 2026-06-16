@@ -12,6 +12,7 @@
 //! rayon gene-parallelism and deterministic output.
 
 pub mod math;
+pub mod profile;
 pub mod types;
 
 mod dispersion;
@@ -39,7 +40,7 @@ const MEAN_FLOOR: f64 = 1e-4;
 
 /// Per-gene fitted state threaded through the orchestration pipeline.
 #[derive(Clone)]
-struct GeneState {
+pub(crate) struct GeneState {
     beta: Vec<f64>,
     mu: Vec<f64>,
     fisher: Vec<f64>,
@@ -102,12 +103,14 @@ pub fn pseudobulk_nb_glm(
     )?;
     validate_contrast(&contrast, n_features)?;
 
+    let _sf_timer = profile::start(profile::Phase::SizeFactors);
     let sf: Vec<f64> = match size_factors {
         Some(s) => s.to_vec(),
         None => median_ratio_size_factors(counts_gene_major, n_genes, n_samples),
     };
     let log_sf: Vec<f64> = sf.iter().map(|v| v.ln()).collect();
     let c = wald::contrast_vector(&contrast, n_features);
+    drop(_sf_timer);
 
     let row_of = |g: usize| &counts_gene_major[g * n_samples..(g + 1) * n_samples];
     let base_mean_of = |row: &[f64]| -> f64 {
@@ -115,6 +118,7 @@ pub fn pseudobulk_nb_glm(
     };
 
     // --- Per-gene MLE pass (gene-parallel): IRLS ↔ Cox–Reid dispersion. ---
+    let _mle_timer = profile::start(profile::Phase::CpuMlePass);
     let mle: Vec<GeneState> = (0..n_genes)
         .into_par_iter()
         .map(|g| {
@@ -204,6 +208,7 @@ pub fn pseudobulk_nb_glm(
             }
         })
         .collect();
+    drop(_mle_timer);
 
     let alpha_mle: Vec<f64> = mle.iter().map(|m| m.alpha).collect();
     let base_means: Vec<f64> = mle.iter().map(|m| m.base_mean).collect();
@@ -248,6 +253,7 @@ pub fn pseudobulk_nb_glm(
         dispersion_trend = trend;
         dispersion_prior_var = Some(prior_var);
 
+        let _shrink_timer = profile::start(profile::Phase::CpuShrinkPass);
         (0..n_genes)
             .into_par_iter()
             .map(|g| {
@@ -342,6 +348,7 @@ fn assemble_result(
     // --- Wald inference + Cook's distance (gene-parallel). ---
     // Cook's reuses the contrast covariance `wald_stat` already inverts (the
     // ridged Fisher inverse), so it costs only the per-sample leverage forms.
+    let _wald_timer = profile::start(profile::Phase::WaldCooks);
     let wald_out: Vec<(wald::WaldOut, f64)> = (0..n_genes)
         .into_par_iter()
         .map(|g| {
@@ -382,6 +389,7 @@ fn assemble_result(
             (w, cooks)
         })
         .collect();
+    drop(_wald_timer);
 
     let cooks: Vec<f64> = wald_out.iter().map(|(_, c)| *c).collect();
     let p_value_raw: Vec<f64> = wald_out.iter().map(|(w, _)| w.p_value).collect();
@@ -415,6 +423,7 @@ fn assemble_result(
     }
 
     // --- Multiple-testing correction: independent filtering (default) or masked BH. ---
+    let _mtc_timer = profile::start(profile::Phase::Mtc);
     let mut n_independent_filtered = 0usize;
     let mut independent_filter_threshold = None;
     let p_adj = if !(options.compute_bh && options.compute_wald) {
@@ -428,8 +437,10 @@ fn assemble_result(
     } else {
         filtering::benjamini_hochberg_masked(&p_value)
     };
+    drop(_mtc_timer);
 
     // --- Assemble result + diagnostics. ---
+    let _assembly_timer = profile::start(profile::Phase::Assembly);
     let beta = if options.store_coefficients {
         let mut flat = vec![0.0_f64; n_genes * n_features];
         for (g, st) in final_states.iter().enumerate() {
@@ -510,7 +521,7 @@ fn assemble_result(
 #[cfg(feature = "gpu")]
 mod gpu;
 #[cfg(feature = "gpu")]
-pub use gpu::gpu_pseudobulk_nb_glm;
+pub use gpu::{finalize_nb_glm, gpu_nb_glm_fit_states, gpu_pseudobulk_nb_glm, NbGlmFitData};
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

@@ -409,6 +409,12 @@ pub(super) fn fit_targets_nbglm(
         )));
     }
 
+    // Per-target loop is **serial** by design: each fit is already gene-parallel
+    // (rayon) and the per-target host tail (MTC etc.) is parallelized internally.
+    // Parallelizing this outer loop was measured to *lower* the GPU/CPU speedup —
+    // it speeds the CPU baseline (whose fit overlaps across targets) far more than
+    // the GPU path (whose fit is off-CPU), and nests rayon. The GPU device handle
+    // is `!Sync` and must stay serial regardless.
     let warnings = py.import("warnings")?;
     let mut fits = Vec::with_capacity(targets.len());
     for target in &targets {
@@ -432,18 +438,20 @@ pub(super) fn fit_targets_nbglm(
             continue;
         }
 
-        // Gene-major counts [n_vars x n_sub] and design [n_sub x 2].
+        // Gene-major counts [n_vars × n_sub] and design [n_sub × 2].
         let mut cg = vec![0.0_f64; n_vars * n_sub];
         let mut design = vec![0.0_f64; n_sub * 2];
         for (s, &g) in sub.iter().enumerate() {
             design[s * 2] = 1.0;
             design[s * 2 + 1] = if cond[g] == target.as_str() { 1.0 } else { 0.0 };
         }
-        // Transpose group-major `counts` → gene-major `cg`; inner loop over `s`
-        // writes `cg` contiguously (stride 1) for cache-friendly stores.
-        for j in 0..n_vars {
-            for (s, &g) in sub.iter().enumerate() {
-                cg[j * n_sub + s] = result.counts[g * n_vars + j];
+        {
+            let _t =
+                scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Transpose);
+            for j in 0..n_vars {
+                for (s, &g) in sub.iter().enumerate() {
+                    cg[j * n_sub + s] = result.counts[g * n_vars + j];
+                }
             }
         }
 
@@ -696,6 +704,35 @@ pub fn nb_glm(
     Ok(df.get_item(order)?.unbind())
 }
 
+/// Snapshot the NB-GLM per-phase wall-time profiler (Stage B0).
+///
+/// Returns a dict mapping each phase name (`transpose`, `cpu_mle_pass`,
+/// `cpu_shrink_pass`, `gpu_mle_fit`, `gpu_trend_prior`, `gpu_shrink_fit`,
+/// `wald_cooks`, `mtc`, `assembly`) to a `{ms, calls}` sub-dict. Accumulates
+/// only when the process was started with `SCX_NBGLM_PROFILE=1`; otherwise every
+/// bucket reads zero. Mirrors `gpu_profile_snapshot`. The `mtc` (multiple-testing
+/// correction: independent filter + BH) and `wald_cooks` buckets quantify the
+/// per-target host tail that bounds the GPU speedup (the GPU fit itself is a
+/// small fraction of wall on the many-target sweep).
+#[pyfunction]
+pub fn nb_glm_profile_snapshot(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    for stat in scx_accel::nb_glm::profile::snapshot() {
+        let d = PyDict::new(py);
+        d.set_item("ms", stat.ms)?;
+        d.set_item("calls", stat.calls)?;
+        dict.set_item(stat.name, d)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+/// Reset the NB-GLM per-phase profiler counters to zero (call between bench runs).
+#[pyfunction]
+pub fn nb_glm_profile_reset() -> PyResult<()> {
+    scx_accel::nb_glm::profile::reset();
+    Ok(())
+}
+
 /// Pseudobulk NB-GLM differential expression for the cell-eval/pdex consumer.
 ///
 /// Aggregates `groupby × stratify_by` pseudobulk **replicates** from `adata`,
@@ -804,15 +841,18 @@ pub fn pdex_nb_glm(
     combined.push(groupby.to_string());
     combined.extend(strat.iter().cloned());
 
-    let result = aggregate_pseudobulk(
-        py,
-        &working,
-        &combined,
-        prefer_format,
-        None,
-        scx_accel::AggregationMethod::Sum,
-        min_cells_per_group,
-    )?;
+    let result = {
+        let _t = scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Aggregate);
+        aggregate_pseudobulk(
+            py,
+            &working,
+            &combined,
+            prefer_format,
+            None,
+            scx_accel::AggregationMethod::Sum,
+            min_cells_per_group,
+        )?
+    };
     if result.n_groups == 0 {
         return Err(PyRuntimeError::new_err(
             "no pseudobulk groups passed the min_cells_per_group filter",
@@ -846,6 +886,8 @@ pub fn pdex_nb_glm(
     super::route::write_accel_route(py, adata, "pdex_nb_glm", &info)?;
 
     // Flatten to the cell-eval/pdex column vectors.
+    let _flatten_timer =
+        scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Flatten);
     let n_vars = result.n_vars;
     let cap = fits.len() * n_vars;
     let mut targets = Vec::with_capacity(cap);
@@ -881,20 +923,24 @@ pub fn pdex_nb_glm(
     dict.set_item("fdr", fdrs)?;
     dict.set_item("log2_fold_change", log2_fcs)?;
     dict.set_item("abs_log2_fold_change", abs_log2_fcs)?;
+    drop(_flatten_timer);
 
-    let df = build_de_dataframe(
-        py,
-        &dict,
-        &[
-            "target",
-            "feature",
-            "fold_change",
-            "p_value",
-            "fdr",
-            "log2_fold_change",
-            "abs_log2_fold_change",
-        ],
-        "polars",
-    )?;
+    let df = {
+        let _t = scx_accel::nb_glm::profile::start(scx_accel::nb_glm::profile::Phase::Dataframe);
+        build_de_dataframe(
+            py,
+            &dict,
+            &[
+                "target",
+                "feature",
+                "fold_change",
+                "p_value",
+                "fdr",
+                "log2_fold_change",
+                "abs_log2_fold_change",
+            ],
+            "polars",
+        )?
+    };
     Ok(df.unbind())
 }

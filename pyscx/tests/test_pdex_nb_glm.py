@@ -179,10 +179,9 @@ def test_pdex_nb_glm_spearman_parity_vs_pdex_ref():
 
 # --- GPU (Stage A) -----------------------------------------------------------
 #
-# No external reference exists (pyDESeq2 OOMs in the comprehensive bench — see
-# DE-GPU-ACC.md §10), so the CPU f64 fitter is the reference. These skip when no
-# CUDA GPU is present; the GPU CI harness (slurm_scx_gpu_tests.sh) runs them on
-# an H100.
+# No external reference exists (pyDESeq2 OOMs in the comprehensive correctness
+# bench), so the CPU f64 fitter is the reference. These skip when no CUDA GPU is
+# present; the GPU CI harness (slurm_scx_gpu_tests.sh) runs them on an H100.
 
 
 def test_pdex_nb_glm_gpu_route_stamped():
@@ -205,7 +204,7 @@ def test_pdex_nb_glm_gpu_route_stamped():
 
 
 def test_pdex_nb_glm_cpu_gpu_agreement():
-    """GPU matches CPU within DE-GPU-ACC.md §10 relative tolerances + ranks."""
+    """GPU matches CPU within per-quantity relative tolerances + rank concordance."""
     pytest.importorskip("polars")
     spearmanr = pytest.importorskip("scipy.stats").spearmanr
     if not pyscx.accel.gpu_available():

@@ -100,7 +100,7 @@ pub use hvg::{
     streaming_mean_var_batched_with_device, streaming_mean_var_with_device,
 };
 #[cfg(feature = "gpu")]
-pub use nb_glm::gpu_pseudobulk_nb_glm;
+pub use nb_glm::{finalize_nb_glm, gpu_nb_glm_fit_states, gpu_pseudobulk_nb_glm, NbGlmFitData};
 #[cfg(feature = "gpu")]
 pub use neighbors::cuvs_available;
 #[cfg(feature = "gpu")]

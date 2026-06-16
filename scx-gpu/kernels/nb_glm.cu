@@ -12,8 +12,8 @@
 // `nb_loglik_sum_dlogalpha`, the Cox-Reid gradient, the safeguarded Illinois
 // root-find, method-of-moments init) are ported verbatim from `math.rs` /
 // `dispersion.rs` / `irls.rs`, including every magic constant, so the GPU result
-// tracks the CPU `f64` reference within the cross-validation tolerances in
-// `DE-GPU-ACC.md` §10. The cheap per-gene tail (Wald, Cook's) and all cross-gene
+// tracks the CPU `f64` reference within per-quantity relative cross-validation
+// tolerances. The cheap per-gene tail (Wald, Cook's) and all cross-gene
 // steps (trend, prior var, filtering, BH) stay on the host.
 //
 // A single kernel serves both passes via `mode`:

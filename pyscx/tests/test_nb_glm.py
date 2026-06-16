@@ -215,7 +215,7 @@ def test_nb_glm_cpu_gpu_agreement():
     """Stage-A GPU fit matches the CPU f64 reference on the small fixture.
 
     Skips without a CUDA GPU; the GPU CI harness runs it on an H100. The CPU
-    fitter is the reference (no external one exists — DE-GPU-ACC.md §10).
+    fitter is the reference (no external one exists — pyDESeq2 OOMs).
     """
     if not pyscx.accel.gpu_available():
         pytest.skip("no CUDA GPU available")
