@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -31,7 +31,11 @@ use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
 use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader, IterMetrics};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
-use crate::sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
+use crate::sparse_cellset::{
+    CollateScalars, CollatedCellSetBatch, CollatedCellSetPlan, SparseCellSetBatch,
+    SparseCellSetLoader, SparseCellSetPlan,
+};
+use crate::sparse_cellset_collate::PreprocessMode;
 use scx_format_io::ScxReader;
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
@@ -1542,6 +1546,55 @@ impl SparseCellSetDataset {
         Ok(SparseCellSetBatchIter { inner: Some(inner) })
     }
 
+    /// Drive the loader from a Python iterable of *collated* batch plans and
+    /// run the per-cell collation kernel in Rust (state3 "3A hybrid"). Each plan
+    /// is a tuple `(file_ids, rows, role_tags, set_offsets, query_gene_ids,
+    /// enc_mask_positions, hide_readout, n_measured)`; `enc_mask_positions` may
+    /// be empty to disable query-based encoder masking (perturbation path).
+    /// Yields dicts of stacked `[n_rows, K]` tensors (flat + shape scalars).
+    /// Requires the dataset to have been built with global remap tables.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        plans, k_enc, k_dec, mode, n_genes_total,
+        target_sum=None, lib_size_redef=None, lookahead=None,
+    ))]
+    fn iter_with_plans_collated(
+        &self,
+        plans: Py<PyAny>,
+        k_enc: usize,
+        k_dec: usize,
+        mode: String,
+        n_genes_total: i64,
+        target_sum: Option<f64>,
+        lib_size_redef: Option<bool>,
+        lookahead: Option<usize>,
+    ) -> PyResult<CollatedCellSetBatchIter> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.SparseCellSetDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+        let lookahead = lookahead.unwrap_or(self.default_lookahead);
+        let mode = PreprocessMode::parse(&mode).map_err(loader_err_to_py)?;
+        let scalars = CollateScalars {
+            k_enc,
+            mode,
+            target_sum: target_sum.unwrap_or(1e4),
+            n_genes_total,
+            lib_size_redef: lib_size_redef.unwrap_or(false),
+        };
+
+        let py_iter: Py<PyAny> = Python::attach(|py| -> PyResult<Py<PyAny>> {
+            Ok(plans.bind(py).call_method0("__iter__")?.unbind())
+        })?;
+
+        let plan_stream = PyCollatedCellSetPlanIterator { py_iter, k_dec };
+        let inner =
+            Arc::clone(&self.loader).iter_with_plans_collated(plan_stream, lookahead, scalars);
+        Ok(CollatedCellSetBatchIter { inner: Some(inner) })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "SparseCellSetDataset(n_files={}, n_cols={})",
@@ -1602,4 +1655,218 @@ fn sparse_cellset_batch_to_dict<'py>(
     dict.set_item("set_offsets", PyArray1::from_vec(py, batch.set_offsets))?;
     dict.set_item("role_tags", PyArray1::from_vec(py, batch.role_tags))?;
     Ok(dict)
+}
+
+/// Adapter: Python iterator of collated plan tuples → Rust
+/// `Iterator<Item = Result<CollatedCellSetPlan>>`. The tuple shape is
+/// `(file_ids u32[], rows u64[], role_tags i32[], set_offsets i64[],
+///   query_gene_ids i32[], enc_mask_positions u8[], hide_readout u8[],
+///   n_measured u32[])`.
+struct PyCollatedCellSetPlanIterator {
+    py_iter: Py<PyAny>,
+    k_dec: usize,
+}
+
+type CollatedPlanTuple = (
+    Vec<u32>, // file_ids
+    Vec<u64>, // rows
+    Vec<i32>, // role_tags
+    Vec<i64>, // set_offsets
+    Vec<i32>, // query_gene_ids   [n_sets * k_dec]
+    Vec<u8>,  // enc_mask_positions [n_rows * k_dec] or empty
+    Vec<u8>,  // hide_readout     [n_rows]
+    Vec<u32>, // n_measured       [n_sets]
+);
+
+impl Iterator for PyCollatedCellSetPlanIterator {
+    type Item = std::result::Result<CollatedCellSetPlan, LoaderError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Python::attach(|py| {
+            let bound = self.py_iter.bind(py);
+            match bound.call_method0("__next__") {
+                Ok(obj) => match obj.extract::<CollatedPlanTuple>() {
+                    Ok((
+                        file_ids,
+                        rows,
+                        role_tags,
+                        set_offsets,
+                        query_gene_ids,
+                        enc_mask_positions,
+                        hide_readout,
+                        n_measured,
+                    )) => Some(Ok(CollatedCellSetPlan {
+                        base: SparseCellSetPlan {
+                            file_ids,
+                            rows,
+                            role_tags,
+                            set_offsets,
+                        },
+                        k_dec: self.k_dec,
+                        query_gene_ids,
+                        enc_mask_positions,
+                        hide_readout,
+                        n_measured,
+                    })),
+                    Err(e) => Some(Err(LoaderError::ConfigError {
+                        reason: format!(
+                            "collated plan extraction failed (expected tuple (file_ids:u32[], \
+                             rows:u64[], role_tags:i32[], set_offsets:i64[], query_gene_ids:i32[], \
+                             enc_mask_positions:u8[], hide_readout:u8[], n_measured:u32[])): {e}"
+                        ),
+                    })),
+                },
+                Err(e) => {
+                    if e.is_instance_of::<PyStopIteration>(py) {
+                        None
+                    } else {
+                        Some(Err(LoaderError::ChannelError(format!(
+                            "collated plan iterator raised: {e}"
+                        ))))
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Python iterator wrapping the boxed collated engine iterator.
+#[pyclass]
+pub struct CollatedCellSetBatchIter {
+    inner:
+        Option<Box<dyn Iterator<Item = crate::error::Result<CollatedCellSetBatch>> + Send + Sync>>,
+}
+
+#[pymethods]
+impl CollatedCellSetBatchIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let next = py.detach(|| inner.next());
+        match next {
+            Some(Ok(batch)) => Ok(Some(collated_cellset_batch_to_dict(py, batch)?)),
+            Some(Err(e)) => Err(loader_err_to_py(e)),
+            None => {
+                self.inner = None;
+                Ok(None)
+            }
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CollatedCellSetBatchIter(exhausted={})",
+            self.inner.is_none()
+        )
+    }
+}
+
+/// Convert a `CollatedCellSetBatch` into a dict of flat stacked tensors plus
+/// shape scalars (`n_rows`, `k_enc`, `k_dec`); state3 reshapes to `[B, S, K]`.
+fn collated_cellset_batch_to_dict<'py>(
+    py: Python<'py>,
+    batch: CollatedCellSetBatch,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "encoder_gene_ids",
+        PyArray1::from_vec(py, batch.encoder_gene_ids),
+    )?;
+    dict.set_item(
+        "encoder_counts",
+        PyArray1::from_vec(py, batch.encoder_counts),
+    )?;
+    dict.set_item("encoder_mask", PyArray1::from_vec(py, batch.encoder_mask))?;
+    dict.set_item(
+        "encoder_pad_mask",
+        PyArray1::from_vec(py, batch.encoder_pad_mask),
+    )?;
+    dict.set_item("target_counts", PyArray1::from_vec(py, batch.target_counts))?;
+    dict.set_item("library_size", PyArray1::from_vec(py, batch.library_size))?;
+    dict.set_item("cell_indices", PyArray1::from_vec(py, batch.cell_indices))?;
+    dict.set_item("file_ids", PyArray1::from_vec(py, batch.file_ids))?;
+    dict.set_item("set_offsets", PyArray1::from_vec(py, batch.set_offsets))?;
+    dict.set_item("role_tags", PyArray1::from_vec(py, batch.role_tags))?;
+    dict.set_item("n_rows", batch.n_rows)?;
+    dict.set_item("k_enc", batch.k_enc)?;
+    dict.set_item("k_dec", batch.k_dec)?;
+    Ok(dict)
+}
+
+/// Collate an already-gathered, **global-vocab** CSR batch into stacked tensors
+/// (state3 "3A hybrid"). Pure compute; releases the GIL. Python gathers (via
+/// `iter_with_plans`) and samples the query, then collates here. `set_offsets`
+/// delimits the sets; `enc_mask_positions` may be empty (perturbation path).
+#[pyfunction]
+#[pyo3(signature = (
+    indptr, indices, data, set_offsets, cell_indices, file_ids, role_tags,
+    k_dec, query_gene_ids, enc_mask_positions, hide_readout, n_measured,
+    k_enc, mode, n_genes_total, target_sum=None, lib_size_redef=None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn collate_cellset_gathered<'py>(
+    py: Python<'py>,
+    indptr: PyReadonlyArray1<'py, i64>,
+    indices: PyReadonlyArray1<'py, i32>,
+    data: PyReadonlyArray1<'py, f32>,
+    set_offsets: PyReadonlyArray1<'py, i64>,
+    cell_indices: PyReadonlyArray1<'py, u64>,
+    file_ids: PyReadonlyArray1<'py, u32>,
+    role_tags: PyReadonlyArray1<'py, i32>,
+    k_dec: usize,
+    query_gene_ids: PyReadonlyArray1<'py, i32>,
+    enc_mask_positions: PyReadonlyArray1<'py, u8>,
+    hide_readout: PyReadonlyArray1<'py, u8>,
+    n_measured: PyReadonlyArray1<'py, u32>,
+    k_enc: usize,
+    mode: String,
+    n_genes_total: i64,
+    target_sum: Option<f64>,
+    lib_size_redef: Option<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mode = PreprocessMode::parse(&mode).map_err(loader_err_to_py)?;
+    let scalars = CollateScalars {
+        k_enc,
+        mode,
+        target_sum: target_sum.unwrap_or(1e4),
+        n_genes_total,
+        lib_size_redef: lib_size_redef.unwrap_or(false),
+    };
+    let err = |e| PyRuntimeError::new_err(format!("array not contiguous: {e}"));
+    let indptr = indptr.as_slice().map_err(err)?;
+    let indices = indices.as_slice().map_err(err)?;
+    let data = data.as_slice().map_err(err)?;
+    let set_offsets = set_offsets.as_slice().map_err(err)?;
+    let cell_indices_v = cell_indices.as_slice().map_err(err)?.to_vec();
+    let file_ids_v = file_ids.as_slice().map_err(err)?.to_vec();
+    let role_tags_v = role_tags.as_slice().map_err(err)?.to_vec();
+    let query = query_gene_ids.as_slice().map_err(err)?;
+    let encmask = enc_mask_positions.as_slice().map_err(err)?;
+    let hide = hide_readout.as_slice().map_err(err)?;
+    let nmeas = n_measured.as_slice().map_err(err)?;
+    let batch = py
+        .detach(|| {
+            crate::sparse_cellset::collate_gathered(
+                indptr,
+                indices,
+                data,
+                set_offsets,
+                cell_indices_v,
+                file_ids_v,
+                role_tags_v,
+                k_dec,
+                query,
+                encmask,
+                hide,
+                nmeas,
+                &scalars,
+            )
+        })
+        .map_err(loader_err_to_py)?;
+    collated_cellset_batch_to_dict(py, batch)
 }

@@ -293,6 +293,101 @@ fn run_one(
 }
 
 #[test]
+fn gather_collated_emits_stacked_tensors_matching_kernel() {
+    use crate::sparse_cellset_collate::PreprocessMode;
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_fixture(&p0, 32, 8, 4); // row r: col r%8, val (r+1)&0xFF
+                                  // Identity remap (local g → global g) so gene ids are global.
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        8,
+        usize::MAX,
+        4,
+        Some(vec![(0..8).collect::<Vec<i32>>()]),
+        Some(8),
+        false,
+        false,
+        0.0,
+    )
+    .unwrap();
+
+    // One set, two cells: row 2 (col2,val3), row 5 (col5,val6).
+    let k_dec = 4;
+    let plan = CollatedCellSetPlan {
+        base: SparseCellSetPlan {
+            file_ids: vec![0, 0],
+            rows: vec![2, 5],
+            role_tags: vec![0, 0],
+            set_offsets: vec![0, 2],
+        },
+        k_dec,
+        query_gene_ids: vec![2, 5, 7, 0], // shared across the set
+        enc_mask_positions: Vec::new(),   // pert-style: no encoder masking
+        hide_readout: vec![0, 0],
+        n_measured: vec![8],
+    };
+    let scalars = CollateScalars {
+        k_enc: 4,
+        mode: PreprocessMode::Log1pRaw,
+        target_sum: 1e4,
+        n_genes_total: 8,
+        lib_size_redef: false,
+    };
+    let b = loader
+        .iter_with_plans_collated(vec![Ok(plan)].into_iter(), 4, scalars)
+        .next()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(b.n_rows, 2);
+    assert_eq!((b.k_enc, b.k_dec), (4, 4));
+    assert_eq!(b.encoder_gene_ids.len(), 2 * 4);
+    assert_eq!(b.target_counts.len(), 2 * 4);
+    // cell 0 (row2): gene2 val3. encoder slot0 = gene2, rest PAD(=9).
+    assert_eq!(&b.encoder_gene_ids[0..4], &[2, 9, 9, 9]);
+    assert!((b.encoder_counts[0] - 3.0f32.ln_1p()).abs() < 1e-6);
+    // target gather over query [2,5,7,0]: cell0 has gene2=3 → [3,0,0,0].
+    assert_eq!(&b.target_counts[0..4], &[3.0, 0.0, 0.0, 0.0]);
+    assert_eq!(b.library_size[0], 3.0);
+    // cell 1 (row5): gene5 val6 → query position 1.
+    assert_eq!(&b.encoder_gene_ids[4..8], &[5, 9, 9, 9]);
+    assert_eq!(&b.target_counts[4..8], &[0.0, 6.0, 0.0, 0.0]);
+    assert_eq!(b.library_size[1], 6.0);
+}
+
+#[test]
+fn gather_collated_requires_remap() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = malformed_plan_loader(dir.path()); // built without remap
+    let plan = CollatedCellSetPlan {
+        base: SparseCellSetPlan {
+            file_ids: vec![0],
+            rows: vec![1],
+            role_tags: vec![0],
+            set_offsets: vec![0, 1],
+        },
+        k_dec: 2,
+        query_gene_ids: vec![0, 1],
+        enc_mask_positions: Vec::new(),
+        hide_readout: vec![0],
+        n_measured: vec![8],
+    };
+    let scalars = CollateScalars {
+        k_enc: 2,
+        mode: crate::sparse_cellset_collate::PreprocessMode::Log1pRaw,
+        target_sum: 1e4,
+        n_genes_total: 8,
+        lib_size_redef: false,
+    };
+    let got = loader
+        .iter_with_plans_collated(vec![Ok(plan)].into_iter(), 2, scalars)
+        .next()
+        .unwrap();
+    assert!(matches!(got, Err(LoaderError::ConfigError { .. })));
+}
+
+#[test]
 fn malformed_plan_file_id_out_of_range_returns_error_not_panic() {
     let dir = tempfile::tempdir().unwrap();
     let loader = malformed_plan_loader(dir.path());

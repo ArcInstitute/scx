@@ -14,10 +14,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use scx_format_io::ScxReader;
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::PrefetchEngine;
+use crate::sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
 /// batch; `set_offsets` (length `n_sets + 1`) delimits each set's row range.
@@ -42,6 +44,52 @@ pub struct SparseCellSetBatch {
     pub file_ids: Vec<u32>,
     pub set_offsets: Vec<i64>,
     pub role_tags: Vec<i32>,
+}
+
+/// Per-set/per-cell collation payload accompanying a [`SparseCellSetPlan`] —
+/// the RNG-dependent values state3 samples in Python (query gene ids + masks).
+#[derive(Clone, Debug)]
+pub struct CollatedCellSetPlan {
+    pub base: SparseCellSetPlan,
+    pub k_dec: usize,
+    /// `[n_sets * k_dec]` global query gene ids (one length-`k_dec` row per set).
+    pub query_gene_ids: Vec<i32>,
+    /// `[total_rows * k_dec]` per-cell encoder-mask positions over the query, or
+    /// **empty** to disable query-based encoder masking (perturbation path).
+    pub enc_mask_positions: Vec<u8>,
+    /// `[total_rows]` per-cell hide-gene-identity (readout) flags.
+    pub hide_readout: Vec<u8>,
+    /// `[n_sets]` measured panel size per set (for the `pflog1ppf` center).
+    pub n_measured: Vec<u32>,
+}
+
+/// Run-constant collation scalars.
+#[derive(Clone, Copy, Debug)]
+pub struct CollateScalars {
+    pub k_enc: usize,
+    pub mode: PreprocessMode,
+    pub target_sum: f64,
+    pub n_genes_total: i64,
+    pub lib_size_redef: bool,
+}
+
+/// Collated batch — stacked dense tensors, row-major `[total_rows, K]`. Wraps
+/// directly into state3's `ScRNABatch` (no Python `task.specify`/`fill_one`).
+#[derive(Clone, Debug)]
+pub struct CollatedCellSetBatch {
+    pub encoder_gene_ids: Vec<i64>, // [n_rows * k_enc]
+    pub encoder_counts: Vec<f32>,   // [n_rows * k_enc]
+    pub encoder_mask: Vec<u8>,      // [n_rows * k_enc]
+    pub encoder_pad_mask: Vec<u8>,  // [n_rows * k_enc]
+    pub target_counts: Vec<f32>,    // [n_rows * k_dec]
+    pub library_size: Vec<f32>,     // [n_rows]
+    pub cell_indices: Vec<u64>,
+    pub file_ids: Vec<u32>,
+    pub set_offsets: Vec<i64>,
+    pub role_tags: Vec<i32>,
+    pub n_rows: usize,
+    pub k_enc: usize,
+    pub k_dec: usize,
 }
 
 /// Drives the prefetch engine to gather sparse cell-set batches.
@@ -293,6 +341,73 @@ impl SparseCellSetLoader {
         })
     }
 
+    /// Like [`Self::iter_with_plans`] but additionally runs the per-cell
+    /// collation kernel (preprocess + top-K + gather + mask) in Rust, emitting
+    /// stacked `[total_rows, K]` tensors (state3 "3A hybrid"). Requires global
+    /// remap tables (gene ids must be comparable to the Python-sampled query).
+    pub fn iter_with_plans_collated<I>(
+        self: Arc<Self>,
+        plans: I,
+        lookahead: usize,
+        scalars: CollateScalars,
+    ) -> Box<dyn Iterator<Item = Result<CollatedCellSetBatch>> + Send + Sync>
+    where
+        I: Iterator<Item = Result<CollatedCellSetPlan>> + Send + 'static,
+    {
+        let engine = Arc::clone(&self.engine);
+        let loader = Arc::clone(&self);
+        let iter = engine.iter_with_plans(
+            plans,
+            lookahead,
+            |plan: &CollatedCellSetPlan| {
+                plan.base
+                    .file_ids
+                    .iter()
+                    .copied()
+                    .zip(plan.base.rows.iter().copied())
+                    .collect()
+            },
+            move |eng: &PrefetchEngine, plan: &CollatedCellSetPlan| {
+                loader.gather_collated(eng, plan, &scalars)
+            },
+        );
+        Box::new(iter)
+    }
+
+    /// Gather one batch and collate it per-cell (rayon over rows). The gathered
+    /// CSR is global-vocab, sorted, coalesced (via `remap_row`), exactly what the
+    /// kernel expects — matching state3's `finalize_csr_row` upstream of `specify`.
+    pub fn gather_collated(
+        &self,
+        engine: &PrefetchEngine,
+        plan: &CollatedCellSetPlan,
+        scalars: &CollateScalars,
+    ) -> Result<CollatedCellSetBatch> {
+        if self.remap.is_none() {
+            return Err(LoaderError::ConfigError {
+                reason: "gather_collated requires global-vocab remap tables (gene ids must be \
+                         comparable to the query)"
+                    .into(),
+            });
+        }
+        let sparse = self.gather(engine, &plan.base)?;
+        collate_gathered(
+            &sparse.indptr,
+            &sparse.indices,
+            &sparse.data,
+            &sparse.set_offsets,
+            sparse.cell_indices,
+            sparse.file_ids,
+            sparse.role_tags,
+            plan.k_dec,
+            &plan.query_gene_ids,
+            &plan.enc_mask_positions,
+            &plan.hide_readout,
+            &plan.n_measured,
+            scalars,
+        )
+    }
+
     /// Apply the optional remap + value-only transforms to one gathered row.
     fn transform_row(&self, fid: u32, idx: &[i32], dat: &[f32]) -> (Vec<i32>, Vec<f32>) {
         let (out_idx, mut out_dat) = match &self.remap {
@@ -304,6 +419,132 @@ impl SparseCellSetLoader {
         }
         (out_idx, out_dat)
     }
+}
+
+/// Run the per-cell collation kernel over an already-gathered, **global-vocab**
+/// CSR batch (each row sorted-unique, as `remap_row` / state3's `finalize_csr_row`
+/// produce). Pure compute — rayon over rows, no I/O. The query gene ids and
+/// per-cell masks are supplied by the caller (Python's RNG side).
+///
+/// This is the entry the state3 "3A hybrid" actually uses: Python gathers (it
+/// must, to sample the query from each set's expressed genes), then collates the
+/// gathered CSR here. `set_offsets` / `cell_indices` / `file_ids` / `role_tags`
+/// pass through unchanged. `enc_mask_positions` empty ⇒ no encoder query masking.
+#[allow(clippy::too_many_arguments)]
+pub fn collate_gathered(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    set_offsets: &[i64],
+    cell_indices: Vec<u64>,
+    file_ids: Vec<u32>,
+    role_tags: Vec<i32>,
+    k_dec: usize,
+    query_gene_ids: &[i32],
+    enc_mask_positions: &[u8],
+    hide_readout: &[u8],
+    n_measured: &[u32],
+    scalars: &CollateScalars,
+) -> Result<CollatedCellSetBatch> {
+    let n_rows = cell_indices.len();
+    let k_enc = scalars.k_enc;
+    let n_sets = set_offsets.len().saturating_sub(1);
+
+    let want = |what: &str, got: usize, exp: usize| {
+        Err(LoaderError::ConfigError {
+            reason: format!("collate_gathered: {what} len {got} != {exp}"),
+        })
+    };
+    if indptr.len() != n_rows + 1 {
+        return want("indptr", indptr.len(), n_rows + 1);
+    }
+    if query_gene_ids.len() != n_sets * k_dec {
+        return want("query_gene_ids", query_gene_ids.len(), n_sets * k_dec);
+    }
+    if hide_readout.len() != n_rows {
+        return want("hide_readout", hide_readout.len(), n_rows);
+    }
+    if n_measured.len() != n_sets {
+        return want("n_measured", n_measured.len(), n_sets);
+    }
+    let has_mask = !enc_mask_positions.is_empty();
+    if has_mask && enc_mask_positions.len() != n_rows * k_dec {
+        return want("enc_mask_positions", enc_mask_positions.len(), n_rows * k_dec);
+    }
+
+    // Row → set index, for per-set query / n_measured lookup.
+    let mut row_set = vec![0usize; n_rows];
+    for s in 0..n_sets {
+        let lo = set_offsets[s] as usize;
+        let hi = set_offsets[s + 1] as usize;
+        for r in row_set.iter_mut().take(hi).skip(lo) {
+            *r = s;
+        }
+    }
+
+    let mut enc_ids = vec![0i64; n_rows * k_enc];
+    let mut enc_counts = vec![0f32; n_rows * k_enc];
+    let mut enc_mask = vec![0u8; n_rows * k_enc];
+    let mut enc_pad = vec![0u8; n_rows * k_enc];
+    let mut target = vec![0f32; n_rows * k_dec];
+    let mut library = vec![0f32; n_rows];
+
+    enc_ids
+        .par_chunks_mut(k_enc)
+        .zip(enc_counts.par_chunks_mut(k_enc))
+        .zip(enc_mask.par_chunks_mut(k_enc))
+        .zip(enc_pad.par_chunks_mut(k_enc))
+        .zip(target.par_chunks_mut(k_dec))
+        .zip(library.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
+            let s = row_set[r];
+            let lo = indptr[r] as usize;
+            let hi = indptr[r + 1] as usize;
+            let cin = CellIn {
+                gene_ids: &indices[lo..hi],
+                raw: &data[lo..hi],
+                query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
+                enc_mask_positions: if has_mask {
+                    Some(&enc_mask_positions[r * k_dec..(r + 1) * k_dec])
+                } else {
+                    None
+                },
+                hide_readout: hide_readout[r] != 0,
+            };
+            let cfg = CollateConfig {
+                k_enc,
+                mode: scalars.mode,
+                target_sum: scalars.target_sum,
+                n_measured: n_measured[s] as usize,
+                n_genes_total: scalars.n_genes_total,
+                lib_size_redef: scalars.lib_size_redef,
+            };
+            let mut out = CellOut {
+                enc_ids: eid,
+                enc_counts: ecnt,
+                enc_mask: emask,
+                enc_pad: epad,
+                target: tgt,
+            };
+            *libslot = collate_cell(&cin, &cfg, &mut out);
+        });
+
+    Ok(CollatedCellSetBatch {
+        encoder_gene_ids: enc_ids,
+        encoder_counts: enc_counts,
+        encoder_mask: enc_mask,
+        encoder_pad_mask: enc_pad,
+        target_counts: target,
+        library_size: library,
+        cell_indices,
+        file_ids,
+        set_offsets: set_offsets.to_vec(),
+        role_tags,
+        n_rows,
+        k_enc,
+        k_dec,
+    })
 }
 
 /// Map local gene ids to global via `local_to_global` (`-1` = drop), then sort
