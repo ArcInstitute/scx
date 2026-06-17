@@ -147,6 +147,23 @@ pub fn highly_variable_genes<'py>(
     let seurat_v3_family = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
     let single_batch = batch_key.is_none();
 
+    // HVG computes per-gene stats and the selection mask over the sorted
+    // column projection (via build_shard_source), then writes them to
+    // adata.var. When the backed X was opened with preserve_var_order=True,
+    // var is in request order while the stats would be in sorted order —
+    // they would misalign. Rather than silently mis-assign, reject: HVG
+    // discovery on a hand-ordered gene panel is not a supported workflow.
+    if let Ok(backed) = adata.getattr("X")?.cast::<ScxBackedSparseDataset>() {
+        if backed.borrow().col_presentation_arc().is_some() {
+            return Err(PyRuntimeError::new_err(
+                "highly_variable_genes is not supported on a dataset opened with \
+                 preserve_var_order=True (the gene axis is in request order, which \
+                 would misalign HVG's per-gene statistics). Run HVG before projecting \
+                 by name, or re-open without preserve_var_order.",
+            ));
+        }
+    }
+
     if prefer_format == "csc" {
         // Explicit CSC: single-batch seurat_v3 only. Reject mismatched
         // configurations with a clear message rather than silently falling
@@ -1249,7 +1266,7 @@ fn apply_hvg_subset(
         backed
             .borrow_mut()
             .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, false)?;
 
         // Slice var via _var: AnnData's public var setter validates
         // len(value) == self.n_vars, where n_vars is derived from the current
@@ -1277,7 +1294,7 @@ fn apply_hvg_subset(
 
         lazy.borrow_mut()
             .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, false)?;
 
         // See comment above in backed branch for why _var is used.
         let var = adata.getattr("var")?;

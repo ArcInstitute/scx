@@ -347,6 +347,8 @@ pub fn to_anndata_filtered<'py>(
     eager: bool,
     memory_budget: Option<u64>,
     skip_x: bool,
+    preserve_var_order: bool,
+    strict_var_names: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     // `skip_x` (the X-less skeleton for `to_gpu_anndata`) is only meaningful on
     // the no-filter fast path — the caller guarantees no var_names / obs_filter /
@@ -425,7 +427,10 @@ pub fn to_anndata_filtered<'py>(
         let builtins = py.import("builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
         let col_idx = if let Some(names) = var_names {
-            let indices = resolve_var_names_to_indices(reader, names)?;
+            // Fancy column indexing honours order, so request order is preserved
+            // automatically when preserve_var_order is set.
+            let indices =
+                resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
             PyArray1::from_vec(py, indices).into_any().unbind()
         } else {
             slice_all.unbind()
@@ -444,9 +449,14 @@ pub fn to_anndata_filtered<'py>(
             .filter_obs(expr)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        // If var_names is also specified, resolve to gene indices
+        // If var_names is also specified, resolve to gene indices. The query
+        // engine (scx-engine collect's F4 ColumnReorder) already presents the
+        // output columns in the order passed to select_genes — so resolving in
+        // request order (preserve_var_order=True) vs sorted order is sufficient;
+        // no post-collect reorder is needed here.
         if let Some(names) = var_names {
-            let gene_indices = resolve_var_names_to_indices(reader, names)?;
+            let gene_indices =
+                resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
             pipeline = pipeline.select_genes(gene_indices);
         }
 
@@ -554,10 +564,13 @@ pub fn to_anndata_filtered<'py>(
 
     if let Some(names) = var_names {
         // Resolve via the same path as backed / query-engine: scans all string
-        // columns (so gene symbols in non-index columns work) and returns
-        // sorted positional indices. Slicing adata[:, np_indices] then projects
-        // X, layers, var, varm, and varp consistently.
-        let indices = resolve_var_names_to_indices(reader, names)?;
+        // columns (so gene symbols in non-index columns work). Returns sorted
+        // positional indices by default, or request-order (deduped first-wins)
+        // when preserve_var_order is set. Slicing adata[:, np_indices] projects
+        // X, layers, var, varm, and varp consistently and honours the index
+        // order, so request order is preserved automatically.
+        let indices =
+            resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
         let np_indices = PyArray1::from_vec(py, indices);
 
         let builtins = py.import("builtins")?;
@@ -573,9 +586,18 @@ pub fn to_anndata_filtered<'py>(
 }
 
 /// Resolve gene names to column indices using the var metadata.
+///
+/// `preserve_order`: when `true`, the returned indices follow the request
+/// order (deduplicated, first occurrence wins); when `false` they are
+/// sorted ascending and deduplicated (matching `scx-engine::project_var`).
+/// `strict`: when `true`, any name absent from the var metadata raises a
+/// `KeyError`; when `false`, unknown names are dropped (and only an
+/// all-unknown request errors).
 pub(crate) fn resolve_var_names_to_indices(
     reader: &ScxReader,
     names: &[String],
+    preserve_order: bool,
+    strict: bool,
 ) -> PyResult<Vec<u32>> {
     let var_batch = match reader.read_var() {
         Ok(batch) => batch,
@@ -614,6 +636,14 @@ pub(crate) fn resolve_var_names_to_indices(
         }
     }
 
+    if strict && !not_found.is_empty() {
+        return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+            "var_names not found in the var metadata: {:?}. \
+             Pass strict_var_names=False to silently drop unknown names.",
+            not_found
+        )));
+    }
+
     if indices.is_empty() {
         return Err(PyRuntimeError::new_err(format!(
             "None of the requested var_names were found in the var metadata: {:?}",
@@ -621,11 +651,17 @@ pub(crate) fn resolve_var_names_to_indices(
         )));
     }
 
-    // Sort + dedup so all callers produce var rows in sorted column-position
-    // order, matching scx-engine::project_var(). Keeps eager / backed /
-    // query-engine paths consistent under reordered or duplicated requests.
-    indices.sort_unstable();
-    indices.dedup();
+    if preserve_order {
+        // Dedup preserving first occurrence so columns follow request order.
+        let mut seen = std::collections::HashSet::new();
+        indices.retain(|&i| seen.insert(i));
+    } else {
+        // Sort + dedup so all callers produce var rows in sorted column-position
+        // order, matching scx-engine::project_var(). Keeps eager / backed /
+        // query-engine paths consistent under reordered or duplicated requests.
+        indices.sort_unstable();
+        indices.dedup();
+    }
 
     Ok(indices)
 }
@@ -649,6 +685,8 @@ pub fn to_anndata_backed<'py>(
     layer_filter: Option<&[String]>,
     obsm_filter: Option<&[String]>,
     eager: bool,
+    preserve_var_order: bool,
+    strict_var_names: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     to_anndata_backed_with_options(
         py,
@@ -660,6 +698,8 @@ pub fn to_anndata_backed<'py>(
         obsm_filter,
         true,
         eager,
+        preserve_var_order,
+        strict_var_names,
     )
 }
 
@@ -682,6 +722,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     obsm_filter: Option<&[String]>,
     apply_deletion_vectors: bool,
     eager: bool,
+    preserve_var_order: bool,
+    strict_var_names: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
     use crate::lazy_mapping::{
@@ -780,8 +822,16 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     };
 
     // --- Resolve var_names to column indices ---
+    // `col_indices` follows request order when preserve_var_order is set
+    // (the X projection then presents columns in that order via
+    // set_col_projection_ordered, and var is sliced with the same iloc).
     let col_indices = if let Some(names) = var_names {
-        Some(resolve_var_names_to_indices(&reader, names)?)
+        Some(resolve_var_names_to_indices(
+            &reader,
+            names,
+            preserve_var_order,
+            strict_var_names,
+        )?)
     } else {
         None
     };
@@ -816,7 +866,11 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     x_dataset.with_csc_reader(x_backed_csc);
     x_dataset.with_source_path(path);
     if let Some(ref indices) = col_indices {
-        x_dataset.set_col_projection(indices.clone());
+        if preserve_var_order {
+            x_dataset.set_col_projection_ordered(indices.clone());
+        } else {
+            x_dataset.set_col_projection(indices.clone());
+        }
     }
 
     // --- var (eager, optionally filtered by var_names) ---

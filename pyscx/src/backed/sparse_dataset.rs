@@ -47,6 +47,13 @@ pub struct ScxBackedSparseDataset {
     /// CSR outputs are filtered through `project_csr()` before returning.
     /// Arc-wrapped to avoid O(n) deep clones when creating lazy datasets.
     col_projection: Option<Arc<Vec<u32>>>,
+    /// If the visible columns should be presented in a caller-requested
+    /// order (via `preserve_var_order`), this is the presentation
+    /// permutation over the (sorted) `col_projection`: output column `k`
+    /// is taken from sorted-projection column `col_presentation[k]`.
+    /// `None` ⇒ identity (the default sorted order). Always `None` unless
+    /// `col_projection` is also `Some`; length equals `col_projection.len()`.
+    col_presentation: Option<Arc<Vec<u32>>>,
     /// Whether the data is known to be non-negative. Defaults to `true`
     /// (raw UMI counts, normalized, log1p). Set to `false` after operations
     /// that produce negative values (e.g., `sc.pp.scale()`), which disables
@@ -85,6 +92,7 @@ impl ScxBackedSparseDataset {
             cache_shards,
             kept_to_global: None,
             col_projection: None,
+            col_presentation: None,
             non_negative: true,
             modality_id: None,
             source_path: None,
@@ -111,6 +119,7 @@ impl ScxBackedSparseDataset {
             cache_shards,
             kept_to_global: Some(Arc::new(kept_to_global)),
             col_projection: None,
+            col_presentation: None,
             non_negative: true,
             modality_id: None,
             source_path: None,
@@ -190,6 +199,39 @@ impl ScxBackedSparseDataset {
         sorted.dedup();
         self.shape_val.1 = sorted.len();
         self.col_projection = Some(Arc::new(sorted));
+        // A plain (sorted) projection has no presentation reorder.
+        self.col_presentation = None;
+    }
+
+    /// Set column projection while preserving the caller's request order.
+    ///
+    /// `ordered` are original column indices in request order; duplicates
+    /// are dropped keeping the first occurrence. The gather still runs over
+    /// the sorted set (`col_projection`); the visible columns are then
+    /// reordered via `col_presentation` so they follow `ordered`.
+    pub fn set_col_projection_ordered(&mut self, ordered: Vec<u32>) {
+        // Dedup preserving first occurrence -> request order R.
+        let mut seen = std::collections::HashSet::new();
+        let request: Vec<u32> = ordered.into_iter().filter(|&i| seen.insert(i)).collect();
+
+        let mut sorted = request.clone();
+        sorted.sort_unstable();
+        // (already unique)
+
+        // perm[k] = position of request[k] within sorted.
+        let perm: Vec<u32> = request
+            .iter()
+            .map(|g| sorted.partition_point(|&s| s < *g) as u32)
+            .collect();
+        let is_identity = perm.iter().enumerate().all(|(k, &p)| k as u32 == p);
+
+        self.shape_val.1 = sorted.len();
+        self.col_projection = Some(Arc::new(sorted));
+        self.col_presentation = if is_identity {
+            None
+        } else {
+            Some(Arc::new(perm))
+        };
     }
 
     /// Replace the deletion vector, adjusting shape.0.
@@ -208,12 +250,46 @@ impl ScxBackedSparseDataset {
         self.col_projection.clone()
     }
 
+    /// Clone the col_presentation Arc (O(1) ref-count increment).
+    pub(crate) fn col_presentation_arc(&self) -> Option<Arc<Vec<u32>>> {
+        self.col_presentation.clone()
+    }
+
+    /// On-disk column indices for every visible column, in presentation
+    /// order. Used by gene-filtering composition so request order survives
+    /// further `filter_genes` / HVG selection. Requires `col_projection`
+    /// to be set.
+    pub(crate) fn visible_ondisk_in_presentation_order(&self) -> Option<Vec<u32>> {
+        let proj = self.col_projection.as_ref()?;
+        Some(match &self.col_presentation {
+            Some(perm) => perm.iter().map(|&p| proj[p as usize]).collect(),
+            None => proj.as_ref().clone(),
+        })
+    }
+
     /// Apply column projection to a CSR matrix if projection is active.
-    /// Returns the original CSR if no projection is set.
+    /// Returns the original CSR if no projection is set. When a
+    /// presentation order is active, columns are reordered after the
+    /// (sorted) gather to follow the caller's requested order.
     pub(crate) fn apply_col_projection(&self, csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
         match &self.col_projection {
-            Some(indices) => project_csr(&csr, indices),
+            Some(indices) => {
+                let projected = project_csr(&csr, indices);
+                match &self.col_presentation {
+                    Some(perm) => scx_engine::projection::reorder_csr_columns(&projected, perm),
+                    None => projected,
+                }
+            }
             None => csr,
+        }
+    }
+
+    /// Reorder a per-visible-column vector (in sorted-projection order) into
+    /// presentation order. No-op when no presentation reorder is active.
+    pub(crate) fn present_reorder<T: Clone>(&self, values: Vec<T>) -> Vec<T> {
+        match &self.col_presentation {
+            Some(perm) => perm.iter().map(|&p| values[p as usize].clone()).collect(),
+            None => values,
         }
     }
 }
@@ -454,28 +530,32 @@ impl ScxBackedSparseDataset {
         // Try to extract a per-row scaling vector.  If the multiplier is
         // a 1D or column array with length == n_obs, express as lazy
         // RowScale transform — mirroring __truediv__ (which inverts).
-        if let Some(row_factors) =
-            try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
-        {
-            let global_factors = expand_to_global(
-                row_factors,
-                self.kept_to_global.as_ref().map(|v| v.as_slice()),
-                self.backed.shape().0,
-                1.0,
-            );
-            let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
-                Arc::clone(&self.backed),
-                self.shape_val,
-                self.kept_to_global.clone(),
-                self.col_projection.clone(),
-                vec![Transform::RowScale {
-                    factors: Arc::new(global_factors),
-                }],
-                self.non_negative,
-            )
-            .with_csc_reader(self.backed_csc.clone())
-            .with_source_path(self.source_path.clone());
-            return Ok(Bound::new(py, lazy)?.into_any());
+        // (Skipped when a presentation reorder is active: the lazy transform
+        // can't carry it, so we fall back to materialization below.)
+        if self.col_presentation.is_none() {
+            if let Some(row_factors) =
+                try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
+            {
+                let global_factors = expand_to_global(
+                    row_factors,
+                    self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                    self.backed.shape().0,
+                    1.0,
+                );
+                let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
+                    Arc::clone(&self.backed),
+                    self.shape_val,
+                    self.kept_to_global.clone(),
+                    self.col_projection.clone(),
+                    vec![Transform::RowScale {
+                        factors: Arc::new(global_factors),
+                    }],
+                    self.non_negative,
+                )
+                .with_csc_reader(self.backed_csc.clone())
+                .with_source_path(self.source_path.clone());
+                return Ok(Bound::new(py, lazy)?.into_any());
+            }
         }
 
         // Cannot be expressed as row scaling — fall back to materialization
@@ -494,36 +574,38 @@ impl ScxBackedSparseDataset {
         // matrix materialization.  This is the code path scanpy's
         // `axis_mul_or_truediv(..., op=truediv)` takes for normalize_total
         // when the numba CSR path isn't available.
-        if let Some(row_factors) =
-            try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
-        {
-            // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
-            // 0 drops the row to empty) — this matches scanpy `normalize_total`,
-            // where empty rows stay empty, NOT raw scipy float division (which
-            // would yield inf/nan for a nonzero numerator over a zero divisor).
-            let inv_factors: Vec<f64> = row_factors
-                .iter()
-                .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
-                .collect();
-            let global_inv = expand_to_global(
-                inv_factors,
-                self.kept_to_global.as_ref().map(|v| v.as_slice()),
-                self.backed.shape().0,
-                1.0,
-            );
-            let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
-                Arc::clone(&self.backed),
-                self.shape_val,
-                self.kept_to_global.clone(),
-                self.col_projection.clone(),
-                vec![Transform::RowScale {
-                    factors: Arc::new(global_inv),
-                }],
-                self.non_negative,
-            )
-            .with_csc_reader(self.backed_csc.clone())
-            .with_source_path(self.source_path.clone());
-            return Ok(Bound::new(py, lazy)?.into_any());
+        if self.col_presentation.is_none() {
+            if let Some(row_factors) =
+                try_extract_row_factors(py, other, self.shape_val.0, self.shape_val.1)?
+            {
+                // A zero divisor leaves the row unscaled (1/0 → 0, i.e. multiply by
+                // 0 drops the row to empty) — this matches scanpy `normalize_total`,
+                // where empty rows stay empty, NOT raw scipy float division (which
+                // would yield inf/nan for a nonzero numerator over a zero divisor).
+                let inv_factors: Vec<f64> = row_factors
+                    .iter()
+                    .map(|&f| if f != 0.0 { 1.0 / f } else { 0.0 })
+                    .collect();
+                let global_inv = expand_to_global(
+                    inv_factors,
+                    self.kept_to_global.as_ref().map(|v| v.as_slice()),
+                    self.backed.shape().0,
+                    1.0,
+                );
+                let lazy = crate::lazy_transform::ScxLazyTransformedDataset::new(
+                    Arc::clone(&self.backed),
+                    self.shape_val,
+                    self.kept_to_global.clone(),
+                    self.col_projection.clone(),
+                    vec![Transform::RowScale {
+                        factors: Arc::new(global_inv),
+                    }],
+                    self.non_negative,
+                )
+                .with_csc_reader(self.backed_csc.clone())
+                .with_source_path(self.source_path.clone());
+                return Ok(Bound::new(py, lazy)?.into_any());
+            }
         }
 
         // Cannot be expressed as row scaling — fall back to materialization
@@ -988,6 +1070,7 @@ impl ScxBackedSparseDataset {
             (None, Some(kept)) => self.backed.col_sums_masked(kept).map_err(|e| e.to_string()),
             (None, None) => self.backed.col_sums().map_err(|e| e.to_string()),
         }
+        .map(|v| self.present_reorder(v))
     }
 
     /// Per-row sums (`axis=1` / total), honoring column projection. Deletion
@@ -1017,6 +1100,7 @@ impl ScxBackedSparseDataset {
                 .map_err(|e| e.to_string()),
             (None, None) => self.backed.col_nnz().map_err(|e| e.to_string()),
         }
+        .map(|v| self.present_reorder(v))
     }
 
     /// Per-row nnz counts (`axis=1`), honoring column projection.
@@ -1068,6 +1152,7 @@ impl ScxBackedSparseDataset {
             (None, Some(kept)) => self.backed.col_var_masked(kept).map_err(|e| e.to_string()),
             (None, None) => self.backed.col_var().map_err(|e| e.to_string()),
         }
+        .map(|v| self.present_reorder(v))
     }
 
     /// Column maxima (`axis=0`), honoring column projection and keep-mask.
@@ -1085,6 +1170,7 @@ impl ScxBackedSparseDataset {
             (None, Some(kept)) => self.backed.col_max_masked(kept).map_err(|e| e.to_string()),
             (None, None) => self.backed.col_max().map_err(|e| e.to_string()),
         }
+        .map(|v| self.present_reorder(v))
     }
 
     /// Column minima (`axis=0`), honoring column projection and keep-mask.
@@ -1102,6 +1188,7 @@ impl ScxBackedSparseDataset {
             (None, Some(kept)) => self.backed.col_min_masked(kept).map_err(|e| e.to_string()),
             (None, None) => self.backed.col_min().map_err(|e| e.to_string()),
         }
+        .map(|v| self.present_reorder(v))
     }
 
     /// Create a lazy comparison result wrapper.
@@ -1303,9 +1390,21 @@ impl ScxBackedSparseDataset {
                     .map_err(|e| e.to_string())
             })
             .map_err(PyRuntimeError::new_err)?;
-            // When col_projection is active, remap user-visible col to on-disk col
+            // When col_projection is active, remap user-visible col to on-disk col.
+            // With a presentation reorder, the visible column maps through the
+            // permutation first (visible → sorted-projection position → on-disk).
             let lookup_col = if let Some(ref proj) = self.col_projection {
-                *proj.get(col).ok_or_else(|| {
+                let sorted_pos = match &self.col_presentation {
+                    Some(perm) => *perm.get(col).ok_or_else(|| {
+                        PyIndexError::new_err(format!(
+                            "column index {} out of range for {} projected columns",
+                            col,
+                            perm.len()
+                        ))
+                    })? as usize,
+                    None => col,
+                };
+                *proj.get(sorted_pos).ok_or_else(|| {
                     PyIndexError::new_err(format!(
                         "column index {} out of range for {} projected columns",
                         col,
@@ -1330,7 +1429,11 @@ impl ScxBackedSparseDataset {
         // with col_projection set instead of materializing to scipy.
         // This keeps subsequent aggregation (sum, var, etc.) on the f64
         // streaming path and avoids O(n_obs × n_vars) materialization.
-        if self.is_all_rows_slice(py, row_idx)? {
+        // Skip this lazy fast path when a presentation reorder is active:
+        // composing a new sorted projection would silently drop the
+        // request-order semantics. Fall through to materialize-then-slice,
+        // which preserves order (the materialized CSR is already reordered).
+        if self.col_presentation.is_none() && self.is_all_rows_slice(py, row_idx)? {
             if let Some(col_indices) = self.extract_col_indices(py, col_idx)? {
                 let composed = self.compose_col_projection(&col_indices);
                 let new_ds = ScxBackedSparseDataset {
@@ -1341,6 +1444,7 @@ impl ScxBackedSparseDataset {
                     cache_shards: self.cache_shards,
                     kept_to_global: self.kept_to_global.clone(),
                     col_projection: Some(Arc::new(composed)),
+                    col_presentation: None,
                     non_negative: self.non_negative,
                     modality_id: self.modality_id,
                     source_path: self.source_path.clone(),

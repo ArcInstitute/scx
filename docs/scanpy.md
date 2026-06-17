@@ -633,6 +633,28 @@ In non-backed mode, this applies column projection to the materialized CSR.
 In backed mode, projection is applied lazily — full rows are decoded from
 disk, but only the requested columns are retained in the returned CSR.
 
+By default `var_names` is a **set selector**: the returned gene axis is in
+sorted original-column order, and duplicate names collapse. Pass
+`preserve_var_order=True` to return columns in the order you listed them
+instead (duplicates still collapse, first occurrence wins) — useful when the
+order carries meaning (e.g. a fixed signature panel):
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(
+    var_names=["CD8A", "CD4", "CD3E"], preserve_var_order=True
+)
+list(adata.var_names)  # ['CD8A', 'CD4', 'CD3E']  (request order)
+```
+
+`preserve_var_order` works on the eager, backed, GPU, and query-engine
+(`obs_filter` + `var_names`) paths. It is **not** supported by
+`pyscx.accel.highly_variable_genes` on the resulting backed dataset (HVG
+discovery on a hand-ordered panel raises) — run HVG before projecting by name.
+
+Unknown names raise `KeyError` by default (`strict_var_names=True`). Pass
+`strict_var_names=False` to silently drop names absent from the var metadata
+(the pre-0.8.6 behaviour, which only errored when *every* name was unknown).
+
 #### Cell filtering (`obs_filter`)
 
 Filter cells using a predicate string. In non-backed mode, this leverages

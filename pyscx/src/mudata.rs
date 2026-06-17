@@ -126,6 +126,10 @@ pub fn to_mudata_backed<'py>(
             None,
             false,
             false,
+            // var_names is None here, so preserve_var_order / strict_var_names
+            // are inert.
+            false,
+            false,
         )?;
         mod_dict.set_item(&modality_key, adata)?;
     }

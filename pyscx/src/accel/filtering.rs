@@ -82,7 +82,9 @@ fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<u32>> {
             .col_nnz()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     };
-    Ok(counts)
+    // Reorder into presentation order so the keep-mask aligns with the
+    // (presentation-ordered) var rows. No-op without preserve_var_order.
+    Ok(backed.present_reorder(counts))
 }
 
 /// Helper: compute col sums for a backed dataset (4-way dispatch).
@@ -103,7 +105,9 @@ fn backed_col_sums(backed: &ScxBackedSparseDataset) -> PyResult<Vec<f64>> {
             .col_sums()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
     };
-    Ok(sums)
+    // Reorder into presentation order so the keep-mask aligns with the
+    // (presentation-ordered) var rows. No-op without preserve_var_order.
+    Ok(backed.present_reorder(sums))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +253,7 @@ pub(super) fn update_layers_kept_to_global(
 pub(super) fn update_layers_col_projection(
     adata: &Bound<'_, PyAny>,
     new_cols: &[u32],
+    preserve_order: bool,
 ) -> PyResult<()> {
     let layers = adata.getattr("layers")?;
     let keys_result: PyResult<Vec<String>> = layers
@@ -260,11 +265,21 @@ pub(super) fn update_layers_col_projection(
         for key in &keys {
             let layer_obj = layers.get_item(key)?;
             if let Ok(layer) = layer_obj.cast::<ScxBackedLayerDataset>() {
-                layer
-                    .borrow_mut()
-                    .inner
-                    .set_col_projection(new_cols.to_vec());
+                if preserve_order {
+                    layer
+                        .borrow_mut()
+                        .inner
+                        .set_col_projection_ordered(new_cols.to_vec());
+                } else {
+                    layer
+                        .borrow_mut()
+                        .inner
+                        .set_col_projection(new_cols.to_vec());
+                }
             }
+            // ScxLazyTransformedDataset cannot carry a presentation reorder;
+            // it never coexists with an ordered X (lazy arithmetic on an
+            // ordered backed dataset materializes instead). Sorted projection.
             if let Ok(lazy_layer) = layer_obj.cast::<ScxLazyTransformedDataset>() {
                 lazy_layer
                     .borrow_mut()
@@ -511,13 +526,19 @@ pub fn filter_genes(
             max_counts,
         );
 
-        // Compose with existing col_projection
-        let new_col_indices: Vec<u32> = match backed.borrow().col_projection() {
-            Some(existing) => keep
+        // Compose with the existing projection. `visible_ondisk_in_presentation_order`
+        // returns the on-disk index for each visible column in presentation order
+        // (or plain on-disk indices when no projection / no reorder is active), so
+        // the kept indices follow the same order as the (presentation-ordered) var
+        // rows the keep-mask was built against.
+        let preserve_order = backed.borrow().col_presentation_arc().is_some();
+        let visible_ondisk = backed.borrow().visible_ondisk_in_presentation_order();
+        let new_col_indices: Vec<u32> = match visible_ondisk {
+            Some(ondisk) => keep
                 .iter()
                 .enumerate()
                 .filter(|(_, &k)| k)
-                .map(|(i, _)| existing[i])
+                .map(|(i, _)| ondisk[i])
                 .collect(),
             None => keep
                 .iter()
@@ -535,11 +556,17 @@ pub fn filter_genes(
         // Use _var to skip shape validation (X.shape changes next)
         adata.setattr("_var", filtered_var)?;
 
-        backed
-            .borrow_mut()
-            .set_col_projection(new_col_indices.clone());
+        if preserve_order {
+            backed
+                .borrow_mut()
+                .set_col_projection_ordered(new_col_indices.clone());
+        } else {
+            backed
+                .borrow_mut()
+                .set_col_projection(new_col_indices.clone());
+        }
 
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, preserve_order)?;
         return Ok(());
     }
 
@@ -634,7 +661,7 @@ pub fn filter_genes(
         lazy.borrow_mut()
             .set_col_projection(new_col_indices.clone());
 
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, false)?;
         return Ok(());
     }
 
