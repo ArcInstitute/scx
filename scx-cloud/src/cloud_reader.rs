@@ -32,6 +32,87 @@ use crate::explode::section_name_to_path;
 /// deferred follow-on (see docs/cloud.md).
 const METADATA_SHARD_FETCH_CONCURRENCY: usize = 8;
 
+/// Chunk size for ranged reads of a single packed section. A monolithic GET of
+/// a multi-GB section (e.g. the `ObsPredicateIndex`, which scales with `n_obs`
+/// — ~2.4 GB at 149 M cells, ~9 GB at 561 M) streams for minutes and is killed
+/// by a single mid-stream HTTP/2 body reset, with every retry re-downloading
+/// from zero. Splitting the read into bounded chunks makes each chunk
+/// independently retryable: a transient body error re-fetches only one
+/// `SECTION_READ_CHUNK_BYTES` window, not the whole section.
+const SECTION_READ_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Concurrency for the chunked section read above. Bounded so a large section
+/// fetch can't fan out an unbounded number of simultaneous range GETs against
+/// the same connection pool (the saturation the chunking is meant to avoid).
+const SECTION_READ_CHUNK_CONCURRENCY: usize = 8;
+
+/// Range-read `start..end` of `path`, splitting reads larger than `chunk_bytes`
+/// into bounded, independently-retryable chunks fetched with `concurrency`-way
+/// parallelism and reassembled in offset order. Small reads take the single-GET
+/// fast path. A monolithic multi-GB GET (e.g. the `ObsPredicateIndex`, ~2.4 GB
+/// at 149 M cells, ~9 GB at 561 M) is killed by a single mid-stream HTTP/2 body
+/// reset and every retry restarts from zero; chunking bounds the blast radius of
+/// a transient to one chunk.
+///
+/// The reassembled buffer length is verified against the requested span: cloud
+/// predicate-index / section bytes are not independently checksum-verified
+/// here, so a backend that returned a short read would otherwise truncate the
+/// section silently.
+pub(crate) async fn read_range_chunked(
+    backend: &dyn ObjectStore,
+    path: &ObjPath,
+    start: u64,
+    end: u64,
+    chunk_bytes: u64,
+    concurrency: usize,
+) -> Result<Vec<u8>> {
+    let total = end.saturating_sub(start);
+    let chunk_bytes = chunk_bytes.max(1);
+
+    let buf = if total <= chunk_bytes {
+        crate::pull::get_range_with_retry(backend, path, start..end)
+            .await?
+            .to_vec()
+    } else {
+        // Ordered chunk ranges. `buffered` (not `buffer_unordered`) preserves
+        // order, so the concatenation below reassembles the section
+        // byte-for-byte.
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        let mut off = start;
+        while off < end {
+            let chunk_end = off.saturating_add(chunk_bytes).min(end);
+            ranges.push(off..chunk_end);
+            off = chunk_end;
+        }
+
+        let chunks: Vec<bytes::Bytes> = futures::stream::iter(
+            ranges
+                .into_iter()
+                .map(|r| crate::pull::get_range_with_retry(backend, path, r)),
+        )
+        .buffered(concurrency.max(1))
+        .try_collect()
+        .await?;
+
+        let mut buf = Vec::with_capacity(total as usize);
+        for c in &chunks {
+            buf.extend_from_slice(c);
+        }
+        buf
+    };
+
+    if buf.len() as u64 != total {
+        return Err(CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "short read for {path}: expected {total} bytes ({start}..{end}), got {}",
+                buf.len()
+            ),
+        )));
+    }
+    Ok(buf)
+}
+
 /// Layout of the cloud reader source.
 enum ReaderLayout {
     /// Exploded .scxd directory — each section is a separate object.
@@ -168,13 +249,8 @@ impl CloudReader {
                         length: entry.length,
                     }
                 })?;
-                let data = crate::pull::get_range_with_retry(
-                    self.backend.as_ref(),
-                    file_path,
-                    entry.offset..end,
-                )
-                .await?;
-                Ok(data.to_vec())
+                self.read_packed_range_chunked(file_path, entry.offset, end)
+                    .await
             }
         }
     }
@@ -339,15 +415,33 @@ impl CloudReader {
                         length: entry.length,
                     }
                 })?;
-                let data = crate::pull::get_range_with_retry(
-                    self.backend.as_ref(),
-                    file_path,
-                    entry.offset..end,
-                )
-                .await?;
-                Ok(data.to_vec())
+                self.read_packed_range_chunked(file_path, entry.offset, end)
+                    .await
             }
         }
+    }
+
+    /// Range-read `start..end` of a packed file, splitting reads larger than
+    /// [`SECTION_READ_CHUNK_BYTES`] into bounded, independently-retryable
+    /// chunks. Small sections take the single-GET fast path. Chunks are fetched
+    /// with bounded concurrency and reassembled in offset order — a monolithic
+    /// multi-GB GET is fatal on a flaky link (a single mid-stream body reset
+    /// fails the whole download, and every retry restarts from zero).
+    async fn read_packed_range_chunked(
+        &self,
+        file_path: &ObjPath,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>> {
+        read_range_chunked(
+            self.backend.as_ref(),
+            file_path,
+            start,
+            end,
+            SECTION_READ_CHUNK_BYTES,
+            SECTION_READ_CHUNK_CONCURRENCY,
+        )
+        .await
     }
 
     /// Read the obs schema — **bounded to a single section**, never

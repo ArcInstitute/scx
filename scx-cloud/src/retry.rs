@@ -58,7 +58,19 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 3,
+            // 6 (not the prior 3) so the multi-shard query fan-out has more
+            // headroom: a query against a 35 K-shard atlas fires that many
+            // independent GETs, each subject to its own budget, so the
+            // probability of *some* shard exhausting its budget during a
+            // transient/congestion window grows with shard count. Kept modest
+            // (not 8+) because this is the shared default for every read path
+            // (incl. one-shot `scx pull`); the per-request `request_timeout`
+            // still bounds worst-case wall-clock. `base_delay` is deliberately
+            // left at 500 ms — lengthening it would slow every one-shot retry
+            // for no benefit. The structural fix for atlas-scale fan-out is
+            // per-shard retry isolation in `scx-engine::collect`, not a larger
+            // global budget.
+            max_retries: 6,
             base_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(30),
             jitter_factor: 0.1,
@@ -152,10 +164,10 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
                 || lower.contains("rate limit")
                 || lower.contains("throttle")
                 || lower.contains("throttled")
-                || lower.contains("503")
-                || lower.contains("502")
-                || lower.contains("500")
-                || lower.contains("504")
+                || contains_http_status(&lower, "503")
+                || contains_http_status(&lower, "502")
+                || contains_http_status(&lower, "500")
+                || contains_http_status(&lower, "504")
                 || lower.contains("server error")
                 || lower.contains("temporarily unavailable")
                 || matches!(
@@ -166,6 +178,24 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
                 )
         }
     }
+}
+
+/// True if the 3-digit HTTP status `code` appears in `haystack` not flanked by
+/// other ASCII digits. Plain `str::contains("500")` over-matches byte counts
+/// and offsets (e.g. `"15000 bytes"`, `"offset 5030"`) as if they were 5xx
+/// statuses; the digit-boundary check keeps the retry budget for genuine
+/// transient signals. `code` is assumed to be ASCII digits.
+pub(crate) fn contains_http_status(haystack: &str, code: &str) -> bool {
+    // A char that is None (string boundary) or a non-digit is a valid boundary;
+    // only an adjacent ASCII digit disqualifies a match. Written with `matches!`
+    // rather than `Option::is_none_or` so it is independent of the toolchain
+    // version that stabilised that method.
+    let is_boundary = |c: Option<char>| !matches!(c, Some(d) if d.is_ascii_digit());
+    haystack.match_indices(code).any(|(i, _)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + code.len()..].chars().next();
+        is_boundary(before) && is_boundary(after)
+    })
 }
 
 /// Compute the exponential-backoff delay for a given attempt number.

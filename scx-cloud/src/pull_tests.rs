@@ -945,7 +945,8 @@ async fn test_pull_filtered_exact_mode_errors() {
 // `LocalFileSystem` and intercepts `get_opts` to inject failures
 // before each delegating call.
 
-use crate::retry::{backoff_delay, is_retryable, RetryingStore};
+use crate::cloud_reader::read_range_chunked;
+use crate::retry::{backoff_delay, contains_http_status, is_retryable, RetryingStore};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
@@ -1087,6 +1088,114 @@ fn is_retryable_distinguishes_permanent_from_transient() {
         source: "request throttled".into(),
     };
     assert!(is_retryable(&g_throttle));
+}
+
+#[test]
+fn contains_http_status_requires_digit_boundaries() {
+    // Genuine status wording matches.
+    assert!(contains_http_status(
+        "status: 503 service unavailable",
+        "503"
+    ));
+    assert!(contains_http_status("http error 500", "500"));
+    assert!(contains_http_status("502", "502")); // whole-string
+    assert!(contains_http_status("(504 gateway timeout)", "504"));
+
+    // Digit runs that merely *contain* the code must NOT match — these are
+    // the byte counts / offsets that the old bare-substring test misread as
+    // 5xx statuses.
+    assert!(!contains_http_status(
+        "read 15000 bytes (offset 5030)",
+        "500"
+    ));
+    assert!(!contains_http_status(
+        "read 15000 bytes (offset 5030)",
+        "503"
+    ));
+    assert!(!contains_http_status("transferred 25022 bytes", "502"));
+    assert!(!contains_http_status("chunk 5041 of 9000", "504"));
+}
+
+#[test]
+fn default_retry_budget_is_six() {
+    // Guards the intentional bump from 3 → 6: the multi-shard query fan-out
+    // needs headroom, but the value is kept modest because this is the shared
+    // default for every read path.
+    assert_eq!(RetryConfig::default().max_retries, 6);
+}
+
+#[tokio::test]
+async fn read_range_chunked_reassembles_byte_identical() {
+    // A section larger than the chunk size must reassemble byte-for-byte,
+    // including a non-zero start offset and a final short chunk.
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("file.bin"), &data).unwrap();
+    let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    let store = RetryingStore::new(Arc::new(inner), RetryConfig::default());
+    let path = ObjPath::from("file.bin");
+
+    // Whole section, chunk=128 → 8 chunks (last short).
+    let whole = read_range_chunked(&store, &path, 0, 1000, 128, 4)
+        .await
+        .unwrap();
+    assert_eq!(whole, data, "chunked whole-section read must match source");
+
+    // Sub-range with a non-zero start, chunk=100 → 9 chunks.
+    let sub = read_range_chunked(&store, &path, 50, 950, 100, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        sub,
+        data[50..950],
+        "chunked sub-range read must match slice"
+    );
+
+    // Read smaller than the chunk takes the single-GET fast path.
+    let small = read_range_chunked(&store, &path, 10, 30, 128, 4)
+        .await
+        .unwrap();
+    assert_eq!(small, data[10..30]);
+}
+
+#[tokio::test]
+async fn read_range_chunked_recovers_transient_chunk_failure() {
+    // A transient body error on a chunk must be retried per-chunk; the full
+    // section still reassembles correctly. This is the atlas-scale
+    // predicate-index download made resilient: pre-fix the whole multi-GB GET
+    // failed on one body reset.
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.path().join("file.bin"), &data).unwrap();
+    let inner = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+    // Two transient failures hit two of the chunk GETs; each is retried.
+    let faulty = Arc::new(FaultyStore::new(
+        inner,
+        vec![FaultMode::TransientError, FaultMode::TransientError],
+    ));
+    let cfg = RetryConfig {
+        max_retries: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        jitter_factor: 0.0,
+        request_timeout: Duration::from_secs(10),
+    };
+    let store = RetryingStore::new(faulty.clone(), cfg);
+    let path = ObjPath::from("file.bin");
+
+    let got = read_range_chunked(&store, &path, 0, 1000, 100, 4)
+        .await
+        .unwrap();
+    assert_eq!(
+        got, data,
+        "section must reassemble despite transient chunk failures"
+    );
+    // 10 chunks + 2 retries = 12 backend hits.
+    assert_eq!(
+        faulty.get_attempts.load(AtomicOrdering::Relaxed),
+        12,
+        "10 chunk GETs + 2 retried transients"
+    );
 }
 
 #[test]
