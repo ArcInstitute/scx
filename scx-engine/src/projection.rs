@@ -110,6 +110,63 @@ pub fn project_csr(csr: &ScxCsr, gene_indices: &[u32]) -> ScxCsr {
     ScxCsr::new_unchecked((n_rows, n_cols), new_indptr, new_indices, new_data)
 }
 
+/// Reorder the columns of a projected CSR into a caller-requested
+/// presentation order.
+///
+/// `csr` is expected to be the output of [`project_csr`] — i.e. its
+/// columns are `0..n` in **sorted** gene order. `out_to_sorted` maps each
+/// output column position to the sorted column it should take its values
+/// from: output column `k` is the projected (sorted) column
+/// `out_to_sorted[k]`. `out_to_sorted` must be a permutation of `0..n`
+/// where `n == csr.n_cols()`.
+///
+/// This is the final step that lets `var_names` honour the caller's
+/// request order while the gather itself stays monotonic (the merge scan
+/// in [`project_csr_row`] requires sorted columns). Indices within each
+/// row are re-sorted so the result is canonical CSR (sorted row indices),
+/// keeping scipy interop and any later [`project_csr`] composition safe.
+pub fn reorder_csr_columns(csr: &ScxCsr, out_to_sorted: &[u32]) -> ScxCsr {
+    let n_rows = csr.n_rows();
+    let n_cols = csr.n_cols();
+    debug_assert_eq!(
+        out_to_sorted.len(),
+        n_cols,
+        "reorder_csr_columns: out_to_sorted length must equal csr.n_cols()"
+    );
+
+    // Inverse map: sorted column -> output column position.
+    let mut sorted_to_out = vec![0u32; n_cols];
+    for (out_pos, &sorted_col) in out_to_sorted.iter().enumerate() {
+        sorted_to_out[sorted_col as usize] = out_pos as u32;
+    }
+
+    let mut new_indptr = Vec::with_capacity(n_rows + 1);
+    new_indptr.push(0i64);
+    let mut new_indices = Vec::with_capacity(csr.indices.len());
+    let mut new_data = Vec::with_capacity(csr.data.len());
+
+    // Scratch reused per row to sort (remapped_index, value) pairs.
+    let mut row: Vec<(i32, f32)> = Vec::new();
+    for r in 0..n_rows {
+        let start = csr.indptr[r] as usize;
+        let end = csr.indptr[r + 1] as usize;
+        row.clear();
+        row.reserve(end - start);
+        for (&old_idx, &val) in csr.indices[start..end].iter().zip(&csr.data[start..end]) {
+            row.push((sorted_to_out[old_idx as usize] as i32, val));
+        }
+        row.sort_unstable_by_key(|&(idx, _)| idx);
+        for &(idx, val) in &row {
+            new_indices.push(idx);
+            new_data.push(val);
+        }
+        let prev = *new_indptr.last().unwrap();
+        new_indptr.push(prev + (end - start) as i64);
+    }
+
+    ScxCsr::new_unchecked((n_rows, n_cols), new_indptr, new_indices, new_data)
+}
+
 /// Project the var (gene) RecordBatch to keep only the specified gene rows.
 ///
 /// Uses `arrow::compute::take()` for efficient row selection.
@@ -434,6 +491,55 @@ mod tests {
             let end = projected.indptr[row + 1] as usize;
             assert_eq!(&projected.indices[start..end], &[0, 1, 2]);
             assert_eq!(&projected.data[start..end], &[1.0, 2.0, 3.0]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // reorder_csr_columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reorder_columns_basic() {
+        // Sorted-order projection of sample_csr to genes {0, 2, 4} (cols 0,1,2).
+        let csr = sample_csr();
+        let sorted = project_csr(&csr, &[0, 2, 4]);
+        // Request order was [4, 0, 2] -> sorted [0, 2, 4]; output col k takes
+        // sorted col perm[k]: perm = [2, 0, 1] (4 is sorted-pos 2, 0 is 0, 2 is 1).
+        let reordered = reorder_csr_columns(&sorted, &[2, 0, 1]);
+        assert_eq!(reordered.shape, (3, 3));
+
+        // Densify and compare: reordered col j == sorted col perm[j].
+        let dense_sorted = sorted.to_dense().unwrap(); // 3x3 row-major
+        let dense_re = reordered.to_dense().unwrap();
+        let perm = [2usize, 0, 1];
+        for r in 0..3 {
+            for (j, &p) in perm.iter().enumerate() {
+                assert_eq!(dense_re[r * 3 + j], dense_sorted[r * 3 + p]);
+            }
+        }
+    }
+
+    #[test]
+    fn reorder_columns_identity() {
+        let csr = sample_csr();
+        let sorted = project_csr(&csr, &[0, 2, 4]);
+        let reordered = reorder_csr_columns(&sorted, &[0, 1, 2]);
+        assert_eq!(reordered.indptr, sorted.indptr);
+        assert_eq!(reordered.indices, sorted.indices);
+        assert_eq!(reordered.data, sorted.data);
+    }
+
+    #[test]
+    fn reorder_columns_indices_stay_sorted_within_row() {
+        let csr = sample_csr();
+        let sorted = project_csr(&csr, &[0, 2, 4]);
+        let reordered = reorder_csr_columns(&sorted, &[2, 0, 1]);
+        for r in 0..reordered.n_rows() {
+            let start = reordered.indptr[r] as usize;
+            let end = reordered.indptr[r + 1] as usize;
+            assert!(reordered.indices[start..end]
+                .windows(2)
+                .all(|w| w[0] < w[1]));
         }
     }
 

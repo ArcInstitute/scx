@@ -41,8 +41,8 @@ are on `.info()`. Key accessors: `obs_keys`, `var_keys`, `obsm_keys`,
 One-liners: `pyscx.read(path, **kwargs)` (= `open(path).to_anndata(**kwargs)`)
 and `pyscx.write(adata, path, **kwargs)` (= `from_anndata`).
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None)` — convert to AnnData.
-  - `var_names`: gene-name list to project (column subset).
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None, preserve_var_order=False, strict_var_names=True)` — convert to AnnData.
+  - `var_names`: gene-name list to project (column subset). Sorted-order set selector by default; `preserve_var_order=True` returns the requested order (first-wins dedup). `strict_var_names=True` (default) raises `KeyError` on unknown names — `False` drops them silently.
   - `obs_filter`: predicate string. **Non-backed mode** routes through the query engine (shard pushdown). **Backed mode** evaluates it with **pandas `.query()`** (richer grammar, no pushdown) and folds the matches into the dataset's row set — so the same expression can resolve via different engines depending on `backed`.
   - `layers`: layer names to load (default all).
   - `obsm`: obsm keys to load (default `None` = all; byte-identical to before). `obsm=[...]` loads only the listed embeddings (unknown key → `KeyError`; `[]` = none) **and** switches the obsm materialisation mode (see next bullet). Use `obsm=[embed_key]` on the random-access dataloader path to drop every unused embedding's per-worker RAM.

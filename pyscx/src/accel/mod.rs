@@ -41,3 +41,33 @@ pub mod route;
 pub mod score_genes;
 pub mod umap;
 pub mod util;
+
+use pyo3::prelude::*;
+
+/// Reject accel ops on a backed `X` opened with `preserve_var_order=True`.
+///
+/// `preserve_var_order` lives only on `ScxBackedSparseDataset` (as
+/// `col_presentation`). Accel ops that build a `ScxLazyTransformedDataset`
+/// or a `ShardSource` from the dataset's *sorted* `col_projection` would
+/// decode columns in sorted order while `adata.var` stays in request order —
+/// a silent X/var misalignment (or, for name-resolving ops like
+/// `score_genes`, the wrong physical columns). Until the permutation is
+/// propagated into those paths, refuse loudly rather than return wrong data.
+///
+/// No-op when `X` is not a presentation-ordered backed dataset.
+pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> PyResult<()> {
+    let Ok(x) = adata.getattr("X") else {
+        return Ok(());
+    };
+    if let Ok(backed) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
+        if backed.borrow().col_presentation_arc().is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op} is not supported on a dataset opened with \
+                 preserve_var_order=True (the gene axis is in request order, which \
+                 would misalign the result against adata.var). Run {op} before \
+                 projecting by name, or re-open without preserve_var_order."
+            )));
+        }
+    }
+    Ok(())
+}

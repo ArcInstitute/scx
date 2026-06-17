@@ -538,7 +538,18 @@ impl PyExperiment {
     ///     cache_shards: Number of decoded shards to LRU-cache (default 4).
     ///                   Only used when backed=True.
     ///     var_names: Optional list of gene names to project to at load time.
-    ///                Only loads the specified genes. Not supported with backed=True.
+    ///                Only loads the specified genes (a set selector by default;
+    ///                see preserve_var_order). By default the returned gene axis
+    ///                is in sorted original-column order; pass
+    ///                preserve_var_order=True to follow the request order instead.
+    ///     preserve_var_order: When True, the var/X gene axis follows the order
+    ///                of `var_names` (duplicates dropped, first occurrence wins)
+    ///                rather than sorted column order. Default False. Works on the
+    ///                eager and backed paths; not supported by highly_variable_genes
+    ///                on the resulting backed dataset.
+    ///     strict_var_names: When True (default), any name in `var_names` that is
+    ///                absent from the var metadata raises KeyError. Pass False to
+    ///                silently drop unknown names (the pre-0.8.6 behaviour).
     ///     obs_filter: Optional predicate expression (e.g., "cell_type == 'T cell'")
     ///                 to filter observations. Uses predicate pushdown for shard skipping.
     ///     layers: Optional list of layer names to load. If None, all layers are loaded.
@@ -587,7 +598,7 @@ impl PyExperiment {
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -602,6 +613,8 @@ impl PyExperiment {
         eager: bool,
         memory_budget: Option<Bound<'_, PyAny>>,
         obsm: Option<Vec<String>>,
+        preserve_var_order: bool,
+        strict_var_names: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
         if let Some(name) = modality.as_deref() {
@@ -631,6 +644,8 @@ impl PyExperiment {
                 layers.as_deref(),
                 obsm.as_deref(),
                 eager,
+                preserve_var_order,
+                strict_var_names,
             )
         } else {
             let adata = convert::to_anndata_filtered(
@@ -645,6 +660,8 @@ impl PyExperiment {
                 eager,
                 memory_budget_bytes,
                 false,
+                preserve_var_order,
+                strict_var_names,
             )?;
             // F10: a materialized (in-memory CSR) AnnData drops the on-disk CSC
             // sidecar, so a later GPU DE call silently falls back to the slower
@@ -679,8 +696,9 @@ impl PyExperiment {
     /// for the >VRAM regime.
     ///
     /// Accepts the same shaping options as `to_anndata` (`var_names`,
-    /// `obs_filter`, `layers`, `obsm`); obs/var/obsm/uns/layers are host-resident
-    /// and `X` is the GPU-resident matrix. Requires cuPy.
+    /// `obs_filter`, `layers`, `obsm`, `preserve_var_order`, `strict_var_names`);
+    /// obs/var/obsm/uns/layers are host-resident and `X` is the GPU-resident
+    /// matrix. Requires cuPy.
     ///
     /// Ownership: the device buffers are owned by a single SCX-side holder that
     /// the returned AnnData keeps alive (via `X`'s `.base` chain); they are freed
@@ -691,7 +709,7 @@ impl PyExperiment {
     ///     adata = pyscx.open("atlas.scx").to_gpu_anndata()
     ///     import rapids_singlecell as rsc
     ///     rsc.pp.pca(adata)            # runs in-VRAM; no host bounce
-    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None))]
+    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None, preserve_var_order=false, strict_var_names=true))]
     #[allow(clippy::too_many_arguments)]
     fn to_gpu_anndata<'py>(
         &self,
@@ -702,6 +720,8 @@ impl PyExperiment {
         obsm: Option<Vec<String>>,
         device: &str,
         memory_budget: Option<Bound<'_, PyAny>>,
+        preserve_var_order: bool,
+        strict_var_names: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         #[cfg(feature = "gpu")]
         {
@@ -762,7 +782,9 @@ impl PyExperiment {
                     false, // preserve_slots
                     true,  // eager
                     memory_budget_bytes,
-                    true, // skip_x
+                    true,  // skip_x
+                    false, // preserve_var_order (fast path: var_names is None)
+                    false, // strict_var_names (no names to check)
                 )?;
 
                 // Raw shard bytes (borrow the reader's mmap) + a cheap header
@@ -866,6 +888,8 @@ impl PyExperiment {
                     true,  // eager
                     memory_budget_bytes,
                     false, // skip_x
+                    preserve_var_order,
+                    strict_var_names,
                 )?;
 
                 // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
@@ -984,6 +1008,8 @@ impl PyExperiment {
                 obsm,
                 device,
                 memory_budget,
+                preserve_var_order,
+                strict_var_names,
             );
             Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "to_gpu_anndata requires pyscx built with the 'gpu' feature",

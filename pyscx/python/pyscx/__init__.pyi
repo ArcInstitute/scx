@@ -317,6 +317,8 @@ class Experiment:
         eager: bool = ...,
         memory_budget: Any = ...,
         obsm: list[str] | None = ...,
+        preserve_var_order: bool = ...,
+        strict_var_names: bool = ...,
     ) -> Any: ...
 
     def query(self) -> Any: ...

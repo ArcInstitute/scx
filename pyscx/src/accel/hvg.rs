@@ -147,6 +147,12 @@ pub fn highly_variable_genes<'py>(
     let seurat_v3_family = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
     let single_batch = batch_key.is_none();
 
+    // HVG computes per-gene stats and the selection mask over the sorted
+    // column projection (via build_shard_source), then writes them to
+    // adata.var. A presentation-ordered backed X (preserve_var_order=True)
+    // would misalign those stats against the request-ordered var — reject.
+    super::reject_preserve_var_order(adata, "highly_variable_genes")?;
+
     if prefer_format == "csc" {
         // Explicit CSC: single-batch seurat_v3 only. Reject mismatched
         // configurations with a clear message rather than silently falling
@@ -1249,7 +1255,7 @@ fn apply_hvg_subset(
         backed
             .borrow_mut()
             .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, false)?;
 
         // Slice var via _var: AnnData's public var setter validates
         // len(value) == self.n_vars, where n_vars is derived from the current
@@ -1277,7 +1283,7 @@ fn apply_hvg_subset(
 
         lazy.borrow_mut()
             .set_col_projection(new_col_indices.clone());
-        update_layers_col_projection(adata, &new_col_indices)?;
+        update_layers_col_projection(adata, &new_col_indices, false)?;
 
         // See comment above in backed branch for why _var is used.
         let var = adata.getattr("var")?;

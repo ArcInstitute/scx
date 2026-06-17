@@ -208,7 +208,9 @@ def test_var_names_none_found_raises(synthetic_adata, scx_from_adata):
 
     path = scx_from_adata(synthetic_adata, "varnames_bad.scx")
 
-    with pytest.raises((RuntimeError, ValueError)):
+    # strict_var_names defaults to True, so an unknown name raises KeyError
+    # (before the all-unknown RuntimeError path).
+    with pytest.raises((RuntimeError, ValueError, KeyError)):
         pyscx.open(path).to_anndata(var_names=["nonexistent_gene"])
 
 
@@ -407,6 +409,187 @@ def test_var_names_consistent_across_paths(tmp_dir):
         == list(backed.var["gene_symbol"])
         == list(query.var["gene_symbol"])
     )
+
+
+def _expected_cols_for(full, requested):
+    """Map requested symbols → their original column positions in `full`."""
+    sym_to_pos = {s: i for i, s in enumerate(full.var["gene_symbol"])}
+    return [sym_to_pos[s] for s in requested]
+
+
+def test_preserve_var_order_eager(tmp_dir):
+    """preserve_var_order=True returns the eager gene axis in request order."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_eager.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_5", "SYM_1", "SYM_3"]
+    out = pyscx.open(path).to_anndata(var_names=requested, preserve_var_order=True)
+
+    assert list(out.var["gene_symbol"]) == requested
+    full = pyscx.open(path).to_anndata()
+    np.testing.assert_array_equal(
+        out.X.toarray(), full.X.toarray()[:, _expected_cols_for(full, requested)]
+    )
+
+
+def test_preserve_var_order_default_is_sorted(tmp_dir):
+    """Without the flag, the gene axis stays in sorted original-column order."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_default.scx")
+    pyscx.from_anndata(adata, path)
+
+    out = pyscx.open(path).to_anndata(var_names=["SYM_5", "SYM_1", "SYM_3"])
+    # SYM_i lives at original column i, so sorted order is SYM_1, SYM_3, SYM_5.
+    assert list(out.var["gene_symbol"]) == ["SYM_1", "SYM_3", "SYM_5"]
+
+
+def test_preserve_var_order_backed(tmp_dir):
+    """preserve_var_order=True on the backed path: X and var both in request order."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_backed.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_6", "SYM_0", "SYM_4"]
+    out = pyscx.open(path).to_anndata(
+        backed=True, var_names=requested, preserve_var_order=True
+    )
+
+    assert list(out.var["gene_symbol"]) == requested
+    backed_x = (
+        out.X[:].toarray() if hasattr(out.X, "to_memory") else out.X.toarray()
+    )
+    full = pyscx.open(path).to_anndata()
+    np.testing.assert_array_equal(
+        backed_x, full.X.toarray()[:, _expected_cols_for(full, requested)]
+    )
+
+
+def test_preserve_var_order_backed_row_slice(tmp_dir):
+    """Row slicing a presentation-ordered backed dataset preserves column order."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_backed_slice.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_7", "SYM_2", "SYM_5"]
+    out = pyscx.open(path).to_anndata(
+        backed=True, var_names=requested, preserve_var_order=True
+    )
+    full = pyscx.open(path).to_anndata()
+    cols = _expected_cols_for(full, requested)
+    # A contiguous row slice through the backed reader.
+    np.testing.assert_array_equal(
+        out.X[3:9].toarray(), full.X.toarray()[3:9][:, cols]
+    )
+
+
+def test_preserve_var_order_obs_filter(tmp_dir):
+    """Query-engine path (obs_filter + var_names) honours request order."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_query.scx")
+    pyscx.from_anndata(adata, path)
+
+    requested = ["SYM_5", "SYM_2", "SYM_0"]
+    out = pyscx.open(path).to_anndata(
+        obs_filter="cell_type == 'A'", var_names=requested, preserve_var_order=True
+    )
+    assert list(out.var["gene_symbol"]) == requested
+    # Column values must follow the same order (cell_type=='A' is the first 15 rows).
+    full = pyscx.open(path).to_anndata()
+    cols = _expected_cols_for(full, requested)
+    np.testing.assert_array_equal(
+        out.X.toarray(), full.X.toarray()[:15][:, cols]
+    )
+
+
+def test_preserve_var_order_dedup_first_wins(tmp_dir):
+    """Duplicate names collapse to the first occurrence, order preserved."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "preserve_dedup.scx")
+    pyscx.from_anndata(adata, path)
+
+    out = pyscx.open(path).to_anndata(
+        var_names=["SYM_3", "SYM_1", "SYM_3"], preserve_var_order=True
+    )
+    assert list(out.var["gene_symbol"]) == ["SYM_3", "SYM_1"]
+
+
+def test_strict_var_names_default_raises_on_unknown(tmp_dir):
+    """strict_var_names defaults to True: an unknown name raises KeyError."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "strict_default.scx")
+    pyscx.from_anndata(adata, path)
+
+    with pytest.raises(KeyError):
+        pyscx.open(path).to_anndata(var_names=["SYM_1", "NOT_A_GENE"])
+    # Backed path is strict too.
+    with pytest.raises(KeyError):
+        pyscx.open(path).to_anndata(backed=True, var_names=["SYM_1", "NOT_A_GENE"])
+
+
+def test_strict_var_names_false_drops_unknown(tmp_dir):
+    """strict_var_names=False restores the lenient silent-drop behaviour."""
+    import pyscx
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "strict_lenient.scx")
+    pyscx.from_anndata(adata, path)
+
+    out = pyscx.open(path).to_anndata(
+        var_names=["SYM_1", "NOT_A_GENE", "SYM_3"], strict_var_names=False
+    )
+    assert set(out.var["gene_symbol"]) == {"SYM_1", "SYM_3"}
+
+
+@pytest.mark.parametrize("op", ["normalize_total", "log1p", "score_genes"])
+def test_accel_ops_reject_preserve_var_order(tmp_dir, op):
+    """Accel ops that gather over the sorted projection must reject a
+    presentation-ordered backed dataset rather than silently misalign."""
+    import pyscx
+    import pyscx.accel as accel
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / f"reject_{op}.scx")
+    pyscx.from_anndata(adata, path)
+
+    ad = pyscx.open(path).to_anndata(
+        backed=True, var_names=["SYM_5", "SYM_1", "SYM_3"], preserve_var_order=True
+    )
+    with pytest.raises(RuntimeError, match="preserve_var_order"):
+        if op == "normalize_total":
+            accel.normalize_total(ad)
+        elif op == "log1p":
+            accel.log1p(ad)
+        else:
+            accel.score_genes(ad, ["SYM_5", "SYM_1"])
+
+
+def test_accel_ops_allow_default_order(tmp_dir):
+    """Default (sorted) backed projection still works with accel ops."""
+    import pyscx
+    import pyscx.accel as accel
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "allow_default.scx")
+    pyscx.from_anndata(adata, path)
+
+    ad = pyscx.open(path).to_anndata(backed=True, var_names=["SYM_5", "SYM_1", "SYM_3"])
+    # No preserve_var_order → no presentation reorder → accel ops run fine.
+    accel.normalize_total(ad)
 
 
 class _DuckAnnData:
