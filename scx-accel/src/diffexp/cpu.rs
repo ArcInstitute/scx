@@ -149,33 +149,13 @@ pub fn wilcoxon_rank_sum(
         None => (0..n_groups).collect(),
     };
 
-    // Pre-compute group sums per gene for logFC (avoids redundant gathering).
-    // group_gene_sums[g][var] = sum of values for cells in group g at gene var.
-    let mut group_gene_sums: Vec<Vec<f64>> = vec![vec![0.0; n_vars]; n_groups];
-    for g in 0..n_groups {
-        for &cell in &group_indices[g] {
-            let base = cell * n_vars;
-            for var in 0..n_vars {
-                group_gene_sums[g][var] += data[base + var] as f64;
-            }
-        }
-    }
-
-    // Pre-compute the total gene sum across all groups so the 1-vs-rest reference
-    // sum is O(1) per (gene, group) — `total_gene_sum[var] - group_gene_sums[g][var]`
-    // — instead of re-summing over all other groups (O(n_groups) per (gene, group),
-    // i.e. O(n_vars · n_groups²) overall). Only needed for the 1-vs-rest arm.
-    let total_gene_sum: Vec<f64> = if reference.is_none() {
-        let mut totals = vec![0.0f64; n_vars];
-        for sums in &group_gene_sums {
-            for (total, &s) in totals.iter_mut().zip(sums.iter()) {
-                *total += s;
-            }
-        }
-        totals
-    } else {
-        Vec::new()
-    };
+    // Per-gene group sums (for logFC) are computed *inside* the parallel per-var
+    // loop below, fused into the value gather each gene already performs — there is
+    // no separate serial O(n_obs·n_vars) pre-pass. Each gene's sums are accumulated
+    // in ascending cell order (matching `group_indices`, built ascending above), so
+    // the f64 accumulation order — and thus the output — is identical to a dedicated
+    // pre-pass would produce, just without the serial bottleneck or the n_groups×n_vars
+    // allocation.
 
     let n_test_groups = test_groups.len();
 
@@ -187,21 +167,34 @@ pub fn wilcoxon_rank_sum(
         .map_init(
             || {
                 // Thread-local buffers reused across genes (no per-gene allocation).
+                // `group_sum_buf` holds this gene's per-group value sums (1-vs-rest arm).
                 (
                     vec![0.0f64; n_obs],
                     Vec::with_capacity(n_obs),
                     Vec::with_capacity(n_obs),
+                    vec![0.0f64; n_groups],
                 )
             },
-            |(values_buf, index_buf, ranks_buf), var_idx| {
+            |(values_buf, index_buf, ranks_buf, group_sum_buf), var_idx| {
                 let mut group_results = Vec::with_capacity(n_test_groups);
 
                 match reference {
                     None => {
                         // 1-vs-rest: rank all n_obs values once, reuse across groups.
+                        // Fuse the per-group value sum into the gather (cells walked in
+                        // ascending order → per-group sums match the `group_indices`
+                        // order). The 1-vs-rest reference sum is then O(1) per group:
+                        // `total - group_sum_buf[g]`, with `total` summed in group order.
+                        group_sum_buf[..n_groups].iter_mut().for_each(|s| *s = 0.0);
                         for i in 0..n_obs {
-                            values_buf[i] = data[i * n_vars + var_idx] as f64;
+                            let v = data[i * n_vars + var_idx] as f64;
+                            values_buf[i] = v;
+                            let g = groups[i];
+                            if g < n_groups {
+                                group_sum_buf[g] += v;
+                            }
                         }
+                        let total: f64 = group_sum_buf[..n_groups].iter().sum();
                         let raw_tc = rank_with_ties(&values_buf[..n_obs], index_buf, ranks_buf);
                         let tc = if tie_correct { raw_tc } else { 0.0 };
 
@@ -216,8 +209,8 @@ pub fn wilcoxon_rank_sum(
                             let (score, pval) =
                                 wilcoxon_from_ranks(ranks_buf, &group_indices[g], n_obs, tc);
 
-                            let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
-                            let rest_sum = total_gene_sum[var_idx] - group_gene_sums[g][var_idx];
+                            let mean_group = group_sum_buf[g] / n1 as f64;
+                            let rest_sum = total - group_sum_buf[g];
                             let mean_ref = rest_sum / n2 as f64;
                             let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
                             group_results.push((score, pval, logfc));
@@ -253,8 +246,11 @@ pub fn wilcoxon_rank_sum(
                             let (score, pval) =
                                 wilcoxon_from_ranks(ranks_buf, &group_indices_in_buf, n_total, tc);
 
-                            let mean_group = group_gene_sums[g][var_idx] / n1 as f64;
-                            let mean_ref = group_gene_sums[ref_idx][var_idx] / n2 as f64;
+                            // Group/ref cells are already gathered (ascending cell order)
+                            // into values_buf[0..n1] and values_buf[n1..n_total]; sum those
+                            // directly rather than from a pre-built group_gene_sums matrix.
+                            let mean_group = values_buf[..n1].iter().sum::<f64>() / n1 as f64;
+                            let mean_ref = values_buf[n1..n_total].iter().sum::<f64>() / n2 as f64;
                             let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
                             group_results.push((score, pval, logfc));
                         }
