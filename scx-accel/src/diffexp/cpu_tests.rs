@@ -385,6 +385,130 @@ fn test_one_vs_rest_logfc_matches_bruteforce_restsum() {
     }
 }
 
+/// Pins OPT-3.3's load-bearing guarantee: folding the per-group sums into the
+/// parallel gather is **bit-identical** to the deleted serial `group_gene_sums` /
+/// `total_gene_sum` pre-pass — not merely within tolerance (the
+/// `..._matches_bruteforce_restsum` test above is a `<1e-9` check using a
+/// *different* summation order, so it would not catch a reorder regression).
+/// This reproduces the old summation order exactly — per-group sums over
+/// `group_indices[g]` ascending, the 1-vs-rest total over groups `0..n_groups`,
+/// pairwise group/ref sums over their ascending cell lists — and asserts the
+/// production logFC matches f64-bit-for-bit, across both `log_transformed`
+/// branches and both the 1-vs-rest and pairwise arms.
+#[test]
+fn test_logfc_bit_identical_to_serial_group_sums() {
+    let n_groups = 7usize;
+    let n_vars = 6usize;
+    let per_group = 9usize; // balanced → no empty/full group → no NaN logFC
+    let n_obs = n_groups * per_group;
+
+    let groups: Vec<usize> = (0..n_obs).map(|i| i / per_group).collect();
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    for (cell, &g) in groups.iter().enumerate() {
+        for var in 0..n_vars {
+            // Non-integer values so any reorder would surface as ULP drift.
+            data[cell * n_vars + var] =
+                (((g * 7 + var * 13 + (cell % per_group) * 3) % 23) as f32) * 0.5 + 0.125;
+        }
+    }
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("c{g}")).collect();
+
+    // Reference sums in the *old* serial order.
+    let mut group_indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
+    for (cell, &g) in groups.iter().enumerate() {
+        group_indices[g].push(cell);
+    }
+    let mut group_gene_sums = vec![vec![0.0f64; n_vars]; n_groups];
+    for g in 0..n_groups {
+        for &cell in &group_indices[g] {
+            for var in 0..n_vars {
+                group_gene_sums[g][var] += data[cell * n_vars + var] as f64;
+            }
+        }
+    }
+    let mut total_gene_sum = vec![0.0f64; n_vars];
+    for sums in &group_gene_sums {
+        for (t, &s) in total_gene_sum.iter_mut().zip(sums.iter()) {
+            *t += s;
+        }
+    }
+
+    let locate = |res: &DiffExpResult, gname: &str, vname: &str| -> f64 {
+        let row = res.group_names.iter().position(|n| n == gname).unwrap();
+        let col = res.names[row].iter().position(|n| n == vname).unwrap();
+        res.logfoldchanges[row][col]
+    };
+
+    for &log_transformed in &[false, true] {
+        // 1-vs-rest.
+        let res = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            None,
+            log_transformed,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        for (g, gname) in group_names.iter().enumerate() {
+            let n1 = group_indices[g].len() as f64;
+            let n2 = (n_obs - group_indices[g].len()) as f64;
+            for (var, vname) in gene_names.iter().enumerate() {
+                let mean_group = group_gene_sums[g][var] / n1;
+                let rest = total_gene_sum[var] - group_gene_sums[g][var];
+                let expected = compute_logfc(mean_group, rest / n2, log_transformed);
+                let got = locate(&res, gname, vname);
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "1-vs-rest logFC not bit-identical for {gname}/{vname} (log={log_transformed}): got {got}, expected {expected}"
+                );
+            }
+        }
+
+        // Pairwise (reference = group 0).
+        let ref_idx = 0usize;
+        let res = wilcoxon_rank_sum(
+            &data,
+            n_obs,
+            n_vars,
+            &gene_names,
+            &groups,
+            &group_names,
+            Some(ref_idx),
+            log_transformed,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        let n2 = group_indices[ref_idx].len() as f64;
+        for (g, gname) in group_names.iter().enumerate() {
+            if g == ref_idx {
+                continue;
+            }
+            let n1 = group_indices[g].len() as f64;
+            for (var, vname) in gene_names.iter().enumerate() {
+                let mean_group = group_gene_sums[g][var] / n1;
+                let mean_ref = group_gene_sums[ref_idx][var] / n2;
+                let expected = compute_logfc(mean_group, mean_ref, log_transformed);
+                let got = locate(&res, gname, vname);
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "pairwise logFC not bit-identical for {gname}/{vname} (log={log_transformed})"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn test_merge_empty() {
     let merged = merge_diff_exp_results(vec![], false).unwrap();
