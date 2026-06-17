@@ -538,10 +538,10 @@ impl PyExperiment {
     ///     cache_shards: Number of decoded shards to LRU-cache (default 4).
     ///                   Only used when backed=True.
     ///     var_names: Optional list of gene names to project to at load time.
-    ///                Only loads the specified genes. By default the returned
-    ///                gene axis is in sorted original-column order (a set
-    ///                selector); pass preserve_var_order=True to follow the
-    ///                request order instead.
+    ///                Only loads the specified genes (a set selector by default;
+    ///                see preserve_var_order). By default the returned gene axis
+    ///                is in sorted original-column order; pass
+    ///                preserve_var_order=True to follow the request order instead.
     ///     preserve_var_order: When True, the var/X gene axis follows the order
     ///                of `var_names` (duplicates dropped, first occurrence wins)
     ///                rather than sorted column order. Default False. Works on the

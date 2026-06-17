@@ -149,20 +149,9 @@ pub fn highly_variable_genes<'py>(
 
     // HVG computes per-gene stats and the selection mask over the sorted
     // column projection (via build_shard_source), then writes them to
-    // adata.var. When the backed X was opened with preserve_var_order=True,
-    // var is in request order while the stats would be in sorted order —
-    // they would misalign. Rather than silently mis-assign, reject: HVG
-    // discovery on a hand-ordered gene panel is not a supported workflow.
-    if let Ok(backed) = adata.getattr("X")?.cast::<ScxBackedSparseDataset>() {
-        if backed.borrow().col_presentation_arc().is_some() {
-            return Err(PyRuntimeError::new_err(
-                "highly_variable_genes is not supported on a dataset opened with \
-                 preserve_var_order=True (the gene axis is in request order, which \
-                 would misalign HVG's per-gene statistics). Run HVG before projecting \
-                 by name, or re-open without preserve_var_order.",
-            ));
-        }
-    }
+    // adata.var. A presentation-ordered backed X (preserve_var_order=True)
+    // would misalign those stats against the request-ordered var — reject.
+    super::reject_preserve_var_order(adata, "highly_variable_genes")?;
 
     if prefer_format == "csc" {
         // Explicit CSC: single-batch seurat_v3 only. Reject mismatched

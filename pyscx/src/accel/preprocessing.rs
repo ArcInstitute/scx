@@ -93,6 +93,11 @@ pub fn normalize_total(
 ) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
 
+    // A presentation-ordered backed X (preserve_var_order=True) would have its
+    // request-ordered var misaligned against the sorted-projection lazy X this
+    // op produces — reject rather than silently mis-order.
+    super::reject_preserve_var_order(adata, "normalize_total")?;
+
     // Any prior fusion marker is now stale: this normalize call supersedes it.
     // The GPU success path will stash a fresh marker; CPU / scipy-fallback
     // paths leave it cleared.
@@ -260,6 +265,9 @@ pub fn normalize_total(
 pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult<()> {
     let _device = validate_device_or_default(device)?;
 
+    // See normalize_total: a presentation-ordered backed X would misalign.
+    super::reject_preserve_var_order(adata, "log1p")?;
+
     // Record the planned route. The GPU kernel runs when a normalize+log1p
     // fusion marker is present (re-runs over the ORIGINAL source) or when X is
     // still backed / lazy; a materialized scipy/dense X falls back to CPU
@@ -398,6 +406,10 @@ pub fn calculate_qc_metrics<'py>(
             "Invalid prefer_format={prefer_format:?}; expected 'csr' or 'csc'"
         )));
     }
+
+    // Per-gene QC metrics are computed over the sorted projection and written to
+    // adata.var; a presentation-ordered backed X would misalign them.
+    super::reject_preserve_var_order(adata, "calculate_qc_metrics")?;
 
     // Record the planned route. QC metrics have no GPU kernel; the only route
     // choice is the gene-axis layout — cpu_csc when prefer_format="csc" (reads

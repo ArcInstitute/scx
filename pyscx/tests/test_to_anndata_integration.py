@@ -555,6 +555,43 @@ def test_strict_var_names_false_drops_unknown(tmp_dir):
     assert set(out.var["gene_symbol"]) == {"SYM_1", "SYM_3"}
 
 
+@pytest.mark.parametrize("op", ["normalize_total", "log1p", "score_genes"])
+def test_accel_ops_reject_preserve_var_order(tmp_dir, op):
+    """Accel ops that gather over the sorted projection must reject a
+    presentation-ordered backed dataset rather than silently misalign."""
+    import pyscx
+    import pyscx.accel as accel
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / f"reject_{op}.scx")
+    pyscx.from_anndata(adata, path)
+
+    ad = pyscx.open(path).to_anndata(
+        backed=True, var_names=["SYM_5", "SYM_1", "SYM_3"], preserve_var_order=True
+    )
+    with pytest.raises(RuntimeError, match="preserve_var_order"):
+        if op == "normalize_total":
+            accel.normalize_total(ad)
+        elif op == "log1p":
+            accel.log1p(ad)
+        else:
+            accel.score_genes(ad, ["SYM_5", "SYM_1"])
+
+
+def test_accel_ops_allow_default_order(tmp_dir):
+    """Default (sorted) backed projection still works with accel ops."""
+    import pyscx
+    import pyscx.accel as accel
+
+    adata = _gene_symbol_adata()
+    path = str(tmp_dir / "allow_default.scx")
+    pyscx.from_anndata(adata, path)
+
+    ad = pyscx.open(path).to_anndata(backed=True, var_names=["SYM_5", "SYM_1", "SYM_3"])
+    # No preserve_var_order → no presentation reorder → accel ops run fine.
+    accel.normalize_total(ad)
+
+
 class _DuckAnnData:
     """Minimal AnnData-like shim for duck-typed validation tests.
 
