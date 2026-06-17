@@ -10,7 +10,7 @@ use arrow::compute;
 use rayon::prelude::*;
 use scx_sparse::ScxCsr;
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::fused_ops::apply_fused_ops;
 use crate::index::{IndexedColumn, PredicateIndex};
 use crate::pipeline::{QueryPipeline, QueryResult};
@@ -19,6 +19,104 @@ use crate::projection::{decode_shard_projected, project_var};
 use crate::pushdown::{prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate};
 
 use scx_format_io::{assemble_filtered_metadata, DeletionVectors, SectionType};
+
+// ============================================================================
+// F0. Resilient parallel shard map
+// ============================================================================
+
+/// Is `e` worth a second attempt? Transient I/O failures are — on the cloud
+/// path every `CloudError` (timeout, download-failed, rate-limited) is erased
+/// to [`EngineError::IoError`] at the `CloudSectionReader` boundary, and
+/// `Generic` covers other transient surfaces. Deterministic decode failures
+/// (`FormatError` / `ArrowError` / `CsrError` / `SchemaError`) are NOT: a retry
+/// would just re-fail and double the work on genuinely corrupt input.
+fn is_retryable_engine_err(e: &EngineError) -> bool {
+    matches!(e, EngineError::IoError(_) | EngineError::Generic(_))
+}
+
+/// Run `f` over `items` in parallel, tolerating transient per-item failures.
+///
+/// Unlike `items.par_iter().map(f).collect::<Result<Vec<_>>>()`, pass 1 does
+/// NOT short-circuit on the first `Err`: it runs `f` on every item via rayon
+/// and keeps each result paired with its input index. If everything succeeded,
+/// the results are returned in input order.
+///
+/// If some items failed:
+/// - A non-retryable failure ([`is_retryable_engine_err`] == false, i.e. a
+///   deterministic decode error) is returned immediately — this preserves the
+///   prior fast-fail on corrupt input.
+/// - Otherwise the failed items are retried once, **sequentially**. Lower
+///   concurrency on the retry pass gives a transient/congestion window time to
+///   clear, and each call still gets a fresh per-request retry budget from the
+///   cloud `RetryingStore`. The call fails only if an item is still unrecovered
+///   after the retry pass, and the error then names the offending indices
+///   rather than surfacing just the first error.
+///
+/// This is the engine-side half of the CLOUD-READ-RETRY-EXHAUSTION fix: a
+/// single shard GET exhausting its per-request budget no longer aborts a whole
+/// atlas-scale query via `?`-propagation. `f` may be invoked up to twice per
+/// item, so it must be idempotent.
+fn par_map_with_shard_retry<I, T, F>(items: &[I], f: F) -> Result<Vec<T>>
+where
+    I: Sync,
+    T: Send,
+    F: Fn(&I) -> Result<T> + Sync,
+{
+    // Pass 1: parallel, order-preserving (slice `par_iter` is indexed), keep
+    // every Result so a single failure doesn't discard the other shards' work.
+    let pass1: Vec<Result<T>> = items.par_iter().map(&f).collect();
+
+    let mut slots: Vec<Option<T>> = Vec::with_capacity(items.len());
+    let mut failed: Vec<usize> = Vec::new();
+    let mut first_nonretryable: Option<EngineError> = None;
+    for (i, r) in pass1.into_iter().enumerate() {
+        match r {
+            Ok(v) => slots.push(Some(v)),
+            Err(e) => {
+                if !is_retryable_engine_err(&e) && first_nonretryable.is_none() {
+                    first_nonretryable = Some(e);
+                }
+                slots.push(None);
+                failed.push(i);
+            }
+        }
+    }
+
+    // A deterministic decode failure is not worth a second attempt — fail fast.
+    if let Some(e) = first_nonretryable {
+        return Err(e);
+    }
+
+    if !failed.is_empty() {
+        let mut last_err: Option<EngineError> = None;
+        let mut unrecovered: Vec<usize> = Vec::new();
+        for &i in &failed {
+            match f(&items[i]) {
+                Ok(v) => slots[i] = Some(v),
+                Err(e) => {
+                    last_err = Some(e);
+                    unrecovered.push(i);
+                }
+            }
+        }
+        if !unrecovered.is_empty() {
+            return Err(EngineError::Generic(format!(
+                "shard read failed after retry for {} of {} item(s) (indices {:?}): {}",
+                unrecovered.len(),
+                items.len(),
+                unrecovered,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            )));
+        }
+    }
+
+    Ok(slots
+        .into_iter()
+        .map(|s| s.expect("every slot filled by pass 1 success or retry recovery"))
+        .collect())
+}
 
 // ============================================================================
 // F1. Execution plan
@@ -498,9 +596,8 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         // Evaluate predicates per shard in parallel; each worker reads its
         // shard, produces a local keep mask, then drops the batch. Peak
         // string memory is bounded by ~(rayon width × one shard).
-        let per_shard: Vec<(u64, Vec<bool>)> = needed
-            .par_iter()
-            .map(|&(idx, cat_row_start)| {
+        let per_shard: Vec<(u64, Vec<bool>)> =
+            par_map_with_shard_retry(&needed, |&(idx, cat_row_start)| {
                 let batch = reader.read_obs_shard(idx)?;
                 let row_start = match cat_row_start {
                     Some(rs) => rs,
@@ -516,8 +613,7 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
                     }
                 }
                 Ok((row_start, local))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            })?;
 
         // Scatter local masks into the global mask. Obs shards are
         // disjoint and contiguous, so writes never overlap.
@@ -705,23 +801,21 @@ fn materialize_filtered_obs(
     let filtered_batches: Vec<RecordBatch> = if groups.is_empty() {
         vec![reader.read_obs_shard(0)?.slice(0, 0)]
     } else {
-        groups
-            .into_par_iter()
-            .map(|(bi, locals)| {
-                let (shard_idx, _, _) = by_start[bi];
-                let batch = reader.read_obs_shard(shard_idx)?;
-                // Consume the owned `locals` Vec: `UInt32Array::from(Vec<u32>)`
-                // takes the allocation via `Buffer::from_vec` (zero-copy), so no
-                // elements are copied into a fresh Arrow buffer.
-                let take_indices = UInt32Array::from(locals);
-                let columns: Vec<_> = batch
-                    .columns()
-                    .iter()
-                    .map(|col| compute::take(col.as_ref(), &take_indices, None))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(RecordBatch::try_new(batch.schema(), columns)?)
-            })
-            .collect::<Result<Vec<_>>>()?
+        par_map_with_shard_retry(&groups, |(bi, locals)| {
+            let (shard_idx, _, _) = by_start[*bi];
+            let batch = reader.read_obs_shard(shard_idx)?;
+            // `par_map_with_shard_retry` may invoke this closure twice (on a
+            // transient-failure retry), so it borrows `locals` and clones per
+            // call rather than consuming the owned Vec. `UInt32Array::from`
+            // still takes the clone's allocation via `Buffer::from_vec`.
+            let take_indices = UInt32Array::from(locals.clone());
+            let columns: Vec<_> = batch
+                .columns()
+                .iter()
+                .map(|col| compute::take(col.as_ref(), &take_indices, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(RecordBatch::try_new(batch.schema(), columns)?)
+        })?
     };
 
     // `template_schema` is only consulted when `batches` is empty; we always
@@ -780,9 +874,8 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     };
 
     // Each shard produces (indptr, indices, data) filtered to matching rows
-    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shard_infos[..decode_count]
-        .par_iter()
-        .map(|si| {
+    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> =
+        par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
             let entry = sorted_shards[si.shard_idx];
 
             // Decode shard (with or without projection)
@@ -797,8 +890,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
                 filter_csr_rows(&indptr, &indices, &data, &si.local_keep_mask);
 
             Ok((filtered_indptr, filtered_indices, filtered_data))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        })?;
 
     // Step 8: Assemble CSR from per-shard results
     let mut merged_indptr: Vec<i64> = Vec::new();
