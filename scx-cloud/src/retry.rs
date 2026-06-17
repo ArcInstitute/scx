@@ -186,10 +186,15 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
 /// statuses; the digit-boundary check keeps the retry budget for genuine
 /// transient signals. `code` is assumed to be ASCII digits.
 pub(crate) fn contains_http_status(haystack: &str, code: &str) -> bool {
+    // A char that is None (string boundary) or a non-digit is a valid boundary;
+    // only an adjacent ASCII digit disqualifies a match. Written with `matches!`
+    // rather than `Option::is_none_or` so it is independent of the toolchain
+    // version that stabilised that method.
+    let is_boundary = |c: Option<char>| !matches!(c, Some(d) if d.is_ascii_digit());
     haystack.match_indices(code).any(|(i, _)| {
         let before = haystack[..i].chars().next_back();
         let after = haystack[i + code.len()..].chars().next();
-        before.is_none_or(|c| !c.is_ascii_digit()) && after.is_none_or(|c| !c.is_ascii_digit())
+        is_boundary(before) && is_boundary(after)
     })
 }
 

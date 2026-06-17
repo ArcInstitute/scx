@@ -1,17 +1,20 @@
-//! Regression tests for the engine-side half of CLOUD-READ-RETRY-EXHAUSTION.
+//! Regression tests for the engine-side per-shard retry isolation in
+//! `collect.rs::par_map_with_shard_retry`.
 //!
 //! At atlas scale a query fans thousands of shard reads out over rayon. The
 //! pre-fix `collect::<Result<_>>()?` made a *single* shard read that exhausted
 //! its per-request retry budget (during a transient/congestion window) abort
-//! the entire query via `?`-propagation. `collect.rs::par_map_with_shard_retry`
-//! now tolerates a transient per-shard failure by retrying only the failed
-//! shards, and fails the query only if a shard is still unrecovered.
+//! the entire query via `?`-propagation. The helper now tolerates a transient
+//! per-shard failure by retrying only the failed shards, and fails the query
+//! only if a shard is still unrecovered.
 //!
 //! These tests wrap a real on-disk sharded `ScxReader` in a fault-injecting
 //! `SectionReader` and assert:
-//!   * a transient single-shard failure is recovered (same rows as no-fault),
+//!   * a transient obs-shard failure is recovered (same rows as no-fault),
 //!   * a persistent shard failure still fails the query, naming the shard,
-//!   * a deterministic (non-retryable) decode error is NOT retried (fast-fail).
+//!   * a deterministic (non-retryable) decode error is NOT retried (fast-fail),
+//!   * a transient CSR X-shard decode failure (`read_shard_from_entry`) is
+//!     likewise recovered.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -155,6 +158,9 @@ struct FaultInjectingReader {
     inner: ScxReader,
     target_obs_shard: u32,
     obs_fails_remaining: AtomicUsize,
+    /// Number of `read_shard_from_entry` (CSR X-shard decode) calls to fail,
+    /// regardless of which entry — exercises the Site 3 fan-out.
+    x_fails_remaining: AtomicUsize,
     fault: Fault,
 }
 
@@ -164,8 +170,29 @@ impl FaultInjectingReader {
             inner,
             target_obs_shard,
             obs_fails_remaining: AtomicUsize::new(obs_fails),
+            x_fails_remaining: AtomicUsize::new(0),
             fault,
         }
+    }
+
+    /// Fail the first `n` CSR X-shard decode reads (`read_shard_from_entry`).
+    fn with_x_fails(mut self, n: usize) -> Self {
+        self.x_fails_remaining = AtomicUsize::new(n);
+        self
+    }
+
+    /// Consume one failure credit from `counter` if any remain; returns true
+    /// when a synthetic failure should be injected for this call.
+    fn take_failure(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
     }
 
     fn make_err(&self) -> EngineError {
@@ -205,20 +232,8 @@ impl SectionReader for FaultInjectingReader {
         SectionReader::obs_metadata_shard_count(&self.inner)
     }
     fn read_obs_shard(&self, shard_idx: u32) -> scx_engine::Result<RecordBatch> {
-        if shard_idx == self.target_obs_shard {
-            // Consume one failure credit if any remain.
-            let prev =
-                self.obs_fails_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                        if n > 0 {
-                            Some(n - 1)
-                        } else {
-                            None
-                        }
-                    });
-            if prev.is_ok() {
-                return Err(self.make_err());
-            }
+        if shard_idx == self.target_obs_shard && Self::take_failure(&self.obs_fails_remaining) {
+            return Err(self.make_err());
         }
         SectionReader::read_obs_shard(&self.inner, shard_idx)
     }
@@ -238,6 +253,9 @@ impl SectionReader for FaultInjectingReader {
         &self,
         entry: &FullCatalogEntry,
     ) -> scx_engine::Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+        if Self::take_failure(&self.x_fails_remaining) {
+            return Err(self.make_err());
+        }
         SectionReader::read_shard_from_entry(&self.inner, entry)
     }
     fn as_any(&self) -> &dyn Any {
@@ -339,5 +357,45 @@ fn deterministic_decode_error_is_not_retried() {
     assert!(
         !msg.contains("shard read failed after retry"),
         "non-retryable error must not go through the retry pass, got: {msg}"
+    );
+}
+
+#[test]
+fn query_survives_transient_csr_shard_failure() {
+    // The CSR X-shard decode fan-out (`read_shard_from_entry`, collect.rs Site
+    // 3) is wrapped by the same per-shard retry as the obs path. A transient
+    // decode failure must be recovered, not abort the materialize.
+    let dir = TempDir::new().unwrap();
+    let path = build_sharded_indexed_file(&dir);
+
+    let reference = n_counts(
+        &QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'B'")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .obs,
+    );
+
+    // Fail the first CSR shard decode once; the engine's retry pass re-reads it.
+    let inner = ScxReader::open(&path).unwrap();
+    let faulty = FaultInjectingReader::new(inner, 0, 0, Fault::Transient).with_x_fails(1);
+    let result = QueryPipeline::from_reader(Box::new(faulty))
+        .unwrap()
+        .filter_obs("cell_type == 'B'")
+        .unwrap()
+        .collect()
+        .expect("a transient CSR-shard decode failure must be recovered");
+
+    assert_eq!(
+        n_counts(&result.obs),
+        reference,
+        "recovered query must match the no-fault result"
+    );
+    assert_eq!(
+        result.x.n_rows(),
+        reference.len(),
+        "all matched rows materialized"
     );
 }

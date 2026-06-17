@@ -52,10 +52,9 @@ fn is_retryable_engine_err(e: &EngineError) -> bool {
 ///   after the retry pass, and the error then names the offending indices
 ///   rather than surfacing just the first error.
 ///
-/// This is the engine-side half of the CLOUD-READ-RETRY-EXHAUSTION fix: a
-/// single shard GET exhausting its per-request budget no longer aborts a whole
-/// atlas-scale query via `?`-propagation. `f` may be invoked up to twice per
-/// item, so it must be idempotent.
+/// This keeps a single shard GET exhausting its per-request retry budget from
+/// aborting a whole atlas-scale query via `?`-propagation. `f` may be invoked
+/// up to twice per item, so it must be idempotent.
 fn par_map_with_shard_retry<I, T, F>(items: &[I], f: F) -> Result<Vec<T>>
 where
     I: Sync,

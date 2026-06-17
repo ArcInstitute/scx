@@ -1118,9 +1118,9 @@ fn contains_http_status_requires_digit_boundaries() {
 
 #[test]
 fn default_retry_budget_is_six() {
-    // Guards the intentional bump from 3 → 6 (CLOUD-READ-RETRY-EXHAUSTION):
-    // the multi-shard query fan-out needs headroom, but the value is kept
-    // modest because this is the shared default for every read path.
+    // Guards the intentional bump from 3 → 6: the multi-shard query fan-out
+    // needs headroom, but the value is kept modest because this is the shared
+    // default for every read path.
     assert_eq!(RetryConfig::default().max_retries, 6);
 }
 
@@ -1162,8 +1162,8 @@ async fn read_range_chunked_reassembles_byte_identical() {
 async fn read_range_chunked_recovers_transient_chunk_failure() {
     // A transient body error on a chunk must be retried per-chunk; the full
     // section still reassembles correctly. This is the atlas-scale
-    // predicate-index download made resilient (CLOUD-READ-RETRY-EXHAUSTION):
-    // pre-fix the whole multi-GB GET failed on one body reset.
+    // predicate-index download made resilient: pre-fix the whole multi-GB GET
+    // failed on one body reset.
     let dir = tempfile::tempdir().unwrap();
     let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(dir.path().join("file.bin"), &data).unwrap();
