@@ -331,6 +331,21 @@ impl PyCloudExperiment {
         self.reader.n_shards()
     }
 
+    /// Number of `ObsMetadataShard` sections (0 on legacy single-section
+    /// obs files). Lets operators distinguish sharded-obs vs legacy cloud
+    /// files, which `shard_count` (CSR shards) conflates.
+    #[getter]
+    fn obs_metadata_shard_count(&self) -> usize {
+        self.reader.obs_metadata_shard_count()
+    }
+
+    /// Number of `VarMetadataShard` sections. Mirror of
+    /// [`Self::obs_metadata_shard_count`].
+    #[getter]
+    fn var_metadata_shard_count(&self) -> usize {
+        self.reader.var_metadata_shard_count()
+    }
+
     #[getter]
     fn format_version(&self) -> u16 {
         self.reader.header().format_version

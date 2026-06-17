@@ -52,7 +52,9 @@ pub use decode_sidecar::{
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use encoder::encode_one_shard;
 pub use mem::MemoryBudget;
-pub use reader::{assemble_filtered_metadata, assemble_sharded_metadata, ScxReader};
+pub use reader::{
+    assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
+};
 pub use shard_decode::decode_shard_bytes;
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{
