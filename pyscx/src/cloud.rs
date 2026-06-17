@@ -287,11 +287,10 @@ impl PyCloudExperiment {
     /// the vocabulary accepted by `query().filter_obs(...)`. Mirrors the
     /// local `Experiment.obs_keys()`.
     ///
-    /// I/O cost: unlike the local footer-only read, the cloud path must read
-    /// obs data to derive the schema. For a sharded obs this reads only the
-    /// FIRST shard (all shards share one schema), avoiding an atlas-scale
-    /// assemble of every shard; for a single-section obs it reads that one
-    /// section (cached on the handle, so a later `.query()` over obs is free).
+    /// I/O cost: for a sharded obs this reads only the FIRST shard (all
+    /// shards share one schema), avoiding an atlas-scale assemble of every
+    /// shard; for a single-section obs it reads that one section's Arrow IPC
+    /// footer. Neither path assembles or caches the full obs table.
     fn obs_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let schema = py
             .detach(|| {
@@ -312,8 +311,8 @@ impl PyCloudExperiment {
 
     /// Column names in `var` (gene metadata), excluding the pandas index.
     /// Mirror of [`Self::obs_keys`]. `var` is gene-axis (small — tens of
-    /// thousands of rows) and rarely sharded, so this reads/assembles the
-    /// var section directly; the assembled batch is cached on the handle.
+    /// thousands of rows) and rarely sharded, so this reads only the first
+    /// var section's Arrow IPC footer (no assembly, no caching).
     fn var_keys(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let schema = py
             .detach(|| self.rt.block_on(self.reader.read_var_schema()))
