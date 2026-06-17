@@ -507,6 +507,17 @@ fn compute_inv_norms(z: &[f64], d: usize, n: usize) -> Vec<f64> {
 /// only on store; values are bounded in `[0, 4]` so f32 storage carries no
 /// meaningful precision loss. Rows are disjoint slices of length N, so we
 /// parallelize across clusters.
+///
+/// PERF NOTE — do not "optimize" this into a faer/BLAS GEMM (`Yᵀ·Z`). This was
+/// tried (perf-review item OPT-3.2, 2026-06) and measured as a *regression* at
+/// every realistic Harmony scale: 0.29× at d=20, 0.45× at d=30, 0.80× at d=50
+/// (K=100, N=300k), and 0.56× at N=1M/d=30 — i.e. 1.25–3.4× *slower*. A GEMM's
+/// contraction dimension here is the PC count `d` (≈20–50), which is far too
+/// short for the blocked microkernel to amortize its overhead, while this
+/// scalar inner loop already auto-vectorizes and the per-cluster `par_chunks_mut`
+/// gives K-way (100–200) core parallelism. The op is O(K·N·d) FLOPs either way —
+/// there is no algorithmic headroom, only constant factors, and the scalar form
+/// already wins them. (A GEMM only reached break-even at d=50 *and* K=200.)
 fn compute_distances(y: &[f64], z: &[f64], d: usize, k: usize, n: usize) -> Vec<f32> {
     let inv_norms = compute_inv_norms(z, d, n);
     let mut out = vec![0f32; k * n];

@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "nb_glm"
 harness = false
+
+[[bench]]
+name = "de_group_sums"
+harness = false
