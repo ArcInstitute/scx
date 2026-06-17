@@ -350,20 +350,58 @@ impl CloudReader {
         }
     }
 
-    /// Read the obs schema.
+    /// Read the obs schema — **bounded to a single section**, never
+    /// assembling the full obs table.
     ///
-    /// Derives the schema from the assembled obs batch (LC4): the batch is
-    /// cached in a `OnceCell`, so a subsequent `read_obs` is free and there is
-    /// no separate `shard_0` / `obs` schema GET. The assembled batch is the
-    /// authoritative schema (post upcast→concat→downcast), matching what
-    /// `read_obs` returns.
+    /// Fetches only the first obs section (`obs_metadata/shard_0` on sharded
+    /// files, else the legacy `obs` section) and decodes its Arrow IPC
+    /// schema via the shared [`scx_format_io::decode_arrow_ipc_schema`], the
+    /// same core `ScxReader::read_obs_schema` uses — so the cloud schema is
+    /// byte-identical to the local path. Does **not** touch [`Self::read_obs`]
+    /// / `obs_assembled` (which would fetch and concatenate every
+    /// `ObsMetadataShard` and OOM at atlas scale); the lazy full-assembly
+    /// path stays available for callers that genuinely need the whole batch.
     pub async fn read_obs_schema(&self) -> Result<Schema> {
-        Ok(self.read_obs().await?.schema().as_ref().clone())
+        let entry = self.first_obs_section_entry()?;
+        let bytes = self.read_section_for_entry(entry).await?;
+        Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
     }
 
     /// Read the var schema. Mirror of [`Self::read_obs_schema`].
     pub async fn read_var_schema(&self) -> Result<Schema> {
-        Ok(self.read_var().await?.schema().as_ref().clone())
+        let entry = self.first_var_section_entry()?;
+        let bytes = self.read_section_for_entry(entry).await?;
+        Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
+    }
+
+    /// Resolve the first obs section catalog entry: `obs_metadata/shard_0`
+    /// when obs is sharded, else the legacy single `obs` section. Mirror of
+    /// `ScxReader::first_obs_section_entry`.
+    fn first_obs_section_entry(&self) -> Result<&FullCatalogEntry> {
+        let (ty, name) = if self.obs_metadata_shard_count() > 0 {
+            (SectionType::ObsMetadataShard, "obs_metadata/shard_0")
+        } else {
+            (SectionType::ObsMetadata, "obs")
+        };
+        self.catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == ty && e.name == name)
+            .ok_or_else(|| CloudError::SectionNotFound(name.into()))
+    }
+
+    /// Mirror of [`Self::first_obs_section_entry`] for the var axis.
+    fn first_var_section_entry(&self) -> Result<&FullCatalogEntry> {
+        let (ty, name) = if self.var_metadata_shard_count() > 0 {
+            (SectionType::VarMetadataShard, "var_metadata/shard_0")
+        } else {
+            (SectionType::VarMetadata, "var")
+        };
+        self.catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == ty && e.name == name)
+            .ok_or_else(|| CloudError::SectionNotFound(name.into()))
     }
 
     /// Raw bytes of the obs predicate index section, if present.
@@ -576,14 +614,6 @@ impl CloudReader {
     }
 }
 
-/// Decode just the schema from an Arrow IPC file's footer.
-///
-/// Delegates to [`scx_format_io::downcast_large_types_schema`] so the
-/// schema matches what `ScxReader::read_obs_schema` returns even when
-/// the on-disk Arrow IPC encodes `LargeUtf8` / `LargeBinary` or
-/// `Dictionary(_, Large*)`. (Local fast path preserves narrow types as
-/// data fits; cloud schemas are eagerly narrowed since we don't have
-/// the offsets to inspect.)
 /// Decode the first `RecordBatch` from an Arrow IPC file **without** any
 /// wide→narrow downcast — used for both single-section reads (caller
 /// downcasts afterward) and per-shard reads (the shared assembler upcasts
@@ -1376,8 +1406,8 @@ mod tests {
         let input = write_sharded_test_file(&dir, 100, 50);
         let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
 
-        // Schema first (derives from — and populates — the cached batch),
-        // then two batch reads: all three must agree.
+        // Schema first (bounded shard_0 footer read — does NOT populate the
+        // assembled-batch cache), then two batch reads: all three must agree.
         let obs_schema = reader.read_obs_schema().await.unwrap();
         let obs1 = reader.read_obs().await.unwrap();
         let obs2 = reader.read_obs().await.unwrap();
@@ -1385,10 +1415,15 @@ mod tests {
             obs1, obs2,
             "repeated read_obs must return identical batches"
         );
+        // Schema is read from shard_0's IPC footer (parity with the local
+        // `ScxReader::read_obs_schema`), so its *fields* match the assembled
+        // batch. The schema-level metadata map legitimately differs — the
+        // footer carries per-shard keys (`row_start` / `shard_idx` / …) that
+        // the assembler consolidates to `n_rows_total` only.
         assert_eq!(
-            &obs_schema,
-            obs1.schema().as_ref(),
-            "read_obs_schema must equal the assembled batch schema"
+            obs_schema.fields(),
+            obs1.schema().fields(),
+            "read_obs_schema fields must equal the assembled batch fields"
         );
 
         let var_schema = reader.read_var_schema().await.unwrap();
@@ -1398,6 +1433,35 @@ mod tests {
             var1, var2,
             "repeated read_var must return identical batches"
         );
-        assert_eq!(&var_schema, var1.schema().as_ref());
+        assert_eq!(var_schema.fields(), var1.schema().fields());
+    }
+
+    /// Regression for CLOUD-READ-OOM2: reading the obs/var schema must
+    /// stay bounded to a single section and must NOT trigger full-obs/var
+    /// assembly (which fetches + concatenates every metadata shard and
+    /// OOMs at atlas scale). The deterministic signal is that the
+    /// assembled-batch `OnceCell`s remain uninitialised after a schema read.
+    #[tokio::test]
+    async fn read_obs_schema_does_not_assemble_full_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+
+        let _obs_schema = reader.read_obs_schema().await.unwrap();
+        let _var_schema = reader.read_var_schema().await.unwrap();
+
+        assert!(
+            reader.obs_assembled.get().is_none(),
+            "read_obs_schema must not assemble the full obs batch"
+        );
+        assert!(
+            reader.var_assembled.get().is_none(),
+            "read_var_schema must not assemble the full var batch"
+        );
+
+        // And the schema fields must still match the assembled batch once it
+        // IS genuinely requested (parity with the local path on narrow data).
+        let obs = reader.read_obs().await.unwrap();
+        assert_eq!(_obs_schema.fields(), obs.schema().fields());
     }
 }
