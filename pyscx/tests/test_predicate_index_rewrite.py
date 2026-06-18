@@ -169,6 +169,62 @@ def test_append_from_anndata_with_index_options_writes_predicate_index(tmp_dir):
     assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 32
 
 
+def test_append_from_anndata_with_index_obs_on_sharded_var_file(tmp_dir):
+    """Regression for the `SectionNotFound("var")` append corruption
+    (fix 151c7e9). When `from_anndata` writes a base whose var is stored
+    as `VarMetadataShard` shards (`n_vars > shard_size`, the layout
+    `from_anndata` emits for full-transcriptome files where
+    `n_vars > shard_target_rows`=16384), an `append_from_anndata` with a
+    non-empty `index_obs` triggers the index-rebuild branch, which must
+    reassemble the sharded var. Pre-fix the rebuild read var via a
+    single-section `get("var")` lookup and failed with
+    `SectionNotFound("var")` ("section not found: var \u2014 the file
+    appears corrupt...").
+
+    Var sharding is forced cheaply with `shard_size=32` + `n_vars=64`
+    (mirrors the Rust fixture `append_with_index_obs_on_sharded_var_base
+    _preserves_var_section`), rather than the 16385-var default-threshold
+    fallback, so the test stays fast. The base file is verified to
+    actually shard var (`var_metadata_shard_count >= 2`) via the reader
+    before the append.
+    """
+    target = tmp_dir / "target.scx"
+    n_vars = 64
+    shard_size = 32  # n_vars (64) > shard_size (32) => var is row-sharded.
+
+    pyscx.from_anndata(
+        _mk_adata(32, n_vars, "DRUG_A"),
+        str(target),
+        shard_size=shard_size,
+    )
+
+    # Precondition: the base really exercises the sharded-var path \u2014 this
+    # is the only layout that hit the bug.
+    base = pyscx.open(str(target))
+    assert base.var_metadata_shard_count >= 2, (
+        "fixture precondition: base var must be row-sharded "
+        f"(got {base.var_metadata_shard_count} shards)"
+    )
+
+    # Pre-fix: this raised RuntimeError 'section not found: var ...'.
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata(32, n_vars, "DRUG_B"),
+        index_obs=["perturbation", "cell_type"],
+        shard_size=shard_size,
+    )
+
+    # Re-open and confirm the var section survived the index rebuild and
+    # the indexed obs query round-trips on the appended file.
+    exp = pyscx.open(str(target))
+    assert exp.n_vars == n_vars, "var row count must equal the original n_vars"
+    # `var_keys()` reads the (reassembled) var section schema directly
+    # — the section the fix repairs; `gene_id` is the only var column.
+    assert exp.var_keys() == ["gene_id"], "var section must be readable post-append"
+    assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 32
+    assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 32
+
+
 def test_append_with_index_options_writes_predicate_index(tmp_dir):
     target = tmp_dir / "target.scx"
     source = tmp_dir / "source.scx"
