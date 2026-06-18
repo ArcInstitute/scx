@@ -871,3 +871,125 @@ fn append_output_enables_shard_skipping() {
     );
     assert_eq!(r.matched_rows, 32, "only the appended DRUG_B rows match");
 }
+
+/// Build a single-modality test file whose var metadata is row-sharded
+/// (`VarMetadataShard` sections) across two shards — the layout
+/// `pyscx.from_anndata` emits for full-transcriptome files (`n_vars >
+/// 16384`). Mirrors `write_test_file` but splits var across two
+/// `write_var_shard` calls instead of one `write_var`. Obs stays legacy
+/// single-section so the indexed-append exercises the var-sharded read
+/// path specifically.
+fn write_var_sharded_test_file(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    perturbation: &str,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs(&obs_with_categories(n_obs, perturbation))
+        .unwrap();
+
+    // Split the var RecordBatch rows across exactly two shards.
+    let var = sample_var(n_vars);
+    let total = n_vars as u64;
+    let first = n_vars / 2;
+    let second = n_vars - first;
+    writer
+        .write_var_shard(0, 0, first as u64, total, &var.slice(0, first))
+        .unwrap();
+    writer
+        .write_var_shard(
+            1,
+            first as u64,
+            second as u64,
+            total,
+            &var.slice(first, second),
+        )
+        .unwrap();
+
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Regression: indexed append (`index_obs` non-empty → index-rebuild
+/// branch) onto a base whose var is stored as `VarMetadataShard` shards
+/// must NOT fail with `SectionNotFound("var")`. The index-rebuild branch
+/// reads the pre-existing var to validate forced columns / build the var
+/// predicate index; the sharded-var layout has no single `"var"` section,
+/// so a `get("var")`-only reader corrupts every full-transcriptome file.
+#[test]
+fn append_with_index_obs_on_sharded_var_base_preserves_var_section() {
+    let dir = TempDir::new().unwrap();
+    let n_vars = 64;
+    let target = write_var_sharded_test_file(&dir, "target.scx", 32, n_vars, "DRUG_A");
+    let source = write_test_file(&dir, "source.scx", 32, n_vars, "DRUG_B");
+
+    // Precondition: the base really exercises the sharded-var path.
+    {
+        let reader = ScxReader::open(&target).unwrap();
+        assert!(
+            reader.var_metadata_shard_count() >= 2,
+            "fixture precondition: base var must be row-sharded (got {} shards)",
+            reader.var_metadata_shard_count()
+        );
+    }
+
+    let source_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader_with_index_options(
+        &target,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+        &forced_obs_pert_options(),
+    )
+    .expect("indexed append onto a var-sharded base must succeed");
+
+    // Re-open and verify the var section survived, obs is readable, and
+    // exactly one obs predicate index was built.
+    let reader = ScxReader::open(&target).unwrap();
+    let var = reader
+        .read_var()
+        .expect("read_var must succeed after append");
+    assert_eq!(
+        var.num_rows(),
+        n_vars,
+        "var row count must equal the original n_vars"
+    );
+    assert!(
+        reader.read_obs().is_ok(),
+        "read_obs must succeed after append"
+    );
+    assert_eq!(
+        count_section(&target, SectionType::ObsPredicateIndex),
+        1,
+        "appended file should have exactly one obs_predicate_index section"
+    );
+}
