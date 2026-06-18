@@ -2427,4 +2427,131 @@ mod streaming_obs_hdf5 {
             .collect();
         assert_eq!(cat_rows(&cats, &codes), want);
     }
+
+    // ---- Review-driven coverage (PR #280 review fixes) ----
+
+    /// Drive shards through the real unified-schema + streaming writer pipeline
+    /// and return the `Result` (un-unwrapped) so error-path tests can assert.
+    fn try_stream_obs_shards(
+        dir: &std::path::Path,
+        shards: Vec<RecordBatch>,
+        n_rows: usize,
+    ) -> Result<(), crate::pipeline::ConvertError> {
+        let shard0_schema = shards[0].schema();
+        let layout = scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema)?;
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+        let file = hdf5::File::create(dir.join("err.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            n_rows,
+            None,
+            &layout.needs_nullable,
+            &mut WarningSink::log(),
+        )
+    }
+
+    /// Acceptance criterion #7: a plain shard whose value *class* differs from
+    /// the categorical column's dictionary value type fails with a clear
+    /// `shard schema mismatch`, not a silent mis-encode.
+    #[test]
+    fn test_review_value_class_mismatch_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B"], true); // Dictionary(_, Utf8)
+                                                          // shard 1: same column name, but plain Int64 — a different value class.
+        let s1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("cell_type", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["cell_000002", "cell_000003"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let err = try_stream_obs_shards(dir.path(), vec![s0, s1], 4)
+            .expect_err("plain Int64 under a Dictionary(_, Utf8) column must be rejected");
+        assert!(
+            format!("{err}").contains("shard schema mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// §3.3 null handling on the plain-shard path: a null row maps to code `-1`,
+    /// while a genuine empty string is a distinct category (not merged with the
+    /// null). Exercised through the real export pipeline.
+    #[test]
+    fn test_review_plain_shard_null_vs_empty_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B"], true); // dict base
+                                                          // plain Utf8 appended shard: null, empty string, and a new value.
+        let s1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("cell_type", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "cell_000002",
+                    "cell_000003",
+                    "cell_000004",
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None, Some(""), Some("C")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        // Empty string is a real category, distinct from the null.
+        assert!(
+            cats.contains(&String::new()),
+            "empty-string category must be preserved, got {cats:?}"
+        );
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from(["A".into(), "B".into(), "".into(), "C".into()]),
+        );
+        let rows = cat_rows(&cats, &codes);
+        assert_eq!(
+            rows,
+            vec![
+                Some("A".to_string()),
+                Some("B".to_string()),
+                None,                 // null row -> code -1
+                Some("".to_string()), // empty-string category, not null
+                Some("C".to_string()),
+            ],
+        );
+    }
+
+    /// Codex P2: a `UInt64` categorical value above `i64::MAX` must be rejected
+    /// (clear error), not silently wrapped to a negative label on export.
+    #[test]
+    fn test_review_uint64_categorical_above_i64_max_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = Int8Array::from(vec![0i8, 1]);
+        let values: ArrayRef = Arc::new(arrow::array::UInt64Array::from(vec![u64::MAX, 7]));
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, values).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("cell_type", dict.data_type().clone(), false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["c0", "c1"])) as ArrayRef,
+                Arc::new(dict) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let err = try_stream_obs_shards(dir.path(), vec![batch], 2)
+            .expect_err("UInt64 categorical value above i64::MAX must be rejected");
+        assert!(
+            format!("{err}").contains("exceeds the i64 range"),
+            "unexpected error: {err}"
+        );
+    }
 }

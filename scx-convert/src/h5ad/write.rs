@@ -591,7 +591,11 @@ fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, Conv
     macro_rules! ints {
         ($t:ty) => {{
             let a = values.as_primitive::<$t>();
-            CatValues::Int(a.values().iter().map(|&v| v as i64).collect())
+            let mut out = Vec::with_capacity(a.len());
+            for &v in a.values().iter() {
+                out.push(cat_int_to_i64(v, name)?);
+            }
+            CatValues::Int(out)
         }};
     }
     macro_rules! floats {
@@ -633,6 +637,26 @@ fn cardinality_err(name: &str) -> ConvertError {
     ))
 }
 
+/// Normalize a categorical integer value to `i64`, **rejecting** an unsigned
+/// value above `i64::MAX` rather than silently wrapping it to a negative label
+/// (which would corrupt the category on round-trip). Signed widths and unsigned
+/// widths ≤ 32 bits always fit, so only `UInt64` can actually fail; the checked
+/// form is applied uniformly across widths (and on both the dictionary and the
+/// plain-shard paths) so the two stay symmetric. The h5ad integer-categorical
+/// `categories` dataset is `i64`, so out-of-range unsigned labels are
+/// genuinely unrepresentable and must error rather than mis-encode.
+fn cat_int_to_i64<T>(v: T, name: &str) -> Result<i64, ConvertError>
+where
+    T: TryInto<i64> + std::fmt::Display + Copy,
+{
+    v.try_into().map_err(|_| {
+        ConvertError::Other(format!(
+            "column '{name}': categorical integer value {v} exceeds the i64 range \
+             of the h5ad integer-categorical encoding"
+        ))
+    })
+}
+
 /// Build a per-shard local categorical view `(local_codes, local_values)` for
 /// the streaming categorical writer, accepting **both** a `Dictionary(_, V)`
 /// array (the existing append-grown base shards) and a **plain `V`** array
@@ -670,7 +694,7 @@ fn local_categorical_view(
             let mut seen: HashMap<i64, i32> = HashMap::new();
             for i in 0..n {
                 if a.is_valid(i) {
-                    let v = a.value(i) as i64;
+                    let v = cat_int_to_i64(a.value(i), name)?;
                     let code = match seen.get(&v) {
                         Some(&c) => c,
                         None => {
@@ -716,7 +740,9 @@ fn local_categorical_view(
         ($a:expr) => {{
             let a = $a;
             let mut order: Vec<VarLenUnicode> = Vec::new();
-            let mut seen: HashMap<String, i32> = HashMap::new();
+            // Key by `&str` borrowed from `a` (valid for this block) to avoid
+            // allocating a `String` per distinct category in this hot path.
+            let mut seen: HashMap<&str, i32> = HashMap::new();
             for i in 0..n {
                 if a.is_valid(i) {
                     let v = a.value(i);
@@ -725,7 +751,7 @@ fn local_categorical_view(
                         None => {
                             let c: i32 =
                                 order.len().try_into().map_err(|_| cardinality_err(name))?;
-                            seen.insert(v.to_string(), c);
+                            seen.insert(v, c);
                             order.push(vlu(v));
                             c
                         }
@@ -1350,6 +1376,15 @@ where
 /// must match exactly. Used to reject a dictionary whose value class differs
 /// across shards (corruption) while allowing the harmless narrow/wide string
 /// difference the per-shard batches legitimately carry.
+///
+/// Numeric widths are required to match **exactly** here (e.g. a plain `Int32`
+/// shard under a `Dictionary(_, Int64)` column is rejected), which is
+/// intentionally stricter than the read-side `reconcile_dictionary_representations`,
+/// where `arrow::compute::cast` would coerce integer widths. The real
+/// `append`/`from_anndata` flow never produces a width-mismatched layout —
+/// `scx-ops::unify_dict_columns` preserves the exact value type `V` — so the only
+/// way to hit the difference is a hand-crafted third-party file, where failing
+/// loudly on export is preferable to a silent width coercion.
 fn cat_value_class_eq(a: &DataType, b: &DataType) -> bool {
     fn is_string_like(t: &DataType) -> bool {
         matches!(t, DataType::Utf8 | DataType::LargeUtf8)
