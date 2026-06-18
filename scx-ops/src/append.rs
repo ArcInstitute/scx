@@ -616,6 +616,66 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
     )?)
 }
 
+/// Read an existing var payload as a single `RecordBatch`, handling both
+/// legacy single-section [`SectionType::VarMetadata`] files and row-sharded
+/// [`SectionType::VarMetadataShard`] files. Mirror of [`read_existing_obs`]
+/// for the var axis: the sharded path concatenates shards in `shard_idx`
+/// order, matching what [`scx_format_io::ScxReader::read_var`] returns at
+/// query time, but goes through the lock-held file handle because the append
+/// path already holds the write lock. Used by the index-rebuild branch of
+/// `finalize_append`, which needs the full pre-existing var in memory to
+/// validate forced index columns and build the var predicate index.
+fn read_existing_var(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
+    let shard_entries: Vec<(u32, &FullCatalogEntry)> = old_catalog
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::VarMetadataShard)
+        .filter_map(|e| {
+            let suffix = e.name.strip_prefix("var_metadata/shard_")?;
+            let idx: u32 = suffix.parse().ok()?;
+            Some((idx, e))
+        })
+        .collect();
+    if shard_entries.is_empty() {
+        return read_existing_arrow_ipc_section(lock, old_catalog, "var");
+    }
+    let mut shards: Vec<(u32, &FullCatalogEntry)> = shard_entries;
+    shards.sort_by_key(|(idx, _)| *idx);
+    let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
+    for (_, entry) in &shards {
+        lock.seek(SeekFrom::Start(entry.offset))?;
+        let mut buf = vec![0u8; entry.length as usize];
+        std::io::Read::read_exact(&mut *lock, &mut buf)?;
+        let cursor = Cursor::new(buf);
+        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+        let mut iter = reader.into_iter();
+        let batch = iter.next().ok_or_else(|| {
+            OpsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} contains no batches", entry.name),
+            ))
+        })??;
+        batches.push(scx_format_io::upcast_to_large_types(&batch).map_err(OpsError::Format)?);
+    }
+    let wide_schema = batches[0].schema();
+    let concatenated =
+        arrow::compute::concat_batches(&wide_schema, batches.iter()).map_err(OpsError::Arrow)?;
+    let narrowed = scx_format_io::downcast_large_types(&concatenated).map_err(OpsError::Format)?;
+    let narrowed_schema = narrowed.schema();
+    let mut clean_metadata = narrowed_schema.metadata().clone();
+    clean_metadata.remove("shard_idx");
+    clean_metadata.remove("row_start");
+    clean_metadata.remove("n_shard_rows");
+    let clean_schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        narrowed_schema.fields().clone(),
+        clean_metadata,
+    ));
+    Ok(RecordBatch::try_new(
+        clean_schema,
+        narrowed.columns().to_vec(),
+    )?)
+}
+
 /// Read an existing Arrow IPC metadata section (`"obs"` or `"var"`) back
 /// into a `RecordBatch`, downcasting `LargeUtf8` / `LargeBinary` to their
 /// narrow forms so downstream schema comparison works regardless of when
@@ -975,7 +1035,7 @@ fn finalize_append(
     // land. On any forced-column error the file still reads as
     // pre-append (header still points to old catalog).
     let var_for_index = if rebuild_index {
-        let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
+        let var = read_existing_var(lock, &prep.old_catalog)?;
         validate_forced_columns(index_options, &schema_for_validate.schema(), &var.schema())?;
         lock.seek(SeekFrom::Start(write_offset))?;
         Some(var)
