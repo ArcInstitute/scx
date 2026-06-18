@@ -627,6 +627,134 @@ fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, Conv
     })
 }
 
+fn cardinality_err(name: &str) -> ConvertError {
+    ConvertError::Other(format!(
+        "column '{name}': categorical cardinality exceeds i32::MAX"
+    ))
+}
+
+/// Build a per-shard local categorical view `(local_codes, local_values)` for
+/// the streaming categorical writer, accepting **both** a `Dictionary(_, V)`
+/// array (the existing append-grown base shards) and a **plain `V`** array
+/// (appended shards, where `append` decoded the dictionary to its value type
+/// before writing — see `scx-ops::unify_dict_columns`). For the plain case it
+/// builds a local first-seen dedup: `local_codes[row]` is the local index of
+/// that row's value (or `-1` when the row is null, keyed on *validity* — a
+/// genuine empty-string category is distinct from a null), and `local_values`
+/// lists the distinct values in first-seen order.
+///
+/// Generic over the value class (string / integer / float) so numeric
+/// categoricals reconcile exactly as strings do — matching
+/// `reconcile_dictionary_representations` on the read side. The downstream
+/// `remap!` then folds the result into the cross-shard `CatAccum` identically
+/// for both representations (a value-class mismatch vs the accumulator — e.g. a
+/// plain `Int64` shard under a `Dictionary(_, Utf8)` column — is rejected by the
+/// `remap!` match's catch-all arm; §3.2's validator relax rejects it earlier).
+fn local_categorical_view(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<i32>, CatValues), ConvertError> {
+    if matches!(array.data_type(), DataType::Dictionary(_, _)) {
+        return Ok((
+            dict_codes_i32(array, name)?,
+            dict_category_values(array, name)?,
+        ));
+    }
+
+    let n = array.len();
+    let mut local_codes = vec![-1i32; n];
+    macro_rules! intern_int {
+        ($t:ty) => {{
+            let a = array.as_primitive::<$t>();
+            let mut order: Vec<i64> = Vec::new();
+            let mut seen: HashMap<i64, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = a.value(i) as i64;
+                    let code = match seen.get(&v) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(v, c);
+                            order.push(v);
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Int(order)))
+        }};
+    }
+    macro_rules! intern_float {
+        ($t:ty) => {{
+            let a = array.as_primitive::<$t>();
+            let mut order: Vec<f64> = Vec::new();
+            let mut seen: HashMap<u64, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = a.value(i) as f64;
+                    let k = v.to_bits();
+                    let code = match seen.get(&k) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(k, c);
+                            order.push(v);
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Float(order)))
+        }};
+    }
+    macro_rules! intern_str {
+        ($a:expr) => {{
+            let a = $a;
+            let mut order: Vec<VarLenUnicode> = Vec::new();
+            let mut seen: HashMap<String, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = a.value(i);
+                    let code = match seen.get(v) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(v.to_string(), c);
+                            order.push(vlu(v));
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Str(order)))
+        }};
+    }
+    match array.data_type() {
+        DataType::Utf8 => intern_str!(array.as_string::<i32>()),
+        DataType::LargeUtf8 => intern_str!(array.as_string::<i64>()),
+        DataType::Int8 => intern_int!(Int8Type),
+        DataType::Int16 => intern_int!(Int16Type),
+        DataType::Int32 => intern_int!(Int32Type),
+        DataType::Int64 => intern_int!(Int64Type),
+        DataType::UInt8 => intern_int!(UInt8Type),
+        DataType::UInt16 => intern_int!(UInt16Type),
+        DataType::UInt32 => intern_int!(UInt32Type),
+        DataType::UInt64 => intern_int!(UInt64Type),
+        DataType::Float32 => intern_float!(Float32Type),
+        DataType::Float64 => intern_float!(Float64Type),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': categorical column has unsupported plain shard type {other:?}"
+        ))),
+    }
+}
+
 /// Whether the streaming/eager categorical writers can preserve a
 /// dictionary with this value type. Mirrors the dtypes [`dict_category_values`]
 /// handles (string + every integer / unsigned / float width); anything else
@@ -1542,22 +1670,39 @@ fn validate_shard_schema(
 }
 
 /// True when a per-shard column type is interchangeable with the
-/// declared schema type for the purpose of streaming export. Exact
-/// equality always passes; additionally `Utf8`/`LargeUtf8` are treated
-/// as equivalent and `Dictionary(_, Utf8|LargeUtf8)` are equivalent
-/// regardless of key width — per-shard batches legitimately carry the
-/// wide string / wide dictionary forms even when the schema says narrow
-/// (the column writers dispatch on both at runtime).
+/// declared (unified) schema type for the purpose of streaming export.
+/// Exact equality always passes; additionally `Utf8`/`LargeUtf8` are
+/// treated as equivalent. For a **categorical** column (schema type
+/// `Dictionary(_, V)`), three further forms are accepted, generic over the
+/// value class V (string AND numeric — §3.2):
+///   * another `Dictionary(_, V')` shard whose value **class** matches V
+///     (key width is irrelevant — base shards may be `Int8`-keyed, etc.);
+///   * a **plain** shard whose type matches V's value class — this is the
+///     append-grown layout (`append` decodes the dictionary to its value
+///     type), folded back into the categorical by [`local_categorical_view`].
+///
+/// A plain shard whose value class differs from V (e.g. plain `Int64` under
+/// a `Dictionary(_, Utf8)` column) still fails — the genuine-corruption case.
 fn logical_type_compatible(schema_dt: &DataType, shard_dt: &DataType) -> bool {
     fn is_string_like(t: &DataType) -> bool {
         matches!(t, DataType::Utf8 | DataType::LargeUtf8)
     }
-    fn is_dict_string(t: &DataType) -> bool {
-        matches!(t, DataType::Dictionary(_, v) if is_string_like(v.as_ref()))
+    fn dict_value_type(t: &DataType) -> Option<&DataType> {
+        match t {
+            DataType::Dictionary(_, v) => Some(v.as_ref()),
+            _ => None,
+        }
     }
-    schema_dt == shard_dt
-        || (is_string_like(schema_dt) && is_string_like(shard_dt))
-        || (is_dict_string(schema_dt) && is_dict_string(shard_dt))
+    if schema_dt == shard_dt || (is_string_like(schema_dt) && is_string_like(shard_dt)) {
+        return true;
+    }
+    match (dict_value_type(schema_dt), dict_value_type(shard_dt)) {
+        // dict schema vs dict shard: value classes must match (any key width).
+        (Some(sv), Some(dv)) => cat_value_class_eq(sv, dv),
+        // dict schema vs plain shard: plain type must be the dict's value class.
+        (Some(sv), None) => cat_value_class_eq(sv, shard_dt),
+        _ => false,
+    }
 }
 
 /// Per-column streaming writer state. Pre-allocated HDF5 datasets +
@@ -1944,8 +2089,10 @@ fn append_shard_to_column(
             accum,
             ..
         } => {
-            let local_codes = dict_codes_i32(array, name)?;
-            let local_values = dict_category_values(array, name)?;
+            // Accept both a `Dictionary(_, V)` shard (base) and a plain `V`
+            // shard (appended): the helper normalizes both to local codes +
+            // distinct values, generic over the value class (§3.3).
+            let (local_codes, local_values) = local_categorical_view(array, name)?;
 
             // C10: intern only the dictionary values actually referenced by
             // `kept_local` rows, so categories present only in
