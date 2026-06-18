@@ -271,24 +271,16 @@ def test_append_categorical_obs_on_sharded_base_roundtrips(tmp_dir):
     assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 200
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Phase-1 tripwire. The Phase-0.5 assembler hardening fixes the READ "
-        "path (assemble_sharded_metadata), but append still reassembles existing "
-        "obs through the hand-rolled read_existing_obs (no reconcile). Once a "
-        "first append has produced heterogeneous Dictionary+Utf8 on-disk shards, "
-        "a *second* append's read_existing_obs hits the same 'cannot concatenate "
-        "different data types' failure. Remove this marker in Phase 1 when "
-        "read_existing_obs is consolidated onto assemble_sharded_metadata."
-    ),
-)
 def test_second_append_over_heterogeneous_obs_shards(tmp_dir):
     """A second append onto a base that already mixes Dictionary (original) and
     Utf8 (first-append) obs shards must succeed. This exercises the append-path
-    reassembly (read_existing_obs), distinct from the read-path round-trip in
+    reassembly (read_existing_axis), distinct from the read-path round-trip in
     test_append_categorical_obs_on_sharded_base_roundtrips. Fixed by the Phase-1
-    consolidation, not by Phase 0.5.
+    consolidation: read_existing_obs/read_existing_var were collapsed onto
+    scx_format_io::assemble_sharded_metadata, so append inherits the
+    Dictionary/plain reconciliation. Pre-fix the second append raised 'cannot
+    concatenate arrays of different data types (Dictionary(Int8, LargeUtf8),
+    LargeUtf8)' from the hand-rolled read_existing_obs.
     """
     target = tmp_dir / "target.scx"
     shard_size = 100
