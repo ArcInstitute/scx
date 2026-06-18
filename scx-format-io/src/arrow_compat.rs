@@ -164,7 +164,29 @@ pub fn reconcile_dictionary_representations(batches: Vec<RecordBatch>) -> Result
     let mut dict_field: Vec<Option<Field>> = vec![None; n_fields];
     let mut any_non_dict: Vec<bool> = vec![false; n_fields];
     for batch in &batches {
-        for (i, field) in batch.schema().fields().iter().enumerate() {
+        // Defensive: this scan indexes the per-field vectors positionally, so a
+        // shard whose schema disagrees on field count/order with the first
+        // shard would index out of bounds (more fields) or silently mismatch
+        // columns. In practice the upstream upcast/widen preserve field
+        // identity and `concat_batches` would reject a mismatch anyway, but a
+        // malformed / third-party file should fail with a clear error here
+        // rather than panic the process.
+        let bfields = batch.schema().fields().clone();
+        if bfields.len() != n_fields {
+            return Err(crate::error::ScxError::InvalidCatalog(format!(
+                "sharded metadata shards disagree on field count: expected {n_fields}, \
+                 got {} in another shard",
+                bfields.len()
+            )));
+        }
+        for (i, field) in bfields.iter().enumerate() {
+            if field.name() != schema.field(i).name() {
+                return Err(crate::error::ScxError::InvalidCatalog(format!(
+                    "sharded metadata shards disagree on column {i}: expected '{}', got '{}'",
+                    schema.field(i).name(),
+                    field.name()
+                )));
+            }
             match field.data_type() {
                 DataType::Dictionary(_, _) => {
                     if dict_field[i].is_none() {
@@ -504,6 +526,45 @@ mod tests {
         assert_eq!(out[1].schema().field(0).data_type(), &target);
         let merged = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
         assert_eq!(merged.num_rows(), 4);
+    }
+
+    #[test]
+    fn reconcile_errors_on_mismatched_field_count() {
+        // A later shard with an extra column would index the per-field vectors
+        // out of bounds; the guard must return a clear error, not panic.
+        let a: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+        let b0: ArrayRef = Arc::new(StringArray::from(vec!["y"]));
+        let b1: ArrayRef = Arc::new(StringArray::from(vec!["z"]));
+        let batches = vec![
+            batch_from(vec![("s", DataType::Utf8, a)]),
+            batch_from(vec![
+                ("s", DataType::Utf8, b0),
+                ("extra", DataType::Utf8, b1),
+            ]),
+        ];
+        let err = reconcile_dictionary_representations(batches).unwrap_err();
+        assert!(
+            err.to_string().contains("field count"),
+            "expected a field-count mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_errors_on_mismatched_field_name() {
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let d0: DictionaryArray<Int8Type> = vec!["a"].into_iter().collect();
+        let plain: ArrayRef = Arc::new(StringArray::from(vec!["b"]));
+        // Same field count, mismatched name at index 0 — would silently graft the
+        // dict field onto the wrong column without the name guard.
+        let batches = vec![
+            batch_from(vec![("ct", dict_dt, Arc::new(d0))]),
+            batch_from(vec![("other", DataType::Utf8, plain)]),
+        ];
+        let err = reconcile_dictionary_representations(batches).unwrap_err();
+        assert!(
+            err.to_string().contains("column 0"),
+            "expected a field-name mismatch error, got: {err}"
+        );
     }
 
     #[test]

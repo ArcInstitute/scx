@@ -605,9 +605,11 @@ fn read_metadata_shard_batches(
             Some((idx, e))
         })
         .collect();
-    // The assembler sorts by shard index, but sort here too so the per-shard
-    // reads hit the file in offset-ascending order.
-    shards.sort_by_key(|(idx, _)| *idx);
+    // The assembler re-sorts by shard index internally, so sort here purely for
+    // read locality — hit the file in offset-ascending order to keep the
+    // per-shard seeks monotonic (shards are usually but not guaranteed written
+    // in index order, e.g. after appends).
+    shards.sort_by_key(|(_, entry)| entry.offset);
 
     let mut batches: Vec<(u32, RecordBatch)> = Vec::with_capacity(shards.len());
     for (idx, entry) in &shards {
