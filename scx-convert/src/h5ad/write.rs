@@ -2,14 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::{
     Array, AsArray, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
     Int64Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{
-    DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    DataType, Field, FieldRef, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    Schema, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
@@ -1098,25 +1099,53 @@ fn write_obsm_entry(
     Ok(())
 }
 
-/// Pre-scan metadata shards to decide which integer / string columns
-/// need anndata's nullable group encoding. Returns a `Vec` aligned with
-/// `schema.fields()`: `true` ⇔ the field is an `Int32` / `Int64` /
-/// `Utf8` / `LargeUtf8` column that actually contains ≥1 null across the
-/// shards. Float and every other type always map to `false` — floats use
-/// `NaN`, and bool / categorical already preserve nulls.
+/// Cross-shard pre-pass result for the streaming dataframe writer. Both
+/// signals must be known before any HDF5 dataset is allocated, so they
+/// are computed together in one decode pass over the metadata shards.
+pub(crate) struct ColumnExportLayout {
+    /// Aligned with `schema.fields()`: `true` ⇔ the field is an `Int32` /
+    /// `Int64` / `Utf8` / `LargeUtf8` column that actually contains ≥1 null
+    /// across the shards (needs anndata's nullable group encoding).
+    pub needs_nullable: Vec<bool>,
+    /// Aligned with `schema.fields()`: `Some(field)` ⇔ the column is a
+    /// `Dictionary` in *at least one* shard (first such shard field seen,
+    /// carrying its value type + categorical metadata). Used to build the
+    /// unified export schema so a column that is categorical in any shard
+    /// is exported as an h5ad categorical even when shard 0 is plain.
+    pub dict_fields: Vec<Option<FieldRef>>,
+}
+
+/// Pre-scan metadata shards to decide (a) which integer / string columns
+/// need anndata's nullable group encoding, and (b) which columns are a
+/// `Dictionary` in any shard (so the unified export schema can declare
+/// them categorical — see [`write_dataframe_group_streaming`]).
 ///
 /// The streaming writer must allocate each HDF5 dataset (plain vs.
-/// nullable group) before it sees any shard data, so this exact
-/// null-presence signal cannot be derived from the static schema (Arrow
-/// field nullability is set unconditionally by pandas → Arrow). The cost
-/// is one extra decode pass over the metadata-only shards.
-pub(crate) fn scan_nullable_columns<I>(
+/// nullable group vs. categorical group) before it sees any shard data,
+/// so neither signal can be derived from the shard-0 schema alone: Arrow
+/// field nullability is set unconditionally by pandas → Arrow, and an
+/// append-grown axis can mix `Dictionary` and plain shards for the same
+/// column. The cost is one decode pass over the metadata-only shards.
+///
+/// Unlike the previous `scan_nullable_columns`, this pass does **not**
+/// early-exit: a column cannot be proven "plain in every shard" (and thus
+/// not a categorical) until every shard has been inspected. It is still a
+/// single pass — no new pass is introduced — but it always runs to
+/// completion. For obs/var metadata (rows, not X) the cost is small.
+///
+/// Mirrors `scx_format_io::reconcile_dictionary_representations` on the
+/// read side by defending against shards that disagree on field count /
+/// name (positional capture would otherwise mis-assign columns) or on a
+/// categorical column's value **class** (`Dictionary(_, Utf8)` in one
+/// shard vs `Dictionary(_, Int64)` in another is genuine corruption).
+pub(crate) fn scan_column_export_layout<I>(
     shards: I,
     schema: &Schema,
-) -> Result<Vec<bool>, ConvertError>
+) -> Result<ColumnExportLayout, ConvertError>
 where
     I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
 {
+    let n_fields = schema.fields().len();
     let eligible: Vec<bool> = schema
         .fields()
         .iter()
@@ -1127,24 +1156,116 @@ where
             )
         })
         .collect();
-    let mut needs = vec![false; schema.fields().len()];
+    let mut needs_nullable = vec![false; n_fields];
+    let mut dict_fields: Vec<Option<FieldRef>> = vec![None; n_fields];
     for batch_result in shards {
         let batch = batch_result?;
-        for i in 0..schema.fields().len() {
-            if eligible[i]
-                && !needs[i]
-                && i < batch.num_columns()
-                && batch.column(i).null_count() > 0
-            {
-                needs[i] = true;
+        let batch_schema = batch.schema();
+
+        // Defend against producers that emit shards disagreeing on column
+        // count / name (positional capture below would otherwise silently
+        // mis-assign columns). Mirrors the read-side reconcile guard.
+        if batch.num_columns() != n_fields {
+            return Err(ConvertError::Other(format!(
+                "shard schema mismatch: dataframe schema has {n_fields} columns but a shard \
+                 has {} (columns must match by name and order across shards)",
+                batch.num_columns()
+            )));
+        }
+        for (i, field) in schema.fields().iter().enumerate() {
+            let shard_field = batch_schema.field(i);
+            if shard_field.name() != field.name() {
+                return Err(ConvertError::Other(format!(
+                    "shard schema mismatch: column {i} is '{}' in the dataframe schema but '{}' \
+                     in a shard (columns must match by name and order across shards)",
+                    field.name(),
+                    shard_field.name(),
+                )));
+            }
+
+            if eligible[i] && !needs_nullable[i] && batch.column(i).null_count() > 0 {
+                needs_nullable[i] = true;
+            }
+
+            if let DataType::Dictionary(_, value_type) = shard_field.data_type() {
+                match &dict_fields[i] {
+                    None => dict_fields[i] = Some(batch_schema.fields()[i].clone()),
+                    Some(seen) => {
+                        // Two shards declare this column categorical with
+                        // different value classes → corruption, not an
+                        // append-grown layout we can reconcile.
+                        let seen_vt = match seen.data_type() {
+                            DataType::Dictionary(_, v) => v.as_ref(),
+                            _ => unreachable!("dict_fields only stores Dictionary fields"),
+                        };
+                        if !cat_value_class_eq(seen_vt, value_type.as_ref()) {
+                            return Err(ConvertError::Other(format!(
+                                "shard schema mismatch: categorical column '{}' is a dictionary \
+                                 of {seen_vt:?} in one shard but {:?} in another",
+                                field.name(),
+                                value_type.as_ref(),
+                            )));
+                        }
+                    }
+                }
             }
         }
-        // Early exit once every eligible column is already flagged.
-        if eligible.iter().zip(&needs).all(|(e, n)| !e || *n) {
-            break;
-        }
     }
-    Ok(needs)
+    Ok(ColumnExportLayout {
+        needs_nullable,
+        dict_fields,
+    })
+}
+
+/// Two categorical value types belong to the same value *class* for export
+/// reconciliation: `Utf8`/`LargeUtf8` are interchangeable; every other type
+/// must match exactly. Used to reject a dictionary whose value class differs
+/// across shards (corruption) while allowing the harmless narrow/wide string
+/// difference the per-shard batches legitimately carry.
+fn cat_value_class_eq(a: &DataType, b: &DataType) -> bool {
+    fn is_string_like(t: &DataType) -> bool {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8)
+    }
+    a == b || (is_string_like(a) && is_string_like(b))
+}
+
+/// Build the unified export schema: the shard-0 `schema` with every column
+/// that is a `Dictionary` in *any* shard ([`ColumnExportLayout::dict_fields`])
+/// re-declared as that dictionary type, so a categorical column is exported as
+/// an h5ad categorical even when shard 0 happened to be plain (the reverse of
+/// the append-grown layout). The declared column **name** and **nullability**
+/// are preserved from the shard-0 schema; the `data_type` comes from the
+/// captured dictionary field; categorical metadata (`CATEGORICAL_ORDERED_KEY`,
+/// etc.) is the union of both (the captured dict field wins on conflict) so the
+/// `ordered` bit survives whichever shard carried it. Columns that are plain in
+/// every shard are returned unchanged, so homogeneous files produce an
+/// identical schema (no behavior change).
+pub(crate) fn build_unified_export_schema(schema: &Schema, layout: &ColumnExportLayout) -> Schema {
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(
+            |(i, schema_field)| match layout.dict_fields.get(i).and_then(|o| o.as_ref()) {
+                None => schema_field.clone(),
+                Some(dict_field) => {
+                    let mut metadata: HashMap<String, String> = schema_field.metadata().clone();
+                    for (k, v) in dict_field.metadata() {
+                        metadata.insert(k.clone(), v.clone());
+                    }
+                    Arc::new(
+                        Field::new(
+                            schema_field.name(),
+                            dict_field.data_type().clone(),
+                            schema_field.is_nullable(),
+                        )
+                        .with_metadata(metadata),
+                    )
+                }
+            },
+        )
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// Streaming counterpart of [`write_dataframe_group_at`]. Pre-allocates
@@ -1172,9 +1293,13 @@ where
 /// `i` is written with anndata's `nullable-integer` /
 /// `nullable-string-array` group encoding (it contains nulls); otherwise
 /// it is written as a plain dataset. Computed up front by
-/// [`super::stream_write::scan_nullable_columns`] because the HDF5
-/// datasets must be allocated before any shard is seen. Float columns
-/// ignore this flag (always plain datasets with `NaN` at nulls).
+/// [`scan_column_export_layout`] because the HDF5 datasets must be
+/// allocated before any shard is seen. Float columns ignore this flag
+/// (always plain datasets with `NaN` at nulls).
+///
+/// `schema` is the unified export schema from
+/// [`build_unified_export_schema`]: a column that is a `Dictionary` in any
+/// shard is declared categorical here even when shard 0 was plain.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_dataframe_group_streaming<I>(
     parent: &hdf5::Group,
