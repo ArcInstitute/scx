@@ -8,8 +8,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, DictionaryArray, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::{ConversionPredicateIndexOptions, QueryPipeline};
 use scx_format_io::header::FileHeader;
@@ -991,5 +991,373 @@ fn append_with_index_obs_on_sharded_var_base_preserves_var_section() {
         count_section(&target, SectionType::ObsPredicateIndex),
         1,
         "appended file should have exactly one obs_predicate_index section"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dictionary reconciliation + cover-validation regression coverage
+// for the assemble-consolidated append path (read_existing_axis →
+// scx_format_io::assemble_sharded_metadata). The assembler's behaviour is unit-
+// tested in scx-format-io/src/reader_tests.rs; these exercise it end-to-end
+// through the public append API on real sharded SCX files.
+// ---------------------------------------------------------------------------
+
+/// One obs shard whose `cell_type` is a `Dictionary(Int8, Utf8)` categorical
+/// drawing from `celltype_vocab` (rows cycle through it). `cell_id` /
+/// `perturbation` mirror `obs_with_categories` so the schema matches an
+/// `obs_with_categories` source on append — `validate_obs_schema`'s
+/// effective-type compare strips `cell_type`'s dictionary wrapper.
+fn dict_obs_shard(
+    row_start: usize,
+    n: usize,
+    perturbation: &str,
+    celltype_vocab: &[&str],
+) -> RecordBatch {
+    let ids: Vec<String> = (row_start..row_start + n)
+        .map(|i| format!("cell_{i}"))
+        .collect();
+    let cts: Vec<&str> = (0..n)
+        .map(|i| celltype_vocab[i % celltype_vocab.len()])
+        .collect();
+    let ct_dict: DictionaryArray<Int8Type> = cts.into_iter().collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("perturbation", DataType::Utf8, false),
+        Field::new(
+            "cell_type",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![perturbation; n])),
+            Arc::new(ct_dict),
+        ],
+    )
+    .unwrap()
+}
+
+/// Write a 2-obs-shard base whose `cell_type` is `Dictionary`-encoded with
+/// either disjoint (`ct_a*` vs `ct_b*`) or identical (`ct_x`) per-shard
+/// vocabularies — the layouts that stress the assembler's dictionary widen and
+/// unify, respectively. `n_per` rows per shard.
+fn write_dict_obs_sharded_file(
+    dir: &TempDir,
+    filename: &str,
+    perturbation: &str,
+    disjoint: bool,
+    n_per: usize,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let n_obs = n_per * 2;
+    let n_vars = 16usize;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let (v0, v1): (&[&str], &[&str]) = if disjoint {
+        (&["ct_a0", "ct_a1"], &["ct_b0", "ct_b1"])
+    } else {
+        (&["ct_x"], &["ct_x"])
+    };
+    let s0 = dict_obs_shard(0, n_per, perturbation, v0);
+    let s1 = dict_obs_shard(n_per, n_per, perturbation, v1);
+    writer
+        .write_obs_shard(0, 0, n_per as u64, n_obs as u64, &s0)
+        .unwrap();
+    writer
+        .write_obs_shard(1, n_per as u64, n_per as u64, n_obs as u64, &s1)
+        .unwrap();
+
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Distinct `cell_type` values from a (possibly dictionary-encoded) obs batch.
+fn distinct_celltypes(batch: &RecordBatch) -> std::collections::BTreeSet<String> {
+    let col = batch
+        .column_by_name("cell_type")
+        .expect("cell_type column present");
+    let utf8 = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let arr = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+    (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+}
+
+/// 2.1 — indexed append onto a base whose obs `cell_type` is dictionary-encoded
+/// with **disjoint** per-shard vocabularies must succeed and round-trip every
+/// category (the assembler widens the per-shard keys before concat instead of
+/// overflowing, and reconciles the appended plain-`Utf8` shard against the base
+/// dictionary shards).
+#[test]
+fn append_indexed_on_disjoint_dict_obs_base_roundtrips() {
+    let dir = TempDir::new().unwrap();
+    let target = write_dict_obs_sharded_file(&dir, "target.scx", "DRUG_A", true, 16);
+    {
+        let r = ScxReader::open(&target).unwrap();
+        assert!(
+            r.obs_metadata_shard_count() >= 2,
+            "fixture precondition: base obs must be row-sharded"
+        );
+    }
+    let source = write_test_file(&dir, "source.scx", 32, 16, "DRUG_B");
+    let source_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader_with_index_options(
+        &target,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+        &forced_obs_pert_options(),
+    )
+    .expect("indexed append onto a disjoint-dict-obs base must succeed");
+
+    let reader = ScxReader::open(&target).unwrap();
+    let obs = reader
+        .read_obs()
+        .expect("read_obs must succeed after append");
+    assert_eq!(obs.num_rows(), 64, "32 base + 32 appended rows");
+    let distinct = distinct_celltypes(&obs);
+    for c in ["ct_a0", "ct_a1", "ct_b0", "ct_b1", "A", "B"] {
+        assert!(
+            distinct.contains(c),
+            "reassembled cell_type must contain '{c}'; got {distinct:?}"
+        );
+    }
+}
+
+/// 2.2 — indexed append onto a base whose obs `cell_type` dictionary repeats the
+/// **same** single category in every shard must produce a *unified*
+/// (deduplicated) dictionary, not `["ct_x"; n_shards]` (which pandas rejects as
+/// non-unique categories).
+#[test]
+fn append_indexed_on_duplicate_dict_obs_base_unifies() {
+    let dir = TempDir::new().unwrap();
+    let target = write_dict_obs_sharded_file(&dir, "target.scx", "DRUG_A", false, 16);
+    let source = write_test_file(&dir, "source.scx", 32, 16, "DRUG_B");
+    let source_reader = ScxReader::open(&source).unwrap();
+    scx_ops::append_from_reader_with_index_options(
+        &target,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+        &forced_obs_pert_options(),
+    )
+    .expect("indexed append onto a duplicate-dict-obs base must succeed");
+
+    let reader = ScxReader::open(&target).unwrap();
+    let obs = reader
+        .read_obs()
+        .expect("read_obs must succeed after append");
+    // Base contributes the single "ct_x"; source contributes "A"/"B".
+    let distinct = distinct_celltypes(&obs);
+    assert_eq!(
+        distinct,
+        ["A", "B", "ct_x"]
+            .into_iter()
+            .map(String::from)
+            .collect::<std::collections::BTreeSet<_>>(),
+        "duplicate per-shard categories must be unified"
+    );
+    // The on-disk dictionary must carry each surviving category exactly once.
+    let col = obs.column_by_name("cell_type").unwrap();
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .expect("cell_type should stay dictionary-encoded (3 distinct → Int8 key)");
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("dictionary values should be Utf8");
+    assert_eq!(
+        values.len(),
+        3,
+        "duplicate 'ct_x' must collapse to one dictionary entry (got {:?})",
+        (0..values.len())
+            .map(|i| values.value(i))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// One var shard with a plain `gene_id` (Utf8) and a `Dictionary(Int8, Utf8)`
+/// `feature_type` drawing from `vocab`.
+fn dict_var_shard(row_start: usize, n: usize, vocab: &[&str]) -> RecordBatch {
+    let ids: Vec<String> = (row_start..row_start + n)
+        .map(|i| format!("gene_{i}"))
+        .collect();
+    let fts: Vec<&str> = (0..n).map(|i| vocab[i % vocab.len()]).collect();
+    let ft_dict: DictionaryArray<Int8Type> = fts.into_iter().collect();
+    let schema = Schema::new(vec![
+        Field::new("gene_id", DataType::Utf8, false),
+        Field::new(
+            "feature_type",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(ft_dict),
+        ],
+    )
+    .unwrap()
+}
+
+/// 2.3 — the var axis closes the same gap symmetrically: a `VarMetadataShard`
+/// base whose `feature_type` categorical has **disjoint** per-shard
+/// vocabularies must reassemble through the consolidated path (`read_var` and
+/// the append rebuild branch both delegate to `assemble_sharded_metadata`).
+#[test]
+fn read_var_on_disjoint_dict_var_base_roundtrips() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("var_dict.scx");
+    let n_per = 16usize;
+    let n_vars = n_per * 2;
+    let n_obs = 8usize;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs(&obs_with_categories(n_obs, "DRUG_A"))
+        .unwrap();
+    let s0 = dict_var_shard(0, n_per, &["protein_coding", "lncRNA"]);
+    let s1 = dict_var_shard(n_per, n_per, &["miRNA", "snoRNA"]);
+    writer
+        .write_var_shard(0, 0, n_per as u64, n_vars as u64, &s0)
+        .unwrap();
+    writer
+        .write_var_shard(1, n_per as u64, n_per as u64, n_vars as u64, &s1)
+        .unwrap();
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.var_metadata_shard_count() >= 2,
+        "fixture precondition: var must be row-sharded"
+    );
+    let var = reader
+        .read_var()
+        .expect("read_var must reassemble disjoint dict var");
+    assert_eq!(var.num_rows(), n_vars);
+    let col = var.column_by_name("feature_type").unwrap();
+    let utf8 = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let arr = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+    let distinct: std::collections::BTreeSet<String> =
+        (0..arr.len()).map(|i| arr.value(i).to_string()).collect();
+    for c in ["protein_coding", "lncRNA", "miRNA", "snoRNA"] {
+        assert!(
+            distinct.contains(c),
+            "reassembled feature_type must contain '{c}'; got {distinct:?}"
+        );
+    }
+}
+
+/// 2.4 — the consolidated path inherits the assembler's contiguous-cover
+/// validation. A base whose obs shards have a **gap** in their `row_start`
+/// stamps must now be rejected with a clear `InvalidCatalog` error on the
+/// append read path (`read_existing_axis` → `assemble_sharded_metadata`) rather
+/// than silently mis-assembled.
+#[test]
+fn append_on_gapped_obs_shard_cover_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("gapped.scx");
+    let n_per = 16usize;
+    let n_obs = n_per * 2;
+    let n_vars = 16usize;
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    let obs = obs_with_categories(n_obs, "DRUG_A");
+    // Shard 0 is well-formed; shard 1 stamps row_start = n_per + 4 (a gap of 4
+    // rows) instead of the contiguous n_per. The writer stamps verbatim.
+    writer
+        .write_obs_shard(0, 0, n_per as u64, n_obs as u64, &obs.slice(0, n_per))
+        .unwrap();
+    writer
+        .write_obs_shard(
+            1,
+            (n_per + 4) as u64,
+            n_per as u64,
+            n_obs as u64,
+            &obs.slice(n_per, n_per),
+        )
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    let (indptr, indices, values) = sample_shard(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let source = write_test_file(&dir, "source.scx", 16, n_vars, "DRUG_B");
+    let source_reader = ScxReader::open(&source).unwrap();
+    let err = scx_ops::append_from_reader_with_index_options(
+        &path,
+        &source_reader,
+        &AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: NonZeroU32::new(64).unwrap(),
+            modality_id: 0,
+        },
+        0,
+        &forced_obs_pert_options(),
+    )
+    .expect_err("append over a gapped obs-shard cover must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("row_start") || msg.contains("cover"),
+        "error must name the cover violation; got: {msg}"
     );
 }

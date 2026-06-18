@@ -982,6 +982,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   extract a single modality as h5ad; otherwise the call raises (use
   `pyscx.to_h5mu`). `stream=False` falls back to the materialising
   path (kept for parity / debugging).
+  - **Known limitation (categorical obs/var on append-grown files):** the default
+    streaming export reads per-shard batches directly (it does not route through
+    `assemble_sharded_metadata`), so a file whose sharded obs/var mixes
+    `Dictionary` (original) and plain-string (appended) representations for a
+    categorical column — the layout `append`/`append_from_anndata` produces — still
+    raises a `shard schema mismatch` on streaming export, even though
+    `pyscx.open(f).to_anndata()` / `.query()` now read it correctly. Workaround:
+    `stream=False` routes through `read_obs`/`read_var` and so handles these files.
+    A streaming-export fix (normalize per-shard representation, or bridge
+    dict↔plain in the writer) is tracked as follow-up.
   - `reader_threads`: parallel shard decoder pool. `None` (default)
     auto-resolves to `RAYON_NUM_THREADS` if set, else
     `os.cpu_count()`. `1` forces the sequential coordinator.
@@ -1015,7 +1025,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
 
 ### File operations
-- `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps).
+- `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps). Appending categorical `obs`/`var` onto a **row-sharded** base reassembles the existing metadata through the shared canonical assembler (`scx_format_io::assemble_sharded_metadata`), so disjoint/duplicate per-shard categorical vocabularies and a mixed `Dictionary`/plain-string shard layout are reconciled rather than failing to read back. A genuinely corrupt/gapped obs/var shard cover (non-contiguous `row_start` stamps) is now rejected with a clear error instead of being silently mis-assembled.
 - `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None, in_place=False, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Append from AnnData. Same `index_*` semantics as `append`.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, reshape_obs=False)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output. `reshape_obs=True` migrates legacy single-section obs metadata to the sharded `ObsMetadataShard` layout (mirrors `scx compact --reshape-obs`; useful after a backed `from_anndata` conversion).
