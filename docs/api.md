@@ -982,16 +982,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   extract a single modality as h5ad; otherwise the call raises (use
   `pyscx.to_h5mu`). `stream=False` falls back to the materialising
   path (kept for parity / debugging).
-  - **Known limitation (categorical obs/var on append-grown files):** the default
-    streaming export reads per-shard batches directly (it does not route through
-    `assemble_sharded_metadata`), so a file whose sharded obs/var mixes
-    `Dictionary` (original) and plain-string (appended) representations for a
-    categorical column — the layout `append`/`append_from_anndata` produces — still
-    raises a `shard schema mismatch` on streaming export, even though
-    `pyscx.open(f).to_anndata()` / `.query()` now read it correctly. Workaround:
-    `stream=False` routes through `read_obs`/`read_var` and so handles these files.
-    A streaming-export fix (normalize per-shard representation, or bridge
-    dict↔plain in the writer) is tracked as follow-up.
+  - **Categorical obs/var on append-grown files (handled):** a file whose sharded
+    obs/var mixes `Dictionary` (original) and plain (appended) representations for a
+    categorical column — the layout `append`/`append_from_anndata` produces — exports
+    a single h5ad categorical with the full unioned, de-duplicated vocabulary,
+    matching `pyscx.open(f).to_anndata()`. This holds for string **and** numeric
+    (`Int*`/`Float*`) categoricals, and for both `stream=True` and `stream=False`
+    (the fix lives in the shared streaming dataframe writer, which both paths use for
+    a sharded axis — there is no separate eager path to fall back to). Category code
+    *order* is best-effort and may differ from the read path under deletion vectors;
+    per-row values are authoritative.
   - `reader_threads`: parallel shard decoder pool. `None` (default)
     auto-resolves to `RAYON_NUM_THREADS` if set, else
     `os.cpu_count()`. `1` forces the sequential coordinator.
