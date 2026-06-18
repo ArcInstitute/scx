@@ -46,23 +46,6 @@ pub struct SparseCellSetBatch {
     pub role_tags: Vec<i32>,
 }
 
-/// Per-set/per-cell collation payload accompanying a [`SparseCellSetPlan`] —
-/// the RNG-dependent values state3 samples in Python (query gene ids + masks).
-#[derive(Clone, Debug)]
-pub struct CollatedCellSetPlan {
-    pub base: SparseCellSetPlan,
-    pub k_dec: usize,
-    /// `[n_sets * k_dec]` global query gene ids (one length-`k_dec` row per set).
-    pub query_gene_ids: Vec<i32>,
-    /// `[total_rows * k_dec]` per-cell encoder-mask positions over the query, or
-    /// **empty** to disable query-based encoder masking (perturbation path).
-    pub enc_mask_positions: Vec<u8>,
-    /// `[total_rows]` per-cell hide-gene-identity (readout) flags.
-    pub hide_readout: Vec<u8>,
-    /// `[n_sets]` measured panel size per set (for the `pflog1ppf` center).
-    pub n_measured: Vec<u32>,
-}
-
 /// Run-constant collation scalars.
 #[derive(Clone, Copy, Debug)]
 pub struct CollateScalars {
@@ -341,73 +324,6 @@ impl SparseCellSetLoader {
         })
     }
 
-    /// Like [`Self::iter_with_plans`] but additionally runs the per-cell
-    /// collation kernel (preprocess + top-K + gather + mask) in Rust, emitting
-    /// stacked `[total_rows, K]` tensors (state3 "3A hybrid"). Requires global
-    /// remap tables (gene ids must be comparable to the Python-sampled query).
-    pub fn iter_with_plans_collated<I>(
-        self: Arc<Self>,
-        plans: I,
-        lookahead: usize,
-        scalars: CollateScalars,
-    ) -> Box<dyn Iterator<Item = Result<CollatedCellSetBatch>> + Send + Sync>
-    where
-        I: Iterator<Item = Result<CollatedCellSetPlan>> + Send + 'static,
-    {
-        let engine = Arc::clone(&self.engine);
-        let loader = Arc::clone(&self);
-        let iter = engine.iter_with_plans(
-            plans,
-            lookahead,
-            |plan: &CollatedCellSetPlan| {
-                plan.base
-                    .file_ids
-                    .iter()
-                    .copied()
-                    .zip(plan.base.rows.iter().copied())
-                    .collect()
-            },
-            move |eng: &PrefetchEngine, plan: &CollatedCellSetPlan| {
-                loader.gather_collated(eng, plan, &scalars)
-            },
-        );
-        Box::new(iter)
-    }
-
-    /// Gather one batch and collate it per-cell (rayon over rows). The gathered
-    /// CSR is global-vocab, sorted, coalesced (via `remap_row`), exactly what the
-    /// kernel expects — matching state3's `finalize_csr_row` upstream of `specify`.
-    pub fn gather_collated(
-        &self,
-        engine: &PrefetchEngine,
-        plan: &CollatedCellSetPlan,
-        scalars: &CollateScalars,
-    ) -> Result<CollatedCellSetBatch> {
-        if self.remap.is_none() {
-            return Err(LoaderError::ConfigError {
-                reason: "gather_collated requires global-vocab remap tables (gene ids must be \
-                         comparable to the query)"
-                    .into(),
-            });
-        }
-        let sparse = self.gather(engine, &plan.base)?;
-        collate_gathered(
-            &sparse.indptr,
-            &sparse.indices,
-            &sparse.data,
-            &sparse.set_offsets,
-            sparse.cell_indices,
-            sparse.file_ids,
-            sparse.role_tags,
-            plan.k_dec,
-            &plan.query_gene_ids,
-            &plan.enc_mask_positions,
-            &plan.hide_readout,
-            &plan.n_measured,
-            scalars,
-        )
-    }
-
     /// Apply the optional remap + value-only transforms to one gathered row.
     fn transform_row(&self, fid: u32, idx: &[i32], dat: &[f32]) -> (Vec<i32>, Vec<f32>) {
         let (out_idx, mut out_dat) = match &self.remap {
@@ -469,7 +385,11 @@ pub fn collate_gathered(
     }
     let has_mask = !enc_mask_positions.is_empty();
     if has_mask && enc_mask_positions.len() != n_rows * k_dec {
-        return want("enc_mask_positions", enc_mask_positions.len(), n_rows * k_dec);
+        return want(
+            "enc_mask_positions",
+            enc_mask_positions.len(),
+            n_rows * k_dec,
+        );
     }
 
     // Row → set index, for per-set query / n_measured lookup.

@@ -28,13 +28,13 @@ pub use plan_engine::{PlanPrefetchIter, PrefetchEngine};
 pub use projection::{scatter_row_full, HvgProjection};
 pub use shuffle::{RowShuffler, ShardShuffler};
 pub use sparse_cellset::{
-    collate_gathered, CollateScalars, CollatedCellSetBatch, CollatedCellSetPlan,
-    SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan,
+    collate_gathered, CollateScalars, CollatedCellSetBatch, SparseCellSetBatch,
+    SparseCellSetLoader, SparseCellSetPlan,
 };
 pub use sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
 
 #[cfg(feature = "python")]
 pub use python::{
-    collate_cellset_gathered, CollatedCellSetBatchIter, IndexPlanDataset, MultimodalTrainingDataset,
-    SparseCellSetBatchIter, SparseCellSetDataset, TrainingDataset,
+    collate_cellset_gathered, IndexPlanDataset, MultimodalTrainingDataset, SparseCellSetBatchIter,
+    SparseCellSetDataset, TrainingDataset,
 };

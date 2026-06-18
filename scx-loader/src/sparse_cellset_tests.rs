@@ -293,12 +293,12 @@ fn run_one(
 }
 
 #[test]
-fn gather_collated_emits_stacked_tensors_matching_kernel() {
+fn collate_gathered_emits_stacked_tensors_matching_kernel() {
     use crate::sparse_cellset_collate::PreprocessMode;
     let dir = tempfile::tempdir().unwrap();
     let p0 = dir.path().join("f0.scx");
     write_fixture(&p0, 32, 8, 4); // row r: col r%8, val (r+1)&0xFF
-                                  // Identity remap (local g → global g) so gene ids are global.
+                                  // Identity remap (local g → global g) so gather emits global CSR.
     let loader = SparseCellSetLoader::new(
         vec![open(&p0)],
         8,
@@ -312,21 +312,23 @@ fn gather_collated_emits_stacked_tensors_matching_kernel() {
     )
     .unwrap();
 
-    // One set, two cells: row 2 (col2,val3), row 5 (col5,val6).
-    let k_dec = 4;
-    let plan = CollatedCellSetPlan {
-        base: SparseCellSetPlan {
-            file_ids: vec![0, 0],
-            rows: vec![2, 5],
-            role_tags: vec![0, 0],
-            set_offsets: vec![0, 2],
-        },
-        k_dec,
-        query_gene_ids: vec![2, 5, 7, 0], // shared across the set
-        enc_mask_positions: Vec::new(),   // pert-style: no encoder masking
-        hide_readout: vec![0, 0],
-        n_measured: vec![8],
-    };
+    // Gather one set, two cells: row 2 (col2,val3), row 5 (col5,val6) → global CSR,
+    // then collate it (the state3 flow: Python gathers, then collate_gathered).
+    let g = loader
+        .iter_with_plans(
+            vec![Ok(SparseCellSetPlan {
+                file_ids: vec![0, 0],
+                rows: vec![2, 5],
+                role_tags: vec![0, 0],
+                set_offsets: vec![0, 2],
+            })]
+            .into_iter(),
+            4,
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+
     let scalars = CollateScalars {
         k_enc: 4,
         mode: PreprocessMode::Log1pRaw,
@@ -334,11 +336,22 @@ fn gather_collated_emits_stacked_tensors_matching_kernel() {
         n_genes_total: 8,
         lib_size_redef: false,
     };
-    let b = loader
-        .iter_with_plans_collated(vec![Ok(plan)].into_iter(), 4, scalars)
-        .next()
-        .unwrap()
-        .unwrap();
+    let b = collate_gathered(
+        &g.indptr,
+        &g.indices,
+        &g.data,
+        &g.set_offsets,
+        g.cell_indices,
+        g.file_ids,
+        g.role_tags,
+        /*k_dec*/ 4,
+        &[2, 5, 7, 0], // query (shared across the set)
+        &[],           // enc_mask_positions: pert-style (no encoder masking)
+        &[0, 0],       // hide_readout
+        &[8],          // n_measured
+        &scalars,
+    )
+    .unwrap();
 
     assert_eq!(b.n_rows, 2);
     assert_eq!((b.k_enc, b.k_dec), (4, 4));
@@ -354,37 +367,6 @@ fn gather_collated_emits_stacked_tensors_matching_kernel() {
     assert_eq!(&b.encoder_gene_ids[4..8], &[5, 9, 9, 9]);
     assert_eq!(&b.target_counts[4..8], &[0.0, 6.0, 0.0, 0.0]);
     assert_eq!(b.library_size[1], 6.0);
-}
-
-#[test]
-fn gather_collated_requires_remap() {
-    let dir = tempfile::tempdir().unwrap();
-    let loader = malformed_plan_loader(dir.path()); // built without remap
-    let plan = CollatedCellSetPlan {
-        base: SparseCellSetPlan {
-            file_ids: vec![0],
-            rows: vec![1],
-            role_tags: vec![0],
-            set_offsets: vec![0, 1],
-        },
-        k_dec: 2,
-        query_gene_ids: vec![0, 1],
-        enc_mask_positions: Vec::new(),
-        hide_readout: vec![0],
-        n_measured: vec![8],
-    };
-    let scalars = CollateScalars {
-        k_enc: 2,
-        mode: crate::sparse_cellset_collate::PreprocessMode::Log1pRaw,
-        target_sum: 1e4,
-        n_genes_total: 8,
-        lib_size_redef: false,
-    };
-    let got = loader
-        .iter_with_plans_collated(vec![Ok(plan)].into_iter(), 2, scalars)
-        .next()
-        .unwrap();
-    assert!(matches!(got, Err(LoaderError::ConfigError { .. })));
 }
 
 #[test]
