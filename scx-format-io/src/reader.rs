@@ -2230,6 +2230,14 @@ pub fn assemble_sharded_metadata(
         })
         .collect::<Result<_>>()?;
 
+    // Reconcile columns that disagree on Dictionary-vs-plain encoding across
+    // shards (an append writes obs categoricals as plain Utf8 while
+    // `from_anndata` writes them as Dictionary, so a sharded axis can carry both
+    // representations). `concat_batches` requires one shared schema, so encode
+    // the plain shards' columns to Dictionary before concat. No-op when every
+    // shard already agrees.
+    let batches = crate::arrow_compat::reconcile_dictionary_representations(batches)?;
+
     // Verify the shards form a contiguous, ordered cover by walking their
     // stamped metadata. Each shard's `n_rows_total` is the file's logical
     // row count *at the time that shard was written* — for single-pass
@@ -2353,6 +2361,11 @@ pub fn assemble_filtered_metadata(
                 .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
         })
         .collect::<Result<_>>()?;
+
+    // Reconcile Dictionary-vs-plain disagreement across the filtered shards
+    // (see `assemble_sharded_metadata`) so concat can't reject a mixed-encoding
+    // column produced by an append. No-op when shards already agree.
+    let wide = crate::arrow_compat::reconcile_dictionary_representations(wide)?;
 
     let wide_schema = wide[0].schema();
     let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;

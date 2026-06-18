@@ -225,6 +225,95 @@ def test_append_from_anndata_with_index_obs_on_sharded_var_file(tmp_dir):
     assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 32
 
 
+def test_append_categorical_obs_on_sharded_base_roundtrips(tmp_dir):
+    """Any categorical-obs append onto a row-sharded obs base must produce a
+    file whose obs reassembles. The base is forced sharded with n_obs=200 >
+    shard_size=100 (2 ObsMetadataShard rows). Vocabulary overlap is irrelevant:
+    the failure was a physical-type mismatch between the Dictionary-encoded base
+    shards and the Utf8-encoded appended shards (append's unify_dict_columns
+    decodes new obs categoricals to plain Utf8 while from_anndata writes them as
+    Dictionary), not a vocab-cardinality issue.
+
+    Fixed by the Phase-0.5 assembler hardening: assemble_sharded_metadata now
+    reconciles heterogeneous Dictionary-vs-plain columns before concat, so the
+    read path (to_anndata / query) round-trips on a file an append produced.
+    Pre-fix this raised 'cannot concatenate arrays of different data types
+    (Dictionary(Int32, LargeUtf8), LargeUtf8)'.
+    """
+    target = tmp_dir / "target.scx"
+    shard_size = 100  # n_obs (200) > shard_size => obs is row-sharded.
+
+    pyscx.from_anndata(
+        _mk_adata(200, 16, "DRUG_A"),
+        str(target),
+        shard_size=shard_size,
+    )
+
+    base = pyscx.open(str(target))
+    assert base.obs_metadata_shard_count >= 2, (
+        "fixture precondition: base obs must be row-sharded "
+        f"(got {base.obs_metadata_shard_count} shards)"
+    )
+
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata(200, 16, "DRUG_B"),
+        index_obs=["perturbation"],
+        shard_size=shard_size,
+    )
+
+    exp = pyscx.open(str(target))
+    ad = exp.to_anndata()
+    assert ad.n_obs == 400
+    assert set(map(str, ad.obs["perturbation"].unique())) == {"DRUG_A", "DRUG_B"}
+    # Indexed pushdown must also round-trip on the reassembled file.
+    assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 200
+    assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 200
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Phase-1 tripwire. The Phase-0.5 assembler hardening fixes the READ "
+        "path (assemble_sharded_metadata), but append still reassembles existing "
+        "obs through the hand-rolled read_existing_obs (no reconcile). Once a "
+        "first append has produced heterogeneous Dictionary+Utf8 on-disk shards, "
+        "a *second* append's read_existing_obs hits the same 'cannot concatenate "
+        "different data types' failure. Remove this marker in Phase 1 when "
+        "read_existing_obs is consolidated onto assemble_sharded_metadata."
+    ),
+)
+def test_second_append_over_heterogeneous_obs_shards(tmp_dir):
+    """A second append onto a base that already mixes Dictionary (original) and
+    Utf8 (first-append) obs shards must succeed. This exercises the append-path
+    reassembly (read_existing_obs), distinct from the read-path round-trip in
+    test_append_categorical_obs_on_sharded_base_roundtrips. Fixed by the Phase-1
+    consolidation, not by Phase 0.5.
+    """
+    target = tmp_dir / "target.scx"
+    shard_size = 100
+
+    pyscx.from_anndata(_mk_adata(200, 16, "DRUG_A"), str(target), shard_size=shard_size)
+    # First append -> heterogeneous on-disk obs (Dictionary base + Utf8 appended).
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata(200, 16, "DRUG_B"),
+        index_obs=["perturbation"],
+        shard_size=shard_size,
+    )
+    # Second append -> read_existing_obs must reassemble the heterogeneous shards.
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata(100, 16, "DRUG_A"),
+        index_obs=["perturbation"],
+        shard_size=shard_size,
+    )
+
+    exp = pyscx.open(str(target))
+    assert exp.n_obs == 500
+    assert exp.to_anndata().n_obs == 500
+
+
 def test_append_with_index_options_writes_predicate_index(tmp_dir):
     target = tmp_dir / "target.scx"
     source = tmp_dir / "source.scx"
