@@ -732,6 +732,59 @@ fn test_assemble_reconciles_mixed_dictionary_and_plain_shards() {
     );
 }
 
+/// Offset-overflow protection: the assembler upcasts to `LargeUtf8` before
+/// concat (so a combined string column above `i32::MAX` can't overflow Arrow's
+/// 32-bit offsets) and opportunistically narrows back afterwards. Drive a
+/// shard set whose `cell_id` is already `LargeUtf8` on input and assert the
+/// assembler concats without error and round-trips every value — a cheap proxy
+/// for the >2 GB path that proves the consolidation did not drop the wide
+/// handling the hand-rolled copies relied on.
+#[test]
+fn test_assemble_preserves_wide_offset_string_column() {
+    use arrow::array::{Array, LargeStringArray};
+
+    let n_shards = 3u32;
+    let per_shard = 2usize;
+    let total = per_shard * n_shards as usize;
+    let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+        .map(|shard_idx| {
+            let row_start = shard_idx as usize * per_shard;
+            let ids: Vec<String> = (0..per_shard)
+                .map(|j| format!("cell_{}", row_start + j))
+                .collect();
+            // Force the wide encoding on input.
+            let col = LargeStringArray::from(ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            let metadata = std::collections::HashMap::from([
+                ("shard_idx".to_string(), shard_idx.to_string()),
+                ("row_start".to_string(), row_start.to_string()),
+                ("n_shard_rows".to_string(), per_shard.to_string()),
+                ("n_rows_total".to_string(), total.to_string()),
+            ]);
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("cell_id", DataType::LargeUtf8, false)])
+                    .with_metadata(metadata),
+            );
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+            (shard_idx, batch)
+        })
+        .collect();
+
+    let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+    assert_eq!(merged.num_rows(), total);
+    // Small payload → opportunistically narrowed back to Utf8.
+    assert_eq!(merged.column(0).data_type(), &DataType::Utf8);
+    let arr = merged
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cell_id narrows to Utf8 when offsets fit");
+    let got: Vec<&str> = (0..arr.len()).map(|i| arr.value(i)).collect();
+    assert_eq!(
+        got,
+        (0..total).map(|i| format!("cell_{i}")).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn test_read_obs_schema_matches_full() {
     let dir = tempfile::tempdir().unwrap();

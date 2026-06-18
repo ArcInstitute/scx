@@ -50,6 +50,20 @@ def _mk_adata(n_obs: int, n_vars: int, perturbation: str) -> anndata.AnnData:
     return anndata.AnnData(X=x, obs=obs, var=var)
 
 
+def _mk_adata_celltypes(
+    n_obs: int, n_vars: int, perturbation: str, celltypes: list[str]
+) -> anndata.AnnData:
+    """Like `_mk_adata` but draws `cell_type` from a caller-supplied vocabulary
+    (cells cycle through it). Used to build chunks whose `cell_type` categorical
+    vocabularies are *disjoint* across appended files, stressing the assembler's
+    dictionary widen + unify + reconcile through the append path."""
+    ad = _mk_adata(n_obs, n_vars, perturbation)
+    ad.obs["cell_type"] = pd.Categorical(
+        [celltypes[i % len(celltypes)] for i in range(n_obs)]
+    )
+    return ad
+
+
 def test_merge_with_index_obs_writes_predicate_index(tmp_dir):
     a = tmp_dir / "a.scx"
     b = tmp_dir / "b.scx"
@@ -304,6 +318,76 @@ def test_second_append_over_heterogeneous_obs_shards(tmp_dir):
     exp = pyscx.open(str(target))
     assert exp.n_obs == 500
     assert exp.to_anndata().n_obs == 500
+
+
+def test_append_from_anndata_disjoint_categorical_obs_indexed(tmp_dir):
+    """2.5 — indexed append onto a sharded-obs base whose `cell_type`
+    categorical vocabulary is **disjoint** from the appended chunk must succeed
+    and round-trip through pandas. n_obs=64 > shard_size=32 forces obs sharding
+    (and n_vars=64 > 32 forces var sharding, as #277's test does). Pre-fix the
+    Dictionary(base)/Utf8(appended) shard mix made `to_anndata()` raise."""
+    target = tmp_dir / "target.scx"
+    shard_size = 32
+
+    pyscx.from_anndata(
+        _mk_adata_celltypes(64, 64, "DRUG_A", ["fibroblast", "epithelial"]),
+        str(target),
+        shard_size=shard_size,
+    )
+    base = pyscx.open(str(target))
+    assert base.obs_metadata_shard_count >= 2, (
+        "fixture precondition: base obs must be row-sharded "
+        f"(got {base.obs_metadata_shard_count})"
+    )
+
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata_celltypes(64, 64, "DRUG_B", ["neuron", "astrocyte"]),
+        index_obs=["perturbation", "cell_type"],
+        shard_size=shard_size,
+    )
+
+    exp = pyscx.open(str(target))
+    ad = exp.to_anndata()
+    assert ad.n_obs == 128
+    assert set(map(str, ad.obs["cell_type"].unique())) == {
+        "fibroblast",
+        "epithelial",
+        "neuron",
+        "astrocyte",
+    }
+    assert exp.query().filter_obs('perturbation == "DRUG_A"').count() == 64
+    assert exp.query().filter_obs('perturbation == "DRUG_B"').count() == 64
+
+
+def test_append_from_anndata_disjoint_categorical_obs_non_indexed(tmp_dir):
+    """2.5 (blast radius) — the same disjoint-categorical append with **no**
+    `index_obs` must also round-trip. `read_existing_obs`/`read_existing_axis`
+    runs on every append, indexed or not, so the non-indexed path is exercised
+    here too (§1.2)."""
+    target = tmp_dir / "target.scx"
+    shard_size = 32
+
+    pyscx.from_anndata(
+        _mk_adata_celltypes(64, 64, "DRUG_A", ["fibroblast", "epithelial"]),
+        str(target),
+        shard_size=shard_size,
+    )
+    pyscx.append_from_anndata(
+        str(target),
+        _mk_adata_celltypes(64, 64, "DRUG_B", ["neuron", "astrocyte"]),
+        shard_size=shard_size,
+    )
+
+    exp = pyscx.open(str(target))
+    ad = exp.to_anndata()
+    assert ad.n_obs == 128
+    assert set(map(str, ad.obs["cell_type"].unique())) == {
+        "fibroblast",
+        "epithelial",
+        "neuron",
+        "astrocyte",
+    }
 
 
 def test_append_with_index_options_writes_predicate_index(tmp_dir):
