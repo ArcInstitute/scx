@@ -2068,4 +2068,363 @@ mod streaming_obs_hdf5 {
         assert_eq!(cats.value(ct_out.keys().value(1) as usize), "typeB");
         assert_eq!(cats.value(ct_out.keys().value(3) as usize), "typeA");
     }
+
+    // ---- Phase 3 (SCX-STREAMING-EXPORT-DICT-RECONCILE) regression coverage ----
+    //
+    // These exercise the heterogeneous dict/plain reconciliation across shard
+    // *representation* permutations that the pyscx `from_anndata`/`append` flow
+    // cannot produce directly (reverse layout, interleaved, duplicate vocab,
+    // high-cardinality, all-plain, deletion-vector pruning). Each builds the
+    // shards with explicit per-shard representations and drives the real
+    // streaming export (`write_scx_to_h5ad_streaming`, which computes the
+    // unified schema), then asserts on the on-disk categorical group.
+
+    use crate::h5ad::write::{build_unified_export_schema, scan_column_export_layout};
+
+    /// One obs shard: `cell_id` (index) + a string `cell_type` column, written
+    /// either as a `Dictionary<Int8, Utf8>` (`dict=true`) or a plain `Utf8`
+    /// (`dict=false`). Lets a test mix representations across shards.
+    fn str_cat_obs_shard(start: usize, vals: &[&str], dict: bool) -> RecordBatch {
+        let n = vals.len();
+        let cell_ids: Vec<String> = (start..start + n).map(|i| format!("cell_{i:06}")).collect();
+        let cell_arr: ArrayRef = Arc::new(StringArray::from(cell_ids));
+        let (ct_field, ct_arr): (Field, ArrayRef) = if dict {
+            let d = DictionaryArray::<Int8Type>::from_iter(vals.iter().map(|s| Some(*s)));
+            (
+                Field::new("cell_type", d.data_type().clone(), false),
+                Arc::new(d),
+            )
+        } else {
+            (
+                Field::new("cell_type", DataType::Utf8, false),
+                Arc::new(StringArray::from(vals.to_vec())),
+            )
+        };
+        let schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false), ct_field]);
+        RecordBatch::try_new(Arc::new(schema), vec![cell_arr, ct_arr]).unwrap()
+    }
+
+    /// One var shard: `gene_id` (index) + a string `feature_type` column,
+    /// dict or plain — the var-axis mirror of [`str_cat_obs_shard`].
+    fn str_cat_var_shard(start: usize, vals: &[&str], dict: bool) -> RecordBatch {
+        let n = vals.len();
+        let gene_ids: Vec<String> = (start..start + n).map(|i| format!("gene_{i:06}")).collect();
+        let gene_arr: ArrayRef = Arc::new(StringArray::from(gene_ids));
+        let (ft_field, ft_arr): (Field, ArrayRef) = if dict {
+            let d = DictionaryArray::<Int8Type>::from_iter(vals.iter().map(|s| Some(*s)));
+            (
+                Field::new("feature_type", d.data_type().clone(), false),
+                Arc::new(d),
+            )
+        } else {
+            (
+                Field::new("feature_type", DataType::Utf8, false),
+                Arc::new(StringArray::from(vals.to_vec())),
+            )
+        };
+        let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false), ft_field]);
+        RecordBatch::try_new(Arc::new(schema), vec![gene_arr, ft_arr]).unwrap()
+    }
+
+    /// Write `shard_batches` as a sharded-obs SCX (one empty CSR shard each),
+    /// export via the streaming writer, and open the output h5ad.
+    fn export_mixed_obs_shards(dir: &std::path::Path, shard_batches: &[RecordBatch]) -> hdf5::File {
+        let rows: Vec<u64> = shard_batches.iter().map(|b| b.num_rows() as u64).collect();
+        let n_obs: u64 = rows.iter().sum();
+        let scx_path = dir.join("mixed_obs.scx");
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(n_obs, 4)).unwrap();
+            let mut row_start = 0u64;
+            for (i, batch) in shard_batches.iter().enumerate() {
+                writer
+                    .write_obs_shard(i as u32, row_start, rows[i], n_obs, batch)
+                    .unwrap();
+                write_zero_csr_shard(&mut writer, row_start, rows[i]);
+                row_start += rows[i];
+            }
+            writer.write_var(&small_var_batch()).unwrap();
+            writer.finish().unwrap();
+        }
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(reader.obs_metadata_shard_count(), shard_batches.len());
+        let h5ad = dir.join("out.h5ad");
+        write_scx_to_h5ad_streaming(
+            &scx_path,
+            &h5ad,
+            &ConvertOptions::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        hdf5::File::open(&h5ad).unwrap()
+    }
+
+    /// Read a categorical column's on-disk `(categories, codes)` from a
+    /// `dataframe` group (`"obs"` / `"var"`).
+    fn read_str_cat(file: &hdf5::File, grp: &str, col: &str) -> (Vec<String>, Vec<i32>) {
+        let g = file.group(grp).unwrap().group(col).unwrap();
+        let cats: Vec<String> = g
+            .dataset("categories")
+            .unwrap()
+            .read_1d::<hdf5::types::VarLenUnicode>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        let codes: Vec<i32> = g
+            .dataset("codes")
+            .unwrap()
+            .read_1d::<i32>()
+            .unwrap()
+            .to_vec();
+        (cats, codes)
+    }
+
+    /// Per-row decoded category strings (None for code `-1`).
+    fn cat_rows(cats: &[String], codes: &[i32]) -> Vec<Option<String>> {
+        codes
+            .iter()
+            .map(|&c| {
+                if c < 0 {
+                    None
+                } else {
+                    Some(cats[c as usize].clone())
+                }
+            })
+            .collect()
+    }
+
+    fn cat_set(cats: &[String]) -> std::collections::HashSet<String> {
+        cats.iter().cloned().collect()
+    }
+
+    fn owned_to_refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(|s| s.as_str()).collect()
+    }
+
+    /// 3.2 — a category present in both a dict shard and a plain shard unifies
+    /// to a single deduplicated entry.
+    #[test]
+    fn test_p3_2_duplicate_category_across_dict_and_plain_shards_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B", "A", "B"], true);
+        let s1 = str_cat_obs_shard(4, &["B", "C", "B", "C"], false); // B duplicates s0
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from(["A".into(), "B".into(), "C".into()]),
+        );
+        assert_eq!(cats.len(), 3, "duplicate 'B' must not be repeated");
+        let want: Vec<Option<String>> = ["A", "B", "A", "B", "B", "C", "B", "C"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// 3.3 — reverse layout: a plain shard 0 followed by a dictionary shard
+    /// still exports as a single categorical (exercises §3.1's unified decision
+    /// + §3.3's plain shard-0 handling).
+    #[test]
+    fn test_p3_3_reverse_layout_plain_then_dict() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B", "A"], false); // plain shard 0
+        let s1 = str_cat_obs_shard(3, &["C", "D", "C"], true); // dict later shard
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from(["A".into(), "B".into(), "C".into(), "D".into()]),
+        );
+        let want: Vec<Option<String>> = ["A", "B", "A", "C", "D", "C"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
+
+    /// 3.4 — var axis: a heterogeneous dict/plain `feature_type` exports as a
+    /// categorical, symmetric with obs.
+    #[test]
+    fn test_p3_4_var_axis_heterogeneous_feature_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let v0 = str_cat_var_shard(0, &["Gene Expression", "Peaks"], true);
+        let v1 = str_cat_var_shard(2, &["Antibody Capture", "Peaks"], false);
+        let n_vars: u64 = (v0.num_rows() + v1.num_rows()) as u64;
+        let scx_path = dir.path().join("mixed_var.scx");
+        {
+            let mut writer = ScxWriter::new(&scx_path, header(2, n_vars)).unwrap();
+            // tiny single-section obs (2 rows) + matching empty CSR.
+            let obs = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "cell_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![Arc::new(StringArray::from(vec!["c0", "c1"]))],
+            )
+            .unwrap();
+            writer.write_obs(&obs).unwrap();
+            let mut row_start = 0u64;
+            for (i, b) in [&v0, &v1].into_iter().enumerate() {
+                let n = b.num_rows() as u64;
+                writer
+                    .write_var_shard(i as u32, row_start, n, n_vars, b)
+                    .unwrap();
+                row_start += n;
+            }
+            write_zero_csr_shard(&mut writer, 0, 2);
+            writer.finish().unwrap();
+        }
+        let reader = ScxReader::open(&scx_path).unwrap();
+        assert_eq!(reader.var_metadata_shard_count(), 2, "var must be sharded");
+        let h5ad = dir.path().join("out.h5ad");
+        write_scx_to_h5ad_streaming(
+            &scx_path,
+            &h5ad,
+            &ConvertOptions::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        let file = hdf5::File::open(&h5ad).unwrap();
+        let (cats, _codes) = read_str_cat(&file, "var", "feature_type");
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from([
+                "Gene Expression".into(),
+                "Peaks".into(),
+                "Antibody Capture".into(),
+            ]),
+        );
+    }
+
+    /// 3.5 — a deletion vector that drops every row of a category present in
+    /// only one shard prunes that category from the exported `categories`
+    /// (the `kept_local` path on a plain shard). Driven at the
+    /// `write_dataframe_group_streaming` level with an explicit keep mask.
+    #[test]
+    fn test_p3_5_deletion_vector_prunes_singleton_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B", "A", "B"], true); // rows 0..4
+        let s1 = str_cat_obs_shard(4, &["C", "C"], false); // rows 4..6, 'C' only here
+        let shard0_schema = s0.schema();
+        let shards = vec![s0, s1];
+        let layout =
+            scan_column_export_layout(shards.iter().cloned().map(Ok), &shard0_schema).unwrap();
+        let unified = build_unified_export_schema(&shard0_schema, &layout);
+
+        // Keep all of shard 0, drop all of shard 1.
+        let keep_mask = [true, true, true, true, false, false];
+        let file = hdf5::File::create(dir.path().join("dv.h5ad")).unwrap();
+        let root = file.as_group().unwrap();
+        write_dataframe_group_streaming(
+            &root,
+            "obs",
+            &unified,
+            shards.into_iter().map(Ok),
+            4,
+            Some(&keep_mask),
+            &layout.needs_nullable,
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+        drop(file);
+
+        let file = hdf5::File::open(dir.path().join("dv.h5ad")).unwrap();
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert!(
+            !cats.contains(&"C".to_string()),
+            "category 'C' (only in deletion-dropped rows) must be pruned, got {cats:?}"
+        );
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from(["A".into(), "B".into()]),
+        );
+        assert_eq!(codes.len(), 4, "only kept rows written");
+    }
+
+    /// 3.6 — a string column that is plain in *every* shard stays a plain
+    /// dataset (no spurious categorical group); numeric mirror for an Int64
+    /// column that is plain everywhere.
+    #[test]
+    fn test_p3_6_all_plain_columns_stay_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two shards, both plain Utf8 `note` + plain Int64 `count`.
+        let shard = |start: usize, notes: &[&str], counts: &[i64]| {
+            let cell_ids: Vec<String> = (start..start + notes.len())
+                .map(|i| format!("cell_{i:06}"))
+                .collect();
+            let schema = Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("note", DataType::Utf8, false),
+                Field::new("count", DataType::Int64, false),
+            ]);
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(StringArray::from(cell_ids)) as ArrayRef,
+                    Arc::new(StringArray::from(notes.to_vec())) as ArrayRef,
+                    Arc::new(Int64Array::from(counts.to_vec())) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+        let s0 = shard(0, &["x", "y"], &[1, 2]);
+        let s1 = shard(2, &["x", "z"], &[3, 4]);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let obs = file.group("obs").unwrap();
+        assert!(
+            obs.dataset("note").is_ok(),
+            "all-plain string column must stay a plain dataset"
+        );
+        assert!(
+            obs.group("note").is_err(),
+            "all-plain string column must NOT become a categorical group"
+        );
+        assert!(
+            obs.dataset("count").is_ok(),
+            "all-plain Int64 column must stay a plain dataset"
+        );
+        assert!(obs.group("count").is_err(), "no spurious categorical group");
+    }
+
+    /// 3.10 — a union exceeding 127 categories over an `Int8`-keyed base
+    /// dictionary plus a plain shard round-trips: the export's uniform i32
+    /// codes sidestep the i8 key-overflow on the concat path.
+    #[test]
+    fn test_p3_10_high_cardinality_union_exceeds_i8_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let base: Vec<String> = (0..120).map(|i| format!("c{i}")).collect(); // Int8 keys 0..119 OK
+        let app: Vec<String> = (120..220).map(|i| format!("c{i}")).collect(); // 100 new → union 220
+        let s0 = str_cat_obs_shard(0, &owned_to_refs(&base), true);
+        let s1 = str_cat_obs_shard(120, &owned_to_refs(&app), false);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(cats.len(), 220, "all categories unioned");
+        assert!(
+            *codes.iter().max().unwrap() >= 128,
+            "i32 codes must exceed the i8 key range without overflow"
+        );
+    }
+
+    /// 3.11 — interleaved dict / plain / dict shard order interns correctly
+    /// across a non-monotonic representation sequence.
+    #[test]
+    fn test_p3_11_interleaved_dict_plain_dict() {
+        let dir = tempfile::tempdir().unwrap();
+        let s0 = str_cat_obs_shard(0, &["A", "B"], true);
+        let s1 = str_cat_obs_shard(2, &["C", "A"], false);
+        let s2 = str_cat_obs_shard(4, &["D", "B"], true);
+        let file = export_mixed_obs_shards(dir.path(), &[s0, s1, s2]);
+        let (cats, codes) = read_str_cat(&file, "obs", "cell_type");
+        assert_eq!(
+            cat_set(&cats),
+            std::collections::HashSet::from(["A".into(), "B".into(), "C".into(), "D".into(),]),
+        );
+        let want: Vec<Option<String>> = ["A", "B", "C", "A", "D", "B"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+        assert_eq!(cat_rows(&cats, &codes), want);
+    }
 }
