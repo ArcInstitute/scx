@@ -153,6 +153,21 @@ def test_count_does_not_consume_pipeline(query_adata, scx_from_adata):
     assert qr.n_obs == 40
 
 
+def test_count_ignores_limit(query_adata, scx_from_adata):
+    """count() reports the full match count, ignoring limit (engine CLI6 contract).
+
+    (Previously pyscx count() ran a full collect() and so reflected the limit;
+    it now routes to the no-decode engine count, which ignores limit.)
+    """
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+    p.filter_obs("cell_type == 'T cell'")  # 40 T cells
+    p.limit(5)
+    assert p.count() == 40  # full match count, not 5
+
+
 def test_exists_matches_count(query_adata, scx_from_adata):
     """exists() agrees with count() > 0 and is non-consuming."""
     import pyscx

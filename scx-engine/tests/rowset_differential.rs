@@ -25,18 +25,30 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use roaring::RoaringBitmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::{
     build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions, QueryPipeline,
 };
 use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::DeletionVectors;
 use tempfile::TempDir;
 
 const N_OBS: u64 = 40;
 const N_VARS: usize = 6;
 const ROWS_PER_SHARD: usize = 8; // 5 shards; obs shards == CSR shards
 const N_SHARDS: usize = 5;
+
+/// Deleted global rows (exercises the deletion-vector path in BOTH the row-set
+/// `deletion_rowset` and the legacy obs_mask loop). Written below as CSR-shard
+/// -local deletions: shard 0 local {1,3} -> global {1,3}; shard 2 local {0,2}
+/// -> global {16,18}.
+const DELETED_GLOBAL: &[usize] = &[1, 3, 16, 18];
+
+fn is_deleted(i: usize) -> bool {
+    DELETED_GLOBAL.contains(&i)
+}
 
 // ---- Ground-truth obs columns (deterministic) ----
 
@@ -157,6 +169,18 @@ fn build_fixture(dir: &TempDir) -> PathBuf {
     for s in 0..N_SHARDS {
         write_csr_shard(&mut writer, ROWS_PER_SHARD, (s * ROWS_PER_SHARD) as u64);
     }
+
+    // Deletion vectors keyed by CSR shard index (matches DELETED_GLOBAL).
+    let mut dv = DeletionVectors::new();
+    let mut bm0 = RoaringBitmap::new();
+    bm0.insert(1); // global 1
+    bm0.insert(3); // global 3
+    dv.shards.insert(0, bm0);
+    let mut bm2 = RoaringBitmap::new();
+    bm2.insert(0); // shard 2 starts at global 16 -> global 16
+    bm2.insert(2); // -> global 18
+    dv.shards.insert(2, bm2);
+    writer.write_deletion_vectors(&dv).unwrap();
 
     // Index keyed to CSR shard ranges (mirrors merge/compact/conversion).
     let csr_row_ranges: Vec<(u64, u64)> = (0..N_SHARDS)
@@ -306,16 +330,29 @@ fn rowset_path_matches_legacy_path() {
     // cross-check BOTH paths against ground truth.
     std::env::remove_var("SCX_DISABLE_ROWSET_PUSHDOWN");
     {
-        // cell_type == 'T cell': rows where i%7!=0 and i%3==0.
+        // cell_type == 'T cell': rows where i%7!=0 and i%3==0, MINUS deleted rows
+        // (cell_3, cell_18 are deleted T cells) — proves deletion_rowset applies.
         let expected: Vec<String> = (0..N_OBS as usize)
-            .filter(|&i| cell_type_at(i) == Some("T cell"))
+            .filter(|&i| cell_type_at(i) == Some("T cell") && !is_deleted(i))
             .map(|i| format!("cell_{i}"))
             .collect();
         let got = run(&path, "cell_type == 'T cell'", None);
         let got_ids: Vec<String> = got.cell_ids.into_iter().flatten().collect();
         assert_eq!(
             got_ids, expected,
-            "ground-truth check for cell_type == 'T cell'"
+            "ground-truth check for cell_type == 'T cell' (deletions applied)"
+        );
+        assert!(
+            !got_ids.contains(&"cell_3".to_string()) && !got_ids.contains(&"cell_18".to_string()),
+            "deleted T cells must be excluded on the row-set path"
+        );
+
+        // A deleted B cell (cell_1) must be absent too.
+        let b = run(&path, "cell_type == 'B cell'", None);
+        let b_ids: Vec<String> = b.cell_ids.into_iter().flatten().collect();
+        assert!(
+            !b_ids.contains(&"cell_1".to_string()) && !b_ids.contains(&"cell_16".to_string()),
+            "deleted B cells must be excluded on the row-set path"
         );
 
         // Absent value -> empty.

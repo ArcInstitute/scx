@@ -624,9 +624,7 @@ fn shard_infos_from_rowset(
         while j < ranges.len() && ranges[j].start < shard_end {
             let lo = ranges[j].start.max(shard_start);
             let hi = ranges[j].end.min(shard_end);
-            for g in lo..hi {
-                local_mask[(g - shard_start) as usize] = true;
-            }
+            local_mask[(lo - shard_start) as usize..(hi - shard_start) as usize].fill(true);
             kept += (hi - lo) as usize;
             // Only step the local cursor past ranges fully inside this shard; a
             // range extending beyond `shard_end` is reprocessed for the next.
@@ -1152,9 +1150,11 @@ pub fn count(pipeline: &QueryPipeline) -> Result<crate::pipeline::CountResult> {
 }
 
 /// Whether any row matches, without decoding `X` and ignoring `limit`. On the
-/// indexed-only row-set path this needs no obs/X shard decode (the match count
-/// comes from the row-set cardinality); with residual predicates it decodes
-/// only the narrowed obs shards, like [`count`].
+/// indexed-only row-set path this needs no obs/X shard decode (the answer comes
+/// from the row-set cardinality); with residual predicates it decodes only the
+/// narrowed obs shards, like [`count`]. Computes the full match count rather
+/// than stopping at the first match — cheap on the indexed path, and a true
+/// early-exit is a deferred refinement.
 pub fn exists(pipeline: &QueryPipeline) -> Result<bool> {
     Ok(plan_and_mask(pipeline)?.matched_rows > 0)
 }

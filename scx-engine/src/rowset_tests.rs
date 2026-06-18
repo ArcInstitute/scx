@@ -199,3 +199,36 @@ fn shard_range_to_global_maps_and_guards() {
     .unwrap();
     assert_eq!(g3, rr(250, 400));
 }
+
+#[test]
+fn shard_range_to_global_rejects_out_of_bounds_local_range() {
+    // shard 0 -> [0,100). A corrupt/stale local range that exceeds the shard
+    // must never yield an invalid (start >= end) RowRange — it returns None so
+    // the caller falls back to the full scan.
+    let table = vec![(0u32, 0u64, 100u64), (1, 100, 250)];
+
+    // local row_start beyond the shard end (start would be 100, clamped end 100)
+    assert!(shard_range_to_global(
+        &ShardRange {
+            shard_id: 0,
+            row_start: 120,
+            row_end: 130,
+        },
+        &table,
+    )
+    .is_none());
+
+    // local range overshoots the shard end: clamp end into the shard, keep the
+    // valid prefix.
+    let clamped = shard_range_to_global(
+        &ShardRange {
+            shard_id: 0,
+            row_start: 90,
+            row_end: 250,
+        },
+        &table,
+    )
+    .unwrap();
+    assert_eq!(clamped, rr(90, 100));
+    assert!(clamped.start < clamped.end, "RowRange invariant must hold");
+}

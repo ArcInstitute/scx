@@ -240,17 +240,14 @@ pub fn shard_range_to_global(
         .ok()?;
     let (_, shard_row_start, shard_row_end) = obs_shard_ranges[pos];
     let start = shard_row_start + sr.row_start as u64;
-    let end = shard_row_start + sr.row_end as u64;
-    // Defensive clamp: a stale/corrupt range must never exceed the shard.
-    if start >= shard_row_end || end > shard_row_end || start >= end {
-        // Out-of-bounds local range for this shard — treat as a coverage gap.
-        if start >= end {
-            return None;
-        }
-        return Some(RowRange {
-            start,
-            end: end.min(shard_row_end),
-        });
+    // Defensive: a stale/corrupt local range must never exceed the shard, and
+    // the result must satisfy the `RowRange` invariant `start < end`. Clamp the
+    // end into the shard, then reject any empty/out-of-bounds range as a
+    // coverage gap (`None`) — the caller treats that as "not index-resolvable"
+    // and falls back to the full obs scan rather than emit an invalid range.
+    let end = (shard_row_start + sr.row_end as u64).min(shard_row_end);
+    if start >= end {
+        return None;
     }
     Some(RowRange { start, end })
 }
