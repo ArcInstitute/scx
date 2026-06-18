@@ -212,6 +212,17 @@ impl QueryPipeline {
         crate::collect::count(self)
     }
 
+    /// Whether any row matches the obs/var predicates, without decoding the X
+    /// matrix and ignoring `limit`.
+    ///
+    /// On the row-set fast path (indexed-only predicates) this short-circuits on
+    /// the first non-empty range with zero obs/X shard decode. With residual
+    /// (non-indexed) predicates it decodes only the narrowed obs shards, like
+    /// [`Self::count`]. Equivalent to `count()? > 0` but allowed to stop early.
+    pub fn exists(&self) -> Result<bool> {
+        crate::collect::exists(self)
+    }
+
     // -- Accessors for testing and collect.rs --
 
     /// Access the cached obs schema.

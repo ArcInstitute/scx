@@ -267,10 +267,32 @@ impl PyQueryPipeline {
         Ok(PyQueryResult::from_result(result))
     }
 
-    /// Convenience: execute the pipeline and return the number of matching cells.
-    fn count(&mut self, py: Python<'_>) -> PyResult<usize> {
-        let result = self.collect(py)?;
-        Ok(result.cached_n_obs)
+    /// Number of matching cells, **without decoding X** and ignoring `limit`.
+    ///
+    /// Runs only the planning + masking half of the engine; on the row-set fast
+    /// path (indexed predicates) this needs no obs/X shard decode. Borrows the
+    /// pipeline — it stays usable for a later `collect()`. The GIL is released
+    /// during execution.
+    fn count(&self, py: Python<'_>) -> PyResult<usize> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))?;
+        let result = py.detach(|| pipeline.count()).map_err(engine_to_pyerr)?;
+        Ok(result.matched_rows)
+    }
+
+    /// Whether any cell matches, **without decoding X** and ignoring `limit`.
+    ///
+    /// On the row-set fast path this needs no obs/X shard decode; with residual
+    /// (non-indexed) predicates it decodes only the narrowed obs shards. Borrows
+    /// the pipeline — it stays usable for a later `collect()`.
+    fn exists(&self, py: Python<'_>) -> PyResult<bool> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Pipeline already consumed by collect()"))?;
+        py.detach(|| pipeline.exists()).map_err(engine_to_pyerr)
     }
 
     fn __repr__(&self) -> String {

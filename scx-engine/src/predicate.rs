@@ -78,6 +78,139 @@ impl Predicate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Row-set evaluator (row-set predicate pushdown over the obs index)
+//
+// A second evaluator that walks the SAME `Predicate` AST as `eval_inner`, but
+// instead of producing a boolean mask over a decoded `RecordBatch` it resolves
+// the predicate to a global obs-row [`RowSet`] directly from the
+// `PredicateIndex` — no obs-shard decode. Returns `None` for any subtree that
+// cannot be resolved *exactly* from the index, so the caller routes that part
+// through the existing decode-and-mask (residual) path.
+//
+// v1 exactness scope: categorical `Eq` / `In` and `And` / `Or` of those. `Ne`,
+// `Not`, and all numeric comparisons return `None` (residual) — see the module
+// docs in `collect.rs` and the staleness/null reasoning in the plan: the
+// categorical index omits null rows, so complementing it (for `Ne`/`Not`) would
+// wrongly re-include nulls, and numeric B+ tree leaves are conservative.
+// ---------------------------------------------------------------------------
+
+use crate::index::PredicateIndex;
+use crate::rowset::{shard_range_to_global, RowSet};
+
+/// Context for [`eval_rowset`]: the obs predicate index plus the **shard
+/// row-range table the index was built against** (`(shard_id, row_start,
+/// row_end)`, sorted by `shard_id`) used to map shard-local ranges to global
+/// rows. The predicate index is keyed to the CSR/output shard ranges
+/// (`output_shard_row_ranges` in merge/compact/append, `csr_row_ranges` in
+/// conversion) — NOT the obs-metadata-shard ranges, which use an independent
+/// `shard_target_rows` chunking — so this table is the catalog's CSR shard
+/// ranges.
+pub struct RowSetCtx<'a> {
+    pub index: &'a PredicateIndex,
+    pub shard_row_ranges: &'a [(u32, u64, u64)],
+    pub n_obs: u64,
+    /// The obs schema, used to check column nullability. The legacy mask
+    /// evaluator uses Arrow's non-Kleene `or` (`null OR true = null → false`),
+    /// so an `Or` over a nullable column would diverge from the row-set union
+    /// (which would include such rows). `Or` is therefore index-resolvable only
+    /// when every referenced column is non-nullable — see [`eval_rowset`].
+    pub obs_schema: &'a Schema,
+}
+
+impl RowSetCtx<'_> {
+    /// True if every column referenced by `pred` is non-nullable in the obs
+    /// schema. A column missing from the schema is treated as nullable
+    /// (conservative → residual).
+    fn all_columns_non_nullable(&self, pred: &Predicate) -> bool {
+        pred.columns().iter().all(|c| {
+            self.obs_schema
+                .field_with_name(c)
+                .map(|f| !f.is_nullable())
+                .unwrap_or(false)
+        })
+    }
+}
+
+impl RowSetCtx<'_> {
+    /// Map a slice of shard-local ranges to a global [`RowSet`]. Returns `None`
+    /// if any range references a shard absent from the range table (stale
+    /// index) — the caller then treats the predicate as residual.
+    fn shard_ranges_to_rowset(&self, ranges: &[crate::index::ShardRange]) -> Option<RowSet> {
+        let mut out = Vec::with_capacity(ranges.len());
+        for sr in ranges {
+            out.push(shard_range_to_global(sr, self.shard_row_ranges)?);
+        }
+        Some(RowSet::from_ranges(out))
+    }
+}
+
+/// Resolve `pred` to an exact global [`RowSet`] using only the index, or `None`
+/// if any node touches a non-indexed column or an op outside the v1 exact
+/// scope (then the whole subtree is residual).
+pub fn eval_rowset(pred: &Predicate, ctx: &RowSetCtx) -> Option<RowSet> {
+    match pred {
+        Predicate::Eq(col, ScalarValue::Utf8(v)) => {
+            // `categorical_eq` returns None iff the column is not an indexed
+            // categorical (residual); Some(&[]) iff indexed but value absent
+            // (exact empty row-set).
+            let ranges = ctx.index.categorical_eq(col, v)?;
+            ctx.shard_ranges_to_rowset(ranges)
+        }
+        // Eq on a categorical column with a non-string literal cannot match a
+        // string category; only string equality is index-resolvable here.
+        Predicate::Eq(_, _) => None,
+        Predicate::In(col, vals) => {
+            // Only index-resolvable if the column is an indexed categorical.
+            if ctx.index.indexed_kind(col) != Some(crate::index::IndexKind::Categorical) {
+                return None;
+            }
+            let mut acc = RowSet::empty();
+            for v in vals {
+                if let ScalarValue::Utf8(s) = v {
+                    let ranges = ctx.index.categorical_eq(col, s)?;
+                    acc = acc.union(&ctx.shard_ranges_to_rowset(ranges)?);
+                }
+                // non-string members can't match a string categorical → skip
+            }
+            Some(acc)
+        }
+        Predicate::And(a, b) => {
+            let ra = eval_rowset(a, ctx)?;
+            let rb = eval_rowset(b, ctx)?;
+            Some(ra.intersect(&rb))
+        }
+        Predicate::Or(a, b) => {
+            // An Or with a residual side can match rows in ANY shard, so it is
+            // not narrowable: both sides must resolve exactly.
+            //
+            // Null semantics: the legacy mask evaluator uses Arrow's non-Kleene
+            // `or`, where `null OR x = null → false`. So a row whose left
+            // operand is null but whose right operand is true is EXCLUDED by the
+            // legacy path, whereas the row-set union would INCLUDE it. They
+            // diverge only when an operand column is nullable, so resolve `Or`
+            // from the index only when every referenced column is non-nullable
+            // (then no operand can be null and union == legacy). Otherwise fall
+            // back to the residual path, which preserves the exact legacy
+            // semantics.
+            if !ctx.all_columns_non_nullable(a) || !ctx.all_columns_non_nullable(b) {
+                return None;
+            }
+            let ra = eval_rowset(a, ctx)?;
+            let rb = eval_rowset(b, ctx)?;
+            Some(ra.union(&rb))
+        }
+        // Residual in v1 (see module docs): Ne/Not (null-complement hazard),
+        // numeric comparisons (conservative B+ tree leaves).
+        Predicate::Ne(_, _)
+        | Predicate::Not(_)
+        | Predicate::Lt(_, _)
+        | Predicate::Gt(_, _)
+        | Predicate::Le(_, _)
+        | Predicate::Ge(_, _) => None,
+    }
+}
+
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1496,6 +1629,224 @@ mod tests {
         let expected = [true, false, false, true, false];
         for (i, &exp) in expected.iter().enumerate() {
             assert_eq!(mask.value(i), exp, "row {i}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Row-set evaluator tests
+    // -----------------------------------------------------------------------
+    mod rowset_eval {
+        use crate::index::{
+            CategoricalEntry, CategoricalIndex, IndexedColumn, PredicateIndex, ShardRange,
+        };
+        use crate::predicate::{eval_rowset, Predicate, RowSetCtx, ScalarValue};
+        use crate::rowset::RowRange;
+
+        fn sr(shard_id: u32, row_start: u32, row_end: u32) -> ShardRange {
+            ShardRange {
+                shard_id,
+                row_start,
+                row_end,
+            }
+        }
+
+        fn idx() -> PredicateIndex {
+            // obs shards: 0 -> [0,10), 1 -> [10,20)
+            // cell_type: "B cell" in shard0 rows[0,5), shard1 rows[0,3) (global 10..13)
+            //            "T cell" in shard0 rows[5,10)
+            // tissue:    "blood"  in shard0 rows[0,10)
+            PredicateIndex {
+                version: 1,
+                columns: vec![
+                    IndexedColumn::Categorical(CategoricalIndex {
+                        column_name: "cell_type".into(),
+                        entries: vec![
+                            CategoricalEntry {
+                                value: "B cell".into(),
+                                shard_ranges: vec![sr(0, 0, 5), sr(1, 0, 3)],
+                            },
+                            CategoricalEntry {
+                                value: "T cell".into(),
+                                shard_ranges: vec![sr(0, 5, 10)],
+                            },
+                        ],
+                    }),
+                    IndexedColumn::Categorical(CategoricalIndex {
+                        column_name: "tissue".into(),
+                        entries: vec![CategoricalEntry {
+                            value: "blood".into(),
+                            shard_ranges: vec![sr(0, 0, 10)],
+                        }],
+                    }),
+                ],
+            }
+        }
+
+        fn ctx_ranges() -> Vec<(u32, u64, u64)> {
+            vec![(0, 0, 10), (1, 10, 20)]
+        }
+
+        /// Schema with cell_type/tissue/donor_id all NON-nullable so `Or` is
+        /// index-resolvable (the nullable-Or case is exercised separately).
+        fn test_schema() -> arrow::datatypes::Schema {
+            use arrow::datatypes::{DataType, Field};
+            arrow::datatypes::Schema::new(vec![
+                Field::new("cell_type", DataType::Utf8, false),
+                Field::new("tissue", DataType::Utf8, false),
+                Field::new("donor_id", DataType::Utf8, false),
+            ])
+        }
+
+        fn mk<'a>(
+            index: &'a PredicateIndex,
+            ranges: &'a [(u32, u64, u64)],
+            schema: &'a arrow::datatypes::Schema,
+        ) -> RowSetCtx<'a> {
+            RowSetCtx {
+                index,
+                shard_row_ranges: ranges,
+                n_obs: 20,
+                obs_schema: schema,
+            }
+        }
+
+        fn eq(col: &str, v: &str) -> Predicate {
+            Predicate::Eq(col.into(), ScalarValue::Utf8(v.into()))
+        }
+
+        #[test]
+        fn eq_categorical_resolves_to_global_rowset() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            let rs = eval_rowset(&eq("cell_type", "B cell"), &ctx).unwrap();
+            // shard0 [0,5) + shard1 global [10,13)
+            assert_eq!(
+                rs.ranges(),
+                &[
+                    RowRange { start: 0, end: 5 },
+                    RowRange { start: 10, end: 13 }
+                ]
+            );
+        }
+
+        #[test]
+        fn eq_absent_value_is_exact_empty() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            let rs = eval_rowset(&eq("cell_type", "NK cell"), &ctx).unwrap();
+            assert!(rs.is_empty());
+        }
+
+        #[test]
+        fn non_indexed_column_is_residual() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            assert!(eval_rowset(&eq("donor_id", "d1"), &ctx).is_none());
+        }
+
+        #[test]
+        fn in_list_unions() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            let p = Predicate::In(
+                "cell_type".into(),
+                vec![
+                    ScalarValue::Utf8("B cell".into()),
+                    ScalarValue::Utf8("T cell".into()),
+                ],
+            );
+            let rs = eval_rowset(&p, &ctx).unwrap();
+            // B cell [0,5)+[10,13) ∪ T cell [5,10) = [0,13)
+            assert_eq!(rs.ranges(), &[RowRange { start: 0, end: 13 }]);
+        }
+
+        #[test]
+        fn and_intersects_or_unions() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            // cell_type==B cell AND tissue==blood -> [0,5) (shard1 not in blood)
+            let and = Predicate::And(
+                Box::new(eq("cell_type", "B cell")),
+                Box::new(eq("tissue", "blood")),
+            );
+            assert_eq!(
+                eval_rowset(&and, &ctx).unwrap().ranges(),
+                &[RowRange { start: 0, end: 5 }]
+            );
+
+            // cell_type==T cell OR tissue==blood -> [0,10) (both columns non-nullable)
+            let or = Predicate::Or(
+                Box::new(eq("cell_type", "T cell")),
+                Box::new(eq("tissue", "blood")),
+            );
+            assert_eq!(
+                eval_rowset(&or, &ctx).unwrap().ranges(),
+                &[RowRange { start: 0, end: 10 }]
+            );
+        }
+
+        #[test]
+        fn or_over_nullable_column_is_residual() {
+            // When an Or operand references a NULLABLE column, the legacy
+            // non-Kleene `or` (null OR true = false) diverges from the row-set
+            // union, so the Or must fall back to residual.
+            use arrow::datatypes::{DataType, Field};
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = arrow::datatypes::Schema::new(vec![
+                Field::new("cell_type", DataType::Utf8, true), // nullable
+                Field::new("tissue", DataType::Utf8, false),
+            ]);
+            let ctx = mk(&index, &ranges, &schema);
+            let or = Predicate::Or(
+                Box::new(eq("cell_type", "T cell")),
+                Box::new(eq("tissue", "blood")),
+            );
+            assert!(eval_rowset(&or, &ctx).is_none());
+        }
+
+        #[test]
+        fn and_with_residual_side_is_residual() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            let and = Predicate::And(
+                Box::new(eq("cell_type", "B cell")),
+                Box::new(eq("donor_id", "d1")), // not indexed
+            );
+            assert!(eval_rowset(&and, &ctx).is_none());
+        }
+
+        #[test]
+        fn ne_not_numeric_are_residual() {
+            let index = idx();
+            let ranges = ctx_ranges();
+            let schema = test_schema();
+            let ctx = mk(&index, &ranges, &schema);
+            assert!(eval_rowset(
+                &Predicate::Ne("cell_type".into(), ScalarValue::Utf8("B cell".into())),
+                &ctx
+            )
+            .is_none());
+            assert!(
+                eval_rowset(&Predicate::Not(Box::new(eq("cell_type", "B cell"))), &ctx).is_none()
+            );
+            assert!(eval_rowset(
+                &Predicate::Gt("cell_type".into(), ScalarValue::Int64(5)),
+                &ctx
+            )
+            .is_none());
         }
     }
 }

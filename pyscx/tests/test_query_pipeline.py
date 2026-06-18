@@ -140,6 +140,54 @@ def test_count(query_adata, scx_from_adata):
     assert p.count() == 40
 
 
+def test_count_does_not_consume_pipeline(query_adata, scx_from_adata):
+    """count() borrows the pipeline (no X decode), so collect() still works."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    p = pyscx.open(path).query()
+    p.filter_obs("cell_type == 'B cell'")
+    # count() must not consume the pipeline.
+    assert p.count() == 40
+    qr = p.collect()
+    assert qr.n_obs == 40
+
+
+def test_exists_matches_count(query_adata, scx_from_adata):
+    """exists() agrees with count() > 0 and is non-consuming."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+
+    p = pyscx.open(path).query()
+    p.filter_obs("cell_type == 'T cell'")
+    assert p.exists() is True
+    # Non-consuming: count() still works afterward.
+    assert p.count() == 40
+
+    p2 = pyscx.open(path).query()
+    p2.filter_obs("cell_type == 'macrophage'")  # absent
+    assert p2.exists() is False
+    assert p2.count() == 0
+
+
+def test_count_matches_collect(query_adata, scx_from_adata):
+    """count() equals collect().n_obs across a few predicates (limit ignored)."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "query.scx")
+    for expr, _ in [
+        ("cell_type == 'T cell'", 40),
+        ("tissue == 'lung'", 60),
+        ("cell_type == 'B cell' and tissue == 'blood'", 20),
+    ]:
+        p = pyscx.open(path).query()
+        p.filter_obs(expr)
+        c = p.count()
+        n = p.collect().n_obs
+        assert c == n, f"count {c} != collect n_obs {n} for `{expr}`"
+
+
 def test_limit(query_adata, scx_from_adata):
     """limit(5) returns at most 5 cells."""
     import pyscx
