@@ -118,6 +118,13 @@ pub struct SortSummary {
     pub partitions: usize,
     /// obs columns for which a predicate index was (re)built.
     pub indexed_columns: Vec<String>,
+    /// Whether the obs write took the memory-bounded spill-scatter path
+    /// (`false` = the in-memory `take` path; always `false` for multimodal /
+    /// legacy single-section obs / no `--memory-budget`).
+    pub obs_spilled: bool,
+    /// Number of obs `new_pos`-range spill partitions used (0 unless
+    /// `obs_spilled`).
+    pub obs_partitions: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +438,10 @@ pub fn leading_key_partitions(
 ///
 /// Callers feed pass-2's emitted obs shards directly; the underlying builder
 /// asserts `shard_row_offset == rows_pushed`, so shards must be in order.
+///
+/// Items are `Result`-typed so a fallible producer (e.g. the obs spill-scatter
+/// reader, which decodes shards lazily off disk) can surface I/O errors mid
+/// stream; the in-memory caller wraps its single batch in `Ok`.
 // Thin pass-through over the 7-arg engine builder plus the sort-key list;
 // bundling these into a struct would only obscure the 1:1 mapping.
 #[allow(clippy::too_many_arguments)]
@@ -445,7 +456,7 @@ pub fn rebuild_obs_predicate_index_streaming<I>(
     base_options: &ConversionPredicateIndexOptions,
 ) -> Result<ConversionPredicateIndexResult>
 where
-    I: IntoIterator<Item = (RecordBatch, u64)>,
+    I: IntoIterator<Item = std::result::Result<(RecordBatch, u64), scx_engine::EngineError>>,
 {
     let mut options = base_options.clone();
     for key in by {
@@ -453,11 +464,10 @@ where
             options.index_obs.push(key.clone());
         }
     }
-    let shards = obs_shards.into_iter().map(Ok::<_, scx_engine::EngineError>);
     let result = build_and_write_conversion_predicate_indexes_streaming(
         writer,
         obs_schema,
-        shards,
+        obs_shards,
         var,
         obs_row_ranges,
         n_vars,
