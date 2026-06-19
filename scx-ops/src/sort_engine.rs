@@ -43,13 +43,22 @@
 //! - **(c) external partition sort** — spill X rows tagged by `new_pos`, emit
 //!   per `new_pos`-range partition.
 //!
-//! ## Scope (Phase 4)
+//! ## Scope
 //!
 //! Local input only (cloud input deferred). obsm and layers are gathered
-//! in-memory (the bounded-memory guarantee is for X). obsp is dropped with a
-//! warning (remap is Phase 5); the detection bitmap is dropped (T0.1);
-//! multimodal input is rejected (Phase 5). CSC sidecar is dropped; the CLI
-//! re-emits it post-write via `rebuild_csc_inplace` on `--rebuild-csc`.
+//! in-memory (the bounded-memory guarantee is for X). The CSC sidecar is
+//! dropped; the CLI re-emits it post-write via `rebuild_csc_inplace` on
+//! `--rebuild-csc`.
+//!
+//! Phase 5 lifted the earlier scope-outs: **multimodal** inputs reorder every
+//! modality's X by the global obs order ([`sort_multimodal`], mirroring
+//! `compact_multimodal`; per-modality X is gathered in-memory, the bounded
+//! external path stays single-modality); **obsp** (obs×obs COO) is remapped
+//! through the permutation via `compact::remap_obsp_coo` (varp passes through —
+//! var axis untouched); and the **detection bitmap** is rebuilt per X shard
+//! when `SortOptions.bitmap` is `Auto`/`Always` (default `Off` = drop). The
+//! predicate index is skipped on the multimodal path (unimodal-only
+//! engine-wide, as in compact).
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -63,7 +72,9 @@ use scx_format_io::codec_select::select_codec;
 use scx_format_io::header::FileHeader;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
-use scx_format_io::{FullCatalogEntry, ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::{
+    BitmapPolicy, BitmapShard, FullCatalogEntry, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
+};
 
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
@@ -98,13 +109,6 @@ pub fn sort_with_strategy(
     let reader = ScxReader::open(input)?;
     let in_header = reader.header().clone();
 
-    if reader.is_multimodal() {
-        return Err(OpsError::InvalidInput(
-            "scx sort does not yet support multimodal inputs (Phase 5); \
-             sort each modality's source before merge, or use a single-modality file"
-                .to_string(),
-        ));
-    }
     if in_header.has_raw() {
         log::warn!(
             "scx sort: input {} carries an adata.raw matrix, which is not preserved \
@@ -147,6 +151,30 @@ pub fn sort_with_strategy(
     let order_old: Vec<u64> = order_local.iter().map(|&l| live_ids[l as usize]).collect();
 
     let sorted_obs = take_rows(&live_obs, &order_local)?;
+
+    // old row -> new position (-1 = deleted / absent). Drives the external
+    // strategy's partition routing and the obsp remap; shared by all paths.
+    let mut new_pos_of_old = vec![-1i64; n_obs];
+    for (new, &old) in order_old.iter().enumerate() {
+        new_pos_of_old[old as usize] = new as i64;
+    }
+
+    // Multimodal inputs reorder every modality's X by the same global obs
+    // order (Phase 5 / T5.1); the single-modality engine below handles the
+    // common case.
+    if reader.is_multimodal() {
+        return sort_multimodal(
+            &reader,
+            &in_header,
+            output,
+            input,
+            &order_old,
+            &new_pos_of_old,
+            &sorted_obs,
+            n_live,
+            opts,
+        );
+    }
 
     // ----- Output writer + header -----
     // Drop has_deletion_vectors (bit 5) and has_csc (bit 0); the sort applies
@@ -222,9 +250,12 @@ pub fn sort_with_strategy(
 
     let mut x_emitter = CsrEmitter::new(
         EmitTarget::X,
+        None,
         opts.shard_target_rows,
         opts.codec,
         value_encoding,
+        n_vars as u32,
+        opts.bitmap,
     );
     match strategy {
         SortStrategy::InMemory => {
@@ -264,11 +295,6 @@ pub fn sort_with_strategy(
                         opts.shard_target_rows
                     )));
                 }
-            }
-            // old row -> new position (-1 = deleted / absent).
-            let mut new_pos_of_old = vec![-1i64; n_obs];
-            for (new, &old) in order_old.iter().enumerate() {
-                new_pos_of_old[old as usize] = new as i64;
             }
             let (sb, np) = emit_x_external(
                 &reader,
@@ -321,14 +347,14 @@ pub fn sort_with_strategy(
     for (name, batch) in &varp {
         writer.write_varp(name, batch)?;
     }
-    let obsp = reader.read_all_obsp()?;
-    if !obsp.is_empty() {
-        log::warn!(
-            "scx sort dropped {} obsp section(s) from {}: obs×obs remap under a row \
-             reorder is a Phase-5 follow-up",
-            obsp.len(),
-            input.display()
-        );
+    // obsp (obs×obs COO): remap both endpoints through the sort permutation
+    // (T5.3). `new_pos_of_old` is exactly the old→new map `remap_obsp_coo`
+    // expects (-1 drops edges touching a deleted obs; dims collapse to n_live).
+    let mut obsp: Vec<_> = reader.read_all_obsp()?.into_iter().collect();
+    obsp.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, batch) in &obsp {
+        let remapped = crate::compact::remap_obsp_coo(batch, &new_pos_of_old)?;
+        writer.write_obsp(name, &remapped)?;
     }
 
     // ----- predicate index (always (re)built; sort key auto-added) -----
@@ -375,6 +401,289 @@ pub fn sort_with_strategy(
 }
 
 // ---------------------------------------------------------------------------
+// Multimodal — one global obs order applied to every modality's X
+// ---------------------------------------------------------------------------
+
+/// Sort a multimodal file: reorder every modality's X (+ layers + per-modality
+/// obsm/varm) by the single global obs order, mirroring `compact_multimodal`
+/// with a permutation in place of the keep-mask. The obs axis is globally
+/// shared (one obs table, one `n_obs`), so `order_old` / `new_pos_of_old`
+/// apply identically to every modality. Per-modality X is gathered in-memory
+/// (`read_all_csr_shards_for`); the bounded-memory external path stays
+/// single-modality. The predicate index is skipped (unimodal-only engine-wide,
+/// as in compact).
+#[allow(clippy::too_many_arguments)]
+fn sort_multimodal(
+    reader: &ScxReader,
+    in_header: &FileHeader,
+    output: &Path,
+    input: &Path,
+    order_old: &[u64],
+    new_pos_of_old: &[i64],
+    sorted_obs: &RecordBatch,
+    n_live: usize,
+    opts: &SortOptions,
+) -> Result<SortSummary> {
+    let table = reader
+        .modality_table()
+        .ok_or_else(|| {
+            OpsError::InvalidInput("scx sort: multimodal file has no modality table".to_string())
+        })?
+        .clone();
+
+    let out_flags = in_header.flags & !(1 << 5) & !(1 << 0);
+    if in_header.has_csc() || table.entries.iter().any(|i| i.flags.has_csc()) {
+        log::warn!(
+            "scx sort dropped CSC shards from {}: pass --rebuild-csc to restore the \
+             column-major sidecar",
+            input.display()
+        );
+    }
+    let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
+    let out_header = FileHeader {
+        format_version: scx_format_io::rewrite_output_format_version(
+            &[in_header.format_version],
+            2,
+        ),
+        flags: out_flags,
+        n_obs: n_live as u64,
+        n_vars: max_n_vars,
+        shard_target_rows: opts.shard_target_rows,
+        index_dtype: in_header.index_dtype,
+        ..Default::default()
+    };
+    let mut writer = ScxWriter::new(output, out_header)?
+        .with_data_generation(reader.catalog().data_generation + 1);
+
+    write_obs_sharded(&mut writer, sorted_obs, opts.shard_target_rows)?;
+
+    let mut total_x_shards = 0u64;
+    for (idx, info) in table.entries.iter().enumerate() {
+        let in_id = (idx + 1) as u8;
+        let default_codec = CodecId::from_u8(info.default_codec_id)
+            .ok_or(OpsError::UnknownCodec(info.default_codec_id))?;
+        let default_ve = ValueEncoding::from_u8(info.default_value_encoding)
+            .ok_or(OpsError::UnknownValueEncoding(info.default_value_encoding))?;
+        let out_id = writer.add_modality(
+            &info.name,
+            info.modality_type,
+            default_codec,
+            default_ve,
+            false,
+        )?;
+        writer.set_modality_n_vars(out_id, info.n_vars)?;
+        writer.write_var_for(out_id, &reader.read_var_for(in_id)?)?;
+
+        // X — in-memory gather, reordered by the global order.
+        let ve = entry_value_encoding(
+            reader,
+            reader
+                .catalog()
+                .csr_shards_for_modality(in_id)
+                .first()
+                .copied(),
+        )?;
+        let csr = reader.read_all_csr_shards_for(in_id)?;
+        let mut emitter = CsrEmitter::new(
+            EmitTarget::X,
+            Some(out_id),
+            opts.shard_target_rows,
+            opts.codec,
+            ve,
+            info.n_vars as u32,
+            opts.bitmap,
+        );
+        for &old in order_old {
+            let s = csr.indptr[old as usize] as usize;
+            let e = csr.indptr[old as usize + 1] as usize;
+            emitter.push_row(&mut writer, &csr.indices[s..e], &csr.data[s..e])?;
+        }
+        emitter.finish(&mut writer)?;
+        total_x_shards += emitter.ranges.len() as u64;
+
+        // Per-modality obsm (obs-axis → reorder).
+        let obsm_prefix = format!("obsm/{}/", info.name);
+        for key in crate::compact::discover_modality_keys(
+            reader,
+            in_id,
+            &obsm_prefix,
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        ) {
+            let batch = reader.read_obsm_for(in_id, &key)?;
+            writer.write_obsm_for(out_id, &key, &take_rows(&batch, order_old)?)?;
+        }
+
+        // Per-modality varm (var-axis → unchanged, one full-coverage shard).
+        let varm_prefix = format!("varm/{}/", info.name);
+        for key in crate::compact::discover_modality_keys(
+            reader,
+            in_id,
+            &varm_prefix,
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        ) {
+            let batch = reader.read_varm_for(in_id, &key)?;
+            let n = batch.num_rows() as u64;
+            writer.write_varm_shard_for(out_id, &key, 0, 0, n, n, &batch)?;
+        }
+
+        // Per-modality uns.
+        if let Ok(uns) = reader.read_uns_for(in_id) {
+            writer.write_uns_for(out_id, &uns)?;
+        }
+
+        // Per-modality layers (obs-axis → reorder; in-memory gather).
+        for layer_name in modality_layer_names(reader, in_id, &info.name) {
+            let lve = entry_value_encoding(
+                reader,
+                reader
+                    .catalog()
+                    .layer_csr_shards_for_modality(in_id, &layer_name)
+                    .first()
+                    .copied(),
+            )?;
+            let (l_indptr, l_indices, l_data) =
+                assemble_modality_layer(reader, in_id, &layer_name)?;
+            let mut em = CsrEmitter::new(
+                EmitTarget::Layer(layer_name.clone()),
+                Some(out_id),
+                opts.shard_target_rows,
+                opts.codec,
+                lve,
+                0,
+                BitmapPolicy::Off,
+            );
+            for &old in order_old {
+                let s = l_indptr[old as usize] as usize;
+                let e = l_indptr[old as usize + 1] as usize;
+                em.push_row(&mut writer, &l_indices[s..e], &l_data[s..e])?;
+            }
+            em.finish(&mut writer)?;
+        }
+    }
+
+    // ----- global sections (modality 0), via modality-0 key discovery -----
+    for key in crate::compact::discover_modality_keys(
+        reader,
+        0,
+        "obsm/",
+        SectionType::ObsmEmbedding,
+        SectionType::ObsmEmbeddingShard,
+    ) {
+        let batch = reader.read_obsm(&key)?;
+        writer.write_obsm(&key, &take_rows(&batch, order_old)?)?;
+    }
+    for key in crate::compact::discover_modality_keys(
+        reader,
+        0,
+        "varm/",
+        SectionType::VarmEmbedding,
+        SectionType::VarmEmbeddingShard,
+    ) {
+        writer.write_varm(&key, &reader.read_varm(&key)?)?;
+    }
+    for key in crate::compact::discover_modality_keys(
+        reader,
+        0,
+        "varp/",
+        SectionType::VarpEmbedding,
+        SectionType::VarpEmbeddingShard,
+    ) {
+        writer.write_varp(&key, &reader.read_varp(&key)?)?;
+    }
+    for key in crate::compact::discover_modality_keys(
+        reader,
+        0,
+        "obsp/",
+        SectionType::ObspEmbedding,
+        SectionType::ObspEmbeddingShard,
+    ) {
+        let batch = reader.read_obsp(&key)?;
+        writer.write_obsp(
+            &key,
+            &crate::compact::remap_obsp_coo(&batch, new_pos_of_old)?,
+        )?;
+    }
+    if let Ok(uns) = reader.read_uns() {
+        writer.write_uns(&uns)?;
+    }
+
+    // Provenance (predicate index skipped — multimodal indexes are unimodal-only).
+    let mut prov = reader
+        .read_provenance()
+        .map(|p| p.operations)
+        .unwrap_or_default();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    prov.push(sort_provenance_entry(
+        &opts.by,
+        opts.reverse,
+        opts.shard_target_rows,
+        &[],
+        ts,
+    ));
+    writer.write_provenance(prov)?;
+    writer.finish()?;
+
+    Ok(SortSummary {
+        n_obs: n_live as u64,
+        n_output_shards: total_x_shards,
+        strategy: SortStrategy::InMemory,
+        spill_bytes: 0,
+        partitions: 1,
+        indexed_columns: Vec::new(),
+    })
+}
+
+/// Distinct layer names for a modality (from `layer/{modality}/{layer}/shard_*`).
+fn modality_layer_names(reader: &ScxReader, modality_id: u8, modality_name: &str) -> Vec<String> {
+    let prefix = format!("layer/{modality_name}/");
+    let mut names = std::collections::BTreeSet::new();
+    for entry in &reader.catalog().entries {
+        if entry.section_type == SectionType::LayerCsrShard
+            && entry.modality_id == modality_id
+            && entry.name.starts_with(&prefix)
+        {
+            if let Some(rem) = entry.name.strip_prefix(&prefix) {
+                if let Some(pos) = rem.find("/shard_") {
+                    names.insert(rem[..pos].to_string());
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Assemble a modality's layer into one in-memory CSR `(indptr, indices, data)`
+/// by concatenating its shards in row order.
+#[allow(clippy::type_complexity)]
+fn assemble_modality_layer(
+    reader: &ScxReader,
+    modality_id: u8,
+    layer_name: &str,
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for entry in reader
+        .catalog()
+        .layer_csr_shards_for_modality(modality_id, layer_name)
+    {
+        let (sh_indptr, sh_indices, sh_data) = reader.read_shard_from_entry(entry)?;
+        let base = *indptr.last().unwrap();
+        for &v in sh_indptr.iter().skip(1) {
+            indptr.push(base + v);
+        }
+        indices.extend_from_slice(&sh_indices);
+        data.extend_from_slice(&sh_data);
+    }
+    Ok((indptr, indices, data))
+}
+
+// ---------------------------------------------------------------------------
 // Strategy selection
 // ---------------------------------------------------------------------------
 
@@ -411,11 +720,18 @@ enum EmitTarget {
     Layer(String),
 }
 
+/// Accumulates re-ordered rows and flushes them as CSR (or layer) shards;
+/// `modality_id = Some(id)` routes to the per-modality writers. For X targets
+/// with a non-`Off` `bitmap` policy it also emits a detection-bitmap sidecar
+/// per shard.
 struct CsrEmitter {
     target: EmitTarget,
+    modality_id: Option<u8>,
     shard_target: u64,
     codec: CodecSelection,
     value_encoding: ValueEncoding,
+    n_vars: u32,
+    bitmap: BitmapPolicy,
     acc_indptr: Vec<u64>,
     acc_indices: Vec<u32>,
     acc_values: Vec<u8>,
@@ -426,17 +742,24 @@ struct CsrEmitter {
 }
 
 impl CsrEmitter {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         target: EmitTarget,
+        modality_id: Option<u8>,
         shard_target: u32,
         codec: CodecSelection,
         value_encoding: ValueEncoding,
+        n_vars: u32,
+        bitmap: BitmapPolicy,
     ) -> Self {
         Self {
             target,
+            modality_id,
             shard_target: shard_target.max(1) as u64,
             codec,
             value_encoding,
+            n_vars,
+            bitmap,
             acc_indptr: vec![0],
             acc_indices: Vec::new(),
             acc_values: Vec::new(),
@@ -467,8 +790,10 @@ impl CsrEmitter {
         }
         let codec = resolve_codec(self.codec, &self.acc_values, self.value_encoding);
         let row_start = self.emitted_rows;
-        match &self.target {
-            EmitTarget::X => writer.write_csr_shard(
+        let n_rows = self.acc_row_count;
+        let nnz = self.acc_indices.len();
+        match (&self.target, self.modality_id) {
+            (EmitTarget::X, None) => writer.write_csr_shard(
                 &self.acc_indptr,
                 &self.acc_indices,
                 &self.acc_values,
@@ -476,7 +801,16 @@ impl CsrEmitter {
                 self.value_encoding,
                 row_start,
             )?,
-            EmitTarget::Layer(name) => writer.write_layer_csr_shard(
+            (EmitTarget::X, Some(id)) => writer.write_csr_shard_for(
+                id,
+                &self.acc_indptr,
+                &self.acc_indices,
+                &self.acc_values,
+                codec,
+                self.value_encoding,
+                row_start,
+            )?,
+            (EmitTarget::Layer(name), None) => writer.write_layer_csr_shard(
                 &self.acc_indptr,
                 &self.acc_indices,
                 &self.acc_values,
@@ -486,8 +820,36 @@ impl CsrEmitter {
                 name,
                 self.shard_idx,
             )?,
+            (EmitTarget::Layer(name), Some(id)) => writer.write_layer_csr_shard_for(
+                id,
+                name,
+                self.shard_idx,
+                &self.acc_indptr,
+                &self.acc_indices,
+                &self.acc_values,
+                codec,
+                self.value_encoding,
+                row_start,
+            )?,
         }
-        self.emitted_rows += self.acc_row_count;
+        // Detection bitmap (X only) — one sidecar per X shard, written in shard
+        // order so its index aligns with the CSR shard (matches convert).
+        if matches!(self.target, EmitTarget::X)
+            && bitmap_should_build(self.bitmap, n_rows, nnz, self.n_vars)
+        {
+            let shard = BitmapShard::build_from_csr(
+                row_start,
+                n_rows as u32,
+                self.n_vars,
+                &self.acc_indptr,
+                &self.acc_indices,
+            );
+            match self.modality_id {
+                None => writer.write_bitmap_shard(&shard)?,
+                Some(id) => writer.write_bitmap_shard_for(id, &shard)?,
+            }
+        }
+        self.emitted_rows += n_rows;
         self.ranges.push((row_start, self.emitted_rows));
         self.acc_indptr = vec![0];
         self.acc_indices.clear();
@@ -506,6 +868,23 @@ fn resolve_codec(sel: CodecSelection, values: &[u8], enc: ValueEncoding) -> Code
     match sel {
         CodecSelection::Auto => select_codec(values, enc),
         CodecSelection::Explicit(c) => c,
+    }
+}
+
+/// Whether to emit a detection bitmap for a shard under `policy`. `auto`
+/// mirrors convert's density + n_vars gates (the codec-compressed-size gate is
+/// convert-only — sort lacks the encoded size cheaply at flush time).
+fn bitmap_should_build(policy: BitmapPolicy, n_rows: u64, nnz: usize, n_vars: u32) -> bool {
+    match policy {
+        BitmapPolicy::Off => false,
+        BitmapPolicy::Always => true,
+        BitmapPolicy::Auto => {
+            if n_vars == 0 || n_vars > 1_000_000 || n_rows == 0 {
+                return false;
+            }
+            let density = nnz as f64 / (n_rows as f64 * n_vars as f64);
+            density <= 0.30
+        }
     }
 }
 
@@ -718,11 +1097,15 @@ fn emit_layers_in_memory(
     for layer_name in reader.layer_names() {
         let ve = layer_value_encoding(reader, &layer_name)?;
         let layer = reader.read_layer(&layer_name)?;
+        // Layers carry no detection bitmap (X-only, matching convert).
         let mut emitter = CsrEmitter::new(
             EmitTarget::Layer(layer_name.clone()),
+            None,
             opts.shard_target_rows,
             opts.codec,
             ve,
+            0,
+            BitmapPolicy::Off,
         );
         for &old in order_old {
             let s = layer.indptr[old as usize] as usize;

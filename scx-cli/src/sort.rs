@@ -23,6 +23,7 @@ pub fn run_sort(
     index_auto_threshold: Option<usize>,
     memory_budget: Option<String>,
     temp_dir: Option<PathBuf>,
+    bitmap: &str,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
@@ -43,6 +44,7 @@ pub fn run_sort(
         None => CodecSelection::Auto,
         Some(c) => CodecSelection::Explicit(c),
     };
+    let bitmap = scx_format_io::BitmapPolicy::parse(bitmap)?;
     let memory_budget = match memory_budget {
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
         None => None,
@@ -78,6 +80,7 @@ pub fn run_sort(
         },
         memory_budget,
         temp_dir,
+        bitmap,
     };
 
     let summary = scx_ops::sort(input, output, &opts)?;

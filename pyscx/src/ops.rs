@@ -581,7 +581,7 @@ pub fn compact(
 
 /// Globally reorder cells (the obs axis) of an SCX file by an obs key,
 /// writing a new file with X-read locality and contiguous predicate-index
-/// shard ranges for the sort key (SCX-SORT-SPEC).
+/// shard ranges for the sort key.
 ///
 /// `by`: one or more obs columns, lexicographic in order (the leading key
 /// gets the full X-read-locality benefit). `reverse`: descending on all keys.
@@ -589,7 +589,7 @@ pub fn compact(
 /// sort; without it the in-memory path is used. The detection bitmap and CSC
 /// sidecar are dropped (the reorder invalidates them); pass `rebuild_csc=True`
 /// to re-emit the column-major sidecar. obsp/multimodal sort are not yet
-/// supported (Phase 5).
+/// supported.
 ///
 /// Example:
 ///     pyscx.sort("atlas.scx", "atlas.sorted.scx", by=["cell_type"])
@@ -597,7 +597,7 @@ pub fn compact(
 #[pyo3(signature = (
     input, output, by, reverse=false, shard_size=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
-    memory_budget=None, temp_dir=None, rebuild_csc=false,
+    memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
     csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -614,6 +614,7 @@ pub fn sort(
     index_auto_threshold: Option<usize>,
     memory_budget: Option<String>,
     temp_dir: Option<String>,
+    bitmap: String,
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
@@ -629,6 +630,7 @@ pub fn sort(
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s).map_err(PyValueError::new_err)?),
         None => None,
     };
+    let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
     let opts = scx_ops::SortOptions {
         by,
         reverse,
@@ -644,6 +646,7 @@ pub fn sort(
         },
         memory_budget,
         temp_dir: temp_dir.map(PathBuf::from),
+        bitmap,
     };
     py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
         .map_err(ops_to_pyerr)?;

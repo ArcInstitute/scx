@@ -397,6 +397,10 @@ enum Commands {
         /// Directory for the external sort's spill files (default: system temp).
         #[arg(long, value_name = "DIR")]
         temp_dir: Option<PathBuf>,
+        /// Detection-bitmap policy for the output: off (drop, default),
+        /// auto (rebuild when sparse), or always. Mirrors `scx convert --bitmap`.
+        #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
+        bitmap: String,
         /// Rebuild the CSC sidecar on the sorted output (the reorder
         /// invalidates the column-major row indices, so it is dropped by
         /// default with a warning).
@@ -955,6 +959,7 @@ fn main() {
             index_auto_threshold,
             memory_budget,
             temp_dir,
+            bitmap,
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
@@ -972,6 +977,7 @@ fn main() {
             index_auto_threshold,
             memory_budget,
             temp_dir,
+            &bitmap,
             rebuild_csc,
             csc_cols_per_shard,
             &csc_memory_limit,

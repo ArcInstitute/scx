@@ -7,8 +7,8 @@
 //! feed, and the provenance entry.
 //!
 //! It deliberately contains **no I/O engine, CLI, or pyscx surface**. The
-//! `sort()` engine + strategy selector (Phase 4), convert-gather (Phase 2),
-//! k-way merge (Phase 3), and multimodal/obsp remap (Phase 5) build on these
+//! `sort()` engine + strategy selector, convert-gather,
+//! k-way merge, and multimodal/obsp remap build on these
 //! primitives.
 //!
 //! Design notes:
@@ -36,7 +36,7 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
     ConversionPredicateIndexResult,
 };
-use scx_format_io::{ProvenanceEntry, ScxWriter, DEFAULT_SHARD_TARGET_ROWS};
+use scx_format_io::{BitmapPolicy, ProvenanceEntry, ScxWriter, DEFAULT_SHARD_TARGET_ROWS};
 
 use crate::error::{OpsError, Result};
 
@@ -65,6 +65,10 @@ pub struct SortOptions {
     pub memory_budget: Option<u64>,
     /// Spill location for the external sort (`None` = system temp).
     pub temp_dir: Option<PathBuf>,
+    /// Detection-bitmap rebuild policy for the output (`Off` = drop, the
+    /// default; `Auto`/`Always` rebuild the gene→local-row sidecar per X
+    /// shard, mirroring `scx convert --bitmap`).
+    pub bitmap: BitmapPolicy,
 }
 
 impl Default for SortOptions {
@@ -77,6 +81,7 @@ impl Default for SortOptions {
             index_options: ConversionPredicateIndexOptions::default(),
             memory_budget: None,
             temp_dir: None,
+            bitmap: BitmapPolicy::default(),
         }
     }
 }
