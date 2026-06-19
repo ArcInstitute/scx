@@ -349,3 +349,137 @@ fn bench_ops_merge_throughput() {
         })
     );
 }
+
+/// Write a categorical-key bench file: `cell_type` cycles over `k`
+/// categories so every input CSR shard contains every category (worst-case
+/// locality before sort). `shard_size` controls the shard count.
+fn write_categorical_bench_file(
+    dir: &TempDir,
+    name: &str,
+    n_obs: usize,
+    n_vars: usize,
+    k: usize,
+    shard_size: usize,
+) -> std::path::PathBuf {
+    use arrow::datatypes::Field;
+    let path = dir.path().join(name);
+    let mut header = sample_header(n_obs as u64, n_vars as u64);
+    header.shard_target_rows = shard_size as u32;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let types: Vec<String> = (0..n_obs).map(|i| format!("ct_{}", i % k)).collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+    ]);
+    let obs = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                types.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let mut row_start = 0usize;
+    while row_start < n_obs {
+        let shard_rows = std::cmp::min(shard_size, n_obs - row_start);
+        let (indptr, indices, values) = sample_shard_data(shard_rows, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+        row_start += shard_rows;
+    }
+    writer.finish().unwrap();
+    path
+}
+
+/// Count the distinct CSR shards that hold at least one row of `target`
+/// (the X-shard fetch count for an "all cells of category X" scan).
+fn shards_touching_category(path: &std::path::Path, target: &str) -> usize {
+    use arrow::array::Array;
+    let r = ScxReader::open(path).unwrap();
+    let obs = r.read_obs().unwrap();
+    let col = obs.column_by_name("cell_type").unwrap();
+    let utf8 = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let ct = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+
+    let mut ranges: Vec<(u64, u64)> = r
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::CsrShard)
+        .filter_map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
+        .collect();
+    ranges.sort_by_key(|(s, _)| *s);
+
+    ranges
+        .iter()
+        .filter(|(s, e)| {
+            (*s..*e).any(|i| !ct.is_null(i as usize) && ct.value(i as usize) == target)
+        })
+        .count()
+}
+
+/// Locality benchmark: X-shard fetch count
+/// for an "all cells of one category" scan *before* vs *after* `scx sort`.
+/// Expectation: O(shards) → O(few) once a category is physically contiguous.
+#[test]
+#[ignore]
+fn bench_ops_sort_locality() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, k, shard_size) = (BENCH_CELLS * 4, 8usize, 4096usize);
+    let path =
+        write_categorical_bench_file(&dir, "sort_locality.scx", n_obs, BENCH_GENES, k, shard_size);
+
+    let target = "ct_3";
+    let before = shards_touching_category(&path, target);
+
+    // Sort by cell_type (in-memory; no budget) and re-shard at the same size.
+    let sorted = dir.path().join("sort_locality.sorted.scx");
+    let opts = scx_ops::SortOptions {
+        by: vec!["cell_type".to_string()],
+        shard_target_rows: shard_size as u32,
+        ..Default::default()
+    };
+    let start = Instant::now();
+    let summary = scx_ops::sort(&path, &sorted, &opts).unwrap();
+    let elapsed = start.elapsed();
+
+    let after = shards_touching_category(&sorted, target);
+    let ratio = before as f64 / after.max(1) as f64;
+
+    assert!(
+        after <= before,
+        "sort must not increase the per-category shard fetch count"
+    );
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "sort_locality",
+            "n_obs": n_obs as u64,
+            "k_categories": k,
+            "shard_size": shard_size,
+            "shards_before": before,
+            "shards_after": after,
+            "locality_ratio": ratio,
+            "sort_time_ms": elapsed.as_millis() as f64,
+            "n_output_shards": summary.n_output_shards,
+        })
+    );
+}

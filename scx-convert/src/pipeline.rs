@@ -180,6 +180,14 @@ pub struct ConvertOptions {
     /// look-ahead buffer; smaller values risk starving encoders when
     /// one shard takes much longer than its siblings.
     pub writer_queue_depth: usize,
+    /// Sort-on-convert: obs columns to globally
+    /// reorder the cell axis by, lexicographic in order (leading key first).
+    /// Empty (default) = no reorder. Requires a CSR or dense `/X`; CSC-on-disk
+    /// X errors. The reorder is applied to X, layers, obs, and obsm; obsp is
+    /// dropped with a warning (obsp remap is Phase 5).
+    pub sort_by: Vec<String>,
+    /// Descending sort when `sort_by` is set.
+    pub sort_reverse: bool,
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -360,6 +368,8 @@ impl Default for ConvertOptions {
             bitmap: BitmapPolicy::Off,
             reader_threads: None,
             writer_queue_depth: 4,
+            sort_by: Vec::new(),
+            sort_reverse: false,
         }
     }
 }
@@ -405,6 +415,7 @@ pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
 /// `ConvertWarning::{MissingPresetIndexColumn, UnsupportedIndexColumn}`.
 /// `pyscx::convert::build_and_write_predicate_indexes_inline` is the
 /// Python-side mirror — keep their outcome handling shapes in sync.
+#[allow(clippy::too_many_arguments)]
 fn build_and_write_predicate_indexes(
     writer: &mut ScxWriter,
     obs: &RecordBatch,
@@ -412,10 +423,20 @@ fn build_and_write_predicate_indexes(
     csr_row_ranges: &[(u64, u64)],
     n_vars: usize,
     opts: &ConvertOptions,
+    // Sort-on-convert: extra obs columns to force-index (the sort key) so its
+    // now-contiguous `shard_ranges` are emitted. Merged into `index_obs`,
+    // deduped, order preserved.
+    extra_index_obs: &[String],
     sink: &mut WarningSink,
 ) -> Result<(Vec<String>, Vec<String>), ConvertError> {
+    let mut index_obs = opts.index_obs.clone();
+    for col in extra_index_obs {
+        if !index_obs.iter().any(|c| c == col) {
+            index_obs.push(col.clone());
+        }
+    }
     let engine_opts = ConversionPredicateIndexOptions {
-        index_obs: opts.index_obs.clone(),
+        index_obs,
         index_var: opts.index_var.clone(),
         index_preset: opts.index_preset.clone(),
         index_auto_threshold: opts.index_auto_threshold,
@@ -570,6 +591,17 @@ pub fn h5ad_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    // Sort-on-convert runs only on the streaming path (it needs the
+    // random-access gather). Callers route `sort_by` to streaming; guard the
+    // eager path defensively.
+    if !opts.sort_by.is_empty() {
+        return Err(ConvertError::Other(
+            "sort-on-convert (--sort-by) requires the streaming conversion path; \
+             enable streaming (the default) and retry."
+                .to_string(),
+        ));
+    }
+
     let file = hdf5::File::open(input)?;
 
     // Validate format
@@ -655,6 +687,7 @@ pub fn h5ad_to_scx(
         "obsm",
         opts.shard_target_rows,
         DenseMappingKind::Obsm,
+        None,
         sink,
     )?;
     write_dense_mapping_section(
@@ -664,6 +697,7 @@ pub fn h5ad_to_scx(
         "varm",
         opts.shard_target_rows,
         DenseMappingKind::Varm,
+        None,
         sink,
     )?;
     write_sparse_mapping_section(
@@ -740,6 +774,7 @@ pub fn h5ad_to_scx(
         &csr_row_ranges,
         n_vars,
         opts,
+        &[],
         sink,
     )?;
 
@@ -848,6 +883,7 @@ pub fn tenx_to_scx(
         &csr_row_ranges,
         tenx.n_genes,
         opts,
+        &[],
         sink,
     )?;
 
@@ -978,6 +1014,19 @@ pub fn h5ad_to_scx_streaming(
     // write. CSR uses the indptr-eager reader; Dense slabs rows on
     // demand; CSC routes through the Phase 2 dispatcher which picks
     // in-memory vs. external-memory transpose based on the budget.
+    // Sort-on-convert (Phase 2): a CSC-on-disk X cannot be reordered during
+    // conversion (the CSC→CSR transposer is sequential and cannot serve the
+    // permuted gather). Fail fast rather than silently emit an unsorted file.
+    let want_sort = !opts.sort_by.is_empty();
+    if want_sort && matches!(matrix_format, MatrixFormat::Csc) {
+        return Err(ConvertError::Other(
+            "sort-on-convert (--sort-by) requires a CSR or dense h5ad X; the on-disk CSC X \
+             cannot be reordered during conversion. Re-export X as CSR/dense, or sort after \
+             conversion with `scx sort` (once available)."
+                .to_string(),
+        ));
+    }
+
     let mut x_reader: Box<dyn CsrShardStream> = match matrix_format {
         MatrixFormat::Csr => Box::new(open_x_streaming(&file, "X", matrix_format, sink)?),
         MatrixFormat::Dense => Box::new(open_dense_streaming(&file, "X", opts, sink)?),
@@ -1014,6 +1063,36 @@ pub fn h5ad_to_scx_streaming(
         Some(batch) => batch.clone(),
         None => read_dataframe_group(&file, "var", sink)?,
     };
+
+    // Sort-on-convert (Phase 2): compute the obs-axis permutation from the
+    // (key) obs columns, reorder obs to match, and wrap the X reader so the
+    // coordinator gathers source rows in sorted order. The non-sort path keeps
+    // `obs` / `x_reader` untouched (byte-identical).
+    let sort_perm: Option<std::sync::Arc<Vec<u64>>> = if want_sort {
+        let perm =
+            crate::permuted_reader::compute_sort_perm(&obs, &opts.sort_by, opts.sort_reverse)?;
+        Some(std::sync::Arc::new(perm))
+    } else {
+        None
+    };
+    let obs = match &sort_perm {
+        Some(perm) => crate::permuted_reader::take_record_batch(&obs, perm)?,
+        None => obs,
+    };
+    if let Some(perm) = &sort_perm {
+        // Re-open X as an indexed reader and wrap it in the permuted gather.
+        drop(x_reader);
+        let inner: Box<dyn crate::stream::IndexedCsrShardStream> = match matrix_format {
+            MatrixFormat::Csr => Box::new(open_x_streaming(&file, "X", matrix_format, sink)?),
+            MatrixFormat::Dense => Box::new(open_dense_streaming(&file, "X", opts, sink)?),
+            MatrixFormat::Csc => unreachable!("CSC + sort guarded above"),
+        };
+        x_reader = Box::new(crate::permuted_reader::PermutedCsrReader::new(
+            inner,
+            perm.clone(),
+        ));
+    }
+
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
@@ -1050,6 +1129,8 @@ pub fn h5ad_to_scx_streaming(
     // on the way out, also keeping peak memory to one shard at a time.
     // Disk-streaming path: the source h5ad is hyperslab-read one
     // row-range at a time per key.
+    // obsm is obs-axis → reorder it by the same permutation when sorting.
+    let obsm_perm: Option<&[u64]> = sort_perm.as_ref().map(|p| p.as_slice());
     write_dense_mapping_section(
         &file,
         &mut writer,
@@ -1057,8 +1138,10 @@ pub fn h5ad_to_scx_streaming(
         "obsm",
         opts.shard_target_rows,
         DenseMappingKind::Obsm,
+        obsm_perm,
         sink,
     )?;
+    // varm is var-axis → never reordered by an obs sort.
     write_dense_mapping_section(
         &file,
         &mut writer,
@@ -1066,17 +1149,38 @@ pub fn h5ad_to_scx_streaming(
         "varm",
         opts.shard_target_rows,
         DenseMappingKind::Varm,
+        None,
         sink,
     )?;
-    write_sparse_mapping_section(
-        &file,
-        &mut writer,
-        overrides.obsp.as_ref(),
-        "obsp",
-        opts.shard_target_rows,
-        SparseMappingKind::Obsp,
-        sink,
-    )?;
+    // obsp (obs×obs) needs both axes remapped through the permutation. The
+    // standalone `scx sort` engine does this remap; the convert-on-sort path
+    // does not yet, so drop obsp with a warning here rather than emit a
+    // misaligned graph. varp (var×var) is untouched by an obs sort.
+    if sort_perm.is_some() {
+        if let Ok(group) = file.group("obsp") {
+            for name in group.member_names().unwrap_or_default() {
+                if name.starts_with("__") {
+                    continue;
+                }
+                sink.emit(ConvertWarning::DroppedObsp {
+                    name: format!("obsp/{name}"),
+                    reason: "obsp remap under sort-on-convert is not yet supported \
+                             (Phase 5); dropped to avoid an axis-misaligned graph"
+                        .to_string(),
+                });
+            }
+        }
+    } else {
+        write_sparse_mapping_section(
+            &file,
+            &mut writer,
+            overrides.obsp.as_ref(),
+            "obsp",
+            opts.shard_target_rows,
+            SparseMappingKind::Obsp,
+            sink,
+        )?;
+    }
     write_sparse_mapping_section(
         &file,
         &mut writer,
@@ -1128,7 +1232,13 @@ pub fn h5ad_to_scx_streaming(
                 };
             let mut layer_reader: Box<dyn CsrShardStream> = match layer_format {
                 MatrixFormat::Csr => match open_layer_streaming(&file, layer_name, sink) {
-                    Ok(r) => Box::new(r),
+                    Ok(r) => match &sort_perm {
+                        Some(p) => Box::new(crate::permuted_reader::PermutedCsrReader::new(
+                            Box::new(r),
+                            p.clone(),
+                        )),
+                        None => Box::new(r),
+                    },
                     Err(e) => {
                         sink.emit(ConvertWarning::LayerSkipped {
                             name: layer_name.clone(),
@@ -1139,7 +1249,13 @@ pub fn h5ad_to_scx_streaming(
                 },
                 MatrixFormat::Dense => {
                     match open_dense_layer_streaming(&file, layer_name, opts, sink) {
-                        Ok(r) => Box::new(r),
+                        Ok(r) => match &sort_perm {
+                            Some(p) => Box::new(crate::permuted_reader::PermutedCsrReader::new(
+                                Box::new(r),
+                                p.clone(),
+                            )),
+                            None => Box::new(r),
+                        },
                         Err(e) => {
                             sink.emit(ConvertWarning::LayerSkipped {
                                 name: layer_name.clone(),
@@ -1150,6 +1266,18 @@ pub fn h5ad_to_scx_streaming(
                     }
                 }
                 MatrixFormat::Csc => {
+                    // A CSC-on-disk layer can't be reordered (sequential
+                    // transposer); under sort-on-convert, drop it rather than
+                    // emit an axis-misaligned layer.
+                    if sort_perm.is_some() {
+                        sink.emit(ConvertWarning::LayerSkipped {
+                            name: layer_name.clone(),
+                            reason: "cannot reorder a CSC-on-disk layer during \
+                                     sort-on-convert; layer dropped"
+                                .to_string(),
+                        });
+                        continue;
+                    }
                     match open_csc_layer_streaming(&file, layer_name, opts, sink) {
                         Ok(r) => r,
                         Err(e) => {
@@ -1198,6 +1326,8 @@ pub fn h5ad_to_scx_streaming(
 
     // Phase 5a: predicate indexes from the obs/var we just wrote and
     // the actual shard boundaries reported by `streaming_writer_coordinator`.
+    // Sort-on-convert auto-indexes the sort key so its contiguous shard ranges
+    // are emitted.
     let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
         &mut writer,
         &obs,
@@ -1205,6 +1335,7 @@ pub fn h5ad_to_scx_streaming(
         &csr_row_ranges,
         n_vars,
         opts,
+        &opts.sort_by,
         sink,
     )?;
 
@@ -1235,6 +1366,8 @@ pub fn h5ad_to_scx_streaming(
                 "var_columns": var_indexed,
                 "preset": opts.index_preset,
             },
+            "sort_by": opts.sort_by,
+            "sort_reverse": opts.sort_reverse,
             "reader_threads": resolved_reader_threads,
             "writer_queue_depth": opts.writer_queue_depth,
         })
@@ -2091,6 +2224,17 @@ fn ingest_raw_streaming(
         )));
     }
     let raw_n_vars = raw_reader.n_vars() as usize;
+
+    // `adata.raw` shares the obs axis, but the sort permutation is applied only
+    // to X/obs/obsm/layers — raw is streamed in source order. Rather than emit a
+    // raw matrix whose rows no longer line up with the sorted cells, drop it
+    // (with a visible warning) under sort-on-convert, mirroring the standalone
+    // `scx sort` engine which also drops raw.
+    if !opts.sort_by.is_empty() {
+        sink.emit(ConvertWarning::DroppedRaw { raw_n_vars });
+        return Ok(());
+    }
+
     let raw_n_vars_u32 = u32::try_from(raw_n_vars)
         .map_err(|_| ConvertError::Other(format!("raw n_vars {raw_n_vars} exceeds u32::MAX")))?;
     let raw_index_dtype: u8 = if raw_n_vars <= 65535 { 0 } else { 1 };
@@ -2132,6 +2276,7 @@ enum SparseMappingKind {
 /// by [`h5ad_to_scx_streaming`] for both the override path (in-memory
 /// `RecordBatch` from pyscx) and the disk-streaming path (h5py
 /// hyperslab reads per shard).
+#[allow(clippy::too_many_arguments)]
 fn write_dense_mapping_section(
     file: &hdf5::File,
     writer: &mut ScxWriter,
@@ -2139,6 +2284,10 @@ fn write_dense_mapping_section(
     group_path: &str,
     shard_target_rows: u32,
     kind: DenseMappingKind,
+    // Sort-on-convert (Phase 2): when `Some`, reorder this section's rows by
+    // `row_perm[output_row] = source_row]` before sharding. Used for obsm
+    // (obs-axis); always `None` for varm (var-axis is untouched by an obs sort).
+    row_perm: Option<&[u64]>,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     let emit = |w: &mut ScxWriter,
@@ -2162,6 +2311,15 @@ fn write_dense_mapping_section(
 
     if let Some(entries) = override_entries {
         for (name, batch) in entries {
+            // Sort-on-convert: permute rows before sharding (obsm only).
+            let permuted;
+            let batch: &RecordBatch = match row_perm {
+                Some(p) => {
+                    permuted = crate::permuted_reader::take_record_batch(batch, p)?;
+                    &permuted
+                }
+                None => batch,
+            };
             let n_rows = batch.num_rows();
             let n_total = n_rows as u64;
             if n_rows == 0 {
@@ -2225,6 +2383,33 @@ fn write_dense_mapping_section(
         if info.n_rows == 0 {
             let batch = read_dense_mapping_shard(file, group_path, &info.name, 0, 0)?;
             emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
+            continue;
+        }
+        // Sort-on-convert (obsm): read the whole mapping for this key, permute
+        // its rows, then shard the permuted batch. Bounded by the mapping size
+        // (n_obs × k); obsm at convert time is small/rare. The non-sort path
+        // below streams one contiguous shard at a time as before.
+        if let Some(perm) = row_perm {
+            let full = read_dense_mapping_shard(file, group_path, &info.name, 0, info.n_rows)?;
+            let permuted = crate::permuted_reader::take_record_batch(&full, perm)?;
+            let step = shard_target_rows.max(1) as usize;
+            let mut shard_idx = 0u32;
+            let mut row_start = 0usize;
+            while row_start < info.n_rows {
+                let n = (info.n_rows - row_start).min(step);
+                let shard = permuted.slice(row_start, n);
+                emit(
+                    writer,
+                    &info.name,
+                    shard_idx,
+                    row_start as u64,
+                    n as u64,
+                    n_total,
+                    &shard,
+                )?;
+                row_start += n;
+                shard_idx += 1;
+            }
             continue;
         }
         let step = shard_target_rows.max(1) as usize;

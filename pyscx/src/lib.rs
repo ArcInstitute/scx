@@ -258,6 +258,7 @@ fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
+    sort_by=None, reverse=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -277,6 +278,8 @@ fn from_anndata(
     bitmap: &str,
     memory_budget: Option<Bound<'_, PyAny>>,
     force_legacy_metadata: bool,
+    sort_by: Option<Vec<String>>,
+    reverse: bool,
 ) -> PyResult<()> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
@@ -297,6 +300,8 @@ fn from_anndata(
         bitmap,
         memory_budget_bytes,
         force_legacy_metadata,
+        sort_by.unwrap_or_default(),
+        reverse,
     )
 }
 
@@ -396,6 +401,7 @@ fn from_anndata(
     memory_budget=None, temp_dir=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", reader_threads=None, writer_queue_depth=4,
+    sort_by=None, reverse=false,
     obs_override=None, var_override=None, uns_override=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -420,6 +426,8 @@ fn from_h5ad(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Option<Vec<String>>,
+    reverse: bool,
     obs_override: Option<Bound<'_, PyAny>>,
     var_override: Option<Bound<'_, PyAny>>,
     uns_override: Option<Bound<'_, PyAny>>,
@@ -442,6 +450,11 @@ fn from_h5ad(
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    // Sort-on-convert (Phase 2): the permuted gather runs only on the
+    // streaming path, so requesting a sort forces streaming on.
+    let sort_by = sort_by.unwrap_or_default();
+    let stream = stream || !sort_by.is_empty();
 
     let has_override = obs_override.is_some() || var_override.is_some() || uns_override.is_some();
     if has_override && !stream {
@@ -511,6 +524,8 @@ fn from_h5ad(
         bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
+        sort_by,
+        sort_reverse: reverse,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -601,6 +616,8 @@ fn from_10x(
         bitmap,
         memory_budget_bytes,
         force_legacy_metadata,
+        Vec::new(), // sort_by (not exposed on the 10x reader)
+        false,      // sort_reverse
     )
 }
 
@@ -1234,6 +1251,7 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
     m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::sort, m)?)?;
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
     m.add_function(wrap_pyfunction!(ops::set_uns, m)?)?;

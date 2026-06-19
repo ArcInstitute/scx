@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{DictionaryArray, Float32Array, Int32Array, StringArray};
+use arrow::array::{Array, DictionaryArray, Float32Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
@@ -1933,4 +1933,242 @@ fn merge_streams_drops_obsm_keys_missing_from_any_input() {
         n_obsm, 0,
         "obsm key missing from any input must be dropped from merge output"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sorted k-way merge: `merge --sort-by`.
+// ---------------------------------------------------------------------------
+
+/// Write an input whose cells are a *sorted run* by `ct`. Each row carries a
+/// `cell_id` and a `ct` (sort key); X has one nnz at col0 with value
+/// `cell + 1` so the source cell is recoverable from the merged X.
+fn write_sorted_run(path: &std::path::Path, cells: &[(&str, u32)]) {
+    let n = cells.len() as u64;
+    let mut w = ScxWriter::new(path, header(n, 4)).unwrap();
+    let cell_ids: Vec<String> = cells.iter().map(|(_, c)| format!("cell_{c}")).collect();
+    let cts: Vec<String> = cells.iter().map(|(ct, _)| ct.to_string()).collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("ct", DataType::Utf8, false),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(cell_ids)),
+            Arc::new(StringArray::from(cts)),
+        ],
+    )
+    .unwrap();
+    w.write_obs(&obs).unwrap();
+    w.write_var(&var_batch()).unwrap();
+    let mut indptr = vec![0u64];
+    let mut indices: Vec<u32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for (_, c) in cells {
+        indices.push(0u32);
+        values.push(((*c % 250) + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    w.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1710000000,
+        action: "convert".to_string(),
+        tool: "sorted-merge test fixture".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: vec![],
+    }])
+    .unwrap();
+    w.finish().unwrap();
+}
+
+fn sorted_merge_opts(by: &[&str], reverse: bool, index: bool) -> scx_ops::MergeOptions {
+    let mut opts = scx_ops::MergeOptions {
+        sort_by: by.iter().map(|s| s.to_string()).collect(),
+        sort_reverse: reverse,
+        ..Default::default()
+    };
+    if index {
+        opts.index_options.index_obs = by.iter().map(|s| s.to_string()).collect();
+    }
+    opts
+}
+
+fn read_ct_col(reader: &ScxReader) -> Vec<String> {
+    let obs = reader.read_obs().unwrap();
+    let col = obs.column_by_name("ct").unwrap();
+    let utf8 = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let a = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+    (0..a.len()).map(|i| a.value(i).to_string()).collect()
+}
+
+/// Recover the source cell id of each output row from X col0 (`value - 1`).
+fn read_cell_tags(reader: &ScxReader) -> Vec<u32> {
+    let csr = reader.read_all_csr_shards().unwrap();
+    let (n, c) = csr.shape;
+    let dense = csr.to_dense().unwrap();
+    (0..n).map(|r| dense[r * c] as u32 - 1).collect()
+}
+
+#[test]
+fn sorted_merge_orders_globally_and_preserves_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("merged.scx");
+    // Two sorted runs that interleave under a global ct sort.
+    write_sorted_run(&p0, &[("A", 0), ("A", 1), ("C", 4)]);
+    write_sorted_run(&p1, &[("B", 2), ("B", 3), ("D", 5)]);
+
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], false, false),
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&out).unwrap();
+    assert_eq!(r.n_obs(), 6);
+    let ct = read_ct_col(&r);
+    assert!(
+        ct.windows(2).all(|w| w[0] <= w[1]),
+        "globally sorted: {ct:?}"
+    );
+    // Global ct order A,A,B,B,C,D → source cells 0,1,2,3,4,5.
+    assert_eq!(read_cell_tags(&r), vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn sorted_merge_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    write_sorted_run(&p0, &[("A", 0), ("C", 4)]);
+    write_sorted_run(&p1, &[("B", 2), ("D", 5)]);
+    let o1 = dir.path().join("m1.scx");
+    let o2 = dir.path().join("m2.scx");
+    for o in [&o1, &o2] {
+        scx_ops::merge_with_options(
+            &[p0.as_path(), p1.as_path()],
+            o,
+            &sorted_merge_opts(&["ct"], false, false),
+        )
+        .unwrap();
+    }
+    let r1 = ScxReader::open(&o1).unwrap();
+    let r2 = ScxReader::open(&o2).unwrap();
+    assert_eq!(read_ct_col(&r1), read_ct_col(&r2));
+    assert_eq!(read_cell_tags(&r1), read_cell_tags(&r2));
+}
+
+#[test]
+fn sorted_merge_tie_order_follows_input_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("m.scx");
+    // Both inputs are all "A" → equal keys; input 0's rows must come first.
+    write_sorted_run(&p0, &[("A", 0), ("A", 1)]);
+    write_sorted_run(&p1, &[("A", 2), ("A", 3)]);
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], false, false),
+    )
+    .unwrap();
+    let r = ScxReader::open(&out).unwrap();
+    assert_eq!(read_cell_tags(&r), vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn sorted_merge_reverse() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("m.scx");
+    // Reverse-sorted runs: each input descending by ct.
+    write_sorted_run(&p0, &[("C", 4), ("A", 0)]);
+    write_sorted_run(&p1, &[("D", 5), ("B", 2)]);
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], true, false),
+    )
+    .unwrap();
+    let ct = read_ct_col(&ScxReader::open(&out).unwrap());
+    assert!(
+        ct.windows(2).all(|w| w[0] >= w[1]),
+        "reverse sorted: {ct:?}"
+    );
+}
+
+#[test]
+fn sorted_merge_unsorted_input_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("m.scx");
+    write_sorted_run(&p0, &[("A", 0), ("B", 1)]);
+    // p1 is NOT sorted by ct (B before A).
+    write_sorted_run(&p1, &[("B", 2), ("A", 3)]);
+    let err = scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], false, false),
+    );
+    assert!(err.is_err(), "unsorted input must error under --sort-by");
+}
+
+#[test]
+fn sorted_merge_index_ranges_contiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("m.scx");
+    write_sorted_run(&p0, &[("A", 0), ("A", 1), ("C", 4)]);
+    write_sorted_run(&p1, &[("B", 2), ("C", 5)]);
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct"], false, true),
+    )
+    .unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    let bytes = reader.read_obs_predicate_index_bytes().unwrap().unwrap();
+    let index = scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes)).unwrap();
+    // Global order A,A,B,C,C → A=[0,2), B=[2,3), C=[3,5); each contiguous.
+    for (val, lo, hi) in [("A", 0u32, 2u32), ("B", 2, 3), ("C", 3, 5)] {
+        let ranges = index.categorical_eq("ct", val).expect("indexed");
+        assert_eq!(ranges.len(), 1, "{val} ranges {ranges:?}");
+        assert_eq!((ranges[0].row_start, ranges[0].row_end), (lo, hi), "{val}");
+    }
+}
+
+#[test]
+fn sorted_merge_composite_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("a.scx");
+    let p1 = dir.path().join("b.scx");
+    let out = dir.path().join("m.scx");
+    // Composite [ct, cell_id]: each input sorted by ct then cell_id.
+    write_sorted_run(&p0, &[("A", 0), ("A", 2), ("B", 10)]);
+    write_sorted_run(&p1, &[("A", 1), ("B", 11)]);
+    scx_ops::merge_with_options(
+        &[p0.as_path(), p1.as_path()],
+        &out,
+        &sorted_merge_opts(&["ct", "cell_id"], false, false),
+    )
+    .unwrap();
+    let r = ScxReader::open(&out).unwrap();
+    let ct = read_ct_col(&r);
+    assert!(ct.windows(2).all(|w| w[0] <= w[1]));
+    // Within ct=="A": cell_id "cell_0","cell_1","cell_2" ascending (string order).
+    assert_eq!(read_cell_tags(&r), vec![0, 1, 2, 10, 11]);
 }

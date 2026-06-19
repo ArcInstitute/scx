@@ -332,6 +332,9 @@ pub fn from_h5mu_impl(
         bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
+        // Sort-on-convert is not supported for multimodal h5mu inputs yet.
+        sort_by: Vec::new(),
+        sort_reverse: false,
     };
 
     let input = std::path::PathBuf::from(path);
