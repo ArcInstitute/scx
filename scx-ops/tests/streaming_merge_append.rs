@@ -1936,7 +1936,7 @@ fn merge_streams_drops_obsm_keys_missing_from_any_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Sorted k-way merge (SCX-SORT-SPEC Phase 3): `merge --sort-by`.
+// Sorted k-way merge: `merge --sort-by`.
 // ---------------------------------------------------------------------------
 
 /// Write an input whose cells are a *sorted run* by `ct`. Each row carries a

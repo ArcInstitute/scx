@@ -1,4 +1,4 @@
-//! `scx sort` standalone engine (SCX-SORT-SPEC §13 Phase 4).
+//! `scx sort` standalone engine.
 //!
 //! Globally reorders the obs (cell) axis of an already-built, codec-compressed
 //! `.scx` by a sort key and writes a new file. The pure primitives (key
@@ -9,7 +9,7 @@
 //!
 //! A global row reorder is a random scatter over compressed CSR shards
 //! (decoding one arbitrary row means decoding its whole shard), so a
-//! permute-then-seek is O(n_shards²). The spec's external partition sort
+//! permute-then-seek is O(n_shards²). A classic external partition sort
 //! solves this by spilling decoded rows tagged with `(full_key,
 //! source_row_id)`. We use a simpler, equivalent reduction: the obs **key**
 //! set fits in RAM at the same memory class the predicate-index build already
@@ -25,7 +25,7 @@
 //! - parallel scatter is trivially safe (append order is irrelevant — a row's
 //!   destination is fixed by `new_pos`);
 //! - partitions are `new_pos` ranges, so each holds ≤ `P` rows **regardless of
-//!   key skew** — the spec's pass-2 sub-split is unnecessary (a dominant
+//!   key skew** — an explicit pass-2 sub-split is unnecessary (a dominant
 //!   category cannot blow a partition past budget).
 //!
 //! The binding constraint (the multi-TB X matrix) is still bounded to one

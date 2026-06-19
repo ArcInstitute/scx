@@ -61,7 +61,7 @@ pub struct MergeOptions {
     /// this many rows.
     pub shard_target_rows: Option<u32>,
 
-    /// Sorted k-way merge (SCX-SORT-SPEC Phase 3): obs columns to
+    /// Sorted k-way merge: obs columns to
     /// globally order the merged cell axis by, lexicographic in order.
     /// Empty (default) = the legacy concatenation. Inputs must each be
     /// **sorted runs** by this key (e.g. produced by `scx convert

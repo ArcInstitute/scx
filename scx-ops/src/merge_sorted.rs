@@ -1,4 +1,4 @@
-//! Sorted k-way merge (SCX-SORT-SPEC Phase 3): `scx merge --sort-by`.
+//! Sorted k-way merge: `scx merge --sort-by`.
 //!
 //! The plain merge concatenates inputs (all of input 0's rows, then input
 //! 1's, …). With a sort key it instead emits the obs axis **globally

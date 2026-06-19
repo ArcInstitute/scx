@@ -1,6 +1,6 @@
 //! `scx sort` — global obs-axis row reorder for query locality.
 //!
-//! This module holds the **shared sort core** (SCX-SORT-SPEC §13 Phase 1):
+//! This module holds the **shared sort core**:
 //! the pure, reusable primitives every delivery form builds on —
 //! option/result types, sort-key extraction, the stability comparator,
 //! leading-key partition-boundary computation, the predicate-index-rebuild
@@ -21,7 +21,7 @@
 //!   of the order rows arrive in (e.g. Phase 4's parallel scatter).
 //! - Phase 0 recorded the design decisions (bitmap drop-only for v1; obs
 //!   axis globally shared; CSC rebuilt post-write via
-//!   [`crate::rebuild_csc_inplace`]); see SCX-SORT-SPEC §7.
+//!   [`crate::rebuild_csc_inplace`]).
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -203,7 +203,7 @@ pub fn stable_argsort(rows: &Rows, base_row_id: u64) -> Vec<u64> {
 // T1.4 — leading-key partition boundaries
 // ---------------------------------------------------------------------------
 
-/// Leading-key partition boundaries (SCX-SORT-SPEC §5 pass 0). Always
+/// Leading-key partition boundaries (external-sort pass 0). Always
 /// computed on the **leading** key only; trailing keys are handled by the
 /// within-partition sort.
 #[derive(Debug, Clone, PartialEq)]
@@ -229,7 +229,8 @@ impl PartitionPlan {
 }
 
 /// Target rows per partition from the memory budget and matrix shape
-/// (SCX-SORT-SPEC §9 sizing). `None` budget → one shard's worth. The result
+/// (one partition ≈ a budget's worth of decoded rows). `None` budget → one
+/// shard's worth. The result
 /// is floored at `shard_target_rows` so a partition is always at least one
 /// output shard.
 pub fn partition_target_rows(

@@ -1,4 +1,4 @@
-//! scx-convert integration tests — sort-on-convert (SCX-SORT-SPEC Phase 2).
+//! scx-convert integration tests — sort-on-convert.
 //!
 //! Exercises `--sort-by` / `ConvertOptions::sort_by`: the obs axis (and X,
 //! layers, obsm) is globally reordered by an obs key during conversion.

@@ -435,7 +435,7 @@ fn shards_touching_category(path: &std::path::Path, target: &str) -> usize {
         .count()
 }
 
-/// Locality benchmark (SCX-SORT-SPEC §10 / §13 T4 gate): X-shard fetch count
+/// Locality benchmark: X-shard fetch count
 /// for an "all cells of one category" scan *before* vs *after* `scx sort`.
 /// Expectation: O(shards) → O(few) once a category is physically contiguous.
 #[test]

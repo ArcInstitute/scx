@@ -98,7 +98,7 @@ pub fn merge_with_options(
     output_path: &Path,
     options: &MergeOptions,
 ) -> Result<PredicateIndexBuildSummary> {
-    // Sorted merge auto-indexes the sort key (SCX-SORT-SPEC T1.5) so its
+    // Sorted merge auto-indexes the sort key so its
     // now-contiguous `shard_ranges` are emitted — but only when the caller
     // already asked for a predicate index. Non-sorted (or no-index) merges
     // keep the original options unchanged (byte-identical concat path).
@@ -147,7 +147,7 @@ pub fn merge_with_options(
         }
     }
 
-    // Sorted k-way merge (SCX-SORT-SPEC Phase 3): `sort_by` reorders the
+    // Sorted k-way merge: `sort_by` reorders the
     // merged obs axis globally instead of concatenating.
     let sorted = !options.sort_by.is_empty();
 
@@ -298,7 +298,7 @@ pub fn merge_with_options(
     };
 
     // ---------------------------------------------------------------
-    // Sorted k-way merge (SCX-SORT-SPEC Phase 3). Self-contained path so
+    // Sorted k-way merge. Self-contained path so
     // the legacy concatenation below stays byte-identical. Reorders obs /
     // X / layers globally by the key; var-axis sections preserved; obsm
     // rejected for now; obsp dropped (as plain merge does).

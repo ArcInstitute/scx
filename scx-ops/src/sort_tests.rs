@@ -1,4 +1,4 @@
-//! Phase 1 gate tests (SCX-SORT-SPEC §13): key ordering, reverse, composite
+//! Shared sort-core gate tests: key ordering, reverse, composite
 //! leading-key precedence, stability, partition sizing, categorical
 //! grouping, and numeric quantile boundaries.
 

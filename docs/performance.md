@@ -726,6 +726,40 @@ fixtures grow beyond memory.
 | Merge 3 files | **342 MB/s** |
 | Compact (after 3 appends) | 0.98x fresh-write size |
 
+### Sort (physical layout)
+
+`scx sort` (see [sharding.md § Sorting for read locality](sharding.md#sorting-for-read-locality-scx-sort))
+globally reorders the obs axis for X-read locality. Measured on
+`tabula_sapiens_100k` (100,000 cells × 61,497 genes, 194.9M nnz, 7 CSR shards,
+`scx1`/uint16), sorting by `cell_type` (33 categories), in-memory strategy:
+
+| metric | unsorted | sorted by `cell_type` | delta |
+|--------|----------|-----------------------|-------|
+| X matrix (CSR) size | 394.1 MB | 394.1 MB | **size-neutral** |
+| obs predicate index (`cell_type`) | 724.3 KB | 1.3 KB | **~557× smaller** |
+| whole file | 427.6 MB | 426.7 MB | −0.2% |
+| shards touched per category (mean) | 2.94 | 1.18 | **2.6× fewer** |
+| shards touched per category (max) | 4 / 7 | 2 / 7 | — |
+
+**Reading the numbers.** Compression: the X matrix is *size-neutral* under a row
+reorder because `scx1` codes each row's gene indices independently of row order;
+the real on-disk win is the **predicate index**, which collapses from per-shard
+scattered row lists (724 KB) to a handful of contiguous ranges (1.3 KB) once each
+category occupies one shard range. So the whole-file compression gain is modest
+for count-data X (data- and codec-dependent, as flagged in the spec) — the
+headline value is **locality**. Locality: the comparison is against an isolated
+unsorted baseline produced by the *same* writer (`scx compact --reshape-obs
+--index-obs cell_type`), so the format-version sidecars (decode metadata, sharded
+obs) are present in both and don't confound the delta. The dominant cell types
+drop from 3–4 shards to 1–2 contiguous shards; the 2.6× figure is conservative
+because real atlas data is already partially clustered by cell type. The
+synthetic worst-case (`bench_ops_sort_locality`: 40k cells, 8 categories cycled
+across every shard) brackets the upper end at **10 → 2 shards (5×)**, and the gap
+widens with shard count at atlas scale. In-memory sort of the 100k file ran in
+~73 s at 2.7 GB peak RSS (debug build); the bounded-memory external strategy
+(`--memory-budget`) caps peak RSS to one `new_pos`-range partition for atlas-scale
+files.
+
 ---
 
 ## Comprehensive Benchmarking + Cloud Validation

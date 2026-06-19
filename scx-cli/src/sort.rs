@@ -1,4 +1,4 @@
-// scx sort — global obs-axis row reorder for query locality (SCX-SORT-SPEC).
+// scx sort — global obs-axis row reorder for query locality.
 
 use std::path::{Path, PathBuf};
 

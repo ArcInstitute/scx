@@ -180,7 +180,7 @@ pub struct ConvertOptions {
     /// look-ahead buffer; smaller values risk starving encoders when
     /// one shard takes much longer than its siblings.
     pub writer_queue_depth: usize,
-    /// Sort-on-convert (SCX-SORT-SPEC Phase 2): obs columns to globally
+    /// Sort-on-convert: obs columns to globally
     /// reorder the cell axis by, lexicographic in order (leading key first).
     /// Empty (default) = no reorder. Requires a CSR or dense `/X`; CSC-on-disk
     /// X errors. The reorder is applied to X, layers, obs, and obsm; obsp is

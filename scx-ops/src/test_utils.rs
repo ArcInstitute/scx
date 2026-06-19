@@ -101,7 +101,7 @@ pub fn write_test_file(dir: &tempfile::TempDir, n_obs: usize, n_vars: usize) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Sort test fixtures (SCX-SORT-SPEC §13 Phase 0 / T0.3)
+// Sort test fixtures
 //
 // Seven small self-contained `.scx` fixtures that back the §10 sort tests
 // across every later phase. Each writes one file into `dir` and returns its
@@ -398,7 +398,7 @@ pub fn fixture_deletion(dir: &tempfile::TempDir) -> (PathBuf, usize) {
 
 #[cfg(test)]
 mod fixture_smoke {
-    //! Phase 0 gate (SCX-SORT-SPEC §13): every sort fixture builds and
+    //! Sort-fixture smoke test: every sort fixture builds and
     //! reopens with its defining structure intact.
     use super::*;
     use arrow::array::Array;

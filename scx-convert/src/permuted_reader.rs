@@ -1,4 +1,4 @@
-//! Sort-on-convert support (SCX-SORT-SPEC §5, Phase 2): a permuted
+//! Sort-on-convert support: a permuted
 //! row-gather adapter over the streaming X/layer readers.
 //!
 //! [`PermutedCsrReader`] wraps any [`IndexedCsrShardStream`] plus a
