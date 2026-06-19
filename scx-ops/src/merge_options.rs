@@ -60,6 +60,16 @@ pub struct MergeOptions {
     /// `header.shard_target_rows`. Each obs shard contains at most
     /// this many rows.
     pub shard_target_rows: Option<u32>,
+
+    /// Sorted k-way merge (SCX-SORT-SPEC Phase 3): obs columns to
+    /// globally order the merged cell axis by, lexicographic in order.
+    /// Empty (default) = the legacy concatenation. Inputs must each be
+    /// **sorted runs** by this key (e.g. produced by `scx convert
+    /// --sort-by`); an unsorted input errors. Reorders obs / X / layers
+    /// / obsm; var-axis preserved; obsp dropped (as plain merge does).
+    pub sort_by: Vec<String>,
+    /// Descending order when `sort_by` is set.
+    pub sort_reverse: bool,
 }
 
 impl Default for MergeOptions {
@@ -75,6 +85,8 @@ impl Default for MergeOptions {
             assume_identical_obs: false,
             uns_policy: UnsPolicy::default(),
             shard_target_rows: None,
+            sort_by: Vec::new(),
+            sort_reverse: false,
         }
     }
 }
@@ -91,6 +103,8 @@ impl MergeOptions {
             assume_identical_obs: false,
             uns_policy: UnsPolicy::First,
             shard_target_rows: None,
+            sort_by: Vec::new(),
+            sort_reverse: false,
         }
     }
 }

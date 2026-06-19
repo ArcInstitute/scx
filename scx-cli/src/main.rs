@@ -475,6 +475,16 @@ enum Commands {
         /// array listing per-input disagreements.
         #[arg(long, value_name = "POLICY")]
         uns_policy: Option<String>,
+        /// Sorted k-way merge: globally reorder the merged cell (obs) axis
+        /// by these obs columns (CSV, lexicographic). Each input must
+        /// already be a sorted run by this key (e.g. from `scx convert
+        /// --sort-by`); an unsorted input errors. Reorders obs / X /
+        /// layers; var-axis preserved; obsm unsupported (errors).
+        #[arg(long, value_name = "CSV")]
+        sort_by: Option<String>,
+        /// Descending order for `--sort-by`.
+        #[arg(long)]
+        sort_reverse: bool,
     },
     /// Query cells by predicate
     Query {
@@ -915,6 +925,8 @@ fn main() {
             assume_identical_var,
             assume_identical_obs,
             uns_policy,
+            sort_by,
+            sort_reverse,
         } => match output {
             Some(output) => merge::run_merge(
                 &inputs,
@@ -929,6 +941,8 @@ fn main() {
                 assume_identical_var,
                 assume_identical_obs,
                 uns_policy,
+                parse_index_columns(sort_by.as_deref()),
+                sort_reverse,
             ),
             // Unlike `scx convert`, the merged output is passed via `--output`,
             // not positionally — `inputs` is variadic, so a trailing path is

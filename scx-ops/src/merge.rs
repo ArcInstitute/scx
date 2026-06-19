@@ -17,6 +17,7 @@ use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
 use crate::merge_options::MergeOptions;
+use crate::merge_sorted;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
@@ -97,7 +98,24 @@ pub fn merge_with_options(
     output_path: &Path,
     options: &MergeOptions,
 ) -> Result<PredicateIndexBuildSummary> {
-    let index_options = &options.index_options;
+    // Sorted merge auto-indexes the sort key (SCX-SORT-SPEC T1.5) so its
+    // now-contiguous `shard_ranges` are emitted — but only when the caller
+    // already asked for a predicate index. Non-sorted (or no-index) merges
+    // keep the original options unchanged (byte-identical concat path).
+    let augmented_index_options;
+    let index_options: &ConversionPredicateIndexOptions =
+        if !options.sort_by.is_empty() && user_wants_index(&options.index_options) {
+            let mut io = options.index_options.clone();
+            for key in &options.sort_by {
+                if !io.index_obs.iter().any(|c| c == key) {
+                    io.index_obs.push(key.clone());
+                }
+            }
+            augmented_index_options = io;
+            &augmented_index_options
+        } else {
+            &options.index_options
+        };
     if input_paths.is_empty() {
         return Err(OpsError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -129,12 +147,23 @@ pub fn merge_with_options(
         }
     }
 
+    // Sorted k-way merge (SCX-SORT-SPEC Phase 3): `sort_by` reorders the
+    // merged obs axis globally instead of concatenating.
+    let sorted = !options.sort_by.is_empty();
+
     // Phase 6: validate modality structure consistency. Multimodal
     // merge requires every input to expose the same set of
     // modalities (name + type + n_vars). On mismatch, raise with a
     // clear error directing to extract-then-merge.
     let any_multimodal = readers.iter().any(|r| r.is_multimodal());
     if any_multimodal {
+        if sorted {
+            return Err(OpsError::InvalidInput(
+                "merge --sort-by does not yet support multimodal inputs (Phase 5); \
+                 merge without --sort-by, or sort a single-modality extract"
+                    .into(),
+            ));
+        }
         let first = readers[0].modality_table();
         for (i, reader) in readers.iter().enumerate().skip(1) {
             let here = reader.modality_table();
@@ -267,6 +296,139 @@ pub fn merge_with_options(
     } else {
         None
     };
+
+    // ---------------------------------------------------------------
+    // Sorted k-way merge (SCX-SORT-SPEC Phase 3). Self-contained path so
+    // the legacy concatenation below stays byte-identical. Reorders obs /
+    // X / layers globally by the key; var-axis sections preserved; obsm
+    // rejected for now; obsp dropped (as plain merge does).
+    // ---------------------------------------------------------------
+    if sorted {
+        if merge_sorted::has_obsm(&readers) {
+            return Err(OpsError::InvalidInput(
+                "merge --sort-by does not yet support obsm; merge without --sort-by then \
+                 `scx sort`, or drop obsm before a sorted merge"
+                    .into(),
+            ));
+        }
+        let order = merge_sorted::compute_merge_order(
+            &readers,
+            &unified_obs_schema,
+            &options.sort_by,
+            options.sort_reverse,
+            shard_target_rows,
+            total_n_obs,
+        )?;
+        let output_shard_row_ranges = merge_sorted::emit_sorted(
+            &readers,
+            &mut writer,
+            &order,
+            shard_target_rows,
+            total_n_obs,
+            &mut obs_index_builder,
+        )?;
+        writer.write_var(&var)?;
+        // varm is var-axis (shared, unchanged); obsm errored above.
+        merge_global_dense_mapping_sharded(&readers, &mut writer, DenseMappingAxis::Varm, n_vars)?;
+        let mut uns_conflicts_warned: usize = 0;
+        if let Some(combined_uns) =
+            combine_uns_for_merge(&readers, options.uns_policy, &mut uns_conflicts_warned)?
+        {
+            writer.write_uns(&combined_uns)?;
+        }
+
+        // Predicate index (same shape as the concat path).
+        let index_result = if let Some(builder) = obs_index_builder.take() {
+            let mut result = scx_engine::ConversionPredicateIndexResult::default();
+            let obs_bytes = builder.finish(
+                &output_shard_row_ranges,
+                &mut result.obs_outcomes,
+                &mut result.obs_indexed_columns,
+            )?;
+            if let Some(bytes) = obs_bytes {
+                writer.write_obs_predicate_index(&bytes)?;
+                scx_engine::apply_obs_shard_column_stats(
+                    &mut writer,
+                    &bytes,
+                    output_shard_row_ranges.len(),
+                )?;
+            }
+            let preset_var = match index_options.index_preset.as_deref() {
+                Some(name) => scx_engine::index_preset_columns(name)
+                    .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let var_row_ranges: [(u64, u64); 1] = [(0, n_vars)];
+            let var_build_opts = scx_engine::PredicateIndexBuildOptions {
+                forced_columns: index_options.index_var.clone(),
+                preset_columns: preset_var,
+                auto_threshold: index_options.index_auto_threshold,
+                high_cardinality_threshold: 100_000,
+            };
+            let var_bytes = scx_engine::build_var_predicate_index_bytes(
+                &var,
+                &var_row_ranges,
+                &var_build_opts,
+                &mut result.var_outcomes,
+                &mut result.var_indexed_columns,
+            )?;
+            if let Some(bytes) = var_bytes {
+                writer.write_var_predicate_index(&bytes)?;
+            }
+            Some(result)
+        } else {
+            None
+        };
+
+        // Provenance (records the sort key alongside the merge audit trail).
+        let mut all_prov_entries = Vec::new();
+        for reader in &readers {
+            if let Ok(prov) = reader.read_provenance() {
+                all_prov_entries.extend(prov.operations);
+            }
+        }
+        let mut params = serde_json::json!({
+            "n_inputs": input_paths.len(),
+            "assume_identical_var": options.assume_identical_var,
+            "assume_identical_obs": options.assume_identical_obs,
+            "uns_policy": options.uns_policy.as_str(),
+            "uns_conflicts_warned": uns_conflicts_warned,
+            "sort_by": options.sort_by,
+            "sort_reverse": options.sort_reverse,
+        });
+        if let Some(ref result) = index_result {
+            params["predicate_index"] = serde_json::json!({
+                "obs_columns": result.obs_indexed_columns,
+                "var_columns": result.var_indexed_columns,
+                "preset": options.index_options.index_preset,
+            });
+        }
+        all_prov_entries.push(ProvenanceEntry {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            action: "merge".to_string(),
+            tool: concat!("scx-ops ", env!("CARGO_PKG_VERSION")).to_string(),
+            params_json: params.to_string(),
+            input_checksums: readers
+                .iter()
+                .map(|r| {
+                    let mut cs = [0u8; 32];
+                    cs[..8].copy_from_slice(&r.header().file_checksum.to_le_bytes());
+                    cs
+                })
+                .collect(),
+        });
+        writer.write_provenance(all_prov_entries)?;
+
+        writer.finish()?;
+        return Ok(PredicateIndexBuildSummary {
+            result: index_result,
+            multimodal_skip: None,
+        });
+    }
 
     let mut out_shard_idx: u32 = 0;
     let mut cumulative_obs_rows: u64 = 0;
@@ -1770,7 +1932,7 @@ fn merge_per_modality_dense_mapping_sharded(
 /// [`ScxReader::obs_shards`]; legacy single-section inputs are sliced
 /// into chunks of `shard_target_rows` so the output keeps a uniform
 /// shard size regardless of the input layout.
-fn input_obs_chunks<'a>(
+pub(crate) fn input_obs_chunks<'a>(
     reader: &'a ScxReader,
     shard_target_rows: u64,
 ) -> Result<Box<dyn Iterator<Item = Result<RecordBatch>> + 'a>> {

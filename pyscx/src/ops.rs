@@ -647,6 +647,7 @@ pub fn rollback(path: &str, to_seq: Option<u64>) -> PyResult<()> {
     inputs, output,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     assume_identical_var=false, assume_identical_obs=false, uns_policy=None,
+    sort_by=None, reverse=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn merge(
@@ -660,6 +661,8 @@ pub fn merge(
     assume_identical_var: bool,
     assume_identical_obs: bool,
     uns_policy: Option<String>,
+    sort_by: Option<Vec<String>>,
+    reverse: bool,
 ) -> PyResult<()> {
     if inputs.len() < 2 {
         return Err(PyValueError::new_err(
@@ -684,6 +687,8 @@ pub fn merge(
         None => scx_ops::UnsPolicy::First,
     };
 
+    let sort_by = sort_by.unwrap_or_default();
+    let want_sort = !sort_by.is_empty();
     let want_policy = assume_identical_var
         || assume_identical_obs
         || uns_policy_parsed != scx_ops::UnsPolicy::First;
@@ -695,13 +700,15 @@ pub fn merge(
                 assume_identical_obs,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
+                sort_by,
+                sort_reverse: reverse,
             };
             let summary = py
                 .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
                 .map_err(ops_to_pyerr)?;
             process_index_summary(py, summary)
         }
-        None if want_policy => {
+        None if want_policy || want_sort => {
             let merge_opts = scx_ops::MergeOptions {
                 index_options: scx_engine::ConversionPredicateIndexOptions {
                     index_obs: Vec::new(),
@@ -713,6 +720,8 @@ pub fn merge(
                 assume_identical_obs,
                 uns_policy: uns_policy_parsed,
                 shard_target_rows: None,
+                sort_by,
+                sort_reverse: reverse,
             };
             let summary = py
                 .detach(|| scx_ops::merge_with_options(&input_refs, &output_path, &merge_opts))
