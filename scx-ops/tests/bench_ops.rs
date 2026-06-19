@@ -349,3 +349,40 @@ fn bench_ops_merge_throughput() {
         })
     );
 }
+
+/// Locality benchmark stub (SCX-SORT-SPEC §10 / §13 Phase 0 T0.4).
+///
+/// The §10 locality benchmark measures the X-shard fetch count for an
+/// "all cells of one category" scan *before* and *after* `scx sort`:
+/// expectation is O(shards) → O(few) once rows of a category are
+/// physically contiguous. Sort is not implemented yet (Phase 1+), so this
+/// is a scaffold: it builds a categorical fixture, records the baseline
+/// shard count, and emits a `not_implemented` JSON line. Fill in the
+/// before/after fetch-count comparison when `scx_ops::sort` lands.
+#[test]
+#[ignore]
+fn bench_ops_sort_locality() {
+    let dir = tempfile::tempdir().unwrap();
+    // A multi-shard fixture so the "before" shard count is meaningful
+    // (> one 16384-row shard).
+    let path = write_bench_file(&dir, "sort_locality.scx", BENCH_CELLS * 4, BENCH_GENES);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let n_obs = reader.n_obs();
+    let baseline_shards = n_obs.div_ceil(16384);
+
+    // TODO(SCX-SORT-SPEC Phase 4): once `scx_ops::sort` exists, sort by a
+    // categorical obs key, then count the distinct CSR shards touched by an
+    // "all cells of category X" scan on the original vs the sorted file and
+    // report the ratio here.
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "benchmark": "sort_locality",
+            "status": "not_implemented",
+            "n_obs": n_obs,
+            "baseline_shards": baseline_shards,
+        })
+    );
+}

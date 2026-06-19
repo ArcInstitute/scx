@@ -183,6 +183,16 @@ enum Commands {
         /// peak RSS linearly; smaller values can starve encoders.
         #[arg(long, value_name = "N", default_value_t = 4)]
         writer_queue_depth: usize,
+        /// Sort-on-convert: globally reorder the cell (obs) axis by these
+        /// obs columns (CSV, lexicographic; leading key first) so output
+        /// CSR shards — and the predicate index — are contiguous per key.
+        /// Requires a CSR or dense h5ad X (CSC errors). Applies to X,
+        /// layers, obs, and obsm; obsp is dropped with a warning.
+        #[arg(long, value_name = "CSV")]
+        sort_by: Option<String>,
+        /// Descending order for `--sort-by`.
+        #[arg(long)]
+        sort_reverse: bool,
     },
     /// Display SCX file information
     Info {
@@ -746,6 +756,8 @@ fn main() {
             bitmap,
             reader_threads,
             writer_queue_depth,
+            sort_by,
+            sort_reverse,
         } => {
             // Resolve the CSC policy: an explicit `--csc` always wins;
             // otherwise an accel-ready `--index-preset` upgrades the
@@ -777,6 +789,8 @@ fn main() {
                 &bitmap,
                 reader_threads,
                 writer_queue_depth,
+                sort_by.as_deref(),
+                sort_reverse,
             )
         }
         Commands::Info {
@@ -1076,8 +1090,11 @@ fn run_convert(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Option<&str>,
+    sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
+    let sort_by_list = parse_index_columns(sort_by);
 
     // CSC mode is meaningful only on input → SCX paths. Reject silently
     // for output paths (h5ad / mtx) where the destination has no CSC
@@ -1139,6 +1156,15 @@ fn run_convert(
         )
         .into());
     }
+    // Sort-on-convert applies only to h5ad → scx and requires the streaming
+    // path (the random-access permuted gather). Force streaming on.
+    if !sort_by_list.is_empty() && direction != "h5ad_to_scx" {
+        return Err(format!(
+            "--sort-by is only supported for h5ad → scx; got direction '{direction}'."
+        )
+        .into());
+    }
+    let stream = stream || !sort_by_list.is_empty();
 
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
@@ -1216,6 +1242,8 @@ fn run_convert(
         bitmap,
         reader_threads,
         writer_queue_depth,
+        sort_by_list,
+        sort_reverse,
     )
 }
 
@@ -1291,6 +1319,8 @@ fn dispatch_convert(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Vec<String>,
+    sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{BitmapPolicy, ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -1319,6 +1349,8 @@ fn dispatch_convert(
         bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
+        sort_by,
+        sort_reverse,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1446,6 +1478,8 @@ fn dispatch_convert(
     _bitmap: &str,
     _reader_threads: Option<usize>,
     _writer_queue_depth: usize,
+    _sort_by: Vec<String>,
+    _sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

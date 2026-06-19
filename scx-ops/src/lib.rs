@@ -15,6 +15,7 @@ pub mod predicate_index;
 pub mod rebuild_csc;
 pub mod rewrite_helpers;
 pub mod rollback;
+pub mod sort;
 
 #[cfg(test)]
 mod test_utils;
@@ -35,3 +36,4 @@ pub use predicate_index::PredicateIndexBuildSummary;
 pub use rebuild_csc::rebuild_csc_inplace;
 pub use rewrite_helpers::copy_auxiliary_sections;
 pub use rollback::{rollback, rollback_to};
+pub use sort::{SortOptions, SortStrategy, SortSummary};
