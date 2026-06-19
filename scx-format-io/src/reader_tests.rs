@@ -657,6 +657,134 @@ fn test_assemble_high_cardinality_dictionary_widens_key() {
     }
 }
 
+/// Regression: an append writes obs categoricals as plain `Utf8` (its
+/// `unify_dict_columns` decodes them) while `from_anndata` writes the same
+/// column as a `Dictionary`. After an append, a sharded obs axis therefore
+/// carries the column as `Dictionary` in the base shards and plain `Utf8` in
+/// the appended shards. Before the fix, `concat_batches` rejected the mix with
+/// *"It is not possible to concatenate arrays of different data types
+/// (Dictionary(Int32, LargeUtf8), LargeUtf8)"* and the file's obs became
+/// unreadable via `to_anndata()`. `reconcile_dictionary_representations` now
+/// encodes the plain shard to a dictionary before concat.
+#[test]
+fn test_assemble_reconciles_mixed_dictionary_and_plain_shards() {
+    use arrow::array::{Array, DictionaryArray};
+
+    let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+
+    // Shard 0: Dictionary-encoded (the `from_anndata` base layout).
+    let s0_vals = StringArray::from(vec!["fibroblast", "epithelial"]);
+    let s0_col =
+        arrow::compute::cast(&(Arc::new(s0_vals) as arrow::array::ArrayRef), &dict_dt).unwrap();
+    let s0_schema = Arc::new(
+        Schema::new(vec![Field::new("cell_type", dict_dt.clone(), false)]).with_metadata(
+            std::collections::HashMap::from([
+                ("shard_idx".to_string(), "0".to_string()),
+                ("row_start".to_string(), "0".to_string()),
+                ("n_shard_rows".to_string(), "2".to_string()),
+                ("n_rows_total".to_string(), "4".to_string()),
+            ]),
+        ),
+    );
+    let s0 = RecordBatch::try_new(s0_schema, vec![s0_col]).unwrap();
+
+    // Shard 1: plain Utf8 (the appended layout), with a disjoint vocabulary.
+    let s1_col = Arc::new(StringArray::from(vec!["neuron", "astrocyte"])) as arrow::array::ArrayRef;
+    let s1_schema = Arc::new(
+        Schema::new(vec![Field::new("cell_type", DataType::Utf8, false)]).with_metadata(
+            std::collections::HashMap::from([
+                ("shard_idx".to_string(), "1".to_string()),
+                ("row_start".to_string(), "2".to_string()),
+                ("n_shard_rows".to_string(), "2".to_string()),
+                ("n_rows_total".to_string(), "4".to_string()),
+            ]),
+        ),
+    );
+    let s1 = RecordBatch::try_new(s1_schema, vec![s1_col]).unwrap();
+
+    // Pre-fix: `Err(Arrow("...concatenate arrays of different data types..."))`.
+    let merged = assemble_sharded_metadata("obs", vec![(0, s0), (1, s1)]).unwrap();
+    assert_eq!(merged.num_rows(), 4);
+
+    let col = merged.column(0);
+    // 4 distinct categories survive, dictionary-encoded with a narrow key.
+    assert_eq!(
+        col.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        "the reconciled column must remain dictionary-encoded"
+    );
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<arrow::datatypes::Int8Type>>()
+        .expect("cell_type should be dictionary-encoded after reconcile");
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("dictionary values should be Utf8");
+    let resolved: Vec<&str> = (0..dict.len())
+        .map(|i| values.value(dict.keys().value(i) as usize))
+        .collect();
+    assert_eq!(
+        resolved,
+        vec!["fibroblast", "epithelial", "neuron", "astrocyte"],
+        "every row must resolve to its original category across the mixed shards"
+    );
+}
+
+/// Offset-overflow protection: the assembler upcasts to `LargeUtf8` before
+/// concat (so a combined string column above `i32::MAX` can't overflow Arrow's
+/// 32-bit offsets) and opportunistically narrows back afterwards. Drive a
+/// shard set whose `cell_id` is already `LargeUtf8` on input and assert the
+/// assembler concats without error and round-trips every value — a cheap proxy
+/// for the >2 GB path that proves the consolidation did not drop the wide
+/// handling the hand-rolled copies relied on.
+#[test]
+fn test_assemble_preserves_wide_offset_string_column() {
+    use arrow::array::{Array, LargeStringArray};
+
+    let n_shards = 3u32;
+    let per_shard = 2usize;
+    let total = per_shard * n_shards as usize;
+    let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+        .map(|shard_idx| {
+            let row_start = shard_idx as usize * per_shard;
+            let ids: Vec<String> = (0..per_shard)
+                .map(|j| format!("cell_{}", row_start + j))
+                .collect();
+            // Force the wide encoding on input.
+            let col = LargeStringArray::from(ids.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+            let metadata = std::collections::HashMap::from([
+                ("shard_idx".to_string(), shard_idx.to_string()),
+                ("row_start".to_string(), row_start.to_string()),
+                ("n_shard_rows".to_string(), per_shard.to_string()),
+                ("n_rows_total".to_string(), total.to_string()),
+            ]);
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("cell_id", DataType::LargeUtf8, false)])
+                    .with_metadata(metadata),
+            );
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+            (shard_idx, batch)
+        })
+        .collect();
+
+    let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+    assert_eq!(merged.num_rows(), total);
+    // Small payload → opportunistically narrowed back to Utf8.
+    assert_eq!(merged.column(0).data_type(), &DataType::Utf8);
+    let arr = merged
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cell_id narrows to Utf8 when offsets fit");
+    let got: Vec<&str> = (0..arr.len()).map(|i| arr.value(i)).collect();
+    assert_eq!(
+        got,
+        (0..total).map(|i| format!("cell_{i}")).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn test_read_obs_schema_matches_full() {
     let dir = tempfile::tempdir().unwrap();

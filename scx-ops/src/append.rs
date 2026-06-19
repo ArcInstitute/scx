@@ -177,7 +177,7 @@ pub fn append_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence.
-    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_axis(&mut lock, &prep.old_catalog, MetadataAxis::Obs)?;
     validate_obs_schema(&old_obs, new_obs)?;
 
     // Seek to EOF for appending and run the per-chunk write loop.
@@ -372,7 +372,7 @@ pub fn append_from_reader_with_index_options(
     }
 
     // Read existing obs and validate schema equivalence (before writing).
-    let old_obs = read_existing_obs(&mut lock, &prep.old_catalog)?;
+    let old_obs = read_existing_axis(&mut lock, &prep.old_catalog, MetadataAxis::Obs)?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
     // Per-source-shard streaming loop.
@@ -539,45 +539,80 @@ fn prepare_append(target_path: &Path, modality_id: u8) -> Result<(FileLock, InPl
     Ok((lock, prep))
 }
 
-/// Read an existing obs payload as a single `RecordBatch`, handling
-/// both legacy single-section [`SectionType::ObsMetadata`] files and
-/// Phase 2 row-sharded [`SectionType::ObsMetadataShard`] files. The
-/// sharded path concatenates shards in `shard_idx` order, matching
-/// what [`scx_format_io::ScxReader::read_obs`] returns at query time —
-/// but goes through the lock-held file handle instead of the mmap
-/// `ScxReader` because the append path already holds the write lock
-/// and can't open a second reader concurrently. Used by `append`
-/// (which needs the full pre-existing obs in memory for the schema
-/// check + the convert-on-append rewrite to `ObsMetadataShard` shard
-/// 0).
+/// A row-sharded metadata axis (`obs` or `var`) on the append path.
 ///
-/// Memory cost: O(old obs size). Same as today's pre-Phase-2 path —
-/// the streaming win shows up in `finalize_append` where new obs is
-/// no longer concatenated with old obs.
-fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<RecordBatch> {
-    let shard_entries: Vec<(u32, &FullCatalogEntry)> = old_catalog
+/// Carries the per-axis constants that [`read_existing_axis`] needs so obs and
+/// var share one assembly routine instead of two near-verbatim copies. Today
+/// only obs and var are row-sharded; a sharded `layer` axis (not sharded today)
+/// would be the intended third variant.
+#[derive(Clone, Copy)]
+enum MetadataAxis {
+    Obs,
+    Var,
+}
+
+impl MetadataAxis {
+    /// The row-sharded section type for this axis.
+    fn section_type(self) -> SectionType {
+        match self {
+            MetadataAxis::Obs => SectionType::ObsMetadataShard,
+            MetadataAxis::Var => SectionType::VarMetadataShard,
+        }
+    }
+
+    /// The catalog name prefix the per-shard sections use.
+    fn shard_prefix(self) -> &'static str {
+        match self {
+            MetadataAxis::Obs => "obs_metadata/shard_",
+            MetadataAxis::Var => "var_metadata/shard_",
+        }
+    }
+
+    /// The logical axis name — used both as the `assemble_sharded_metadata`
+    /// error label and as the legacy single-section fallback name.
+    fn name(self) -> &'static str {
+        match self {
+            MetadataAxis::Obs => "obs",
+            MetadataAxis::Var => "var",
+        }
+    }
+}
+
+/// Read every metadata shard for `section_type` (whose catalog entries carry
+/// the name prefix `shard_name_prefix`) through the held write-lock, returning
+/// the raw, freshly-decoded batches paired with their shard index — ready to
+/// hand to [`scx_format_io::assemble_sharded_metadata`].
+///
+/// Reads through the lock-held file handle (not a second mmap `ScxReader`,
+/// which append cannot open while holding the write lock). Does **not** upcast,
+/// concat, or strip per-shard metadata: the assembler owns the
+/// upcast → widen → reconcile → validate cover → concat → unify → downcast →
+/// strip pipeline, so this returns batches exactly as decoded. Returns an empty
+/// vec when the file has no shards of this type (legacy single-section layout).
+fn read_metadata_shard_batches(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+    section_type: SectionType,
+    shard_name_prefix: &str,
+) -> Result<Vec<(u32, RecordBatch)>> {
+    let mut shards: Vec<(u32, &FullCatalogEntry)> = old_catalog
         .entries
         .iter()
-        .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+        .filter(|e| e.section_type == section_type)
         .filter_map(|e| {
-            let suffix = e.name.strip_prefix("obs_metadata/shard_")?;
+            let suffix = e.name.strip_prefix(shard_name_prefix)?;
             let idx: u32 = suffix.parse().ok()?;
             Some((idx, e))
         })
         .collect();
-    if shard_entries.is_empty() {
-        return read_existing_arrow_ipc_section(lock, old_catalog, "obs");
-    }
-    let mut shards: Vec<(u32, &FullCatalogEntry)> = shard_entries;
-    shards.sort_by_key(|(idx, _)| *idx);
-    // Decode each shard and force the wide encoding before concat —
-    // mirrors `ScxReader::read_sharded_layout_by_prefix`. Concatenating
-    // narrow-offset batches would re-trigger Arrow's `Offset overflow
-    // error` once the cumulative per-column string payload exceeds
-    // `i32::MAX`, which is exactly the failure mode the streaming
-    // merge-write path eliminated.
-    let mut batches: Vec<RecordBatch> = Vec::with_capacity(shards.len());
-    for (_, entry) in &shards {
+    // The assembler re-sorts by shard index internally, so sort here purely for
+    // read locality — hit the file in offset-ascending order to keep the
+    // per-shard seeks monotonic (shards are usually but not guaranteed written
+    // in index order, e.g. after appends).
+    shards.sort_by_key(|(_, entry)| entry.offset);
+
+    let mut batches: Vec<(u32, RecordBatch)> = Vec::with_capacity(shards.len());
+    for (idx, entry) in &shards {
         lock.seek(SeekFrom::Start(entry.offset))?;
         let mut buf = vec![0u8; entry.length as usize];
         std::io::Read::read_exact(&mut *lock, &mut buf)?;
@@ -590,30 +625,38 @@ fn read_existing_obs(lock: &mut FileLock, old_catalog: &FullCatalog) -> Result<R
                 format!("{} contains no batches", entry.name),
             ))
         })??;
-        batches.push(scx_format_io::upcast_to_large_types(&batch).map_err(OpsError::Format)?);
+        batches.push((*idx, batch));
     }
-    let wide_schema = batches[0].schema();
-    let concatenated =
-        arrow::compute::concat_batches(&wide_schema, batches.iter()).map_err(OpsError::Arrow)?;
-    // Narrow back to `Utf8` / `Binary` for columns whose combined
-    // offsets fit; columns above `i32::MAX` stay wide so the >2 GB
-    // append case still reads cleanly.
-    let narrowed = scx_format_io::downcast_large_types(&concatenated).map_err(OpsError::Format)?;
-    // Strip per-shard schema metadata so the schema matches what
-    // `ScxReader::read_obs` returns at query time.
-    let narrowed_schema = narrowed.schema();
-    let mut clean_metadata = narrowed_schema.metadata().clone();
-    clean_metadata.remove("shard_idx");
-    clean_metadata.remove("row_start");
-    clean_metadata.remove("n_shard_rows");
-    let clean_schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        narrowed_schema.fields().clone(),
-        clean_metadata,
-    ));
-    Ok(RecordBatch::try_new(
-        clean_schema,
-        narrowed.columns().to_vec(),
-    )?)
+    Ok(batches)
+}
+
+/// Read the full pre-existing payload for a metadata `axis` as one logical
+/// `RecordBatch`, handling both row-sharded (`*MetadataShard`) and legacy
+/// single-section layouts.
+///
+/// Delegates assembly to the canonical [`scx_format_io::assemble_sharded_metadata`]
+/// so the append path shares the reader/cloud/query dictionary widening,
+/// dictionary unification, heterogeneous `Dictionary`/plain reconciliation, and
+/// contiguous-cover validation — collapsing what used to be two near-verbatim
+/// hand-rolled copies (`read_existing_obs` / `read_existing_var`) onto one
+/// source of truth. Reads through the held write-lock because append cannot
+/// open a concurrent mmap reader.
+///
+/// Memory cost: O(axis size). Used by `append` (full pre-existing obs for the
+/// schema check + convert-on-append rewrite) and by the index-rebuild branch of
+/// `finalize_append` (full pre-existing var to validate forced index columns
+/// and build the var predicate index).
+fn read_existing_axis(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+    axis: MetadataAxis,
+) -> Result<RecordBatch> {
+    let batches =
+        read_metadata_shard_batches(lock, old_catalog, axis.section_type(), axis.shard_prefix())?;
+    if batches.is_empty() {
+        return read_existing_arrow_ipc_section(lock, old_catalog, axis.name());
+    }
+    scx_format_io::assemble_sharded_metadata(axis.name(), batches).map_err(OpsError::Format)
 }
 
 /// Read an existing Arrow IPC metadata section (`"obs"` or `"var"`) back
@@ -975,7 +1018,7 @@ fn finalize_append(
     // land. On any forced-column error the file still reads as
     // pre-append (header still points to old catalog).
     let var_for_index = if rebuild_index {
-        let var = read_existing_arrow_ipc_section(lock, &prep.old_catalog, "var")?;
+        let var = read_existing_axis(lock, &prep.old_catalog, MetadataAxis::Var)?;
         validate_forced_columns(index_options, &schema_for_validate.schema(), &var.schema())?;
         lock.seek(SeekFrom::Start(write_offset))?;
         Some(var)

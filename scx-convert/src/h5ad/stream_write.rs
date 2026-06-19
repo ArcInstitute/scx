@@ -31,8 +31,8 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
 use super::write::{
-    scan_nullable_columns, write_dataframe_group_at, write_dataframe_group_streaming,
-    write_obsm_entry_at, write_uns_entries_at,
+    build_unified_export_schema, scan_column_export_layout, write_dataframe_group_at,
+    write_dataframe_group_streaming, write_obsm_entry_at, write_uns_entries_at,
 };
 use crate::pipeline::{ConvertError, ConvertOptions};
 use crate::warnings::{ConvertWarning, WarningSink};
@@ -87,17 +87,21 @@ pub(crate) fn write_obs_streaming_or_eager(
         Some(mask) => mask.iter().take(n_rows_total).filter(|&&b| b).count(),
         None => n_rows_total,
     };
-    // Pre-scan to decide plain-dataset vs nullable-group layout per
-    // int/string column (datasets are allocated before any shard is seen).
-    let needs_nullable = scan_nullable_columns(reader.obs_shards(), &schema)?;
+    // Pre-scan (one decode pass over the metadata shards) to decide
+    // plain-dataset vs nullable-group layout per int/string column AND to
+    // detect columns that are a `Dictionary` in any shard. Both signals are
+    // needed before any HDF5 dataset is allocated. The unified schema then
+    // declares a dict-anywhere column categorical even when shard 0 was plain.
+    let layout = scan_column_export_layout(reader.obs_shards(), &schema)?;
+    let unified_schema = build_unified_export_schema(&schema, &layout);
     write_dataframe_group_streaming(
         parent,
         "obs",
-        &schema,
+        &unified_schema,
         reader.obs_shards(),
         n_rows_kept,
         keep_mask_opt,
-        &needs_nullable,
+        &layout.needs_nullable,
         sink,
     )
 }
@@ -130,15 +134,16 @@ pub(crate) fn write_var_streaming_or_eager(
 
     let schema = reader.read_var_schema_logical_lossy()?;
     let n_rows_total = reader.n_vars() as usize;
-    let needs_nullable = scan_nullable_columns(reader.var_shards(), &schema)?;
+    let layout = scan_column_export_layout(reader.var_shards(), &schema)?;
+    let unified_schema = build_unified_export_schema(&schema, &layout);
     write_dataframe_group_streaming(
         parent,
         "var",
-        &schema,
+        &unified_schema,
         reader.var_shards(),
         n_rows_total,
         None,
-        &needs_nullable,
+        &layout.needs_nullable,
         sink,
     )
 }

@@ -130,6 +130,127 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
     )?)
 }
 
+/// Reconcile per-shard columns that disagree on `Dictionary`-vs-plain encoding
+/// so they can be concatenated.
+///
+/// `append` writes new obs/var as plain `Utf8`/`LargeUtf8` (its
+/// `unify_dict_columns` decodes categoricals before write), while `from_anndata`
+/// writes the same column as a `Dictionary`. After an append, a sharded axis can
+/// therefore carry the column as `Dictionary(_, V)` in some shards and plain `V`
+/// in others. `arrow::compute::concat_batches` requires every batch to share one
+/// schema, so it rejects the mix with *"It is not possible to concatenate arrays
+/// of different data types (Dictionary(Int32, LargeUtf8), LargeUtf8)"*.
+///
+/// For each field that is `Dictionary(_, V)` in **any** batch, cast every batch's
+/// column for that field to `Dictionary(Int32, V)` (encoding the plain columns;
+/// a no-op for columns already in that type). Fields that are dictionary in no
+/// batch are left untouched. Must run **after** [`upcast_to_large_types`] +
+/// [`widen_dictionary_keys`], so the value type `V` and the `Int32` key already
+/// agree across shards and the only residual difference is the dictionary
+/// wrapper. The captured dictionary `Field` (name + metadata, e.g. categorical
+/// attrs) is applied uniformly so `concat` sees identical schemas.
+///
+/// Returns the batches unchanged when no field is mixed (homogeneous all-dict or
+/// all-plain), so the common single-source-write read path is byte-unaffected.
+pub fn reconcile_dictionary_representations(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+    if batches.len() < 2 {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let n_fields = schema.fields().len();
+
+    // For each field, capture a dictionary `Field` if ANY batch carries it as a
+    // dictionary, and record whether the representation is mixed across batches.
+    let mut dict_field: Vec<Option<Field>> = vec![None; n_fields];
+    let mut any_non_dict: Vec<bool> = vec![false; n_fields];
+    for batch in &batches {
+        // Defensive: this scan indexes the per-field vectors positionally, so a
+        // shard whose schema disagrees on field count/order with the first
+        // shard would index out of bounds (more fields) or silently mismatch
+        // columns. In practice the upstream upcast/widen preserve field
+        // identity and `concat_batches` would reject a mismatch anyway, but a
+        // malformed / third-party file should fail with a clear error here
+        // rather than panic the process.
+        let bfields = batch.schema().fields().clone();
+        if bfields.len() != n_fields {
+            return Err(crate::error::ScxError::InvalidCatalog(format!(
+                "sharded metadata shards disagree on field count: expected {n_fields}, \
+                 got {} in another shard",
+                bfields.len()
+            )));
+        }
+        for (i, field) in bfields.iter().enumerate() {
+            if field.name() != schema.field(i).name() {
+                return Err(crate::error::ScxError::InvalidCatalog(format!(
+                    "sharded metadata shards disagree on column {i}: expected '{}', got '{}'",
+                    schema.field(i).name(),
+                    field.name()
+                )));
+            }
+            match field.data_type() {
+                DataType::Dictionary(_, _) => {
+                    if dict_field[i].is_none() {
+                        dict_field[i] = Some(field.as_ref().clone());
+                    }
+                }
+                _ => any_non_dict[i] = true,
+            }
+        }
+    }
+
+    // A field needs reconciling iff it is dictionary in some batch and plain in
+    // another. If nothing is mixed, every batch is already concat-compatible.
+    let mixed: Vec<bool> = (0..n_fields)
+        .map(|i| dict_field[i].is_some() && any_non_dict[i])
+        .collect();
+    if !mixed.iter().any(|&m| m) {
+        return Ok(batches);
+    }
+
+    batches
+        .into_iter()
+        .map(|batch| {
+            let bschema = batch.schema();
+            let mut new_fields = Vec::with_capacity(n_fields);
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(n_fields);
+            for (i, field) in bschema.fields().iter().enumerate() {
+                if mixed[i] {
+                    // Target: Int32-keyed dictionary over the existing value type.
+                    let target_field = dict_field[i]
+                        .as_ref()
+                        .expect("mixed field must have a captured dictionary field");
+                    let DataType::Dictionary(_, value_type) = target_field.data_type() else {
+                        unreachable!("captured field is dictionary by construction");
+                    };
+                    let target_dt =
+                        DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
+                    let col = batch.column(i);
+                    let cast_col = if col.data_type() == &target_dt {
+                        col.clone()
+                    } else {
+                        arrow::compute::cast(col, &target_dt)?
+                    };
+                    new_columns.push(cast_col);
+                    // Inherit the captured dictionary field's metadata (categorical
+                    // attrs) but keep this batch's nullability for the column.
+                    new_fields.push(
+                        Field::new(target_field.name(), target_dt, field.is_nullable())
+                            .with_metadata(target_field.metadata().clone()),
+                    );
+                } else {
+                    new_columns.push(batch.column(i).clone());
+                    new_fields.push(field.as_ref().clone());
+                }
+            }
+            let new_schema = Schema::new(new_fields).with_metadata(bschema.metadata().clone());
+            Ok(RecordBatch::try_new(
+                std::sync::Arc::new(new_schema),
+                new_columns,
+            )?)
+        })
+        .collect()
+}
+
 /// True if `col`'s value-offsets buffer can be re-expressed as `i32`
 /// (i.e. last offset ≤ `i32::MAX`). Returns `true` for any non-wide
 /// type. Used by the downcast path to decide between narrowing and
@@ -360,6 +481,90 @@ mod tests {
         let batch = batch_from(vec![("s", DataType::Utf8, arr)]);
         let out = widen_dictionary_keys(&batch).unwrap();
         assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn reconcile_is_noop_on_homogeneous_batches() {
+        // All-plain: untouched.
+        let a: ArrayRef = Arc::new(StringArray::from(vec!["x", "y"]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["z"]));
+        let plain = vec![
+            batch_from(vec![("s", DataType::Utf8, a)]),
+            batch_from(vec![("s", DataType::Utf8, b)]),
+        ];
+        let out = reconcile_dictionary_representations(plain).unwrap();
+        assert_eq!(out[0].schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(out[1].schema().field(0).data_type(), &DataType::Utf8);
+
+        // All-dictionary: untouched (still Dictionary, same key width).
+        let d0: DictionaryArray<Int8Type> = vec!["a", "b"].into_iter().collect();
+        let d1: DictionaryArray<Int8Type> = vec!["c"].into_iter().collect();
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let dicts = vec![
+            batch_from(vec![("ct", dict_dt.clone(), Arc::new(d0))]),
+            batch_from(vec![("ct", dict_dt.clone(), Arc::new(d1))]),
+        ];
+        let out = reconcile_dictionary_representations(dicts).unwrap();
+        assert_eq!(out[0].schema().field(0).data_type(), &dict_dt);
+        assert_eq!(out[1].schema().field(0).data_type(), &dict_dt);
+    }
+
+    #[test]
+    fn reconcile_encodes_plain_shard_to_dictionary_when_mixed() {
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let d0: DictionaryArray<Int8Type> = vec!["a", "b"].into_iter().collect();
+        let plain: ArrayRef = Arc::new(StringArray::from(vec!["c", "d"]));
+        let mixed = vec![
+            batch_from(vec![("ct", dict_dt, Arc::new(d0))]),
+            batch_from(vec![("ct", DataType::Utf8, plain)]),
+        ];
+
+        let out = reconcile_dictionary_representations(mixed).unwrap();
+        let target = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        // Both batches now share one Dictionary schema, so concat succeeds.
+        assert_eq!(out[0].schema().field(0).data_type(), &target);
+        assert_eq!(out[1].schema().field(0).data_type(), &target);
+        let merged = arrow::compute::concat_batches(&out[0].schema(), out.iter()).unwrap();
+        assert_eq!(merged.num_rows(), 4);
+    }
+
+    #[test]
+    fn reconcile_errors_on_mismatched_field_count() {
+        // A later shard with an extra column would index the per-field vectors
+        // out of bounds; the guard must return a clear error, not panic.
+        let a: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
+        let b0: ArrayRef = Arc::new(StringArray::from(vec!["y"]));
+        let b1: ArrayRef = Arc::new(StringArray::from(vec!["z"]));
+        let batches = vec![
+            batch_from(vec![("s", DataType::Utf8, a)]),
+            batch_from(vec![
+                ("s", DataType::Utf8, b0),
+                ("extra", DataType::Utf8, b1),
+            ]),
+        ];
+        let err = reconcile_dictionary_representations(batches).unwrap_err();
+        assert!(
+            err.to_string().contains("field count"),
+            "expected a field-count mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_errors_on_mismatched_field_name() {
+        let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let d0: DictionaryArray<Int8Type> = vec!["a"].into_iter().collect();
+        let plain: ArrayRef = Arc::new(StringArray::from(vec!["b"]));
+        // Same field count, mismatched name at index 0 — would silently graft the
+        // dict field onto the wrong column without the name guard.
+        let batches = vec![
+            batch_from(vec![("ct", dict_dt, Arc::new(d0))]),
+            batch_from(vec![("other", DataType::Utf8, plain)]),
+        ];
+        let err = reconcile_dictionary_representations(batches).unwrap_err();
+        assert!(
+            err.to_string().contains("column 0"),
+            "expected a field-name mismatch error, got: {err}"
+        );
     }
 
     #[test]

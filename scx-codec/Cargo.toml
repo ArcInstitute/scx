@@ -1,6 +1,6 @@
 [package]
 name = "scx-codec"
-version = "0.8.6"
+version = "0.8.9"
 edition = "2021"
 description = "Compression codecs for SCX (Rice, FOR-BP, Delta-Golomb)"
 license.workspace = true

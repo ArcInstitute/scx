@@ -2,14 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::{
     Array, AsArray, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
     Int64Array, LargeStringArray, RecordBatch, StringArray,
 };
 use arrow::datatypes::{
-    DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Schema,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    DataType, Field, FieldRef, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    Schema, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
@@ -590,7 +591,11 @@ fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, Conv
     macro_rules! ints {
         ($t:ty) => {{
             let a = values.as_primitive::<$t>();
-            CatValues::Int(a.values().iter().map(|&v| v as i64).collect())
+            let mut out = Vec::with_capacity(a.len());
+            for &v in a.values().iter() {
+                out.push(cat_int_to_i64(v, name)?);
+            }
+            CatValues::Int(out)
         }};
     }
     macro_rules! floats {
@@ -624,6 +629,156 @@ fn dict_category_values(array: &dyn Array, name: &str) -> Result<CatValues, Conv
             )));
         }
     })
+}
+
+fn cardinality_err(name: &str) -> ConvertError {
+    ConvertError::Other(format!(
+        "column '{name}': categorical cardinality exceeds i32::MAX"
+    ))
+}
+
+/// Normalize a categorical integer value to `i64`, **rejecting** an unsigned
+/// value above `i64::MAX` rather than silently wrapping it to a negative label
+/// (which would corrupt the category on round-trip). Signed widths and unsigned
+/// widths ≤ 32 bits always fit, so only `UInt64` can actually fail; the checked
+/// form is applied uniformly across widths (and on both the dictionary and the
+/// plain-shard paths) so the two stay symmetric. The h5ad integer-categorical
+/// `categories` dataset is `i64`, so out-of-range unsigned labels are
+/// genuinely unrepresentable and must error rather than mis-encode.
+fn cat_int_to_i64<T>(v: T, name: &str) -> Result<i64, ConvertError>
+where
+    T: TryInto<i64> + std::fmt::Display + Copy,
+{
+    v.try_into().map_err(|_| {
+        ConvertError::Other(format!(
+            "column '{name}': categorical integer value {v} exceeds the i64 range \
+             of the h5ad integer-categorical encoding"
+        ))
+    })
+}
+
+/// Build a per-shard local categorical view `(local_codes, local_values)` for
+/// the streaming categorical writer, accepting **both** a `Dictionary(_, V)`
+/// array (the existing append-grown base shards) and a **plain `V`** array
+/// (appended shards, where `append` decoded the dictionary to its value type
+/// before writing — see `scx-ops::unify_dict_columns`). For the plain case it
+/// builds a local first-seen dedup: `local_codes[row]` is the local index of
+/// that row's value (or `-1` when the row is null, keyed on *validity* — a
+/// genuine empty-string category is distinct from a null), and `local_values`
+/// lists the distinct values in first-seen order.
+///
+/// Generic over the value class (string / integer / float) so numeric
+/// categoricals reconcile exactly as strings do — matching
+/// `reconcile_dictionary_representations` on the read side. The downstream
+/// `remap!` then folds the result into the cross-shard `CatAccum` identically
+/// for both representations (a value-class mismatch vs the accumulator — e.g. a
+/// plain `Int64` shard under a `Dictionary(_, Utf8)` column — is rejected by the
+/// `remap!` match's catch-all arm; §3.2's validator relax rejects it earlier).
+fn local_categorical_view(
+    array: &dyn Array,
+    name: &str,
+) -> Result<(Vec<i32>, CatValues), ConvertError> {
+    if matches!(array.data_type(), DataType::Dictionary(_, _)) {
+        return Ok((
+            dict_codes_i32(array, name)?,
+            dict_category_values(array, name)?,
+        ));
+    }
+
+    let n = array.len();
+    let mut local_codes = vec![-1i32; n];
+    macro_rules! intern_int {
+        ($t:ty) => {{
+            let a = array.as_primitive::<$t>();
+            let mut order: Vec<i64> = Vec::new();
+            let mut seen: HashMap<i64, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = cat_int_to_i64(a.value(i), name)?;
+                    let code = match seen.get(&v) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(v, c);
+                            order.push(v);
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Int(order)))
+        }};
+    }
+    macro_rules! intern_float {
+        ($t:ty) => {{
+            let a = array.as_primitive::<$t>();
+            let mut order: Vec<f64> = Vec::new();
+            let mut seen: HashMap<u64, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = a.value(i) as f64;
+                    let k = v.to_bits();
+                    let code = match seen.get(&k) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(k, c);
+                            order.push(v);
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Float(order)))
+        }};
+    }
+    macro_rules! intern_str {
+        ($a:expr) => {{
+            let a = $a;
+            let mut order: Vec<VarLenUnicode> = Vec::new();
+            // Key by `&str` borrowed from `a` (valid for this block) to avoid
+            // allocating a `String` per distinct category in this hot path.
+            let mut seen: HashMap<&str, i32> = HashMap::new();
+            for i in 0..n {
+                if a.is_valid(i) {
+                    let v = a.value(i);
+                    let code = match seen.get(v) {
+                        Some(&c) => c,
+                        None => {
+                            let c: i32 =
+                                order.len().try_into().map_err(|_| cardinality_err(name))?;
+                            seen.insert(v, c);
+                            order.push(vlu(v));
+                            c
+                        }
+                    };
+                    local_codes[i] = code;
+                }
+            }
+            Ok((local_codes, CatValues::Str(order)))
+        }};
+    }
+    match array.data_type() {
+        DataType::Utf8 => intern_str!(array.as_string::<i32>()),
+        DataType::LargeUtf8 => intern_str!(array.as_string::<i64>()),
+        DataType::Int8 => intern_int!(Int8Type),
+        DataType::Int16 => intern_int!(Int16Type),
+        DataType::Int32 => intern_int!(Int32Type),
+        DataType::Int64 => intern_int!(Int64Type),
+        DataType::UInt8 => intern_int!(UInt8Type),
+        DataType::UInt16 => intern_int!(UInt16Type),
+        DataType::UInt32 => intern_int!(UInt32Type),
+        DataType::UInt64 => intern_int!(UInt64Type),
+        DataType::Float32 => intern_float!(Float32Type),
+        DataType::Float64 => intern_float!(Float64Type),
+        other => Err(ConvertError::Other(format!(
+            "column '{name}': categorical column has unsupported plain shard type {other:?}"
+        ))),
+    }
 }
 
 /// Whether the streaming/eager categorical writers can preserve a
@@ -1098,25 +1253,53 @@ fn write_obsm_entry(
     Ok(())
 }
 
-/// Pre-scan metadata shards to decide which integer / string columns
-/// need anndata's nullable group encoding. Returns a `Vec` aligned with
-/// `schema.fields()`: `true` ⇔ the field is an `Int32` / `Int64` /
-/// `Utf8` / `LargeUtf8` column that actually contains ≥1 null across the
-/// shards. Float and every other type always map to `false` — floats use
-/// `NaN`, and bool / categorical already preserve nulls.
+/// Cross-shard pre-pass result for the streaming dataframe writer. Both
+/// signals must be known before any HDF5 dataset is allocated, so they
+/// are computed together in one decode pass over the metadata shards.
+pub(crate) struct ColumnExportLayout {
+    /// Aligned with `schema.fields()`: `true` ⇔ the field is an `Int32` /
+    /// `Int64` / `Utf8` / `LargeUtf8` column that actually contains ≥1 null
+    /// across the shards (needs anndata's nullable group encoding).
+    pub needs_nullable: Vec<bool>,
+    /// Aligned with `schema.fields()`: `Some(field)` ⇔ the column is a
+    /// `Dictionary` in *at least one* shard (first such shard field seen,
+    /// carrying its value type + categorical metadata). Used to build the
+    /// unified export schema so a column that is categorical in any shard
+    /// is exported as an h5ad categorical even when shard 0 is plain.
+    pub dict_fields: Vec<Option<FieldRef>>,
+}
+
+/// Pre-scan metadata shards to decide (a) which integer / string columns
+/// need anndata's nullable group encoding, and (b) which columns are a
+/// `Dictionary` in any shard (so the unified export schema can declare
+/// them categorical — see [`write_dataframe_group_streaming`]).
 ///
 /// The streaming writer must allocate each HDF5 dataset (plain vs.
-/// nullable group) before it sees any shard data, so this exact
-/// null-presence signal cannot be derived from the static schema (Arrow
-/// field nullability is set unconditionally by pandas → Arrow). The cost
-/// is one extra decode pass over the metadata-only shards.
-pub(crate) fn scan_nullable_columns<I>(
+/// nullable group vs. categorical group) before it sees any shard data,
+/// so neither signal can be derived from the shard-0 schema alone: Arrow
+/// field nullability is set unconditionally by pandas → Arrow, and an
+/// append-grown axis can mix `Dictionary` and plain shards for the same
+/// column. The cost is one decode pass over the metadata-only shards.
+///
+/// Unlike the previous `scan_nullable_columns`, this pass does **not**
+/// early-exit: a column cannot be proven "plain in every shard" (and thus
+/// not a categorical) until every shard has been inspected. It is still a
+/// single pass — no new pass is introduced — but it always runs to
+/// completion. For obs/var metadata (rows, not X) the cost is small.
+///
+/// Mirrors `scx_format_io::reconcile_dictionary_representations` on the
+/// read side by defending against shards that disagree on field count /
+/// name (positional capture would otherwise mis-assign columns) or on a
+/// categorical column's value **class** (`Dictionary(_, Utf8)` in one
+/// shard vs `Dictionary(_, Int64)` in another is genuine corruption).
+pub(crate) fn scan_column_export_layout<I>(
     shards: I,
     schema: &Schema,
-) -> Result<Vec<bool>, ConvertError>
+) -> Result<ColumnExportLayout, ConvertError>
 where
     I: IntoIterator<Item = Result<RecordBatch, scx_format_io::error::ScxError>>,
 {
+    let n_fields = schema.fields().len();
     let eligible: Vec<bool> = schema
         .fields()
         .iter()
@@ -1127,24 +1310,125 @@ where
             )
         })
         .collect();
-    let mut needs = vec![false; schema.fields().len()];
+    let mut needs_nullable = vec![false; n_fields];
+    let mut dict_fields: Vec<Option<FieldRef>> = vec![None; n_fields];
     for batch_result in shards {
         let batch = batch_result?;
-        for i in 0..schema.fields().len() {
-            if eligible[i]
-                && !needs[i]
-                && i < batch.num_columns()
-                && batch.column(i).null_count() > 0
-            {
-                needs[i] = true;
+        let batch_schema = batch.schema();
+
+        // Defend against producers that emit shards disagreeing on column
+        // count / name (positional capture below would otherwise silently
+        // mis-assign columns). Mirrors the read-side reconcile guard.
+        if batch.num_columns() != n_fields {
+            return Err(ConvertError::Other(format!(
+                "shard schema mismatch: dataframe schema has {n_fields} columns but a shard \
+                 has {} (columns must match by name and order across shards)",
+                batch.num_columns()
+            )));
+        }
+        for (i, field) in schema.fields().iter().enumerate() {
+            let shard_field = batch_schema.field(i);
+            if shard_field.name() != field.name() {
+                return Err(ConvertError::Other(format!(
+                    "shard schema mismatch: column {i} is '{}' in the dataframe schema but '{}' \
+                     in a shard (columns must match by name and order across shards)",
+                    field.name(),
+                    shard_field.name(),
+                )));
+            }
+
+            if eligible[i] && !needs_nullable[i] && batch.column(i).null_count() > 0 {
+                needs_nullable[i] = true;
+            }
+
+            if let DataType::Dictionary(_, value_type) = shard_field.data_type() {
+                match &dict_fields[i] {
+                    None => dict_fields[i] = Some(batch_schema.fields()[i].clone()),
+                    Some(seen) => {
+                        // Two shards declare this column categorical with
+                        // different value classes → corruption, not an
+                        // append-grown layout we can reconcile.
+                        let seen_vt = match seen.data_type() {
+                            DataType::Dictionary(_, v) => v.as_ref(),
+                            _ => unreachable!("dict_fields only stores Dictionary fields"),
+                        };
+                        if !cat_value_class_eq(seen_vt, value_type.as_ref()) {
+                            return Err(ConvertError::Other(format!(
+                                "shard schema mismatch: categorical column '{}' is a dictionary \
+                                 of {seen_vt:?} in one shard but {:?} in another",
+                                field.name(),
+                                value_type.as_ref(),
+                            )));
+                        }
+                    }
+                }
             }
         }
-        // Early exit once every eligible column is already flagged.
-        if eligible.iter().zip(&needs).all(|(e, n)| !e || *n) {
-            break;
-        }
     }
-    Ok(needs)
+    Ok(ColumnExportLayout {
+        needs_nullable,
+        dict_fields,
+    })
+}
+
+/// Two categorical value types belong to the same value *class* for export
+/// reconciliation: `Utf8`/`LargeUtf8` are interchangeable; every other type
+/// must match exactly. Used to reject a dictionary whose value class differs
+/// across shards (corruption) while allowing the harmless narrow/wide string
+/// difference the per-shard batches legitimately carry.
+///
+/// Numeric widths are required to match **exactly** here (e.g. a plain `Int32`
+/// shard under a `Dictionary(_, Int64)` column is rejected), which is
+/// intentionally stricter than the read-side `reconcile_dictionary_representations`,
+/// where `arrow::compute::cast` would coerce integer widths. The real
+/// `append`/`from_anndata` flow never produces a width-mismatched layout —
+/// `scx-ops::unify_dict_columns` preserves the exact value type `V` — so the only
+/// way to hit the difference is a hand-crafted third-party file, where failing
+/// loudly on export is preferable to a silent width coercion.
+fn cat_value_class_eq(a: &DataType, b: &DataType) -> bool {
+    fn is_string_like(t: &DataType) -> bool {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8)
+    }
+    a == b || (is_string_like(a) && is_string_like(b))
+}
+
+/// Build the unified export schema: the shard-0 `schema` with every column
+/// that is a `Dictionary` in *any* shard ([`ColumnExportLayout::dict_fields`])
+/// re-declared as that dictionary type, so a categorical column is exported as
+/// an h5ad categorical even when shard 0 happened to be plain (the reverse of
+/// the append-grown layout). The declared column **name** and **nullability**
+/// are preserved from the shard-0 schema; the `data_type` comes from the
+/// captured dictionary field; categorical metadata (`CATEGORICAL_ORDERED_KEY`,
+/// etc.) is the union of both (the captured dict field wins on conflict) so the
+/// `ordered` bit survives whichever shard carried it. Columns that are plain in
+/// every shard are returned unchanged, so homogeneous files produce an
+/// identical schema (no behavior change).
+pub(crate) fn build_unified_export_schema(schema: &Schema, layout: &ColumnExportLayout) -> Schema {
+    let fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(
+            |(i, schema_field)| match layout.dict_fields.get(i).and_then(|o| o.as_ref()) {
+                None => schema_field.clone(),
+                Some(dict_field) => {
+                    let mut metadata: HashMap<String, String> = schema_field.metadata().clone();
+                    for (k, v) in dict_field.metadata() {
+                        metadata.insert(k.clone(), v.clone());
+                    }
+                    Arc::new(
+                        Field::new(
+                            schema_field.name(),
+                            dict_field.data_type().clone(),
+                            schema_field.is_nullable(),
+                        )
+                        .with_metadata(metadata),
+                    )
+                }
+            },
+        )
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// Streaming counterpart of [`write_dataframe_group_at`]. Pre-allocates
@@ -1172,9 +1456,13 @@ where
 /// `i` is written with anndata's `nullable-integer` /
 /// `nullable-string-array` group encoding (it contains nulls); otherwise
 /// it is written as a plain dataset. Computed up front by
-/// [`super::stream_write::scan_nullable_columns`] because the HDF5
-/// datasets must be allocated before any shard is seen. Float columns
-/// ignore this flag (always plain datasets with `NaN` at nulls).
+/// [`scan_column_export_layout`] because the HDF5 datasets must be
+/// allocated before any shard is seen. Float columns ignore this flag
+/// (always plain datasets with `NaN` at nulls).
+///
+/// `schema` is the unified export schema from
+/// [`build_unified_export_schema`]: a column that is a `Dictionary` in any
+/// shard is declared categorical here even when shard 0 was plain.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_dataframe_group_streaming<I>(
     parent: &hdf5::Group,
@@ -1417,22 +1705,39 @@ fn validate_shard_schema(
 }
 
 /// True when a per-shard column type is interchangeable with the
-/// declared schema type for the purpose of streaming export. Exact
-/// equality always passes; additionally `Utf8`/`LargeUtf8` are treated
-/// as equivalent and `Dictionary(_, Utf8|LargeUtf8)` are equivalent
-/// regardless of key width — per-shard batches legitimately carry the
-/// wide string / wide dictionary forms even when the schema says narrow
-/// (the column writers dispatch on both at runtime).
+/// declared (unified) schema type for the purpose of streaming export.
+/// Exact equality always passes; additionally `Utf8`/`LargeUtf8` are
+/// treated as equivalent. For a **categorical** column (schema type
+/// `Dictionary(_, V)`), three further forms are accepted, generic over the
+/// value class V (string AND numeric — §3.2):
+///   * another `Dictionary(_, V')` shard whose value **class** matches V
+///     (key width is irrelevant — base shards may be `Int8`-keyed, etc.);
+///   * a **plain** shard whose type matches V's value class — this is the
+///     append-grown layout (`append` decodes the dictionary to its value
+///     type), folded back into the categorical by [`local_categorical_view`].
+///
+/// A plain shard whose value class differs from V (e.g. plain `Int64` under
+/// a `Dictionary(_, Utf8)` column) still fails — the genuine-corruption case.
 fn logical_type_compatible(schema_dt: &DataType, shard_dt: &DataType) -> bool {
     fn is_string_like(t: &DataType) -> bool {
         matches!(t, DataType::Utf8 | DataType::LargeUtf8)
     }
-    fn is_dict_string(t: &DataType) -> bool {
-        matches!(t, DataType::Dictionary(_, v) if is_string_like(v.as_ref()))
+    fn dict_value_type(t: &DataType) -> Option<&DataType> {
+        match t {
+            DataType::Dictionary(_, v) => Some(v.as_ref()),
+            _ => None,
+        }
     }
-    schema_dt == shard_dt
-        || (is_string_like(schema_dt) && is_string_like(shard_dt))
-        || (is_dict_string(schema_dt) && is_dict_string(shard_dt))
+    if schema_dt == shard_dt || (is_string_like(schema_dt) && is_string_like(shard_dt)) {
+        return true;
+    }
+    match (dict_value_type(schema_dt), dict_value_type(shard_dt)) {
+        // dict schema vs dict shard: value classes must match (any key width).
+        (Some(sv), Some(dv)) => cat_value_class_eq(sv, dv),
+        // dict schema vs plain shard: plain type must be the dict's value class.
+        (Some(sv), None) => cat_value_class_eq(sv, shard_dt),
+        _ => false,
+    }
 }
 
 /// Per-column streaming writer state. Pre-allocated HDF5 datasets +
@@ -1819,8 +2124,10 @@ fn append_shard_to_column(
             accum,
             ..
         } => {
-            let local_codes = dict_codes_i32(array, name)?;
-            let local_values = dict_category_values(array, name)?;
+            // Accept both a `Dictionary(_, V)` shard (base) and a plain `V`
+            // shard (appended): the helper normalizes both to local codes +
+            // distinct values, generic over the value class (§3.3).
+            let (local_codes, local_values) = local_categorical_view(array, name)?;
 
             // C10: intern only the dictionary values actually referenced by
             // `kept_local` rows, so categories present only in

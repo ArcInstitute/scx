@@ -32,6 +32,87 @@ use crate::explode::section_name_to_path;
 /// deferred follow-on (see docs/cloud.md).
 const METADATA_SHARD_FETCH_CONCURRENCY: usize = 8;
 
+/// Chunk size for ranged reads of a single packed section. A monolithic GET of
+/// a multi-GB section (e.g. the `ObsPredicateIndex`, which scales with `n_obs`
+/// — ~2.4 GB at 149 M cells, ~9 GB at 561 M) streams for minutes and is killed
+/// by a single mid-stream HTTP/2 body reset, with every retry re-downloading
+/// from zero. Splitting the read into bounded chunks makes each chunk
+/// independently retryable: a transient body error re-fetches only one
+/// `SECTION_READ_CHUNK_BYTES` window, not the whole section.
+const SECTION_READ_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Concurrency for the chunked section read above. Bounded so a large section
+/// fetch can't fan out an unbounded number of simultaneous range GETs against
+/// the same connection pool (the saturation the chunking is meant to avoid).
+const SECTION_READ_CHUNK_CONCURRENCY: usize = 8;
+
+/// Range-read `start..end` of `path`, splitting reads larger than `chunk_bytes`
+/// into bounded, independently-retryable chunks fetched with `concurrency`-way
+/// parallelism and reassembled in offset order. Small reads take the single-GET
+/// fast path. A monolithic multi-GB GET (e.g. the `ObsPredicateIndex`, ~2.4 GB
+/// at 149 M cells, ~9 GB at 561 M) is killed by a single mid-stream HTTP/2 body
+/// reset and every retry restarts from zero; chunking bounds the blast radius of
+/// a transient to one chunk.
+///
+/// The reassembled buffer length is verified against the requested span: cloud
+/// predicate-index / section bytes are not independently checksum-verified
+/// here, so a backend that returned a short read would otherwise truncate the
+/// section silently.
+pub(crate) async fn read_range_chunked(
+    backend: &dyn ObjectStore,
+    path: &ObjPath,
+    start: u64,
+    end: u64,
+    chunk_bytes: u64,
+    concurrency: usize,
+) -> Result<Vec<u8>> {
+    let total = end.saturating_sub(start);
+    let chunk_bytes = chunk_bytes.max(1);
+
+    let buf = if total <= chunk_bytes {
+        crate::pull::get_range_with_retry(backend, path, start..end)
+            .await?
+            .to_vec()
+    } else {
+        // Ordered chunk ranges. `buffered` (not `buffer_unordered`) preserves
+        // order, so the concatenation below reassembles the section
+        // byte-for-byte.
+        let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
+        let mut off = start;
+        while off < end {
+            let chunk_end = off.saturating_add(chunk_bytes).min(end);
+            ranges.push(off..chunk_end);
+            off = chunk_end;
+        }
+
+        let chunks: Vec<bytes::Bytes> = futures::stream::iter(
+            ranges
+                .into_iter()
+                .map(|r| crate::pull::get_range_with_retry(backend, path, r)),
+        )
+        .buffered(concurrency.max(1))
+        .try_collect()
+        .await?;
+
+        let mut buf = Vec::with_capacity(total as usize);
+        for c in &chunks {
+            buf.extend_from_slice(c);
+        }
+        buf
+    };
+
+    if buf.len() as u64 != total {
+        return Err(CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "short read for {path}: expected {total} bytes ({start}..{end}), got {}",
+                buf.len()
+            ),
+        )));
+    }
+    Ok(buf)
+}
+
 /// Layout of the cloud reader source.
 enum ReaderLayout {
     /// Exploded .scxd directory — each section is a separate object.
@@ -168,13 +249,8 @@ impl CloudReader {
                         length: entry.length,
                     }
                 })?;
-                let data = crate::pull::get_range_with_retry(
-                    self.backend.as_ref(),
-                    file_path,
-                    entry.offset..end,
-                )
-                .await?;
-                Ok(data.to_vec())
+                self.read_packed_range_chunked(file_path, entry.offset, end)
+                    .await
             }
         }
     }
@@ -339,31 +415,87 @@ impl CloudReader {
                         length: entry.length,
                     }
                 })?;
-                let data = crate::pull::get_range_with_retry(
-                    self.backend.as_ref(),
-                    file_path,
-                    entry.offset..end,
-                )
-                .await?;
-                Ok(data.to_vec())
+                self.read_packed_range_chunked(file_path, entry.offset, end)
+                    .await
             }
         }
     }
 
-    /// Read the obs schema.
+    /// Range-read `start..end` of a packed file, splitting reads larger than
+    /// [`SECTION_READ_CHUNK_BYTES`] into bounded, independently-retryable
+    /// chunks. Small sections take the single-GET fast path. Chunks are fetched
+    /// with bounded concurrency and reassembled in offset order — a monolithic
+    /// multi-GB GET is fatal on a flaky link (a single mid-stream body reset
+    /// fails the whole download, and every retry restarts from zero).
+    async fn read_packed_range_chunked(
+        &self,
+        file_path: &ObjPath,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>> {
+        read_range_chunked(
+            self.backend.as_ref(),
+            file_path,
+            start,
+            end,
+            SECTION_READ_CHUNK_BYTES,
+            SECTION_READ_CHUNK_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// Read the obs schema — **bounded to a single section**, never
+    /// assembling the full obs table.
     ///
-    /// Derives the schema from the assembled obs batch (LC4): the batch is
-    /// cached in a `OnceCell`, so a subsequent `read_obs` is free and there is
-    /// no separate `shard_0` / `obs` schema GET. The assembled batch is the
-    /// authoritative schema (post upcast→concat→downcast), matching what
-    /// `read_obs` returns.
+    /// Fetches only the first obs section (`obs_metadata/shard_0` on sharded
+    /// files, else the legacy `obs` section) and decodes its Arrow IPC
+    /// schema via the shared [`scx_format_io::decode_arrow_ipc_schema`], the
+    /// same core `ScxReader::read_obs_schema` uses — so the cloud schema is
+    /// byte-identical to the local path. Does **not** touch [`Self::read_obs`]
+    /// / `obs_assembled` (which would fetch and concatenate every
+    /// `ObsMetadataShard` and OOM at atlas scale); the lazy full-assembly
+    /// path stays available for callers that genuinely need the whole batch.
     pub async fn read_obs_schema(&self) -> Result<Schema> {
-        Ok(self.read_obs().await?.schema().as_ref().clone())
+        let entry = self.first_obs_section_entry()?;
+        let bytes = self.read_section_for_entry(entry).await?;
+        Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
     }
 
     /// Read the var schema. Mirror of [`Self::read_obs_schema`].
     pub async fn read_var_schema(&self) -> Result<Schema> {
-        Ok(self.read_var().await?.schema().as_ref().clone())
+        let entry = self.first_var_section_entry()?;
+        let bytes = self.read_section_for_entry(entry).await?;
+        Ok(scx_format_io::decode_arrow_ipc_schema(&bytes)?)
+    }
+
+    /// Resolve the first obs section catalog entry: `obs_metadata/shard_0`
+    /// when obs is sharded, else the legacy single `obs` section. Mirror of
+    /// `ScxReader::first_obs_section_entry`.
+    fn first_obs_section_entry(&self) -> Result<&FullCatalogEntry> {
+        let (ty, name) = if self.obs_metadata_shard_count() > 0 {
+            (SectionType::ObsMetadataShard, "obs_metadata/shard_0")
+        } else {
+            (SectionType::ObsMetadata, "obs")
+        };
+        self.catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == ty && e.name == name)
+            .ok_or_else(|| CloudError::SectionNotFound(name.into()))
+    }
+
+    /// Mirror of [`Self::first_obs_section_entry`] for the var axis.
+    fn first_var_section_entry(&self) -> Result<&FullCatalogEntry> {
+        let (ty, name) = if self.var_metadata_shard_count() > 0 {
+            (SectionType::VarMetadataShard, "var_metadata/shard_0")
+        } else {
+            (SectionType::VarMetadata, "var")
+        };
+        self.catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == ty && e.name == name)
+            .ok_or_else(|| CloudError::SectionNotFound(name.into()))
     }
 
     /// Raw bytes of the obs predicate index section, if present.
@@ -576,14 +708,6 @@ impl CloudReader {
     }
 }
 
-/// Decode just the schema from an Arrow IPC file's footer.
-///
-/// Delegates to [`scx_format_io::downcast_large_types_schema`] so the
-/// schema matches what `ScxReader::read_obs_schema` returns even when
-/// the on-disk Arrow IPC encodes `LargeUtf8` / `LargeBinary` or
-/// `Dictionary(_, Large*)`. (Local fast path preserves narrow types as
-/// data fits; cloud schemas are eagerly narrowed since we don't have
-/// the offsets to inspect.)
 /// Decode the first `RecordBatch` from an Arrow IPC file **without** any
 /// wide→narrow downcast — used for both single-section reads (caller
 /// downcasts afterward) and per-shard reads (the shared assembler upcasts
@@ -1376,8 +1500,8 @@ mod tests {
         let input = write_sharded_test_file(&dir, 100, 50);
         let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
 
-        // Schema first (derives from — and populates — the cached batch),
-        // then two batch reads: all three must agree.
+        // Schema first (bounded shard_0 footer read — does NOT populate the
+        // assembled-batch cache), then two batch reads: all three must agree.
         let obs_schema = reader.read_obs_schema().await.unwrap();
         let obs1 = reader.read_obs().await.unwrap();
         let obs2 = reader.read_obs().await.unwrap();
@@ -1385,10 +1509,15 @@ mod tests {
             obs1, obs2,
             "repeated read_obs must return identical batches"
         );
+        // Schema is read from shard_0's IPC footer (parity with the local
+        // `ScxReader::read_obs_schema`), so its *fields* match the assembled
+        // batch. The schema-level metadata map legitimately differs — the
+        // footer carries per-shard keys (`row_start` / `shard_idx` / …) that
+        // the assembler consolidates to `n_rows_total` only.
         assert_eq!(
-            &obs_schema,
-            obs1.schema().as_ref(),
-            "read_obs_schema must equal the assembled batch schema"
+            obs_schema.fields(),
+            obs1.schema().fields(),
+            "read_obs_schema fields must equal the assembled batch fields"
         );
 
         let var_schema = reader.read_var_schema().await.unwrap();
@@ -1398,6 +1527,35 @@ mod tests {
             var1, var2,
             "repeated read_var must return identical batches"
         );
-        assert_eq!(&var_schema, var1.schema().as_ref());
+        assert_eq!(var_schema.fields(), var1.schema().fields());
+    }
+
+    /// Regression for CLOUD-READ-OOM2: reading the obs/var schema must
+    /// stay bounded to a single section and must NOT trigger full-obs/var
+    /// assembly (which fetches + concatenates every metadata shard and
+    /// OOMs at atlas scale). The deterministic signal is that the
+    /// assembled-batch `OnceCell`s remain uninitialised after a schema read.
+    #[tokio::test]
+    async fn read_obs_schema_does_not_assemble_full_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+
+        let _obs_schema = reader.read_obs_schema().await.unwrap();
+        let _var_schema = reader.read_var_schema().await.unwrap();
+
+        assert!(
+            reader.obs_assembled.get().is_none(),
+            "read_obs_schema must not assemble the full obs batch"
+        );
+        assert!(
+            reader.var_assembled.get().is_none(),
+            "read_var_schema must not assemble the full var batch"
+        );
+
+        // And the schema fields must still match the assembled batch once it
+        // IS genuinely requested (parity with the local path on narrow data).
+        let obs = reader.read_obs().await.unwrap();
+        assert_eq!(_obs_schema.fields(), obs.schema().fields());
     }
 }

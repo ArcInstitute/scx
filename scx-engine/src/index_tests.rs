@@ -1197,3 +1197,88 @@ mod column_not_found_message_tests {
         );
     }
 }
+
+// -------------------------------------------------------------------
+// Query-time lookups: categorical_eq / indexed_kind / index_covers_all_obs
+// -------------------------------------------------------------------
+mod query_lookup_tests {
+    use super::*;
+    use crate::index::{index_covers_all_obs, IndexKind};
+
+    fn cat(column_name: &str, entries: Vec<(&str, Vec<ShardRange>)>) -> IndexedColumn {
+        IndexedColumn::Categorical(CategoricalIndex {
+            column_name: column_name.to_string(),
+            entries: entries
+                .into_iter()
+                .map(|(value, shard_ranges)| CategoricalEntry {
+                    value: value.to_string(),
+                    shard_ranges,
+                })
+                .collect(),
+        })
+    }
+
+    fn sr(shard_id: u32, row_start: u32, row_end: u32) -> ShardRange {
+        ShardRange {
+            shard_id,
+            row_start,
+            row_end,
+        }
+    }
+
+    fn sample_index() -> PredicateIndex {
+        // entries MUST be sorted lexicographically by value (build_indexes invariant)
+        PredicateIndex {
+            version: 1,
+            columns: vec![cat(
+                "cell_type",
+                vec![
+                    ("B cell", vec![sr(0, 0, 5), sr(1, 2, 4)]),
+                    ("T cell", vec![sr(0, 5, 10)]),
+                ],
+            )],
+        }
+    }
+
+    #[test]
+    fn categorical_eq_hit_miss_and_not_indexed() {
+        let idx = sample_index();
+        // hit
+        assert_eq!(
+            idx.categorical_eq("cell_type", "B cell"),
+            Some(&[sr(0, 0, 5), sr(1, 2, 4)][..])
+        );
+        // indexed column, absent value -> Some(empty) (exact empty row-set)
+        assert_eq!(idx.categorical_eq("cell_type", "NK cell"), Some(&[][..]));
+        // column not indexed -> None (residual)
+        assert_eq!(idx.categorical_eq("tissue", "blood"), None);
+    }
+
+    #[test]
+    fn indexed_kind_reports_kind() {
+        let idx = sample_index();
+        assert_eq!(idx.indexed_kind("cell_type"), Some(IndexKind::Categorical));
+        assert_eq!(idx.indexed_kind("tissue"), None);
+    }
+
+    #[test]
+    fn covers_all_obs_true_when_index_reaches_n_obs() {
+        let idx = sample_index();
+        // obs shard 0 -> [0,10), shard 1 -> [10,20)
+        let ranges = vec![(0u32, 0u64, 10u64), (1, 10, 20)];
+        // index references up to shard 1 row_end 4 -> global 14; shard 0 row_end 10 -> 10
+        // max covered = 14
+        assert!(index_covers_all_obs(&idx, &ranges, 14));
+        // stale: n_obs beyond covered (appended rows) -> false (full-scan fallback)
+        assert!(!index_covers_all_obs(&idx, &ranges, 20));
+    }
+
+    #[test]
+    fn covers_all_obs_false_for_empty_index() {
+        let idx = PredicateIndex {
+            version: 1,
+            columns: vec![],
+        };
+        assert!(!index_covers_all_obs(&idx, &[(0, 0, 10)], 10));
+    }
+}

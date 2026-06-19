@@ -10,15 +10,122 @@ use arrow::compute;
 use rayon::prelude::*;
 use scx_sparse::ScxCsr;
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::fused_ops::apply_fused_ops;
-use crate::index::{IndexedColumn, PredicateIndex};
+use crate::index::{index_covers_all_obs, IndexedColumn, PredicateIndex};
 use crate::pipeline::{QueryPipeline, QueryResult};
-use crate::predicate::{evaluate, Predicate};
+use crate::predicate::{eval_rowset, evaluate, Predicate, RowSetCtx};
 use crate::projection::{decode_shard_projected, project_var};
 use crate::pushdown::{prune_shards_by_catalog_with_dict, CategoryDictionaries, ShardCandidate};
+use crate::reader::SectionReader;
+use crate::rowset::{RowRange, RowSet};
 
+use scx_format_io::catalog::FullCatalogEntry;
 use scx_format_io::{assemble_filtered_metadata, DeletionVectors, SectionType};
+
+/// Env var (test/diagnostic only) that forces the legacy full-decode obs path,
+/// disabling row-set predicate pushdown. The differential correctness oracle
+/// runs each query with and without it set and asserts byte-identical results.
+fn rowset_pushdown_disabled() -> bool {
+    std::env::var_os("SCX_DISABLE_ROWSET_PUSHDOWN").is_some()
+}
+
+// ============================================================================
+// F0. Resilient parallel shard map
+// ============================================================================
+
+/// Is `e` worth a second attempt? Transient I/O failures are — on the cloud
+/// path every `CloudError` (timeout, download-failed, rate-limited) is erased
+/// to [`EngineError::IoError`] at the `CloudSectionReader` boundary, and
+/// `Generic` covers other transient surfaces. Deterministic decode failures
+/// (`FormatError` / `ArrowError` / `CsrError` / `SchemaError`) are NOT: a retry
+/// would just re-fail and double the work on genuinely corrupt input.
+fn is_retryable_engine_err(e: &EngineError) -> bool {
+    matches!(e, EngineError::IoError(_) | EngineError::Generic(_))
+}
+
+/// Run `f` over `items` in parallel, tolerating transient per-item failures.
+///
+/// Unlike `items.par_iter().map(f).collect::<Result<Vec<_>>>()`, pass 1 does
+/// NOT short-circuit on the first `Err`: it runs `f` on every item via rayon
+/// and keeps each result paired with its input index. If everything succeeded,
+/// the results are returned in input order.
+///
+/// If some items failed:
+/// - A non-retryable failure ([`is_retryable_engine_err`] == false, i.e. a
+///   deterministic decode error) is returned immediately — this preserves the
+///   prior fast-fail on corrupt input.
+/// - Otherwise the failed items are retried once, **sequentially**. Lower
+///   concurrency on the retry pass gives a transient/congestion window time to
+///   clear, and each call still gets a fresh per-request retry budget from the
+///   cloud `RetryingStore`. The call fails only if an item is still unrecovered
+///   after the retry pass, and the error then names the offending indices
+///   rather than surfacing just the first error.
+///
+/// This keeps a single shard GET exhausting its per-request retry budget from
+/// aborting a whole atlas-scale query via `?`-propagation. `f` may be invoked
+/// up to twice per item, so it must be idempotent.
+fn par_map_with_shard_retry<I, T, F>(items: &[I], f: F) -> Result<Vec<T>>
+where
+    I: Sync,
+    T: Send,
+    F: Fn(&I) -> Result<T> + Sync,
+{
+    // Pass 1: parallel, order-preserving (slice `par_iter` is indexed), keep
+    // every Result so a single failure doesn't discard the other shards' work.
+    let pass1: Vec<Result<T>> = items.par_iter().map(&f).collect();
+
+    let mut slots: Vec<Option<T>> = Vec::with_capacity(items.len());
+    let mut failed: Vec<usize> = Vec::new();
+    let mut first_nonretryable: Option<EngineError> = None;
+    for (i, r) in pass1.into_iter().enumerate() {
+        match r {
+            Ok(v) => slots.push(Some(v)),
+            Err(e) => {
+                if !is_retryable_engine_err(&e) && first_nonretryable.is_none() {
+                    first_nonretryable = Some(e);
+                }
+                slots.push(None);
+                failed.push(i);
+            }
+        }
+    }
+
+    // A deterministic decode failure is not worth a second attempt — fail fast.
+    if let Some(e) = first_nonretryable {
+        return Err(e);
+    }
+
+    if !failed.is_empty() {
+        let mut last_err: Option<EngineError> = None;
+        let mut unrecovered: Vec<usize> = Vec::new();
+        for &i in &failed {
+            match f(&items[i]) {
+                Ok(v) => slots[i] = Some(v),
+                Err(e) => {
+                    last_err = Some(e);
+                    unrecovered.push(i);
+                }
+            }
+        }
+        if !unrecovered.is_empty() {
+            return Err(EngineError::Generic(format!(
+                "shard read failed after retry for {} of {} item(s) (indices {:?}): {}",
+                unrecovered.len(),
+                items.len(),
+                unrecovered,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            )));
+        }
+    }
+
+    Ok(slots
+        .into_iter()
+        .map(|s| s.expect("every slot filled by pass 1 success or retry recovery"))
+        .collect())
+}
 
 // ============================================================================
 // F1. Execution plan
@@ -35,6 +142,11 @@ struct ExecutionPlan {
     log1p: bool,
     limit: Option<usize>,
     deletion_vectors: Option<DeletionVectors>,
+    /// The deserialized obs predicate index, retained for **row-set pushdown**
+    /// (row selection), not just the category dictionaries used for
+    /// catalog-level shard pruning. `None` when the file has no obs predicate
+    /// index. See [`try_rowset_mask`].
+    obs_predicate_index: Option<PredicateIndex>,
 }
 
 /// Build an execution plan from a QueryPipeline.
@@ -78,6 +190,7 @@ fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
         log1p: pipeline.log1p(),
         limit: pipeline.limit_value(),
         deletion_vectors: pipeline.deletion_vectors().clone(),
+        obs_predicate_index,
     })
 }
 
@@ -242,6 +355,537 @@ fn obs_shard_row_start(batch: &RecordBatch) -> Result<u64> {
                 "obs metadata shard missing stamped `row_start` schema metadata".to_string(),
             )
         })
+}
+
+// ============================================================================
+// F1b. Per-shard masking — row-set fast path + legacy full-decode fallback
+// ============================================================================
+
+/// The per-shard masking output of [`compute_mask`]: everything `materialize`
+/// needs to decode X and filter obs/var, computed without decoding any X shard.
+struct MaskResult {
+    /// Full obs batch — populated ONLY on the legacy single-section path.
+    legacy_obs: Option<RecordBatch>,
+    obs_shard_ranges: Vec<(u32, u64, u64)>,
+    shard_infos: Vec<ShardInfo>,
+    /// Pre-limit Level-2 match count (Σ keep-mask trues over ALL matching
+    /// candidate shards). Used by `count()`; equals `csr.n_rows()` after an
+    /// unlimited materialise. NOT reduced when `shard_infos` is capped for a
+    /// limited query (the row-set path keeps it exact and full).
+    matched_rows: usize,
+}
+
+/// Build the per-shard keep masks. Prefers the **row-set fast path** — resolve
+/// indexed obs predicates straight from the predicate index, decoding no obs
+/// shard for the indexed part — and falls back to the legacy full-decode path
+/// for non-indexed / residual-only predicates, legacy single-section obs, a
+/// stale index, or when the pushdown kill-switch is set.
+fn compute_mask(
+    pipeline: &QueryPipeline,
+    plan: &ExecutionPlan,
+    sorted_shards: &[&FullCatalogEntry],
+    n_obs: usize,
+) -> Result<MaskResult> {
+    if let Some(m) = try_rowset_mask(pipeline, plan, sorted_shards, n_obs)? {
+        return Ok(m);
+    }
+    build_legacy_mask(pipeline, plan, sorted_shards, n_obs)
+}
+
+/// Flatten the implicit top-level AND across an obs-predicate list (multiple
+/// `filter_obs` calls are AND-ed) and across nested [`Predicate::And`] nodes,
+/// collecting the leaf conjuncts.
+fn flatten_and<'a>(pred: &'a Predicate, out: &mut Vec<&'a Predicate>) {
+    match pred {
+        Predicate::And(a, b) => {
+            flatten_and(a, out);
+            flatten_and(b, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Partition the AND-combined obs predicates into an exactly-indexed row-set and
+/// a residual subtree. Conjuncts resolvable from the index (`eval_rowset`
+/// `Some`) are intersected into the row-set; the rest become residual.
+/// Returns `(None, ...)` when nothing resolves — the caller then uses the
+/// legacy full-decode path, unchanged (no regression).
+fn partition_obs_predicates(
+    preds: &[Predicate],
+    ctx: &RowSetCtx,
+) -> (Option<RowSet>, Vec<Predicate>) {
+    let mut conjuncts: Vec<&Predicate> = Vec::new();
+    for p in preds {
+        flatten_and(p, &mut conjuncts);
+    }
+    let mut indexed: Option<RowSet> = None;
+    let mut residual: Vec<Predicate> = Vec::new();
+    for c in conjuncts {
+        match eval_rowset(c, ctx) {
+            Some(rs) => {
+                indexed = Some(match indexed {
+                    None => rs,
+                    Some(prev) => prev.intersect(&rs),
+                });
+            }
+            None => residual.push(c.clone()),
+        }
+    }
+    (indexed, residual)
+}
+
+/// The CSR/output shard row-range table the predicate index was built against:
+/// `(shard_id, row_start, row_end)` where `shard_id` is the shard's position in
+/// `shards_sorted()` (== its index in `output_shard_row_ranges` at build time).
+/// Returns `None` if any shard lacks row-range stats — the index then can't be
+/// mapped to global rows safely, so the caller falls back to the legacy path.
+fn csr_shard_ranges_table(sorted_shards: &[&FullCatalogEntry]) -> Option<Vec<(u32, u64, u64)>> {
+    let mut table = Vec::with_capacity(sorted_shards.len());
+    for (i, entry) in sorted_shards.iter().enumerate() {
+        let stats = entry.stats.as_ref()?;
+        table.push((i as u32, stats.row_start, stats.row_end));
+    }
+    Some(table)
+}
+
+/// Global-row coverage of the surviving candidate shards (post Level-1 catalog
+/// pruning). Intersecting the indexed row-set with this drops rows in shards
+/// proven non-matching, keeping `matched_rows` exact.
+fn candidate_shard_coverage(plan: &ExecutionPlan, sorted_shards: &[&FullCatalogEntry]) -> RowSet {
+    let ranges: Vec<RowRange> = plan
+        .candidate_shards
+        .iter()
+        .filter_map(|sc| {
+            sorted_shards[sc.shard_idx]
+                .stats
+                .as_ref()
+                .map(|s| RowRange {
+                    start: s.row_start,
+                    end: s.row_end,
+                })
+        })
+        .collect();
+    RowSet::from_ranges(ranges)
+}
+
+/// The set of deleted global rows, built from the per-CSR-shard deletion
+/// bitmaps (same shard-idx→global translation as the legacy path).
+fn deletion_rowset(
+    dv: &DeletionVectors,
+    sorted_shards: &[&FullCatalogEntry],
+    n_obs: u64,
+) -> RowSet {
+    let mut ranges: Vec<RowRange> = Vec::new();
+    for (shard_idx, entry) in sorted_shards.iter().enumerate() {
+        let Some(stats) = entry.stats.as_ref() else {
+            continue;
+        };
+        let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) else {
+            continue;
+        };
+        // Bitmap iterates ascending; coalesce consecutive deleted rows.
+        let mut run: Option<(u64, u64)> = None;
+        for local_row in bitmap.iter() {
+            let g = stats.row_start + local_row as u64;
+            if g >= n_obs {
+                break;
+            }
+            match run {
+                Some((s, e)) if g == e => run = Some((s, g + 1)),
+                Some((s, e)) => {
+                    ranges.push(RowRange { start: s, end: e });
+                    run = Some((g, g + 1));
+                }
+                None => run = Some((g, g + 1)),
+            }
+        }
+        if let Some((s, e)) = run {
+            ranges.push(RowRange { start: s, end: e });
+        }
+    }
+    RowSet::from_ranges(ranges)
+}
+
+/// Coalesce a per-shard boolean keep mask into global [`RowRange`]s.
+fn mask_to_ranges(mask: &[bool], row_start: u64) -> Vec<RowRange> {
+    let mut out = Vec::new();
+    let mut start: Option<u64> = None;
+    for (i, &keep) in mask.iter().enumerate() {
+        if keep {
+            if start.is_none() {
+                start = Some(row_start + i as u64);
+            }
+        } else if let Some(s) = start.take() {
+            out.push(RowRange {
+                start: s,
+                end: row_start + i as u64,
+            });
+        }
+    }
+    if let Some(s) = start {
+        out.push(RowRange {
+            start: s,
+            end: row_start + mask.len() as u64,
+        });
+    }
+    out
+}
+
+/// The obs metadata shards spanned by `rs`, paired with their `row_start`.
+/// `obs_shard_ranges` is sorted by `shard_idx` (== ascending `row_start`), so
+/// each rs range is located with a binary search and a short forward walk.
+fn obs_shards_spanned(rs: &RowSet, obs_shard_ranges: &[(u32, u64, u64)]) -> Vec<(u32, u64)> {
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    let mut last: Option<usize> = None;
+    for r in rs.ranges() {
+        let mut i = obs_shard_ranges.partition_point(|(_, _, rend)| *rend <= r.start);
+        while i < obs_shard_ranges.len() {
+            let (idx, rstart, _) = obs_shard_ranges[i];
+            if rstart >= r.end {
+                break;
+            }
+            if last != Some(i) {
+                out.push((idx, rstart));
+                last = Some(i);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Apply the residual (non-indexed) predicates by decoding ONLY the obs shards
+/// that `rs` spans, evaluating the residual over them, and intersecting the
+/// result back into `rs`. No obs shard outside `rs`'s span is read.
+fn apply_residual(
+    reader: &dyn SectionReader,
+    residual: &[Predicate],
+    rs: &RowSet,
+    obs_shard_ranges: &[(u32, u64, u64)],
+) -> Result<RowSet> {
+    let needed = obs_shards_spanned(rs, obs_shard_ranges);
+    let per_shard: Vec<Vec<RowRange>> = par_map_with_shard_retry(&needed, |&(idx, row_start)| {
+        let batch = reader.read_obs_shard(idx)?;
+        let mut local = vec![true; batch.num_rows()];
+        for pred in residual {
+            let arr = evaluate(pred, &batch)?;
+            for (i, m) in local.iter_mut().enumerate() {
+                if *m {
+                    *m = arr.is_valid(i) && arr.value(i);
+                }
+            }
+        }
+        Ok(mask_to_ranges(&local, row_start))
+    })?;
+    let mut all: Vec<RowRange> = Vec::new();
+    for ranges in per_shard {
+        all.extend(ranges);
+    }
+    Ok(rs.intersect(&RowSet::from_ranges(all)))
+}
+
+/// Build per-shard keep masks from the (final, exact) row-set, iterating
+/// candidate shards ascending. With a `limit` the walk stops once the
+/// cumulative kept count reaches it, so only the first K candidate shards get
+/// masks — the `limit(N)` short-circuit. Uses a forward cursor over the sorted
+/// row-set so the whole pass is O(candidate shards + row-set ranges).
+fn shard_infos_from_rowset(
+    plan: &ExecutionPlan,
+    sorted_shards: &[&FullCatalogEntry],
+    rs: &RowSet,
+    limit: Option<usize>,
+) -> Vec<ShardInfo> {
+    let ranges = rs.ranges();
+    let mut shard_infos: Vec<ShardInfo> = Vec::new();
+    let mut cum = 0usize;
+    let mut ri = 0usize; // forward cursor over `ranges`
+    for sc in &plan.candidate_shards {
+        if let Some(limit) = limit {
+            if cum >= limit {
+                break;
+            }
+        }
+        let Some(stats) = sorted_shards[sc.shard_idx].stats.as_ref() else {
+            continue;
+        };
+        let shard_start = stats.row_start;
+        let shard_end = stats.row_end;
+        let n_shard_rows = (shard_end - shard_start) as usize;
+
+        // Skip ranges that end at/before this shard starts (fully consumed by
+        // an earlier shard or sitting in a Level-1-pruned gap).
+        while ri < ranges.len() && ranges[ri].end <= shard_start {
+            ri += 1;
+        }
+
+        let mut local_mask = vec![false; n_shard_rows];
+        let mut kept = 0usize;
+        let mut j = ri;
+        while j < ranges.len() && ranges[j].start < shard_end {
+            let lo = ranges[j].start.max(shard_start);
+            let hi = ranges[j].end.min(shard_end);
+            local_mask[(lo - shard_start) as usize..(hi - shard_start) as usize].fill(true);
+            kept += (hi - lo) as usize;
+            // Only step the local cursor past ranges fully inside this shard; a
+            // range extending beyond `shard_end` is reprocessed for the next.
+            if ranges[j].end <= shard_end {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+
+        if kept > 0 {
+            cum += kept;
+            shard_infos.push(ShardInfo {
+                shard_idx: sc.shard_idx,
+                row_start: shard_start,
+                row_end: shard_end,
+                local_keep_mask: local_mask,
+            });
+        }
+    }
+    shard_infos
+}
+
+/// Attempt the row-set fast path. Returns `Ok(None)` (so the caller uses the
+/// legacy full-decode path) when it does not apply: kill-switch set, no obs
+/// shards (legacy single-section file), no obs predicate index, no obs-shard
+/// range table, a stale index, or no obs predicate resolvable from the index.
+fn try_rowset_mask(
+    pipeline: &QueryPipeline,
+    plan: &ExecutionPlan,
+    sorted_shards: &[&FullCatalogEntry],
+    n_obs: usize,
+) -> Result<Option<MaskResult>> {
+    if rowset_pushdown_disabled() {
+        return Ok(None);
+    }
+    let reader = pipeline.reader();
+    // Only the row-sharded (atlas) path has obs shards + a range table.
+    if reader.obs_metadata_shard_count() == 0 {
+        return Ok(None);
+    }
+    let Some(index) = plan.obs_predicate_index.as_ref() else {
+        return Ok(None);
+    };
+    // The predicate index is keyed to the CSR/output shard ranges (see
+    // `RowSetCtx`), so the index→global mapping uses the catalog's CSR shard
+    // ranges. The obs-metadata-shard ranges (separate `shard_target_rows`
+    // chunking) are used only by `materialize` to read filtered obs.
+    let Some(csr_shard_ranges) = csr_shard_ranges_table(sorted_shards) else {
+        return Ok(None);
+    };
+    let Some(obs_shard_ranges) = obs_shard_ranges_from_catalog(reader.catalog()) else {
+        return Ok(None);
+    };
+    // Staleness guard: a file-scope index that doesn't cover all obs rows (e.g.
+    // after `append`) must not drive row selection.
+    if !index_covers_all_obs(index, &csr_shard_ranges, n_obs as u64) {
+        return Ok(None);
+    }
+
+    let ctx = RowSetCtx {
+        index,
+        shard_row_ranges: &csr_shard_ranges,
+        n_obs: n_obs as u64,
+        obs_schema: pipeline.obs_schema(),
+    };
+    let (indexed, residual) = partition_obs_predicates(&plan.obs_predicates, &ctx);
+    // Nothing resolved from the index (including a no-filter query) → legacy
+    // path, unchanged.
+    let Some(mut rs) = indexed else {
+        return Ok(None);
+    };
+
+    // Restrict to surviving candidate shards, then subtract deletions.
+    rs = rs.intersect(&candidate_shard_coverage(plan, sorted_shards));
+    if let Some(ref dv) = plan.deletion_vectors {
+        rs = rs.difference(&deletion_rowset(dv, sorted_shards, n_obs as u64));
+    }
+
+    // Residual predicates: decode only the obs shards `rs` spans.
+    if !residual.is_empty() {
+        rs = apply_residual(reader, &residual, &rs, &obs_shard_ranges)?;
+    }
+
+    // Full match count (used by `count()`), with no X decode.
+    let matched_rows = rs.cardinality() as usize;
+    let shard_infos = shard_infos_from_rowset(plan, sorted_shards, &rs, plan.limit);
+
+    Ok(Some(MaskResult {
+        legacy_obs: None,
+        obs_shard_ranges,
+        shard_infos,
+        matched_rows,
+    }))
+}
+
+/// Legacy full-decode masking path (pre-row-set behavior). Decodes the obs
+/// shards overlapping the candidate CSR shards, evaluates ALL obs predicates as
+/// boolean masks, applies deletion vectors, and builds per-shard keep masks.
+fn build_legacy_mask(
+    pipeline: &QueryPipeline,
+    plan: &ExecutionPlan,
+    sorted_shards: &[&FullCatalogEntry],
+    n_obs: usize,
+) -> Result<MaskResult> {
+    let reader = pipeline.reader();
+    let mut obs_mask = vec![true; n_obs];
+    let mut legacy_obs: Option<RecordBatch> = None;
+    let mut obs_shard_ranges: Vec<(u32, u64, u64)> = Vec::new();
+
+    if reader.obs_metadata_shard_count() > 0 {
+        // Catalog row ranges (cheap) let us skip decoding obs shards that
+        // don't overlap any surviving CSR shard. Absent (pre-stats files)
+        // -> stream every shard (bounded memory, no I/O skip).
+        let catalog_ranges = obs_shard_ranges_from_catalog(reader.catalog());
+
+        // Candidate CSR shard row ranges, sorted by row_start, for the
+        // overlap test.
+        let mut candidate_ranges: Vec<(u64, u64)> = plan
+            .candidate_shards
+            .iter()
+            .filter_map(|sc| {
+                sorted_shards[sc.shard_idx]
+                    .stats
+                    .as_ref()
+                    .map(|s| (s.row_start, s.row_end))
+            })
+            .collect();
+        candidate_ranges.sort_unstable_by_key(|(s, _)| *s);
+
+        // Which obs shards to actually decode, each paired with its
+        // catalog row_start when known (avoids a metadata parse).
+        let needed: Vec<(u32, Option<u64>)> = match &catalog_ranges {
+            Some(ranges) => ranges
+                .iter()
+                .filter(|(_, rs, re)| range_overlaps_any(*rs, *re, &candidate_ranges))
+                .map(|(idx, rs, _)| (*idx, Some(*rs)))
+                .collect(),
+            None => (0..reader.obs_metadata_shard_count() as u32)
+                .map(|idx| (idx, None))
+                .collect(),
+        };
+
+        // Evaluate predicates per shard in parallel; each worker reads its
+        // shard, produces a local keep mask, then drops the batch. Peak
+        // string memory is bounded by ~(rayon width × one shard).
+        let per_shard: Vec<(u64, Vec<bool>)> =
+            par_map_with_shard_retry(&needed, |&(idx, cat_row_start)| {
+                let batch = reader.read_obs_shard(idx)?;
+                let row_start = match cat_row_start {
+                    Some(rs) => rs,
+                    None => obs_shard_row_start(&batch)?,
+                };
+                let mut local = vec![true; batch.num_rows()];
+                for pred in &plan.obs_predicates {
+                    let arr = evaluate(pred, &batch)?;
+                    for (i, m) in local.iter_mut().enumerate() {
+                        if *m {
+                            *m = arr.is_valid(i) && arr.value(i);
+                        }
+                    }
+                }
+                Ok((row_start, local))
+            })?;
+
+        // Scatter local masks into the global mask. Obs shards are
+        // disjoint and contiguous, so writes never overlap.
+        for (row_start, local) in &per_shard {
+            let base = *row_start as usize;
+            if base >= n_obs {
+                continue;
+            }
+            let end = (base + local.len()).min(n_obs);
+            obs_mask[base..end].copy_from_slice(&local[..end - base]);
+        }
+
+        // Ranges for `materialize`: catalog ranges are the complete,
+        // ordered set; otherwise we read every shard so the read results
+        // cover all of obs — reconstruct from them.
+        obs_shard_ranges = match catalog_ranges {
+            Some(ranges) => ranges,
+            None => {
+                let mut r: Vec<(u32, u64, u64)> = needed
+                    .iter()
+                    .zip(per_shard.iter())
+                    .map(|((idx, _), (rs, local))| (*idx, *rs, *rs + local.len() as u64))
+                    .collect();
+                r.sort_by_key(|(idx, _, _)| *idx);
+                r
+            }
+        };
+    } else {
+        // Legacy single-section obs: read once and evaluate over the full
+        // batch (these files are not atlas-scale).
+        let obs_batch = reader.read_obs()?;
+        for pred in &plan.obs_predicates {
+            let mask_array = evaluate(pred, &obs_batch)?;
+            for (i, m) in obs_mask.iter_mut().enumerate() {
+                if *m {
+                    *m = mask_array.is_valid(i) && mask_array.value(i);
+                }
+            }
+        }
+        legacy_obs = Some(obs_batch);
+    }
+
+    // Step 4: Apply deletion vectors — exclude deleted cells.
+    if let Some(ref dv) = plan.deletion_vectors {
+        for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
+            if let Some(ref stats) = shard_entry.stats {
+                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
+                    for local_row in bitmap.iter() {
+                        let global_row = stats.row_start + local_row as u64;
+                        if (global_row as usize) < n_obs {
+                            obs_mask[global_row as usize] = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 5: Map matching cells to shards — build per-shard keep masks.
+    let mut shard_infos: Vec<ShardInfo> = Vec::new();
+    for sc in &plan.candidate_shards {
+        let entry = sorted_shards[sc.shard_idx];
+        if let Some(ref stats) = entry.stats {
+            let n_shard_rows = (stats.row_end - stats.row_start) as usize;
+            let mut local_mask = Vec::with_capacity(n_shard_rows);
+            let mut any_match = false;
+            for local_row in 0..n_shard_rows {
+                let global_row = stats.row_start as usize + local_row;
+                let keep = global_row < n_obs && obs_mask[global_row];
+                if keep {
+                    any_match = true;
+                }
+                local_mask.push(keep);
+            }
+            if any_match {
+                shard_infos.push(ShardInfo {
+                    shard_idx: sc.shard_idx,
+                    row_start: stats.row_start,
+                    row_end: stats.row_end,
+                    local_keep_mask: local_mask,
+                });
+            }
+        }
+    }
+
+    // Pre-limit Level-2 match count, from the keep masks alone — no X decode.
+    let matched_rows: usize = shard_infos
+        .iter()
+        .map(|si| si.local_keep_mask.iter().filter(|&&k| k).count())
+        .sum();
+
+    Ok(MaskResult {
+        legacy_obs,
+        obs_shard_ranges,
+        shard_infos,
+        matched_rows,
+    })
 }
 
 /// True if `[rs, re)` overlaps any range in `sorted`.
@@ -450,164 +1094,18 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         });
     }
 
-    // Steps 2+3: Build the global obs row mask by evaluating the obs
-    // predicates. On row-sharded (atlas-scale) files we stream one obs
-    // shard at a time instead of concatenating all of obs into memory
-    // (the old `read_obs()` peaked at hundreds of GB on 9000+ shards). The
-    // only O(n_obs) structure is the bool mask itself.
+    // Steps 2-5: produce the per-shard keep masks. `compute_mask` prefers the
+    // row-set fast path — resolving indexed obs predicates directly from the
+    // predicate index without decoding any obs shard — and falls back to the
+    // legacy full-decode path otherwise (non-indexed / residual-only predicates,
+    // legacy single-section obs, a stale index, or the pushdown kill-switch).
     let n_obs = reader.header().n_obs as usize;
-    let mut obs_mask = vec![true; n_obs];
-    // Full obs batch is materialised only on the legacy single-section
-    // path; the sharded path leaves this `None` and records shard ranges.
-    let mut legacy_obs: Option<RecordBatch> = None;
-    let mut obs_shard_ranges: Vec<(u32, u64, u64)> = Vec::new();
-
-    if reader.obs_metadata_shard_count() > 0 {
-        // Catalog row ranges (cheap) let us skip decoding obs shards that
-        // don't overlap any surviving CSR shard. Absent (pre-stats files)
-        // -> stream every shard (bounded memory, no I/O skip).
-        let catalog_ranges = obs_shard_ranges_from_catalog(reader.catalog());
-
-        // Candidate CSR shard row ranges, sorted by row_start, for the
-        // overlap test.
-        let mut candidate_ranges: Vec<(u64, u64)> = plan
-            .candidate_shards
-            .iter()
-            .filter_map(|sc| {
-                sorted_shards[sc.shard_idx]
-                    .stats
-                    .as_ref()
-                    .map(|s| (s.row_start, s.row_end))
-            })
-            .collect();
-        candidate_ranges.sort_unstable_by_key(|(s, _)| *s);
-
-        // Which obs shards to actually decode, each paired with its
-        // catalog row_start when known (avoids a metadata parse).
-        let needed: Vec<(u32, Option<u64>)> = match &catalog_ranges {
-            Some(ranges) => ranges
-                .iter()
-                .filter(|(_, rs, re)| range_overlaps_any(*rs, *re, &candidate_ranges))
-                .map(|(idx, rs, _)| (*idx, Some(*rs)))
-                .collect(),
-            None => (0..reader.obs_metadata_shard_count() as u32)
-                .map(|idx| (idx, None))
-                .collect(),
-        };
-
-        // Evaluate predicates per shard in parallel; each worker reads its
-        // shard, produces a local keep mask, then drops the batch. Peak
-        // string memory is bounded by ~(rayon width × one shard).
-        let per_shard: Vec<(u64, Vec<bool>)> = needed
-            .par_iter()
-            .map(|&(idx, cat_row_start)| {
-                let batch = reader.read_obs_shard(idx)?;
-                let row_start = match cat_row_start {
-                    Some(rs) => rs,
-                    None => obs_shard_row_start(&batch)?,
-                };
-                let mut local = vec![true; batch.num_rows()];
-                for pred in &plan.obs_predicates {
-                    let arr = evaluate(pred, &batch)?;
-                    for (i, m) in local.iter_mut().enumerate() {
-                        if *m {
-                            *m = arr.is_valid(i) && arr.value(i);
-                        }
-                    }
-                }
-                Ok((row_start, local))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Scatter local masks into the global mask. Obs shards are
-        // disjoint and contiguous, so writes never overlap.
-        for (row_start, local) in &per_shard {
-            let base = *row_start as usize;
-            if base >= n_obs {
-                continue;
-            }
-            let end = (base + local.len()).min(n_obs);
-            obs_mask[base..end].copy_from_slice(&local[..end - base]);
-        }
-
-        // Ranges for `materialize`: catalog ranges are the complete,
-        // ordered set; otherwise we read every shard so the read results
-        // cover all of obs — reconstruct from them.
-        obs_shard_ranges = match catalog_ranges {
-            Some(ranges) => ranges,
-            None => {
-                let mut r: Vec<(u32, u64, u64)> = needed
-                    .iter()
-                    .zip(per_shard.iter())
-                    .map(|((idx, _), (rs, local))| (*idx, *rs, *rs + local.len() as u64))
-                    .collect();
-                r.sort_by_key(|(idx, _, _)| *idx);
-                r
-            }
-        };
-    } else {
-        // Legacy single-section obs: read once and evaluate over the full
-        // batch (these files are not atlas-scale).
-        let obs_batch = reader.read_obs()?;
-        for pred in &plan.obs_predicates {
-            let mask_array = evaluate(pred, &obs_batch)?;
-            for (i, m) in obs_mask.iter_mut().enumerate() {
-                if *m {
-                    *m = mask_array.is_valid(i) && mask_array.value(i);
-                }
-            }
-        }
-        legacy_obs = Some(obs_batch);
-    }
-
-    // Step 4: Apply deletion vectors — exclude deleted cells.
-    // This is the same shard-idx→global-row translation as
-    // `DeletionVectors::build_keep_mask`, but deliberately folded in place
-    // into the running `obs_mask` (which already carries the predicate
-    // filter) rather than calling the shared helper: building a fresh mask
-    // would cost a second `n_obs` allocation and discard the predicate work.
-    if let Some(ref dv) = plan.deletion_vectors {
-        for (shard_idx, shard_entry) in sorted_shards.iter().enumerate() {
-            if let Some(ref stats) = shard_entry.stats {
-                if let Some(bitmap) = dv.shards.get(&(shard_idx as u32)) {
-                    for local_row in bitmap.iter() {
-                        let global_row = stats.row_start + local_row as u64;
-                        if (global_row as usize) < n_obs {
-                            obs_mask[global_row as usize] = false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 5: Map matching cells to shards
-    // Build per-shard keep masks (local row indices)
-    let mut shard_infos: Vec<ShardInfo> = Vec::new();
-    for sc in &plan.candidate_shards {
-        let entry = sorted_shards[sc.shard_idx];
-        if let Some(ref stats) = entry.stats {
-            let n_shard_rows = (stats.row_end - stats.row_start) as usize;
-            let mut local_mask = Vec::with_capacity(n_shard_rows);
-            let mut any_match = false;
-            for local_row in 0..n_shard_rows {
-                let global_row = stats.row_start as usize + local_row;
-                let keep = global_row < n_obs && obs_mask[global_row];
-                if keep {
-                    any_match = true;
-                }
-                local_mask.push(keep);
-            }
-            if any_match {
-                shard_infos.push(ShardInfo {
-                    shard_idx: sc.shard_idx,
-                    row_start: stats.row_start,
-                    row_end: stats.row_end,
-                    local_keep_mask: local_mask,
-                });
-            }
-        }
-    }
+    let MaskResult {
+        legacy_obs,
+        obs_shard_ranges,
+        shard_infos,
+        matched_rows,
+    } = compute_mask(pipeline, &plan, &sorted_shards, n_obs)?;
 
     // Step 6: Handle var predicates and gene projection (assembled via trait impl)
     let var_batch = reader.read_var()?;
@@ -616,13 +1114,6 @@ fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
         n_output_cols,
         reorder,
     } = resolve_gene_projection(&plan, &var_batch, n_vars)?;
-
-    // Pre-limit Level-2 match count, computed from the keep masks alone — no
-    // X decode required (CLI2/CLI6). Equals `csr.n_rows()` post-materialise.
-    let matched_rows: usize = shard_infos
-        .iter()
-        .map(|si| si.local_keep_mask.iter().filter(|&&k| k).count())
-        .sum();
 
     Ok(PlanAndMask {
         plan,
@@ -656,6 +1147,16 @@ pub fn count(pipeline: &QueryPipeline) -> Result<crate::pipeline::CountResult> {
         total_shards: pm.total_shards,
         candidate_shard_rows: pm.candidate_shard_rows,
     })
+}
+
+/// Whether any row matches, without decoding `X` and ignoring `limit`. On the
+/// indexed-only row-set path this needs no obs/X shard decode (the answer comes
+/// from the row-set cardinality); with residual predicates it decodes only the
+/// narrowed obs shards, like [`count`]. Computes the full match count rather
+/// than stopping at the first match — cheap on the indexed path, and a true
+/// early-exit is a deferred refinement.
+pub fn exists(pipeline: &QueryPipeline) -> Result<bool> {
+    Ok(plan_and_mask(pipeline)?.matched_rows > 0)
 }
 
 /// Rebuild the filtered obs metadata for a row-sharded file by reading only
@@ -705,23 +1206,21 @@ fn materialize_filtered_obs(
     let filtered_batches: Vec<RecordBatch> = if groups.is_empty() {
         vec![reader.read_obs_shard(0)?.slice(0, 0)]
     } else {
-        groups
-            .into_par_iter()
-            .map(|(bi, locals)| {
-                let (shard_idx, _, _) = by_start[bi];
-                let batch = reader.read_obs_shard(shard_idx)?;
-                // Consume the owned `locals` Vec: `UInt32Array::from(Vec<u32>)`
-                // takes the allocation via `Buffer::from_vec` (zero-copy), so no
-                // elements are copied into a fresh Arrow buffer.
-                let take_indices = UInt32Array::from(locals);
-                let columns: Vec<_> = batch
-                    .columns()
-                    .iter()
-                    .map(|col| compute::take(col.as_ref(), &take_indices, None))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok(RecordBatch::try_new(batch.schema(), columns)?)
-            })
-            .collect::<Result<Vec<_>>>()?
+        par_map_with_shard_retry(&groups, |(bi, locals)| {
+            let (shard_idx, _, _) = by_start[*bi];
+            let batch = reader.read_obs_shard(shard_idx)?;
+            // `par_map_with_shard_retry` may invoke this closure twice (on a
+            // transient-failure retry), so it borrows `locals` and clones per
+            // call rather than consuming the owned Vec. `UInt32Array::from`
+            // still takes the clone's allocation via `Buffer::from_vec`.
+            let take_indices = UInt32Array::from(locals.clone());
+            let columns: Vec<_> = batch
+                .columns()
+                .iter()
+                .map(|col| compute::take(col.as_ref(), &take_indices, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(RecordBatch::try_new(batch.schema(), columns)?)
+        })?
     };
 
     // `template_schema` is only consulted when `batches` is empty; we always
@@ -780,9 +1279,8 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
     };
 
     // Each shard produces (indptr, indices, data) filtered to matching rows
-    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> = shard_infos[..decode_count]
-        .par_iter()
-        .map(|si| {
+    let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> =
+        par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
             let entry = sorted_shards[si.shard_idx];
 
             // Decode shard (with or without projection)
@@ -797,8 +1295,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
                 filter_csr_rows(&indptr, &indices, &data, &si.local_keep_mask);
 
             Ok((filtered_indptr, filtered_indices, filtered_data))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        })?;
 
     // Step 8: Assemble CSR from per-shard results
     let mut merged_indptr: Vec<i64> = Vec::new();

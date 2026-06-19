@@ -431,41 +431,7 @@ impl ScxReader {
     ///   matches what `read_arrow_ipc` would produce — narrow types
     ///   when offsets fit, wide types when they overflow.
     fn read_arrow_ipc_schema(&self, entry: &FullCatalogEntry) -> Result<arrow::datatypes::Schema> {
-        let slice = self.section_bytes(entry)?;
-        let cursor = Cursor::new(slice);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        let on_disk = reader.schema();
-
-        let has_wide = on_disk.fields().iter().any(|f| {
-            use arrow::datatypes::DataType;
-            matches!(f.data_type(), DataType::LargeUtf8 | DataType::LargeBinary)
-                || matches!(
-                    f.data_type(),
-                    DataType::Dictionary(_, v)
-                        if matches!(v.as_ref(), DataType::LargeUtf8 | DataType::LargeBinary)
-                )
-        });
-        if !has_wide {
-            return Ok(on_disk.as_ref().clone());
-        }
-
-        // Wide types present — drive the slow path through the same
-        // logic the data path uses, so schema reflects whether offsets
-        // actually overflow per column.
-        let cursor = Cursor::new(self.section_bytes(entry)?);
-        let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
-        let mut batches = reader.into_iter();
-        let batch = batches
-            .next()
-            .ok_or_else(|| {
-                ScxError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Arrow IPC file contains no batches",
-                ))
-            })?
-            .map_err(ScxError::Arrow)?;
-        let normalized = crate::arrow_compat::downcast_large_types(&batch)?;
-        Ok(normalized.schema().as_ref().clone())
+        decode_arrow_ipc_schema(self.section_bytes(entry)?)
     }
 
     /// Read an Arrow IPC section from a catalog entry.
@@ -2178,6 +2144,58 @@ fn min_dictionary_key_type(n_distinct: usize) -> arrow::datatypes::DataType {
     }
 }
 
+/// Decode an Arrow IPC schema from a raw section byte slice.
+///
+/// - **Fast path** (no `LargeUtf8` / `LargeBinary` / `Dictionary(_, Large*)`
+///   in the footer): return the IPC footer schema directly. No data
+///   deserialization — ~KB of work.
+/// - **Slow path** (any wide type present): deserialize only the *first*
+///   batch and run [`crate::arrow_compat::downcast_large_types`] so the
+///   returned schema matches what the data path produces — narrow types
+///   when offsets fit, wide types when they overflow.
+///
+/// Cost is bounded by the bytes passed in (one section / one shard), never
+/// the full logical table. This is the shared core of
+/// [`ScxReader::read_obs_schema`] / [`ScxReader::read_var_schema`]; the
+/// cloud reader calls it on a single fetched shard so its schema reads stay
+/// byte-identical to the local path without assembling the whole obs/var.
+pub fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<arrow::datatypes::Schema> {
+    let cursor = Cursor::new(bytes);
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+    let on_disk = reader.schema();
+
+    let has_wide = on_disk.fields().iter().any(|f| {
+        use arrow::datatypes::DataType;
+        matches!(f.data_type(), DataType::LargeUtf8 | DataType::LargeBinary)
+            || matches!(
+                f.data_type(),
+                DataType::Dictionary(_, v)
+                    if matches!(v.as_ref(), DataType::LargeUtf8 | DataType::LargeBinary)
+            )
+    });
+    if !has_wide {
+        return Ok(on_disk.as_ref().clone());
+    }
+
+    // Wide types present — drive the slow path through the same logic the
+    // data path uses, so the schema reflects whether offsets actually
+    // overflow per column.
+    let cursor = Cursor::new(bytes);
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)?;
+    let mut batches = reader.into_iter();
+    let batch = batches
+        .next()
+        .ok_or_else(|| {
+            ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Arrow IPC file contains no batches",
+            ))
+        })?
+        .map_err(ScxError::Arrow)?;
+    let normalized = crate::arrow_compat::downcast_large_types(&batch)?;
+    Ok(normalized.schema().as_ref().clone())
+}
+
 pub fn assemble_sharded_metadata(
     logical: &str,
     mut raw_batches: Vec<(u32, RecordBatch)>,
@@ -2211,6 +2229,14 @@ pub fn assemble_sharded_metadata(
                 .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
         })
         .collect::<Result<_>>()?;
+
+    // Reconcile columns that disagree on Dictionary-vs-plain encoding across
+    // shards (an append writes obs categoricals as plain Utf8 while
+    // `from_anndata` writes them as Dictionary, so a sharded axis can carry both
+    // representations). `concat_batches` requires one shared schema, so encode
+    // the plain shards' columns to Dictionary before concat. No-op when every
+    // shard already agrees.
+    let batches = crate::arrow_compat::reconcile_dictionary_representations(batches)?;
 
     // Verify the shards form a contiguous, ordered cover by walking their
     // stamped metadata. Each shard's `n_rows_total` is the file's logical
@@ -2335,6 +2361,11 @@ pub fn assemble_filtered_metadata(
                 .and_then(|b| crate::arrow_compat::widen_dictionary_keys(&b))
         })
         .collect::<Result<_>>()?;
+
+    // Reconcile Dictionary-vs-plain disagreement across the filtered shards
+    // (see `assemble_sharded_metadata`) so concat can't reject a mixed-encoding
+    // column produced by an append. No-op when shards already agree.
+    let wide = crate::arrow_compat::reconcile_dictionary_representations(wide)?;
 
     let wide_schema = wide[0].schema();
     let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;

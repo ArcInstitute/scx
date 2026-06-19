@@ -38,6 +38,8 @@ benchmarks/comprehensive/results/v3on2_*/
 benchmarks/comprehensive/results/v*/
 benchmarks/comprehensive/results/opt*/
 benchmarks/scripts/g4*
+# Benchmark run logs (regenerable SLURM/orchestrator output; keep the scripts)
+benchmarks/scripts/*.log
 
 build_artifacts/
 LINT_WARNINGS.json

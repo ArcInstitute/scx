@@ -196,10 +196,13 @@ fn count_streams_obs_without_full_read() {
             0,
             "the sharded path must never materialise the full obs table"
         );
+        // `cell_type` is indexed, so the row-set fast path resolves the match
+        // directly from the predicate index — NO obs metadata shard is decoded
+        // (previously 2 shards were streamed and masked).
         assert_eq!(
             reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
-            2,
-            "only the 2 obs shards overlapping surviving CSR shard 0 may be read"
+            0,
+            "indexed predicate resolves from the index with no obs-shard decode"
         );
     }
 }
@@ -252,10 +255,13 @@ fn collect_no_skip_reads_all_overlapping_shards() {
     {
         let reader = debug_reader(&pipeline);
         assert_eq!(reader.debug_counts().read_obs.load(Ordering::Relaxed), 0);
+        // `donor` is indexed, so the row-set fast path resolves the match from
+        // the predicate index — no obs-shard decode (was 4 shards streamed).
+        // Level-1 CSR-shard pruning still reports skipped_shards == 0.
         assert_eq!(
             reader.debug_counts().read_obs_shard.load(Ordering::Relaxed),
-            4,
-            "no-skip predicate must read all 4 obs shards (full cover)"
+            0,
+            "indexed predicate resolves from the index with no obs-shard decode"
         );
     }
 
