@@ -17,6 +17,7 @@ pub mod rebuild_csc;
 pub mod rewrite_helpers;
 pub mod rollback;
 pub mod sort;
+pub mod sort_engine;
 
 #[cfg(test)]
 mod test_utils;
@@ -38,3 +39,4 @@ pub use rebuild_csc::rebuild_csc_inplace;
 pub use rewrite_helpers::copy_auxiliary_sections;
 pub use rollback::{rollback, rollback_to};
 pub use sort::{SortOptions, SortStrategy, SortSummary};
+pub use sort_engine::{sort, sort_with_strategy};

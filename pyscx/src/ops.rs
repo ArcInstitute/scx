@@ -579,6 +579,83 @@ pub fn compact(
     }
 }
 
+/// Globally reorder cells (the obs axis) of an SCX file by an obs key,
+/// writing a new file with X-read locality and contiguous predicate-index
+/// shard ranges for the sort key (SCX-SORT-SPEC).
+///
+/// `by`: one or more obs columns, lexicographic in order (the leading key
+/// gets the full X-read-locality benefit). `reverse`: descending on all keys.
+/// Pass `memory_budget` (e.g. "4G") to force the bounded external partition
+/// sort; without it the in-memory path is used. The detection bitmap and CSC
+/// sidecar are dropped (the reorder invalidates them); pass `rebuild_csc=True`
+/// to re-emit the column-major sidecar. obsp/multimodal sort are not yet
+/// supported (Phase 5).
+///
+/// Example:
+///     pyscx.sort("atlas.scx", "atlas.sorted.scx", by=["cell_type"])
+#[pyfunction]
+#[pyo3(signature = (
+    input, output, by, reverse=false, shard_size=None,
+    index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    memory_budget=None, temp_dir=None, rebuild_csc=false,
+    csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn sort(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    by: Vec<String>,
+    reverse: bool,
+    shard_size: Option<u32>,
+    index_obs: Option<Vec<String>>,
+    index_var: Option<Vec<String>>,
+    index_preset: Option<String>,
+    index_auto_threshold: Option<usize>,
+    memory_budget: Option<String>,
+    temp_dir: Option<String>,
+    rebuild_csc: bool,
+    csc_cols_per_shard: usize,
+    csc_memory_limit: String,
+) -> PyResult<()> {
+    if by.is_empty() {
+        return Err(PyValueError::new_err(
+            "sort requires at least one `by` column",
+        ));
+    }
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
+    let memory_budget = match memory_budget {
+        Some(s) => Some(scx_format_io::MemoryBudget::parse(&s).map_err(PyValueError::new_err)?),
+        None => None,
+    };
+    let opts = scx_ops::SortOptions {
+        by,
+        reverse,
+        shard_target_rows: shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS),
+        codec: CodecSelection::Auto,
+        index_options: ConversionPredicateIndexOptions {
+            index_obs: index_obs.unwrap_or_default(),
+            index_var: index_var.unwrap_or_default(),
+            index_preset,
+            // The sort key is auto-added regardless; this caps auto-detection
+            // of other low-cardinality columns (0 = none).
+            index_auto_threshold: index_auto_threshold.unwrap_or(0),
+        },
+        memory_budget,
+        temp_dir: temp_dir.map(PathBuf::from),
+    };
+    py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
+        .map_err(ops_to_pyerr)?;
+    if rebuild_csc {
+        // `rebuild_csc_inplace` returns a non-`Send` `Box<dyn Error>`, so it
+        // cannot cross `py.detach`; run it on the calling thread.
+        scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // C6. pyscx.rollback()
 // ---------------------------------------------------------------------------

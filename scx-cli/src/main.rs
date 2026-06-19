@@ -20,6 +20,7 @@ mod query;
 mod rollback;
 mod set_uns;
 mod shard_utils;
+mod sort;
 mod subset;
 mod upgrade;
 mod validate;
@@ -352,6 +353,61 @@ enum Commands {
         /// sharded inputs.
         #[arg(long)]
         reshape_obs: bool,
+    },
+    /// Globally reorder cells (obs axis) by an obs key for query locality
+    Sort {
+        /// Input SCX file (local path)
+        input: PathBuf,
+        /// Output SCX file path
+        output: PathBuf,
+        /// Comma-separated obs columns to sort by, lexicographic in order
+        /// (the leading key gets the full X-read-locality benefit).
+        #[arg(long, value_name = "CSV")]
+        by: String,
+        /// Sort descending on all keys
+        #[arg(long)]
+        reverse: bool,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
+        /// Target rows per shard in the output file
+        #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
+        shard_size: u32,
+        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
+        #[arg(long, default_value = "auto")]
+        codec: String,
+        /// Comma-separated obs columns to also index on the output (the sort
+        /// key is always indexed so its shard ranges are contiguous).
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to index on the output.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns.
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
+        /// Spill / partition memory budget for the external sort (binary
+        /// suffix `K`/`M`/`G`/`T` or `KiB`..`TiB`; decimal `KB`/`MB` rejected).
+        /// Without it the in-memory path is used.
+        #[arg(long, value_name = "SIZE")]
+        memory_budget: Option<String>,
+        /// Directory for the external sort's spill files (default: system temp).
+        #[arg(long, value_name = "DIR")]
+        temp_dir: Option<PathBuf>,
+        /// Rebuild the CSC sidecar on the sorted output (the reorder
+        /// invalidates the column-major row indices, so it is dropped by
+        /// default with a warning).
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc` is set.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
+        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
+        #[arg(long, default_value = "4G")]
+        csc_memory_limit: String,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -884,6 +940,41 @@ fn main() {
             index_preset.filter(|s| !s.trim().is_empty()),
             index_auto_threshold,
             reshape_obs,
+        ),
+        Commands::Sort {
+            input,
+            output,
+            by,
+            reverse,
+            force,
+            shard_size,
+            codec,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
+            memory_budget,
+            temp_dir,
+            rebuild_csc,
+            csc_cols_per_shard,
+            csc_memory_limit,
+        } => sort::run_sort(
+            &input,
+            &output,
+            parse_index_columns(Some(&by)),
+            reverse,
+            force,
+            shard_size,
+            &codec,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
+            memory_budget,
+            temp_dir,
+            rebuild_csc,
+            csc_cols_per_shard,
+            &csc_memory_limit,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),
