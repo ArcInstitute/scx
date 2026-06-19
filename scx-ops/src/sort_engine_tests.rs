@@ -107,6 +107,52 @@ fn strategy_differential_identical() {
     assert_eq!(results[1], results[2], "K-pass vs external must match");
 }
 
+// --- Part 1 OOM fix: sharded-obs input via projected key-only pass 0 -------
+
+/// `scx sort` always writes obs via `write_obs_sharded`, so sorting a fixture
+/// once yields a multi-`ObsMetadataShard` file. Re-sorting that file drives
+/// pass 0 through `read_obs_keys`'s sharded assembly path (the atlas-scale
+/// path the OOM fix targets); the result must be byte-identical across the
+/// in-memory and external (spill) strategies and correctly ordered.
+#[test]
+fn sharded_obs_input_sorts_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+
+    // First sort → sharded-obs .scx (12 obs / shard_target_rows 2 = 6 shards).
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    let shard_count = ScxReader::open(&sharded)
+        .unwrap()
+        .obs_metadata_shard_count();
+    assert!(
+        shard_count >= 2,
+        "expected a multi-shard obs input, got {shard_count}"
+    );
+
+    // Re-sort the sharded-obs file under both strategies; the projected
+    // key-only pass-0 read must yield identical output.
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(64); // force the external path to actually partition
+    let in_mem = dir.path().join("in_mem.scx");
+    let external = dir.path().join("external.scx");
+    sort_with_strategy(&sharded, &in_mem, &o, Some(SortStrategy::InMemory)).unwrap();
+    sort_with_strategy(
+        &sharded,
+        &external,
+        &o,
+        Some(SortStrategy::ExternalPartition),
+    )
+    .unwrap();
+
+    assert_eq!(
+        content(&in_mem),
+        content(&external),
+        "sharded-obs input: in-memory vs external must match"
+    );
+    assert!(is_sorted_asc(&col_of(&in_mem, "cell_type")));
+}
+
 // --- Determinism (modulo provenance timestamp) -----------------------------
 
 #[test]

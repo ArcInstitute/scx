@@ -766,6 +766,82 @@ impl ScxReader {
         }
     }
 
+    /// Read only the named obs columns, assembled in global obs row
+    /// order, with dtypes **identical** to the same columns of a full
+    /// [`Self::read_obs`].
+    ///
+    /// On sharded files this projects each [`SectionType::ObsMetadataShard`]
+    /// to `col_names` (Arrow IPC column projection — the unselected
+    /// columns are never decoded) and runs the shared
+    /// [`assemble_sharded_metadata`] pipeline over just those columns. It
+    /// therefore avoids decoding and concatenating the non-selected (often
+    /// high-cardinality) obs columns, which dominate peak RSS in a full
+    /// `read_obs()` on atlas-scale files. `scx sort` uses this to compute
+    /// the global order from the sort-key columns alone. Because the same
+    /// assembler (and its dictionary-unify) runs on the projected columns,
+    /// the result is byte-identical to projecting `read_obs()` after the
+    /// fact.
+    pub fn read_obs_keys(&self, col_names: &[String]) -> Result<RecordBatch> {
+        let physical = self.read_obs_schema_physical()?;
+        let projection: Vec<usize> = col_names
+            .iter()
+            .map(|name| {
+                physical
+                    .index_of(name)
+                    .map_err(|_| ScxError::SectionNotFound(format!("obs column '{name}'")))
+            })
+            .collect::<Result<_>>()?;
+
+        if self.obs_metadata_shard_count() > 0 {
+            let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+                .full_catalog
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::ObsMetadataShard
+                        && e.name.starts_with("obs_metadata/shard_")
+                })
+                .filter_map(|e| {
+                    let suffix = e.name.strip_prefix("obs_metadata/shard_")?;
+                    let idx: u32 = suffix.parse().ok()?;
+                    Some((idx, e))
+                })
+                .collect();
+            shards.sort_by_key(|(idx, _)| *idx);
+            // Project each shard raw (no wide→narrow downcast); the
+            // assembler upcasts → validates the cover → concats → unifies
+            // dictionaries → narrows, exactly as the full read_obs() path.
+            let raw_batches: Vec<(u32, RecordBatch)> = shards
+                .iter()
+                .map(|(idx, _)| Ok((*idx, self.read_obs_shard_projected(*idx, &projection)?)))
+                .collect::<Result<_>>()?;
+            assemble_sharded_metadata("obs_metadata", raw_batches)
+        } else {
+            // Legacy single-section obs (non-atlas): project the one
+            // section and narrow, matching read_obs()'s downcast.
+            let entry = self
+                .full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+            let slice = self.section_bytes(entry)?;
+            let cursor = Cursor::new(slice);
+            let reader = arrow::ipc::reader::FileReaderBuilder::new()
+                .with_projection(projection)
+                .build(cursor)?;
+            let batch = reader
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    ScxError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Arrow IPC file contains no batches",
+                    ))
+                })?
+                .map_err(ScxError::Arrow)?;
+            crate::arrow_compat::downcast_large_types(&batch)
+        }
+    }
+
     /// Read the var (variable/gene) metadata as an Arrow RecordBatch.
     /// Mirror of [`Self::read_obs`] for the var axis — same dual-layout
     /// handling, same memory cost caveat, and same streaming
@@ -823,6 +899,41 @@ impl ScxReader {
             .get(&key)
             .ok_or(ScxError::SectionNotFound(key))?;
         self.read_arrow_ipc(entry)
+    }
+
+    /// Read one obs row-shard projected to `projection` (column indices
+    /// into the on-disk obs schema), **without** the wide→narrow
+    /// downcast — the raw, column-projected counterpart to
+    /// [`Self::read_obs_shard`] used by [`Self::read_obs_keys`]. Arrow IPC
+    /// column projection skips decoding the unselected columns. The
+    /// shard's stamped schema metadata (`shard_idx` / `row_start` /
+    /// `n_shard_rows` / `n_rows_total`) is preserved by `Schema::project`,
+    /// so the result feeds [`assemble_sharded_metadata`] unchanged.
+    pub fn read_obs_shard_projected(
+        &self,
+        shard_idx: u32,
+        projection: &[usize],
+    ) -> Result<RecordBatch> {
+        let key = format!("obs_metadata/shard_{shard_idx}");
+        let entry = self
+            .full_catalog
+            .get(&key)
+            .ok_or(ScxError::SectionNotFound(key))?;
+        let slice = self.section_bytes(entry)?;
+        let cursor = Cursor::new(slice);
+        let reader = arrow::ipc::reader::FileReaderBuilder::new()
+            .with_projection(projection.to_vec())
+            .build(cursor)?;
+        reader
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                ScxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Arrow IPC file contains no batches",
+                ))
+            })?
+            .map_err(ScxError::Arrow)
     }
 
     /// Read one row-shard of var metadata. Mirror of

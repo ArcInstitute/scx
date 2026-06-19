@@ -941,6 +941,136 @@ fn test_four_shards_individual_vs_assembled() {
     assert_eq!(csr.shape, (12, 10));
 }
 
+/// Part 1 of the `scx sort` OOM fix: `read_obs_keys` must return the
+/// requested obs column(s) byte-identical to projecting a full `read_obs()`,
+/// while only decoding those columns from each shard. Exercises the sharded
+/// path (cross-shard dictionary unify, where each shard carries a *local*
+/// vocabulary) plus a numeric column, and verifies an unknown column errors
+/// cleanly.
+#[test]
+fn test_read_obs_keys_matches_full_read_obs() {
+    use arrow::array::{Array, DictionaryArray, Int64Array};
+    use arrow::datatypes::Int8Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sharded_obs_keys.scx");
+
+    let n_obs: usize = 9;
+    let n_vars: usize = 4;
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 3, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    // Single CSR shard so the file passes its catalog invariants.
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // 3 obs shards, each with a LOCAL dictionary vocabulary so the assembler
+    // must unify across shards. cell_type sequence: A B A | B C A | C C B.
+    let cell_types = [["A", "B", "A"], ["B", "C", "A"], ["C", "C", "B"]];
+    let obs_schema = Arc::new(Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new(
+            "cell_type",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new("n_genes", DataType::Int64, false),
+    ]));
+    for (shard_idx, types) in cell_types.iter().enumerate() {
+        let row_start = shard_idx * 3;
+        let ids: Vec<String> = (row_start..row_start + 3)
+            .map(|i| format!("cell_{i}"))
+            .collect();
+        let dict: DictionaryArray<Int8Type> = types.iter().copied().map(Some).collect();
+        let n_genes = Int64Array::from(
+            (row_start..row_start + 3)
+                .map(|i| (i as i64) * 10)
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(
+            obs_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(dict),
+                Arc::new(n_genes),
+            ],
+        )
+        .unwrap();
+        writer
+            .write_obs_shard(shard_idx as u32, row_start as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.obs_metadata_shard_count() >= 3);
+    let full = reader.read_obs().unwrap();
+
+    let to_utf8 = |a: &dyn Array| -> StringArray {
+        arrow::compute::cast(a, &DataType::Utf8)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+
+    // Dictionary key column: projected assembly must match the full read,
+    // same dtype (including the narrowed dictionary key) and same values.
+    let keys = reader.read_obs_keys(&["cell_type".to_string()]).unwrap();
+    assert_eq!(
+        keys.num_columns(),
+        1,
+        "read_obs_keys must project to just the requested column"
+    );
+    let full_ct = full.column_by_name("cell_type").unwrap();
+    let key_ct = keys.column_by_name("cell_type").unwrap();
+    assert_eq!(
+        full_ct.data_type(),
+        key_ct.data_type(),
+        "projected key dtype must match full read_obs"
+    );
+    assert_eq!(to_utf8(full_ct), to_utf8(key_ct));
+    assert_eq!(
+        to_utf8(key_ct),
+        StringArray::from(vec!["A", "B", "A", "B", "C", "A", "C", "C", "B"])
+    );
+
+    // Numeric key column: projection works for non-dictionary columns too.
+    let nkeys = reader.read_obs_keys(&["n_genes".to_string()]).unwrap();
+    assert_eq!(nkeys.num_columns(), 1);
+    let full_ng = full
+        .column_by_name("n_genes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let key_ng = nkeys
+        .column_by_name("n_genes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(full_ng, key_ng);
+
+    // Unknown column is a clean error, not a panic.
+    assert!(reader
+        .read_obs_keys(&["does_not_exist".to_string()])
+        .is_err());
+}
+
 // -----------------------------------------------------------------------
 // 2B.7: Single-allocation assembly matches individual shard merge
 // -----------------------------------------------------------------------

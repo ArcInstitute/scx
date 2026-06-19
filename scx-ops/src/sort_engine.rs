@@ -124,7 +124,6 @@ pub fn sort_with_strategy(
     })?;
 
     // ----- Pass 0: compute the global order (shared by all strategies) -----
-    let obs_full = reader.read_obs()?;
     let keep_mask = reader.deletion_keep_mask()?;
 
     // Live rows only (deletions are materialized away, as compact does).
@@ -132,28 +131,37 @@ pub fn sort_with_strategy(
         Some(mask) => (0..n_obs as u64).filter(|&i| mask[i as usize]).collect(),
         None => (0..n_obs as u64).collect(),
     };
-    let live_obs = match &keep_mask {
+
+    // Pass 0a — compute the order from the sort-key columns ONLY. Reading
+    // just `opts.by` (projected, assembled with the same dictionary-unify
+    // as a full obs read) keeps the order computation off the unbudgeted
+    // full-obs materialization that OOMs on atlas-scale sharded files.
+    let key_batch = reader.read_obs_keys(&opts.by)?;
+    let live_keys = match &keep_mask {
         Some(mask) => {
             let bool_arr = arrow::array::BooleanArray::from(mask.clone());
-            arrow::compute::filter_record_batch(&obs_full, &bool_arr)?
+            arrow::compute::filter_record_batch(&key_batch, &bool_arr)?
         }
-        None => obs_full.clone(),
+        None => key_batch,
     };
-    let n_live = live_obs.num_rows();
+    let n_live = live_keys.num_rows();
     if n_live == 0 {
         return Err(OpsError::InvalidInput(
             "scx sort: input has no live rows to sort".to_string(),
         ));
     }
 
-    let extractor = SortKeyExtractor::new(&live_obs.schema(), &opts.by, opts.reverse)?;
-    let rows = extractor.rows(&live_obs)?;
-    // Local indices into `live_obs`, in sorted order (stable, ties by source id).
+    let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
+    let rows = extractor.rows(&live_keys)?;
+    // Local indices into the live sequence, in sorted order (stable, ties by
+    // source id). `live_keys` and `live_obs` (built below) are filtered from
+    // the same row universe in the same shard-concatenated order, so these
+    // local indices apply to both.
     let order_local = stable_argsort(&rows, 0);
     // Output row -> original (global) old row id.
     let order_old: Vec<u64> = order_local.iter().map(|&l| live_ids[l as usize]).collect();
-
-    let sorted_obs = take_rows(&live_obs, &order_local)?;
+    drop(rows);
+    drop(live_keys);
 
     // old row -> new position (-1 = deleted / absent). Drives the external
     // strategy's partition routing and the obsp remap; shared by all paths.
@@ -161,6 +169,20 @@ pub fn sort_with_strategy(
     for (new, &old) in order_old.iter().enumerate() {
         new_pos_of_old[old as usize] = new as i64;
     }
+
+    // Pass 0b — materialize the full obs ONLY to write the reordered output.
+    // TODO(SCX-SORT-OOM-BUG Part 2): replace this full read_obs + take_rows
+    // with the new_pos-routed streaming spill-scatter so the obs WRITE is
+    // also memory-bounded; see SCX-SORT-OOM-BUG.md §(2).
+    let obs_full = reader.read_obs()?;
+    let live_obs = match &keep_mask {
+        Some(mask) => {
+            let bool_arr = arrow::array::BooleanArray::from(mask.clone());
+            arrow::compute::filter_record_batch(&obs_full, &bool_arr)?
+        }
+        None => obs_full.clone(),
+    };
+    let sorted_obs = take_rows(&live_obs, &order_local)?;
 
     // Multimodal inputs reorder every modality's X by the same global obs
     // order (Phase 5 / T5.1); the single-modality engine below handles the
