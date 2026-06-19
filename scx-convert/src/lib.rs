@@ -26,6 +26,8 @@ mod tenx_read;
 #[cfg(feature = "hdf5")]
 mod hdf5_threadsafe;
 #[cfg(feature = "hdf5")]
+mod permuted_reader;
+#[cfg(feature = "hdf5")]
 mod stream;
 mod warnings;
 
@@ -101,6 +103,8 @@ mod convert_tests_h5ad;
 mod convert_tests_index_export;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_parallel;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_sort;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_streaming;
 

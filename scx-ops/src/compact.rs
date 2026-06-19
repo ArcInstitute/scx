@@ -596,9 +596,6 @@ fn filter_obsp_coo(
     batch: &arrow::array::RecordBatch,
     keep_mask: &[bool],
 ) -> Result<arrow::array::RecordBatch> {
-    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field};
-
     // old obs index -> new obs index (or -1 if the obs was deleted).
     let mut old_to_new = vec![-1i64; keep_mask.len()];
     let mut next = 0i64;
@@ -608,7 +605,29 @@ fn filter_obsp_coo(
             next += 1;
         }
     }
-    let new_dim = next;
+    remap_obsp_coo(batch, &old_to_new)
+}
+
+/// Remap an obsp COO `RecordBatch` (obs×obs) through an explicit old→new obs
+/// index map: `old_to_new[i]` is the new position of obs `i`, or `-1` if obs
+/// `i` is absent from the output (deleted, or — for `compact` — filtered).
+///
+/// Drops entries whose `row` OR `col` maps to `-1` and renumbers surviving
+/// endpoints into the new index space; rewrites `n_rows`/`n_cols` metadata to
+/// the surviving dimension; all other metadata keys are preserved. Both the v1
+/// `Int32` and v2 `Int64` coordinate widths are accepted on input; the output
+/// width is chosen from the new dimension (no silent wrap above `i32::MAX`).
+///
+/// Used by `compact` (keep-mask → sequential new ids) and `scx sort`
+/// (permutation → new sorted position via `new_pos_of_old`).
+pub(crate) fn remap_obsp_coo(
+    batch: &arrow::array::RecordBatch,
+    old_to_new: &[i64],
+) -> Result<arrow::array::RecordBatch> {
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field};
+
+    let new_dim = old_to_new.iter().filter(|&&v| v >= 0).count() as i64;
 
     let rows = obsp_coords_as_i64(batch, "row")?;
     let cols = obsp_coords_as_i64(batch, "col")?;
@@ -694,7 +713,7 @@ fn filter_obsp_coo(
 /// family (obsm/varm), spanning both the legacy single-section type and the
 /// sharded type. Shard entry names (`{key}_shard_{idx}`) are reduced to their
 /// logical `{key}`. Keys are returned sorted for deterministic output order.
-fn discover_modality_keys(
+pub(crate) fn discover_modality_keys(
     reader: &ScxReader,
     modality_id: u8,
     prefix: &str,

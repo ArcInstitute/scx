@@ -46,6 +46,8 @@ pub(crate) fn route_backed_anndata_to_streaming(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Vec<String>,
+    sort_reverse: bool,
 ) -> PyResult<()> {
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -217,6 +219,8 @@ pub(crate) fn route_backed_anndata_to_streaming(
         bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
+        sort_by,
+        sort_reverse,
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);

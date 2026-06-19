@@ -23,6 +23,8 @@ pub fn run_merge(
     assume_identical_var: bool,
     assume_identical_obs: bool,
     uns_policy: Option<String>,
+    sort_by: Vec<String>,
+    sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate at least 2 inputs
     if inputs.len() < 2 {
@@ -73,7 +75,10 @@ pub fn run_merge(
         || index_auto_threshold.is_some();
     let any_policy_flag =
         assume_identical_var || assume_identical_obs || uns_policy != UnsPolicy::First;
-    if any_index_flag || any_policy_flag {
+    // A sort always needs the full options path (the bare `merge` wrapper
+    // can't carry a sort key).
+    let any_sort_flag = !sort_by.is_empty();
+    if any_index_flag || any_policy_flag || any_sort_flag {
         let index_options = ConversionPredicateIndexOptions {
             index_obs,
             index_var,
@@ -86,6 +91,8 @@ pub fn run_merge(
             assume_identical_obs,
             uns_policy,
             shard_target_rows: None,
+            sort_by,
+            sort_reverse,
         };
         let summary = scx_ops::merge_with_options(&input_refs, output, &merge_opts)?;
         emit_index_summary("merge", &summary);

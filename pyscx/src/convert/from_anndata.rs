@@ -510,6 +510,8 @@ pub fn from_anndata_impl(
     bitmap: &str,
     memory_budget: Option<u64>,
     force_legacy_metadata: bool,
+    sort_by: Vec<String>,
+    sort_reverse: bool,
 ) -> PyResult<()> {
     let explicit_codec = parse_codec(codec)?;
     let shard_target_rows = shard_size.unwrap_or(16384);
@@ -535,9 +537,9 @@ pub fn from_anndata_impl(
     if is_backed {
         #[cfg(feature = "hdf5")]
         {
-            // `from_anndata(adata)` doesn't take Phase 1 kwargs yet —
-            // it always asks for streaming with default policy. Phase
-            // 1 kwarg surface lives on `pyscx.from_h5ad(path, ...)`.
+            // Backed AnnData routes through the streaming converter, which
+            // supports sort-on-convert (Phase 2). Other Phase-1 kwargs still
+            // live on `pyscx.from_h5ad(path, ...)`.
             return route_backed_anndata_to_streaming(
                 py,
                 adata,
@@ -559,6 +561,8 @@ pub fn from_anndata_impl(
                 bitmap,
                 None, // reader_threads (auto)
                 4,    // writer_queue_depth (default)
+                sort_by,
+                sort_reverse,
             );
         }
         #[cfg(not(feature = "hdf5"))]
@@ -573,6 +577,7 @@ pub fn from_anndata_impl(
                 &index_preset,
                 index_auto_threshold,
                 bitmap,
+                sort_reverse,
             );
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "pyscx was built without the `hdf5` feature; backed AnnData \
@@ -581,6 +586,17 @@ pub fn from_anndata_impl(
                  to a non-backed form first.",
             ));
         }
+    }
+
+    // Sort-on-convert (Phase 2) currently rides the streaming converter,
+    // which only the backed-AnnData path uses. For in-memory / SCX-backed
+    // inputs, fail clearly rather than silently ignore the request.
+    if !sort_by.is_empty() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "from_anndata(sort_by=...) is currently supported only for backed AnnData \
+             (read with backed='r'). For an in-memory AnnData, write it to h5ad and use \
+             `pyscx.from_h5ad(..., sort_by=...)`, or `scx convert --sort-by`.",
+        ));
     }
 
     // Extract X as CSR. By default we do not mutate caller-owned CSR

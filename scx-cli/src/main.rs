@@ -20,6 +20,7 @@ mod query;
 mod rollback;
 mod set_uns;
 mod shard_utils;
+mod sort;
 mod subset;
 mod upgrade;
 mod validate;
@@ -183,6 +184,16 @@ enum Commands {
         /// peak RSS linearly; smaller values can starve encoders.
         #[arg(long, value_name = "N", default_value_t = 4)]
         writer_queue_depth: usize,
+        /// Sort-on-convert: globally reorder the cell (obs) axis by these
+        /// obs columns (CSV, lexicographic; leading key first) so output
+        /// CSR shards — and the predicate index — are contiguous per key.
+        /// Requires a CSR or dense h5ad X (CSC errors). Applies to X,
+        /// layers, obs, and obsm; obsp is dropped with a warning.
+        #[arg(long, value_name = "CSV")]
+        sort_by: Option<String>,
+        /// Descending order for `--sort-by`.
+        #[arg(long)]
+        sort_reverse: bool,
     },
     /// Display SCX file information
     Info {
@@ -343,6 +354,65 @@ enum Commands {
         #[arg(long)]
         reshape_obs: bool,
     },
+    /// Globally reorder cells (obs axis) by an obs key for query locality
+    Sort {
+        /// Input SCX file (local path)
+        input: PathBuf,
+        /// Output SCX file path
+        output: PathBuf,
+        /// Comma-separated obs columns to sort by, lexicographic in order
+        /// (the leading key gets the full X-read-locality benefit).
+        #[arg(long, value_name = "CSV")]
+        by: String,
+        /// Sort descending on all keys
+        #[arg(long)]
+        reverse: bool,
+        /// Overwrite output if it exists
+        #[arg(long)]
+        force: bool,
+        /// Target rows per shard in the output file
+        #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
+        shard_size: u32,
+        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
+        #[arg(long, default_value = "auto")]
+        codec: String,
+        /// Comma-separated obs columns to also index on the output (the sort
+        /// key is always indexed so its shard ranges are contiguous).
+        #[arg(long, value_name = "CSV")]
+        index_obs: Option<String>,
+        /// Comma-separated var columns to index on the output.
+        #[arg(long, value_name = "CSV")]
+        index_var: Option<String>,
+        /// Named column preset (`cellxgene` | `perturbseq` | `training`).
+        #[arg(long, value_name = "NAME")]
+        index_preset: Option<String>,
+        /// Cardinality cap for auto-detected index columns.
+        #[arg(long, value_name = "N")]
+        index_auto_threshold: Option<usize>,
+        /// Spill / partition memory budget for the external sort (binary
+        /// suffix `K`/`M`/`G`/`T` or `KiB`..`TiB`; decimal `KB`/`MB` rejected).
+        /// Without it the in-memory path is used.
+        #[arg(long, value_name = "SIZE")]
+        memory_budget: Option<String>,
+        /// Directory for the external sort's spill files (default: system temp).
+        #[arg(long, value_name = "DIR")]
+        temp_dir: Option<PathBuf>,
+        /// Detection-bitmap policy for the output: off (drop, default),
+        /// auto (rebuild when sparse), or always. Mirrors `scx convert --bitmap`.
+        #[arg(long, default_value = "off", value_parser = ["off", "auto", "always"])]
+        bitmap: String,
+        /// Rebuild the CSC sidecar on the sorted output (the reorder
+        /// invalidates the column-major row indices, so it is dropped by
+        /// default with a warning).
+        #[arg(long)]
+        rebuild_csc: bool,
+        /// Maximum columns per emitted CSC shard when `--rebuild-csc` is set.
+        #[arg(long, default_value_t = 5000)]
+        csc_cols_per_shard: usize,
+        /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
+        #[arg(long, default_value = "4G")]
+        csc_memory_limit: String,
+    },
     /// Revert to a previous manifest version
     Rollback {
         /// SCX file to roll back
@@ -465,6 +535,16 @@ enum Commands {
         /// array listing per-input disagreements.
         #[arg(long, value_name = "POLICY")]
         uns_policy: Option<String>,
+        /// Sorted k-way merge: globally reorder the merged cell (obs) axis
+        /// by these obs columns (CSV, lexicographic). Each input must
+        /// already be a sorted run by this key (e.g. from `scx convert
+        /// --sort-by`); an unsorted input errors. Reorders obs / X /
+        /// layers; var-axis preserved; obsm unsupported (errors).
+        #[arg(long, value_name = "CSV")]
+        sort_by: Option<String>,
+        /// Descending order for `--sort-by`.
+        #[arg(long)]
+        sort_reverse: bool,
     },
     /// Query cells by predicate
     Query {
@@ -746,6 +826,8 @@ fn main() {
             bitmap,
             reader_threads,
             writer_queue_depth,
+            sort_by,
+            sort_reverse,
         } => {
             // Resolve the CSC policy: an explicit `--csc` always wins;
             // otherwise an accel-ready `--index-preset` upgrades the
@@ -777,6 +859,8 @@ fn main() {
                 &bitmap,
                 reader_threads,
                 writer_queue_depth,
+                sort_by.as_deref(),
+                sort_reverse,
             )
         }
         Commands::Info {
@@ -861,6 +945,43 @@ fn main() {
             index_auto_threshold,
             reshape_obs,
         ),
+        Commands::Sort {
+            input,
+            output,
+            by,
+            reverse,
+            force,
+            shard_size,
+            codec,
+            index_obs,
+            index_var,
+            index_preset,
+            index_auto_threshold,
+            memory_budget,
+            temp_dir,
+            bitmap,
+            rebuild_csc,
+            csc_cols_per_shard,
+            csc_memory_limit,
+        } => sort::run_sort(
+            &input,
+            &output,
+            parse_index_columns(Some(&by)),
+            reverse,
+            force,
+            shard_size,
+            &codec,
+            parse_index_columns(index_obs.as_deref()),
+            parse_index_columns(index_var.as_deref()),
+            index_preset.filter(|s| !s.trim().is_empty()),
+            index_auto_threshold,
+            memory_budget,
+            temp_dir,
+            &bitmap,
+            rebuild_csc,
+            csc_cols_per_shard,
+            &csc_memory_limit,
+        ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),
         Commands::ModifyMetadata {
@@ -901,6 +1022,8 @@ fn main() {
             assume_identical_var,
             assume_identical_obs,
             uns_policy,
+            sort_by,
+            sort_reverse,
         } => match output {
             Some(output) => merge::run_merge(
                 &inputs,
@@ -915,6 +1038,8 @@ fn main() {
                 assume_identical_var,
                 assume_identical_obs,
                 uns_policy,
+                parse_index_columns(sort_by.as_deref()),
+                sort_reverse,
             ),
             // Unlike `scx convert`, the merged output is passed via `--output`,
             // not positionally — `inputs` is variadic, so a trailing path is
@@ -1076,8 +1201,11 @@ fn run_convert(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Option<&str>,
+    sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
+    let sort_by_list = parse_index_columns(sort_by);
 
     // CSC mode is meaningful only on input → SCX paths. Reject silently
     // for output paths (h5ad / mtx) where the destination has no CSC
@@ -1139,6 +1267,15 @@ fn run_convert(
         )
         .into());
     }
+    // Sort-on-convert applies only to h5ad → scx and requires the streaming
+    // path (the random-access permuted gather). Force streaming on.
+    if !sort_by_list.is_empty() && direction != "h5ad_to_scx" {
+        return Err(format!(
+            "--sort-by is only supported for h5ad → scx; got direction '{direction}'."
+        )
+        .into());
+    }
+    let stream = stream || !sort_by_list.is_empty();
 
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
@@ -1216,6 +1353,8 @@ fn run_convert(
         bitmap,
         reader_threads,
         writer_queue_depth,
+        sort_by_list,
+        sort_reverse,
     )
 }
 
@@ -1291,6 +1430,8 @@ fn dispatch_convert(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    sort_by: Vec<String>,
+    sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{BitmapPolicy, ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -1319,6 +1460,8 @@ fn dispatch_convert(
         bitmap: bitmap_policy,
         reader_threads,
         writer_queue_depth,
+        sort_by,
+        sort_reverse,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1446,6 +1589,8 @@ fn dispatch_convert(
     _bitmap: &str,
     _reader_threads: Option<usize>,
     _writer_queue_depth: usize,
+    _sort_by: Vec<String>,
+    _sort_reverse: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

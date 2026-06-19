@@ -53,6 +53,72 @@ compresses to ~50–100 MB. Key considerations:
 - **Append**: New cells are written as new shards at EOF. The `shard_target_rows`
   controls how many rows go into each appended shard.
 
+## Sorting for read locality (`scx sort`)
+
+Sharding decides *how many* rows live in a block; **sorting** decides *which*
+rows. `scx sort` globally reorders the obs (cell) axis by a chosen obs key and
+re-shards into the canonical row-major layout, so cells that share a key value
+land in the same few contiguous shards. The X matrix, layers, obsm, and obsp are
+reordered to match; var/varm/varp are untouched; the predicate index is rebuilt
+so each category's `shard_ranges` become a single contiguous range.
+
+**What it buys you — read locality, not filter cost.** After sorting by
+`cell_type`, "fetch all macrophages" touches a handful of adjacent shards instead
+of being scattered across the whole file, and the catalog-dict shard pruning the
+query engine already does (`prune_shards_by_catalog_with_dict`) collapses the
+scan to that contiguous range. This is the one thing the engine-side **row-set
+predicate pushdown** (the O(result) obs-filter path) *cannot* do — pushdown
+decodes matching shards in catalog order but never reorders them, so physical
+layout is the only lever for X-read locality. The two are **complementary**:
+pushdown is the workload-agnostic filter-cost fix (no rebuild); sort is an opt-in
+layout tool for *"I know my dominant query axis and run large/unbounded scans on
+it."* Only the leading sort key benefits — a shifting query axis should rely on
+the pushdown instead.
+
+Sorting is **stable** (equal keys keep their original order) and **deterministic**
+(same input + flags ⇒ byte-identical output, modulo the provenance timestamp).
+Deletions are materialized away first (the output is dense and deletion-free).
+The CSC sidecar and detection bitmap are dropped by default; pass `--rebuild-csc`
+/ `--bitmap auto|always` to re-emit them on the sorted output.
+
+### Three ways to sort
+
+The reorder ships as three entry points — prefer the build-time forms, which are
+spill-free:
+
+| form | when | mechanism |
+|------|------|-----------|
+| `scx convert --sort-by` / `from_anndata(sort_by=…)` | sorting at ingest from h5ad | spill-free hyperslab gather from the random-access source |
+| `scx merge --sort-by` / `merge(sort_by=…)` | building an atlas from many `.scx` | sorted **k-way merge** of (pre-sorted) inputs; spill-free streaming |
+| `scx sort` / `pyscx.sort(…)` | re-sorting an already-built file | external partition sort (bounded memory; the recovery path) |
+
+```bash
+# Recovery: sort an existing file by a categorical key, indexing it
+scx sort --by cell_type --index-obs cell_type input.scx sorted.scx
+
+# Composite (lexicographic), descending, custom shard size, bounded memory
+scx sort --by cell_type,donor_id input.scx out.scx
+scx sort --by n_genes --reverse input.scx out.scx
+scx sort --by cell_type --memory-budget 8G --temp-dir /scratch in.scx out.scx
+scx sort --by cell_type --rebuild-csc --bitmap auto in.scx out.scx
+```
+
+```python
+import pyscx
+# Build-time (preferred): bake the order into the conversion / merge
+pyscx.from_anndata(adata, "out.scx", sort_by=["cell_type"])
+pyscx.merge(inputs, "atlas.scx", sort_by=["cell_type"])
+# Recovery: sort an already-built file
+pyscx.sort("input.scx", "sorted.scx", by=["cell_type"], memory_budget="8G")
+```
+
+The standalone engine auto-selects a strategy from `(n_obs, n_vars, density, key
+cardinality, --memory-budget)`: an in-memory argsort for files that fit the
+budget, a zero-spill K-pass-by-category for a low-cardinality categorical key,
+or a bounded-memory external partition sort otherwise. See
+[performance.md § Sort (physical layout)](performance.md#sort-physical-layout)
+for measured compression and locality numbers.
+
 ## CLI commands
 
 ### Setting shard size during conversion
