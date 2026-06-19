@@ -1152,9 +1152,10 @@ pub fn h5ad_to_scx_streaming(
         None,
         sink,
     )?;
-    // obsp (obs×obs) needs both axes remapped through the permutation; that
-    // remap is Phase 5. For now, drop obsp with a warning when sorting rather
-    // than emit a misaligned graph. varp (var×var) is untouched by an obs sort.
+    // obsp (obs×obs) needs both axes remapped through the permutation. The
+    // standalone `scx sort` engine does this remap; the convert-on-sort path
+    // does not yet, so drop obsp with a warning here rather than emit a
+    // misaligned graph. varp (var×var) is untouched by an obs sort.
     if sort_perm.is_some() {
         if let Ok(group) = file.group("obsp") {
             for name in group.member_names().unwrap_or_default() {
@@ -2223,6 +2224,17 @@ fn ingest_raw_streaming(
         )));
     }
     let raw_n_vars = raw_reader.n_vars() as usize;
+
+    // `adata.raw` shares the obs axis, but the sort permutation is applied only
+    // to X/obs/obsm/layers — raw is streamed in source order. Rather than emit a
+    // raw matrix whose rows no longer line up with the sorted cells, drop it
+    // (with a visible warning) under sort-on-convert, mirroring the standalone
+    // `scx sort` engine which also drops raw.
+    if !opts.sort_by.is_empty() {
+        sink.emit(ConvertWarning::DroppedRaw { raw_n_vars });
+        return Ok(());
+    }
+
     let raw_n_vars_u32 = u32::try_from(raw_n_vars)
         .map_err(|_| ConvertError::Other(format!("raw n_vars {raw_n_vars} exceeds u32::MAX")))?;
     let raw_index_dtype: u8 = if raw_n_vars <= 65535 { 0 } else { 1 };

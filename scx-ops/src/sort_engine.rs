@@ -61,7 +61,7 @@
 //! engine-wide, as in compact).
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -119,6 +119,9 @@ pub fn sort_with_strategy(
 
     let n_obs = in_header.n_obs as usize;
     let n_vars = in_header.n_vars;
+    let n_vars_u32 = u32::try_from(n_vars).map_err(|_| {
+        OpsError::InvalidInput(format!("scx sort: n_vars {n_vars} exceeds u32::MAX"))
+    })?;
 
     // ----- Pass 0: compute the global order (shared by all strategies) -----
     let obs_full = reader.read_obs()?;
@@ -220,7 +223,33 @@ pub fn sort_with_strategy(
     } else {
         1.0
     };
-    let est_x_bytes = total_nnz.saturating_mul(8).saturating_add(n_obs as u64 * 8);
+    // Estimate peak resident bytes for the in-memory strategy: X (nnz·8 +
+    // indptr) plus the layers and obsm it also gathers whole — so the selector
+    // does not pick `InMemory` when layers/obsm push total RSS over the budget.
+    let layer_nnz: u64 = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::LayerCsrShard)
+        .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
+        .sum();
+    let obsm_bytes: u64 = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.section_type,
+                SectionType::ObsmEmbedding | SectionType::ObsmEmbeddingShard
+            )
+        })
+        .map(|e| e.length)
+        .sum();
+    let est_x_bytes = total_nnz
+        .saturating_add(layer_nnz)
+        .saturating_mul(8)
+        .saturating_add(n_obs as u64 * 8)
+        .saturating_add(obsm_bytes);
 
     // Leading-key cardinality + single-categorical-key flag for selector / K-pass.
     let leading_categorical = !is_numeric(
@@ -231,6 +260,14 @@ pub fn sort_with_strategy(
             .unwrap_or(DataType::Utf8),
     );
     let single_key = opts.by.len() == 1;
+    // K-pass derives its emit order from the non-null category enumeration and
+    // cannot place null-key rows; only the in-memory / external paths (which
+    // use the full `stable_argsort` order) handle nulls. Detect nulls in the
+    // leading key so the selector avoids K-pass and a forced K-pass errors.
+    let leading_key_has_nulls = single_key && leading_categorical && {
+        let col = live_obs.column_by_name(&opts.by[0]);
+        col.map(|c| c.null_count() > 0).unwrap_or(false)
+    };
 
     let mut spill_bytes = 0u64;
     let mut partitions = 1usize;
@@ -245,7 +282,12 @@ pub fn sort_with_strategy(
     let k = categories.as_ref().map(|c| c.len()).unwrap_or(usize::MAX);
 
     let strategy = force_strategy.unwrap_or_else(|| {
-        select_strategy(opts, est_x_bytes, single_key && leading_categorical, k)
+        select_strategy(
+            opts,
+            est_x_bytes,
+            single_key && leading_categorical && !leading_key_has_nulls,
+            k,
+        )
     });
 
     let mut x_emitter = CsrEmitter::new(
@@ -254,7 +296,7 @@ pub fn sort_with_strategy(
         opts.shard_target_rows,
         opts.codec,
         value_encoding,
-        n_vars as u32,
+        n_vars_u32,
         opts.bitmap,
     );
     match strategy {
@@ -262,6 +304,13 @@ pub fn sort_with_strategy(
             emit_x_in_memory(&reader, &mut writer, &mut x_emitter, &order_old)?;
         }
         SortStrategy::KPassByCategory => {
+            if leading_key_has_nulls {
+                return Err(OpsError::InvalidInput(
+                    "K-pass strategy cannot sort a key column containing nulls (it would drop \
+                     null-key rows); use the in-memory or external strategy"
+                        .to_string(),
+                ));
+            }
             let cats = categories.as_ref().ok_or_else(|| {
                 OpsError::InvalidInput(
                     "K-pass strategy requires a single categorical sort key".to_string(),
@@ -950,15 +999,31 @@ impl SpillDir {
         let base = base
             .map(|p| p.to_path_buf())
             .unwrap_or_else(std::env::temp_dir);
-        // Session uniqueness via pid + monotonic nanos (Math.random is not used
-        // here; a collision would only be across concurrent same-pid sorts).
+        std::fs::create_dir_all(&base)?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = base.join(format!("scx-sort-{}-{}", std::process::id(), nanos));
-        std::fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        // Use `create_dir` (not `create_dir_all`) so a name collision — e.g. a
+        // stale dir left by a SIGKILL'd prior run that reused this pid — fails
+        // rather than silently reusing leftover `part_*.bin`; retry with a
+        // bumped counter until we get a fresh, exclusively-created directory.
+        for attempt in 0..1024u32 {
+            let path = base.join(format!(
+                "scx-sort-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                attempt
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(OpsError::InvalidInput(
+            "scx sort: could not create a unique spill directory".to_string(),
+        ))
     }
 
     fn partition_file(&self, p: usize) -> PathBuf {
@@ -984,8 +1049,16 @@ fn emit_x_external(
     n_live: usize,
     temp_dir: Option<&Path>,
 ) -> Result<(u64, usize)> {
-    let p = p.max(1);
-    let n_parts = n_live.div_ceil(p);
+    let mut p = p.max(1);
+    let mut n_parts = n_live.div_ceil(p);
+    // Pass 1 opens one spill file per partition simultaneously; cap the count so
+    // an atlas-scale `n_live` with a small `p` cannot exhaust file descriptors
+    // (EMFILE). Widening `p` keeps each partition ≈ one budget's worth of rows.
+    const MAX_PARTITIONS: usize = 512;
+    if n_parts > MAX_PARTITIONS {
+        p = n_live.div_ceil(MAX_PARTITIONS);
+        n_parts = n_live.div_ceil(p);
+    }
     let spill = SpillDir::create(temp_dir)?;
 
     // ----- Pass 1: scatter decoded rows to per-partition spill files -----
@@ -1018,9 +1091,11 @@ fn emit_x_external(
     drop(part_writers);
 
     // ----- Pass 2: per partition, load + sort by new_pos + emit -----
+    // Stream-parse the spill straight into the row Vec (one buffered reader)
+    // rather than reading the whole file into a separate byte buffer first —
+    // that keeps peak RAM to the parsed partition, not raw bytes + parsed.
     for part in 0..n_parts {
-        let bytes = std::fs::read(spill.partition_file(part))?;
-        let mut rows = parse_spill(&bytes)?;
+        let mut rows = parse_spill_file(&spill.partition_file(part))?;
         rows.sort_by_key(|r| r.0);
         for (_np, indices, data) in &rows {
             emitter.push_row(writer, indices, data)?;
@@ -1050,35 +1125,36 @@ fn write_spill_row(
     Ok(8 + 4 + nnz as u64 * 8)
 }
 
-/// Parse a partition spill buffer into `(new_pos, indices, values)` rows.
+/// Stream a partition spill file into `(new_pos, indices, values)` rows via a
+/// buffered reader — peak RAM is the parsed partition plus one record's scratch
+/// buffers, not a whole-file byte copy on top of the parsed rows.
 #[allow(clippy::type_complexity)]
-fn parse_spill(buf: &[u8]) -> Result<Vec<(u64, Vec<i32>, Vec<f32>)>> {
+fn parse_spill_file(path: &Path) -> Result<Vec<(u64, Vec<i32>, Vec<f32>)>> {
+    let mut r = BufReader::new(File::open(path)?);
     let mut out = Vec::new();
-    let mut off = 0usize;
-    let err = || OpsError::InvalidInput("scx sort: truncated spill record".to_string());
-    while off < buf.len() {
-        if off + 12 > buf.len() {
-            return Err(err());
+    let mut hdr = [0u8; 12];
+    loop {
+        // A clean EOF at a record boundary ends the stream; a partial read
+        // inside a record is a truncated spill.
+        match r.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
         }
-        let np = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-        let nnz = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()) as usize;
-        off += 12;
-        let idx_end = off + nnz * 4;
-        let val_end = idx_end + nnz * 4;
-        if val_end > buf.len() {
-            return Err(err());
-        }
-        let mut indices = Vec::with_capacity(nnz);
-        for k in 0..nnz {
-            let b = off + k * 4;
-            indices.push(i32::from_le_bytes(buf[b..b + 4].try_into().unwrap()));
-        }
-        let mut data = Vec::with_capacity(nnz);
-        for k in 0..nnz {
-            let b = idx_end + k * 4;
-            data.push(f32::from_le_bytes(buf[b..b + 4].try_into().unwrap()));
-        }
-        off = val_end;
+        let np = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+        let nnz = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+        let mut ibuf = vec![0u8; nnz * 4];
+        r.read_exact(&mut ibuf)?;
+        let mut vbuf = vec![0u8; nnz * 4];
+        r.read_exact(&mut vbuf)?;
+        let indices: Vec<i32> = ibuf
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let data: Vec<f32> = vbuf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         out.push((np, indices, data));
     }
     Ok(out)
@@ -1223,21 +1299,55 @@ fn category_of_old(
     Ok(out)
 }
 
-/// Value encoding of the main X matrix (first CSR shard header).
+/// Value encoding wide enough to re-encode the whole sorted X output. Reorder
+/// mixes rows across shards, so a single shard's encoding can be too narrow
+/// (e.g. the first shard is `Uint8` but a later row exceeds 255). We probe the
+/// first shard for the float/integer *kind* and widen the integer width to the
+/// max value across all shard stats — cheap (catalog stats + one header read),
+/// and avoids a spurious `ValueOutOfRange` mid-sort.
 fn x_value_encoding(reader: &ScxReader) -> Result<ValueEncoding> {
     let shards = reader.catalog().shards_sorted();
-    entry_value_encoding(reader, shards.first().copied())
+    widest_value_encoding(reader, &shards)
 }
 
-/// Value encoding of a layer (first layer-shard header).
+/// Value encoding wide enough for a layer's whole sorted output (see
+/// [`x_value_encoding`]).
 fn layer_value_encoding(reader: &ScxReader, layer_name: &str) -> Result<ValueEncoding> {
     let prefix = format!("{layer_name}_shard_");
-    let first = reader
+    let shards: Vec<&FullCatalogEntry> = reader
         .catalog()
         .entries
         .iter()
-        .find(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix));
-    entry_value_encoding(reader, first)
+        .filter(|e| e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&prefix))
+        .collect();
+    widest_value_encoding(reader, &shards)
+}
+
+/// Pick the narrowest encoding that covers every shard in `shards`: float wins
+/// outright; otherwise the integer width that fits the max `value_max`.
+fn widest_value_encoding(
+    reader: &ScxReader,
+    shards: &[&FullCatalogEntry],
+) -> Result<ValueEncoding> {
+    let Some(first) = shards.first() else {
+        return Ok(ValueEncoding::Uint8);
+    };
+    let base = entry_value_encoding(reader, Some(*first))?;
+    if matches!(base, ValueEncoding::Float32 | ValueEncoding::Float16) {
+        return Ok(ValueEncoding::Float32);
+    }
+    let max_val = shards
+        .iter()
+        .filter_map(|e| e.stats.as_ref().map(|s| s.value_max))
+        .max()
+        .unwrap_or(0);
+    Ok(if max_val <= u8::MAX as u32 {
+        ValueEncoding::Uint8
+    } else if max_val <= u16::MAX as u32 {
+        ValueEncoding::Uint16
+    } else {
+        ValueEncoding::Uint32
+    })
 }
 
 fn entry_value_encoding(
@@ -1247,6 +1357,12 @@ fn entry_value_encoding(
     match entry {
         Some(e) => {
             let section = reader.section_bytes(e)?;
+            if section.len() < SHARD_HEADER_SIZE {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort: truncated shard header in section '{}'",
+                    e.name
+                )));
+            }
             let sh =
                 ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
             ValueEncoding::from_u8(sh.value_encoding)

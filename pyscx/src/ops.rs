@@ -607,7 +607,7 @@ pub fn sort(
     output: &str,
     by: Vec<String>,
     reverse: bool,
-    shard_size: Option<u32>,
+    shard_size: Option<i64>,
     index_obs: Option<Vec<String>>,
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
@@ -631,10 +631,14 @@ pub fn sort(
         None => None,
     };
     let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
+    // Route shard_size through the shared validator (signed i64 so a negative
+    // value is a clean `ValueError`, not pyo3 `OverflowError`), matching every
+    // other op.
+    let shard_target_rows = validate_shard_size(shard_size)?.get();
     let opts = scx_ops::SortOptions {
         by,
         reverse,
-        shard_target_rows: shard_size.unwrap_or(scx_format_io::DEFAULT_SHARD_TARGET_ROWS),
+        shard_target_rows,
         codec: CodecSelection::Auto,
         index_options: ConversionPredicateIndexOptions {
             index_obs: index_obs.unwrap_or_default(),
@@ -651,10 +655,14 @@ pub fn sort(
     py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
         .map_err(ops_to_pyerr)?;
     if rebuild_csc {
-        // `rebuild_csc_inplace` returns a non-`Send` `Box<dyn Error>`, so it
-        // cannot cross `py.detach`; run it on the calling thread.
-        scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Run the heavy CSC rebuild off the GIL too. Its `Box<dyn Error>` is
+        // not `Send`, so map it to a `String` inside the closure to cross
+        // `py.detach`.
+        py.detach(|| {
+            scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)?;
     }
     Ok(())
 }

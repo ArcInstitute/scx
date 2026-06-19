@@ -168,8 +168,9 @@ pub fn fixture_plain(dir: &tempfile::TempDir) -> PathBuf {
     path
 }
 
-/// (b) Skewed fixture: one dominant category (~90% `T cell`) to drive the
-/// pass-2 partition sub-split test.
+/// (b) Skewed fixture: one dominant category (~90% `T cell`). Exercises the
+/// external path under heavy skew — `new_pos`-range partitions stay balanced
+/// regardless, so no sub-split is needed.
 #[allow(dead_code)]
 pub fn fixture_skewed(dir: &tempfile::TempDir) -> PathBuf {
     let (n_obs, n_vars) = (20usize, 8usize);
@@ -186,6 +187,45 @@ pub fn fixture_skewed(dir: &tempfile::TempDir) -> PathBuf {
     writer
         .write_obs(&obs_with_string_cols(n_obs, &[("cell_type", types)]))
         .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    write_csr_single_shard(&mut writer, n_obs, n_vars);
+    writer.finish().unwrap();
+    path
+}
+
+/// Null-key fixture: a categorical `cell_type` with some null values. The
+/// in-memory / external strategies place nulls via `nulls_first`; K-pass is
+/// gated off null keys (it cannot enumerate a null category), so this drives
+/// both the null-ordering and the K-pass-rejection paths.
+#[allow(dead_code)]
+pub fn fixture_null_key(dir: &tempfile::TempDir) -> PathBuf {
+    let (n_obs, n_vars) = (12usize, 8usize);
+    let path = dir.path().join("sort_null_key.scx");
+    let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, n_vars as u64)).unwrap();
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let types: Vec<Option<&str>> = (0..n_obs)
+        .map(|i| match i % 4 {
+            0 => None,
+            1 => Some("B cell"),
+            2 => Some("T cell"),
+            _ => Some("NK cell"),
+        })
+        .collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(types)),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
     writer.write_var(&sample_var(n_vars)).unwrap();
     write_csr_single_shard(&mut writer, n_obs, n_vars);
     writer.finish().unwrap();

@@ -33,10 +33,19 @@ pub fn run_sort(
         return Err("scx sort requires --by with at least one obs column".into());
     }
 
-    if output.exists() && !force {
-        return Err("output file already exists, use --force to overwrite".into());
-    }
-    if output.exists() && force {
+    if output.exists() {
+        // Guard against `scx sort in.scx in.scx --force`: removing the output
+        // would delete the input before the engine reads it (data loss). sort
+        // always writes a fresh file, so same-path is never valid.
+        if let (Ok(in_p), Ok(out_p)) = (std::fs::canonicalize(input), std::fs::canonicalize(output))
+        {
+            if in_p == out_p {
+                return Err("input and output must be different files".into());
+            }
+        }
+        if !force {
+            return Err("output file already exists, use --force to overwrite".into());
+        }
         std::fs::remove_file(output)?;
     }
 

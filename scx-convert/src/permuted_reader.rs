@@ -87,39 +87,66 @@ impl PermutedCsrReader {
         let mut order: Vec<(usize, u64)> = want.iter().copied().enumerate().collect();
         order.sort_unstable_by_key(|&(_, src)| src);
 
-        let mut row_indices: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut row_values: Vec<Vec<f32>> = vec![Vec::new(); n];
+        // Cap each inner read at the reader's slab limit: a long contiguous
+        // source run (an already-sorted block, or a large categorical mapping
+        // to a near-`n_obs` run) must not exceed a dense reader's max hyperslab
+        // — otherwise `DenseXStreamReader::read_range` hard-errors. The run
+        // shards together still hold only one output block's worth of rows, so
+        // peak memory stays ~one output shard.
+        let max_run = self
+            .inner
+            .max_slab_rows()
+            .map(|m| m.max(1) as usize)
+            .unwrap_or(usize::MAX);
+
+        let mut shards: Vec<StreamedCsrShard> = Vec::new();
+        // For each output-local row: (index into `shards`, row index within it).
+        let mut row_sources: Vec<(usize, usize)> = vec![(0, 0); n];
+        let mut row_lengths: Vec<usize> = vec![0; n];
         let mut n_cols = self.inner.n_vars() as u32;
 
         let mut i = 0;
         while i < order.len() {
             let run_start_src = order[i].1;
-            // extend the run while source ids stay strictly consecutive
+            // extend the run while source ids stay strictly consecutive, but
+            // never beyond the inner reader's slab cap
             let mut j = i + 1;
-            while j < order.len() && order[j].1 == order[j - 1].1 + 1 {
+            while j < order.len() && order[j].1 == order[j - 1].1 + 1 && (j - i) < max_run {
                 j += 1;
             }
             let run_len = (j - i) as u32;
             let shard = self.inner.read_range(run_start_src, run_len)?;
             n_cols = shard.n_cols;
+            let shard_idx = shards.len();
             for k in 0..run_len as usize {
                 let out_local = order[i + k].0;
-                let lo = shard.indptr[k] as usize;
-                let hi = shard.indptr[k + 1] as usize;
-                row_indices[out_local] = shard.indices[lo..hi].to_vec();
-                row_values[out_local] = shard.values[lo..hi].to_vec();
+                row_sources[out_local] = (shard_idx, k);
+                row_lengths[out_local] = (shard.indptr[k + 1] - shard.indptr[k]) as usize;
             }
+            shards.push(shard);
             i = j;
         }
 
+        // Pre-allocate the flat output and copy each row directly from its
+        // source shard (no per-row Vec allocations).
         let mut indptr = Vec::with_capacity(n + 1);
         indptr.push(0u64);
-        let mut indices = Vec::new();
-        let mut values = Vec::new();
+        let mut total_nnz = 0usize;
+        for &len in &row_lengths {
+            total_nnz += len;
+            indptr.push(total_nnz as u64);
+        }
+        let mut indices = vec![0u32; total_nnz];
+        let mut values = vec![0.0f32; total_nnz];
         for r in 0..n {
-            indices.extend_from_slice(&row_indices[r]);
-            values.extend_from_slice(&row_values[r]);
-            indptr.push(indices.len() as u64);
+            let (s_idx, row_idx) = row_sources[r];
+            let shard = &shards[s_idx];
+            let lo = shard.indptr[row_idx] as usize;
+            let hi = shard.indptr[row_idx + 1] as usize;
+            let out_lo = indptr[r] as usize;
+            let out_hi = indptr[r + 1] as usize;
+            indices[out_lo..out_hi].copy_from_slice(&shard.indices[lo..hi]);
+            values[out_lo..out_hi].copy_from_slice(&shard.values[lo..hi]);
         }
 
         Ok(StreamedCsrShard {

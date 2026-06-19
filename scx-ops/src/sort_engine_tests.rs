@@ -1,6 +1,5 @@
-//! Gate tests  for the standalone
-//! `scx sort` engine. Pure SCX; built on the Phase-0 fixtures in
-//! `crate::test_utils`.
+//! Gate tests for the standalone `scx sort` engine. Pure SCX; built on the
+//! fixtures in `crate::test_utils`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -15,8 +14,8 @@ use scx_format_io::{BitmapPolicy, ScxReader};
 use super::{sort, sort_with_strategy};
 use crate::sort::{SortOptions, SortStrategy};
 use crate::test_utils::{
-    fixture_composite, fixture_deletion, fixture_multimodal, fixture_numeric, fixture_obsp_layers,
-    fixture_plain, fixture_skewed,
+    fixture_composite, fixture_deletion, fixture_multimodal, fixture_null_key, fixture_numeric,
+    fixture_obsp_layers, fixture_plain, fixture_skewed,
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -563,4 +562,65 @@ fn bitmap_off_writes_none() {
     sort(&inp, &out, &opts(&["cell_type"])).unwrap(); // default Off
     let (n_bm, _) = bitmap_total_counts(&out, 8);
     assert_eq!(n_bm, 0, "default bitmap policy drops the sidecar");
+}
+
+// --- null sort-key handling (review fix) -----------------------------------
+
+#[test]
+fn null_key_in_memory_matches_external() {
+    // The in-memory and external strategies both derive order from the full
+    // `stable_argsort` (nulls placed via nulls_first), so they must agree even
+    // when the sort key contains nulls — and no row may be dropped.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_null_key(&dir); // 12 obs, cell_type with 3 nulls
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(64);
+    sort_with_strategy(&inp, &a, &o, Some(SortStrategy::InMemory)).unwrap();
+    sort_with_strategy(&inp, &b, &o, Some(SortStrategy::ExternalPartition)).unwrap();
+
+    let (a_ids, a_rows) = content(&a);
+    assert_eq!(a_ids.len(), 12, "no rows dropped (incl. null-key rows)");
+    assert_eq!(
+        (a_ids, a_rows),
+        content(&b),
+        "in-memory == external on nulls"
+    );
+
+    // Round-trips the full cell set including the null-key cells.
+    let (in_ids, _) = content(&inp);
+    let got: HashSet<String> = col_of(&a, "cell_id").into_iter().collect();
+    assert_eq!(got, in_ids.into_iter().collect::<HashSet<_>>());
+}
+
+#[test]
+fn kpass_rejects_null_key() {
+    // Forcing K-pass on a null-containing key must error rather than silently
+    // drop the null-key rows.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_null_key(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(64);
+    let err = sort_with_strategy(&inp, &out, &o, Some(SortStrategy::KPassByCategory));
+    assert!(
+        err.is_err(),
+        "K-pass must reject a null-containing sort key"
+    );
+}
+
+#[test]
+fn auto_selection_avoids_kpass_on_null_key() {
+    // With a budget that would otherwise pick K-pass (small categorical key),
+    // a null in the key must route to a null-safe strategy and preserve all
+    // rows.
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_null_key(&dir);
+    let out = dir.path().join("out.scx");
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(64);
+    let summary = sort(&inp, &out, &o).unwrap();
+    assert_ne!(summary.strategy, SortStrategy::KPassByCategory);
+    assert_eq!(summary.n_obs, 12);
 }
