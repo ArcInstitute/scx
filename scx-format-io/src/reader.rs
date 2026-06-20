@@ -766,21 +766,22 @@ impl ScxReader {
         }
     }
 
-    /// Read only the named obs columns, assembled in global obs row
-    /// order, with dtypes **identical** to the same columns of a full
-    /// [`Self::read_obs`].
+    /// Read only the named obs columns, assembled in global obs row order, for
+    /// computing a sort/order over them. Per-row **values** match a full
+    /// [`Self::read_obs`]; string columns are returned **dictionary-encoded**
+    /// (see below), so the dtype may differ from `read_obs` for columns stored
+    /// plain on disk — fine for ordering (the comparator keys off values).
     ///
-    /// On sharded files this projects each [`SectionType::ObsMetadataShard`]
-    /// to `col_names` (Arrow IPC column projection — the unselected
-    /// columns are never decoded) and runs the shared
-    /// [`assemble_sharded_metadata`] pipeline over just those columns. It
-    /// therefore avoids decoding and concatenating the non-selected (often
-    /// high-cardinality) obs columns, which dominate peak RSS in a full
-    /// `read_obs()` on atlas-scale files. `scx sort` uses this to compute
-    /// the global order from the sort-key columns alone. Because the same
-    /// assembler (and its dictionary-unify) runs on the projected columns,
-    /// the result is byte-identical to projecting `read_obs()` after the
-    /// fact.
+    /// On sharded files this projects each [`SectionType::ObsMetadataShard`] to
+    /// `col_names`, **compacts** each projected shard (see [`compact_key_shard`]),
+    /// then runs the shared [`assemble_sharded_metadata`] pipeline. Compaction
+    /// is load-bearing: Arrow IPC column projection returns the projected column
+    /// as a zero-copy slice into the shard's full message body, so a retained
+    /// projected batch keeps *every* un-projected column resident — accumulating
+    /// all shards would hold the entire obs table (the projection saving
+    /// nothing). Compaction rebuilds each key column into fresh compact buffers
+    /// (dictionary-encoding strings, which also collapses categoricals stored
+    /// plain), so peak RSS is the small key data, not the whole obs.
     pub fn read_obs_keys(&self, col_names: &[String]) -> Result<RecordBatch> {
         let physical = self.read_obs_schema_physical()?;
         let projection: Vec<usize> = col_names
@@ -808,13 +809,20 @@ impl ScxReader {
                 })
                 .collect();
             shards.sort_by_key(|(idx, _)| *idx);
-            // Project each shard raw (no wide→narrow downcast); the
-            // assembler upcasts → validates the cover → concats → unifies
-            // dictionaries → narrows, exactly as the full read_obs() path.
-            let raw_batches: Vec<(u32, RecordBatch)> = shards
-                .iter()
-                .map(|(idx, _)| Ok((*idx, self.read_obs_shard_projected(*idx, &projection)?)))
-                .collect::<Result<_>>()?;
+            // Project + **compact** each shard. Arrow IPC column projection
+            // returns the projected column as a zero-copy slice into the shard's
+            // full message body, so the body of every (un-projected) column
+            // stays resident as long as the batch is held — accumulating all
+            // shards would retain the entire obs table (the projection saves
+            // nothing). `compact_key_shard` rebuilds each key column into fresh,
+            // compact buffers (dictionary-encoding plain string columns, which
+            // also collapses categoricals stored plain), dropping the body
+            // alias so only the small key data is retained.
+            let mut raw_batches: Vec<(u32, RecordBatch)> = Vec::with_capacity(shards.len());
+            for (idx, _) in shards.iter() {
+                let projected = self.read_obs_shard_projected(*idx, &projection)?;
+                raw_batches.push((*idx, compact_key_shard(&projected)?));
+            }
             assemble_sharded_metadata("obs_metadata", raw_batches)
         } else {
             // Legacy single-section obs (non-atlas): project the one
@@ -2202,26 +2210,39 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
         let col = batch.column(i);
         match field.data_type() {
             DataType::Dictionary(_, value_type) => {
-                // Decode to the plain value array (drops the per-shard,
-                // possibly-duplicated dictionary), then re-encode to a fresh
-                // unified dictionary. Encode once with a wide Int32 key to learn
-                // the deduplicated cardinality, then re-encode with the minimal
-                // signed key type that fits it so atlas-scale categoricals don't
-                // carry needlessly wide codes.
-                let values = arrow::compute::cast(col, value_type.as_ref())?;
-                let wide_dt = DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
-                let wide = arrow::compute::cast(&values, &wide_dt)?;
-                let n_distinct = wide
-                    .as_any()
-                    .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
-                    .map(|d| d.values().len())
-                    .unwrap_or(usize::MAX);
-                let key_type = min_dictionary_key_type(n_distinct);
-                let final_dt = DataType::Dictionary(Box::new(key_type), value_type.clone());
-                let encoded = if final_dt == wide_dt {
-                    wide
-                } else {
-                    arrow::compute::cast(&values, &final_dt)?
+                // Fast path: deduplicate by remapping over the (small)
+                // concatenated dictionary *values* array — O(dict_len) hashing
+                // + an O(n_obs) integer key gather — instead of decoding the
+                // whole column to a flat `n_obs`-length Utf8 array (the
+                // multi-GB-per-column transient that OOMs atlas-scale
+                // `read_obs`; see SCX-SORT-OOM-BUG Part 3). Falls back to the
+                // decode/re-encode cast for non-string value types.
+                let (encoded, final_dt) = match dedup_dictionary_column(col, value_type)? {
+                    Some(pair) => pair,
+                    None => {
+                        // Decode to the plain value array (drops the per-shard,
+                        // possibly-duplicated dictionary), then re-encode to a
+                        // fresh unified dictionary. Encode once with a wide Int32
+                        // key to learn the deduplicated cardinality, then
+                        // re-encode with the minimal signed key type that fits.
+                        let values = arrow::compute::cast(col, value_type.as_ref())?;
+                        let wide_dt =
+                            DataType::Dictionary(Box::new(DataType::Int32), value_type.clone());
+                        let wide = arrow::compute::cast(&values, &wide_dt)?;
+                        let n_distinct = wide
+                            .as_any()
+                            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+                            .map(|d| d.values().len())
+                            .unwrap_or(usize::MAX);
+                        let key_type = min_dictionary_key_type(n_distinct);
+                        let final_dt = DataType::Dictionary(Box::new(key_type), value_type.clone());
+                        let encoded = if final_dt == wide_dt {
+                            wide
+                        } else {
+                            arrow::compute::cast(&values, &final_dt)?
+                        };
+                        (encoded, final_dt)
+                    }
                 };
                 new_columns.push(encoded);
                 new_fields.push(
@@ -2237,6 +2258,96 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
     }
     let new_schema = Schema::new(new_fields).with_metadata(schema.metadata().clone());
     Ok(RecordBatch::try_new(Arc::new(new_schema), new_columns)?)
+}
+
+/// Deduplicate a `Dictionary(Int32, value_type)` column without materializing
+/// the full `n_obs`-length value array. Returns the unified `(array, dtype)`
+/// (key narrowed via [`min_dictionary_key_type`]) for string value types, or
+/// `None` for any shape that should take the decode/re-encode fallback
+/// (non-Int32 keys — not produced by the assembler's `widen_dictionary_keys` —
+/// or non-string value types). Categoricals are strings, so the fast path
+/// covers all real cases.
+fn dedup_dictionary_column(
+    col: &arrow::array::ArrayRef,
+    value_type: &arrow::datatypes::DataType,
+) -> Result<Option<(arrow::array::ArrayRef, arrow::datatypes::DataType)>> {
+    use arrow::array::{Array, Int32Array, LargeStringArray, StringArray};
+    use arrow::datatypes::{DataType, Int32Type};
+
+    let Some(dict) = col
+        .as_any()
+        .downcast_ref::<arrow::array::DictionaryArray<Int32Type>>()
+    else {
+        return Ok(None);
+    };
+    let keys: &Int32Array = dict.keys();
+    let values = dict.values();
+    match value_type {
+        DataType::LargeUtf8 => {
+            let v = values
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
+            Ok(Some(dedup_string_dict::<i64>(keys, v, value_type)?))
+        }
+        DataType::Utf8 => {
+            let v = values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
+            Ok(Some(dedup_string_dict::<i32>(keys, v, value_type)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Core of [`dedup_dictionary_column`] for a string value type: intern the
+/// dictionary's values (first-occurrence order over the values array), remap
+/// keys to the deduplicated index space, and narrow the key to the minimal fit.
+fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
+    keys: &arrow::array::Int32Array,
+    values: &arrow::array::GenericStringArray<O>,
+    value_type: &arrow::datatypes::DataType,
+) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
+    use arrow::array::{Array, DictionaryArray, GenericStringArray, Int32Array};
+    use arrow::datatypes::{DataType, Int32Type};
+
+    let mut interner: HashMap<Option<&str>, u32> = HashMap::new();
+    let mut old_to_new: Vec<u32> = Vec::with_capacity(values.len());
+    let mut unified: Vec<Option<&str>> = Vec::new();
+    for i in 0..values.len() {
+        let v = if values.is_null(i) {
+            None
+        } else {
+            Some(values.value(i))
+        };
+        let code = *interner.entry(v).or_insert_with(|| {
+            let c = unified.len() as u32;
+            unified.push(v);
+            c
+        });
+        old_to_new.push(code);
+    }
+    let n_distinct = unified.len();
+
+    // Remap keys (O(n_obs) integer gather; null keys preserved).
+    let new_keys: Int32Array = keys
+        .iter()
+        .map(|k| k.map(|k| old_to_new[k as usize] as i32))
+        .collect();
+    let unified_values: arrow::array::ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
+    let wide = DictionaryArray::<Int32Type>::try_new(new_keys, unified_values)?;
+
+    let key_type = min_dictionary_key_type(n_distinct);
+    let is_int32 = key_type == DataType::Int32;
+    let final_dt = DataType::Dictionary(Box::new(key_type), Box::new(value_type.clone()));
+    let arr: arrow::array::ArrayRef = if is_int32 {
+        Arc::new(wide)
+    } else {
+        // Narrows keys only (values untouched) — no full-column materialization.
+        arrow::compute::cast(&wide, &final_dt)?
+    };
+    Ok((arr, final_dt))
 }
 
 /// Smallest signed Arrow dictionary key (index) type that can address
@@ -2305,6 +2416,44 @@ pub fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<arrow::datatypes::Schema>
         .map_err(ScxError::Arrow)?;
     let normalized = crate::arrow_compat::downcast_large_types(&batch)?;
     Ok(normalized.schema().as_ref().clone())
+}
+
+/// Rebuild a projected obs key shard into fresh, compact buffers so it no
+/// longer aliases the full Arrow IPC message body. Column projection returns
+/// each column as a zero-copy slice into the shard's whole-batch body buffer,
+/// so a *retained* projected batch keeps every un-projected column resident —
+/// accumulating thousands of shards would hold the entire obs table. String
+/// columns are dictionary-encoded (drops the alias **and** collapses
+/// categoricals stored plain — a merge/append artifact — to compact codes);
+/// other columns are deep-copied via `concat`. The shard's schema metadata
+/// (cover stamps `shard_idx`/`row_start`/…) is preserved for the assembler.
+fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = batch.schema();
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+    let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, f) in schema.fields().iter().enumerate() {
+        let c = batch.column(i);
+        match f.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let dt = DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(f.data_type().clone()),
+                );
+                cols.push(arrow::compute::cast(c, &dt)?);
+                fields.push(
+                    Field::new(f.name(), dt, f.is_nullable()).with_metadata(f.metadata().clone()),
+                );
+            }
+            _ => {
+                // Deep-copy to drop the body alias; preserve dtype.
+                cols.push(arrow::compute::concat(&[c.as_ref()])?);
+                fields.push(f.as_ref().clone());
+            }
+        }
+    }
+    let new_schema = Schema::new(fields).with_metadata(schema.metadata().clone());
+    Ok(RecordBatch::try_new(Arc::new(new_schema), cols)?)
 }
 
 pub fn assemble_sharded_metadata(

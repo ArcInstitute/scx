@@ -50,6 +50,17 @@
 //! dropped; the CLI re-emits it post-write via `rebuild_csc_inplace` on
 //! `--rebuild-csc`.
 //!
+//! **Output size is not guaranteed neutral.** The reorder re-encodes every X
+//! shard with `--codec` (default `auto`). `scx1`-coded shards are size-neutral
+//! under a row permutation (per-row independent index coding), but `zstd`-coded
+//! shards and per-shard auto-codec re-selection shift X size a few percent in
+//! either direction (regrouping which cells share a shard changes cross-row
+//! compressibility). Observed: sorting the 149M-cell `drug.scx` (`mixed
+//! scx1/zstd`, uint32) by `cell_type` grew the X matrix ~8%. Value encoding is
+//! preserved (`x_value_encoding` widens only to fit the global max), so the
+//! growth is purely codec/order-dependent. See docs/sharding.md and
+//! docs/performance.md § Sort.
+//!
 //! Phase 5 lifted the earlier scope-outs: **multimodal** inputs reorder every
 //! modality's X by the global obs order ([`sort_multimodal`], mirroring
 //! `compact_multimodal`; per-modality X is gathered in-memory, the bounded
@@ -126,6 +137,7 @@ pub fn sort_with_strategy(
     })?;
 
     // ----- Pass 0: compute the global order (shared by all strategies) -----
+    log::info!("scx sort: pass 0 begin (n_obs={n_obs})");
     let keep_mask = reader.deletion_keep_mask()?;
 
     // Live rows only (deletions are materialized away, as compact does).
@@ -138,7 +150,18 @@ pub fn sort_with_strategy(
     // just `opts.by` (projected, assembled with the same dictionary-unify
     // as a full obs read) keeps the order computation off the unbudgeted
     // full-obs materialization that OOMs on atlas-scale sharded files.
+    log::info!("scx sort: pass 0a reading sort-key columns {:?}", opts.by);
     let key_batch = reader.read_obs_keys(&opts.by)?;
+    log::info!(
+        "scx sort: pass 0a key batch read ({} rows, {} cols, key dtype {:?})",
+        key_batch.num_rows(),
+        key_batch.num_columns(),
+        key_batch
+            .schema()
+            .fields()
+            .first()
+            .map(|f| f.data_type().clone())
+    );
     let live_keys = match &keep_mask {
         Some(mask) => {
             let bool_arr = arrow::array::BooleanArray::from(mask.clone());
@@ -155,6 +178,7 @@ pub fn sort_with_strategy(
 
     let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
     let rows = extractor.rows(&live_keys)?;
+    log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
     // Local indices into the live sequence, in sorted order (stable, ties by
     // source id). `live_keys` and `live_obs` (built below) are filtered from
     // the same row universe in the same shard-concatenated order, so these
@@ -176,12 +200,29 @@ pub fn sort_with_strategy(
 
     // Pass 0b — obs write strategy (SCX-SORT-OOM-BUG Part 2). The bounded
     // spill-scatter path applies only to a single-modality sort with a
-    // `--memory-budget` on a sharded-obs input whose decoded obs would exceed
-    // the budget; everything else keeps the in-memory take path (which also
-    // feeds the multimodal dispatch).
+    // `--memory-budget` on a sharded-obs input whose in-memory peak would
+    // exceed the budget; everything else keeps the in-memory take path (which
+    // also feeds the multimodal dispatch).
+    //
+    // The in-memory path's *peak* is well above one steady-state copy: `read_obs`
+    // itself peaks at ~2× obs while concatenating shards, then `take_rows`
+    // holds `obs_full` + `sorted_obs` co-resident, plus the three O(n_obs)
+    // order arrays (8 B each). Comparing one steady-state estimate to the budget
+    // (as a first cut did) routed atlas obs to the in-memory path and OOM-killed
+    // it — so estimate the peak conservatively.
     let obs_spill = if !reader.is_multimodal() && reader.obs_metadata_shard_count() > 0 {
         match opts.memory_budget {
-            Some(b) => est_obs_bytes(&reader, n_live)? > b,
+            Some(b) => {
+                let steady = est_obs_bytes(&reader, n_live)?;
+                let order_bytes = (n_live as u64).saturating_mul(24);
+                let inmem_peak = steady.saturating_mul(2).saturating_add(order_bytes);
+                log::info!(
+                    "scx sort: obs steady-state ~{steady} B, in-memory peak ~{inmem_peak} B, \
+                     budget {b} B -> {} path",
+                    if inmem_peak > b { "spill" } else { "in-memory" }
+                );
+                inmem_peak > b
+            }
             None => false,
         }
     } else {
@@ -261,16 +302,22 @@ pub fn sort_with_strategy(
         None => {
             let state = prepare_obs_spill(&reader, &new_pos_of_old, n_live, opts)?;
             obs_partitions = state.n_parts;
+            log::info!(
+                "scx sort: obs write pass begin ({} partitions)",
+                state.n_parts
+            );
             for (out_idx, item) in state.reader().enumerate() {
                 let (batch, offset) = item?;
                 let n = batch.num_rows() as u64;
                 writer.write_obs_shard(out_idx as u32, offset, n, n_live as u64, &batch)?;
             }
+            log::info!("scx sort: obs write pass done");
             obs_spill_state = Some(state);
         }
     }
     let var = reader.read_var()?;
     writer.write_var(&var)?;
+    log::info!("scx sort: var written; starting X gather");
 
     // ----- X: strategy-specific gather -----
     let value_encoding = x_value_encoding(&reader)?;
@@ -1347,11 +1394,26 @@ fn obs_partition_rows(budget: u64, obs_bytes_per_row: u64, shard_target: u32) ->
     ((budget / per_row) as usize).max(floor)
 }
 
+/// Widen a string/binary value type to its 64-bit-offset variant. A spilled
+/// obs partition concatenates up to one budget's worth of rows (hundreds of
+/// thousands), so a narrow `Utf8`/`Binary` (i32 offsets) column can exceed
+/// `i32::MAX` total bytes and raise `Offset overflow error`. The full
+/// `read_obs` assembler avoids this by upcasting before concat; the spill path
+/// must do the same. `write_obs_shard` re-narrows per output shard on write and
+/// the reader narrows again on read, so this only affects the spill/concat.
+fn largen_value_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8 => DataType::LargeUtf8,
+        DataType::Binary => DataType::LargeBinary,
+        other => other.clone(),
+    }
+}
+
 /// Build the spill schema (obs with every dictionary column decoded to its
-/// value type, plus the trailing [`OBS_NEW_POS_COL`]), the output schema (obs
-/// with the original dictionary columns re-encoded as `Dictionary(Int32, v)`),
-/// and the set of column names that were categorical. Derived from one decoded
-/// shard; `from_decoded` schemas are narrow (the reader downcasts on read).
+/// value type, string types widened to 64-bit offsets, plus the trailing
+/// [`OBS_NEW_POS_COL`]), the output schema (obs with the original dictionary
+/// columns re-encoded as `Dictionary(Int32, v)`), and the set of column names
+/// that were categorical. Derived from one decoded shard.
 fn obs_spill_schemas(shard_schema: &Schema) -> Result<(SchemaRef, SchemaRef, HashSet<String>)> {
     let mut plain_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
@@ -1365,22 +1427,29 @@ fn obs_spill_schemas(shard_schema: &Schema) -> Result<(SchemaRef, SchemaRef, Has
         match f.data_type() {
             DataType::Dictionary(_, value) => {
                 categorical.insert(f.name().clone());
+                let value = largen_value_type(value);
                 plain_fields.push(
-                    Field::new(f.name(), value.as_ref().clone(), f.is_nullable())
+                    Field::new(f.name(), value.clone(), f.is_nullable())
                         .with_metadata(f.metadata().clone()),
                 );
                 out_fields.push(
                     Field::new(
                         f.name(),
-                        DataType::Dictionary(Box::new(DataType::Int32), value.clone()),
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value)),
                         f.is_nullable(),
                     )
                     .with_metadata(f.metadata().clone()),
                 );
             }
-            _ => {
-                plain_fields.push(f.as_ref().clone());
-                out_fields.push(f.as_ref().clone());
+            other => {
+                let dt = largen_value_type(other);
+                plain_fields.push(
+                    Field::new(f.name(), dt.clone(), f.is_nullable())
+                        .with_metadata(f.metadata().clone()),
+                );
+                out_fields.push(
+                    Field::new(f.name(), dt, f.is_nullable()).with_metadata(f.metadata().clone()),
+                );
             }
         }
     }
@@ -1709,14 +1778,20 @@ fn is_numeric(dt: DataType) -> bool {
 /// Distinct values of a categorical/string-like column in sorted (or reversed)
 /// order. Nulls excluded (routed to the leading partition under `nulls_first`).
 fn distinct_categories(obs: &RecordBatch, name: &str, reverse: bool) -> Result<Vec<String>> {
-    use arrow::array::StringArray;
+    use arrow::array::LargeStringArray;
     let col = obs.column_by_name(name).ok_or_else(|| {
         OpsError::InvalidInput(format!("sort key column '{name}' missing from obs"))
     })?;
-    let utf8 = arrow::compute::cast(col, &DataType::Utf8)?;
-    let arr = utf8.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        OpsError::InvalidInput(format!("sort key '{name}' is not categorical/string-like"))
-    })?;
+    // Decode to `LargeUtf8` (i64 offsets): the leading key is the full obs
+    // column (e.g. 149 M rows), so a narrow `Utf8` decode overflows i32 offsets
+    // at >2 GB of total string bytes (`Offset overflow error`).
+    let utf8 = arrow::compute::cast(col, &DataType::LargeUtf8)?;
+    let arr = utf8
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .ok_or_else(|| {
+            OpsError::InvalidInput(format!("sort key '{name}' is not categorical/string-like"))
+        })?;
     let mut set = std::collections::BTreeSet::new();
     for i in 0..arr.len() {
         if !arr.is_null(i) {
@@ -1739,12 +1814,14 @@ fn category_of_old(
     cats: &[String],
     n_obs: usize,
 ) -> Result<Vec<i32>> {
-    use arrow::array::StringArray;
+    use arrow::array::LargeStringArray;
     let col = live_obs.column_by_name(name).ok_or_else(|| {
         OpsError::InvalidInput(format!("sort key column '{name}' missing from obs"))
     })?;
-    let utf8 = arrow::compute::cast(col, &DataType::Utf8)?;
-    let arr = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+    // `LargeUtf8` (i64 offsets): the key spans the full obs, so a narrow `Utf8`
+    // decode overflows i32 offsets at >2 GB of total string bytes.
+    let utf8 = arrow::compute::cast(col, &DataType::LargeUtf8)?;
+    let arr = utf8.as_any().downcast_ref::<LargeStringArray>().unwrap();
     let index: std::collections::HashMap<&str, i32> = cats
         .iter()
         .enumerate()

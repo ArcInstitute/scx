@@ -657,6 +657,99 @@ fn test_assemble_high_cardinality_dictionary_widens_key() {
     }
 }
 
+/// Part 3 (memory-bounded dict unify): assembling many shards that all share the
+/// same small category pool — with distinct per-shard local vocab orders and
+/// null keys — must deduplicate to the unique set (not pool×n_shards), narrow
+/// the key to the minimal fit, and decode every row (incl. nulls) correctly.
+/// This exercises the values-remap dedup path that replaced the full-column
+/// Utf8 round-trip.
+#[test]
+fn test_assemble_dictionary_dedup_many_shards() {
+    use arrow::array::{Array, DictionaryArray};
+    use arrow::datatypes::Int8Type;
+
+    let pool = ["alpha", "beta", "gamma"];
+    let per_shard = 4usize;
+    let n_shards = 50u32;
+    let total = per_shard * n_shards as usize;
+    let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+
+    let mut expected: Vec<Option<String>> = Vec::with_capacity(total);
+    let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+        .map(|shard_idx| {
+            // Rotate the assignment per shard so each shard's *local* dictionary
+            // has a different vocab order; null every 7th shard's row 1.
+            let vals: Vec<Option<&str>> = (0..per_shard)
+                .map(|r| {
+                    if shard_idx % 7 == 0 && r == 1 {
+                        None
+                    } else {
+                        Some(pool[(shard_idx as usize + r) % pool.len()])
+                    }
+                })
+                .collect();
+            for v in &vals {
+                expected.push(v.map(|s| s.to_string()));
+            }
+            let strs = StringArray::from(vals);
+            let dict = arrow::compute::cast(&(Arc::new(strs) as arrow::array::ArrayRef), &dict_dt)
+                .unwrap();
+            let row_start = shard_idx as usize * per_shard;
+            let metadata = std::collections::HashMap::from([
+                ("shard_idx".to_string(), shard_idx.to_string()),
+                ("row_start".to_string(), row_start.to_string()),
+                ("n_shard_rows".to_string(), per_shard.to_string()),
+                ("n_rows_total".to_string(), total.to_string()),
+            ]);
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("cell_type", dict_dt.clone(), true)])
+                    .with_metadata(metadata),
+            );
+            let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+            (shard_idx, batch)
+        })
+        .collect();
+
+    let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+    assert_eq!(merged.num_rows(), total);
+
+    let col = merged.column(0);
+    assert_eq!(
+        col.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        "3 distinct categories across 50 shards must dedup to an Int8 key"
+    );
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .expect("cell_type should remain dictionary-encoded");
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("dictionary values should be Utf8");
+    assert_eq!(
+        values.len(),
+        pool.len(),
+        "duplicate categories across shards must collapse to the unique set"
+    );
+    let got_set: std::collections::HashSet<&str> =
+        (0..values.len()).map(|i| values.value(i)).collect();
+    let want_set: std::collections::HashSet<&str> = pool.iter().copied().collect();
+    assert_eq!(
+        got_set, want_set,
+        "unified vocab must equal the category pool"
+    );
+    for (row, exp) in expected.iter().enumerate() {
+        if dict.is_null(row) {
+            assert_eq!(*exp, None, "row {row} should decode to null");
+        } else {
+            let got = values.value(dict.keys().value(row) as usize);
+            assert_eq!(Some(got.to_string()), *exp, "row {row} mismatch");
+        }
+    }
+}
+
 /// Regression: an append writes obs categoricals as plain `Utf8` (its
 /// `unify_dict_columns` decodes them) while `from_anndata` writes the same
 /// column as a `Dictionary`. After an append, a sharded obs axis therefore
