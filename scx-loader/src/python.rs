@@ -1546,6 +1546,15 @@ impl SparseCellSetDataset {
         Ok(SparseCellSetBatchIter { inner: Some(inner) })
     }
 
+    /// Snapshot of the readers' shared shard-cache counters, cumulative since
+    /// construction (the multi-file sibling of `IndexPlanDataset.cache_metrics`).
+    /// Returns a dict with keys: `hits`, `misses` (= shard decodes), `evictions`,
+    /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`. All `int`;
+    /// atomic, lock-free — sample as often as you like.
+    fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "SparseCellSetDataset(n_files={}, n_cols={})",

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use scx_format_io::ScxReader;
+use scx_format_io::{CacheMetrics, ScxReader};
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::PrefetchEngine;
@@ -148,6 +148,12 @@ impl SparseCellSetLoader {
     /// Number of readers (`file_id` range).
     pub fn n_files(&self) -> usize {
         self.engine.n_readers()
+    }
+
+    /// Shared handle to the readers' one `SharedShardCache` counters
+    /// (hits / misses / evictions / …), cumulative since construction.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        self.engine.cache_metrics()
     }
 
     /// CSR column count of emitted batches.

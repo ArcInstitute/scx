@@ -26,7 +26,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver};
-use scx_format_io::{BackedCsrReader, ScxReader, SharedShardCache};
+use scx_format_io::{BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
 use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -47,16 +47,28 @@ pub struct PrefetchEngine {
     runtime: OnceLock<Runtime>,
     /// Default lookahead depth (overridable per `iter_with_plans` call).
     default_lookahead: usize,
+    /// Shared handle to the readers' one `SharedShardCache` counters
+    /// (hits / misses / evictions / …). Mirrors `IndexPlanLoader::cache_metrics`;
+    /// always populated (a zeroed default when no reader enabled metrics).
+    cache_metrics: Arc<CacheMetrics>,
 }
 
 impl PrefetchEngine {
     /// Build an engine over `readers` (already sharing one cache). `file_id` is
     /// the reader's index in the slice.
     pub fn new(readers: Vec<Arc<BackedCsrReader>>, default_lookahead: usize) -> Arc<Self> {
+        // Read back the shared cache's metrics handle (enabled upstream, e.g. in
+        // `from_scx_readers`). All readers share one cache, so any reader's handle
+        // is the single aggregate; a zeroed default when metrics were never enabled.
+        let cache_metrics = readers
+            .iter()
+            .find_map(|r| r.metrics().cloned())
+            .unwrap_or_else(|| Arc::new(CacheMetrics::default()));
         Arc::new(PrefetchEngine {
             readers,
             runtime: OnceLock::new(),
             default_lookahead,
+            cache_metrics,
         })
     }
 
@@ -73,11 +85,13 @@ impl PrefetchEngine {
             .into_iter()
             .enumerate()
             .map(|(fid, r)| {
-                Arc::new(BackedCsrReader::with_shared_cache(
-                    r,
-                    fid as u32,
-                    Arc::clone(&shared),
-                ))
+                let mut backed =
+                    BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
+                // Always-on metrics, mirroring `IndexPlanLoader`. `enable_metrics`
+                // is idempotent on the shared cache, so doing it per reader installs
+                // one aggregate handle that `new` reads back via `metrics()`.
+                backed.enable_metrics();
+                Arc::new(backed)
             })
             .collect();
         Self::new(readers, default_lookahead)
@@ -96,6 +110,12 @@ impl PrefetchEngine {
     /// Default lookahead depth.
     pub fn default_lookahead(&self) -> usize {
         self.default_lookahead
+    }
+
+    /// Shared handle to the readers' one `SharedShardCache` counters. Always
+    /// populated; cloning the `Arc` lets callers sample without the cache lock.
+    pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
+        Arc::clone(&self.cache_metrics)
     }
 
     /// Lazily build the prefetch runtime (2 blocking-friendly worker threads),

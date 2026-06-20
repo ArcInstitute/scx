@@ -232,6 +232,71 @@ fn read_rows_sidecar_row_range_matches_full_decode() {
     assert_eq!(full.data, ev);
 }
 
+/// G2: the *scattered* gather (`read_rows_with`, the path SparseCellSetDataset
+/// uses) must produce byte-identical rows whether it decodes via the Scx1
+/// sidecar (O(rows)) or the full-shard fallback, and must actually take the
+/// sidecar path for sparse cold groups.
+#[test]
+fn read_rows_with_sidecar_matches_full_decode() {
+    let dir = TempDir::new().unwrap();
+    let rows_per_shard = 32usize;
+    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+    // Gather scattered rows into a dense buffer keyed by request position.
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
+        for (i, &row) in rows.iter().enumerate() {
+            let (_ip, eix, ev) = slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
+            assert_eq!(out[i].0, eix, "indices row {row}");
+            assert_eq!(out[i].1, ev, "data row {row}");
+        }
+    };
+
+    // Sparse group across both shards with consecutive runs ([5,6], [40,41])
+    // and singletons ([2],[63]) + a duplicate request (5). Per-shard group
+    // size (≤4) << shard_rows/4 = 8 ⇒ sidecar path. Runs: shard0 {2},{5,6};
+    // shard1 {8,9},{31} ⇒ 4 row-range decodes.
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let out = gather(&backed, &sparse_rows);
+    assert_matches(&out, &sparse_rows);
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            backed.reader.debug_counts().decode_scx1_row_range.load(Ordering::Relaxed),
+            4,
+            "sparse scattered group must take the sidecar row-range path (4 runs)",
+        );
+    }
+
+    // Dense group (≥8 rows/shard ⇒ k*4 ≥ shard_rows) takes the full-shard
+    // fallback; a fresh reader keeps the counter clean. Same byte-identical rows.
+    let backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    let out2 = gather(&backed2, &dense_rows);
+    assert_matches(&out2, &dense_rows);
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            backed2.reader.debug_counts().decode_scx1_row_range.load(Ordering::Relaxed),
+            0,
+            "dense group must take the full-shard fallback, not the sidecar path",
+        );
+    }
+}
+
 #[test]
 fn shard_source_read_shard_arc_serves_cache_hits() {
     use crate::shard_source::ShardSource;

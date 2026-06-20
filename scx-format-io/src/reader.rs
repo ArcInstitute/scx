@@ -3326,6 +3326,55 @@ impl ScxReader {
         Ok(Some(scipy))
     }
 
+    /// Decode several contiguous row `runs` (`(row_start, n_rows)`) of one CSR
+    /// shard `entry` via its decode sidecar, resolving the sidecar metadata,
+    /// section bytes, header, and encoded streams **once** for the whole shard
+    /// (vs once per run in [`Self::decode_scx1_row_range`]). This is the hot
+    /// path for the scattered cell-set gather, where a single shard is touched
+    /// by many small runs in one batch — repeating the O(shard-rows) sidecar
+    /// metadata deserialization per run dominated the gather (~3 ms/cell;
+    /// STATE3-SCX-DL-OPT-V2 §10.4). Returns `Ok(None)` (no fresh Scx1 sidecar)
+    /// so the caller falls back to a full-shard decode; each run's result is
+    /// byte-identical to that fallback's matching slice.
+    pub fn decode_scx1_row_runs(
+        &self,
+        entry: &FullCatalogEntry,
+        runs: &[(usize, usize)],
+    ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
+        let Some(sidecar) = self.scx1_sidecar_for(entry)? else {
+            return Ok(None);
+        };
+        let section = self.section_bytes(entry)?;
+        let header = self.read_shard_header(entry)?;
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let encoded = Self::encoded_ref_from_section(section, &header, &entry.name)?;
+        let meta = sidecar.to_scx1_metadata();
+        let mut out = Vec::with_capacity(runs.len());
+        for &(row_start, n_rows) in runs {
+            let decoded =
+                scx_codec::decode_scx1_row_range(&encoded, venc, &meta, row_start, n_rows)
+                    .map_err(|e| {
+                        ScxError::InvalidCatalog(format!(
+                            "sidecar row-range decode of {}: {e}",
+                            entry.name
+                        ))
+                    })?;
+            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "sidecar row-range convert of {}: {e}",
+                    entry.name
+                ))
+            })?;
+            out.push(scipy);
+            #[cfg(debug_assertions)]
+            self.debug_counts
+                .decode_scx1_row_range
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Some(out))
+    }
+
     fn read_shard_from_entry_inner(
         &self,
         entry: &FullCatalogEntry,
