@@ -256,7 +256,8 @@ fn read_rows_with_sidecar_matches_full_decode() {
 
     let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
         for (i, &row) in rows.iter().enumerate() {
-            let (_ip, eix, ev) = slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
+            let (_ip, eix, ev) =
+                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
             assert_eq!(out[i].0, eix, "indices row {row}");
             assert_eq!(out[i].1, ev, "data row {row}");
         }
@@ -274,7 +275,11 @@ fn read_rows_with_sidecar_matches_full_decode() {
     {
         use std::sync::atomic::Ordering;
         assert_eq!(
-            backed.reader.debug_counts().decode_scx1_row_range.load(Ordering::Relaxed),
+            backed
+                .reader
+                .debug_counts()
+                .decode_scx1_row_range
+                .load(Ordering::Relaxed),
             4,
             "sparse scattered group must take the sidecar row-range path (4 runs)",
         );
@@ -290,9 +295,67 @@ fn read_rows_with_sidecar_matches_full_decode() {
     {
         use std::sync::atomic::Ordering;
         assert_eq!(
-            backed2.reader.debug_counts().decode_scx1_row_range.load(Ordering::Relaxed),
+            backed2
+                .reader
+                .debug_counts()
+                .decode_scx1_row_range
+                .load(Ordering::Relaxed),
             0,
             "dense group must take the full-shard fallback, not the sidecar path",
+        );
+    }
+}
+
+/// Lever S (STATE3-SCX-DL-OPT-V3 §3): the per-shard Scx1 sidecar metadata is
+/// parsed once and reused across batches. Repeatedly gathering sparse groups
+/// from the same shard takes the sidecar path each time (so the rows are still
+/// correct) yet parses the metadata only once *per distinct shard* — proof the
+/// cache eliminates the per-batch O(shard-rows) BLAKE3 + clone reparse.
+#[test]
+fn sidecar_metadata_cached_across_batches() {
+    let dir = TempDir::new().unwrap();
+    let rows_per_shard = 32usize;
+    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
+        for (i, &row) in rows.iter().enumerate() {
+            let (_ip, eix, ev) =
+                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
+            assert_eq!(out[i].0, eix, "indices row {row}");
+            assert_eq!(out[i].1, ev, "data row {row}");
+        }
+    };
+
+    // Three "batches", all sparse sidecar groups (group*4 < shard_rows=32):
+    // b1, b2 touch shard 0; b3 touches shard 1. One reader (cache persists).
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let batches: [&[u64]; 3] = [&[2, 5, 6], &[3, 7], &[40, 41]];
+    for b in batches {
+        let out = gather(&backed, b);
+        assert_matches(&out, b);
+    }
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        let dc = backed.reader.debug_counts();
+        assert!(
+            dc.decode_scx1_row_range.load(Ordering::Relaxed) >= 3,
+            "all three sparse batches must take the sidecar row-range path",
+        );
+        assert_eq!(
+            dc.sidecar_meta_parse.load(Ordering::Relaxed),
+            2,
+            "metadata parsed once per distinct shard (shard 0 reused across b1/b2), not per batch",
         );
     }
 }
