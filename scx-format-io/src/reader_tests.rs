@@ -1158,6 +1158,24 @@ fn test_read_obs_keys_matches_full_read_obs() {
         .unwrap();
     assert_eq!(full_ng, key_ng);
 
+    // Plain `Utf8` key column: `read_obs_keys` dictionary-encodes string columns
+    // during compaction (to drop the IPC-body alias), so the returned dtype is
+    // `Dictionary` even though `read_obs` keeps `cell_id` plain. The *values*
+    // must still match per row — that is the contract the sort relies on (the
+    // RowConverter keys off decoded values, not dtype).
+    let id_keys = reader.read_obs_keys(&["cell_id".to_string()]).unwrap();
+    let id_col = id_keys.column_by_name("cell_id").unwrap();
+    assert!(
+        matches!(id_col.data_type(), DataType::Dictionary(_, _)),
+        "plain Utf8 key should come back dictionary-encoded, got {:?}",
+        id_col.data_type()
+    );
+    assert_eq!(
+        to_utf8(id_col),
+        to_utf8(full.column_by_name("cell_id").unwrap()),
+        "decoded cell_id values must match the full read_obs",
+    );
+
     // Unknown column is a clean error, not a panic.
     assert!(reader
         .read_obs_keys(&["does_not_exist".to_string()])

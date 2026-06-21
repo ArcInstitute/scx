@@ -2321,6 +2321,9 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
         } else {
             Some(values.value(i))
         };
+        // A null dictionary value interns to a single `None` slot, so all nulls
+        // in the source dictionary intentionally collapse to one unified entry
+        // (null == null in SCX categorical semantics).
         let code = *interner.entry(v).or_insert_with(|| {
             let c = unified.len() as u32;
             unified.push(v);
@@ -2330,11 +2333,26 @@ fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
     }
     let n_distinct = unified.len();
 
-    // Remap keys (O(n_obs) integer gather; null keys preserved).
+    // Remap keys (O(n_obs) integer gather; null keys preserved). Each key must
+    // index into the source dictionary; a malformed file with an out-of-range
+    // (or negative) key is rejected rather than panicking on the slice index
+    // (readers return errors on malformed input — see docs/conventions.md).
     let new_keys: Int32Array = keys
         .iter()
-        .map(|k| k.map(|k| old_to_new[k as usize] as i32))
-        .collect();
+        .map(|k| {
+            k.map(|k| {
+                let idx = usize::try_from(k).ok().filter(|&i| i < old_to_new.len());
+                match idx {
+                    Some(i) => Ok(old_to_new[i] as i32),
+                    None => Err(ScxError::InvalidCatalog(format!(
+                        "dictionary key {k} out of bounds (dictionary length {})",
+                        old_to_new.len()
+                    ))),
+                }
+            })
+            .transpose()
+        })
+        .collect::<Result<Int32Array>>()?;
     let unified_values: arrow::array::ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
     let wide = DictionaryArray::<Int32Type>::try_new(new_keys, unified_values)?;
 
@@ -2425,11 +2443,17 @@ pub fn decode_arrow_ipc_schema(bytes: &[u8]) -> Result<arrow::datatypes::Schema>
 /// accumulating thousands of shards would hold the entire obs table. String
 /// columns are dictionary-encoded (drops the alias **and** collapses
 /// categoricals stored plain — a merge/append artifact — to compact codes);
-/// other columns are deep-copied via `concat`. The shard's schema metadata
-/// (cover stamps `shard_idx`/`row_start`/…) is preserved for the assembler.
+/// other columns are deep-copied. The shard's schema metadata (cover stamps
+/// `shard_idx`/`row_start`/…) is preserved for the assembler.
 fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::array::UInt32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     let schema = batch.schema();
+    // Identity gather index — `take` always writes fresh output buffers, so it
+    // forces a real copy that drops the IPC-body alias for non-string key
+    // columns. (`concat(&[single])` does NOT: Arrow returns the lone input
+    // as-is, zero-copy, leaving the full message body alive.)
+    let identity = UInt32Array::from_iter_values(0..batch.num_rows() as u32);
     let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
     let mut cols: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (i, f) in schema.fields().iter().enumerate() {
@@ -2446,8 +2470,8 @@ fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
                 );
             }
             _ => {
-                // Deep-copy to drop the body alias; preserve dtype.
-                cols.push(arrow::compute::concat(&[c.as_ref()])?);
+                // Deep-copy via identity `take` to drop the body alias; dtype preserved.
+                cols.push(arrow::compute::take(c.as_ref(), &identity, None)?);
                 fields.push(f.as_ref().clone());
             }
         }

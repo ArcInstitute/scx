@@ -1387,7 +1387,9 @@ fn est_obs_bytes(reader: &ScxReader, n_live: usize) -> Result<u64> {
 }
 
 /// Rows per obs spill partition from the budget and per-row footprint, floored
-/// at one output shard.
+/// at one output shard. When `budget < per_row` the integer division yields 0;
+/// the `.max(floor)` floor is what guarantees a partition is always at least one
+/// output shard (the caller's per-shard-fits-budget guard runs separately).
 fn obs_partition_rows(budget: u64, obs_bytes_per_row: u64, shard_target: u32) -> usize {
     let floor = shard_target.max(1) as usize;
     let per_row = obs_bytes_per_row.max(1);
@@ -1413,7 +1415,10 @@ fn largen_value_type(dt: &DataType) -> DataType {
 /// value type, string types widened to 64-bit offsets, plus the trailing
 /// [`OBS_NEW_POS_COL`]), the output schema (obs with the original dictionary
 /// columns re-encoded as `Dictionary(Int32, v)`), and the set of column names
-/// that were categorical. Derived from one decoded shard.
+/// that were categorical. Derived from one decoded shard. The schemas
+/// intentionally carry only the column fields, not `shard_schema.metadata()`
+/// (the per-shard cover stamps): the spill is an internal format that never
+/// feeds the assembler, and `write_obs_shard` re-stamps the output shards.
 fn obs_spill_schemas(shard_schema: &Schema) -> Result<(SchemaRef, SchemaRef, HashSet<String>)> {
     let mut plain_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
@@ -1464,6 +1469,19 @@ fn obs_spill_schemas(shard_schema: &Schema) -> Result<(SchemaRef, SchemaRef, Has
 /// casting dictionary columns to their value type and any wide/narrow mismatch
 /// to the target. Returns the plain columns (no `new_pos`).
 fn decode_obs_shard_to_plain(batch: &RecordBatch, plain_fields: &[Field]) -> Result<Vec<ArrayRef>> {
+    // The spill schema is derived from shard 0 and applied positionally to every
+    // shard; a malformed file whose shard has fewer columns would panic on
+    // `batch.column(i)`. Reject it instead (the spill path does not run the
+    // assembler's cover validation). Uniform-schema sharded obs — the normal
+    // case — passes; heterogeneous dict-vs-plain reconciliation across shards is
+    // a deferred follow-up (F3 in SCX-SORT-OOM-BUG).
+    if batch.num_columns() < plain_fields.len() {
+        return Err(OpsError::InvalidInput(format!(
+            "scx sort: obs shard has {} columns, expected at least {}",
+            batch.num_columns(),
+            plain_fields.len()
+        )));
+    }
     let mut cols = Vec::with_capacity(plain_fields.len());
     for (i, f) in plain_fields.iter().enumerate() {
         let c = batch.column(i);
@@ -1492,6 +1510,9 @@ fn scatter_obs_to_spill(
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
+    // Opens `n_parts` spill files at once. The caller caps `n_parts` at 512
+    // (MAX_PARTITIONS) so this stays well under a typical `ulimit -n` (1024+);
+    // the X external path uses the same bound.
     let mut writers: Vec<arrow::ipc::writer::StreamWriter<BufWriter<File>>> = (0..n_parts)
         .map(|i| {
             let f = BufWriter::new(File::create(spill.partition_file(i))?);
@@ -1503,6 +1524,16 @@ fn scatter_obs_to_spill(
     for res in reader.obs_shards() {
         let batch = res?;
         let n = batch.num_rows();
+        // The obs shards must cover exactly `new_pos_of_old` rows; a malformed
+        // file whose shard rows sum past `n_obs` would otherwise index out of
+        // bounds below. Reject rather than panic.
+        if cursor + n > new_pos_of_old.len() {
+            return Err(OpsError::InvalidInput(format!(
+                "scx sort: obs shards cover more rows than n_obs ({} > {})",
+                cursor + n,
+                new_pos_of_old.len()
+            )));
+        }
         let plain_cols = decode_obs_shard_to_plain(&batch, &plain_fields)?;
         // Group this shard's live rows by destination partition.
         let mut part_rows: Vec<Vec<u64>> = vec![Vec::new(); n_parts];
@@ -1513,7 +1544,15 @@ fn scatter_obs_to_spill(
                 continue; // deleted row
             }
             let np = np as u64;
+            // `part = new_pos / p` is < n_parts by construction (n_parts =
+            // n_live.div_ceil(p) and new_pos < n_live); guard anyway so a stale
+            // `new_pos_of_old` can never write past the partition vectors.
             let part = (np as usize) / p;
+            if part >= n_parts {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort: new_pos {np} maps to partition {part} >= n_parts {n_parts}"
+                )));
+            }
             part_rows[part].push(local as u64);
             part_pos[part].push(np);
         }
@@ -1603,7 +1642,11 @@ impl ObsScatterReader {
             .column(pos_idx)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("new_pos column is UInt64");
+            .ok_or_else(|| {
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "obs spill column '{OBS_NEW_POS_COL}' is not UInt64"
+                ))
+            })?;
         // new_pos is a unique per-partition key; a plain sort suffices.
         let mut order: Vec<u64> = (0..with_pos.num_rows() as u64).collect();
         order.sort_by_key(|&i| pos.value(i as usize));

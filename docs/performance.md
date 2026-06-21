@@ -754,8 +754,9 @@ shard byte stream, so regrouping *which* cells share a shard changes cross-row
 redundancy, and the auto-codec `scx1`-vs-`zstd` median heuristic can flip per
 shard under the reorder. On a mixed-codec atlas this shifts X size by a few
 percent in **either** direction. Measured: sorting the 149M-cell `drug.scx`
-(380.1 GB X, `mixed scx1/zstd`, uint32) by `cell_type` **grew** the X matrix
-~30 GB (~8%; ~6% of the 530.7 GB file) — with value encoding (uint32 → uint32),
+(380.1 GB X, `mixed scx1/zstd`, uint32) by `cell_type` **grew** the X matrix by
+~30 GB — that is ~8% of the 380 GB X matrix (equivalently ~6% of the 530.7 GB
+whole file) — with value encoding (uint32 → uint32),
 predicate index (2.2 GB over the same columns, present in both), CSC (none), and
 obs (plain `LargeUtf8`, order-independent) all ruled out by the input catalog, so
 the delta is entirely X re-compression. So whole-file size after a sort is
