@@ -741,13 +741,30 @@ globally reorders the obs axis for X-read locality. Measured on
 | shards touched per category (mean) | 2.94 | 1.18 | **2.6× fewer** |
 | shards touched per category (max) | 4 / 7 | 2 / 7 | — |
 
-**Reading the numbers.** Compression: the X matrix is *size-neutral* under a row
-reorder because `scx1` codes each row's gene indices independently of row order;
-the real on-disk win is the **predicate index**, which collapses from per-shard
-scattered row lists (724 KB) to a handful of contiguous ranges (1.3 KB) once each
-category occupies one shard range. So the whole-file compression gain is modest
-for count-data X (data- and codec-dependent, as flagged in the spec) — the
-headline value is **locality**. Locality: the comparison is against an isolated
+**Reading the numbers.** Compression: the X matrix is *size-neutral* here because
+**`scx1` codes each row's gene indices independently of row order**, so a
+permutation just relocates identically-sized per-row blocks (394.1 MB → 394.1 MB
+above). The real on-disk win is the **predicate index**, which collapses from
+per-shard scattered row lists (724 KB) to a handful of contiguous ranges (1.3 KB)
+once each category occupies one shard range.
+
+This neutrality is **specific to `scx1`** and does **not** generalize to
+`zstd`-coded shards or to auto-codec re-selection. `zstd` compresses the whole
+shard byte stream, so regrouping *which* cells share a shard changes cross-row
+redundancy, and the auto-codec `scx1`-vs-`zstd` median heuristic can flip per
+shard under the reorder. On a mixed-codec atlas this shifts X size by a few
+percent in **either** direction. Measured: sorting the 149M-cell `drug.scx`
+(380.1 GB X, `mixed scx1/zstd`, uint32) by `cell_type` **grew** the X matrix by
+~30 GB — that is ~8% of the 380 GB X matrix (equivalently ~6% of the 530.7 GB
+whole file) — with value encoding (uint32 → uint32),
+predicate index (2.2 GB over the same columns, present in both), CSC (none), and
+obs (plain `LargeUtf8`, order-independent) all ruled out by the input catalog, so
+the delta is entirely X re-compression. So whole-file size after a sort is
+data- and codec-dependent and not guaranteed to shrink — the headline value is
+**locality**, not compression. Pin `--codec zstd` or run a follow-up
+`scx compact` if output size matters.
+
+Locality: the comparison is against an isolated
 unsorted baseline produced by the *same* writer (`scx compact --reshape-obs
 --index-obs cell_type`), so the format-version sidecars (decode metadata, sharded
 obs) are present in both and don't confound the delta. The dominant cell types

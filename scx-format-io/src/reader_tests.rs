@@ -657,6 +657,99 @@ fn test_assemble_high_cardinality_dictionary_widens_key() {
     }
 }
 
+/// Part 3 (memory-bounded dict unify): assembling many shards that all share the
+/// same small category pool — with distinct per-shard local vocab orders and
+/// null keys — must deduplicate to the unique set (not pool×n_shards), narrow
+/// the key to the minimal fit, and decode every row (incl. nulls) correctly.
+/// This exercises the values-remap dedup path that replaced the full-column
+/// Utf8 round-trip.
+#[test]
+fn test_assemble_dictionary_dedup_many_shards() {
+    use arrow::array::{Array, DictionaryArray};
+    use arrow::datatypes::Int8Type;
+
+    let pool = ["alpha", "beta", "gamma"];
+    let per_shard = 4usize;
+    let n_shards = 50u32;
+    let total = per_shard * n_shards as usize;
+    let dict_dt = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+
+    let mut expected: Vec<Option<String>> = Vec::with_capacity(total);
+    let raw_batches: Vec<(u32, RecordBatch)> = (0..n_shards)
+        .map(|shard_idx| {
+            // Rotate the assignment per shard so each shard's *local* dictionary
+            // has a different vocab order; null every 7th shard's row 1.
+            let vals: Vec<Option<&str>> = (0..per_shard)
+                .map(|r| {
+                    if shard_idx % 7 == 0 && r == 1 {
+                        None
+                    } else {
+                        Some(pool[(shard_idx as usize + r) % pool.len()])
+                    }
+                })
+                .collect();
+            for v in &vals {
+                expected.push(v.map(|s| s.to_string()));
+            }
+            let strs = StringArray::from(vals);
+            let dict = arrow::compute::cast(&(Arc::new(strs) as arrow::array::ArrayRef), &dict_dt)
+                .unwrap();
+            let row_start = shard_idx as usize * per_shard;
+            let metadata = std::collections::HashMap::from([
+                ("shard_idx".to_string(), shard_idx.to_string()),
+                ("row_start".to_string(), row_start.to_string()),
+                ("n_shard_rows".to_string(), per_shard.to_string()),
+                ("n_rows_total".to_string(), total.to_string()),
+            ]);
+            let schema = Arc::new(
+                Schema::new(vec![Field::new("cell_type", dict_dt.clone(), true)])
+                    .with_metadata(metadata),
+            );
+            let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+            (shard_idx, batch)
+        })
+        .collect();
+
+    let merged = assemble_sharded_metadata("obs", raw_batches).unwrap();
+    assert_eq!(merged.num_rows(), total);
+
+    let col = merged.column(0);
+    assert_eq!(
+        col.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        "3 distinct categories across 50 shards must dedup to an Int8 key"
+    );
+    let dict = col
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .expect("cell_type should remain dictionary-encoded");
+    let values = dict
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("dictionary values should be Utf8");
+    assert_eq!(
+        values.len(),
+        pool.len(),
+        "duplicate categories across shards must collapse to the unique set"
+    );
+    let got_set: std::collections::HashSet<&str> =
+        (0..values.len()).map(|i| values.value(i)).collect();
+    let want_set: std::collections::HashSet<&str> = pool.iter().copied().collect();
+    assert_eq!(
+        got_set, want_set,
+        "unified vocab must equal the category pool"
+    );
+    for (row, exp) in expected.iter().enumerate() {
+        if dict.is_null(row) {
+            assert_eq!(*exp, None, "row {row} should decode to null");
+        } else {
+            let got = values.value(dict.keys().value(row) as usize);
+            assert_eq!(Some(got.to_string()), *exp, "row {row} mismatch");
+        }
+    }
+}
+
 /// Regression: an append writes obs categoricals as plain `Utf8` (its
 /// `unify_dict_columns` decodes them) while `from_anndata` writes the same
 /// column as a `Dictionary`. After an append, a sharded obs axis therefore
@@ -939,6 +1032,154 @@ fn test_four_shards_individual_vs_assembled() {
     assert_eq!(csr.indices, individual_indices);
     assert_eq!(csr.data, individual_data);
     assert_eq!(csr.shape, (12, 10));
+}
+
+/// Part 1 of the `scx sort` OOM fix: `read_obs_keys` must return the
+/// requested obs column(s) byte-identical to projecting a full `read_obs()`,
+/// while only decoding those columns from each shard. Exercises the sharded
+/// path (cross-shard dictionary unify, where each shard carries a *local*
+/// vocabulary) plus a numeric column, and verifies an unknown column errors
+/// cleanly.
+#[test]
+fn test_read_obs_keys_matches_full_read_obs() {
+    use arrow::array::{Array, DictionaryArray, Int64Array};
+    use arrow::datatypes::Int8Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sharded_obs_keys.scx");
+
+    let n_obs: usize = 9;
+    let n_vars: usize = 4;
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 3, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+
+    // Single CSR shard so the file passes its catalog invariants.
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    // 3 obs shards, each with a LOCAL dictionary vocabulary so the assembler
+    // must unify across shards. cell_type sequence: A B A | B C A | C C B.
+    let cell_types = [["A", "B", "A"], ["B", "C", "A"], ["C", "C", "B"]];
+    let obs_schema = Arc::new(Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new(
+            "cell_type",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+        Field::new("n_genes", DataType::Int64, false),
+    ]));
+    for (shard_idx, types) in cell_types.iter().enumerate() {
+        let row_start = shard_idx * 3;
+        let ids: Vec<String> = (row_start..row_start + 3)
+            .map(|i| format!("cell_{i}"))
+            .collect();
+        let dict: DictionaryArray<Int8Type> = types.iter().copied().map(Some).collect();
+        let n_genes = Int64Array::from(
+            (row_start..row_start + 3)
+                .map(|i| (i as i64) * 10)
+                .collect::<Vec<_>>(),
+        );
+        let batch = RecordBatch::try_new(
+            obs_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(dict),
+                Arc::new(n_genes),
+            ],
+        )
+        .unwrap();
+        writer
+            .write_obs_shard(shard_idx as u32, row_start as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert!(reader.obs_metadata_shard_count() >= 3);
+    let full = reader.read_obs().unwrap();
+
+    let to_utf8 = |a: &dyn Array| -> StringArray {
+        arrow::compute::cast(a, &DataType::Utf8)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+
+    // Dictionary key column: projected assembly must match the full read,
+    // same dtype (including the narrowed dictionary key) and same values.
+    let keys = reader.read_obs_keys(&["cell_type".to_string()]).unwrap();
+    assert_eq!(
+        keys.num_columns(),
+        1,
+        "read_obs_keys must project to just the requested column"
+    );
+    let full_ct = full.column_by_name("cell_type").unwrap();
+    let key_ct = keys.column_by_name("cell_type").unwrap();
+    assert_eq!(
+        full_ct.data_type(),
+        key_ct.data_type(),
+        "projected key dtype must match full read_obs"
+    );
+    assert_eq!(to_utf8(full_ct), to_utf8(key_ct));
+    assert_eq!(
+        to_utf8(key_ct),
+        StringArray::from(vec!["A", "B", "A", "B", "C", "A", "C", "C", "B"])
+    );
+
+    // Numeric key column: projection works for non-dictionary columns too.
+    let nkeys = reader.read_obs_keys(&["n_genes".to_string()]).unwrap();
+    assert_eq!(nkeys.num_columns(), 1);
+    let full_ng = full
+        .column_by_name("n_genes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let key_ng = nkeys
+        .column_by_name("n_genes")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(full_ng, key_ng);
+
+    // Plain `Utf8` key column: `read_obs_keys` dictionary-encodes string columns
+    // during compaction (to drop the IPC-body alias), so the returned dtype is
+    // `Dictionary` even though `read_obs` keeps `cell_id` plain. The *values*
+    // must still match per row — that is the contract the sort relies on (the
+    // RowConverter keys off decoded values, not dtype).
+    let id_keys = reader.read_obs_keys(&["cell_id".to_string()]).unwrap();
+    let id_col = id_keys.column_by_name("cell_id").unwrap();
+    assert!(
+        matches!(id_col.data_type(), DataType::Dictionary(_, _)),
+        "plain Utf8 key should come back dictionary-encoded, got {:?}",
+        id_col.data_type()
+    );
+    assert_eq!(
+        to_utf8(id_col),
+        to_utf8(full.column_by_name("cell_id").unwrap()),
+        "decoded cell_id values must match the full read_obs",
+    );
+
+    // Unknown column is a clean error, not a panic.
+    assert!(reader
+        .read_obs_keys(&["does_not_exist".to_string()])
+        .is_err());
 }
 
 // -----------------------------------------------------------------------

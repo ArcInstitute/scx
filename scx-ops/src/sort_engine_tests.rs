@@ -5,10 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::Path;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use arrow::array::{Array, DictionaryArray, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+use scx_codec::{CodecId, ValueEncoding};
 use scx_engine::index::PredicateIndex;
+use scx_format_io::header::FileHeader;
 use scx_format_io::section::SectionType;
+use scx_format_io::writer::ScxWriter;
 use scx_format_io::{BitmapPolicy, ScxReader};
 
 use super::{sort, sort_with_strategy};
@@ -105,6 +110,284 @@ fn strategy_differential_identical() {
     }
     assert_eq!(results[0], results[1], "in-memory vs K-pass must match");
     assert_eq!(results[1], results[2], "K-pass vs external must match");
+}
+
+// --- Part 1 OOM fix: sharded-obs input via projected key-only pass 0 -------
+
+/// `scx sort` always writes obs via `write_obs_sharded`, so sorting a fixture
+/// once yields a multi-`ObsMetadataShard` file. Re-sorting that file drives
+/// pass 0 through `read_obs_keys`'s sharded assembly path (the atlas-scale
+/// path the OOM fix targets); the result must be byte-identical across the
+/// in-memory and external (spill) strategies and correctly ordered.
+#[test]
+fn sharded_obs_input_sorts_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+
+    // First sort → sharded-obs .scx (12 obs / shard_target_rows 2 = 6 shards).
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    let shard_count = ScxReader::open(&sharded)
+        .unwrap()
+        .obs_metadata_shard_count();
+    assert!(
+        shard_count >= 2,
+        "expected a multi-shard obs input, got {shard_count}"
+    );
+
+    // Re-sort the sharded-obs file under both strategies; the projected
+    // key-only pass-0 read must yield identical output. A large budget keeps
+    // obs on the in-memory path (Part 2's obs spill is exercised separately)
+    // while still letting a forced external X strategy run.
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(1 << 30);
+    let in_mem = dir.path().join("in_mem.scx");
+    let external = dir.path().join("external.scx");
+    sort_with_strategy(&sharded, &in_mem, &o, Some(SortStrategy::InMemory)).unwrap();
+    sort_with_strategy(
+        &sharded,
+        &external,
+        &o,
+        Some(SortStrategy::ExternalPartition),
+    )
+    .unwrap();
+
+    assert_eq!(
+        content(&in_mem),
+        content(&external),
+        "sharded-obs input: in-memory vs external must match"
+    );
+    assert!(is_sorted_asc(&col_of(&in_mem, "cell_type")));
+}
+
+/// obs bytes-per-row from a sharded-obs file's first shard (for budget
+/// calibration).
+fn obs_bytes_per_row(path: &Path) -> u64 {
+    let s0 = ScxReader::open(path).unwrap().read_obs_shard(0).unwrap();
+    let bytes: usize = s0.columns().iter().map(|c| c.get_array_memory_size()).sum();
+    (bytes / s0.num_rows().max(1)) as u64
+}
+
+/// The obs spill-scatter path must produce output logically identical to the
+/// in-memory `take` path. X is forced to `InMemory` for both so only the obs
+/// write strategy differs; the budget is calibrated to hold ~3 rows/partition
+/// (≥ one shard, < all rows) so partitions don't align to `shard_target` —
+/// exercising cross-partition shard chunking.
+#[test]
+fn obs_spill_matches_in_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    assert!(
+        ScxReader::open(&sharded)
+            .unwrap()
+            .obs_metadata_shard_count()
+            >= 2
+    );
+
+    let bpr = obs_bytes_per_row(&sharded);
+
+    // In-memory baseline (no budget → obs in-memory).
+    let mem = dir.path().join("mem.scx");
+    let mem_s = sort_with_strategy(
+        &sharded,
+        &mem,
+        &opts(&["cell_type"]),
+        Some(SortStrategy::InMemory),
+    )
+    .unwrap();
+    assert!(!mem_s.obs_spilled, "no budget must keep obs in memory");
+
+    // Spill (budget holds ~3 rows/partition; shard_target is 2 → shards span
+    // partitions). X forced InMemory so only the obs strategy differs.
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(bpr * 3);
+    let spilled = dir.path().join("spilled.scx");
+    let sp_s = sort_with_strategy(&sharded, &spilled, &o, Some(SortStrategy::InMemory)).unwrap();
+    assert!(
+        sp_s.obs_spilled,
+        "budget {} should force obs spill",
+        bpr * 3
+    );
+    assert!(
+        sp_s.obs_partitions >= 2,
+        "expected multiple obs partitions, got {}",
+        sp_s.obs_partitions
+    );
+
+    assert_eq!(
+        content(&mem),
+        content(&spilled),
+        "obs spill vs in-memory content must match"
+    );
+    assert!(is_sorted_asc(&col_of(&spilled, "cell_type")));
+}
+
+/// Build a sharded-obs `.scx` whose `cell_type` is a `Dictionary` column with a
+/// distinct local vocabulary per shard (exercises decode→re-encode + the
+/// reader's cross-shard unify). 9 obs across 3 shards, one CSR shard.
+fn write_dict_obs_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("dict_obs.scx");
+    let (n_obs, n_vars) = (9usize, 4usize);
+    let header =
+        FileHeader::new_single_modality(n_obs as u64, n_vars as u64, (n_obs * 2) as u64, 3, 0, 0);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..n_obs {
+        indices.push(((r * 2) % n_vars) as u32);
+        indices.push(((r * 2 + 1) % n_vars) as u32);
+        values.push(((r + 1) % 256) as u8);
+        values.push(((r + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    w.write_csr_shard(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+        0,
+    )
+    .unwrap();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    w.write_var(&var).unwrap();
+
+    let cts = [["b", "a", "b"], ["c", "a", "b"], ["a", "c", "a"]];
+    let obs_schema = Arc::new(Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new(
+            "cell_type",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        ),
+    ]));
+    for (si, types) in cts.iter().enumerate() {
+        let rs = si * 3;
+        let ids: Vec<String> = (rs..rs + 3).map(|i| format!("cell_{i}")).collect();
+        let dict: DictionaryArray<Int8Type> = types.iter().copied().map(Some).collect();
+        let batch = RecordBatch::try_new(
+            obs_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(dict),
+            ],
+        )
+        .unwrap();
+        w.write_obs_shard(si as u32, rs as u64, 3, n_obs as u64, &batch)
+            .unwrap();
+    }
+    w.finish().unwrap();
+    path
+}
+
+/// On a `Dictionary`-typed categorical sort key, the spill path must (a)
+/// preserve the categorical dtype on read (re-encode works), and (b) produce
+/// content + values identical to the in-memory path.
+#[test]
+fn obs_spill_preserves_categorical_dtype() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = write_dict_obs_fixture(&dir);
+    let bpr = obs_bytes_per_row(&inp);
+
+    let mem = dir.path().join("mem.scx");
+    sort_with_strategy(
+        &inp,
+        &mem,
+        &opts(&["cell_type"]),
+        Some(SortStrategy::InMemory),
+    )
+    .unwrap();
+
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(bpr * 3);
+    let out = dir.path().join("out.scx");
+    let s = sort_with_strategy(&inp, &out, &o, Some(SortStrategy::InMemory)).unwrap();
+    assert!(s.obs_spilled);
+    assert!(s.obs_partitions >= 2);
+
+    let obs = ScxReader::open(&out).unwrap().read_obs().unwrap();
+    let ct = obs.column_by_name("cell_type").unwrap();
+    assert!(
+        matches!(ct.data_type(), DataType::Dictionary(_, _)),
+        "spill path must preserve categorical dtype, got {:?}",
+        ct.data_type()
+    );
+
+    assert_eq!(content(&mem), content(&out), "spill vs in-memory content");
+    assert_eq!(col_of(&out, "cell_type"), col_of(&mem, "cell_type"));
+    assert!(is_sorted_asc(&col_of(&out, "cell_type")));
+}
+
+/// Deletions + obs spill: the scatter skips `new_pos < 0` (deleted) rows, so a
+/// sharded-obs input carrying a deletion vector must spill-sort to the same
+/// dense, deletion-free output as the in-memory path. Builds the fixture by
+/// sorting (→ sharded obs) then marking deletions on that file.
+#[test]
+fn obs_spill_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    // Add a deletion vector to the (now sharded-obs) file.
+    crate::delete::mark_deleted(&sharded, &[1u64, 4, 7]).unwrap();
+    assert!(
+        ScxReader::open(&sharded)
+            .unwrap()
+            .obs_metadata_shard_count()
+            >= 2
+    );
+
+    let bpr = obs_bytes_per_row(&sharded);
+
+    // In-memory baseline (no budget) vs forced obs spill.
+    let mem = dir.path().join("mem.scx");
+    let mem_s = sort_with_strategy(
+        &sharded,
+        &mem,
+        &opts(&["cell_type"]),
+        Some(SortStrategy::InMemory),
+    )
+    .unwrap();
+    assert!(!mem_s.obs_spilled);
+
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(bpr * 3);
+    let spilled = dir.path().join("spilled.scx");
+    let sp_s = sort_with_strategy(&sharded, &spilled, &o, Some(SortStrategy::InMemory)).unwrap();
+    assert!(sp_s.obs_spilled, "budget should force obs spill");
+    assert!(sp_s.obs_partitions >= 2);
+
+    // 3 of 12 deleted → 9 live, identical content on both paths, deletion-free.
+    assert_eq!(sp_s.n_obs, 9);
+    assert_eq!(mem_s.n_obs, 9);
+    assert_eq!(
+        content(&mem),
+        content(&spilled),
+        "deletion + spill must match the in-memory path"
+    );
+    assert!(is_sorted_asc(&col_of(&spilled, "cell_type")));
+    let clean = ScxReader::open(&spilled)
+        .unwrap()
+        .deletion_keep_mask()
+        .unwrap()
+        .map(|m| m.iter().all(|&k| k))
+        .unwrap_or(true);
+    assert!(clean, "spilled output must be deletion-free");
 }
 
 // --- Determinism (modulo provenance timestamp) -----------------------------

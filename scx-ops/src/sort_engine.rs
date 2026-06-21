@@ -50,6 +50,17 @@
 //! dropped; the CLI re-emits it post-write via `rebuild_csc_inplace` on
 //! `--rebuild-csc`.
 //!
+//! **Output size is not guaranteed neutral.** The reorder re-encodes every X
+//! shard with `--codec` (default `auto`). `scx1`-coded shards are size-neutral
+//! under a row permutation (per-row independent index coding), but `zstd`-coded
+//! shards and per-shard auto-codec re-selection shift X size a few percent in
+//! either direction (regrouping which cells share a shard changes cross-row
+//! compressibility). Observed: sorting the 149M-cell `drug.scx` (`mixed
+//! scx1/zstd`, uint32) by `cell_type` grew the X matrix ~8%. Value encoding is
+//! preserved (`x_value_encoding` widens only to fit the global max), so the
+//! growth is purely codec/order-dependent. See docs/sharding.md and
+//! docs/performance.md § Sort.
+//!
 //! Phase 5 lifted the earlier scope-outs: **multimodal** inputs reorder every
 //! modality's X by the global obs order ([`sort_multimodal`], mirroring
 //! `compact_multimodal`; per-modality X is gathered in-memory, the bounded
@@ -60,13 +71,15 @@
 //! predicate index is skipped on the multimodal path (unimodal-only
 //! engine-wide, as in compact).
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format_io::codec_select::select_codec;
 use scx_format_io::header::FileHeader;
@@ -124,7 +137,7 @@ pub fn sort_with_strategy(
     })?;
 
     // ----- Pass 0: compute the global order (shared by all strategies) -----
-    let obs_full = reader.read_obs()?;
+    log::info!("scx sort: pass 0 begin (n_obs={n_obs})");
     let keep_mask = reader.deletion_keep_mask()?;
 
     // Live rows only (deletions are materialized away, as compact does).
@@ -132,28 +145,51 @@ pub fn sort_with_strategy(
         Some(mask) => (0..n_obs as u64).filter(|&i| mask[i as usize]).collect(),
         None => (0..n_obs as u64).collect(),
     };
-    let live_obs = match &keep_mask {
+
+    // Pass 0a — compute the order from the sort-key columns ONLY. Reading
+    // just `opts.by` (projected, assembled with the same dictionary-unify
+    // as a full obs read) keeps the order computation off the unbudgeted
+    // full-obs materialization that OOMs on atlas-scale sharded files.
+    log::info!("scx sort: pass 0a reading sort-key columns {:?}", opts.by);
+    let key_batch = reader.read_obs_keys(&opts.by)?;
+    log::info!(
+        "scx sort: pass 0a key batch read ({} rows, {} cols, key dtype {:?})",
+        key_batch.num_rows(),
+        key_batch.num_columns(),
+        key_batch
+            .schema()
+            .fields()
+            .first()
+            .map(|f| f.data_type().clone())
+    );
+    let live_keys = match &keep_mask {
         Some(mask) => {
             let bool_arr = arrow::array::BooleanArray::from(mask.clone());
-            arrow::compute::filter_record_batch(&obs_full, &bool_arr)?
+            arrow::compute::filter_record_batch(&key_batch, &bool_arr)?
         }
-        None => obs_full.clone(),
+        None => key_batch,
     };
-    let n_live = live_obs.num_rows();
+    let n_live = live_keys.num_rows();
     if n_live == 0 {
         return Err(OpsError::InvalidInput(
             "scx sort: input has no live rows to sort".to_string(),
         ));
     }
 
-    let extractor = SortKeyExtractor::new(&live_obs.schema(), &opts.by, opts.reverse)?;
-    let rows = extractor.rows(&live_obs)?;
-    // Local indices into `live_obs`, in sorted order (stable, ties by source id).
+    let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
+    let rows = extractor.rows(&live_keys)?;
+    log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
+    // Local indices into the live sequence, in sorted order (stable, ties by
+    // source id). `live_keys` and `live_obs` (built below) are filtered from
+    // the same row universe in the same shard-concatenated order, so these
+    // local indices apply to both.
     let order_local = stable_argsort(&rows, 0);
     // Output row -> original (global) old row id.
     let order_old: Vec<u64> = order_local.iter().map(|&l| live_ids[l as usize]).collect();
-
-    let sorted_obs = take_rows(&live_obs, &order_local)?;
+    drop(rows);
+    // `live_keys` (the projected sort-key columns) stays resident — it feeds the
+    // X strategy selector / K-pass below (category enumeration, null detection),
+    // replacing the full `live_obs` the in-memory path no longer always builds.
 
     // old row -> new position (-1 = deleted / absent). Drives the external
     // strategy's partition routing and the obsp remap; shared by all paths.
@@ -162,10 +198,60 @@ pub fn sort_with_strategy(
         new_pos_of_old[old as usize] = new as i64;
     }
 
+    // Pass 0b — obs write strategy (SCX-SORT-OOM-BUG Part 2). The bounded
+    // spill-scatter path applies only to a single-modality sort with a
+    // `--memory-budget` on a sharded-obs input whose in-memory peak would
+    // exceed the budget; everything else keeps the in-memory take path (which
+    // also feeds the multimodal dispatch).
+    //
+    // The in-memory path's *peak* is well above one steady-state copy: `read_obs`
+    // itself peaks at ~2× obs while concatenating shards, then `take_rows`
+    // holds `obs_full` + `sorted_obs` co-resident, plus the three O(n_obs)
+    // order arrays (8 B each). Comparing one steady-state estimate to the budget
+    // (as a first cut did) routed atlas obs to the in-memory path and OOM-killed
+    // it — so estimate the peak conservatively.
+    let obs_spill = if !reader.is_multimodal() && reader.obs_metadata_shard_count() > 0 {
+        match opts.memory_budget {
+            Some(b) => {
+                let steady = est_obs_bytes(&reader, n_live)?;
+                let order_bytes = (n_live as u64).saturating_mul(24);
+                let inmem_peak = steady.saturating_mul(2).saturating_add(order_bytes);
+                log::info!(
+                    "scx sort: obs steady-state ~{steady} B, in-memory peak ~{inmem_peak} B, \
+                     budget {b} B -> {} path",
+                    if inmem_peak > b { "spill" } else { "in-memory" }
+                );
+                inmem_peak > b
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    // In-memory path materializes the full sorted obs; the spill path builds it
+    // shard-by-shard during the write below.
+    let sorted_obs = if obs_spill {
+        None
+    } else {
+        let obs_full = reader.read_obs()?;
+        let live_obs = match &keep_mask {
+            Some(mask) => {
+                let bool_arr = arrow::array::BooleanArray::from(mask.clone());
+                arrow::compute::filter_record_batch(&obs_full, &bool_arr)?
+            }
+            None => obs_full.clone(),
+        };
+        Some(take_rows(&live_obs, &order_local)?)
+    };
+
     // Multimodal inputs reorder every modality's X by the same global obs
     // order (Phase 5 / T5.1); the single-modality engine below handles the
-    // common case.
+    // common case. Multimodal always takes the in-memory obs path.
     if reader.is_multimodal() {
+        let sorted_obs = sorted_obs
+            .as_ref()
+            .expect("multimodal sort uses the in-memory obs path");
         return sort_multimodal(
             &reader,
             &in_header,
@@ -173,7 +259,7 @@ pub fn sort_with_strategy(
             input,
             &order_old,
             &new_pos_of_old,
-            &sorted_obs,
+            sorted_obs,
             n_live,
             opts,
         );
@@ -206,9 +292,32 @@ pub fn sort_with_strategy(
         .with_data_generation(reader.catalog().data_generation + 1);
 
     // ----- obs (sorted, re-sharded) + var -----
-    write_obs_sharded(&mut writer, &sorted_obs, opts.shard_target_rows)?;
+    // In-memory: slice the materialized sorted obs. Spill: scatter input obs
+    // rows to `new_pos`-range partitions, then emit sorted output shards (the
+    // SpillDir is kept alive in `obs_spill_state` for the index rebuild).
+    let mut obs_spill_state: Option<ObsSpillState> = None;
+    let mut obs_partitions = 0usize;
+    match &sorted_obs {
+        Some(sorted_obs) => write_obs_sharded(&mut writer, sorted_obs, opts.shard_target_rows)?,
+        None => {
+            let state = prepare_obs_spill(&reader, &new_pos_of_old, n_live, opts)?;
+            obs_partitions = state.n_parts;
+            log::info!(
+                "scx sort: obs write pass begin ({} partitions)",
+                state.n_parts
+            );
+            for (out_idx, item) in state.reader().enumerate() {
+                let (batch, offset) = item?;
+                let n = batch.num_rows() as u64;
+                writer.write_obs_shard(out_idx as u32, offset, n, n_live as u64, &batch)?;
+            }
+            log::info!("scx sort: obs write pass done");
+            obs_spill_state = Some(state);
+        }
+    }
     let var = reader.read_var()?;
     writer.write_var(&var)?;
+    log::info!("scx sort: var written; starting X gather");
 
     // ----- X: strategy-specific gather -----
     let value_encoding = x_value_encoding(&reader)?;
@@ -253,7 +362,7 @@ pub fn sort_with_strategy(
 
     // Leading-key cardinality + single-categorical-key flag for selector / K-pass.
     let leading_categorical = !is_numeric(
-        live_obs
+        live_keys
             .schema()
             .field_with_name(&opts.by[0])
             .map(|f| f.data_type().clone())
@@ -265,7 +374,7 @@ pub fn sort_with_strategy(
     // use the full `stable_argsort` order) handle nulls. Detect nulls in the
     // leading key so the selector avoids K-pass and a forced K-pass errors.
     let leading_key_has_nulls = single_key && leading_categorical && {
-        let col = live_obs.column_by_name(&opts.by[0]);
+        let col = live_keys.column_by_name(&opts.by[0]);
         col.map(|c| c.null_count() > 0).unwrap_or(false)
     };
 
@@ -275,7 +384,7 @@ pub fn sort_with_strategy(
     // Build the category map only if K-pass is a candidate (avoids the scan
     // when an explicit non-K-pass strategy is forced or selected).
     let categories = if single_key && leading_categorical {
-        Some(distinct_categories(&live_obs, &opts.by[0], opts.reverse)?)
+        Some(distinct_categories(&live_keys, &opts.by[0], opts.reverse)?)
     } else {
         None
     };
@@ -316,7 +425,7 @@ pub fn sort_with_strategy(
                     "K-pass strategy requires a single categorical sort key".to_string(),
                 )
             })?;
-            let cat_of_old = category_of_old(&live_obs, &live_ids, &opts.by[0], cats, n_obs)?;
+            let cat_of_old = category_of_old(&live_keys, &live_ids, &opts.by[0], cats, n_obs)?;
             emit_x_kpass(
                 &reader,
                 &mut writer,
@@ -407,16 +516,31 @@ pub fn sort_with_strategy(
     }
 
     // ----- predicate index (always (re)built; sort key auto-added) -----
-    let index_result = rebuild_obs_predicate_index_streaming(
-        &mut writer,
-        sorted_obs.schema(),
-        std::iter::once((sorted_obs.clone(), 0u64)),
-        &var,
-        &output_shard_row_ranges,
-        n_vars as usize,
-        &opts.by,
-        &opts.index_options,
-    )?;
+    let index_result = match (&sorted_obs, &obs_spill_state) {
+        (Some(sorted_obs), _) => rebuild_obs_predicate_index_streaming(
+            &mut writer,
+            sorted_obs.schema(),
+            std::iter::once(Ok::<_, scx_engine::EngineError>((sorted_obs.clone(), 0u64))),
+            &var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            &opts.by,
+            &opts.index_options,
+        )?,
+        // Spill path: replay the spill (bounded, ~2× pass-2 CPU, no re-scatter)
+        // to feed the index the same sorted obs shards the write pass emitted.
+        (None, Some(state)) => rebuild_obs_predicate_index_streaming(
+            &mut writer,
+            state.out_schema.clone(),
+            state.reader(),
+            &var,
+            &output_shard_row_ranges,
+            n_vars as usize,
+            &opts.by,
+            &opts.index_options,
+        )?,
+        (None, None) => unreachable!("obs path produced neither sorted_obs nor a spill state"),
+    };
     let indexed_columns = index_result.obs_indexed_columns.clone();
 
     // ----- provenance -----
@@ -446,6 +570,8 @@ pub fn sort_with_strategy(
         spill_bytes,
         partitions,
         indexed_columns,
+        obs_spilled: obs_spill_state.is_some(),
+        obs_partitions,
     })
 }
 
@@ -684,6 +810,8 @@ fn sort_multimodal(
         spill_bytes: 0,
         partitions: 1,
         indexed_columns: Vec::new(),
+        obs_spilled: false,
+        obs_partitions: 0,
     })
 }
 
@@ -1226,6 +1354,453 @@ fn write_obs_sharded(writer: &mut ScxWriter, obs: &RecordBatch, shard_target: u3
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Memory-bounded obs write (spill-scatter)
+//
+// A global obs reorder is a random scatter, so the bounded path mirrors the X
+// external strategy: pass 1 streams input obs shards and scatters their live
+// rows to `new_pos`-range spill partitions; pass 2 reads each partition back,
+// sorts by `new_pos`, and emits `shard_target`-sized output obs shards in
+// global order. Dictionary columns are decoded to their value type before
+// spilling (one uniform plain schema across all input shards — no cross-shard
+// dictionary reconciliation) and re-encoded per output shard at emit time
+// (categorical dtype preserved; the reader narrows the key + unifies the vocab
+// on `read_obs`). Used only for single-modality sorts with a `--memory-budget`.
+// ---------------------------------------------------------------------------
+
+/// Reserved synthetic column carrying each spilled row's destination row index
+/// so a partition can be sorted into global order in pass 2.
+const OBS_NEW_POS_COL: &str = "__scx_sort_new_pos";
+
+/// Estimate the decoded in-memory size of the full obs table from one shard's
+/// per-row footprint × the live row count. Conservative (a small shard
+/// amortizes dictionary overhead over few rows, biasing toward the spill path,
+/// which is always safe).
+fn est_obs_bytes(reader: &ScxReader, n_live: usize) -> Result<u64> {
+    if n_live == 0 {
+        return Ok(0);
+    }
+    let s0 = reader.read_obs_shard(0)?;
+    let rows = s0.num_rows().max(1) as u64;
+    let bytes: usize = s0.columns().iter().map(|c| c.get_array_memory_size()).sum();
+    Ok((bytes as u64 / rows).saturating_mul(n_live as u64))
+}
+
+/// Rows per obs spill partition from the budget and per-row footprint, floored
+/// at one output shard. When `budget < per_row` the integer division yields 0;
+/// the `.max(floor)` floor is what guarantees a partition is always at least one
+/// output shard (the caller's per-shard-fits-budget guard runs separately).
+fn obs_partition_rows(budget: u64, obs_bytes_per_row: u64, shard_target: u32) -> usize {
+    let floor = shard_target.max(1) as usize;
+    let per_row = obs_bytes_per_row.max(1);
+    ((budget / per_row) as usize).max(floor)
+}
+
+/// Widen a string/binary value type to its 64-bit-offset variant. A spilled
+/// obs partition concatenates up to one budget's worth of rows (hundreds of
+/// thousands), so a narrow `Utf8`/`Binary` (i32 offsets) column can exceed
+/// `i32::MAX` total bytes and raise `Offset overflow error`. The full
+/// `read_obs` assembler avoids this by upcasting before concat; the spill path
+/// must do the same. `write_obs_shard` re-narrows per output shard on write and
+/// the reader narrows again on read, so this only affects the spill/concat.
+fn largen_value_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Utf8 => DataType::LargeUtf8,
+        DataType::Binary => DataType::LargeBinary,
+        other => other.clone(),
+    }
+}
+
+/// Build the spill schema (obs with every dictionary column decoded to its
+/// value type, string types widened to 64-bit offsets, plus the trailing
+/// [`OBS_NEW_POS_COL`]), the output schema (obs with the original dictionary
+/// columns re-encoded as `Dictionary(Int32, v)`), and the set of column names
+/// that were categorical. Derived from one decoded shard. The schemas
+/// intentionally carry only the column fields, not `shard_schema.metadata()`
+/// (the per-shard cover stamps): the spill is an internal format that never
+/// feeds the assembler, and `write_obs_shard` re-stamps the output shards.
+fn obs_spill_schemas(shard_schema: &Schema) -> Result<(SchemaRef, SchemaRef, HashSet<String>)> {
+    let mut plain_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
+    let mut out_fields: Vec<Field> = Vec::with_capacity(shard_schema.fields().len());
+    let mut categorical: HashSet<String> = HashSet::new();
+    for f in shard_schema.fields() {
+        if f.name() == OBS_NEW_POS_COL {
+            return Err(OpsError::InvalidInput(format!(
+                "scx sort: obs already has a column named '{OBS_NEW_POS_COL}' (reserved)"
+            )));
+        }
+        match f.data_type() {
+            DataType::Dictionary(_, value) => {
+                categorical.insert(f.name().clone());
+                let value = largen_value_type(value);
+                plain_fields.push(
+                    Field::new(f.name(), value.clone(), f.is_nullable())
+                        .with_metadata(f.metadata().clone()),
+                );
+                out_fields.push(
+                    Field::new(
+                        f.name(),
+                        DataType::Dictionary(Box::new(DataType::Int32), Box::new(value)),
+                        f.is_nullable(),
+                    )
+                    .with_metadata(f.metadata().clone()),
+                );
+            }
+            other => {
+                let dt = largen_value_type(other);
+                plain_fields.push(
+                    Field::new(f.name(), dt.clone(), f.is_nullable())
+                        .with_metadata(f.metadata().clone()),
+                );
+                out_fields.push(
+                    Field::new(f.name(), dt, f.is_nullable()).with_metadata(f.metadata().clone()),
+                );
+            }
+        }
+    }
+    let out_schema = Arc::new(Schema::new(out_fields));
+    let mut spill_fields = plain_fields;
+    spill_fields.push(Field::new(OBS_NEW_POS_COL, DataType::UInt64, false));
+    let spill_schema = Arc::new(Schema::new(spill_fields));
+    Ok((spill_schema, out_schema, categorical))
+}
+
+/// Align one input obs shard to the plain (dictionary-decoded) column types,
+/// casting dictionary columns to their value type and any wide/narrow mismatch
+/// to the target. Returns the plain columns (no `new_pos`).
+fn decode_obs_shard_to_plain(batch: &RecordBatch, plain_fields: &[Field]) -> Result<Vec<ArrayRef>> {
+    // The spill schema is derived from shard 0 and applied positionally to every
+    // shard; a malformed file whose shard has fewer columns would panic on
+    // `batch.column(i)`. Reject it instead (the spill path does not run the
+    // assembler's cover validation). Uniform-schema sharded obs — the normal
+    // case — passes; heterogeneous dict-vs-plain reconciliation across shards is
+    // a deferred follow-up (F3 in SCX-SORT-OOM-BUG).
+    if batch.num_columns() < plain_fields.len() {
+        return Err(OpsError::InvalidInput(format!(
+            "scx sort: obs shard has {} columns, expected at least {}",
+            batch.num_columns(),
+            plain_fields.len()
+        )));
+    }
+    let mut cols = Vec::with_capacity(plain_fields.len());
+    for (i, f) in plain_fields.iter().enumerate() {
+        let c = batch.column(i);
+        if c.data_type() == f.data_type() {
+            cols.push(c.clone());
+        } else {
+            cols.push(arrow::compute::cast(c, f.data_type())?);
+        }
+    }
+    Ok(cols)
+}
+
+/// Pass 1 — scatter every live obs row to its `new_pos`-range partition spill
+/// file (Arrow IPC stream, uniform plain schema). `p` rows per partition,
+/// `n_parts` partitions.
+fn scatter_obs_to_spill(
+    reader: &ScxReader,
+    new_pos_of_old: &[i64],
+    p: usize,
+    n_parts: usize,
+    spill_schema: &SchemaRef,
+    spill: &SpillDir,
+) -> Result<()> {
+    // Plain fields without the trailing new_pos column.
+    let plain_fields: Vec<Field> = spill_schema.fields()[..spill_schema.fields().len() - 1]
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    // Opens `n_parts` spill files at once. The caller caps `n_parts` at 512
+    // (MAX_PARTITIONS) so this stays well under a typical `ulimit -n` (1024+);
+    // the X external path uses the same bound.
+    let mut writers: Vec<arrow::ipc::writer::StreamWriter<BufWriter<File>>> = (0..n_parts)
+        .map(|i| {
+            let f = BufWriter::new(File::create(spill.partition_file(i))?);
+            Ok(arrow::ipc::writer::StreamWriter::try_new(f, spill_schema)?)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut cursor = 0usize; // global input obs row
+    for res in reader.obs_shards() {
+        let batch = res?;
+        let n = batch.num_rows();
+        // The obs shards must cover exactly `new_pos_of_old` rows; a malformed
+        // file whose shard rows sum past `n_obs` would otherwise index out of
+        // bounds below. Reject rather than panic.
+        if cursor + n > new_pos_of_old.len() {
+            return Err(OpsError::InvalidInput(format!(
+                "scx sort: obs shards cover more rows than n_obs ({} > {})",
+                cursor + n,
+                new_pos_of_old.len()
+            )));
+        }
+        let plain_cols = decode_obs_shard_to_plain(&batch, &plain_fields)?;
+        // Group this shard's live rows by destination partition.
+        let mut part_rows: Vec<Vec<u64>> = vec![Vec::new(); n_parts];
+        let mut part_pos: Vec<Vec<u64>> = vec![Vec::new(); n_parts];
+        for local in 0..n {
+            let np = new_pos_of_old[cursor + local];
+            if np < 0 {
+                continue; // deleted row
+            }
+            let np = np as u64;
+            // `part = new_pos / p` is < n_parts by construction (n_parts =
+            // n_live.div_ceil(p) and new_pos < n_live); guard anyway so a stale
+            // `new_pos_of_old` can never write past the partition vectors.
+            let part = (np as usize) / p;
+            if part >= n_parts {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort: new_pos {np} maps to partition {part} >= n_parts {n_parts}"
+                )));
+            }
+            part_rows[part].push(local as u64);
+            part_pos[part].push(np);
+        }
+        for part in 0..n_parts {
+            if part_rows[part].is_empty() {
+                continue;
+            }
+            let idx = UInt64Array::from(std::mem::take(&mut part_rows[part]));
+            let mut sub: Vec<ArrayRef> = plain_cols
+                .iter()
+                .map(|c| arrow::compute::take(c, &idx, None))
+                .collect::<std::result::Result<_, _>>()?;
+            sub.push(Arc::new(UInt64Array::from(std::mem::take(&mut part_pos[part]))) as ArrayRef);
+            let batch = RecordBatch::try_new(spill_schema.clone(), sub)?;
+            writers[part].write(&batch)?;
+        }
+        cursor += n;
+    }
+    for w in writers.iter_mut() {
+        w.finish()?;
+    }
+    Ok(())
+}
+
+/// Pass 2 — yields `shard_target`-sized output obs shards (dictionary columns
+/// re-encoded) in global `new_pos` order, reading one partition spill at a
+/// time. Drives both the obs-shard write and (re-constructed) the predicate
+/// index rebuild. Items are `EngineError`-typed so it composes with
+/// [`rebuild_obs_predicate_index_streaming`].
+struct ObsScatterReader {
+    partition_files: Vec<PathBuf>,
+    next_part: usize,
+    pending: Option<RecordBatch>, // globally-ordered plain rows not yet emitted
+    spill_schema: SchemaRef,      // plain + new_pos (the on-spill schema)
+    plain_schema: SchemaRef,      // plain, no new_pos (pending / concat schema)
+    out_schema: SchemaRef,        // re-encoded (dictionary) output schema
+    categorical: HashSet<String>,
+    shard_target: usize,
+    emitted: u64,
+}
+
+impl ObsScatterReader {
+    fn new(
+        partition_files: Vec<PathBuf>,
+        spill_schema: SchemaRef,
+        out_schema: SchemaRef,
+        categorical: HashSet<String>,
+        shard_target: u32,
+    ) -> Self {
+        // plain schema = spill schema minus the trailing new_pos column.
+        let plain_fields: Vec<Field> = spill_schema.fields()[..spill_schema.fields().len() - 1]
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        Self {
+            partition_files,
+            next_part: 0,
+            pending: None,
+            plain_schema: Arc::new(Schema::new(plain_fields)),
+            spill_schema,
+            out_schema,
+            categorical,
+            shard_target: shard_target.max(1) as usize,
+            emitted: 0,
+        }
+    }
+
+    /// Read one partition spill, sort it by `new_pos`, and return its rows in
+    /// plain (no `new_pos`) form. `Ok(None)` for an empty partition.
+    fn load_partition(
+        &self,
+        part: usize,
+    ) -> std::result::Result<Option<RecordBatch>, scx_engine::EngineError> {
+        let f = BufReader::new(File::open(&self.partition_files[part])?);
+        let rdr = arrow::ipc::reader::StreamReader::try_new(f, None)?;
+        let batches: Vec<RecordBatch> = rdr.collect::<std::result::Result<_, _>>()?;
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let with_pos = arrow::compute::concat_batches(&self.spill_schema, &batches)?;
+        let pos_idx = with_pos.schema().index_of(OBS_NEW_POS_COL).map_err(|_| {
+            arrow::error::ArrowError::InvalidArgumentError(format!(
+                "obs spill partition missing '{OBS_NEW_POS_COL}'"
+            ))
+        })?;
+        let pos = with_pos
+            .column(pos_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "obs spill column '{OBS_NEW_POS_COL}' is not UInt64"
+                ))
+            })?;
+        // new_pos is a unique per-partition key; a plain sort suffices.
+        let mut order: Vec<u64> = (0..with_pos.num_rows() as u64).collect();
+        order.sort_by_key(|&i| pos.value(i as usize));
+        let idx = UInt64Array::from(order);
+        let cols: Vec<ArrayRef> = (0..with_pos.num_columns())
+            .filter(|&i| i != pos_idx)
+            .map(|i| arrow::compute::take(with_pos.column(i), &idx, None))
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(Some(RecordBatch::try_new(self.plain_schema.clone(), cols)?))
+    }
+
+    /// Re-encode the categorical columns of a plain shard back to
+    /// `Dictionary(Int32, value)`, producing the output obs shard.
+    fn reencode(
+        &self,
+        plain: &RecordBatch,
+    ) -> std::result::Result<RecordBatch, scx_engine::EngineError> {
+        let mut cols = Vec::with_capacity(plain.num_columns());
+        for (i, f) in plain.schema().fields().iter().enumerate() {
+            let c = plain.column(i);
+            if self.categorical.contains(f.name()) {
+                let dt = DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(f.data_type().clone()),
+                );
+                cols.push(arrow::compute::cast(c, &dt)?);
+            } else {
+                cols.push(c.clone());
+            }
+        }
+        Ok(RecordBatch::try_new(self.out_schema.clone(), cols)?)
+    }
+
+    fn next_shard(
+        &mut self,
+    ) -> std::result::Result<Option<(RecordBatch, u64)>, scx_engine::EngineError> {
+        // Fill `pending` to at least one output shard (or exhaust partitions).
+        while self.pending.as_ref().map(|b| b.num_rows()).unwrap_or(0) < self.shard_target
+            && self.next_part < self.partition_files.len()
+        {
+            let part = self.next_part;
+            self.next_part += 1;
+            if let Some(batch) = self.load_partition(part)? {
+                self.pending = Some(match self.pending.take() {
+                    None => batch,
+                    Some(prev) => {
+                        arrow::compute::concat_batches(&self.plain_schema, &[prev, batch])?
+                    }
+                });
+            }
+        }
+        let pending = match self.pending.take() {
+            Some(b) if b.num_rows() > 0 => b,
+            _ => return Ok(None),
+        };
+        let have = pending.num_rows();
+        let take_n = have.min(self.shard_target);
+        let shard = pending.slice(0, take_n);
+        if have > take_n {
+            self.pending = Some(pending.slice(take_n, have - take_n));
+        }
+        let out = self.reencode(&shard)?;
+        let offset = self.emitted;
+        self.emitted += take_n as u64;
+        Ok(Some((out, offset)))
+    }
+}
+
+impl Iterator for ObsScatterReader {
+    type Item = std::result::Result<(RecordBatch, u64), scx_engine::EngineError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_shard().transpose()
+    }
+}
+
+/// Holds the obs spill for the duration of the sort (SpillDir RAII removes it
+/// on drop) plus the parameters to construct an [`ObsScatterReader`] — once for
+/// the write pass, once for the predicate-index rebuild.
+struct ObsSpillState {
+    _spill: SpillDir,
+    partition_files: Vec<PathBuf>,
+    spill_schema: SchemaRef,
+    out_schema: SchemaRef,
+    categorical: HashSet<String>,
+    shard_target: u32,
+    n_parts: usize,
+}
+
+impl ObsSpillState {
+    fn reader(&self) -> ObsScatterReader {
+        ObsScatterReader::new(
+            self.partition_files.clone(),
+            self.spill_schema.clone(),
+            self.out_schema.clone(),
+            self.categorical.clone(),
+            self.shard_target,
+        )
+    }
+}
+
+/// Build the obs spill: size partitions from the budget, scatter all live obs
+/// rows to per-partition spill files, and return the state needed to emit and
+/// index the sorted output shards. Caller must have established `obs_spill`
+/// (single-modality, sharded obs, budget set).
+fn prepare_obs_spill(
+    reader: &ScxReader,
+    new_pos_of_old: &[i64],
+    n_live: usize,
+    opts: &SortOptions,
+) -> Result<ObsSpillState> {
+    let budget = opts
+        .memory_budget
+        .expect("obs spill requires a memory budget");
+    let s0 = reader.read_obs_shard(0)?;
+    let bytes: usize = s0.columns().iter().map(|c| c.get_array_memory_size()).sum();
+    let bytes_per_row = (bytes as u64 / s0.num_rows().max(1) as u64).max(1);
+
+    // No silent cap: one output obs shard must fit the budget (mirrors the X
+    // external path's per-shard refuse guard).
+    let one_shard = bytes_per_row.saturating_mul(opts.shard_target_rows.max(1) as u64);
+    if one_shard > budget {
+        return Err(OpsError::InvalidInput(format!(
+            "scx sort: --memory-budget {budget} too small for one obs shard \
+             (~{one_shard} bytes for {} rows); raise the budget or lower --shard-size",
+            opts.shard_target_rows
+        )));
+    }
+
+    let mut p = obs_partition_rows(budget, bytes_per_row, opts.shard_target_rows);
+    let mut n_parts = n_live.div_ceil(p);
+    // Cap simultaneously-open spill files (EMFILE), widening partitions to fit.
+    const MAX_PARTITIONS: usize = 512;
+    if n_parts > MAX_PARTITIONS {
+        p = n_live.div_ceil(MAX_PARTITIONS);
+        n_parts = n_live.div_ceil(p);
+    }
+
+    let (spill_schema, out_schema, categorical) = obs_spill_schemas(&s0.schema())?;
+    let spill = SpillDir::create(opts.temp_dir.as_deref())?;
+    scatter_obs_to_spill(reader, new_pos_of_old, p, n_parts, &spill_schema, &spill)?;
+    let partition_files = (0..n_parts).map(|i| spill.partition_file(i)).collect();
+    log::info!("scx sort: obs spill-scatter across {n_parts} partitions (~{p} rows each)");
+
+    Ok(ObsSpillState {
+        _spill: spill,
+        partition_files,
+        spill_schema,
+        out_schema,
+        categorical,
+        shard_target: opts.shard_target_rows,
+        n_parts,
+    })
+}
+
 fn is_numeric(dt: DataType) -> bool {
     use DataType::*;
     matches!(
@@ -1246,14 +1821,20 @@ fn is_numeric(dt: DataType) -> bool {
 /// Distinct values of a categorical/string-like column in sorted (or reversed)
 /// order. Nulls excluded (routed to the leading partition under `nulls_first`).
 fn distinct_categories(obs: &RecordBatch, name: &str, reverse: bool) -> Result<Vec<String>> {
-    use arrow::array::StringArray;
+    use arrow::array::LargeStringArray;
     let col = obs.column_by_name(name).ok_or_else(|| {
         OpsError::InvalidInput(format!("sort key column '{name}' missing from obs"))
     })?;
-    let utf8 = arrow::compute::cast(col, &DataType::Utf8)?;
-    let arr = utf8.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        OpsError::InvalidInput(format!("sort key '{name}' is not categorical/string-like"))
-    })?;
+    // Decode to `LargeUtf8` (i64 offsets): the leading key is the full obs
+    // column (e.g. 149 M rows), so a narrow `Utf8` decode overflows i32 offsets
+    // at >2 GB of total string bytes (`Offset overflow error`).
+    let utf8 = arrow::compute::cast(col, &DataType::LargeUtf8)?;
+    let arr = utf8
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .ok_or_else(|| {
+            OpsError::InvalidInput(format!("sort key '{name}' is not categorical/string-like"))
+        })?;
     let mut set = std::collections::BTreeSet::new();
     for i in 0..arr.len() {
         if !arr.is_null(i) {
@@ -1276,12 +1857,14 @@ fn category_of_old(
     cats: &[String],
     n_obs: usize,
 ) -> Result<Vec<i32>> {
-    use arrow::array::StringArray;
+    use arrow::array::LargeStringArray;
     let col = live_obs.column_by_name(name).ok_or_else(|| {
         OpsError::InvalidInput(format!("sort key column '{name}' missing from obs"))
     })?;
-    let utf8 = arrow::compute::cast(col, &DataType::Utf8)?;
-    let arr = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+    // `LargeUtf8` (i64 offsets): the key spans the full obs, so a narrow `Utf8`
+    // decode overflows i32 offsets at >2 GB of total string bytes.
+    let utf8 = arrow::compute::cast(col, &DataType::LargeUtf8)?;
+    let arr = utf8.as_any().downcast_ref::<LargeStringArray>().unwrap();
     let index: std::collections::HashMap<&str, i32> = cats
         .iter()
         .enumerate()

@@ -81,6 +81,17 @@ Deletions are materialized away first (the output is dense and deletion-free).
 The CSC sidecar and detection bitmap are dropped by default; pass `--rebuild-csc`
 / `--bitmap auto|always` to re-emit them on the sorted output.
 
+**Output size is not guaranteed neutral.** A sort is a row permutation, not a
+recompression pass: `scx1`-coded X is size-neutral (each row's gene indices are
+coded independently of row order), but `zstd`-coded shards and per-shard
+auto-codec re-selection make the sorted X a few percent larger *or* smaller
+because regrouping which cells share a shard changes cross-row compressibility.
+On the 149M-cell `drug.scx` (`mixed scx1/zstd`, uint32), sorting by `cell_type`
+grew the file ~6% — all in the X matrix (value encoding, predicate index, and
+CSC were unchanged). Pin `--codec` or run a follow-up `scx compact` if size
+matters; the point of `sort` is read locality, not compression. See
+[performance.md § Sort (physical layout)](performance.md#sort-physical-layout).
+
 ### Three ways to sort
 
 The reorder ships as three entry points — prefer the build-time forms, which are
