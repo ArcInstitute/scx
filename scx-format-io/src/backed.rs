@@ -509,14 +509,16 @@ impl WeightedLruCache {
             }
         }
 
-        // Distinguish a same-key replacement from a true count-cap eviction.
-        // `LruCache::put` returns the displaced entry in both cases; only
-        // the latter should bump the eviction counter.
-        let was_replace = self.inner.contains(&key);
+        // Use `push`, not `put`: `LruCache::put` returns `Some` only on a
+        // same-key *replacement* and `None` when a new key evicts the LRU, so a
+        // count-cap eviction would go uncounted AND its bytes never subtracted
+        // (inflating `bytes_used` / `peak_bytes_in_cache`). `push` returns the
+        // displaced `(key, entry)` in BOTH cases; a returned key != the inserted
+        // key is a genuine eviction.
         let entry = CacheEntry { csr, bytes };
-        if let Some(displaced) = self.inner.put(key, entry) {
+        if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if !was_replace {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1377,6 +1379,17 @@ impl BackedCsrReader {
 
             let shard_rows = s_end - s_start;
             let cached = self.shard_cache.contains(self.file_id, shard_idx);
+            // Interaction with the prefetch engine (worth knowing): under a
+            // plan-prefetch loader with `lookahead >= 1`, `PlanPrefetchIter`
+            // warms every touched shard (`read_shard_cached_arc`) *before* the
+            // gather runs, so `cached` is already true here and the sidecar
+            // O(rows) path is bypassed — the (byte-identical, already-decoded)
+            // full-shard slice is used instead. The sidecar therefore pays off
+            // mainly for `lookahead == 0`, cache-cold / cache-thrash paths, and
+            // non-prefetch callers (e.g. `Experiment::gather_rows_sparse`).
+            // Making the prefetch planner skip sidecar-eligible sparse groups
+            // (so the sidecar isn't negated by eager full-shard warms) is a
+            // deliberate follow-up, not done here.
             let use_sidecar =
                 sidecar_on && !cached && (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
             if !use_sidecar {
@@ -1497,6 +1510,11 @@ impl BackedCsrReader {
                 gi += 1;
             }
         }
+        // Every requested row of this shard must have been scattered exactly
+        // once; a shortfall would mean a planner/coalescing regression (e.g. a
+        // run boundary that skips rows). Debug-only — release relies on the
+        // byte-identical parity tests.
+        debug_assert_eq!(gi, group.len(), "sidecar scatter left rows unscattered");
         Ok(true)
     }
 
@@ -2570,9 +2588,11 @@ impl CscCache {
     }
 
     fn put(&mut self, key: usize, value: Arc<ScxCsc>) {
-        let was_replace = self.inner.contains(&key);
-        if let Some(_displaced) = self.inner.put(key, value) {
-            if !was_replace {
+        // `push` (not `put`) so a count-cap eviction is counted: `put` returns
+        // `None` when a new key evicts the LRU, so the eviction would be missed.
+        // A returned key != the inserted key is a genuine eviction.
+        if let Some((evicted_key, _displaced)) = self.inner.push(key, value) {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2997,11 +3017,14 @@ impl DenseLruCache {
                 break;
             }
         }
-        let was_replace = self.inner.contains(&key);
+        // `push` (not `put`): see `WeightedLruCache::put_with_budget` — `put`
+        // returns `None` on a count-cap eviction, so the eviction would go
+        // uncounted and its bytes never subtracted. `push` returns the displaced
+        // entry; a returned key != the inserted key is a genuine eviction.
         let entry = DenseCacheEntry { shard, bytes };
-        if let Some(displaced) = self.inner.put(key, entry) {
+        if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if !was_replace {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }

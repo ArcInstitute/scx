@@ -306,7 +306,7 @@ fn read_rows_with_sidecar_matches_full_decode() {
     }
 }
 
-/// Lever S (STATE3-SCX-DL-OPT-V3 §3): the per-shard Scx1 sidecar metadata is
+/// Lever S: the per-shard Scx1 sidecar metadata is
 /// parsed once and reused across batches. Repeatedly gathering sparse groups
 /// from the same shard takes the sidecar path each time (so the rows are still
 /// correct) yet parses the metadata only once *per distinct shard* — proof the
@@ -998,6 +998,36 @@ fn test_cache_eviction() {
     assert_eq!(result.indptr, expected.indptr);
     assert_eq!(result.indices, expected.indices);
     assert_eq!(result.data, expected.data);
+}
+
+#[test]
+fn cache_metrics_count_eviction_and_peak() {
+    // Regression for the count-cap eviction undercount (CACHE-CULM-BUG): a new
+    // key that evicts the LRU is returned by `push` (not `put`, which yields
+    // `None`), so `evictions` must increment and `peak_bytes_in_cache` must be
+    // the resident high-water mark — NOT the cumulative `bytes_inserted`.
+    let dir = tempfile::tempdir().unwrap();
+    // 4 shards, cache holds 2 → touching all 4 forces 2 count-cap evictions.
+    let (mut backed, _full) = write_test_file_and_open(&dir, 12, 10, 4, 2);
+    let m = backed.enable_metrics();
+    for (a, b) in [(0u64, 3u64), (3, 6), (6, 9), (9, 12)] {
+        let _ = backed.read_rows(a, b).unwrap();
+    }
+    use std::sync::atomic::Ordering;
+    assert_eq!(m.misses.load(Ordering::Relaxed), 4, "4 cold shards decoded");
+    assert_eq!(
+        m.evictions.load(Ordering::Relaxed),
+        2,
+        "4 inserts into a cap-2 cache ⇒ 2 count-cap evictions",
+    );
+    let inserted = m.bytes_inserted.load(Ordering::Relaxed);
+    let peak = m.peak_bytes_in_cache.load(Ordering::Relaxed);
+    assert!(inserted > 0 && peak > 0);
+    assert!(
+        peak < inserted,
+        "peak (resident high-water, ~2 shards) must be < cumulative bytes_inserted \
+         (~4 shards); got peak={peak} inserted={inserted}",
+    );
 }
 
 // -----------------------------------------------------------------------

@@ -98,8 +98,8 @@ pub struct ScxReader {
     /// `debug_counts()` accessor is stable across build profiles, but the
     /// increment sites are `cfg(debug_assertions)`-gated.
     debug_counts: ReaderDebugCounts,
-    /// Per-shard Scx1 decode-sidecar metadata cache (lever S,
-    /// STATE3-SCX-DL-OPT-V3 §3). Keyed by the CSR shard's `entry.offset`
+    /// Per-shard Scx1 decode-sidecar metadata cache (lever S). Keyed by the
+    /// CSR shard's `entry.offset`
     /// (unique per shard — see [`Self::full_entry_at_offset`]) → the parsed
     /// [`scx_codec::Scx1DecodeMetadata`]. The scattered cell-set gather touches
     /// one shard with many small runs across many batches; without this every
@@ -3292,8 +3292,8 @@ impl ScxReader {
             .map(|sidecar| sidecar.to_scx1_metadata()))
     }
 
-    /// Memoized [`Self::scx1_metadata_for`] keyed by `entry.offset` (lever S,
-    /// STATE3-SCX-DL-OPT-V3 §3). Returns a shared `Arc` so the parsed metadata
+    /// Memoized [`Self::scx1_metadata_for`] keyed by `entry.offset` (lever S).
+    /// Returns a shared `Arc` so the parsed metadata
     /// is resolved once per shard and reused across the many row-range decodes
     /// of the scattered cell-set gather, instead of re-running the sidecar
     /// read (BLAKE3) + `to_scx1_metadata` (O(shard-rows) clone) every call.
@@ -3389,8 +3389,8 @@ impl ScxReader {
     /// (vs once per run in [`Self::decode_scx1_row_range`]). This is the hot
     /// path for the scattered cell-set gather, where a single shard is touched
     /// by many small runs in one batch — repeating the O(shard-rows) sidecar
-    /// metadata deserialization per run dominated the gather (~3 ms/cell;
-    /// STATE3-SCX-DL-OPT-V2 §10.4). Returns `Ok(None)` (no fresh Scx1 sidecar)
+    /// metadata deserialization per run dominated the gather (~3 ms/cell).
+    /// Returns `Ok(None)` (no fresh Scx1 sidecar)
     /// so the caller falls back to a full-shard decode; each run's result is
     /// byte-identical to that fallback's matching slice.
     pub fn decode_scx1_row_runs(

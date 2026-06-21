@@ -199,6 +199,13 @@ class SparseCellSetDataset:
         """
         ...
 
+    def cache_metrics(self) -> dict[str, Any]:
+        """Cumulative shard-cache counters since construction (hits, misses,
+        evictions, bytes, peak) — the multi-file sibling of
+        `IndexPlanDataset.cache_metrics`. For runtime hit/miss/eviction
+        observability."""
+        ...
+
     def __repr__(self) -> str: ...
 
 
@@ -385,6 +392,32 @@ def write(adata: Any, path: Any, **kwargs: Any) -> None:
 
 
 def validate(path: Any) -> list[tuple[str, bool]]: ...
+
+
+def collate_cellset_gathered(
+    indptr: np.ndarray,
+    indices: np.ndarray,
+    data: np.ndarray,
+    set_offsets: np.ndarray,
+    cell_indices: np.ndarray,
+    file_ids: np.ndarray,
+    role_tags: np.ndarray,
+    k_dec: int,
+    query_gene_ids: np.ndarray,
+    enc_mask_positions: np.ndarray,
+    hide_readout: np.ndarray,
+    n_measured: np.ndarray,
+    k_enc: int,
+    mode: str,
+    n_genes_total: int,
+    target_sum: float | None = None,
+    lib_size_redef: bool | None = None,
+) -> dict[str, Any]:
+    """Collate an already-gathered, **global-vocab** CSR batch (from
+    `SparseCellSetDataset.iter_with_plans`) into stacked encoder/target tensors
+    (state3 "3A hybrid"). Pure compute; releases the GIL. Returns a dict of flat
+    stacked arrays plus the shape scalars ``n_rows``/``k_enc``/``k_dec``."""
+    ...
 
 
 # ---------------------------------------------------------------------------
