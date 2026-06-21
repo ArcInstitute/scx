@@ -206,17 +206,177 @@ fn fill_batch_parallel(
 // D4: Obs metadata column extraction
 // ---------------------------------------------------------------------------
 
+/// Label of the reserved category that null/missing cells map to.
+const MISSING_CATEGORY_LABEL: &str = "NaN";
+
+/// Stable, file-global category dictionary for one categorical obs column.
+///
+/// Built once over the full obs `RecordBatch` (see [`build_category_dicts`]) so
+/// that every batch and every epoch encode the same category string to the
+/// same integer code — and so the `TrainingDataset` and `IndexPlanDataset`
+/// paths agree. This replaces the previous per-batch, first-seen-in-batch
+/// encoding whose codes drifted with batch composition (silently wrong ML
+/// labels). Codes index [`categories`](Self::categories) directly.
+#[derive(Debug, Clone)]
+pub struct CategoryDict {
+    /// Category string → stable code (used by the Utf8/LargeUtf8 path).
+    map: HashMap<String, u32>,
+    /// Code → category string; the `Vec` index *is* the code.
+    categories: Vec<String>,
+    /// Code of the reserved trailing missing/`"NaN"` category, present iff the
+    /// column contains any null cell.
+    missing_code: Option<u32>,
+}
+
+/// Decode an Arrow dictionary value array (`Utf8` / `LargeUtf8`) to owned strings.
+fn dict_value_strings(values: &dyn Array, col_name: &str) -> Result<Vec<String>> {
+    if let Some(v) = values.as_any().downcast_ref::<StringArray>() {
+        Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+    } else if let Some(v) = values.as_any().downcast_ref::<LargeStringArray>() {
+        Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+    } else {
+        Err(LoaderError::ConfigError {
+            reason: format!("obs column '{col_name}': dictionary values are not Utf8/LargeUtf8"),
+        })
+    }
+}
+
+/// Append the reserved missing/`"NaN"` category when the column has nulls,
+/// returning its code. If a literal `"NaN"` level already exists it is reused
+/// (a column carrying both real nulls and a literal `"NaN"` string conflates
+/// the two — an accepted minor limitation).
+fn maybe_add_missing(
+    categories: &mut Vec<String>,
+    map: &mut HashMap<String, u32>,
+    has_null: bool,
+) -> Option<u32> {
+    if !has_null {
+        return None;
+    }
+    if let Some(&code) = map.get(MISSING_CATEGORY_LABEL) {
+        return Some(code);
+    }
+    let code = categories.len() as u32;
+    categories.push(MISSING_CATEGORY_LABEL.to_string());
+    map.insert(MISSING_CATEGORY_LABEL.to_string(), code);
+    Some(code)
+}
+
+/// Build the stable global category dictionary for one obs column, or `None`
+/// when the column is not categorical (numeric / unsupported types are decoded
+/// directly by `extract_single_column`).
+fn build_single_category_dict(array: &dyn Array, col_name: &str) -> Result<Option<CategoryDict>> {
+    match array.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {
+            let mut categories: Vec<String> = Vec::new();
+            let mut map: HashMap<String, u32> = HashMap::new();
+            let mut has_null = false;
+            macro_rules! scan {
+                ($arr:expr) => {{
+                    let arr = $arr;
+                    for i in 0..arr.len() {
+                        if arr.is_null(i) {
+                            has_null = true;
+                            continue;
+                        }
+                        let val = arr.value(i);
+                        if !map.contains_key(val) {
+                            let code = categories.len() as u32;
+                            categories.push(val.to_string());
+                            map.insert(val.to_string(), code);
+                        }
+                    }
+                }};
+            }
+            if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                scan!(arr);
+            } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+                scan!(arr);
+            } else {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "obs column '{col_name}': expected StringArray/LargeStringArray"
+                    ),
+                });
+            }
+            let missing_code = maybe_add_missing(&mut categories, &mut map, has_null);
+            Ok(Some(CategoryDict {
+                map,
+                categories,
+                missing_code,
+            }))
+        }
+        DataType::Dictionary(_, _) => {
+            // Preserve the full declared value set (incl. unused levels) to
+            // match pandas.Categorical semantics. Codes come straight from the
+            // dictionary keys (already file-global), so `categories[key] == str`.
+            let dict = array.as_any_dictionary();
+            let mut categories = dict_value_strings(dict.values().as_ref(), col_name)?;
+            let mut map: HashMap<String, u32> = HashMap::with_capacity(categories.len());
+            for (i, c) in categories.iter().enumerate() {
+                map.entry(c.clone()).or_insert(i as u32);
+            }
+            let has_null = dict.keys().null_count() > 0;
+            let missing_code = maybe_add_missing(&mut categories, &mut map, has_null);
+            Ok(Some(CategoryDict {
+                map,
+                categories,
+                missing_code,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Build stable global category dictionaries for the categorical columns among
+/// `obs_columns`, computed ONCE over the full obs `RecordBatch`.
+///
+/// Numeric columns produce no entry (they are decoded directly). Returns an
+/// error if a requested column is missing or a string/dictionary column has an
+/// unsupported value layout. The result is reused for every batch and epoch so
+/// categorical codes are stable and identical across the `TrainingDataset` and
+/// `IndexPlanDataset` paths.
+pub fn build_category_dicts(
+    obs: &RecordBatch,
+    obs_columns: &[String],
+) -> Result<HashMap<String, CategoryDict>> {
+    let mut dicts = HashMap::new();
+    for col_name in obs_columns {
+        let col_idx =
+            obs.schema()
+                .index_of(col_name)
+                .map_err(|_| LoaderError::ObsColumnNotFound {
+                    name: col_name.clone(),
+                    available: obs
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect(),
+                })?;
+        if let Some(dict) = build_single_category_dict(obs.column(col_idx), col_name)? {
+            dicts.insert(col_name.clone(), dict);
+        }
+    }
+    Ok(dicts)
+}
+
 /// Extract the requested observation metadata columns for a batch.
 ///
 /// For each requested column name, looks up the column in the `RecordBatch`
 /// and extracts values at the positions given by `cell_indices` (global row
 /// indices). Converts to the appropriate `ObsColumn` variant.
 ///
+/// `cat_dicts` holds the precomputed stable global category dictionaries (from
+/// [`build_category_dicts`]) keyed by column name; categorical columns require
+/// an entry, numeric columns are unaffected.
+///
 /// Returns an error if a requested column is not found in the RecordBatch.
 pub fn extract_obs_columns(
     obs: &RecordBatch,
     cell_indices: &[u64],
     obs_columns: &[String],
+    cat_dicts: &HashMap<String, CategoryDict>,
 ) -> Result<HashMap<String, ObsColumn>> {
     let mut result = HashMap::with_capacity(obs_columns.len());
 
@@ -235,7 +395,8 @@ pub fn extract_obs_columns(
                 })?;
 
         let array = obs.column(col_idx);
-        let obs_col = extract_single_column(array, cell_indices, col_name)?;
+        let obs_col =
+            extract_single_column(array, cell_indices, col_name, cat_dicts.get(col_name))?;
         result.insert(col_name.clone(), obs_col);
     }
 
@@ -243,10 +404,15 @@ pub fn extract_obs_columns(
 }
 
 /// Extract a single Arrow column into an `ObsColumn` for the given cell indices.
+///
+/// `cat_dict` is the precomputed stable global category dictionary for this
+/// column (required for categorical Utf8/LargeUtf8/Dictionary columns; ignored
+/// for numeric columns).
 fn extract_single_column(
     array: &dyn Array,
     cell_indices: &[u64],
     col_name: &str,
+    cat_dict: Option<&CategoryDict>,
 ) -> Result<ObsColumn> {
     let dt = array.data_type();
 
@@ -328,73 +494,88 @@ fn extract_single_column(
             Ok(ObsColumn::Float64(values))
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
-            // String → categorical via unique-value indexing. The
-            // opportunistic downcast in `scx_format_io::arrow_compat` may
-            // surface obs as either `Utf8` (StringArray, i32 offsets)
-            // or `LargeUtf8` (LargeStringArray, i64 offsets) on >2 GB
-            // single-column metadata. Both array types share the same
-            // `.value(idx) -> &str` API.
+            // String → categorical via the precomputed stable global dictionary
+            // (codes are file-global, not batch-local). The opportunistic
+            // downcast in `scx_format_io::arrow_compat` may surface obs as
+            // either `Utf8` (StringArray, i32 offsets) or `LargeUtf8`
+            // (LargeStringArray, i64 offsets) on >2 GB single-column metadata.
+            // Both array types share the same `.value(idx) -> &str` API.
+            let dict = cat_dict.ok_or_else(|| LoaderError::ConfigError {
+                reason: format!(
+                    "obs column '{col_name}': category dictionary not precomputed (internal error)"
+                ),
+            })?;
             macro_rules! decode_strings {
                 ($arr:expr) => {{
                     let arr = $arr;
-                    let mut categories: Vec<String> = Vec::new();
-                    let mut cat_map: HashMap<String, u32> = HashMap::new();
-                    let mut codes: Vec<u32> = Vec::with_capacity(cell_indices.len());
-                    for &idx in cell_indices {
-                        let val = arr.value(idx as usize).to_string();
-                        let code = if let Some(&existing) = cat_map.get(&val) {
-                            existing
-                        } else {
-                            let code = categories.len() as u32;
-                            categories.push(val.clone());
-                            cat_map.insert(val, code);
-                            code
-                        };
-                        codes.push(code);
-                    }
-                    ObsColumn::Categorical(codes, categories)
+                    cell_indices
+                        .iter()
+                        .map(|&idx| -> Result<u32> {
+                            let i = idx as usize;
+                            if arr.is_null(i) {
+                                dict.missing_code.ok_or_else(|| LoaderError::ConfigError {
+                                    reason: format!(
+                                        "obs column '{col_name}': null cell but no missing \
+                                         category reserved (internal error)"
+                                    ),
+                                })
+                            } else {
+                                dict.map.get(arr.value(i)).copied().ok_or_else(|| {
+                                    LoaderError::ConfigError {
+                                        reason: format!(
+                                            "obs column '{col_name}': value not in precomputed \
+                                             category dictionary (internal error)"
+                                        ),
+                                    }
+                                })
+                            }
+                        })
+                        .collect::<Result<Vec<u32>>>()
                 }};
             }
-            if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-                Ok(decode_strings!(arr))
+            let codes = if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                decode_strings!(arr)?
             } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-                Ok(decode_strings!(arr))
+                decode_strings!(arr)?
             } else {
-                Err(LoaderError::ConfigError {
+                return Err(LoaderError::ConfigError {
                     reason: format!(
                         "obs column '{col_name}': expected StringArray/LargeStringArray"
                     ),
-                })
-            }
+                });
+            };
+            Ok(ObsColumn::Categorical(codes, dict.categories.clone()))
         }
         DataType::Dictionary(key_type, _value_type) => {
-            // Arrow dictionary encoding → Categorical.
-            // Values may be `Utf8` or `LargeUtf8` (`scx_format_io::arrow_compat`
-            // opportunistic downcast surfaces wide types when offsets
-            // overflow). Keys come in the usual signed/unsigned int spread.
-            fn dict_categories(values: &dyn Array, col_name: &str) -> Result<Vec<String>> {
-                if let Some(v) = values.as_any().downcast_ref::<StringArray>() {
-                    Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
-                } else if let Some(v) = values.as_any().downcast_ref::<LargeStringArray>() {
-                    Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
-                } else {
-                    Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "obs column '{col_name}': dictionary values are not Utf8/LargeUtf8"
-                        ),
-                    })
-                }
-            }
+            // Arrow dictionary encoding → Categorical. Keys are already
+            // file-global codes into the dictionary's value set; the categories
+            // come from the precomputed global dict (full declared level set).
+            let dict = cat_dict.ok_or_else(|| LoaderError::ConfigError {
+                reason: format!(
+                    "obs column '{col_name}': category dictionary not precomputed (internal error)"
+                ),
+            })?;
             macro_rules! decode_dict {
                 ($key_ty:ty) => {{
                     let dict_arr = array.as_dictionary::<$key_ty>();
                     let keys = dict_arr.keys();
-                    let categories = dict_categories(dict_arr.values().as_ref(), col_name)?;
-                    let codes: Vec<u32> = cell_indices
+                    let codes: Result<Vec<u32>> = cell_indices
                         .iter()
-                        .map(|&idx| keys.value(idx as usize) as u32)
+                        .map(|&idx| -> Result<u32> {
+                            let i = idx as usize;
+                            if keys.is_null(i) {
+                                dict.missing_code.ok_or_else(|| LoaderError::ConfigError {
+                                    reason: format!(
+                                        "obs column '{col_name}': null cell but no missing \
+                                         category reserved (internal error)"
+                                    ),
+                                })
+                            } else {
+                                Ok(keys.value(i) as u32)
+                            }
+                        })
                         .collect();
-                    Ok(ObsColumn::Categorical(codes, categories))
+                    codes.map(|codes| ObsColumn::Categorical(codes, dict.categories.clone()))
                 }};
             }
             match key_type.as_ref() {
@@ -448,6 +629,7 @@ pub fn decode_stage(
     n_vars: u64,
     projection: Option<HvgProjection>,
     obs_metadata: &RecordBatch,
+    cat_dicts: &HashMap<String, CategoryDict>,
     epoch: u64,
     pool: &rayon::ThreadPool,
 ) -> Result<()> {
@@ -516,7 +698,7 @@ pub fn decode_stage(
             let obs = if config.obs_columns.is_empty() {
                 HashMap::new()
             } else {
-                extract_obs_columns(obs_metadata, batch_cells, &config.obs_columns)?
+                extract_obs_columns(obs_metadata, batch_cells, &config.obs_columns, cat_dicts)?
             };
 
             // Step 8: Build and send batch
@@ -879,7 +1061,9 @@ mod tests {
         let obs = make_obs(10);
         let cell_indices: Vec<u64> = vec![2, 5, 8];
 
-        let result = extract_obs_columns(&obs, &cell_indices, &["count".to_string()]).unwrap();
+        let cols = ["count".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &cols, &dicts).unwrap();
 
         let col = result.get("count").unwrap();
         if let ObsColumn::Int64(values) = col {
@@ -894,13 +1078,16 @@ mod tests {
         let obs = make_obs(5);
         let cell_indices: Vec<u64> = vec![0, 1, 2];
 
-        let result = extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
+        let cols = ["cell_id".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &cols, &dicts).unwrap();
 
         let col = result.get("cell_id").unwrap();
         if let ObsColumn::Categorical(codes, categories) = col {
-            // Each cell_id is unique, so each gets its own category
+            // Codes index the stable GLOBAL category set (all 5 unique cell_ids
+            // in the full obs table), not a batch-local subset.
             assert_eq!(codes.len(), 3);
-            assert_eq!(categories.len(), 3);
+            assert_eq!(categories.len(), 5);
             assert_eq!(&categories[codes[0] as usize], "cell_0");
             assert_eq!(&categories[codes[1] as usize], "cell_1");
             assert_eq!(&categories[codes[2] as usize], "cell_2");
@@ -928,7 +1115,9 @@ mod tests {
         )
         .unwrap();
         let cell_indices: Vec<u64> = vec![0, 2, 3];
-        let result = extract_obs_columns(&obs, &cell_indices, &["cell_id".to_string()]).unwrap();
+        let cols = ["cell_id".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &cols, &dicts).unwrap();
         let col = result.get("cell_id").unwrap();
         if let ObsColumn::Categorical(codes, categories) = col {
             assert_eq!(codes.len(), 3);
@@ -956,7 +1145,9 @@ mod tests {
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict) as Arc<dyn Array>]).unwrap();
 
         let cell_indices: Vec<u64> = vec![0, 1, 2, 3, 4];
-        let result = extract_obs_columns(&obs, &cell_indices, &["cluster".to_string()]).unwrap();
+        let cols = ["cluster".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &cols, &dicts).unwrap();
         let col = result.get("cluster").unwrap();
         if let ObsColumn::Categorical(codes, categories) = col {
             assert_eq!(codes, &vec![0_u32, 1, 2, 1, 0]);
@@ -974,7 +1165,12 @@ mod tests {
         let obs = make_obs(5);
         let cell_indices: Vec<u64> = vec![0];
 
-        let result = extract_obs_columns(&obs, &cell_indices, &["nonexistent".to_string()]);
+        let result = extract_obs_columns(
+            &obs,
+            &cell_indices,
+            &["nonexistent".to_string()],
+            &HashMap::new(),
+        );
 
         match result {
             Err(LoaderError::ObsColumnNotFound { name, available }) => {
@@ -994,12 +1190,9 @@ mod tests {
         let obs = make_obs(10);
         let cell_indices: Vec<u64> = vec![0, 3, 7];
 
-        let result = extract_obs_columns(
-            &obs,
-            &cell_indices,
-            &["count".to_string(), "cell_id".to_string()],
-        )
-        .unwrap();
+        let cols = ["count".to_string(), "cell_id".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &cell_indices, &cols, &dicts).unwrap();
 
         // Verify count column
         if let ObsColumn::Int64(values) = result.get("count").unwrap() {
@@ -1013,6 +1206,94 @@ mod tests {
             assert_eq!(&cats[codes[0] as usize], "cell_0");
             assert_eq!(&cats[codes[1] as usize], "cell_3");
             assert_eq!(&cats[codes[2] as usize], "cell_7");
+        } else {
+            panic!("expected Categorical");
+        }
+    }
+
+    /// Regression for the per-batch categorical-code instability bug: the same
+    /// category string MUST map to the same code regardless of which batch
+    /// (which `cell_indices` subset) it is decoded in, and the `categories`
+    /// list must be identical across batches. Before the fix, the Utf8 path
+    /// built a fresh batch-local dictionary, so codes drifted with batch
+    /// composition.
+    #[test]
+    fn test_categorical_codes_stable_across_batches() {
+        // Repeated categories so the two disjoint batches see them in a
+        // different first-seen order — exactly what made codes drift before.
+        let labels = ["X", "Y", "X", "Z", "Y", "Z"];
+        let schema = Schema::new(vec![Field::new("grp", DataType::Utf8, false)]);
+        let obs = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(labels.to_vec()))],
+        )
+        .unwrap();
+
+        let cols = ["grp".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+
+        // Batch A sees rows [0,1,2] → X,Y,X ; Batch B sees [3,4,5] → Z,Y,Z.
+        let batch_a = extract_obs_columns(&obs, &[0u64, 1, 2], &cols, &dicts).unwrap();
+        let batch_b = extract_obs_columns(&obs, &[3u64, 4, 5], &cols, &dicts).unwrap();
+
+        let (codes_a, cats_a) = match batch_a.get("grp").unwrap() {
+            ObsColumn::Categorical(c, cats) => (c, cats),
+            _ => panic!("expected Categorical"),
+        };
+        let (codes_b, cats_b) = match batch_b.get("grp").unwrap() {
+            ObsColumn::Categorical(c, cats) => (c, cats),
+            _ => panic!("expected Categorical"),
+        };
+
+        // Identical global category list across batches.
+        assert_eq!(cats_a, cats_b);
+        assert_eq!(
+            cats_a,
+            &vec!["X".to_string(), "Y".to_string(), "Z".to_string()]
+        );
+
+        // Build a string→code map from each batch and assert no string is
+        // assigned two different codes across the two batches.
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        for (codes, cats) in [(codes_a, cats_a), (codes_b, cats_b)] {
+            for &code in codes {
+                let label = cats[code as usize].clone();
+                if let Some(&prev) = seen.get(&label) {
+                    assert_eq!(prev, code, "category '{label}' got two different codes");
+                } else {
+                    seen.insert(label, code);
+                }
+            }
+        }
+        // Concretely: "Y" is row 1 in batch A and row 4 in batch B — same code.
+        assert_eq!(codes_a[1], codes_b[1]);
+        assert_eq!(cats_a[codes_a[1] as usize], "Y");
+    }
+
+    /// Null/missing cells in a categorical obs column map to the reserved
+    /// trailing `"NaN"` category (and no phantom real category is created).
+    #[test]
+    fn test_categorical_null_maps_to_reserved_missing() {
+        let arr = StringArray::from(vec![Some("a"), None, Some("b"), None, Some("a")]);
+        let schema = Schema::new(vec![Field::new("grp", DataType::Utf8, true)]);
+        let obs = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(arr)]).unwrap();
+
+        let cols = ["grp".to_string()];
+        let dicts = build_category_dicts(&obs, &cols).unwrap();
+        let result = extract_obs_columns(&obs, &[0u64, 1, 2, 3, 4], &cols, &dicts).unwrap();
+
+        if let ObsColumn::Categorical(codes, cats) = result.get("grp").unwrap() {
+            // Real levels first (first-seen), reserved "NaN" appended last.
+            assert_eq!(
+                cats,
+                &vec!["a".to_string(), "b".to_string(), "NaN".to_string()]
+            );
+            let nan_code = 2u32;
+            assert_eq!(codes[1], nan_code, "null cell should map to NaN code");
+            assert_eq!(codes[3], nan_code, "null cell should map to NaN code");
+            assert_eq!(&cats[codes[0] as usize], "a");
+            assert_eq!(&cats[codes[2] as usize], "b");
+            assert_eq!(codes[0], codes[4], "'a' should be stable");
         } else {
             panic!("expected Categorical");
         }
@@ -1058,6 +1339,7 @@ mod tests {
                 n_vars as u64,
                 None,
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1120,6 +1402,7 @@ mod tests {
                 n_vars as u64,
                 None,
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1173,6 +1456,7 @@ mod tests {
                 n_vars as u64,
                 None,
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1229,6 +1513,7 @@ mod tests {
                 n_vars as u64,
                 Some(proj),
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1276,6 +1561,7 @@ mod tests {
                 n_vars as u64,
                 None,
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1360,6 +1646,7 @@ mod tests {
                 n_vars as u64,
                 None,
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
@@ -1431,6 +1718,7 @@ mod tests {
                 n_vars as u64,
                 Some(proj),
                 &obs,
+                &HashMap::new(),
                 0,
                 &test_pool(),
             )
