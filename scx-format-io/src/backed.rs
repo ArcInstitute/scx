@@ -1461,8 +1461,9 @@ impl BackedCsrReader {
         // Resolve the *real* catalog entry (name + checksum) once — `ShardEntryLite`
         // drops both, but the sidecar lookup needs them; `(offset, section_type)`
         // identifies the section uniquely.
-        let Some((offset, section_type)) =
-            self.shard_entry(shard_idx).map(|l| (l.offset, l.section_type))
+        let Some((offset, section_type)) = self
+            .shard_entry(shard_idx)
+            .map(|l| (l.offset, l.section_type))
         else {
             return Ok(false);
         };
