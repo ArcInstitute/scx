@@ -180,3 +180,49 @@ fn pflog1ppf_target_is_raw_and_encoder_centered() {
     approx(b.counts[1], lp[1] - center);
     approx(b.counts[2], lp[2] - center);
 }
+
+#[test]
+fn normalize_log1p_encoder_and_target_are_normalized() {
+    // NormalizeLog1p: both encoder and target carry log1p(raw * target_sum/lib).
+    // Encoder top-K order still uses RAW counts (selection is on raw, desc).
+    let c = cfg(PreprocessMode::NormalizeLog1p, 4); // target_sum=1e4
+    let (b, lib) = run(
+        &[10, 20, 30],
+        &[1.0, 2.0, 3.0],
+        &[10, 20, 30, 40],
+        None,
+        false,
+        &c,
+    );
+
+    assert_eq!(lib, 6.0); // sum of raw
+    let factor = (1e4f64 / 6.0) as f32;
+    let v = |r: f32| (r * factor).ln_1p();
+    // top-K by raw desc → gene 30 (raw 3), 20 (raw 2), 10 (raw 1), then PAD.
+    assert_eq!(b.ids[0], 30);
+    assert_eq!(b.ids[1], 20);
+    assert_eq!(b.ids[2], 10);
+    assert_eq!(b.ids[3], PAD);
+    approx(b.counts[0], v(3.0));
+    approx(b.counts[1], v(2.0));
+    approx(b.counts[2], v(1.0));
+    // target gathered at query positions [10,20,30,40] = normalized-log1p (not raw),
+    // 0 for the absent gene 40.
+    approx(b.target[0], v(1.0));
+    approx(b.target[1], v(2.0));
+    approx(b.target[2], v(3.0));
+    assert_eq!(b.target[3], 0.0);
+}
+
+#[test]
+fn normalize_log1p_zero_library_uses_factor_one() {
+    // All-zero counts → lib == 0 → factor falls back to 1.0 (no div-by-zero),
+    // scaled == raw, log1p(0) == 0; degenerate cell emits one GENE_MASK token.
+    let c = cfg(PreprocessMode::NormalizeLog1p, 4);
+    let (b, lib) = run(&[10, 20], &[0.0, 0.0], &[10, 20, 30], None, false, &c);
+
+    assert_eq!(lib, 0.0);
+    assert_eq!(b.ids[0], MASK); // no positive counts → single mask token
+    assert_eq!(b.pad[0], 0);
+    assert_eq!(b.target, vec![0.0, 0.0, 0.0]); // log1p(0)=0 everywhere
+}

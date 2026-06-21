@@ -16,8 +16,8 @@ resolver = "2"
 # parse-boundary guards in delta_golomb/rice). Per-package overrides must live
 # at the workspace root; a [profile.*] block in scx-codec/Cargo.toml is ignored.
 # Thin LTO across the workspace: a small, free win for the compiled gather /
-# collation hot path now that Rust collation (sparse_cellset_collate) is on the
-# training critical path (STATE3-SCX-DL-OPT.md §4C).
+# collation hot path now that Rust collation (sparse_cellset_collate) runs on
+# the per-batch training critical path of the sparse cell-set loader.
 [profile.release]
 lto = "thin"
 

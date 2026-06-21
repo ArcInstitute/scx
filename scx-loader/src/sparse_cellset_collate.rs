@@ -192,6 +192,8 @@ pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32
             order.sort_by(|&a, &b| {
                 let ra = cin.raw[a].max(0.0);
                 let rb = cin.raw[b].max(0.0);
+                // unwrap is safe: `max(0.0)` yields a finite, non-NaN f32, so
+                // partial_cmp is always `Some`.
                 rb.partial_cmp(&ra)
                     .unwrap()
                     .then(cin.gene_ids[a].cmp(&cin.gene_ids[b]))
