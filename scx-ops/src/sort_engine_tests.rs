@@ -333,6 +333,63 @@ fn obs_spill_preserves_categorical_dtype() {
     assert!(is_sorted_asc(&col_of(&out, "cell_type")));
 }
 
+/// Deletions + obs spill: the scatter skips `new_pos < 0` (deleted) rows, so a
+/// sharded-obs input carrying a deletion vector must spill-sort to the same
+/// dense, deletion-free output as the in-memory path. Builds the fixture by
+/// sorting (→ sharded obs) then marking deletions on that file.
+#[test]
+fn obs_spill_with_deletions() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let sharded = dir.path().join("sharded.scx");
+    sort(&inp, &sharded, &opts(&["cell_type"])).unwrap();
+    // Add a deletion vector to the (now sharded-obs) file.
+    crate::delete::mark_deleted(&sharded, &[1u64, 4, 7]).unwrap();
+    assert!(
+        ScxReader::open(&sharded)
+            .unwrap()
+            .obs_metadata_shard_count()
+            >= 2
+    );
+
+    let bpr = obs_bytes_per_row(&sharded);
+
+    // In-memory baseline (no budget) vs forced obs spill.
+    let mem = dir.path().join("mem.scx");
+    let mem_s = sort_with_strategy(
+        &sharded,
+        &mem,
+        &opts(&["cell_type"]),
+        Some(SortStrategy::InMemory),
+    )
+    .unwrap();
+    assert!(!mem_s.obs_spilled);
+
+    let mut o = opts(&["cell_type"]);
+    o.memory_budget = Some(bpr * 3);
+    let spilled = dir.path().join("spilled.scx");
+    let sp_s = sort_with_strategy(&sharded, &spilled, &o, Some(SortStrategy::InMemory)).unwrap();
+    assert!(sp_s.obs_spilled, "budget should force obs spill");
+    assert!(sp_s.obs_partitions >= 2);
+
+    // 3 of 12 deleted → 9 live, identical content on both paths, deletion-free.
+    assert_eq!(sp_s.n_obs, 9);
+    assert_eq!(mem_s.n_obs, 9);
+    assert_eq!(
+        content(&mem),
+        content(&spilled),
+        "deletion + spill must match the in-memory path"
+    );
+    assert!(is_sorted_asc(&col_of(&spilled, "cell_type")));
+    let clean = ScxReader::open(&spilled)
+        .unwrap()
+        .deletion_keep_mask()
+        .unwrap()
+        .map(|m| m.iter().all(|&k| k))
+        .unwrap_or(true);
+    assert!(clean, "spilled output must be deletion-free");
+}
+
 // --- Determinism (modulo provenance timestamp) -----------------------------
 
 #[test]
