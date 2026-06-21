@@ -738,7 +738,7 @@ fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
 /// Used to decide layout fallback and, ultimately, to emit the actionable
 /// `CatalogNotFound` instead of leaking a raw 404 / canonicalize error —
 /// while leaving auth/network errors verbose.
-fn is_missing_object(e: &object_store::Error) -> bool {
+pub(crate) fn is_missing_object(e: &object_store::Error) -> bool {
     // Remote stores (GCS/S3/Azure) report a missing object as the canonical
     // `NotFound` variant.
     if matches!(e, object_store::Error::NotFound { .. }) {
