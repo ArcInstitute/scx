@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArrayMethods};
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PyRuntimeError, PyStopIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
@@ -31,7 +31,11 @@ use crate::batch::{Batch, ObsColumn};
 use crate::error::LoaderError;
 use crate::index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader, IterMetrics};
 use crate::pipeline::{LoaderConfig, TrainingPipeline};
-use crate::sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
+use crate::sparse_cellset::{
+    CollateScalars, CollatedCellSetBatch, SparseCellSetBatch, SparseCellSetLoader,
+    SparseCellSetPlan,
+};
+use crate::sparse_cellset_collate::PreprocessMode;
 use scx_format_io::ScxReader;
 
 /// A PyTorch-compatible iterable dataset for SCX training data.
@@ -1542,6 +1546,15 @@ impl SparseCellSetDataset {
         Ok(SparseCellSetBatchIter { inner: Some(inner) })
     }
 
+    /// Snapshot of the readers' shared shard-cache counters, cumulative since
+    /// construction (the multi-file sibling of `IndexPlanDataset.cache_metrics`).
+    /// Returns a dict with keys: `hits`, `misses` (= shard decodes), `evictions`,
+    /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`. All `int`;
+    /// atomic, lock-free — sample as often as you like.
+    fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        cache_metrics_to_pydict(py, &self.loader.cache_metrics())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "SparseCellSetDataset(n_files={}, n_cols={})",
@@ -1602,4 +1615,109 @@ fn sparse_cellset_batch_to_dict<'py>(
     dict.set_item("set_offsets", PyArray1::from_vec(py, batch.set_offsets))?;
     dict.set_item("role_tags", PyArray1::from_vec(py, batch.role_tags))?;
     Ok(dict)
+}
+
+/// Convert a `CollatedCellSetBatch` into a dict of flat stacked tensors plus
+/// shape scalars (`n_rows`, `k_enc`, `k_dec`); state3 reshapes to `[B, S, K]`.
+fn collated_cellset_batch_to_dict<'py>(
+    py: Python<'py>,
+    batch: CollatedCellSetBatch,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "encoder_gene_ids",
+        PyArray1::from_vec(py, batch.encoder_gene_ids),
+    )?;
+    dict.set_item(
+        "encoder_counts",
+        PyArray1::from_vec(py, batch.encoder_counts),
+    )?;
+    dict.set_item("encoder_mask", PyArray1::from_vec(py, batch.encoder_mask))?;
+    dict.set_item(
+        "encoder_pad_mask",
+        PyArray1::from_vec(py, batch.encoder_pad_mask),
+    )?;
+    dict.set_item("target_counts", PyArray1::from_vec(py, batch.target_counts))?;
+    dict.set_item("library_size", PyArray1::from_vec(py, batch.library_size))?;
+    dict.set_item("cell_indices", PyArray1::from_vec(py, batch.cell_indices))?;
+    dict.set_item("file_ids", PyArray1::from_vec(py, batch.file_ids))?;
+    dict.set_item("set_offsets", PyArray1::from_vec(py, batch.set_offsets))?;
+    dict.set_item("role_tags", PyArray1::from_vec(py, batch.role_tags))?;
+    dict.set_item("n_rows", batch.n_rows)?;
+    dict.set_item("k_enc", batch.k_enc)?;
+    dict.set_item("k_dec", batch.k_dec)?;
+    Ok(dict)
+}
+
+/// Collate an already-gathered, **global-vocab** CSR batch into stacked tensors
+/// (state3 "3A hybrid"). Pure compute; releases the GIL. Python gathers (via
+/// `iter_with_plans`) and samples the query, then collates here. `set_offsets`
+/// delimits the sets; `enc_mask_positions` may be empty (perturbation path).
+#[pyfunction]
+#[pyo3(signature = (
+    indptr, indices, data, set_offsets, cell_indices, file_ids, role_tags,
+    k_dec, query_gene_ids, enc_mask_positions, hide_readout, n_measured,
+    k_enc, mode, n_genes_total, target_sum=None, lib_size_redef=None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn collate_cellset_gathered<'py>(
+    py: Python<'py>,
+    indptr: PyReadonlyArray1<'py, i64>,
+    indices: PyReadonlyArray1<'py, i32>,
+    data: PyReadonlyArray1<'py, f32>,
+    set_offsets: PyReadonlyArray1<'py, i64>,
+    cell_indices: PyReadonlyArray1<'py, u64>,
+    file_ids: PyReadonlyArray1<'py, u32>,
+    role_tags: PyReadonlyArray1<'py, i32>,
+    k_dec: usize,
+    query_gene_ids: PyReadonlyArray1<'py, i32>,
+    enc_mask_positions: PyReadonlyArray1<'py, u8>,
+    hide_readout: PyReadonlyArray1<'py, u8>,
+    n_measured: PyReadonlyArray1<'py, u32>,
+    k_enc: usize,
+    mode: String,
+    n_genes_total: i64,
+    target_sum: Option<f64>,
+    lib_size_redef: Option<bool>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mode = PreprocessMode::parse(&mode).map_err(loader_err_to_py)?;
+    let scalars = CollateScalars {
+        k_enc,
+        mode,
+        target_sum: target_sum.unwrap_or(1e4),
+        n_genes_total,
+        lib_size_redef: lib_size_redef.unwrap_or(false),
+    };
+    let err = |e| PyRuntimeError::new_err(format!("array not contiguous: {e}"));
+    let indptr = indptr.as_slice().map_err(err)?;
+    let indices = indices.as_slice().map_err(err)?;
+    let data = data.as_slice().map_err(err)?;
+    let set_offsets = set_offsets.as_slice().map_err(err)?;
+    let cell_indices_v = cell_indices.as_slice().map_err(err)?.to_vec();
+    let file_ids_v = file_ids.as_slice().map_err(err)?.to_vec();
+    let role_tags_v = role_tags.as_slice().map_err(err)?.to_vec();
+    let query = query_gene_ids.as_slice().map_err(err)?;
+    let encmask = enc_mask_positions.as_slice().map_err(err)?;
+    let hide = hide_readout.as_slice().map_err(err)?;
+    let nmeas = n_measured.as_slice().map_err(err)?;
+    let batch = py
+        .detach(|| {
+            crate::sparse_cellset::collate_gathered(
+                indptr,
+                indices,
+                data,
+                set_offsets,
+                cell_indices_v,
+                file_ids_v,
+                role_tags_v,
+                k_dec,
+                query,
+                encmask,
+                hide,
+                nmeas,
+                &scalars,
+            )
+        })
+        .map_err(loader_err_to_py)?;
+    collated_cellset_batch_to_dict(py, batch)
 }

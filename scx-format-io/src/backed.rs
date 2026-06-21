@@ -21,6 +21,19 @@ use crate::error::{Result, ScxError};
 use crate::reader::ScxReader;
 use crate::section::SectionType;
 
+/// Whether the scattered gather (`read_rows_with`) may decode touched rows
+/// directly from the Scx1 per-row sidecar (O(rows)) instead of decoding whole
+/// shards. On by default; set `SCX_SCATTER_SIDECAR=0` (or `false`) to force the
+/// legacy full-shard path — an A/B and rollback switch. Read once per process.
+fn scatter_sidecar_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SCX_SCATTER_SIDECAR")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // ShardEntryLite — internal per-shard row
 // ---------------------------------------------------------------------------
@@ -496,14 +509,16 @@ impl WeightedLruCache {
             }
         }
 
-        // Distinguish a same-key replacement from a true count-cap eviction.
-        // `LruCache::put` returns the displaced entry in both cases; only
-        // the latter should bump the eviction counter.
-        let was_replace = self.inner.contains(&key);
+        // Use `push`, not `put`: `LruCache::put` returns `Some` only on a
+        // same-key *replacement* and `None` when a new key evicts the LRU, so a
+        // count-cap eviction would go uncounted AND its bytes never subtracted
+        // (inflating `bytes_used` / `peak_bytes_in_cache`). `push` returns the
+        // displaced `(key, entry)` in BOTH cases; a returned key != the inserted
+        // key is a genuine eviction.
         let entry = CacheEntry { csr, bytes };
-        if let Some(displaced) = self.inner.put(key, entry) {
+        if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if !was_replace {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1325,18 +1340,22 @@ impl BackedCsrReader {
             rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         sorted_pairs.sort_by_key(|&(r, _)| r);
 
-        // Pre-decode cold shards in parallel before the per-shard gather.
-        // `shards_for_indices` silently drops out-of-range rows (vs. the
-        // in-loop `shard_for_row` below which raises) — that's the right
-        // behavior here: warm what's resolvable, defer the proper error
-        // to the gather loop so out-of-range error semantics are preserved.
-        let warm_rows: Vec<u64> = sorted_pairs.iter().map(|&(r, _)| r).collect();
-        let prewarm_shards = self.index.shards_for_indices(&warm_rows);
-        self.warm_shards(&prewarm_shards)?;
-
-        // Walk by shard. partition_point finds each shard's request
-        // sub-slice in O(log R) instead of the O(R) inner scan that
-        // `read_row_indices` does for every touched shard.
+        // Plan each shard's request group: sidecar (row-range) vs full-shard
+        // decode — same policy as the contiguous `read_rows` planner. Use the
+        // sidecar only when the shard isn't already decoded AND the requested
+        // rows are a small fraction of the shard (so O(rows) sidecar decode
+        // beats one full 16k-row shard decode). Scattered cell-set gather hits
+        // the sidecar path; sequential / cached reads keep the full-shard path.
+        //
+        // `shard_for_row` (not `shards_for_indices`) preserves the out-of-range
+        // error semantics. Planning before warming is what lets the `!cached`
+        // test mean something — we then warm ONLY the full-path shards, so
+        // sidecar-group shards stay undecoded and the row-range path is taken.
+        const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
+        // (start, end, shard_idx, s_start, use_sidecar)
+        let mut groups: Vec<(usize, usize, usize, u64, bool)> = Vec::new();
+        let mut full_shards: Vec<usize> = Vec::new();
+        let sidecar_on = scatter_sidecar_enabled();
         let mut start = 0;
         while start < sorted_pairs.len() {
             let row = sorted_pairs[start].0;
@@ -1358,23 +1377,145 @@ impl BackedCsrReader {
             let group_len = sorted_pairs[start..].partition_point(|&(r, _)| r < s_end);
             let end = start + group_len;
 
-            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
-
-            for &(row, orig_pos) in &sorted_pairs[start..end] {
-                let local = (row - s_start) as usize;
-                let lo = shard_csr.indptr[local] as usize;
-                let hi = shard_csr.indptr[local + 1] as usize;
-                scatter(
-                    orig_pos,
-                    &shard_csr.indices[lo..hi],
-                    &shard_csr.data[lo..hi],
-                )?;
+            let shard_rows = s_end - s_start;
+            let cached = self.shard_cache.contains(self.file_id, shard_idx);
+            // Interaction with the prefetch engine (worth knowing): under a
+            // plan-prefetch loader with `lookahead >= 1`, `PlanPrefetchIter`
+            // warms every touched shard (`read_shard_cached_arc`) *before* the
+            // gather runs, so `cached` is already true here and the sidecar
+            // O(rows) path is bypassed — the (byte-identical, already-decoded)
+            // full-shard slice is used instead. The sidecar therefore pays off
+            // mainly for `lookahead == 0`, cache-cold / cache-thrash paths, and
+            // non-prefetch callers (e.g. `Experiment::gather_rows_sparse`).
+            // Making the prefetch planner skip sidecar-eligible sparse groups
+            // (so the sidecar isn't negated by eager full-shard warms) is a
+            // deliberate follow-up, not done here.
+            let use_sidecar =
+                sidecar_on && !cached && (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
+            if !use_sidecar {
+                full_shards.push(shard_idx);
             }
-
+            groups.push((start, end, shard_idx, s_start, use_sidecar));
             start = end;
         }
 
+        // Pre-decode the cold full-path shards in parallel (no-op if all cached
+        // or if every group took the sidecar path).
+        self.warm_shards(&full_shards)?;
+
+        for (start, end, shard_idx, s_start, use_sidecar) in groups {
+            let group = &sorted_pairs[start..end];
+
+            let handled = if use_sidecar {
+                self.scatter_group_via_sidecar(shard_idx, s_start, group, &mut scatter)?
+            } else {
+                false
+            };
+
+            if !handled {
+                // Full-shard fallback: decode once (cached), slice each row.
+                let shard_csr = self.read_shard_cached_arc(shard_idx)?;
+                for &(row, orig_pos) in group {
+                    let local = (row - s_start) as usize;
+                    let lo = shard_csr.indptr[local] as usize;
+                    let hi = shard_csr.indptr[local + 1] as usize;
+                    scatter(
+                        orig_pos,
+                        &shard_csr.indices[lo..hi],
+                        &shard_csr.data[lo..hi],
+                    )?;
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Scatter one shard's request `group` (sorted `(row, orig_pos)` pairs all in
+    /// `shard_idx`, `s_start` = shard's global row offset) directly from the Scx1
+    /// decode sidecar, decoding only the rows touched — O(rows), not O(shard).
+    ///
+    /// Returns `Ok(false)` (having scattered NOTHING) when the shard has no fresh
+    /// Scx1 sidecar, so the caller falls back to a full-shard decode. To guarantee
+    /// the all-or-nothing contract, every consecutive-row run is decoded *before*
+    /// any `scatter` fires: sidecar freshness is shard-level, so the first run's
+    /// availability decides the whole shard, but collecting first means a `None`
+    /// from any run leaves the caller free to fall back without double-scattering.
+    /// Output is byte-identical to decoding the whole shard and slicing.
+    fn scatter_group_via_sidecar<F>(
+        &self,
+        shard_idx: usize,
+        s_start: u64,
+        group: &[(u64, usize)],
+        scatter: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
+        // Coalesce the sorted local rows into maximal runs of *consecutive*
+        // rows (extend while next local <= run_max + 1, which also absorbs
+        // duplicate requests), so gap rows are never decoded. Each run is
+        // (run_start_local, run_len).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_min = (group[0].0 - s_start) as usize;
+        let mut run_max = run_min;
+        for &(row, _) in &group[1..] {
+            let local = (row - s_start) as usize;
+            if local <= run_max + 1 {
+                run_max = run_max.max(local);
+            } else {
+                runs.push((run_min, run_max - run_min + 1));
+                run_min = local;
+                run_max = local;
+            }
+        }
+        runs.push((run_min, run_max - run_min + 1));
+
+        // Resolve the *real* catalog entry (name + checksum) once — `ShardEntryLite`
+        // drops both, but the sidecar lookup needs them; `(offset, section_type)`
+        // identifies the section uniquely.
+        let Some((offset, section_type)) = self
+            .shard_entry(shard_idx)
+            .map(|l| (l.offset, l.section_type))
+        else {
+            return Ok(false);
+        };
+        let Some(entry) = self.reader.full_entry_at_offset(offset, section_type) else {
+            return Ok(false);
+        };
+
+        // Decode every run in one call — the sidecar metadata / section / header
+        // are resolved ONCE per shard here (not once per run), which is what makes
+        // the scattered gather O(rows) rather than O(runs × shard-rows). `None` ⇒
+        // no fresh Scx1 sidecar ⇒ caller falls back, nothing scattered yet.
+        let decoded = match self.reader.decode_scx1_row_runs(entry, &runs)? {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+
+        // Scatter each requested row from its run's CSR triplet (indptr, indices,
+        // data), in original request order via `orig_pos`. `group` is sorted by
+        // row, matching `runs`/`decoded` order.
+        let mut gi = 0usize;
+        for (&(run_start, _run_len), (indptr, indices, data)) in runs.iter().zip(&decoded) {
+            while gi < group.len() {
+                let (row, orig_pos) = group[gi];
+                let in_run = (row - s_start) as usize - run_start;
+                if in_run >= indptr.len() - 1 {
+                    break; // row belongs to the next run
+                }
+                let lo = indptr[in_run] as usize;
+                let hi = indptr[in_run + 1] as usize;
+                scatter(orig_pos, &indices[lo..hi], &data[lo..hi])?;
+                gi += 1;
+            }
+        }
+        // Every requested row of this shard must have been scattered exactly
+        // once; a shortfall would mean a planner/coalescing regression (e.g. a
+        // run boundary that skips rows). Debug-only — release relies on the
+        // byte-identical parity tests.
+        debug_assert_eq!(gi, group.len(), "sidecar scatter left rows unscattered");
+        Ok(true)
     }
 
     /// Read all rows — materializes the full matrix.
@@ -2447,9 +2588,11 @@ impl CscCache {
     }
 
     fn put(&mut self, key: usize, value: Arc<ScxCsc>) {
-        let was_replace = self.inner.contains(&key);
-        if let Some(_displaced) = self.inner.put(key, value) {
-            if !was_replace {
+        // `push` (not `put`) so a count-cap eviction is counted: `put` returns
+        // `None` when a new key evicts the LRU, so the eviction would be missed.
+        // A returned key != the inserted key is a genuine eviction.
+        if let Some((evicted_key, _displaced)) = self.inner.push(key, value) {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }
@@ -2874,11 +3017,14 @@ impl DenseLruCache {
                 break;
             }
         }
-        let was_replace = self.inner.contains(&key);
+        // `push` (not `put`): see `WeightedLruCache::put_with_budget` — `put`
+        // returns `None` on a count-cap eviction, so the eviction would go
+        // uncounted and its bytes never subtracted. `push` returns the displaced
+        // entry; a returned key != the inserted key is a genuine eviction.
         let entry = DenseCacheEntry { shard, bytes };
-        if let Some(displaced) = self.inner.put(key, entry) {
+        if let Some((evicted_key, displaced)) = self.inner.push(key, entry) {
             self.bytes_used = self.bytes_used.saturating_sub(displaced.bytes);
-            if !was_replace {
+            if evicted_key != key {
                 if let Some(m) = &self.metrics {
                     m.evictions.fetch_add(1, Ordering::Relaxed);
                 }

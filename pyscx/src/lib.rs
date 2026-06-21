@@ -960,6 +960,9 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(preprocess::preprocess, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess::save_layer, m)?)?;
 
+    // Native cell-set collation (state3 "3A hybrid")
+    m.add_function(wrap_pyfunction!(scx_loader::collate_cellset_gathered, m)?)?;
+
     // File operations (scx-ops)
     register_ops(m)?;
 

@@ -232,6 +232,134 @@ fn read_rows_sidecar_row_range_matches_full_decode() {
     assert_eq!(full.data, ev);
 }
 
+/// G2: the *scattered* gather (`read_rows_with`, the path SparseCellSetDataset
+/// uses) must produce byte-identical rows whether it decodes via the Scx1
+/// sidecar (O(rows)) or the full-shard fallback, and must actually take the
+/// sidecar path for sparse cold groups.
+#[test]
+fn read_rows_with_sidecar_matches_full_decode() {
+    let dir = TempDir::new().unwrap();
+    let rows_per_shard = 32usize;
+    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+    // Gather scattered rows into a dense buffer keyed by request position.
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
+        for (i, &row) in rows.iter().enumerate() {
+            let (_ip, eix, ev) =
+                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
+            assert_eq!(out[i].0, eix, "indices row {row}");
+            assert_eq!(out[i].1, ev, "data row {row}");
+        }
+    };
+
+    // Sparse group across both shards with consecutive runs ([5,6], [40,41])
+    // and singletons ([2],[63]) + a duplicate request (5). Per-shard group
+    // size (≤4) << shard_rows/4 = 8 ⇒ sidecar path. Runs: shard0 {2},{5,6};
+    // shard1 {8,9},{31} ⇒ 4 row-range decodes.
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let out = gather(&backed, &sparse_rows);
+    assert_matches(&out, &sparse_rows);
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            backed
+                .reader
+                .debug_counts()
+                .decode_scx1_row_range
+                .load(Ordering::Relaxed),
+            4,
+            "sparse scattered group must take the sidecar row-range path (4 runs)",
+        );
+    }
+
+    // Dense group (≥8 rows/shard ⇒ k*4 ≥ shard_rows) takes the full-shard
+    // fallback; a fresh reader keeps the counter clean. Same byte-identical rows.
+    let backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    let out2 = gather(&backed2, &dense_rows);
+    assert_matches(&out2, &dense_rows);
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            backed2
+                .reader
+                .debug_counts()
+                .decode_scx1_row_range
+                .load(Ordering::Relaxed),
+            0,
+            "dense group must take the full-shard fallback, not the sidecar path",
+        );
+    }
+}
+
+/// Lever S: the per-shard Scx1 sidecar metadata is
+/// parsed once and reused across batches. Repeatedly gathering sparse groups
+/// from the same shard takes the sidecar path each time (so the rows are still
+/// correct) yet parses the metadata only once *per distinct shard* — proof the
+/// cache eliminates the per-batch O(shard-rows) BLAKE3 + clone reparse.
+#[test]
+fn sidecar_metadata_cached_across_batches() {
+    let dir = TempDir::new().unwrap();
+    let rows_per_shard = 32usize;
+    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
+        for (i, &row) in rows.iter().enumerate() {
+            let (_ip, eix, ev) =
+                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
+            assert_eq!(out[i].0, eix, "indices row {row}");
+            assert_eq!(out[i].1, ev, "data row {row}");
+        }
+    };
+
+    // Three "batches", all sparse sidecar groups (group*4 < shard_rows=32):
+    // b1, b2 touch shard 0; b3 touches shard 1. One reader (cache persists).
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let batches: [&[u64]; 3] = [&[2, 5, 6], &[3, 7], &[40, 41]];
+    for b in batches {
+        let out = gather(&backed, b);
+        assert_matches(&out, b);
+    }
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::Ordering;
+        let dc = backed.reader.debug_counts();
+        assert!(
+            dc.decode_scx1_row_range.load(Ordering::Relaxed) >= 3,
+            "all three sparse batches must take the sidecar row-range path",
+        );
+        assert_eq!(
+            dc.sidecar_meta_parse.load(Ordering::Relaxed),
+            2,
+            "metadata parsed once per distinct shard (shard 0 reused across b1/b2), not per batch",
+        );
+    }
+}
+
 #[test]
 fn shard_source_read_shard_arc_serves_cache_hits() {
     use crate::shard_source::ShardSource;
@@ -870,6 +998,36 @@ fn test_cache_eviction() {
     assert_eq!(result.indptr, expected.indptr);
     assert_eq!(result.indices, expected.indices);
     assert_eq!(result.data, expected.data);
+}
+
+#[test]
+fn cache_metrics_count_eviction_and_peak() {
+    // Regression for the count-cap eviction undercount (CACHE-CULM-BUG): a new
+    // key that evicts the LRU is returned by `push` (not `put`, which yields
+    // `None`), so `evictions` must increment and `peak_bytes_in_cache` must be
+    // the resident high-water mark — NOT the cumulative `bytes_inserted`.
+    let dir = tempfile::tempdir().unwrap();
+    // 4 shards, cache holds 2 → touching all 4 forces 2 count-cap evictions.
+    let (mut backed, _full) = write_test_file_and_open(&dir, 12, 10, 4, 2);
+    let m = backed.enable_metrics();
+    for (a, b) in [(0u64, 3u64), (3, 6), (6, 9), (9, 12)] {
+        let _ = backed.read_rows(a, b).unwrap();
+    }
+    use std::sync::atomic::Ordering;
+    assert_eq!(m.misses.load(Ordering::Relaxed), 4, "4 cold shards decoded");
+    assert_eq!(
+        m.evictions.load(Ordering::Relaxed),
+        2,
+        "4 inserts into a cap-2 cache ⇒ 2 count-cap evictions",
+    );
+    let inserted = m.bytes_inserted.load(Ordering::Relaxed);
+    let peak = m.peak_bytes_in_cache.load(Ordering::Relaxed);
+    assert!(inserted > 0 && peak > 0);
+    assert!(
+        peak < inserted,
+        "peak (resident high-water, ~2 shards) must be < cumulative bytes_inserted \
+         (~4 shards); got peak={peak} inserted={inserted}",
+    );
 }
 
 // -----------------------------------------------------------------------

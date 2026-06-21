@@ -293,6 +293,83 @@ fn run_one(
 }
 
 #[test]
+fn collate_gathered_emits_stacked_tensors_matching_kernel() {
+    use crate::sparse_cellset_collate::PreprocessMode;
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_fixture(&p0, 32, 8, 4); // row r: col r%8, val (r+1)&0xFF
+                                  // Identity remap (local g → global g) so gather emits global CSR.
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        8,
+        usize::MAX,
+        4,
+        Some(vec![(0..8).collect::<Vec<i32>>()]),
+        Some(8),
+        false,
+        false,
+        0.0,
+    )
+    .unwrap();
+
+    // Gather one set, two cells: row 2 (col2,val3), row 5 (col5,val6) → global CSR,
+    // then collate it (the state3 flow: Python gathers, then collate_gathered).
+    let g = loader
+        .iter_with_plans(
+            vec![Ok(SparseCellSetPlan {
+                file_ids: vec![0, 0],
+                rows: vec![2, 5],
+                role_tags: vec![0, 0],
+                set_offsets: vec![0, 2],
+            })]
+            .into_iter(),
+            4,
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+
+    let scalars = CollateScalars {
+        k_enc: 4,
+        mode: PreprocessMode::Log1pRaw,
+        target_sum: 1e4,
+        n_genes_total: 8,
+        lib_size_redef: false,
+    };
+    let b = collate_gathered(
+        &g.indptr,
+        &g.indices,
+        &g.data,
+        &g.set_offsets,
+        g.cell_indices,
+        g.file_ids,
+        g.role_tags,
+        /*k_dec*/ 4,
+        &[2, 5, 7, 0], // query (shared across the set)
+        &[],           // enc_mask_positions: pert-style (no encoder masking)
+        &[0, 0],       // hide_readout
+        &[8],          // n_measured
+        &scalars,
+    )
+    .unwrap();
+
+    assert_eq!(b.n_rows, 2);
+    assert_eq!((b.k_enc, b.k_dec), (4, 4));
+    assert_eq!(b.encoder_gene_ids.len(), 2 * 4);
+    assert_eq!(b.target_counts.len(), 2 * 4);
+    // cell 0 (row2): gene2 val3. encoder slot0 = gene2, rest PAD(=9).
+    assert_eq!(&b.encoder_gene_ids[0..4], &[2, 9, 9, 9]);
+    assert!((b.encoder_counts[0] - 3.0f32.ln_1p()).abs() < 1e-6);
+    // target gather over query [2,5,7,0]: cell0 has gene2=3 → [3,0,0,0].
+    assert_eq!(&b.target_counts[0..4], &[3.0, 0.0, 0.0, 0.0]);
+    assert_eq!(b.library_size[0], 3.0);
+    // cell 1 (row5): gene5 val6 → query position 1.
+    assert_eq!(&b.encoder_gene_ids[4..8], &[5, 9, 9, 9]);
+    assert_eq!(&b.target_counts[4..8], &[0.0, 6.0, 0.0, 0.0]);
+    assert_eq!(b.library_size[1], 6.0);
+}
+
+#[test]
 fn malformed_plan_file_id_out_of_range_returns_error_not_panic() {
     let dir = tempfile::tempdir().unwrap();
     let loader = malformed_plan_loader(dir.path());

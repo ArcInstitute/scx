@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 #[cfg(debug_assertions)]
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
+use lru::LruCache;
 use memmap2::Mmap;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_sparse::{ScxCsc, ScxCsr};
@@ -58,6 +60,12 @@ pub struct ReaderDebugCounts {
     /// prove the row-range fast path was taken rather than silently falling
     /// back to a full-shard decode.
     pub decode_scx1_row_range: AtomicU64,
+    /// Number of times the per-shard Scx1 sidecar metadata was actually parsed
+    /// (sidecar read + `to_scx1_metadata`) rather than served from
+    /// `sidecar_meta_cache` (lever S). Tests assert this stays at 1 across
+    /// repeated touches of one shard to prove the cache eliminates the
+    /// per-batch O(shard-rows) reparse.
+    pub sidecar_meta_parse: AtomicU64,
     pub read_layer: AtomicU64,
     pub read_layer_for: AtomicU64,
     pub read_obsm: AtomicU64,
@@ -90,7 +98,25 @@ pub struct ScxReader {
     /// `debug_counts()` accessor is stable across build profiles, but the
     /// increment sites are `cfg(debug_assertions)`-gated.
     debug_counts: ReaderDebugCounts,
+    /// Per-shard Scx1 decode-sidecar metadata cache (lever S). Keyed by the
+    /// CSR shard's `entry.offset`
+    /// (unique per shard — see [`Self::full_entry_at_offset`]) → the parsed
+    /// [`scx_codec::Scx1DecodeMetadata`]. The scattered cell-set gather touches
+    /// one shard with many small runs across many batches; without this every
+    /// touch re-ran [`DecodeSidecar::read_from`] (BLAKE3 over the whole sidecar)
+    /// and `to_scx1_metadata()` (a second O(shard-rows) clone). Memoizing the
+    /// parsed metadata makes those O(rows) — byte-identical, since the sidecar
+    /// is a deterministic function of the read-only mmap bytes. `Mutex` gives
+    /// interior mutability (mirrors the `SharedShardCache` Mutex in `backed.rs`);
+    /// per-instance, so fork-safe; bounded LRU so a many-shard file stays
+    /// memory-capped.
+    sidecar_meta_cache: Mutex<LruCache<u64, Arc<scx_codec::Scx1DecodeMetadata>>>,
 }
+
+/// Bound on the per-reader sidecar-metadata LRU (lever S). Parsed metadata is
+/// ~0.3–0.5 MB per 16k-row shard, so this caps the cache near ~0.5 GB worst
+/// case; a per-file reader rarely holds more than a few dozen shards.
+const SIDECAR_META_CACHE_CAP: usize = 1024;
 
 impl ScxReader {
     /// Open an SCX file for reading.
@@ -231,6 +257,9 @@ impl ScxReader {
             full_catalog: Arc::new(full_catalog),
             modality_table,
             debug_counts: ReaderDebugCounts::default(),
+            sidecar_meta_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SIDECAR_META_CACHE_CAP).unwrap(),
+            )),
         })
     }
 
@@ -343,6 +372,9 @@ impl ScxReader {
             full_catalog: catalog,
             modality_table,
             debug_counts: ReaderDebugCounts::default(),
+            sidecar_meta_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(SIDECAR_META_CACHE_CAP).unwrap(),
+            )),
         })
     }
 
@@ -3544,6 +3576,37 @@ impl ScxReader {
             .map(|sidecar| sidecar.to_scx1_metadata()))
     }
 
+    /// Memoized [`Self::scx1_metadata_for`] keyed by `entry.offset` (lever S).
+    /// Returns a shared `Arc` so the parsed metadata
+    /// is resolved once per shard and reused across the many row-range decodes
+    /// of the scattered cell-set gather, instead of re-running the sidecar
+    /// read (BLAKE3) + `to_scx1_metadata` (O(shard-rows) clone) every call.
+    /// `None` (no fresh Scx1 sidecar) behaves exactly as the uncached path.
+    /// Byte-identical: the metadata is a pure function of the read-only bytes.
+    fn scx1_metadata_cached(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<Option<Arc<scx_codec::Scx1DecodeMetadata>>> {
+        if let Some(meta) = self.sidecar_meta_cache.lock().unwrap().get(&entry.offset) {
+            return Ok(Some(Arc::clone(meta)));
+        }
+        let Some(sidecar) = self.scx1_sidecar_for(entry)? else {
+            return Ok(None);
+        };
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .sidecar_meta_parse
+            .fetch_add(1, Ordering::Relaxed);
+        let meta = Arc::new(sidecar.to_scx1_metadata());
+        // A racing peer may have inserted/parsed the same shard meanwhile; `put`
+        // is idempotent (same deterministic bytes), so overwrite is harmless.
+        self.sidecar_meta_cache
+            .lock()
+            .unwrap()
+            .put(entry.offset, Arc::clone(&meta));
+        Ok(Some(meta))
+    }
+
     /// Slice a shard section's three encoded streams into an `EncodedShardRef`
     /// using the `ShardHeader` relative offsets (mirrors the slicing in
     /// `validate_decode_sidecar_entry`).
@@ -3582,7 +3645,7 @@ impl ScxReader {
         row_start: usize,
         n_rows: usize,
     ) -> Result<Option<scx_codec::ScipyShard>> {
-        let Some(sidecar) = self.scx1_sidecar_for(entry)? else {
+        let Some(meta) = self.scx1_metadata_cached(entry)? else {
             return Ok(None);
         };
         let section = self.section_bytes(entry)?;
@@ -3590,16 +3653,10 @@ impl ScxReader {
         let venc = ValueEncoding::from_u8(header.value_encoding)
             .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
         let encoded = Self::encoded_ref_from_section(section, &header, &entry.name)?;
-        let decoded = scx_codec::decode_scx1_row_range(
-            &encoded,
-            venc,
-            &sidecar.to_scx1_metadata(),
-            row_start,
-            n_rows,
-        )
-        .map_err(|e| {
-            ScxError::InvalidCatalog(format!("sidecar row-range decode of {}: {e}", entry.name))
-        })?;
+        let decoded = scx_codec::decode_scx1_row_range(&encoded, venc, &meta, row_start, n_rows)
+            .map_err(|e| {
+                ScxError::InvalidCatalog(format!("sidecar row-range decode of {}: {e}", entry.name))
+            })?;
         let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
             ScxError::InvalidCatalog(format!("sidecar row-range convert of {}: {e}", entry.name))
         })?;
@@ -3608,6 +3665,54 @@ impl ScxReader {
             .decode_scx1_row_range
             .fetch_add(1, Ordering::Relaxed);
         Ok(Some(scipy))
+    }
+
+    /// Decode several contiguous row `runs` (`(row_start, n_rows)`) of one CSR
+    /// shard `entry` via its decode sidecar, resolving the sidecar metadata,
+    /// section bytes, header, and encoded streams **once** for the whole shard
+    /// (vs once per run in [`Self::decode_scx1_row_range`]). This is the hot
+    /// path for the scattered cell-set gather, where a single shard is touched
+    /// by many small runs in one batch — repeating the O(shard-rows) sidecar
+    /// metadata deserialization per run dominated the gather (~3 ms/cell).
+    /// Returns `Ok(None)` (no fresh Scx1 sidecar)
+    /// so the caller falls back to a full-shard decode; each run's result is
+    /// byte-identical to that fallback's matching slice.
+    pub fn decode_scx1_row_runs(
+        &self,
+        entry: &FullCatalogEntry,
+        runs: &[(usize, usize)],
+    ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
+        let Some(meta) = self.scx1_metadata_cached(entry)? else {
+            return Ok(None);
+        };
+        let section = self.section_bytes(entry)?;
+        let header = self.read_shard_header(entry)?;
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let encoded = Self::encoded_ref_from_section(section, &header, &entry.name)?;
+        let mut out = Vec::with_capacity(runs.len());
+        for &(row_start, n_rows) in runs {
+            let decoded =
+                scx_codec::decode_scx1_row_range(&encoded, venc, &meta, row_start, n_rows)
+                    .map_err(|e| {
+                        ScxError::InvalidCatalog(format!(
+                            "sidecar row-range decode of {}: {e}",
+                            entry.name
+                        ))
+                    })?;
+            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "sidecar row-range convert of {}: {e}",
+                    entry.name
+                ))
+            })?;
+            out.push(scipy);
+            #[cfg(debug_assertions)]
+            self.debug_counts
+                .decode_scx1_row_range
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Some(out))
     }
 
     fn read_shard_from_entry_inner(
