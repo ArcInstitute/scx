@@ -42,6 +42,103 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
     }
 }
 
+/// A messy CSR `/X` (unsorted column indices, a duplicate `(row,col)`, and an
+/// explicit zero) must be canonicalized — sorted + summed + zero-dropped — on
+/// the eager ingest path, matching the CSC/raw/dense branches. Before the fix
+/// the CSR branch only dropped explicit zeros and passed unsorted/duplicate
+/// indices straight through, producing a non-canonical SCX file.
+#[test]
+fn test_eager_csr_canonicalizes_messy_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("messy_csr.h5ad");
+    let scx_path = dir.path().join("messy_csr.scx");
+
+    let n_obs = 2usize;
+    let n_vars = 4usize;
+    // Row 0: cols [2, 0, 2] vals [5, 3, 7] — unsorted + duplicate col 2.
+    // Row 1: cols [1, 3] vals [0, 4] — explicit zero at col 1.
+    let indptr = vec![0i64, 3, 5];
+    let indices = vec![2i32, 0, 2, 1, 3];
+    let data = vec![5.0f32, 3.0, 7.0, 0.0, 4.0];
+
+    {
+        let file = hdf5::File::create(&h5ad_path).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([n_obs])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+
+        let var = file.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    // Row 0 sorted with col 2 summed (5+7=12); row 1 explicit zero dropped.
+    assert_eq!(csr.indptr, vec![0i64, 2, 3], "indptr not canonical");
+    assert_eq!(csr.indices, vec![0i32, 2, 3], "indices not sorted/deduped");
+    assert_eq!(
+        csr.data,
+        vec![3.0f32, 12.0, 4.0],
+        "duplicate not summed / zero not dropped"
+    );
+}
+
 /// `adata.raw` (its own, wider var axis) round-trips h5ad → scx → h5ad
 /// through both the eager and streaming convert paths.
 #[test]
