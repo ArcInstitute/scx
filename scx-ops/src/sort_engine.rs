@@ -93,8 +93,9 @@ use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_value;
 use crate::sort::{
-    partition_target_rows, rebuild_obs_predicate_index_streaming, sort_provenance_entry,
-    stable_argsort, SortKeyExtractor, SortOptions, SortStrategy, SortSummary,
+    cap_spill_partitions, partition_target_rows, rebuild_obs_predicate_index_streaming,
+    sort_provenance_entry, stable_argsort, SortKeyExtractor, SortOptions, SortStrategy,
+    SortSummary,
 };
 
 /// K-pass is only considered for a single categorical key with at most this
@@ -441,11 +442,11 @@ pub fn sort_with_strategy(
                 density,
                 opts.shard_target_rows,
             );
+            let per_row = (n_vars as f64 * density * 16.0).max(1.0) as u64;
             // Refuse if a single output shard's rows cannot fit the budget
             // (T4.7 — no silent cap).
             if let Some(budget) = opts.memory_budget {
-                let per_shard =
-                    (opts.shard_target_rows as f64 * n_vars as f64 * density * 16.0) as u64;
+                let per_shard = per_row.saturating_mul(opts.shard_target_rows.max(1) as u64);
                 if per_shard > budget {
                     return Err(OpsError::InvalidInput(format!(
                         "scx sort: --memory-budget {budget} too small for one output shard \
@@ -454,6 +455,10 @@ pub fn sort_with_strategy(
                     )));
                 }
             }
+            // Cap simultaneously-open spill files (EMFILE) and re-validate that a
+            // widened partition — which pass 2 loads whole into RAM — still fits
+            // the budget (the per-shard guard above only bounds one output shard).
+            let (p, _n_parts) = cap_spill_partitions(p, n_live, per_row, opts.memory_budget)?;
             let (sb, np) = emit_x_external(
                 &reader,
                 &mut writer,
@@ -1177,16 +1182,10 @@ fn emit_x_external(
     n_live: usize,
     temp_dir: Option<&Path>,
 ) -> Result<(u64, usize)> {
-    let mut p = p.max(1);
-    let mut n_parts = n_live.div_ceil(p);
-    // Pass 1 opens one spill file per partition simultaneously; cap the count so
-    // an atlas-scale `n_live` with a small `p` cannot exhaust file descriptors
-    // (EMFILE). Widening `p` keeps each partition ≈ one budget's worth of rows.
-    const MAX_PARTITIONS: usize = 512;
-    if n_parts > MAX_PARTITIONS {
-        p = n_live.div_ceil(MAX_PARTITIONS);
-        n_parts = n_live.div_ceil(p);
-    }
+    // Partition sizing + the EMFILE cap and budget re-validation are owned by the
+    // caller (`cap_spill_partitions`); `p` arrives already widened.
+    let p = p.max(1);
+    let n_parts = n_live.div_ceil(p);
     let spill = SpillDir::create(temp_dir)?;
 
     // ----- Pass 1: scatter decoded rows to per-partition spill files -----
@@ -1775,14 +1774,11 @@ fn prepare_obs_spill(
         )));
     }
 
-    let mut p = obs_partition_rows(budget, bytes_per_row, opts.shard_target_rows);
-    let mut n_parts = n_live.div_ceil(p);
-    // Cap simultaneously-open spill files (EMFILE), widening partitions to fit.
-    const MAX_PARTITIONS: usize = 512;
-    if n_parts > MAX_PARTITIONS {
-        p = n_live.div_ceil(MAX_PARTITIONS);
-        n_parts = n_live.div_ceil(p);
-    }
+    // Cap simultaneously-open spill files (EMFILE), widening partitions to fit,
+    // and re-validate that a widened partition — which pass 2 loads whole into
+    // RAM — still fits the budget (the per-shard guard above bounds one shard).
+    let p0 = obs_partition_rows(budget, bytes_per_row, opts.shard_target_rows);
+    let (p, n_parts) = cap_spill_partitions(p0, n_live, bytes_per_row, Some(budget))?;
 
     let (spill_schema, out_schema, categorical) = obs_spill_schemas(&s0.schema())?;
     let spill = SpillDir::create(opts.temp_dir.as_deref())?;
