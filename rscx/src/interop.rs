@@ -572,6 +572,15 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
             dim.len()
         )));
     }
+    // A host-built S4 object can carry a negative @Dim; `as usize` would wrap it
+    // to a huge value and turn the loop bounds below into an OOB index panic
+    // (an uncatchable R-session abort across the FFI boundary).
+    if dim[0] < 0 || dim[1] < 0 {
+        return Err(Error::Other(format!(
+            "Dim has a negative extent: [{}, {}]",
+            dim[0], dim[1]
+        )));
+    }
     let n_rows = dim[0] as usize; // genes in Seurat/SCE (becomes cells after transpose)
     let n_cols = dim[1] as usize; // cells in Seurat/SCE (becomes genes after transpose)
 
@@ -597,6 +606,61 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
         .to_vec();
 
     let nnz = csc_values.len();
+
+    // Validate the remaining dgCMatrix slots before they are used as loop
+    // bounds / indices below. These come from an arbitrary (possibly
+    // host-built) S4 object, so a malformed slot must surface as a catchable
+    // `Error` rather than an unchecked index panic that aborts the R session.
+    // Mirrors the `@p`-length guard in `accel.rs`, extended to monotonicity,
+    // terminal value, and `@i` bounds.
+    if csc_indptr.len() != n_cols + 1 {
+        return Err(Error::Other(format!(
+            "@p length {} != n_cols + 1 ({})",
+            csc_indptr.len(),
+            n_cols + 1
+        )));
+    }
+    if csc_indices.len() != nnz {
+        return Err(Error::Other(format!(
+            "@i length {} != @x length ({})",
+            csc_indices.len(),
+            nnz
+        )));
+    }
+    if csc_indptr[0] != 0 {
+        return Err(Error::Other(format!(
+            "@p[0] = {}, expected 0",
+            csc_indptr[0]
+        )));
+    }
+    // @p must be monotonically non-decreasing (so `end - start` never
+    // underflows) and terminate at nnz.
+    for j in 0..n_cols {
+        if csc_indptr[j + 1] < csc_indptr[j] {
+            return Err(Error::Other(format!(
+                "@p not monotonic: @p[{}] = {} < @p[{}] = {}",
+                j + 1,
+                csc_indptr[j + 1],
+                j,
+                csc_indptr[j]
+            )));
+        }
+    }
+    if csc_indptr[n_cols] as usize != nnz {
+        return Err(Error::Other(format!(
+            "@p[{}] = {} != @x length ({})",
+            n_cols, csc_indptr[n_cols], nnz
+        )));
+    }
+    // @i holds 0-based row (gene) indices; each must fall within [0, n_rows).
+    for &gi in &csc_indices {
+        if gi < 0 || gi as usize >= n_rows {
+            return Err(Error::Other(format!(
+                "@i value {} out of range [0, {})",
+                gi, n_rows
+            )));
+        }
+    }
 
     // Transpose CSC (genes × cells) → CSR (cells × genes)
     // In the transposed layout: rows = cells (n_cols), cols = genes (n_rows)
