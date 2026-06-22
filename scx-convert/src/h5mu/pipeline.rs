@@ -802,6 +802,64 @@ fn sample_modality_values(
     }
 }
 
+/// Shard a modality's in-memory CSR (`indptr`/`indices`/`data`) by row and
+/// emit each shard via `write_shard`, which receives the shard's 0-based index,
+/// global `row_start`, and the rebased shard arrays (indptr `u64`, indices
+/// `u32`, raw value bytes).
+///
+/// Per-shard validate + rebase + index-narrow go through the shared
+/// `scx_sparse` helpers (`shard_nnz_bounds` + `rebase_csr_shard`), matching the
+/// eager `pipeline.rs` and streaming `h5ad/stream.rs` ingest paths. This also
+/// runs the `indices < n_vars` column-bound check (via `validate_csr_arrays`)
+/// that the previously hand-rolled h5mu loops skipped.
+#[allow(clippy::too_many_arguments)]
+fn shard_modality_csr<F>(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    shard_target_rows: usize,
+    value_encoding: ValueEncoding,
+    mut write_shard: F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(u32, u64, &[u64], &[u32], &[u8]) -> Result<(), ConvertError>,
+{
+    let backing_len = indices.len().min(data.len());
+    let mut row_start: usize = 0;
+    let mut shard_idx: u32 = 0;
+    while row_start < n_obs {
+        let row_end = (row_start + shard_target_rows).min(n_obs);
+
+        let shard_indptr_slice = &indptr[row_start..=row_end];
+        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(shard_indptr_slice, backing_len)
+            .map_err(|e| {
+                ConvertError::Other(format!("modality CSR shard validation failed: {e}"))
+            })?;
+        let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
+            shard_indptr_slice,
+            &indices[nnz_start..nnz_end],
+            n_vars as u64,
+        )
+        .map_err(|e| ConvertError::Other(format!("modality CSR shard validation failed: {e}")))?;
+        let raw_values = values_to_raw_bytes(&data[nnz_start..nnz_end], value_encoding)
+            .map_err(ScxError::from)?;
+
+        write_shard(
+            shard_idx,
+            row_start as u64,
+            &shard_indptr,
+            &shard_indices,
+            &raw_values,
+        )?;
+
+        row_start = row_end;
+        shard_idx += 1;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_modality_csr_shards(
     writer: &mut ScxWriter,
@@ -810,63 +868,33 @@ fn write_modality_csr_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
 ) -> Result<(), ConvertError> {
-    let mut row_start: usize = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
-        })?;
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
-
-        writer
-            .write_csr_shard_for(
-                modality_id,
-                &shard_indptr,
-                &shard_indices,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                row_start as u64,
-            )
-            .map_err(ConvertError::from)?;
-
-        row_start = row_end;
-    }
-    Ok(())
+    shard_modality_csr(
+        indptr,
+        indices,
+        data,
+        n_obs,
+        n_vars,
+        shard_target_rows,
+        value_encoding,
+        |_shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            writer
+                .write_csr_shard_for(
+                    modality_id,
+                    shard_indptr,
+                    shard_indices,
+                    raw_values,
+                    codec_id,
+                    value_encoding,
+                    row_start,
+                )
+                .map_err(ConvertError::from)
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -914,65 +942,33 @@ fn write_modality_layer_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
 ) -> Result<(), ConvertError> {
-    let mut row_start: usize = 0;
-    let mut shard_idx: u32 = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
-        })?;
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
-
-        writer
-            .write_layer_csr_shard_for(
-                modality_id,
-                layer_name,
-                shard_idx,
-                &shard_indptr,
-                &shard_indices,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                row_start as u64,
-            )
-            .map_err(ConvertError::from)?;
-
-        row_start = row_end;
-        shard_idx += 1;
-    }
-    Ok(())
+    shard_modality_csr(
+        indptr,
+        indices,
+        data,
+        n_obs,
+        n_vars,
+        shard_target_rows,
+        value_encoding,
+        |shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            writer
+                .write_layer_csr_shard_for(
+                    modality_id,
+                    layer_name,
+                    shard_idx,
+                    shard_indptr,
+                    shard_indices,
+                    raw_values,
+                    codec_id,
+                    value_encoding,
+                    row_start,
+                )
+                .map_err(ConvertError::from)
+        },
+    )
 }
