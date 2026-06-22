@@ -590,7 +590,9 @@ pub fn merge_with_options(
         let mut layer_encs: Vec<ValueEncoding> = Vec::new();
         for reader in &readers {
             for entry in reader.catalog().entries.iter().filter(|e| {
-                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
+                e.section_type == SectionType::LayerCsrShard
+                    && e.modality_id == 0
+                    && e.name.starts_with(&layer_prefix)
             }) {
                 let sh = reader.read_shard_header(entry)?;
                 layer_encs.push(

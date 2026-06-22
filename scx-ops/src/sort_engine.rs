@@ -442,11 +442,17 @@ pub fn sort_with_strategy(
                 density,
                 opts.shard_target_rows,
             );
-            let per_row = (n_vars as f64 * density * 16.0).max(1.0) as u64;
+            // Per-row decoded footprint (CSR ≈ 16 B/nnz, matching
+            // `partition_target_rows`). `ceil` so a fractional estimate on sparse
+            // data never *undercounts* the partition footprint the budget guard
+            // re-validates after widening.
+            let per_row = (n_vars as f64 * density * 16.0).max(1.0).ceil() as u64;
             // Refuse if a single output shard's rows cannot fit the budget
-            // (T4.7 — no silent cap).
+            // (T4.7 — no silent cap). Kept in f64 until after multiplying so the
+            // fractional per-row estimate is not truncated before scaling.
             if let Some(budget) = opts.memory_budget {
-                let per_shard = per_row.saturating_mul(opts.shard_target_rows.max(1) as u64);
+                let per_shard =
+                    (opts.shard_target_rows.max(1) as f64 * n_vars as f64 * density * 16.0) as u64;
                 if per_shard > budget {
                     return Err(OpsError::InvalidInput(format!(
                         "scx sort: --memory-budget {budget} too small for one output shard \
@@ -1509,9 +1515,10 @@ fn scatter_obs_to_spill(
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
-    // Opens `n_parts` spill files at once. The caller caps `n_parts` at 512
-    // (MAX_PARTITIONS) so this stays well under a typical `ulimit -n` (1024+);
-    // the X external path uses the same bound.
+    // Opens `n_parts` spill files at once. The caller caps `n_parts` via
+    // `cap_spill_partitions` (`MAX_SPILL_PARTITIONS` in `sort.rs`) so this stays
+    // well under a typical `ulimit -n` (1024+); the X external path uses the
+    // same bound.
     let mut writers: Vec<arrow::ipc::writer::StreamWriter<BufWriter<File>>> = (0..n_parts)
         .map(|i| {
             let f = BufWriter::new(File::create(spill.partition_file(i))?);

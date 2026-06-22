@@ -826,6 +826,63 @@ fn test_data_integrity_after_compact() {
     );
 }
 
+/// Regression (MED — compact.rs same bug class as merge layer encoding):
+/// compact sampled the X / layer `value_encoding` from the first shard only,
+/// then re-encoded every row with it. A file with mixed per-shard encodings
+/// (as `scx merge` concat and `scx append` legitimately produce) aborted with
+/// `ValueOutOfRange` when a later shard was wider. The encoding is now widened
+/// across all shards, so compact succeeds and the wide value round-trips.
+#[test]
+fn test_compact_widens_value_encoding_across_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed_enc.scx");
+    let n_vars = 10usize;
+    let header = sample_header(4, n_vars as u64);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    w.write_obs(&sample_obs(4)).unwrap();
+    w.write_var(&sample_var(n_vars)).unwrap();
+
+    let ip = vec![0u64, 1, 2];
+    let ix = vec![0u32, 1];
+    // Shard 0 (rows 0-1): Uint8.
+    let mut v0 = Vec::new();
+    scx_ops::helpers::encode_value(&mut v0, 5.0, ValueEncoding::Uint8).unwrap();
+    scx_ops::helpers::encode_value(&mut v0, 7.0, ValueEncoding::Uint8).unwrap();
+    w.write_csr_shard(&ip, &ix, &v0, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    // Shard 1 (rows 2-3): Uint16 with a value > u8::MAX.
+    let mut v1 = Vec::new();
+    scx_ops::helpers::encode_value(&mut v1, 300.0, ValueEncoding::Uint16).unwrap();
+    scx_ops::helpers::encode_value(&mut v1, 9.0, ValueEncoding::Uint16).unwrap();
+    w.write_csr_shard(&ip, &ix, &v1, CodecId::None, ValueEncoding::Uint16, 2)
+        .unwrap();
+    w.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1710000000,
+        action: "convert".to_string(),
+        tool: "test".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: vec![],
+    }])
+    .unwrap();
+    w.finish().unwrap();
+
+    let out = dir.path().join("mixed_enc_compact.scx");
+    scx_ops::compact(&path, &out)
+        .expect("compact must widen X encoding instead of failing with ValueOutOfRange");
+
+    let reader = ScxReader::open(&out).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 4);
+    // Row 2's first value (300) must round-trip — it would have wrapped/aborted
+    // under the first shard's Uint8 encoding.
+    let r2 = csr.indptr[2] as usize;
+    assert!(
+        (csr.data[r2] - 300.0).abs() < 0.01,
+        "expected wide value 300 to round-trip after compact, got {}",
+        csr.data[r2]
+    );
+}
+
 /// Merge preserves obs metadata in correct order
 #[test]
 fn test_merge_preserves_obs_metadata() {
