@@ -383,14 +383,16 @@ impl CloudReader {
         )?)
     }
 
-    /// Read multiple shard sections in parallel.
+    /// Read multiple shard sections in parallel, capping inflight requests at
+    /// [`METADATA_SHARD_FETCH_CONCURRENCY`] so atlas-scale files don't fire an
+    /// unbounded number of simultaneous fetches. Output order matches
+    /// `shard_names` (`buffered`, not `buffer_unordered`).
     pub async fn read_shards(&self, shard_names: &[&str]) -> Result<Vec<Vec<u8>>> {
-        let handles: Vec<_> = shard_names
-            .iter()
+        futures::stream::iter(shard_names.iter().copied())
             .map(|name| self.read_section(name))
-            .collect();
-        let results = futures::future::join_all(handles).await;
-        results.into_iter().collect()
+            .buffered(METADATA_SHARD_FETCH_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Read a section by its catalog entry. Equivalent to

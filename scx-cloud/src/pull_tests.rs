@@ -1144,6 +1144,38 @@ fn is_retryable_treats_missing_object_as_permanent() {
 }
 
 #[test]
+fn is_retryable_treats_unknown_config_key_as_permanent() {
+    // A bad object_store config key can never succeed on retry — classifying
+    // it as transient would burn the full backoff budget (~31s) on a
+    // guaranteed failure. Must be permanent.
+    let e = object_store::Error::UnknownConfigurationKey {
+        store: "test",
+        key: "bogus_option".into(),
+    };
+    assert!(!is_retryable(&e));
+
+    // Regression: the Display string embeds the key, so a key literally
+    // containing a transient token (`timeout`, `500`, …) must still be
+    // permanent — it has to be matched before the substring heuristics, not
+    // by the final `matches!` arm.
+    for key in [
+        "connect_timeout",
+        "retry_500",
+        "server_error_mode",
+        "throttle_limit",
+    ] {
+        let e = object_store::Error::UnknownConfigurationKey {
+            store: "test",
+            key: key.into(),
+        };
+        assert!(
+            !is_retryable(&e),
+            "config key {key:?} must be permanent despite its transient-looking token",
+        );
+    }
+}
+
+#[test]
 fn contains_http_status_requires_digit_boundaries() {
     // Genuine status wording matches.
     assert!(contains_http_status(

@@ -9,19 +9,18 @@
 //!   [Shards...] [Layers...] [ObsmEmbeddings...] [Obsp...] [Uns]
 //!   [PredicateIndexes] [Provenance] [DeletionVectors] [FullCatalog]
 
-use std::collections::BTreeMap;
-use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
+use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 
 use scx_format_io::header::{FileHeader, HEADER_SIZE};
 use scx_format_io::section::{align_to_8, SectionType};
 
 use crate::error::Result;
-
-/// Offset where sections begin: 256 (header) + 4096 (root catalog placeholder).
-const SECTIONS_START_OFFSET: u64 = 4352;
+use crate::layout::{
+    build_root_catalog, compute_file_checksum, order_entries_for_layout, SECTIONS_START_OFFSET,
+};
 
 /// Rewrite an SCX file with a front-of-file catalog for cloud-optimized access.
 ///
@@ -74,56 +73,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     full_catalog.write_to(&mut orig_catalog_bytes)?;
     let front_catalog_reserved_size = orig_catalog_bytes.len() as u64;
 
-    // 2. Determine section ordering for the output file
-    //    Order: obs → var → CsrShard → CscShard → LayerCsrShard
-    //         → ObsmEmbedding → ObspCsrShard → UnsBlob
-    //         → ObsPredicateIndex → VarPredicateIndex → Provenance
-    //         → DeletionVectors
-    //
-    // CscShard placed adjacent to CsrShard so column-major reads stay
-    // in a contiguous prefix region of the cloud-optimized file.
-    let section_order: &[SectionType] = &[
-        SectionType::ObsMetadata,
-        SectionType::ObsIndex,
-        SectionType::VarMetadata,
-        SectionType::VarIndex,
-        SectionType::CsrShard,
-        SectionType::CscShard,
-        SectionType::LayerCsrShard,
-        SectionType::ObsmEmbedding,
-        SectionType::ObspCsrShard,
-        SectionType::UnsBlob,
-        SectionType::ObsPredicateIndex,
-        SectionType::VarPredicateIndex,
-        SectionType::Provenance,
-        SectionType::DeletionVectors,
-    ];
-
-    // Group entries by section type, preserving order within each group
-    let mut grouped: BTreeMap<u8, Vec<&FullCatalogEntry>> = BTreeMap::new();
-    for entry in &full_catalog.entries {
-        grouped
-            .entry(entry.section_type as u8)
-            .or_default()
-            .push(entry);
-    }
-
-    // Build ordered list of entries following section_order
-    let known_types: std::collections::HashSet<u8> =
-        section_order.iter().map(|&st| st as u8).collect();
-    let mut ordered_entries: Vec<&FullCatalogEntry> =
-        Vec::with_capacity(full_catalog.entries.len());
-    for &st in section_order {
-        if let Some(entries) = grouped.get(&(st as u8)) {
-            ordered_entries.extend(entries);
-        }
-    }
-    // Include any section types not in section_order (unknown/future types)
-    for (&group_type, entries) in &grouped {
-        if !known_types.contains(&group_type) {
-            ordered_entries.extend(entries);
-        }
-    }
+    // 2. Order entries into the cloud-optimized layout.
+    let ordered_entries = order_entries_for_layout(&full_catalog.entries);
 
     // 3. Create output file via collision-safe sibling tempfile.
     let (raw_file, tmp_path) = scx_format_io::make_sibling_tempfile(output)?;
@@ -206,7 +157,12 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 
     // 6. Write the full catalog at EOF
     let catalog_aligned = align_to_8(write_offset);
-    let pad = (catalog_aligned - write_offset) as usize;
+    let pad = catalog_aligned.checked_sub(write_offset).ok_or_else(|| {
+        crate::error::CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog alignment underflow (inconsistent layout)",
+        ))
+    })? as usize;
     if pad > 0 {
         writer.write_all(&vec![0u8; pad])?;
     }
@@ -297,52 +253,6 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     scx_format_io::fsync_parent_dir(output)?;
 
     Ok(())
-}
-
-/// Build a root catalog from a full catalog.
-fn build_root_catalog(catalog: &FullCatalog) -> RootCatalog {
-    let mut groups: BTreeMap<u8, Vec<&FullCatalogEntry>> = BTreeMap::new();
-    for entry in &catalog.entries {
-        groups
-            .entry(entry.section_type as u8)
-            .or_default()
-            .push(entry);
-    }
-
-    let mut root_entries = Vec::new();
-    for (&group_type, entries) in &groups {
-        let first_offset = entries.iter().map(|e| e.offset).min().unwrap_or(0);
-        let total_length: u64 = entries.iter().map(|e| e.length).sum();
-        let n_sections = entries.len() as u32;
-        root_entries.push(RootCatalogEntry {
-            group_type,
-            first_section_offset: first_offset,
-            total_group_length: total_length,
-            n_sections,
-            summary: [0u8; 32],
-        });
-    }
-
-    RootCatalog {
-        n_section_groups: root_entries.len() as u16,
-        entries: root_entries,
-    }
-}
-
-/// Compute file checksum: BLAKE3 of entire file, truncated to u64.
-fn compute_file_checksum(file: &mut (impl Read + Seek)) -> Result<u64> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut chunk = [0u8; 65536];
-    loop {
-        let n = file.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&chunk[..n]);
-    }
-    let hash = hasher.finalize();
-    Ok(scx_format_io::checksum::truncate_hash_to_u64(&hash))
 }
 
 #[cfg(test)]

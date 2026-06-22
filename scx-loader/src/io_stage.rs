@@ -116,7 +116,7 @@ pub async fn io_stage(
             for &idx in group_indices {
                 if let Some(entry) = sorted_entries.get(idx) {
                     let start = entry.offset as usize;
-                    let end = start + entry.length as usize;
+                    let end = start.saturating_add(entry.length as usize);
                     min_offset = min_offset.min(start);
                     max_end = max_end.max(end);
                 }
