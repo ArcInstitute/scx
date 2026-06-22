@@ -243,10 +243,12 @@ pub fn h5mu_to_scx(
     writer.write_obs(&outer_obs)?;
 
     // Outer obsm (global) → write as obsm/{key} with modality_id=0.
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
-        for (key, batch) in &global_obsm {
-            writer.write_obsm(key, batch)?;
-        }
+    // `read_obsm_at` returns Ok(empty) when absent and warns per-entry; a
+    // propagated Err means the group is present but structurally unreadable
+    // (member listing failed) — surface it rather than silently skipping.
+    let global_obsm = read_obsm_at(&file, "obsm", sink)?;
+    for (key, batch) in &global_obsm {
+        writer.write_obsm(key, batch)?;
     }
 
     // Outer uns (global) → write as the global uns blob.
@@ -320,36 +322,36 @@ pub fn h5mu_to_scx(
             )?;
         }
 
-        // Per-modality obsm.
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
-            for (key, batch) in &obsm_map {
-                writer
-                    .write_obsm_for(modality_id, key, batch)
-                    .map_err(ConvertError::from)?;
-            }
+        // Per-modality obsm. (Ok(empty) when absent / warned per-entry; a
+        // propagated Err means a present-but-unreadable obsm group.)
+        let obsm_map = read_obsm_at(&file, &obsm_path, sink)?;
+        for (key, batch) in &obsm_map {
+            writer
+                .write_obsm_for(modality_id, key, batch)
+                .map_err(ConvertError::from)?;
         }
 
         // Per-modality layers — written as layer-CSR shards stamped
-        // with this modality_id.
-        if let Ok(layers) = read_layers_at(&file, &layers_path, sink) {
-            for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
-                let (l_enc, l_codec) =
-                    detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
-                        .map_err(ScxError::from)?;
-                write_modality_layer_shards(
-                    &mut writer,
-                    modality_id,
-                    layer_name,
-                    l_indptr,
-                    l_indices,
-                    l_data,
-                    n_obs,
-                    *l_nvars,
-                    opts.shard_target_rows as usize,
-                    l_enc,
-                    l_codec,
-                )?;
-            }
+        // with this modality_id. (Same absent-vs-unreadable contract as
+        // obsm: Ok(empty)/warned per-entry, Err only on a corrupt group.)
+        let layers = read_layers_at(&file, &layers_path, sink)?;
+        for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
+            let (l_enc, l_codec) =
+                detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
+                    .map_err(ScxError::from)?;
+            write_modality_layer_shards(
+                &mut writer,
+                modality_id,
+                layer_name,
+                l_indptr,
+                l_indices,
+                l_data,
+                n_obs,
+                *l_nvars,
+                opts.shard_target_rows as usize,
+                l_enc,
+                l_codec,
+            )?;
         }
     }
 
@@ -504,10 +506,11 @@ pub fn h5mu_to_scx_streaming(
 
     // Outer obs / obsm / uns. Global obs goes first.
     writer.write_obs(&outer_obs)?;
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
-        for (key, batch) in &global_obsm {
-            writer.write_obsm(key, batch)?;
-        }
+    // Ok(empty) when absent / warned per-entry; Err only on a present-but-
+    // unreadable obsm group — propagate rather than silently skip.
+    let global_obsm = read_obsm_at(&file, "obsm", sink)?;
+    for (key, batch) in &global_obsm {
+        writer.write_obsm(key, batch)?;
     }
     if file.group("uns").is_ok() {
         let uns = crate::h5ad::read::read_uns(&file, opts.strict_uns, sink)?;
@@ -701,13 +704,13 @@ pub fn h5mu_to_scx_streaming(
         }
 
         // Per-modality obsm (small dense; non-streaming reuse of the
-        // existing helper).
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
-            for (key, batch) in &obsm_map {
-                writer
-                    .write_obsm_for(modality_id, key, batch)
-                    .map_err(ConvertError::from)?;
-            }
+        // existing helper). Ok(empty) when absent / warned per-entry; Err
+        // only on a present-but-unreadable obsm group — propagate it.
+        let obsm_map = read_obsm_at(&file, &obsm_path, sink)?;
+        for (key, batch) in &obsm_map {
+            writer
+                .write_obsm_for(modality_id, key, batch)
+                .map_err(ConvertError::from)?;
         }
     }
 
