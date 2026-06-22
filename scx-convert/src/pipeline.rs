@@ -2339,6 +2339,55 @@ enum SparseMappingKind {
     Varp,
 }
 
+/// Gather the obsm/varm rows for one output shard in permuted (sorted) order
+/// while reading only contiguous source runs from disk — peak memory stays
+/// ~one output shard, mirroring [`crate::permuted_reader::PermutedCsrReader::gather`]
+/// for the dense case. `want[i]` is the source row index for output-local row
+/// `i`. Used by the sort-on-convert disk-streaming path so it preserves the
+/// same per-shard RSS bound as the non-sort path (the previous code
+/// materialized the whole `n_obs × k` mapping before permuting).
+fn gather_dense_mapping_shard(
+    file: &hdf5::File,
+    group_path: &str,
+    name: &str,
+    want: &[u64],
+) -> Result<RecordBatch, ConvertError> {
+    // (output-local index, source id) sorted by source id so consecutive
+    // source rows coalesce into a single contiguous hyperslab read.
+    let mut order: Vec<(usize, u64)> = want.iter().copied().enumerate().collect();
+    order.sort_unstable_by_key(|&(_, src)| src);
+
+    let mut runs: Vec<RecordBatch> = Vec::new();
+    // `take_idx[out_local]` = row position of that output row within the
+    // run-order concatenation below.
+    let mut take_idx = vec![0u64; want.len()];
+    let mut concat_pos = 0u64;
+    let mut i = 0;
+    while i < order.len() {
+        let run_start = order[i].1 as usize;
+        let mut j = i + 1;
+        while j < order.len() && order[j].1 == order[j - 1].1 + 1 {
+            j += 1;
+        }
+        // `read_dense_mapping_shard` takes a half-open [start, end) range.
+        let run_end = order[j - 1].1 as usize + 1;
+        runs.push(read_dense_mapping_shard(
+            file, group_path, name, run_start, run_end,
+        )?);
+        for entry in &order[i..j] {
+            take_idx[entry.0] = concat_pos;
+            concat_pos += 1;
+        }
+        i = j;
+    }
+
+    // Runs are read in source-sorted order; concatenate then permute into
+    // output (sorted-by-obs-key) order.
+    let schema = runs[0].schema();
+    let concatenated = arrow::compute::concat_batches(&schema, runs.iter())?;
+    crate::permuted_reader::take_record_batch(&concatenated, &take_idx)
+}
+
 /// Emit one logical obsm/varm matrix as a sequence of row-shards. Used
 /// by [`h5ad_to_scx_streaming`] for both the override path (in-memory
 /// `RecordBatch` from pyscx) and the disk-streaming path (h5py
@@ -2452,19 +2501,23 @@ fn write_dense_mapping_section(
             emit(writer, &info.name, 0, 0, 0, 0, &batch)?;
             continue;
         }
-        // Sort-on-convert (obsm): read the whole mapping for this key, permute
-        // its rows, then shard the permuted batch. Bounded by the mapping size
-        // (n_obs × k); obsm at convert time is small/rare. The non-sort path
-        // below streams one contiguous shard at a time as before.
+        // Sort-on-convert (obsm): gather each output shard in permuted order
+        // directly, reading only the contiguous source runs that shard needs.
+        // Peak memory stays ~one output shard (independent of n_obs), matching
+        // the non-sort path's per-shard RSS bound rather than materializing the
+        // whole n_obs × k mapping. Mirrors `PermutedCsrReader::gather` (X path).
         if let Some(perm) = row_perm {
-            let full = read_dense_mapping_shard(file, group_path, &info.name, 0, info.n_rows)?;
-            let permuted = crate::permuted_reader::take_record_batch(&full, perm)?;
             let step = shard_target_rows.max(1) as usize;
             let mut shard_idx = 0u32;
             let mut row_start = 0usize;
             while row_start < info.n_rows {
                 let n = (info.n_rows - row_start).min(step);
-                let shard = permuted.slice(row_start, n);
+                let shard = gather_dense_mapping_shard(
+                    file,
+                    group_path,
+                    &info.name,
+                    &perm[row_start..row_start + n],
+                )?;
                 emit(
                     writer,
                     &info.name,

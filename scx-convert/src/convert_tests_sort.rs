@@ -40,6 +40,22 @@ fn convert_sorted(h5ad: &Path, scx: &Path, by: &[&str], reverse: bool) {
     .unwrap();
 }
 
+fn convert_sorted_shard_rows(h5ad: &Path, scx: &Path, by: &[&str], shard_target_rows: u32) {
+    let opts = ConvertOptions {
+        sort_by: by.iter().map(|s| s.to_string()).collect(),
+        shard_target_rows,
+        ..Default::default()
+    };
+    h5ad_to_scx_streaming(
+        h5ad,
+        scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+}
+
 fn convert_plain(h5ad: &Path, scx: &Path) {
     h5ad_to_scx_streaming(
         h5ad,
@@ -65,6 +81,20 @@ fn col_i32(batch: &arrow::array::RecordBatch, name: &str) -> Vec<i32> {
         .downcast_ref::<Int32Array>()
         .unwrap();
     (0..a.len()).map(|i| a.value(i)).collect()
+}
+
+/// Read an obsm/varm dense mapping `RecordBatch` (one Float32 column per
+/// embedding dim, named `"0".."k-1"`) into per-row `Vec<f32>`.
+fn obsm_rows(batch: &arrow::array::RecordBatch) -> Vec<Vec<f32>> {
+    use arrow::array::Float32Array;
+    let cols: Vec<&Float32Array> = batch
+        .columns()
+        .iter()
+        .map(|c| c.as_any().downcast_ref::<Float32Array>().unwrap())
+        .collect();
+    (0..batch.num_rows())
+        .map(|r| cols.iter().map(|c| c.value(r)).collect())
+        .collect()
 }
 
 fn col_str(batch: &arrow::array::RecordBatch, name: &str) -> Vec<String> {
@@ -224,8 +254,51 @@ fn sort_tracks_layers_and_obsm() {
             "layer row {k}"
         );
     }
-    // obsm survives the reorder with the full row count.
-    assert_eq!(sr.read_obsm("X_pca").unwrap().num_rows(), n_obs);
+    // obsm survives the reorder with the full row count AND each sorted row's
+    // embedding equals its source cell's embedding (the bounded disk-streaming
+    // gather must permute rows correctly, not just preserve the count).
+    let plain_obsm = obsm_rows(&pr.read_obsm("X_pca").unwrap());
+    let sorted_obsm = obsm_rows(&sr.read_obsm("X_pca").unwrap());
+    assert_eq!(sorted_obsm.len(), n_obs);
+    for k in 0..n_obs {
+        assert_eq!(
+            sorted_obsm[k],
+            plain_obsm[src_row(sorted_id[k])],
+            "obsm row {k}"
+        );
+    }
+}
+
+#[test]
+fn sort_obsm_multishard_gather_orders_rows() {
+    // Force the obsm dense mapping across multiple output shards
+    // (shard_target_rows=3 over 10 rows → 4 shards) to exercise the bounded
+    // per-shard row-gather across shard boundaries, not just a single shard.
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let plain = dir.path().join("plain.scx");
+    let sorted = dir.path().join("sorted.scx");
+    let (n_obs, n_vars) = (10usize, 8usize);
+    make_h5ad(&h5ad, n_obs, n_vars, "csr", true);
+    convert_plain(&h5ad, &plain);
+    convert_sorted_shard_rows(&h5ad, &sorted, &["cell_type"], 3);
+
+    let pr = ScxReader::open(&plain).unwrap();
+    let sr = ScxReader::open(&sorted).unwrap();
+    let plain_id = col_i32(&pr.read_obs().unwrap(), "n_counts");
+    let sorted_id = col_i32(&sr.read_obs().unwrap(), "n_counts");
+    let src_row = |id: i32| plain_id.iter().position(|&v| v == id).unwrap();
+
+    let plain_obsm = obsm_rows(&pr.read_obsm("X_pca").unwrap());
+    let sorted_obsm = obsm_rows(&sr.read_obsm("X_pca").unwrap());
+    assert_eq!(sorted_obsm.len(), n_obs);
+    for k in 0..n_obs {
+        assert_eq!(
+            sorted_obsm[k],
+            plain_obsm[src_row(sorted_id[k])],
+            "obsm row {k}"
+        );
+    }
 }
 
 #[test]
