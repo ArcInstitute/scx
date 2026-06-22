@@ -821,12 +821,23 @@ fn write_de_to_adata(
     n_genes: Option<usize>,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
-    let n_groups = result.group_names.len();
-    let full_n_genes = if n_groups > 0 {
-        result.names[0].len()
-    } else {
-        0
-    };
+    // Rank depth = the SHORTEST per-group vector across all emitted fields, not
+    // just group 0's. Groups are rectangular by construction
+    // (`[n_groups][n_genes]`), so this is a no-op on well-formed results, but
+    // clamping to the min keeps the numpy structured array rectangular and every
+    // `[..n_genes]` slice in the builder closures below in-bounds even on a
+    // malformed/degenerate DiffExpResult — avoids a PanicException. The zip also
+    // stops at the shortest outer vec.
+    let full_n_genes = result
+        .names
+        .iter()
+        .zip(&result.scores)
+        .zip(&result.pvals)
+        .zip(&result.pvals_adj)
+        .zip(&result.logfoldchanges)
+        .map(|((((n, s), p), pa), l)| n.len().min(s.len()).min(p.len()).min(pa.len()).min(l.len()))
+        .min()
+        .unwrap_or(0);
     let n_genes = n_genes.unwrap_or(full_n_genes).min(full_n_genes);
 
     let rgg = PyDict::new(py);
