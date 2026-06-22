@@ -175,11 +175,15 @@ fn parallel_memory_budget_derates_workers() {
     // C7: per-worker bytes are now nnz-exact (derived from the resident
     // indptr), not a density estimate. Each aligned 16-row window of this
     // fixture holds 40 nnz (rows alternate 2/3 nnz), so per-worker working set
-    // = 16 B/nnz × 40 + 8 × (16 + 1) = 776 bytes. Budget = 1600 → grants
-    // floor(1600 / 776) = 2 workers; requested = 8 → derate fires.
+    // = 16 B/nnz × 40 + 8 × (16 + 1) = 776 bytes. The derate now bounds peak
+    // outstanding shards (threads + writer_queue_depth), not threads alone:
+    // budget = 2400 → outstanding_max = floor(2400 / 776) = 3. With requested
+    // threads = 8 + depth = 4 = 12 > 3, the derate shrinks depth first to 1 and
+    // grants 2 threads — staying on the parallel route while keeping peak RSS
+    // (2 + 1) × 776 = 2328 ≤ 2400.
     let mut opts = streaming_opts(16);
     opts.reader_threads = Some(8);
-    opts.memory_budget = Some(1600);
+    opts.memory_budget = Some(2400);
 
     // Capture warnings to assert ReaderThreadsDerated emitted.
     use std::sync::{Arc, Mutex};
@@ -202,6 +206,16 @@ fn parallel_memory_budget_derates_workers() {
     assert!(
         warnings.iter().any(|w| w.contains("ReaderThreadsDerated")),
         "expected ReaderThreadsDerated warning; got: {:?}",
+        *warnings
+    );
+    // Depth is shrunk before threads so the parallel route is preserved
+    // (threads = 2, depth = 1) instead of collapsing to the sequential
+    // coordinator.
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("writer_queue_depth granted = 1")),
+        "expected derate to shrink depth first (writer_queue_depth granted = 1); got: {:?}",
         *warnings
     );
 

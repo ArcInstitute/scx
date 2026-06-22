@@ -391,6 +391,80 @@ pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
         .unwrap_or(1)
 }
 
+/// Apply `memory_budget` to the requested `(reader_threads,
+/// writer_queue_depth)` so the peak outstanding shards stay within the
+/// budget. Returns `(granted_threads, granted_depth)`.
+///
+/// Peak outstanding shards in the parallel coordinators is
+/// `granted_threads + granted_depth` (workers in-flight + reorder
+/// buffer + bounded channel), each holding roughly `per_shard_bytes`.
+/// The constraint is therefore `(granted_threads + granted_depth) ×
+/// per_shard_bytes ≤ budget`. The derate prefers shrinking
+/// `granted_depth` over `granted_threads` so the dispatcher stays on
+/// the parallel route under tight budgets — collapsing
+/// `granted_threads` to 1 would route through the sequential
+/// coordinator and lose parallelism entirely. Both have a floor of 1
+/// (a queue depth of zero would starve the writer).
+///
+/// Shared by the streaming **ingest** coordinator
+/// (`run_streaming_writer_coordinator`) and the streaming **export**
+/// coordinator (`h5ad::stream_write`); `shard_noun` / `remedy`
+/// customise the refusal error for each caller.
+pub(crate) fn derate_threads_and_depth(
+    memory_budget: Option<u64>,
+    per_shard_bytes: u64,
+    requested_threads: usize,
+    requested_depth: usize,
+    shard_noun: &str,
+    remedy: &str,
+    sink: &mut WarningSink,
+) -> Result<(usize, usize), ConvertError> {
+    let Some(budget) = memory_budget else {
+        return Ok((requested_threads, requested_depth));
+    };
+    if per_shard_bytes == 0 {
+        // Empty shards (no rows / no stats) — nothing to cap.
+        return Ok((requested_threads, requested_depth));
+    }
+    if per_shard_bytes > budget {
+        return Err(ConvertError::Other(format!(
+            "single {shard_noun} requires \u{2248} {per_shard_bytes} bytes \
+             but memory_budget is {budget}; {remedy}"
+        )));
+    }
+    // peak outstanding = threads + depth. Solve for the largest
+    // outstanding ≤ budget / per_shard_bytes.
+    let outstanding_max = (budget / per_shard_bytes).max(1) as usize;
+    let requested_outstanding = requested_threads.saturating_add(requested_depth);
+    if requested_outstanding <= outstanding_max {
+        return Ok((requested_threads, requested_depth));
+    }
+    // Preserve parallelism: shrink depth first (floor 1), then shrink
+    // threads only if necessary (floor 1). Reserving one slot for depth
+    // and giving the rest to threads keeps `granted_threads > 1`
+    // whenever `outstanding_max >= 2`, so the dispatcher stays on the
+    // parallel route under tight budgets instead of falling back to
+    // sequential.
+    let granted_threads = outstanding_max
+        .saturating_sub(1)
+        .min(requested_threads)
+        .max(1);
+    let granted_depth = outstanding_max
+        .saturating_sub(granted_threads)
+        .min(requested_depth)
+        .max(1);
+    sink.emit(ConvertWarning::ReaderThreadsDerated {
+        requested: requested_threads,
+        granted: granted_threads,
+        reason: format!(
+            "memory_budget {budget} caps outstanding shards to {outstanding_max} \
+             (per shard \u{2248} {per_shard_bytes} bytes); writer_queue_depth granted = \
+             {granted_depth}"
+        ),
+    });
+    Ok((granted_threads, granted_depth))
+}
+
 /// Build and write obs/var predicate indexes from the
 /// currently configured conversion options, then return the list of
 /// columns that ended up indexed so the caller can stamp provenance.
@@ -1876,28 +1950,20 @@ pub fn run_streaming_writer_coordinator(
     let per_worker_bytes = indexed
         .per_worker_bytes(effective_target, modality_type)
         .max(1);
-    let granted = match opts.memory_budget {
-        Some(b) if per_worker_bytes > b => {
-            return Err(ConvertError::Other(format!(
-                "single parallel-streaming shard requires \u{2248} {per_worker_bytes} bytes \
-                 but memory_budget is {b}; lower --shard-size or raise --memory-budget"
-            )));
-        }
-        Some(b) => {
-            let max_workers = (b / per_worker_bytes).max(1) as usize;
-            max_workers.min(requested)
-        }
-        None => requested,
-    };
-    if granted < requested {
-        sink.emit(ConvertWarning::ReaderThreadsDerated {
-            requested,
-            granted,
-            reason: format!(
-                "memory_budget caps per-worker working set to {per_worker_bytes} bytes"
-            ),
-        });
-    }
+    // Derate threads AND depth together: peak outstanding shards is
+    // `granted + granted_depth` (see `streaming_writer_coordinator_parallel`'s
+    // `in_flight_cap`), so the budget must cover both — sizing threads alone
+    // overshot by up to `writer_queue_depth × per_worker_bytes`.
+    let requested_depth = opts.writer_queue_depth.max(1);
+    let (granted, granted_depth) = derate_threads_and_depth(
+        opts.memory_budget,
+        per_worker_bytes,
+        requested,
+        requested_depth,
+        "parallel-streaming shard",
+        "lower --shard-size or raise --memory-budget",
+        sink,
+    )?;
 
     if granted <= 1 {
         return streaming_writer_coordinator(
@@ -1924,7 +1990,7 @@ pub fn run_streaming_writer_coordinator(
         section_name_prefix,
         sink,
         granted,
-        opts.writer_queue_depth.max(1),
+        granted_depth,
         effective_target,
     )
 }
