@@ -426,9 +426,13 @@ fn test_rollback_after_append() {
     )
     .unwrap();
 
-    // Verify append worked
+    // Verify append worked, and the whole-file checksum verifies post-append.
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), 10);
+    assert!(
+        reader.verify_file_checksum().unwrap(),
+        "file_checksum must verify after append"
+    );
     drop(reader);
 
     // Rollback
@@ -438,6 +442,16 @@ fn test_rollback_after_append() {
     let reader = ScxReader::open(&path).unwrap();
     assert_eq!(reader.n_obs(), original_n_obs);
     assert_eq!(reader.header().manifest_sequence, original_seq);
+
+    // The whole-file checksum must still verify after rollback. Rollback
+    // repoints the header at the older catalog while the superseded
+    // catalog/sections remain trailing past the active catalog, so the checksum
+    // extent must run to EOF (not to full_catalog_offset+length) to match the
+    // value `finalize_header_with_checksum` stored.
+    assert!(
+        reader.verify_file_checksum().unwrap(),
+        "file_checksum must verify after rollback (extent must reach EOF)"
+    );
 
     let csr = reader.read_all_csr_shards().unwrap();
     assert_eq!(csr.shape.0, 6);

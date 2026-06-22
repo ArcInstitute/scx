@@ -1214,7 +1214,7 @@ fn test_strict_shard_type_v2_rejects_corrupted_csc() {
     // Open and try to read the CSC shard. The strict v2 validator
     // fires inside `read_shard_from_entry_inner` and returns
     // `InvalidShardType`.
-    let reader = ScxReader::open_unchecked(&corrupt_path).unwrap();
+    let reader = crate::reader::ScxReader::open_unchecked(&corrupt_path).unwrap();
     let err = reader.read_csc_shard(0).unwrap_err();
     match err {
         ScxError::InvalidShardType {
@@ -1424,7 +1424,7 @@ fn test_csc_two_shard_round_trip() {
     writer.finish().unwrap();
 
     // Read back via the high-level CSC API.
-    let reader = ScxReader::open(&path).unwrap();
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
     assert_eq!(reader.csc_shard_count(), 2);
 
     let csc = reader.read_all_csc_shards().unwrap();
@@ -1552,7 +1552,7 @@ fn test_csc_shard_large_n_obs_roundtrip() {
     writer.finish().unwrap();
 
     // Read back via the high-level CSC API.
-    let reader = ScxReader::open(&path).unwrap();
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
     assert_eq!(reader.csc_shard_count(), 1);
     // File-level index_dtype unchanged from the header (u16); the per-
     // shard index_dtype is what was widened to u32 internally.
@@ -1638,7 +1638,7 @@ fn test_csc_codec_sweep() {
                 .unwrap();
             writer.finish().unwrap();
 
-            let reader = ScxReader::open(&path).unwrap();
+            let reader = crate::reader::ScxReader::open(&path).unwrap();
             let csc = reader.read_all_csc_shards().unwrap();
             let densified = csc.to_dense().unwrap();
             assert_eq!(densified, dense, "round-trip mismatch for {label}");
@@ -1699,7 +1699,7 @@ fn test_read_csc_columns_range_correctness() {
     }
     writer.finish().unwrap();
 
-    let reader = ScxReader::open(&path).unwrap();
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
     assert_eq!(reader.csc_shard_count(), 3);
 
     // Reference: dense slice for the same column range.
@@ -2607,4 +2607,107 @@ fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
     // Per-modality totals reconcile with the file-level total.
     assert_eq!(rna_info.nnz + adt_info.nnz, reader.header().nnz);
     assert_eq!(pre_nnz, src_nnz, "both shards carry the same sample nnz");
+}
+
+/// Write a minimal valid file and return its path (plus the owning tempdir,
+/// which must stay alive for the file to exist).
+fn write_minimal_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checksum_test.scx");
+    let mut writer = ScxWriter::new(&path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+    (dir, final_path)
+}
+
+/// A freshly written file's stored file_checksum matches a recomputation, and
+/// `validate()` reports the `file_checksum` entry as passing.
+#[test]
+fn verify_file_checksum_passes_on_clean_file() {
+    let (_dir, path) = write_minimal_file();
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+
+    assert!(
+        reader.verify_file_checksum().unwrap(),
+        "clean file must match its stored file_checksum"
+    );
+
+    let results = reader.validate().unwrap();
+    let (name, passed) = &results[0];
+    assert_eq!(name, "file_checksum");
+    assert!(passed, "file_checksum entry must pass on a clean file");
+}
+
+/// Flipping a byte in the 256-byte header (here `n_obs`) leaves the file
+/// openable and every per-section catalog checksum intact, but the whole-file
+/// `file_checksum` no longer matches — so `validate()` now fails. This is the
+/// corruption class that previously passed `scx validate` clean.
+#[test]
+fn validate_detects_header_corruption() {
+    let (dir, path) = write_minimal_file();
+
+    let mut data = std::fs::read(&path).unwrap();
+    // `n_obs` is at byte offset 12: magic(4) + format_version(2) +
+    // header_length(2) + flags(4). It is not cross-checked at open and is
+    // covered by no per-section catalog checksum.
+    data[12] ^= 0xFF;
+    let corrupt_path = dir.path().join("header_corrupt.scx");
+    std::fs::write(&corrupt_path, &data).unwrap();
+
+    // The file still opens (the corrupt byte is not in the catalog) ...
+    let reader = crate::reader::ScxReader::open(&corrupt_path).unwrap();
+    // ... but the whole-file checksum no longer matches.
+    assert!(
+        !reader.verify_file_checksum().unwrap(),
+        "header corruption must be caught by verify_file_checksum"
+    );
+    // validate() still returns Ok (file_checksum is non-essential — see its
+    // doc note) but flags the file_checksum entry as failed. Every per-section
+    // checksum is intact, which is exactly why this slipped through before.
+    let results = reader.validate().unwrap();
+    let file_ok = results
+        .iter()
+        .find(|(name, _)| name == "file_checksum")
+        .map(|(_, p)| *p)
+        .expect("file_checksum entry must be present");
+    assert!(!file_ok, "validate() must flag header corruption");
+    assert!(
+        results
+            .iter()
+            .filter(|(name, _)| name != "file_checksum")
+            .all(|(_, p)| *p),
+        "per-section checksums stay intact under header corruption"
+    );
+}
+
+/// Flipping a byte in the 4096-byte root catalog region (`[256..4352]`) is also
+/// caught by the whole-file checksum.
+#[test]
+fn validate_detects_root_catalog_corruption() {
+    let (dir, path) = write_minimal_file();
+
+    let mut data = std::fs::read(&path).unwrap();
+    // Pick a byte inside the root-catalog region but past the live entries
+    // (the trailing padding) so the file still opens.
+    data[HEADER_SIZE + 2048] ^= 0xFF;
+    let corrupt_path = dir.path().join("root_corrupt.scx");
+    std::fs::write(&corrupt_path, &data).unwrap();
+
+    let reader = crate::reader::ScxReader::open_unchecked(&corrupt_path).unwrap();
+    assert!(
+        !reader.verify_file_checksum().unwrap(),
+        "root-catalog corruption must be caught by verify_file_checksum"
+    );
 }

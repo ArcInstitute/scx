@@ -1907,10 +1907,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
@@ -1925,6 +1931,30 @@ impl ScxReader {
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
+            // catalog would otherwise panic in the `copy_from_slice` /
+            // `shard_ip[j + 1]` indexing below in release — mirroring the guards
+            // in `assemble_shards`/`assemble_shards_parallel`.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
             indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
             data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
             if i == 0 {
@@ -3205,13 +3235,77 @@ impl ScxReader {
     // Validate (11.12)
     // -----------------------------------------------------------------------
 
+    /// Recompute the whole-file BLAKE3 checksum and compare it against the
+    /// stored `header.file_checksum`.
+    ///
+    /// Hashes the 256-byte header (with the `file_checksum` field zeroed)
+    /// followed by every byte from offset 256 to EOF. This is the same extent
+    /// every writer uses — `ScxWriter::finish` (`scx-format-io`),
+    /// `scx_ops::checksum::finalize_header_with_checksum` (rollback / append),
+    /// and the cloud relayout — so a rolled-back file (whose header points at an
+    /// older catalog while newer, now-superseded catalogs/sections remain
+    /// trailing past the active catalog) still verifies. Hashing only up to
+    /// `full_catalog_offset + full_catalog_length` would wrongly report such a
+    /// file as corrupt.
+    ///
+    /// Covers the 256-byte header and the 4096-byte root catalog, which no
+    /// per-section catalog-entry checksum protects — so a flipped byte in
+    /// `n_vars`/`full_catalog_offset`/`flags` or the root catalog is caught here
+    /// but not by [`validate`](Self::validate)'s per-section walk.
+    ///
+    /// O(file size); intended for the explicit `validate` path, not the hot
+    /// `open` path. Never panics: the only slice (`[HEADER_SIZE..]`) is always
+    /// in range because `open` already enforced `mmap.len() >= HEADER_SIZE`, and
+    /// a corrupt header simply hashes to a non-matching value (returns `false`).
+    pub fn verify_file_checksum(&self) -> Result<bool> {
+        let stored = self.header.file_checksum;
+
+        // `open` guarantees this, but guard anyway so the slice below is always
+        // sound even if a caller constructs a reader some other way.
+        if self.mmap.len() < HEADER_SIZE {
+            return Ok(false);
+        }
+
+        // Re-serialize the header with the checksum field zeroed, exactly as
+        // every writer does before hashing.
+        let mut header_for_hash = self.header.clone();
+        header_for_hash.file_checksum = 0;
+        let mut header_bytes = Vec::with_capacity(HEADER_SIZE);
+        header_for_hash.write_to(&mut header_bytes)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header_bytes); // header [0..256], checksum field zeroed
+        hasher.update(&self.mmap[HEADER_SIZE..]); // body [256..EOF]
+        let computed = crate::checksum::truncate_hash_to_u64(&hasher.finalize());
+        Ok(computed == stored)
+    }
+
     /// Validate all section checksums.
     ///
-    /// Returns a list of `(section_name, passed)` pairs. If any essential
-    /// section (obs, var, CsrShard) fails, returns `Err(ChecksumMismatch)`.
+    /// Returns a list of `(section_name, passed)` pairs. The first entry is
+    /// always `("file_checksum", _)` — the whole-file integrity check from
+    /// [`verify_file_checksum`](Self::verify_file_checksum), covering the header
+    /// and root catalog that no per-section checksum protects — followed by one
+    /// entry per catalog section. If any essential section (obs, var, CsrShard)
+    /// fails, returns `Err(ChecksumMismatch)`.
+    ///
+    /// A failing `file_checksum` is reported as a flag but is **not** treated as
+    /// essential: the whole-file hash cannot localize the corrupted region, so
+    /// promoting it to an error would force `Err` even when only a non-essential
+    /// (e.g. rebuildable CSC sidecar) section is damaged — contradicting the
+    /// granular per-section contract. Callers wanting strict whole-file
+    /// integrity should inspect the `file_checksum` flag (the CLI `scx validate`
+    /// does, and fails on it).
     pub fn validate(&self) -> Result<Vec<(String, bool)>> {
         let mut results = Vec::new();
         let mut essential_failed = false;
+
+        // Whole-file integrity first: catches corruption in the 256-byte header
+        // and root catalog that the per-section walk below cannot see (those
+        // bytes are covered by no catalog-entry checksum). Reported as a flag,
+        // not an essential error (see the doc note above).
+        let file_ok = self.verify_file_checksum()?;
+        results.push(("file_checksum".to_string(), file_ok));
 
         for entry in &self.full_catalog.entries {
             let slice = self.section_bytes(entry)?;
@@ -4010,10 +4104,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
@@ -4067,25 +4167,30 @@ impl ScxReader {
             );
 
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            debug_assert_eq!(
-                shard_ip.len(),
-                n_rows + 1,
-                "shard {i} indptr length mismatch: catalog says {}, got {}",
-                n_rows + 1,
-                shard_ip.len()
-            );
-            debug_assert_eq!(
-                shard_ix.len(),
-                nnz,
-                "shard {i} indices length mismatch: catalog says {nnz}, got {}",
-                shard_ix.len()
-            );
-            debug_assert_eq!(
-                shard_data.len(),
-                nnz,
-                "shard {i} data length mismatch: catalog says {nnz}, got {}",
-                shard_data.len()
-            );
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because these are reachable on a corrupt /
+            // stat-drifted catalog: a mismatch would otherwise panic in the
+            // `copy_from_slice` / `shard_ip[j + 1]` indexing below in release,
+            // violating the "readers return errors, not panic" convention.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
 
             // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping.
             // The non-overlap invariant is enforced by the monotonic `nnz_offsets`
@@ -4174,10 +4279,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
@@ -4194,9 +4305,29 @@ impl ScxReader {
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            debug_assert_eq!(shard_ip.len(), n_rows + 1);
-            debug_assert_eq!(shard_ix.len(), nnz);
-            debug_assert_eq!(shard_data.len(), nnz);
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
+            // catalog would otherwise panic in the `copy_from_slice` /
+            // `shard_ip[j + 1]` indexing below in release.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
 
             // Copy indices and data into their target region
             indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);

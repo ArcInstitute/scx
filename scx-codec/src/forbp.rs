@@ -69,14 +69,19 @@ pub fn read_varint(reader: &mut &[u8]) -> Result<u32, BitStreamError> {
         }
         let byte = reader[0];
         *reader = &reader[1..];
+        if shift == 28 {
+            // 5th byte: only 4 value bits remain (bits 28..31). Any continuation
+            // bit or value bit above bit 3 overflows u32 → malformed input.
+            if byte > 0x0F {
+                return Err(BitStreamError);
+            }
+            return Ok(result | ((byte as u32) << shift));
+        }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
             return Ok(result);
         }
         shift += 7;
-        if shift >= 35 {
-            return Err(BitStreamError);
-        }
     }
 }
 
@@ -838,6 +843,22 @@ mod tests {
     fn leb128_truncated_data() {
         // A continuation byte with no follow-up
         let buf = vec![0x80];
+        let mut slice = buf.as_slice();
+        assert!(read_varint(&mut slice).is_err());
+    }
+
+    #[test]
+    fn leb128_rejects_overflowing_fifth_byte() {
+        // 5th byte carries value bits above bit 3 → value overflows u32.
+        let buf = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x10];
+        let mut slice = buf.as_slice();
+        assert!(read_varint(&mut slice).is_err());
+    }
+
+    #[test]
+    fn leb128_rejects_overlong_with_continuation() {
+        // Continuation bit set on the 5th byte demands a (nonexistent) 6th.
+        let buf = vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
         let mut slice = buf.as_slice();
         assert!(read_varint(&mut slice).is_err());
     }

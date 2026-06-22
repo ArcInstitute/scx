@@ -26,6 +26,21 @@ pub fn run_validate(
     let mut all_passed = true;
     let mut n_checks = 0usize;
 
+    // Whole-file integrity: re-hash header + root catalog + sections + full
+    // catalog and compare against header.file_checksum. Catches corruption in
+    // the 256-byte header and root catalog that the per-section walk below
+    // (which only re-hashes catalog sections) cannot.
+    let file_ok = reader.verify_file_checksum()?;
+    n_checks += 1;
+    let icon = if file_ok { "OK" } else { "FAIL" };
+    println!("[{icon}] file_checksum (whole-file integrity)");
+    if verbose {
+        println!("       header: {:016x}", header.file_checksum);
+    }
+    if !file_ok {
+        all_passed = false;
+    }
+
     for entry in &catalog.entries {
         let bytes = reader.section_bytes(entry)?;
         let computed = blake3_hash(bytes);
