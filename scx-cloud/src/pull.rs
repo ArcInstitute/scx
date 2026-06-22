@@ -528,7 +528,12 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
         total_bytes_downloaded += data.len() as u64;
 
         let target_offset = section_offsets[idx];
-        let pad = (target_offset - write_offset) as usize;
+        let pad = target_offset.checked_sub(write_offset).ok_or_else(|| {
+            CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "section offset precedes write cursor (inconsistent layout)",
+            ))
+        })? as usize;
         if pad > 0 {
             writer.write_all(&ZEROS[..pad])?;
             write_offset = target_offset;
@@ -546,7 +551,14 @@ pub async fn pull(source: &str, dest: &Path, options: PullOptions) -> Result<Pul
     );
 
     // Pad to align with full_catalog_offset_new, then write the full catalog.
-    let pad = (full_catalog_offset_new - write_offset) as usize;
+    let pad = full_catalog_offset_new
+        .checked_sub(write_offset)
+        .ok_or_else(|| {
+            CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "catalog offset precedes write cursor (inconsistent layout)",
+            ))
+        })? as usize;
     if pad > 0 {
         writer.write_all(&ZEROS[..pad])?;
     }

@@ -152,7 +152,12 @@ pub fn pack(input_dir: &Path, output: &Path) -> Result<()> {
 
     // 7. Write the full catalog at EOF
     let catalog_aligned = align_to_8(write_offset);
-    let pad = (catalog_aligned - write_offset) as usize;
+    let pad = catalog_aligned.checked_sub(write_offset).ok_or_else(|| {
+        crate::error::CloudError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "catalog alignment underflow (inconsistent layout)",
+        ))
+    })? as usize;
     if pad > 0 {
         writer.write_all(&vec![0u8; pad])?;
     }
