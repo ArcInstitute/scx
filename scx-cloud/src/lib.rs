@@ -3,6 +3,7 @@ pub mod cloud_optimize;
 pub mod cloud_reader;
 pub mod error;
 pub mod explode;
+pub(crate) mod layout;
 pub mod pack;
 pub mod pull;
 pub mod push;
