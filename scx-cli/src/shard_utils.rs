@@ -7,7 +7,6 @@
 
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::reader::ScxReader;
-use scx_format_io::section::SectionType;
 use scx_format_io::shard::ShardHeader;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -22,20 +21,6 @@ pub fn decode_value_encoding(byte: u8) -> CliResult<ValueEncoding> {
 /// unknown value.
 pub fn decode_codec_id(byte: u8) -> CliResult<CodecId> {
     CodecId::from_u8(byte).ok_or_else(|| format!("unknown codec: {byte}").into())
-}
-
-/// Detect the [`ValueEncoding`] from the first CSR shard of an open
-/// reader. Files with no CSR shards default to `Uint16`.
-pub fn detect_first_value_encoding(reader: &ScxReader) -> CliResult<ValueEncoding> {
-    let csr_entries = reader.catalog().shards(SectionType::CsrShard);
-    match csr_entries.first() {
-        Some(first) => {
-            let sh = reader.read_shard_header(first)?;
-            decode_value_encoding(sh.value_encoding)
-        }
-        // Default for files with no shards.
-        None => Ok(ValueEncoding::Uint16),
-    }
 }
 
 /// Read every shard header in `shards`, project one byte field via
