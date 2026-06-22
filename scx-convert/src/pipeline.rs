@@ -442,9 +442,10 @@ pub(crate) fn derate_threads_and_depth(
     // Preserve parallelism: shrink depth first (floor 1), then shrink
     // threads only if necessary (floor 1). Reserving one slot for depth
     // and giving the rest to threads keeps `granted_threads > 1`
-    // whenever `outstanding_max >= 2`, so the dispatcher stays on the
-    // parallel route under tight budgets instead of falling back to
-    // sequential.
+    // whenever `outstanding_max >= 3` (at `outstanding_max == 2`,
+    // `granted_threads == 1` routes to the sequential coordinator), so the
+    // dispatcher stays on the parallel route under tight budgets instead of
+    // falling back to sequential.
     let granted_threads = outstanding_max
         .saturating_sub(1)
         .min(requested_threads)

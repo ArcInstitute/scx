@@ -263,13 +263,37 @@ fn read_sparse_matrix(
                 n_obs + 1
             )));
         }
+        // Validate the on-disk CSR before canonicalizing: a malformed indptr
+        // (negative, non-monotonic, or overrunning indices/data) or an
+        // out-of-range column index would otherwise wrap on the `as` casts
+        // below and panic inside `canonicalize_csr`'s row slicing. Readers
+        // return errors, not panic, on malformed input.
+        scx_sparse::validate_csr_arrays(&indptr, &indices, n_vars as u64)
+            .map_err(|e| ConvertError::Other(format!("CSR matrix '{group_name}': {e}")))?;
+        if indices.len() != data.len() {
+            return Err(ConvertError::Other(format!(
+                "CSR matrix '{group_name}': indices ({}) and data ({}) lengths differ",
+                indices.len(),
+                data.len()
+            )));
+        }
+        // `indptr` is non-negative + monotonic (validated above), so its last
+        // value is the max; it must not overrun the indices/data arrays.
+        if indptr.last().copied().unwrap_or(0) as usize > indices.len() {
+            return Err(ConvertError::Other(format!(
+                "CSR matrix '{group_name}': indptr last value {} exceeds nnz {}",
+                indptr.last().copied().unwrap_or(0),
+                indices.len()
+            )));
+        }
+
         // Canonicalize through the shared scx-sparse entry point so a messy
         // source CSR (unsorted or duplicate column indices within a row) is
         // sorted + summed, not passed through, and explicit zeros are dropped —
         // matching the CSC/raw/dense branches. Short-circuits on already-
         // canonical input (the common anndata case). The i32→u32 / i64→u64
-        // casts are lossless for a valid CSR (non-negative indptr and
-        // 0 <= col < n_vars).
+        // casts are lossless: `validate_csr_arrays` proved every value
+        // non-negative and `0 <= col < n_vars`.
         let mut u_indptr: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
         let mut u_indices: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
         let mut u_data = data;

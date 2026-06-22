@@ -714,8 +714,8 @@ fn per_shard_export_bytes(stats: &ShardStats) -> u64 {
 }
 
 /// Test seam — exposes the per-shard export budget estimate so the
-/// budget arithmetic in `derate_export_for_budget` can be anchored
-/// against accidental regressions.
+/// budget arithmetic in `pipeline::derate_threads_and_depth` can be
+/// anchored against accidental regressions.
 #[cfg(test)]
 pub(crate) fn per_shard_export_bytes_for_test(stats: &ShardStats) -> u64 {
     per_shard_export_bytes(stats)

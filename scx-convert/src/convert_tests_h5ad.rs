@@ -139,6 +139,94 @@ fn test_eager_csr_canonicalizes_messy_indices() {
     );
 }
 
+/// A malformed CSR `/X` whose `indptr` overruns the `indices`/`data` arrays
+/// (zero-free, so it bypassed the old `drop_explicit_zeros` fast path) must
+/// return a `ConvertError`, not panic inside `canonicalize_csr`'s row slicing.
+/// Guards the validation added ahead of the eager-CSR canonicalization.
+#[test]
+fn test_eager_csr_malformed_indptr_errors_not_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("bad_csr.h5ad");
+    let scx_path = dir.path().join("bad_csr.scx");
+
+    let n_obs = 1usize;
+    let n_vars = 4usize;
+    // indptr last = 5 but indices/data hold only 2 entries → overrun.
+    let indptr = vec![0i64, 5];
+    let indices = vec![0i32, 1];
+    let data = vec![1.0f32, 2.0]; // zero-free → old fast path returned early
+
+    {
+        let file = hdf5::File::create(&h5ad_path).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([n_obs])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+
+        let var = file.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let res = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log());
+    assert!(
+        res.is_err(),
+        "malformed CSR indptr overrun must return Err, not panic"
+    );
+}
+
 /// `adata.raw` (its own, wider var axis) round-trips h5ad → scx → h5ad
 /// through both the eager and streaming convert paths.
 #[test]
