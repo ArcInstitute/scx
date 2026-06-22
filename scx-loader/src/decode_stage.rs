@@ -9,6 +9,7 @@
 //! and [docs/multithreading.md §Training data loader](../../docs/multithreading.md#training-data-loader-triple-buffered-pipeline).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{
@@ -217,12 +218,20 @@ const MISSING_CATEGORY_LABEL: &str = "NaN";
 /// paths agree. This replaces the previous per-batch, first-seen-in-batch
 /// encoding whose codes drifted with batch composition (silently wrong ML
 /// labels). Codes index [`categories`](Self::categories) directly.
+///
+/// Code ordering is internally stable but *not* guaranteed to match
+/// `pandas.Categorical.codes`: the Utf8 path assigns codes in first-seen order
+/// over obs, while the Dictionary path uses the dictionary's declared order. So
+/// loader codes are training-internal labels and should not be cross-referenced
+/// against codes computed elsewhere.
 #[derive(Debug, Clone)]
 pub struct CategoryDict {
     /// Category string → stable code (used by the Utf8/LargeUtf8 path).
     map: HashMap<String, u32>,
-    /// Code → category string; the `Vec` index *is* the code.
-    categories: Vec<String>,
+    /// Code → category string; the slice index *is* the code. Held behind an
+    /// `Arc` so each emitted batch shares one allocation (refcount bump) rather
+    /// than re-cloning the full (possibly `O(n_obs)`) string list per batch.
+    categories: Arc<[String]>,
     /// Code of the reserved trailing missing/`"NaN"` category, present iff the
     /// column contains any null cell.
     missing_code: Option<u32>,
@@ -230,10 +239,16 @@ pub struct CategoryDict {
 
 /// Decode an Arrow dictionary value array (`Utf8` / `LargeUtf8`) to owned strings.
 fn dict_value_strings(values: &dyn Array, col_name: &str) -> Result<Vec<String>> {
+    // `iter()` yields `Option<&str>`; a null value slot maps to "" rather than
+    // returning garbage / panicking via positional `value(i)`.
     if let Some(v) = values.as_any().downcast_ref::<StringArray>() {
-        Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+        Ok(v.iter()
+            .map(|opt| opt.unwrap_or_default().to_string())
+            .collect())
     } else if let Some(v) = values.as_any().downcast_ref::<LargeStringArray>() {
-        Ok((0..v.len()).map(|i| v.value(i).to_string()).collect())
+        Ok(v.iter()
+            .map(|opt| opt.unwrap_or_default().to_string())
+            .collect())
     } else {
         Err(LoaderError::ConfigError {
             reason: format!("obs column '{col_name}': dictionary values are not Utf8/LargeUtf8"),
@@ -274,16 +289,17 @@ fn build_single_category_dict(array: &dyn Array, col_name: &str) -> Result<Optio
             macro_rules! scan {
                 ($arr:expr) => {{
                     let arr = $arr;
-                    for i in 0..arr.len() {
-                        if arr.is_null(i) {
-                            has_null = true;
-                            continue;
-                        }
-                        let val = arr.value(i);
-                        if !map.contains_key(val) {
-                            let code = categories.len() as u32;
-                            categories.push(val.to_string());
-                            map.insert(val.to_string(), code);
+                    for val_opt in arr.iter() {
+                        match val_opt {
+                            Some(val) => {
+                                if !map.contains_key(val) {
+                                    let code = categories.len() as u32;
+                                    let owned = val.to_string();
+                                    categories.push(owned.clone());
+                                    map.insert(owned, code);
+                                }
+                            }
+                            None => has_null = true,
                         }
                     }
                 }};
@@ -302,7 +318,7 @@ fn build_single_category_dict(array: &dyn Array, col_name: &str) -> Result<Optio
             let missing_code = maybe_add_missing(&mut categories, &mut map, has_null);
             Ok(Some(CategoryDict {
                 map,
-                categories,
+                categories: categories.into(),
                 missing_code,
             }))
         }
@@ -320,7 +336,7 @@ fn build_single_category_dict(array: &dyn Array, col_name: &str) -> Result<Optio
             let missing_code = maybe_add_missing(&mut categories, &mut map, has_null);
             Ok(Some(CategoryDict {
                 map,
-                categories,
+                categories: categories.into(),
                 missing_code,
             }))
         }
@@ -1152,8 +1168,8 @@ mod tests {
         if let ObsColumn::Categorical(codes, categories) = col {
             assert_eq!(codes, &vec![0_u32, 1, 2, 1, 0]);
             assert_eq!(
-                categories,
-                &vec!["A".to_string(), "B".to_string(), "C".to_string()]
+                &categories[..],
+                ["A".to_string(), "B".to_string(), "C".to_string()].as_slice()
             );
         } else {
             panic!("expected Categorical variant from Dictionary(_, LargeUtf8) obs column");
@@ -1248,8 +1264,8 @@ mod tests {
         // Identical global category list across batches.
         assert_eq!(cats_a, cats_b);
         assert_eq!(
-            cats_a,
-            &vec!["X".to_string(), "Y".to_string(), "Z".to_string()]
+            &cats_a[..],
+            ["X".to_string(), "Y".to_string(), "Z".to_string()].as_slice()
         );
 
         // Build a string→code map from each batch and assert no string is
@@ -1285,8 +1301,8 @@ mod tests {
         if let ObsColumn::Categorical(codes, cats) = result.get("grp").unwrap() {
             // Real levels first (first-seen), reserved "NaN" appended last.
             assert_eq!(
-                cats,
-                &vec!["a".to_string(), "b".to_string(), "NaN".to_string()]
+                &cats[..],
+                ["a".to_string(), "b".to_string(), "NaN".to_string()].as_slice()
             );
             let nan_code = 2u32;
             assert_eq!(codes[1], nan_code, "null cell should map to NaN code");

@@ -1224,7 +1224,7 @@ fn obs_to_pydict<'py>(
                 let codes_i32: Vec<i32> = codes.into_iter().map(|c| c as i32).collect();
                 let codes_arr = PyArray1::from_vec(py, codes_i32);
                 cat_dict.set_item("codes", codes_arr)?;
-                let cat_list = PyList::new(py, &categories).map_err(|e| {
+                let cat_list = PyList::new(py, categories.iter()).map_err(|e| {
                     PyRuntimeError::new_err(format!("failed to create category list: {e}"))
                 })?;
                 cat_dict.set_item("categories", cat_list)?;
