@@ -409,6 +409,22 @@ fn hbeta_weights(dists: &[f64], target_logu: f64, tol: f64, max_iter: usize) -> 
         iter += 1;
     }
 
+    // Non-convergence diagnostic. The binary search exhausted `max_iter`
+    // without bringing the entropy within `tol` of the target — common for
+    // degenerate equal-distance neighbour vectors, where no beta can shape the
+    // (uniform) kernel. We keep the R `lisi` parity behaviour of returning the
+    // last `p`, but surface the truncated calibration at `debug` level (off by
+    // default — this is called once per cell, so a degenerate dataset could log
+    // per cell otherwise).
+    if h_diff.abs() > tol {
+        log::debug!(
+            "hbeta_weights: perplexity calibration did not converge after {max_iter} \
+             iterations (|h_diff|={:.3e} > tol={tol:.3e}); returning last beta. \
+             Common for degenerate equal-distance neighbour vectors.",
+            h_diff.abs()
+        );
+    }
+
     p
 }
 
@@ -537,6 +553,31 @@ mod tests {
             .map(|&v| v * v.ln())
             .sum::<f64>();
         assert!((h - target).abs() < 1e-3, "H={h} target={target}");
+    }
+
+    #[test]
+    fn test_hbeta_degenerate_equal_distances_returns_uniform() {
+        // Degenerate input: all neighbours equidistant. No beta can shape the
+        // (uniform) kernel to hit the target entropy, so the binary search
+        // exhausts max_iter without converging. We assert the parity-preserving
+        // fallback still returns a valid normalised distribution (and does not
+        // panic); the debug-log on non-convergence is best-effort and not
+        // asserted here.
+        // Equal distances give a uniform kernel (entropy = ln(k)) for *any*
+        // beta, so it can never reach the smaller target entropy. A small
+        // max_iter keeps beta from growing large enough to underflow exp(),
+        // isolating the non-convergence behaviour from float-underflow garbage.
+        let k = 30;
+        let dists = vec![1.0f64; k];
+        let target = 15.0_f64.ln();
+        let p = hbeta_weights(&dists, target, 1e-9, 5);
+        assert_eq!(p.len(), k);
+        let s: f64 = p.iter().sum();
+        assert!((s - 1.0).abs() < 1e-10, "sum {s}");
+        assert!(p.iter().all(|&v| v >= 0.0));
+        // Equal distances → uniform weights.
+        let u = 1.0 / k as f64;
+        assert!(p.iter().all(|&v| (v - u).abs() < 1e-9), "expected uniform");
     }
 
     #[test]
