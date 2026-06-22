@@ -569,7 +569,7 @@ fn forbp_decode_inner(
                 // Prefix-sum to reconstruct absolute indices
                 let mut prev = frame_min;
                 for idx in &mut all_indices[start..start + nnz] {
-                    prev += *idx;
+                    prev = prev.checked_add(*idx).ok_or(BitStreamError)?;
                     *idx = prev;
                 }
             } else {
@@ -749,6 +749,21 @@ mod tests {
             rows.push(row);
         }
         round_trip(&rows, false);
+    }
+
+    // Corrupt/hostile shard: prefix-sum overflow must return Err, not panic
+    // (scx-codec pins overflow-checks=true even in release).
+    #[test]
+    fn corrupt_overflow_returns_err_not_panic() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes()); // block_nnz
+        data.extend_from_slice(&1u16.to_le_bytes()); // n_rows_in_block
+        data.push(2); // varint: nnz = 2
+        data.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // frame_min
+        data.push(8); // frame_bits
+        data.extend_from_slice(&[0x00, 0xFF]); // deltas [0, 255] → frame_min + 255 overflows
+        let res = forbp_decode(&data, 1, false);
+        assert!(res.is_err(), "overflow must return Err, not panic");
     }
 
     // 5.12: Verify block_nnz matches sum of row_nnz

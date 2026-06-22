@@ -120,8 +120,9 @@ pub fn open_csc_layer_streaming(
 // ---------------------------------------------------------------------
 
 /// In-memory CSR cursor. Loads the full CSC up front, runs the
-/// existing [`csc_to_csr`] scatter (with `drop_explicit_zeros`), then
-/// yields shards by slicing successive row ranges.
+/// existing [`csc_to_csr`] scatter (with `canonicalize_csr`: sort +
+/// dedup + drop-zeros), then yields shards by slicing successive row
+/// ranges.
 pub(crate) struct MaterializedCsrStream {
     n_obs: u64,
     n_vars: u64,
@@ -135,8 +136,9 @@ pub(crate) struct MaterializedCsrStream {
 impl MaterializedCsrStream {
     fn open(file: &hdf5::File, path: &str) -> Result<Self, ConvertError> {
         // `read_x_matrix_at(.., Csc)` already runs csc_to_csr +
-        // drop_explicit_zeros. Reuses the bulk-path code so the
-        // in-memory CSC route is byte-identical to `h5ad_to_scx`.
+        // canonicalize_csr (sort + dedup + drop-zeros). Reuses the
+        // bulk-path code so the in-memory CSC route is byte-identical
+        // to `h5ad_to_scx`.
         let (indptr, indices, data, n_obs, n_vars) =
             read_x_matrix_at(file, path, crate::detect::MatrixFormat::Csc)?;
         Ok(MaterializedCsrStream {

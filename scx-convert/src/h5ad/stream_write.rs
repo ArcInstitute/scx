@@ -35,7 +35,7 @@ use super::write::{
     write_dataframe_group_streaming, write_obsm_entry_at, write_uns_entries_at,
 };
 use crate::pipeline::{ConvertError, ConvertOptions};
-use crate::warnings::{ConvertWarning, WarningSink};
+use crate::warnings::WarningSink;
 
 /// Write obs into `parent` under `name="obs"`. Routes to the streaming
 /// path when the source has `ObsMetadataShard` sections, else falls back
@@ -357,11 +357,13 @@ pub(crate) fn stream_csr_to_group_at(
             .map(per_shard_export_bytes)
             .max()
             .unwrap_or(0);
-        derate_export_for_budget(
+        crate::pipeline::derate_threads_and_depth(
             opts.memory_budget,
             max_shard_bytes,
             requested_threads,
             queue_depth,
+            "export shard",
+            "raise --memory-budget or pass --reader-threads 1",
             sink,
         )?
     };
@@ -712,76 +714,11 @@ fn per_shard_export_bytes(stats: &ShardStats) -> u64 {
 }
 
 /// Test seam — exposes the per-shard export budget estimate so the
-/// budget arithmetic in `derate_export_for_budget` can be anchored
-/// against accidental regressions.
+/// budget arithmetic in `pipeline::derate_threads_and_depth` can be
+/// anchored against accidental regressions.
 #[cfg(test)]
 pub(crate) fn per_shard_export_bytes_for_test(stats: &ShardStats) -> u64 {
     per_shard_export_bytes(stats)
-}
-
-/// Apply `memory_budget` to the requested `(reader_threads,
-/// writer_queue_depth)` so the outstanding decoded shards stay
-/// within the budget. Returns `(granted_threads, granted_depth)`.
-///
-/// The constraint is `(granted_threads + granted_depth) ×
-/// max_shard_bytes ≤ budget`. The derate prefers shrinking
-/// `granted_depth` over `granted_threads` so the dispatcher stays
-/// on the parallel route under tight budgets — falling back to
-/// `granted_threads = 1` would route through the sequential
-/// coordinator and lose parallelism entirely. Both have a floor of 1
-/// (a queue depth of zero would starve the writer).
-fn derate_export_for_budget(
-    memory_budget: Option<u64>,
-    max_shard_bytes: u64,
-    requested_threads: usize,
-    requested_depth: usize,
-    sink: &mut WarningSink,
-) -> Result<(usize, usize), ConvertError> {
-    let Some(budget) = memory_budget else {
-        return Ok((requested_threads, requested_depth));
-    };
-    if max_shard_bytes == 0 {
-        // Empty shards (no rows / no stats) — nothing to cap.
-        return Ok((requested_threads, requested_depth));
-    }
-    if max_shard_bytes > budget {
-        return Err(ConvertError::Other(format!(
-            "single export shard requires \u{2248} {max_shard_bytes} bytes \
-             but memory_budget is {budget}; raise --memory-budget or pass \
-             --reader-threads 1"
-        )));
-    }
-    // outstanding = threads + depth. Solve for the largest
-    // outstanding ≤ budget / max_shard_bytes.
-    let outstanding_max = (budget / max_shard_bytes).max(1) as usize;
-    let requested_outstanding = requested_threads.saturating_add(requested_depth);
-    if requested_outstanding <= outstanding_max {
-        return Ok((requested_threads, requested_depth));
-    }
-    // Preserve parallelism: shrink depth first (floor 1), then
-    // shrink threads only if necessary (floor 1). Reserving one slot
-    // for depth and giving the rest to threads keeps `granted_threads
-    // > 1` whenever `outstanding_max >= 2`, so the dispatcher stays
-    // on the parallel route under tight budgets instead of falling
-    // back to sequential.
-    let granted_threads = outstanding_max
-        .saturating_sub(1)
-        .min(requested_threads)
-        .max(1);
-    let granted_depth = outstanding_max
-        .saturating_sub(granted_threads)
-        .min(requested_depth)
-        .max(1);
-    sink.emit(ConvertWarning::ReaderThreadsDerated {
-        requested: requested_threads,
-        granted: granted_threads,
-        reason: format!(
-            "memory_budget {budget} caps outstanding decoded shards to {outstanding_max} \
-             (max shard \u{2248} {max_shard_bytes} bytes); writer_queue_depth granted = \
-             {granted_depth}"
-        ),
-    });
-    Ok((granted_threads, granted_depth))
 }
 
 /// Worker → writer payload for the parallel export coordinator.

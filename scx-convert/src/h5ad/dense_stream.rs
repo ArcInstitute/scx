@@ -221,7 +221,10 @@ impl DenseXStreamReader {
                 let base = row * n_vars;
                 for col in 0..n_vars {
                     let v = flat[base + col];
-                    if v.abs() > eps {
+                    // Retain NaN like scipy/anndata (the eps==0 branch above
+                    // keeps it via `v != 0.0`); `NaN.abs() > eps` is false, so
+                    // without the explicit guard NaN would be silently dropped.
+                    if v.is_nan() || v.abs() > eps {
                         indices.push(col as u32);
                         values.push(v);
                     }

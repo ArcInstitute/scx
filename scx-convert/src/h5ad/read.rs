@@ -244,7 +244,7 @@ fn read_sparse_matrix(
         Ok((csr_indptr, csr_indices, u_data, n_obs, n_vars))
     } else {
         // C1: a CSC matrix misdetected as CSR has indptr length n_vars+1, not
-        // n_obs+1, which would index out of bounds in drop_explicit_zeros (a
+        // n_obs+1, which would index out of bounds when iterating rows (a
         // panic when n_vars < n_obs) or silently transpose. The shared
         // classifier refines the diagnostic; the gate is the CSR length
         // invariant (square matrices satisfy n_obs+1 and are valid here).
@@ -263,7 +263,44 @@ fn read_sparse_matrix(
                 n_obs + 1
             )));
         }
-        Ok(drop_explicit_zeros(indptr, indices, data, n_obs, n_vars))
+        // Validate the on-disk CSR before canonicalizing: a malformed indptr
+        // (negative, non-monotonic, or overrunning indices/data) or an
+        // out-of-range column index would otherwise wrap on the `as` casts
+        // below and panic inside `canonicalize_csr`'s row slicing. Readers
+        // return errors, not panic, on malformed input.
+        scx_sparse::validate_csr_arrays(&indptr, &indices, n_vars as u64)
+            .map_err(|e| ConvertError::Other(format!("CSR matrix '{group_name}': {e}")))?;
+        if indices.len() != data.len() {
+            return Err(ConvertError::Other(format!(
+                "CSR matrix '{group_name}': indices ({}) and data ({}) lengths differ",
+                indices.len(),
+                data.len()
+            )));
+        }
+        // `indptr` is non-negative + monotonic (validated above), so its last
+        // value is the max; it must not overrun the indices/data arrays.
+        if indptr.last().copied().unwrap_or(0) as usize > indices.len() {
+            return Err(ConvertError::Other(format!(
+                "CSR matrix '{group_name}': indptr last value {} exceeds nnz {}",
+                indptr.last().copied().unwrap_or(0),
+                indices.len()
+            )));
+        }
+
+        // Canonicalize through the shared scx-sparse entry point so a messy
+        // source CSR (unsorted or duplicate column indices within a row) is
+        // sorted + summed, not passed through, and explicit zeros are dropped —
+        // matching the CSC/raw/dense branches. Short-circuits on already-
+        // canonical input (the common anndata case). The i32→u32 / i64→u64
+        // casts are lossless: `validate_csr_arrays` proved every value
+        // non-negative and `0 <= col < n_vars`.
+        let mut u_indptr: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
+        let mut u_indices: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
+        let mut u_data = data;
+        scx_sparse::canonicalize_csr(&mut u_indptr, &mut u_indices, &mut u_data);
+        let csr_indptr: Vec<i64> = u_indptr.iter().map(|&v| v as i64).collect();
+        let csr_indices: Vec<i32> = u_indices.iter().map(|&v| v as i32).collect();
+        Ok((csr_indptr, csr_indices, u_data, n_obs, n_vars))
     }
 }
 
@@ -1339,42 +1376,6 @@ fn read_categorical_column(
     Ok((field, Arc::new(dict)))
 }
 
-/// Remove explicit zeros from a CSR matrix.
-///
-/// Some h5ad files store explicit zeros in their sparse representation.
-/// The SCX Rice codec requires values >= 1, so we must drop these entries.
-fn drop_explicit_zeros(
-    indptr: Vec<i64>,
-    indices: Vec<i32>,
-    data: Vec<f32>,
-    n_obs: usize,
-    n_vars: usize,
-) -> CsrArrays {
-    // Fast path: no zeros present
-    if data.iter().all(|&v| v != 0.0) {
-        return (indptr, indices, data, n_obs, n_vars);
-    }
-
-    let mut new_indptr = Vec::with_capacity(indptr.len());
-    let mut new_indices = Vec::new();
-    let mut new_data = Vec::new();
-    new_indptr.push(0i64);
-
-    for row in 0..n_obs {
-        let start = indptr[row] as usize;
-        let end = indptr[row + 1] as usize;
-        for i in start..end {
-            if data[i] != 0.0 {
-                new_indices.push(indices[i]);
-                new_data.push(data[i]);
-            }
-        }
-        new_indptr.push(new_data.len() as i64);
-    }
-
-    (new_indptr, new_indices, new_data, n_obs, n_vars)
-}
-
 /// Read obsm embeddings from h5ad file (root `/obsm`).
 ///
 /// Kept for callers that need the non-streaming, fully-materialised
@@ -1952,8 +1953,11 @@ fn read_uns_entry(
             )));
         }
 
-        // Scalar
-        if shape.is_empty() || (shape.len() == 1 && shape[0] == 1) {
+        // Scalar (true HDF5 scalar: empty shape). A 1-D dataset of shape [1]
+        // is a 1-element array, not a scalar — let it fall through to the 1-D
+        // arm so it round-trips with its rank preserved (anndata distinguishes
+        // a Python scalar from a 1-element numpy array).
+        if shape.is_empty() {
             return match desc {
                 TypeDescriptor::Integer(_) => {
                     let v: i64 = ds.read_scalar()?;

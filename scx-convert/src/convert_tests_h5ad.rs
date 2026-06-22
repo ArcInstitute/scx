@@ -42,6 +42,191 @@ fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
     }
 }
 
+/// A messy CSR `/X` (unsorted column indices, a duplicate `(row,col)`, and an
+/// explicit zero) must be canonicalized — sorted + summed + zero-dropped — on
+/// the eager ingest path, matching the CSC/raw/dense branches. Before the fix
+/// the CSR branch only dropped explicit zeros and passed unsorted/duplicate
+/// indices straight through, producing a non-canonical SCX file.
+#[test]
+fn test_eager_csr_canonicalizes_messy_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("messy_csr.h5ad");
+    let scx_path = dir.path().join("messy_csr.scx");
+
+    let n_obs = 2usize;
+    let n_vars = 4usize;
+    // Row 0: cols [2, 0, 2] vals [5, 3, 7] — unsorted + duplicate col 2.
+    // Row 1: cols [1, 3] vals [0, 4] — explicit zero at col 1.
+    let indptr = vec![0i64, 3, 5];
+    let indices = vec![2i32, 0, 2, 1, 3];
+    let data = vec![5.0f32, 3.0, 7.0, 0.0, 4.0];
+
+    {
+        let file = hdf5::File::create(&h5ad_path).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([n_obs])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+
+        let var = file.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    // Row 0 sorted with col 2 summed (5+7=12); row 1 explicit zero dropped.
+    assert_eq!(csr.indptr, vec![0i64, 2, 3], "indptr not canonical");
+    assert_eq!(csr.indices, vec![0i32, 2, 3], "indices not sorted/deduped");
+    assert_eq!(
+        csr.data,
+        vec![3.0f32, 12.0, 4.0],
+        "duplicate not summed / zero not dropped"
+    );
+}
+
+/// A malformed CSR `/X` whose `indptr` overruns the `indices`/`data` arrays
+/// (zero-free, so it bypassed the old `drop_explicit_zeros` fast path) must
+/// return a `ConvertError`, not panic inside `canonicalize_csr`'s row slicing.
+/// Guards the validation added ahead of the eager-CSR canonicalization.
+#[test]
+fn test_eager_csr_malformed_indptr_errors_not_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("bad_csr.h5ad");
+    let scx_path = dir.path().join("bad_csr.scx");
+
+    let n_obs = 1usize;
+    let n_vars = 4usize;
+    // indptr last = 5 but indices/data hold only 2 entries → overrun.
+    let indptr = vec![0i64, 5];
+    let indices = vec![0i32, 1];
+    let data = vec![1.0f32, 2.0]; // zero-free → old fast path returned early
+
+    {
+        let file = hdf5::File::create(&h5ad_path).unwrap();
+        let x = file.create_group("X").unwrap();
+        x.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        x.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        x.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        x.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        x.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, n_vars as i64])
+            .unwrap();
+
+        let obs = file.create_group("obs").unwrap();
+        let obs_index: Vec<VarLenUnicode> = (0..n_obs).map(|i| vlu(&format!("cell_{i}"))).collect();
+        obs.new_dataset::<VarLenUnicode>()
+            .shape([n_obs])
+            .create("_index")
+            .unwrap()
+            .write(&obs_index)
+            .unwrap();
+        obs.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+
+        let var = file.create_group("var").unwrap();
+        let var_index: Vec<VarLenUnicode> =
+            (0..n_vars).map(|i| vlu(&format!("gene_{i}"))).collect();
+        var.new_dataset::<VarLenUnicode>()
+            .shape([n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&var_index)
+            .unwrap();
+        var.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    let res = h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log());
+    assert!(
+        res.is_err(),
+        "malformed CSR indptr overrun must return Err, not panic"
+    );
+}
+
 /// `adata.raw` (its own, wider var axis) round-trips h5ad → scx → h5ad
 /// through both the eager and streaming convert paths.
 #[test]
@@ -542,6 +727,64 @@ fn test_uns_2d_and_bool_round_trip() {
         .unwrap()
         .to_vec();
     assert_eq!(out_flags, flags, "1-D bool uns dropped on export");
+}
+
+// A 1-D length-1 `uns` array (shape [1]) must NOT collapse to a Python scalar
+// (HDF5 shape []) on round-trip — anndata distinguishes a scalar from a
+// 1-element numpy array. Before the read.rs fix the `shape == [1]` arm read it
+// via `read_scalar`, silently changing its rank on export.
+#[test]
+fn test_uns_length1_array_preserves_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("uns_len1.h5ad");
+    let scx_path = dir.path().join("uns_len1.scx");
+    let h5ad_out = dir.path().join("uns_len1_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        // True scalar (HDF5 shape []).
+        uns.new_dataset::<i64>()
+            .shape(())
+            .create("scalar")
+            .unwrap()
+            .write_scalar(&42i64)
+            .unwrap();
+        // 1-element 1-D array (HDF5 shape [1]).
+        uns.new_dataset::<i64>()
+            .shape([1])
+            .create("vec1")
+            .unwrap()
+            .write(&[7i64])
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+
+    // Scalar stays rank 0.
+    let scalar_ds = uns.dataset("scalar").unwrap();
+    assert!(
+        scalar_ds.shape().is_empty(),
+        "true scalar uns gained rank on export: shape = {:?}",
+        scalar_ds.shape()
+    );
+
+    // Length-1 array stays a 1-D dataset of shape [1], not collapsed to scalar.
+    let vec1_ds = uns.dataset("vec1").unwrap();
+    assert_eq!(
+        vec1_ds.shape(),
+        vec![1],
+        "1-D length-1 uns array collapsed to scalar on export"
+    );
+    let vec1: Vec<i64> = vec1_ds.read_1d::<i64>().unwrap().to_vec();
+    assert_eq!(vec1, vec![7], "1-D length-1 uns array value garbled");
 }
 
 #[test]

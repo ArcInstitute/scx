@@ -806,6 +806,50 @@ fn phase1_streaming_dense_int_matches_non_streaming() {
 }
 
 #[test]
+fn phase1_streaming_dense_nan_retained_with_epsilon() {
+    // With `dense_zero_epsilon > 0`, NaN cells must be retained — scipy/anndata
+    // keep explicit NaN, and the eps==0 branch already keeps it via `v != 0.0`.
+    // Before the fix, `NaN.abs() > eps` was false so NaN was silently dropped.
+    // Drive the dense reader directly to assert on the pre-encode shard.
+    use crate::stream::CsrShardStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense_nan.h5ad");
+    let n_obs = 1usize;
+    let n_vars = 4usize;
+    // [NaN, 0.05 (< eps → drop), 0.0 (drop), 3.0 (keep)]
+    let dense = vec![f32::NAN, 0.05, 0.0, 3.0];
+    write_dense_h5ad(&h5ad, n_obs, n_vars, &dense);
+
+    let opts = ConvertOptions {
+        dense_zero_epsilon: 0.1,
+        ..ConvertOptions::default()
+    };
+    let file = hdf5::File::open(&h5ad).unwrap();
+    let mut reader =
+        crate::h5ad::dense_stream::open_dense_streaming(&file, "X", &opts, &mut WarningSink::log())
+            .unwrap();
+    let shard = reader.next_csr_shard(16).unwrap().unwrap();
+
+    assert_eq!(
+        shard.indptr,
+        vec![0u64, 2],
+        "indptr should count 2 kept cells"
+    );
+    assert_eq!(
+        shard.indices,
+        vec![0u32, 3],
+        "sub-epsilon 0.05 and 0.0 dropped; NaN (col 0) and 3.0 (col 3) kept"
+    );
+    assert_eq!(shard.values.len(), 2);
+    assert!(
+        shard.values[0].is_nan(),
+        "NaN must be retained, not dropped, under dense_zero_epsilon"
+    );
+    assert_eq!(shard.values[1], 3.0);
+}
+
+#[test]
 fn phase1_streaming_dense_float_round_trip() {
     // Fractional values force `ValueEncoding::Float32` and exercise
     // the codec dispatch on a float dense fixture. Verify the
