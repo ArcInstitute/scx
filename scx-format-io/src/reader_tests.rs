@@ -1666,6 +1666,35 @@ fn test_parallel_matches_sequential() {
     assert_eq!(sequential.data, parallel.data);
 }
 
+/// A catalog whose `stats.nnz` disagrees with the decoded shard length must
+/// return `Err` from both assemble paths, not panic. Before the fix the
+/// decoded-vs-catalog length checks were `debug_assert_eq!` (compiled out in
+/// release), so a mismatch panicked in `copy_from_slice` instead of erroring.
+#[test]
+fn test_assemble_shards_rejects_stat_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "stat_drift.scx", 12, 10, 4, false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+
+    // Clone the first shard entry and inflate its catalog nnz so it no longer
+    // matches what the shard actually decodes to.
+    let mut doctored = shards[0].clone();
+    doctored.stats.as_mut().unwrap().nnz += 1;
+
+    assert!(
+        reader.assemble_shards(&[&doctored]).is_err(),
+        "sequential assemble must reject decoded-vs-catalog nnz drift"
+    );
+
+    #[cfg(feature = "parallel")]
+    assert!(
+        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        "parallel assemble must reject decoded-vs-catalog nnz drift"
+    );
+}
+
 #[test]
 #[cfg(feature = "parallel")]
 fn test_parallel_single_shard() {

@@ -4132,25 +4132,30 @@ impl ScxReader {
             );
 
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            debug_assert_eq!(
-                shard_ip.len(),
-                n_rows + 1,
-                "shard {i} indptr length mismatch: catalog says {}, got {}",
-                n_rows + 1,
-                shard_ip.len()
-            );
-            debug_assert_eq!(
-                shard_ix.len(),
-                nnz,
-                "shard {i} indices length mismatch: catalog says {nnz}, got {}",
-                shard_ix.len()
-            );
-            debug_assert_eq!(
-                shard_data.len(),
-                nnz,
-                "shard {i} data length mismatch: catalog says {nnz}, got {}",
-                shard_data.len()
-            );
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because these are reachable on a corrupt /
+            // stat-drifted catalog: a mismatch would otherwise panic in the
+            // `copy_from_slice` / `shard_ip[j + 1]` indexing below in release,
+            // violating the "readers return errors, not panic" convention.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
 
             // SAFETY: each shard writes to [nnz_off..nnz_off+nnz], non-overlapping.
             // The non-overlap invariant is enforced by the monotonic `nnz_offsets`
@@ -4259,9 +4264,29 @@ impl ScxReader {
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
-            debug_assert_eq!(shard_ip.len(), n_rows + 1);
-            debug_assert_eq!(shard_ix.len(), nnz);
-            debug_assert_eq!(shard_data.len(), nnz);
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
+            // catalog would otherwise panic in the `copy_from_slice` /
+            // `shard_ip[j + 1]` indexing below in release.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
 
             // Copy indices and data into their target region
             indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
