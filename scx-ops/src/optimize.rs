@@ -223,7 +223,8 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
 /// per non-empty input shard. Peak memory is one shard — `read_var()` (which
 /// assembles every `VarMetadataShard` into one batch) is never called. Mirror of
 /// compact's [`write_obs_shards_streaming`](crate::compact::write_obs_shards_streaming)
-/// for the var axis; optimize applies no deletions, so there is no keep-mask.
+/// for the var axis; optimize applies no deletions, so (unlike the obs helper)
+/// it takes no `keep_mask` and renumbers output shards over the non-empty inputs.
 fn write_var_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
@@ -240,6 +241,16 @@ fn write_var_shards_streaming(
         writer.write_var_shard(out_idx, row_start, n, n_vars_total, &batch)?;
         out_idx += 1;
         row_start += n;
+    }
+    if out_idx == 0 {
+        // Every input var shard was empty (degenerate `n_vars == 0` file with a
+        // sharded var layout). Mirror `write_obs_shards_streaming`'s empty-section
+        // fallback: emit one empty legacy var section so the output stays
+        // well-formed instead of carrying no var section at all (which the old
+        // `write_var(read_var())` path would also have written). Footer-only
+        // schema read — no batch decode.
+        let schema = std::sync::Arc::new(reader.read_var_schema_physical()?);
+        writer.write_var(&arrow::array::RecordBatch::new_empty(schema))?;
     }
     Ok(())
 }
