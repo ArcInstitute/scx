@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +9,7 @@ use scx_format_io::reader::ScxReader;
 
 use crate::batch::Batch;
 use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
-use crate::decode_stage::decode_stage;
+use crate::decode_stage::{build_category_dicts, decode_stage, CategoryDict};
 use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
 use crate::projection::HvgProjection;
@@ -508,6 +509,10 @@ pub struct TrainingPipeline {
     config: LoaderConfig,
     reader: Arc<ScxReader>,
     obs_metadata: RecordBatch,
+    /// Stable global category dictionaries (one per categorical obs column),
+    /// computed once at construction so categorical codes are identical across
+    /// batches and epochs. See [`build_category_dicts`].
+    cat_dicts: HashMap<String, CategoryDict>,
     deletion_vectors: Option<DeletionVectors>,
     n_vars: u64,
     #[allow(dead_code)]
@@ -600,6 +605,11 @@ impl TrainingPipeline {
                 obs_metadata.num_rows()
             );
         }
+
+        // Build stable global category dictionaries for categorical obs columns
+        // once over the full obs table — so per-batch codes never drift with
+        // batch composition. Also validates that requested columns exist.
+        let cat_dicts = build_category_dicts(&obs_metadata, &config.obs_columns)?;
 
         // Load deletion vectors if present
         let t0 = Instant::now();
@@ -721,6 +731,7 @@ impl TrainingPipeline {
             config,
             reader,
             obs_metadata,
+            cat_dicts,
             deletion_vectors,
             n_vars,
             shard_target_rows,
@@ -929,6 +940,7 @@ impl TrainingPipeline {
         let decode_n_vars = self.n_vars;
         let decode_projection = self.projection.clone();
         let decode_obs = self.obs_metadata.clone();
+        let decode_cat_dicts = self.cat_dicts.clone();
         let decode_epoch = self.shuffler.epoch().saturating_sub(1); // epoch was already incremented by shuffle_epoch()
         let t_spawn_decode = Instant::now();
         let decode_handle = std::thread::Builder::new()
@@ -942,6 +954,7 @@ impl TrainingPipeline {
                     decode_n_vars,
                     decode_projection,
                     &decode_obs,
+                    &decode_cat_dicts,
                     decode_epoch,
                     &decode_pool,
                 )

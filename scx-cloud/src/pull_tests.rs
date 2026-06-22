@@ -1091,6 +1091,59 @@ fn is_retryable_distinguishes_permanent_from_transient() {
 }
 
 #[test]
+fn is_retryable_treats_missing_object_as_permanent() {
+    // Regression: a missing LOCAL file surfaces not as the canonical
+    // `NotFound` but as a `Generic` wrapping a `std::io::Error` of kind
+    // `NotFound`. Such a Generic must be classified permanent so the
+    // open_cloud `_catalog.bin` probe fails fast (no full backoff budget) and
+    // the actionable `CatalogNotFound` mapping survives.
+    let g_notfound = object_store::Error::Generic {
+        store: "test",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        )),
+    };
+    assert!(!is_retryable(&g_notfound));
+
+    // Mirror LocalFileSystem's actual shape: the io NotFound sits one level
+    // deeper, behind an `UnableToCanonicalize`-style wrapper whose `source()`
+    // returns the io error. `is_missing_object` walks the chain, so this must
+    // also be permanent.
+    #[derive(Debug)]
+    struct Wrapper(std::io::Error);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "unable to canonicalize")
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let g_nested = object_store::Error::Generic {
+        store: "test",
+        source: Box::new(Wrapper(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing",
+        ))),
+    };
+    assert!(!is_retryable(&g_nested));
+
+    // Guard against over-broadening: a transient Generic with no io NotFound in
+    // its source chain is still retryable.
+    let g_io_transient = object_store::Error::Generic {
+        store: "test",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )),
+    };
+    assert!(is_retryable(&g_io_transient));
+}
+
+#[test]
 fn contains_http_status_requires_digit_boundaries() {
     // Genuine status wording matches.
     assert!(contains_http_status(

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Observation metadata column types stored in each batch.
 #[derive(Debug, Clone)]
@@ -8,7 +9,12 @@ pub enum ObsColumn {
     /// Float column (f64 values).
     Float64(Vec<f64>),
     /// Categorical column: (encoded integer codes, category label strings).
-    Categorical(Vec<u32>, Vec<String>),
+    ///
+    /// The category list is the file-global, stable set shared across every
+    /// batch and epoch, so it is held behind an `Arc` — each batch clones only
+    /// a refcount bump rather than re-allocating the (potentially `O(n_obs)`,
+    /// e.g. for `cell_id`) string vector.
+    Categorical(Vec<u32>, Arc<[String]>),
 }
 
 /// A training mini-batch ready for GPU transfer.
@@ -132,10 +138,10 @@ mod tests {
             "cat_b".to_string(),
             "cat_c".to_string(),
         ];
-        let col = ObsColumn::Categorical(codes.clone(), categories.clone());
+        let col = ObsColumn::Categorical(codes.clone(), categories.clone().into());
         if let ObsColumn::Categorical(c, cats) = col {
             assert_eq!(c, codes);
-            assert_eq!(cats, categories);
+            assert_eq!(&cats[..], categories.as_slice());
         } else {
             panic!("expected Categorical variant");
         }

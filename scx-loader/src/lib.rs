@@ -16,7 +16,7 @@ pub mod sparse_cellset_collate;
 
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
-pub use decode_stage::{decode_stage, extract_obs_columns};
+pub use decode_stage::{build_category_dicts, decode_stage, extract_obs_columns, CategoryDict};
 pub use error::{LoaderError, Result};
 pub use index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
 pub use io_stage::{io_stage, ShardData, ShardGroup};

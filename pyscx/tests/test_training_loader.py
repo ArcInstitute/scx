@@ -122,6 +122,54 @@ class TestObsColumns:
             assert isinstance(batch["obs"], dict)
             break
 
+    def test_categorical_codes_stable_across_batches(self, scx_path):
+        """Regression: a category string must map to the SAME integer code in
+        every batch, and the `categories` list must be identical across
+        batches. Before the fix, the Utf8 obs path built a per-batch dictionary,
+        so codes drifted with batch composition (silently wrong ML labels).
+
+        `cell_id` is a plain-string (Utf8-path) column with one value per cell,
+        so any batch-local encoding would assign the same string different codes
+        across batches — exactly the bug this guards.
+        """
+        ds = pyscx.TrainingDataset(
+            scx_path,
+            batch_size=8,  # small → many batches per epoch
+            obs_columns=["cell_id"],
+            normalize=False,
+            log1p=False,
+        )
+
+        reference_categories = None
+        cell_to_code = {}
+        n_batches = 0
+        for batch in ds:
+            col = batch["obs"]["cell_id"]
+            codes = col["codes"]
+            categories = list(col["categories"])
+            cells = batch["cell_indices"].tolist()
+            n_batches += 1
+
+            # The global category list is identical in every batch.
+            if reference_categories is None:
+                reference_categories = categories
+            else:
+                assert categories == reference_categories
+
+            for pos, cell in enumerate(cells):
+                code = int(codes[pos])
+                # Codes correctly index the global categories list.
+                assert categories[code] == f"cell_{cell}"
+                # The same cell (hence same string) always gets the same code.
+                if cell in cell_to_code:
+                    assert cell_to_code[cell] == code
+                else:
+                    cell_to_code[cell] = code
+
+        assert n_batches > 1, "test must span multiple batches"
+        # No two distinct cells (distinct strings) share a code.
+        assert len(set(cell_to_code.values())) == len(cell_to_code)
+
 
 class TestMultiEpoch:
     """F1: Second for batch in dataset loop starts a new epoch."""

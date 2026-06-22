@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::batch::ObsColumn;
 use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
-use crate::decode_stage::extract_obs_columns;
+use crate::decode_stage::{build_category_dicts, extract_obs_columns, CategoryDict};
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
@@ -100,6 +100,10 @@ struct PairedDenseGather {
 pub struct IndexPlanLoader {
     backed: BackedCsrReader,
     obs_metadata: RecordBatch,
+    /// Stable global category dictionaries (one per categorical obs column),
+    /// computed once at construction. Built from the same full obs table as
+    /// `TrainingPipeline`, so categorical codes match across the two paths.
+    cat_dicts: HashMap<String, CategoryDict>,
     config: LoaderConfig,
     hvg_projection: Option<HvgProjection>,
     n_output_cols: usize,
@@ -193,9 +197,16 @@ impl IndexPlanLoader {
         // Borrow obs / sizes off ScxReader before BackedCsrReader::new takes ownership.
         let obs_metadata = reader.read_obs()?;
 
-        // Validate obs columns up front — fail at construction, not on first batch.
+        // Stable global category dictionaries, built once over the full obs
+        // table so codes are identical across pulls and match TrainingPipeline.
+        // Also validates that requested columns exist.
+        let cat_dicts = build_category_dicts(&obs_metadata, &config.obs_columns)?;
+
+        // Validate obs column dtypes up front — fail at construction, not on
+        // first batch (the builder validates presence + string/dict layout;
+        // this also catches unsupported numeric/other dtypes via a row probe).
         if !config.obs_columns.is_empty() && n_obs > 0 {
-            extract_obs_columns(&obs_metadata, &[0u64], &config.obs_columns)?;
+            extract_obs_columns(&obs_metadata, &[0u64], &config.obs_columns, &cat_dicts)?;
         }
 
         // HvgProjection::new does not validate against n_vars — do it here so
@@ -365,6 +376,7 @@ impl IndexPlanLoader {
         Ok(Self {
             backed,
             obs_metadata,
+            cat_dicts,
             config,
             hvg_projection,
             n_output_cols,
@@ -549,11 +561,13 @@ impl IndexPlanLoader {
             &self.obs_metadata,
             &gathered.pert_indices,
             &self.config.obs_columns,
+            &self.cat_dicts,
         )?;
         let obs_paired = extract_obs_columns(
             &self.obs_metadata,
             &gathered.ctrl_indices,
             &self.config.obs_columns,
+            &self.cat_dicts,
         )?;
 
         Ok(IndexPlanBatch {

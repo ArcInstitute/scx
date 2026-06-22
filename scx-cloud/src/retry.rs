@@ -146,6 +146,14 @@ fn retry_error_to_store(e: RetryError) -> object_store::Error {
 /// throttle / 5xx / connection-reset wording are considered retryable.
 pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
     use object_store::Error;
+    // A missing object (canonical NotFound, or LocalFileSystem's Generic-wrapped
+    // io NotFound) is permanent — never retry it. Keeps open_cloud's _catalog.bin
+    // probe fast and preserves the CatalogNotFound mapping (a retried+rewrapped
+    // error would no longer carry the io NotFound in its source chain, so
+    // is_missing_object would then miss it).
+    if crate::cloud_reader::is_missing_object(err) {
+        return false;
+    }
     match err {
         // Definite permanent failures.
         Error::NotFound { .. } | Error::AlreadyExists { .. } | Error::NotModified { .. } => false,
