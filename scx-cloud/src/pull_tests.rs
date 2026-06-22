@@ -1144,6 +1144,18 @@ fn is_retryable_treats_missing_object_as_permanent() {
 }
 
 #[test]
+fn is_retryable_treats_unknown_config_key_as_permanent() {
+    // A bad object_store config key can never succeed on retry — classifying
+    // it as transient would burn the full backoff budget (~31s) on a
+    // guaranteed failure. Must be permanent.
+    let e = object_store::Error::UnknownConfigurationKey {
+        store: "test",
+        key: "bogus_option".into(),
+    };
+    assert!(!is_retryable(&e));
+}
+
+#[test]
 fn contains_http_status_requires_digit_boundaries() {
     // Genuine status wording matches.
     assert!(contains_http_status(

@@ -178,12 +178,7 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
                 || contains_http_status(&lower, "504")
                 || lower.contains("server error")
                 || lower.contains("temporarily unavailable")
-                || matches!(
-                    err,
-                    Error::Generic { .. }
-                        | Error::JoinError { .. }
-                        | Error::UnknownConfigurationKey { .. }
-                )
+                || matches!(err, Error::Generic { .. } | Error::JoinError { .. })
         }
     }
 }
