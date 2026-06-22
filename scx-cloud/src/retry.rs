@@ -39,7 +39,7 @@ use object_store::{
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Number of retry attempts on top of the first try. Total attempts
-    /// = `max_retries + 1`. Default 3.
+    /// = `max_retries + 1`. Default 6.
     pub max_retries: usize,
     /// Initial backoff delay before retry attempt 1. Default 500 ms.
     pub base_delay: Duration,

@@ -1017,10 +1017,11 @@ impl LeidenOptimizer {
 
         let batcher = ConflictFreeBatcher::new(10_000);
 
-        // Safety limit: parallel batching with stale reads can cause oscillation
-        // where nodes cycle between communities. Bound queue passes to prevent
-        // infinite loops. The C++ sequential move_nodes converges naturally;
-        // this limit approximates the same bound for the parallel variant.
+        // Parallel batching with stale reads can cause oscillation where
+        // nodes cycle between communities. The C++ sequential move_nodes
+        // converges naturally; here convergence is enforced by the
+        // `!made_move` break below (a pass that makes no move terminates the
+        // loop), not by an explicit pass-count cap.
         while !pending.is_empty() {
             let current: Vec<usize> = pending.drain(..).collect();
             let batches = batcher.create_batches(&current, &graph, &is_stable);
@@ -1388,8 +1389,9 @@ pub fn leiden(
     //
     // When max_iterations == 0 (from n_iterations=-1, convergence mode):
     // repeat until no improvement, matching leidenalg's Optimiser.py:299-310.
-    // When max_iterations > 0 (default 2, matching leidenalg package default):
-    // run exactly that many outer passes.
+    // When max_iterations > 0: run exactly that many outer passes. This is
+    // the caller-supplied n_iterations (leidenalg's own n_iterations default
+    // is 2); this function takes it as a required argument with no default.
     if max_iterations == 0 {
         // Converge: repeat until no improvement.
         // Safety cap at 100 to prevent infinite loops on pathological inputs.

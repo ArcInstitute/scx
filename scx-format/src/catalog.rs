@@ -678,13 +678,16 @@ impl FullCatalog {
     /// layout shipped (2026-05-10 tier-full gate run #2).
     ///
     /// The two v4 generation counters ride in 16 trailing bytes after the
-    /// entry list. The declared `catalog_version` is upgraded to 4 only
-    /// when a non-zero counter is carried; a fully-zero pair (the common
-    /// no-CSC / legacy case) keeps the declared version at its v2+ floor
-    /// and emits **no** trailing bytes, so existing zero-counter files are
-    /// byte-identical to before. v4 catalogs carry the 16 bytes; v<4 do
-    /// not — `read_from` keys the trailing read strictly on
-    /// `catalog_version >= 4`.
+    /// entry list, emitted whenever the declared `catalog_version >= 4`.
+    /// A non-zero counter forces the declared version up to 4; if the
+    /// caller declares a lower version AND both counters are zero, no
+    /// trailing bytes are written (the legacy/v2-floor path, kept so a
+    /// hand-constructed v2 catalog still round-trips byte-identically).
+    /// Note the shipped writer always passes `CURRENT_CATALOG_VERSION`
+    /// (= 4, `writer.rs`), so production catalogs always carry the 16
+    /// trailing bytes even with zero counters. `read_from` keys the
+    /// trailing read strictly on `catalog_version >= 4`, so read-back is
+    /// self-consistent in every case.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         let mut catalog_version = std::cmp::max(self.catalog_version, 2);
         if self.data_generation != 0 || self.csc_build_generation != 0 {

@@ -378,7 +378,7 @@ For the full binary specification, see [format.md §CSR Shard Internal Layout](f
 ## Obs/var metadata sharding
 
 Streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when
-`n_obs > shard_target_rows`) write obs and var metadata as row-sharded
+`n_obs > shard_size`) write obs and var metadata as row-sharded
 Arrow IPC sections (section types 24/25) instead of a single monolithic
 `obs_metadata` / `var_metadata` section. This bounds peak memory at one
 shard's worth of metadata during the merge/append/ingest hot path and

@@ -108,7 +108,10 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   `rand_chacha` for deterministic seeding and `libc::malloc_trim` on
   Linux to return freed arenas to the OS after large reductions.
 - Pseudobulk aggregation streams via `BackedCsrReader`; statistical
-  testing delegated to `pydeseq2`.
+  testing is a Rust-native DESeq2-style negative-binomial GLM
+  (`scx_accel::nb_glm`, surfaced as `accel.nb_glm` / `pdex_nb_glm` /
+  `pseudobulk_dex(backend="nb_glm")`). `pydeseq2` is now only a
+  benchmark/correctness reference, not a runtime dependency.
 - **Execution route is computed once and *drives* dispatch.** The single
   planner `scx_accel::route::plan_de_route` is the source of truth for the
   `pdex_ref` *and* `rank_genes_groups` (Wilcoxon) route + fallback reason. Both

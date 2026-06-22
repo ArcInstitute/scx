@@ -1010,20 +1010,20 @@ sidecars.
 
 ### 12.2 BitmapShard wire format
 
-Each `BitmapShard` section is a 76-byte header followed by per-gene
-roaring blobs and trailing checksum bytes. All values little-endian.
+Each `BitmapShard` section is a 28-byte fixed header followed by per-gene
+roaring blobs and a trailing checksum. All values little-endian.
 
 ```
 u32 magic = b"SCXB"
 u16 version = 1
 u8  orientation = 0          (0 = gene → local row ids; reserved for future)
-u8  index_dtype              (gene id width: 1 = u8, 2 = u16, 4 = u32)
+u8  index_dtype              (gene id width enum: 0 = u16 when n_vars ≤ 65535, 1 = u32)
 u64 row_start                (global row id of the shard's first row)
 u32 n_rows                   (rows in this shard)
 u32 n_vars                   (variables in the file / modality)
 u32 n_genes_with_hits        (count of (gene_id, bitmap) pairs that follow)
 repeated × n_genes_with_hits:
-  uN  gene_id                (width = index_dtype; local var id)
+  uN  gene_id                (u16 if index_dtype = 0, else u32; local var id)
   u32 roaring_len            (length in bytes of the following roaring blob)
   u8  roaring_bytes[roaring_len]
 u8  checksum[32]             (BLAKE3-256 over the preceding header + payload)

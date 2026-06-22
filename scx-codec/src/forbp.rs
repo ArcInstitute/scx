@@ -371,7 +371,10 @@ pub fn forbp_decode_with_metadata(
 /// Reads u64 words from `src` starting at `bit_offset` bits, extracting
 /// `count` values of `bits` width each into `dst`. This replaces the
 /// per-value `BitReader::read_bits()` loop with word-at-a-time extraction,
-/// processing `floor(64 / bits)` values per u64 word.
+/// processing up to `floor(64 / bits)` values per u64 word — the exact
+/// count per word is recomputed from the running bit position, since a
+/// value straddling a word boundary leaves fewer than `floor(64 / bits)`
+/// fully-contained values in the current word.
 ///
 /// # Safety / correctness
 /// - `dst.len()` must be `>= count`

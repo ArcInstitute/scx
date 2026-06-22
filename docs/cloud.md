@@ -456,10 +456,10 @@ relative to a cloud-optimized layout.
 
 **Sharded obs/var metadata** (`ObsMetadataShard` / `VarMetadataShard`,
 section types 24–25) emitted by `merge`, `append`, and `from_anndata`
-(when `n_obs > shard_target_rows`) is supported on the cloud path:
+(when `n_obs > shard_size`) is supported on the cloud path:
 `open_cloud(...).query()` assembles the per-shard sections over parallel
 range reads (the same upcast → cover-validation → concat → downcast
-pipeline the local reader uses, via `scx_format::assemble_sharded_metadata`)
+pipeline the local reader uses, via `scx_format_io::assemble_sharded_metadata`)
 and returns results identical to the local in-process query. The single
 file-scope `ObsPredicateIndex` is read unchanged, so catalog-level
 predicate pushdown still applies.
@@ -490,12 +490,13 @@ transforms are not exposed on `read_cloud` — build the explicit
 you need them. Returns a regular `anndata.AnnData`. `file://` URLs and local
 paths work too, so the same call serves local exploded directories.
 
-> **Caveat — stale index after append.** `scx append` with the default
-> `--rebuild-index=false` leaves the file-scope predicate index covering
-> only the original rows; it is *not* auto-merged across the appended
-> shards. A cloud query over such a file falls back to a full obs scan of
-> the appended rows (correct, but slower). Rebuild the index on append, or
-> treat the incremental delta-index design as a separate follow-on.
+> **Caveat — stale index after append.** Unless `scx append` is given
+> `--index-obs`/`--index-var`/`--index-preset` (which rebuild the predicate
+> index over the full output), the file-scope predicate index covers only the
+> original rows; it is *not* auto-merged across the appended shards. A cloud
+> query over such a file falls back to a full obs scan of the appended rows
+> (correct, but slower). Rebuild the index on append, or treat the
+> incremental delta-index design as a separate follow-on.
 
 **Deferred to follow-on PRs:**
 
@@ -553,7 +554,7 @@ Heuristics:
 | `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the reorder window — peak memory is `parallelism × max_section_size`. |
 | `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
 | `retry_config.request_timeout` | 120 s | Per-request wall-clock cap. A timed-out request is retried subject to `max_retries`; final exhaustion surfaces as `CloudError::Timeout`. Raise on slow links pulling very large shards. |
-| `retry_config.max_retries` | 3 | Application-level retries on top of `object_store`'s internal retries. Total HTTP attempts per request ≈ `max_retries × object_store_max_retries` (~9 by default). Lower to 0–1 to fail fast in CI; raise on flaky networks. |
+| `retry_config.max_retries` | 6 | Application-level retries on top of `object_store`'s internal retries. Total HTTP attempts per request ≈ `(max_retries + 1) × object_store_max_retries`. Lower to 0–1 to fail fast in CI; raise on flaky networks. |
 | `retry_config.base_delay` / `max_delay` / `jitter_factor` | 500 ms / 30 s / 0.1 | Exponential backoff schedule with ±10% jitter for breaking thundering-herd. Defaults rarely need tuning. |
 | Shard size at write time | 10k cells | Smaller shards → finer pushdown granularity, but more objects and more request overhead. See [docs/sharding.md]. |
 | `RAYON_NUM_THREADS` | #cores | Affects downstream decode after download. Does **not** control download parallelism — that's `parallelism`. |

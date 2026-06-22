@@ -12,7 +12,7 @@ For the API reference, see [api.md](api.md).
 
 ## Crate Dependency Graph
 
-The workspace contains 16 crates plus an integration-test crate (`scx-integration-tests`). Dependencies flow bottom-up:
+The workspace contains 15 crates plus an integration-test crate (`scx-integration-tests`), 16 members in total. Dependencies flow bottom-up:
 
 ```
                         ┌──────────┐
@@ -70,6 +70,7 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
 | **scx-mtx** | Matrix Market (MTX) I/O (always-on, no feature gate) | `read` (COO→CSR, TSV parsers, gzip), `write` (CSR→COO, gzipped output) |
+| **scx-convert** | h5ad / h5mu ↔ SCX streaming conversion (opt. `hdf5` feature) | `pipeline` (parallel streaming writer coordinator), `h5ad` (`read`, `write`, `stream_write`, `dense_stream`, `csc_stream`), `h5mu` (multimodal pipeline) |
 | **scx-accel** | Rust-native analysis accelerators (opt. GPU via `gpu` feature) | `route` (accelerator execution planner + rapids probe), `pca` (streaming/randomized SVD, auto-routed; in-VRAM routes to `rsc.pp.pca`), `neighbors` (HNSW kNN; in-VRAM routes to `rsc.pp.neighbors`), `umap` (routes to `rsc.tl.umap`), `hvg` (streaming `seurat_v3`; extra flavors route to `rsc.pp.highly_variable_genes`), `fused` (fused `pca_neighbors_umap` / `pca_neighbors` pipelines via rapids), `diffexp` (Wilcoxon with pre-ranking), `leiden` (Rust-native CPU + cuGraph GPU), `harmony` (Harmony2 batch integration — soft k-means + ridge regression), `lisi` (exact-kNN Local Inverse Simpson Index), `pseudobulk`. GPU dispatch when `gpu` feature enabled; rapids-singlecell detected at runtime (not a pip extra). |
 | **scx-gpu** | CUDA-accelerated codec decoding, GPU analysis, and GPU interop | `rice_decode`, `forbp_decode`, `sparse_to_dense`, `cusparse` (SpMM), `cusolver` (QR), `curand` (random matrix), `gpu_pca`, `gpu_knn` (CAGRA, device-resident fused path), `gpu_harmony` (distance / softmax+penalty / L2-normalize / batched correction kernels), `gpu_preprocess` (fused normalize+log1p), `gpu_matrix_source` (unified `GpuMatrixSource` capability trait over the row-major `GpuShardSource` (CSR) and column-major `GpuCscShardSource` (CSC) device shard sources, with G3-shaped pinned-ring staging), `gds` |
 | **scx-cli** | Command-line interface | `convert`, `info`, `validate`, `query`, `append`, `delete`, `compact`, `optimize`, `merge`, `rollback`, `benchmark`, cloud ops |
@@ -847,8 +848,8 @@ MTX conversion is **always available** — no feature flag required.
   experiment.scx
 ```
 
-The conversion code lives in the **`scx-convert`** crate (workspace
-member 15, opt-in `hdf5` feature). Both `scx-cli` and `pyscx` depend on
+The conversion code lives in the **`scx-convert`** crate (opt-in `hdf5`
+feature; see the crate summary above). Both `scx-cli` and `pyscx` depend on
 it; the previous in-line `scx-cli/src/convert/` module was extracted
 when streaming conversion landed so `pyscx` could share the pipeline
 without depending on the binary-only `scx-cli`.

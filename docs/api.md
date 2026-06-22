@@ -2,7 +2,7 @@
 
 ## Section Types
 
-26 section types are defined in `scx-format/src/section.rs`:
+29 section types (IDs 0–28) are defined in `scx-format/src/section.rs`:
 
 ```
 ObsMetadata (0)        — Arrow IPC metadata for observations
@@ -48,9 +48,16 @@ ObspEmbeddingShard (22)— Row-sharded obsp (section per shard × key).
 VarpEmbeddingShard (23)— Row-sharded varp (mirror of 22).
 ObsMetadataShard (24)  — Row-sharded obs Arrow IPC. Produced by merge,
                          append, and from_anndata when n_obs exceeds
-                         shard_target_rows. Mutually exclusive with
+                         shard_size. Mutually exclusive with
                          ObsMetadata (0) in the same file.
 VarMetadataShard (25)  — Row-sharded var Arrow IPC (mirror of 24).
+DecodeMetadataShard (26)— v3 decode-metadata sidecar for a CSR shard
+                         (enables in-VRAM Scx1 decode and other fast
+                         decode paths). One per CSR shard when present.
+RawCsrShard (27)       — Row-sharded `raw.X` CSR (anndata `.raw` layer),
+                         parallel to CsrShard (4).
+RawVarMetadata (28)    — Arrow IPC var metadata for the `.raw` layer
+                         (mirror of VarMetadata (2)).
 ```
 
 ## ScxReader (`scx-format-io/src/reader.rs`)
@@ -843,7 +850,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.open(path, verify=True) -> Experiment` — Open SCX file (local), returning a lazy `Experiment` handle.
 - `pyscx.read(path, *, verify=True, **kwargs) -> AnnData` — One-liner read mirroring `sc.read_h5ad`: shorthand for `pyscx.open(path).to_anndata(**kwargs)`. `**kwargs` forward to [`Experiment.to_anndata`](#experiment) (`backed=`, `var_names=`, `obs_filter=`, `layers=`, …).
 - `pyscx.write(adata, path, **kwargs)` — One-liner write mirroring `AnnData.write_h5ad`: shorthand for `pyscx.from_anndata(adata, path, **kwargs)`.
-- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None, shard_target_rows=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
+- `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
   pairwise slots `obsp` / `varp`. Pairwise matrices are stored as float32 COO
   Arrow IPC; higher-precision inputs are downcast on write. `in_place=True`
@@ -859,11 +866,12 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   `force_legacy_metadata=True` forces a single `ObsMetadata` /
   `VarMetadata` section regardless of size; the default (`False`)
   emits `ObsMetadataShard` / `VarMetadataShard` sections when
-  `n_obs > shard_target_rows`. `memory_budget` (`"4G"`, `"512M"`,
+  `n_obs > shard_size`. `memory_budget` (`"4G"`, `"512M"`,
   bytes) emits `MappingPeakFootprintHigh` when an individual mapping's
-  estimated footprint exceeds the budget. `shard_target_rows` overrides
-  the default obs shard size. Obsm, varm, obsp, and varp are extracted
-  and written one key at a time (incremental, not collected).
+  estimated footprint exceeds the budget. `shard_size` sets the per-shard
+  row count for both `X` and the obs/var metadata shards. Obsm, varm,
+  obsp, and varp are extracted and written one key at a time (incremental,
+  not collected).
 - `pyscx.from_h5ad(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", stream=True, strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None, temp_dir=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4, obs_override=None, var_override=None, uns_override=None)` — Stream an h5ad file directly to SCX without materialising `X` in Python or Rust.
   Bounded peak memory: `shard_target_rows × n_vars × density × ~16` bytes
   per X shard, plus `shard_target_rows × k × 4` bytes per `obsm` / `varm` /
@@ -1032,7 +1040,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
 - `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`. **`set_uns` is a strict subset of `modify_metadata`** — `pyscx.modify_metadata(path, uns=...)` does the same thing and also reaches `obs`/`var`/`obsm`/`varm`; prefer `modify_metadata` unless you only need the one-arg `uns` convenience.
 - `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. `index_*` kwargs rebuild predicate indexes over a replaced `obs`/`var` (otherwise the stale index is dropped). Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
-- `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `uns_policy` controls conflicting uns sections: `"first"` (keep first input), `"require_equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (write conflict report as `uns["_merge_uns_summary"]`). `shard_target_rows` overrides the default obs shard size during merge. Merge now streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
+- `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, assume_identical_obs=False, uns_policy=None, sort_by=None, reverse=False)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `assume_identical_obs` (default `False`) validates each input's obs schema (column names + dtypes) against input 0; set `True` to skip. `uns_policy` controls conflicting uns sections: `None` / `"first"` (keep first input), `"require-equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (keep first input and record a `_scx_uns_conflicts` array). `sort_by` / `reverse` optionally sort the merged obs by a column. Merge streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.
 
 ### Cloud operations (requires `--features cloud`)
 - `pyscx.pull(source, dest, filter=None, parallelism=None)` — Streaming cloud → local

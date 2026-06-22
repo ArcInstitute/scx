@@ -1,10 +1,18 @@
 //! CUDA Graph capture/replay infrastructure for iteration-heavy GPU loops.
 //!
-//! Iteration-heavy stages (PCA power, Harmony k-means, UMAP SGD, GPU DE
-//! chunk loops) launch many small kernels per iteration. Per-launch
-//! overhead (~5–20 µs each) dominates on small inputs. `cudaStreamBegin/
-//! EndCapture` records a stable kernel sequence into a `cudaGraph_t` once;
-//! subsequent replays via `cuGraphLaunch` amortize per-launch latency.
+//! Iteration-heavy stages (Harmony k-means, UMAP SGD, GPU DE chunk loops)
+//! launch many small kernels per iteration. Per-launch overhead (~5–20 µs
+//! each) dominates on small inputs. `cudaStreamBegin/EndCapture` records a
+//! stable kernel sequence into a `cudaGraph_t` once; subsequent replays via
+//! `cuGraphLaunch` amortize per-launch latency.
+//!
+//! NOTE: the PCA power loop is **no longer a capture target** — its
+//! SpMM-segment capture was removed in ACC-RUST-OPT-V4 Phase 3.4
+//! (`run_resident_power_loop` always reports "no replay"). The
+//! `GpuPcaScratch` stable-buffer prerequisite is kept only as a model for
+//! the remaining capture sites; do not re-enable PCA capture without first
+//! moving its per-iteration QR/eigh/slot-grow allocations outside the
+//! capture region.
 //!
 //! ## Prerequisites
 //!

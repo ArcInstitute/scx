@@ -2158,7 +2158,7 @@ df = pyscx.accel.pdex_nb_glm(
 # 3. accel.nb_glm — direct, on an already-pseudobulked matrix + numeric design.
 df = pyscx.accel.nb_glm(counts, design, contrast=1)
 # columns: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
-#          dispersion, converged, n_iter
+#          dispersion, cooks, converged, n_iter
 ```
 
 > [!IMPORTANT]
@@ -2522,8 +2522,11 @@ print(adata.uns["umap"]["backend"])         # "rapids_singlecell_gpu"
 On GPU, PCA, kNN, and UMAP all route to `rapids_singlecell` (`rsc.pp.pca`,
 `rsc.pp.neighbors`, `rsc.tl.umap`). Preprocessing ops (`normalize_total`,
 `log1p`, `highly_variable_genes`) also route to `rsc.pp.*` on GPU. GPU
-Leiden uses cuGraph. The Leiden dispatch order is: Rust-native CPU →
-cuGraph GPU → Python leidenalg. Set `SCX_FORCE_NATIVE_GPU=1` to pin
+Leiden uses cuGraph: `device="cpu"` runs the Rust-native CPU path,
+`device="gpu"` runs cuGraph and hard-errors if cuGraph is absent (the
+Python `leidenalg` fallback was deleted — call
+`scanpy.tl.leiden(flavor="leidenalg")` directly if you need it). Set
+`SCX_FORCE_NATIVE_GPU=1` to pin
 surviving native GPU paths (HVG `seurat_v3`, DE, Harmony, Leiden); set
 `SCX_DISABLE_RAPIDS=1` to force the rapids-absent fallback for testing.
 When rapids is unavailable, a one-shot `UserWarning` is emitted and the

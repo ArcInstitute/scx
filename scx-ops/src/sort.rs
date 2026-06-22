@@ -3,13 +3,20 @@
 //! This module holds the **shared sort core**:
 //! the pure, reusable primitives every delivery form builds on —
 //! option/result types, sort-key extraction, the stability comparator,
-//! leading-key partition-boundary computation, the predicate-index-rebuild
-//! feed, and the provenance entry.
+//! the predicate-index-rebuild feed, and the provenance entry.
 //!
 //! It deliberately contains **no I/O engine, CLI, or pyscx surface**. The
 //! `sort()` engine + strategy selector, convert-gather,
 //! k-way merge, and multimodal/obsp remap build on these
 //! primitives.
+//!
+//! NOTE: the histogram-partition primitives below (`PartitionPlan`,
+//! `numeric_histogram`, `compute_partition_plan`, and the `cmp_keyed`
+//! comparator) describe a leading-key external-sort pass-0 that is **not
+//! currently wired into the live engine** — `sort_engine` reduces on
+//! `new_pos` ranges instead. They are retained (and unit-tested) as the
+//! seam for that planned strategy; treat them as not-yet-live, not as the
+//! shipped sort path.
 //!
 //! Design notes:
 //! - Key extraction and comparison go through `arrow::row::RowConverter`,
