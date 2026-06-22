@@ -823,7 +823,10 @@ fn filtered_obs_shards<'a>(
 /// called. `total_kept` is the post-deletion obs row count (stamped as each
 /// shard's `n_rows_total`). When every row is deleted, a single empty obs
 /// section keeps the file well-formed.
-fn write_obs_shards_streaming(
+///
+/// `pub(crate)` so `scx optimize` can reuse it (with `keep_mask = None`) to
+/// preserve a sharded obs layout instead of collapsing it via `read_obs()`.
+pub(crate) fn write_obs_shards_streaming(
     reader: &ScxReader,
     writer: &mut ScxWriter,
     keep_mask: Option<&[bool]>,

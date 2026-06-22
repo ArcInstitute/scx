@@ -13,6 +13,39 @@ use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtrMut};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 
+/// RAII wrapper around a cuRAND generator (`curandGenerator_t`).
+///
+/// `Drop` calls `curandDestroyGenerator` so the handle is released on every
+/// path — success, `?`-error, or panic — closing the leak where the previous
+/// explicit destroy only ran on the success path. Function-local (not stored
+/// across threads), so unlike the cuBLAS/cuSPARSE/cuSOLVER handles it needs no
+/// `Send`/`Sync`.
+struct CurandGenerator {
+    raw: crand_sys::curandGenerator_t,
+}
+
+impl CurandGenerator {
+    fn new(kind: crand_sys::curandRngType_t) -> Result<Self, GpuError> {
+        let raw = crand::create_generator_kind(kind)
+            .map_err(|e| GpuError::CuRandError(format!("curandCreateGenerator: {e:?}")))?;
+        Ok(Self { raw })
+    }
+
+    fn raw(&self) -> crand_sys::curandGenerator_t {
+        self.raw
+    }
+}
+
+impl Drop for CurandGenerator {
+    fn drop(&mut self) {
+        // Mirror the cuBLAS/cuSPARSE/cuSOLVER handle drops: best-effort
+        // destroy, error swallowed (nothing actionable in `drop`).
+        unsafe {
+            let _ = crand::destroy_generator(self.raw);
+        }
+    }
+}
+
 /// Generate a random Gaussian matrix directly on GPU.
 ///
 /// Uses cuRAND's XORWOW generator for speed. The output is a `CudaSlice<f32>`
@@ -43,19 +76,19 @@ pub fn random_gaussian_gpu(
     // cuRAND requires even count for normal generation (Box-Muller).
     let alloc_count = if total % 2 == 1 { total + 1 } else { total };
 
-    // Create generator (XORWOW — fast, adequate quality for PCA)
-    let gen = crand::create_generator_kind(crand_sys::curandRngType_t::CURAND_RNG_PSEUDO_XORWOW)
-        .map_err(|e| GpuError::CuRandError(format!("curandCreateGenerator: {e:?}")))?;
+    // Create generator (XORWOW — fast, adequate quality for PCA). The RAII
+    // wrapper destroys it on every exit path below, including the `?`-errors.
+    let gen = CurandGenerator::new(crand_sys::curandRngType_t::CURAND_RNG_PSEUDO_XORWOW)?;
 
     // Set seed
     unsafe {
-        crand::set_seed(gen, seed)
+        crand::set_seed(gen.raw(), seed)
             .map_err(|e| GpuError::CuRandError(format!("curandSetSeed: {e:?}")))?;
     }
 
     // Set stream
     unsafe {
-        crand::set_stream(gen, stream.cu_stream() as _)
+        crand::set_stream(gen.raw(), stream.cu_stream() as _)
             .map_err(|e| GpuError::CuRandError(format!("curandSetStream: {e:?}")))?;
     }
 
@@ -66,16 +99,13 @@ pub fn random_gaussian_gpu(
     {
         let (buf_ptr, _guard) = buf.device_ptr_mut(stream);
         unsafe {
-            crand::generate::normal_f32(gen, buf_ptr as *mut f32, alloc_count, 0.0, 1.0)
+            crand::generate::normal_f32(gen.raw(), buf_ptr as *mut f32, alloc_count, 0.0, 1.0)
                 .map_err(|e| GpuError::CuRandError(format!("curandGenerateNormal: {e:?}")))?;
         }
     }
 
-    // Destroy generator
-    unsafe {
-        crand::destroy_generator(gen)
-            .map_err(|e| GpuError::CuRandError(format!("curandDestroyGenerator: {e:?}")))?;
-    }
+    // `gen` is destroyed by its `Drop` impl when it falls out of scope below
+    // (after the optional trim) — no explicit `destroy_generator` needed.
 
     // If we allocated an extra element for even count, trim via round-trip.
     // Only 1 extra element so the overhead is trivial.

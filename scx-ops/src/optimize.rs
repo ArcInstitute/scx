@@ -80,9 +80,29 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
 
-    // obs / var pass through unchanged (rows are preserved 1:1).
-    writer.write_obs(&reader.read_obs()?)?;
-    writer.write_var(&reader.read_var()?)?;
+    // obs / var pass through unchanged (rows are preserved 1:1). Stream
+    // shard-by-shard when the input is already sharded so the row-sharded
+    // layout survives and peak memory stays at one shard: `read_obs()` would
+    // assemble every `ObsMetadataShard` into one in-memory batch (atlas-scale
+    // OOM) and `write_obs()` would collapse it back to a single legacy section,
+    // breaking the "faithful 1:1 upgrade" contract. Legacy single-section input
+    // (`*_metadata_shard_count() == 0`) has no per-shard reader and falls
+    // through to the materialising path. Both counts are pure catalog scans.
+    if reader.obs_metadata_shard_count() > 0 {
+        crate::compact::write_obs_shards_streaming(
+            &reader,
+            &mut writer,
+            None,
+            in_header.n_obs as usize,
+        )?;
+    } else {
+        writer.write_obs(&reader.read_obs()?)?;
+    }
+    if reader.var_metadata_shard_count() > 0 {
+        write_var_shards_streaming(&reader, &mut writer, in_header.n_vars)?;
+    } else {
+        writer.write_var(&reader.read_var()?)?;
+    }
 
     // Re-encode every CSR-backed shard (X first, then layers, then obs×obs
     // pairwise graphs) preserving its name and global row offset, canonicalizing
@@ -196,6 +216,42 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     .map_err(|e| OpsError::InvalidInput(format!("append provenance: {e}")))?;
 
     writer.finish()?;
+    Ok(())
+}
+
+/// Stream var shards from `reader` straight to sharded output, one output shard
+/// per non-empty input shard. Peak memory is one shard — `read_var()` (which
+/// assembles every `VarMetadataShard` into one batch) is never called. Mirror of
+/// compact's [`write_obs_shards_streaming`](crate::compact::write_obs_shards_streaming)
+/// for the var axis; optimize applies no deletions, so (unlike the obs helper)
+/// it takes no `keep_mask` and renumbers output shards over the non-empty inputs.
+fn write_var_shards_streaming(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    n_vars_total: u64,
+) -> Result<()> {
+    let mut out_idx = 0u32;
+    let mut row_start = 0u64;
+    for res in reader.var_shards() {
+        let batch = res?;
+        let n = batch.num_rows() as u64;
+        if n == 0 {
+            continue;
+        }
+        writer.write_var_shard(out_idx, row_start, n, n_vars_total, &batch)?;
+        out_idx += 1;
+        row_start += n;
+    }
+    if out_idx == 0 {
+        // Every input var shard was empty (degenerate `n_vars == 0` file with a
+        // sharded var layout). Mirror `write_obs_shards_streaming`'s empty-section
+        // fallback: emit one empty legacy var section so the output stays
+        // well-formed instead of carrying no var section at all (which the old
+        // `write_var(read_var())` path would also have written). Footer-only
+        // schema read — no batch decode.
+        let schema = std::sync::Arc::new(reader.read_var_schema_physical()?);
+        writer.write_var(&arrow::array::RecordBatch::new_empty(schema))?;
+    }
     Ok(())
 }
 
@@ -631,5 +687,144 @@ mod tests {
                 .any(|e| e.section_type == SectionType::ObsmEmbedding),
             "no flattened single-section obsm emitted"
         );
+    }
+
+    #[test]
+    fn optimize_preserves_sharded_obs_layout() {
+        // A sharded `ObsMetadataShard` input must NOT collapse to a single
+        // legacy `ObsMetadata` section (the atlas-scale read_obs() OOM +
+        // layout regression this fix addresses).
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 6usize;
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        let (indptr, indices, values) = small_csr(n_obs);
+        let obs = sample_obs(n_obs);
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            // Two 3-row obs shards (sharded layout to prove it is preserved).
+            for shard_idx in 0u32..2 {
+                let row_start = shard_idx as usize * 3;
+                let slice = obs.slice(row_start, 3); // zero-copy
+                w.write_obs_shard(shard_idx, row_start as u64, 3, n_obs as u64, &slice)
+                    .unwrap();
+            }
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        optimize(&input, &output, None).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        // Sharded layout preserved (not flattened to a single section).
+        assert_eq!(
+            out.catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+                .count(),
+            2,
+            "sharded obs preserved as shards"
+        );
+        assert!(
+            !out.catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::ObsMetadata),
+            "no flattened single-section obs emitted"
+        );
+        // Rows + values still readable and intact (assembled view).
+        let out_obs = out.read_obs().unwrap();
+        assert_eq!(out_obs.num_rows(), n_obs);
+        let ids = out_obs
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "cell_0");
+        assert_eq!(ids.value(n_obs - 1), &format!("cell_{}", n_obs - 1)[..]);
+    }
+
+    #[test]
+    fn optimize_preserves_sharded_var_layout() {
+        // Mirror of the obs test for the var axis.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 6usize;
+        let n_vars = 8usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 0; // n_vars <= 65535 → u16 indices
+        let (indptr, indices, values) = small_csr(n_obs);
+        // small_csr emits indices > n_vars; clamp into [0, n_vars) so the shard
+        // is valid for this small gene axis.
+        let indices: Vec<u32> = indices.iter().map(|&c| c % n_vars as u32).collect();
+        let var = sample_var(n_vars);
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            // Two 4-row var shards.
+            for shard_idx in 0u32..2 {
+                let row_start = shard_idx as usize * 4;
+                let slice = var.slice(row_start, 4); // zero-copy
+                w.write_var_shard(shard_idx, row_start as u64, 4, n_vars as u64, &slice)
+                    .unwrap();
+            }
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        optimize(&input, &output, None).unwrap();
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            out.catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::VarMetadataShard)
+                .count(),
+            2,
+            "sharded var preserved as shards"
+        );
+        assert!(
+            !out.catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::VarMetadata),
+            "no flattened single-section var emitted"
+        );
+        let out_var = out.read_var().unwrap();
+        assert_eq!(out_var.num_rows(), n_vars);
+        let ids = out_var
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(0), "gene_0");
+        assert_eq!(ids.value(n_vars - 1), &format!("gene_{}", n_vars - 1)[..]);
     }
 }
