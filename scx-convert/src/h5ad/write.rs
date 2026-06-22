@@ -439,6 +439,17 @@ fn coo_batch_to_csr(batch: &RecordBatch, keep: Option<&[bool]>) -> Result<CooCsr
         None => (None, n_rows),
     };
 
+    // CSR `indices` are i32 (scipy zero-copy). The largest column index emitted
+    // is `n_out - 1`; reject axes too wide to represent rather than silently
+    // wrapping the `c as i32` narrowing below. Checked here (before the
+    // `indptr` allocation) so an oversized dimension fails fast.
+    if n_out > i32::MAX as usize {
+        return Err(ConvertError::Other(format!(
+            "pairwise matrix dimension {n_out} exceeds the i32 CSR index limit ({})",
+            i32::MAX
+        )));
+    }
+
     // Filter + remap into (row, col, value) triples.
     let mut triples: Vec<(i64, i64, f32)> = Vec::with_capacity(rows.len());
     for k in 0..rows.len() {
@@ -2778,6 +2789,19 @@ mod pairwise_tests {
         assert!(
             err.to_string().contains("out of bounds"),
             "expected out-of-bounds error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn coo_to_csr_rejects_dimension_exceeding_i32() {
+        // A pairwise axis wider than i32::MAX cannot be represented in the i32
+        // CSR `indices`; reject rather than wrap. Empty triples so the guard
+        // fires before the large `indptr` allocation (cheap test).
+        let batch = coo(i32::MAX as usize + 1, &[]);
+        let err = coo_batch_to_csr(&batch, None).unwrap_err();
+        assert!(
+            err.to_string().contains("i32"),
+            "expected i32 index-limit error, got: {err}"
         );
     }
 }
