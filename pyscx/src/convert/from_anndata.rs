@@ -886,10 +886,31 @@ pub fn from_anndata_impl(
             let hi = boundary.row_end;
             let nnz_lo = boundary.nnz_start;
             let nnz_hi = boundary.nnz_end;
-            let mut local_indptr: Vec<u64> = indptr_slice[lo..=hi]
-                .iter()
-                .map(|&v| (v - boundary.indptr_base) as u64)
-                .collect();
+            // Rebase indptr to shard-local. Mirror `parallel_encode_csr_shards`'s
+            // guard: on non-canonical input, `v < base` would make `(v - base)`
+            // go negative and wrap to a huge u64, corrupting the bitmap. (The
+            // upstream encode call already rejects such shards, so this is
+            // defense-in-depth.)
+            let mut local_indptr: Vec<u64> = if csr_validated {
+                indptr_slice[lo..=hi]
+                    .iter()
+                    .map(|&v| (v - boundary.indptr_base) as u64)
+                    .collect()
+            } else {
+                indptr_slice[lo..=hi]
+                    .iter()
+                    .map(|&v| {
+                        if v < boundary.indptr_base {
+                            Err(PyRuntimeError::new_err(format!(
+                                "indptr value {v} < base {} (non-monotonic)",
+                                boundary.indptr_base
+                            )))
+                        } else {
+                            Ok((v - boundary.indptr_base) as u64)
+                        }
+                    })
+                    .collect::<PyResult<Vec<u64>>>()?
+            };
             let mut local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
                 .iter()
                 .map(|&v| v as u32)
