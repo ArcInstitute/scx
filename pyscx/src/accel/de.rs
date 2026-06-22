@@ -180,9 +180,19 @@ fn run_rank_genes_groups_inner(
         .map(|(i, name)| (name.as_str(), i))
         .collect();
 
+    // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
+    // sentinel >= n_groups so the Wilcoxon kernels drop them, instead of
+    // contaminating group 0. Mirrors resolve_groups_and_reference.
+    let oor = unique_groups.len();
     let groups: Vec<usize> = group_labels
         .iter()
-        .map(|label| *group_name_to_idx.get(label.as_str()).unwrap_or(&0))
+        .map(|label| {
+            if label.is_empty() || label == "nan" {
+                oor
+            } else {
+                *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
+            }
+        })
         .collect();
 
     // Resolve reference.
