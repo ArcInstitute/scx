@@ -1907,10 +1907,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
@@ -4075,10 +4081,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();
@@ -4244,10 +4256,16 @@ impl ScxReader {
                         e.name, e.offset
                     ))
                 })?;
-                Ok::<_, ScxError>((
-                    (stats.row_end - stats.row_start) as usize,
-                    stats.nnz as usize,
-                ))
+                // checked_sub (not bare `-`): a corrupt catalog with
+                // row_end < row_start would otherwise underflow-panic in debug
+                // or wrap to a huge usize in release (driving a giant alloc).
+                let n_rows = stats.row_end.checked_sub(stats.row_start).ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard '{}' has row_end {} < row_start {}",
+                        e.name, stats.row_end, stats.row_start
+                    ))
+                })? as usize;
+                Ok::<_, ScxError>((n_rows, stats.nnz as usize))
             })
             .collect::<Result<_>>()?;
         let total_rows: usize = shard_sizes.iter().map(|(r, _)| *r).sum();

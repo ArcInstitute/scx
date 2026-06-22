@@ -1695,6 +1695,36 @@ fn test_assemble_shards_rejects_stat_drift() {
     );
 }
 
+/// A catalog whose `stats.row_end < stats.row_start` must return `Err` from
+/// both assemble paths, not underflow-panic (debug) / wrap to a huge `usize`
+/// (release) in the `(row_end - row_start)` shard-size precompute.
+#[test]
+fn test_assemble_shards_rejects_inverted_row_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_test_file(&dir, "inverted_rows.scx", 12, 10, 4, false);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let shards = reader.catalog().shards_sorted();
+
+    // Clone the first shard entry and invert its row range.
+    let mut doctored = shards[0].clone();
+    {
+        let s = doctored.stats.as_mut().unwrap();
+        s.row_start = s.row_end + 1;
+    }
+
+    assert!(
+        reader.assemble_shards(&[&doctored]).is_err(),
+        "sequential assemble must reject inverted row range"
+    );
+
+    #[cfg(feature = "parallel")]
+    assert!(
+        reader.assemble_shards_parallel(&[&doctored]).is_err(),
+        "parallel assemble must reject inverted row range"
+    );
+}
+
 #[test]
 #[cfg(feature = "parallel")]
 fn test_parallel_single_shard() {
