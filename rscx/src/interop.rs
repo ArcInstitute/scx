@@ -334,6 +334,49 @@ where
 
 // ─── ScxCsr (CSR) → dgCMatrix (CSC) ─────────────────────────────────────────
 
+/// Validate a CSR's structural invariants before [`csr_to_dgcmatrix`]'s
+/// transpose loop consumes them as bounds / indices.
+///
+/// The CSR may have been built via `ScxCsr::new_unchecked` on a decode path
+/// that skips column-bound validation, so a checksum-valid but logically
+/// out-of-range shard can reach this function. Without these guards,
+/// `col_counts[idx]` / `write_pos[col]` (indexed by `csr.indices[k]`) and the
+/// `indptr[i + 1]` / `indices[row_start..row_end]` slicing would panic — an
+/// uncatchable R-session abort across the FFI boundary. Every violation is
+/// surfaced as a catchable [`Error::Other`] instead.
+///
+/// Checks: `indptr.len() == n_rows + 1`; non-negative, monotonic `indptr` with
+/// every column index in `[0, n_cols)` (via [`scx_sparse::validate_csr_arrays`]);
+/// `indices.len() == nnz`; and `indptr[n_rows] == nnz` so `row_start..row_end`
+/// never overruns the `indices` / `data` arrays.
+fn validate_csr_for_dgcmatrix(csr: &ScxCsr) -> Result<()> {
+    let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+    let nnz = csr.nnz();
+    if csr.indptr.len() != n_rows + 1 {
+        return Err(Error::Other(format!(
+            "CSR indptr length {} != n_rows + 1 ({})",
+            csr.indptr.len(),
+            n_rows + 1
+        )));
+    }
+    scx_sparse::validate_csr_arrays(&csr.indptr, &csr.indices, n_cols as u64)
+        .map_err(|e| Error::Other(format!("invalid CSR for dgCMatrix conversion: {e}")))?;
+    if csr.indices.len() != nnz {
+        return Err(Error::Other(format!(
+            "CSR indices length {} != nnz ({})",
+            csr.indices.len(),
+            nnz
+        )));
+    }
+    if csr.indptr[n_rows] as usize != nnz {
+        return Err(Error::Other(format!(
+            "CSR indptr[n_rows] = {} != nnz ({})",
+            csr.indptr[n_rows], nnz
+        )));
+    }
+    Ok(())
+}
+
 /// Convert ScxCsr (CSR, i64/i32/f32) → R dgCMatrix (CSC, i32/i32/f64).
 ///
 /// Steps:
@@ -355,6 +398,10 @@ pub fn csr_to_dgcmatrix(csr: &ScxCsr) -> Result<Robj> {
             nnz
         )));
     }
+
+    // Guard the structural invariants the transpose loop relies on before
+    // touching any slot (see `validate_csr_for_dgcmatrix`).
+    validate_csr_for_dgcmatrix(csr)?;
 
     // Handle empty matrix
     if nnz == 0 {
@@ -2063,4 +2110,42 @@ extendr_module! {
     fn from_seurat;
     fn from_sce;
     fn from_mae;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A valid 2-row × 3-col CSR built via the unchecked constructor (mirrors
+    // the decode path that produces the `ScxCsr` reaching `csr_to_dgcmatrix`).
+    fn valid_csr() -> ScxCsr {
+        ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, 2, 1], vec![1.0, 2.0, 3.0])
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_accepts_valid() {
+        assert!(validate_csr_for_dgcmatrix(&valid_csr()).is_ok());
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_rejects_out_of_range_column() {
+        // Column index 5 >= n_cols (3). `new_unchecked` does not bounds-check
+        // column indices, so this is exactly the corrupt shard the review flags:
+        // it would drive `col_counts[5]` out of bounds and abort the R session.
+        let csr = ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, 5, 1], vec![1.0, 2.0, 3.0]);
+        let err = validate_csr_for_dgcmatrix(&csr).unwrap_err();
+        match err {
+            Error::Other(m) => assert!(m.contains("invalid CSR"), "unexpected message: {m}"),
+            other => panic!("expected Error::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_rejects_negative_column() {
+        let csr = ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, -1, 1], vec![1.0, 2.0, 3.0]);
+        assert!(matches!(
+            validate_csr_for_dgcmatrix(&csr),
+            Err(Error::Other(_))
+        ));
+    }
 }
