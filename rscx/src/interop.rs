@@ -334,6 +334,73 @@ where
 
 // ─── ScxCsr (CSR) → dgCMatrix (CSC) ─────────────────────────────────────────
 
+/// Validate a CSR's structural invariants before [`csr_to_dgcmatrix`]'s
+/// transpose loop consumes them as bounds / indices.
+///
+/// The CSR may have been built via `ScxCsr::new_unchecked` on a decode path
+/// that skips column-bound validation, so a checksum-valid but logically
+/// out-of-range shard can reach this function. Without these guards,
+/// `col_counts[idx]` / `write_pos[col]` (indexed by `csr.indices[k]`) and the
+/// `indptr[i + 1]` / `indices[row_start..row_end]` slicing would panic — an
+/// uncatchable R-session abort across the FFI boundary. Every violation is
+/// surfaced as a catchable [`Error::Other`] instead.
+///
+/// Checks: `n_rows`/`n_cols` within `i32::MAX` (they become the dgCMatrix
+/// `@Dim`); `indptr.len() == n_rows + 1`; `indptr[0] == 0`; non-negative,
+/// monotonic `indptr` with every column index in `[0, n_cols)` (via
+/// [`scx_sparse::validate_csr_arrays`]); `indices.len() == nnz`; and
+/// `indptr[n_rows] == nnz` so `row_start..row_end` never overruns the
+/// `indices` / `data` arrays.
+fn validate_csr_for_dgcmatrix(csr: &ScxCsr) -> Result<()> {
+    let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
+    let nnz = csr.nnz();
+    // `n_rows`/`n_cols` are cast to `i32` for the dgCMatrix `@Dim` slot
+    // (`csr_to_dgcmatrix`), mirroring the existing `nnz > i32::MAX` guard there.
+    if n_rows > i32::MAX as usize {
+        return Err(Error::Other(format!(
+            "CSR n_rows {n_rows} exceeds i32::MAX, cannot create dgCMatrix"
+        )));
+    }
+    if n_cols > i32::MAX as usize {
+        return Err(Error::Other(format!(
+            "CSR n_cols {n_cols} exceeds i32::MAX, cannot create dgCMatrix"
+        )));
+    }
+    if csr.indptr.len() != n_rows + 1 {
+        return Err(Error::Other(format!(
+            "CSR indptr length {} != n_rows + 1 ({})",
+            csr.indptr.len(),
+            n_rows + 1
+        )));
+    }
+    // `validate_csr_arrays` permits a nonzero monotonic start; the transpose
+    // counts every `indices` entry but only scatters the `indptr[0]..` ranges,
+    // so a `indptr[0] > 0` would silently drop the leading nonzeros. Require
+    // the scipy `indptr[0] == 0` convention up front.
+    if csr.indptr[0] != 0 {
+        return Err(Error::Other(format!(
+            "CSR indptr[0] = {}, expected 0",
+            csr.indptr[0]
+        )));
+    }
+    scx_sparse::validate_csr_arrays(&csr.indptr, &csr.indices, n_cols as u64)
+        .map_err(|e| Error::Other(format!("invalid CSR for dgCMatrix conversion: {e}")))?;
+    if csr.indices.len() != nnz {
+        return Err(Error::Other(format!(
+            "CSR indices length {} != nnz ({})",
+            csr.indices.len(),
+            nnz
+        )));
+    }
+    if csr.indptr[n_rows] as usize != nnz {
+        return Err(Error::Other(format!(
+            "CSR indptr[n_rows] = {} != nnz ({})",
+            csr.indptr[n_rows], nnz
+        )));
+    }
+    Ok(())
+}
+
 /// Convert ScxCsr (CSR, i64/i32/f32) → R dgCMatrix (CSC, i32/i32/f64).
 ///
 /// Steps:
@@ -355,6 +422,10 @@ pub fn csr_to_dgcmatrix(csr: &ScxCsr) -> Result<Robj> {
             nnz
         )));
     }
+
+    // Guard the structural invariants the transpose loop relies on before
+    // touching any slot (see `validate_csr_for_dgcmatrix`).
+    validate_csr_for_dgcmatrix(csr)?;
 
     // Handle empty matrix
     if nnz == 0 {
@@ -572,6 +643,15 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
             dim.len()
         )));
     }
+    // A host-built S4 object can carry a negative @Dim; `as usize` would wrap it
+    // to a huge value and turn the loop bounds below into an OOB index panic
+    // (an uncatchable R-session abort across the FFI boundary).
+    if dim[0] < 0 || dim[1] < 0 {
+        return Err(Error::Other(format!(
+            "Dim has a negative extent: [{}, {}]",
+            dim[0], dim[1]
+        )));
+    }
     let n_rows = dim[0] as usize; // genes in Seurat/SCE (becomes cells after transpose)
     let n_cols = dim[1] as usize; // cells in Seurat/SCE (becomes genes after transpose)
 
@@ -597,6 +677,61 @@ fn dgcmatrix_to_csr(dgc: &Robj) -> Result<CsrData> {
         .to_vec();
 
     let nnz = csc_values.len();
+
+    // Validate the remaining dgCMatrix slots before they are used as loop
+    // bounds / indices below. These come from an arbitrary (possibly
+    // host-built) S4 object, so a malformed slot must surface as a catchable
+    // `Error` rather than an unchecked index panic that aborts the R session.
+    // Mirrors the `@p`-length guard in `accel.rs`, extended to monotonicity,
+    // terminal value, and `@i` bounds.
+    if csc_indptr.len() != n_cols + 1 {
+        return Err(Error::Other(format!(
+            "@p length {} != n_cols + 1 ({})",
+            csc_indptr.len(),
+            n_cols + 1
+        )));
+    }
+    if csc_indices.len() != nnz {
+        return Err(Error::Other(format!(
+            "@i length {} != @x length ({})",
+            csc_indices.len(),
+            nnz
+        )));
+    }
+    if csc_indptr[0] != 0 {
+        return Err(Error::Other(format!(
+            "@p[0] = {}, expected 0",
+            csc_indptr[0]
+        )));
+    }
+    // @p must be monotonically non-decreasing (so `end - start` never
+    // underflows) and terminate at nnz.
+    for j in 0..n_cols {
+        if csc_indptr[j + 1] < csc_indptr[j] {
+            return Err(Error::Other(format!(
+                "@p not monotonic: @p[{}] = {} < @p[{}] = {}",
+                j + 1,
+                csc_indptr[j + 1],
+                j,
+                csc_indptr[j]
+            )));
+        }
+    }
+    if csc_indptr[n_cols] as usize != nnz {
+        return Err(Error::Other(format!(
+            "@p[{}] = {} != @x length ({})",
+            n_cols, csc_indptr[n_cols], nnz
+        )));
+    }
+    // @i holds 0-based row (gene) indices; each must fall within [0, n_rows).
+    for &gi in &csc_indices {
+        if gi < 0 || gi as usize >= n_rows {
+            return Err(Error::Other(format!(
+                "@i value {} out of range [0, {})",
+                gi, n_rows
+            )));
+        }
+    }
 
     // Transpose CSC (genes × cells) → CSR (cells × genes)
     // In the transposed layout: rows = cells (n_cols), cols = genes (n_rows)
@@ -1999,4 +2134,49 @@ extendr_module! {
     fn from_seurat;
     fn from_sce;
     fn from_mae;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A valid 2-row × 3-col CSR built via the unchecked constructor (mirrors
+    // the decode path that produces the `ScxCsr` reaching `csr_to_dgcmatrix`).
+    fn valid_csr() -> ScxCsr {
+        ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, 2, 1], vec![1.0, 2.0, 3.0])
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_accepts_valid() {
+        assert!(validate_csr_for_dgcmatrix(&valid_csr()).is_ok());
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_rejects_out_of_range_column() {
+        // Column index 5 >= n_cols (3). `new_unchecked` does not bounds-check
+        // column indices, so this is exactly the corrupt shard the review flags:
+        // it would drive `col_counts[5]` out of bounds and abort the R session.
+        let csr = ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, 5, 1], vec![1.0, 2.0, 3.0]);
+        let err = validate_csr_for_dgcmatrix(&csr).unwrap_err();
+        match err {
+            Error::Other(m) => assert!(m.contains("invalid CSR"), "unexpected message: {m}"),
+            other => panic!("expected Error::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_csr_for_dgcmatrix_rejects_negative_column() {
+        let csr = ScxCsr::new_unchecked((2, 3), vec![0, 2, 3], vec![0, -1, 1], vec![1.0, 2.0, 3.0]);
+        assert!(matches!(
+            validate_csr_for_dgcmatrix(&csr),
+            Err(Error::Other(_))
+        ));
+    }
+
+    // Note: the `indptr[0] != 0`, `indptr.len()`, terminal-value, and
+    // `n_rows/n_cols > i32::MAX` guards in `validate_csr_for_dgcmatrix` are not
+    // unit-tested here because `ScxCsr::new_unchecked` `debug_assert!`s those
+    // same invariants (so the malformed input can't be constructed in a debug
+    // test). The guards exist for release builds, where `new_unchecked` skips
+    // the asserts and a corrupt decoded shard can otherwise reach the transpose.
 }

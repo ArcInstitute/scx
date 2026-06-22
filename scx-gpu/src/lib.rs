@@ -143,7 +143,8 @@ pub use shard_decode::{
     decode_shard_gpu, decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr,
 };
 pub use sparse_dense::{
-    sparse_to_dense_gpu, sparse_to_dense_gpu_into, sparse_to_dense_gpu_into_view,
+    sparse_to_dense_gpu, sparse_to_dense_gpu_into, sparse_to_dense_gpu_into_view, upload_hvg_map,
+    validate_hvg_map, HVG_MAP_SKIP,
 };
 pub use staging::{GpuCsrShardView, GpuCsrSlot, InMemoryCsrShardSource, PinnedCsrSlot};
 

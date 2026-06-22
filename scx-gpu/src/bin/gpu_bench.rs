@@ -19,7 +19,7 @@ use scx_codec::{encode_shard, CodecId, EncodedShardRef, ValueEncoding};
 use scx_gpu::test_utils::{build_test_shard, build_test_shard_with_metadata};
 use scx_gpu::{
     decode_shard_gpu, decode_shard_gpu_with_metadata, forbp_decode_gpu, rice_decode_gpu,
-    sparse_to_dense_gpu, GpuDevice,
+    sparse_to_dense_gpu, upload_hvg_map, GpuDevice, HVG_MAP_SKIP,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ fn bench_sparse_to_dense(dev: &GpuDevice) -> Vec<BenchResult> {
             eprintln!("  Sparse→dense HVG ({n_hvg} genes)...");
 
             // Build HVG map: select every 15th gene (2000 out of 30000)
-            let mut hvg_map = vec![0xFFFF_FFFFu32; n_cols];
+            let mut hvg_map = vec![HVG_MAP_SKIP; n_cols];
             let mut out_col = 0u32;
             for i in (0..n_cols).step_by(n_cols / n_hvg) {
                 if (out_col as usize) < n_hvg {
@@ -499,7 +499,7 @@ fn bench_sparse_to_dense(dev: &GpuDevice) -> Vec<BenchResult> {
                 );
             });
 
-            let d_hvg_map = dev.htod_copy(&hvg_map).unwrap();
+            let d_hvg_map = upload_hvg_map(dev, &hvg_map, n_output_cols, n_cols).unwrap();
             let gpu_hvg = time_fn(2, 5, || {
                 let _ =
                     sparse_to_dense_gpu(dev, &gpu_csr, Some(&d_hvg_map), n_output_cols).unwrap();

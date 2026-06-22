@@ -3,13 +3,11 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use scx_codec::ValueEncoding;
 use scx_engine::{QueryPipeline, QueryResult};
 use scx_format_io::header::FileHeader;
-use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
 
-use crate::cloud_url::{has_cloud_scheme, is_cloud_url};
+use crate::cloud_url::is_cloud_url;
 
 /// Format the `--explain` "Level 2 row eliminations" line, or `None`
 /// when the inputs aren't interpretable as an elimination count.
@@ -182,23 +180,13 @@ pub fn run_query(
     }
 
     if let Some(out_path) = output {
-        // Default to Float32 when normalize/log1p was applied (the
-        // result is no longer integer-valued) or when the source is a
-        // true remote URL (no easy way to peek a shard header without
-        // a second round-trip). Local files AND local exploded
-        // directories peek the first shard header.
-        let value_encoding = if normalize.is_some() || log1p || has_cloud_scheme(source) {
-            ValueEncoding::Float32
-        } else {
-            let path = Path::new(source);
-            if path.is_dir() {
-                detect_value_encoding_from_dir(path)?
-            } else {
-                detect_value_encoding(path)?
-            }
-        };
-
-        write_query_result(&result, out_path, value_encoding)?;
+        // The value encoding is auto-detected per output shard from the
+        // actual `f32` values (see `write_query_result` →
+        // `write_csr_shards_auto`), so a result whose values are wider
+        // than the source's first-shard encoding — or non-integer after
+        // normalize/log1p — is written losslessly without first-shard
+        // guesswork.
+        write_query_result(&result, out_path)?;
         println!("Wrote {} cells to {}", n_cells, out_path.display());
         return Ok(());
     }
@@ -308,71 +296,10 @@ pub fn parse_gene_indices(path: &Path) -> Result<Vec<u32>, Box<dyn std::error::E
     Ok(indices)
 }
 
-/// Detect the ValueEncoding from the first CSR shard of an SCX file.
-fn detect_value_encoding(path: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    let reader = ScxReader::open(path)?;
-    crate::shard_utils::detect_first_value_encoding(&reader)
-}
-
-/// Detect the ValueEncoding from the first CSR shard of a local
-/// exploded `.scxd/` directory. Reads only the 76-byte shard header.
-///
-/// The exploded layout (see `scx_cloud::explode::section_name_to_path`)
-/// places single-modality shards at `X/{idx:06}.shard` and
-/// per-modality shards at `X/{modality}/{idx:06}.shard`. We probe the
-/// canonical first shard `X/000000.shard`, and if absent, walk one
-/// level deep to find any `*.shard` file under `X/`.
-fn detect_value_encoding_from_dir(dir: &Path) -> Result<ValueEncoding, Box<dyn std::error::Error>> {
-    use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
-    use std::fs::File;
-    use std::io::Read;
-
-    let canonical = dir.join("X").join("000000.shard");
-    let shard_path: std::path::PathBuf = if canonical.is_file() {
-        canonical
-    } else {
-        // Walk one level deep under X/ looking for any *.shard file.
-        let x_dir = dir.join("X");
-        let mut found: Option<std::path::PathBuf> = None;
-        if x_dir.is_dir() {
-            'outer: for entry in std::fs::read_dir(&x_dir)? {
-                let entry = entry?;
-                let p = entry.path();
-                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("shard") {
-                    found = Some(p);
-                    break;
-                }
-                if p.is_dir() {
-                    for sub in std::fs::read_dir(&p)? {
-                        let sub = sub?;
-                        let sp = sub.path();
-                        if sp.is_file() && sp.extension().and_then(|e| e.to_str()) == Some("shard")
-                        {
-                            found = Some(sp);
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-        }
-        match found {
-            Some(p) => p,
-            None => return Ok(ValueEncoding::Uint16), // empty / no shards
-        }
-    };
-
-    let mut f = File::open(&shard_path)?;
-    let mut buf = [0u8; SHARD_HEADER_SIZE];
-    f.read_exact(&mut buf)?;
-    let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&buf[..]))?;
-    crate::shard_utils::decode_value_encoding(sh.value_encoding)
-}
-
 /// Write a QueryResult to a new SCX file.
 fn write_query_result(
     result: &QueryResult,
     output: &Path,
-    value_encoding: ValueEncoding,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n_obs = result.x.n_rows() as u64;
     let n_vars = result.x.n_cols() as u64;
@@ -393,61 +320,23 @@ fn write_query_result(
     writer.write_obs(&result.obs)?;
     writer.write_var(&result.var)?;
 
-    // Convert from in-memory types (i64/i32/f32) to on-disk types (u64/u32/u8-raw)
-    let indptr: Vec<u64> = result.x.indptr.iter().map(|&v| v as u64).collect();
-    let indices: Vec<u32> = result.x.indices.iter().map(|&v| v as u32).collect();
-    let raw_values = f32_to_raw_values(&result.x.data, value_encoding);
-
-    // Shard the data
-    let shard_target = 10000usize;
-    let total_rows = indptr.len() - 1;
-    let mut row_offset = 0usize;
-
-    while row_offset < total_rows {
-        let shard_rows = std::cmp::min(shard_target, total_rows - row_offset);
-        let shard_indptr_start = indptr[row_offset];
-
-        // Extract shard-local indptr (rebased to 0)
-        let shard_indptr: Vec<u64> = indptr[row_offset..=row_offset + shard_rows]
-            .iter()
-            .map(|&v| v - shard_indptr_start)
-            .collect();
-
-        let shard_nnz = *shard_indptr.last().unwrap();
-
-        // Extract shard-local indices
-        let idx_start = shard_indptr_start as usize;
-        let idx_end = (shard_indptr_start + shard_nnz) as usize;
-        let shard_indices = &indices[idx_start..idx_end];
-
-        // Extract shard-local values
-        let value_byte_size = match value_encoding {
-            ValueEncoding::Uint8 => 1,
-            ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
-            ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
-        };
-        let val_start = idx_start * value_byte_size;
-        let val_end = idx_end * value_byte_size;
-        let shard_values = &raw_values[val_start..val_end];
-
-        // Auto-codec selection (single-modality query → RNA default)
-        let codec_id = scx_format_io::select_codec_for_modality(
-            shard_values,
-            value_encoding,
-            scx_format_io::ModalityType::Rna,
-        );
-
-        writer.write_csr_shard(
-            &shard_indptr,
-            shard_indices,
-            shard_values,
-            codec_id,
-            value_encoding,
-            row_offset as u64,
-        )?;
-
-        row_offset += shard_rows;
-    }
+    // Write X as row-major shards through the shared per-shard auto-encode
+    // path (same as `scx subset` / `scx convert`). The value encoding and
+    // codec are detected per shard from the actual `f32` values, so a result
+    // whose values are wider than any single source shard's encoding is
+    // written losslessly, and normalize/log1p float results auto-route to
+    // Float32.
+    crate::subset::write_csr_shards_auto(
+        &mut writer,
+        &result.x.indptr,
+        &result.x.indices,
+        &result.x.data,
+        n_vars as u32,
+        10_000,
+        index_dtype,
+        None,
+        scx_format_io::ModalityType::Rna,
+    )?;
 
     // Write provenance
     writer.write_provenance(vec![scx_format_io::ProvenanceEntry {
@@ -465,94 +354,9 @@ fn write_query_result(
     Ok(())
 }
 
-/// Convert f32 data to raw LE bytes matching the given ValueEncoding.
-fn f32_to_raw_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                bytes.extend_from_slice(&(v as u16).to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Uint32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                bytes.extend_from_slice(&(v as u32).to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Float32 => {
-            let mut bytes = Vec::with_capacity(data.len() * 4);
-            for &v in data {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            bytes
-        }
-        ValueEncoding::Float16 => {
-            let mut bytes = Vec::with_capacity(data.len() * 2);
-            for &v in data {
-                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
-            }
-            bytes
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detect_value_encoding_from_dir_reads_first_shard_header() {
-        use scx_codec::CodecId;
-        use scx_format_io::shard::SHARD_HEADER_SIZE;
-
-        let dir = tempfile::tempdir().unwrap();
-        let x_dir = dir.path().join("X");
-        std::fs::create_dir_all(&x_dir).unwrap();
-        let shard_path = x_dir.join("000000.shard");
-
-        // Synthesize a minimal valid ShardHeader with Uint8 encoding.
-        let sh = scx_format_io::shard::ShardHeader {
-            magic: scx_format_io::shard::SHARD_MAGIC,
-            shard_format_version: 1,
-            shard_type: 0,
-            codec_id: CodecId::None as u8,
-            value_encoding: ValueEncoding::Uint8 as u8,
-            index_dtype: 1,
-            reserved_flags: [0u8; 3],
-            n_major: 1,
-            n_minor: 1,
-            nnz: 0,
-            global_offset: 0,
-            indptr_rel_offset: SHARD_HEADER_SIZE as u32,
-            indptr_length: 0,
-            indices_rel_offset: SHARD_HEADER_SIZE as u32,
-            indices_length: 0,
-            values_rel_offset: SHARD_HEADER_SIZE as u32,
-            values_length: 0,
-            block_index_rel_offset: SHARD_HEADER_SIZE as u32,
-            block_index_length: 0,
-            checksum: [0u8; 8],
-        };
-        let mut buf = Vec::with_capacity(SHARD_HEADER_SIZE);
-        sh.write_to(&mut buf).unwrap();
-        std::fs::write(&shard_path, &buf).unwrap();
-
-        let encoding = detect_value_encoding_from_dir(dir.path()).unwrap();
-        assert_eq!(encoding, ValueEncoding::Uint8);
-    }
-
-    #[test]
-    fn detect_value_encoding_from_dir_handles_empty_dir() {
-        // No shards present → conservative Uint16 default (matches the
-        // local detect_value_encoding behaviour for shard-less files).
-        let dir = tempfile::tempdir().unwrap();
-        let encoding = detect_value_encoding_from_dir(dir.path()).unwrap();
-        assert_eq!(encoding, ValueEncoding::Uint16);
-    }
 
     #[test]
     fn level2_eliminations_formats_when_candidate_exceeds_matched() {
@@ -579,5 +383,49 @@ mod tests {
         let line = format_level2_eliminations(50, 50).expect("should format");
         assert!(line.contains(" 0 "), "{line}");
         assert!(line.contains("0.0%"), "{line}");
+    }
+
+    // Regression: `scx query --output` must not truncate values wider than the
+    // source's first-shard encoding. `write_query_result` now auto-detects the
+    // encoding per output shard from the actual `f32` values, so a value beyond
+    // Uint16's 65_535 ceiling is written as Uint32 and round-trips losslessly
+    // (the old first-shard-peek + `v as u16` path wrapped it).
+    #[test]
+    fn write_query_result_preserves_values_wider_than_uint16() {
+        use crate::test_utils::{sample_obs, sample_var};
+        use scx_sparse::ScxCsr;
+
+        // 2 cells × 3 genes; nonzeros span Uint8 / Uint16 / Uint32 ranges.
+        let x = ScxCsr::new(
+            (2, 3),
+            vec![0, 2, 3],
+            vec![0, 2, 1],
+            vec![5.0, 70_000.0, 130_000.0],
+        )
+        .unwrap();
+        let result = QueryResult {
+            x,
+            obs: sample_obs(2),
+            var: sample_var(3),
+            skipped_shards: 0,
+            total_shards: 1,
+            candidate_shard_rows: 2,
+            matched_rows: 2,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("query_out.scx");
+        write_query_result(&result, &out).unwrap();
+
+        // Reopen via the engine (unfiltered collect = all rows) and confirm the
+        // full value set survived without truncation/wrapping.
+        let roundtrip = QueryPipeline::open(&out).unwrap().collect().unwrap();
+        let mut got: Vec<f32> = roundtrip.x.data.clone();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            got,
+            vec![5.0, 70_000.0, 130_000.0],
+            "wide values must round-trip losslessly"
+        );
     }
 }

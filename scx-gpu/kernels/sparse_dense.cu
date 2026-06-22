@@ -12,6 +12,13 @@
 //   NULL → identity mapping (col_idx → col_idx, n_output_cols == n_vars)
 //   non-NULL → hvg_map[col_idx] gives the output column index, or
 //              0xFFFFFFFF to skip (gene not in subset).
+//
+// INVARIANT: hvg_map MUST be injective over its non-sentinel entries — each
+// output column index may appear at most once. The scatter below writes one
+// nonzero per lane with a plain (non-atomic) store, so two input columns of the
+// same row mapping to the same output column would race with an undefined
+// winner (silent corruption). Callers are responsible for guaranteeing
+// injectivity; the Rust `upload_hvg_map` helper validates this before upload.
 
 extern "C" __global__ void sparse_to_dense_kernel(
     const long long*     __restrict__ indptr,       // [n_rows + 1], i64

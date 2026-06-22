@@ -327,7 +327,7 @@ fn resolve_gene_names(
 /// (B3). `index_dtype` (the file-wide gene-index width) is threaded through so
 /// every shard header agrees with the file header.
 #[allow(clippy::too_many_arguments)]
-fn write_csr_shards_auto(
+pub(crate) fn write_csr_shards_auto(
     writer: &mut ScxWriter,
     indptr: &[i64],
     indices: &[i32],
