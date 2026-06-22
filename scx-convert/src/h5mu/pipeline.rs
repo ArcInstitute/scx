@@ -137,13 +137,26 @@ fn read_modality_header_meta(
                         shape.len()
                     )));
                 }
-                let mod_n_obs = shape[0] as usize;
+                // The `/shape` attr is read as signed i64; guard against a
+                // negative (corrupt) dimension silently wrapping to a huge
+                // usize/u64 (review theme #1) instead of a bare `as` cast.
+                let mod_n_obs = usize::try_from(shape[0]).map_err(|_| {
+                    ConvertError::Other(format!(
+                        "modality '{mname}' has negative n_obs dimension {} on '{x_path}'",
+                        shape[0]
+                    ))
+                })?;
                 if mod_n_obs != n_obs {
                     return Err(ConvertError::Other(format!(
                         "modality '{mname}' has n_obs={mod_n_obs} but outer obs has n_obs={n_obs}"
                     )));
                 }
-                shape[1] as u64
+                u64::try_from(shape[1]).map_err(|_| {
+                    ConvertError::Other(format!(
+                        "modality '{mname}' has negative n_vars dimension {} on '{x_path}'",
+                        shape[1]
+                    ))
+                })?
             }
             MatrixFormat::Dense => {
                 let ds = file.dataset(&x_path)?;
@@ -826,6 +839,13 @@ fn shard_modality_csr<F>(
 where
     F: FnMut(u32, u64, &[u64], &[u32], &[u8]) -> Result<(), ConvertError>,
 {
+    // Guard against a zero shard size: `row_end == row_start` would never
+    // advance the cursor, hanging the `while row_start < n_obs` loop.
+    if shard_target_rows == 0 {
+        return Err(ConvertError::Other(
+            "shard_target_rows must be greater than 0".to_string(),
+        ));
+    }
     let backing_len = indices.len().min(data.len());
     let mut row_start: usize = 0;
     let mut shard_idx: u32 = 0;

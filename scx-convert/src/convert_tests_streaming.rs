@@ -1484,6 +1484,7 @@ fn phase3_streaming_h5mu_round_trip_matches_bulk() {
     assert_eq!(a.n_modalities(), 2);
     // Per-modality CSR shard payloads must match exactly.
     let n = a.n_modalities() as u8;
+    let mut total_nnz: usize = 0;
     for mid in 1u8..=n {
         let csr_a = a.read_all_csr_shards_for(mid).unwrap();
         let csr_b = b.read_all_csr_shards_for(mid).unwrap();
@@ -1496,7 +1497,22 @@ fn phase3_streaming_h5mu_round_trip_matches_bulk() {
             "modality {mid} indices divergence"
         );
         assert_eq!(csr_a.data, csr_b.data, "modality {mid} data divergence");
+        total_nnz += csr_b.data.len();
     }
+    // The header `nnz` is reconstructed by `ScxWriter::finish()` (not the
+    // pre-pass), so the streaming and bulk paths must agree on it, and it must
+    // equal the cross-modality total. Pre-PR the two paths could silently
+    // disagree here with no test noticing.
+    assert_eq!(
+        a.nnz(),
+        b.nnz(),
+        "header nnz divergence between streaming and bulk h5mu paths"
+    );
+    assert_eq!(
+        b.nnz() as usize,
+        total_nnz,
+        "header nnz must equal summed per-modality CSR nnz"
+    );
 }
 
 #[test]
