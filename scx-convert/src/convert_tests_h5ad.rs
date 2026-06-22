@@ -544,6 +544,64 @@ fn test_uns_2d_and_bool_round_trip() {
     assert_eq!(out_flags, flags, "1-D bool uns dropped on export");
 }
 
+// A 1-D length-1 `uns` array (shape [1]) must NOT collapse to a Python scalar
+// (HDF5 shape []) on round-trip — anndata distinguishes a scalar from a
+// 1-element numpy array. Before the read.rs fix the `shape == [1]` arm read it
+// via `read_scalar`, silently changing its rank on export.
+#[test]
+fn test_uns_length1_array_preserves_rank() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad_path = dir.path().join("uns_len1.h5ad");
+    let scx_path = dir.path().join("uns_len1.scx");
+    let h5ad_out = dir.path().join("uns_len1_out.h5ad");
+
+    create_test_h5ad(&h5ad_path, 5, 4, "csr", false);
+
+    {
+        let file = hdf5::File::open_rw(&h5ad_path).unwrap();
+        let uns = file.create_group("uns").unwrap();
+        // True scalar (HDF5 shape []).
+        uns.new_dataset::<i64>()
+            .shape(())
+            .create("scalar")
+            .unwrap()
+            .write_scalar(&42i64)
+            .unwrap();
+        // 1-element 1-D array (HDF5 shape [1]).
+        uns.new_dataset::<i64>()
+            .shape([1])
+            .create("vec1")
+            .unwrap()
+            .write(&[7i64])
+            .unwrap();
+    }
+
+    let opts = ConvertOptions::default();
+    h5ad_to_scx(&h5ad_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+
+    // Scalar stays rank 0.
+    let scalar_ds = uns.dataset("scalar").unwrap();
+    assert!(
+        scalar_ds.shape().is_empty(),
+        "true scalar uns gained rank on export: shape = {:?}",
+        scalar_ds.shape()
+    );
+
+    // Length-1 array stays a 1-D dataset of shape [1], not collapsed to scalar.
+    let vec1_ds = uns.dataset("vec1").unwrap();
+    assert_eq!(
+        vec1_ds.shape(),
+        vec![1],
+        "1-D length-1 uns array collapsed to scalar on export"
+    );
+    let vec1: Vec<i64> = vec1_ds.read_1d::<i64>().unwrap().to_vec();
+    assert_eq!(vec1, vec![7], "1-D length-1 uns array value garbled");
+}
+
 #[test]
 fn test_categorical_columns() {
     let dir = tempfile::tempdir().unwrap();

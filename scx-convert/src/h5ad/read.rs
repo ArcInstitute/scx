@@ -1952,8 +1952,11 @@ fn read_uns_entry(
             )));
         }
 
-        // Scalar
-        if shape.is_empty() || (shape.len() == 1 && shape[0] == 1) {
+        // Scalar (true HDF5 scalar: empty shape). A 1-D dataset of shape [1]
+        // is a 1-element array, not a scalar — let it fall through to the 1-D
+        // arm so it round-trips with its rank preserved (anndata distinguishes
+        // a Python scalar from a 1-element numpy array).
+        if shape.is_empty() {
             return match desc {
                 TypeDescriptor::Integer(_) => {
                     let v: i64 = ds.read_scalar()?;
