@@ -23,31 +23,59 @@ pub const HVG_MAP_SKIP: u32 = 0xFFFF_FFFF;
 /// friends. `host_map[col]` is the output column for input column `col`, or
 /// [`HVG_MAP_SKIP`] to drop that column.
 ///
-/// Returns an error if any non-skip entry is `>= n_output_cols`, or if two input
-/// columns map to the same output column. The kernel scatters one nonzero per
-/// warp lane with a plain (non-atomic) store, so a many-to-one map races on the
-/// shared output cell with an undefined winner — see `sparse_dense.cu`. This is
-/// a pure host-side check (no device interaction).
-pub fn validate_hvg_map(host_map: &[u32], n_output_cols: usize) -> Result<(), GpuError> {
-    let mut seen = vec![false; n_output_cols];
-    for (col, &mapped) in host_map.iter().enumerate() {
-        if mapped == HVG_MAP_SKIP {
+/// `n_input_cols` is the number of input (original) columns the map must cover
+/// — i.e. `gpu_csr.shape.1`. The kernel indexes `hvg_map[col]` for every CSR
+/// column `col ∈ [0, n_input_cols)`, so a map shorter than this would make the
+/// kernel read past the device allocation; the map length is required to match.
+///
+/// Returns an error if the map length `!= n_input_cols`, if any non-skip entry
+/// is `>= n_output_cols`, or if two input columns map to the same output column.
+/// The kernel scatters one nonzero per warp lane with a plain (non-atomic)
+/// store, so a many-to-one map races on the shared output cell with an undefined
+/// winner — see `sparse_dense.cu`. This is a pure host-side check (no device
+/// interaction); its allocation is bounded by `host_map.len()`, not by the
+/// caller-supplied `n_output_cols` (which could be arbitrarily large on corrupt
+/// input).
+pub fn validate_hvg_map(
+    host_map: &[u32],
+    n_output_cols: usize,
+    n_input_cols: usize,
+) -> Result<(), GpuError> {
+    if host_map.len() != n_input_cols {
+        return Err(GpuError::KernelLaunchFailed(format!(
+            "validate_hvg_map: map length {} != n_input_cols ({}); the kernel \
+             reads hvg_map[col] for every input column and would read out of bounds",
+            host_map.len(),
+            n_input_cols
+        )));
+    }
+    // Collect the mapped (non-skip) output columns, checking the range bound as
+    // we go, then sort + scan for duplicates to detect a non-injective map. The
+    // scratch is bounded by the number of mapped columns (`<= host_map.len()`),
+    // never by `n_output_cols` — so a corrupt, huge `n_output_cols` cannot drive
+    // an out-of-memory allocation here.
+    let mut mapped: Vec<u32> = Vec::with_capacity(host_map.len());
+    for (col, &m) in host_map.iter().enumerate() {
+        if m == HVG_MAP_SKIP {
             continue;
         }
-        let out = mapped as usize;
-        if out >= n_output_cols {
+        if m as usize >= n_output_cols {
             return Err(GpuError::KernelLaunchFailed(format!(
-                "upload_hvg_map: input column {col} maps to output column {out} \
+                "validate_hvg_map: input column {col} maps to output column {m} \
                  but n_output_cols == {n_output_cols}"
             )));
         }
-        if seen[out] {
+        mapped.push(m);
+    }
+    mapped.sort_unstable();
+    for w in mapped.windows(2) {
+        if w[0] == w[1] {
             return Err(GpuError::KernelLaunchFailed(format!(
-                "upload_hvg_map: non-injective map — output column {out} is \
-                 written by more than one input column (kernel scatter would race)"
+                "validate_hvg_map: non-injective map — output column {} is \
+                 written by more than one input column (kernel scatter would race)",
+                w[0]
             )));
         }
-        seen[out] = true;
     }
     Ok(())
 }
@@ -55,15 +83,17 @@ pub fn validate_hvg_map(host_map: &[u32], n_output_cols: usize) -> Result<(), Gp
 /// Validate ([`validate_hvg_map`]) and upload an HVG projection map to the
 /// device. This is the sanctioned way to build the `hvg_map` argument for
 /// [`sparse_to_dense_gpu`] / [`sparse_to_dense_gpu_into`] /
-/// [`sparse_to_dense_gpu_into_view`]: it guarantees the injectivity the kernel
-/// requires, failing with an error instead of producing a silently corrupted
-/// dense matrix on a malformed map.
+/// [`sparse_to_dense_gpu_into_view`]: it guarantees the injectivity and input
+/// coverage the kernel requires, failing with an error instead of producing a
+/// silently corrupted dense matrix (or an out-of-bounds device read) on a
+/// malformed map. `n_input_cols` is the CSR's column count (`gpu_csr.shape.1`).
 pub fn upload_hvg_map(
     device: &GpuDevice,
     host_map: &[u32],
     n_output_cols: usize,
+    n_input_cols: usize,
 ) -> Result<CudaSlice<u32>, GpuError> {
-    validate_hvg_map(host_map, n_output_cols)?;
+    validate_hvg_map(host_map, n_output_cols, n_input_cols)?;
     device
         .htod_copy(host_map)
         .map_err(|e| GpuError::KernelLaunchFailed(format!("upload_hvg_map: htod copy: {e}")))
@@ -391,7 +421,7 @@ mod tests {
         for (out_col, &orig_col) in selected_cols.iter().enumerate() {
             hvg_map[orig_col as usize] = out_col as u32;
         }
-        let d_hvg_map = upload_hvg_map(&dev, &hvg_map, n_output_cols).unwrap();
+        let d_hvg_map = upload_hvg_map(&dev, &hvg_map, n_output_cols, n_cols as usize).unwrap();
 
         // GPU sparse → dense with HVG
         let d_dense = sparse_to_dense_gpu(&dev, &gpu_csr, Some(&d_hvg_map), n_output_cols).unwrap();
@@ -433,12 +463,12 @@ mod tests {
     // no GPU.
     #[test]
     fn test_validate_hvg_map_accepts_injective() {
-        // cols 0,2,5 → out 0,1,2; everything else skipped.
+        // cols 0,2,5 → out 0,1,2; everything else skipped. 10 input columns.
         let mut map = vec![HVG_MAP_SKIP; 10];
         map[0] = 0;
         map[2] = 1;
         map[5] = 2;
-        assert!(validate_hvg_map(&map, 3).is_ok());
+        assert!(validate_hvg_map(&map, 3, 10).is_ok());
     }
 
     #[test]
@@ -447,7 +477,7 @@ mod tests {
         let mut map = vec![HVG_MAP_SKIP; 10];
         map[1] = 0;
         map[4] = 0;
-        let err = validate_hvg_map(&map, 2).unwrap_err();
+        let err = validate_hvg_map(&map, 2, 10).unwrap_err();
         assert!(
             matches!(err, GpuError::KernelLaunchFailed(ref m) if m.contains("non-injective")),
             "expected non-injective error, got {err:?}"
@@ -458,10 +488,22 @@ mod tests {
     fn test_validate_hvg_map_rejects_out_of_range() {
         let mut map = vec![HVG_MAP_SKIP; 10];
         map[3] = 5; // 5 >= n_output_cols (2)
-        let err = validate_hvg_map(&map, 2).unwrap_err();
+        let err = validate_hvg_map(&map, 2, 10).unwrap_err();
         assert!(
             matches!(err, GpuError::KernelLaunchFailed(ref m) if m.contains("n_output_cols")),
             "expected out-of-range error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_hvg_map_rejects_short_map() {
+        // Map shorter than the input column count → the kernel would read
+        // hvg_map[col] past the device allocation for col >= map.len().
+        let map = vec![HVG_MAP_SKIP; 8];
+        let err = validate_hvg_map(&map, 4, 10).unwrap_err();
+        assert!(
+            matches!(err, GpuError::KernelLaunchFailed(ref m) if m.contains("n_input_cols")),
+            "expected coverage error, got {err:?}"
         );
     }
 }

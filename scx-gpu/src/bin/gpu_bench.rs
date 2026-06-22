@@ -499,7 +499,7 @@ fn bench_sparse_to_dense(dev: &GpuDevice) -> Vec<BenchResult> {
                 );
             });
 
-            let d_hvg_map = upload_hvg_map(dev, &hvg_map, n_output_cols).unwrap();
+            let d_hvg_map = upload_hvg_map(dev, &hvg_map, n_output_cols, n_cols).unwrap();
             let gpu_hvg = time_fn(2, 5, || {
                 let _ =
                     sparse_to_dense_gpu(dev, &gpu_csr, Some(&d_hvg_map), n_output_cols).unwrap();

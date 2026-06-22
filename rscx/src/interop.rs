@@ -345,18 +345,42 @@ where
 /// uncatchable R-session abort across the FFI boundary. Every violation is
 /// surfaced as a catchable [`Error::Other`] instead.
 ///
-/// Checks: `indptr.len() == n_rows + 1`; non-negative, monotonic `indptr` with
-/// every column index in `[0, n_cols)` (via [`scx_sparse::validate_csr_arrays`]);
-/// `indices.len() == nnz`; and `indptr[n_rows] == nnz` so `row_start..row_end`
-/// never overruns the `indices` / `data` arrays.
+/// Checks: `n_rows`/`n_cols` within `i32::MAX` (they become the dgCMatrix
+/// `@Dim`); `indptr.len() == n_rows + 1`; `indptr[0] == 0`; non-negative,
+/// monotonic `indptr` with every column index in `[0, n_cols)` (via
+/// [`scx_sparse::validate_csr_arrays`]); `indices.len() == nnz`; and
+/// `indptr[n_rows] == nnz` so `row_start..row_end` never overruns the
+/// `indices` / `data` arrays.
 fn validate_csr_for_dgcmatrix(csr: &ScxCsr) -> Result<()> {
     let (n_rows, n_cols) = (csr.n_rows(), csr.n_cols());
     let nnz = csr.nnz();
+    // `n_rows`/`n_cols` are cast to `i32` for the dgCMatrix `@Dim` slot
+    // (`csr_to_dgcmatrix`), mirroring the existing `nnz > i32::MAX` guard there.
+    if n_rows > i32::MAX as usize {
+        return Err(Error::Other(format!(
+            "CSR n_rows {n_rows} exceeds i32::MAX, cannot create dgCMatrix"
+        )));
+    }
+    if n_cols > i32::MAX as usize {
+        return Err(Error::Other(format!(
+            "CSR n_cols {n_cols} exceeds i32::MAX, cannot create dgCMatrix"
+        )));
+    }
     if csr.indptr.len() != n_rows + 1 {
         return Err(Error::Other(format!(
             "CSR indptr length {} != n_rows + 1 ({})",
             csr.indptr.len(),
             n_rows + 1
+        )));
+    }
+    // `validate_csr_arrays` permits a nonzero monotonic start; the transpose
+    // counts every `indices` entry but only scatters the `indptr[0]..` ranges,
+    // so a `indptr[0] > 0` would silently drop the leading nonzeros. Require
+    // the scipy `indptr[0] == 0` convention up front.
+    if csr.indptr[0] != 0 {
+        return Err(Error::Other(format!(
+            "CSR indptr[0] = {}, expected 0",
+            csr.indptr[0]
         )));
     }
     scx_sparse::validate_csr_arrays(&csr.indptr, &csr.indices, n_cols as u64)
@@ -2148,4 +2172,11 @@ mod tests {
             Err(Error::Other(_))
         ));
     }
+
+    // Note: the `indptr[0] != 0`, `indptr.len()`, terminal-value, and
+    // `n_rows/n_cols > i32::MAX` guards in `validate_csr_for_dgcmatrix` are not
+    // unit-tested here because `ScxCsr::new_unchecked` `debug_assert!`s those
+    // same invariants (so the malformed input can't be constructed in a debug
+    // test). The guards exist for release builds, where `new_unchecked` skips
+    // the asserts and a corrupt decoded shard can otherwise reach the transpose.
 }
