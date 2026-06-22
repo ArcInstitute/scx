@@ -1931,6 +1931,30 @@ impl ScxReader {
         for (i, entry) in shards.iter().enumerate() {
             let (n_rows, nnz) = shard_sizes[i];
             let (shard_ip, shard_ix, shard_data) = self.read_shard_from_entry(entry)?;
+            // Decoded-vs-catalog length checks. Returned errors (not
+            // `debug_assert!`) because a mismatch on a corrupt / stat-drifted
+            // catalog would otherwise panic in the `copy_from_slice` /
+            // `shard_ip[j + 1]` indexing below in release — mirroring the guards
+            // in `assemble_shards`/`assemble_shards_parallel`.
+            if shard_ip.len() != n_rows + 1 {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} indptr length mismatch: catalog stats say {}, decoded {}",
+                    n_rows + 1,
+                    shard_ip.len()
+                )));
+            }
+            if shard_ix.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} indices length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_ix.len()
+                )));
+            }
+            if shard_data.len() != nnz {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "raw CSR shard {i} data length mismatch: catalog stats say {nnz}, decoded {}",
+                    shard_data.len()
+                )));
+            }
             indices[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_ix);
             data[cum_nnz..cum_nnz + nnz].copy_from_slice(&shard_data);
             if i == 0 {
@@ -3214,45 +3238,44 @@ impl ScxReader {
     /// Recompute the whole-file BLAKE3 checksum and compare it against the
     /// stored `header.file_checksum`.
     ///
-    /// Mirrors `ScxWriter::finish` exactly: hashes the 256-byte header (with
-    /// the `file_checksum` field zeroed) + the 4096-byte root catalog + the
-    /// section bytes + the full catalog. This covers the header and root
-    /// catalog, which no per-section catalog-entry checksum protects — so a
-    /// flipped byte in `n_vars`/`full_catalog_offset`/`flags` or the root
-    /// catalog is caught here but not by [`validate`](Self::validate)'s
-    /// per-section walk.
+    /// Hashes the 256-byte header (with the `file_checksum` field zeroed)
+    /// followed by every byte from offset 256 to EOF. This is the same extent
+    /// every writer uses — `ScxWriter::finish` (`scx-format-io`),
+    /// `scx_ops::checksum::finalize_header_with_checksum` (rollback / append),
+    /// and the cloud relayout — so a rolled-back file (whose header points at an
+    /// older catalog while newer, now-superseded catalogs/sections remain
+    /// trailing past the active catalog) still verifies. Hashing only up to
+    /// `full_catalog_offset + full_catalog_length` would wrongly report such a
+    /// file as corrupt.
+    ///
+    /// Covers the 256-byte header and the 4096-byte root catalog, which no
+    /// per-section catalog-entry checksum protects — so a flipped byte in
+    /// `n_vars`/`full_catalog_offset`/`flags` or the root catalog is caught here
+    /// but not by [`validate`](Self::validate)'s per-section walk.
     ///
     /// O(file size); intended for the explicit `validate` path, not the hot
-    /// `open` path. Returns `Ok(false)` (rather than panicking) when the
-    /// header's catalog offsets are themselves corrupt.
+    /// `open` path. Never panics: the only slice (`[HEADER_SIZE..]`) is always
+    /// in range because `open` already enforced `mmap.len() >= HEADER_SIZE`, and
+    /// a corrupt header simply hashes to a non-matching value (returns `false`).
     pub fn verify_file_checksum(&self) -> Result<bool> {
         let stored = self.header.file_checksum;
-        let fc_offset = self.header.full_catalog_offset as usize;
-        let fc_len = self.header.full_catalog_length as usize;
-        let sections_start = crate::SECTIONS_START_OFFSET as usize;
 
-        // Re-guard the offsets: `open()` checked the catalog range, but not
-        // `fc_offset >= sections_start`. A corrupt offset returns `false`
-        // instead of panicking on a reversed slice range. This also makes all
-        // three mmap slices below provably in-range (it forces
-        // `mmap.len() >= fc_end >= fc_offset >= sections_start`).
-        let fc_end = match fc_offset.checked_add(fc_len) {
-            Some(e) if fc_offset >= sections_start && e <= self.mmap.len() => e,
-            _ => return Ok(false),
-        };
+        // `open` guarantees this, but guard anyway so the slice below is always
+        // sound even if a caller constructs a reader some other way.
+        if self.mmap.len() < HEADER_SIZE {
+            return Ok(false);
+        }
 
         // Re-serialize the header with the checksum field zeroed, exactly as
-        // the writer did before hashing.
+        // every writer does before hashing.
         let mut header_for_hash = self.header.clone();
         header_for_hash.file_checksum = 0;
         let mut header_bytes = Vec::with_capacity(HEADER_SIZE);
         header_for_hash.write_to(&mut header_bytes)?;
 
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&header_bytes); // header [0..256]
-        hasher.update(&self.mmap[HEADER_SIZE..sections_start]); // root catalog [256..4352]
-        hasher.update(&self.mmap[sections_start..fc_offset]); // section bytes
-        hasher.update(&self.mmap[fc_offset..fc_end]); // full catalog
+        hasher.update(&header_bytes); // header [0..256], checksum field zeroed
+        hasher.update(&self.mmap[HEADER_SIZE..]); // body [256..EOF]
         let computed = crate::checksum::truncate_hash_to_u64(&hasher.finalize());
         Ok(computed == stored)
     }
