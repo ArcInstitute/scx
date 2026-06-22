@@ -883,31 +883,14 @@ impl ScxBackedSparseDataset {
 
     /// Number of stored values (nonzeros) — without materializing.
     /// Respects deletion vectors and column projections.
+    ///
+    /// Delegates to `total_nnz_raw()` (the same routine `getnnz(axis=None)`
+    /// uses) so the projected per-column counts are summed as `u64` — a plain
+    /// `Vec<u32>` sum overflows once projected nnz exceeds `u32::MAX` (atlas
+    /// scale).
     #[getter]
     pub(crate) fn nnz(&self) -> PyResult<usize> {
-        match (&self.col_projection, &self.kept_to_global) {
-            (Some(cols), Some(kept)) => {
-                let nnz = projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<u32>() as usize)
-            }
-            (Some(cols), None) => {
-                let nnz = projected_agg::col_nnz_projected(&self.backed, cols)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<u32>() as usize)
-            }
-            (None, Some(kept)) => {
-                let all_nnz = self
-                    .backed
-                    .row_nnz()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(kept.iter().map(|&g| all_nnz[g as usize]).sum::<i64>() as usize)
-            }
-            (None, None) => self
-                .backed
-                .total_nnz()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string())),
-        }
+        self.total_nnz_raw().map_err(PyRuntimeError::new_err)
     }
 
     /// Number of CSR shards in the backing file.

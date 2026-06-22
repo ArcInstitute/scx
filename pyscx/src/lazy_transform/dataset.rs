@@ -1086,13 +1086,15 @@ impl ScxLazyTransformedDataset {
                     let nnz =
                         crate::projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
                             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u32 = nnz.iter().sum();
+                    // Sum as u64: projected nnz can exceed u32::MAX at atlas scale.
+                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (Some(cols), None) => {
                     let nnz = crate::projected_agg::col_nnz_projected(&self.backed, cols)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let total: u32 = nnz.iter().sum();
+                    // Sum as u64: projected nnz can exceed u32::MAX at atlas scale.
+                    let total: u64 = nnz.iter().map(|&v| v as u64).sum();
                     Ok((total as usize).into_pyobject(py)?.into_any())
                 }
                 (None, Some(kept)) => {
@@ -1139,12 +1141,14 @@ impl ScxLazyTransformedDataset {
             (Some(cols), Some(kept)) => {
                 let nnz = crate::projected_agg::col_nnz_masked_projected(&self.backed, kept, cols)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<u32>() as usize)
+                // Sum as u64: projected nnz can exceed u32::MAX at atlas scale.
+                Ok(nnz.iter().map(|&v| v as u64).sum::<u64>() as usize)
             }
             (Some(cols), None) => {
                 let nnz = crate::projected_agg::col_nnz_projected(&self.backed, cols)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Ok(nnz.iter().sum::<u32>() as usize)
+                // Sum as u64: projected nnz can exceed u32::MAX at atlas scale.
+                Ok(nnz.iter().map(|&v| v as u64).sum::<u64>() as usize)
             }
             (None, Some(kept)) => {
                 let all_nnz = self
