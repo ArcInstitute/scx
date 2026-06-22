@@ -10,12 +10,12 @@
 extern "C" __global__ void mean_correct_kernel(
     float* __restrict__ Y,         // [n_obs × k], row-major
     const float* __restrict__ mc,  // [k], mean correction vector
-    int n_obs, int k
+    long long n_obs, long long k
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_obs * k;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = n_obs * k;
     if (idx >= total) return;
 
-    int col = idx % k;
+    long long col = idx % k;
     Y[idx] -= mc[col];
 }
