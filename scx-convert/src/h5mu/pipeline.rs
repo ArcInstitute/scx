@@ -34,7 +34,7 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 
 use crate::detect::{detect_matrix_format_at, MatrixFormat};
-use crate::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
+use crate::dtype::{detect_value_encoding_for_modality, index_dtype_for, values_to_raw_bytes};
 use crate::h5ad::csc_stream::open_csc_streaming;
 use crate::h5ad::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
 use crate::h5ad::read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
@@ -221,7 +221,7 @@ pub fn h5mu_to_scx(
 
     // index_dtype is shared across all CSR shards in the file (it's
     // a header-level setting). Pick the widest needed.
-    let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(max_n_vars);
 
     // Build header. n_modalities + modality-table fields are set by
     // writer.finish() once add_modality has been called for each modality;
@@ -455,7 +455,7 @@ pub fn h5mu_to_scx_streaming(
     let (modality_meta, max_n_vars) =
         read_modality_header_meta(&file, &modality_names, n_obs, sink)?;
 
-    let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(max_n_vars);
 
     // CSC sidecar policy on the streaming multimodal path. The streaming
     // writer cannot build per-modality CSC: the non-streaming `h5mu_to_scx`
@@ -558,7 +558,7 @@ pub fn h5mu_to_scx_streaming(
         let mod_n_vars_u32: u32 = u32::try_from(*mod_n_vars).map_err(|_| {
             ConvertError::Other(format!("modality '{mname}' n_vars exceeds u32::MAX"))
         })?;
-        let mod_index_dtype: u8 = if *mod_n_vars <= 65535 { 0 } else { 1 };
+        let mod_index_dtype: u8 = index_dtype_for(*mod_n_vars);
 
         // Open the per-modality X reader and validate its n_obs
         // matches the global axis. Phase 1/2 readers are reused
@@ -676,7 +676,7 @@ pub fn h5mu_to_scx_streaming(
                         continue;
                     }
                 };
-                let layer_index_dtype: u8 = if layer_n_vars <= 65535 { 0 } else { 1 };
+                let layer_index_dtype: u8 = index_dtype_for(layer_n_vars);
                 // Must match `ScxWriter::write_layer_csr_shard_for`'s naming
                 // (`layer/{mname}/{layer_name}/shard_{idx}`): the coordinator
                 // appends `_{shard_idx}`, and both

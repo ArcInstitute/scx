@@ -12,7 +12,7 @@ use scx_format_io::writer::{PreEncodedSection, ScxWriter};
 use scx_sparse::canonicalize_csr;
 
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
-use super::dtype::{detect_value_encoding, values_to_raw_bytes};
+use super::dtype::{detect_value_encoding, index_dtype_for, values_to_raw_bytes};
 use super::stream::CsrShardStream;
 use super::tenx_read::read_tenx_h5;
 use super::warnings::{ConvertWarning, WarningSink};
@@ -696,7 +696,7 @@ pub fn h5ad_to_scx(
     // Detect encoding and codec
     let (value_encoding, codec_id) =
         detect_value_encoding(&data, opts.codec).map_err(ScxError::from)?;
-    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(n_vars as u64);
 
     // Build header
     let header = FileHeader::new_single_modality(
@@ -823,7 +823,7 @@ pub fn h5ad_to_scx(
             }
             let (l_enc, l_codec) =
                 detect_value_encoding(l_data, opts.codec).map_err(ScxError::from)?;
-            let l_index_dtype: u8 = if *l_nvars <= 65535 { 0 } else { 1 };
+            let l_index_dtype: u8 = index_dtype_for(*l_nvars as u64);
             write_layer_shards(
                 &mut writer,
                 l_indptr,
@@ -900,7 +900,7 @@ pub fn tenx_to_scx(
     let nnz = *tenx.indptr.last().unwrap_or(&0) as u64;
     let (value_encoding, codec_id) =
         detect_value_encoding(&tenx.data, opts.codec).map_err(ScxError::from)?;
-    let index_dtype: u8 = if tenx.n_genes <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(tenx.n_genes as u64);
 
     let header = FileHeader::new_single_modality(
         tenx.n_cells as u64,
@@ -1111,7 +1111,7 @@ pub fn h5ad_to_scx_streaming(
     let n_vars = x_reader.n_vars() as usize;
     let n_vars_u32: u32 = u32::try_from(n_vars)
         .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
-    let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(n_vars as u64);
 
     // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
     // `codec_id` are overwritten by `ScxWriter::finish()` from
@@ -1384,7 +1384,7 @@ pub fn h5ad_to_scx_streaming(
                     continue;
                 }
             };
-            let l_index_dtype: u8 = if l_n_vars <= 65535 { 0 } else { 1 };
+            let l_index_dtype: u8 = index_dtype_for(l_n_vars as u64);
             let (_, _) = run_streaming_writer_coordinator(
                 layer_reader.as_mut(),
                 &mut writer,
@@ -2304,7 +2304,7 @@ fn ingest_raw_streaming(
 
     let raw_n_vars_u32 = u32::try_from(raw_n_vars)
         .map_err(|_| ConvertError::Other(format!("raw n_vars {raw_n_vars} exceeds u32::MAX")))?;
-    let raw_index_dtype: u8 = if raw_n_vars <= 65535 { 0 } else { 1 };
+    let raw_index_dtype: u8 = index_dtype_for(raw_n_vars as u64);
 
     run_streaming_writer_coordinator(
         raw_reader.as_mut(),

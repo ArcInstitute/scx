@@ -34,6 +34,7 @@ use super::write::{
     build_unified_export_schema, scan_column_export_layout, write_dataframe_group_at,
     write_dataframe_group_streaming, write_obsm_entry_at, write_uns_entries_at,
 };
+use crate::h5_write_util::vlu;
 use crate::pipeline::{ConvertError, ConvertOptions};
 use crate::warnings::WarningSink;
 
@@ -165,15 +166,6 @@ pub(crate) fn filter_record_batch_by_mask(
     }
     let bool_arr = BooleanArray::from(mask[..n].to_vec());
     arrow::compute::filter_record_batch(batch, &bool_arr).map_err(ConvertError::Arrow)
-}
-
-fn vlu(s: &str) -> VarLenUnicode {
-    s.parse::<VarLenUnicode>().unwrap_or_else(|_| {
-        let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
-        cleaned
-            .parse::<VarLenUnicode>()
-            .expect("cleaned string should have no NUL bytes")
-    })
 }
 
 /// Streaming SCX → h5ad entry point. Mirrors `write_scx_to_h5ad`

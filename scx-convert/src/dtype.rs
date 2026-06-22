@@ -10,6 +10,19 @@ pub use scx_codec::value_encoding::{
     detect_value_encoding as detect_value_encoding_only, values_to_raw_bytes,
 };
 
+/// CSR `index_dtype` code for a matrix with `n_vars` columns:
+/// `0` = u16 indices (`n_vars ≤ u16::MAX`), `1` = u32 indices.
+///
+/// Single source of truth for the `if n_vars <= 65535 { 0 } else { 1 }`
+/// boundary that every CSR / layer writer in the convert pipeline needs.
+pub(crate) fn index_dtype_for(n_vars: u64) -> u8 {
+    if n_vars <= u16::MAX as u64 {
+        0
+    } else {
+        1
+    }
+}
+
 /// Detect the best value encoding and auto-select codec for the data.
 /// When `explicit_codec` is Some, uses that codec (with Scx1→Zstd fallback for floats).
 /// When None, auto-selects based on value distribution. Single-modality

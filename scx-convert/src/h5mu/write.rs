@@ -24,6 +24,7 @@ use hdf5::types::VarLenUnicode;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
+use crate::h5_write_util::vlu;
 use crate::h5ad::stream_write::{
     stream_csr_to_group_at, stream_layers_at, write_obs_streaming_or_eager,
 };
@@ -32,10 +33,6 @@ use crate::h5ad::write::{
 };
 use crate::pipeline::{ConvertError, ConvertOptions};
 use crate::warnings::WarningSink;
-
-fn vlu(s: &str) -> VarLenUnicode {
-    s.parse().unwrap_or_else(|_| "".parse().unwrap())
-}
 
 /// Write an SCX file to h5mu format. Requires `reader.is_multimodal()`.
 pub fn scx_to_h5mu(
