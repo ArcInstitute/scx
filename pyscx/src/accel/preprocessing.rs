@@ -216,7 +216,9 @@ pub fn normalize_total(
         // then project_csr restricts to projected genes before summing.
         // Returns a global-length vector (n_obs_global), which is what
         // apply_transforms_to_csr expects (indexes by global row).
-        let sums = lazy_ref.streaming_row_sums_projected()?;
+        let sums = lazy_ref
+            .streaming_row_sums_projected()
+            .map_err(PyRuntimeError::new_err)?;
         lazy_ref.transforms.push(Transform::NormalizeTotal {
             row_sums: Arc::new(sums),
             target_sum,
@@ -486,7 +488,7 @@ pub fn calculate_qc_metrics<'py>(
         )
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let row_sums = lazy.streaming_row_sums()?;
+        let row_sums = lazy.streaming_row_sums().map_err(PyRuntimeError::new_err)?;
         let row_nnz = lazy
             .backed
             .row_nnz()
@@ -530,10 +532,11 @@ pub fn calculate_qc_metrics<'py>(
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
         let col_sums = if lazy.kept_to_global.is_some() {
-            lazy.streaming_col_sums_masked()?
+            lazy.streaming_col_sums_masked()
         } else {
-            lazy.streaming_col_sums()?
-        };
+            lazy.streaming_col_sums()
+        }
+        .map_err(PyRuntimeError::new_err)?;
         let col_nnz = if let Some(ref kept) = lazy.kept_to_global {
             lazy.backed
                 .col_nnz_masked(kept)

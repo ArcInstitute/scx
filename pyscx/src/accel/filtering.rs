@@ -387,7 +387,9 @@ pub fn filter_cells(
         // shard scan. NNZ is transform-invariant but we compute it from the
         // same decoded shard to avoid double I/O.
         let (row_nnz, row_sums) = if need_nnz && need_sums {
-            let (all_nnz, all_sums) = lazy_ref.streaming_row_nnz_and_sums()?;
+            let (all_nnz, all_sums) = lazy_ref
+                .streaming_row_nnz_and_sums()
+                .map_err(PyRuntimeError::new_err)?;
             (
                 Some(lazy_ref.filter_row_results(&all_nnz)),
                 Some(lazy_ref.filter_row_results(&all_sums)),
@@ -403,7 +405,9 @@ pub fn filter_cells(
                 None
             };
             let sums = if need_sums {
-                let all_sums = lazy_ref.streaming_row_sums()?;
+                let all_sums = lazy_ref
+                    .streaming_row_sums()
+                    .map_err(PyRuntimeError::new_err)?;
                 Some(lazy_ref.filter_row_results(&all_sums))
             } else {
                 None
@@ -607,10 +611,11 @@ pub fn filter_genes(
         // When col_projection is active, extract only projected columns.
         let col_sums = if need_sums {
             let full_sums = if lazy_ref.kept_to_global.is_some() {
-                lazy_ref.streaming_col_sums_masked()?
+                lazy_ref.streaming_col_sums_masked()
             } else {
-                lazy_ref.streaming_col_sums()?
-            };
+                lazy_ref.streaming_col_sums()
+            }
+            .map_err(PyRuntimeError::new_err)?;
             if let Some(cols) = lazy_ref.col_projection() {
                 Some(
                     cols.iter()

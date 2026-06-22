@@ -12,6 +12,7 @@ use pyo3::types::{PyDict, PyList, PySlice, PyTuple};
 use scx_format_io::{BackedCscReader, BackedCsrReader};
 use scx_sparse::ScxCsr;
 
+use crate::backed::detached;
 use crate::backed::ScxComparisonResult;
 use crate::convert::csr_to_scipy;
 
@@ -288,7 +289,10 @@ impl ScxLazyTransformedDataset {
     // rationale.
 
     /// Stream all shards, apply transforms, compute per-row sums.
-    pub(crate) fn streaming_row_sums(&self) -> PyResult<Vec<f64>> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn streaming_row_sums(&self) -> Result<Vec<f64>, String> {
         let n_obs_global = self.backed.shape().0;
         let mut sums = vec![0.0f64; n_obs_global];
         let mut global_row = 0usize;
@@ -297,7 +301,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
             for row in 0..csr.n_rows() {
                 let s = csr.indptr[row] as usize;
@@ -317,7 +321,10 @@ impl ScxLazyTransformedDataset {
     ///
     /// Used by `filter_cells` when both `min_genes` and `min_counts` are specified.
     /// Returns global-length vectors (NOT filtered through deletion vectors).
-    pub(crate) fn streaming_row_nnz_and_sums(&self) -> PyResult<(Vec<i64>, Vec<f64>)> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn streaming_row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>), String> {
         let n_obs_global = self.backed.shape().0;
         let mut all_nnz = vec![0i64; n_obs_global];
         let mut all_sums = vec![0.0f64; n_obs_global];
@@ -327,7 +334,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             // NNZ from indptr before transforms (transforms preserve sparsity pattern)
             for row in 0..csr.n_rows() {
                 all_nnz[global_row + row] = csr.indptr[row + 1] - csr.indptr[row];
@@ -358,7 +365,10 @@ impl ScxLazyTransformedDataset {
     ///
     /// Returns a global-length vector (`n_obs_global`), NOT filtered through
     /// deletion vectors.
-    pub(crate) fn streaming_row_sums_projected(&self) -> PyResult<Vec<f64>> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn streaming_row_sums_projected(&self) -> Result<Vec<f64>, String> {
         let cols = match &self.col_projection {
             Some(c) => c,
             None => return self.streaming_row_sums(),
@@ -370,7 +380,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
             let projected = scx_engine::projection::project_csr(&csr, cols);
             for row in 0..projected.n_rows() {
@@ -388,7 +398,10 @@ impl ScxLazyTransformedDataset {
     /// Returns a vector of length `backed.shape().1` (physical column count),
     /// NOT `shape_val.1` (projected). Callers must apply
     /// `apply_col_projection_to_vec()` before exposing to Python.
-    pub(crate) fn streaming_col_sums(&self) -> PyResult<Vec<f64>> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn streaming_col_sums(&self) -> Result<Vec<f64>, String> {
         let n_vars = self.backed.shape().1; // physical width, intentionally
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
@@ -397,7 +410,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
             for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
                 sums[col as usize] += val as f64;
@@ -416,7 +429,7 @@ impl ScxLazyTransformedDataset {
     /// Python. This is correct because per-column variance is independent —
     /// computing var for filtered-out columns is wasted work but doesn't affect
     /// the values for kept columns.
-    fn streaming_col_var(&self) -> PyResult<Vec<f64>> {
+    fn streaming_col_var(&self) -> Result<Vec<f64>, String> {
         let n_vars = self.backed.shape().1; // physical width, intentionally
         let n_obs = self.shape_val.0;
         if n_obs == 0 {
@@ -443,7 +456,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
 
             if let Some(ref kept) = self.kept_to_global {
@@ -500,7 +513,10 @@ impl ScxLazyTransformedDataset {
     ///
     /// Like `streaming_col_sums()`, returns a vector of length `backed.shape().1`
     /// (physical column count). Callers must apply `apply_col_projection_to_vec()`.
-    pub(crate) fn streaming_col_sums_masked(&self) -> PyResult<Vec<f64>> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn streaming_col_sums_masked(&self) -> Result<Vec<f64>, String> {
         let n_vars = self.backed.shape().1; // physical width, intentionally
         let mut sums = vec![0.0f64; n_vars];
         let mut global_row = 0usize;
@@ -514,7 +530,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
 
             let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
@@ -543,7 +559,10 @@ impl ScxLazyTransformedDataset {
     /// Materialize the full matrix with all transforms applied.
     ///
     /// Public within the crate so ScxComparisonResult can call it.
-    pub(crate) fn materialize_csr(&self) -> PyResult<ScxCsr> {
+    ///
+    /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
+    /// it through `detached` with the GIL released.
+    pub(crate) fn materialize_csr(&self) -> Result<ScxCsr, String> {
         let mut global_row = 0usize;
         let mut all_slices = Vec::new();
 
@@ -551,7 +570,7 @@ impl ScxLazyTransformedDataset {
             let mut csr = self
                 .backed
                 .read_shard_uncached(shard_idx)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             self.apply_transforms(&mut csr, global_row);
             global_row += csr.n_rows();
             all_slices.push(csr);
@@ -572,8 +591,12 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Materialize the full matrix as a scipy CSR, callable from other modules.
+    ///
+    /// Shard decode + transform runs off the GIL (`detached`); only the scipy
+    /// object is built on the GIL. This is the single hot path behind every
+    /// `to_memory`-based method (`multiply`, `power`, `std`, row/scalar `var`, …).
     pub(crate) fn to_memory_py<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let csr = self.materialize_csr()?;
+        let csr = detached(py, || self.materialize_csr()).map_err(PyRuntimeError::new_err)?;
         csr_to_scipy(py, csr)
     }
 }
@@ -926,23 +949,29 @@ impl ScxLazyTransformedDataset {
             Some(0) => {
                 // Streaming col sums return physical-width vector;
                 // apply_col_projection_to_vec extracts projected subset.
-                let sums = if self.kept_to_global.is_some() {
-                    self.streaming_col_sums_masked()?
-                } else {
-                    self.streaming_col_sums()?
-                };
+                // Shard decode + transform + reduction runs off the GIL.
+                let sums = detached(py, || {
+                    if self.kept_to_global.is_some() {
+                        self.streaming_col_sums_masked()
+                    } else {
+                        self.streaming_col_sums()
+                    }
+                })
+                .map_err(PyRuntimeError::new_err)?;
                 let sums = self.apply_col_projection_to_vec(sums);
                 let arr = numpy::PyArray::from_vec(py, sums);
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
-                let all_sums = self.streaming_row_sums()?;
+                let all_sums =
+                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let arr = numpy::PyArray::from_vec(py, filtered);
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                let all_sums = self.streaming_row_sums()?;
+                let all_sums =
+                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 Ok(total.into_pyobject(py)?.into_any())
@@ -959,11 +988,15 @@ impl ScxLazyTransformedDataset {
     fn mean<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let sums = if self.kept_to_global.is_some() {
-                    self.streaming_col_sums_masked()?
-                } else {
-                    self.streaming_col_sums()?
-                };
+                // Shard decode + transform + reduction runs off the GIL.
+                let sums = detached(py, || {
+                    if self.kept_to_global.is_some() {
+                        self.streaming_col_sums_masked()
+                    } else {
+                        self.streaming_col_sums()
+                    }
+                })
+                .map_err(PyRuntimeError::new_err)?;
                 // Post-filter to projected columns, then compute means.
                 let sums = self.apply_col_projection_to_vec(sums);
                 let n = self.shape_val.0 as f64;
@@ -972,7 +1005,8 @@ impl ScxLazyTransformedDataset {
                 arr.call_method1("reshape", ((1i32, self.shape_val.1),))
             }
             Some(1) => {
-                let all_sums = self.streaming_row_sums()?;
+                let all_sums =
+                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let n = self.shape_val.1 as f64;
                 let means: Vec<f64> = filtered.iter().map(|&s| s / n).collect();
@@ -980,7 +1014,8 @@ impl ScxLazyTransformedDataset {
                 arr.call_method1("reshape", ((self.shape_val.0, 1i32),))
             }
             None => {
-                let all_sums = self.streaming_row_sums()?;
+                let all_sums =
+                    detached(py, || self.streaming_row_sums()).map_err(PyRuntimeError::new_err)?;
                 let filtered = self.filter_row_results(&all_sums);
                 let total: f64 = filtered.iter().sum();
                 let n = (self.shape_val.0 as f64) * (self.shape_val.1 as f64);
@@ -1004,7 +1039,8 @@ impl ScxLazyTransformedDataset {
     fn var<'py>(&self, py: Python<'py>, axis: Option<i32>) -> PyResult<Bound<'py, PyAny>> {
         match axis {
             Some(0) => {
-                let var = self.streaming_col_var()?;
+                let var =
+                    detached(py, || self.streaming_col_var()).map_err(PyRuntimeError::new_err)?;
                 // Apply column projection: streaming_col_var returns physical-width
                 let var = self.apply_col_projection_to_vec(var);
                 let arr = numpy::PyArray::from_vec(py, var);
@@ -1235,12 +1271,17 @@ impl ScxLazyTransformedDataset {
         if let Ok(i) = row_idx.extract::<i64>() {
             let row = self.normalize_row_index(i)?;
             let global_row = self.to_global_row(row)?;
-            let mut csr = self
-                .backed
-                .read_rows(global_row as u64, global_row as u64 + 1)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            self.apply_transforms(&mut csr, global_row);
-            let csr = self.apply_col_projection(csr);
+            // Decode + transform + project off the GIL; build scipy on-GIL.
+            let csr = detached(py, || {
+                self.backed
+                    .read_rows(global_row as u64, global_row as u64 + 1)
+                    .map(|mut csr| {
+                        self.apply_transforms(&mut csr, global_row);
+                        self.apply_col_projection(csr)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1252,13 +1293,18 @@ impl ScxLazyTransformedDataset {
             let step = indices.step;
 
             if step == 1 && self.kept_to_global.is_none() {
-                // Contiguous slice, no deletions — direct range read + transform
-                let mut csr = self
-                    .backed
-                    .read_rows(start, stop)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                self.apply_transforms(&mut csr, start as usize);
-                let csr = self.apply_col_projection(csr);
+                // Contiguous slice, no deletions — direct range read + transform.
+                // Decode + transform + project off the GIL; build scipy on-GIL.
+                let csr = detached(py, || {
+                    self.backed
+                        .read_rows(start, stop)
+                        .map(|mut csr| {
+                            self.apply_transforms(&mut csr, start as usize);
+                            self.apply_col_projection(csr)
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(PyRuntimeError::new_err)?;
                 return csr_to_scipy(py, csr);
             }
 
@@ -1272,14 +1318,18 @@ impl ScxLazyTransformedDataset {
                 i += step;
             }
 
-            let mut csr = self
-                .backed
-                .read_row_indices(&rows)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            // We need to apply transforms row-by-row with correct global offsets.
-            // For fancy indexing, apply transforms per-row.
-            self.apply_transforms_per_row(&mut csr, &rows);
-            let csr = self.apply_col_projection(csr);
+            // Decode + per-row transform + project off the GIL; scipy on-GIL.
+            let csr = detached(py, || {
+                self.backed
+                    .read_row_indices(&rows)
+                    .map(|mut csr| {
+                        // Apply transforms row-by-row with correct global offsets.
+                        self.apply_transforms_per_row(&mut csr, &rows);
+                        self.apply_col_projection(csr)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1302,12 +1352,17 @@ impl ScxLazyTransformedDataset {
                 .iter()
                 .map(|&v| self.to_global_row(v as usize).map(|g| g as u64))
                 .collect::<PyResult<Vec<u64>>>()?;
-            let mut csr = self
-                .backed
-                .read_row_indices(&rows)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            self.apply_transforms_per_row(&mut csr, &rows);
-            let csr = self.apply_col_projection(csr);
+            // Decode + per-row transform + project off the GIL; scipy on-GIL.
+            let csr = detached(py, || {
+                self.backed
+                    .read_row_indices(&rows)
+                    .map(|mut csr| {
+                        self.apply_transforms_per_row(&mut csr, &rows);
+                        self.apply_col_projection(csr)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .map_err(PyRuntimeError::new_err)?;
             return csr_to_scipy(py, csr);
         }
 
@@ -1331,12 +1386,17 @@ impl ScxLazyTransformedDataset {
                 self.to_global_row(normalized as usize).map(|g| g as u64)
             })
             .collect::<PyResult<Vec<u64>>>()?;
-        let mut csr = self
-            .backed
-            .read_row_indices(&rows)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        self.apply_transforms_per_row(&mut csr, &rows);
-        let csr = self.apply_col_projection(csr);
+        // Decode + per-row transform + project off the GIL; scipy on-GIL.
+        let csr = detached(py, || {
+            self.backed
+                .read_row_indices(&rows)
+                .map(|mut csr| {
+                    self.apply_transforms_per_row(&mut csr, &rows);
+                    self.apply_col_projection(csr)
+                })
+                .map_err(|e| e.to_string())
+        })
+        .map_err(PyRuntimeError::new_err)?;
         csr_to_scipy(py, csr)
     }
 
