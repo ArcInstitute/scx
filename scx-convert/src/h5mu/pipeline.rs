@@ -34,7 +34,7 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 
 use crate::detect::{detect_matrix_format_at, MatrixFormat};
-use crate::dtype::{detect_value_encoding_for_modality, values_to_raw_bytes};
+use crate::dtype::{detect_value_encoding_for_modality, index_dtype_for, values_to_raw_bytes};
 use crate::h5ad::csc_stream::open_csc_streaming;
 use crate::h5ad::dense_stream::{open_dense_streaming, read_dense_slab_f32, DenseDtype};
 use crate::h5ad::read::{read_dataframe_group, read_layers_at, read_obsm_at, read_x_matrix_at};
@@ -101,6 +101,89 @@ pub(crate) fn infer_modality_type_from_name(name: &str) -> ModalityType {
     ModalityType::infer_from_name(name)
 }
 
+/// Per-modality header metadata from the shape-only pre-pass:
+/// `(modality name, matrix format, n_vars)`.
+type ModalityHeaderMeta = (String, MatrixFormat, u64);
+
+/// Pre-pass: detect each modality's matrix format and read its column
+/// count from the `/X` `/shape` attr (CSR/CSC) or dataset dims (dense),
+/// reading no X data. Validates each modality's row count against the
+/// shared outer `n_obs`. Returns per-modality `(name, format, n_vars)`
+/// plus the widest `n_vars` seen (for the file-level `index_dtype`).
+///
+/// Shared by both `h5mu_to_scx` (non-streaming) and
+/// `h5mu_to_scx_streaming`: neither needs to materialise X to populate
+/// the file header — `n_vars` comes from the shape, and `nnz` is
+/// reconstructed by `ScxWriter::finish()` from the per-shard catalog
+/// stats, so it is left at `0` in the header by both callers.
+fn read_modality_header_meta(
+    file: &hdf5::File,
+    modality_names: &[String],
+    n_obs: usize,
+    sink: &mut WarningSink,
+) -> Result<(Vec<ModalityHeaderMeta>, u64), ConvertError> {
+    let mut modality_meta: Vec<ModalityHeaderMeta> = Vec::with_capacity(modality_names.len());
+    let mut max_n_vars: u64 = 0;
+    for mname in modality_names {
+        let x_path = format!("mod/{mname}/X");
+        let fmt = detect_matrix_format_at(file, &x_path, sink)?;
+        let mod_n_vars: u64 = match fmt {
+            MatrixFormat::Csr | MatrixFormat::Csc => {
+                let group = file.group(&x_path)?;
+                let shape: Vec<i64> = group.attr("shape")?.read_1d()?.to_vec();
+                if shape.len() != 2 {
+                    return Err(ConvertError::Other(format!(
+                        "expected 2D shape attr on '{x_path}', got {}-D",
+                        shape.len()
+                    )));
+                }
+                // The `/shape` attr is read as signed i64; guard against a
+                // negative (corrupt) dimension silently wrapping to a huge
+                // usize/u64 (review theme #1) instead of a bare `as` cast.
+                let mod_n_obs = usize::try_from(shape[0]).map_err(|_| {
+                    ConvertError::Other(format!(
+                        "modality '{mname}' has negative n_obs dimension {} on '{x_path}'",
+                        shape[0]
+                    ))
+                })?;
+                if mod_n_obs != n_obs {
+                    return Err(ConvertError::Other(format!(
+                        "modality '{mname}' has n_obs={mod_n_obs} but outer obs has n_obs={n_obs}"
+                    )));
+                }
+                u64::try_from(shape[1]).map_err(|_| {
+                    ConvertError::Other(format!(
+                        "modality '{mname}' has negative n_vars dimension {} on '{x_path}'",
+                        shape[1]
+                    ))
+                })?
+            }
+            MatrixFormat::Dense => {
+                let ds = file.dataset(&x_path)?;
+                let shape = ds.shape();
+                if shape.len() != 2 {
+                    return Err(ConvertError::Other(format!(
+                        "dense modality '{mname}' /X must be 2D, got {}-D",
+                        shape.len()
+                    )));
+                }
+                if shape[0] != n_obs {
+                    return Err(ConvertError::Other(format!(
+                        "modality '{mname}' has n_obs={} but outer obs has n_obs={n_obs}",
+                        shape[0]
+                    )));
+                }
+                shape[1] as u64
+            }
+        };
+        if mod_n_vars > max_n_vars {
+            max_n_vars = mod_n_vars;
+        }
+        modality_meta.push((mname.clone(), fmt, mod_n_vars));
+    }
+    Ok((modality_meta, max_n_vars))
+}
+
 /// Convert an h5mu file to a multimodal SCX v2 file.
 pub fn h5mu_to_scx(
     input: &Path,
@@ -140,47 +223,28 @@ pub fn h5mu_to_scx(
         ));
     }
 
-    // Pre-read each modality's X to learn shapes + nnz so we can
-    // populate the file header before opening the writer. We discard
-    // the read data afterwards and re-read inside the per-modality
-    // write loop — h5mu files are typically small enough that this
-    // double-read is acceptable for an MVP. A streaming-only path
-    // (Phase D follow-up) can compute n_vars / nnz from group attrs
-    // alone without materialising X.
-    let mut modality_meta: Vec<(String, MatrixFormat, usize, u64)> = Vec::new();
-    let mut total_nnz: u64 = 0;
-    let mut max_n_vars: u64 = 0;
-    for mname in &modality_names {
-        let x_path = format!("mod/{mname}/X");
-        let fmt = detect_matrix_format_at(&file, &x_path, sink)?;
-        let (indptr, _indices, _data, mod_n_obs, mod_n_vars) =
-            read_x_matrix_at(&file, &x_path, fmt)?;
-        if mod_n_obs != n_obs {
-            return Err(ConvertError::Other(format!(
-                "modality '{mname}' has n_obs={mod_n_obs} but outer obs has n_obs={n_obs} — \
-                 Phase D currently requires cell-aligned modalities"
-            )));
-        }
-        let nnz = *indptr.last().unwrap_or(&0) as u64;
-        total_nnz += nnz;
-        if (mod_n_vars as u64) > max_n_vars {
-            max_n_vars = mod_n_vars as u64;
-        }
-        modality_meta.push((mname.clone(), fmt, mod_n_vars, nnz));
-    }
+    // Pre-pass: detect each modality's format and read its column count
+    // from the `/X` shape attr / dataset dims — no X data is read here.
+    // The full X is read exactly once, inside the per-modality write loop
+    // below. The header `nnz` is reconstructed by `ScxWriter::finish()`
+    // from the per-shard catalog stats, so we leave it at 0 (see the
+    // shared `read_modality_header_meta` doc and the streaming path).
+    let (modality_meta, max_n_vars) =
+        read_modality_header_meta(&file, &modality_names, n_obs, sink)?;
 
     // index_dtype is shared across all CSR shards in the file (it's
     // a header-level setting). Pick the widest needed.
-    let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(max_n_vars);
 
     // Build header. n_modalities + modality-table fields are set by
     // writer.finish() once add_modality has been called for each modality;
     // codec_id/value_encoding are per-modality at write time, so the header
-    // value is a nominal default.
+    // value is a nominal default. `nnz` is left at 0 and reconstructed by
+    // writer.finish() (sync_from_catalog) from the per-shard stats.
     let header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
-        total_nnz,
+        0,
         opts.shard_target_rows,
         0,
         index_dtype,
@@ -192,10 +256,12 @@ pub fn h5mu_to_scx(
     writer.write_obs(&outer_obs)?;
 
     // Outer obsm (global) → write as obsm/{key} with modality_id=0.
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
-        for (key, batch) in &global_obsm {
-            writer.write_obsm(key, batch)?;
-        }
+    // `read_obsm_at` returns Ok(empty) when absent and warns per-entry; a
+    // propagated Err means the group is present but structurally unreadable
+    // (member listing failed) — surface it rather than silently skipping.
+    let global_obsm = read_obsm_at(&file, "obsm", sink)?;
+    for (key, batch) in &global_obsm {
+        writer.write_obsm(key, batch)?;
     }
 
     // Outer uns (global) → write as the global uns blob.
@@ -207,7 +273,7 @@ pub fn h5mu_to_scx(
     // Per-modality writes. Each iteration registers the modality,
     // writes its var, streams CSR shards, optionally emits CSC, then
     // writes per-modality obsm / layers / uns.
-    for (mname, fmt, mod_n_vars, _expected_nnz) in &modality_meta {
+    for (mname, fmt, mod_n_vars) in &modality_meta {
         let x_path = format!("mod/{mname}/X");
         let var_path = format!("mod/{mname}/var");
         let obsm_path = format!("mod/{mname}/obsm");
@@ -230,7 +296,7 @@ pub fn h5mu_to_scx(
             .add_modality(mname, modality_type, codec_id, value_encoding, false)
             .map_err(ConvertError::from)?;
         writer
-            .set_modality_n_vars(modality_id, *mod_n_vars as u64)
+            .set_modality_n_vars(modality_id, *mod_n_vars)
             .map_err(ConvertError::from)?;
 
         let var = read_dataframe_group(&file, &var_path, sink)?;
@@ -246,7 +312,7 @@ pub fn h5mu_to_scx(
             &indices,
             &data,
             n_obs,
-            *mod_n_vars,
+            *mod_n_vars as usize,
             opts.shard_target_rows as usize,
             value_encoding,
             codec_id,
@@ -254,7 +320,7 @@ pub fn h5mu_to_scx(
 
         // Optional CSC sidecar — uses the same streaming-transpose
         // helper as the h5ad pipeline, but stamped on this modality.
-        if opts.csc.should_build_csc(n_obs as u64, *mod_n_vars as u64) {
+        if opts.csc.should_build_csc(n_obs as u64, *mod_n_vars) {
             write_modality_csc_shards_from_csr(
                 &mut writer,
                 modality_id,
@@ -262,43 +328,43 @@ pub fn h5mu_to_scx(
                 &indices,
                 &data,
                 n_obs,
-                *mod_n_vars,
+                *mod_n_vars as usize,
                 value_encoding,
                 codec_id,
                 opts.csc_cols_per_shard,
             )?;
         }
 
-        // Per-modality obsm.
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
-            for (key, batch) in &obsm_map {
-                writer
-                    .write_obsm_for(modality_id, key, batch)
-                    .map_err(ConvertError::from)?;
-            }
+        // Per-modality obsm. (Ok(empty) when absent / warned per-entry; a
+        // propagated Err means a present-but-unreadable obsm group.)
+        let obsm_map = read_obsm_at(&file, &obsm_path, sink)?;
+        for (key, batch) in &obsm_map {
+            writer
+                .write_obsm_for(modality_id, key, batch)
+                .map_err(ConvertError::from)?;
         }
 
         // Per-modality layers — written as layer-CSR shards stamped
-        // with this modality_id.
-        if let Ok(layers) = read_layers_at(&file, &layers_path, sink) {
-            for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
-                let (l_enc, l_codec) =
-                    detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
-                        .map_err(ScxError::from)?;
-                write_modality_layer_shards(
-                    &mut writer,
-                    modality_id,
-                    layer_name,
-                    l_indptr,
-                    l_indices,
-                    l_data,
-                    n_obs,
-                    *l_nvars,
-                    opts.shard_target_rows as usize,
-                    l_enc,
-                    l_codec,
-                )?;
-            }
+        // with this modality_id. (Same absent-vs-unreadable contract as
+        // obsm: Ok(empty)/warned per-entry, Err only on a corrupt group.)
+        let layers = read_layers_at(&file, &layers_path, sink)?;
+        for (layer_name, (l_indptr, l_indices, l_data, _l_nobs, l_nvars)) in &layers {
+            let (l_enc, l_codec) =
+                detect_value_encoding_for_modality(l_data, opts.codec, modality_type)
+                    .map_err(ScxError::from)?;
+            write_modality_layer_shards(
+                &mut writer,
+                modality_id,
+                layer_name,
+                l_indptr,
+                l_indices,
+                l_data,
+                n_obs,
+                *l_nvars,
+                opts.shard_target_rows as usize,
+                l_enc,
+                l_codec,
+            )?;
         }
     }
 
@@ -397,56 +463,12 @@ pub fn h5mu_to_scx_streaming(
     }
 
     // Pre-pass: detect each modality's format and read the X /shape
-    // attr (CSR/CSC) or dataset dims (dense). No data is read.
-    let mut modality_meta: Vec<(String, MatrixFormat, u64)> =
-        Vec::with_capacity(modality_names.len());
-    let mut max_n_vars: u64 = 0;
-    for mname in &modality_names {
-        let x_path = format!("mod/{mname}/X");
-        let fmt = detect_matrix_format_at(&file, &x_path, sink)?;
-        let mod_n_vars: u64 = match fmt {
-            MatrixFormat::Csr | MatrixFormat::Csc => {
-                let group = file.group(&x_path)?;
-                let shape: Vec<i64> = group.attr("shape")?.read_1d()?.to_vec();
-                if shape.len() != 2 {
-                    return Err(ConvertError::Other(format!(
-                        "expected 2D shape attr on '{x_path}', got {}-D",
-                        shape.len()
-                    )));
-                }
-                let mod_n_obs = shape[0] as usize;
-                if mod_n_obs != n_obs {
-                    return Err(ConvertError::Other(format!(
-                        "modality '{mname}' has n_obs={mod_n_obs} but outer obs has n_obs={n_obs}"
-                    )));
-                }
-                shape[1] as u64
-            }
-            MatrixFormat::Dense => {
-                let ds = file.dataset(&x_path)?;
-                let shape = ds.shape();
-                if shape.len() != 2 {
-                    return Err(ConvertError::Other(format!(
-                        "dense modality '{mname}' /X must be 2D, got {}-D",
-                        shape.len()
-                    )));
-                }
-                if shape[0] != n_obs {
-                    return Err(ConvertError::Other(format!(
-                        "modality '{mname}' has n_obs={} but outer obs has n_obs={n_obs}",
-                        shape[0]
-                    )));
-                }
-                shape[1] as u64
-            }
-        };
-        if mod_n_vars > max_n_vars {
-            max_n_vars = mod_n_vars;
-        }
-        modality_meta.push((mname.clone(), fmt, mod_n_vars));
-    }
+    // attr (CSR/CSC) or dataset dims (dense). No data is read. Shared
+    // with the non-streaming `h5mu_to_scx` path.
+    let (modality_meta, max_n_vars) =
+        read_modality_header_meta(&file, &modality_names, n_obs, sink)?;
 
-    let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
+    let index_dtype: u8 = index_dtype_for(max_n_vars);
 
     // CSC sidecar policy on the streaming multimodal path. The streaming
     // writer cannot build per-modality CSC: the non-streaming `h5mu_to_scx`
@@ -497,10 +519,11 @@ pub fn h5mu_to_scx_streaming(
 
     // Outer obs / obsm / uns. Global obs goes first.
     writer.write_obs(&outer_obs)?;
-    if let Ok(global_obsm) = read_obsm_at(&file, "obsm", sink) {
-        for (key, batch) in &global_obsm {
-            writer.write_obsm(key, batch)?;
-        }
+    // Ok(empty) when absent / warned per-entry; Err only on a present-but-
+    // unreadable obsm group — propagate rather than silently skip.
+    let global_obsm = read_obsm_at(&file, "obsm", sink)?;
+    for (key, batch) in &global_obsm {
+        writer.write_obsm(key, batch)?;
     }
     if file.group("uns").is_ok() {
         let uns = crate::h5ad::read::read_uns(&file, opts.strict_uns, sink)?;
@@ -548,7 +571,7 @@ pub fn h5mu_to_scx_streaming(
         let mod_n_vars_u32: u32 = u32::try_from(*mod_n_vars).map_err(|_| {
             ConvertError::Other(format!("modality '{mname}' n_vars exceeds u32::MAX"))
         })?;
-        let mod_index_dtype: u8 = if *mod_n_vars <= 65535 { 0 } else { 1 };
+        let mod_index_dtype: u8 = index_dtype_for(*mod_n_vars);
 
         // Open the per-modality X reader and validate its n_obs
         // matches the global axis. Phase 1/2 readers are reused
@@ -666,7 +689,7 @@ pub fn h5mu_to_scx_streaming(
                         continue;
                     }
                 };
-                let layer_index_dtype: u8 = if layer_n_vars <= 65535 { 0 } else { 1 };
+                let layer_index_dtype: u8 = index_dtype_for(layer_n_vars);
                 // Must match `ScxWriter::write_layer_csr_shard_for`'s naming
                 // (`layer/{mname}/{layer_name}/shard_{idx}`): the coordinator
                 // appends `_{shard_idx}`, and both
@@ -694,13 +717,13 @@ pub fn h5mu_to_scx_streaming(
         }
 
         // Per-modality obsm (small dense; non-streaming reuse of the
-        // existing helper).
-        if let Ok(obsm_map) = read_obsm_at(&file, &obsm_path, sink) {
-            for (key, batch) in &obsm_map {
-                writer
-                    .write_obsm_for(modality_id, key, batch)
-                    .map_err(ConvertError::from)?;
-            }
+        // existing helper). Ok(empty) when absent / warned per-entry; Err
+        // only on a present-but-unreadable obsm group — propagate it.
+        let obsm_map = read_obsm_at(&file, &obsm_path, sink)?;
+        for (key, batch) in &obsm_map {
+            writer
+                .write_obsm_for(modality_id, key, batch)
+                .map_err(ConvertError::from)?;
         }
     }
 
@@ -792,6 +815,71 @@ fn sample_modality_values(
     }
 }
 
+/// Shard a modality's in-memory CSR (`indptr`/`indices`/`data`) by row and
+/// emit each shard via `write_shard`, which receives the shard's 0-based index,
+/// global `row_start`, and the rebased shard arrays (indptr `u64`, indices
+/// `u32`, raw value bytes).
+///
+/// Per-shard validate + rebase + index-narrow go through the shared
+/// `scx_sparse` helpers (`shard_nnz_bounds` + `rebase_csr_shard`), matching the
+/// eager `pipeline.rs` and streaming `h5ad/stream.rs` ingest paths. This also
+/// runs the `indices < n_vars` column-bound check (via `validate_csr_arrays`)
+/// that the previously hand-rolled h5mu loops skipped.
+#[allow(clippy::too_many_arguments)]
+fn shard_modality_csr<F>(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    shard_target_rows: usize,
+    value_encoding: ValueEncoding,
+    mut write_shard: F,
+) -> Result<(), ConvertError>
+where
+    F: FnMut(u32, u64, &[u64], &[u32], &[u8]) -> Result<(), ConvertError>,
+{
+    // Guard against a zero shard size: `row_end == row_start` would never
+    // advance the cursor, hanging the `while row_start < n_obs` loop.
+    if shard_target_rows == 0 {
+        return Err(ConvertError::Other(
+            "shard_target_rows must be greater than 0".to_string(),
+        ));
+    }
+    let backing_len = indices.len().min(data.len());
+    let mut row_start: usize = 0;
+    let mut shard_idx: u32 = 0;
+    while row_start < n_obs {
+        let row_end = (row_start + shard_target_rows).min(n_obs);
+
+        let shard_indptr_slice = &indptr[row_start..=row_end];
+        let (nnz_start, nnz_end) = scx_sparse::shard_nnz_bounds(shard_indptr_slice, backing_len)
+            .map_err(|e| {
+                ConvertError::Other(format!("modality CSR shard validation failed: {e}"))
+            })?;
+        let (shard_indptr, shard_indices) = scx_sparse::rebase_csr_shard(
+            shard_indptr_slice,
+            &indices[nnz_start..nnz_end],
+            n_vars as u64,
+        )
+        .map_err(|e| ConvertError::Other(format!("modality CSR shard validation failed: {e}")))?;
+        let raw_values = values_to_raw_bytes(&data[nnz_start..nnz_end], value_encoding)
+            .map_err(ScxError::from)?;
+
+        write_shard(
+            shard_idx,
+            row_start as u64,
+            &shard_indptr,
+            &shard_indices,
+            &raw_values,
+        )?;
+
+        row_start = row_end;
+        shard_idx += 1;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_modality_csr_shards(
     writer: &mut ScxWriter,
@@ -800,63 +888,33 @@ fn write_modality_csr_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
 ) -> Result<(), ConvertError> {
-    let mut row_start: usize = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
-        })?;
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
-
-        writer
-            .write_csr_shard_for(
-                modality_id,
-                &shard_indptr,
-                &shard_indices,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                row_start as u64,
-            )
-            .map_err(ConvertError::from)?;
-
-        row_start = row_end;
-    }
-    Ok(())
+    shard_modality_csr(
+        indptr,
+        indices,
+        data,
+        n_obs,
+        n_vars,
+        shard_target_rows,
+        value_encoding,
+        |_shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            writer
+                .write_csr_shard_for(
+                    modality_id,
+                    shard_indptr,
+                    shard_indices,
+                    raw_values,
+                    codec_id,
+                    value_encoding,
+                    row_start,
+                )
+                .map_err(ConvertError::from)
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -904,65 +962,33 @@ fn write_modality_layer_shards(
     indices: &[i32],
     data: &[f32],
     n_obs: usize,
-    _n_vars: usize,
+    n_vars: usize,
     shard_target_rows: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
 ) -> Result<(), ConvertError> {
-    let mut row_start: usize = 0;
-    let mut shard_idx: u32 = 0;
-    while row_start < n_obs {
-        let row_end = (row_start + shard_target_rows).min(n_obs);
-
-        let shard_indptr_slice = &indptr[row_start..=row_end];
-        let base = shard_indptr_slice[0];
-        let shard_indptr: Vec<u64> = shard_indptr_slice
-            .iter()
-            .map(|&v| {
-                if v < base {
-                    Err(ConvertError::Other(format!(
-                        "indptr value {v} less than base {base}"
-                    )))
-                } else {
-                    Ok((v - base) as u64)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let nnz_start = usize::try_from(base)
-            .map_err(|_| ConvertError::Other(format!("negative indptr base {base}")))?;
-        let nnz_end = usize::try_from(*shard_indptr_slice.last().unwrap()).map_err(|_| {
-            ConvertError::Other(format!(
-                "negative indptr value {}",
-                shard_indptr_slice.last().unwrap()
-            ))
-        })?;
-        let shard_indices: Vec<u32> = indices[nnz_start..nnz_end]
-            .iter()
-            .map(|&v| {
-                u32::try_from(v)
-                    .map_err(|_| ConvertError::Other(format!("negative column index {v}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let shard_data = &data[nnz_start..nnz_end];
-        let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
-
-        writer
-            .write_layer_csr_shard_for(
-                modality_id,
-                layer_name,
-                shard_idx,
-                &shard_indptr,
-                &shard_indices,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                row_start as u64,
-            )
-            .map_err(ConvertError::from)?;
-
-        row_start = row_end;
-        shard_idx += 1;
-    }
-    Ok(())
+    shard_modality_csr(
+        indptr,
+        indices,
+        data,
+        n_obs,
+        n_vars,
+        shard_target_rows,
+        value_encoding,
+        |shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            writer
+                .write_layer_csr_shard_for(
+                    modality_id,
+                    layer_name,
+                    shard_idx,
+                    shard_indptr,
+                    shard_indices,
+                    raw_values,
+                    codec_id,
+                    value_encoding,
+                    row_start,
+                )
+                .map_err(ConvertError::from)
+        },
+    )
 }

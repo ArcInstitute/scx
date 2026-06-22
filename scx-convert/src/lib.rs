@@ -15,6 +15,8 @@ mod detect;
 #[cfg(feature = "hdf5")]
 mod dtype;
 #[cfg(feature = "hdf5")]
+mod h5_write_util;
+#[cfg(feature = "hdf5")]
 mod h5ad;
 #[cfg(feature = "hdf5")]
 mod h5mu;

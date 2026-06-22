@@ -15,16 +15,7 @@ use arrow::datatypes::{
 use hdf5::types::VarLenUnicode;
 use ndarray::ArrayView1;
 
-/// Convert &str to VarLenUnicode, validating no NUL bytes are present.
-fn vlu(s: &str) -> VarLenUnicode {
-    s.parse::<VarLenUnicode>().unwrap_or_else(|_| {
-        // Strip NUL bytes rather than panicking (finding 8.2).
-        let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
-        cleaned
-            .parse::<VarLenUnicode>()
-            .expect("cleaned string should have no NUL bytes")
-    })
-}
+use crate::h5_write_util::vlu;
 
 use scx_format_io::reader::ScxReader;
 
@@ -240,13 +231,24 @@ pub(crate) fn write_dataframe_group_at(
 /// excludes the index column from `column-order`, and always writes
 /// `column-order` (length-0 OK) since anndata.read_h5ad requires the
 /// attribute to be present.
-fn write_dataframe_body(
+/// Write the dataframe-level encoding attrs (`encoding-type="dataframe"`,
+/// `encoding-version="0.2.0"`), resolve the pandas index field, and write the
+/// `_index` attr. Shared prologue for the eager [`write_dataframe_body`] and
+/// streaming [`write_dataframe_group_streaming`] writers — anndata.read_h5ad
+/// requires these on every dataframe group, even an empty one.
+///
+/// Returns `(index_field_name, on_disk_index)` for the caller's per-column
+/// loop. The index field is probed as: (1) the `pandas` schema metadata's
+/// `index_columns` (the authoritative source — `pyarrow.Table.from_pandas`
+/// stamps it; covers named and unnamed indexes), else (2) `schema.field(0)`
+/// (the CLI path where obs/var come from disk without pandas metadata, and
+/// field 0 already IS the index). pyarrow's canonical `__index_level_0__`
+/// (unnamed pandas index) is renamed to anndata's `_index` literal on disk;
+/// named indexes keep their original name.
+fn write_dataframe_header(
     group: &hdf5::Group,
-    df_name: &str,
-    batch: &arrow::array::RecordBatch,
-    sink: &mut WarningSink,
-) -> Result<(), ConvertError> {
-    let schema = batch.schema();
+    schema: &Schema,
+) -> Result<(Option<String>, String), ConvertError> {
     group
         .new_attr::<VarLenUnicode>()
         .create("encoding-type")?
@@ -256,34 +258,54 @@ fn write_dataframe_body(
         .create("encoding-version")?
         .write_scalar(&vlu("0.2.0"))?;
 
-    // Resolve the schema field that holds the pandas index. Probe order:
-    //   1. The `pandas` schema metadata's `index_columns` (the
-    //      authoritative source — `pyarrow.Table.from_pandas` stamps
-    //      this; covers both named and unnamed indexes).
-    //   2. Fallback: `schema.field(0)` — preserves the CLI path's
-    //      behaviour where obs/var come from disk without pandas
-    //      metadata, and the first field already IS the index dataset.
-    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema.as_ref());
+    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema);
     let index_field_name: Option<String> = pandas_idx_cols
         .into_iter()
         .find(|n| schema.field_with_name(n).is_ok())
         .or_else(|| schema.fields().first().map(|f| f.name().clone()));
 
-    // Rename pyarrow's canonical `__index_level_0__` (unnamed pandas
-    // index) to anndata's `_index` literal on disk. Named indexes keep
-    // their original name.
-    let on_disk_index: &str = match index_field_name.as_deref() {
-        Some("__index_level_0__") => "_index",
-        Some(n) => n,
-        None => "_index",
+    let on_disk_index: String = match index_field_name.as_deref() {
+        Some("__index_level_0__") => "_index".to_string(),
+        Some(n) => n.to_string(),
+        None => "_index".to_string(),
     };
 
     if !schema.fields().is_empty() {
         group
             .new_attr::<VarLenUnicode>()
             .create("_index")?
-            .write_scalar(&vlu(on_disk_index))?;
+            .write_scalar(&vlu(&on_disk_index))?;
     }
+
+    Ok((index_field_name, on_disk_index))
+}
+
+/// Write the `column-order` attr. anndata.read_h5ad requires it on every
+/// dataframe group even when there are no non-index columns (it raises
+/// `KeyError: "...can't locate attribute: 'column-order'"` otherwise), so a
+/// length-0 array is written for the no-columns case — matching anndata's own
+/// emission. SCX's reader handles the empty-attr case in
+/// `read_dataframe_group`'s fallback branch. Shared by both dataframe writers.
+fn write_column_order_attr(
+    group: &hdf5::Group,
+    col_order: &[VarLenUnicode],
+) -> Result<(), ConvertError> {
+    group
+        .new_attr::<VarLenUnicode>()
+        .shape(col_order.len())
+        .create("column-order")?
+        .write_raw(col_order)?;
+    Ok(())
+}
+
+fn write_dataframe_body(
+    group: &hdf5::Group,
+    df_name: &str,
+    batch: &arrow::array::RecordBatch,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    let schema = batch.schema();
+    let (index_field_name, on_disk_index) = write_dataframe_header(group, schema.as_ref())?;
 
     let mut col_order: Vec<VarLenUnicode> =
         Vec::with_capacity(batch.num_columns().saturating_sub(1));
@@ -294,7 +316,7 @@ fn write_dataframe_body(
             // exclude from `column-order` (matches anndata convention).
             // anndata requires `_index` to be a plain dataset, so the
             // nullable-group encoding is disabled for it.
-            write_column_to_hdf5(group, df_name, on_disk_index, col, field, false, sink)?;
+            write_column_to_hdf5(group, df_name, &on_disk_index, col, field, false, sink)?;
         } else if write_column_to_hdf5(group, df_name, field.name(), col, field, true, sink)? {
             // Only list the column in `column-order` when a dataset
             // was actually created — unsupported types are
@@ -303,19 +325,7 @@ fn write_dataframe_body(
         }
     }
 
-    // anndata.read_h5ad requires `column-order` to be present on every
-    // dataframe group, even when the dataframe has no non-index columns
-    // (it will raise `KeyError: "...can't locate attribute:
-    // 'column-order'"` otherwise). Write it unconditionally — a
-    // length-0 array for the no-columns case matches anndata's own
-    // emission. SCX's own reader handles the empty-attr case in
-    // `read_dataframe_group`'s fallback branch.
-    group
-        .new_attr::<VarLenUnicode>()
-        .shape(col_order.len())
-        .create("column-order")?
-        .write_raw(&col_order)?;
-
+    write_column_order_attr(group, &col_order)?;
     Ok(())
 }
 
@@ -1490,37 +1500,9 @@ where
 {
     let group = parent.group(name).or_else(|_| parent.create_group(name))?;
 
-    // Dataframe-level encoding attrs. Same shape as `write_dataframe_body`
-    // — anndata.read_h5ad requires these even on empty obs.
-    group
-        .new_attr::<VarLenUnicode>()
-        .create("encoding-type")?
-        .write_scalar(&vlu("dataframe"))?;
-    group
-        .new_attr::<VarLenUnicode>()
-        .create("encoding-version")?
-        .write_scalar(&vlu("0.2.0"))?;
-
-    // Resolve the pandas index field (same probe order as
-    // `write_dataframe_body`: pandas metadata first, else field(0)).
-    let pandas_idx_cols = scx_format_io::pandas_index_columns(schema);
-    let index_field_name: Option<String> = pandas_idx_cols
-        .into_iter()
-        .find(|n| schema.field_with_name(n).is_ok())
-        .or_else(|| schema.fields().first().map(|f| f.name().clone()));
-
-    let on_disk_index: &str = match index_field_name.as_deref() {
-        Some("__index_level_0__") => "_index",
-        Some(n) => n,
-        None => "_index",
-    };
-
-    if !schema.fields().is_empty() {
-        group
-            .new_attr::<VarLenUnicode>()
-            .create("_index")?
-            .write_scalar(&vlu(on_disk_index))?;
-    }
+    // Dataframe-level encoding attrs + pandas index resolution + `_index`
+    // attr — shared prologue with the eager `write_dataframe_body`.
+    let (index_field_name, on_disk_index) = write_dataframe_header(&group, schema)?;
 
     // Pre-allocate column writers and assemble `column-order` in schema
     // order (index excluded). Unsupported types are warn-and-skipped
@@ -1533,7 +1515,7 @@ where
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let is_index = Some(field.name()) == index_field_name.as_ref();
         let on_disk_name: &str = if is_index {
-            on_disk_index
+            on_disk_index.as_str()
         } else {
             field.name()
         };
@@ -1552,13 +1534,7 @@ where
         col_writers.push((col_idx, writer));
     }
 
-    // anndata requires `column-order` even when empty (matches
-    // `write_dataframe_body`).
-    group
-        .new_attr::<VarLenUnicode>()
-        .shape(col_order.len())
-        .create("column-order")?
-        .write_raw(&col_order)?;
+    write_column_order_attr(&group, &col_order)?;
 
     // Drain shards. Each shard's stamped `row_start` schema metadata
     // (set by the writer via `stamp_dense_shard_metadata`) gives its
