@@ -1958,6 +1958,97 @@ fn test_merge_preserves_layer_encoding() {
     );
 }
 
+/// Write a file whose `"normalized"` layer is stored with `layer_enc`, the
+/// first layer value set to `peak` and the rest to 1.0. The X shard is always
+/// `Uint8`. Used to exercise the merge layer value-encoding widening path.
+fn write_test_file_with_layer_enc(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    layer_enc: ValueEncoding,
+    peak: f32,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    let mut layer_bytes = Vec::new();
+    for j in 0..values.len() {
+        let v = if j == 0 { peak } else { 1.0 };
+        scx_ops::helpers::encode_value(&mut layer_bytes, v, layer_enc).unwrap();
+    }
+    writer
+        .write_layer_csr_shard(
+            &indptr,
+            &indices,
+            &layer_bytes,
+            CodecId::None,
+            layer_enc,
+            0,
+            "normalized",
+            0,
+        )
+        .unwrap();
+
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Regression (MED — merge.rs non-sorted layer merge): the concat layer merge
+/// previously sampled the layer value encoding from `readers[0]`'s first shard
+/// only, so merging a `Uint8`-layer file with a `Uint16`-layer file holding a
+/// value > 255 aborted with `ValueOutOfRange`. The encoding is now widened
+/// across all inputs, so the merge succeeds and the wide value round-trips.
+#[test]
+fn test_merge_widens_layer_value_encoding_across_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    // readers[0]: narrow Uint8 layer. readers[1]: Uint16 layer with 300 > u8::MAX.
+    let path1 = write_test_file_with_layer_enc(&dir, "lw1.scx", 4, 10, ValueEncoding::Uint8, 1.0);
+    let path2 =
+        write_test_file_with_layer_enc(&dir, "lw2.scx", 4, 10, ValueEncoding::Uint16, 300.0);
+
+    let output = dir.path().join("lw_merged.scx");
+    scx_ops::merge(&[path1.as_path(), path2.as_path()], &output)
+        .expect("merge must widen layer encoding instead of failing with ValueOutOfRange");
+
+    let reader = ScxReader::open(&output).unwrap();
+    assert_eq!(reader.n_obs(), 8);
+
+    let layer = reader.read_layer("normalized").unwrap();
+    assert_eq!(layer.shape.0, 8);
+    // readers[1]'s first value (300) lands at the first nnz of row 4 (rows 0-3
+    // came from readers[0]). Its nnz offset = total nnz of readers[0] = 8.
+    assert!(
+        (layer.data[8] - 300.0).abs() < 0.01,
+        "expected the wide value 300 to round-trip, got {}",
+        layer.data[8]
+    );
+}
+
 /// Task 7: append with 0 rows is a no-op
 #[test]
 fn test_append_empty_rows() {

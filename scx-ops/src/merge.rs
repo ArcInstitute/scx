@@ -10,12 +10,12 @@ use scx_format_io::header::FileHeader;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
-use scx_format_io::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::ScxReader;
 
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
-use crate::helpers::encode_value;
+use crate::helpers::{encode_value, widest_value_encoding};
 use crate::merge_options::MergeOptions;
 use crate::merge_sorted;
 use crate::predicate_index::{
@@ -580,24 +580,29 @@ pub fn merge_with_options(
         all_names
     };
     for layer_name in &layer_names {
-        // Determine this layer's value encoding from its first shard header
+        // Determine this layer's value encoding as the widest across *every*
+        // input's layer shards. Sampling only `readers[0]`'s first shard would
+        // abort with `ValueOutOfRange` when a later input stored the layer with
+        // a wider encoding (rows from all inputs are re-packed into shared
+        // output shards, so per-shard encoding does not apply — see the sorted
+        // path in `merge_sorted.rs`).
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format_io::catalog::FullCatalogEntry> = readers[0]
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| {
+        let mut layer_encs: Vec<ValueEncoding> = Vec::new();
+        for reader in &readers {
+            for entry in reader.catalog().entries.iter().filter(|e| {
                 e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
-            })
-            .collect();
-        let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = readers[0].section_bytes(first_entry)?;
-            let sh =
-                ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))?;
-            ValueEncoding::from_u8(sh.value_encoding)
-                .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?
-        } else {
+            }) {
+                let sh = reader.read_shard_header(entry)?;
+                layer_encs.push(
+                    ValueEncoding::from_u8(sh.value_encoding)
+                        .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?,
+                );
+            }
+        }
+        let layer_value_encoding = if layer_encs.is_empty() {
             ValueEncoding::Uint8
+        } else {
+            widest_value_encoding(&layer_encs)
         };
 
         // Accumulate and flush at shard_target_rows, matching compact.rs pattern.
@@ -1099,30 +1104,32 @@ fn merge_multimodal(
         }
 
         for layer_name in &layer_names {
-            // Probe value_encoding from the first input that has a shard for
-            // this (modality, layer); fall back to the modality default.
+            // Value encoding = widest across *every* input's shards for this
+            // (modality, layer), falling back to the modality default when no
+            // input has a shard. Sampling only the first input's first shard
+            // would abort with `ValueOutOfRange` when a later input stored the
+            // layer with a wider encoding (mirror of the single-modality path
+            // above and the sorted merge).
             let layer_value_encoding = {
-                let mut enc: Option<ValueEncoding> = None;
+                let mut encs: Vec<ValueEncoding> = Vec::new();
                 for reader in readers {
-                    let shards = reader
+                    for shard in reader
                         .catalog()
-                        .layer_csr_shards_for_modality(modality_id, layer_name);
-                    if let Some(first) = shards.first() {
-                        let section = reader.section_bytes(first)?;
-                        let sh = ShardHeader::read_from(&mut std::io::Cursor::new(
-                            &section[..SHARD_HEADER_SIZE],
-                        ))?;
-                        enc = Some(
+                        .layer_csr_shards_for_modality(modality_id, layer_name)
+                    {
+                        let sh = reader.read_shard_header(shard)?;
+                        encs.push(
                             ValueEncoding::from_u8(sh.value_encoding)
                                 .ok_or(OpsError::UnknownValueEncoding(sh.value_encoding))?,
                         );
-                        break;
                     }
                 }
-                enc.unwrap_or_else(|| {
+                if encs.is_empty() {
                     ValueEncoding::from_u8(info.default_value_encoding)
                         .unwrap_or(ValueEncoding::Uint8)
-                })
+                } else {
+                    widest_value_encoding(&encs)
+                }
             };
 
             let mut l_indptr: Vec<u64> = vec![0];
