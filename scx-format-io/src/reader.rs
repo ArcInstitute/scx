@@ -3205,13 +3205,78 @@ impl ScxReader {
     // Validate (11.12)
     // -----------------------------------------------------------------------
 
+    /// Recompute the whole-file BLAKE3 checksum and compare it against the
+    /// stored `header.file_checksum`.
+    ///
+    /// Mirrors `ScxWriter::finish` exactly: hashes the 256-byte header (with
+    /// the `file_checksum` field zeroed) + the 4096-byte root catalog + the
+    /// section bytes + the full catalog. This covers the header and root
+    /// catalog, which no per-section catalog-entry checksum protects — so a
+    /// flipped byte in `n_vars`/`full_catalog_offset`/`flags` or the root
+    /// catalog is caught here but not by [`validate`](Self::validate)'s
+    /// per-section walk.
+    ///
+    /// O(file size); intended for the explicit `validate` path, not the hot
+    /// `open` path. Returns `Ok(false)` (rather than panicking) when the
+    /// header's catalog offsets are themselves corrupt.
+    pub fn verify_file_checksum(&self) -> Result<bool> {
+        let stored = self.header.file_checksum;
+        let fc_offset = self.header.full_catalog_offset as usize;
+        let fc_len = self.header.full_catalog_length as usize;
+        let sections_start = crate::SECTIONS_START_OFFSET as usize;
+
+        // Re-guard the offsets: `open()` checked the catalog range, but not
+        // `fc_offset >= sections_start`. A corrupt offset returns `false`
+        // instead of panicking on a reversed slice range. This also makes all
+        // three mmap slices below provably in-range (it forces
+        // `mmap.len() >= fc_end >= fc_offset >= sections_start`).
+        let fc_end = match fc_offset.checked_add(fc_len) {
+            Some(e) if fc_offset >= sections_start && e <= self.mmap.len() => e,
+            _ => return Ok(false),
+        };
+
+        // Re-serialize the header with the checksum field zeroed, exactly as
+        // the writer did before hashing.
+        let mut header_for_hash = self.header.clone();
+        header_for_hash.file_checksum = 0;
+        let mut header_bytes = Vec::with_capacity(HEADER_SIZE);
+        header_for_hash.write_to(&mut header_bytes)?;
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&header_bytes); // header [0..256]
+        hasher.update(&self.mmap[HEADER_SIZE..sections_start]); // root catalog [256..4352]
+        hasher.update(&self.mmap[sections_start..fc_offset]); // section bytes
+        hasher.update(&self.mmap[fc_offset..fc_end]); // full catalog
+        let computed = crate::checksum::truncate_hash_to_u64(&hasher.finalize());
+        Ok(computed == stored)
+    }
+
     /// Validate all section checksums.
     ///
-    /// Returns a list of `(section_name, passed)` pairs. If any essential
-    /// section (obs, var, CsrShard) fails, returns `Err(ChecksumMismatch)`.
+    /// Returns a list of `(section_name, passed)` pairs. The first entry is
+    /// always `("file_checksum", _)` — the whole-file integrity check from
+    /// [`verify_file_checksum`](Self::verify_file_checksum), covering the header
+    /// and root catalog that no per-section checksum protects — followed by one
+    /// entry per catalog section. If any essential section (obs, var, CsrShard)
+    /// fails, returns `Err(ChecksumMismatch)`.
+    ///
+    /// A failing `file_checksum` is reported as a flag but is **not** treated as
+    /// essential: the whole-file hash cannot localize the corrupted region, so
+    /// promoting it to an error would force `Err` even when only a non-essential
+    /// (e.g. rebuildable CSC sidecar) section is damaged — contradicting the
+    /// granular per-section contract. Callers wanting strict whole-file
+    /// integrity should inspect the `file_checksum` flag (the CLI `scx validate`
+    /// does, and fails on it).
     pub fn validate(&self) -> Result<Vec<(String, bool)>> {
         let mut results = Vec::new();
         let mut essential_failed = false;
+
+        // Whole-file integrity first: catches corruption in the 256-byte header
+        // and root catalog that the per-section walk below cannot see (those
+        // bytes are covered by no catalog-entry checksum). Reported as a flag,
+        // not an essential error (see the doc note above).
+        let file_ok = self.verify_file_checksum()?;
+        results.push(("file_checksum".to_string(), file_ok));
 
         for entry in &self.full_catalog.entries {
             let slice = self.section_bytes(entry)?;
