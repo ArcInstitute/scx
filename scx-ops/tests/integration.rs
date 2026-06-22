@@ -826,6 +826,63 @@ fn test_data_integrity_after_compact() {
     );
 }
 
+/// Regression (MED — compact.rs same bug class as merge layer encoding):
+/// compact sampled the X / layer `value_encoding` from the first shard only,
+/// then re-encoded every row with it. A file with mixed per-shard encodings
+/// (as `scx merge` concat and `scx append` legitimately produce) aborted with
+/// `ValueOutOfRange` when a later shard was wider. The encoding is now widened
+/// across all shards, so compact succeeds and the wide value round-trips.
+#[test]
+fn test_compact_widens_value_encoding_across_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed_enc.scx");
+    let n_vars = 10usize;
+    let header = sample_header(4, n_vars as u64);
+    let mut w = ScxWriter::new(&path, header).unwrap();
+    w.write_obs(&sample_obs(4)).unwrap();
+    w.write_var(&sample_var(n_vars)).unwrap();
+
+    let ip = vec![0u64, 1, 2];
+    let ix = vec![0u32, 1];
+    // Shard 0 (rows 0-1): Uint8.
+    let mut v0 = Vec::new();
+    scx_ops::helpers::encode_value(&mut v0, 5.0, ValueEncoding::Uint8).unwrap();
+    scx_ops::helpers::encode_value(&mut v0, 7.0, ValueEncoding::Uint8).unwrap();
+    w.write_csr_shard(&ip, &ix, &v0, CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    // Shard 1 (rows 2-3): Uint16 with a value > u8::MAX.
+    let mut v1 = Vec::new();
+    scx_ops::helpers::encode_value(&mut v1, 300.0, ValueEncoding::Uint16).unwrap();
+    scx_ops::helpers::encode_value(&mut v1, 9.0, ValueEncoding::Uint16).unwrap();
+    w.write_csr_shard(&ip, &ix, &v1, CodecId::None, ValueEncoding::Uint16, 2)
+        .unwrap();
+    w.write_provenance(vec![ProvenanceEntry {
+        timestamp: 1710000000,
+        action: "convert".to_string(),
+        tool: "test".to_string(),
+        params_json: "{}".to_string(),
+        input_checksums: vec![],
+    }])
+    .unwrap();
+    w.finish().unwrap();
+
+    let out = dir.path().join("mixed_enc_compact.scx");
+    scx_ops::compact(&path, &out)
+        .expect("compact must widen X encoding instead of failing with ValueOutOfRange");
+
+    let reader = ScxReader::open(&out).unwrap();
+    let csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(csr.shape.0, 4);
+    // Row 2's first value (300) must round-trip — it would have wrapped/aborted
+    // under the first shard's Uint8 encoding.
+    let r2 = csr.indptr[2] as usize;
+    assert!(
+        (csr.data[r2] - 300.0).abs() < 0.01,
+        "expected wide value 300 to round-trip after compact, got {}",
+        csr.data[r2]
+    );
+}
+
 /// Merge preserves obs metadata in correct order
 #[test]
 fn test_merge_preserves_obs_metadata() {
@@ -1955,6 +2012,97 @@ fn test_merge_preserves_layer_encoding() {
         (layer.data[0] - 1.5).abs() < 0.01,
         "expected ~1.5, got {}",
         layer.data[0]
+    );
+}
+
+/// Write a file whose `"normalized"` layer is stored with `layer_enc`, the
+/// first layer value set to `peak` and the rest to 1.0. The X shard is always
+/// `Uint8`. Used to exercise the merge layer value-encoding widening path.
+fn write_test_file_with_layer_enc(
+    dir: &TempDir,
+    filename: &str,
+    n_obs: usize,
+    n_vars: usize,
+    layer_enc: ValueEncoding,
+    peak: f32,
+) -> PathBuf {
+    let path = dir.path().join(filename);
+    let header = sample_header(n_obs as u64, n_vars as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    let mut layer_bytes = Vec::new();
+    for j in 0..values.len() {
+        let v = if j == 0 { peak } else { 1.0 };
+        scx_ops::helpers::encode_value(&mut layer_bytes, v, layer_enc).unwrap();
+    }
+    writer
+        .write_layer_csr_shard(
+            &indptr,
+            &indices,
+            &layer_bytes,
+            CodecId::None,
+            layer_enc,
+            0,
+            "normalized",
+            0,
+        )
+        .unwrap();
+
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+/// Regression (MED — merge.rs non-sorted layer merge): the concat layer merge
+/// previously sampled the layer value encoding from `readers[0]`'s first shard
+/// only, so merging a `Uint8`-layer file with a `Uint16`-layer file holding a
+/// value > 255 aborted with `ValueOutOfRange`. The encoding is now widened
+/// across all inputs, so the merge succeeds and the wide value round-trips.
+#[test]
+fn test_merge_widens_layer_value_encoding_across_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    // readers[0]: narrow Uint8 layer. readers[1]: Uint16 layer with 300 > u8::MAX.
+    let path1 = write_test_file_with_layer_enc(&dir, "lw1.scx", 4, 10, ValueEncoding::Uint8, 1.0);
+    let path2 =
+        write_test_file_with_layer_enc(&dir, "lw2.scx", 4, 10, ValueEncoding::Uint16, 300.0);
+
+    let output = dir.path().join("lw_merged.scx");
+    scx_ops::merge(&[path1.as_path(), path2.as_path()], &output)
+        .expect("merge must widen layer encoding instead of failing with ValueOutOfRange");
+
+    let reader = ScxReader::open(&output).unwrap();
+    assert_eq!(reader.n_obs(), 8);
+
+    let layer = reader.read_layer("normalized").unwrap();
+    assert_eq!(layer.shape.0, 8);
+    // readers[1]'s first value (300) lands at the first nnz of row 4 (rows 0-3
+    // came from readers[0]). Its nnz offset = total nnz of readers[0] = 8.
+    assert!(
+        (layer.data[8] - 300.0).abs() < 0.01,
+        "expected the wide value 300 to round-trip, got {}",
+        layer.data[8]
     );
 }
 

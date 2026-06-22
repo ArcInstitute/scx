@@ -264,6 +264,48 @@ pub fn partition_target_rows(
     }
 }
 
+/// Pass 1 of the external sort opens one spill file per partition
+/// simultaneously; cap the count so an atlas-scale `n_live` with a small `p`
+/// cannot exhaust file descriptors (EMFILE). Kept well under a typical
+/// `ulimit -n` (1024+).
+pub const MAX_SPILL_PARTITIONS: usize = 512;
+
+/// Cap simultaneously-open spill files at [`MAX_SPILL_PARTITIONS`], widening
+/// each partition to `n_live.div_ceil(cap)` rows when the natural count would
+/// exceed it. Pass 2 loads **one whole partition into RAM**, so a widened
+/// partition must still fit `budget` — the caller's per-output-shard guard only
+/// bounds a single shard, and a widened partition can hold many shards' worth of
+/// rows. Returns `(rows_per_partition, n_partitions)`, or `Err(InvalidInput)`
+/// if a widened partition's worst-case footprint would exceed the budget.
+///
+/// `per_row_bytes` is the decoded per-row footprint used to size partitions
+/// (CSR: `n_vars × density × 16`; obs: bytes per obs row).
+pub fn cap_spill_partitions(
+    p: usize,
+    n_live: usize,
+    per_row_bytes: u64,
+    budget: Option<u64>,
+) -> Result<(usize, usize)> {
+    let mut p = p.max(1);
+    let mut n_parts = n_live.div_ceil(p);
+    if n_parts > MAX_SPILL_PARTITIONS {
+        p = n_live.div_ceil(MAX_SPILL_PARTITIONS);
+        n_parts = n_live.div_ceil(p);
+        if let Some(budget) = budget {
+            let part_bytes = (p as u64).saturating_mul(per_row_bytes.max(1));
+            if part_bytes > budget {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort: --memory-budget {budget} too small — the \
+                     {MAX_SPILL_PARTITIONS}-partition file-descriptor cap forces ~{p} rows per \
+                     spill partition (~{part_bytes} bytes), which pass 2 loads into RAM; raise \
+                     --memory-budget to at least {part_bytes}"
+                )));
+            }
+        }
+    }
+    Ok((p, n_parts))
+}
+
 /// Numeric DataTypes the leading-key numeric path handles (everything else is
 /// treated as categorical / string-like).
 fn is_numeric_dtype(dt: &DataType) -> bool {

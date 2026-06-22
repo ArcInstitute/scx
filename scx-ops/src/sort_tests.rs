@@ -111,6 +111,43 @@ fn partition_target_rows_formula() {
 }
 
 #[test]
+fn cap_spill_partitions_below_cap_never_widens() {
+    // n_parts = ceil(100/2) = 50 ≤ 512 → unchanged, no budget check applied
+    // (returns the input p even with a tiny budget).
+    assert_eq!(
+        cap_spill_partitions(2, 100, 1_000_000, Some(1)).unwrap(),
+        (2, 50)
+    );
+    // No budget at all behaves the same below the cap.
+    assert_eq!(
+        cap_spill_partitions(2, 100, 1_000_000, None).unwrap(),
+        (2, 50)
+    );
+}
+
+#[test]
+fn cap_spill_partitions_widens_when_partition_fits_budget() {
+    // p=1 over 1025 rows → 1025 partitions > 512, widened to ceil(1025/512)=3
+    // rows/partition (n_parts = ceil(1025/3)). Budget holds ≥3 rows.
+    let per_row = 10u64;
+    let (p, n_parts) = cap_spill_partitions(1, 1025, per_row, Some(3 * per_row)).unwrap();
+    assert_eq!(p, 3);
+    assert_eq!(n_parts, 1025usize.div_ceil(3));
+}
+
+#[test]
+fn cap_spill_partitions_refuses_when_widened_partition_exceeds_budget() {
+    // Same widening (p→3) but the budget only holds 2 rows: the per-output-shard
+    // guard (1 row) would pass, yet the widened 3-row partition overshoots.
+    let per_row = 10u64;
+    let err = cap_spill_partitions(1, 1025, per_row, Some(2 * per_row));
+    assert!(
+        matches!(err, Err(OpsError::InvalidInput(_))),
+        "widened partition over budget must refuse, got {err:?}"
+    );
+}
+
+#[test]
 fn categorical_partitions_group_and_isolate_dominant() {
     let dir = tempfile::tempdir().unwrap();
     let path = crate::test_utils::fixture_skewed(&dir);

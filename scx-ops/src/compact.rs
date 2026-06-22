@@ -17,7 +17,7 @@ use scx_format_io::ScxReader;
 
 use crate::error::Result;
 use crate::flock::SharedFileLock;
-use crate::helpers::encode_value;
+use crate::helpers::{encode_value, widest_value_encoding};
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
@@ -226,19 +226,23 @@ pub fn compact_with_index_options(
     writer.write_var(&var)?;
 
     // Process CSR shards: decode, filter deleted rows, re-shard.
-    // Read value_encoding from first shard header for the main X matrix.
+    // Compact accumulates rows from *all* input shards into shared output
+    // shards, so the output encoding must hold the widest value across every
+    // input shard — sampling `shards[0]` alone aborts with `ValueOutOfRange`
+    // when a later shard is wider (merge/append write per-shard encodings).
     let shards = reader.catalog().shards_sorted();
     let value_encoding = {
-        if !shards.is_empty() {
-            let section = reader.section_bytes(shards[0])?;
-            let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format_io::SHARD_HEADER_SIZE],
-            ))?;
-            ValueEncoding::from_u8(sh.value_encoding).ok_or(
+        let mut encs = Vec::new();
+        for s in &shards {
+            let sh = reader.read_shard_header(s)?;
+            encs.push(ValueEncoding::from_u8(sh.value_encoding).ok_or(
                 crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
-            )?
-        } else {
+            )?);
+        }
+        if encs.is_empty() {
             ValueEncoding::Uint8
+        } else {
+            widest_value_encoding(&encs)
         }
     };
     let shard_target = in_header.shard_target_rows;
@@ -347,26 +351,23 @@ pub fn compact_with_index_options(
     // Copy layers (row-filtered)
     let layer_names = reader.layer_names();
     for layer_name in &layer_names {
-        // Determine this layer's value encoding from its first shard header
+        // Value encoding = widest across this layer's shards (same repack
+        // rationale as the X matrix above; sampling the first shard alone
+        // aborts with `ValueOutOfRange` on a later wider shard).
         let layer_prefix = format!("{layer_name}_shard_");
-        let layer_shard_entries: Vec<&scx_format_io::FullCatalogEntry> = reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| {
-                e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
-            })
-            .collect();
-        let layer_value_encoding = if let Some(first_entry) = layer_shard_entries.first() {
-            let section = reader.section_bytes(first_entry)?;
-            let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
-                &section[..scx_format_io::SHARD_HEADER_SIZE],
-            ))?;
-            ValueEncoding::from_u8(sh.value_encoding).ok_or(
+        let mut layer_encs = Vec::new();
+        for entry in reader.catalog().entries.iter().filter(|e| {
+            e.section_type == SectionType::LayerCsrShard && e.name.starts_with(&layer_prefix)
+        }) {
+            let sh = reader.read_shard_header(entry)?;
+            layer_encs.push(ValueEncoding::from_u8(sh.value_encoding).ok_or(
                 crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
-            )?
-        } else {
+            )?);
+        }
+        let layer_value_encoding = if layer_encs.is_empty() {
             ValueEncoding::Uint8
+        } else {
+            widest_value_encoding(&layer_encs)
         };
 
         let layer = reader.read_layer(layer_name)?;

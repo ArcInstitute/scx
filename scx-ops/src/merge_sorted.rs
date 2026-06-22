@@ -31,7 +31,7 @@ use scx_format_io::ScxReader;
 
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
-use crate::helpers::encode_value;
+use crate::helpers::{encode_value, widest_value_encoding};
 
 /// True if any input carries an obsm (obs-axis dense mapping) section.
 /// Sorted merge does not yet reorder obsm — the caller errors when this is
@@ -304,30 +304,6 @@ impl<'a> CsrCursor<'a> {
             need -= take;
         }
         Ok(())
-    }
-}
-
-/// Pick one output value encoding wide enough to hold every input shard's
-/// rows: any float source forces `Float32`, else the widest integer present.
-fn widest_value_encoding(encs: &[ValueEncoding]) -> ValueEncoding {
-    let mut any_float = false;
-    let mut max_int = ValueEncoding::Uint8;
-    for &e in encs {
-        match e {
-            ValueEncoding::Float32 | ValueEncoding::Float16 => any_float = true,
-            ValueEncoding::Uint16 => {
-                if matches!(max_int, ValueEncoding::Uint8) {
-                    max_int = ValueEncoding::Uint16;
-                }
-            }
-            ValueEncoding::Uint32 => max_int = ValueEncoding::Uint32,
-            ValueEncoding::Uint8 => {}
-        }
-    }
-    if any_float {
-        ValueEncoding::Float32
-    } else {
-        max_int
     }
 }
 
