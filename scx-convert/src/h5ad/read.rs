@@ -1447,14 +1447,45 @@ fn read_obsm_entry(obsm_group: &hdf5::Group, name: &str) -> Result<RecordBatch, 
     // Read as f32 2D
     let flat: Vec<f32> = read_f32_dataset(&ds)?;
 
-    // Build RecordBatch with numbered columns
+    dense_f32_to_record_batch(flat, n_rows, n_cols)
+}
+
+/// Transpose a row-major `flat` f32 slab (shape `n_rows × n_cols`) into a
+/// column-major Arrow `RecordBatch` with numbered columns `"0".."n_cols-1"`.
+///
+/// Uses a single sequential pass over `flat` scattering each element into its
+/// column's pre-sized vec — cache-friendly, unlike a per-column strided gather
+/// which makes `n_cols` full passes over the buffer. `flat` is dropped before
+/// the Arrow arrays are built, so peak memory drops back to ~1× the slab after
+/// the transpose rather than holding both copies until return.
+fn dense_f32_to_record_batch(
+    flat: Vec<f32>,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<RecordBatch, ConvertError> {
+    if flat.len() != n_rows.saturating_mul(n_cols) {
+        return Err(ConvertError::Other(format!(
+            "dense slab length {} != n_rows {n_rows} × n_cols {n_cols}",
+            flat.len()
+        )));
+    }
+
     let mut fields = Vec::with_capacity(n_cols);
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_cols);
-
-    for col in 0..n_cols {
-        let col_data: Vec<f32> = (0..n_rows).map(|row| flat[row * n_cols + col]).collect();
-        fields.push(Field::new(format!("{col}"), DataType::Float32, false));
-        arrays.push(Arc::new(Float32Array::from(col_data)));
+    // `chunks_exact(0)` would panic, and a zero-column batch has no arrays to
+    // build — skip straight to the empty schema (matches the old `0..0` loop).
+    if n_cols > 0 {
+        let mut cols: Vec<Vec<f32>> = (0..n_cols).map(|_| Vec::with_capacity(n_rows)).collect();
+        for row in flat.chunks_exact(n_cols) {
+            for (col, &v) in row.iter().enumerate() {
+                cols[col].push(v);
+            }
+        }
+        drop(flat);
+        for (col, col_data) in cols.into_iter().enumerate() {
+            fields.push(Field::new(format!("{col}"), DataType::Float32, false));
+            arrays.push(Arc::new(Float32Array::from(col_data)));
+        }
     }
 
     let schema = Schema::new(fields);
@@ -1566,15 +1597,7 @@ pub fn read_dense_mapping_shard(
     let flat: Vec<f32> = read_dense_slab_f32(&ds, dtype, row_start, row_end)?;
 
     let n_local = row_end - row_start;
-    let mut fields = Vec::with_capacity(n_cols);
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(n_cols);
-    for col in 0..n_cols {
-        let col_data: Vec<f32> = (0..n_local).map(|row| flat[row * n_cols + col]).collect();
-        fields.push(Field::new(format!("{col}"), DataType::Float32, false));
-        arrays.push(Arc::new(Float32Array::from(col_data)));
-    }
-    let schema = Schema::new(fields);
-    Ok(RecordBatch::try_new(Arc::new(schema), arrays)?)
+    dense_f32_to_record_batch(flat, n_local, n_cols)
 }
 
 /// Describes a sparse obsp/varp pairwise matrix without reading the
