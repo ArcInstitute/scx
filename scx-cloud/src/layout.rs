@@ -7,7 +7,7 @@
 //! are identical across all three; they live here so a change lands on every
 //! path at once.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry};
@@ -56,18 +56,16 @@ pub(crate) fn order_entries_for_layout(entries: &[FullCatalogEntry]) -> Vec<&Ful
             .push(entry);
     }
 
-    let known_types: HashSet<u8> = SECTION_ORDER.iter().map(|&st| st as u8).collect();
     let mut ordered: Vec<&FullCatalogEntry> = Vec::with_capacity(entries.len());
     for &st in SECTION_ORDER {
-        if let Some(group) = grouped.get(&(st as u8)) {
+        if let Some(group) = grouped.remove(&(st as u8)) {
             ordered.extend(group);
         }
     }
-    // Include any section types not in SECTION_ORDER (unknown/future types).
-    for (&group_type, group) in &grouped {
-        if !known_types.contains(&group_type) {
-            ordered.extend(group);
-        }
+    // Whatever remains is an unknown/future section type — appended in
+    // `section_type` order (`BTreeMap` iterates by sorted key).
+    for group in grouped.into_values() {
+        ordered.extend(group);
     }
     ordered
 }

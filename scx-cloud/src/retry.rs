@@ -155,8 +155,15 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
         return false;
     }
     match err {
-        // Definite permanent failures.
-        Error::NotFound { .. } | Error::AlreadyExists { .. } | Error::NotModified { .. } => false,
+        // Definite permanent failures. `UnknownConfigurationKey` is matched
+        // here, before the substring heuristics below, because its Display
+        // string embeds the offending key — a key literally containing a
+        // transient token (e.g. `connect_timeout`, `retry_500`) would
+        // otherwise be misclassified as retryable by the keyword scan.
+        Error::NotFound { .. }
+        | Error::AlreadyExists { .. }
+        | Error::NotModified { .. }
+        | Error::UnknownConfigurationKey { .. } => false,
         // `object_store` has internal classification — when in doubt
         // (Generic, JoinError, etc.) we treat the error as retryable so
         // the outer layer gets a chance.
@@ -179,6 +186,8 @@ pub(crate) fn is_retryable(err: &object_store::Error) -> bool {
                 || lower.contains("server error")
                 || lower.contains("temporarily unavailable")
                 || matches!(err, Error::Generic { .. } | Error::JoinError { .. })
+            // NB: `UnknownConfigurationKey` is intentionally handled in the
+            // permanent arm above, not here — see that arm's comment.
         }
     }
 }

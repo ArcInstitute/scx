@@ -1153,6 +1153,26 @@ fn is_retryable_treats_unknown_config_key_as_permanent() {
         key: "bogus_option".into(),
     };
     assert!(!is_retryable(&e));
+
+    // Regression: the Display string embeds the key, so a key literally
+    // containing a transient token (`timeout`, `500`, …) must still be
+    // permanent — it has to be matched before the substring heuristics, not
+    // by the final `matches!` arm.
+    for key in [
+        "connect_timeout",
+        "retry_500",
+        "server_error_mode",
+        "throttle_limit",
+    ] {
+        let e = object_store::Error::UnknownConfigurationKey {
+            store: "test",
+            key: key.into(),
+        };
+        assert!(
+            !is_retryable(&e),
+            "config key {key:?} must be permanent despite its transient-looking token",
+        );
+    }
 }
 
 #[test]

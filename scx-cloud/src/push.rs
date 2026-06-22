@@ -61,22 +61,14 @@ pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<Pus
     let header = FileHeader::read_from(&mut Cursor::new(&file_data[..HEADER_SIZE]))?;
     let fc_offset = header.full_catalog_offset as usize;
     let fc_length = header.full_catalog_length as usize;
-    let fc_end =
-        fc_offset
-            .checked_add(fc_length)
-            .ok_or_else(|| CloudError::SliceBoundsExceeded {
-                offset: fc_offset,
-                length: fc_length,
-                data_len: file_data.len(),
-            })?;
-
-    if fc_end > file_data.len() {
-        return Err(CloudError::SliceBoundsExceeded {
+    let fc_end = fc_offset
+        .checked_add(fc_length)
+        .filter(|&end| end <= file_data.len())
+        .ok_or_else(|| CloudError::SliceBoundsExceeded {
             offset: fc_offset,
             length: fc_length,
             data_len: file_data.len(),
-        });
-    }
+        })?;
 
     let full_catalog = FullCatalog::read_from(
         &mut Cursor::new(&file_data[fc_offset..fc_end]),
