@@ -14,6 +14,61 @@ use crate::shard_decode::GpuCsr;
 /// Compiled PTX for the sparse-to-dense kernel (produced by build.rs via nvcc --ptx).
 const SPARSE_DENSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sparse_dense.ptx"));
 
+/// Sentinel value in an HVG projection map marking an input column that is
+/// dropped (not present in the selected gene subset). Matches the `0xFFFFFFFF`
+/// skip code recognised by `sparse_to_dense_kernel`.
+pub const HVG_MAP_SKIP: u32 = 0xFFFF_FFFF;
+
+/// Validate an HVG projection map for use with [`sparse_to_dense_gpu`] and
+/// friends. `host_map[col]` is the output column for input column `col`, or
+/// [`HVG_MAP_SKIP`] to drop that column.
+///
+/// Returns an error if any non-skip entry is `>= n_output_cols`, or if two input
+/// columns map to the same output column. The kernel scatters one nonzero per
+/// warp lane with a plain (non-atomic) store, so a many-to-one map races on the
+/// shared output cell with an undefined winner — see `sparse_dense.cu`. This is
+/// a pure host-side check (no device interaction).
+pub fn validate_hvg_map(host_map: &[u32], n_output_cols: usize) -> Result<(), GpuError> {
+    let mut seen = vec![false; n_output_cols];
+    for (col, &mapped) in host_map.iter().enumerate() {
+        if mapped == HVG_MAP_SKIP {
+            continue;
+        }
+        let out = mapped as usize;
+        if out >= n_output_cols {
+            return Err(GpuError::KernelLaunchFailed(format!(
+                "upload_hvg_map: input column {col} maps to output column {out} \
+                 but n_output_cols == {n_output_cols}"
+            )));
+        }
+        if seen[out] {
+            return Err(GpuError::KernelLaunchFailed(format!(
+                "upload_hvg_map: non-injective map — output column {out} is \
+                 written by more than one input column (kernel scatter would race)"
+            )));
+        }
+        seen[out] = true;
+    }
+    Ok(())
+}
+
+/// Validate ([`validate_hvg_map`]) and upload an HVG projection map to the
+/// device. This is the sanctioned way to build the `hvg_map` argument for
+/// [`sparse_to_dense_gpu`] / [`sparse_to_dense_gpu_into`] /
+/// [`sparse_to_dense_gpu_into_view`]: it guarantees the injectivity the kernel
+/// requires, failing with an error instead of producing a silently corrupted
+/// dense matrix on a malformed map.
+pub fn upload_hvg_map(
+    device: &GpuDevice,
+    host_map: &[u32],
+    n_output_cols: usize,
+) -> Result<CudaSlice<u32>, GpuError> {
+    validate_hvg_map(host_map, n_output_cols)?;
+    device
+        .htod_copy(host_map)
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("upload_hvg_map: htod copy: {e}")))
+}
+
 /// Convert a GPU-resident CSR matrix to a dense row-major matrix, allocating
 /// a fresh zero-initialised output buffer.
 ///
@@ -22,8 +77,12 @@ const SPARSE_DENSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/sparse_de
 /// * `device` — GPU device handle.
 /// * `gpu_csr` — GPU-resident CSR matrix (i64 indptr, i32 indices, f32 data).
 /// * `hvg_map` — Optional gene projection map on device. `hvg_map[original_col]`
-///   gives the output column index, or `0xFFFFFFFF` to skip. If `None`,
+///   gives the output column index, or [`HVG_MAP_SKIP`] to skip. If `None`,
 ///   identity mapping is used (all columns, `n_output_cols == n_cols`).
+///   **Contract:** the map MUST be injective over its non-skip entries (each
+///   output column written by at most one input column) — the kernel's
+///   warp-cooperative scatter races on a many-to-one map. Build the device map
+///   with [`upload_hvg_map`], which validates this.
 /// * `n_output_cols` — Number of columns in the dense output. Must equal
 ///   `gpu_csr.shape.1` when `hvg_map` is `None`, or the number of selected
 ///   genes when projecting.
@@ -328,11 +387,11 @@ mod tests {
         // Build a mapping: hvg_map[col] = output_col or 0xFFFFFFFF
         let selected_cols: Vec<u32> = vec![0, 2, 10, 50, 80];
         let n_output_cols = selected_cols.len();
-        let mut hvg_map = vec![0xFFFFFFFFu32; n_cols as usize];
+        let mut hvg_map = vec![HVG_MAP_SKIP; n_cols as usize];
         for (out_col, &orig_col) in selected_cols.iter().enumerate() {
             hvg_map[orig_col as usize] = out_col as u32;
         }
-        let d_hvg_map = dev.htod_copy(&hvg_map).unwrap();
+        let d_hvg_map = upload_hvg_map(&dev, &hvg_map, n_output_cols).unwrap();
 
         // GPU sparse → dense with HVG
         let d_dense = sparse_to_dense_gpu(&dev, &gpu_csr, Some(&d_hvg_map), n_output_cols).unwrap();
@@ -368,5 +427,41 @@ mod tests {
         assert_eq!(gpu_dense[3], 3.0, "row0 col50→out3");
         // Unmapped columns should be zero
         assert_eq!(gpu_dense[1], 0.0, "row0 unmapped col2");
+    }
+
+    // Host-only: validation runs before any device interaction, so these need
+    // no GPU.
+    #[test]
+    fn test_validate_hvg_map_accepts_injective() {
+        // cols 0,2,5 → out 0,1,2; everything else skipped.
+        let mut map = vec![HVG_MAP_SKIP; 10];
+        map[0] = 0;
+        map[2] = 1;
+        map[5] = 2;
+        assert!(validate_hvg_map(&map, 3).is_ok());
+    }
+
+    #[test]
+    fn test_validate_hvg_map_rejects_non_injective() {
+        // Two input columns map to the same output column 0 → race.
+        let mut map = vec![HVG_MAP_SKIP; 10];
+        map[1] = 0;
+        map[4] = 0;
+        let err = validate_hvg_map(&map, 2).unwrap_err();
+        assert!(
+            matches!(err, GpuError::KernelLaunchFailed(ref m) if m.contains("non-injective")),
+            "expected non-injective error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_hvg_map_rejects_out_of_range() {
+        let mut map = vec![HVG_MAP_SKIP; 10];
+        map[3] = 5; // 5 >= n_output_cols (2)
+        let err = validate_hvg_map(&map, 2).unwrap_err();
+        assert!(
+            matches!(err, GpuError::KernelLaunchFailed(ref m) if m.contains("n_output_cols")),
+            "expected out-of-range error, got {err:?}"
+        );
     }
 }
