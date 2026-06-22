@@ -246,6 +246,12 @@ pub fn gpu_harmony_softmax_penalty(
     if k == 0 || n == 0 || c == 0 {
         return Ok(());
     }
+    if (n as u64) > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n < 2^31 (CUDA grid_dim.x cap)".into(),
+            got: format!("n = {n}"),
+        });
+    }
 
     let module = dev.load_module_cached(HARMONY_PTX)?;
     let func = module
@@ -308,6 +314,12 @@ pub fn gpu_harmony_softmax(
 ) -> Result<(), GpuError> {
     if k == 0 || n == 0 {
         return Ok(());
+    }
+    if (n as u64) > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n < 2^31 (CUDA grid_dim.x cap)".into(),
+            got: format!("n = {n}"),
+        });
     }
     let module = dev.load_module_cached(HARMONY_PTX)?;
     let func = module
@@ -606,6 +618,12 @@ pub fn gpu_harmony_obj_kmeans_entropy(
 ) -> Result<(), GpuError> {
     if k == 0 || n == 0 {
         return Ok(());
+    }
+    if (n as u64) > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n < 2^31 (CUDA grid_dim.x cap)".into(),
+            got: format!("n = {n}"),
+        });
     }
     let module = dev.load_module_cached(HARMONY_PTX)?;
     let func = module
