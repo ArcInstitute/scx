@@ -17,7 +17,7 @@
 //! walked once and rows scatter directly into the final dense buffers without
 //! materialising intermediate `ScxCsr` values.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -762,6 +762,11 @@ pub struct IterMetrics {
     /// Shards whose prefetch was skipped because a peer leader was already
     /// decoding them in `BackedCsrReader`'s singleflight table.
     pub prefetch_skipped_in_flight: AtomicU64,
+    /// Shards whose prefetch was skipped because the group is **sidecar-eligible**
+    /// (cold + sparse): the dense gather's `read_rows_with` decodes the touched
+    /// rows O(rows) via the scx1 decode sidecar, so warming the whole shard would
+    /// negate the win (STATE-TX-SIDECAR.md L2).
+    pub prefetch_skipped_sidecar: AtomicU64,
 }
 
 /// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
@@ -876,26 +881,36 @@ impl IndexPlanIter {
             return Ok(Vec::new());
         }
 
-        let mut all_rows: Vec<u64> = Vec::with_capacity(plan.len() * 2);
+        // Deduplicate the (pert, ctrl) rows and count unique rows per shard. The
+        // gather (`gather_pairs_dense`) passes the SAME deduped set to
+        // `read_rows_with`, so this per-shard `group_len` matches what the
+        // gather's sidecar decision sees — the prefetch skip and the gather
+        // choice must agree (else the adoption the metric proves diverges).
+        let index = self.loader.backed.index();
+        let mut seen: HashSet<u64> = HashSet::with_capacity(plan.len() * 2);
+        let mut per_shard: HashMap<usize, usize> = HashMap::new();
         for &(p, c) in plan {
-            all_rows.push(p);
-            all_rows.push(c);
+            for row in [p, c] {
+                if seen.insert(row) {
+                    if let Some(sidx) = index.shard_for_row(row) {
+                        *per_shard.entry(sidx).or_insert(0) += 1;
+                    }
+                }
+            }
         }
-        // shards_for_indices internally sorts + dedups, so the returned
-        // shard set has no duplicates we'd waste prefetches on.
-        let shards = self.loader.backed.index().shards_for_indices(&all_rows);
 
-        // Skip shards that are already cached or whose decode is already in
-        // flight via the BackedCsrReader singleflight table. Without this
-        // filter, a window of N plans touching shard S queues up to N
-        // `spawn_blocking` tasks for S — the singleflight short-circuits
-        // the redundant decode but the per-task tokio overhead and the
-        // associated `runtime.block_on` round-trips are still paid in
-        // `await_head`. Filtering here keeps the queue tight.
+        // Warm only shards NOT served by the sidecar. Skips:
+        //  - already cached / in-flight (the singleflight already covers them);
+        //  - **sidecar-eligible** cold sparse groups — leaving them undecoded is
+        //    what lets `read_rows_with` take the O(rows) sidecar path (L2). The
+        //    skip predicate is the shared `sidecar_eligible`, so it can never
+        //    drift from the gather's `use_sidecar`.
+        // Dense/large groups (and sidecar-less shards) still prefetch and warm
+        // the cache as before.
         let handle = self.loader.runtime()?.handle().clone();
-        Ok(shards
+        Ok(per_shard
             .into_iter()
-            .filter(|&sidx| {
+            .filter(|&(sidx, group_len)| {
                 if self.loader.backed.cache_contains(sidx) {
                     self.iter_metrics
                         .prefetch_skipped_cache_hit
@@ -908,9 +923,15 @@ impl IndexPlanIter {
                         .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                if self.loader.backed.sidecar_eligible(sidx, group_len) {
+                    self.iter_metrics
+                        .prefetch_skipped_sidecar
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
                 true
             })
-            .map(|sidx| {
+            .map(|(sidx, _group_len)| {
                 self.iter_metrics
                     .prefetch_tasks_spawned
                     .fetch_add(1, Ordering::Relaxed);

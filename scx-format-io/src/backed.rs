@@ -34,6 +34,12 @@ fn scatter_sidecar_enabled() -> bool {
     })
 }
 
+/// A shard request-group takes the O(rows) sidecar path only when the requested
+/// rows are a small fraction of the shard — `group_len * DIVISOR < shard_rows`.
+/// Shared by `read_rows_with`'s `use_sidecar` decision and the plan-prefetch
+/// skip ([`BackedCsrReader::sidecar_eligible`]) so the two can never drift.
+pub const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
+
 // ---------------------------------------------------------------------------
 // ShardEntryLite — internal per-shard row
 // ---------------------------------------------------------------------------
@@ -1058,6 +1064,29 @@ impl BackedCsrReader {
         self.shard_cache.contains(self.file_id, shard_idx)
     }
 
+    /// Whether a request-group of `group_len` rows landing in `shard_idx` would
+    /// be served by the O(rows) scx1 decode sidecar rather than a full-shard
+    /// decode. This is the single source of truth for the sidecar-vs-full-shard
+    /// decision: it is called both by `read_rows_with` (which then decodes the
+    /// group accordingly) and by the plan-prefetch engines (which skip warming
+    /// an eligible shard so the gather's sidecar path isn't negated). Keeping
+    /// one predicate guarantees the prefetch skip and the gather choice agree.
+    ///
+    /// Eligible when the scattered-sidecar path is enabled, the shard is not
+    /// already decoded in the LRU, and the requested rows are a small fraction
+    /// of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR < shard_rows`). Note
+    /// this does NOT check whether the shard actually carries a sidecar on disk
+    /// — a sidecar-less eligible shard falls back to a full-shard decode inside
+    /// `read_rows_with`; skipping its warm is still correct (just synchronous).
+    pub fn sidecar_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
+        scatter_sidecar_enabled()
+            && !self.shard_cache.contains(self.file_id, shard_idx)
+            && self
+                .index
+                .shard_range(shard_idx)
+                .is_some_and(|(s, e)| (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < (e - s))
+    }
+
     /// Live count cap on the decoded-shard LRU. `0` means no cache was
     /// installed and the cached read APIs decode on every call. Reflects any
     /// growth from [`Self::ensure_cache_capacity`] (not just the open-time
@@ -1362,11 +1391,9 @@ impl BackedCsrReader {
         // error semantics. Planning before warming is what lets the `!cached`
         // test mean something — we then warm ONLY the full-path shards, so
         // sidecar-group shards stay undecoded and the row-range path is taken.
-        const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
         // (start, end, shard_idx, s_start, use_sidecar)
         let mut groups: Vec<(usize, usize, usize, u64, bool)> = Vec::new();
         let mut full_shards: Vec<usize> = Vec::new();
-        let sidecar_on = scatter_sidecar_enabled();
         let mut start = 0;
         while start < sorted_pairs.len() {
             let row = sorted_pairs[start].0;
@@ -1388,21 +1415,12 @@ impl BackedCsrReader {
             let group_len = sorted_pairs[start..].partition_point(|&(r, _)| r < s_end);
             let end = start + group_len;
 
-            let shard_rows = s_end - s_start;
-            let cached = self.shard_cache.contains(self.file_id, shard_idx);
-            // Interaction with the prefetch engine (worth knowing): under a
-            // plan-prefetch loader with `lookahead >= 1`, `PlanPrefetchIter`
-            // warms every touched shard (`read_shard_cached_arc`) *before* the
-            // gather runs, so `cached` is already true here and the sidecar
-            // O(rows) path is bypassed — the (byte-identical, already-decoded)
-            // full-shard slice is used instead. The sidecar therefore pays off
-            // mainly for `lookahead == 0`, cache-cold / cache-thrash paths, and
-            // non-prefetch callers (e.g. `Experiment::gather_rows_sparse`).
-            // Making the prefetch planner skip sidecar-eligible sparse groups
-            // (so the sidecar isn't negated by eager full-shard warms) is a
-            // deliberate follow-up, not done here.
-            let use_sidecar =
-                sidecar_on && !cached && (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
+            // Sidecar-vs-full-shard via the shared predicate (also used by the
+            // plan-prefetch skip, so the two never drift). As of L2, the prefetch
+            // engines leave sidecar-eligible cold sparse shards un-warmed, so
+            // `sidecar_eligible` returns true here and the O(rows) path is taken;
+            // dense/cached groups still go full-shard.
+            let use_sidecar = self.sidecar_eligible(shard_idx, group_len);
             if !use_sidecar {
                 full_shards.push(shard_idx);
             }

@@ -1194,6 +1194,10 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
         "prefetch_skipped_in_flight",
         m.prefetch_skipped_in_flight.load(Ordering::Relaxed),
     )?;
+    dict.set_item(
+        "prefetch_skipped_sidecar",
+        m.prefetch_skipped_sidecar.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

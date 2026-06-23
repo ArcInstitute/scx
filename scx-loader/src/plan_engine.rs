@@ -20,7 +20,7 @@
 //! Plan order is preserved (no `sort_by_shard` reorder): the sparse gather
 //! recovers intra-call shard locality inside `BackedCsrReader::read_rows_with`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -275,10 +275,27 @@ where
             let Some(reader) = self.engine.readers.get(fid as usize) else {
                 continue;
             };
-            // shards_for_indices sorts + dedups internally.
-            let shards = reader.index().shards_for_indices(&rs);
-            for sidx in shards {
-                if reader.cache_contains(sidx) || reader.in_flight_contains(sidx) {
+            // Dedup rows + count unique rows per shard (matches the gather's
+            // post-dedup `read_rows_with` grouping). Skip warming a shard that
+            // is already cached / in-flight, OR **sidecar-eligible** (cold +
+            // sparse): leaving it undecoded lets the gather take the O(rows)
+            // sidecar path instead of being negated by a full-shard warm (L2).
+            // The shared `sidecar_eligible` predicate keeps this in lockstep
+            // with the gather's `use_sidecar`. Dense/large groups still warm.
+            let mut seen: HashSet<u64> = HashSet::with_capacity(rs.len());
+            let mut per_shard: HashMap<usize, usize> = HashMap::new();
+            for row in rs {
+                if seen.insert(row) {
+                    if let Some(sidx) = reader.index().shard_for_row(row) {
+                        *per_shard.entry(sidx).or_insert(0) += 1;
+                    }
+                }
+            }
+            for (sidx, group_len) in per_shard {
+                if reader.cache_contains(sidx)
+                    || reader.in_flight_contains(sidx)
+                    || reader.sidecar_eligible(sidx, group_len)
+                {
                     continue;
                 }
                 let reader = Arc::clone(reader);

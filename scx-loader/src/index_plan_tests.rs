@@ -417,6 +417,70 @@ fn iter_with_plans_lookahead_zero_vs_four_parity() {
     }
 }
 
+/// With the sidecar-aware prefetch, a sparse plan
+/// driven at `lookahead=4` must STILL reach the O(rows) sidecar path — the
+/// prefetch skips warming sidecar-eligible cold shards instead of negating the
+/// gather. Pre-L2 this read `sidecar_groups=0`. Output must stay
+/// byte-identical to `lookahead=0`.
+#[test]
+fn iter_with_plans_lookahead_four_still_reaches_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx1 = write_dense_scx1_fixture(&dir.path().join("scx1.scx"), 256, 8, 256, CodecId::Scx1);
+    assert_eq!(count_sidecars(&scx1), 8, "fixture must carry sidecars");
+
+    // Sparse-per-shard plans: ≤3 unique rows per 32-row shard → eligible.
+    let plans = vec![
+        vec![(3u64, 200u64), (40, 12), (70, 5)],
+        vec![(130, 5), (250, 200), (12, 3)],
+    ];
+
+    // Wide var axis (sidecar-friendly deltas) → small max_plan_size + generous
+    // budget, as in the Phase-1 sidecar test.
+    let mk = || {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        config.max_memory_mb = 4096;
+        Arc::new(
+            IndexPlanLoader::new(
+                &scx1, config, /*cache_shards*/ 8, /*sort_by_shard*/ false,
+                /*lookahead*/ 4, /*max_plan_size*/ 256,
+            )
+            .unwrap(),
+        )
+    };
+    let loader0 = mk();
+    let loader4 = mk();
+    let zero: Vec<_> = Arc::clone(&loader0)
+        .iter_with_plans(into_plan_iter(plans.clone()), 0)
+        .map(|r| r.unwrap())
+        .collect();
+    let four: Vec<_> = Arc::clone(&loader4)
+        .iter_with_plans(into_plan_iter(plans.clone()), 4)
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Hard gate: lookahead=4 still adopts the sidecar (prefetch skipped eligible
+    // shards rather than warming them).
+    let sg = loader4
+        .cache_metrics()
+        .sidecar_groups
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        sg > 0,
+        "lookahead=4 must still reach the sidecar after L2 (sidecar-aware prefetch); got {sg}"
+    );
+
+    // Byte-identical output vs lookahead=0.
+    assert_eq!(zero.len(), four.len());
+    for (a, b) in zero.iter().zip(four.iter()) {
+        assert_eq!(a.pairs, b.pairs, "pair order must match lookahead 0 vs 4");
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.x_paired, b.x_paired);
+    }
+}
+
 /// Errors injected into the plan stream propagate as Err items in order.
 #[test]
 fn iter_with_plans_propagates_plan_errors() {
