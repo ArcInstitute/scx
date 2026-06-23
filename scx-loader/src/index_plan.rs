@@ -144,9 +144,12 @@ pub struct IndexPlanLoader {
     /// Per-dataset escape hatch gating the **L2 sidecar-aware prefetch skip**
     /// only (default `true`). When `false`, the prefetch warms cold shards as
     /// before, so the gather falls back to full-shard decode — legacy
-    /// behaviour. L1 (`gather_pairs_dense` → `read_rows_with`) is unconditional;
-    /// the process-wide `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar
-    /// at the reader layer entirely. See STATE-TX-SIDECAR.md §4.1.
+    /// behaviour. Because it gates *only* the prefetch skip, it has no effect at
+    /// `lookahead == 0`: with no prefetch, the L1 gather still reaches the
+    /// sidecar regardless of this flag. L1 (`gather_pairs_dense` →
+    /// `read_rows_with`) is unconditional; the process-wide
+    /// `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar at the reader
+    /// layer entirely.
     scatter_sidecar: bool,
 }
 
@@ -627,7 +630,7 @@ impl IndexPlanLoader {
         // (cached / dense / no sidecar). Output is byte-identical to the old
         // full-shard-decode-and-slice path because each PairRequest still
         // carries its `pair_idx` and writes the same output slot; only the
-        // decode strategy changes. See STATE-TX-SIDECAR.md (L1).
+        // decode strategy changes (L1 sidecar gather).
         let mut row_to_pos: HashMap<u64, usize> = HashMap::with_capacity(n_pairs * 2);
         let mut unique_rows: Vec<u64> = Vec::with_capacity(n_pairs * 2);
         let mut row_to_requests: Vec<Vec<PairRequest>> = Vec::with_capacity(n_pairs * 2);
@@ -657,12 +660,17 @@ impl IndexPlanLoader {
                     if let Err(e) =
                         self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)
                     {
+                        // Stash the real LoaderError and abort iteration with a
+                        // sentinel ScxError (the closure must return ScxError).
                         scatter_err = Some(e);
                         return Err(scx_format_io::ScxError::InconsistentCsr);
                     }
                 }
                 Ok(())
             });
+        // Invariant: the closure returns Err ONLY after setting `scatter_err`,
+        // so a Some here is always the original scatter error — check it before
+        // `res` so the precise LoaderError wins over the sentinel.
         if let Some(e) = scatter_err {
             return Err(e);
         }
@@ -781,7 +789,7 @@ pub struct IterMetrics {
     /// Shards whose prefetch was skipped because the group is **sidecar-eligible**
     /// (cold + sparse): the dense gather's `read_rows_with` decodes the touched
     /// rows O(rows) via the scx1 decode sidecar, so warming the whole shard would
-    /// negate the win (STATE-TX-SIDECAR.md L2).
+    /// negate the win (the L2 sidecar-aware prefetch skip).
     pub prefetch_skipped_sidecar: AtomicU64,
 }
 

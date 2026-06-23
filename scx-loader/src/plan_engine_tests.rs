@@ -257,7 +257,7 @@ fn engine_lookahead_zero_vs_four_parity() {
     assert_eq!(run(0), run(4));
 }
 
-/// L2 (STATE-TX-SIDECAR.md) on the sparse cell-set path: with the sidecar-aware
+/// L2 sidecar-aware prefetch on the sparse cell-set path: with the sidecar-aware
 /// prefetch, a sparse plan driven at `lookahead=4` must STILL reach the O(rows)
 /// sidecar path — the prefetch skips warming sidecar-eligible cold shards. Hard
 /// gate on `sidecar_groups > 0`; output byte-identical to `lookahead=0`.

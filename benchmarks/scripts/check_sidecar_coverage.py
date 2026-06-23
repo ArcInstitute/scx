@@ -5,9 +5,9 @@ The per-row scx1 *decode sidecar* (``DecodeMetadataShard``, section id 26) is a
 write-time property: it is emitted by default for Scx1 integer-CSR shards within
 a 25% overhead budget, but ``.scx`` files written before scx 0.9.1 carry **none**.
 Benchmarking the IndexPlan sidecar gather against a sidecar-less fixture shows no
-change and looks like a failed fix (STATE-TX-SIDECAR.md §6.3 / T0.3) — so this
-script is the pre-benchmark gate: it counts decode sidecars vs. CSR shards and
-asserts coverage before any sidecar benchmark runs.
+change and looks like a failed fix — so this script is the pre-benchmark gate: it
+counts decode sidecars vs. CSR shards and asserts coverage before any sidecar
+benchmark runs.
 
 Detection uses ``scx info <path> --json``: the top-level ``n_csr_shards`` field
 and the ``sections[]`` array, where ``DecodeMetadataShard`` entries render their
@@ -104,7 +104,7 @@ def main() -> int:
     if failures and not args.report:
         print(
             f"\n{failures} fixture(s) lack full sidecar coverage — "
-            f"regenerate before benchmarking (see STATE-TX-SIDECAR.md T0.3).",
+            f"regenerate under a post-0.9.x writer before benchmarking.",
             file=sys.stderr,
         )
     return 1 if (failures and not args.report) else 0

@@ -1,4 +1,4 @@
-// STATE-TX-SIDECAR.md Phase 4 — sidecar correctness checklist → owning tests:
+// Sidecar correctness checklist (Phase 4) → owning tests:
 //   T4.1 sidecar↔full-shard parity (cold) ......... gather_pairs_dense_reaches_sidecar_and_matches_full_decode
 //   T4.1 SCX_SCATTER_SIDECAR=0 kill-switch ........ tests/sidecar_kill_switch.rs (separate process; env is OnceLock-cached)
 //   T4.2 pair-dedup + plan-order (reused ctrl, pert==ctrl)
@@ -10,7 +10,7 @@
 //                                                  + plan_engine_tests::engine_lookahead_four_still_reaches_sidecar
 //   T4.5 sidecar-less fallback .................... the CodecId::None twin arm asserted in every cross-codec test
 //        (read_rows_with is CSR-only; a CodecId::None CSR shard is the sidecar-less fallback — no CSC path to gather)
-//   §4.1 scatter_sidecar=false escape hatch ....... scatter_sidecar_false_disables_l2_prefetch_skip
+//   scatter_sidecar=false escape hatch (gates L2 only) .. scatter_sidecar_false_disables_l2_prefetch_skip
 
 use super::*;
 
@@ -497,7 +497,7 @@ fn iter_with_plans_lookahead_four_still_reaches_sidecar() {
     }
 }
 
-/// Phase 3 escape hatch (STATE-TX-SIDECAR.md §4.1): `scatter_sidecar=false`
+/// Escape hatch (gates L2 only): `scatter_sidecar=false`
 /// disables the L2 prefetch-skip, so at `lookahead=4` the prefetch warms the
 /// cold shards and the gather takes the full-shard path (legacy) —
 /// `sidecar_groups == 0`, `full_shard_groups > 0`. Output must stay
@@ -832,7 +832,7 @@ fn count_sidecars(path: &std::path::Path) -> usize {
         .count()
 }
 
-/// L1 (STATE-TX-SIDECAR.md): a cache-cold, sparse-per-shard plan gathered
+/// L1 sidecar gather: a cache-cold, sparse-per-shard plan gathered
 /// through `gather_pairs_dense` must reach the O(rows) scx1 **decode sidecar**
 /// (`read_rows_with` → `scatter_group_via_sidecar`), bumping
 /// `CacheMetrics.sidecar_groups`. And the sidecar gather must be **byte-identical**

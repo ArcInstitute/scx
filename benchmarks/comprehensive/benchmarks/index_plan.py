@@ -702,8 +702,9 @@ def run(
             # request-groups served by the O(rows) decode sidecar vs.
             # full-shard decode. `None` for scenarios with no cache metrics
             # (manual baselines) and when no groups were observed. This is the
-            # primary success signal for the sidecar gather work — see §6.2 of
-            # STATE-TX-SIDECAR.md (L1 alone shows no wall-clock change).
+            # primary success signal for the sidecar gather work — the L1 gather
+            # alone shows no wall-clock change (prefetch warms shards first), so
+            # this adoption counter is what proves the sidecar path was reached.
             sc = outcome.sidecar_groups
             fs = outcome.full_shard_groups
             if sc is None or fs is None or (sc + fs) == 0:
