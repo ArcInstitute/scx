@@ -74,6 +74,112 @@ fn write_multi_shard_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize
     writer.finish().unwrap();
 }
 
+/// Single-file dense Scx1 fixture with strictly-increasing, collision-free
+/// columns (gaps up to 250) so the writer emits a per-row decode sidecar per
+/// shard. Mirrors `index_plan_tests::write_dense_scx1_fixture`.
+fn write_dense_scx1_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_shards: usize,
+    nnz_per_row: usize,
+) {
+    assert!(n_obs % n_shards == 0);
+    let rows_per_shard = n_obs / n_shards;
+    let n_vars = nnz_per_row * 251 + 16;
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (n_obs * nnz_per_row) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(obs_schema),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(var_schema),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((row * 13 + k * 7) % 250) as u32;
+                indices.push(col);
+                values.push(1u8 + ((row + k) % 5) as u8);
+            }
+            indptr.push(*indptr.last().unwrap() + nnz_per_row as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Scx1,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+fn count_sidecars(path: &std::path::Path) -> usize {
+    ScxReader::open(path)
+        .unwrap()
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::SectionType::DecodeMetadataShard)
+        .count()
+}
+
+/// Gather full CSR rows (not just the first nonzero) — for codec-agnostic
+/// self-parity checks across lookahead settings.
+fn gather_full(engine: &PrefetchEngine, plan: &Plan) -> Result<Vec<(Vec<i32>, Vec<f32>)>> {
+    let mut out = Vec::with_capacity(plan.len());
+    for &(fid, row) in plan {
+        let mut got = (Vec::new(), Vec::new());
+        engine
+            .reader(fid)
+            .read_rows_with(&[row], |_pos, idx, data| {
+                got = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .map_err(LoaderError::FormatError)?;
+        out.push(got);
+    }
+    Ok(out)
+}
+
 /// A two-file engine: each file 32 rows × 8 vars × 4 shards, sharing one cache.
 fn two_file_engine(dir: &std::path::Path, cache_shards: usize) -> Arc<PrefetchEngine> {
     let p0 = dir.join("f0.scx");
@@ -149,6 +255,54 @@ fn engine_lookahead_zero_vs_four_parity() {
             .collect()
     };
     assert_eq!(run(0), run(4));
+}
+
+/// L2 sidecar-aware prefetch on the sparse cell-set path: with the sidecar-aware
+/// prefetch, a sparse plan driven at `lookahead=4` must STILL reach the O(rows)
+/// sidecar path — the prefetch skips warming sidecar-eligible cold shards. Hard
+/// gate on `sidecar_groups > 0`; output byte-identical to `lookahead=0`.
+#[test]
+fn engine_lookahead_four_still_reaches_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scx1.scx");
+    write_dense_scx1_fixture(&path, 128, 4, 256); // 4 shards × 32 rows
+    assert_eq!(count_sidecars(&path), 4, "fixture must carry sidecars");
+
+    // Sparse-per-shard plan: ≤3 unique rows per 32-row shard → eligible.
+    let plans = vec![
+        vec![(0u32, 3u64), (0, 40), (0, 70)],
+        vec![(0, 100), (0, 12), (0, 5)],
+    ];
+
+    let run = |lookahead: usize| -> (Vec<Vec<(Vec<i32>, Vec<f32>)>>, u64) {
+        let reader = ScxReader::open(&path).unwrap();
+        let engine = PrefetchEngine::from_scx_readers(
+            vec![reader],
+            /*cache_shards*/ 8,
+            usize::MAX,
+            lookahead,
+        );
+        let out: Vec<_> = Arc::clone(&engine)
+            .iter_with_plans(into_iter(plans.clone()), lookahead, rows_of, gather_full)
+            .map(|r| r.unwrap())
+            .collect();
+        let sg = engine
+            .cache_metrics()
+            .sidecar_groups
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (out, sg)
+    };
+
+    let (zero, _) = run(0);
+    let (four, sg_four) = run(4);
+    assert!(
+        sg_four > 0,
+        "lookahead=4 must still reach the sidecar after L2 (sidecar-aware prefetch); got {sg_four}"
+    );
+    assert_eq!(
+        zero, four,
+        "output must be byte-identical across lookahead 0 vs 4"
+    );
 }
 
 #[test]

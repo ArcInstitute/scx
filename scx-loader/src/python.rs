@@ -799,6 +799,11 @@ impl IndexPlanDataset {
     ///     max_memory_mb: Memory budget in MB (default: 512). On overflow,
     ///         lookahead is reduced first (down to 1), then cache_shards
     ///         (down to 1); construction fails if neither fits.
+    ///     scatter_sidecar: Per-dataset escape hatch (default: True) gating the
+    ///         sidecar-aware prefetch skip. True lets cold sparse plans decode
+    ///         O(rows) via the scx1 decode sidecar; False makes the prefetch
+    ///         warm whole shards (legacy full-shard decode). `SCX_SCATTER_SIDECAR=0`
+    ///         is the process-wide reader-layer kill-switch.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -815,6 +820,7 @@ impl IndexPlanDataset {
         lookahead=None,
         max_plan_size=None,
         max_memory_mb=None,
+        scatter_sidecar=None,
     ))]
     fn new(
         path: &str,
@@ -830,6 +836,7 @@ impl IndexPlanDataset {
         lookahead: Option<usize>,
         max_plan_size: Option<usize>,
         max_memory_mb: Option<usize>,
+        scatter_sidecar: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = LoaderConfig::default();
         if let Some(v) = hvg_indices {
@@ -861,6 +868,7 @@ impl IndexPlanDataset {
         let sort_by_shard = sort_by_shard.unwrap_or(true);
         let lookahead = lookahead.unwrap_or(4);
         let max_plan_size = max_plan_size.unwrap_or(16384);
+        let scatter_sidecar = scatter_sidecar.unwrap_or(true);
 
         let loader = IndexPlanLoader::new(
             path,
@@ -869,6 +877,7 @@ impl IndexPlanDataset {
             sort_by_shard,
             lookahead,
             max_plan_size,
+            scatter_sidecar,
         )
         .map_err(loader_err_to_py)?;
 
@@ -1171,6 +1180,11 @@ fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<B
         "peak_bytes_in_cache",
         m.peak_bytes_in_cache.load(Ordering::Relaxed),
     )?;
+    dict.set_item("sidecar_groups", m.sidecar_groups.load(Ordering::Relaxed))?;
+    dict.set_item(
+        "full_shard_groups",
+        m.full_shard_groups.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 
@@ -1188,6 +1202,10 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     dict.set_item(
         "prefetch_skipped_in_flight",
         m.prefetch_skipped_in_flight.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "prefetch_skipped_sidecar",
+        m.prefetch_skipped_sidecar.load(Ordering::Relaxed),
     )?;
     Ok(dict)
 }

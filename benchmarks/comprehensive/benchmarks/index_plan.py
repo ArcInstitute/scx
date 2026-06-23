@@ -168,6 +168,27 @@ class _ScenarioOutcome:
     # expose `memory_budget()`.
     memory_budget_total_mb: float | None = None
     estimate_overshoot_mb: float | None = None
+    # Sidecar adoption: count of `read_rows_with` shard request-groups served
+    # by the O(rows) scx1 decode sidecar vs. full-shard decode (cumulative,
+    # loader-level, sampled from `IndexPlanDataset.cache_metrics()` after the
+    # run). `sidecar_adoption_rate = sidecar_groups / (sidecar_groups +
+    # full_shard_groups)` is the primary success signal for the sidecar work —
+    # wall-clock cannot distinguish "sidecar reached" from "prefetch warmed the
+    # shard first". `None` for non-IndexPlan scenarios that have no cache
+    # metrics. NOTE: until the gather is routed through `read_rows_with`
+    # (Phase 1), IndexPlan scenarios report 0 sidecar groups — the intended
+    # pre-fix baseline.
+    sidecar_groups: int | None = None
+    full_shard_groups: int | None = None
+    # Consumer-observed per-batch latency (ms): the wall time between successive
+    # batches yielded by `iter_with_plans` (prefetch-overlapped). The sidecar
+    # (L1+L2) trades an async full-shard warm for a synchronous O(rows) sidecar
+    # decode on the gather thread (§6.4), so per-batch latency — not just
+    # aggregate throughput — is the metric that catches a borderline-dense
+    # regression. `None` for non-IndexPlan scenarios.
+    gather_latency_ms_mean: float | None = None
+    gather_latency_ms_p50: float | None = None
+    gather_latency_ms_p99: float | None = None
 
 
 def _run_index_plan(
@@ -181,6 +202,7 @@ def _run_index_plan(
     lookahead: int,
     cache_shards: int,
     max_plan_size: int,
+    scatter_sidecar: bool = True,
 ) -> _ScenarioOutcome:
     import pyscx
 
@@ -196,6 +218,7 @@ def _run_index_plan(
         lookahead=lookahead,
         max_plan_size=max_plan_size,
         max_memory_mb=8192,
+        scatter_sidecar=scatter_sidecar,
     )
     # Snapshot the estimator's per-component breakdown right after ctor so
     # the auto-tune output (post-reduction) drives the overshoot delta.
@@ -205,10 +228,25 @@ def _run_index_plan(
     t0 = time.perf_counter()
     seen = 0
     cells = 0
+    per_batch_s: list[float] = []
+    prev = t0
     for batch in ds.iter_with_plans(plans_factory(), lookahead=lookahead):
+        now = time.perf_counter()
+        per_batch_s.append(now - prev)
+        prev = now
         seen += 1
         cells += 2 * batch["X"].shape[0]
     wall = time.perf_counter() - t0
+    # Sample loader-level cache metrics (cumulative across the run). The
+    # `sidecar_groups` / `full_shard_groups` keys were added alongside the
+    # sidecar gather work; tolerate older pyscx that lacks them.
+    try:
+        cm = ds.cache_metrics()
+        sidecar_groups = int(cm.get("sidecar_groups", 0))
+        full_shard_groups = int(cm.get("full_shard_groups", 0))
+    except Exception:
+        sidecar_groups = None
+        full_shard_groups = None
     peak_rss_after = _peak_rss_mb()
     peak_rss = max(rss0, peak_rss_after)
     # Scenario-local ru_maxrss growth — eliminates cross-scenario
@@ -217,6 +255,16 @@ def _run_index_plan(
     # 0 for scenarios that don't push past a prior peak; that's a weaker
     # but honest signal vs. inheriting an unrelated scenario's high-water.
     peak_rss_growth = max(0.0, peak_rss_after - rss0)
+    # Per-batch gather latency (ms). Drop the first interval — it includes the
+    # initial prefetch fill / lazy tokio-runtime spin-up, not steady-state gather.
+    steady = per_batch_s[1:] if len(per_batch_s) > 1 else per_batch_s
+    if steady:
+        ms = sorted(v * 1000.0 for v in steady)
+        mean_ms = sum(ms) / len(ms)
+        p50_ms = ms[len(ms) // 2]
+        p99_ms = ms[min(len(ms) - 1, int(len(ms) * 0.99))]
+    else:
+        mean_ms = p50_ms = p99_ms = None
     return _ScenarioOutcome(
         n_batches=seen,
         n_cells=cells,
@@ -224,6 +272,11 @@ def _run_index_plan(
         peak_rss_mb=peak_rss,
         memory_budget_total_mb=round(budget_total_mb, 1),
         estimate_overshoot_mb=round(peak_rss_growth - budget_total_mb, 1),
+        sidecar_groups=sidecar_groups,
+        full_shard_groups=full_shard_groups,
+        gather_latency_ms_mean=round(mean_ms, 3) if mean_ms is not None else None,
+        gather_latency_ms_p50=round(p50_ms, 3) if p50_ms is not None else None,
+        gather_latency_ms_p99=round(p99_ms, 3) if p99_ms is not None else None,
     )
 
 
@@ -645,6 +698,20 @@ def run(
             bps = outcome.n_batches / wall if wall > 0 else 0.0
             cps = outcome.n_cells / wall if wall > 0 else 0.0
 
+            # Sidecar adoption rate = fraction of `read_rows_with` shard
+            # request-groups served by the O(rows) decode sidecar vs.
+            # full-shard decode. `None` for scenarios with no cache metrics
+            # (manual baselines) and when no groups were observed. This is the
+            # primary success signal for the sidecar gather work — the L1 gather
+            # alone shows no wall-clock change (prefetch warms shards first), so
+            # this adoption counter is what proves the sidecar path was reached.
+            sc = outcome.sidecar_groups
+            fs = outcome.full_shard_groups
+            if sc is None or fs is None or (sc + fs) == 0:
+                adoption_rate = None
+            else:
+                adoption_rate = round(sc / (sc + fs), 4)
+
             run_extra: dict[str, Any] = {
                 "scenario": scenario_name,
                 "n_batches": outcome.n_batches,
@@ -658,6 +725,15 @@ def run(
                 # counter. Slot is preserved so the gate's threshold key
                 # remains stable when the counter lands.
                 f"shard_cache_hit_rate__{scenario_name}": None,
+                # Sidecar adoption — primary success signal for the sidecar
+                # gather work. `None` for manual baselines / no observed
+                # groups; 0.0 until the gather is routed through
+                # `read_rows_with` (Phase 1). Raw counts kept for debugging.
+                f"sidecar_adoption_rate__{scenario_name}": adoption_rate,
+                f"sidecar_groups__{scenario_name}": outcome.sidecar_groups,
+                f"full_shard_groups__{scenario_name}": outcome.full_shard_groups,
+                f"gather_latency_ms_p50__{scenario_name}": outcome.gather_latency_ms_p50,
+                f"gather_latency_ms_p99__{scenario_name}": outcome.gather_latency_ms_p99,
                 # Estimator validation: `None` for scenarios that don't
                 # go through `IndexPlanDataset` (no `memory_budget()`
                 # accessor on the manual baselines).

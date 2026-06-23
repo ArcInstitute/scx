@@ -79,7 +79,7 @@ fn build_loader(
     config.hvg_indices = hvg;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }
 
 /// Spec: full-gene path with no normalize. process_plan rows match manual.

@@ -17,7 +17,7 @@
 //! walked once and rows scatter directly into the final dense buffers without
 //! materialising intermediate `ScxCsr` values.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -70,7 +70,6 @@ enum PairSide {
 
 #[derive(Clone, Copy, Debug)]
 struct PairRequest {
-    row: u64,
     pair_idx: usize,
     side: PairSide,
 }
@@ -142,6 +141,16 @@ pub struct IndexPlanLoader {
     /// construction. Surfaced through `IndexPlanDataset.memory_budget()` for
     /// production sizing.
     budget_breakdown: BudgetBreakdown,
+    /// Per-dataset escape hatch gating the **L2 sidecar-aware prefetch skip**
+    /// only (default `true`). When `false`, the prefetch warms cold shards as
+    /// before, so the gather falls back to full-shard decode — legacy
+    /// behaviour. Because it gates *only* the prefetch skip, it has no effect at
+    /// `lookahead == 0`: with no prefetch, the L1 gather still reaches the
+    /// sidecar regardless of this flag. L1 (`gather_pairs_dense` →
+    /// `read_rows_with`) is unconditional; the process-wide
+    /// `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar at the reader
+    /// layer entirely.
+    scatter_sidecar: bool,
 }
 
 impl IndexPlanLoader {
@@ -178,6 +187,7 @@ impl IndexPlanLoader {
         sort_by_shard: bool,
         lookahead: usize,
         max_plan_size: usize,
+        scatter_sidecar: bool,
     ) -> Result<Self> {
         if cache_shards < 1 {
             return Err(LoaderError::ConfigError {
@@ -284,16 +294,25 @@ impl IndexPlanLoader {
             .saturating_mul(n_output_cols)
             .saturating_mul(4);
         const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
-                                            // `gather_pairs_dense` request scratch holds 2 × max_plan_size
-                                            // `PairRequest`s. Use `size_of` so this term tracks struct churn
-                                            // automatically instead of drifting against a hand-derived constant.
-        const PAIR_REQUEST_BYTES: usize = std::mem::size_of::<PairRequest>();
-        // `extract_obs_columns` allocates one `Vec` per configured obs
-        // column per side (pert + ctrl). `ObsColumn` variants store `i64`
-        // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
-        // the per-batch label dictionary is shared, not per-cell, and
-        // intentionally excluded from this term). `8` is the worst-case
-        // per-cell width across the supported variants.
+                                            // `gather_pairs_dense` deduplicates the 2 × max_plan_size (pert+ctrl)
+                                            // rows into `unique_rows: Vec<u64>`, a `row_to_requests:
+                                            // Vec<Vec<PairRequest>>` fan-out map, and a `row_to_pos:
+                                            // HashMap<u64, usize>`. Worst case (all rows distinct) holds
+                                            // 2 × max_plan_size entries across these structures. Use `size_of`
+                                            // for each so the term tracks struct churn automatically instead of
+                                            // drifting against a hand-derived constant. (HashMap load-factor
+                                            // slack is ignored — it's a small, transient term dominated by the
+                                            // shard cache and dense batch buffers.)
+        const GATHER_SCRATCH_BYTES_PER_ROW: usize = std::mem::size_of::<u64>()           // unique_rows entry
+            + std::mem::size_of::<Vec<PairRequest>>()                          // row_to_requests outer Vec header
+            + std::mem::size_of::<PairRequest>()                               // one PairRequest (inner, all-distinct)
+            + std::mem::size_of::<(u64, usize)>(); // row_to_pos entry
+                                                   // `extract_obs_columns` allocates one `Vec` per configured obs
+                                                   // column per side (pert + ctrl). `ObsColumn` variants store `i64`
+                                                   // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
+                                                   // the per-batch label dictionary is shared, not per-cell, and
+                                                   // intentionally excluded from this term). `8` is the worst-case
+                                                   // per-cell width across the supported variants.
         const OBS_CELL_BYTES: usize = 8;
 
         let transient_bytes = {
@@ -303,7 +322,7 @@ impl IndexPlanLoader {
                 .saturating_mul(OBS_CELL_BYTES);
             let request_bytes = 2usize
                 .saturating_mul(max_plan_size)
-                .saturating_mul(PAIR_REQUEST_BYTES);
+                .saturating_mul(GATHER_SCRATCH_BYTES_PER_ROW);
             obs_bytes.saturating_add(request_bytes)
         };
 
@@ -387,6 +406,7 @@ impl IndexPlanLoader {
             max_plan_size,
             cache_metrics,
             budget_breakdown,
+            scatter_sidecar,
         })
     }
 
@@ -458,6 +478,13 @@ impl IndexPlanLoader {
     /// `iter_with_plans` when the caller passes `lookahead=None`.
     pub fn effective_lookahead(&self) -> usize {
         self.effective_lookahead
+    }
+
+    /// Whether the L2 sidecar-aware prefetch skip is enabled for this dataset
+    /// (default `true`). Gates only the prefetch skip in `IndexPlanIter`; L1 is
+    /// unconditional. See [`Self::scatter_sidecar`] field docs.
+    pub fn scatter_sidecar(&self) -> bool {
+        self.scatter_sidecar
     }
 
     /// Per-component memory breakdown produced by the auto-tune at
@@ -594,75 +621,60 @@ impl IndexPlanLoader {
         let mut x_paired = vec![0f32; n_pairs * n_cols];
         let mut pert_indices = Vec::with_capacity(n_pairs);
         let mut ctrl_indices = Vec::with_capacity(n_pairs);
-        let mut requests = Vec::with_capacity(n_pairs * 2);
 
+        // Deduplicate the (pert, ctrl) rows into a single set of distinct rows
+        // plus a fan-out map (unique-row → every PairRequest referencing it).
+        // The gather then runs through `BackedCsrReader::read_rows_with`, which
+        // sorts internally and — per shard — decodes either O(rows) via the
+        // scx1 decode sidecar (cold, sparse-per-shard groups) or the full shard
+        // (cached / dense / no sidecar). Output is byte-identical to the old
+        // full-shard-decode-and-slice path because each PairRequest still
+        // carries its `pair_idx` and writes the same output slot; only the
+        // decode strategy changes (L1 sidecar gather).
+        let mut row_to_pos: HashMap<u64, usize> = HashMap::with_capacity(n_pairs * 2);
+        let mut unique_rows: Vec<u64> = Vec::with_capacity(n_pairs * 2);
+        let mut row_to_requests: Vec<Vec<PairRequest>> = Vec::with_capacity(n_pairs * 2);
         for (pair_idx, &(pert, ctrl)) in plan.iter().enumerate() {
             pert_indices.push(pert);
             ctrl_indices.push(ctrl);
-            requests.push(PairRequest {
-                row: pert,
-                pair_idx,
-                side: PairSide::Perturbed,
-            });
-            requests.push(PairRequest {
-                row: ctrl,
-                pair_idx,
-                side: PairSide::Control,
-            });
-        }
-
-        requests.sort_by_key(|r| r.row);
-
-        let mut start = 0;
-        while start < requests.len() {
-            let row = requests[start].row;
-            let shard_idx = self.backed.index().shard_for_row(row).ok_or_else(|| {
-                scx_format_io::ScxError::Io(std::io::Error::other(format!(
-                    "row index {row} is not covered by any shard (n_obs={})",
-                    self.n_obs()
-                )))
-            })?;
-            let (s_start, s_end) = self.backed.index().shard_range(shard_idx).ok_or(
-                scx_format_io::ScxError::ShardIndexOutOfBounds {
-                    index: shard_idx,
-                    count: self.backed.index().n_shards(),
-                },
-            )?;
-
-            let end = start + requests[start..].partition_point(|r| r.row < s_end);
-            let shard = self.backed.read_shard_cached_arc(shard_idx)?;
-
-            let mut row_start = start;
-            while row_start < end {
-                let row = requests[row_start].row;
-                let row_end =
-                    row_start + requests[row_start..end].partition_point(|r| r.row == row);
-                let local = (row - s_start) as usize;
-                let lo = *shard
-                    .indptr
-                    .get(local)
-                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
-                    as usize;
-                let hi = *shard
-                    .indptr
-                    .get(local + 1)
-                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
-                    as usize;
-                if hi < lo || hi > shard.indices.len() || hi > shard.data.len() {
-                    return Err(scx_format_io::ScxError::InconsistentCsr.into());
-                }
-                let idx = &shard.indices[lo..hi];
-                let data = &shard.data[lo..hi];
-
-                for &request in &requests[row_start..row_end] {
-                    self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)?;
-                }
-
-                row_start = row_end;
+            for (row, side) in [(pert, PairSide::Perturbed), (ctrl, PairSide::Control)] {
+                let pos = *row_to_pos.entry(row).or_insert_with(|| {
+                    unique_rows.push(row);
+                    row_to_requests.push(Vec::new());
+                    unique_rows.len() - 1
+                });
+                row_to_requests[pos].push(PairRequest { pair_idx, side });
             }
-
-            start = end;
         }
+
+        // `scatter_pair_request` returns the loader's `Result` (LoaderError),
+        // but `read_rows_with`'s closure must return `scx_format_io::Result`
+        // (ScxError). Stash any scatter error in a slot and abort iteration with
+        // a sentinel ScxError, then surface the original LoaderError afterward —
+        // preserving the precise error variant rather than stringifying it.
+        let mut scatter_err: Option<LoaderError> = None;
+        let res = self
+            .backed
+            .read_rows_with(&unique_rows, |orig_pos, idx, data| {
+                for &request in &row_to_requests[orig_pos] {
+                    if let Err(e) =
+                        self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)
+                    {
+                        // Stash the real LoaderError and abort iteration with a
+                        // sentinel ScxError (the closure must return ScxError).
+                        scatter_err = Some(e);
+                        return Err(scx_format_io::ScxError::InconsistentCsr);
+                    }
+                }
+                Ok(())
+            });
+        // Invariant: the closure returns Err ONLY after setting `scatter_err`,
+        // so a Some here is always the original scatter error — check it before
+        // `res` so the precise LoaderError wins over the sentinel.
+        if let Some(e) = scatter_err {
+            return Err(e);
+        }
+        res?;
 
         // PFlog1pPF is applied at scatter time (it needs the full pre-projection
         // row for depth/baseline — see `scatter_pair_request`), so the
@@ -774,6 +786,11 @@ pub struct IterMetrics {
     /// Shards whose prefetch was skipped because a peer leader was already
     /// decoding them in `BackedCsrReader`'s singleflight table.
     pub prefetch_skipped_in_flight: AtomicU64,
+    /// Shards whose prefetch was skipped because the group is **sidecar-eligible**
+    /// (cold + sparse): the dense gather's `read_rows_with` decodes the touched
+    /// rows O(rows) via the scx1 decode sidecar, so warming the whole shard would
+    /// negate the win (the L2 sidecar-aware prefetch skip).
+    pub prefetch_skipped_sidecar: AtomicU64,
 }
 
 /// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
@@ -888,26 +905,36 @@ impl IndexPlanIter {
             return Ok(Vec::new());
         }
 
-        let mut all_rows: Vec<u64> = Vec::with_capacity(plan.len() * 2);
+        // Deduplicate the (pert, ctrl) rows and count unique rows per shard. The
+        // gather (`gather_pairs_dense`) passes the SAME deduped set to
+        // `read_rows_with`, so this per-shard `group_len` matches what the
+        // gather's sidecar decision sees — the prefetch skip and the gather
+        // choice must agree (else the adoption the metric proves diverges).
+        let index = self.loader.backed.index();
+        let mut seen: HashSet<u64> = HashSet::with_capacity(plan.len() * 2);
+        let mut per_shard: HashMap<usize, usize> = HashMap::new();
         for &(p, c) in plan {
-            all_rows.push(p);
-            all_rows.push(c);
+            for row in [p, c] {
+                if seen.insert(row) {
+                    if let Some(sidx) = index.shard_for_row(row) {
+                        *per_shard.entry(sidx).or_insert(0) += 1;
+                    }
+                }
+            }
         }
-        // shards_for_indices internally sorts + dedups, so the returned
-        // shard set has no duplicates we'd waste prefetches on.
-        let shards = self.loader.backed.index().shards_for_indices(&all_rows);
 
-        // Skip shards that are already cached or whose decode is already in
-        // flight via the BackedCsrReader singleflight table. Without this
-        // filter, a window of N plans touching shard S queues up to N
-        // `spawn_blocking` tasks for S — the singleflight short-circuits
-        // the redundant decode but the per-task tokio overhead and the
-        // associated `runtime.block_on` round-trips are still paid in
-        // `await_head`. Filtering here keeps the queue tight.
+        // Warm only shards NOT served by the sidecar. Skips:
+        //  - already cached / in-flight (the singleflight already covers them);
+        //  - **sidecar-eligible** cold sparse groups — leaving them undecoded is
+        //    what lets `read_rows_with` take the O(rows) sidecar path (L2). The
+        //    skip predicate is the shared `sidecar_eligible`, so it can never
+        //    drift from the gather's `use_sidecar`.
+        // Dense/large groups (and sidecar-less shards) still prefetch and warm
+        // the cache as before.
         let handle = self.loader.runtime()?.handle().clone();
-        Ok(shards
+        Ok(per_shard
             .into_iter()
-            .filter(|&sidx| {
+            .filter(|&(sidx, group_len)| {
                 if self.loader.backed.cache_contains(sidx) {
                     self.iter_metrics
                         .prefetch_skipped_cache_hit
@@ -920,9 +947,17 @@ impl IndexPlanIter {
                         .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                if self.loader.scatter_sidecar()
+                    && self.loader.backed.sidecar_eligible(sidx, group_len)
+                {
+                    self.iter_metrics
+                        .prefetch_skipped_sidecar
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
                 true
             })
-            .map(|sidx| {
+            .map(|(sidx, _group_len)| {
                 self.iter_metrics
                     .prefetch_tasks_spawned
                     .fetch_add(1, Ordering::Relaxed);

@@ -1,6 +1,6 @@
 [package]
 name = "scx-accel"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 description = "Rust-native analysis accelerators for SCX (PCA, kNN, etc.)"
 license.workspace = true

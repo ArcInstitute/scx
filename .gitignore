@@ -37,6 +37,8 @@ benchmarks/comprehensive/results/v*soak_*/
 benchmarks/comprehensive/results/v3on2_*/
 benchmarks/comprehensive/results/v*/
 benchmarks/comprehensive/results/opt*/
+benchmarks/comprehensive/results/phase0/
+benchmarks/scripts/phase0_*
 benchmarks/scripts/g4*
 # Benchmark run logs (regenerable SLURM/orchestrator output; keep the scripts)
 benchmarks/scripts/*.log

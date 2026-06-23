@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::ScxReader;
 use scx_loader::{IndexPlanLoader, LoaderConfig};
 
 /// Build a multi-shard `.scx` fixture with one nonzero per row at column
@@ -96,6 +97,107 @@ pub fn write_multi_shard_fixture(
     path.to_path_buf()
 }
 
+/// Build a dense multi-shard `.scx` fixture with strictly-increasing,
+/// collision-free columns (gaps up to 250) written with the given `codec`.
+/// With `CodecId::Scx1` + dense integer rows the writer emits a per-row decode
+/// sidecar per shard (within the 25% overhead budget); with `CodecId::None` it
+/// emits none. Two calls with identical params produce byte-identical logical
+/// data, enabling a sidecar-vs-full-shard parity check. Mirrors
+/// `index_plan.rs::tests::write_dense_scx1_fixture`.
+pub fn write_dense_scx1_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_shards: usize,
+    nnz_per_row: usize,
+    codec: CodecId,
+) -> std::path::PathBuf {
+    assert!(n_obs % n_shards == 0);
+    let rows_per_shard = n_obs / n_shards;
+    let n_vars = nnz_per_row * 251 + 16;
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (n_obs * nnz_per_row) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "cell_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "gene_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((row * 13 + k * 7) % 250) as u32;
+                indices.push(col);
+                values.push(1u8 + ((row + k) % 5) as u8);
+            }
+            indptr.push(*indptr.last().unwrap() + nnz_per_row as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                codec,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Count `DecodeMetadataShard` (per-row scx1 decode sidecar) sections in a file.
+pub fn count_sidecars(path: &std::path::Path) -> usize {
+    ScxReader::open(path)
+        .unwrap()
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::SectionType::DecodeMetadataShard)
+        .count()
+}
+
 /// Build an `IndexPlanLoader` against a fixture with default settings —
 /// no normalization, no log1p, single obs column `"cell_id"`, 4 cache shards,
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous
@@ -106,7 +208,7 @@ pub fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoad
     config.log1p = false;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }
 
 /// Same as `open_loader` but with a fully-saturating normalize+log1p config.
@@ -134,7 +236,7 @@ pub fn open_loader_with_flags(
     config.target_sum = target_sum;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }
 
 /// HVG-projected loader. Validates HVG indices against `n_vars` at
@@ -150,5 +252,5 @@ pub fn open_loader_hvg(
     config.hvg_indices = Some(hvg);
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }

@@ -349,14 +349,16 @@ class TestEffectiveBudget:
 
     def test_tight_budget_reduces_lookahead(self, scx_path):
         # max_plan_size=65536 → lookahead overhead ≈ 1 MB/unit.
-        # batch_buffer = 2 × 65536 × 50 × 4 ≈ 25 MB. py = 50 MB.
-        # At lookahead=8: ≈ 83 MB. Budget 80 forces lookahead reduction.
+        # batch_buffer ≈ 25 MB; py = 50 MB; transient ≈ 8 MB (post-L1 dedup
+        # gather: unique_rows + row_to_requests + row_to_pos, ≈64 B/row).
+        # Floor @ lookahead=1 ≈ 84 MB; full @ lookahead=8 ≈ 91 MB. Budget 88
+        # forces lookahead reduction without floor-failing.
         ds = pyscx.IndexPlanDataset(
             scx_path,
             cache_shards=8,
             lookahead=8,
             max_plan_size=65536,
-            max_memory_mb=80,
+            max_memory_mb=88,
         )
         assert ds.effective_lookahead() < 8
         assert ds.effective_lookahead() >= 1
@@ -368,7 +370,7 @@ class TestEffectiveBudget:
             cache_shards=8,
             lookahead=8,
             max_plan_size=65536,
-            max_memory_mb=80,
+            max_memory_mb=88,
         )
         # No explicit lookahead → uses effective_lookahead().
         it = ds.iter_with_plans(iter([[(0, 1)]]))
@@ -554,6 +556,8 @@ class TestMetrics:
             "bytes_inserted",
             "duplicate_waiters",
             "peak_bytes_in_cache",
+            "sidecar_groups",
+            "full_shard_groups",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -593,6 +597,7 @@ class TestMetrics:
             "prefetch_tasks_spawned",
             "prefetch_skipped_cache_hit",
             "prefetch_skipped_in_flight",
+            "prefetch_skipped_sidecar",
         }
         assert set(m["cache"]) == {
             "hits",
@@ -601,6 +606,8 @@ class TestMetrics:
             "bytes_inserted",
             "duplicate_waiters",
             "peak_bytes_in_cache",
+            "sidecar_groups",
+            "full_shard_groups",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, scx_path):
