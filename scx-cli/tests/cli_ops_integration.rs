@@ -831,6 +831,48 @@ fn test_info_history_fresh_file() {
     assert!(stdout.contains("seq 1"));
 }
 
+#[test]
+fn test_info_history_after_append() {
+    // `append` writes a new catalog whose `prev_catalog_offset` chains to the
+    // original — so `--history` walks the chain via `try_read_catalog_at`,
+    // which the fresh-file test never exercises (its loop never runs). This
+    // covers the exact-size catalog read on a real prior catalog.
+    let dir = tempfile::tempdir().unwrap();
+    let target = write_test_file(&dir, "hist_target.scx", 8, 10);
+    let source = write_test_file(&dir, "hist_source.scx", 6, 10);
+
+    let output = scx_cli()
+        .args(["append", target.to_str().unwrap(), source.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "append failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = scx_cli()
+        .args(["info", target.to_str().unwrap(), "--history"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "info --history failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Manifest history:"));
+    // Both the appended head (seq 2) and the chained prior catalog (seq 1).
+    assert!(
+        stdout.contains("seq 2"),
+        "expected appended manifest seq 2 in history:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("seq 1"),
+        "expected prior manifest seq 1 (walked via try_read_catalog_at):\n{stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Delete --dry-run
 // ---------------------------------------------------------------------------

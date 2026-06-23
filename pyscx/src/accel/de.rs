@@ -180,9 +180,19 @@ fn run_rank_genes_groups_inner(
         .map(|(i, name)| (name.as_str(), i))
         .collect();
 
+    // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
+    // sentinel >= n_groups so the Wilcoxon kernels drop them, instead of
+    // contaminating group 0. Mirrors resolve_groups_and_reference.
+    let oor = unique_groups.len();
     let groups: Vec<usize> = group_labels
         .iter()
-        .map(|label| *group_name_to_idx.get(label.as_str()).unwrap_or(&0))
+        .map(|label| {
+            if label.is_empty() || label == "nan" {
+                oor
+            } else {
+                *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
+            }
+        })
         .collect();
 
     // Resolve reference.
@@ -811,12 +821,39 @@ fn write_de_to_adata(
     n_genes: Option<usize>,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
+    // The builder closures below iterate `result.group_names` (length n_groups)
+    // and index `field_data[i]`, so every outer field vector must have at least
+    // n_groups rows or that indexing panics. Rectangular by construction, but
+    // validate explicitly so a malformed DiffExpResult returns an error instead
+    // of panicking (the `full_n_genes` zip only bounds the *inner* lengths).
     let n_groups = result.group_names.len();
-    let full_n_genes = if n_groups > 0 {
-        result.names[0].len()
-    } else {
-        0
-    };
+    if result.names.len() < n_groups
+        || result.scores.len() < n_groups
+        || result.pvals.len() < n_groups
+        || result.pvals_adj.len() < n_groups
+        || result.logfoldchanges.len() < n_groups
+    {
+        return Err(PyRuntimeError::new_err(
+            "DiffExpResult has fewer per-field rows than groups (malformed result)",
+        ));
+    }
+    // Rank depth = the SHORTEST per-group vector across all emitted fields, not
+    // just group 0's. Groups are rectangular by construction
+    // (`[n_groups][n_genes]`), so this is a no-op on well-formed results, but
+    // clamping to the min keeps the numpy structured array rectangular and every
+    // `[..n_genes]` slice in the builder closures below in-bounds even on a
+    // malformed/degenerate DiffExpResult — avoids a PanicException. The zip also
+    // stops at the shortest outer vec.
+    let full_n_genes = result
+        .names
+        .iter()
+        .zip(&result.scores)
+        .zip(&result.pvals)
+        .zip(&result.pvals_adj)
+        .zip(&result.logfoldchanges)
+        .map(|((((n, s), p), pa), l)| n.len().min(s.len()).min(p.len()).min(pa.len()).min(l.len()))
+        .min()
+        .unwrap_or(0);
     let n_genes = n_genes.unwrap_or(full_n_genes).min(full_n_genes);
 
     let rgg = PyDict::new(py);

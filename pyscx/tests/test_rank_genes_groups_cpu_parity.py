@@ -212,3 +212,73 @@ def test_rank_genes_groups_cpu_tie_order_is_ascending_var_index():
             f"group {g}: tied genes not in ascending var-index order: {tied}"
         )
         assert len(tied) >= 2, f"group {g}: fixture lost its score ties"
+
+
+def test_rank_genes_groups_cpu_drops_unknown_group_labels():
+    """Cells whose groupby label is missing (NaN → "nan" after astype(str))
+    or otherwise outside the category set must be DROPPED from DE, not folded
+    into group 0.
+
+    Regression for the `.unwrap_or(&0)` contamination bug at
+    pyscx/src/accel/de.rs:185 (2026-06-21 review): unknown labels now map to
+    the out-of-range sentinel `unique_groups.len()` so the Wilcoxon kernels
+    skip them, matching `pdex_ref`/`resolve_groups_and_reference`.
+
+    Construction: take the clean 3-group fixture, then append phantom cells
+    with a NaN group label and extreme expression. Under the old code those
+    cells landed in group index 0 and shifted that group's scores/pvals/logFC;
+    with the fix they are dropped, so DE is byte-for-byte identical to the
+    clean run for every group.
+    """
+    base = _make_adata()
+    # Explicit categorical so the injected NaN label is NOT a category — keeps
+    # unique_groups at the 3 real groups (no spurious "nan" group).
+    cats = ["non-targeting", "ko_a", "ko_b"]
+    base.obs["target"] = pd.Categorical(base.obs["target"], categories=cats)
+    base.X = sp.csr_matrix(base.X)
+
+    a_clean = base.copy()
+    pyscx.accel.rank_genes_groups(
+        a_clean, "target", reference=REFERENCE, device="cpu"
+    )
+    clean = _scores_and_pvals_by_gene(a_clean)
+
+    # Phantom cells: missing group label + extreme counts. Under the bug these
+    # contaminate the first group's DE; with the fix they are dropped.
+    n_extra = 30
+    n_vars = base.n_vars
+    extra_counts = np.full((n_extra, n_vars), 1000.0, dtype=np.float32)
+    extra_obs = pd.DataFrame(
+        {"target": pd.Categorical([np.nan] * n_extra, categories=cats)},
+        index=[f"phantom_{i}" for i in range(n_extra)],
+    )
+    extra = ad.AnnData(
+        X=sp.csr_matrix(extra_counts), obs=extra_obs, var=base.var.copy()
+    )
+    contaminated = ad.concat([base.copy(), extra], join="outer")
+    # ad.concat may relax the categorical / densify; pin both back.
+    contaminated.obs["target"] = pd.Categorical(
+        contaminated.obs["target"], categories=cats
+    )
+    contaminated.X = sp.csr_matrix(contaminated.X)
+
+    pyscx.accel.rank_genes_groups(
+        contaminated, "target", reference=REFERENCE, device="cpu"
+    )
+    got = _scores_and_pvals_by_gene(contaminated)
+
+    assert got.keys() == clean.keys(), (
+        "group/gene set changed — phantom NaN-label cells leaked a group or "
+        "altered the gene ranking"
+    )
+    for key in clean:
+        np.testing.assert_allclose(
+            got[key],
+            clean[key],
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=(
+                f"DE for {key} differs after appending NaN-label cells — they "
+                f"were folded into a real group instead of being dropped"
+            ),
+        )

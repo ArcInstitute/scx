@@ -605,61 +605,95 @@ fn collect_history_local(reader: &ScxReader) -> CliResult<Vec<ManifestHistoryEnt
     Ok(rows)
 }
 
-/// Try to read a FullCatalog at the given offset in the mmap.
-/// Probes increasing sizes until the checksum validates.
+/// Read the `FullCatalog` at `offset` in the mmap.
+///
+/// Prior catalogs in the manifest chain don't record their own byte length,
+/// but a catalog is self-delimiting: the header records `n_entries` and each
+/// entry carries `name_len` / `stats_len` prefixes, so the exact serialized
+/// size is computable in one O(n_entries) pass over the length prefixes. We
+/// compute `total_len` that way and hand it to `FullCatalog::read_from` once —
+/// no size probing. The per-entry arithmetic mirrors `FullCatalog::write_to`.
+///
+/// All offsets/lengths are bounds-checked against the mmap, so a corrupt
+/// `prev_catalog_offset` (past EOF) or a garbage `n_entries` / length prefix
+/// returns `Err` rather than panicking or scanning the whole file.
 fn try_read_catalog_at(
     mmap: &[u8],
     offset: usize,
 ) -> Result<FullCatalog, Box<dyn std::error::Error>> {
-    let remaining = mmap.len() - offset;
-    // The catalog has a trailing 32-byte BLAKE3 checksum.
-    // Start with a reasonable guess and grow.
-    let min_size = 64; // minimum catalog: header fields + checksum
-    let max_size = remaining;
+    // Catalog payload header: u16 version + u64 manifest_seq + u64 prev_offset
+    // + u64 n_obs + u32 n_entries = 30 bytes. Trailing 32-byte BLAKE3 checksum.
+    const HEADER_LEN: usize = 2 + 8 + 8 + 8 + 4;
+    const CHECKSUM_LEN: usize = 32;
+    // Smallest serialized entry (v1, empty name, no stats): 2 + 0 + 8 + 8 + 1
+    // + 32 + 2 = 53 bytes. Matches `FullCatalog::read_from`'s alloc guard.
+    const MIN_ENTRY_BYTES: usize = 53;
 
-    // Try the full remaining size first — the catalog read_from validates checksum
-    // so it will fail if we give it too many or too few bytes. But actually,
-    // read_from reads exactly total_len bytes, so we need the exact size.
-    //
-    // Strategy: try sizes from min up to max, stepping by scanning for a valid
-    // BLAKE3 checksum at each candidate size. But this is expensive.
-    //
-    // Better strategy: read the catalog header to determine n_entries, estimate
-    // the size, then try.
-    let slice = &mmap[offset..];
+    // (a) A corrupt `prev_catalog_offset` can point past EOF — `checked_sub`
+    // avoids the underflow/panic.
+    let remaining = mmap
+        .len()
+        .checked_sub(offset)
+        .ok_or("catalog offset points beyond end of file")?;
+    if remaining < HEADER_LEN + CHECKSUM_LEN {
+        return Err("catalog truncated: fewer bytes remain than a minimal catalog".into());
+    }
+    let slice = &mmap[offset..]; // safe: offset <= mmap.len()
 
-    // Read catalog header fields to estimate size
-    let mut cur = Cursor::new(slice);
-    use byteorder::{LittleEndian, ReadBytesExt};
-    let _catalog_version = cur.read_u16::<LittleEndian>()?;
-    let _manifest_sequence = cur.read_u64::<LittleEndian>()?;
-    let _prev_catalog_offset = cur.read_u64::<LittleEndian>()?;
-    let _n_obs = cur.read_u64::<LittleEndian>()?;
-    let n_entries = cur.read_u32::<LittleEndian>()? as usize;
+    let read_u16 = |p: usize| -> Option<usize> {
+        slice
+            .get(p..p + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let catalog_version = read_u16(0).ok_or("catalog header truncated")?;
+    // n_entries is the u32 at byte offset 2+8+8+8 = 26.
+    let n_entries = slice
+        .get(26..30)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .ok_or("catalog header truncated")?;
 
-    // Each entry is approximately: 2 (name_len) + ~20 (name) + 8+8+1+32+2 = ~73 bytes
-    // plus optional stats ~41 bytes. Estimate generously.
-    let header_size = 2 + 8 + 8 + 8 + 4; // 30 bytes
-    let estimated_entry_size = 120; // generous estimate
-    let estimated_size = header_size + n_entries * estimated_entry_size + 32; // +32 for checksum
-
-    // Try sizes from estimated down to min, then up from estimated
-    for delta in 0..max_size {
-        for candidate in [
-            estimated_size.wrapping_add(delta),
-            estimated_size.wrapping_sub(delta),
-        ] {
-            if candidate < min_size || candidate > max_size {
-                continue;
-            }
-            let try_slice = &mmap[offset..offset + candidate];
-            if let Ok(fc) = FullCatalog::read_from(&mut Cursor::new(try_slice), candidate, true) {
-                return Ok(fc);
-            }
-        }
+    // (b) Guard against a garbage `n_entries` driving a long walk — the
+    // entries can't fit if even their minimum size exceeds the remaining bytes.
+    if n_entries.saturating_mul(MIN_ENTRY_BYTES) > remaining {
+        return Err("catalog entry count exceeds remaining bytes (corrupt offset)".into());
     }
 
-    Err("could not read previous catalog: no valid checksum found".into())
+    // Bytes between an entry's name and its stats-length prefix: offset(8) +
+    // length(8) + section_type(1) + checksum(32) + modality_id(1, v2+ only).
+    let entry_mid = 8 + 8 + 1 + 32 + if catalog_version >= 2 { 1 } else { 0 };
+
+    // Walk the length prefixes to find the exact end of the entry block,
+    // bounds-checking every step against `remaining`.
+    let mut pos = HEADER_LEN;
+    for _ in 0..n_entries {
+        let name_len = read_u16(pos).ok_or("catalog entry name length truncated")?;
+        // Advance past name_len(2) + name + entry_mid to the stats-length prefix.
+        let stats_len_pos = pos
+            .checked_add(2 + name_len + entry_mid)
+            .filter(|&p| p + 2 <= remaining)
+            .ok_or("catalog entry truncated")?;
+        let stats_len = read_u16(stats_len_pos).ok_or("catalog entry stats length truncated")?;
+        pos = stats_len_pos
+            .checked_add(2 + stats_len)
+            .filter(|&p| p <= remaining)
+            .ok_or("catalog entry stats truncated")?;
+    }
+
+    // v4 trailing generation counters (two u64), present only when declared v4.
+    if catalog_version >= 4 {
+        pos = pos
+            .checked_add(16)
+            .filter(|&p| p <= remaining)
+            .ok_or("catalog v4 trailer truncated")?;
+    }
+
+    let total_len = pos
+        .checked_add(CHECKSUM_LEN)
+        .filter(|&p| p <= remaining)
+        .ok_or("catalog checksum truncated")?;
+
+    let mut cur = Cursor::new(&mmap[offset..offset + total_len]);
+    Ok(FullCatalog::read_from(&mut cur, total_len, true)?)
 }
 
 /// Format a Unix timestamp for display.
@@ -906,5 +940,20 @@ mod tests {
         writer.finish().unwrap();
         let reader = ScxReader::open(&path).unwrap();
         assert_eq!(summarize_csr_codec(&reader).unwrap(), "n/a");
+    }
+
+    #[test]
+    fn try_read_catalog_at_rejects_out_of_bounds_offset() {
+        // A corrupt `prev_catalog_offset` pointing at/past EOF must return Err,
+        // not underflow `mmap.len() - offset` or panic on `&mmap[offset..]`.
+        let dir = tempfile::tempdir().unwrap();
+        let reader = ScxReader::open(write_test_file(&dir, 6, 5)).unwrap();
+        let len = reader.mmap().len();
+
+        // offset == len: zero remaining → "too short" error, no panic.
+        assert!(try_read_catalog_at(reader.mmap(), len).is_err());
+        // offset > len: would underflow the old `mmap.len() - offset`.
+        assert!(try_read_catalog_at(reader.mmap(), len + 1).is_err());
+        assert!(try_read_catalog_at(reader.mmap(), usize::MAX).is_err());
     }
 }

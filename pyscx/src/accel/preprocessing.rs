@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::backed::ScxBackedSparseDataset;
+use crate::backed::{detached, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::projected_agg;
 
@@ -170,15 +170,17 @@ pub fn normalize_total(
         // Without col_projection, this sums all columns (same as before).
         // Must be in physical-row space because transforms are applied
         // per-shard before deletion vector filtering.
-        let all_row_sums = if let Some(cols) = backed_ref.col_projection() {
-            projected_agg::row_sums_projected(&backed_ref.backed, cols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        } else {
-            backed_ref
-                .backed
-                .row_sums()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        };
+        // Heavy row-sum scan runs off the GIL (`detached`); rebind to a plain
+        // `&Self` (Send) so the closure captures `b`, not the `!Send` PyRef.
+        let b: &ScxBackedSparseDataset = &backed_ref;
+        let all_row_sums = detached(py, || {
+            if let Some(cols) = b.col_projection() {
+                projected_agg::row_sums_projected(&b.backed, cols).map_err(|e| e.to_string())
+            } else {
+                b.backed.row_sums().map_err(|e| e.to_string())
+            }
+        })
+        .map_err(PyRuntimeError::new_err)?;
 
         let non_negative = backed_ref.non_negative;
         let lazy = ScxLazyTransformedDataset::new(
@@ -216,7 +218,13 @@ pub fn normalize_total(
         // then project_csr restricts to projected genes before summing.
         // Returns a global-length vector (n_obs_global), which is what
         // apply_transforms_to_csr expects (indexes by global row).
-        let sums = lazy_ref.streaming_row_sums_projected()?;
+        // Heavy streaming scan runs off the GIL (`detached`); rebind to a plain
+        // `&Self` (Send) so the closure captures `l`, not the `!Send` PyRefMut.
+        // `l`'s immutable borrow ends before the mutable `transforms.push` below.
+        let sums = {
+            let l: &ScxLazyTransformedDataset = &lazy_ref;
+            detached(py, || l.streaming_row_sums_projected()).map_err(PyRuntimeError::new_err)?
+        };
         lazy_ref.transforms.push(Transform::NormalizeTotal {
             row_sums: Arc::new(sums),
             target_sum,
@@ -470,31 +478,32 @@ pub fn calculate_qc_metrics<'py>(
     // aggregations stay CSR regardless of prefer_format — CSC offers
     // no win for row sums (would require gathering per-shard column
     // contributions back into a row index).
+    // Heavy row-axis scans run off the GIL (`detached`); rebind to a plain
+    // `&Self` (Send) so the closure captures the ref, not the `!Send` PyRef.
     let (total_counts, n_genes): (Vec<f64>, Vec<i64>) = if is_backed {
         let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-        let row_sums = backed
-            .backed
-            .row_sums()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let row_nnz = backed
-            .backed
-            .row_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        (
-            backed.filter_row_results(&row_sums),
-            backed.filter_row_results(&row_nnz),
-        )
+        let b: &ScxBackedSparseDataset = &backed;
+        detached(py, || {
+            let row_sums = b.backed.row_sums().map_err(|e| e.to_string())?;
+            let row_nnz = b.backed.row_nnz().map_err(|e| e.to_string())?;
+            Ok::<_, String>((
+                b.filter_row_results(&row_sums),
+                b.filter_row_results(&row_nnz),
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let row_sums = lazy.streaming_row_sums()?;
-        let row_nnz = lazy
-            .backed
-            .row_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        (
-            lazy.filter_row_results(&row_sums),
-            lazy.filter_row_results(&row_nnz),
-        )
+        let l: &ScxLazyTransformedDataset = &lazy;
+        detached(py, || {
+            let row_sums = l.streaming_row_sums()?;
+            let row_nnz = l.backed.row_nnz().map_err(|e| e.to_string())?;
+            Ok::<_, String>((
+                l.filter_row_results(&row_sums),
+                l.filter_row_results(&row_nnz),
+            ))
+        })
+        .map_err(PyRuntimeError::new_err)?
     };
 
     // Compute per-gene total_counts and n_cells_by_counts.
@@ -503,50 +512,47 @@ pub fn calculate_qc_metrics<'py>(
         compute_gene_axis_csc(&x)?
     } else if is_backed {
         let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-        let col_sums = match &backed.kept_to_global {
-            Some(kept) => backed
-                .backed
-                .col_sums_masked(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            None => backed
-                .backed
-                .col_sums()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        };
-        let col_nnz = match &backed.kept_to_global {
-            Some(kept) => backed
-                .backed
-                .col_nnz_masked(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                .iter()
-                .map(|&v| v as u32)
-                .collect(),
-            None => backed
-                .backed
-                .col_nnz()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        };
-        (col_sums, col_nnz)
+        let b: &ScxBackedSparseDataset = &backed;
+        detached(py, || {
+            let col_sums = match &b.kept_to_global {
+                Some(kept) => b.backed.col_sums_masked(kept).map_err(|e| e.to_string())?,
+                None => b.backed.col_sums().map_err(|e| e.to_string())?,
+            };
+            let col_nnz: Vec<u32> = match &b.kept_to_global {
+                Some(kept) => b
+                    .backed
+                    .col_nnz_masked(kept)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect(),
+                None => b.backed.col_nnz().map_err(|e| e.to_string())?,
+            };
+            Ok::<_, String>((col_sums, col_nnz))
+        })
+        .map_err(PyRuntimeError::new_err)?
     } else {
         let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let col_sums = if lazy.kept_to_global.is_some() {
-            lazy.streaming_col_sums_masked()?
-        } else {
-            lazy.streaming_col_sums()?
-        };
-        let col_nnz = if let Some(ref kept) = lazy.kept_to_global {
-            lazy.backed
-                .col_nnz_masked(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                .iter()
-                .map(|&v| v as u32)
-                .collect()
-        } else {
-            lazy.backed
-                .col_nnz()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-        };
-        (col_sums, col_nnz)
+        let l: &ScxLazyTransformedDataset = &lazy;
+        detached(py, || {
+            let col_sums = if l.kept_to_global.is_some() {
+                l.streaming_col_sums_masked()
+            } else {
+                l.streaming_col_sums()
+            }?;
+            let col_nnz: Vec<u32> = if let Some(ref kept) = l.kept_to_global {
+                l.backed
+                    .col_nnz_masked(kept)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect()
+            } else {
+                l.backed.col_nnz().map_err(|e| e.to_string())?
+            };
+            Ok::<_, String>((col_sums, col_nnz))
+        })
+        .map_err(PyRuntimeError::new_err)?
     };
 
     // Build obs DataFrame
@@ -608,20 +614,29 @@ pub fn calculate_qc_metrics<'py>(
             continue;
         }
 
-        // Streaming projected row sums for the gene subset
+        // Streaming projected row sums for the gene subset — heavy scan off the
+        // GIL (`detached`); rebind to a plain `&Self` (Send), capture `col_indices`.
         let subset_sums = if is_backed {
             let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-            let all_sums = projected_agg::row_sums_projected(&backed.backed, &col_indices)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            backed.filter_row_results(&all_sums)
+            let b: &ScxBackedSparseDataset = &backed;
+            detached(py, || {
+                let all_sums = projected_agg::row_sums_projected(&b.backed, &col_indices)
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(b.filter_row_results(&all_sums))
+            })
+            .map_err(PyRuntimeError::new_err)?
         } else {
             let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+            let l: &ScxLazyTransformedDataset = &lazy;
             // For lazy data, streaming through transforms with projection
             // is not yet supported. Fall back to the raw (pre-transform) sums
             // since QC metrics are typically computed before normalization.
-            let all_sums = projected_agg::row_sums_projected(&lazy.backed, &col_indices)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            lazy.filter_row_results(&all_sums)
+            detached(py, || {
+                let all_sums = projected_agg::row_sums_projected(&l.backed, &col_indices)
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(l.filter_row_results(&all_sums))
+            })
+            .map_err(PyRuntimeError::new_err)?
         };
 
         // pct_counts = subset_sum / total * 100

@@ -886,7 +886,7 @@ pub fn mean_correct_gpu(
     n_obs: usize,
     k: usize,
 ) -> Result<(), GpuError> {
-    let total = n_obs * k;
+    let total: u64 = (n_obs as u64) * (k as u64);
     if total == 0 {
         return Ok(());
     }
@@ -896,13 +896,19 @@ pub fn mean_correct_gpu(
         .load_function("mean_correct_kernel")
         .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_kernel: {e}")))?;
 
-    let n_obs_i32 = n_obs as i32;
-    let k_i32 = k as i32;
+    let n_obs_i64 = n_obs as i64;
+    let k_i64 = k as i64;
 
     let threads: u32 = 256;
-    let blocks = (total as u32).div_ceil(threads);
+    let blocks_u64 = total.div_ceil(threads as u64);
+    if blocks_u64 > i32::MAX as u64 {
+        return Err(GpuError::ShapeMismatch {
+            expected: "n_obs*k / 256 < 2^31 (CUDA grid_dim.x cap)".into(),
+            got: format!("blocks = {blocks_u64}"),
+        });
+    }
     let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
+        grid_dim: (blocks_u64 as u32, 1, 1),
         block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -912,8 +918,8 @@ pub fn mean_correct_gpu(
             .launch_builder(&func)
             .arg(y)
             .arg(mc)
-            .arg(&n_obs_i32)
-            .arg(&k_i32)
+            .arg(&n_obs_i64)
+            .arg(&k_i64)
             .launch(cfg)
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("mean_correct_kernel: {e}")))?;

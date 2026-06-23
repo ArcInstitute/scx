@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::accel::preprocessing::clear_gpu_normalize_marker;
-use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
+use crate::backed::{detached, ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::ScxLazyTransformedDataset;
 use crate::projected_agg;
 
@@ -14,29 +14,27 @@ use crate::projected_agg;
 // ---------------------------------------------------------------------------
 
 /// Helper: compute row NNZ for a backed dataset (respecting col_projection + deletions).
-fn backed_row_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<i64>> {
+///
+/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
+/// `detached` with the GIL released.
+fn backed_row_nnz(backed: &ScxBackedSparseDataset) -> Result<Vec<i64>, String> {
     let all_nnz = if let Some(cols) = backed.col_projection() {
-        projected_agg::row_nnz_projected(&backed.backed, cols)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        projected_agg::row_nnz_projected(&backed.backed, cols).map_err(|e| e.to_string())?
     } else {
-        backed
-            .backed
-            .row_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        backed.backed.row_nnz().map_err(|e| e.to_string())?
     };
     Ok(backed.filter_row_results(&all_nnz))
 }
 
 /// Helper: compute row sums for a backed dataset (respecting col_projection + deletions).
-fn backed_row_sums(backed: &ScxBackedSparseDataset) -> PyResult<Vec<f64>> {
+///
+/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
+/// `detached` with the GIL released.
+fn backed_row_sums(backed: &ScxBackedSparseDataset) -> Result<Vec<f64>, String> {
     let all_sums = if let Some(cols) = backed.col_projection() {
-        projected_agg::row_sums_projected(&backed.backed, cols)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        projected_agg::row_sums_projected(&backed.backed, cols).map_err(|e| e.to_string())?
     } else {
-        backed
-            .backed
-            .row_sums()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        backed.backed.row_sums().map_err(|e| e.to_string())?
     };
     Ok(backed.filter_row_results(&all_sums))
 }
@@ -44,16 +42,19 @@ fn backed_row_sums(backed: &ScxBackedSparseDataset) -> PyResult<Vec<f64>> {
 /// Helper: compute row NNZ and sums in a single shard scan (fused).
 ///
 /// Avoids the double I/O of `backed_row_nnz()` + `backed_row_sums()` when
-/// `filter_cells` needs both `min_genes` and `min_counts`.
-fn backed_row_nnz_and_sums(backed: &ScxBackedSparseDataset) -> PyResult<(Vec<i64>, Vec<f64>)> {
+/// `filter_cells` needs both `min_genes` and `min_counts`. Pure-Rust
+/// (`Result<_, String>`, no `PyErr`) so callers can run it through `detached`.
+fn backed_row_nnz_and_sums(
+    backed: &ScxBackedSparseDataset,
+) -> Result<(Vec<i64>, Vec<f64>), String> {
     let (all_nnz, all_sums) = if let Some(cols) = backed.col_projection() {
         projected_agg::row_nnz_and_sums_projected(&backed.backed, cols)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .map_err(|e| e.to_string())?
     } else {
         backed
             .backed
             .row_nnz_and_sums()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            .map_err(|e| e.to_string())?
     };
     Ok((
         backed.filter_row_results(&all_nnz),
@@ -62,25 +63,26 @@ fn backed_row_nnz_and_sums(backed: &ScxBackedSparseDataset) -> PyResult<(Vec<i64
 }
 
 /// Helper: compute col NNZ for a backed dataset (4-way dispatch).
-fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<u32>> {
+///
+/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
+/// `detached` with the GIL released.
+fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> Result<Vec<u32>, String> {
     let counts = match (backed.col_projection(), &backed.kept_to_global) {
         (Some(cols), Some(kept)) => {
             projected_agg::col_nnz_masked_projected(&backed.backed, kept, cols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .map_err(|e| e.to_string())?
         }
-        (Some(cols), None) => projected_agg::col_nnz_projected(&backed.backed, cols)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        (Some(cols), None) => {
+            projected_agg::col_nnz_projected(&backed.backed, cols).map_err(|e| e.to_string())?
+        }
         (None, Some(kept)) => {
             let f_counts = backed
                 .backed
                 .col_nnz_masked(kept)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(|e| e.to_string())?;
             f_counts.iter().map(|&v| v as u32).collect()
         }
-        (None, None) => backed
-            .backed
-            .col_nnz()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        (None, None) => backed.backed.col_nnz().map_err(|e| e.to_string())?,
     };
     // Reorder into presentation order so the keep-mask aligns with the
     // (presentation-ordered) var rows. No-op without preserve_var_order.
@@ -88,22 +90,23 @@ fn backed_col_nnz(backed: &ScxBackedSparseDataset) -> PyResult<Vec<u32>> {
 }
 
 /// Helper: compute col sums for a backed dataset (4-way dispatch).
-fn backed_col_sums(backed: &ScxBackedSparseDataset) -> PyResult<Vec<f64>> {
+///
+/// Pure-Rust (`Result<_, String>`, no `PyErr`) so callers can run it through
+/// `detached` with the GIL released.
+fn backed_col_sums(backed: &ScxBackedSparseDataset) -> Result<Vec<f64>, String> {
     let sums = match (backed.col_projection(), &backed.kept_to_global) {
         (Some(cols), Some(kept)) => {
             projected_agg::col_sums_masked_projected(&backed.backed, kept, cols)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                .map_err(|e| e.to_string())?
         }
-        (Some(cols), None) => projected_agg::col_sums_projected(&backed.backed, cols)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        (Some(cols), None) => {
+            projected_agg::col_sums_projected(&backed.backed, cols).map_err(|e| e.to_string())?
+        }
         (None, Some(kept)) => backed
             .backed
             .col_sums_masked(kept)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        (None, None) => backed
-            .backed
-            .col_sums()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            .map_err(|e| e.to_string())?,
+        (None, None) => backed.backed.col_sums().map_err(|e| e.to_string())?,
     };
     // Reorder into presentation order so the keep-mask aligns with the
     // (presentation-ordered) var rows. No-op without preserve_var_order.
@@ -334,23 +337,31 @@ pub fn filter_cells(
     // Case 1: X is ScxBackedSparseDataset
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let n_obs = backed.borrow().shape_val.0;
-        // Fused: compute both NNZ and sums in a single shard scan when both are needed
-        let (row_nnz, row_sums) = if need_nnz && need_sums {
-            let (nnz, sums) = backed_row_nnz_and_sums(&backed.borrow())?;
-            (Some(nnz), Some(sums))
-        } else {
-            (
-                if need_nnz {
-                    Some(backed_row_nnz(&backed.borrow())?)
-                } else {
-                    None
-                },
-                if need_sums {
-                    Some(backed_row_sums(&backed.borrow())?)
-                } else {
-                    None
-                },
-            )
+        // Heavy shard scan runs off the GIL (`detached`). Rebind the dataset to a
+        // plain `&Self` (Send) — the closure captures `b`, not the `!Send` PyRef.
+        // The borrow is scoped to this block so it drops before `borrow_mut` below.
+        let (row_nnz, row_sums) = {
+            let bref = backed.borrow();
+            let b: &ScxBackedSparseDataset = &bref;
+            // Fused: compute both NNZ and sums in a single shard scan when both are needed
+            if need_nnz && need_sums {
+                let (nnz, sums) =
+                    detached(py, || backed_row_nnz_and_sums(b)).map_err(PyRuntimeError::new_err)?;
+                (Some(nnz), Some(sums))
+            } else {
+                (
+                    if need_nnz {
+                        Some(detached(py, || backed_row_nnz(b)).map_err(PyRuntimeError::new_err)?)
+                    } else {
+                        None
+                    },
+                    if need_sums {
+                        Some(detached(py, || backed_row_sums(b)).map_err(PyRuntimeError::new_err)?)
+                    } else {
+                        None
+                    },
+                )
+            }
         };
 
         let keep = build_keep_mask(
@@ -386,25 +397,39 @@ pub fn filter_cells(
         // Fused: when both NNZ and sums are needed, compute them in a single
         // shard scan. NNZ is transform-invariant but we compute it from the
         // same decoded shard to avoid double I/O.
+        // Heavy shard scan + transforms run off the GIL (`detached`); rebind to a
+        // plain `&Self` (Send) so the closure captures `l`, not the `!Send` PyRef.
+        let l: &ScxLazyTransformedDataset = &lazy_ref;
         let (row_nnz, row_sums) = if need_nnz && need_sums {
-            let (all_nnz, all_sums) = lazy_ref.streaming_row_nnz_and_sums()?;
-            (
-                Some(lazy_ref.filter_row_results(&all_nnz)),
-                Some(lazy_ref.filter_row_results(&all_sums)),
-            )
+            let (nnz, sums) = detached(py, || {
+                let (all_nnz, all_sums) = l.streaming_row_nnz_and_sums()?;
+                Ok::<_, String>((
+                    l.filter_row_results(&all_nnz),
+                    l.filter_row_results(&all_sums),
+                ))
+            })
+            .map_err(PyRuntimeError::new_err)?;
+            (Some(nnz), Some(sums))
         } else {
             let nnz = if need_nnz {
-                let all_nnz = lazy_ref
-                    .backed
-                    .row_nnz()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                Some(lazy_ref.filter_row_results(&all_nnz))
+                Some(
+                    detached(py, || {
+                        let all_nnz = l.backed.row_nnz().map_err(|e| e.to_string())?;
+                        Ok::<_, String>(l.filter_row_results(&all_nnz))
+                    })
+                    .map_err(PyRuntimeError::new_err)?,
+                )
             } else {
                 None
             };
             let sums = if need_sums {
-                let all_sums = lazy_ref.streaming_row_sums()?;
-                Some(lazy_ref.filter_row_results(&all_sums))
+                Some(
+                    detached(py, || {
+                        let all_sums = l.streaming_row_sums()?;
+                        Ok::<_, String>(l.filter_row_results(&all_sums))
+                    })
+                    .map_err(PyRuntimeError::new_err)?,
+                )
             } else {
                 None
             };
@@ -500,20 +525,29 @@ pub fn filter_genes(
     // Case 1: X is ScxBackedSparseDataset
     if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
         let n_vars = backed.borrow().shape_val.1;
-        let col_nnz: Option<Vec<i64>> = if need_nnz {
-            Some(
-                backed_col_nnz(&backed.borrow())?
-                    .iter()
-                    .map(|&v| v as i64)
-                    .collect(),
-            )
-        } else {
-            None
-        };
-        let col_sums = if need_sums {
-            Some(backed_col_sums(&backed.borrow())?)
-        } else {
-            None
+        // Heavy col scan runs off the GIL (`detached`). Rebind to a plain `&Self`
+        // (Send) so the closure captures `b`, not the `!Send` PyRef; the borrow is
+        // scoped to this block so it drops before the `borrow_mut` calls below.
+        let (col_nnz, col_sums): (Option<Vec<i64>>, Option<Vec<f64>>) = {
+            let bref = backed.borrow();
+            let b: &ScxBackedSparseDataset = &bref;
+            let col_nnz = if need_nnz {
+                Some(
+                    detached(py, || backed_col_nnz(b))
+                        .map_err(PyRuntimeError::new_err)?
+                        .iter()
+                        .map(|&v| v as i64)
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            let col_sums = if need_sums {
+                Some(detached(py, || backed_col_sums(b)).map_err(PyRuntimeError::new_err)?)
+            } else {
+                None
+            };
+            (col_nnz, col_sums)
         };
 
         let keep = build_keep_mask(
@@ -575,28 +609,29 @@ pub fn filter_genes(
         let lazy_ref = lazy.borrow();
         let n_vars = lazy_ref.shape_val.1;
 
+        // Heavy col scans run off the GIL (`detached`); rebind to a plain `&Self`
+        // (Send) so the closures capture `l`, not the `!Send` PyRef. `l`'s borrow
+        // ends before the direct `lazy_ref` use / `drop(lazy_ref)` below.
+        let l: &ScxLazyTransformedDataset = &lazy_ref;
         // For lazy datasets, NNZ is transform-invariant: use underlying backed reader
         // with the lazy dataset's col_projection and kept_to_global
         let col_nnz: Option<Vec<i64>> = if need_nnz {
-            let counts: Vec<u32> = match (lazy_ref.col_projection(), &lazy_ref.kept_to_global) {
+            let counts: Vec<u32> = detached(py, || match (l.col_projection(), &l.kept_to_global) {
                 (Some(cols), Some(kept)) => {
-                    projected_agg::col_nnz_masked_projected(&lazy_ref.backed, kept, cols)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+                    projected_agg::col_nnz_masked_projected(&l.backed, kept, cols)
+                        .map_err(|e| e.to_string())
                 }
-                (Some(cols), None) => projected_agg::col_nnz_projected(&lazy_ref.backed, cols)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-                (None, Some(kept)) => {
-                    let f_counts = lazy_ref
-                        .backed
-                        .col_nnz_masked(kept)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    f_counts.iter().map(|&v| v as u32).collect()
+                (Some(cols), None) => {
+                    projected_agg::col_nnz_projected(&l.backed, cols).map_err(|e| e.to_string())
                 }
-                (None, None) => lazy_ref
+                (None, Some(kept)) => l
                     .backed
-                    .col_nnz()
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-            };
+                    .col_nnz_masked(kept)
+                    .map(|f| f.iter().map(|&v| v as u32).collect())
+                    .map_err(|e| e.to_string()),
+                (None, None) => l.backed.col_nnz().map_err(|e| e.to_string()),
+            })
+            .map_err(PyRuntimeError::new_err)?;
             Some(counts.iter().map(|&v| v as i64).collect())
         } else {
             None
@@ -606,11 +641,14 @@ pub fn filter_genes(
         // streaming_col_sums returns full-width (all original columns).
         // When col_projection is active, extract only projected columns.
         let col_sums = if need_sums {
-            let full_sums = if lazy_ref.kept_to_global.is_some() {
-                lazy_ref.streaming_col_sums_masked()?
-            } else {
-                lazy_ref.streaming_col_sums()?
-            };
+            let full_sums = detached(py, || {
+                if l.kept_to_global.is_some() {
+                    l.streaming_col_sums_masked()
+                } else {
+                    l.streaming_col_sums()
+                }
+            })
+            .map_err(PyRuntimeError::new_err)?;
             if let Some(cols) = lazy_ref.col_projection() {
                 Some(
                     cols.iter()

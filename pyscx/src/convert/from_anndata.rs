@@ -886,14 +886,52 @@ pub fn from_anndata_impl(
             let hi = boundary.row_end;
             let nnz_lo = boundary.nnz_start;
             let nnz_hi = boundary.nnz_end;
-            let mut local_indptr: Vec<u64> = indptr_slice[lo..=hi]
-                .iter()
-                .map(|&v| (v - boundary.indptr_base) as u64)
-                .collect();
-            let mut local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
-                .iter()
-                .map(|&v| v as u32)
-                .collect();
+            // Rebase indptr to shard-local. Mirror `parallel_encode_csr_shards`'s
+            // guard: on non-canonical input, `v < base` would make `(v - base)`
+            // go negative and wrap to a huge u64, corrupting the bitmap. (The
+            // upstream encode call already rejects such shards, so this is
+            // defense-in-depth.)
+            let mut local_indptr: Vec<u64> = if csr_validated {
+                indptr_slice[lo..=hi]
+                    .iter()
+                    .map(|&v| (v - boundary.indptr_base) as u64)
+                    .collect()
+            } else {
+                indptr_slice[lo..=hi]
+                    .iter()
+                    .map(|&v| {
+                        if v < boundary.indptr_base {
+                            Err(PyRuntimeError::new_err(format!(
+                                "indptr value {v} < base {} (non-monotonic)",
+                                boundary.indptr_base
+                            )))
+                        } else {
+                            Ok((v - boundary.indptr_base) as u64)
+                        }
+                    })
+                    .collect::<PyResult<Vec<u64>>>()?
+            };
+            // Mirror `parallel_encode_csr_shards`'s index guard: on non-canonical
+            // input a negative `i32` index would wrap via `as u32` to a huge
+            // column, silently corrupting the bitmap. (Defense-in-depth — the
+            // upstream encode call already rejects such shards.)
+            let mut local_indices: Vec<u32> = if csr_validated {
+                indices_slice[nnz_lo..nnz_hi]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect()
+            } else {
+                indices_slice[nnz_lo..nnz_hi]
+                    .iter()
+                    .map(|&v| {
+                        if v < 0 {
+                            Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
+                        } else {
+                            Ok(v as u32)
+                        }
+                    })
+                    .collect::<PyResult<Vec<u32>>>()?
+            };
             let mut local_data = data_slice[nnz_lo..nnz_hi].to_vec();
             canonicalize_csr(&mut local_indptr, &mut local_indices, &mut local_data);
             let n_rows = (hi - lo) as u32;
