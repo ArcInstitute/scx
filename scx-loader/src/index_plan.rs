@@ -70,7 +70,6 @@ enum PairSide {
 
 #[derive(Clone, Copy, Debug)]
 struct PairRequest {
-    row: u64,
     pair_idx: usize,
     side: PairSide,
 }
@@ -284,16 +283,25 @@ impl IndexPlanLoader {
             .saturating_mul(n_output_cols)
             .saturating_mul(4);
         const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
-                                            // `gather_pairs_dense` request scratch holds 2 × max_plan_size
-                                            // `PairRequest`s. Use `size_of` so this term tracks struct churn
-                                            // automatically instead of drifting against a hand-derived constant.
-        const PAIR_REQUEST_BYTES: usize = std::mem::size_of::<PairRequest>();
-        // `extract_obs_columns` allocates one `Vec` per configured obs
-        // column per side (pert + ctrl). `ObsColumn` variants store `i64`
-        // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
-        // the per-batch label dictionary is shared, not per-cell, and
-        // intentionally excluded from this term). `8` is the worst-case
-        // per-cell width across the supported variants.
+                                            // `gather_pairs_dense` deduplicates the 2 × max_plan_size (pert+ctrl)
+                                            // rows into `unique_rows: Vec<u64>`, a `row_to_requests:
+                                            // Vec<Vec<PairRequest>>` fan-out map, and a `row_to_pos:
+                                            // HashMap<u64, usize>`. Worst case (all rows distinct) holds
+                                            // 2 × max_plan_size entries across these structures. Use `size_of`
+                                            // for each so the term tracks struct churn automatically instead of
+                                            // drifting against a hand-derived constant. (HashMap load-factor
+                                            // slack is ignored — it's a small, transient term dominated by the
+                                            // shard cache and dense batch buffers.)
+        const GATHER_SCRATCH_BYTES_PER_ROW: usize = std::mem::size_of::<u64>()           // unique_rows entry
+            + std::mem::size_of::<Vec<PairRequest>>()                          // row_to_requests outer Vec header
+            + std::mem::size_of::<PairRequest>()                               // one PairRequest (inner, all-distinct)
+            + std::mem::size_of::<(u64, usize)>(); // row_to_pos entry
+                                                   // `extract_obs_columns` allocates one `Vec` per configured obs
+                                                   // column per side (pert + ctrl). `ObsColumn` variants store `i64`
+                                                   // (8 B), `f64` (8 B), or `Categorical(Vec<u32>, …)` (4 B/cell —
+                                                   // the per-batch label dictionary is shared, not per-cell, and
+                                                   // intentionally excluded from this term). `8` is the worst-case
+                                                   // per-cell width across the supported variants.
         const OBS_CELL_BYTES: usize = 8;
 
         let transient_bytes = {
@@ -303,7 +311,7 @@ impl IndexPlanLoader {
                 .saturating_mul(OBS_CELL_BYTES);
             let request_bytes = 2usize
                 .saturating_mul(max_plan_size)
-                .saturating_mul(PAIR_REQUEST_BYTES);
+                .saturating_mul(GATHER_SCRATCH_BYTES_PER_ROW);
             obs_bytes.saturating_add(request_bytes)
         };
 
@@ -594,75 +602,55 @@ impl IndexPlanLoader {
         let mut x_paired = vec![0f32; n_pairs * n_cols];
         let mut pert_indices = Vec::with_capacity(n_pairs);
         let mut ctrl_indices = Vec::with_capacity(n_pairs);
-        let mut requests = Vec::with_capacity(n_pairs * 2);
 
+        // Deduplicate the (pert, ctrl) rows into a single set of distinct rows
+        // plus a fan-out map (unique-row → every PairRequest referencing it).
+        // The gather then runs through `BackedCsrReader::read_rows_with`, which
+        // sorts internally and — per shard — decodes either O(rows) via the
+        // scx1 decode sidecar (cold, sparse-per-shard groups) or the full shard
+        // (cached / dense / no sidecar). Output is byte-identical to the old
+        // full-shard-decode-and-slice path because each PairRequest still
+        // carries its `pair_idx` and writes the same output slot; only the
+        // decode strategy changes. See STATE-TX-SIDECAR.md (L1).
+        let mut row_to_pos: HashMap<u64, usize> = HashMap::with_capacity(n_pairs * 2);
+        let mut unique_rows: Vec<u64> = Vec::with_capacity(n_pairs * 2);
+        let mut row_to_requests: Vec<Vec<PairRequest>> = Vec::with_capacity(n_pairs * 2);
         for (pair_idx, &(pert, ctrl)) in plan.iter().enumerate() {
             pert_indices.push(pert);
             ctrl_indices.push(ctrl);
-            requests.push(PairRequest {
-                row: pert,
-                pair_idx,
-                side: PairSide::Perturbed,
-            });
-            requests.push(PairRequest {
-                row: ctrl,
-                pair_idx,
-                side: PairSide::Control,
-            });
-        }
-
-        requests.sort_by_key(|r| r.row);
-
-        let mut start = 0;
-        while start < requests.len() {
-            let row = requests[start].row;
-            let shard_idx = self.backed.index().shard_for_row(row).ok_or_else(|| {
-                scx_format_io::ScxError::Io(std::io::Error::other(format!(
-                    "row index {row} is not covered by any shard (n_obs={})",
-                    self.n_obs()
-                )))
-            })?;
-            let (s_start, s_end) = self.backed.index().shard_range(shard_idx).ok_or(
-                scx_format_io::ScxError::ShardIndexOutOfBounds {
-                    index: shard_idx,
-                    count: self.backed.index().n_shards(),
-                },
-            )?;
-
-            let end = start + requests[start..].partition_point(|r| r.row < s_end);
-            let shard = self.backed.read_shard_cached_arc(shard_idx)?;
-
-            let mut row_start = start;
-            while row_start < end {
-                let row = requests[row_start].row;
-                let row_end =
-                    row_start + requests[row_start..end].partition_point(|r| r.row == row);
-                let local = (row - s_start) as usize;
-                let lo = *shard
-                    .indptr
-                    .get(local)
-                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
-                    as usize;
-                let hi = *shard
-                    .indptr
-                    .get(local + 1)
-                    .ok_or(scx_format_io::ScxError::InconsistentCsr)?
-                    as usize;
-                if hi < lo || hi > shard.indices.len() || hi > shard.data.len() {
-                    return Err(scx_format_io::ScxError::InconsistentCsr.into());
-                }
-                let idx = &shard.indices[lo..hi];
-                let data = &shard.data[lo..hi];
-
-                for &request in &requests[row_start..row_end] {
-                    self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)?;
-                }
-
-                row_start = row_end;
+            for (row, side) in [(pert, PairSide::Perturbed), (ctrl, PairSide::Control)] {
+                let pos = *row_to_pos.entry(row).or_insert_with(|| {
+                    unique_rows.push(row);
+                    row_to_requests.push(Vec::new());
+                    unique_rows.len() - 1
+                });
+                row_to_requests[pos].push(PairRequest { pair_idx, side });
             }
-
-            start = end;
         }
+
+        // `scatter_pair_request` returns the loader's `Result` (LoaderError),
+        // but `read_rows_with`'s closure must return `scx_format_io::Result`
+        // (ScxError). Stash any scatter error in a slot and abort iteration with
+        // a sentinel ScxError, then surface the original LoaderError afterward —
+        // preserving the precise error variant rather than stringifying it.
+        let mut scatter_err: Option<LoaderError> = None;
+        let res = self
+            .backed
+            .read_rows_with(&unique_rows, |orig_pos, idx, data| {
+                for &request in &row_to_requests[orig_pos] {
+                    if let Err(e) =
+                        self.scatter_pair_request(request, idx, data, n_cols, &mut x, &mut x_paired)
+                    {
+                        scatter_err = Some(e);
+                        return Err(scx_format_io::ScxError::InconsistentCsr);
+                    }
+                }
+                Ok(())
+            });
+        if let Some(e) = scatter_err {
+            return Err(e);
+        }
+        res?;
 
         // PFlog1pPF is applied at scatter time (it needs the full pre-projection
         // row for depth/baseline — see `scatter_pair_request`), so the

@@ -579,6 +579,180 @@ fn write_dense_fixture(
     path.to_path_buf()
 }
 
+/// Build a dense multi-shard `.scx` fixture with **strictly increasing,
+/// collision-free** columns per row (mirrors the proven
+/// `scx-format-io backed_tests::write_sidecar_scx1_file` recipe), written with
+/// the given `codec`. With `CodecId::Scx1` + dense integer rows the writer
+/// emits a per-row decode sidecar per shard (within the 25% overhead budget);
+/// with `CodecId::None` it emits none. Two calls with identical params produce
+/// byte-identical logical data, enabling a sidecar-vs-full-shard parity check.
+fn write_dense_scx1_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_shards: usize,
+    nnz_per_row: usize,
+    codec: CodecId,
+) -> std::path::PathBuf {
+    assert!(n_obs % n_shards == 0);
+    let rows_per_shard = n_obs / n_shards;
+    // Strictly increasing cols with gaps up to 250 (like the proven
+    // backed_tests recipe) → max col < nnz_per_row * 251. Large-ish deltas keep
+    // the Scx1-encoded shard from compressing so far that the per-row sidecar
+    // exceeds the 25% overhead budget and gets skipped.
+    let n_vars = nnz_per_row * 251 + 16;
+    let total_nnz = (n_obs * nnz_per_row) as u64;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        total_nnz,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let obs = arrow::record_batch::RecordBatch::try_new(
+        StdArc::new(obs_schema),
+        vec![StdArc::new(StringArray::from(
+            cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+
+    let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let var = arrow::record_batch::RecordBatch::try_new(
+        StdArc::new(var_schema),
+        vec![StdArc::new(StringArray::from(
+            gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    writer.write_var(&var).unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((row * 13 + k * 7) % 250) as u32; // strictly increasing
+                indices.push(col);
+                values.push(1u8 + ((row + k) % 5) as u8); // nonzero 1..=5
+            }
+            indptr.push(*indptr.last().unwrap() + nnz_per_row as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                codec,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// Count `DecodeMetadataShard` (per-row scx1 decode sidecar) sections in a file.
+fn count_sidecars(path: &std::path::Path) -> usize {
+    let reader = ScxReader::open(path).unwrap();
+    reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::SectionType::DecodeMetadataShard)
+        .count()
+}
+
+/// L1 (STATE-TX-SIDECAR.md): a cache-cold, sparse-per-shard plan gathered
+/// through `gather_pairs_dense` must reach the O(rows) scx1 **decode sidecar**
+/// (`read_rows_with` → `scatter_group_via_sidecar`), bumping
+/// `CacheMetrics.sidecar_groups`. And the sidecar gather must be **byte-identical**
+/// to a full-shard-decode gather of the same logical data (a `CodecId::None`
+/// copy, which carries no sidecar so always takes the full-shard path).
+#[test]
+fn gather_pairs_dense_reaches_sidecar_and_matches_full_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    // Dense integer rows keep the per-row sidecar overhead well under the 25%
+    // budget, so every Scx1 shard carries a sidecar. 8 shards × 32 rows = 256.
+    let scx1 = write_dense_scx1_fixture(&dir.path().join("scx1.scx"), 256, 8, 256, CodecId::Scx1);
+    let none = write_dense_scx1_fixture(&dir.path().join("none.scx"), 256, 8, 256, CodecId::None);
+    assert_eq!(
+        count_sidecars(&scx1),
+        8,
+        "every Scx1 shard must carry a decode sidecar (else the test is vacuous)"
+    );
+    assert_eq!(count_sidecars(&none), 0, "CodecId::None carries no sidecar");
+
+    // Sparse-per-shard plan: a few scattered rows across distinct shards so
+    // `group_len * 4 < shard_rows (32)` holds → sidecar-eligible. Include a
+    // reused control row and a `pert == ctrl` pair to exercise the fan-out map.
+    let plan: Vec<(u64, u64)> = vec![(3, 200), (40, 200), (70, 12), (130, 130), (250, 5)];
+
+    // Fresh (cache-cold) loaders, no prefetch on the synchronous `process_plan`
+    // path. Construct inline: the sidecar-friendly fixture has a wide var axis
+    // (large deltas keep the sidecar under budget), so use a small max_plan_size
+    // + generous memory budget to keep the dense batch buffer in range.
+    let mk = |p: &std::path::Path| {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        config.max_memory_mb = 4096;
+        IndexPlanLoader::new(
+            p, config, /*cache_shards*/ 8, /*sort_by_shard*/ false, /*lookahead*/ 0,
+            /*max_plan_size*/ 256,
+        )
+        .unwrap()
+    };
+    let scx1_loader = mk(&scx1);
+    let none_loader = mk(&none);
+
+    let scx1_batch = scx1_loader.process_plan(plan.clone()).unwrap();
+    let none_batch = none_loader.process_plan(plan.clone()).unwrap();
+
+    let m = scx1_loader.cache_metrics();
+    assert!(
+        m.sidecar_groups.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "cold sparse gather on the Scx1 fixture must reach the sidecar path \
+         (sidecar_groups > 0); got {}",
+        m.sidecar_groups.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    let m_none = none_loader.cache_metrics();
+    assert_eq!(
+        m_none
+            .sidecar_groups
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "sidecar-less fixture must take the full-shard path only"
+    );
+
+    // Byte-identical output: sidecar decode vs full-shard decode of the same data.
+    assert_eq!(scx1_batch.pairs, none_batch.pairs);
+    let p_bits = |b: &[f32]| b.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        p_bits(&scx1_batch.x),
+        p_bits(&none_batch.x),
+        "perturbed-side gather must be byte-identical across sidecar/full-shard"
+    );
+    assert_eq!(
+        p_bits(&scx1_batch.x_paired),
+        p_bits(&none_batch.x_paired),
+        "control-side gather must be byte-identical across sidecar/full-shard"
+    );
+}
+
 /// Generous memory budget — both effective values match the requested.
 #[test]
 fn budget_generous_no_autotune() {
@@ -604,15 +778,16 @@ fn budget_tight_reduces_lookahead_first() {
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 256, 8, 4);
 
     let mut config = LoaderConfig::default();
-    // Budget components at requested settings (post-issue-#6 model):
+    // Budget components at requested settings (post-L1-dedup-gather model):
     //   python       = 50 MB
     //   batch buffer = 2 × 65536 × 8 × 4         ≈ 4 MB
     //   lookahead    = 8 × 65536 × 16            ≈ 8 MB
-    //   transient    = 2 × 65536 × 24 (no obs)   ≈ 3 MB  (PairRequest)
+    //   transient    = 2 × 65536 × 64 (no obs)   ≈ 8 MB  (dedup scratch:
+    //                  unique_rows + row_to_requests + row_to_pos, per-row)
     //   shard cache  = ~negligible (sparse fixture)
-    // Total ≈ 65 MB. Floor at lookahead=1: 50+4+1+3 ≈ 58 MB.
-    // A 60 MB budget forces lookahead reduction without floor-failure.
-    config.max_memory_mb = 60;
+    // Total ≈ 70 MB. Floor at lookahead=1: 50+4+1+8 ≈ 63 MB.
+    // A 66 MB budget forces lookahead reduction without floor-failure.
+    config.max_memory_mb = 66;
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 8,
         /*max_plan_size*/ 65536,

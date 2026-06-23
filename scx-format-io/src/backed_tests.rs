@@ -306,6 +306,61 @@ fn read_rows_with_sidecar_matches_full_decode() {
     }
 }
 
+/// Phase 0 adoption counter: `read_rows_with` must bump
+/// `CacheMetrics::sidecar_groups` for sparse cold groups it serves via the
+/// sidecar, and `CacheMetrics::full_shard_groups` for groups it serves via a
+/// full-shard decode. `sidecar_adoption_rate = sidecar / (sidecar + full)` is
+/// the primary success signal for the IndexPlan sidecar gather work (the
+/// wall-clock-invisible §6.2 trap). NOTE: the `SCX_SCATTER_SIDECAR=0` arm is
+/// not asserted here — `scatter_sidecar_enabled()` caches the env via
+/// `OnceLock`, so it cannot be toggled within one test process.
+#[test]
+fn read_rows_with_bumps_sidecar_adoption_counters() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let rows_per_shard = 32usize;
+    let (path, _indptr, _indices, _values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
+
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) {
+        backed
+            .read_rows_with(rows, |_i, _idx, _data| Ok(()))
+            .unwrap();
+    }
+
+    // Sparse cold group across both shards (≤4 rows/shard << shard_rows/4 = 8)
+    // ⇒ both shard groups take the sidecar path.
+    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m = backed.enable_metrics();
+    gather(&backed, &[2u64, 5, 6, 40, 41]);
+    assert_eq!(
+        m.sidecar_groups.load(Ordering::Relaxed),
+        2,
+        "both sparse cold shard groups must be served via the sidecar",
+    );
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        0,
+        "no full-shard decode for a sparse cold gather",
+    );
+
+    // Dense group (≥8 rows/shard ⇒ k*4 ≥ shard_rows) ⇒ both shard groups take
+    // the full-shard fallback. Fresh reader keeps the counters clean.
+    let mut backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m2 = backed2.enable_metrics();
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    gather(&backed2, &dense_rows);
+    assert_eq!(
+        m2.sidecar_groups.load(Ordering::Relaxed),
+        0,
+        "dense group must not take the sidecar path",
+    );
+    assert_eq!(
+        m2.full_shard_groups.load(Ordering::Relaxed),
+        2,
+        "both dense shard groups must be served via full-shard decode",
+    );
+}
+
 /// Lever S: the per-shard Scx1 sidecar metadata is
 /// parsed once and reused across batches. Repeatedly gathering sparse groups
 /// from the same shard takes the sidecar path each time (so the rows are still

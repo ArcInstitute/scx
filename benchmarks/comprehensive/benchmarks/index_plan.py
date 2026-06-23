@@ -168,6 +168,18 @@ class _ScenarioOutcome:
     # expose `memory_budget()`.
     memory_budget_total_mb: float | None = None
     estimate_overshoot_mb: float | None = None
+    # Sidecar adoption: count of `read_rows_with` shard request-groups served
+    # by the O(rows) scx1 decode sidecar vs. full-shard decode (cumulative,
+    # loader-level, sampled from `IndexPlanDataset.cache_metrics()` after the
+    # run). `sidecar_adoption_rate = sidecar_groups / (sidecar_groups +
+    # full_shard_groups)` is the primary success signal for the sidecar work —
+    # wall-clock cannot distinguish "sidecar reached" from "prefetch warmed the
+    # shard first". `None` for non-IndexPlan scenarios that have no cache
+    # metrics. NOTE: until the gather is routed through `read_rows_with`
+    # (Phase 1), IndexPlan scenarios report 0 sidecar groups — the intended
+    # pre-fix baseline.
+    sidecar_groups: int | None = None
+    full_shard_groups: int | None = None
 
 
 def _run_index_plan(
@@ -209,6 +221,16 @@ def _run_index_plan(
         seen += 1
         cells += 2 * batch["X"].shape[0]
     wall = time.perf_counter() - t0
+    # Sample loader-level cache metrics (cumulative across the run). The
+    # `sidecar_groups` / `full_shard_groups` keys were added alongside the
+    # sidecar gather work; tolerate older pyscx that lacks them.
+    try:
+        cm = ds.cache_metrics()
+        sidecar_groups = int(cm.get("sidecar_groups", 0))
+        full_shard_groups = int(cm.get("full_shard_groups", 0))
+    except Exception:
+        sidecar_groups = None
+        full_shard_groups = None
     peak_rss_after = _peak_rss_mb()
     peak_rss = max(rss0, peak_rss_after)
     # Scenario-local ru_maxrss growth — eliminates cross-scenario
@@ -224,6 +246,8 @@ def _run_index_plan(
         peak_rss_mb=peak_rss,
         memory_budget_total_mb=round(budget_total_mb, 1),
         estimate_overshoot_mb=round(peak_rss_growth - budget_total_mb, 1),
+        sidecar_groups=sidecar_groups,
+        full_shard_groups=full_shard_groups,
     )
 
 
@@ -645,6 +669,19 @@ def run(
             bps = outcome.n_batches / wall if wall > 0 else 0.0
             cps = outcome.n_cells / wall if wall > 0 else 0.0
 
+            # Sidecar adoption rate = fraction of `read_rows_with` shard
+            # request-groups served by the O(rows) decode sidecar vs.
+            # full-shard decode. `None` for scenarios with no cache metrics
+            # (manual baselines) and when no groups were observed. This is the
+            # primary success signal for the sidecar gather work — see §6.2 of
+            # STATE-TX-SIDECAR.md (L1 alone shows no wall-clock change).
+            sc = outcome.sidecar_groups
+            fs = outcome.full_shard_groups
+            if sc is None or fs is None or (sc + fs) == 0:
+                adoption_rate = None
+            else:
+                adoption_rate = round(sc / (sc + fs), 4)
+
             run_extra: dict[str, Any] = {
                 "scenario": scenario_name,
                 "n_batches": outcome.n_batches,
@@ -658,6 +695,13 @@ def run(
                 # counter. Slot is preserved so the gate's threshold key
                 # remains stable when the counter lands.
                 f"shard_cache_hit_rate__{scenario_name}": None,
+                # Sidecar adoption — primary success signal for the sidecar
+                # gather work. `None` for manual baselines / no observed
+                # groups; 0.0 until the gather is routed through
+                # `read_rows_with` (Phase 1). Raw counts kept for debugging.
+                f"sidecar_adoption_rate__{scenario_name}": adoption_rate,
+                f"sidecar_groups__{scenario_name}": outcome.sidecar_groups,
+                f"full_shard_groups__{scenario_name}": outcome.full_shard_groups,
                 # Estimator validation: `None` for scenarios that don't
                 # go through `IndexPlanDataset` (no `memory_budget()`
                 # accessor on the manual baselines).

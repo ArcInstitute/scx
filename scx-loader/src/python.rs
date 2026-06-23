@@ -1171,6 +1171,11 @@ fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<B
         "peak_bytes_in_cache",
         m.peak_bytes_in_cache.load(Ordering::Relaxed),
     )?;
+    dict.set_item("sidecar_groups", m.sidecar_groups.load(Ordering::Relaxed))?;
+    dict.set_item(
+        "full_shard_groups",
+        m.full_shard_groups.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

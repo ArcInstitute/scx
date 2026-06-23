@@ -389,6 +389,17 @@ pub struct CacheMetrics {
     /// every successful `put_with_budget`. Lets callers see whether the
     /// byte cap was actually exercised, vs. just configured generously.
     pub peak_bytes_in_cache: AtomicU64,
+    /// `read_rows_with` shard request-groups served by the O(rows) scx1 decode
+    /// sidecar (sparse, cache-cold groups). Together with `full_shard_groups`
+    /// this gives the **sidecar adoption rate** — the primary signal that the
+    /// scattered gather is actually reaching the sidecar rather than being
+    /// negated by full-shard decode / eager prefetch warms.
+    pub sidecar_groups: AtomicU64,
+    /// `read_rows_with` shard request-groups served by a full-shard decode.
+    /// Covers both the planned `!use_sidecar` case (cached/dense group) and the
+    /// `use_sidecar` group that fell back because the shard carried no fresh
+    /// sidecar (e.g. CSC / non-Scx1 / over-budget / pre-0.9.1 fixture).
+    pub full_shard_groups: AtomicU64,
 }
 
 /// Per-shard rendezvous slot used by the singleflight in
@@ -1411,6 +1422,14 @@ impl BackedCsrReader {
             } else {
                 false
             };
+
+            if let Some(m) = self.metrics() {
+                if handled {
+                    m.sidecar_groups.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    m.full_shard_groups.fetch_add(1, Ordering::Relaxed);
+                }
+            }
 
             if !handled {
                 // Full-shard fallback: decode once (cached), slice each row.
