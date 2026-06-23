@@ -106,7 +106,7 @@ pub fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoad
     config.log1p = false;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }
 
 /// Same as `open_loader` but with a fully-saturating normalize+log1p config.
@@ -134,7 +134,7 @@ pub fn open_loader_with_flags(
     config.target_sum = target_sum;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }
 
 /// HVG-projected loader. Validates HVG indices against `n_vars` at
@@ -150,5 +150,5 @@ pub fn open_loader_hvg(
     config.hvg_indices = Some(hvg);
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
 }

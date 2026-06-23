@@ -96,6 +96,7 @@ fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoader {
         sort_by_shard,
         /*lookahead*/ 4,
         /*max_plan_size*/ 16384,
+        /*scatter_sidecar*/ true,
     )
     .unwrap()
 }
@@ -117,6 +118,7 @@ fn open_loader_hvg(
         sort_by_shard,
         /*lookahead*/ 4,
         /*max_plan_size*/ 16384,
+        /*scatter_sidecar*/ true,
     )
     .unwrap()
 }
@@ -354,7 +356,7 @@ fn open_loader_arc(path: &std::path::Path) -> Arc<IndexPlanLoader> {
     Arc::new(
         IndexPlanLoader::new(
             path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true,
-            /*lookahead*/ 4, /*max_plan_size*/ 16384,
+            /*lookahead*/ 4, /*max_plan_size*/ 16384, /*scatter_sidecar*/ true,
         )
         .unwrap(),
     )
@@ -445,7 +447,7 @@ fn iter_with_plans_lookahead_four_still_reaches_sidecar() {
         Arc::new(
             IndexPlanLoader::new(
                 &scx1, config, /*cache_shards*/ 8, /*sort_by_shard*/ false,
-                /*lookahead*/ 4, /*max_plan_size*/ 256,
+                /*lookahead*/ 4, /*max_plan_size*/ 256, /*scatter_sidecar*/ true,
             )
             .unwrap(),
         )
@@ -476,6 +478,83 @@ fn iter_with_plans_lookahead_four_still_reaches_sidecar() {
     assert_eq!(zero.len(), four.len());
     for (a, b) in zero.iter().zip(four.iter()) {
         assert_eq!(a.pairs, b.pairs, "pair order must match lookahead 0 vs 4");
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.x_paired, b.x_paired);
+    }
+}
+
+/// Phase 3 escape hatch (STATE-TX-SIDECAR.md §4.1): `scatter_sidecar=false`
+/// disables the L2 prefetch-skip, so at `lookahead=4` the prefetch warms the
+/// cold shards and the gather takes the full-shard path (legacy) —
+/// `sidecar_groups == 0`, `full_shard_groups > 0`. Output must stay
+/// byte-identical to the `scatter_sidecar=true` run (L1 is unconditional; only
+/// the decode strategy differs).
+#[test]
+fn scatter_sidecar_false_disables_l2_prefetch_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx1 = write_dense_scx1_fixture(&dir.path().join("scx1.scx"), 256, 8, 256, CodecId::Scx1);
+    assert_eq!(count_sidecars(&scx1), 8, "fixture must carry sidecars");
+
+    let plans = vec![
+        vec![(3u64, 200u64), (40, 12), (70, 5)],
+        vec![(130, 5), (250, 200), (12, 3)],
+    ];
+
+    let mk = |scatter_sidecar: bool| {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        config.max_memory_mb = 4096;
+        Arc::new(
+            IndexPlanLoader::new(
+                &scx1,
+                config,
+                /*cache_shards*/ 8,
+                /*sort_by_shard*/ false,
+                /*lookahead*/ 4,
+                /*max_plan_size*/ 256,
+                scatter_sidecar,
+            )
+            .unwrap(),
+        )
+    };
+    let loader_on = mk(true);
+    let loader_off = mk(false);
+    let on: Vec<_> = Arc::clone(&loader_on)
+        .iter_with_plans(into_plan_iter(plans.clone()), 4)
+        .map(|r| r.unwrap())
+        .collect();
+    let off: Vec<_> = Arc::clone(&loader_off)
+        .iter_with_plans(into_plan_iter(plans.clone()), 4)
+        .map(|r| r.unwrap())
+        .collect();
+
+    use std::sync::atomic::Ordering;
+    let m_off = loader_off.cache_metrics();
+    assert_eq!(
+        m_off.sidecar_groups.load(Ordering::Relaxed),
+        0,
+        "scatter_sidecar=false must NOT reach the sidecar at lookahead=4 (legacy prefetch warms)"
+    );
+    assert!(
+        m_off.full_shard_groups.load(Ordering::Relaxed) > 0,
+        "scatter_sidecar=false must serve groups via full-shard decode"
+    );
+    // And scatter_sidecar=true still adopts the sidecar (Phase 2 behaviour).
+    assert!(
+        loader_on
+            .cache_metrics()
+            .sidecar_groups
+            .load(Ordering::Relaxed)
+            > 0,
+        "scatter_sidecar=true must reach the sidecar at lookahead=4"
+    );
+
+    // Byte-identical output regardless of the knob.
+    assert_eq!(on.len(), off.len());
+    for (a, b) in on.iter().zip(off.iter()) {
+        assert_eq!(a.pairs, b.pairs);
         assert_eq!(a.x, b.x);
         assert_eq!(a.x_paired, b.x_paired);
     }
@@ -776,7 +855,7 @@ fn gather_pairs_dense_reaches_sidecar_and_matches_full_decode() {
         config.max_memory_mb = 4096;
         IndexPlanLoader::new(
             p, config, /*cache_shards*/ 8, /*sort_by_shard*/ false, /*lookahead*/ 0,
-            /*max_plan_size*/ 256,
+            /*max_plan_size*/ 256, /*scatter_sidecar*/ true,
         )
         .unwrap()
     };
@@ -826,7 +905,7 @@ fn budget_generous_no_autotune() {
     config.max_memory_mb = 4096; // way over budget needed for this tiny file
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 4,
-        /*max_plan_size*/ 1024,
+        /*max_plan_size*/ 1024, /*scatter_sidecar*/ true,
     )
     .unwrap();
     assert_eq!(loader.effective_cache_shards(), 8);
@@ -854,7 +933,7 @@ fn budget_tight_reduces_lookahead_first() {
     config.max_memory_mb = 66;
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 8, /*sort_by_shard*/ true, /*lookahead*/ 8,
-        /*max_plan_size*/ 65536,
+        /*max_plan_size*/ 65536, /*scatter_sidecar*/ true,
     )
     .unwrap();
     assert!(
@@ -898,7 +977,7 @@ fn budget_very_tight_reduces_cache_shards() {
     config.max_memory_mb = 96;
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 16, /*sort_by_shard*/ true, /*lookahead*/ 4,
-        /*max_plan_size*/ 1024,
+        /*max_plan_size*/ 1024, /*scatter_sidecar*/ true,
     )
     .unwrap();
     assert_eq!(
@@ -929,7 +1008,7 @@ fn budget_below_floor_refuses_construction() {
     config.max_memory_mb = 40; // below the 50 MB python overhead alone
     let result = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true, /*lookahead*/ 2,
-        /*max_plan_size*/ 4096,
+        /*max_plan_size*/ 4096, /*scatter_sidecar*/ true,
     );
     let err = match result {
         Ok(_) => panic!("expected ConfigError, got Ok"),
@@ -960,7 +1039,7 @@ fn budget_lookahead_zero_honored_when_fits() {
     config.max_memory_mb = 256;
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ true, /*lookahead*/ 0,
-        /*max_plan_size*/ 1024,
+        /*max_plan_size*/ 1024, /*scatter_sidecar*/ true,
     )
     .unwrap();
     assert_eq!(loader.effective_lookahead(), 0);
@@ -980,7 +1059,7 @@ fn process_plan_rejects_oversize_plan() {
 
     let loader = IndexPlanLoader::new(
         &path, config, /*cache_shards*/ 4, /*sort_by_shard*/ false, /*lookahead*/ 1,
-        /*max_plan_size*/ 4,
+        /*max_plan_size*/ 4, /*scatter_sidecar*/ true,
     )
     .unwrap();
 

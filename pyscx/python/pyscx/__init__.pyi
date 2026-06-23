@@ -76,6 +76,7 @@ class IndexPlanDataset:
         lookahead: int | None = None,
         max_plan_size: int | None = None,
         max_memory_mb: int | None = None,
+        scatter_sidecar: bool | None = None,
     ) -> None: ...
 
     @property

@@ -141,6 +141,13 @@ pub struct IndexPlanLoader {
     /// construction. Surfaced through `IndexPlanDataset.memory_budget()` for
     /// production sizing.
     budget_breakdown: BudgetBreakdown,
+    /// Per-dataset escape hatch gating the **L2 sidecar-aware prefetch skip**
+    /// only (default `true`). When `false`, the prefetch warms cold shards as
+    /// before, so the gather falls back to full-shard decode — legacy
+    /// behaviour. L1 (`gather_pairs_dense` → `read_rows_with`) is unconditional;
+    /// the process-wide `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar
+    /// at the reader layer entirely. See STATE-TX-SIDECAR.md §4.1.
+    scatter_sidecar: bool,
 }
 
 impl IndexPlanLoader {
@@ -177,6 +184,7 @@ impl IndexPlanLoader {
         sort_by_shard: bool,
         lookahead: usize,
         max_plan_size: usize,
+        scatter_sidecar: bool,
     ) -> Result<Self> {
         if cache_shards < 1 {
             return Err(LoaderError::ConfigError {
@@ -395,6 +403,7 @@ impl IndexPlanLoader {
             max_plan_size,
             cache_metrics,
             budget_breakdown,
+            scatter_sidecar,
         })
     }
 
@@ -466,6 +475,13 @@ impl IndexPlanLoader {
     /// `iter_with_plans` when the caller passes `lookahead=None`.
     pub fn effective_lookahead(&self) -> usize {
         self.effective_lookahead
+    }
+
+    /// Whether the L2 sidecar-aware prefetch skip is enabled for this dataset
+    /// (default `true`). Gates only the prefetch skip in `IndexPlanIter`; L1 is
+    /// unconditional. See [`Self::scatter_sidecar`] field docs.
+    pub fn scatter_sidecar(&self) -> bool {
+        self.scatter_sidecar
     }
 
     /// Per-component memory breakdown produced by the auto-tune at
@@ -923,7 +939,9 @@ impl IndexPlanIter {
                         .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
-                if self.loader.backed.sidecar_eligible(sidx, group_len) {
+                if self.loader.scatter_sidecar()
+                    && self.loader.backed.sidecar_eligible(sidx, group_len)
+                {
                     self.iter_metrics
                         .prefetch_skipped_sidecar
                         .fetch_add(1, Ordering::Relaxed);
