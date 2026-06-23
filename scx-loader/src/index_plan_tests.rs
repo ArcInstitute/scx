@@ -1,3 +1,17 @@
+// STATE-TX-SIDECAR.md Phase 4 — sidecar correctness checklist → owning tests:
+//   T4.1 sidecar↔full-shard parity (cold) ......... gather_pairs_dense_reaches_sidecar_and_matches_full_decode
+//   T4.1 SCX_SCATTER_SIDECAR=0 kill-switch ........ tests/sidecar_kill_switch.rs (separate process; env is OnceLock-cached)
+//   T4.2 pair-dedup + plan-order (reused ctrl, pert==ctrl)
+//        ......................................... gather_pairs_dense_reaches_sidecar_and_matches_full_decode
+//                                                  + fused_paired_gather_preserves_duplicate_rows_and_same_row_pairs
+//   T4.3 HVG through the sidecar .................. gather_pairs_dense_hvg_sidecar_matches_full_decode
+//   T4.3 PFlog1pPF through the sidecar ............ gather_pairs_dense_pflog1ppf_sidecar_matches_full_decode
+//   T4.4 prefetch-skip adoption (hard gate) ....... iter_with_plans_lookahead_four_still_reaches_sidecar
+//                                                  + plan_engine_tests::engine_lookahead_four_still_reaches_sidecar
+//   T4.5 sidecar-less fallback .................... the CodecId::None twin arm asserted in every cross-codec test
+//        (read_rows_with is CSR-only; a CodecId::None CSR shard is the sidecar-less fallback — no CSC path to gather)
+//   §4.1 scatter_sidecar=false escape hatch ....... scatter_sidecar_false_disables_l2_prefetch_skip
+
 use super::*;
 
 use std::sync::Arc as StdArc;
@@ -894,6 +908,92 @@ fn gather_pairs_dense_reaches_sidecar_and_matches_full_decode() {
         p_bits(&none_batch.x_paired),
         "control-side gather must be byte-identical across sidecar/full-shard"
     );
+}
+
+/// Shared T4.3 driver: gather the same cache-cold sparse plan through the Scx1
+/// sidecar fixture and an identical `CodecId::None` twin, with `configure`
+/// applied to both loaders' configs, then assert the output is byte-identical
+/// AND that the Scx1 side actually exercised the sidecar (so the parity is not
+/// vacuous). Lets the HVG and PFlog1pPF cases share one harness.
+fn assert_sidecar_matches_full_decode(configure: impl Fn(&mut LoaderConfig)) {
+    let dir = tempfile::tempdir().unwrap();
+    let scx1 = write_dense_scx1_fixture(&dir.path().join("scx1.scx"), 256, 8, 256, CodecId::Scx1);
+    let none = write_dense_scx1_fixture(&dir.path().join("none.scx"), 256, 8, 256, CodecId::None);
+    assert_eq!(count_sidecars(&scx1), 8, "fixture must carry sidecars");
+    assert_eq!(count_sidecars(&none), 0, "None twin carries no sidecar");
+
+    // Sparse-per-shard plan (≤3 unique rows / 32-row shard → sidecar-eligible),
+    // with a reused control row and a `pert == ctrl` pair.
+    let plan: Vec<(u64, u64)> = vec![(3, 200), (40, 200), (70, 12), (130, 130), (250, 5)];
+
+    let mk = |p: &std::path::Path| {
+        let mut config = LoaderConfig::default();
+        config.normalize = false;
+        config.log1p = false;
+        config.obs_columns = vec!["cell_id".to_string()];
+        config.max_memory_mb = 4096;
+        configure(&mut config);
+        IndexPlanLoader::new(
+            p, config, /*cache_shards*/ 8, /*sort_by_shard*/ false, /*lookahead*/ 0,
+            /*max_plan_size*/ 256, /*scatter_sidecar*/ true,
+        )
+        .unwrap()
+    };
+    let scx1_loader = mk(&scx1);
+    let none_loader = mk(&none);
+    let sb = scx1_loader.process_plan(plan.clone()).unwrap();
+    let nb = none_loader.process_plan(plan.clone()).unwrap();
+
+    use std::sync::atomic::Ordering;
+    assert!(
+        scx1_loader
+            .cache_metrics()
+            .sidecar_groups
+            .load(Ordering::Relaxed)
+            > 0,
+        "Scx1 cold gather must reach the sidecar path (else parity is vacuous)"
+    );
+    assert_eq!(
+        none_loader
+            .cache_metrics()
+            .sidecar_groups
+            .load(Ordering::Relaxed),
+        0,
+        "None twin must take the full-shard path only"
+    );
+
+    assert_eq!(sb.pairs, nb.pairs);
+    let bits = |b: &[f32]| b.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&sb.x),
+        bits(&nb.x),
+        "perturbed-side must be byte-identical sidecar vs full-shard"
+    );
+    assert_eq!(
+        bits(&sb.x_paired),
+        bits(&nb.x_paired),
+        "control-side must be byte-identical sidecar vs full-shard"
+    );
+}
+
+/// T4.3: HVG projection through the sidecar path is byte-identical to full-shard.
+#[test]
+fn gather_pairs_dense_hvg_sidecar_matches_full_decode() {
+    assert_sidecar_matches_full_decode(|c| {
+        // Sorted indices within the fixture's wide var axis (nnz*251+16).
+        c.hvg_indices = Some(vec![10, 5000, 12345, 30000, 60000]);
+    });
+}
+
+/// T4.3: PFlog1pPF through the sidecar path is byte-identical to full-shard. The
+/// sidecar returns full-width rows, so depth/baseline (computed over the whole
+/// transcriptome) match the full-shard decode exactly.
+#[test]
+fn gather_pairs_dense_pflog1ppf_sidecar_matches_full_decode() {
+    assert_sidecar_matches_full_decode(|c| {
+        c.pflog1ppf = true;
+        c.pflog1ppf_c = 1.0;
+    });
 }
 
 /// Generous memory budget — both effective values match the requested.
