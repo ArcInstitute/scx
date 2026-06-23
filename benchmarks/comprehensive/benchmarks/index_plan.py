@@ -180,6 +180,15 @@ class _ScenarioOutcome:
     # pre-fix baseline.
     sidecar_groups: int | None = None
     full_shard_groups: int | None = None
+    # Consumer-observed per-batch latency (ms): the wall time between successive
+    # batches yielded by `iter_with_plans` (prefetch-overlapped). The sidecar
+    # (L1+L2) trades an async full-shard warm for a synchronous O(rows) sidecar
+    # decode on the gather thread (§6.4), so per-batch latency — not just
+    # aggregate throughput — is the metric that catches a borderline-dense
+    # regression. `None` for non-IndexPlan scenarios.
+    gather_latency_ms_mean: float | None = None
+    gather_latency_ms_p50: float | None = None
+    gather_latency_ms_p99: float | None = None
 
 
 def _run_index_plan(
@@ -193,6 +202,7 @@ def _run_index_plan(
     lookahead: int,
     cache_shards: int,
     max_plan_size: int,
+    scatter_sidecar: bool = True,
 ) -> _ScenarioOutcome:
     import pyscx
 
@@ -208,6 +218,7 @@ def _run_index_plan(
         lookahead=lookahead,
         max_plan_size=max_plan_size,
         max_memory_mb=8192,
+        scatter_sidecar=scatter_sidecar,
     )
     # Snapshot the estimator's per-component breakdown right after ctor so
     # the auto-tune output (post-reduction) drives the overshoot delta.
@@ -217,7 +228,12 @@ def _run_index_plan(
     t0 = time.perf_counter()
     seen = 0
     cells = 0
+    per_batch_s: list[float] = []
+    prev = t0
     for batch in ds.iter_with_plans(plans_factory(), lookahead=lookahead):
+        now = time.perf_counter()
+        per_batch_s.append(now - prev)
+        prev = now
         seen += 1
         cells += 2 * batch["X"].shape[0]
     wall = time.perf_counter() - t0
@@ -239,6 +255,16 @@ def _run_index_plan(
     # 0 for scenarios that don't push past a prior peak; that's a weaker
     # but honest signal vs. inheriting an unrelated scenario's high-water.
     peak_rss_growth = max(0.0, peak_rss_after - rss0)
+    # Per-batch gather latency (ms). Drop the first interval — it includes the
+    # initial prefetch fill / lazy tokio-runtime spin-up, not steady-state gather.
+    steady = per_batch_s[1:] if len(per_batch_s) > 1 else per_batch_s
+    if steady:
+        ms = sorted(v * 1000.0 for v in steady)
+        mean_ms = sum(ms) / len(ms)
+        p50_ms = ms[len(ms) // 2]
+        p99_ms = ms[min(len(ms) - 1, int(len(ms) * 0.99))]
+    else:
+        mean_ms = p50_ms = p99_ms = None
     return _ScenarioOutcome(
         n_batches=seen,
         n_cells=cells,
@@ -248,6 +274,9 @@ def _run_index_plan(
         estimate_overshoot_mb=round(peak_rss_growth - budget_total_mb, 1),
         sidecar_groups=sidecar_groups,
         full_shard_groups=full_shard_groups,
+        gather_latency_ms_mean=round(mean_ms, 3) if mean_ms is not None else None,
+        gather_latency_ms_p50=round(p50_ms, 3) if p50_ms is not None else None,
+        gather_latency_ms_p99=round(p99_ms, 3) if p99_ms is not None else None,
     )
 
 
@@ -702,6 +731,8 @@ def run(
                 f"sidecar_adoption_rate__{scenario_name}": adoption_rate,
                 f"sidecar_groups__{scenario_name}": outcome.sidecar_groups,
                 f"full_shard_groups__{scenario_name}": outcome.full_shard_groups,
+                f"gather_latency_ms_p50__{scenario_name}": outcome.gather_latency_ms_p50,
+                f"gather_latency_ms_p99__{scenario_name}": outcome.gather_latency_ms_p99,
                 # Estimator validation: `None` for scenarios that don't
                 # go through `IndexPlanDataset` (no `memory_budget()`
                 # accessor on the manual baselines).
