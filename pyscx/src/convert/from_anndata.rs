@@ -911,10 +911,27 @@ pub fn from_anndata_impl(
                     })
                     .collect::<PyResult<Vec<u64>>>()?
             };
-            let mut local_indices: Vec<u32> = indices_slice[nnz_lo..nnz_hi]
-                .iter()
-                .map(|&v| v as u32)
-                .collect();
+            // Mirror `parallel_encode_csr_shards`'s index guard: on non-canonical
+            // input a negative `i32` index would wrap via `as u32` to a huge
+            // column, silently corrupting the bitmap. (Defense-in-depth — the
+            // upstream encode call already rejects such shards.)
+            let mut local_indices: Vec<u32> = if csr_validated {
+                indices_slice[nnz_lo..nnz_hi]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect()
+            } else {
+                indices_slice[nnz_lo..nnz_hi]
+                    .iter()
+                    .map(|&v| {
+                        if v < 0 {
+                            Err(PyRuntimeError::new_err(format!("negative CSR index {v}")))
+                        } else {
+                            Ok(v as u32)
+                        }
+                    })
+                    .collect::<PyResult<Vec<u32>>>()?
+            };
             let mut local_data = data_slice[nnz_lo..nnz_hi].to_vec();
             canonicalize_csr(&mut local_indptr, &mut local_indices, &mut local_data);
             let n_rows = (hi - lo) as u32;

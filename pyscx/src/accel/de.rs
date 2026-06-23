@@ -821,6 +821,22 @@ fn write_de_to_adata(
     n_genes: Option<usize>,
 ) -> PyResult<()> {
     let numpy = py.import("numpy")?;
+    // The builder closures below iterate `result.group_names` (length n_groups)
+    // and index `field_data[i]`, so every outer field vector must have at least
+    // n_groups rows or that indexing panics. Rectangular by construction, but
+    // validate explicitly so a malformed DiffExpResult returns an error instead
+    // of panicking (the `full_n_genes` zip only bounds the *inner* lengths).
+    let n_groups = result.group_names.len();
+    if result.names.len() < n_groups
+        || result.scores.len() < n_groups
+        || result.pvals.len() < n_groups
+        || result.pvals_adj.len() < n_groups
+        || result.logfoldchanges.len() < n_groups
+    {
+        return Err(PyRuntimeError::new_err(
+            "DiffExpResult has fewer per-field rows than groups (malformed result)",
+        ));
+    }
     // Rank depth = the SHORTEST per-group vector across all emitted fields, not
     // just group 0's. Groups are rectangular by construction
     // (`[n_groups][n_genes]`), so this is a no-op on well-formed results, but
