@@ -1798,10 +1798,18 @@ fn shared_shard_cache_spans_readers_under_one_budget() {
 
     // One shared cache, count cap = 1 across BOTH readers.
     let shared = SharedShardCache::new(1, usize::MAX);
-    let r0 =
-        BackedCsrReader::with_shared_cache(ScxReader::open(&p0).unwrap(), 0, Arc::clone(&shared));
-    let r1 =
-        BackedCsrReader::with_shared_cache(ScxReader::open(&p1).unwrap(), 1, Arc::clone(&shared));
+    let r0 = BackedCsrReader::with_shared_cache(
+        ScxReader::open(&p0).unwrap(),
+        0,
+        Arc::clone(&shared),
+        true,
+    );
+    let r1 = BackedCsrReader::with_shared_cache(
+        ScxReader::open(&p1).unwrap(),
+        1,
+        Arc::clone(&shared),
+        true,
+    );
 
     // Warm (file 0, shard 0); keys are namespaced, so file 1 shard 0 is distinct.
     let _ = r0.read_shard_cached_arc(0).unwrap();

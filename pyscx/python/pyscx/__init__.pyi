@@ -169,7 +169,15 @@ class SparseCellSetDataset:
         normalize: bool | None = None,
         log1p: bool | None = None,
         target_sum: float | None = None,
-    ) -> None: ...
+        scatter_sidecar: bool | None = None,
+    ) -> None:
+        """``scatter_sidecar`` (default ``False``) gates the O(rows) scx1
+        decode-sidecar gather. Off by default so hot shards decode once into the
+        LRU and are reused across batches — the cache-friendly sorted +
+        control-pool workload (SCX-CACHE-SHARDS.md §5.0). Pass ``True`` for
+        cache-hostile runs (working set ≫ cache) where the per-row sidecar's
+        lower RAM wins."""
+        ...
 
     @property
     def n_files(self) -> int: ...
