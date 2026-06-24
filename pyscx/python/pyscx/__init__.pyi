@@ -172,11 +172,15 @@ class SparseCellSetDataset:
         scatter_sidecar: bool | None = None,
     ) -> None:
         """``scatter_sidecar`` (default ``False``) gates the O(rows) scx1
-        decode-sidecar gather. Off by default so hot shards decode once into the
-        LRU and are reused across batches — the cache-friendly sorted +
-        control-pool workload (SCX-CACHE-SHARDS.md §5.0). Pass ``True`` for
-        cache-hostile runs (working set ≫ cache) where the per-row sidecar's
-        lower RAM wins."""
+        decode-sidecar gather. It is off by default because the typical cell-set
+        workload is cache-friendly (sorted data + a reused control pool → a small
+        working set that fits the shard cache): decoding each hot shard once into
+        the LRU and reusing it across batches beats re-decoding touched rows from
+        the per-row sidecar every batch. Pass ``True`` for cache-hostile runs
+        (working set ≫ cache, low shard reuse), where the per-row sidecar's
+        bounded, lower peak RAM is the memory-safe choice. The process-wide
+        ``SCX_SCATTER_SIDECAR=0`` env var remains a hard kill-switch that forces
+        the full-shard path regardless of this argument."""
         ...
 
     @property

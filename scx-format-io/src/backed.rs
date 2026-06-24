@@ -1091,18 +1091,23 @@ impl BackedCsrReader {
     /// an eligible shard so the gather's sidecar path isn't negated). Keeping
     /// one predicate guarantees the prefetch skip and the gather choice agree.
     ///
-    /// Eligible when this reader's per-reader `scatter_sidecar` gate is on, the
-    /// shard is not already decoded in the LRU, and the requested rows are a
-    /// small fraction of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR <
-    /// shard_rows`). Note this does NOT check whether the shard actually carries
-    /// a sidecar on disk — a sidecar-less eligible shard falls back to a
-    /// full-shard decode inside `read_rows_with`; skipping its warm is still
-    /// correct (just synchronous). Gating here covers both consumers (the L1
-    /// `read_rows_with` gather and the L2 plan-prefetch warm-skip) at once: when
-    /// `false`, the gather takes the full-shard cached path and the prefetch
-    /// warms reused shards into the LRU.
+    /// Eligible when the process-global `SCX_SCATTER_SIDECAR` kill-switch is on
+    /// **and** this reader's per-reader `scatter_sidecar` gate is on, the shard
+    /// is not already decoded in the LRU, and the requested rows are a small
+    /// fraction of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR <
+    /// shard_rows`). The env gate is kept as a hard, always-respected master
+    /// rollback switch: `SCX_SCATTER_SIDECAR=0` forces the full-shard path for
+    /// every reader even one explicitly built with `scatter_sidecar=true`; the
+    /// per-reader flag is the finer-grained opt-out layered under it. Note this
+    /// does NOT check whether the shard actually carries a sidecar on disk — a
+    /// sidecar-less eligible shard falls back to a full-shard decode inside
+    /// `read_rows_with`; skipping its warm is still correct (just synchronous).
+    /// Gating here covers both consumers (the L1 `read_rows_with` gather and the
+    /// L2 plan-prefetch warm-skip) at once: when `false`, the gather takes the
+    /// full-shard cached path and the prefetch warms reused shards into the LRU.
     pub fn sidecar_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
-        self.scatter_sidecar
+        scatter_sidecar_enabled()
+            && self.scatter_sidecar
             && !self.shard_cache.contains(self.file_id, shard_idx)
             && self
                 .index
