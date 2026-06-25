@@ -1,6 +1,6 @@
 [package]
 name = "scx-sparse"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 description = "CSR sparse matrix operations for SCX"
 license.workspace = true
