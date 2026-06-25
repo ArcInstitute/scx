@@ -1277,20 +1277,26 @@ All accelerators that support GPU expose a `device` parameter:
 |--------------------------|:---:|:---:|-----------------------------------------------------------------------|------------------------------------------------|
 | `normalize_total`        | ✓   | ✓   | `target_sum`                                                          | `device`                                       |
 | `log1p`                  | ✓   | ✓   | —                                                                     | `device`                                       |
+| `filter_cells`           | ✓   | —   | `min_genes`, `max_genes`, `min_counts`, `max_counts`                  | —                                              |
+| `filter_genes`           | ✓   | —   | `min_cells`, `max_cells`, `min_counts`, `max_counts`                  | —                                              |
+| `subset_obs`             | ✓   | —   | — (no direct scanpy equivalent)                                      | `mask_or_indices`                              |
 | `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
 | `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
 | `pflog1ppf`              | ✓   | —   | — (no scanpy equivalent)                                             | `c`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
-| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32` |
+| `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32`, `n_oversamples`, `n_power_iterations`, `spmm_policy`, `memory_budget` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
 | `pca_neighbors`          | ✓   | ✓   | (PCA + neighbors kwargs, see below)                                   | `device`, `method`, `qr_method`, `prefer_format` |
 | `pca_neighbors_umap`     | ✓   | ✓   | (PCA + neighbors + UMAP kwargs, see below)                            | `device`, `method`, `qr_method`, `prefer_format` |
-| `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`                           |
+| `umap`                   | ✓   | ✓   | `n_components`, `n_epochs`, `min_dist`, `spread`, `learning_rate`, `random_state` | `device`, `negative_sample_rate`   |
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
-| `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`                 |
+| `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`, `n_clusters`, `alpha`, `max_iter_kmeans`, `random_state`, `device` |
 | `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
-| `rank_genes_groups`      | ✓   | —   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format` |
-| `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format` |
+| `rank_genes_groups`      | ✓   | ✓   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format`, `tie_correct`, `rankby_abs`, `device` |
+| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
+| `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
+| `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
+| `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
 
 ¹ GPU Leiden has a documented label-stability divergence vs `leidenalg` —
 pin `device="cpu"` to preserve label stability for downstream DE / annotation
@@ -1991,7 +1997,24 @@ Z = pyscx.accel.pflog1ppf_reconstruct(re)   # exact dense Z = delta + baseline[:
 > materializes into `adata.layers[layer_out]` guarded by `dense_max_elems`.
 > CPU-only — `device` is accepted for API symmetry but there is no GPU kernel.
 
-### Differential Expression (`pyscx.accel.rank_genes_groups`)
+### Differential Expression
+
+SCX offers several DE functions covering different experimental designs:
+
+| Function | Use case | Method |
+|----------|----------|--------|
+| `rank_genes_groups` | Standard cluster marker genes (scanpy-compatible) | Wilcoxon rank-sum |
+| `pdex_ref` | Perturbation-specific fold changes against a control | Wilcoxon rank-sum (perturbation semantics) |
+| `rank_genes_groups_df` | Same as `rank_genes_groups` but returns a DataFrame (cell-eval schema), or extracts precomputed results | Wilcoxon rank-sum |
+| `pseudobulk_dex` | Pseudobulk DE with biological replicates | PyDESeq2 or Rust-native NB-GLM |
+| `nb_glm` | Direct NB-GLM on a pre-aggregated pseudobulk count matrix | Rust-native negative-binomial GLM |
+| `pdex_nb_glm` | Perturbation NB-GLM with replicate-forming stratification | Rust-native negative-binomial GLM |
+
+All Wilcoxon-based functions support GPU via `device="gpu"` (CSC-direct
+`gpu_csc_v3` when a sidecar is present, CSR-direct `gpu_csr_v3` otherwise).
+The NB-GLM functions are CPU-only.
+
+#### `pyscx.accel.rank_genes_groups`
 
 Parallel Wilcoxon rank-sum test with rayon. Uses a pre-ranking approach:
 for 1-vs-rest, all cells are ranked once per gene and the ranks are reused
@@ -2024,8 +2047,38 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
+| `tie_correct` | `False` | Apply tie correction to the Wilcoxon rank-sum variance estimate. |
+| `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
+| `prefer_format` | `"csr"` | `"csr"` (default) or `"csc"` — selects the CPU column-major CSC streaming path when set to `"csc"`. |
+| `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
+
+#### `pyscx.accel.pdex_ref`
+
+Perturbation DE in reference mode — computes Wilcoxon rank-sum fold changes
+for each non-reference group against the reference (e.g. `"non-targeting"`
+or `"control"`). Designed for Perturb-seq experiments where you compare each
+perturbation against a common control population. Returns a polars or pandas
+DataFrame in cell-eval's `DEResults` schema.
+
+```python
+df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
+# Columns: target, feature, fold_change, p_value, fdr,
+#          log2_fold_change, abs_log2_fold_change
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `groupby` | (required) | Column in `adata.obs` containing perturbation labels |
+| `reference` | `"non-targeting"` | Control group label |
+| `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects. |
+| `geometric_mean` | `True` | Use geometric mean for fold-change computation |
+| `epsilon` | `0.0` | Pseudocount for fold-change stability |
+| `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
+| `prefer_format` | `"csr"` | `"csr"` or `"csc"` |
+| `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
+| `output` | `"polars"` | `"polars"` or `"pandas"` — output DataFrame type |
 
 ### Pseudobulk Differential Expression (`pyscx.accel.pseudobulk_dex`)
 
@@ -2698,8 +2751,23 @@ adata = pyscx.open("experiment.scx").to_anndata()
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 
+# Using scanpy directly (works fine):
 sc.tl.rank_genes_groups(adata, groupby="cell_type", method="wilcoxon")
 sc.pl.rank_genes_groups(adata, n_genes=20)
+
+# Or using pyscx accelerator (3× faster, supports GPU):
+pyscx.accel.rank_genes_groups(adata, "cell_type")
+sc.pl.rank_genes_groups(adata, n_genes=20)  # scanpy plotting works identically
+
+# Perturbation DE (Perturb-seq experiments):
+df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
+
+# Pseudobulk DE with biological replicates:
+result = pyscx.accel.pseudobulk_dex(
+    adata, groupby=["perturbation", "donor"],
+    test_col="perturbation", reference="control",
+    backend="nb_glm",  # Rust-native NB-GLM, no pydeseq2 needed
+)
 ```
 
 ### Batch integration

@@ -1,9 +1,13 @@
 # GPU Setup Guide
 
 This guide covers installing and configuring GPU acceleration for SCX.
-GPU support enables CUDA-accelerated PCA, kNN, UMAP, Leiden clustering,
-and fused preprocessing — accessed through the same `pyscx.accel.*` API
-with a `device="gpu"` parameter.
+Most GPU-accelerated analysis — PCA, kNN, UMAP, preprocessing, and extra
+HVG flavors — routes to
+[rapids-singlecell](https://rapids-singlecell.readthedocs.io/) as the in-VRAM
+GPU compute layer. Native SCX GPU kernels remain for Leiden (cuGraph),
+streaming/out-of-VRAM PCA, seurat_v3 HVG, CSC-direct / pdex DE, Harmony,
+and the ML training loader. All ops are accessed through the same
+`pyscx.accel.*` API with a `device="gpu"` parameter.
 
 ## Requirements
 
@@ -12,26 +16,34 @@ with a `device="gpu"` parameter.
 | NVIDIA GPU | Volta (compute 7.0) | Ampere / Hopper | PTX compiled for compute_70, forward-compatible |
 | NVIDIA driver | 525+ | 535+ | Must support CUDA ≥ 12.0 (`nvidia-smi` shows max CUDA version) |
 | CUDA Toolkit | 12.0 | 12.2–12.6 | Provides `nvcc` for kernel compilation |
-| cuVS | 24.10+ | 24.12+ | GPU kNN via CAGRA (optional — CPU fallback available) |
+| rapids-singlecell | 0.12+ | latest | In-VRAM PCA/kNN/UMAP/preprocess — **most important GPU dep** |
 | cuGraph | 24.10+ | 24.12+ | GPU Leiden clustering (optional — CPU fallback available) |
+| cuVS | 24.10+ | 24.12+ | Device-resident CAGRA kNN in fused `pca_neighbors` only (optional) |
 | Rust toolchain | 1.78+ | stable | For building scx-gpu crate |
 | Python | 3.10+ | 3.12–3.13 | For pyscx bindings |
 
 **What requires what:**
 
-| SCX operation | CUDA Toolkit (`nvcc`) | cuVS | cuGraph |
-|---------------|----------------------|------|---------|
-| GPU PCA — randomized (cuSPARSE SpMM + cuSOLVER QR + cuBLAS) | required | — | — |
-| GPU CholeskyQR2 (cuSOLVER `potrf` + cuBLAS `strsm`) | required | — | — |
-| GPU preprocessing (`normalize_total` / `log1p` / `highly_variable_genes` with `device="gpu"`) | required | — | — |
-| GPU kNN — CAGRA (device-resident, fused `pca_neighbors`) | required | required | — |
-| GPU Leiden clustering | — | — | required |
+| SCX operation | rapids-singlecell | CUDA Toolkit (`nvcc`) | cuVS | cuGraph |
+|---------------|-------------------|----------------------|------|---------|
+| In-VRAM PCA (`device="gpu"`, in-memory `X`) | **required** | — | — | — |
+| In-VRAM kNN / neighbors (`device="gpu"`, in-memory `X`) | **required** | — | — | — |
+| In-VRAM UMAP (`device="gpu"`, in-memory `X`) | **required** | — | — | — |
+| In-VRAM preprocessing (`normalize_total` / `log1p`, in-memory `X`) | **required** | — | — | — |
+| In-VRAM extra HVG flavors (`seurat`, `cell_ranger`, `pearson_residuals`, `poisson_gene_selection`) | **required** | — | — | — |
+| Streaming / out-of-VRAM PCA (backed / lazy `X`) | — | required | — | — |
+| Native `seurat_v3` / `seurat_v3_paper` HVG | — | required | — | — |
+| Streaming preprocessing (ML loader, lazy `X`) | — | required | — | — |
+| Device-resident CAGRA kNN (fused `pca_neighbors` only) | — | required | required | — |
+| GPU Leiden clustering | — | — | — | required |
+| CSC-direct / pdex DE (`device="gpu"`) | — | required | — | — |
+| Harmony (`device="gpu"`) | — | required | — | — |
 
 Operations without their required dependencies fall back to CPU automatically
-with a warning — no crashes. In-VRAM `device="gpu"` PCA, kNN, and UMAP route to
-**rapids-singlecell** (a separate runtime dependency — see the routing section
-below); the in-VRAM native covariance PCA, CAGRA kNN, and CUDA-SGD UMAP kernels
-were removed in ACC-RUST-OPT-V4 Phase 3 (CAGRA survives only inside the
+with a warning — no crashes. **For most in-VRAM GPU analysis, rapids-singlecell
+is the critical dependency** — without it, PCA, kNN, UMAP, and preprocessing
+fall back to CPU (the native in-VRAM covariance PCA, standalone CAGRA kNN, and
+CUDA-SGD UMAP kernels were removed; CAGRA survives only inside the
 device-resident fused `pca_neighbors` path).
 
 **Note on cuBLAS:** randomized PCA, GPU-resident final-embedding
@@ -81,23 +93,29 @@ driver automatically.
 conda create -n scx-gpu python=3.13
 conda activate scx-gpu
 
-# 2. Install RAPIDS + the rapids-singlecell analysis backend — pin cuda-version
-#    to match your driver.
+# 2. Install the RAPIDS stack — pin cuda-version to match your driver.
 #    Check your driver's max CUDA version:  nvidia-smi
 #    Driver 535.x → cuda-version=12.2
 #    Driver 550.x → cuda-version=12.4
 #    Driver 560.x → cuda-version=12.6
+#    The <26.04 band pin is the last cuda12 RAPIDS band; 26.04+ is cuda13-only.
 conda install -c rapidsai -c conda-forge \
-    cuvs cugraph cuml rapids-singlecell cuda-version=12.2
+    cuml'>=25.10,<26.04' cuvs'>=25.10,<26.04' cugraph'>=25.10,<26.04' \
+    cuda-version=12.6
 
-# 3. Install Python dependencies
+# 3. Install rapids-singlecell — ON A GPU NODE (>=0.12 ships CUDA kernels
+#    built with -arch=native, so nvcc must see a real GPU at build time).
+pip install --no-deps 'rapids-singlecell>=0.12'
+pip install docrep scikit-image
+
+# 4. Install Python dependencies
 pip install maturin numpy scipy pyarrow anndata scanpy scikit-learn leidenalg
 
-# 4. Build pyscx with GPU support — INTO this env (rapids-singlecell must be
+# 5. Build pyscx with GPU support — INTO this env (rapids-singlecell must be
 #    importable from the same interpreter that imports pyscx)
 cd pyscx && maturin develop --release --features hdf5,gpu
 
-# 5. Verify — both halves must be present, not just the GPU build
+# 6. Verify — both halves must be present, not just the GPU build
 python -c "import pyscx; print('GPU build:', pyscx.accel.gpu_available())"
 python -c "import rapids_singlecell as rsc; print('rapids-singlecell:', rsc.__version__)"
 ```
@@ -115,8 +133,13 @@ not in the same environment.
 
 ## Option B: system CUDA Toolkit (no RAPIDS)
 
-Use this if you only need GPU PCA and UMAP and want to avoid conda. kNN and
-Leiden will fall back to CPU since cuVS/cuGraph are not installed.
+> **Important:** without rapids-singlecell, **in-VRAM PCA, kNN, and UMAP all
+> fall back to CPU.** The native in-VRAM kernels for those ops were removed.
+> Use this option only if you need the **native streaming/out-of-VRAM GPU
+> paths** (randomized PCA on backed/lazy `X`, seurat_v3 HVG, streaming
+> preprocessing, Harmony, CSC-direct DE) or GPU Leiden (cuGraph, installed
+> separately). For the full GPU-accelerated analysis stack, use
+> [Option A](#option-a-conda-recommended) with rapids-singlecell.
 
 ### Ubuntu / Debian
 
@@ -185,8 +208,9 @@ docker run --gpus all scx-gpu scx info /data/atlas.scx
 
 ### Docker (CUDA-only, no RAPIDS)
 
-For a lighter image with only GPU PCA and UMAP (kNN/Leiden fall back to CPU),
-use the NVIDIA CUDA devel base image directly:
+For a lighter image with only the native GPU paths (streaming PCA, seurat_v3
+HVG, Leiden via cuGraph, CSC-direct DE — in-VRAM PCA/kNN/UMAP fall back to CPU
+without rapids), use the NVIDIA CUDA devel base image directly:
 
 ```bash
 docker run --gpus all -it nvidia/cuda:12.2.2-devel-ubuntu22.04
@@ -213,17 +237,20 @@ apptainer build scx-gpu.sif docker://rapidsai/base:24.12-cuda12.2-py3.12
 apptainer exec --nv scx-gpu.sif python -c "import pyscx; print(pyscx.accel.gpu_available())"
 ```
 
-## rapids-singlecell analysis backend (GPU compute layer)
+## rapids-singlecell — the GPU compute layer
 
-SCX's native GPU accelerators (PCA, kNN, UMAP, Leiden, HVG, preprocessing, DE)
-work with the conda/CUDA setup above and **do not** require RAPIDS. Separately,
-SCX can route `device="gpu"` analysis ops to
-[rapids-singlecell](https://rapids-singlecell.readthedocs.io/) as a GPU *compute
-layer* (the destination of the ACC-RUST-OPT-V4 transition). This backend is an
-**optional, detected runtime dependency**, not a hard requirement:
+rapids-singlecell is the **primary GPU compute layer** for in-VRAM analysis ops.
+After the ACC-RUST-OPT-V4 transition, most in-VRAM `device="gpu"` analysis ops
+delegate to rapids-singlecell rather than native SCX CUDA kernels. The surviving
+native GPU paths (streaming PCA, seurat_v3 HVG, Leiden, CSC-direct DE, Harmony,
+streaming preprocessing, ML loader) work with the CUDA setup above and do
+**not** require rapids.
 
-- When rapids-singlecell **is** importable, supported GPU-analysis ops route to
-  it; SCX hands it a GPU-resident matrix so there is no host round-trip.
+rapids-singlecell is a **detected runtime dependency**, not a hard requirement:
+
+- When rapids-singlecell **is** importable, in-VRAM PCA / kNN / UMAP /
+  preprocessing / extra HVG flavors route to it; SCX hands it a GPU-resident
+  matrix so there is no host round-trip.
 - When it is **absent**, those ops fall back to CPU with a one-shot diagnostic
   naming this install path and `fallback_reason="no_rapids"`. SCX still imports
   and runs (CPU + native streaming + the ML loader) with rapids absent.
@@ -389,39 +416,86 @@ nvidia-smi
 
 ## How GPU dispatch works
 
-SCX's GPU support is layered:
+SCX's GPU acceleration is split between **rapids-singlecell** (in-VRAM compute
+layer for most analysis ops) and **native Rust CUDA kernels** (streaming,
+out-of-VRAM, and structurally-unique paths).
 
-1. **scx-gpu** crate — Rust CUDA kernels (compiled to PTX via `nvcc` at build
-   time) and cuSPARSE/cuSOLVER bindings via `cudarc`. Provides GPU PCA
-   (streaming SpMM), UMAP (CUDA SGD), and fused preprocessing.
+### Architecture layers
 
-2. **scx-accel** crate — analysis accelerators with optional `gpu` feature.
-   When enabled, PCA/kNN/UMAP functions accept `device="gpu"` and dispatch
-   to scx-gpu.
+1. **rapids-singlecell** (Python, runtime-detected) — the primary in-VRAM GPU
+   compute layer. When present and `device="gpu"`, PCA / kNN / UMAP /
+   preprocessing / extra HVG flavors delegate to `rsc.pp.*` / `rsc.tl.*`.
+   SCX hands it a GPU-resident `cupyx.sparse.csr_matrix` (from
+   `to_gpu_anndata()` or via `rsc.get.anndata_to_GPU`), so there is no host
+   round-trip for chained ops.
 
-3. **pyscx** Python bindings — `pyscx.accel.*` functions pass `device=`
-   through to scx-accel. cuVS (kNN) and cuGraph (Leiden) are loaded at
-   runtime from Python — they don't need to be present at Rust compile time.
+2. **scx-gpu** crate (Rust, compiled PTX) — streaming/randomized PCA
+   (cuSPARSE SpMM + cuSOLVER QR + cuBLAS), streaming preprocessing kernels,
+   CSC-direct DE, Harmony, and the ML loader decode-to-device path. These
+   run for backed/lazy `X` (out-of-VRAM), under `SCX_FORCE_NATIVE_GPU=1`,
+   or on ops where rapids has no equivalent.
 
-4. **Fallback** — every operation falls back to CPU if the GPU path is
-   unavailable (no device, missing library, CUDA error). A warning is emitted
-   but no exception is raised.
+3. **scx-accel** crate — analysis accelerator routing with optional `gpu`
+   feature. The **execution planner** (`scx_accel::route`) decides which
+   backend receives each op based on input type, device request, and rapids
+   availability.
+
+4. **pyscx** Python bindings — `pyscx.accel.*` functions pass `device=`
+   through to scx-accel. rapids-singlecell, cuVS (fused CAGRA kNN), and
+   cuGraph (Leiden) are loaded at runtime from Python — they don't need to
+   be present at Rust compile time.
+
+5. **Fallback** — every operation falls back to CPU if the GPU path is
+   unavailable (no device, missing library, CUDA error). A `UserWarning` is
+   emitted but no exception is raised (except `device="gpu"` on a host with
+   no CUDA GPU, which errors up front; `device="auto"` falls back quietly).
+
+### Dispatch examples
 
 ```
+# In-VRAM with rapids (the common case)
 pyscx.accel.pca(adata, device="gpu")
-    → scx-accel (Rust, gpu feature)
-        → scx-gpu: cuSPARSE SpMM + cuSOLVER QR + cuRAND
-            → CUDA kernels (PTX, compiled from scx-gpu/kernels/*.cu)
+    → rapids-singlecell: rsc.pp.pca()
+    → route: rapids_singlecell_gpu
 
 pyscx.accel.neighbors(adata, device="gpu")
-    → scx-accel (Rust, gpu feature)
-        → Python-side: import cuvs → CAGRA index build + search
-            → Falls back to CPU HNSW if cuvs not installed
+    → rapids-singlecell: rsc.pp.neighbors()
+    → route: rapids_singlecell_gpu
+    → Falls back to CPU HNSW if rapids absent
+
+pyscx.accel.umap(adata, device="gpu")
+    → rapids-singlecell: rsc.tl.umap()
+    → route: rapids_singlecell_gpu
+    → Falls back to cuML then CPU SGD if rapids absent
+
+# Native GPU paths (no rapids needed)
+pyscx.accel.pca(adata_backed, device="gpu")
+    → scx-gpu: streaming randomized PCA (cuSPARSE SpMM + cuSOLVER QR)
+    → route: gpu_csr
 
 pyscx.accel.leiden(adata, device="gpu")
     → Python-side: import cugraph → GPU Leiden
-        → Falls back to leidenalg (CPU) if cugraph not installed
+    → Falls back to leidenalg (CPU) if cugraph absent
+
+pyscx.accel.pdex_ref(adata_backed, device="gpu")
+    → scx-gpu: CSC-direct DE (with CSC sidecar → gpu_csc_v3)
+    → Falls back to gpu_csr_v3 without sidecar
 ```
+
+### What routes where
+
+| Operation | In-VRAM (in-memory `X`) | Out-of-VRAM (backed/lazy `X`) |
+|-----------|------------------------|-------------------------------|
+| PCA | rapids (`rsc.pp.pca`) | Native streaming randomized (cuSPARSE) |
+| kNN / neighbors | rapids (`rsc.pp.neighbors`) | CPU HNSW |
+| UMAP | rapids (`rsc.tl.umap`) | cuML fallback → CPU SGD |
+| Preprocessing | rapids (`rsc.pp.normalize_total`/`log1p`) | Native streaming kernels |
+| HVG (seurat_v3) | Native (atomic-CSR) | Native streaming |
+| HVG (other flavors) | rapids (`rsc.pp.highly_variable_genes`) | CPU |
+| Leiden | cuGraph (native) | cuGraph (native) |
+| DE (pdex/Wilcoxon) | Native CSC-direct / CSR | Native CSC-direct / CSR |
+| Harmony | Native | Native |
+| Fused PCA→kNN | rapids pipeline (in-memory) | Native streaming PCA + device-resident CAGRA (cuVS) |
 
 ## Troubleshooting
 
@@ -557,15 +631,17 @@ Your CUDA Toolkit version exceeds what the driver supports. Either:
 
 ### GPU out of memory
 
-GPU PCA streams shards to avoid full matrix materialization, but kNN (CAGRA)
-and UMAP load the full embedding matrix into VRAM.
+In-VRAM ops (via rapids) require the full matrix and working memory to fit in
+VRAM. For backed / lazy `X`, SCX automatically uses the native streaming path
+(GPU PCA streams shards to avoid full matrix materialization).
 
 For a dataset with N cells and D dimensions:
+- In-VRAM `X`: N × nnz_avg × 12 bytes (CSR values + indices + indptr)
 - kNN input: N × D × 4 bytes (float32) — 1M cells × 50 PCs ≈ 200 MB
 - UMAP working memory: ~N × 12 bytes for graph + embeddings
 
-If VRAM is insufficient, operations fall back to CPU. To force a specific GPU
-on multi-GPU systems:
+If VRAM is insufficient for in-memory ops, use `backed=True` to take the
+streaming path. To force a specific GPU on multi-GPU systems:
 
 ```python
 pyscx.accel.pca(adata, device="gpu:0")   # first GPU
