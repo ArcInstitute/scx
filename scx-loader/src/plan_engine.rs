@@ -79,14 +79,19 @@ impl PrefetchEngine {
         cache_shards: usize,
         bytes_budget: usize,
         default_lookahead: usize,
+        scatter_sidecar: bool,
     ) -> Arc<Self> {
         let shared = SharedShardCache::new(cache_shards, bytes_budget);
         let readers = scx_readers
             .into_iter()
             .enumerate()
             .map(|(fid, r)| {
-                let mut backed =
-                    BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
+                let mut backed = BackedCsrReader::with_shared_cache(
+                    r,
+                    fid as u32,
+                    Arc::clone(&shared),
+                    scatter_sidecar,
+                );
                 // Always-on metrics, mirroring `IndexPlanLoader`. `enable_metrics`
                 // is idempotent on the shared cache, so doing it per reader installs
                 // one aggregate handle that `new` reads back via `metrics()`.

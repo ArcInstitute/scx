@@ -187,7 +187,13 @@ fn two_file_engine(dir: &std::path::Path, cache_shards: usize) -> Arc<PrefetchEn
     write_multi_shard_fixture(&p0, 32, 8, 4);
     write_multi_shard_fixture(&p1, 32, 8, 4);
     let readers = vec![ScxReader::open(&p0).unwrap(), ScxReader::open(&p1).unwrap()];
-    PrefetchEngine::from_scx_readers(readers, cache_shards, usize::MAX, /*lookahead*/ 4)
+    PrefetchEngine::from_scx_readers(
+        readers,
+        cache_shards,
+        usize::MAX,
+        /*lookahead*/ 4,
+        /*scatter_sidecar*/ true,
+    )
 }
 
 /// Plan = list of `(file_id, row)`; `rows_of` just clones it.
@@ -281,6 +287,7 @@ fn engine_lookahead_four_still_reaches_sidecar() {
             /*cache_shards*/ 8,
             usize::MAX,
             lookahead,
+            /*scatter_sidecar*/ true,
         );
         let out: Vec<_> = Arc::clone(&engine)
             .iter_with_plans(into_iter(plans.clone()), lookahead, rows_of, gather_full)
@@ -302,6 +309,67 @@ fn engine_lookahead_four_still_reaches_sidecar() {
     assert_eq!(
         zero, four,
         "output must be byte-identical across lookahead 0 vs 4"
+    );
+}
+
+/// Per-reader `scatter_sidecar = false` (the sparse cell-set default, SCX-CACHE-
+/// SHARDS.md Phase 1): the SAME sparse plan that reaches the sidecar when the
+/// gate is on must instead take the full-shard cached path and warm reused
+/// shards into the LRU — `sidecar_groups == 0`, `full_shard_groups > 0`, and a
+/// shard touched by two plans yields a cache `hit`. Output stays byte-identical
+/// to the sidecar-on run (path choice never changes results).
+#[test]
+fn engine_scatter_sidecar_off_warms_cache_instead_of_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scx1.scx");
+    write_dense_scx1_fixture(&path, 128, 4, 256); // 4 shards × 32 rows
+    assert_eq!(count_sidecars(&path), 4, "fixture must carry sidecars");
+
+    // Plan 1 touches shards {0,1,2}; plan 2 touches {3,0} — shard 0 is reused.
+    let plans = vec![
+        vec![(0u32, 3u64), (0, 40), (0, 70)],
+        vec![(0, 100), (0, 12), (0, 5)],
+    ];
+
+    let build = |scatter_sidecar: bool| -> Arc<PrefetchEngine> {
+        PrefetchEngine::from_scx_readers(
+            vec![ScxReader::open(&path).unwrap()],
+            /*cache_shards*/ 8,
+            usize::MAX,
+            /*lookahead*/ 4,
+            scatter_sidecar,
+        )
+    };
+    let collect = |engine: &Arc<PrefetchEngine>| -> Vec<Vec<(Vec<i32>, Vec<f32>)>> {
+        Arc::clone(engine)
+            .iter_with_plans(into_iter(plans.clone()), 4, rows_of, gather_full)
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+
+    let off = build(false);
+    let off_out = collect(&off);
+    let m = off.cache_metrics();
+    assert_eq!(
+        load(&m.sidecar_groups),
+        0,
+        "scatter_sidecar=false must never take the sidecar path"
+    );
+    assert!(
+        load(&m.full_shard_groups) > 0,
+        "scatter_sidecar=false must use the full-shard cached path"
+    );
+    assert!(
+        load(&m.hits) > 0,
+        "the shard reused across both plans must produce a cache hit (warmed LRU)"
+    );
+
+    // Path choice never changes results: identical output with the sidecar on.
+    let on_out = collect(&build(true));
+    assert_eq!(
+        off_out, on_out,
+        "output must be byte-identical regardless of the scatter_sidecar gate"
     );
 }
 

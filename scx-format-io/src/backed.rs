@@ -866,6 +866,15 @@ pub struct BackedCsrReader {
     /// cache. Only read under `cfg(feature = "parallel")`.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     cache_shards: usize,
+    /// Per-reader gate for the O(rows) scx1 decode-sidecar gather path
+    /// (see [`Self::sidecar_eligible`]). Replaces the former process-global
+    /// `scatter_sidecar_enabled()` consult so each reader can opt out
+    /// independently. Defaults to the `SCX_SCATTER_SIDECAR` env value for all
+    /// standalone / index-plan readers (back-compat); the sparse-cellset
+    /// prefetch engine sets it explicitly via [`Self::with_shared_cache`].
+    /// When `false`, the gather always takes the full-shard cached path and
+    /// the plan-prefetch warms reused shards into the LRU.
+    scatter_sidecar: bool,
 }
 
 impl BackedCsrReader {
@@ -916,6 +925,7 @@ impl BackedCsrReader {
             file_id: 0,
             prefetch_count,
             cache_shards,
+            scatter_sidecar: scatter_sidecar_enabled(),
         }
     }
 
@@ -923,10 +933,16 @@ impl BackedCsrReader {
     /// under `file_id`, for a multi-file run where several readers draw against
     /// one bounded decoded-shard budget (the Phase 1 prefetch engine). The
     /// reader's own `cache_shards` (warm chunking cap) mirrors the shared cap.
+    ///
+    /// `scatter_sidecar` gates the O(rows) decode-sidecar gather for this
+    /// reader (see [`Self::sidecar_eligible`]). The sparse-cellset loader
+    /// passes `false` by default so reused shards warm into the LRU instead of
+    /// being re-decoded per batch via the sidecar.
     pub fn with_shared_cache(
         reader: ScxReader,
         file_id: u32,
         shard_cache: Arc<SharedShardCache>,
+        scatter_sidecar: bool,
     ) -> Self {
         let view = CatalogView::from_full(reader.catalog());
         let sorted = view.csr_shards_sorted();
@@ -951,6 +967,7 @@ impl BackedCsrReader {
             file_id,
             prefetch_count,
             cache_shards,
+            scatter_sidecar,
         }
     }
 
@@ -988,6 +1005,7 @@ impl BackedCsrReader {
             file_id: 0,
             prefetch_count,
             cache_shards,
+            scatter_sidecar: scatter_sidecar_enabled(),
         }
     }
 
@@ -1041,6 +1059,7 @@ impl BackedCsrReader {
             file_id: 0,
             prefetch_count,
             cache_shards,
+            scatter_sidecar: scatter_sidecar_enabled(),
         }
     }
 
@@ -1072,14 +1091,23 @@ impl BackedCsrReader {
     /// an eligible shard so the gather's sidecar path isn't negated). Keeping
     /// one predicate guarantees the prefetch skip and the gather choice agree.
     ///
-    /// Eligible when the scattered-sidecar path is enabled, the shard is not
-    /// already decoded in the LRU, and the requested rows are a small fraction
-    /// of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR < shard_rows`). Note
-    /// this does NOT check whether the shard actually carries a sidecar on disk
-    /// — a sidecar-less eligible shard falls back to a full-shard decode inside
+    /// Eligible when the process-global `SCX_SCATTER_SIDECAR` kill-switch is on
+    /// **and** this reader's per-reader `scatter_sidecar` gate is on, the shard
+    /// is not already decoded in the LRU, and the requested rows are a small
+    /// fraction of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR <
+    /// shard_rows`). The env gate is kept as a hard, always-respected master
+    /// rollback switch: `SCX_SCATTER_SIDECAR=0` forces the full-shard path for
+    /// every reader even one explicitly built with `scatter_sidecar=true`; the
+    /// per-reader flag is the finer-grained opt-out layered under it. Note this
+    /// does NOT check whether the shard actually carries a sidecar on disk — a
+    /// sidecar-less eligible shard falls back to a full-shard decode inside
     /// `read_rows_with`; skipping its warm is still correct (just synchronous).
+    /// Gating here covers both consumers (the L1 `read_rows_with` gather and the
+    /// L2 plan-prefetch warm-skip) at once: when `false`, the gather takes the
+    /// full-shard cached path and the prefetch warms reused shards into the LRU.
     pub fn sidecar_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
         scatter_sidecar_enabled()
+            && self.scatter_sidecar
             && !self.shard_cache.contains(self.file_id, shard_idx)
             && self
                 .index

@@ -745,6 +745,19 @@ sizes — there the win is **memory**, which is universal. The per-dataset
 `scatter_sidecar=false` kwarg (and the process-wide `SCX_SCATTER_SIDECAR=0`
 kill-switch) restore the legacy path for the fits-cache regime.
 
+**`SparseCellSetDataset` defaults the other way (`scatter_sidecar=false`).** The
+cell-set loader serves a cache-*friendly* regime (sorted data + a reused
+control-pool cache → a small working set that fits the shard cache and is touched
+on most batches). There the sidecar's "skip the warm, decode O(rows) each batch"
+strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
+populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
+recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
+337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_sidecar=true` for a
+genuinely cache-hostile cell-set run (working set ≫ cache), where the per-row
+sidecar's bounded peak RAM is the memory-safe choice. The gate is per-reader: the
+`IndexPlanDataset` defaults above are unchanged, and `SCX_SCATTER_SIDECAR=0`
+remains a hard master kill-switch over both.
+
 **Sidecars are a write-time property** (emitted by default for Scx1 integer-CSR
 shards within a 25% overhead budget). `.scx` files written before the sidecar
 writer (pre-0.9.x) carry none and silently fall back to full-shard — **regenerate

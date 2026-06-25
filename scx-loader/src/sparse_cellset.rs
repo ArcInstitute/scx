@@ -106,6 +106,7 @@ impl SparseCellSetLoader {
         normalize: bool,
         log1p: bool,
         target_sum: f64,
+        scatter_sidecar: bool,
     ) -> Result<Arc<Self>> {
         if let Some(tables) = &remap {
             if tables.len() != scx_readers.len() {
@@ -133,8 +134,13 @@ impl SparseCellSetLoader {
                 .max()
                 .unwrap_or(0),
         };
-        let engine =
-            PrefetchEngine::from_scx_readers(scx_readers, cache_shards, bytes_budget, lookahead);
+        let engine = PrefetchEngine::from_scx_readers(
+            scx_readers,
+            cache_shards,
+            bytes_budget,
+            lookahead,
+            scatter_sidecar,
+        );
         Ok(Arc::new(SparseCellSetLoader {
             engine,
             remap,

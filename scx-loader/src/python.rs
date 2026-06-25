@@ -1471,6 +1471,7 @@ impl SparseCellSetDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
+        scatter_sidecar=None,
     ))]
     fn new(
         paths: Vec<String>,
@@ -1482,6 +1483,7 @@ impl SparseCellSetDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
+        scatter_sidecar: Option<bool>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -1496,6 +1498,13 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
+        // Default OFF: the cache-friendly sparse cell-set workload (sorted data
+        // + control-pool cache → high shard reuse) wins by decoding each hot
+        // shard once into the LRU rather than re-decoding it via the per-row
+        // sidecar every batch. See SCX-CACHE-SHARDS.md §5.0 (Phase 0 measured
+        // 2.80 → 4.63 steps/s). Pass `scatter_sidecar=True` to opt back into the
+        // sidecar gather for genuinely cache-hostile (working-set ≫ cache) runs.
+        let scatter_sidecar = scatter_sidecar.unwrap_or(false);
 
         let mut readers = Vec::with_capacity(paths.len());
         for p in &paths {
@@ -1515,6 +1524,7 @@ impl SparseCellSetDataset {
             normalize,
             log1p,
             target_sum,
+            scatter_sidecar,
         )
         .map_err(loader_err_to_py)?;
 
