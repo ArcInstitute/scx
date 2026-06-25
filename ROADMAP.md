@@ -49,8 +49,12 @@ Validate the thesis end-to-end: `h5ad → scx convert → scx.open().to_anndata(
 ### 1.2 scx-codec
 - [x] Rice encoder/decoder (docs/codec.md §Values) with per-block adaptive k
 - [x] FOR-BP encoder/decoder for indices (docs/codec.md §Indices)
+- [x] Rice-gap encoder/decoder for indices — `scx2` (`codec_id` 5), adaptive
+      Rice on column-gaps; −12 % to −23 % index payload vs FOR-BP on real UMI
+      data (−10 % to −14 % whole-file), at ~30 % slower decode. Opt-in via the
+      `compact` profile / `--codec scx2` (never auto-selected). docs/codec.md §3a
 - [x] Delta-Golomb encoder/decoder for indptr (docs/codec.md §Indptr)
-- [x] Codec dispatch by `codec_id` (none, scx1, zstd)
+- [x] Codec dispatch by `codec_id` (none, scx1, scx2, zstd, lz4, pcodec)
 - [x] Per-shard codec override (shard header overrides file header)
 - [x] Conformance test vectors: known input → exact encoded bytes
 - [x] Scalar reference implementation (normative)

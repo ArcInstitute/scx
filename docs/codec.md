@@ -22,7 +22,8 @@ header's `codec_id`**, not the file header's, when decoding.
 | 2 | `zstd` | Zstd applied independently to each of indptr / indices / values. Fallback for float layers. |
 | 3 | `lz4shuffle` | Byte-shuffle pre-filter + LZ4 frame compression (§7). Matches the Zarr/Blosc pipeline. |
 | 4 | `pcodec` | Pco lossless numerical compression. Optimal for float layers. |
-| 5–255 | Reserved | Future codecs. |
+| 5 | `scx2` | Delta-Golomb-Rice indptr + **Rice-gap indices (§3a)** + Adaptive Rice values. Like `scx1` but adaptively Rice-codes column-gaps instead of FOR-BP fixed-width packing — smaller index payload, slower decode. Integer value encodings only. |
+| 6–255 | Reserved | Future codecs. |
 
 ## 2. Indptr: Delta-Golomb-Rice (codec_id = 1)
 
@@ -101,6 +102,61 @@ simultaneously for single-pass 128-element decode.
   readers cannot decode those rows.
 
 Implementation: `scx-codec/src/forbp.rs`.
+
+## 3a. Indices: Rice-gap (codec_id = 5, `scx2`)
+
+**Input**: `nnz` column indices (uint16 or uint32), strictly increasing within
+each row (canonical deduplicated CSR).
+
+`scx2` keeps `scx1`'s Delta-Golomb indptr (§2) and Adaptive-Rice values (§4)
+**byte-identical**, and replaces only the indices stream. Motivation: FOR-BP
+(§3) chooses one `frame_bits` for an entire row, so a single large column-gap
+widens *every* delta in that row. Rice coding spends ~entropy per gap and
+degrades gracefully on the tail.
+
+### Block structure
+
+Indices are encoded in blocks of `B_idx = 128` rows, reusing the **exact §3
+block header** (`block_nnz: u32`, `n_rows_in_block: u16`, `row_nnz: [varint]`).
+Only the per-row body differs:
+
+```
+For each row within the block (row_nnz > 0):
+  frame_min : uint16 / uint32        (first column index, stored raw)
+  rice_k    : u8                     (Rice parameter for this row's gaps, 0..=15)
+  gaps      : Rice-coded shifted gaps for j = 1..row_nnz
+              shifted[j] = indices[j] - indices[j-1] - 1
+              each: unary(shifted >> k) then k low bits (LSB-first)
+              byte-padded to a byte boundary at the row end
+```
+
+`row_nnz == 0` rows emit nothing; `row_nnz == 1` rows emit `frame_min + rice_k`
+only (no gaps). Gaps are `≥ 1` for strictly-increasing rows, so `shifted ≥ 0`;
+a dense run (gap 1) costs 1 bit, matching FOR-BP's `frame_bits = 1`.
+
+### `rice_k` selection
+
+Per row, `k = clamp(floor(log2(0.6931 × median(shifted))), 0, 15)` — the same
+estimator as the values codec (§4).
+
+### Decoding
+
+A single bit reader walks the stream: byte-aligned header fields are read at
+byte boundaries (a 32/16-bit LSB-first read reconstructs the LE integer), each
+row's gaps are Rice-decoded and `align_to_byte`-terminated, then prefix-summed
+from `frame_min`. Index overflow during prefix-sum returns an error (no wrap).
+
+### Random access
+
+Per-row metadata (`frame_min`, `rice_k`, byte offset to the gap payload) makes
+each row independently decodable, preserving the O(rows) row-range gather the
+training loaders depend on. `scx2` does **not** currently emit an on-disk
+`DecodeMetadataShard` sidecar (§format.md) or a GPU device-decode path — those
+shards host-bounce / full-decode; persisting the sidecar is a documented
+follow-on. In-memory random access is implemented
+(`scx_codec::decode_scx2_row_range`).
+
+Implementation: `scx-codec/src/rice_gap.rs`.
 
 ## 4. Values: Adaptive Rice Coding (codec_id = 1)
 
@@ -231,6 +287,14 @@ Median is computed from a sample of up to 10,000 non-zero values from the
 shard — the same calculation used for Rice parameter selection (§4). The
 actual codec used is recorded in each shard header's `codec_id`.
 
+The **`compact`** profile (`CodecProfile::Compact`) is identical to `auto`
+except it upgrades the small-median-integer selection from `scx1` to **`scx2`**
+(Rice-gap indices, §3a): ~10–23 % smaller indices on real UMI data at the cost
+of ~30 % slower decode. `auto` deliberately stays on `scx1` so the
+decode-bound training loaders keep full speed (and its output stays
+byte-identical to pre-`scx2` writers); choose `compact` / `--codec scx2` when
+storage size matters more than decode throughput. `scx2` is never auto-selected.
+
 ## 8a. Per-modality Codec Defaults
 
 Multimodal writers (CITE-seq, 10x Multiome, TEA-seq, MuData round-trips
@@ -296,18 +360,50 @@ conformance in v1; recommended for robustness.
 ### Indices dominate compressed size
 
 For typical datasets, FOR-BP indices are ~75–80 % of the compressed CSR
-payload; Rice values are ~20 %. Optimizing indices (e.g. PFor-Delta with
-outlier patching) has ~4× more impact on file size than further optimizing
-values. Future codec versions should prioritize index improvements.
+payload (measured: 87 % on a 11.5k-gene 10x matrix, 61 % on a deep 58k-gene
+one); Rice values are ~20 %. Optimizing indices has ~4× more impact on file
+size than further optimizing values.
+
+This motivated the **`scx2`** codec (§3a, `codec_id = 5`): adaptive Rice coding
+of column-gaps. Measured index-payload and whole-file reductions vs `scx1`
+(real `encode_shard`, three real UMI matrices):
+
+| dataset (genes, density) | index Δ | file Δ | scx2 bits/nnz |
+|---|---|---|---|
+| 24.6k × 11.5k, ~200/row | −12.1 % | −10.5 % | 9.17 (scx1 10.25) |
+| 9.4k × 58.6k, ~2217/row | −23.1 % | −14.2 % | 12.95 (scx1 15.10) |
+| 405k × 20.7k, ~44/row | −6.4 % | −2.6 % | 28.99 (scx1 29.77) |
+
+A PFor-Delta-with-outlier-patching variant was prototyped on the same data but
+beaten by Rice-gap everywhere (8.2 % vs 12.4 % on the first matrix), because
+per-exception position+value overhead eats the gains; Rice spends ~entropy with
+no exception bookkeeping. **Trade-off**: `scx2` decode is ~30 % slower and
+encode ~40–60 % slower than `scx1` (scalar Rice-unary vs FOR-BP's
+fixed-width/BitPacker4x path), so `scx2` is opt-in (`compact` / `--codec scx2`),
+never auto-selected — see §8.
+
+End-to-end whole-file comparison (real `pyscx.from_anndata` + reader, via the
+comprehensive benchmark harness):
+
+| dataset (protocol) | best non-scx2 | `scx2` | scx2 vs scx1 |
+|---|---|---|---|
+| pbmc3k (UMI, 2.7k×33k) | scx1 5.05 MB / zstd 5.32 MB | **4.43 MB** (best) | −12.4 % |
+| smartseq2 (non-UMI, 50k×61k) | **zstd 401 MB / lz4 385 MB** | 860 MB | −2.6 % (both poor) |
+
+On non-UMI (Smart-seq2) Rice-based codecs are the wrong choice — `scx1` *and*
+`scx2` lose ~2.2× to zstd/lz4 — which is exactly why `scx2` is never
+auto-selected: `auto` stays `scx1`, and `compact` upgrades only the median≤8
+(UMI) shards to `scx2`, leaving high-median (non-UMI) shards on zstd.
 
 ## 10. Implementation Map
 
 | Topic | Source |
 |-------|--------|
 | Scalar Rice encode/decode | `scx-codec/src/rice.rs` |
+| Rice-gap indices (scx2) | `scx-codec/src/rice_gap.rs` |
 | FOR-BP + BitPacker4x | `scx-codec/src/forbp.rs` |
 | Delta-Golomb-Rice indptr | `scx-codec/src/delta_golomb.rs` |
 | LZ4+Shuffle byte permutation | `scx-codec/src/shuffle.rs` |
 | Codec dispatch (`codec_id`) | `scx-codec/src/dispatch.rs` |
-| Auto codec selection | `scx-format/src/codec_select.rs` |
+| Auto / compact codec selection | `scx-format/src/codec_select.rs` |
 | CUDA kernel decoders | `scx-gpu/src/kernels/` |

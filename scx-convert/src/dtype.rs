@@ -37,7 +37,7 @@ pub fn detect_value_encoding(
 
     let codec = match explicit_codec {
         Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !encoding.is_integer() {
+            if matches!(codec_id, CodecId::Scx1 | CodecId::Scx2) && !encoding.is_integer() {
                 CodecId::Zstd
             } else {
                 codec_id
@@ -62,7 +62,7 @@ pub fn detect_value_encoding_for_modality(
 
     let codec = match explicit_codec {
         Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !encoding.is_integer() {
+            if matches!(codec_id, CodecId::Scx1 | CodecId::Scx2) && !encoding.is_integer() {
                 CodecId::Zstd
             } else {
                 codec_id

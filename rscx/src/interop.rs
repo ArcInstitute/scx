@@ -995,11 +995,12 @@ fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
         None | Some("auto") => Ok(None),
         Some("none") => Ok(Some(CodecId::None)),
         Some("scx1") => Ok(Some(CodecId::Scx1)),
+        Some("scx2") => Ok(Some(CodecId::Scx2)),
         Some("zstd") => Ok(Some(CodecId::Zstd)),
         Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
         Some("pcodec") => Ok(Some(CodecId::Pcodec)),
         Some(other) => Err(Error::Other(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', or 'pcodec'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'scx2', 'zstd', 'lz4', or 'pcodec'.",
             other
         ))),
     }
@@ -1084,7 +1085,7 @@ fn write_csr_to_scx(
 
         let codec = match explicit_codec {
             Some(c) => {
-                if c == CodecId::Scx1 && !value_encoding.is_integer() {
+                if matches!(c, CodecId::Scx1 | CodecId::Scx2) && !value_encoding.is_integer() {
                     CodecId::Zstd
                 } else {
                     c

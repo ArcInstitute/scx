@@ -755,7 +755,7 @@ pub fn from_anndata_impl(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let header_codec = match explicit_codec {
         Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !first_encoding.is_integer() {
+            if matches!(codec_id, CodecId::Scx1 | CodecId::Scx2) && !first_encoding.is_integer() {
                 CodecId::Zstd
             } else {
                 codec_id

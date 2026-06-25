@@ -104,7 +104,7 @@ fn detect_value_encoding(
     let raw_bytes = values_to_raw_bytes(data, encoding).map_err(ScxError::from)?;
     let codec = match explicit_codec {
         Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !encoding.is_integer() {
+            if matches!(codec_id, CodecId::Scx1 | CodecId::Scx2) && !encoding.is_integer() {
                 CodecId::Zstd
             } else {
                 codec_id

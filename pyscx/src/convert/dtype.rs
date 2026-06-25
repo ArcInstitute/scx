@@ -76,11 +76,12 @@ pub(crate) fn parse_codec(codec: Option<&str>) -> PyResult<Option<CodecId>> {
         None | Some("auto") => Ok(None),
         Some("none") => Ok(Some(CodecId::None)),
         Some("scx1") => Ok(Some(CodecId::Scx1)),
+        Some("scx2") => Ok(Some(CodecId::Scx2)),
         Some("zstd") => Ok(Some(CodecId::Zstd)),
         Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
         Some("pcodec") => Ok(Some(CodecId::Pcodec)),
         Some(other) => Err(PyRuntimeError::new_err(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', or 'pcodec'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'scx2', 'zstd', 'lz4', or 'pcodec'.",
             other
         ))),
     }

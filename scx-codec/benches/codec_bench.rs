@@ -6,6 +6,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use scx_codec::bitstream::BitWriter;
 use scx_codec::forbp::{forbp_decode, forbp_encode};
 use scx_codec::rice::{rice_decode, rice_encode, B_VAL};
+use scx_codec::rice_gap::{rice_gap_decode, rice_gap_encode};
 use scx_codec::{decode_shard, encode_shard, CodecId, ValueEncoding};
 
 // ---------------------------------------------------------------------------
@@ -201,23 +202,25 @@ fn bench_encode_shard(c: &mut Criterion) {
     {
         let (indptr, indices, values, _, nnz) = generate_shard(n_rows, avg_nnz, 30000);
         group.throughput(Throughput::Elements(nnz as u64));
-        group.bench_with_input(
-            BenchmarkId::new("scx1", label),
-            &(indptr, indices, values),
-            |b, (ip, idx, val)| {
-                b.iter(|| {
-                    encode_shard(
-                        black_box(ip),
-                        black_box(idx),
-                        black_box(val),
-                        CodecId::Scx1,
-                        ValueEncoding::Uint8,
-                        true,
-                    )
-                    .unwrap()
-                })
-            },
-        );
+        for (codec, name) in [(CodecId::Scx1, "scx1"), (CodecId::Scx2, "scx2")] {
+            group.bench_with_input(
+                BenchmarkId::new(name, label),
+                &(&indptr, &indices, &values),
+                |b, (ip, idx, val)| {
+                    b.iter(|| {
+                        encode_shard(
+                            black_box(ip),
+                            black_box(idx),
+                            black_box(val),
+                            codec,
+                            ValueEncoding::Uint8,
+                            true,
+                        )
+                        .unwrap()
+                    })
+                },
+            );
+        }
     }
     group.finish();
 }
@@ -301,6 +304,28 @@ fn bench_forbp_decode(c: &mut Criterion) {
     group.finish();
 }
 
+/// Index codec head-to-head: FOR-BP (scx1) vs Rice-gap (scx2) decode on the
+/// same CSR indices. Quantifies the decode-speed cost of the smaller scx2 index
+/// payload.
+fn bench_index_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_decode");
+    for &(n_rows, avg_nnz, label) in &[(2048, 500, "2048r_500nnz"), (16384, 2000, "16384r_2000nnz")]
+    {
+        let (indptr, indices, _, n_rows_actual, nnz) = generate_shard(n_rows, avg_nnz, 30000);
+        let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
+        let forbp = forbp_encode(&indices, &row_lengths, true).unwrap();
+        let ricegap = rice_gap_encode(&indices, &row_lengths, true).unwrap();
+        group.throughput(Throughput::Elements(nnz as u64));
+        group.bench_with_input(BenchmarkId::new("forbp", label), &forbp, |b, enc| {
+            b.iter(|| forbp_decode(black_box(enc), black_box(n_rows_actual), true).unwrap())
+        });
+        group.bench_with_input(BenchmarkId::new("ricegap", label), &ricegap, |b, enc| {
+            b.iter(|| rice_gap_decode(black_box(enc), black_box(n_rows_actual), true).unwrap())
+        });
+    }
+    group.finish();
+}
+
 fn bench_rice_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("rice_decode");
 
@@ -342,30 +367,33 @@ fn bench_decode_shard(c: &mut Criterion) {
     {
         let (indptr, indices, values, n_rows_actual, nnz) = generate_shard(n_rows, avg_nnz, 30000);
         let index_dtype_u16 = true;
+        group.throughput(Throughput::Elements(nnz as u64));
 
-        let encoded = encode_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::Scx1,
-            ValueEncoding::Uint8,
-            index_dtype_u16,
-        )
-        .unwrap();
+        for (codec, name) in [(CodecId::Scx1, "scx1"), (CodecId::Scx2, "scx2")] {
+            let encoded = encode_shard(
+                &indptr,
+                &indices,
+                &values,
+                codec,
+                ValueEncoding::Uint8,
+                index_dtype_u16,
+            )
+            .unwrap();
 
-        group.bench_with_input(BenchmarkId::new("scx1", label), &encoded, |b, enc| {
-            b.iter(|| {
-                decode_shard(
-                    black_box(enc),
-                    black_box(CodecId::Scx1),
-                    black_box(ValueEncoding::Uint8),
-                    black_box(n_rows_actual),
-                    black_box(nnz),
-                    black_box(index_dtype_u16),
-                )
-                .unwrap()
-            })
-        });
+            group.bench_with_input(BenchmarkId::new(name, label), &encoded, |b, enc| {
+                b.iter(|| {
+                    decode_shard(
+                        black_box(enc),
+                        black_box(codec),
+                        black_box(ValueEncoding::Uint8),
+                        black_box(n_rows_actual),
+                        black_box(nnz),
+                        black_box(index_dtype_u16),
+                    )
+                    .unwrap()
+                })
+            });
+        }
     }
 
     group.finish();
@@ -374,6 +402,7 @@ fn bench_decode_shard(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_forbp_decode,
+    bench_index_decode,
     bench_rice_decode,
     bench_decode_shard,
     bench_bitwriter_encode,

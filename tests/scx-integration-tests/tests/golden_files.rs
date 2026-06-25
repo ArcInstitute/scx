@@ -8,6 +8,11 @@
 //!   None  × {u8, u16, u32, f32}  = 4
 //!   Scx1  × {u8, u16, u32}       = 3  (Scx1 rejects float encodings)
 //!   Zstd  × {u8, u16, u32, f32}  = 4
+//!
+//! Scx2 is intentionally NOT in the pinned golden set (its end-to-end
+//! write→read path is covered by `scx2_writer_reader_round_trip` below, without
+//! re-pinning bytes — the committed goldens predate a writer format-version bump
+//! and must not be regenerated as a side effect of this change).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -112,6 +117,7 @@ fn codec_name(c: CodecId) -> &'static str {
     match c {
         CodecId::None => "none",
         CodecId::Scx1 => "scx1",
+        CodecId::Scx2 => "scx2",
         CodecId::Zstd => "zstd",
         CodecId::Lz4Shuffle => "lz4shuffle",
         CodecId::Pcodec => "pcodec",
@@ -231,6 +237,59 @@ fn make_var() -> RecordBatch {
 fn make_header() -> FileHeader {
     // N_VARS=50 < 65535, so index_dtype (last arg) = 0 (u16 on-disk indices).
     FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, 10_000, 0, 0)
+}
+
+/// ISC-24/25: end-to-end ScxWriter → ScxReader round-trip for the `scx2` codec
+/// across integer encodings, without pinning bytes. Confirms the shard header
+/// carries `codec_id = 5` (the reader resolves it via `from_u8` and decodes the
+/// Rice-gap index stream) and that scx2 decodes identically to the source CSR
+/// and to scx1 (which shares everything but the index stream).
+#[test]
+fn scx2_writer_reader_round_trip() {
+    let tmp = std::env::temp_dir().join(format!("scx2_rt_{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let obs = make_obs();
+    let var = make_var();
+
+    for encoding in [
+        ValueEncoding::Uint8,
+        ValueEncoding::Uint16,
+        ValueEncoding::Uint32,
+    ] {
+        let (indptr, indices, data_f32) = generate_matrix(encoding);
+        let values_bytes = encoding.encode_f32_batch(&data_f32).unwrap();
+        let exp_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+        let exp_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+
+        let mut decoded = Vec::new();
+        for codec in [CodecId::Scx1, CodecId::Scx2] {
+            let path = tmp.join(format!(
+                "rt_{}_{}.scx",
+                codec_name(codec),
+                encoding_name(encoding)
+            ));
+            let mut w = ScxWriter::new(&path, make_header()).unwrap();
+            w.write_obs(&obs).unwrap();
+            w.write_var(&var).unwrap();
+            w.write_csr_shard(&indptr, &indices, &values_bytes, codec, encoding, 0)
+                .unwrap();
+            w.finish().unwrap();
+
+            let reader = ScxReader::open(&path).unwrap();
+            let csr = reader.read_all_csr_shards().unwrap();
+            assert_eq!(csr.indptr, exp_indptr, "{codec:?} {encoding:?} indptr");
+            assert_eq!(csr.indices, exp_indices, "{codec:?} {encoding:?} indices");
+            decoded.push(csr);
+        }
+        // scx2 decodes bit-identically to scx1 for the same matrix.
+        assert_eq!(decoded[0].indptr, decoded[1].indptr, "{encoding:?} indptr");
+        assert_eq!(
+            decoded[0].indices, decoded[1].indices,
+            "{encoding:?} indices"
+        );
+        assert_eq!(decoded[0].data, decoded[1].data, "{encoding:?} data");
+    }
+    fs::remove_dir_all(&tmp).ok();
 }
 
 // ---------------------------------------------------------------------------

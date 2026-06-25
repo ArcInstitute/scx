@@ -44,6 +44,7 @@ _CODEC_NAMES = {
     "zstd": ("SCX (zstd)", "scx_zstd"),
     "lz4": ("SCX (lz4)", "scx_lz4"),
     "pcodec": ("SCX (pcodec)", "scx_pcodec"),
+    "scx2": ("SCX (scx2)", "scx_scx2"),
     # Phase K multimodal variants — name + key tags for the
     # comprehensive results pipeline.
     "_multimodal_per_modality_auto": (

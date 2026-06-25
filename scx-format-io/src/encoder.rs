@@ -98,7 +98,11 @@ pub fn encode_one_shard(
     // 4. Select codec.
     let shard_codec = match explicit_codec {
         Some(codec_id) => {
-            if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
+            // Scx1/Scx2 are integer-only; gracefully fall back to Zstd for float
+            // layers rather than erroring in encode_shard.
+            if matches!(codec_id, CodecId::Scx1 | CodecId::Scx2)
+                && !shard_value_encoding.is_integer()
+            {
                 CodecId::Zstd
             } else {
                 codec_id

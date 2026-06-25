@@ -12,6 +12,9 @@ use crate::forbp::{
 use crate::rice::{
     rice_decode, rice_decode_with_metadata, rice_encode_with_metadata, RiceBlockMetadata, B_VAL,
 };
+use crate::rice_gap::{
+    rice_gap_decode_with_hint, rice_gap_decode_with_metadata, rice_gap_encode_with_metadata,
+};
 use crate::shuffle::{byte_shuffle, byte_unshuffle};
 
 // ---------------------------------------------------------------------------
@@ -34,6 +37,11 @@ pub enum CodecId {
     /// Pcodec (pco) lossless numerical compression.
     /// Optimal for float layers; uses Zstd for indptr/indices.
     Pcodec = 4,
+    /// Domain-specific: Delta-Golomb (indptr) + Rice-gap (indices) + Rice
+    /// (values). Like Scx1 but replaces FOR-BP fixed-width index packing with
+    /// adaptive Rice coding of column-gaps for a smaller index payload. Integer
+    /// value encodings only.
+    Scx2 = 5,
 }
 
 impl CodecId {
@@ -44,6 +52,7 @@ impl CodecId {
             2 => Some(Self::Zstd),
             3 => Some(Self::Lz4Shuffle),
             4 => Some(Self::Pcodec),
+            5 => Some(Self::Scx2),
             _ => None,
         }
     }
@@ -58,11 +67,12 @@ impl CodecId {
             "auto" => Ok(None),
             "none" => Ok(Some(CodecId::None)),
             "scx1" => Ok(Some(CodecId::Scx1)),
+            "scx2" => Ok(Some(CodecId::Scx2)),
             "zstd" => Ok(Some(CodecId::Zstd)),
             "lz4" => Ok(Some(CodecId::Lz4Shuffle)),
             "pcodec" => Ok(Some(CodecId::Pcodec)),
             other => Err(format!(
-                "unknown codec: '{other}'. Use auto, none, scx1, zstd, lz4, or pcodec."
+                "unknown codec: '{other}'. Use auto, none, scx1, scx2, zstd, lz4, or pcodec."
             )),
         }
     }
@@ -73,6 +83,7 @@ impl CodecId {
         match self {
             CodecId::None => "none",
             CodecId::Scx1 => "scx1",
+            CodecId::Scx2 => "scx2",
             CodecId::Zstd => "zstd",
             CodecId::Lz4Shuffle => "lz4+shuffle",
             CodecId::Pcodec => "pcodec",
@@ -257,6 +268,7 @@ pub fn encode_shard(
     match codec_id {
         CodecId::None => encode_none(indptr, indices, values, index_dtype_u16),
         CodecId::Scx1 => encode_scx1(indptr, indices, values, value_encoding, index_dtype_u16),
+        CodecId::Scx2 => encode_scx2(indptr, indices, values, value_encoding, index_dtype_u16),
         CodecId::Zstd => encode_zstd(indptr, indices, values, index_dtype_u16),
         CodecId::Lz4Shuffle => {
             encode_lz4_shuffle(indptr, indices, values, value_encoding, index_dtype_u16)
@@ -299,6 +311,7 @@ pub fn decode_shard_ref(
     match codec_id {
         CodecId::None => decode_none_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
         CodecId::Scx1 => decode_scx1_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
+        CodecId::Scx2 => decode_scx2_ref(encoded, value_encoding, n_rows, nnz, index_dtype_u16),
         CodecId::Zstd => decode_zstd_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16),
         CodecId::Lz4Shuffle => {
             decode_lz4_shuffle_ref(encoded, n_rows, nnz, value_encoding, index_dtype_u16)
@@ -392,7 +405,7 @@ pub fn decode_indptr_only(
 ) -> Result<Vec<i64>, CodecError> {
     let indptr_u64: Vec<u64> = match codec_id {
         CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows + 1)?,
-        CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows + 1)?,
+        CodecId::Scx1 | CodecId::Scx2 => delta_golomb_decode(indptr_bytes, n_rows + 1)?,
         CodecId::Zstd | CodecId::Pcodec => {
             let raw = zstd_decode_bounded(indptr_bytes, (n_rows + 1) * 8)?;
             le_bytes_to_u64(&raw, n_rows + 1)?
@@ -785,6 +798,215 @@ fn decode_scx1_ref(
 
     // values ← Rice decode, then convert u32 back to raw bytes
     let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
+
+    Ok((indptr, indices, values_bytes))
+}
+
+// ---------------------------------------------------------------------------
+// CodecId::Scx2 (Delta-Golomb indptr + Rice-gap indices + Rice values)
+// ---------------------------------------------------------------------------
+
+/// Encode a CSR shard as Scx2.
+///
+/// indptr and values bytes are byte-identical to [`encode_scx1`]; only the
+/// indices stream differs (Rice-gap instead of FOR-BP). The returned
+/// `scx1_decode` metadata is shared with Scx1 — its `rows` carry the Rice-gap
+/// per-row `k` in `frame_bits` and `index_packing = 3`
+/// ([`crate::rice_gap::RICE_GAP_INDEX_PACKING`]).
+fn encode_scx2(
+    indptr: &[u64],
+    indices: &[u32],
+    values: &[u8],
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<EncodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+
+    let indptr_bytes = delta_golomb_encode(indptr)?;
+
+    let row_lengths: Vec<usize> = indptr.windows(2).map(|w| (w[1] - w[0]) as usize).collect();
+    let indices_encoded = rice_gap_encode_with_metadata(indices, &row_lengths, index_dtype_u16)?;
+
+    let values_u32 = raw_bytes_to_u32(values, value_encoding)?;
+    let values_encoded = rice_encode_with_metadata(&values_u32, B_VAL)?;
+
+    Ok(EncodedShard {
+        indptr_bytes,
+        indices_bytes: indices_encoded.bytes,
+        values_bytes: values_encoded.bytes,
+        scx1_decode: Some(Scx1DecodeMetadata {
+            rows: indices_encoded.rows,
+            rice_blocks: values_encoded.blocks,
+        }),
+    })
+}
+
+fn decode_scx2_ref(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    index_dtype_u16: bool,
+) -> Result<DecodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+
+    let indptr = delta_golomb_decode(encoded.indptr_bytes, n_rows + 1)?;
+
+    let (indices, _row_lengths) =
+        rice_gap_decode_with_hint(encoded.indices_bytes, n_rows, nnz, index_dtype_u16)?;
+
+    let values_u32 = rice_decode(encoded.values_bytes, nnz, B_VAL)?;
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
+
+    Ok((indptr, indices, values_bytes))
+}
+
+/// Decode an Scx2 shard through encoder-produced metadata offsets (random
+/// access). Mirrors [`decode_scx1_with_metadata`] but decodes Rice-gap indices.
+pub fn decode_scx2_with_metadata(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    n_rows: usize,
+    nnz: usize,
+    metadata: &Scx1DecodeMetadata,
+) -> Result<DecodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+    if metadata.rows.len() != n_rows {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 metadata row count {} != n_rows {n_rows}",
+            metadata.rows.len()
+        )));
+    }
+
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0);
+    let mut covered = 0u64;
+    for (row_idx, row) in metadata.rows.iter().enumerate() {
+        if row.value_start != covered {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx2 metadata row {row_idx} value_start {} != expected {covered}",
+                row.value_start
+            )));
+        }
+        covered = covered
+            .checked_add(row.nnz as u64)
+            .ok_or_else(|| CodecError::MalformedInput("Scx2 metadata nnz overflows u64".into()))?;
+        indptr.push(covered);
+    }
+    if covered != nnz as u64 {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 metadata covers {covered} values, expected {nnz}"
+        )));
+    }
+
+    let indices = rice_gap_decode_with_metadata(encoded.indices_bytes, &metadata.rows)?;
+    if indices.len() != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 metadata decoded {} indices, expected {nnz}",
+            indices.len()
+        )));
+    }
+
+    let values_u32 = rice_decode_with_metadata(encoded.values_bytes, &metadata.rice_blocks)?;
+    if values_u32.len() != nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 metadata decoded {} values, expected {nnz}",
+            values_u32.len()
+        )));
+    }
+    let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
+
+    Ok((indptr, indices, values_bytes))
+}
+
+/// Random-access decode of a contiguous **row range** of an Scx2 shard. Mirrors
+/// [`decode_scx1_row_range`] but decodes Rice-gap indices; the Rice-value block
+/// handling is identical (values stream is byte-identical to Scx1).
+pub fn decode_scx2_row_range(
+    encoded: &EncodedShardRef,
+    value_encoding: ValueEncoding,
+    metadata: &Scx1DecodeMetadata,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<DecodedShard, CodecError> {
+    if !value_encoding.is_integer() {
+        return Err(CodecError::FloatWithScx1);
+    }
+    let row_end = row_start
+        .checked_add(n_rows)
+        .ok_or_else(|| CodecError::MalformedInput("Scx2 row range end overflows usize".into()))?;
+    if row_end > metadata.rows.len() {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 row range [{row_start}, {row_end}) exceeds shard rows {}",
+            metadata.rows.len()
+        )));
+    }
+    let row_slice = &metadata.rows[row_start..row_end];
+
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    indptr.push(0u64);
+    let mut window_nnz = 0u64;
+    for row in row_slice {
+        window_nnz = window_nnz
+            .checked_add(row.nnz as u64)
+            .ok_or_else(|| CodecError::MalformedInput("Scx2 row-range nnz overflows u64".into()))?;
+        indptr.push(window_nnz);
+    }
+    let window_nnz = window_nnz as usize;
+
+    let indices = rice_gap_decode_with_metadata(encoded.indices_bytes, row_slice)?;
+    if indices.len() != window_nnz {
+        return Err(CodecError::MalformedInput(format!(
+            "Scx2 row-range decoded {} indices, expected {window_nnz}",
+            indices.len()
+        )));
+    }
+
+    let values_u32 = if window_nnz == 0 {
+        Vec::new()
+    } else {
+        let v0 = row_slice[0].value_start;
+        let v1 = v0 + window_nnz as u64;
+        let blocks = &metadata.rice_blocks;
+        let b0 = blocks
+            .partition_point(|b| b.value_start <= v0)
+            .saturating_sub(1);
+        let b1 = blocks.partition_point(|b| b.value_start < v1);
+        if b1 <= b0 || blocks[b0].value_start > v0 {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx2 row-range: sidecar rice_blocks do not cover value ordinal {v0} \
+                 for rows [{row_start}, {row_end})"
+            )));
+        }
+        let covered = &blocks[b0..b1];
+        let block_base = covered[0].value_start;
+        let rebased: Vec<RiceBlockMetadata> = covered
+            .iter()
+            .map(|b| RiceBlockMetadata {
+                value_start: b.value_start - block_base,
+                n_values: b.n_values,
+                bit_offset: b.bit_offset,
+                k: b.k,
+            })
+            .collect();
+        let decoded = rice_decode_with_metadata(encoded.values_bytes, &rebased)?;
+        let head = (v0 - block_base) as usize;
+        if head + window_nnz > decoded.len() {
+            return Err(CodecError::MalformedInput(format!(
+                "Scx2 row-range value window [{head}, {}) exceeds covered block decode {}",
+                head + window_nnz,
+                decoded.len()
+            )));
+        }
+        decoded[head..head + window_nnz].to_vec()
+    };
     let values_bytes = u32_to_raw_bytes(&values_u32, value_encoding)?;
 
     Ok((indptr, indices, values_bytes))
@@ -1321,6 +1543,7 @@ mod tests {
         let codecs = [
             CodecId::None,
             CodecId::Scx1,
+            CodecId::Scx2,
             CodecId::Zstd,
             CodecId::Lz4Shuffle,
         ];
@@ -1711,7 +1934,8 @@ mod tests {
         assert_eq!(CodecId::from_u8(2), Some(CodecId::Zstd));
         assert_eq!(CodecId::from_u8(3), Some(CodecId::Lz4Shuffle));
         assert_eq!(CodecId::from_u8(4), Some(CodecId::Pcodec));
-        assert_eq!(CodecId::from_u8(5), None);
+        assert_eq!(CodecId::from_u8(5), Some(CodecId::Scx2));
+        assert_eq!(CodecId::from_u8(6), None);
 
         assert_eq!(ValueEncoding::from_u8(0), Some(ValueEncoding::Uint8));
         assert_eq!(ValueEncoding::from_u8(4), Some(ValueEncoding::Float16));
@@ -1821,6 +2045,7 @@ mod tests {
         assert_eq!(CodecId::parse_cli("auto").unwrap(), None);
         assert_eq!(CodecId::parse_cli("none").unwrap(), Some(CodecId::None));
         assert_eq!(CodecId::parse_cli("scx1").unwrap(), Some(CodecId::Scx1));
+        assert_eq!(CodecId::parse_cli("scx2").unwrap(), Some(CodecId::Scx2));
         assert_eq!(CodecId::parse_cli("zstd").unwrap(), Some(CodecId::Zstd));
         assert_eq!(
             CodecId::parse_cli("lz4").unwrap(),
@@ -1834,14 +2059,165 @@ mod tests {
     fn test_codec_id_display_name() {
         assert_eq!(CodecId::None.display_name(), "none");
         assert_eq!(CodecId::Scx1.display_name(), "scx1");
+        assert_eq!(CodecId::Scx2.display_name(), "scx2");
         assert_eq!(CodecId::Zstd.display_name(), "zstd");
         assert_eq!(CodecId::Lz4Shuffle.display_name(), "lz4+shuffle");
         assert_eq!(CodecId::Pcodec.display_name(), "pcodec");
         // Every explicit CLI codec parses back to a value whose display name
         // is stable (round-trip guard so the two maps can't drift).
-        for s in ["none", "scx1", "zstd", "pcodec"] {
+        for s in ["none", "scx1", "scx2", "zstd", "pcodec"] {
             let c = CodecId::parse_cli(s).unwrap().unwrap();
             assert_eq!(c.display_name(), s);
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Scx2 (Rice-gap indices)
+    // ----------------------------------------------------------------------
+
+    /// Build a slightly larger canonical CSR (strictly increasing rows, varied
+    /// densities incl. a >128-nnz row) for Scx2 dispatch tests.
+    fn make_scx2_csr() -> (Vec<u64>, Vec<u32>, Vec<u8>, usize, usize) {
+        let mut state: u64 = 0x1357_9BDF_2468_ACE0;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        let row_nnz = [0usize, 1, 5, 200, 3, 0, 64, 130, 7];
+        for &m in &row_nnz {
+            let mut prev = (next() % 30) as u32;
+            for _ in 0..m {
+                prev += 1 + (next() % 40) as u32;
+                indices.push(prev);
+                values.push(1 + (next() % 5) as u8);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        let n_rows = row_nnz.len();
+        let nnz = indices.len();
+        (indptr, indices, values, n_rows, nnz)
+    }
+
+    /// ISC-1/ISC-2: Scx2 indptr and values bytes are byte-identical to Scx1;
+    /// only the indices stream differs.
+    #[test]
+    fn scx2_shares_indptr_and_values_with_scx1() {
+        let (indptr, indices, values, _n, _nnz) = make_scx2_csr();
+        let enc = ValueEncoding::Uint8;
+        let s1 = encode_shard(&indptr, &indices, &values, CodecId::Scx1, enc, true).unwrap();
+        let s2 = encode_shard(&indptr, &indices, &values, CodecId::Scx2, enc, true).unwrap();
+        assert_eq!(s1.indptr_bytes, s2.indptr_bytes, "indptr must match scx1");
+        assert_eq!(s1.values_bytes, s2.values_bytes, "values must match scx1");
+        // Indices differ and (for this data) Scx2 is no larger than Scx1.
+        assert!(
+            s2.indices_bytes.len() <= s1.indices_bytes.len(),
+            "scx2 indices {} should be <= scx1 {}",
+            s2.indices_bytes.len(),
+            s1.indices_bytes.len()
+        );
+    }
+
+    /// ISC-13/14/21: Scx2 metadata decode + row-range decode + scipy decode all
+    /// agree with the canonical full decode.
+    #[test]
+    fn scx2_metadata_and_row_range_match_canonical() {
+        let (indptr, indices, values, n_rows, nnz) = make_scx2_csr();
+        let enc = ValueEncoding::Uint8;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::Scx2, enc, true).unwrap();
+        let meta = encoded.scx1_decode.clone().unwrap();
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+
+        let canonical = decode_shard_ref(&r, CodecId::Scx2, enc, n_rows, nnz, true).unwrap();
+        assert_eq!(canonical.0, indptr);
+        assert_eq!(canonical.1, indices);
+        assert_eq!(canonical.2, values);
+
+        let via_meta = decode_scx2_with_metadata(&r, enc, n_rows, nnz, &meta).unwrap();
+        assert_eq!(via_meta, canonical, "metadata decode != canonical");
+
+        let scipy = decode_shard_scipy(&r, CodecId::Scx2, enc, n_rows, nnz, true).unwrap();
+        let exp_idx: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+        assert_eq!(scipy.1, exp_idx, "scipy indices");
+
+        // Every contiguous row window matches the corresponding canonical slice.
+        for start in 0..=n_rows {
+            for len in 0..=(n_rows - start) {
+                let win = decode_scx2_row_range(&r, enc, &meta, start, len).unwrap();
+                let nnz0 = indptr[start] as usize;
+                let nnz1 = indptr[start + len] as usize;
+                assert_eq!(
+                    &win.1,
+                    &indices[nnz0..nnz1],
+                    "row range ({start},{len}) idx"
+                );
+                assert_eq!(&win.2, &values[nnz0..nnz1], "row range ({start},{len}) val");
+            }
+        }
+    }
+
+    /// ISC-7: Scx2 rejects float value encodings.
+    #[test]
+    fn scx2_rejects_float() {
+        let res = encode_shard(
+            &[0, 1],
+            &[0],
+            &[0u8; 4],
+            CodecId::Scx2,
+            ValueEncoding::Float32,
+            true,
+        );
+        assert!(matches!(res, Err(CodecError::FloatWithScx1)));
+    }
+
+    /// ISC-12: golden byte vector pinning the Scx2 encoding of a tiny CSR.
+    #[test]
+    fn scx2_golden_vector() {
+        // 1 row, indices [3, 5, 8] → frame_min=3, gaps shifted = [5-3-1, 8-5-1]
+        // = [1, 2]; median([1,2])=1 → k = clamp(floor(log2(0.6931*1)))=0.
+        // Block header: block_nnz=3 (u32 LE), n_rows=1 (u16 LE), varint nnz=3.
+        // Row: frame_min=3 (u16 LE), k=0 (u8), gaps Rice k=0:
+        //   gap shifted 1 -> unary(1)= "1 0"; shifted 2 -> unary(2)= "1 1 0"
+        //   bitstream LSB-first: bits = 1,0, 1,1,0 -> byte = 0b00001101 = 0x0D
+        let indptr = vec![0u64, 3];
+        let indices = vec![3u32, 5, 8];
+        let values = vec![1u8, 1, 1];
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx2,
+            ValueEncoding::Uint8,
+            true,
+        )
+        .unwrap();
+        let expected_indices: Vec<u8> = vec![
+            3, 0, 0, 0, // block_nnz = 3
+            1, 0, // n_rows_in_block = 1
+            3, // varint row nnz = 3
+            3, 0,    // frame_min = 3 (u16)
+            0,    // k = 0
+            0x0D, // gaps byte
+        ];
+        assert_eq!(
+            encoded.indices_bytes, expected_indices,
+            "scx2 indices golden bytes drifted"
+        );
+        // Round-trips.
+        let r = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        let dec = decode_shard_ref(&r, CodecId::Scx2, ValueEncoding::Uint8, 1, 3, true).unwrap();
+        assert_eq!(dec.1, indices);
     }
 }

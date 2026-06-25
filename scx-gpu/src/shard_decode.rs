@@ -158,7 +158,8 @@ pub fn decode_shard_gpu_with_metadata(
             nnz,
             metadata,
         ),
-        CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
+        // Scx2 (Rice-gap indices) has no GPU kernel; host-bounce via CPU decode.
+        CodecId::None | CodecId::Scx2 | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
             decode_cpu_fallback(
                 dev,
                 indptr_bytes,
