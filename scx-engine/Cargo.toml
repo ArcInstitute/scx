@@ -19,8 +19,9 @@ byteorder = { workspace = true }
 # E2-2026-05-20: `did you mean ...?` suggestion rendered by
 # `index::forced_column_missing_message` for forced-column errors.
 strsim = { workspace = true }
+# F1: parse the `group_index` JSON sidecar payload.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 proptest = { workspace = true }

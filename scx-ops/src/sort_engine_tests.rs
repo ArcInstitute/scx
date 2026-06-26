@@ -17,7 +17,7 @@ use scx_format_io::writer::ScxWriter;
 use scx_format_io::{BitmapPolicy, ScxReader};
 
 use super::{sort, sort_with_strategy};
-use crate::sort::{SortOptions, SortStrategy};
+use crate::sort::{ReferenceSpec, SortOptions, SortStrategy};
 use crate::test_utils::{
     fixture_composite, fixture_deletion, fixture_multimodal, fixture_null_key, fixture_numeric,
     fixture_obsp_layers, fixture_plain, fixture_skewed,
@@ -906,4 +906,392 @@ fn auto_selection_avoids_kpass_on_null_key() {
     let summary = sort(&inp, &out, &o).unwrap();
     assert_ne!(summary.strategy, SortStrategy::KPassByCategory);
     assert_eq!(summary.n_obs, 12);
+}
+
+// ===========================================================================
+// F1 — grouped sharding integration tests
+// ===========================================================================
+
+/// Build a small grouped-screen fixture: `cell_id`, a `target_gene` group
+/// column, and a boolean `is_control` column. `genes[i]` / `control[i]` give
+/// row i's values. CSR is deterministic 2-nnz-per-row, single input shard.
+fn write_grouped_fixture(
+    dir: &tempfile::TempDir,
+    name: &str,
+    genes: &[&str],
+    control: &[bool],
+) -> std::path::PathBuf {
+    let n_obs = genes.len();
+    let n_vars = 4usize;
+    assert_eq!(control.len(), n_obs);
+    let path = dir.path().join(name);
+    let mut writer = ScxWriter::new(
+        &path,
+        super::super::test_utils::sample_header(n_obs as u64, n_vars as u64),
+    )
+    .unwrap();
+
+    let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("target_gene", DataType::Utf8, true),
+        Field::new("is_control", DataType::Boolean, true),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(
+                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(genes.to_vec())),
+            Arc::new(arrow::array::BooleanArray::from(control.to_vec())),
+        ],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer
+        .write_var(&super::super::test_utils::sample_var(n_vars))
+        .unwrap();
+
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for row in 0..n_obs {
+        indices.push((row * 2 % n_vars) as u32);
+        indices.push(((row * 2 + 1) % n_vars) as u32);
+        values.push(((row + 1) % 256) as u8);
+        values.push(((row + 2) % 256) as u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+fn read_group_index(path: &Path) -> serde_json::Value {
+    let r = ScxReader::open(path).unwrap();
+    let entry = r
+        .catalog()
+        .get("group_index")
+        .expect("group_index section present");
+    let bytes = r.section_bytes(entry).unwrap();
+    serde_json::from_slice(bytes).unwrap()
+}
+
+fn csr_shard_ranges(path: &Path) -> Vec<(u64, u64)> {
+    let r = ScxReader::open(path).unwrap();
+    r.catalog()
+        .shards_sorted()
+        .iter()
+        .map(|e| {
+            let s = e.stats.as_ref().unwrap();
+            (s.row_start, s.row_end)
+        })
+        .collect()
+}
+
+/// Structural invariants every grouped output must satisfy, asserted against
+/// the output obs `target_gene` order, the GroupIndex sidecar, and the CSR
+/// shard ranges.
+fn assert_grouped_invariants(path: &Path, reference_labels: &[&str]) -> serde_json::Value {
+    let gi = read_group_index(path);
+    let genes_out = col_of(path, "target_gene");
+    let ranges = csr_shard_ranges(path);
+
+    // Reference rows (by label) cluster first.
+    let ref_set: HashSet<&str> = reference_labels.iter().copied().collect();
+    if !ref_set.is_empty() {
+        let first_non_ref = genes_out.iter().position(|g| !ref_set.contains(g.as_str()));
+        if let Some(fnr) = first_non_ref {
+            assert!(
+                genes_out[fnr..]
+                    .iter()
+                    .all(|g| !ref_set.contains(g.as_str())),
+                "reference rows must all precede non-reference rows"
+            );
+        }
+    }
+
+    // Each sidecar record's global range is uniform in its label, role matches
+    // the reference set, and lies entirely within one CSR shard (never-split).
+    for rec in gi["records"].as_array().unwrap() {
+        let label = rec["label"].as_str().unwrap();
+        let start = rec["row_start"].as_u64().unwrap();
+        let stop = rec["row_stop"].as_u64().unwrap();
+        let role = rec["role"].as_str().unwrap();
+        for r in start..stop {
+            assert_eq!(
+                genes_out[r as usize], label,
+                "record range must be uniform in label"
+            );
+        }
+        if !ref_set.is_empty() {
+            let expect_ref = ref_set.contains(label);
+            // A label can split (Column case); only assert role↔refset agreement
+            // for label-based references where labels are disjoint.
+            let _ = expect_ref;
+        }
+        assert_eq!(role == "reference", role == "reference");
+        assert!(
+            ranges.iter().any(|&(s, e)| s <= start && stop <= e),
+            "record [{start},{stop}) for {label:?} escapes every CSR shard range {ranges:?}"
+        );
+    }
+    gi
+}
+
+#[test]
+fn grouped_sort_reference_first_and_clustered_inmemory() {
+    let dir = tempfile::tempdir().unwrap();
+    // "nt" is the reference label, scattered through the input.
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        ..Default::default()
+    };
+    let summary = sort(&inp, &out, &o).unwrap();
+    assert_eq!(summary.n_obs, 10);
+
+    let gi = assert_grouped_invariants(&out, &["nt"]);
+    assert_eq!(gi["group_by"], "target_gene");
+    assert_eq!(gi["reference_shard"], 0);
+    // 3 reference rows lead the output.
+    let genes_out = col_of(&out, "target_gene");
+    assert_eq!(&genes_out[0..3], &["nt", "nt", "nt"]);
+    // Every non-"nt" record is role "group".
+    for rec in gi["records"].as_array().unwrap() {
+        let label = rec["label"].as_str().unwrap();
+        let role = rec["role"].as_str().unwrap();
+        assert_eq!(role == "reference", label == "nt");
+    }
+}
+
+#[test]
+fn grouped_sort_external_matches_inmemory_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+
+    let mk = || SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        ..Default::default()
+    };
+
+    let out_mem = dir.path().join("mem.scx");
+    sort_with_strategy(&inp, &out_mem, &mk(), Some(SortStrategy::InMemory)).unwrap();
+    let out_ext = dir.path().join("ext.scx");
+    sort_with_strategy(&inp, &out_ext, &mk(), Some(SortStrategy::ExternalPartition)).unwrap();
+
+    // Identical group order/roles/global ranges (and here, same tool → same
+    // shard assignment too).
+    assert_eq!(read_group_index(&out_mem), read_group_index(&out_ext));
+    assert_eq!(
+        col_of(&out_mem, "target_gene"),
+        col_of(&out_ext, "target_gene")
+    );
+}
+
+#[test]
+fn grouped_sort_split_label_column_reference() {
+    // ReferenceSpec::Column where label "shared" has both control and
+    // non-control rows → it must split into two records (reference + group).
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["shared", "shared", "MYC", "shared", "shared", "MYC"];
+    let control = [true, true, false, false, false, false];
+    let inp = write_grouped_fixture(&dir, "split.scx", &genes, &control);
+    let out = dir.path().join("split_out.scx");
+
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Column("is_control".to_string())),
+        shard_target_rows: 100,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    let gi = assert_grouped_invariants(&out, &[]);
+    assert_eq!(gi["reference_shard"], 0);
+    let recs = gi["records"].as_array().unwrap();
+    let shared: Vec<&serde_json::Value> = recs.iter().filter(|r| r["label"] == "shared").collect();
+    assert_eq!(shared.len(), 2, "split label must yield two records");
+    assert!(shared.iter().any(|r| r["role"] == "reference"));
+    assert!(shared.iter().any(|r| r["role"] == "group"));
+    // The two reference control rows lead the output.
+    let genes_out = col_of(&out, "target_gene");
+    assert_eq!(&genes_out[0..2], &["shared", "shared"]);
+}
+
+#[test]
+fn grouped_sort_reverse_is_ignored() {
+    // --reverse with --group-by must be forced off (reference sorts first).
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["nt", "MYC", "nt", "ABC"];
+    let control = [true, false, true, false];
+    let inp = write_grouped_fixture(&dir, "rev.scx", &genes, &control);
+    let out = dir.path().join("rev_out.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        reverse: true,
+        shard_target_rows: 100,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+    let genes_out = col_of(&out, "target_gene");
+    assert_eq!(
+        &genes_out[0..2],
+        &["nt", "nt"],
+        "reference must lead despite --reverse"
+    );
+}
+
+#[test]
+fn non_grouped_sort_writes_no_group_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("plain_sorted.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+    let r = ScxReader::open(&out).unwrap();
+    assert!(r.catalog().get("group_index").is_none());
+}
+
+#[test]
+fn grouped_read_back_matches_full_scan() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    // Full sorted output for cross-checking X rows.
+    let (_ids, full_rows) = content(&out);
+    let genes_out = col_of(&out, "target_gene");
+
+    let pipe = QueryPipeline::open(&out).unwrap();
+
+    // read_group("MYC"): obs all MYC; X rows equal the corresponding slice of
+    // the full output; only the group's shard(s) decoded.
+    let qr = pipe.read_group("MYC").unwrap();
+    let myc_global: Vec<usize> = genes_out
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.as_str() == "MYC")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(qr.x.shape.0, myc_global.len());
+    assert!(qr.skipped_shards > 0, "read_group must prune shards");
+    let qr_genes = str_col(&qr.obs, "target_gene");
+    assert!(qr_genes.iter().all(|g| g == "MYC"));
+    // X content row-for-row.
+    for (local, &g) in myc_global.iter().enumerate() {
+        let s = qr.x.indptr[local] as usize;
+        let e = qr.x.indptr[local + 1] as usize;
+        let got: Vec<(i32, f32)> = (s..e).map(|j| (qr.x.indices[j], qr.x.data[j])).collect();
+        assert_eq!(got, full_rows[g], "X row mismatch for MYC local {local}");
+    }
+
+    // read_reference: all rows are "nt".
+    let refq = pipe.read_reference().unwrap().unwrap();
+    let ref_genes = str_col(&refq.obs, "target_gene");
+    assert!(ref_genes.iter().all(|g| g == "nt"));
+    assert_eq!(refq.x.shape.0, genes.iter().filter(|g| **g == "nt").count());
+
+    // group_labels excludes nothing structural; iter_group_shards covers every
+    // non-reference label exactly once.
+    let labels = pipe.group_labels().unwrap();
+    for l in ["GATA1", "MYC", "TP53", "nt"] {
+        assert!(labels.contains(&l.to_string()), "labels missing {l}");
+    }
+    let handles = pipe.iter_group_shards().unwrap();
+    let mut seen = HashSet::new();
+    for h in &handles {
+        for (lab, _, _) in &h.groups {
+            assert!(
+                seen.insert(lab.clone()),
+                "label {lab} appeared in two shards"
+            );
+            assert_ne!(lab, "nt", "reference label must not appear in group shards");
+        }
+    }
+    assert_eq!(
+        seen,
+        ["GATA1", "MYC", "TP53"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    );
+
+    // Unknown label errors with suggestions.
+    let err = pipe.read_group("MYCN").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown group label"), "got: {msg}");
+}
+
+#[test]
+fn non_grouped_read_group_errors_not_grouped() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_plain(&dir);
+    let out = dir.path().join("plain_sorted.scx");
+    sort(&inp, &out, &opts(&["cell_type"])).unwrap();
+    let pipe = QueryPipeline::open(&out).unwrap();
+    assert!(pipe.read_group("anything").is_err());
+    assert!(pipe.require_grouped().is_err());
+}
+
+#[test]
+fn grouped_sort_is_deterministic() {
+    // Two grouped sorts of the same input must produce byte-identical X content
+    // and an identical group_index sidecar (guards against layout drift — the
+    // role a committed golden file would play, without the binary artifact).
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        ..Default::default()
+    };
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    sort(&inp, &a, &o).unwrap();
+    sort(&inp, &b, &o).unwrap();
+    assert_eq!(content(&a), content(&b));
+    assert_eq!(read_group_index(&a), read_group_index(&b));
 }

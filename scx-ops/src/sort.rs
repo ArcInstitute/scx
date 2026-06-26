@@ -76,6 +76,36 @@ pub struct SortOptions {
     /// default; `Auto`/`Always` rebuild the gene→local-row sidecar per X
     /// shard, mirroring `scx convert --bitmap`).
     pub bitmap: BitmapPolicy,
+
+    // ---- F1: condition/label-grouped sharding (all opt-in; None => current behaviour) ----
+    /// obs column whose label clusters rows into shards (the "group_by" key).
+    /// When `Some`, it is forced to be the leading sort key so clustering and
+    /// the predicate index are guaranteed, and the byte-budget group planner
+    /// is engaged. `--reverse` is ignored in grouped mode (reference rows must
+    /// sort first under ascending order).
+    pub group_by: Option<String>,
+    /// Which rows are reference cells (e.g. "non-targeting"); packed first and
+    /// isolated in shard 0. Requires `group_by` to be `Some`. `None` => no
+    /// reference isolation.
+    pub reference: Option<ReferenceSpec>,
+    /// Byte budget per shard for the group bin-packer. `None` => the planner
+    /// runs in row-count mode against `shard_target_rows` (still cuts only at
+    /// group edges). Only meaningful when `group_by` is `Some`.
+    pub group_target_bytes: Option<u64>,
+    /// Oversize threshold: a single group exceeding this gets its own oversized
+    /// shard plus a warning. `None` => derived as a multiple of
+    /// `group_target_bytes`. Only meaningful when `group_by` is `Some`.
+    pub group_max_bytes: Option<u64>,
+}
+
+/// How to identify reference rows for grouped sharding (F1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceSpec {
+    /// Explicit set of `group_by` labels that are reference (e.g.
+    /// `["non-targeting"]`).
+    Labels(Vec<String>),
+    /// A boolean obs column that is `true` for reference rows.
+    Column(String),
 }
 
 impl Default for SortOptions {
@@ -89,6 +119,10 @@ impl Default for SortOptions {
             memory_budget: None,
             temp_dir: None,
             bitmap: BitmapPolicy::default(),
+            group_by: None,
+            reference: None,
+            group_target_bytes: None,
+            group_max_bytes: None,
         }
     }
 }

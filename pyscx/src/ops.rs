@@ -651,6 +651,12 @@ pub fn sort(
         memory_budget,
         temp_dir: temp_dir.map(PathBuf::from),
         bitmap,
+        // F1 grouped sharding is driven from the CLI (`scx sort --group-by`);
+        // the pyscx `sort` wrapper keeps the ungrouped behaviour.
+        group_by: None,
+        reference: None,
+        group_target_bytes: None,
+        group_max_bytes: None,
     };
     py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
         .map_err(ops_to_pyerr)?;

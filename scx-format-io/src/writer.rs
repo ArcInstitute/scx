@@ -2476,6 +2476,15 @@ impl ScxWriter {
         )
     }
 
+    /// F1: write the condition/label-grouped sharding sidecar
+    /// ([`SectionType::GroupIndex`], section name `group_index`). `data` is the
+    /// pre-serialized JSON payload
+    /// `{group_by, reference_shard, reference_labels, records[]}`. One per file;
+    /// written after the last CSR shard flush by the grouped sort path.
+    pub fn write_group_index(&mut self, data: &[u8]) -> Result<()> {
+        self.write_section_bytes("group_index", SectionType::GroupIndex, data, None)
+    }
+
     /// Phase 5b: write a detection-bitmap shard.
     ///
     /// Modality-aware: if [`Self::with_modality`] has set

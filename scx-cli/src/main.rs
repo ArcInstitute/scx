@@ -361,10 +361,11 @@ enum Commands {
         /// Output SCX file path
         output: PathBuf,
         /// Comma-separated obs columns to sort by, lexicographic in order
-        /// (the leading key gets the full X-read-locality benefit).
+        /// (the leading key gets the full X-read-locality benefit). Optional
+        /// when `--group-by` is given (which becomes the leading key).
         #[arg(long, value_name = "CSV")]
-        by: String,
-        /// Sort descending on all keys
+        by: Option<String>,
+        /// Sort descending on all keys (ignored with `--group-by`).
         #[arg(long)]
         reverse: bool,
         /// Overwrite output if it exists
@@ -412,6 +413,27 @@ enum Commands {
         /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
         #[arg(long, default_value = "4G")]
         csc_memory_limit: String,
+        /// F1: obs column whose label clusters rows into shards (condition /
+        /// perturbation grouping). Forced to be the leading sort key; engages
+        /// the byte-budget group planner and writes a `group_index` sidecar.
+        /// `--reverse` is ignored when set. Restricted to single-modality
+        /// inputs in v1.
+        #[arg(long, value_name = "COL")]
+        group_by: Option<String>,
+        /// F1: which rows are reference cells (e.g. "non-targeting"), packed
+        /// first / isolated in shard 0. A comma-separated label list, or
+        /// `col:<name>` for a boolean obs column. Requires `--group-by`.
+        #[arg(long, value_name = "LABELS|col:NAME")]
+        reference: Option<String>,
+        /// F1: byte budget per shard for the group bin-packer (binary suffix
+        /// `K`/`M`/`G`/`T`). Without it the planner packs by `--shard-size`
+        /// rows. Only with `--group-by`.
+        #[arg(long, value_name = "SIZE")]
+        group_target_bytes: Option<String>,
+        /// F1: oversize threshold — a single group exceeding it gets its own
+        /// shard plus a warning. Defaults to a multiple of the target.
+        #[arg(long, value_name = "SIZE")]
+        group_max_bytes: Option<String>,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -963,10 +985,14 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
+            group_by,
+            reference,
+            group_target_bytes,
+            group_max_bytes,
         } => sort::run_sort(
             &input,
             &output,
-            parse_index_columns(Some(&by)),
+            parse_index_columns(by.as_deref()),
             reverse,
             force,
             shard_size,
@@ -981,6 +1007,10 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             &csc_memory_limit,
+            group_by,
+            reference,
+            group_target_bytes,
+            group_max_bytes,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),

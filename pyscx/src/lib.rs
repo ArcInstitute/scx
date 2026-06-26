@@ -18,7 +18,7 @@ mod cloud;
 use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use experiment::PyExperiment;
+use experiment::{PyExperiment, PyGroupShard};
 use query::{PyQueryPipeline, PyQueryResult};
 use scx_format_io::{ScxError, ScxErrorClass};
 
@@ -972,6 +972,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Classes
     m.add_class::<PyExperiment>()?;
+    m.add_class::<PyGroupShard>()?;
     m.add_class::<PyQueryPipeline>()?;
     m.add_class::<PyQueryResult>()?;
     m.add_class::<scx_loader::TrainingDataset>()?;

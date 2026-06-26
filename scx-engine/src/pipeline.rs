@@ -225,6 +225,115 @@ impl QueryPipeline {
         crate::collect::exists(self)
     }
 
+    // -- F2: grouped reads (over the `group_index` sidecar) -----------------
+
+    /// Load the group index, or `Err(EngineError::NotGrouped)` if the archive
+    /// was not written with `--group-by`.
+    pub fn require_grouped(&self) -> Result<crate::group::GroupIndex> {
+        crate::group::GroupIndex::open(self.reader.as_ref())
+    }
+
+    /// Read exactly the rows of `label` in the `group_by` column (Route B —
+    /// direct global row-range slice). Grouped archive only.
+    ///
+    /// `Err(EngineError::UnknownGroupLabel { suggestions })` on a miss, carrying
+    /// `strsim` close matches (difflib-equivalent).
+    pub fn read_group(&self, label: &str) -> Result<QueryResult> {
+        let gi = self.require_grouped()?;
+        match gi.record(label) {
+            Some(rec) => self.read_row_range(rec.row_start, rec.row_stop),
+            None => Err(crate::error::EngineError::UnknownGroupLabel {
+                label: label.to_string(),
+                suggestions: gi.close_matches(label, 5),
+            }),
+        }
+    }
+
+    /// Read the full reference region (the contiguous leading range spanning
+    /// every reference record). `Ok(None)` if the archive has no reference
+    /// rows. A reference set spanning several leading shards is fully returned.
+    pub fn read_reference(&self) -> Result<Option<QueryResult>> {
+        let gi = self.require_grouped()?;
+        match gi.reference_range() {
+            Some((start, stop)) => Ok(Some(self.read_row_range(start, stop)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Distinct group labels present (for discovery / error messages).
+    pub fn group_labels(&self) -> Result<Vec<String>> {
+        Ok(self.require_grouped()?.labels())
+    }
+
+    /// One handle per non-reference shard (global range + label→local-slice
+    /// map). The caller streams each shard via [`Self::read_row_range`] over the
+    /// handle's `[global_start, global_stop)`, keeping ~one shard resident.
+    pub fn iter_group_shards(&self) -> Result<Vec<crate::group::GroupShardHandle>> {
+        Ok(self.require_grouped()?.shard_handles())
+    }
+
+    /// Read a contiguous global output-row range `[start, stop)` as a
+    /// `QueryResult` (the Route B seam). Decodes only the CSR shards covering
+    /// the range; `skipped_shards` reflects the pruning. obs is sliced to the
+    /// range and var passed through, so `.to_anndata()` matches every other read
+    /// path.
+    ///
+    /// v1 note: obs metadata is read in full and sliced (cheap Arrow slice); the
+    /// expensive X decode is what the range restricts.
+    pub fn read_row_range(&self, start: u64, stop: u64) -> Result<QueryResult> {
+        use scx_format_io::catalog::FullCatalogEntry;
+        let stop = stop.max(start);
+        let n = (stop - start) as usize;
+        let n_vars = self.reader.header().n_vars as usize;
+        let csr_shards: Vec<&FullCatalogEntry> = self.reader.catalog().shards_sorted();
+        let total_shards = csr_shards.len();
+
+        let mut merged_indptr: Vec<i64> = vec![0];
+        let mut merged_indices: Vec<i32> = Vec::new();
+        let mut merged_data: Vec<f32> = Vec::new();
+        let mut candidate_shard_rows = 0usize;
+        let mut touched = 0usize;
+
+        for e in &csr_shards {
+            let Some(stats) = e.stats.as_ref() else {
+                continue;
+            };
+            let (rs, re) = (stats.row_start, stats.row_end);
+            if re <= start || rs >= stop {
+                continue; // no overlap
+            }
+            touched += 1;
+            candidate_shard_rows += (re - rs) as usize;
+            let (indptr, indices, data) = self.reader.read_shard_from_entry(e)?;
+            let lo = start.max(rs);
+            let hi = stop.min(re);
+            for g in lo..hi {
+                let l = (g - rs) as usize;
+                let s = indptr[l] as usize;
+                let en = indptr[l + 1] as usize;
+                merged_indices.extend_from_slice(&indices[s..en]);
+                merged_data.extend_from_slice(&data[s..en]);
+                let prev = *merged_indptr.last().unwrap();
+                merged_indptr.push(prev + (en - s) as i64);
+            }
+        }
+
+        let x = ScxCsr::new_unchecked((n, n_vars), merged_indptr, merged_indices, merged_data);
+        let obs_full = self.reader.read_obs()?;
+        let obs = obs_full.slice(start as usize, n);
+        let var = self.reader.read_var()?;
+
+        Ok(QueryResult {
+            x,
+            obs,
+            var,
+            skipped_shards: total_shards.saturating_sub(touched),
+            total_shards,
+            candidate_shard_rows,
+            matched_rows: n,
+        })
+    }
+
     // -- Accessors for testing and collect.rs --
 
     /// Access the cached obs schema.

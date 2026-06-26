@@ -220,7 +220,8 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 | 26 | `decode_metadata_shard` (optional decode metadata sidecar for a source Scx1 CSR-like shard — see §4.2) |
 | 27 | `raw_csr_shard` (row-shard of the `adata.raw` count matrix — same obs axis as `csr_shard` but its OWN, typically wider, var axis; signalled by the `has_raw` flag) |
 | 28 | `raw_var_metadata` (Arrow IPC; the `adata.raw.var` DataFrame, companion to `raw_csr_shard`) |
-| 29–31 | Reserved for multimodal/spatial extensions |
+| 29 | `group_index` (JSON; condition/label-grouped sharding sidecar — `{group_by, reference_shard, reference_labels, records[]}`, records `{label, shard, row_start, row_stop, role}` with **global** output-row indices; written by `scx sort --group-by`, consumed by the grouped-read API) |
+| 30–31 | Reserved for multimodal/spatial extensions |
 | 32–239 | Reserved for future use |
 | 240–254 | Reserved for vendor / encrypted / private section types |
 | 255 | Sentinel |
