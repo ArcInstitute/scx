@@ -61,7 +61,7 @@
 //! growth is purely codec/order-dependent. See docs/sharding.md and
 //! docs/performance.md § Sort.
 //!
-//! Phase 5 lifted the earlier scope-outs: **multimodal** inputs reorder every
+//! Lifted the earlier scope-outs: **multimodal** inputs reorder every
 //! modality's X by the global obs order ([`sort_multimodal`], mirroring
 //! `compact_multimodal`; per-modality X is gathered in-memory, the bounded
 //! external path stays single-modality); **obsp** (obs×obs COO) is remapped
@@ -105,12 +105,14 @@ const K_PASS_MAX_CARDINALITY: usize = 32;
 /// F1: packing-size estimate per non-zero for the byte-budget group planner —
 /// in-memory `i32` index (4 B) + `f32` value (4 B). This sizes packing
 /// decisions, NOT bytes-on-disk (the codec + narrowest-int width determine the
-/// real shard size).
-const GROUP_BYTES_PER_NNZ: u64 = 8;
+/// real shard size). Public so `scx convert --group-target-bytes`
+/// sizes byte-mode shards identically to `scx sort`.
+pub const GROUP_BYTES_PER_NNZ: u64 = 8;
 
 /// F1: default oversize threshold as a multiple of the per-shard target when
-/// `--group-max-bytes` is not supplied.
-const GROUP_MAX_BYTES_MULTIPLE: u64 = 4;
+/// `--group-max-bytes` is not supplied. Public for the same reason as
+/// [`GROUP_BYTES_PER_NNZ`].
+pub const GROUP_MAX_BYTES_MULTIPLE: u64 = 4;
 
 /// Sort an SCX file: reorder the obs axis by `opts.by`, writing a new file.
 ///
@@ -232,35 +234,68 @@ pub fn sort_with_strategy(
         ));
     }
 
-    // F1: build the reference mask (live order) and, when present, inject the
-    // synthetic `__scx_ref__` reference-first sort key. `ref_mask_live` is
-    // retained for the planner's per-row role; `live_keys` / `extractor_by`
-    // become the (possibly augmented) sort inputs.
-    let ref_mask_live: Option<Vec<bool>> = match (&opts.group_by, &opts.reference) {
-        (Some(group_col), Some(reference)) => {
-            Some(build_reference_mask(&live_keys, group_col, reference)?)
-        }
-        _ => None,
-    };
-    let (live_keys, extractor_by) = match &ref_mask_live {
-        Some(mask) => inject_reference_first_key(&live_keys, &opts.by, mask)?,
-        None => (live_keys, opts.by.clone()),
-    };
-
-    let extractor = SortKeyExtractor::new(&live_keys.schema(), &extractor_by, opts.reverse)?;
-    let rows = extractor.rows(&live_keys)?;
-    log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
-    // Local indices into the live sequence, in sorted order (stable, ties by
-    // source id). `live_keys` and `live_obs` (built below) are filtered from
-    // the same row universe in the same shard-concatenated order, so these
-    // local indices apply to both.
-    let order_local = stable_argsort(&rows, 0);
+    // ----- F1: grouped order + plan (or plain global order) -----
+    // Grouped sorts delegate the reference-first / group-by order + label /
+    // reference computation to the shared `compute_grouped_order` (also used by
+    // `scx convert --group-by`), so both paths produce a byte-identical grouped
+    // layout. `live_keys` (the projected sort-key columns) stays resident and
+    // un-augmented — it feeds the X strategy selector / K-pass below (category
+    // enumeration, null detection) and `compute_grouped_order` injects the
+    // synthetic reference-first key on its own clone.
+    let mut grouped_reference_labels: Vec<String> = Vec::new();
+    let (order_local, group_plan): (Vec<u64>, Option<crate::group_plan::GroupPlan>) =
+        if let Some(group_col) = &opts.group_by {
+            // `opts.by` is normalized to `[group_col, <secondary...>]`.
+            let secondary: Vec<String> = opts.by.iter().skip(1).cloned().collect();
+            let go =
+                compute_grouped_order(&live_keys, group_col, &secondary, opts.reference.as_ref())?;
+            log::info!("scx sort: pass 0a grouped order built; argsort over {n_live} rows");
+            // Byte-budget pre-scan (skipped in row-count mode); needs emission
+            // order in global old-row ids for the shard indptr lookup.
+            let (per_row_nnz, target_units, bytes_per_nnz) = match opts.group_target_bytes {
+                Some(tb) => {
+                    let order_old_tmp: Vec<u64> =
+                        go.perm.iter().map(|&l| live_ids[l as usize]).collect();
+                    (
+                        prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?,
+                        tb.max(1),
+                        GROUP_BYTES_PER_NNZ,
+                    )
+                }
+                None => (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64),
+            };
+            let max_units = opts
+                .group_max_bytes
+                .unwrap_or_else(|| target_units.saturating_mul(GROUP_MAX_BYTES_MULTIPLE));
+            let plan = crate::group_plan::plan_group_shards(
+                &go.group_of_new,
+                &go.ref_of_new,
+                &go.labels,
+                &per_row_nnz,
+                target_units,
+                bytes_per_nnz,
+                max_units,
+            );
+            log::info!(
+                "scx sort: group plan -> {} shards, {} records, reference_shard={:?}",
+                plan.n_shards,
+                plan.records.len(),
+                plan.reference_shard
+            );
+            grouped_reference_labels = go.reference_labels;
+            (go.perm, Some(plan))
+        } else {
+            let extractor = SortKeyExtractor::new(&live_keys.schema(), &opts.by, opts.reverse)?;
+            let rows = extractor.rows(&live_keys)?;
+            log::info!("scx sort: pass 0a key rows built; argsort over {n_live} rows");
+            // Local indices into the live sequence, in sorted order (stable, ties
+            // by source id). `live_keys` and `live_obs` are filtered from the same
+            // row universe in the same shard-concatenated order, so these local
+            // indices apply to both.
+            (stable_argsort(&rows, 0), None)
+        };
     // Output row -> original (global) old row id.
     let order_old: Vec<u64> = order_local.iter().map(|&l| live_ids[l as usize]).collect();
-    drop(rows);
-    // `live_keys` (the projected sort-key columns) stays resident — it feeds the
-    // X strategy selector / K-pass below (category enumeration, null detection),
-    // replacing the full `live_obs` the in-memory path no longer always builds.
 
     // old row -> new position (-1 = deleted / absent). Drives the external
     // strategy's partition routing and the obsp remap; shared by all paths.
@@ -268,74 +303,6 @@ pub fn sort_with_strategy(
     for (new, &old) in order_old.iter().enumerate() {
         new_pos_of_old[old as usize] = new as i64;
     }
-
-    // ----- F1: build the group plan (drives emitter breaks + the sidecar) -----
-    let group_plan = if let Some(group_col) = &opts.group_by {
-        let cats = distinct_categories(&live_keys, group_col, false)?;
-        let cat_of_old = category_of_old(&live_keys, &live_ids, group_col, &cats, n_obs)?;
-        let mut labels = cats;
-        let ungrouped_idx = labels.len() as i32;
-        let mut used_ungrouped = false;
-        let group_of_new: Vec<i32> = order_old
-            .iter()
-            .map(|&old| {
-                let c = cat_of_old[old as usize];
-                if c < 0 {
-                    used_ungrouped = true;
-                    ungrouped_idx
-                } else {
-                    c
-                }
-            })
-            .collect();
-        if used_ungrouped {
-            labels.push("__ungrouped__".to_string());
-        }
-        // Per-row reference flag in emission order.
-        let ref_of_new: Vec<bool> = match &ref_mask_live {
-            Some(mask) => {
-                let mut ref_global = vec![false; n_obs];
-                for (local, &old) in live_ids.iter().enumerate() {
-                    ref_global[old as usize] = mask[local];
-                }
-                order_old
-                    .iter()
-                    .map(|&old| ref_global[old as usize])
-                    .collect()
-            }
-            None => vec![false; order_old.len()],
-        };
-        // Byte-budget pre-scan (skipped in row-count mode).
-        let (per_row_nnz, target_units, bytes_per_nnz) = match opts.group_target_bytes {
-            Some(tb) => (
-                prescan_per_row_nnz(&reader, &order_old, n_obs)?,
-                tb.max(1),
-                GROUP_BYTES_PER_NNZ,
-            ),
-            None => (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64),
-        };
-        let max_units = opts
-            .group_max_bytes
-            .unwrap_or_else(|| target_units.saturating_mul(GROUP_MAX_BYTES_MULTIPLE));
-        let plan = crate::group_plan::plan_group_shards(
-            &group_of_new,
-            &ref_of_new,
-            &labels,
-            &per_row_nnz,
-            target_units,
-            bytes_per_nnz,
-            max_units,
-        );
-        log::info!(
-            "scx sort: group plan -> {} shards, {} records, reference_shard={:?}",
-            plan.n_shards,
-            plan.records.len(),
-            plan.reference_shard
-        );
-        Some(plan)
-    } else {
-        None
-    };
 
     // Pass 0b — obs write strategy (SCX-SORT-OOM-BUG Part 2). The bounded
     // spill-scatter path applies only to a single-modality sort with a
@@ -385,7 +352,7 @@ pub fn sort_with_strategy(
     };
 
     // Multimodal inputs reorder every modality's X by the same global obs
-    // order (Phase 5 / T5.1); the single-modality engine below handles the
+    // order; the single-modality engine below handles the
     // common case. Multimodal always takes the in-memory obs path.
     if reader.is_multimodal() {
         let sorted_obs = sorted_obs
@@ -658,21 +625,10 @@ pub fn sort_with_strategy(
             }),
             "group record range escapes its emitter shard range"
         );
-        // reference_labels: explicit set for `Labels`, else the distinct labels
-        // that ended up reference (covers `ReferenceSpec::Column`).
-        let reference_labels: Vec<String> = match &opts.reference {
-            Some(crate::sort::ReferenceSpec::Labels(set)) => set.clone(),
-            _ => {
-                let mut seen = std::collections::BTreeSet::new();
-                for r in &plan.records {
-                    if r.role == crate::group_plan::Role::Reference {
-                        seen.insert(r.label.clone());
-                    }
-                }
-                seen.into_iter().collect()
-            }
-        };
-        let payload = plan.to_sidecar_json(group_col, &reference_labels);
+        // reference_labels computed alongside the order in `compute_grouped_order`
+        // (explicit set for `Labels`, else the distinct labels that ended up
+        // reference for `ReferenceSpec::Column`).
+        let payload = plan.to_sidecar_json(group_col, &grouped_reference_labels);
         let bytes = serde_json::to_vec(&payload).map_err(|e| {
             OpsError::InvalidInput(format!("scx sort: failed to serialize group index: {e}"))
         })?;
@@ -690,7 +646,7 @@ pub fn sort_with_strategy(
         writer.write_obsm(name, &reordered)?;
     }
 
-    // ----- uns / varm / varp passthrough; obsp dropped (Phase 5 remap) -----
+    // ----- uns / varm / varp passthrough; obsp dropped  -----
     if let Ok(uns) = reader.read_uns() {
         writer.write_uns(&uns)?;
     }
@@ -2200,6 +2156,151 @@ fn inject_reference_first_key(
     extractor_by.push("__scx_ref__".to_string());
     extractor_by.extend(by.iter().cloned());
     Ok((batch, extractor_by))
+}
+
+/// Map a local obs-row index -> category index (-1 = null), using the sorted
+/// `cats` order. Local analogue of [`category_of_old`] for callers that work
+/// purely in the obs-batch row space (no global old-id remap), e.g.
+/// [`compute_grouped_order`].
+fn category_of_local(obs: &RecordBatch, name: &str, cats: &[String]) -> Result<Vec<i32>> {
+    use arrow::array::LargeStringArray;
+    let col = obs.column_by_name(name).ok_or_else(|| {
+        OpsError::InvalidInput(format!("sort key column '{name}' missing from obs"))
+    })?;
+    // `LargeUtf8` (i64 offsets): the key can span the full obs, so a narrow
+    // `Utf8` decode overflows i32 offsets at >2 GB of total string bytes.
+    let utf8 = arrow::compute::cast(col, &DataType::LargeUtf8)?;
+    let arr = utf8
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .ok_or_else(|| {
+            OpsError::InvalidInput(format!("sort key '{name}' is not categorical/string-like"))
+        })?;
+    let index: std::collections::HashMap<&str, i32> = cats
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.as_str(), i as i32))
+        .collect();
+    let mut out = vec![-1i32; arr.len()];
+    for (i, slot) in out.iter_mut().enumerate() {
+        if arr.is_null(i) {
+            continue;
+        }
+        if let Some(&ci) = index.get(arr.value(i)) {
+            *slot = ci;
+        }
+    }
+    Ok(out)
+}
+
+/// The grouped emission order + per-row group/reference metadata produced by
+/// [`compute_grouped_order`]. Shared by `scx sort` (F1) and `scx convert
+/// --group-by` so both produce a byte-identical grouped layout.
+pub struct GroupedOrder {
+    /// `perm[emission_row] = obs_row` — the reference-first / group-by order
+    /// (indices into the obs `RecordBatch` passed to `compute_grouped_order`).
+    pub perm: Vec<u64>,
+    /// Per-emission-row group id (index into `labels`).
+    pub group_of_new: Vec<i32>,
+    /// Per-emission-row reference flag.
+    pub ref_of_new: Vec<bool>,
+    /// Label table; `labels[group_of_new[e]]` is row `e`'s group label. A
+    /// trailing `"__ungrouped__"` is appended iff some row's `group_by` is null.
+    pub labels: Vec<String>,
+    /// Distinct reference labels for the sidecar `reference_labels` field.
+    pub reference_labels: Vec<String>,
+}
+
+/// Compute the grouped (reference-first, then `group_by` label, then
+/// `secondary_by`) emission order over an obs `RecordBatch`, plus the per-row
+/// group id / reference flag, label table, and reference labels.
+///
+/// Operates purely on the obs batch (the caller must have already filtered out
+/// deleted rows and projected the sort-key columns + any reference column), so
+/// it is reusable by both the standalone sort engine and convert-time grouping.
+/// `per_row_nnz` is intentionally *not* computed here — the caller pairs the
+/// result with [`crate::group_plan::plan_group_shards`], supplying per-row nnz
+/// from its own source (SCX shards for sort, the h5ad indptr for convert).
+pub fn compute_grouped_order(
+    obs: &RecordBatch,
+    group_by: &str,
+    secondary_by: &[String],
+    reference: Option<&crate::sort::ReferenceSpec>,
+) -> Result<GroupedOrder> {
+    // Reference mask in local obs-row order (None => clustering only).
+    let ref_mask: Option<Vec<bool>> = match reference {
+        Some(r) => Some(build_reference_mask(obs, group_by, r)?),
+        None => None,
+    };
+    // Sort keys: `group_by` leading, then any secondary keys.
+    let mut by = Vec::with_capacity(secondary_by.len() + 1);
+    by.push(group_by.to_string());
+    by.extend(secondary_by.iter().cloned());
+    // Inject the synthetic reference-first key when a reference is configured.
+    // Ascending order is forced (reference rows sort first); `--reverse` has no
+    // meaning in grouped mode.
+    let (keys, extractor_by) = match &ref_mask {
+        Some(mask) => inject_reference_first_key(obs, &by, mask)?,
+        None => (obs.clone(), by.clone()),
+    };
+    let extractor = SortKeyExtractor::new(&keys.schema(), &extractor_by, false)?;
+    let rows = extractor.rows(&keys)?;
+    let perm = stable_argsort(&rows, 0);
+    drop(rows);
+
+    // Group ids in emission order.
+    let cats = distinct_categories(obs, group_by, false)?;
+    let cat_of_local = category_of_local(obs, group_by, &cats)?;
+    let mut labels = cats;
+    let ungrouped_idx = labels.len() as i32;
+    let mut used_ungrouped = false;
+    let group_of_new: Vec<i32> = perm
+        .iter()
+        .map(|&l| {
+            let c = cat_of_local[l as usize];
+            if c < 0 {
+                used_ungrouped = true;
+                ungrouped_idx
+            } else {
+                c
+            }
+        })
+        .collect();
+    if used_ungrouped {
+        labels.push("__ungrouped__".to_string());
+    }
+
+    // Reference flags in emission order.
+    let ref_of_new: Vec<bool> = match &ref_mask {
+        Some(mask) => perm.iter().map(|&l| mask[l as usize]).collect(),
+        None => vec![false; perm.len()],
+    };
+
+    // Reference labels for the sidecar: the explicit set for `Labels`, else the
+    // distinct group labels that ended up reference (covers `Column`). Matches
+    // the post-plan derivation the sort engine historically used — a reference
+    // record exists for exactly these labels, since groups are never split.
+    let reference_labels: Vec<String> = match reference {
+        Some(crate::sort::ReferenceSpec::Labels(set)) => set.clone(),
+        Some(crate::sort::ReferenceSpec::Column(_)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for e in 0..group_of_new.len() {
+                if ref_of_new[e] {
+                    seen.insert(labels[group_of_new[e] as usize].clone());
+                }
+            }
+            seen.into_iter().collect()
+        }
+        None => Vec::new(),
+    };
+
+    Ok(GroupedOrder {
+        perm,
+        group_of_new,
+        ref_of_new,
+        labels,
+        reference_labels,
+    })
 }
 
 /// F1.3b — per-row nnz in emission order via an indptr-only pre-scan. For each

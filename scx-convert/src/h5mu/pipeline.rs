@@ -55,6 +55,20 @@ pub fn is_h5mu_file(file: &hdf5::File) -> bool {
 /// per-modality sections at conversion time would produce on-disk
 /// artefacts that `QueryPipeline` cannot consume. Drop them with a
 /// typed warning instead; users get a clear signal at convert time.
+/// Convert-time grouping (`--group-by`) is single-modality
+/// only. Reject it on h5mu input rather than silently emit an ungrouped file —
+/// multimodal grouping (per-modality emission over one shared obs order).
+fn reject_group_by_multimodal(opts: &ConvertOptions) -> Result<(), ConvertError> {
+    if opts.group_by.is_some() {
+        return Err(ConvertError::Other(
+            "convert --group-by is not supported on multimodal (h5mu) inputs (Phase 7.5); \
+             convert a single modality or drop --group-by"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn emit_multimodal_index_skip_warning(opts: &ConvertOptions, sink: &mut WarningSink) {
     if opts.index_obs.is_empty() && opts.index_var.is_empty() && opts.index_preset.is_none() {
         return;
@@ -200,6 +214,7 @@ pub fn h5mu_to_scx(
         });
     }
 
+    reject_group_by_multimodal(opts)?;
     emit_multimodal_index_skip_warning(opts, sink);
 
     // List modalities under /mod, in member-name order. h5mu stores
@@ -418,6 +433,7 @@ pub fn h5mu_to_scx_streaming(
         });
     }
 
+    reject_group_by_multimodal(opts)?;
     emit_multimodal_index_skip_warning(opts, sink);
 
     let mod_group = file.group("mod")?;
@@ -611,6 +627,7 @@ pub fn h5mu_to_scx_streaming(
                 modality_type,
                 &section_prefix,
                 sink,
+                None,
             )?;
             Ok(())
         })?;
@@ -710,6 +727,7 @@ pub fn h5mu_to_scx_streaming(
                         modality_type,
                         &prefix,
                         sink,
+                        None,
                     )?;
                     Ok(())
                 })?;

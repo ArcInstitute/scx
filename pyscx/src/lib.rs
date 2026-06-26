@@ -402,6 +402,8 @@ fn from_anndata(
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", reader_threads=None, writer_queue_depth=4,
     sort_by=None, reverse=false,
+    group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
+    group_pass="auto",
     obs_override=None, var_override=None, uns_override=None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -428,6 +430,11 @@ fn from_h5ad(
     writer_queue_depth: usize,
     sort_by: Option<Vec<String>>,
     reverse: bool,
+    group_by: Option<String>,
+    reference: Option<Bound<'_, PyAny>>,
+    group_target_bytes: Option<Bound<'_, PyAny>>,
+    group_max_bytes: Option<Bound<'_, PyAny>>,
+    group_pass: &str,
     obs_override: Option<Bound<'_, PyAny>>,
     var_override: Option<Bound<'_, PyAny>>,
     uns_override: Option<Bound<'_, PyAny>>,
@@ -451,10 +458,20 @@ fn from_h5ad(
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    // Sort-on-convert (Phase 2): the permuted gather runs only on the
-    // streaming path, so requesting a sort forces streaming on.
+    // Sort-on-convert (Phase 2) / grouped convert: the permuted
+    // gather runs only on the streaming path, so either forces streaming on.
     let sort_by = sort_by.unwrap_or_default();
-    let stream = stream || !sort_by.is_empty();
+    let group_reference = crate::ops::parse_reference_spec(reference.as_ref())?;
+    if group_reference.is_some() && group_by.is_none() {
+        return Err(PyValueError::new_err(
+            "reference requires group_by to be set",
+        ));
+    }
+    let group_target_bytes_val = convert::parse_memory_budget(group_target_bytes.as_ref())?;
+    let group_max_bytes_val = convert::parse_memory_budget(group_max_bytes.as_ref())?;
+    let group_pass_val =
+        scx_convert::GroupPass::parse(group_pass).map_err(PyValueError::new_err)?;
+    let stream = stream || !sort_by.is_empty() || group_by.is_some();
 
     let has_override = obs_override.is_some() || var_override.is_some() || uns_override.is_some();
     if has_override && !stream {
@@ -526,6 +543,11 @@ fn from_h5ad(
         writer_queue_depth,
         sort_by,
         sort_reverse: reverse,
+        group_by,
+        reference: group_reference,
+        group_target_bytes: group_target_bytes_val,
+        group_max_bytes: group_max_bytes_val,
+        group_pass: group_pass_val,
     };
 
     let input = std::path::PathBuf::from(path);

@@ -599,7 +599,9 @@ pub fn compact(
 /// dict `{"column": name}` (boolean obs column). Mirrors the CLI's
 /// label-list / `col:NAME` forms. `str` is checked before `list[str]` because
 /// pyo3 would otherwise iterate a string into single-character labels.
-fn parse_reference_spec(v: Option<&Bound<'_, PyAny>>) -> PyResult<Option<ReferenceSpec>> {
+pub(crate) fn parse_reference_spec(
+    v: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<ReferenceSpec>> {
     let Some(obj) = v else { return Ok(None) };
     if obj.is_none() {
         return Ok(None);

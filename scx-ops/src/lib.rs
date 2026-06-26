@@ -41,4 +41,7 @@ pub use rebuild_csc::rebuild_csc_inplace;
 pub use rewrite_helpers::copy_auxiliary_sections;
 pub use rollback::{rollback, rollback_to};
 pub use sort::{ReferenceSpec, SortOptions, SortStrategy, SortSummary};
-pub use sort_engine::{sort, sort_with_strategy};
+pub use sort_engine::{
+    compute_grouped_order, sort, sort_with_strategy, GroupedOrder, GROUP_BYTES_PER_NNZ,
+    GROUP_MAX_BYTES_MULTIPLE,
+};

@@ -221,6 +221,9 @@ pub(crate) fn route_backed_anndata_to_streaming(
         writer_queue_depth,
         sort_by,
         sort_reverse,
+        // Convert-time grouping is exposed via `pyscx.from_h5ad(group_by=...)`,
+        // not this in-memory `from_anndata` path.
+        ..Default::default()
     };
     let input = std::path::PathBuf::from(filename);
     let output = std::path::PathBuf::from(path);

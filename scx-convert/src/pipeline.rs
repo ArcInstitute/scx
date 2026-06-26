@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::GroupPass;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::encode_one_shard;
 use scx_format_io::error::ScxError;
@@ -90,6 +91,7 @@ pub enum ConvertError {
     Other(String),
 }
 
+#[derive(Clone)]
 pub struct ConvertOptions {
     pub shard_target_rows: u32,
     /// Explicit codec override. None = auto-select based on value distribution.
@@ -188,6 +190,33 @@ pub struct ConvertOptions {
     pub sort_by: Vec<String>,
     /// Descending sort when `sort_by` is set.
     pub sort_reverse: bool,
+    /// Phase 7.4 convert-time grouping: obs column whose label clusters cells
+    /// into contiguous, never-split shards (reference-first), writing a grouped
+    /// layout directly during conversion (byte-equivalent to convert-then-`scx
+    /// sort --group-by`). `None` (default) = no grouping. Implies an obs-axis
+    /// reorder, so it requires a CSR or dense `/X` (CSC-on-disk errors) and a
+    /// single-modality input; `sort_by`, when also set, supplies secondary sort
+    /// keys after the group key.
+    pub group_by: Option<String>,
+    /// Which cells are reference (e.g. non-targeting controls); packed first and
+    /// isolated in shard 0. Requires `group_by`. `None` = no reference shard.
+    pub reference: Option<scx_ops::ReferenceSpec>,
+    /// Target shard size in bytes for the group planner (group edges only). When
+    /// set, a per-row nnz pre-scan sizes shards by encoded width instead of row
+    /// count. CSR inputs only; dense/CSC fall back to row-count mode with a
+    /// warning. Only meaningful with `group_by`.
+    pub group_target_bytes: Option<u64>,
+    /// Oversize threshold: a single group exceeding this becomes its own shard
+    /// with a warning. Defaults to a multiple of `group_target_bytes`. Only
+    /// meaningful with `group_by`.
+    pub group_max_bytes: Option<u64>,
+    /// How to realize convert-time grouping (only meaningful with `group_by`).
+    /// `Auto` (default) routes by source density: a CSR source uses the
+    /// one-pass streaming grouped gather (cheaper — reads only nnz per row); a
+    /// dense source falls back to a two-pass plain-convert-then-`scx sort`
+    /// (the grouped random-row gather over a dense matrix reads full rows and
+    /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
+    pub group_pass: GroupPass,
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -370,6 +399,11 @@ impl Default for ConvertOptions {
             writer_queue_depth: 4,
             sort_by: Vec::new(),
             sort_reverse: false,
+            group_by: None,
+            reference: None,
+            group_target_bytes: None,
+            group_max_bytes: None,
+            group_pass: GroupPass::default(),
         }
     }
 }
@@ -666,13 +700,13 @@ pub fn h5ad_to_scx(
     opts: &ConvertOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    // Sort-on-convert runs only on the streaming path (it needs the
-    // random-access gather). Callers route `sort_by` to streaming; guard the
-    // eager path defensively.
-    if !opts.sort_by.is_empty() {
+    // Reorder-on-convert (`--sort-by` / `--group-by`) runs only on the streaming
+    // path (it needs the random-access gather). Callers route these to streaming;
+    // guard the eager path defensively.
+    if !opts.sort_by.is_empty() || opts.group_by.is_some() {
         return Err(ConvertError::Other(
-            "sort-on-convert (--sort-by) requires the streaming conversion path; \
-             enable streaming (the default) and retry."
+            "reorder-on-convert (--sort-by / --group-by) requires the streaming conversion \
+             path; enable streaming (the default) and retry."
                 .to_string(),
         ));
     }
@@ -1089,17 +1123,45 @@ pub fn h5ad_to_scx_streaming(
     // write. CSR uses the indptr-eager reader; Dense slabs rows on
     // demand; CSC routes through the Phase 2 dispatcher which picks
     // in-memory vs. external-memory transpose based on the budget.
-    // Sort-on-convert (Phase 2): a CSC-on-disk X cannot be reordered during
-    // conversion (the CSC→CSR transposer is sequential and cannot serve the
-    // permuted gather). Fail fast rather than silently emit an unsorted file.
-    let want_sort = !opts.sort_by.is_empty();
-    if want_sort && matches!(matrix_format, MatrixFormat::Csc) {
+    // Reorder-on-convert: `--sort-by` (Phase 2) and `--group-by` (Phase 7.4)
+    // both permute the obs axis during ingest. A CSC-on-disk X cannot be
+    // reordered (the CSC→CSR transposer is sequential and cannot serve the
+    // permuted gather). Fail fast rather than silently emit a misordered file.
+    if opts.reference.is_some() && opts.group_by.is_none() {
         return Err(ConvertError::Other(
-            "sort-on-convert (--sort-by) requires a CSR or dense h5ad X; the on-disk CSC X \
-             cannot be reordered during conversion. Re-export X as CSR/dense, or sort after \
-             conversion with `scx sort` (once available)."
+            "convert --reference requires --group-by".to_string(),
+        ));
+    }
+    let want_sort = !opts.sort_by.is_empty();
+    let want_group = opts.group_by.is_some();
+    let want_reorder = want_sort || want_group;
+    if want_reorder && matches!(matrix_format, MatrixFormat::Csc) {
+        return Err(ConvertError::Other(
+            "reorder-on-convert (--sort-by / --group-by) requires a CSR or dense h5ad X; the \
+             on-disk CSC X cannot be reordered during conversion. Re-export X as CSR/dense, or \
+             reorder after conversion with `scx sort`."
                 .to_string(),
         ));
+    }
+
+    // Phase 7.4 group-pass routing. The one-pass streaming grouped gather is a
+    // win for CSR (reads only nnz/row) but a ~4–5× loss for dense (full-width
+    // random row reads), so `Auto` routes dense → two-pass (plain convert then
+    // `scx sort --group-by`), which is faster and lighter and produces the same
+    // grouped layout. `One`/`Two` force the choice.
+    if want_group {
+        let two_pass = match opts.group_pass {
+            GroupPass::One => false,
+            GroupPass::Two => true,
+            GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense),
+        };
+        if two_pass {
+            log::info!(
+                "convert --group-by: routing to two-pass (plain convert + scx sort) for \
+                 {matrix_format:?} source"
+            );
+            return convert_then_sort_grouped(input, output, opts, overrides, sink);
+        }
     }
 
     let mut x_reader: Box<dyn CsrShardStream> = match matrix_format {
@@ -1139,11 +1201,74 @@ pub fn h5ad_to_scx_streaming(
         None => read_dataframe_group(&file, "var", sink)?,
     };
 
-    // Sort-on-convert (Phase 2): compute the obs-axis permutation from the
-    // (key) obs columns, reorder obs to match, and wrap the X reader so the
-    // coordinator gathers source rows in sorted order. The non-sort path keeps
-    // `obs` / `x_reader` untouched (byte-identical).
-    let sort_perm: Option<std::sync::Arc<Vec<u64>>> = if want_sort {
+    // Reorder-on-convert: compute the obs-axis permutation, reorder obs to
+    // match, and wrap the X reader so the coordinator gathers source rows in the
+    // new order. `--group-by` (Phase 7.4) takes precedence over `--sort-by`: it
+    // computes a reference-first / group-by permutation via the shared
+    // `scx_ops::compute_grouped_order` (the same routine `scx sort --group-by`
+    // uses, so the output is byte-equivalent to convert-then-sort), plans
+    // group-aligned shard breaks, and stages the `group_index` sidecar (written
+    // after X). The non-reorder path keeps `obs` / `x_reader` untouched.
+    let mut group_ranges: Option<Vec<(u64, u32)>> = None;
+    let mut group_index_bytes: Option<Vec<u8>> = None;
+    let sort_perm: Option<std::sync::Arc<Vec<u64>>> = if let Some(group_col) = &opts.group_by {
+        let go =
+            scx_ops::compute_grouped_order(&obs, group_col, &opts.sort_by, opts.reference.as_ref())
+                .map_err(|e| ConvertError::Other(format!("convert --group-by: {e}")))?;
+
+        // Per-row nnz in emission order (byte-budget mode, CSR only): the h5ad
+        // CSR indptr is the cheap per-row nnz source. Dense/CSC have no cheap
+        // per-row nnz, so byte mode falls back to row-count with a warning.
+        let (per_row_nnz, target_units, bytes_per_nnz) = match opts.group_target_bytes {
+            Some(tb) if matches!(matrix_format, MatrixFormat::Csr) => {
+                let indptr_ds = file.group("X")?.dataset("indptr")?;
+                let indptr = crate::h5ad::read::read_i64_dataset(&indptr_ds)?;
+                let prn: Vec<u64> = go
+                    .perm
+                    .iter()
+                    .map(|&src| {
+                        let s = src as usize;
+                        (indptr[s + 1] - indptr[s]) as u64
+                    })
+                    .collect();
+                (prn, tb.max(1), scx_ops::GROUP_BYTES_PER_NNZ)
+            }
+            Some(_) => {
+                sink.emit(ConvertWarning::GroupByteModeUnsupported {
+                    source_format: match matrix_format {
+                        MatrixFormat::Dense => "dense".to_string(),
+                        MatrixFormat::Csc => "csc".to_string(),
+                        MatrixFormat::Csr => "csr".to_string(),
+                    },
+                });
+                (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64)
+            }
+            None => (Vec::new(), opts.shard_target_rows.max(1) as u64, 0u64),
+        };
+        let max_units = opts
+            .group_max_bytes
+            .unwrap_or_else(|| target_units.saturating_mul(scx_ops::GROUP_MAX_BYTES_MULTIPLE));
+        let plan = scx_ops::plan_group_shards(
+            &go.group_of_new,
+            &go.ref_of_new,
+            &go.labels,
+            &per_row_nnz,
+            target_units,
+            bytes_per_nnz,
+            max_units,
+        );
+        group_ranges = Some(group_shard_starts_to_ranges(
+            &plan.shard_starts,
+            n_obs as u64,
+        ));
+        let payload = plan.to_sidecar_json(group_col, &go.reference_labels);
+        group_index_bytes = Some(serde_json::to_vec(&payload).map_err(|e| {
+            ConvertError::Other(format!(
+                "convert --group-by: failed to serialize group index: {e}"
+            ))
+        })?);
+        Some(std::sync::Arc::new(go.perm))
+    } else if want_sort {
         let perm =
             crate::permuted_reader::compute_sort_perm(&obs, &opts.sort_by, opts.sort_reverse)?;
         Some(std::sync::Arc::new(perm))
@@ -1192,8 +1317,14 @@ pub fn h5ad_to_scx_streaming(
         // name) but `scx explode`/`scx push` rejected.
         "X_shard",
         sink,
+        group_ranges.as_deref(),
     )?;
     drop(x_reader);
+
+    // Phase 7.4: write the `group_index` sidecar (same bytes `scx sort` emits).
+    if let Some(bytes) = &group_index_bytes {
+        writer.write_group_index(bytes)?;
+    }
 
     // obsm / varm / obsp / varp / uns. The dense + sparse mappings are
     // emitted as row-sharded sections — one Arrow IPC section per
@@ -1395,14 +1526,26 @@ pub fn h5ad_to_scx_streaming(
                 ModalityType::Rna,
                 &format!("{layer_name}_shard"),
                 sink,
+                // Layers keep fixed-size shard breaks even under a grouped
+                // convert — matching `scx sort`, which group-breaks only X.
+                None,
             )?;
         }
     }
 
     // Phase 5a: predicate indexes from the obs/var we just wrote and
     // the actual shard boundaries reported by `streaming_writer_coordinator`.
-    // Sort-on-convert auto-indexes the sort key so its contiguous shard ranges
-    // are emitted.
+    // Reorder-on-convert auto-indexes its keys so the contiguous shard ranges
+    // are emitted: the `--group-by` column leads (Phase 7.4), then `--sort-by`.
+    let reorder_keys: Vec<String> = match &opts.group_by {
+        Some(group_col) => {
+            let mut keys = Vec::with_capacity(opts.sort_by.len() + 1);
+            keys.push(group_col.clone());
+            keys.extend(opts.sort_by.iter().filter(|c| *c != group_col).cloned());
+            keys
+        }
+        None => opts.sort_by.clone(),
+    };
     let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
         &mut writer,
         &obs,
@@ -1410,7 +1553,7 @@ pub fn h5ad_to_scx_streaming(
         &csr_row_ranges,
         n_vars,
         opts,
-        &opts.sort_by,
+        &reorder_keys,
         sink,
     )?;
 
@@ -1426,6 +1569,24 @@ pub fn h5ad_to_scx_streaming(
         MatrixFormat::Dense => "array",
     };
     let resolved_reader_threads = resolve_reader_threads(opts);
+    // Phase 7.4: record the grouping config when `--group-by` was used (mirrors
+    // `scx sort`'s `grouping_provenance`), else `null`.
+    let grouping_json = match &opts.group_by {
+        Some(group_by) => {
+            let reference = match &opts.reference {
+                Some(scx_ops::ReferenceSpec::Labels(l)) => serde_json::json!({ "labels": l }),
+                Some(scx_ops::ReferenceSpec::Column(c)) => serde_json::json!({ "column": c }),
+                None => serde_json::Value::Null,
+            };
+            serde_json::json!({
+                "group_by": group_by,
+                "reference": reference,
+                "group_target_bytes": opts.group_target_bytes,
+                "group_max_bytes": opts.group_max_bytes,
+            })
+        }
+        None => serde_json::Value::Null,
+    };
     writer.write_provenance(vec![ProvenanceEntry {
         timestamp,
         action: "convert".to_string(),
@@ -1443,6 +1604,7 @@ pub fn h5ad_to_scx_streaming(
             },
             "sort_by": opts.sort_by,
             "sort_reverse": opts.sort_reverse,
+            "grouping": grouping_json,
             "reader_threads": resolved_reader_threads,
             "writer_queue_depth": opts.writer_queue_depth,
         })
@@ -1462,6 +1624,91 @@ pub fn h5ad_to_scx_streaming(
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
 
+    Ok(())
+}
+
+/// Phase 7.4 two-pass grouped convert: plain convert to a temp SCX, then
+/// `scx sort --group-by` into `output`. The `Auto` group-pass routes dense
+/// sources here because the one-pass streaming gather reads full rows for a
+/// dense matrix (~4–5× slower / ~2× memory than this). Produces the same
+/// grouped layout as a manual convert-then-sort; the temp is removed on exit.
+fn convert_then_sort_grouped(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+    overrides: &StreamingOverrides,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    let group_by = opts
+        .group_by
+        .clone()
+        .expect("convert_then_sort_grouped requires group_by");
+
+    // Temp plain SCX alongside the output (same filesystem). Grouping / sort /
+    // index / bitmap / csc are stripped from the plain pass — `scx sort` owns
+    // the final grouped layout, predicate index, bitmaps, and (rebuilt) CSC.
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output.file_name().and_then(|s| s.to_str()).unwrap_or("out");
+    let tmp = parent.join(format!(".{stem}.grouptmp.scx"));
+
+    let plain_opts = ConvertOptions {
+        group_by: None,
+        reference: None,
+        group_target_bytes: None,
+        group_max_bytes: None,
+        group_pass: GroupPass::One,
+        sort_by: Vec::new(),
+        sort_reverse: false,
+        csc: CscPolicy::Off,
+        bitmap: BitmapPolicy::Off,
+        index_obs: Vec::new(),
+        index_var: Vec::new(),
+        index_preset: None,
+        ..opts.clone()
+    };
+    h5ad_to_scx_streaming(input, &tmp, &plain_opts, overrides, sink)?;
+
+    let mut by = Vec::with_capacity(opts.sort_by.len() + 1);
+    by.push(group_by.clone());
+    by.extend(opts.sort_by.iter().filter(|c| **c != group_by).cloned());
+    let sort_opts = scx_ops::SortOptions {
+        by,
+        reverse: false,
+        shard_target_rows: opts.shard_target_rows,
+        codec: match opts.codec {
+            Some(c) => scx_codec::CodecSelection::Explicit(c),
+            None => scx_codec::CodecSelection::Auto,
+        },
+        index_options: ConversionPredicateIndexOptions {
+            index_obs: opts.index_obs.clone(),
+            index_var: opts.index_var.clone(),
+            index_preset: opts.index_preset.clone(),
+            index_auto_threshold: opts.index_auto_threshold,
+        },
+        memory_budget: opts.memory_budget,
+        temp_dir: opts.temp_dir.clone(),
+        bitmap: opts.bitmap,
+        group_by: Some(group_by),
+        reference: opts.reference.clone(),
+        group_target_bytes: opts.group_target_bytes,
+        group_max_bytes: opts.group_max_bytes,
+    };
+    let sort_result = scx_ops::sort(&tmp, output, &sort_opts)
+        .map_err(|e| ConvertError::Other(format!("convert --group-by (two-pass sort): {e}")));
+    // Always clean up the temp, even on sort failure.
+    let _ = std::fs::remove_file(&tmp);
+    sort_result?;
+
+    // `scx sort` drops any CSC sidecar; rebuild it on the output to honour the
+    // requested CSC policy (mirrors the one-pass path's end-of-convert rebuild).
+    if let Ok(reader) = scx_format_io::reader::ScxReader::open(output) {
+        let (n_obs, n_vars) = (reader.n_obs(), reader.n_vars());
+        drop(reader);
+        if opts.csc.should_build_csc(n_obs, n_vars) {
+            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+                .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
+        }
+    }
     Ok(())
 }
 
@@ -1568,6 +1815,26 @@ pub(crate) fn compute_shard_row_ranges(n_obs: u64, target_rows: u32) -> Vec<(u64
     out
 }
 
+/// Phase 7.4: expand a group planner's `shard_starts` (emit-row indices at
+/// which a new shard begins, excluding 0 and EOF) into the explicit
+/// `[(row_start, n_rows)]` shard ranges covering `[0, n_obs)` that the
+/// coordinator drives. Groups are never split, so ranges are contiguous and
+/// gap-free.
+fn group_shard_starts_to_ranges(shard_starts: &[u64], n_obs: u64) -> Vec<(u64, u32)> {
+    let mut ranges: Vec<(u64, u32)> = Vec::with_capacity(shard_starts.len() + 1);
+    let mut start = 0u64;
+    for &brk in shard_starts {
+        if brk > start {
+            ranges.push((start, (brk - start) as u32));
+            start = brk;
+        }
+    }
+    if start < n_obs {
+        ranges.push((start, (n_obs - start) as u32));
+    }
+    ranges
+}
+
 /// Payload from a worker thread to the ordered writer.
 struct EncodedShardOutput {
     pre: PreEncodedSection,
@@ -1601,13 +1868,11 @@ fn streaming_writer_coordinator_parallel(
     sink: &mut WarningSink,
     reader_threads: usize,
     queue_depth: usize,
-    effective_target_rows: u32,
+    ranges: Vec<(u64, u32)>,
 ) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
     use crossbeam_channel::bounded;
     use rayon::ThreadPoolBuilder;
 
-    let n_obs = reader.n_obs();
-    let ranges = compute_shard_row_ranges(n_obs, effective_target_rows);
     if ranges.is_empty() {
         return Ok((0, Vec::new()));
     }
@@ -1868,6 +2133,14 @@ fn encode_one_shard_worker(
 /// Always returns `(shard_count, row_ranges)` matching the sequential
 /// coordinator's contract. Output is byte-identical regardless of
 /// path.
+///
+/// `explicit_ranges` (Phase 7.4 convert-time grouping): when `Some`, the
+/// caller supplies group-aligned `[(row_start, n_rows)]` shard ranges instead
+/// of the fixed-`shard_target_rows` partition. Groups are never split, so a
+/// single range may exceed `shard_target_rows`; the per-worker budget is sized
+/// by the largest range. The grouped X reader is always indexed, so the ranges
+/// are honored in both the parallel pool and the sequential fallback. All
+/// non-grouped callers pass `None` and are byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 pub fn run_streaming_writer_coordinator(
     reader: &mut dyn CsrShardStream,
@@ -1879,8 +2152,86 @@ pub fn run_streaming_writer_coordinator(
     modality_type: ModalityType,
     section_name_prefix: &str,
     sink: &mut WarningSink,
+    explicit_ranges: Option<&[(u64, u32)]>,
 ) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
     let requested = resolve_reader_threads(opts);
+
+    // ----- Phase 7.4: group-aligned ranges -----
+    if let Some(ranges) = explicit_ranges {
+        if ranges.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        // The grouped X reader is always an indexed (row-range) reader
+        // (PermutedCsrReader). Without it we cannot honor variable breaks.
+        let Some(indexed) = reader.as_indexed() else {
+            return Err(ConvertError::Other(
+                "grouped convert requires an indexed (row-range) X reader".to_string(),
+            ));
+        };
+        // The largest group bounds the per-worker working set (groups are never
+        // split), so size the derate by it rather than by `--shard-size`.
+        let max_range_rows = ranges.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let threadsafe = crate::hdf5_threadsafe::hdf5_is_threadsafe();
+        if requested <= 1 || !threadsafe {
+            if requested > 1 && !threadsafe {
+                crate::hdf5_threadsafe::try_emit_not_threadsafe_warning(sink);
+            }
+            return streaming_writer_coordinator_ranges(
+                indexed,
+                writer,
+                opts,
+                index_dtype,
+                n_vars_u32,
+                section_type,
+                modality_type,
+                section_name_prefix,
+                sink,
+                ranges,
+            );
+        }
+        let per_worker_bytes = indexed
+            .per_worker_bytes(max_range_rows, modality_type)
+            .max(1);
+        let requested_depth = opts.writer_queue_depth.max(1);
+        let (granted, granted_depth) = derate_threads_and_depth(
+            opts.memory_budget,
+            per_worker_bytes,
+            requested,
+            requested_depth,
+            "grouped parallel-streaming shard",
+            "raise --group-target-bytes/--memory-budget or accept a larger group shard",
+            sink,
+        )?;
+        if granted <= 1 {
+            return streaming_writer_coordinator_ranges(
+                indexed,
+                writer,
+                opts,
+                index_dtype,
+                n_vars_u32,
+                section_type,
+                modality_type,
+                section_name_prefix,
+                sink,
+                ranges,
+            );
+        }
+        return streaming_writer_coordinator_parallel(
+            indexed,
+            writer,
+            opts,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            section_name_prefix,
+            sink,
+            granted,
+            granted_depth,
+            ranges.to_vec(),
+        );
+    }
+
     if requested <= 1 {
         return streaming_writer_coordinator(
             reader,
@@ -1980,6 +2331,7 @@ pub fn run_streaming_writer_coordinator(
         );
     }
 
+    let ranges = compute_shard_row_ranges(indexed.n_obs(), effective_target);
     streaming_writer_coordinator_parallel(
         indexed,
         writer,
@@ -1992,8 +2344,71 @@ pub fn run_streaming_writer_coordinator(
         sink,
         granted,
         granted_depth,
-        effective_target,
+        ranges,
     )
+}
+
+/// Sequential sibling of [`streaming_writer_coordinator`] that honors an
+/// explicit list of (possibly variable-size) shard ranges — the group-aligned
+/// breaks from the Phase 7.4 grouped-convert planner. Reuses
+/// [`encode_one_shard_worker`] per range so the encoded bytes are identical to
+/// the parallel path for the same ranges (which is in turn byte-identical to
+/// the fixed-size sequential coordinator). Requires an indexed reader.
+#[allow(clippy::too_many_arguments)]
+fn streaming_writer_coordinator_ranges(
+    reader: &dyn crate::stream::IndexedCsrShardStream,
+    writer: &mut ScxWriter,
+    opts: &ConvertOptions,
+    index_dtype: u8,
+    n_vars_u32: u32,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    section_name_prefix: &str,
+    sink: &mut WarningSink,
+    ranges: &[(u64, u32)],
+) -> Result<(u32, Vec<(u64, u64)>), ConvertError> {
+    let want_bitmap = section_type == SectionType::CsrShard;
+    let mut row_ranges: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (shard_idx, &(row_start, n_rows)) in ranges.iter().enumerate() {
+        let out = encode_one_shard_worker(
+            reader,
+            row_start,
+            n_rows,
+            opts.codec,
+            index_dtype,
+            n_vars_u32,
+            section_type,
+            modality_type,
+            format!("{section_name_prefix}_{shard_idx}"),
+            opts.bitmap,
+            want_bitmap,
+        )?;
+        if out.duplicates_merged > 0 {
+            sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
+                count: out.duplicates_merged,
+                policy: "sum".to_string(),
+            });
+        }
+        writer.write_preencoded_shard(out.pre)?;
+        if want_bitmap {
+            match out.bitmap {
+                None => { /* policy was Off — nothing to do */ }
+                Some(BitmapBuildOutcome::Skip { reason }) => {
+                    sink.emit(ConvertWarning::BitmapSkipped {
+                        modality: None,
+                        reason,
+                    });
+                }
+                Some(BitmapBuildOutcome::Built(shard)) => {
+                    writer
+                        .write_bitmap_shard(&shard)
+                        .map_err(ConvertError::from)?;
+                }
+            }
+        }
+        row_ranges.push((row_start, row_start + n_rows as u64));
+    }
+    Ok((ranges.len() as u32, row_ranges))
 }
 
 #[cfg(test)]
@@ -2292,12 +2707,13 @@ fn ingest_raw_streaming(
     }
     let raw_n_vars = raw_reader.n_vars() as usize;
 
-    // `adata.raw` shares the obs axis, but the sort permutation is applied only
-    // to X/obs/obsm/layers — raw is streamed in source order. Rather than emit a
-    // raw matrix whose rows no longer line up with the sorted cells, drop it
-    // (with a visible warning) under sort-on-convert, mirroring the standalone
-    // `scx sort` engine which also drops raw.
-    if !opts.sort_by.is_empty() {
+    // `adata.raw` shares the obs axis, but the reorder permutation is applied
+    // only to X/obs/obsm/layers — raw is streamed in source order. Rather than
+    // emit a raw matrix whose rows no longer line up with the reordered cells,
+    // drop it (with a visible warning) under any obs-axis reorder (--sort-by or
+    // --group-by), mirroring the standalone `scx sort` engine which also drops
+    // raw.
+    if !opts.sort_by.is_empty() || opts.group_by.is_some() {
         sink.emit(ConvertWarning::DroppedRaw { raw_n_vars });
         return Ok(());
     }
@@ -2316,6 +2732,7 @@ fn ingest_raw_streaming(
         ModalityType::Rna,
         "raw/X_shard",
         sink,
+        None,
     )?;
 
     let raw_var = read_dataframe_group(file, "raw/var", sink)?;
