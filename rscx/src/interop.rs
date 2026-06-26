@@ -1850,14 +1850,16 @@ fn from_mae_impl(
     // Per-experiment cell-alignment check. We compare each
     // experiment's colnames against the first experiment's; on
     // mismatch, raise.
+    // NB: a single if/else expression — no top-level `return()`, which fails
+    // to evaluate inside extendr's `R!` ("no function to return from").
     let aligned = R!("
         col_lists <- {{info.dollar(\"col_lists\").map_err(|e| Error::Other(format!(\"{e}\")))?}}
-        if (length(col_lists) <= 1) return(TRUE)
-        ref <- col_lists[[1]]
-        for (i in seq_along(col_lists)[-1]) {
-            if (!identical(col_lists[[i]], ref)) return(FALSE)
+        if (length(col_lists) <= 1) {
+            TRUE
+        } else {
+            ref <- col_lists[[1]]
+            all(vapply(col_lists[-1], function(x) identical(x, ref), logical(1)))
         }
-        TRUE
     ")
     .map_err(|e| Error::Other(format!("MAE alignment check: {e}")))?;
     let aligned_b: bool = aligned.as_logical().map(|b| b.is_true()).unwrap_or(false);
@@ -2072,6 +2074,11 @@ pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
         .read_obs()
         .map_err(|e| Error::Other(format!("read_obs failed: {}", e)))?;
     let obs_df = record_batch_to_dataframe(&obs_batch)?;
+    // Cell ids (global obs index) become each SCE's colnames so they align
+    // with the MAE colData rownames — without this, `MultiAssayExperiment()`
+    // errors ("colData rownames and ExperimentList colnames are empty").
+    let cell_ids =
+        R!("rownames({{&obs_df}})").map_err(|e| Error::Other(format!("MAE cell ids: {e}")))?;
 
     // Build a list of SingleCellExperiments (one per modality) on
     // the R side, then assemble a MAE.
@@ -2092,9 +2099,14 @@ pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
             if (!requireNamespace('SingleCellExperiment', quietly = TRUE))
                 stop('SingleCellExperiment is required for to_mae()')
             counts_t <- Matrix::t({{dgc}})
+            rd <- S4Vectors::DataFrame({{var_df}})
+            # Set dimnames so the SCE's colnames (cells) align with the MAE
+            # colData rownames and rownames (features) with rowData.
+            rownames(counts_t) <- rownames(rd)
+            colnames(counts_t) <- {{&cell_ids}}
             SingleCellExperiment::SingleCellExperiment(
                 assays = list(counts = counts_t),
-                rowData = S4Vectors::DataFrame({{var_df}})
+                rowData = rd
             )
         ")
         .map_err(|e| Error::Other(format!("SCE for modality '{name}': {e}")))?;
