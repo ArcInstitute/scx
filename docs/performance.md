@@ -473,6 +473,18 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 GPU-accelerated analysis via **rapids-singlecell** (`rsc.pp.pca`, `rsc.pp.neighbors`, `rsc.tl.umap`, `rsc.pp.*`) for in-VRAM ops, plus native Rust/CUDA paths for streaming PCA, HVG `seurat_v3`, Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct), Harmony, and codec decode. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
 
+**GPU VRAM usage.** `to_gpu_anndata()` preserves sparse CSR on the GPU — VRAM
+for `X` scales with NNZ, not N×M. A 1M-cell × 2K-gene HVG-selected matrix at
+5% density occupies ~800 MB as sparse CSR (vs ~8 GB dense). Peak VRAM during
+an operation also includes per-op working memory (PCA dense working matrices,
+kNN embeddings, DE per-chunk intermediates). rapids-singlecell ops may allocate
+additional dense working buffers internally. Use
+`pyscx.accel.estimate_gpu_memory(adata, operation=...)` for pre-flight sizing;
+`to_gpu_anndata()` includes a VRAM pre-flight guard (1.2× headroom) that raises
+`ValueError` if insufficient. See
+[gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model) for the full
+sizing model. Formal per-op peak-VRAM benchmarks are planned.
+
 Numbers below are from the full-tier gate run on 2026-05-25 (post-G10 graph capture for GPU DE + bench env-routing fix). The per-job conda-env routing fix (`run_parallel.py::_env_for_format`) unlocked real GPU coverage for Leiden + kNN that prior baselines silently missed (workers were running on the orchestrator's env which lacked cuGraph + cuVS — see `benchmarks/README.md` § Environment notes for the routing details).
 
 #### Per-operation timing
