@@ -15,8 +15,7 @@ use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
 use crate::shard::{
-    BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
-    SHARD_MAGIC,
+    BlockIndex, ShardHeader, CURRENT_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 
@@ -117,12 +116,13 @@ pub fn encode_one_shard(
         index_dtype_u16,
     )?;
 
-    // 6. Build block index (single entry covering the full shard).
+    // 6. Build block index, splitting into ≤MAX_BLOCK_ROWS-row blocks so an
+    // oversized shard does not overflow the u16 per-block row count. Single
+    // block for the common (≤65535-row) case — byte-identical to the legacy
+    // layout.
     let n_major = (shard_indptr.len() - 1) as u32;
     let nnz = *shard_indptr.last().unwrap_or(&0);
-    let block_index = BlockIndex {
-        entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)?],
-    };
+    let block_index = BlockIndex::for_shard(n_major, shard_indptr)?;
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
 
