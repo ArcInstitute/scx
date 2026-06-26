@@ -497,3 +497,101 @@ class TestCloudMultimodalDiscoverability:
             exp = pyscx.open_cloud(exploded_dir)
             with pytest.raises(RuntimeError, match="pull the file locally"):
                 exp.to_mudata()
+
+
+def _create_grouped_exploded(tmpdir):
+    """Build a grouped .scx (via native pyscx.sort, 7.2a) and explode it to a
+    .scxd, returning (grouped_scx_path, exploded_dir)."""
+    import anndata
+    import pandas as pd
+    import pyscx
+
+    genes = ["nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1", "TP53", "nt"]
+    n_obs, n_vars = len(genes), 8
+    rng = np.random.default_rng(7)
+    dense = rng.integers(0, 20, size=(n_obs, n_vars)).astype(np.float32)
+    dense[rng.random((n_obs, n_vars)) > 0.6] = 0
+    X = sp.csr_matrix(dense)
+    obs = pd.DataFrame(
+        {"target_gene": pd.Categorical(genes), "cell_id": [f"cell_{i}" for i in range(n_obs)]},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame({"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+                       index=[f"gene_{i}" for i in range(n_vars)])
+    src = os.path.join(tmpdir, "src.scx")
+    pyscx.from_anndata(anndata.AnnData(X=X, obs=obs, var=var), src, codec="none")
+    grouped = os.path.join(tmpdir, "grouped.scx")
+    pyscx.sort(src, grouped, by=[], group_by="target_gene", reference=["nt"], shard_size=3)
+    exploded = os.path.join(tmpdir, "grouped.scxd")
+    pyscx.explode(grouped, exploded)
+    return grouped, exploded
+
+
+class TestCloudGrouped:
+    """Phase 7.3: open_cloud(...).read_group/read_reference/group_labels/
+    iter_group_shards must match the local open(...) grouped reads on an
+    equivalent exploded file (SectionReader unification over the cloud path)."""
+
+    def test_read_group_matches_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grouped, exploded = _create_grouped_exploded(tmpdir)
+            local = pyscx.open(grouped).read_group("MYC")
+            cloud = pyscx.open_cloud(exploded).read_group("MYC")
+            assert cloud.n_obs == local.n_obs > 0
+            np.testing.assert_array_equal(cloud.X.toarray(), local.X.toarray())
+            assert list(cloud.obs["target_gene"]) == list(local.obs["target_gene"])
+            assert list(cloud.obs["cell_id"]) == list(local.obs["cell_id"])
+            assert all(cloud.obs["target_gene"] == "MYC")
+
+    def test_read_reference_and_labels_match_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grouped, exploded = _create_grouped_exploded(tmpdir)
+            lref = pyscx.open(grouped).read_reference()
+            cref = pyscx.open_cloud(exploded).read_reference()
+            assert cref is not None and lref is not None
+            assert cref.n_obs == lref.n_obs
+            assert all(cref.obs["target_gene"] == "nt")
+            assert set(pyscx.open_cloud(exploded).group_labels()) == set(
+                pyscx.open(grouped).group_labels()
+            )
+
+    def test_iter_group_shards_matches_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grouped, exploded = _create_grouped_exploded(tmpdir)
+            exp = pyscx.open_cloud(exploded)
+            shards = exp.iter_group_shards()
+            assert shards
+            total = 0
+            seen = []
+            for gs in shards:
+                ad = gs.to_anndata()
+                total += ad.n_obs
+                seen.extend(gs.labels)
+                lab = gs.labels[0]
+                # Per-label read out of the cloud shard matches the whole-file read.
+                assert gs.read_group(lab).n_obs == exp.read_group(lab).n_obs
+            assert "nt" not in seen
+            ref = exp.read_reference()
+            assert total + (0 if ref is None else ref.n_obs) == exp.n_obs
+
+    def test_unknown_label_and_ungrouped_errors(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, exploded = _create_grouped_exploded(tmpdir)
+            with pytest.raises(KeyError):
+                pyscx.open_cloud(exploded).read_group("NOPE")
+
+            # Ungrouped exploded file → read_group raises ValueError (NotGrouped).
+            plain = os.path.join(tmpdir, "plain.scx")
+            _create_test_scx(plain, n_obs=30, n_vars=10)
+            plain_exploded = os.path.join(tmpdir, "plain.scxd")
+            pyscx.explode(plain, plain_exploded)
+            with pytest.raises(ValueError):
+                pyscx.open_cloud(plain_exploded).read_group("anything")

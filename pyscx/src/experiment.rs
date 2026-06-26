@@ -558,10 +558,7 @@ impl PyExperiment {
         let handles = pipeline.iter_group_shards().map_err(engine_to_pyerr)?;
         Ok(handles
             .into_iter()
-            .map(|handle| PyGroupShard {
-                pipeline: Arc::clone(&pipeline),
-                handle,
-            })
+            .map(|handle| PyGroupShard::new(Arc::clone(&pipeline), handle))
             .collect())
     }
 
@@ -1360,7 +1357,7 @@ impl PyExperiment {
 /// Map an `scx_engine::EngineError` to the right Python exception for the
 /// grouped-read API: unknown label → `KeyError` (with close matches in the
 /// message), not-grouped → `ValueError`, everything else → `RuntimeError`.
-fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
+pub(crate) fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
     use scx_engine::EngineError as E;
     match e {
         E::UnknownGroupLabel { .. } => pyo3::exceptions::PyKeyError::new_err(e.to_string()),
@@ -1378,6 +1375,14 @@ fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
 pub struct PyGroupShard {
     pipeline: Arc<QueryPipeline>,
     handle: scx_engine::GroupShardHandle,
+}
+
+impl PyGroupShard {
+    /// Construct from a shared pipeline + engine handle (Rust-only). Shared by
+    /// the local and cloud `iter_group_shards` surfaces.
+    pub(crate) fn new(pipeline: Arc<QueryPipeline>, handle: scx_engine::GroupShardHandle) -> Self {
+        Self { pipeline, handle }
+    }
 }
 
 #[pymethods]
