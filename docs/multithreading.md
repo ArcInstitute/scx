@@ -8,9 +8,12 @@ runtimes are involved, and how it all stays safe.
 
 | Component | Threading model | Key crate(s) |
 |-----------|----------------|---------------|
-| **Shard decode** (read) | Rayon data parallelism + SIMD BitPacker4x | `scx-format-io` (opt-in), `scx-engine` |
-| **Query engine** | Rayon `par_iter` over shards | `scx-engine` |
+| **Shard decode** (read) | Rayon data parallelism + SIMD BitPacker4x | `scx-format-io` (default), `scx-engine` |
+| **Query engine** | Rayon `par_iter` with shard retry | `scx-engine` |
 | **Training loader** | Triple-buffered pipeline (tokio + rayon + std::thread) | `scx-loader` |
+| **Streaming ingest** (h5ad/h5mu → SCX) | Rayon worker pool + crossbeam reorder buffer | `scx-convert` |
+| **Streaming export** (SCX → h5ad/h5mu) | Rayon worker pool + crossbeam reorder buffer | `scx-convert` |
+| **Analysis accelerators** | Rayon `par_iter` / `par_chunks` per op | `scx-accel` |
 | **Cloud I/O** | Tokio async tasks | `scx-cloud` |
 | **File mutations** | Advisory `flock()` via `fs4` | `scx-ops` |
 | **GPU decode** | CUDA kernel parallelism | `scx-gpu` |
@@ -23,7 +26,7 @@ SCX's sharded layout (see [`docs/sharding.md`](sharding.md)) makes parallelism
 natural: each shard is independently decompressible with its own header, codec,
 and checksum.
 
-### scx-format-io (opt-in `parallel` feature)
+### scx-format-io (`parallel` feature — enabled by default)
 
 `ScxReader::read_all_csr_shards()` and `ScxReader::read_layer()` use rayon's
 `par_iter()` to decode shards concurrently via `assemble_shards_parallel()`.
@@ -31,28 +34,37 @@ Each shard is independently decompressible — the reader issues `MADV_SEQUENTIA
 on the shard byte range before the parallel decode loop. Within each shard,
 FOR-BP index decode uses SIMD BitPacker4x (4 × 32-element blocks) for rows
 with ≥128 non-zeros, further reducing per-shard decode time. The parallel
-feature is enabled:
+feature is part of the `default` features:
 
 ```toml
 # Cargo.toml
 [features]
+default = ["parallel", "deletion-vectors"]
 parallel = ["rayon"]
 ```
 
-Without the feature flag, the same functions fall back to sequential decode.
-This lets downstream crates (e.g., `scx-engine`) always get parallelism while
-keeping `scx-format-io` lightweight for single-shard use cases.
+Downstream crates that depend on `scx-format-io` with `default-features = true`
+(the Cargo default) get parallelism automatically. Disabling the feature falls
+back to sequential decode, which is useful for single-shard use cases or when
+keeping `scx-format-io` lightweight.
 
 ### scx-engine (always parallel)
 
-The query engine's `collect()` function always decodes candidate shards in
-parallel via rayon:
+The query engine decodes candidate shards in parallel via
+`par_map_with_shard_retry`, which wraps rayon's `par_iter` with transient-failure
+tolerance:
 
 ```text
-shard_infos.par_iter()
-    .map(|si| decode_shard → filter_rows → Ok(csr_arrays))
-    .collect::<Result<Vec<_>>>()?
+par_map_with_shard_retry(&needed, |shard| {
+    decode_shard → filter_rows → Ok(csr_arrays)
+})
 ```
+
+Pass 1 runs `par_iter` over all candidate shards without short-circuiting on the
+first error. If some shards fail with a retryable error (I/O, transient cloud),
+they are retried once **sequentially** to let congestion clear. Deterministic
+decode errors (corrupt data) fail fast without retry. This prevents a single
+shard's transient failure from discarding work already completed on other shards.
 
 Catalog-level predicate pushdown first prunes shards that can't contain matching
 cells, so only candidate shards are decoded — parallelism multiplied by
@@ -164,7 +176,7 @@ the rayon `ThreadPool` (per-instance, lazily built on first
 `TrainingPipeline` value contains no live runtime, registry, or worker
 threads at construction time. A forked child therefore inherits no
 fork-hostile state from the parent. The eager-construct-then-fork case is
-caught by the PID check in `__next__` (`scx-loader/src/python.rs:134-141`).
+caught by the PID check in `__next__` (`scx-loader/src/python.rs`).
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths
@@ -226,6 +238,85 @@ locks degrade gracefully — readers are never blocked.
 
 > [!TIP]
 > Unlike HDF5's mandatory POSIX locks, SCX's advisory locks never cause
+
+## Streaming conversion (parallel ingest and export)
+
+The `scx-convert` crate parallelises both h5ad/h5mu → SCX (ingest) and
+SCX → h5ad/h5mu (export) shard processing via rayon worker pools.
+
+### Parallel streaming ingest (h5ad/h5mu → SCX)
+
+`run_streaming_writer_coordinator` in `scx-convert/src/pipeline.rs` routes
+to `streaming_writer_coordinator_parallel` when `reader_threads > 1`, the
+reader supports indexed row-range reads, and libhdf5 is thread-safe
+(`H5is_library_threadsafe` probe). The parallel coordinator:
+
+1. Builds a per-coordinator `rayon::ThreadPool` with `reader_threads` workers
+   (thread name prefix `scx-stream-`).
+2. Partitions the input into row ranges matching `shard_target_rows`.
+3. Fans shard read → sort → encode work out via `rayon::in_place_scope`,
+   using a **rolling-window spawn** that caps outstanding shards at
+   `reader_threads + writer_queue_depth`.
+4. A bounded `crossbeam` reorder buffer drains encoded shards in shard-index
+   order on the calling thread, which performs sequential writes to the
+   `ScxWriter`. Output is byte-identical to the sequential path.
+5. **Memory-budget derate**: `derate_threads_and_depth` shrinks both the
+   worker count and queue depth to fit under `--memory-budget`, emitting a
+   `ReaderThreadsDerated` warning when active.
+
+Fallback to sequential when: `reader_threads <= 1`, reader is not indexed
+(e.g., CSC external-memory transpose, h5mu cross-modality), or libhdf5 is
+not thread-safe (emits `ConvertWarning::Hdf5NotThreadsafe`).
+
+```python
+# Python: parallel ingest with 8 reader threads
+pyscx.from_h5ad("atlas.h5ad", "atlas.scx", reader_threads=8, memory_budget=8_000_000_000)
+```
+
+### Parallel streaming export (SCX → h5ad/h5mu)
+
+`stream_csr_to_group_at` in `scx-convert/src/h5ad/stream_write.rs` routes to
+`stream_csr_into_prealloc_parallel` when `reader_threads > 1`. The parallel
+exporter:
+
+1. Builds a per-export `rayon::ThreadPool` with `reader_threads` workers
+   (thread name prefix `scx-export-`).
+2. Workers decode + filter shards in the rayon pool; the calling thread
+   drains the bounded crossbeam channel in shard-index order and performs
+   HDF5 hyperslab writes (libhdf5 holds its own global lock, but workers
+   never touch HDF5).
+3. No `H5is_library_threadsafe` probe is required — per-shard memory comes
+   from exact `FullCatalogEntry::stats.nnz` and row range (no density
+   heuristic). Same rolling-window spawn cap as ingest.
+
+```python
+# Python: parallel export
+pyscx.to_h5ad("atlas.scx", "atlas.h5ad", reader_threads=8)
+```
+
+## Analysis accelerators
+
+The `scx-accel` crate parallelises CPU-side analysis via rayon. Each
+accelerator uses rayon's global thread pool or a locally-scoped pool:
+
+| Accelerator | Threading model |
+|-------------|----------------|
+| **PCA** (covariance / randomized) | Per-op `rayon::ThreadPool`; row-chunked `par_chunks` for SpMM with thread-local accumulators |
+| **Differential expression** (Wilcoxon) | `par_iter` over genes |
+| **NB-GLM** (DESeq2-style DE) | `par_iter` over genes for IRLS, shrinkage refit, and Wald inference |
+| **Harmony** batch integration | Per-op `rayon::ThreadPool`; tiled cell updates via `par_chunks` |
+| **Leiden** clustering | Conflict-free parallel batching via `par_iter` |
+| **kNN** (HNSW) | `par_iter` over query points; faer `Par::rayon(0)` for matmul |
+| **LISI** | `par_iter` over cells |
+| **HVG** (seurat_v3 / seurat) | Streaming shard-parallel gene statistics |
+| **Gene-set scoring** (`score_genes`) | Streaming shard-parallel mean/score computation |
+| **Pseudobulk** aggregation | Streaming shard-parallel group sums |
+| **Perturbation eval metrics** | `par_iter` over perturbations; faer `Par::rayon(0)` for distance matmul |
+
+PCA and Harmony build isolated `rayon::ThreadPool` instances scoped to the
+op to avoid contention with the global pool. All other ops use the process-global
+rayon registry (controllable via `RAYON_NUM_THREADS`).
+
 > `errno 37` ("No locks available") on NFS/Lustre/GPFS.
 
 ## File writing
@@ -383,19 +474,25 @@ scx pull gs://bucket/atlas.scxd/ atlas.scx --parallelism 16
                          │  (Python / R / Rust CLI)    │
                          └──────────┬──────────────────┘
                                     │
-              ┌─────────────────────┼────────────────────┐
-              │                     │                    │
-    ┌─────────▼────────┐  ┌────────▼────────┐   ┌────────▼────────┐
-    │   scx-engine     │  │   scx-loader    │   │   scx-cloud     │
-    │  rayon par_iter  │  │  tokio + rayon  │   │  tokio async    │
-    │  (query decode)  │  │  + std::thread  │   │  (cloud I/O)    │
-    └─────────┬────────┘  └────────┬────────┘   └────────┬────────┘
-              │                    │                     │
-              └────────────────────┼─────────────────────┘
+          ┌──────────────┬──────────┼──────────┬──────────────┐
+          │              │          │          │              │
+┌─────────▼────────┐ ┌───▼───────┐ │  ┌───────▼───────┐ ┌───▼────────────┐
+│   scx-engine     │ │ scx-accel │ │  │  scx-convert  │ │   scx-cloud    │
+│  rayon par_iter  │ │ rayon per │ │  │  rayon pool + │ │  tokio async   │
+│  (query decode)  │ │  op/pool  │ │  │  crossbeam    │ │  (cloud I/O)   │
+└─────────┬────────┘ └───┬───────┘ │  └───────┬───────┘ └───┬────────────┘
+          │              │         │          │              │
+          └──────────────┴─────────┤──────────┘              │
+                                   │                         │
+                         ┌─────────▼─────────┐   ┌──────────▼──────────┐
+                         │   scx-loader      │   │                     │
+                         │  tokio + rayon    │   │  object_store       │
+                         │  + std::thread   │   │  (async range I/O)  │
+                         └─────────┬─────────┘   └─────────────────────┘
                                    │
                          ┌─────────▼─────────┐
-                         │   scx-format      │
-                         │  (opt-in rayon)   │
+                         │  scx-format-io    │
+                         │  (default rayon)  │
                          │  mmap reader      │
                          └─────────┬─────────┘
                                    │

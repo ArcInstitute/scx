@@ -27,8 +27,9 @@ cd pyscx && ../.venv/bin/maturin develop --features hdf5,cloud
 cargo install --path scx-cli --features cloud
 ```
 
-Without this flag, `pyscx.pull`, `pyscx.push`, `pyscx.open_cloud`, and the
-`scx pull` / `scx push` / `scx cloud-optimize` / `scx explode` / `scx pack`
+Without this flag, `pyscx.pull`, `pyscx.push`, `pyscx.open_cloud`,
+`pyscx.read_cloud`, `pyscx.cloud_optimize`, `pyscx.explode`, `pyscx.pack`,
+and the `scx pull` / `scx push` / `scx cloud-optimize` / `scx explode` / `scx pack`
 subcommands are not available. On a non-cloud CLI build, invoking one of these
 fails with `error: unrecognized subcommand 'pull'` preceded by a hint —
 `note: \`pull\` is a cloud subcommand and is not compiled into this build.
@@ -220,7 +221,8 @@ scx cloud-optimize atlas.scx --output atlas.cloud.scx
 ```
 
 ```python
-pyscx.cloud_optimize("atlas.scx", "atlas.cloud.scx")
+pyscx.cloud_optimize("atlas.scx", "atlas.cloud.scx")  # explicit output
+pyscx.cloud_optimize("atlas.scx")                      # in-place rewrite
 ```
 
 `pull` produces a cloud-optimized file by default (`cloud_ready=True`), so
@@ -340,11 +342,8 @@ completion, so:
   (in-flight, safe to delete). The next pull will sweep the `.tmp.*`
   automatically.
 
-The `CloudError::Interrupted` enum variant is reserved for callers that
-want to explicitly signal an interruption in downstream orchestration
-(e.g., surfacing to the regression gate); the pull implementation itself
-does not raise it today since interruptions in the streaming pipeline
-surface as `object_store::Error` / `io::Error` at the failing GET.
+Interruptions in the streaming pipeline surface as `CloudError::Timeout` /
+`CloudError::DownloadFailed` / `object_store::Error` at the failing GET.
 
 ### `push` — stream local `.scx` → cloud `.scxd/`
 
@@ -554,21 +553,24 @@ Heuristics:
 | `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the reorder window — peak memory is `parallelism × max_section_size`. |
 | `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
 | `retry_config.request_timeout` | 120 s | Per-request wall-clock cap. A timed-out request is retried subject to `max_retries`; final exhaustion surfaces as `CloudError::Timeout`. Raise on slow links pulling very large shards. |
-| `retry_config.max_retries` | 6 | Application-level retries on top of `object_store`'s internal retries. Total HTTP attempts per request ≈ `(max_retries + 1) × object_store_max_retries`. Lower to 0–1 to fail fast in CI; raise on flaky networks. |
+| `retry_config.max_retries` | 6 | Total retry attempts per request. Effective attempt count is exactly `max_retries + 1`. Lower to 0–1 to fail fast in CI; raise on flaky networks. |
 | `retry_config.base_delay` / `max_delay` / `jitter_factor` | 500 ms / 30 s / 0.1 | Exponential backoff schedule with ±10% jitter for breaking thundering-herd. Defaults rarely need tuning. |
 | Shard size at write time | 10k cells | Smaller shards → finer pushdown granularity, but more objects and more request overhead. See [docs/sharding.md]. |
 | `RAYON_NUM_THREADS` | #cores | Affects downstream decode after download. Does **not** control download parallelism — that's `parallelism`. |
 
 #### Retry layering
 
-`pyscx.pull` (and Rust `scx_cloud::pull`) wraps every cloud `GET` in two
-nested retry loops: the **inner** loop is `object_store`'s built-in retry
-(transient HTTP errors, short backoff, ~3 attempts by default); the
-**outer** loop is `RetryConfig` (application-classified transient errors,
-exponential backoff + jitter, request-level timeout). The outer loop also
-enforces a hard `request_timeout` per attempt via `tokio::time::timeout`,
-which `object_store`'s defaults do not provide. To disable the outer
-loop entirely, pass `retry_config = RetryConfig::disabled()`.
+Every cloud read — `pull`, cloud query (`CloudReader`), metadata reads,
+predicate-index and deletion-vector reads — goes through a single
+`RetryingStore` decorator installed at the `ObjectStore` boundary.
+`RetryingStore` wraps every `get_opts` (and `head`) call with a
+per-request `tokio::time::timeout` deadline and application-classified
+retry/backoff (`RetryConfig`). `object_store`'s own internal retry is
+**disabled** (`max_retries: 0`) at backend construction, so
+`RetryingStore` is the sole retry authority — there is no
+`outer × inner` attempt compounding; the effective attempt count is
+exactly `max_retries + 1`. To disable retries entirely, pass
+`retry_config = RetryConfig::disabled()`.
 
 ### Request cost vs. bandwidth cost
 

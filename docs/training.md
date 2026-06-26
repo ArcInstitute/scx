@@ -130,13 +130,15 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=0)
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded; check via `effective_batch_size`. |
 | `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
 | `obs_columns` | `[]` | Obs metadata column names included in each batch dict. |
-| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). |
+| `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). **scVI and other count-likelihood models need `normalize=False, log1p=False`.** |
 | `log1p` | `True` | Apply `log1p` after normalize. |
 | `target_sum` | `1e4` | Normalization target sum. |
+| `pflog1ppf` | `False` | Apply PFlog1pPF / shifted-CLR normalization (Booeshaghi et al. 2026) instead of normalize/log1p. Mutually exclusive with `normalize`/`log1p` (takes precedence when `True`). Depth and centering denominator are computed over the full transcriptome even under `hvg_indices` projection. |
+| `pflog1ppf_c` | `1.0` | PFlog1pPF shift / pseudocount `c` (only used when `pflog1ppf=True`). |
 | `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
 | `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
 | `seed` | `42` | RNG seed. Deterministic shuffle via `(seed, epoch_number)`. |
-| `max_memory_mb` | `512` | Memory budget. Pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` to fit. |
+| `max_memory_mb` | adaptive | When omitted, the budget is adaptive: scales up to fit the file's configuration (floor 512 MB, cap 4096 MB) so a full-width ~33k-gene file keeps its requested `batch_size`. Pass an explicit value to pin a hard ceiling — the pipeline then auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` down to fit. |
 | `modality` | `None` | For multimodal v2 files: name of the modality to load (e.g. `"rna"`). Ignored on single-modality files. |
 
 ### Batch dict schema
@@ -321,14 +323,20 @@ dm = ScxDataModule(
     "atlas.scx",
     batch_size=1024,
     hvg_indices=hvg_indices,
-    normalize=True,
-    log1p=True,
+    normalize=False,      # scVI requires raw counts — disable normalize + log1p
+    log1p=False,
 )
 
 # dm wraps TrainingDataset internally — num_workers=0, Rust handles threading
 # dm exposes n_obs, n_vars, n_output_genes properties
 print(f"Dataset: {dm.n_obs} cells, {dm.n_output_genes} genes")
 ```
+
+> [!WARNING]
+> `ScxDataModule` inherits `normalize=True` and `log1p=True` from
+> `TrainingDataset`. **scVI and other count-likelihood models require raw
+> integer counts** — always pass `normalize=False, log1p=False` as shown
+> above.
 
 ### Generic Lightning DataModule
 

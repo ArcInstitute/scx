@@ -48,8 +48,11 @@ stratifier is supplied (see [§ Replicate requirement](#replicate-requirement)).
 
 ## Three entry points
 
-All three are CPU-only (`f64` end-to-end) — there is **no `device=` argument** and
-no GPU path in v1.
+All three accept `device="auto"` (`"auto"` / `"cpu"` / `"gpu"` / `"gpu:N"`). The
+core NB-GLM fit runs in `f64` end-to-end; GPU routes (`gpu_nb_glm_csr`,
+`gpu_nb_glm_csc`) accelerate the pseudobulk aggregation stage while the IRLS /
+Cox–Reid fit itself remains CPU. `pseudobulk_dex(backend="nb_glm")` is CPU-only
+(no `device` parameter).
 
 ### 1. `pyscx.accel.nb_glm` — direct, already-pseudobulked
 

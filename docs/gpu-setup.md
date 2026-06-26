@@ -20,7 +20,7 @@ and the ML training loader. All ops are accessed through the same
 | cuGraph | 24.10+ | 24.12+ | GPU Leiden clustering (optional — CPU fallback available) |
 | cuVS | 24.10+ | 24.12+ | Device-resident CAGRA kNN in fused `pca_neighbors` only (optional) |
 | Rust toolchain | 1.78+ | stable | For building scx-gpu crate |
-| Python | 3.10+ | 3.12–3.13 | For pyscx bindings |
+| Python | 3.11+ | 3.12–3.13 | For pyscx bindings |
 
 **What requires what:**
 
@@ -38,6 +38,7 @@ and the ML training loader. All ops are accessed through the same
 | GPU Leiden clustering | — | — | — | required |
 | CSC-direct / pdex DE (`device="gpu"`) | — | required | — | — |
 | Harmony (`device="gpu"`) | — | required | — | — |
+| NB-GLM pseudobulk DE (`device="gpu"`) | — | required | — | — |
 
 Operations without their required dependencies fall back to CPU automatically
 with a warning — no crashes. **For most in-VRAM GPU analysis, rapids-singlecell
@@ -90,7 +91,7 @@ driver automatically.
 
 ```bash
 # 1. Create a dedicated environment
-conda create -n scx-gpu python=3.13
+conda create -n scx-gpu python=3.13   # pyscx requires >=3.11
 conda activate scx-gpu
 
 # 2. Install the RAPIDS stack — pin cuda-version to match your driver.
@@ -243,8 +244,8 @@ rapids-singlecell is the **primary GPU compute layer** for in-VRAM analysis ops.
 After the ACC-RUST-OPT-V4 transition, most in-VRAM `device="gpu"` analysis ops
 delegate to rapids-singlecell rather than native SCX CUDA kernels. The surviving
 native GPU paths (streaming PCA, seurat_v3 HVG, Leiden, CSC-direct DE, Harmony,
-streaming preprocessing, ML loader) work with the CUDA setup above and do
-**not** require rapids.
+NB-GLM pseudobulk DE, streaming preprocessing, ML loader) work with the CUDA
+setup above and do **not** require rapids.
 
 rapids-singlecell is a **detected runtime dependency**, not a hard requirement:
 
@@ -325,10 +326,10 @@ float `X` (Pcodec → host decode, no sidecar). See
 [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
 
 These stay **native** (SCX wins or is structurally unique): `seurat_v3` /
-`seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, and every
-**out-of-VRAM** path — a backed/lazy `X` (`ScxBackedSparseDataset` /
-`ScxLazyTransformedDataset`) always uses SCX's native streaming kernels, never
-rapids (which would OOM).
+`seurat_v3_paper` HVG, Leiden, CSC-direct / pdex DE, Harmony, NB-GLM pseudobulk
+DE, and every **out-of-VRAM** path — a backed/lazy `X`
+(`ScxBackedSparseDataset` / `ScxLazyTransformedDataset`) always uses SCX's
+native streaming kernels, never rapids (which would OOM).
 
 ### Forcing the native GPU kernels
 
@@ -431,9 +432,9 @@ out-of-VRAM, and structurally-unique paths).
 
 2. **scx-gpu** crate (Rust, compiled PTX) — streaming/randomized PCA
    (cuSPARSE SpMM + cuSOLVER QR + cuBLAS), streaming preprocessing kernels,
-   CSC-direct DE, Harmony, and the ML loader decode-to-device path. These
-   run for backed/lazy `X` (out-of-VRAM), under `SCX_FORCE_NATIVE_GPU=1`,
-   or on ops where rapids has no equivalent.
+   CSC-direct DE, NB-GLM pseudobulk DE, Harmony, and the ML loader
+   decode-to-device path. These run for backed/lazy `X` (out-of-VRAM),
+   under `SCX_FORCE_NATIVE_GPU=1`, or on ops where rapids has no equivalent.
 
 3. **scx-accel** crate — analysis accelerator routing with optional `gpu`
    feature. The **execution planner** (`scx_accel::route`) decides which
@@ -494,6 +495,7 @@ pyscx.accel.pdex_ref(adata_backed, device="gpu")
 | HVG (other flavors) | rapids (`rsc.pp.highly_variable_genes`) | CPU |
 | Leiden | cuGraph (native) | cuGraph (native) |
 | DE (pdex/Wilcoxon) | Native CSC-direct / CSR | Native CSC-direct / CSR |
+| NB-GLM pseudobulk DE | Native (`gpu_nb_glm_csr`) | Native (`gpu_nb_glm_csr`) |
 | Harmony | Native | Native |
 | Fused PCA→kNN | rapids pipeline (in-memory) | Native streaming PCA + device-resident CAGRA (cuVS) |
 

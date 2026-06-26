@@ -143,9 +143,15 @@ n_vars / nnz / 62-shard catalog).
 | streaming   | 87.6 | 87.8 | 88.4 | 87.6 | 87.9 | 88.9 |
 | materialise | 92.2 | 72.6 | 61.8 | 58.0 | 55.4 | 54.6 |
 
-The streaming pipeline is currently sequential by design — wall is
-flat (±1.5 %) across the whole range. Materialise scales sub-linearly
-(1.69× peak at 32 threads, efficiency 5 %) because the upstream
+The streaming pipeline now supports a **parallel reader coordinator**
+(`--reader-threads N` / `reader_threads=N`; default auto-derived from
+`RAYON_NUM_THREADS` or `available_parallelism()`), which fans shard
+reads across a rayon worker pool with a bounded crossbeam reorder
+buffer when libhdf5 is threadsafe. Output is byte-identical to the
+sequential path. The benchmark numbers above predate the parallel
+reader and show the sequential-era profile — wall was flat (±1.5 %)
+across the whole range. Materialise scales sub-linearly (1.69× peak
+at 32 threads, efficiency 5 %) because the upstream
 `anndata.read_h5ad` is single-threaded HDF5 and the rayon-parallel
 encode pool runs into Amdahl's law on top of that. Materialise peak
 RSS is thread-independent at ~13.6 GB.
@@ -580,26 +586,26 @@ The headline speedup is modest because v1 caps the per-gene sort pool at `GPU_DE
 
 Tolerance-based parity for p-values / FDR (not exact) because of `erfc` and sort-order numerics; U statistics agree exactly in f64. The CPU path itself is pinned bit-for-bit to upstream `pdex` via `pyscx/tests/test_pdex_ref_parity.py`, so CPU↔GPU parity here transitively pins the GPU path to the upstream oracle.
 
-`pyscx.accel.rank_genes_groups(device="gpu", prefer_format="csc")` returns `RuntimeError` — CSC dispatch is CPU-only in v1.
+GPU Wilcoxon (`rank_genes_groups(device="gpu")`) now routes through `plan_de_route` — when a CSC sidecar is present, it takes the `gpu_csc_v3` CSC-direct path (same as `pdex_ref`); otherwise it falls back to `gpu_csr_v3`. `prefer_format="csc"` on the CPU path uses `CpuCsc`.
 
 #### Canonical baseline
 
-Two baselines live side-by-side under `benchmarks/comprehensive/results/baselines/`. **Format / cloud / multimodal** PRs gate against the default `LATEST` symlink; **accel** PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE) pin the accel-only baseline explicitly. The split exists because the multi-surface baseline captures `accel_*` rows but doesn't produce gate signal against them — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
+Two baselines live side-by-side under `benchmarks/comprehensive/results/baselines/`. **Accel** PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE) gate against `LATEST` (currently accel-only); **format / cloud / multimodal** PRs must pin the multi-surface baseline `v0.6.2-n_counts-augmentation` explicitly (not `LATEST`). The split exists because the multi-surface baseline captures `accel_*` rows but doesn't produce gate signal against them — see [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating).
 
 | Use | Baseline | Date | Coverage |
 |---|---|---|---|
-| Format / cloud / multimodal | `LATEST` → `v0.6.2-n_counts-augmentation` | 2026-05-11 | 806 rows × 8 datasets (`pbmc3k` → `census_1m`, `cite_seq_pbmc`, `multiome_pbmc`) |
-| Accel (incl. `accel_de`) | `v0.6.5-accel-gpu-rapids-floors` | 2026-06-XX | rapids-routed accel rows; cross-tier rapids route + correctness gates (`*_route_rapids_correct`, `*_fallback_no_rapids_correct`); Phase 2 promotion |
+| Format / cloud / multimodal | `v0.6.2-n_counts-augmentation` (pin explicitly — not `LATEST`) | 2026-05-11 | 806 rows × 8 datasets (`pbmc3k` → `census_1m`, `cite_seq_pbmc`, `multiome_pbmc`) |
+| Accel (incl. `accel_de`) | `LATEST` → `v0.6.5-accel-gpu-to-gpu-anndata` | 2026-06-10 | rapids-routed accel rows; cross-tier rapids route + correctness gates (`*_route_rapids_correct`, `*_fallback_no_rapids_correct`); `to_gpu_anndata` promotion |
 
 Per-run correctness metrics (`cosine_sim_min`/`mean`, `recall_vs_scanpy`, `trustworthiness`, `ari_vs_leidenalg`, `max_abs_diff_vs_scanpy`, `hvg_overlap_vs_scanpy`, plus `de_pval_agreement_vs_cpu` / `de_top_gene_overlap_vs_cpu` added in G1) flow through `runs[].extra` so the floor checks in `thresholds.yaml` evaluate real observed values, not `missing` placeholders.
 
 ```bash
-# Format / cloud / multimodal — default LATEST:
-python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel
+# Accel PRs (PCA / kNN / UMAP / Leiden / preprocess / HVG / DE) — default LATEST:
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only
 
-# Accel (incl. DE) — pin the accel-only baseline:
-python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
-    --baseline benchmarks/comprehensive/results/baselines/v0.6.5-accel-gpu-rapids-floors
+# Format / cloud / multimodal — pin the multi-surface baseline:
+python benchmarks/comprehensive/scripts/gate_candidate.py --no-accel \
+    --baseline benchmarks/comprehensive/results/baselines/v0.6.2-n_counts-augmentation
 ```
 
 Older accel-only baselines (`v0.6.0-gpu-phase1-7`, `v0.6.0-gpu-phase1-7-multidataset`) remain in-tree for historical bisects but are no longer the gate targets. The earlier stop-gap wrappers (`benchmarks/scripts/gpu_regression_{diff,driver}.py` and `slurm_gpu_regression*.sh`) have been deleted; use `gate_candidate.py` for accelerator regression runs.
@@ -1030,7 +1036,9 @@ optional expiry date. The dashboard (`reporting/dashboard.py`) emits a
 browsable HTML snapshot alongside the markdown report, threaded with
 "← previous snapshot" navigation via `dashboard_history.json`.
 
-The canonical baseline sits at
-`benchmarks/comprehensive/results/baselines/v0.5.0-phase5/` (371 raw
-JSONs archived, manifest + environment committed). `LATEST` symlink
-makes on-demand gate runs (`gate_candidate.py`) work with no flags.
+Two baselines coexist: `LATEST` (currently
+`v0.6.5-accel-gpu-to-gpu-anndata`, accel-only) is the default gate
+target for accelerator PRs; format / cloud / multimodal PRs pin
+`v0.6.2-n_counts-augmentation` explicitly. See the [Canonical
+baseline](#canonical-baseline) table above for coverage details.
+`gate_candidate.py` with no flags gates against `LATEST`.

@@ -57,7 +57,7 @@ Per-cell "this modality has no measurement here" is expressed by an
 empty CSR row in that modality's shard, not by varying obs across
 modalities.
 
-See [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension)
+See [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension-optional)
 for the on-disk byte layout and [docs/api.md § Section Types](api.md#section-types)
 for the `SectionType` enum.
 
@@ -78,7 +78,7 @@ pyscx.from_mudata(mu, "citeseq.scx")    # codec="auto" by default
 `codec="auto"` routes through `select_codec_for_modality(...)`:
 RNA → Scx1 (UMI counts) or Pcodec (floats); Protein/ADT → Zstd; ATAC →
 Zstd for binary peaks else Lz4Shuffle (see
-[docs/codec.md § Per-modality codec defaults](codec.md#per-modality-codec-defaults)).
+[docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults)).
 
 ### 3.2 Reading — `to_mudata()` / `to_anndata()`
 
@@ -136,7 +136,7 @@ too — the result is a one-modality `MuData` rather than an error, so the
 same code paths work uniformly across file layouts.
 
 Filter kwargs (`var_names`, `obs_filter`, `layers`) are **not** supported
-together with `modality=...` in this PR — the modality-scoped backed
+together with `modality=...` currently — the modality-scoped backed
 path doesn't share a `QueryPipeline` with the unimodal predicate-pushdown
 machinery yet. Use `scx subset --modality NAME --filter '<expr>'` (now
 supported, see § 5) to materialise a filtered single-modality file
@@ -330,8 +330,8 @@ are resolved.
 
 ## 7. Cross-references
 
-- [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension) — on-disk byte layout.
+- [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension-optional) — on-disk byte layout.
 - [docs/api.md § Multimodal API](api.md#multimodal-api) — Rust + PyO3 surface.
-- [docs/codec.md § Per-modality codec defaults](codec.md#per-modality-codec-defaults) — auto-codec routing per modality.
+- [docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults) — auto-codec routing per modality.
 - [docs/cloud.md § Exploded `.scxd/` layout](cloud.md#exploded-scxd-layout) — `_modality_table.bin` + `X/{modality}/` directories.
 - [docs/scanpy.md](scanpy.md) — single-modality scanpy/AnnData integration (multimodal example follows the same `pyscx.from_mudata` / `to_mudata` pattern shown here).

@@ -7,15 +7,17 @@
 | Crate | Location | Key tests |
 |-------|----------|-----------|
 | `scx-format` | `tests/integration.rs` | Round-trip validation, minimum file size, checksum verification |
-| `scx-codec` | Per-module unit tests | Rice, FOR-BP (scalar + SIMD BitPacker4x), Delta-Golomb, LZ4+shuffle, byte-shuffle encode/decode round-trips. Reference vector tests for all codecs. |
+| `scx-codec` | Per-module unit tests | Rice, FOR-BP (scalar + SIMD BitPacker4x), Delta-Golomb, LZ4+shuffle, Pcodec, byte-shuffle encode/decode round-trips. Reference vector tests for all codecs. |
 | `scx-sparse` | Unit tests | CSR construction, row slicing, dense conversion |
-| `scx-ops` | `tests/` | Append, delete, compact, rollback, merge, flock concurrency |
+| `scx-format-io` | Unit tests + `tests/` | Reader/writer round-trip, backed I/O, Arrow compat, bitmap, CSC sidecar, decode sidecar |
+| `scx-convert` | Unit tests + `tests/` | h5ad/h5mu streaming ingest, parallel determinism, HDF5 thread-safety probe |
+| `scx-ops` | `tests/` | Append, delete, compact, rollback, merge, flock concurrency, predicate-index rewrite, streaming merge/append |
 | `scx-engine` | Unit tests | Predicate parsing, pipeline validation, pushdown, fused ops |
 | `scx-loader` | Unit tests | Pipeline lifecycle, batch format, shuffle, projection, normalize |
-| `scx-cloud` | `tests/` | Explode/pack round-trip, cloud-optimize, pull/push (local backend) |
-| `scx-accel` | Unit tests | PCA round-trip, kNN recall, UMAP trustworthiness, DE p-values, pseudobulk aggregation |
+| `scx-cloud` | `tests/` | Explode/pack round-trip, cloud-optimize, pull/push (local backend), cloud query |
+| `scx-accel` | Unit tests | PCA round-trip, kNN recall, UMAP trustworthiness, DE p-values, pseudobulk aggregation, NB-GLM, Harmony, LISI, HVG, gene scoring, CSC dispatch, eval metrics |
 | `scx-gpu` | Unit tests | CUDA Rice/FOR-BP decode, sparse-to-dense, cuSPARSE SpMM, cuSOLVER QR, cuRAND, GPU PCA pipeline, GPU UMAP SGD, GPU preprocessing (normalize+log1p). GPU parity with CPU reference. |
-| `scx-integration-tests` | `tests/golden_files.rs` | Golden file regression: 15 golden files (None/Scx1/Zstd/Lz4Shuffle × value encodings), BLAKE3 manifest, CSR bit-exact match, metadata match, backward compatibility, unknown codec rejection |
+| `scx-integration-tests` | `tests/` | Golden file regression (19 golden files: None/Scx1/Zstd/Lz4Shuffle/Pcodec × value encodings), conformance vectors (layers, obsm, uns, CSC, predicate indexes, deletion vectors, multimodal, bitmap, cloud layouts), doc-drift guards, integration lifecycle (write → append → delete → compact → query cross-crate), Harmony pipeline end-to-end |
 | `rscx` | via `R CMD check` | Seurat/SCE round-trip, query, CSR transpose |
 
 ## Python Test Suite
@@ -25,40 +27,37 @@
 **With cloud**: `../.venv/bin/maturin develop --features hdf5,cloud && ../.venv/bin/pytest tests/ -v`
 **With GPU**: `../.venv/bin/maturin develop --features hdf5,gpu && ../.venv/bin/pytest tests/ -v`
 
-| Test file | Purpose |
-|-----------|---------|
-| `test_round_trip.py` | AnnData round-trip validation |
-| `test_scanpy_pipeline.py` | Full scanpy workflow (QC → PCA → Leiden → DE) |
-| `test_zero_copy.py` | Zero-copy verification (`np.shares_memory`) |
-| `test_go_no_go.py` | Go/No-Go gate criteria validation |
-| `test_metadata.py` | Metadata preservation tests |
-| `test_auto_codec.py` | Auto-codec selection (Scx1 vs Zstd) |
-| `test_ops.py` | File operations (append, delete, compact, rollback, merge) |
-| `test_query_pipeline.py` | Query engine Python bindings |
-| `test_training_loader.py` | TrainingDataset iteration, batch format |
-| `test_e2e_pipeline.py` | End-to-end loader pipeline (shuffle, HVG, normalize, memory) |
-| `test_training_integration.py` | Training integration with scVI-style loops |
-| `test_scvi_integration.py` | scVI DataModule integration |
-| `test_python_lifecycle.py` | Python object lifecycle (GC, refcount) |
-| `test_cloud.py` | Cloud operations (explode, pack, pull, push, cloud-optimize) |
-| `test_backed.py` | Backed mode indexing, slicing, layer access |
-| `test_backed_aggregation.py` | Backed mode streaming aggregation (sum, mean, var, max, min, nnz per axis) |
-| `test_comparison_optimization.py` | `(X > 0).sum()` → `getnnz()` short-circuit optimization |
-| `test_chunk_iterator.py` | Shard-aligned and fixed-size chunk iteration |
-| `test_preprocess.py` | Streaming preprocessing pipeline (normalize, log1p, save_layer) |
-| `test_to_anndata_integration.py` | Selective loading (var_names, obs_filter, layers) |
-| `test_h5ad_scx_equivalence.py` | h5ad ↔ SCX equivalence validation |
-| `test_accel.py` | Rust accelerators: PCA, kNN, UMAP, DE (Wilcoxon + streaming), pseudobulk, stratified DE |
-| `test_lazy_transform.py` | Lazy transform wrapper: slicing, aggregation through transforms, chaining |
-| `test_normalize_total.py` | `pyscx.accel.normalize_total()` correctness vs scanpy |
-| `test_log1p.py` | `pyscx.accel.log1p()` correctness vs scanpy |
-| `test_normalize_col_projection.py` | NormalizeTotal with column projection active |
-| `test_truediv_interception.py` | `__truediv__` lazy RowScale interception for backed/lazy datasets |
-| `test_mul_interception.py` | `__mul__` lazy RowScale interception |
-| `test_col_projected_agg.py` | Column-projected streaming aggregation (sum, nnz, var, max, min) |
-| `test_index_space_regression.py` | Deletion vector + transform index space correctness regression |
-| `test_b2_col_projection.py` | Column projection bug regression (streaming col aggregation) |
-| `conftest.py` | Shared pytest fixtures |
+The test suite has 100+ test files. Key categories:
+
+| Category | Test files | Purpose |
+|----------|------------|---------|
+| **Core round-trip** | `test_round_trip.py`, `test_dtype_round_trip.py`, `test_raw_round_trip.py`, `test_golden_files.py` | AnnData round-trip, dtype preservation, raw layer, golden file parity |
+| **Scanpy pipeline** | `test_scanpy_pipeline.py`, `test_go_no_go.py` | Full scanpy workflow (QC → PCA → Leiden → DE), gate criteria |
+| **File operations** | `test_ops.py`, `test_metadata.py`, `test_modify_metadata.py`, `test_auto_codec.py` | Append, delete, compact, rollback, merge; metadata; auto-codec |
+| **Query engine** | `test_query_pipeline.py`, `test_predicate_index.py`, `test_predicate_index_rewrite.py` | Query pipeline, predicate index build + rewrite |
+| **Training loader** | `test_training_loader.py`, `test_training_loader_pflog1ppf.py`, `test_e2e_pipeline.py`, `test_training_integration.py`, `test_scvi_integration.py`, `test_multimodal_training.py` | Dataset iteration, batch format, PFlog1pPF transforms, scVI DataModule |
+| **Backed mode** | `test_backed.py`, `test_backed_aggregation.py`, `test_chunk_iterator.py`, `test_lazy_transform.py`, `test_from_anndata_scx_backed.py` | Indexing, slicing, streaming aggregation, chunk iteration, lazy transforms, backed→SCX rewrite |
+| **Operator interception** | `test_truediv_interception.py`, `test_mul_interception.py`, `test_comparison_optimization.py` | `__truediv__`/`__mul__` lazy RowScale, `(X>0).sum()` → `getnnz()` |
+| **Column projection** | `test_col_projected_agg.py`, `test_col_projection_getitem.py`, `test_normalize_col_projection.py`, `test_b2_col_projection.py` | Column-projected aggregation, getitem, normalize, regressions |
+| **Accelerators (CPU)** | `test_accel.py`, `test_accel_fused.py`, `test_accel_leiden.py`, `test_accel_pflog1ppf.py`, `test_accel_score_genes.py`, `test_accel_route_metadata.py`, `test_accel_stub_coverage.py` | PCA, kNN, UMAP, DE, Leiden, PFlog1pPF, gene scoring, route metadata, stub coverage |
+| **Accelerators (GPU)** | `test_accel_gpu_device.py`, `test_accel_pca_gpu.py`, `test_accel_pipeline_gpu.py`, `test_to_gpu_anndata_e2e.py` | GPU device selection, GPU PCA, fused GPU pipeline, GPU AnnData handoff |
+| **HVG** | `test_hvg.py`, `test_hvg_csc.py`, `test_hvg_gpu_batch_key.py`, `test_hvg_inmemory_native.py`, `test_hvg_layer_kwarg.py`, `test_hvg_loess_singularity.py`, `test_hvg_scanpy_fallback_warning.py` | HVG (seurat_v3/seurat), CSC path, GPU batch_key, loess singularity handling |
+| **Differential expression** | `test_rank_genes_groups_cpu_parity.py`, `test_rank_genes_groups_gpu_parity.py`, `test_rank_genes_groups_gpu_csc_parity.py`, `test_pdex_ref_parity.py`, `test_pdex_ref_gpu_parity.py`, `test_pdex_ref_gpu_csc_parity.py`, `test_pdex_nb_glm.py`, `test_nb_glm.py` | Wilcoxon CPU/GPU/CSC parity, pdex_ref parity, NB-GLM |
+| **CSC sidecar** | `test_csc_convert.py`, `test_csc_dispatch.py`, `test_csc_dispatch_lazy.py`, `test_csc_filtered_genes.py`, `test_csc_lifecycle.py`, `test_csc_capability_gate.py`, `test_csr_bypass.py` | CSC build, dispatch routing, lazy CSC, lifecycle, capability gates |
+| **Preprocessing** | `test_preprocess.py`, `test_normalize_total.py`, `test_normalize_total_fallback_warning.py`, `test_log1p.py` | Streaming normalize/log1p, correctness vs scanpy, fallback warnings |
+| **QC / filtering** | `test_calculate_qc_metrics_empty_qc_var.py`, `test_calculate_qc_metrics_mt_warning.py` | QC edge cases (empty qc_var, MT warning) |
+| **Harmony / LISI** | `test_harmony.py`, `test_harmony_validation.py`, `test_lisi.py` | Harmony2 batch integration, reference parity, LISI metric |
+| **Conversion / export** | `test_h5ad_scx_equivalence.py`, `test_streaming_conversion.py`, `test_to_h5ad.py`, `test_to_h5ad_dispatch.py`, `test_to_h5ad_heterogeneous_categorical.py`, `test_to_h5mu.py`, `test_read_h5ad_metadata.py`, `test_from_10x.py` | h5ad/h5mu streaming ingest/export, metadata read, 10x mtx |
+| **Multimodal** | `test_mudata.py`, `test_multimodal_ops_rejection.py`, `test_multimodal_training.py` | MuData round-trip, ops rejection on multimodal, multimodal training |
+| **Selective loading** | `test_to_anndata_integration.py`, `test_obsm_loading.py`, `test_obsp_to_h5ad.py` | var_names, obs_filter, layers, obsm, obsp |
+| **Fork safety** | `test_fork_safety.py`, `test_fork_deadlock.py`, `test_fork_deadlock_dataloader.py` | Fork-after-init safety, deadlock regression, DataLoader fork |
+| **Lifecycle / misc** | `test_python_lifecycle.py`, `test_zero_copy.py`, `test_import_smoke.py`, `test_import_paths.py`, `test_version.py`, `test_ordered_categorical.py`, `test_uns_dataframe_warning.py`, `test_phase3_ergonomics.py`, `test_phase4_streaming.py`, `test_phase5_coo_v2.py` | GC/refcount, zero-copy, import paths, version, categoricals |
+| **Index / bitmap** | `test_index_space_regression.py`, `test_bitmap.py`, `test_predicate_index.py`, `test_predicate_index_rewrite.py`, `test_index_plan_dataset.py` | Deletion vector index space, detection bitmap, predicate index |
+| **Cloud** | `test_cloud.py`, `test_resumable_pull.py` | Cloud operations, resumable pull |
+| **Eval metrics** | `test_eval_metrics.py`, `test_cell_eval_parity.py`, `test_knockdown_efficiency_cpu_parity.py` | Perturbation evaluation, cell-eval parity, knockdown efficiency |
+| **Determinism** | `test_parallel_determinism.py`, `test_conformance_vectors.py`, `test_cli_pyscx_parity.py` | Parallel reproducibility, conformance vectors, CLI↔pyscx parity |
+| **Misc regression** | `test_obs_shard_oom.py`, `test_t2_warnings.py`, `test_gather_rows_sparse.py`, `test_sparse_cellset_dataset.py` | OOM regression, tier-2 warnings, sparse gather, CellSet |
+| `conftest.py`, `_pdex_fixtures.py` | — | Shared fixtures |
 
 ## Correctness Validation Suite
 
@@ -192,6 +191,7 @@ GPU/analysis paths:
 | `benchmark_bpcells.R` | BPCells R comparison |
 | `benchmark_harmony.py` | Harmony2 batch-integration throughput |
 | `benchmark_lisi.py` | LISI batch/cell-type mixing metric |
+| `benchmark_gather_rows_sparse.py` | Sparse row-gather throughput |
 | `benchmark_gpu_pca.py` | GPU PCA throughput |
 | `benchmark_gpu_knn.py` | GPU kNN throughput |
 | `benchmark_gpu_umap.py` | GPU UMAP throughput |
