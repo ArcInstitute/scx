@@ -1,29 +1,13 @@
 """F2 — grouped-read API tests (read_group / read_reference / iter_group_shards).
 
-The grouped layout is produced by `scx sort --group-by` (write side is the CLI,
-not pyscx), so these tests build an SCX via `pyscx.from_anndata`, then shell out
-to the freshly built `scx` binary to sort it with grouping, then exercise the
-pyscx read surface.
+The grouped layout is produced natively by `pyscx.sort(group_by=...)` (7.2a),
+then these tests exercise the pyscx read surface — no `scx` subprocess.
 """
-
-import os
-import subprocess
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import scipy.sparse as sp
-
-
-def _scx_binary():
-    """Locate the debug `scx` CLI built by `cargo build`."""
-    # pyscx/tests/ -> repo root -> target/debug/scx
-    root = Path(__file__).resolve().parents[2]
-    for cand in (root / "target" / "debug" / "scx", root / "target" / "release" / "scx"):
-        if cand.exists():
-            return str(cand)
-    return None
 
 
 @pytest.fixture
@@ -49,25 +33,27 @@ def screen_adata():
     return anndata.AnnData(X=x, obs=obs, var=var), genes
 
 
-def _sort_grouped(scx_bin, src, out, extra):
-    subprocess.run(
-        [scx_bin, "sort", src, out, "--group-by", "target_gene", "--force", *extra],
-        check=True,
-        capture_output=True,
+def _sort_grouped(src, out, reference=None, shard_size=None):
+    """Write a grouped SCX via the native pyscx sort (7.2a) — no subprocess."""
+    import pyscx
+
+    pyscx.sort(
+        src,
+        out,
+        by=[],  # group_by becomes the leading key
+        group_by="target_gene",
+        reference=reference,
+        shard_size=shard_size,
     )
 
 
 def test_grouped_reads_roundtrip(screen_adata, scx_from_adata, tmp_dir):
     import pyscx
 
-    scx_bin = _scx_binary()
-    if scx_bin is None:
-        pytest.skip("scx CLI binary not built (run `cargo build`)")
-
     adata, genes = screen_adata
     src = scx_from_adata(adata, "screen_src.scx")
     out = str(tmp_dir / "screen_grouped.scx")
-    _sort_grouped(scx_bin, src, out, ["--reference", "nt"])
+    _sort_grouped(src, out, reference=["nt"])
 
     exp = pyscx.open(out)
 
@@ -109,15 +95,11 @@ def test_group_shard_per_label_reads(screen_adata, scx_from_adata, tmp_dir):
     single label out of a multi-group shard."""
     import pyscx
 
-    scx_bin = _scx_binary()
-    if scx_bin is None:
-        pytest.skip("scx CLI binary not built (run `cargo build`)")
-
     adata, _genes = screen_adata
     src = scx_from_adata(adata, "screen_src.scx")
     out = str(tmp_dir / "screen_grouped.scx")
     # Large shards so several labels share one shard (exercises per-label slicing).
-    _sort_grouped(scx_bin, src, out, ["--reference", "nt", "--shard-size", "100"])
+    _sort_grouped(src, out, reference=["nt"], shard_size=100)
 
     exp = pyscx.open(out)
     shards = exp.iter_group_shards()
@@ -145,14 +127,10 @@ def test_group_shard_stream_matches_whole_file(screen_adata, scx_from_adata, tmp
     reference reconstructs the full sorted file."""
     import pyscx
 
-    scx_bin = _scx_binary()
-    if scx_bin is None:
-        pytest.skip("scx CLI binary not built (run `cargo build`)")
-
     adata, genes = screen_adata
     src = scx_from_adata(adata, "screen_src.scx")
     out = str(tmp_dir / "screen_grouped.scx")
-    _sort_grouped(scx_bin, src, out, ["--reference", "nt", "--shard-size", "3"])
+    _sort_grouped(src, out, reference=["nt"], shard_size=3)
 
     exp = pyscx.open(out)
     # Sum of all non-reference shard rows + reference rows == total cells.
@@ -160,6 +138,46 @@ def test_group_shard_stream_matches_whole_file(screen_adata, scx_from_adata, tmp
     ref = exp.read_reference()
     ref_rows = 0 if ref is None else ref.n_obs
     assert shard_rows + ref_rows == len(genes)
+
+
+def test_sort_reference_column_spec(scx_from_adata, tmp_dir):
+    """7.2a: reference={'column': name} (boolean obs column) is accepted and
+    isolates the flagged rows as the reference region."""
+    import anndata
+
+    import pyscx
+
+    genes = ["nt", "MYC", "nt", "TP53", "MYC", "nt"]
+    is_control = [g == "nt" for g in genes]
+    n_obs, n_vars = len(genes), 5
+    x = sp.csr_matrix(np.random.RandomState(3).randint(0, 9, (n_obs, n_vars)).astype(np.float32))
+    obs = pd.DataFrame(
+        {"target_gene": pd.Categorical(genes), "is_control": is_control},
+        index=[f"c{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+    src = scx_from_adata(anndata.AnnData(X=x, obs=obs, var=var), "col_src.scx")
+    out = str(tmp_dir / "col_grouped.scx")
+
+    pyscx.sort(
+        src, out, by=[], group_by="target_gene", reference={"column": "is_control"}
+    )
+    exp = pyscx.open(out)
+    ref = exp.read_reference()
+    assert ref is not None
+    assert ref.n_obs == sum(is_control)
+    assert all(ref.obs["target_gene"] == "nt")
+
+
+def test_sort_reference_requires_group_by(screen_adata, scx_from_adata, tmp_dir):
+    """7.2a: reference without group_by is a clean ValueError."""
+    import pyscx
+
+    adata, _ = screen_adata
+    src = scx_from_adata(adata, "screen_src.scx")
+    out = str(tmp_dir / "bad.scx")
+    with pytest.raises(ValueError):
+        pyscx.sort(src, out, by=["target_gene"], reference=["nt"])
 
 
 def test_read_group_on_ungrouped_errors(query_adata, scx_from_adata):

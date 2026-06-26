@@ -19,7 +19,7 @@ use scx_format_io::section::SectionType;
 use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format_io::ScxReader;
 
-use scx_ops::{OpsError, PredicateIndexBuildSummary};
+use scx_ops::{OpsError, PredicateIndexBuildSummary, ReferenceSpec};
 
 use crate::convert;
 
@@ -593,12 +593,43 @@ pub fn compact(
 ///
 /// Example:
 ///     pyscx.sort("atlas.scx", "atlas.sorted.scx", by=["cell_type"])
+/// Parse the `reference` kwarg of `sort` into a [`ReferenceSpec`].
+///
+/// Accepts `None`, a `str` (single label), a `list[str]` (label set), or a
+/// dict `{"column": name}` (boolean obs column). Mirrors the CLI's
+/// label-list / `col:NAME` forms. `str` is checked before `list[str]` because
+/// pyo3 would otherwise iterate a string into single-character labels.
+fn parse_reference_spec(v: Option<&Bound<'_, PyAny>>) -> PyResult<Option<ReferenceSpec>> {
+    let Some(obj) = v else { return Ok(None) };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    if let Ok(d) = obj.cast::<PyDict>() {
+        return match d.get_item("column")? {
+            Some(col) => Ok(Some(ReferenceSpec::Column(col.extract::<String>()?))),
+            None => Err(PyValueError::new_err(
+                "reference dict must have a 'column' key, e.g. {'column': 'is_control'}",
+            )),
+        };
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(Some(ReferenceSpec::Labels(vec![s])));
+    }
+    if let Ok(labels) = obj.extract::<Vec<String>>() {
+        return Ok(Some(ReferenceSpec::Labels(labels)));
+    }
+    Err(PyValueError::new_err(
+        "reference must be None, a str, a list[str], or {'column': name}",
+    ))
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     input, output, by, reverse=false, shard_size=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
     memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
     csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
+    group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn sort(
@@ -618,10 +649,14 @@ pub fn sort(
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: String,
+    group_by: Option<String>,
+    reference: Option<Bound<'_, PyAny>>,
+    group_target_bytes: Option<Bound<'_, PyAny>>,
+    group_max_bytes: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
-    if by.is_empty() {
+    if by.is_empty() && group_by.is_none() {
         return Err(PyValueError::new_err(
-            "sort requires at least one `by` column",
+            "sort requires at least one `by` column (or `group_by`)",
         ));
     }
     let input_path = PathBuf::from(input);
@@ -630,6 +665,15 @@ pub fn sort(
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s).map_err(PyValueError::new_err)?),
         None => None,
     };
+    // F1 grouped sharding (parse Python args into plain Rust before `py.detach`).
+    let reference = parse_reference_spec(reference.as_ref())?;
+    if reference.is_some() && group_by.is_none() {
+        return Err(PyValueError::new_err(
+            "reference requires group_by to be set",
+        ));
+    }
+    let group_target_bytes = convert::parse_memory_budget(group_target_bytes.as_ref())?;
+    let group_max_bytes = convert::parse_memory_budget(group_max_bytes.as_ref())?;
     let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
     // Route shard_size through the shared validator (signed i64 so a negative
     // value is a clean `ValueError`, not pyo3 `OverflowError`), matching every
@@ -651,12 +695,12 @@ pub fn sort(
         memory_budget,
         temp_dir: temp_dir.map(PathBuf::from),
         bitmap,
-        // F1 grouped sharding is driven from the CLI (`scx sort --group-by`);
-        // the pyscx `sort` wrapper keeps the ungrouped behaviour.
-        group_by: None,
-        reference: None,
-        group_target_bytes: None,
-        group_max_bytes: None,
+        // F1 grouped sharding (7.2a): thread the grouping options through so
+        // Python can write grouped files without the `scx sort --group-by` CLI.
+        group_by,
+        reference,
+        group_target_bytes,
+        group_max_bytes,
     };
     py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
         .map_err(ops_to_pyerr)?;

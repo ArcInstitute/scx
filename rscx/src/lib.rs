@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use extendr_api::prelude::*;
-use scx_engine::pipeline::QueryResult;
+use scx_engine::pipeline::{QueryPipeline, QueryResult};
 use scx_format_io::ScxReader;
+
+use crate::query::RGroupShardHandle;
 
 mod accel;
 mod harmony;
@@ -87,6 +89,55 @@ impl ScxExperiment {
             .to_str()
             .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
         RQueryPipeline::from_path(path)
+    }
+
+    /// Open a fresh `QueryPipeline` over this file (re-open, like `query()`).
+    fn open_pipeline(&self) -> Result<QueryPipeline> {
+        QueryPipeline::open(&self.path).map_err(|e| Error::Other(e.to_string()))
+    }
+
+    /// Fallible body of `read_group` (F2 grouped reads; see B3 / `throw_on_err`).
+    fn read_group_impl(&self, label: &str) -> Result<RQueryResult> {
+        let qr = self
+            .open_pipeline()?
+            .read_group(label)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(RQueryResult::from_result(qr))
+    }
+
+    /// Fallible body of `read_reference`. `Ok(NULL)` when the archive has no
+    /// reference rows.
+    fn read_reference_impl(&self) -> Result<Robj> {
+        match self
+            .open_pipeline()?
+            .read_reference()
+            .map_err(|e| Error::Other(e.to_string()))?
+        {
+            Some(qr) => Ok(RQueryResult::from_result(qr).into()),
+            None => Ok(().into()),
+        }
+    }
+
+    /// Fallible body of `group_labels` (character vector of distinct labels).
+    fn group_labels_impl(&self) -> Result<Robj> {
+        let labels = self
+            .open_pipeline()?
+            .group_labels()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(labels.into())
+    }
+
+    /// Fallible body of `iter_group_shards` (R list of `RGroupShardHandle`).
+    fn iter_group_shards_impl(&self) -> Result<Robj> {
+        let handles = self
+            .open_pipeline()?
+            .iter_group_shards()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let items: Vec<Robj> = handles
+            .into_iter()
+            .map(|h| RGroupShardHandle::new(self.path.clone(), h).into())
+            .collect();
+        Ok(List::from_values(items).into())
     }
 
     /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
@@ -216,6 +267,31 @@ impl ScxExperiment {
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
     fn query(&self) -> Robj {
         crate::util::throw_on_err(self.query_impl())
+    }
+
+    /// F2: read exactly the cells of one `group_by` label as an `RQueryResult`
+    /// (call `$to_dgcmatrix()` / `$to_seurat()` / `$to_sce()` / `$obs()` on it).
+    /// Grouped archive only (written with `group_by`). Unknown label or an
+    /// ungrouped file → clean R `stop()` via `throw_on_err`.
+    fn read_group(&self, label: &str) -> Robj {
+        crate::util::throw_on_err(self.read_group_impl(label))
+    }
+
+    /// F2: read the reference cells (e.g. "non-targeting") as an `RQueryResult`,
+    /// or `NULL` if the archive has no reference rows.
+    fn read_reference(&self) -> Robj {
+        crate::util::throw_on_err(self.read_reference_impl())
+    }
+
+    /// F2: distinct group labels present in the archive (character vector).
+    fn group_labels(&self) -> Robj {
+        crate::util::throw_on_err(self.group_labels_impl())
+    }
+
+    /// F2: one `RGroupShardHandle` per non-reference shard (a list), for
+    /// streaming reads that keep ~one shard resident.
+    fn iter_group_shards(&self) -> Robj {
+        crate::util::throw_on_err(self.iter_group_shards_impl())
     }
 
     /// Phase I.1: True if this file has a registered modality table.
