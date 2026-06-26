@@ -58,63 +58,35 @@ impl GroupIndex {
     }
 
     /// Parse the JSON payload (§ format.md `group_index`).
+    ///
+    /// Deserializes via the shared `scx_format::GroupIndexPayload` derive, so
+    /// every field is required by construction (a missing field is a hard
+    /// deserialization error) and the wire schema has a single definition.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let v: serde_json::Value = serde_json::from_slice(bytes)
+        let payload: scx_format::GroupIndexPayload = serde_json::from_slice(bytes)
             .map_err(|e| EngineError::Generic(format!("malformed group_index payload: {e}")))?;
-        let group_by = v
-            .get("group_by")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| EngineError::Generic("group_index missing 'group_by'".into()))?
-            .to_string();
-        let reference_shard = v
-            .get("reference_shard")
-            .and_then(|x| x.as_u64())
-            .map(|n| n as u32);
-        let reference_labels = v
-            .get("reference_labels")
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect()
+        let scx_format::GroupIndexPayload {
+            group_by,
+            reference_shard,
+            reference_labels,
+            records: records_wire,
+        } = payload;
+        let records: Vec<GroupRecord> = records_wire
+            .into_iter()
+            .map(|r| GroupRecord {
+                label: r.label,
+                shard: r.shard,
+                row_start: r.row_start,
+                row_stop: r.row_stop,
+                // Lenient on unknown role strings (default Group), matching the
+                // historical parser; the writer only ever emits group/reference.
+                role: if r.role == "reference" {
+                    GroupRole::Reference
+                } else {
+                    GroupRole::Group
+                },
             })
-            .unwrap_or_default();
-        let records_json = v
-            .get("records")
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| EngineError::Generic("group_index missing 'records'".into()))?;
-        let mut records = Vec::with_capacity(records_json.len());
-        for r in records_json {
-            let label = r
-                .get("label")
-                .and_then(|x| x.as_str())
-                .ok_or_else(|| EngineError::Generic("group record missing 'label'".into()))?
-                .to_string();
-            let shard = r
-                .get("shard")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| EngineError::Generic("group record missing 'shard'".into()))?
-                as u32;
-            let row_start = r
-                .get("row_start")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| EngineError::Generic("group record missing 'row_start'".into()))?;
-            let row_stop = r
-                .get("row_stop")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| EngineError::Generic("group record missing 'row_stop'".into()))?;
-            let role = match r.get("role").and_then(|x| x.as_str()) {
-                Some("reference") => GroupRole::Reference,
-                _ => GroupRole::Group,
-            };
-            records.push(GroupRecord {
-                label,
-                shard,
-                row_start,
-                row_stop,
-                role,
-            });
-        }
+            .collect();
 
         // Build the label map: non-reference wins on collision.
         let mut by_label: HashMap<String, usize> = HashMap::new();
@@ -236,6 +208,23 @@ pub struct GroupShardHandle {
     pub global_stop: u64,
     /// `(label, local_start, local_stop)`, local to this shard's `global_start`.
     pub groups: Vec<(String, u64, u64)>,
+}
+
+impl GroupShardHandle {
+    /// The **global** `[start, stop)` row range of `label` within this shard, or
+    /// `None` if the label is not resident here. Reads of a single label go
+    /// through [`crate::QueryPipeline::read_row_range`] over this range.
+    pub fn range(&self, label: &str) -> Option<(u64, u64)> {
+        self.groups
+            .iter()
+            .find(|(l, _, _)| l == label)
+            .map(|(_, ls, le)| (self.global_start + ls, self.global_start + le))
+    }
+
+    /// Label → shard-local `(start, stop)` map for introspection.
+    pub fn local_ranges(&self) -> Vec<(String, u64, u64)> {
+        self.groups.clone()
+    }
 }
 
 #[cfg(test)]

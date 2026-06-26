@@ -104,6 +104,64 @@ def test_grouped_reads_roundtrip(screen_adata, scx_from_adata, tmp_dir):
         exp.read_group("MYCN")
 
 
+def test_group_shard_per_label_reads(screen_adata, scx_from_adata, tmp_dir):
+    """7.1d: GroupShard exposes per-label shard-local ranges and can read a
+    single label out of a multi-group shard."""
+    import pyscx
+
+    scx_bin = _scx_binary()
+    if scx_bin is None:
+        pytest.skip("scx CLI binary not built (run `cargo build`)")
+
+    adata, _genes = screen_adata
+    src = scx_from_adata(adata, "screen_src.scx")
+    out = str(tmp_dir / "screen_grouped.scx")
+    # Large shards so several labels share one shard (exercises per-label slicing).
+    _sort_grouped(scx_bin, src, out, ["--reference", "nt", "--shard-size", "100"])
+
+    exp = pyscx.open(out)
+    shards = exp.iter_group_shards()
+    assert shards, "expected at least one non-reference shard"
+
+    for gs in shards:
+        groups = gs.groups  # dict[label] -> (local_start, local_stop)
+        assert set(groups) == set(gs.labels)
+        for label, (ls, le) in groups.items():
+            # Local ranges are within the shard and ordered.
+            assert 0 <= ls < le <= (gs.global_stop - gs.global_start)
+            # Reading one label out of the shard matches the whole-file read_group.
+            per_label = gs.read_group(label)
+            whole = exp.read_group(label)
+            assert per_label.n_obs == whole.n_obs == (le - ls)
+            assert all(per_label.obs["target_gene"] == label)
+
+    # Unknown label in a shard → KeyError.
+    with pytest.raises(KeyError):
+        shards[0].read_group("not_a_label")
+
+
+def test_group_shard_stream_matches_whole_file(screen_adata, scx_from_adata, tmp_dir):
+    """7.1c: streaming over iter_group_shards (shared pipeline) plus the
+    reference reconstructs the full sorted file."""
+    import pyscx
+
+    scx_bin = _scx_binary()
+    if scx_bin is None:
+        pytest.skip("scx CLI binary not built (run `cargo build`)")
+
+    adata, genes = screen_adata
+    src = scx_from_adata(adata, "screen_src.scx")
+    out = str(tmp_dir / "screen_grouped.scx")
+    _sort_grouped(scx_bin, src, out, ["--reference", "nt", "--shard-size", "3"])
+
+    exp = pyscx.open(out)
+    # Sum of all non-reference shard rows + reference rows == total cells.
+    shard_rows = sum(gs.to_anndata().n_obs for gs in exp.iter_group_shards())
+    ref = exp.read_reference()
+    ref_rows = 0 if ref is None else ref.n_obs
+    assert shard_rows + ref_rows == len(genes)
+
+
 def test_read_group_on_ungrouped_errors(query_adata, scx_from_adata):
     import pyscx
 

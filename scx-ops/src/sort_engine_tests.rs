@@ -1264,6 +1264,54 @@ fn grouped_read_back_matches_full_scan() {
 }
 
 #[test]
+fn grouped_read_is_obs_shard_scoped() {
+    // 7.1a: on a row-sharded file `read_group` must read only the obs shards
+    // overlapping the group's range, never the full obs table. The
+    // `read_obs` / `read_obs_shard` debug counters distinguish the two paths.
+    use scx_engine::QueryPipeline;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    // Confirm the output really is multi-obs-shard (otherwise the assertion is
+    // vacuous).
+    assert!(
+        ScxReader::open(&out).unwrap().obs_metadata_shard_count() >= 2,
+        "fixture must produce a multi-obs-shard file"
+    );
+
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let _ = pipe.read_group("MYC").unwrap();
+    let _ = pipe.read_reference().unwrap();
+
+    let counts = pipe
+        .local_reader()
+        .expect("local file pipeline")
+        .debug_counts();
+    assert_eq!(
+        counts.read_obs.load(Relaxed),
+        0,
+        "grouped read on a sharded file must not materialize the full obs table"
+    );
+    assert!(
+        counts.read_obs_shard.load(Relaxed) >= 1,
+        "grouped read must take the shard-scoped obs path"
+    );
+}
+
+#[test]
 fn non_grouped_read_group_errors_not_grouped() {
     use scx_engine::QueryPipeline;
     let dir = tempfile::tempdir().unwrap();
@@ -1377,6 +1425,36 @@ fn read_row_range_rejects_out_of_bounds() {
     );
     // Valid full-range read still works.
     assert_eq!(pipe.read_row_range(0, n).unwrap().x.shape.0 as u64, n);
+}
+
+#[test]
+fn require_grouped_caches_parsed_index() {
+    // 7.1b: the sidecar is parsed at most once per pipeline; repeated calls
+    // return the same cached `GroupIndex` (proven by pointer identity).
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["nt", "MYC", "nt", "TP53", "MYC"];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let a = pipe.require_grouped().unwrap();
+    let b = pipe.require_grouped().unwrap();
+    assert!(
+        std::ptr::eq(a, b),
+        "require_grouped must return the same cached GroupIndex on repeat calls"
+    );
+    // And grouped reads in a loop stay correct over the cache.
+    for _ in 0..3 {
+        assert!(pipe.read_group("MYC").is_ok());
+    }
 }
 
 #[test]

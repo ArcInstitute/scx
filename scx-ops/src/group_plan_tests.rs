@@ -259,3 +259,51 @@ fn sidecar_json_shape_matches_contract() {
     assert_eq!(recs[1]["role"], "group");
     assert_eq!(recs[1]["label"], "MYC");
 }
+
+#[test]
+fn sidecar_bytes_are_byte_identical_to_legacy_json() {
+    // 7.1e: the serde-derive payload must serialize byte-for-byte the same as
+    // the historical hand-written `json!` emit, so existing grouped files keep
+    // an identical `group_index` section.
+    let group_of_new = [0, 1, 1, 2];
+    let ref_of_new = [true, false, false, false];
+    let labs = vec!["nt".to_string(), "MYC".to_string(), "TP53".to_string()];
+    let plan = plan_group_shards(&group_of_new, &ref_of_new, &labs, &[], 100, 0, 1000);
+
+    let group_by = "target_gene";
+    let reference_labels = ["nt".to_string()];
+
+    // Reconstruct the exact legacy `json!` payload (pre-7.1e emit path).
+    let legacy_records: Vec<serde_json::Value> = plan
+        .records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "label": r.label,
+                "shard": r.shard,
+                "row_start": r.row_start,
+                "row_stop": r.row_stop,
+                "role": r.role.as_str(),
+            })
+        })
+        .collect();
+    let legacy = serde_json::json!({
+        "group_by": group_by,
+        "reference_shard": plan.reference_shard,
+        "reference_labels": reference_labels,
+        "records": legacy_records,
+    });
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+
+    // The new path: GroupPlan::to_sidecar_json → serde-derive payload.
+    let new_bytes = serde_json::to_vec(&plan.to_sidecar_json(group_by, &reference_labels)).unwrap();
+
+    assert_eq!(
+        new_bytes, legacy_bytes,
+        "serde-derive sidecar must be byte-identical to the legacy json! emit"
+    );
+    // And serializing the payload struct directly matches too.
+    let payload_bytes =
+        serde_json::to_vec(&plan.to_sidecar_payload(group_by, &reference_labels)).unwrap();
+    assert_eq!(payload_bytes, legacy_bytes);
+}

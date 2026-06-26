@@ -95,7 +95,52 @@ fn shard_handles_exclude_reference_and_localize() {
 }
 
 #[test]
+fn shard_handle_range_resolves_global_offsets() {
+    // 7.1d: GroupShardHandle::range maps a label to its global [start, stop).
+    let gi = GroupIndex::from_bytes(&payload()).unwrap();
+    let handles = gi.shard_handles();
+    // Shard 1 holds MYC (global 50..60) and TP53 (global 60..65).
+    assert_eq!(handles[0].range("MYC"), Some((50, 60)));
+    assert_eq!(handles[0].range("TP53"), Some((60, 65)));
+    // A label not in this shard returns None.
+    assert_eq!(handles[0].range("GATA1"), None);
+    assert_eq!(handles[1].range("GATA1"), Some((65, 90)));
+}
+
+#[test]
 fn malformed_payload_errors() {
     assert!(GroupIndex::from_bytes(b"not json").is_err());
     assert!(GroupIndex::from_bytes(b"{}").is_err());
+}
+
+#[test]
+fn missing_record_field_is_a_hard_error() {
+    // 7.1e: every wire field is required by construction. A record missing
+    // `shard` (or any other field) must fail to deserialize rather than
+    // silently defaulting.
+    for missing in ["shard", "row_start", "row_stop", "label", "role"] {
+        let mut rec = serde_json::Map::new();
+        for (k, v) in [
+            ("label", serde_json::json!("MYC")),
+            ("shard", serde_json::json!(1)),
+            ("row_start", serde_json::json!(0)),
+            ("row_stop", serde_json::json!(10)),
+            ("role", serde_json::json!("group")),
+        ] {
+            if k != missing {
+                rec.insert(k.to_string(), v);
+            }
+        }
+        let v = serde_json::json!({
+            "group_by": "g",
+            "reference_shard": serde_json::Value::Null,
+            "reference_labels": [],
+            "records": [serde_json::Value::Object(rec)],
+        });
+        let bytes = serde_json::to_vec(&v).unwrap();
+        assert!(
+            GroupIndex::from_bytes(&bytes).is_err(),
+            "record missing '{missing}' must error"
+        );
+    }
 }

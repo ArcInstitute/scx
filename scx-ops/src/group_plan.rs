@@ -70,25 +70,36 @@ impl GroupPlan {
         group_by: &str,
         reference_labels: &[String],
     ) -> serde_json::Value {
-        let records: Vec<serde_json::Value> = self
-            .records
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "label": r.label,
-                    "shard": r.shard,
-                    "row_start": r.row_start,
-                    "row_stop": r.row_stop,
-                    "role": r.role.as_str(),
+        // Go through the shared serde-derive payload (`scx_format`) so the writer
+        // and reader share one wire-schema definition. The payload's field order
+        // matches the historical hand-written JSON, so the bytes are unchanged.
+        let payload = self.to_sidecar_payload(group_by, reference_labels);
+        serde_json::to_value(&payload)
+            .expect("GroupIndexPayload always serializes to a JSON object")
+    }
+
+    /// Build the shared serde-derive sidecar payload (`scx_format::GroupIndexPayload`).
+    pub fn to_sidecar_payload(
+        &self,
+        group_by: &str,
+        reference_labels: &[String],
+    ) -> scx_format::GroupIndexPayload {
+        scx_format::GroupIndexPayload {
+            group_by: group_by.to_string(),
+            reference_shard: self.reference_shard,
+            reference_labels: reference_labels.to_vec(),
+            records: self
+                .records
+                .iter()
+                .map(|r| scx_format::GroupRecordWire {
+                    label: r.label.clone(),
+                    shard: r.shard,
+                    row_start: r.row_start,
+                    row_stop: r.row_stop,
+                    role: r.role.as_str().to_string(),
                 })
-            })
-            .collect();
-        serde_json::json!({
-            "group_by": group_by,
-            "reference_shard": self.reference_shard,
-            "reference_labels": reference_labels,
-            "records": records,
-        })
+                .collect(),
+        }
     }
 }
 

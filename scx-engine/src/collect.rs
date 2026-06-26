@@ -318,7 +318,7 @@ struct PlanAndMask {
 /// row_end)`, sorted by `shard_idx`. Returns `None` if any obs shard entry
 /// lacks row-range stats (files written before stats were stamped on
 /// metadata shards) — the caller then falls back to streaming every shard.
-fn obs_shard_ranges_from_catalog(
+pub(crate) fn obs_shard_ranges_from_catalog(
     catalog: &scx_format_io::FullCatalog,
 ) -> Option<Vec<(u32, u64, u64)>> {
     let mut ranges: Vec<(u32, u64, u64)> = Vec::new();
@@ -1164,7 +1164,7 @@ pub fn exists(pipeline: &QueryPipeline) -> Result<bool> {
 /// fix). `obs_shard_ranges` is `(shard_idx, row_start, row_end)` and
 /// `matching_global_rows` is ascending. Peak memory is bounded by the
 /// result size, not the file size.
-fn materialize_filtered_obs(
+pub(crate) fn materialize_filtered_obs(
     reader: &dyn crate::reader::SectionReader,
     obs_shard_ranges: &[(u32, u64, u64)],
     matching_global_rows: &[u32],

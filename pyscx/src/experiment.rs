@@ -1,6 +1,7 @@
 // PyExperiment — lazy handle for SCX files
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use arrow::array::Array;
 use numpy::{PyArray1, PyReadonlyArray1};
@@ -25,6 +26,12 @@ pub struct PyExperiment {
     /// access doesn't re-decode the deletion section. `OnceLock` keeps the
     /// pyclass `Send + Sync`.
     n_deleted: std::sync::OnceLock<u64>,
+    /// Shared, lazily-opened query pipeline for the grouped-read API
+    /// (`read_group` / `read_reference` / `group_labels` / `iter_group_shards`).
+    /// Opened once per `Experiment` so a streaming loop parses the catalog and
+    /// `group_index` sidecar a single time (combined with the engine-side
+    /// `GroupIndex` cache). Shared into each `GroupShard` via `Arc`.
+    grouped_pipeline: std::sync::OnceLock<Arc<QueryPipeline>>,
 }
 
 impl PyExperiment {
@@ -34,7 +41,22 @@ impl PyExperiment {
             reader,
             path,
             n_deleted: std::sync::OnceLock::new(),
+            grouped_pipeline: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The shared grouped-read pipeline, opening it once on first use.
+    fn grouped_pipeline(&self) -> PyResult<Arc<QueryPipeline>> {
+        if let Some(p) = self.grouped_pipeline.get() {
+            return Ok(Arc::clone(p));
+        }
+        let p = Arc::new(QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?);
+        let _ = self.grouped_pipeline.set(p);
+        Ok(Arc::clone(
+            self.grouped_pipeline
+                .get()
+                .expect("grouped_pipeline populated above"),
+        ))
     }
 }
 
@@ -498,7 +520,7 @@ impl PyExperiment {
     /// Example:
     ///     adata = pyscx.open("screen.scx").read_group("MYC")
     fn read_group<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?;
+        let pipeline = self.grouped_pipeline()?;
         let result = py
             .detach(|| pipeline.read_group(label))
             .map_err(engine_to_pyerr)?;
@@ -509,7 +531,7 @@ impl PyExperiment {
     /// `None` if the archive has no reference rows. Returns the full reference
     /// region (all leading reference shards).
     fn read_reference<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?;
+        let pipeline = self.grouped_pipeline()?;
         let result = py
             .detach(|| pipeline.read_reference())
             .map_err(engine_to_pyerr)?;
@@ -521,7 +543,7 @@ impl PyExperiment {
 
     /// F2: distinct group labels present in the archive.
     fn group_labels(&self) -> PyResult<Vec<String>> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?;
+        let pipeline = self.grouped_pipeline()?;
         pipeline.group_labels().map_err(engine_to_pyerr)
     }
 
@@ -532,16 +554,13 @@ impl PyExperiment {
     ///     for gs in pyscx.open("screen.scx").iter_group_shards():
     ///         adata = gs.to_anndata()
     fn iter_group_shards(&self) -> PyResult<Vec<PyGroupShard>> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?;
+        let pipeline = self.grouped_pipeline()?;
         let handles = pipeline.iter_group_shards().map_err(engine_to_pyerr)?;
         Ok(handles
             .into_iter()
-            .map(|h| PyGroupShard {
-                path: self.path.clone(),
-                shard_index: h.shard_index,
-                global_start: h.global_start,
-                global_stop: h.global_stop,
-                labels: h.groups.into_iter().map(|(l, _, _)| l).collect(),
+            .map(|handle| PyGroupShard {
+                pipeline: Arc::clone(&pipeline),
+                handle,
             })
             .collect())
     }
@@ -1351,31 +1370,79 @@ fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
 }
 
 /// F2: a non-reference shard's grouped contents, with deferred I/O.
+///
+/// Holds a shared `Arc<QueryPipeline>` (cloned from the parent `Experiment`), so
+/// streaming over `iter_group_shards()` opens/parses the file once rather than
+/// re-opening per shard.
 #[pyclass(name = "GroupShard")]
 pub struct PyGroupShard {
-    path: PathBuf,
-    #[pyo3(get)]
-    shard_index: u32,
-    #[pyo3(get)]
-    global_start: u64,
-    #[pyo3(get)]
-    global_stop: u64,
-    labels: Vec<String>,
+    pipeline: Arc<QueryPipeline>,
+    handle: scx_engine::GroupShardHandle,
 }
 
 #[pymethods]
 impl PyGroupShard {
+    /// This shard's index in the grouped layout.
+    #[getter]
+    fn shard_index(&self) -> u32 {
+        self.handle.shard_index
+    }
+
+    /// First global output row in this shard (inclusive).
+    #[getter]
+    fn global_start(&self) -> u64 {
+        self.handle.global_start
+    }
+
+    /// One past the last global output row in this shard (exclusive).
+    #[getter]
+    fn global_stop(&self) -> u64 {
+        self.handle.global_stop
+    }
+
     /// Labels present in this shard.
     #[getter]
     fn labels(&self) -> Vec<String> {
-        self.labels.clone()
+        self.handle
+            .groups
+            .iter()
+            .map(|(l, _, _)| l.clone())
+            .collect()
+    }
+
+    /// Per-label **shard-local** `(start, stop)` row ranges as a dict
+    /// `{label: (start, stop)}` (offsets relative to this shard's start).
+    #[getter]
+    fn groups(&self) -> std::collections::HashMap<String, (u64, u64)> {
+        self.handle
+            .groups
+            .iter()
+            .map(|(l, ls, le)| (l.clone(), (*ls, *le)))
+            .collect()
     }
 
     /// Read this shard's rows as an AnnData (deferred I/O — decodes only this
     /// shard's range).
     fn to_anndata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let pipeline = QueryPipeline::open(&self.path).map_err(engine_to_pyerr)?;
-        let (start, stop) = (self.global_start, self.global_stop);
+        let pipeline = Arc::clone(&self.pipeline);
+        let (start, stop) = (self.handle.global_start, self.handle.global_stop);
+        let result = py
+            .detach(|| pipeline.read_row_range(start, stop))
+            .map_err(engine_to_pyerr)?;
+        crate::query::query_result_to_anndata(py, result)
+    }
+
+    /// Read just the cells of `label` within this shard as an AnnData (deferred
+    /// I/O — decodes only the label's sub-range). Raises `KeyError` if the label
+    /// is not resident in this shard.
+    fn read_group<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (start, stop) = self.handle.range(label).ok_or_else(|| {
+            pyo3::exceptions::PyKeyError::new_err(format!(
+                "label '{label}' is not in shard {}",
+                self.handle.shard_index
+            ))
+        })?;
+        let pipeline = Arc::clone(&self.pipeline);
         let result = py
             .detach(|| pipeline.read_row_range(start, stop))
             .map_err(engine_to_pyerr)?;
@@ -1385,10 +1452,10 @@ impl PyGroupShard {
     fn __repr__(&self) -> String {
         format!(
             "GroupShard(shard_index={}, rows={}..{}, labels={})",
-            self.shard_index,
-            self.global_start,
-            self.global_stop,
-            self.labels.len()
+            self.handle.shard_index,
+            self.handle.global_start,
+            self.handle.global_stop,
+            self.handle.groups.len()
         )
     }
 }

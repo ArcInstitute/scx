@@ -91,6 +91,10 @@ pub struct QueryPipeline {
     log1p: bool,
     limit: Option<usize>,
     deletion_vectors: Option<DeletionVectors>,
+    /// Lazily-parsed `group_index` sidecar (F2 grouped reads). Parsed at most
+    /// once per pipeline by [`require_grouped`](Self::require_grouped); shared
+    /// by all grouped-read calls on this pipeline.
+    group_index: std::sync::OnceLock<crate::group::GroupIndex>,
 }
 
 impl std::fmt::Debug for QueryPipeline {
@@ -143,6 +147,7 @@ impl QueryPipeline {
             log1p: false,
             limit: None,
             deletion_vectors,
+            group_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -229,8 +234,18 @@ impl QueryPipeline {
 
     /// Load the group index, or `Err(EngineError::NotGrouped)` if the archive
     /// was not written with `--group-by`.
-    pub fn require_grouped(&self) -> Result<crate::group::GroupIndex> {
-        crate::group::GroupIndex::open(self.reader.as_ref())
+    ///
+    /// The sidecar is parsed at most once per pipeline and cached; repeated
+    /// grouped reads share the same `GroupIndex`.
+    pub fn require_grouped(&self) -> Result<&crate::group::GroupIndex> {
+        if let Some(gi) = self.group_index.get() {
+            return Ok(gi);
+        }
+        let gi = crate::group::GroupIndex::open(self.reader.as_ref())?;
+        // Idempotent on a race: a concurrent caller may have set it first; the
+        // value is identical either way, so discard our copy on a lost race.
+        let _ = self.group_index.set(gi);
+        Ok(self.group_index.get().expect("group_index populated above"))
     }
 
     /// Read exactly the rows of `label` in the `group_by` column (Route B —
@@ -291,10 +306,12 @@ impl QueryPipeline {
     /// safe (each opens a fresh pipeline with no builder state); Rust callers who
     /// need projection/transforms must post-process or use `collect()`.
     ///
-    /// v1 note: obs metadata is read in full and sliced (cheap Arrow slice); the
-    /// expensive X decode is what the range restricts.
+    /// On a row-sharded file (atlas scale) obs metadata is read shard-scoped —
+    /// only the `ObsMetadataShard`s overlapping `[start, stop)` are decoded, so
+    /// peak obs memory is bounded by the touched shards, not the whole table.
+    /// Legacy single-section obs (and pre-stats files) fall back to a full read
+    /// + slice.
     pub fn read_row_range(&self, start: u64, stop: u64) -> Result<QueryResult> {
-        use arrow::array::{RecordBatch, UInt32Array};
         use scx_format_io::catalog::FullCatalogEntry;
 
         let n_obs = self.reader.header().n_obs;
@@ -373,24 +390,41 @@ impl QueryPipeline {
 
         let x = ScxCsr::new_unchecked((kept, n_vars), merged_indptr, merged_indices, merged_data);
 
-        // obs: slice the range, then filter by the deletion keep-mask (if any).
-        let obs_full = self.reader.read_obs()?;
-        let obs_range = obs_full.slice(start as usize, range_len);
-        let obs = if keep_mask.is_some() {
-            let idx: Vec<u32> = keep_local
+        // obs: the kept global rows of [start, stop), ascending. With no
+        // deletion vector that's the whole contiguous range; otherwise only the
+        // rows the keep-mask retained.
+        let matching_global_rows: Vec<u32> = if keep_mask.is_some() {
+            keep_local
                 .iter()
                 .enumerate()
-                .filter_map(|(i, &k)| if k { Some(i as u32) } else { None })
-                .collect();
-            let take = UInt32Array::from(idx);
-            let cols = obs_range
-                .columns()
-                .iter()
-                .map(|c| arrow::compute::take(c.as_ref(), &take, None))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            RecordBatch::try_new(obs_range.schema(), cols)?
+                .filter_map(|(i, &k)| {
+                    if k {
+                        Some(start as u32 + i as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         } else {
-            obs_range
+            (start..stop).map(|g| g as u32).collect()
+        };
+
+        // Prefer reading only the obs shards overlapping [start, stop) on a
+        // row-sharded file. Fall back to a full read + slice for legacy
+        // single-section obs (or pre-stats shards that lack row ranges).
+        let obs = if self.reader.obs_metadata_shard_count() > 0 {
+            match crate::collect::obs_shard_ranges_from_catalog(self.reader.catalog()) {
+                Some(ranges) if !ranges.is_empty() => crate::collect::materialize_filtered_obs(
+                    self.reader.as_ref(),
+                    &ranges,
+                    &matching_global_rows,
+                )?,
+                _ => {
+                    self.read_obs_range_full(start, range_len, &keep_local, keep_mask.is_some())?
+                }
+            }
+        } else {
+            self.read_obs_range_full(start, range_len, &keep_local, keep_mask.is_some())?
         };
         let var = self.reader.read_var()?;
 
@@ -403,6 +437,38 @@ impl QueryPipeline {
             candidate_shard_rows,
             matched_rows: kept,
         })
+    }
+
+    /// Legacy obs path for `read_row_range`: read the full obs table, slice the
+    /// `[start, start+range_len)` window, then (if the archive has deletions)
+    /// keep only the rows flagged in `keep_local`. Used for single-section obs
+    /// and pre-stats sharded files where shard-scoped reads aren't available.
+    fn read_obs_range_full(
+        &self,
+        start: u64,
+        range_len: usize,
+        keep_local: &[bool],
+        has_deletions: bool,
+    ) -> Result<arrow::array::RecordBatch> {
+        use arrow::array::{RecordBatch, UInt32Array};
+        let obs_full = self.reader.read_obs()?;
+        let obs_range = obs_full.slice(start as usize, range_len);
+        if has_deletions {
+            let idx: Vec<u32> = keep_local
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| if k { Some(i as u32) } else { None })
+                .collect();
+            let take = UInt32Array::from(idx);
+            let cols = obs_range
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c.as_ref(), &take, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(RecordBatch::try_new(obs_range.schema(), cols)?)
+        } else {
+            Ok(obs_range)
+        }
     }
 
     // -- Accessors for testing and collect.rs --
