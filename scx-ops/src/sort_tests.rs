@@ -227,6 +227,7 @@ fn provenance_entry_shape() {
         16384,
         &["cell_type".to_string()],
         1_700_000_000,
+        None,
     );
     assert_eq!(entry.action, "sort");
     assert_eq!(entry.timestamp, 1_700_000_000);
@@ -237,5 +238,28 @@ fn provenance_entry_shape() {
     assert_eq!(
         v["predicate_index"]["obs_columns"],
         serde_json::json!(["cell_type"])
+    );
+    // Non-grouped sorts record no grouping block.
+    assert!(v.get("grouping").is_none());
+
+    // Grouped sorts record the grouping params.
+    let grouped = sort_provenance_entry(
+        &["target_gene".to_string()],
+        false,
+        16384,
+        &["target_gene".to_string()],
+        1_700_000_000,
+        Some(serde_json::json!({
+            "group_by": "target_gene",
+            "reference": { "labels": ["nt"] },
+            "group_target_bytes": serde_json::Value::Null,
+            "group_max_bytes": serde_json::Value::Null,
+        })),
+    );
+    let gv: serde_json::Value = serde_json::from_str(&grouped.params_json).unwrap();
+    assert_eq!(gv["grouping"]["group_by"], "target_gene");
+    assert_eq!(
+        gv["grouping"]["reference"]["labels"],
+        serde_json::json!(["nt"])
     );
 }

@@ -1161,6 +1161,34 @@ Spatial transcriptomics files can be modeled as either:
 An R-tree spatial index is reserved as a future section type (out of
 scope for v2).
 
+## 13.7 Grouped-sharding sidecar (`group_index`, id 29)
+
+Written by `scx sort --group-by` to record the condition/label-grouped shard
+layout (see [sharding.md § Condition/label-grouped sharding](sharding.md)).
+One per file, section name `group_index`. The payload is UTF-8 JSON:
+
+```jsonc
+{
+  "group_by": "target_gene",      // obs column the layout groups on
+  "reference_shard": 0,           // shard holding reference rows, or null
+  "reference_labels": ["non-targeting"],
+  "records": [
+    // one per (label, role) contiguous run; row_start/row_stop are GLOBAL
+    // output-row indices (post-reorder), half-open [start, stop), u64.
+    {"label": "non-targeting", "shard": 0, "row_start": 0,     "row_stop": 50000, "role": "reference"},
+    {"label": "MYC",           "shard": 1, "row_start": 50000, "row_stop": 50250, "role": "group"}
+  ]
+}
+```
+
+`role` is `"group"` or `"reference"`. With the never-split-a-group invariant
+each record lies entirely within one shard. A label may appear in two records
+(one per role) only under `--reference col:<name>`, where a label spans both
+the reference and non-reference regions. Forward-compatible: pre-F1 readers hit
+the unknown-section path (logged + skipped), so grouped archives stay readable.
+The sidecar is dropped by `scx append` and is not propagated by
+`compact`/`merge`/`subset` (re-sort to regroup).
+
 ## 14. Cloud Layouts
 
 SCX supports three deployment shapes:

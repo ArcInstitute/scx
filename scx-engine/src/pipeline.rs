@@ -278,13 +278,42 @@ impl QueryPipeline {
     /// range and var passed through, so `.to_anndata()` matches every other read
     /// path.
     ///
+    /// Deletion vectors are honored: if the archive gained a deletion vector
+    /// after the grouped sort (e.g. a later `mark_deleted`), rows marked deleted
+    /// in `[start, stop)` are dropped from both `X` and `obs`, preserving
+    /// equivalence with `query().collect().to_anndata()`.
+    ///
+    /// **Raw read.** This method (and the grouped `read_group` / `read_reference`
+    /// / `iter_group_shards` built on it) ignores the pipeline *builder* state —
+    /// `filter_obs` / `filter_var` predicates, `select_genes`, `with_normalize`,
+    /// `with_log1p`, and `limit` are NOT applied. It returns the raw cells of the
+    /// range (minus deletions). The pyscx grouped-read methods are structurally
+    /// safe (each opens a fresh pipeline with no builder state); Rust callers who
+    /// need projection/transforms must post-process or use `collect()`.
+    ///
     /// v1 note: obs metadata is read in full and sliced (cheap Arrow slice); the
     /// expensive X decode is what the range restricts.
     pub fn read_row_range(&self, start: u64, stop: u64) -> Result<QueryResult> {
+        use arrow::array::{RecordBatch, UInt32Array};
         use scx_format_io::catalog::FullCatalogEntry;
+
+        let n_obs = self.reader.header().n_obs;
         let stop = stop.max(start);
-        let n = (stop - start) as usize;
+        if stop > n_obs {
+            return Err(crate::error::EngineError::Generic(format!(
+                "read_row_range: stop {stop} exceeds n_obs {n_obs}"
+            )));
+        }
+        let range_len = (stop - start) as usize;
         let n_vars = self.reader.header().n_vars as usize;
+
+        // Global keep-mask for deletion vectors (None when the archive is clean,
+        // which is the case for a freshly written grouped output).
+        let keep_mask: Option<Vec<bool>> = self
+            .deletion_vectors
+            .as_ref()
+            .map(|dv| dv.build_keep_mask(n_obs as usize, self.reader.catalog()));
+
         let csr_shards: Vec<&FullCatalogEntry> = self.reader.catalog().shards_sorted();
         let total_shards = csr_shards.len();
 
@@ -293,6 +322,11 @@ impl QueryPipeline {
         let mut merged_data: Vec<f32> = Vec::new();
         let mut candidate_shard_rows = 0usize;
         let mut touched = 0usize;
+        let mut covered = 0u64; // rows of [start, stop) actually decoded
+        let mut kept = 0usize; // rows surviving the deletion filter
+                               // Per-range keep flags, in ascending global-row order (aligned with the
+                               // obs slice). Empty when there are no deletion vectors.
+        let mut keep_local: Vec<bool> = Vec::new();
 
         for e in &csr_shards {
             let Some(stats) = e.stats.as_ref() else {
@@ -308,6 +342,14 @@ impl QueryPipeline {
             let lo = start.max(rs);
             let hi = stop.min(re);
             for g in lo..hi {
+                covered += 1;
+                let keep = keep_mask.as_ref().map(|m| m[g as usize]).unwrap_or(true);
+                if keep_mask.is_some() {
+                    keep_local.push(keep);
+                }
+                if !keep {
+                    continue;
+                }
                 let l = (g - rs) as usize;
                 let s = indptr[l] as usize;
                 let en = indptr[l + 1] as usize;
@@ -315,12 +357,41 @@ impl QueryPipeline {
                 merged_data.extend_from_slice(&data[s..en]);
                 let prev = *merged_indptr.last().unwrap();
                 merged_indptr.push(prev + (en - s) as i64);
+                kept += 1;
             }
         }
 
-        let x = ScxCsr::new_unchecked((n, n_vars), merged_indptr, merged_indices, merged_data);
+        // Coverage guard: every row in [start, stop) must be backed by a shard
+        // (no gap, no double-count). Protects the `new_unchecked` below from a
+        // silently-corrupt CSR on a bad/out-of-cover range.
+        if covered != stop - start {
+            return Err(crate::error::EngineError::Generic(format!(
+                "read_row_range: range [{start}, {stop}) is not fully covered by CSR shards \
+                 (covered {covered} of {range_len} rows)"
+            )));
+        }
+
+        let x = ScxCsr::new_unchecked((kept, n_vars), merged_indptr, merged_indices, merged_data);
+
+        // obs: slice the range, then filter by the deletion keep-mask (if any).
         let obs_full = self.reader.read_obs()?;
-        let obs = obs_full.slice(start as usize, n);
+        let obs_range = obs_full.slice(start as usize, range_len);
+        let obs = if keep_mask.is_some() {
+            let idx: Vec<u32> = keep_local
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| if k { Some(i as u32) } else { None })
+                .collect();
+            let take = UInt32Array::from(idx);
+            let cols = obs_range
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c.as_ref(), &take, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            RecordBatch::try_new(obs_range.schema(), cols)?
+        } else {
+            obs_range
+        };
         let var = self.reader.read_var()?;
 
         Ok(QueryResult {
@@ -330,7 +401,7 @@ impl QueryPipeline {
             skipped_shards: total_shards.saturating_sub(touched),
             total_shards,
             candidate_shard_rows,
-            matched_rows: n,
+            matched_rows: kept,
         })
     }
 

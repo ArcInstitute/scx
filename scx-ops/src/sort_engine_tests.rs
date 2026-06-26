@@ -1034,13 +1034,17 @@ fn assert_grouped_invariants(path: &Path, reference_labels: &[&str]) -> serde_js
                 "record range must be uniform in label"
             );
         }
+        // For a label-based reference spec (`ref_set` non-empty), reference and
+        // group labels are disjoint, so role must agree with set membership.
+        // The `Column` split-label case passes an empty `ref_set` and is exempt
+        // (a label can carry both roles there).
         if !ref_set.is_empty() {
-            let expect_ref = ref_set.contains(label);
-            // A label can split (Column case); only assert role↔refset agreement
-            // for label-based references where labels are disjoint.
-            let _ = expect_ref;
+            assert_eq!(
+                role == "reference",
+                ref_set.contains(label),
+                "record role for {label:?} must match reference-set membership"
+            );
         }
-        assert_eq!(role == "reference", role == "reference");
         assert!(
             ranges.iter().any(|&(s, e)| s <= start && stop <= e),
             "record [{start},{stop}) for {label:?} escapes every CSR shard range {ranges:?}"
@@ -1294,4 +1298,148 @@ fn grouped_sort_is_deterministic() {
     sort(&inp, &b, &o).unwrap();
     assert_eq!(content(&a), content(&b));
     assert_eq!(read_group_index(&a), read_group_index(&b));
+}
+
+#[test]
+fn grouped_read_respects_deletion_vectors() {
+    // After a post-sort mark_deleted, grouped reads must drop the deleted rows
+    // (closes the read_row_range deletion-vector gap).
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 100,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    let genes_out = col_of(&out, "target_gene");
+    let myc_global: Vec<u64> = genes_out
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.as_str() == "MYC")
+        .map(|(i, _)| i as u64)
+        .collect();
+    // Mark the first MYC cell deleted (by its post-sort global row index).
+    crate::mark_deleted(&out, &[myc_global[0]]).unwrap();
+
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let qr = pipe.read_group("MYC").unwrap();
+    assert_eq!(
+        qr.x.shape.0,
+        myc_global.len() - 1,
+        "deleted MYC cell must be excluded from read_group"
+    );
+    let qr_genes = str_col(&qr.obs, "target_gene");
+    assert_eq!(qr_genes.len(), myc_global.len() - 1);
+    assert!(qr_genes.iter().all(|g| g == "MYC"));
+
+    // Equivalence with the predicate path, which also respects deletions.
+    let viaq = QueryPipeline::open(&out)
+        .unwrap()
+        .filter_obs("target_gene == 'MYC'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(viaq.x.shape.0, qr.x.shape.0);
+
+    // read_reference still returns all (undeleted) nt cells.
+    let refq = pipe.read_reference().unwrap().unwrap();
+    assert_eq!(refq.x.shape.0, genes.iter().filter(|g| **g == "nt").count());
+}
+
+#[test]
+fn read_row_range_rejects_out_of_bounds() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["nt", "MYC", "TP53"];
+    let control = [true, false, false];
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+    let n = ScxReader::open(&out).unwrap().n_obs();
+    let pipe = QueryPipeline::open(&out).unwrap();
+    assert!(
+        pipe.read_row_range(0, n + 5).is_err(),
+        "stop past n_obs must error rather than panic / corrupt"
+    );
+    // Valid full-range read still works.
+    assert_eq!(pipe.read_row_range(0, n).unwrap().x.shape.0 as u64, n);
+}
+
+#[test]
+fn append_drops_group_index_sidecar() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["nt", "MYC", "nt", "TP53", "MYC"];
+    let control = genes.iter().map(|g| *g == "nt").collect::<Vec<_>>();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let out = dir.path().join("grouped.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+    assert!(QueryPipeline::open(&out).unwrap().require_grouped().is_ok());
+
+    // Append 2 rows with a matching obs schema (cell_id, target_gene, is_control).
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("target_gene", DataType::Utf8, true),
+        Field::new("is_control", DataType::Boolean, true),
+    ]);
+    let new_obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec!["new_0", "new_1"])),
+            Arc::new(StringArray::from(vec!["MYC", "TP53"])),
+            Arc::new(arrow::array::BooleanArray::from(vec![false, false])),
+        ],
+    )
+    .unwrap();
+    let n_vars = 4usize; // write_grouped_fixture uses 4 vars
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for row in 0..2usize {
+        indices.push((row * 2 % n_vars) as u32);
+        indices.push(((row * 2 + 1) % n_vars) as u32);
+        values.push(1u8);
+        values.push(2u8);
+        indptr.push(indptr.last().unwrap() + 2);
+    }
+    crate::append(
+        &out,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &crate::AppendOptions::default(),
+    )
+    .unwrap();
+
+    // The stale grouped sidecar must be gone; grouped reads cleanly report it.
+    let r = ScxReader::open(&out).unwrap();
+    assert!(
+        r.catalog().get("group_index").is_none(),
+        "append must drop the stale group_index sidecar"
+    );
+    assert!(QueryPipeline::open(&out)
+        .unwrap()
+        .require_grouped()
+        .is_err());
 }

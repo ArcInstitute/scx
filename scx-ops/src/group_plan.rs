@@ -205,6 +205,14 @@ pub fn plan_group_shards(
             cur_units = 0;
         }
 
+        debug_assert!(
+            b.gid >= 0 && (b.gid as usize) < labels.len(),
+            "group id {} out of range for {} labels (caller must remap null/deleted to a real \
+             synthetic group, never -1)",
+            b.gid,
+            labels.len()
+        );
+
         if b.role == Role::Reference {
             total_ref_units += gb;
         } else if gb > max_units {

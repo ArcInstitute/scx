@@ -757,6 +757,7 @@ pub fn sort_with_strategy(
         opts.shard_target_rows,
         &indexed_columns,
         ts,
+        grouping_provenance(opts),
     ));
     writer.write_provenance(prov)?;
 
@@ -998,6 +999,7 @@ fn sort_multimodal(
         opts.shard_target_rows,
         &[],
         ts,
+        grouping_provenance(opts),
     ));
     writer.write_provenance(prov)?;
     writer.finish()?;
@@ -2104,6 +2106,23 @@ fn category_of_old(
 // ---------------------------------------------------------------------------
 // F1 — grouped-sharding helpers
 // ---------------------------------------------------------------------------
+
+/// Build the grouping provenance payload for a grouped sort (`None` when
+/// `--group-by` was not used).
+fn grouping_provenance(opts: &SortOptions) -> Option<serde_json::Value> {
+    let group_by = opts.group_by.as_ref()?;
+    let reference = match &opts.reference {
+        Some(crate::sort::ReferenceSpec::Labels(l)) => serde_json::json!({ "labels": l }),
+        Some(crate::sort::ReferenceSpec::Column(c)) => serde_json::json!({ "column": c }),
+        None => serde_json::Value::Null,
+    };
+    Some(serde_json::json!({
+        "group_by": group_by,
+        "reference": reference,
+        "group_target_bytes": opts.group_target_bytes,
+        "group_max_bytes": opts.group_max_bytes,
+    }))
+}
 
 /// Build the per-(live)row reference mask for a grouped sort. `live_keys` holds
 /// the projected sort-key columns (group_by leading) plus, for

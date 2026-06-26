@@ -572,13 +572,20 @@ pub fn sort_provenance_entry(
     shard_target_rows: u32,
     indexed_columns: &[String],
     timestamp: i64,
+    grouping: Option<serde_json::Value>,
 ) -> ProvenanceEntry {
-    let params = serde_json::json!({
+    let mut params = serde_json::json!({
         "by": by,
         "reverse": reverse,
         "shard_size": shard_target_rows,
         "predicate_index": { "obs_columns": indexed_columns },
     });
+    // F1: record grouping params so a grouped file is self-describing in
+    // provenance (the `group_index` sidecar holds the layout; this records how
+    // it was produced).
+    if let Some(g) = grouping {
+        params["grouping"] = g;
+    }
     ProvenanceEntry {
         timestamp,
         action: "sort".to_string(),

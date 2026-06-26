@@ -726,6 +726,44 @@ QueryPipeline::open("file.scx")?
   compares `.cat.categories` against the source file (e.g. plotting that
   assumes a fixed palette) should re-derive categories from the result.
 
+### Grouped reads (condition/label-grouped sharding)
+
+On an archive written by `scx sort --group-by` (see
+[sharding.md § Condition/label-grouped sharding](sharding.md)),
+`QueryPipeline` exposes a targeted-read API over the `group_index` sidecar:
+
+```rust
+let pipe = QueryPipeline::open("grouped.scx")?;
+pipe.read_group("MYC")?;        // QueryResult — just the MYC cells (Route B slice)
+pipe.read_reference()?;          // Option<QueryResult> — the full reference region
+pipe.group_labels()?;            // Vec<String>
+pipe.iter_group_shards()?;       // Vec<GroupShardHandle> — per non-reference shard
+pipe.read_row_range(start, stop)?; // the underlying contiguous-range read
+```
+
+- **Raw reads.** These ignore builder state (`filter_obs`/`filter_var`/
+  `select_genes`/`with_normalize`/`with_log1p`/`limit`) — they return the
+  range's cells only. Deletion vectors **are** honored (rows deleted after the
+  sort are dropped), so results match `query().collect()` for the same cells.
+- **Errors:** `EngineError::NotGrouped` when the archive has no sidecar;
+  `EngineError::UnknownGroupLabel { suggestions }` (with `strsim` close matches)
+  for an unknown label; bounds/coverage errors from `read_row_range` on an
+  out-of-range or gapped range.
+
+In pyscx these surface on `Experiment` (each opens a fresh pipeline, so builder
+bypass cannot happen):
+
+- `Experiment.read_group(label) -> AnnData` — raises `KeyError` (with
+  suggestions) on miss, `ValueError` if not grouped.
+- `Experiment.read_reference() -> AnnData | None`.
+- `Experiment.group_labels() -> list[str]`.
+- `Experiment.iter_group_shards() -> list[GroupShard]` — each `GroupShard` has
+  `.shard_index`, `.global_start`, `.global_stop`, `.labels`, and `.to_anndata()`
+  (deferred per-shard I/O).
+
+Grouped reads are local-only in v1 (no `open_cloud` / `rscx` surface), and the
+sidecar is dropped by `append` (re-sort to regroup).
+
 ## scx-loader — Training Data Loader
 
 ### `TrainingPipeline`

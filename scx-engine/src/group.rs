@@ -90,7 +90,11 @@ impl GroupIndex {
                 .and_then(|x| x.as_str())
                 .ok_or_else(|| EngineError::Generic("group record missing 'label'".into()))?
                 .to_string();
-            let shard = r.get("shard").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let shard = r
+                .get("shard")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| EngineError::Generic("group record missing 'shard'".into()))?
+                as u32;
             let row_start = r
                 .get("row_start")
                 .and_then(|x| x.as_u64())

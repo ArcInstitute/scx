@@ -384,10 +384,13 @@ reading one perturbation touches one shard, and to isolate reference cells
 does exactly that:
 
 ```bash
+# --reference takes a comma-separated label list, or `col:<name>` for a
+# boolean obs column. --group-target-bytes is optional; omit it to pack by
+# --shard-size rows instead of a byte budget.
 scx sort screen.scx grouped.scx \
   --group-by target_gene \
-  --reference non-targeting \      # or `col:is_control` for a boolean column
-  --group-target-bytes 256M        # optional; omit to pack by --shard-size rows
+  --reference non-targeting \
+  --group-target-bytes 256M
 ```
 
 The sort forces `--group-by` to be the leading sort key (so the column is
@@ -435,6 +438,38 @@ across the reference / non-reference boundary (only possible with
 `read_reference` serves the reference rows. The Rust seam is
 `scx_engine::QueryPipeline::{read_group, read_reference, group_labels,
 iter_group_shards, read_row_range}`.
+
+### Limitations & staleness
+
+The `group_index` sidecar is **write-once** — produced only by `scx sort
+--group-by`. Mutating an archive afterward affects it as follows:
+
+- **`scx append` drops the sidecar** (with a warning), because its records hold
+  global row ranges over the pre-append row universe. After an append the file
+  is ungrouped and grouped reads raise `ValueError` (`NotGrouped`); re-run `scx
+  sort --group-by` to regroup.
+- **`scx merge` / `scx subset` produce fresh, ungrouped files** (no sidecar is
+  written) — re-sort the output to regroup.
+- **`scx compact` does not propagate the sidecar**, so a compacted file is
+  ungrouped.
+- **Deletion vectors are honored** by grouped reads: if you `mark_deleted` /
+  `delete_cells` on a grouped file, `read_group` / `read_reference` /
+  `iter_group_shards` drop the deleted rows, staying equivalent to
+  `query().filter_obs(...).collect()`. (A fresh grouped output has no deletion
+  vectors — the sort materializes them away.)
+- **Grouped reads are *raw*.** They return the cells of the range only — builder
+  state on a `QueryPipeline` (`filter_obs` / `filter_var` / `select_genes` /
+  `with_normalize` / `with_log1p` / `limit`) is **not** applied. The pyscx
+  `Experiment.read_*` methods are structurally safe (each opens a fresh
+  pipeline); compose transforms via `query().collect()` instead.
+- **Local files only (v1).** The cloud `SectionReader` implements
+  `read_group_index_bytes`, but `open_cloud(...)` exposes no grouped-read methods
+  yet. There are no `rscx` grouped bindings, and `pyscx.sort()` cannot yet
+  produce a grouped file (use the `scx sort --group-by` CLI).
+
+> v1 note: `read_group` decodes only the group's CSR shard(s) but reads obs
+> metadata in full before slicing. The expensive X decode is range-restricted;
+> obs-shard-scoped reads are a follow-up.
 
 ## Obs/var metadata sharding
 
