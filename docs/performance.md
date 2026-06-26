@@ -839,6 +839,55 @@ widens with shard count at atlas scale. In-memory sort of the 100k file ran in
 (`--memory-budget`) caps peak RSS to one `new_pos`-range partition for atlas-scale
 files.
 
+### Grouped sharding (`scx sort --group-by` / `scx convert --group-by`)
+
+Grouped sharding writes a **reference-first, group-clustered** CSR layout — each
+`group_by` label occupies a contiguous, never-split shard range, with reference
+cells (e.g. `non-targeting`) isolated in shard 0 — so `read_group(label)` /
+`read_reference()` touch only that group's byte range
+(see [sharding.md](sharding.md) and [docs/api.md](api.md)). It is produced two
+ways: `scx sort --group-by` re-shards an existing `.scx`, and `scx convert
+--group-by` (Phase 7.4) writes the grouped layout **directly during ingest** —
+byte-equivalent to convert-then-sort, but in one pass. Measured by the
+`grouped_sort` comprehensive benchmark
+(`benchmarks/comprehensive/results/raw/grouped_sort__scx_auto__{dataset}.json`).
+
+**Convert-time grouping: one-pass vs two-pass, and the density auto-route.**
+Convert-time grouping does a random-access *gather* of the source whose cost
+scales with bytes-read-per-row — `nnz` for CSR, the full `n_vars` for dense — so
+`--group-pass auto` (the default) routes **CSR → one-pass** streaming gather and
+**dense → two-pass** (plain convert + `scx sort`). Real Perturb-seq fixtures,
+`grouped_sort` benchmark (release pyscx, 16 threads; wall = median, RSS sampled
+post-op):
+
+| source (X format, cells × genes) | one-pass wall / RSS | two-pass wall / RSS | `auto` route |
+|---|---|---|---|
+| `tahoe_c38` (CSR, 69,245 × 62,710, by `drug`) | **16.9 s / 1.0 GB** | 27.9 s / 1.4 GB | one-pass (1.7× faster) |
+| `replogle_k562` (dense, 68,729 × 6,546, by `gene`) | 3 m 39 s / 6.8 GB | **39 s / 4.7 GB** | two-pass (5.6× faster) |
+
+For a **CSR** source the one-pass gather reads only each row's non-zeros and wins
+outright; for a **dense** source it reads full-width rows per gathered cell and is
+a ~5× loss, so `auto` falls back to the two-pass path (which costs a transient
+~2× output disk for the intermediate file). Output is byte-identical regardless of
+route. Both synthetic CSR fixtures confirm the ordering (`pert_synth_10k`:
+one-pass 1.6 s vs two-pass 3.4 s; `nb_glm_synth`: 3.6 s vs 6.5 s). The post-op RSS
+above understates true peak (the suite samples after the op, not a high-water
+mark); a `/usr/bin/time` true-peak measurement of the release `scx` CLI puts the
+dense one-pass at ~11.5 GB vs ~6.5 GB for two-pass — the memory motivation for the
+dense → two-pass route.
+
+**Grouped sort + reference isolation.** On `replogle_k562` (415 perturbation
+groups), `sort --group-by gene --reference non-targeting` isolates all 10,691
+`non-targeting` cells into shard 0 and clusters each remaining gene into its own
+contiguous shard range; `read_group("MYC")` / `read_reference()` then decode only
+that range rather than scanning all shards. The read-locality mechanics (predicate
+index collapse, shards-touched-per-group) match the generic "Sort (physical
+layout)" numbers above — grouping is the never-split, reference-first special case.
+The benchmark's read-back parity check (`read_group(label)` partitions the obs axis
+and the reference is isolated) is a hard regression gate
+(`thresholds.yaml`: `correctness_passed_int` / `reference_isolated_int` /
+`n_group_records`).
+
 ---
 
 ## Comprehensive Benchmarking + Cloud Validation
