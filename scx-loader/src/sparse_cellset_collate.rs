@@ -16,6 +16,23 @@
 //! Inputs assume a single cell's CSR already in **global vocab, sorted ascending
 //! by gene id, with duplicates coalesced** — exactly what `remap_row`
 //! (`sparse_cellset.rs`) produces, which mirrors state3's `finalize_csr_row`.
+//!
+//! # Cross-repo contract (DO NOT drift)
+//!
+//! The encoder-crop / mask / target semantics here mirror, byte-exact, state3's
+//! `_sparse_encoder_inputs` (`state3/src/state3/data/task.py`). In particular the
+//! encoder masking policy is **drop-to-PAD**: a withheld query gene is removed from
+//! the top-K crop (its slot becomes PAD), NOT replaced in place with a GENE_MASK
+//! token. A single GENE_MASK token appears only in the whole-cell hidden-readout
+//! and all-masked-fallback branches.
+//!
+//! The executable contract is the golden-vector fixture committed identically in
+//! both repos (`scx-loader/tests/data/encoder_crop_golden.json` ==
+//! `state3/tests/data/encoder_crop_golden.json`), asserted by the kernel test here
+//! and by state3's `test_encoder_crop_golden`. **Any change to either side must:
+//! update both implementations, regenerate the golden fixture, update the kernel
+//! tests, and bump `pyscx::COLLATE_CELLSET_CONTRACT_VERSION`** (which state3 asserts
+//! at `rust_collate` setup to fail loudly on version skew).
 
 use std::collections::HashSet;
 
@@ -57,6 +74,12 @@ fn pad_id(n_genes_total: i64) -> i64 {
 }
 
 /// Mutable output slices for one cell (caller-owned; sized `k_enc`/`k_dec`).
+///
+/// NOTE: `_sparse_encoder_inputs` also produces a `pe_mask` (set at slot 0 in the
+/// hidden-readout and all-masked branches). It is intentionally NOT emitted on the
+/// rust path and NOT compared by the parity gate. If the model ever consumes
+/// `pe_mask` on this path, add it here AND to the golden fixture, the parity
+/// comparison, and bump `pyscx::COLLATE_CELLSET_CONTRACT_VERSION`.
 pub struct CellOut<'a> {
     pub enc_ids: &'a mut [i64],    // [k_enc]
     pub enc_counts: &'a mut [f32], // [k_enc]
@@ -199,30 +222,47 @@ pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32
                     .then(cin.gene_ids[a].cmp(&cin.gene_ids[b]))
             });
             let take = k_enc.min(order.len());
-            for (slot, &i) in order.iter().take(take).enumerate() {
-                out.enc_ids[slot] = cin.gene_ids[i] as i64;
-                out.enc_counts[slot] = enc_vals[i];
-                out.enc_pad[slot] = 0;
-            }
-            // Encoder masking (obs): hide top-K genes that fall in the cell's
-            // role query subset (np.isin, task.py:197).
-            if let Some(maskpos) = cin.enc_mask_positions {
-                let masked: HashSet<i64> = cin
-                    .query
+
+            // Encoder masking (obs): the set of gene ids withheld from the encoder
+            // crop — the cell's role query positions flagged in `enc_mask_positions`
+            // (mirrors `mask_gene_ids = query_gene_ids[role_target_mask]`, task.py:1154).
+            // `None` ⇒ perturbation path (no masking).
+            let masked: Option<HashSet<i64>> = cin.enc_mask_positions.map(|maskpos| {
+                cin.query
                     .iter()
                     .zip(maskpos.iter())
                     .filter(|(_, &m)| m != 0)
                     .map(|(&g, _)| g as i64)
-                    .collect();
-                if !masked.is_empty() {
-                    for slot in 0..take {
-                        if masked.contains(&out.enc_ids[slot]) {
-                            out.enc_ids[slot] = mask;
-                            out.enc_mask[slot] = 1;
-                        }
-                    }
+                    .collect()
+            });
+
+            // Walk the top-K order, DROPPING withheld genes (their slot is left PAD;
+            // no backfill from beyond `take`) and compacting survivors to the left.
+            // Mirrors `_sparse_encoder_inputs`' `selected[keep]` (task.py:231-252):
+            // withheld genes are absent (PAD), never a GENE_MASK token.
+            let mut slot = 0usize;
+            for &i in order.iter().take(take) {
+                let gid = cin.gene_ids[i] as i64;
+                if masked.as_ref().is_some_and(|m| m.contains(&gid)) {
+                    continue;
                 }
+                out.enc_ids[slot] = gid;
+                out.enc_counts[slot] = enc_vals[i];
+                out.enc_pad[slot] = 0;
+                slot += 1;
             }
+
+            // All-masked fallback: every selected top-K gene was withheld ⇒ a single
+            // active GENE_MASK token at slot 0 (task.py:235-247). Distinct from the
+            // degenerate-cell branch above, which leaves `enc_mask[0]=0`; here
+            // `enc_mask[0]=1`. `enc_counts[0]` stays 0 (matches Python `counts[0]`).
+            if slot == 0 {
+                out.enc_ids[0] = mask;
+                out.enc_mask[0] = 1;
+                out.enc_pad[0] = 0;
+            }
+            // Slots [slot..k_enc] keep their PAD-init values (id=pad, enc_pad=1,
+            // counts=0, enc_mask=0).
         }
     }
 
