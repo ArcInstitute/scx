@@ -480,6 +480,12 @@ def read_cloud(
     ...
 
 
+# Encoder-crop/mask/target contract version for `collate_cellset_gathered`.
+# Consumers (e.g. state3) assert this at rust_collate setup to fail loudly on
+# version skew. See scx-loader/src/sparse_cellset_collate.rs.
+COLLATE_CELLSET_CONTRACT_VERSION: int
+
+
 # ---------------------------------------------------------------------------
 # Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 # `Any` here. Add explicit stubs above if/when type-checking on those
