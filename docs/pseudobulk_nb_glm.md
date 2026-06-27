@@ -36,7 +36,7 @@ It is the **wrong** tool when you have **one profile per condition** (no
 replicates): a pseudobulk NB-GLM cannot estimate dispersion from a single sample,
 so the estimator degenerates. For no-replicate layouts use the per-cell tests
 instead — [`pyscx.accel.pdex_ref`](api.md#python-api-pyscx) (Mann–Whitney U +
-pseudobulk log fold change) or `pyscx.accel.rank_genes_groups` (Wilcoxon). The
+pseudobulk log fold change) or `pyscx.accel.rank_genes_groups` (Wilcoxon rank-sum). The
 `pdex_nb_glm` entry point **enforces** this: it errors with guidance when no
 stratifier is supplied (see [§ Replicate requirement](#replicate-requirement)).
 
@@ -134,7 +134,7 @@ condition.
 `pdex_nb_glm` enforces this:
 
 - No `stratify_by` (or an empty list) → `ValueError` pointing you to
-  `pdex_ref` / `wilcoxon`.
+  `pdex_ref` / `wilcoxon` (rank-sum).
 - A perturbation with fewer than 2 replicates per condition is **skipped with a
   `UserWarning`** (rather than silently returning a meaningless dispersion).
 

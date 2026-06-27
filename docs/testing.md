@@ -42,7 +42,7 @@ The test suite has 100+ test files. Key categories:
 | **Accelerators (CPU)** | `test_accel.py`, `test_accel_fused.py`, `test_accel_leiden.py`, `test_accel_pflog1ppf.py`, `test_accel_score_genes.py`, `test_accel_route_metadata.py`, `test_accel_stub_coverage.py` | PCA, kNN, UMAP, DE, Leiden, PFlog1pPF, gene scoring, route metadata, stub coverage |
 | **Accelerators (GPU)** | `test_accel_gpu_device.py`, `test_accel_pca_gpu.py`, `test_accel_pipeline_gpu.py`, `test_to_gpu_anndata_e2e.py` | GPU device selection, GPU PCA, fused GPU pipeline, GPU AnnData handoff |
 | **HVG** | `test_hvg.py`, `test_hvg_csc.py`, `test_hvg_gpu_batch_key.py`, `test_hvg_inmemory_native.py`, `test_hvg_layer_kwarg.py`, `test_hvg_loess_singularity.py`, `test_hvg_scanpy_fallback_warning.py` | HVG (seurat_v3/seurat), CSC path, GPU batch_key, loess singularity handling |
-| **Differential expression** | `test_rank_genes_groups_cpu_parity.py`, `test_rank_genes_groups_gpu_parity.py`, `test_rank_genes_groups_gpu_csc_parity.py`, `test_pdex_ref_parity.py`, `test_pdex_ref_gpu_parity.py`, `test_pdex_ref_gpu_csc_parity.py`, `test_pdex_nb_glm.py`, `test_nb_glm.py` | Wilcoxon CPU/GPU/CSC parity, pdex_ref parity, NB-GLM |
+| **Differential expression** | `test_rank_genes_groups_cpu_parity.py`, `test_rank_genes_groups_gpu_parity.py`, `test_rank_genes_groups_gpu_csc_parity.py`, `test_pdex_ref_parity.py`, `test_pdex_ref_gpu_parity.py`, `test_pdex_ref_gpu_csc_parity.py`, `test_pdex_nb_glm.py`, `test_nb_glm.py` | Wilcoxon rank-sum CPU/GPU/CSC parity, pdex_ref parity, NB-GLM |
 | **CSC sidecar** | `test_csc_convert.py`, `test_csc_dispatch.py`, `test_csc_dispatch_lazy.py`, `test_csc_filtered_genes.py`, `test_csc_lifecycle.py`, `test_csc_capability_gate.py`, `test_csr_bypass.py` | CSC build, dispatch routing, lazy CSC, lifecycle, capability gates |
 | **Preprocessing** | `test_preprocess.py`, `test_normalize_total.py`, `test_normalize_total_fallback_warning.py`, `test_log1p.py` | Streaming normalize/log1p, correctness vs scanpy, fallback warnings |
 | **QC / filtering** | `test_calculate_qc_metrics_empty_qc_var.py`, `test_calculate_qc_metrics_mt_warning.py` | QC edge cases (empty qc_var, MT warning) |
@@ -252,7 +252,7 @@ into hard gate failures. Every GPU accelerator benchmark emits an
 `<op>_route_gpu_correct` signal (1.0 = correct route, 0.0 = silent fallback);
 `bench_csc_dispatch.py` emits `csc_dispatch_correct`; and `accel_de.py` emits
 `de_route_csc_direct` for the pdex_ref CSC-direct path. The floor entries
-cover PCA, kNN, UMAP, Leiden, HVG, DE (pdex_ref + Wilcoxon), and CSC dispatch.
+cover PCA, kNN, UMAP, Leiden, HVG, DE (pdex_ref + Wilcoxon rank-sum), and CSC dispatch.
 
 See [benchmarks/README.md § Regression Gating](../benchmarks/README.md#regression-gating)
 for the full gate table and workflow.

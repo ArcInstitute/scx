@@ -114,7 +114,7 @@ For navigational summary, see [AGENTS.md](../AGENTS.md).
   benchmark/correctness reference, not a runtime dependency.
 - **Execution route is computed once and *drives* dispatch.** The single
   planner `scx_accel::route::plan_de_route` is the source of truth for the
-  `pdex_ref` *and* `rank_genes_groups` (Wilcoxon) route + fallback reason. Both
+  `pdex_ref` *and* `rank_genes_groups` (Wilcoxon rank-sum) route + fallback reason. Both
   ops' GPU entry points `match` on the planned `AccelRoute` to pick the kernel,
   and the pyscx CPU dispatch calls `plan_de_route` too — so the recorded route
   can never diverge from the code that ran. v3 is the unconditional default GPU

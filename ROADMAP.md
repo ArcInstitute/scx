@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-06-25
+**Last updated**: 2026-06-27
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -446,9 +446,9 @@ full scverse pipeline works via AnnData from the format / codec / bridge work.
 - [x] **PCA** (randomized SVD): streaming SpMM from backed mode, `faer` for QR/SVD
 - [x] **kNN graph**: HNSW via `instant-distance`, UMAP-style connectivities
 - [x] **UMAP**: SGD embedding with spectral initialization
-- [x] **DE (Wilcoxon)**: parallel rank-sum with rayon, in-memory + gene-chunked streaming
+- [x] **DE (Wilcoxon rank-sum)**: parallel rank-sum with rayon, in-memory + gene-chunked streaming
 - [x] **Pseudobulk DE**: streaming aggregation via `BackedCsrReader` + `pydeseq2`
-- [x] **Stratified DE**: per-stratum execution for both Wilcoxon and pseudobulk
+- [x] **Stratified DE**: per-stratum execution for both Wilcoxon rank-sum and pseudobulk
 
 ### 4c. GPU Accelerators — COMPLETE (rapids-singlecell transition done)
 - [x] GPU PCA — in-VRAM routes to `rsc.pp.pca`; streaming/randomized PCA survives natively (>VRAM moat)
@@ -490,7 +490,7 @@ is a detected runtime dependency (not a pip extra); install story is in
 - ✅ **Phase 3 — Removal**: deleted native UMAP (`umap_sgd.cu`, `umap_edges.cu`, `gpu_umap.rs`, `fuzzy_simplicial_set.cu`, `gpu_fuzzy.rs`), covariance PCA (`gpu_pca_covariance.rs`), standalone kNN CAGRA dispatch, PCA SpMM graph-capture (`pca_spmm_capture_opt_in`). Dead-kernel audit complete; FOR-BP kept
 - 🟨 **Phase 4 — Format sidecar** *(not yet implemented)*: decode-metadata sidecar, sorted+deduped CSR invariant, decode→device fast path
 
-**What survives natively**: streaming/randomized PCA (>VRAM moat), HVG `seurat_v3` (1.2× at 1M), Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct, structural moat), Harmony, preprocessing kernels (ML loader + streaming), device-resident CAGRA kNN (fused pipeline only), codec decode (`rice_decode.cu`, `forbp_decode.cu`), `colmajor_ops.cu`, `gpu_graph.rs`, `shard_decode.rs`.
+**What survives natively**: streaming/randomized PCA (>VRAM moat), HVG `seurat_v3` (1.2× at 1M), Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon rank-sum/pdex (CSC/CSR-direct, structural moat), Harmony, preprocessing kernels (ML loader + streaming), device-resident CAGRA kNN (fused pipeline only), codec decode (`rice_decode.cu`, `forbp_decode.cu`), `colmajor_ops.cu`, `gpu_graph.rs`, `shard_decode.rs`.
 
 ---
 

@@ -330,14 +330,14 @@ Benchmarked on 1M cells (CELLxGENE Census), HVG-selected (2000 genes):
 | Operation | SCX (s) | scanpy (s) | Speedup vs scanpy |
 |-----------|---------|------------|-------------------|
 | PCA (covariance, 50 PCs, 2K HVGs) | **4.2** | 8.0 | **1.9x** |
-| Wilcoxon DE (pre-ranking) | **5.4** | 17.3 | **3.2x** |
+| Wilcoxon rank-sum DE (pre-ranking) | **5.4** | 17.3 | **3.2x** |
 | Leiden (Rust-native) | **55** | 2,226 (leidenalg) | **40x** |
 
 Full pipeline (PCA -> kNN -> UMAP -> Leiden -> DE) on 1M cells: **870s** (vs 3,971s — **4.6x faster**).
 
 ### Differential expression (CPU, full-matrix)
 
-The Wilcoxon DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
+The Wilcoxon rank-sum DE row above is from an HVG-projected (2K genes) 1M-cell fixture. The dedicated `accel_de` benchmark sweeps the raw count matrix (no HVG projection) across the full dataset tier — scanpy's per-gene rank pass becomes the bottleneck and times out on census-scale:
 
 | Dataset | scanpy `rank_genes_groups` | `pyscx.accel.rank_genes_groups` (CPU) | Speedup |
 |---------|---:|---:|---:|
@@ -471,7 +471,7 @@ Full per-operation results (wall time + peak RSS) are tracked in `benchmarks/com
 
 ### GPU Analysis Pipeline
 
-GPU-accelerated analysis via **rapids-singlecell** (`rsc.pp.pca`, `rsc.pp.neighbors`, `rsc.tl.umap`, `rsc.pp.*`) for in-VRAM ops, plus native Rust/CUDA paths for streaming PCA, HVG `seurat_v3`, Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon/pdex (CSC/CSR-direct), Harmony, and codec decode. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
+GPU-accelerated analysis via **rapids-singlecell** (`rsc.pp.pca`, `rsc.pp.neighbors`, `rsc.tl.umap`, `rsc.pp.*`) for in-VRAM ops, plus native Rust/CUDA paths for streaming PCA, HVG `seurat_v3`, Leiden (Rust-native CPU + cuGraph GPU), DE Wilcoxon rank-sum/pdex (CSC/CSR-direct), Harmony, and codec decode. Benchmarked on H100 80GB (driver 560.35.05, CUDA 12.6, scx-bench-gpu conda env).
 
 **GPU VRAM usage.** `to_gpu_anndata()` preserves sparse CSR on the GPU — VRAM
 for `X` scales with NNZ, not N×M. A 1M-cell × 2K-gene HVG-selected matrix at
@@ -507,17 +507,17 @@ Numbers below are from the full-tier gate run on 2026-05-25 (post-G10 graph capt
 | Leiden (`device="gpu"`, cuGraph) | tabula_sapiens_100k | 100.73 (`leidenalg_cpu`) | 0.54 | **187×** | cuGraph |
 | Leiden (`device="gpu"`) | census_500k | 838.94 (`leidenalg_cpu`) | 1.59 | **528×** | cuGraph |
 | Leiden (`device="gpu"`) | census_1m | 659.0 (`leidenalg_cpu`, prior baseline) | 3.06 | 215× | cuGraph |
-| Wilcoxon (vs `pyscx_cpu` reference) | pbmc10k | 5.85 | 12.60 | 0.47× | CUB block sort + searchsorted + tie + p-value |
-| Wilcoxon (vs `pyscx_cpu`) | tabula_sapiens_100k | 42.28 | 89.77 | 0.47× | (same) |
-| Wilcoxon (vs `pyscx_cpu`) | census_500k | 106.13 | 213.07 | 0.50× | (same) |
-| Wilcoxon (vs `pyscx_cpu`) | census_1m | 156.51 | 365.15 | 0.43× | (same) |
-| Wilcoxon (vs `scanpy_cpu`) | tabula_sapiens_100k | 318.77 | 89.77 | **3.6×** | (same) |
+| Wilcoxon rank-sum (vs `pyscx_cpu` reference) | pbmc10k | 5.85 | 12.60 | 0.47× | CUB block sort + searchsorted + tie + p-value |
+| Wilcoxon rank-sum (vs `pyscx_cpu`) | tabula_sapiens_100k | 42.28 | 89.77 | 0.47× | (same) |
+| Wilcoxon rank-sum (vs `pyscx_cpu`) | census_500k | 106.13 | 213.07 | 0.50× | (same) |
+| Wilcoxon rank-sum (vs `pyscx_cpu`) | census_1m | 156.51 | 365.15 | 0.43× | (same) |
+| Wilcoxon rank-sum (vs `scanpy_cpu`) | tabula_sapiens_100k | 318.77 | 89.77 | **3.6×** | (same) |
 | pdex_ref (vs `pyscx_cpu`) | pbmc10k | 5.52 | 12.58 | 0.44× | (same) |
 | pdex_ref (vs `pyscx_cpu`) | tabula_sapiens_100k | 42.04 | 93.81 | 0.45× | (same) |
 | pdex_ref (vs `pyscx_cpu`) | census_500k | 119.86 | 212.37 | 0.56× | (same) |
 | pdex_ref (vs `pyscx_cpu`) | census_1m | 268.28 | 356.34 | 0.75× | (same) |
 
-The accel_de wilcoxon/pdex_ref GPU rows above are **slower than `pyscx_cpu`** (CPU's rayon-parallel implementation effectively uses ~3-5 of the 16 SLURM-allocated CPUs and is highly tuned). G10's graph capture closed ~7-10% of the gap but the GPU implementation is bottlenecked by the per-chunk `[n_obs × chunk_size]` dense materialization step. The GPU paths are still **3-5× faster than `scanpy_cpu`** — for users replacing scanpy directly, GPU is the clear win; for users who already have `pyscx.accel.rank_genes_groups(device="cpu")` working, the default GPU variant is a draw or worse.
+The accel_de Wilcoxon rank-sum/pdex_ref GPU rows above are **slower than `pyscx_cpu`** (CPU's rayon-parallel implementation effectively uses ~3-5 of the 16 SLURM-allocated CPUs and is highly tuned). G10's graph capture closed ~7-10% of the gap but the GPU implementation is bottlenecked by the per-chunk `[n_obs × chunk_size]` dense materialization step. The GPU paths are still **3-5× faster than `scanpy_cpu`** — for users replacing scanpy directly, GPU is the clear win; for users who already have `pyscx.accel.rank_genes_groups(device="cpu")` working, the default GPU variant is a draw or worse.
 
 **`pdex_ref` GPU v3-CSC (default, requires CSC sidecar).** An SCX file with a CSC sidecar (`pyscx.from_anndata(..., csc="always")` or `scx convert --csc=always`) routes the GPU `pdex_ref` through a CSC-direct driver (`pdex_ref_gpu_chunked_v3_csc` in `scx-accel/src/diffexp/gpu.rs`) — v3 is the default GPU DE route (the `SCX_GPU_DE_V3` opt-in gate was removed when v3 became the default). The driver drops the dense intermediate entirely and replaces the per-chunk pseudobulk with a block-per-(gene, group) shared-memory tree-reduce (`csc_shard_pseudobulk_kernel`) that avoids `atomicAdd` contention. The shard source (`RawGpuCscShardSource`) ships full G3-shape pipelining (2-slot pinned ring + dedicated copy stream + scoped worker pre-decode + dual event handshake) and uses cheap catalog metadata to skip CSC shards whose `[col_start, col_end)` doesn't overlap the current gene chunk — so non-overlapping shards never get decoded or uploaded. Measured 2026-05-27 against backed-AnnData fixtures (`pyscx.open(path).to_anndata(backed=True)`):
 
@@ -582,8 +582,8 @@ Native GPU PCA (streaming/randomized path, used for backed/lazy/streaming inputs
 | `pdex_ref` | pbmc10k (12K) | n_ref ≈ 2.4K | 3.6 s | 3.4 s | 1.07× | ~tied |
 | `pdex_ref` | smartseq2 (18K) | n_ref ≈ 3.5K | 21.4 s | 18.5 s | **1.16×** | searchsorted starts winning |
 | `pdex_ref` | tabula_100k → census_1m | n_ref > 8192 | 54 → 317 s | **skip** | — | v1 capacity cap |
-| Wilcoxon (1-vs-rest) | pbmc3k (2.7K) | n_obs = 2.7K | 0.74 s | 0.92 s | 0.80× | launch-overhead bound |
-| Wilcoxon (1-vs-rest) | pbmc10k → census_1m | n_obs > 8192 | 3.4 → 210 s | **skip** | — | v1 capacity cap |
+| Wilcoxon rank-sum (1-vs-rest) | pbmc3k (2.7K) | n_obs = 2.7K | 0.74 s | 0.92 s | 0.80× | launch-overhead bound |
+| Wilcoxon rank-sum (1-vs-rest) | pbmc10k → census_1m | n_obs > 8192 | 3.4 → 210 s | **skip** | — | v1 capacity cap |
 
 The headline speedup is modest because v1 caps the per-gene sort pool at `GPU_DE_BLOCK_SORT_CAPACITY = 8192` cells — the CUB `BlockRadixSort` is one block per gene, holding the whole row in registers + shared memory. Above that, the dispatch returns `AccelError::InvalidInput("…use device='cpu' or subsample the reference")` and the caller falls back to the rayon-parallel CPU path. Where the GPU does run (small + medium datasets, mid-size reference groups), launch overhead and chunked-upload latency dominate the on-device sort + searchsorted work. The spec-anticipated **10–50× win** lives at Perturb-seq scale (≥ 50K cells × hundreds of perturbation groups, `n_ref` typically a few thousand non-targeting controls) — none of the dataset-tier fixtures match that group structure with the synthetic 2-way `groupby` the benchmark falls back to. Lifting the 8192 cap via a tiled merge-sort upgrade is deferred to PR series G4.
 
@@ -598,7 +598,7 @@ The headline speedup is modest because v1 caps the per-gene sort pool at `GPU_DE
 
 Tolerance-based parity for p-values / FDR (not exact) because of `erfc` and sort-order numerics; U statistics agree exactly in f64. The CPU path itself is pinned bit-for-bit to upstream `pdex` via `pyscx/tests/test_pdex_ref_parity.py`, so CPU↔GPU parity here transitively pins the GPU path to the upstream oracle.
 
-GPU Wilcoxon (`rank_genes_groups(device="gpu")`) now routes through `plan_de_route` — when a CSC sidecar is present, it takes the `gpu_csc_v3` CSC-direct path (same as `pdex_ref`); otherwise it falls back to `gpu_csr_v3`. `prefer_format="csc"` on the CPU path uses `CpuCsc`.
+GPU Wilcoxon rank-sum (`rank_genes_groups(device="gpu")`) now routes through `plan_de_route` — when a CSC sidecar is present, it takes the `gpu_csc_v3` CSC-direct path (same as `pdex_ref`); otherwise it falls back to `gpu_csr_v3`. `prefer_format="csc"` on the CPU path uses `CpuCsc`.
 
 #### Canonical baseline
 
