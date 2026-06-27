@@ -1385,6 +1385,11 @@ contiguous gene columns instead of decoding and projecting every row.
   GPU-fast. So a CSC sidecar makes Wilcoxon GPU-fast too.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
+- **CSC-direct does not double VRAM usage.** The `gpu_csc_v3` route reads CSC
+  shards *instead of* CSR shards — it does not load both representations
+  simultaneously. VRAM usage for the CSC-direct path is comparable to the CSR
+  path (proportional to NNZ), plus the per-chunk dense intermediate replaced
+  by the shared-memory tree-reduce.
 
 > **Which `(device, prefer_format)` selects `gpu_csc_v3`?** `device` and
 > `prefer_format` are independent axes, and the GPU CSC-direct route is chosen
@@ -1525,6 +1530,18 @@ Two methods, auto-routed by the number of variables:
   `cupyx.scipy.sparse.csr_matrix` X — no host round-trip. The streaming/
   randomized CPU PCA path (>VRAM datasets) survives natively as a fallback.
 
+> [!NOTE]
+> **GPU PCA VRAM usage.** SCX preserves sparse CSR when handing `X` to
+> rapids, but `rsc.pp.pca()` internally allocates dense working buffers
+> (cuBLAS matmul) — peak VRAM during GPU PCA can be substantially higher
+> than the sparse `X` footprint alone. Use
+> `pyscx.accel.estimate_gpu_memory(adata, operation="pca")` to check
+> whether the operation fits before launching. For datasets that exceed
+> VRAM, use `backed=True` — the native streaming/randomized PCA path
+> processes shards one at a time with bounded VRAM (one shard + working
+> matrices). See [gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model)
+> for the full VRAM sizing model.
+
 Both methods work in backed mode without materializing the full matrix.
 
 ```python
@@ -1557,7 +1574,10 @@ SVD and 1.9× faster than scanpy. The method is auto-selected based on
 `n_vars`; no user configuration needed. On GPU, PCA routes to
 `rapids_singlecell` (`rsc.pp.pca`) which handles method selection
 internally. Peak memory on CPU is one shard plus working matrices (plus
-~30 MB covariance matrix for 2K genes).
+~30 MB covariance matrix for 2K genes). Peak VRAM on GPU includes the
+sparse `X` plus rapids' internal dense working buffers — use
+`pyscx.accel.estimate_gpu_memory(adata, operation="pca")` for pre-flight
+sizing (see [gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model)).
 
 ### kNN graph (`pyscx.accel.neighbors`)
 

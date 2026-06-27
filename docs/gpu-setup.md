@@ -631,16 +631,91 @@ Your CUDA Toolkit version exceeds what the driver supports. Either:
 - Install a lower CUDA Toolkit version matching your driver (see driver
   compatibility table above)
 
-### GPU out of memory
+### GPU memory model
 
-In-VRAM ops (via rapids) require the full matrix and working memory to fit in
-VRAM. For backed / lazy `X`, SCX automatically uses the native streaming path
-(GPU PCA streams shards to avoid full matrix materialization).
+**Sparse CSR is preserved on GPU.** `to_gpu_anndata()` always produces a
+`cupyx.scipy.sparse.csr_matrix` — data is never densified during the
+host→device transfer. VRAM usage for `X` scales with the number of non-zero
+elements (NNZ), not the full N×M dense dimensions:
 
-For a dataset with N cells and D dimensions:
-- In-VRAM `X`: N × nnz_avg × 12 bytes (CSR values + indices + indptr)
-- kNN input: N × D × 4 bytes (float32) — 1M cells × 50 PCs ≈ 200 MB
-- UMAP working memory: ~N × 12 bytes for graph + embeddings
+```
+VRAM(X) ≈ NNZ × 4 (f32 values) + NNZ × 4 (i32 indices) + (N + 1) × 8 (i64 indptr)
+        = NNZ × 8 + (N + 1) × 8 bytes
+```
+
+For example, a 1M-cell × 30K-gene matrix at 5% density (~1.5B NNZ) requires
+~12 GB as sparse CSR, versus ~120 GB if densified. SCX's native GPU PCA uses
+cuSPARSE `SpMM` (sparse × dense multiply) without densifying `X` — only the
+dense working matrices (`n_obs × n_comps`) are allocated alongside the sparse
+input.
+
+**Shard-by-shard GPU assembly.** `to_gpu_anndata()` pre-allocates combined
+device buffers for the full sparse matrix, then decodes each shard into the
+combined buffer one at a time. Peak device memory during transfer is the
+combined buffer plus **one shard** — not all shards simultaneously. Only the
+indptr array (tiny: `N + 1` elements) round-trips to the host. The result is
+the **complete** sparse matrix in VRAM — this is not a streaming/partial
+representation.
+
+> [!NOTE]
+> **rapids-singlecell may allocate additional dense working memory.** SCX
+> preserves sparsity when handing data to rapids, but rapids ops may
+> internally allocate dense working buffers. For example, `rsc.pp.pca()` uses
+> cuBLAS dense matmul internally, so peak VRAM during GPU PCA can be
+> substantially higher than the sparse `X` footprint alone. Use
+> `estimate_gpu_memory()` (below) to pre-flight sizing before launching an op.
+
+#### VRAM pre-flight guard
+
+`to_gpu_anndata()` checks available VRAM before transferring. It computes
+`device_bytes = NNZ × 8 + (N + 1) × 8`, multiplies by a **1.2× headroom
+factor**, and compares against free device memory. If VRAM is insufficient, it
+raises a `ValueError` with an actionable message pointing to the backed /
+streaming workflows — it never silently OOMs.
+
+#### Estimating VRAM requirements
+
+Use `estimate_gpu_memory()` and `gpu_info()` to plan GPU resource allocation
+before launching an operation:
+
+```python
+import pyscx
+
+# Check available VRAM
+info = pyscx.accel.gpu_info()
+# {'device': 'NVIDIA A100-SXM4-80GB', 'total_vram_gb': 80.0, 'free_vram_gb': 72.3}
+
+# Estimate VRAM for a specific operation
+est = pyscx.accel.estimate_gpu_memory(adata, operation="pca", n_comps=50)
+# {'required_gb': 2.1, 'fits_in_vram': True}
+```
+
+Per-op VRAM sizing (approximate):
+
+| Component | Formula | Example (1M × 2K) |
+|-----------|---------|-------------------|
+| Sparse `X` on device | `NNZ × 8 + (N + 1) × 8` | ~800 MB at 5% density |
+| PCA working matrices | `Y: N × k × 4` + `Ω+B: 2 × D × k × 4` + `shard_dense: shard_rows × D × 4` + `QR: 2 × N × k × 4` | ~600 MB (k=50) |
+| kNN input | `N × D × 4` (float32 embeddings) | 200 MB (50 PCs) |
+| UMAP working memory | ~`N × 12` bytes for graph + embeddings | ~12 MB |
+| DE dense chunk (CSR path) | `N × gene_chunk_size × 4` | ~2 GB (chunk=500) |
+
+> [!WARNING]
+> Estimates are approximate — cuSOLVER QR workspace may be undercounted
+> by ~1.5×. When NNZ is not available from the input data, the estimator
+> falls back to a ~10% density assumption.
+
+#### Backed / lazy `X` — automatic streaming
+
+For backed / lazy `X` (`ScxBackedSparseDataset` / `ScxLazyTransformedDataset`),
+SCX automatically uses native streaming kernels instead of uploading the full
+matrix. GPU PCA streams shards to avoid full-matrix materialization; backed
+`X` never routes to rapids (which would OOM). This means:
+
+- `pyscx.open(...).to_anndata(backed=True)` + `pyscx.accel.pca(adata, device="gpu")`
+  streams shard-by-shard — peak VRAM is one shard plus working matrices.
+- `pyscx.open(...).to_gpu_anndata()` + rapids ops loads the full sparse `X`
+  into VRAM — use only when `X` fits.
 
 If VRAM is insufficient for in-memory ops, use `backed=True` to take the
 streaming path. To force a specific GPU on multi-GPU systems:

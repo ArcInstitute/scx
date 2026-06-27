@@ -95,7 +95,10 @@ fn topk_tiebreak_by_gene_id_ascending() {
 }
 
 #[test]
-fn encoder_masking_hides_query_genes() {
+fn encoder_masking_drops_withheld_genes_to_pad() {
+    // Contract: `task.py::_sparse_encoder_inputs` DROPS withheld query genes from
+    // the top-K crop (slot becomes PAD), it does NOT replace them in place with a
+    // GENE_MASK token. STATE3-PYSCX-KERNEL-ISSUE §2.1 example.
     let c = cfg(PreprocessMode::Log1pRaw, 4);
     // mask query positions for ids {3, 1}.
     let (b, _) = run(
@@ -106,9 +109,92 @@ fn encoder_masking_hides_query_genes() {
         false,
         &c,
     );
-    // top-K order is gene3, gene1, gene5; gene3 & gene1 masked.
-    assert_eq!(b.ids, vec![MASK, MASK, 5, PAD]);
-    assert_eq!(b.mask, vec![1, 1, 0, 0]);
+    // top-K order is gene3, gene1, gene5; gene3 & gene1 dropped -> only gene5 survives.
+    assert_eq!(b.ids, vec![5, PAD, PAD, PAD]);
+    assert_eq!(b.mask, vec![0, 0, 0, 0]);
+    assert_eq!(b.pad, vec![0, 1, 1, 1]);
+    // The surviving gene keeps its count; dropped slots are zero (no count leak).
+    approx(b.counts[0], 1.0f32.ln_1p());
+    assert_eq!(b.counts[1], 0.0);
+    assert_eq!(b.counts[2], 0.0);
+    assert_eq!(b.counts[3], 0.0);
+}
+
+#[test]
+fn encoder_masking_drops_one_keeps_rest() {
+    // Partial mask dropping some-but-not-all: drop gene3, keep gene1 & gene5,
+    // compacted left with a trailing PAD.
+    let c = cfg(PreprocessMode::Log1pRaw, 4);
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[2.0, 4.0, 1.0],
+        &[3, 5, 7, 1],
+        Some(&[1, 0, 0, 0]),
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![1, 5, PAD, PAD]);
+    assert_eq!(b.mask, vec![0, 0, 0, 0]);
+    assert_eq!(b.pad, vec![0, 0, 1, 1]);
+    approx(b.counts[0], 2.0f32.ln_1p());
+    approx(b.counts[1], 1.0f32.ln_1p());
+}
+
+#[test]
+fn encoder_masking_all_topk_masked_emits_single_mask_token() {
+    // All selected top-K genes withheld -> all-masked fallback (task.py:235-247):
+    // a single active GENE_MASK at slot 0 with expr_mask[0]=1 (distinct from the
+    // degenerate-cell branch, which leaves expr_mask[0]=0).
+    let c = cfg(PreprocessMode::Log1pRaw, 4);
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[2.0, 4.0, 1.0],
+        &[3, 5, 7, 1],
+        Some(&[1, 1, 0, 1]), // mask genes {3, 5, 1} -> all of top-K
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![MASK, PAD, PAD, PAD]);
+    assert_eq!(b.mask, vec![1, 0, 0, 0]);
+    assert_eq!(b.pad, vec![0, 1, 1, 1]);
+    assert_eq!(b.counts[0], 0.0); // fallback token carries no count
+}
+
+#[test]
+fn encoder_masking_outside_topk_has_no_effect() {
+    // Mask set overlaps only genes that are not in the top-K -> crop unchanged.
+    let c = cfg(PreprocessMode::Log1pRaw, 4);
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[2.0, 4.0, 1.0],
+        &[7, 9, 2, 8], // none of these are stored genes 1/3/5
+        Some(&[1, 1, 1, 1]),
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![3, 1, 5, PAD]);
+    assert_eq!(b.mask, vec![0, 0, 0, 0]);
+    assert_eq!(b.pad, vec![0, 0, 0, 1]);
+}
+
+#[test]
+fn encoder_masking_no_backfill_beyond_take() {
+    // No-backfill boundary: take = min(k_enc, n_positive) = 2 < 4 positive genes.
+    // top-K (raw desc) = [gene3(4), gene7(3)]; mask the KEPT gene3. The drop must
+    // NOT pull in the take-th gene (gene1) — survivor is just gene7 + trailing PAD.
+    let c = cfg(PreprocessMode::Log1pRaw, 2);
+    let (b, _) = run(
+        &[1, 3, 5, 7],
+        &[2.0, 4.0, 1.0, 3.0],
+        &[3, 1, 5, 7],
+        Some(&[1, 0, 0, 0]), // mask gene3
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![7, PAD]);
+    assert_eq!(b.mask, vec![0, 0]);
+    assert_eq!(b.pad, vec![0, 1]);
+    approx(b.counts[0], 3.0f32.ln_1p());
 }
 
 #[test]
@@ -212,6 +298,95 @@ fn normalize_log1p_encoder_and_target_are_normalized() {
     approx(b.target[1], v(2.0));
     approx(b.target[2], v(3.0));
     assert_eq!(b.target[3], 0.0);
+}
+
+#[test]
+fn golden_vectors_match_state3_reference() {
+    // Executable cross-repo contract: every vector here is generated from state3's
+    // `_sparse_encoder_inputs` (PassThrough) by `state3/tests/_gen_encoder_crop_golden.py`
+    // and committed byte-identically in both repos. The kernel MUST reproduce each
+    // one exactly. See the module doc comment + STATE3-PYSCX-KERNEL-ISSUE.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/encoder_crop_golden.json"
+    );
+    let raw =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read golden fixture {path}: {e}"));
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    let as_i32 = |v: &serde_json::Value| -> Vec<i32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap() as i32)
+            .collect()
+    };
+    let as_f32 = |v: &serde_json::Value| -> Vec<f32> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    };
+    let as_u8 = |v: &serde_json::Value| -> Vec<u8> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect()
+    };
+    let as_i64 = |v: &serde_json::Value| -> Vec<i64> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_i64().unwrap())
+            .collect()
+    };
+
+    for case in doc["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let gene_ids = as_i32(&case["cell_gene_ids"]);
+        let raw_counts = as_f32(&case["raw_counts"]);
+        let query = as_i32(&case["query"]);
+        let positions = as_u8(&case["enc_mask_positions"]);
+        let k_enc = case["k_enc"].as_u64().unwrap() as usize;
+        let n_genes_total = case["n_genes_total"].as_i64().unwrap();
+        let hide = case["hide_readout"].as_bool().unwrap();
+
+        let c = CollateConfig {
+            k_enc,
+            // PassThrough: encoder counts == raw counts, so the masking/crop contract
+            // is asserted with exact equality (no log1p tolerance).
+            mode: PreprocessMode::PassThrough,
+            target_sum: 1e4,
+            n_measured: gene_ids.len().max(1),
+            n_genes_total,
+            lib_size_redef: false,
+        };
+        let (b, _) = run(&gene_ids, &raw_counts, &query, Some(&positions), hide, &c);
+
+        let exp = &case["expected"];
+        assert_eq!(
+            b.ids,
+            as_i64(&exp["encoder_gene_ids"]),
+            "ids mismatch [{name}]"
+        );
+        assert_eq!(
+            b.counts,
+            as_f32(&exp["encoder_counts"]),
+            "counts mismatch [{name}]"
+        );
+        assert_eq!(
+            b.mask,
+            as_u8(&exp["encoder_mask"]),
+            "mask mismatch [{name}]"
+        );
+        assert_eq!(
+            b.pad,
+            as_u8(&exp["encoder_pad_mask"]),
+            "pad mismatch [{name}]"
+        );
+    }
 }
 
 #[test]
