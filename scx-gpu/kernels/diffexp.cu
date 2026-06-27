@@ -532,7 +532,20 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
 // release-active at the host-side staging boundary (`GpuError::InvalidShard`),
 // and the CPU DE entry point rejects non-finite input symmetrically.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void block_radix_sort_per_gene_kernel(
+// `__launch_bounds__(BLOCK_THREADS)` is REQUIRED, not an optimization hint.
+// This kernel is always launched with exactly BLOCK_THREADS (1024) threads/block
+// (see `gpu_de_single_tile_block_sort`). The HW caps a block at 65,536 32-bit
+// registers on every current arch, so 1024 threads ⇒ ≤64 regs/thread. The PTX is
+// built `-arch=compute_70` and JIT-compiled to the runtime arch (e.g. sm_90);
+// without the launch bound the JIT has no signal that the block is 1024 threads,
+// optimizes `cub::BlockRadixSort<float,1024,8>::Sort()` for lower occupancy, and
+// emits >64 regs/thread → the 1024-thread launch is rejected at runtime with
+// CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES. The launch bound emits `.maxntid` into the
+// PTX so the JIT caps registers at ≤64/thread (spilling to local if needed) on
+// every arch. Occupancy is already pinned to 1 block/SM at 1024 threads, so this
+// costs nothing. Same applies to `tile_block_radix_sort_kernel` below.
+extern "C" __global__ void __launch_bounds__(BLOCK_THREADS)
+block_radix_sort_per_gene_kernel(
     float* __restrict__ slab,
     int chunk_size,
     int n_per_gene
@@ -585,7 +598,11 @@ extern "C" __global__ void block_radix_sort_per_gene_kernel(
 // Caller pairs this with `merge_pass_per_gene_kernel` to sort rows of arbitrary
 // length via bottom-up merge sort.
 // ---------------------------------------------------------------------------
-extern "C" __global__ void tile_block_radix_sort_kernel(
+// `__launch_bounds__(BLOCK_THREADS)` required for the same reason as
+// `block_radix_sort_per_gene_kernel` — see that kernel's comment. Launched at
+// 1024 threads/block by `gpu_de_tile_block_sort`.
+extern "C" __global__ void __launch_bounds__(BLOCK_THREADS)
+tile_block_radix_sort_kernel(
     float* __restrict__ slab,
     int chunk_size,
     int n_per_gene,

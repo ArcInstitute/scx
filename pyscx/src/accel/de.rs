@@ -685,10 +685,11 @@ pub fn rank_genes_groups(
         let _ = resolved;
         None
     };
-    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
-    // is "auto" (the default) so users passing only `prefer_format="csc"`
-    // on a GPU host don't hit an error. Reject only when the user
-    // explicitly asked for GPU.
+    // `prefer_format="csc"` selects the CPU column-major path (it is a CPU-only
+    // knob — the GPU CSC-direct route `gpu_csc_v3` is reached via the *default*
+    // prefer_format="csr", chosen by the planner when a CSC sidecar is present).
+    // Reject when the user explicitly asked for GPU; for device="auto" fall back
+    // to CPU, but nudge on a GPU host so the silent CPU pin is not surprising.
     let gpu_device_id = if prefer_format == "csc" {
         if device.starts_with("gpu") {
             return Err(PyRuntimeError::new_err(
@@ -699,6 +700,19 @@ pub fn rank_genes_groups(
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
             ));
+        }
+        if device == "auto" && super::route::gpu_available() {
+            py.import("warnings")?.call_method1(
+                "warn",
+                (
+                    "rank_genes_groups(device=\"auto\", prefer_format=\"csc\") runs on the \
+                     CPU: prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
+                     host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
+                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
+                    py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                ),
+            )?;
         }
         None
     } else {
@@ -1947,9 +1961,11 @@ pub fn pdex_ref(
         let _ = resolved;
         None
     };
-    // CSC has no GPU kernel in v1. Silently fall back to CPU when device
-    // is "auto" so `prefer_format="csc"` works on GPU hosts; reject only
-    // when the user explicitly asked for GPU.
+    // `prefer_format="csc"` selects the CPU column-major path (it is a CPU-only
+    // knob — the GPU CSC-direct route `gpu_csc_v3` is reached via the *default*
+    // prefer_format="csr", chosen by the planner when a CSC sidecar is present).
+    // Reject when the user explicitly asked for GPU; for device="auto" fall back
+    // to CPU, but nudge on a GPU host so the silent CPU pin is not surprising.
     let gpu_device_id = if prefer_format == "csc" {
         if device.starts_with("gpu") {
             return Err(PyRuntimeError::new_err(
@@ -1960,6 +1976,19 @@ pub fn pdex_ref(
                  planner routes to gpu_csc_v3 automatically. For the CPU column-major \
                  path, use device='cpu'.",
             ));
+        }
+        if device == "auto" && super::route::gpu_available() {
+            py.import("warnings")?.call_method1(
+                "warn",
+                (
+                    "pdex_ref(device=\"auto\", prefer_format=\"csc\") runs on the CPU: \
+                     prefer_format=\"csc\" pins the CPU column-major path even on a GPU \
+                     host. For GPU CSC-direct DE (route gpu_csc_v3), drop prefer_format \
+                     (keep the default \"csr\") with device=\"auto\"/\"gpu\" — the planner \
+                     routes to gpu_csc_v3 automatically when a CSC sidecar is present.",
+                    py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                ),
+            )?;
         }
         None
     } else {
