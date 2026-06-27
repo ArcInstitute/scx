@@ -1,0 +1,447 @@
+{
+  "_comment": "Source of truth: state3 _sparse_encoder_inputs (PassThrough). Regenerate via state3/tests/_gen_encoder_crop_golden.py and copy verbatim into scx-loader/tests/data/. Keep both copies byte-identical and bump pyscx.COLLATE_CELLSET_CONTRACT_VERSION on any contract change.",
+  "cases": [
+    {
+      "name": "topk_basic_no_mask",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        3,
+        5,
+        7,
+        1
+      ],
+      "enc_mask_positions": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          3,
+          1,
+          5,
+          101
+        ],
+        "encoder_counts": [
+          4.0,
+          2.0,
+          1.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "partial_mask_drops_two_of_three",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        3,
+        5,
+        7,
+        1
+      ],
+      "enc_mask_positions": [
+        1,
+        0,
+        0,
+        1
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          5,
+          101,
+          101,
+          101
+        ],
+        "encoder_counts": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "partial_mask_drops_one_of_three",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        3,
+        5,
+        7,
+        1
+      ],
+      "enc_mask_positions": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          1,
+          5,
+          101,
+          101
+        ],
+        "encoder_counts": [
+          2.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          0,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "all_topk_masked_fallback",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        3,
+        5,
+        7,
+        1
+      ],
+      "enc_mask_positions": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          100,
+          101,
+          101,
+          101
+        ],
+        "encoder_counts": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "mask_outside_topk_no_effect",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        7,
+        9,
+        2,
+        8
+      ],
+      "enc_mask_positions": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          3,
+          1,
+          5,
+          101
+        ],
+        "encoder_counts": [
+          4.0,
+          2.0,
+          1.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "no_backfill_boundary",
+      "cell_gene_ids": [
+        1,
+        3,
+        5,
+        7
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0,
+        3.0
+      ],
+      "query": [
+        3,
+        1,
+        5,
+        7
+      ],
+      "enc_mask_positions": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "k_enc": 2,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          7,
+          101
+        ],
+        "encoder_counts": [
+          3.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "hide_readout_single_mask_token",
+      "cell_gene_ids": [
+        1,
+        3,
+        5
+      ],
+      "raw_counts": [
+        2.0,
+        4.0,
+        1.0
+      ],
+      "query": [
+        3,
+        1
+      ],
+      "enc_mask_positions": [
+        0,
+        0
+      ],
+      "k_enc": 4,
+      "n_genes_total": 100,
+      "hide_readout": true,
+      "expected": {
+        "encoder_gene_ids": [
+          100,
+          101,
+          101,
+          101
+        ],
+        "encoder_counts": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          1,
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "degenerate_empty_cell",
+      "cell_gene_ids": [],
+      "raw_counts": [],
+      "query": [
+        3,
+        5
+      ],
+      "enc_mask_positions": [
+        0,
+        0
+      ],
+      "k_enc": 3,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          100,
+          101,
+          101
+        ],
+        "encoder_counts": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "no_positive_counts_single_mask",
+      "cell_gene_ids": [
+        2
+      ],
+      "raw_counts": [
+        0.0
+      ],
+      "query": [
+        2
+      ],
+      "enc_mask_positions": [
+        0
+      ],
+      "k_enc": 2,
+      "n_genes_total": 100,
+      "hide_readout": false,
+      "expected": {
+        "encoder_gene_ids": [
+          100,
+          101
+        ],
+        "encoder_counts": [
+          0.0,
+          0.0
+        ],
+        "encoder_mask": [
+          0,
+          0
+        ],
+        "encoder_pad_mask": [
+          0,
+          1
+        ]
+      }
+    }
+  ]
+}
