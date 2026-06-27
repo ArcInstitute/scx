@@ -494,7 +494,7 @@ pyscx.accel.pdex_ref(adata_backed, device="gpu")
 | HVG (seurat_v3) | Native (atomic-CSR) | Native streaming |
 | HVG (other flavors) | rapids (`rsc.pp.highly_variable_genes`) | CPU |
 | Leiden | cuGraph (native) | cuGraph (native) |
-| DE (pdex/Wilcoxon) | Native CSC-direct / CSR | Native CSC-direct / CSR |
+| DE (pdex/Wilcoxon rank-sum) | Native CSC-direct / CSR | Native CSC-direct / CSR |
 | NB-GLM pseudobulk DE | Native (`gpu_nb_glm_csr`) | Native (`gpu_nb_glm_csr`) |
 | Harmony | Native | Native |
 | Fused PCA→kNN | rapids pipeline (in-memory) | Native streaming PCA + device-resident CAGRA (cuVS) |

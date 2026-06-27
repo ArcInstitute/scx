@@ -1262,7 +1262,7 @@ All accelerators that support GPU expose a `device` parameter:
 > path, and it requires a *backed* SCX file with a CSC sidecar
 > (`pyscx.from_anndata(..., csc="always")` / `scx convert --csc=always`); v3
 > CSC-direct is the default GPU DE route. In-memory scipy CSR can run on GPU but
-> may be slower than CPU. (`rank_genes_groups` / Wilcoxon shares the same
+> may be slower than CPU. (`rank_genes_groups` / Wilcoxon rank-sum shares the same
 > CSC-direct (`gpu_csc_v3`) and CSR-direct (`gpu_csr_v3`) routes as `pdex_ref`;
 > dense-host input is densified to CSR and also records `gpu_csr_v3`.) When comparing performance,
 > **check the recorded route** at
@@ -1379,10 +1379,10 @@ contiguous gene columns instead of decoding and projecting every row.
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
   falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
   *GPU-supported but not GPU-fast*.
-- **Wilcoxon (`rank_genes_groups`) takes the same v3 routes as `pdex_ref`.** With a
+- **Wilcoxon rank-sum (`rank_genes_groups`) takes the same v3 routes as `pdex_ref`.** With a
   CSC sidecar it runs CSC-direct (`gpu_csc_v3`); without one it runs CSR-direct
   (`gpu_csr_v3`, `fallback_reason == "no_csc_sidecar"`) — GPU-supported but not
-  GPU-fast. So a CSC sidecar makes Wilcoxon GPU-fast too.
+  GPU-fast. So a CSC sidecar makes Wilcoxon rank-sum GPU-fast too.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
 - **CSC-direct does not double VRAM usage.** The `gpu_csc_v3` route reads CSC
@@ -2030,7 +2030,7 @@ SCX offers several DE functions covering different experimental designs:
 | `nb_glm` | Direct NB-GLM on a pre-aggregated pseudobulk count matrix | Rust-native negative-binomial GLM |
 | `pdex_nb_glm` | Perturbation NB-GLM with replicate-forming stratification | Rust-native negative-binomial GLM |
 
-All Wilcoxon-based functions support GPU via `device="gpu"` (CSC-direct
+All Wilcoxon rank-sum-based functions support GPU via `device="gpu"` (CSC-direct
 `gpu_csc_v3` when a sidecar is present, CSR-direct `gpu_csr_v3` otherwise).
 The NB-GLM functions are CPU-only.
 
@@ -2491,7 +2491,7 @@ df = pyscx.accel.rank_genes_groups_df(
 #          log2_fold_change, abs_log2_fold_change
 ```
 
-Useful when you want SCX's faster Wilcoxon but cell-eval's DE metrics
+Useful when you want SCX's faster Wilcoxon rank-sum but cell-eval's DE metrics
 downstream (overlap@N, precision@N, pr_auc, etc.).
 
 > **`group=` is the scanpy extractor alias.** Calling it the scanpy way —
