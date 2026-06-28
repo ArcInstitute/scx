@@ -297,6 +297,18 @@ usable without Seurat installed):
   sets `Idents()` / `seurat_clusters`.
 - `scx_rank_genes_groups(obj, group.by, reference=NULL, tie_correct=FALSE)` —
   Wilcoxon rank-sum DE (FindAllMarkers analog); returns a tidy `data.frame`.
+- `scx_score_genes(obj, gene_list, method="control", ctrl_size=50, n_bins=25,
+  random_state=0, gene_pool=NULL, score_name="score")` — gene-set scoring
+  (scanpy `score_genes` analog; methods `"control"` / `"mean"` / `"zscore"`).
+  Missing genes are dropped with a warning. On a Seurat object writes
+  `obj[[score_name]]` (returned invisibly); on a matrix returns the per-cell
+  score vector.
+- `scx_pseudobulk(obj, group_by, method="sum", min_cells_per_group=0)` —
+  pseudobulk aggregation (cells → group×gene; `"sum"` / `"mean"`). `group_by`
+  is one or more `meta.data` column names (Seurat) or a per-cell label
+  vector/`data.frame` (matrix). Returns a `list(counts, samples, gene_names)`
+  where `counts` is a features×samples matrix and `samples` is a `data.frame`
+  of the groupby columns plus `n_cells` per group.
 
 Notes:
 - `scx_umap` / `scx_leiden` build their **own** kNN (default `n_neighbors`)

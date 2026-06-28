@@ -234,6 +234,29 @@ scx_hvg_clipped_sums <- function(counts, clip_val) {
   .Call(wrap__scx_hvg_clipped_sums, counts, as.numeric(clip_val))
 }
 
+scx_score_genes_matrix <- function(counts, gene_list_idx, gene_pool_idx, method,
+                                   ctrl_size, n_bins, random_state) {
+  .Call(wrap__scx_score_genes_matrix,
+        counts,
+        as.integer(gene_list_idx),
+        as.integer(gene_pool_idx),
+        as.character(method),
+        as.integer(ctrl_size),
+        as.integer(n_bins),
+        as.numeric(random_state))
+}
+
+scx_pseudobulk_matrix <- function(counts, groupby, groupby_columns, gene_names,
+                                  method, min_cells_per_group) {
+  .Call(wrap__scx_pseudobulk_matrix,
+        counts,
+        groupby,
+        as.character(groupby_columns),
+        as.character(gene_names),
+        as.character(method),
+        as.integer(min_cells_per_group))
+}
+
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path, codec = NULL,

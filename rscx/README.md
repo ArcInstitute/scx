@@ -157,6 +157,34 @@ If both `rscx` and `dplyr` are attached, `count` is masked — use
 > **Note:** an `RQueryResult` is consumed by the first extraction call, so call
 > one of the above once per `collect()`.
 
+## Analysis accelerators
+
+CPU-native, pipe-friendly front ends over the same Rust kernels the Python
+accelerators use. Each accepts a `Seurat` object (results written into the
+expected slot, object returned invisibly) **or** a raw genes × cells
+`dgCMatrix` (the raw result is returned, no Seurat needed):
+
+```r
+obj <- scx_highly_variable_genes(obj)            # seurat_v3 HVG
+obj <- scx_pca(obj)                              # randomized / covariance PCA
+obj <- scx_neighbors(obj, dims = 1:30)           # HNSW kNN graph
+obj <- scx_umap(obj, dims = 1:30)                # UMAP
+obj <- scx_leiden(obj, resolution = 1.0)         # Leiden clustering
+de  <- scx_rank_genes_groups(obj, group.by = "seurat_clusters")  # Wilcoxon DE
+
+# Gene-set scoring (scanpy score_genes analog: "control" / "mean" / "zscore"):
+obj <- scx_score_genes(obj, gene_list = c("CD3D", "CD3E", "CD8A"),
+                       score_name = "t_cell_score")
+
+# Pseudobulk aggregation (cells -> group x gene; "sum" or "mean"):
+pb <- scx_pseudobulk(obj, group_by = c("condition", "donor"), method = "sum")
+pb$counts    # genes x pseudobulk-samples matrix
+pb$samples   # per-sample metadata (groupby columns + n_cells)
+```
+
+`scx_harmony_integrate()` / `RunHarmony_scx()` and `scx_compute_lisi()` round
+out the set. All paths are CPU-only (rscx links no GPU feature).
+
 ## Build Notes
 
 The package compiles a Rust shared library during installation. The first

@@ -396,3 +396,135 @@ scx_highly_variable_genes <- function(object, assay = NULL, layer = "counts",
   SeuratObject::VariableFeatures(object, assay = assay) <- hvg_names
   invisible(object)
 }
+
+#' @describeIn scx-accelerators Gene-set scoring (scanpy `score_genes` analog).
+#' @param gene_list Character vector of gene names to score. Genes absent from
+#'   the matrix are dropped with a warning; an all-missing set is an error.
+#' @param method One of `"control"` (scanpy `score_genes`: mean(gene_list) minus
+#'   a binned control set), `"mean"` (per-cell mean over `gene_list`), or
+#'   `"zscore"` (decoupler `mt.zscore`). Default `"control"`.
+#' @param ctrl_size,n_bins Control-method knobs (control genes per expression
+#'   bin / number of bins). Defaults `50` / `25`.
+#' @param random_state Seed for the deterministic control sampler (not
+#'   numpy-compatible). Default `0`.
+#' @param gene_pool Optional character vector restricting the control binning
+#'   universe (control method only); default `NULL` = all genes.
+#' @param score_name obs/meta.data column to write the score into on a Seurat
+#'   object. Default `"score"`.
+#' @return For `scx_score_genes`: on a Seurat object, the object with
+#'   `score_name` added to `meta.data` (returned invisibly); on a matrix, a
+#'   numeric per-cell score vector (named by cell when column names exist).
+#' @export
+scx_score_genes <- function(object, gene_list, method = "control",
+                            ctrl_size = 50L, n_bins = 25L, random_state = 0L,
+                            gene_pool = NULL, score_name = "score",
+                            assay = NULL, layer = "data") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+  }
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) {
+    stop("score_genes needs gene (row) names to resolve `gene_list`", call. = FALSE)
+  }
+
+  # Resolve gene_list -> 0-based indices; drop (warn) the missing, error if none.
+  gene_list <- unique(as.character(gene_list))
+  pos <- match(gene_list, gene_names)
+  missing <- gene_list[is.na(pos)]
+  if (length(missing) > 0L) {
+    shown <- missing[seq_len(min(10L, length(missing)))]
+    warning(sprintf("score_genes: %d/%d genes not found and dropped: %s",
+                    length(missing), length(gene_list),
+                    paste(shown, collapse = ", ")),
+            call. = FALSE)
+  }
+  gene_list_idx <- pos[!is.na(pos)] - 1L
+  if (length(gene_list_idx) == 0L) {
+    stop("score_genes: no genes in `gene_list` matched the matrix", call. = FALSE)
+  }
+
+  # gene_pool: only the control method bins it; default to all genes.
+  if (identical(method, "control")) {
+    if (is.null(gene_pool)) {
+      gene_pool_idx <- seq_len(nrow(mat)) - 1L
+    } else {
+      gp <- match(unique(as.character(gene_pool)), gene_names)
+      gene_pool_idx <- gp[!is.na(gp)] - 1L
+    }
+  } else {
+    gene_pool_idx <- integer(0)
+  }
+
+  scores <- scx_score_genes_matrix(mat, gene_list_idx, gene_pool_idx, method,
+                                   ctrl_size, n_bins, random_state)
+
+  if (!.is_seurat(object)) {
+    names(scores) <- colnames(mat)
+    return(scores)
+  }
+  object[[score_name]] <- scores
+  invisible(object)
+}
+
+#' @describeIn scx-accelerators Pseudobulk aggregation (cells -> group x gene).
+#' @param group_by Grouping of cells. On a Seurat object: a character vector of
+#'   `meta.data` column name(s). On a matrix: a per-cell label vector, or a
+#'   `data.frame` / named list of per-cell label columns for multi-column
+#'   groupby.
+#' @param min_cells_per_group Drop groups with fewer than this many cells
+#'   (default `0` = keep all).
+#' @return For `scx_pseudobulk`: a list with `counts` (a genes x groups matrix,
+#'   rownames = genes, colnames = the group labels joined by `"_"`), `samples`
+#'   (a `data.frame` of the groupby columns plus `n_cells` per group), and
+#'   `gene_names`. Returned for both Seurat and matrix inputs (pseudobulk
+#'   collapses the cell axis, so it cannot be written back into the object).
+#' @export
+scx_pseudobulk <- function(object, group_by, method = "sum",
+                           min_cells_per_group = 0L, assay = NULL,
+                           layer = "counts") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+    # group_by names meta.data columns.
+    cols <- as.character(group_by)
+    groupby <- lapply(cols, function(cn) as.character(object[[cn, drop = TRUE]]))
+    names(groupby) <- cols
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+    # group_by is a vector / data.frame / list of per-cell labels.
+    if (is.data.frame(group_by) || is.list(group_by)) {
+      groupby <- lapply(group_by, as.character)
+      cols <- names(groupby)
+      if (is.null(cols)) cols <- paste0("group", seq_along(groupby))
+      names(groupby) <- cols
+    } else {
+      groupby <- list(group = as.character(group_by))
+      cols <- "group"
+    }
+  }
+
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(mat)))
+
+  res <- scx_pseudobulk_matrix(mat, groupby, cols, gene_names, method,
+                               min_cells_per_group)
+
+  # Kernel returns counts as n_groups x n_genes; transpose to the R-native
+  # features x samples (genes x groups) orientation.
+  counts <- t(res$counts)
+  rownames(counts) <- res$gene_names
+  # group_labels: one character vector per groupby column, length n_groups.
+  label_df <- as.data.frame(res$group_labels, stringsAsFactors = FALSE)
+  names(label_df) <- res$groupby_columns
+  sample_ids <- do.call(paste, c(label_df, sep = "_"))
+  colnames(counts) <- sample_ids
+
+  samples <- label_df
+  samples$n_cells <- res$cell_counts
+  rownames(samples) <- sample_ids
+
+  list(counts = counts, samples = samples, gene_names = res$gene_names)
+}

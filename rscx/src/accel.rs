@@ -15,8 +15,9 @@ use extendr_api::prelude::*;
 
 use scx_accel::{
     build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, pflog1ppf_baseline_from_delta,
-    pflog1ppf_pca, randomized_pca_inmemory, streaming_clip_square_sum, streaming_mean_var,
-    wilcoxon_rank_sum, COVARIANCE_PCA_THRESHOLD,
+    pflog1ppf_pca, pseudobulk_aggregate_inmemory, randomized_pca_inmemory, score_genes,
+    streaming_clip_square_sum, streaming_mean_var, wilcoxon_rank_sum, AggregationMethod,
+    ScoreMethod, COVARIANCE_PCA_THRESHOLD,
 };
 use scx_sparse::ScxCsr;
 
@@ -785,6 +786,205 @@ fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Robj {
     })())
 }
 
+// ─── Gene-set scoring (score_genes) ─────────────────────────────────────
+
+/// Gene-set scoring (scanpy `score_genes` equivalent).
+///
+/// @param counts A **genes × cells** `dgCMatrix` (log-normalized recommended).
+/// @param gene_list_idx 0-based gene (var) indices to score; resolved from names
+///   in R. Hard-checked against `n_vars`.
+/// @param gene_pool_idx 0-based gene indices forming the binning universe;
+///   consulted only by `method = "control"` (pass `integer(0)` otherwise).
+/// @param method One of `"control"`, `"mean"`, `"zscore"`.
+/// @param ctrl_size,n_bins Control-method knobs (genes per bin / expression bins).
+/// @param random_state Seed for the deterministic (non-numpy) control sampler.
+/// @return Numeric vector of per-cell scores (length `n_cells`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+fn scx_score_genes_matrix(
+    counts: Robj,
+    gene_list_idx: Vec<i32>,
+    gene_pool_idx: Vec<i32>,
+    method: &str,
+    ctrl_size: i32,
+    n_bins: i32,
+    random_state: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_score_genes_matrix_impl(
+        counts,
+        gene_list_idx,
+        gene_pool_idx,
+        method,
+        ctrl_size,
+        n_bins,
+        random_state,
+    ))
+}
+
+fn scx_score_genes_matrix_impl(
+    counts: Robj,
+    gene_list_idx: Vec<i32>,
+    gene_pool_idx: Vec<i32>,
+    method: &str,
+    ctrl_size: i32,
+    n_bins: i32,
+    random_state: f64,
+) -> Result<Robj> {
+    let csr = dgc_genes_by_cells_to_csr(&counts)?;
+    let source = SingleShardSource { csr: &csr };
+
+    let gene_list: Vec<u32> = gene_list_idx.iter().map(|&i| i as u32).collect();
+    let gene_pool: Vec<u32> = gene_pool_idx.iter().map(|&i| i as u32).collect();
+
+    let score_method = match method {
+        "control" => ScoreMethod::Control {
+            ctrl_size: ctrl_size as usize,
+            n_bins: n_bins as usize,
+            random_state: random_state as u64,
+        },
+        "mean" => ScoreMethod::Mean,
+        "zscore" => ScoreMethod::Zscore,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown score_genes method '{other}' (expected 'control', 'mean', or 'zscore')"
+            )))
+        }
+    };
+
+    let scores = score_genes(&source, &gene_list, &gene_pool, &score_method)
+        .map_err(|e| Error::Other(format!("score_genes: {e}")))?;
+    Ok(scores.into_robj())
+}
+
+// ─── Pseudobulk aggregation ─────────────────────────────────────────────
+
+/// Aggregate cells into pseudobulk groups (group × gene), summing or averaging.
+///
+/// @param counts A **genes × cells** `dgCMatrix`.
+/// @param groupby An R list of per-cell label character vectors (one element per
+///   groupby column), each of length `n_cells`.
+/// @param groupby_columns Names of the groupby columns (parallel to `groupby`).
+/// @param gene_names Gene names, length `n_genes`.
+/// @param method `"sum"` or `"mean"`.
+/// @param min_cells_per_group Drop groups with fewer than this many cells (0 = keep all).
+/// @return list(`counts` = n_groups × n_genes matrix, `group_labels` = per-column
+///   character vectors of length n_groups, `groupby_columns`, `cell_counts`,
+///   `gene_names`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+fn scx_pseudobulk_matrix(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    gene_names: Strings,
+    method: &str,
+    min_cells_per_group: i32,
+) -> Robj {
+    crate::util::throw_on_err(scx_pseudobulk_matrix_impl(
+        counts,
+        groupby,
+        groupby_columns,
+        gene_names,
+        method,
+        min_cells_per_group,
+    ))
+}
+
+fn scx_pseudobulk_matrix_impl(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    gene_names: Strings,
+    method: &str,
+    min_cells_per_group: i32,
+) -> Result<Robj> {
+    let csr = dgc_genes_by_cells_to_csr(&counts)?;
+    let n_obs = csr.n_rows();
+    let n_vars = csr.n_cols();
+
+    // Each groupby list element is a per-cell character vector (length n_obs).
+    let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
+    for (_, col) in groupby.iter() {
+        let labels: Vec<String> = col
+            .as_str_vector()
+            .ok_or_else(|| Error::Other("groupby columns must be character vectors".into()))?
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if labels.len() != n_obs {
+            return Err(Error::Other(format!(
+                "groupby column length {} != n_cells {}",
+                labels.len(),
+                n_obs
+            )));
+        }
+        obs_groups.push(labels);
+    }
+
+    let cols: Vec<String> = groupby_columns.iter().map(|s| s.to_string()).collect();
+    if cols.len() != obs_groups.len() {
+        return Err(Error::Other(format!(
+            "groupby_columns length {} != number of groupby columns {}",
+            cols.len(),
+            obs_groups.len()
+        )));
+    }
+    let genes: Vec<String> = gene_names.iter().map(|s| s.to_string()).collect();
+    if genes.len() != n_vars {
+        return Err(Error::Other(format!(
+            "gene_names length {} != n_vars {}",
+            genes.len(),
+            n_vars
+        )));
+    }
+
+    let agg = match method {
+        "sum" => AggregationMethod::Sum,
+        "mean" => AggregationMethod::Mean,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown pseudobulk method '{other}' (expected 'sum' or 'mean')"
+            )))
+        }
+    };
+
+    let result = pseudobulk_aggregate_inmemory(
+        &csr,
+        &obs_groups,
+        &cols,
+        &genes,
+        agg,
+        min_cells_per_group as usize,
+    )
+    .map_err(|e| Error::Other(format!("pseudobulk: {e}")))?;
+
+    // counts: row-major [n_groups × n_vars] → column-major R matrix.
+    let counts_mat = row_major_to_rmatrix(&result.counts, result.n_groups, result.n_vars)?;
+
+    // group_labels: Vec<group>[Vec<column>] → one R character vector per column,
+    // each of length n_groups (so they can become data.frame columns in R).
+    let n_cols = cols.len();
+    let labels_per_col: Vec<Robj> = (0..n_cols)
+        .map(|c| {
+            let v: Vec<&str> = result.group_labels.iter().map(|g| g[c].as_str()).collect();
+            v.into_robj()
+        })
+        .collect();
+    let labels_list: Robj = List::from_values(labels_per_col).into();
+
+    let cell_counts: Vec<i32> = result.cell_counts.iter().map(|&c| c as i32).collect();
+    let cols_out = cols.clone();
+
+    R!("list(
+        counts = {{counts_mat}},
+        group_labels = {{labels_list}},
+        groupby_columns = {{cols_out}},
+        cell_counts = {{cell_counts}},
+        gene_names = {{genes}}
+    )")
+    .map_err(|e| Error::Other(e.to_string()))
+}
+
 extendr_module! {
     mod accel;
     fn scx_pca_matrix;
@@ -795,6 +995,8 @@ extendr_module! {
     fn scx_rank_genes;
     fn scx_hvg_mean_var;
     fn scx_hvg_clipped_sums;
+    fn scx_score_genes_matrix;
+    fn scx_pseudobulk_matrix;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

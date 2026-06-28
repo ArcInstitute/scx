@@ -241,3 +241,108 @@ test_that("the accelerators write into Seurat slots end to end", {
   de <- scx_rank_genes_groups(obj, group.by = "seurat_clusters")
   expect_s3_class(de, "data.frame")
 })
+
+# ─── score_genes ────────────────────────────────────────────────────────
+
+test_that("scx_score_genes method='mean' equals the per-cell mean over the set", {
+  counts <- make_counts()
+  gene_list <- c("g1", "g5", "g10")
+  scores <- scx_score_genes(counts, gene_list, method = "mean")
+
+  expect_type(scores, "double")
+  expect_length(scores, ncol(counts)) # one score per cell
+  expect_equal(names(scores), colnames(counts))
+
+  # Reference: mean of the selected gene rows, per cell.
+  idx <- match(gene_list, rownames(counts))
+  ref <- colMeans(as.matrix(counts[idx, , drop = FALSE]))
+  expect_equal(unname(scores), unname(ref), tolerance = 1e-5)
+})
+
+test_that("scx_score_genes control method is deterministic for a fixed seed", {
+  counts <- make_counts()
+  gl <- paste0("g", 1:5)
+  s1 <- scx_score_genes(counts, gl, method = "control", random_state = 7L)
+  s2 <- scx_score_genes(counts, gl, method = "control", random_state = 7L)
+  expect_equal(s1, s2)
+  expect_true(all(is.finite(s1)))
+  expect_length(s1, ncol(counts))
+})
+
+test_that("scx_score_genes warns on missing genes and errors when none match", {
+  counts <- make_counts()
+  expect_warning(
+    scx_score_genes(counts, c("g1", "nope_gene"), method = "mean"),
+    "not found"
+  )
+  expect_error(
+    scx_score_genes(counts, c("nope1", "nope2"), method = "mean"),
+    "no genes"
+  )
+})
+
+# ─── pseudobulk aggregation ─────────────────────────────────────────────
+
+test_that("scx_pseudobulk sum matches a manual per-group rowSums", {
+  counts <- make_counts(n_genes = 12L, n_cells = 30L)
+  grp <- rep(c("A", "B", "C"), length.out = 30L)
+
+  res <- scx_pseudobulk(counts, group_by = grp, method = "sum")
+
+  # counts is genes x groups.
+  expect_equal(nrow(res$counts), nrow(counts))
+  expect_equal(ncol(res$counts), 3L)
+  expect_equal(rownames(res$counts), rownames(counts))
+  expect_setequal(colnames(res$counts), c("A", "B", "C"))
+
+  dense <- as.matrix(counts)
+  for (g in c("A", "B", "C")) {
+    manual <- rowSums(dense[, grp == g, drop = FALSE])
+    expect_equal(unname(res$counts[, g]), unname(manual), tolerance = 1e-6)
+    expect_equal(res$samples[g, "n_cells"], sum(grp == g))
+  }
+})
+
+test_that("scx_pseudobulk mean equals sum divided by cells-per-group", {
+  counts <- make_counts(n_genes = 10L, n_cells = 24L)
+  grp <- rep(c("X", "Y"), each = 12L)
+
+  s_sum <- scx_pseudobulk(counts, group_by = grp, method = "sum")
+  s_mean <- scx_pseudobulk(counts, group_by = grp, method = "mean")
+
+  for (g in c("X", "Y")) {
+    n <- s_sum$samples[g, "n_cells"]
+    expect_equal(s_mean$counts[, g], s_sum$counts[, g] / n, tolerance = 1e-6)
+  }
+})
+
+test_that("scx_pseudobulk min_cells_per_group drops small groups", {
+  counts <- make_counts(n_genes = 8L, n_cells = 20L)
+  # Group "rare" has only 2 cells; "big" has 18.
+  grp <- c(rep("rare", 2L), rep("big", 18L))
+
+  res <- scx_pseudobulk(counts, group_by = grp, method = "sum",
+                        min_cells_per_group = 5L)
+  expect_equal(colnames(res$counts), "big")
+  expect_equal(res$samples[["n_cells"]], 18L)
+})
+
+test_that("scx_pseudobulk supports multi-column groupby", {
+  counts <- make_counts(n_genes = 6L, n_cells = 24L)
+  cond <- rep(c("ctrl", "drug"), each = 12L)
+  donor <- rep(c("d1", "d2", "d3"), length.out = 24L)
+  meta <- data.frame(cond = cond, donor = donor, stringsAsFactors = FALSE)
+
+  res <- scx_pseudobulk(counts, group_by = meta, method = "sum")
+
+  # 2 conditions x 3 donors = 6 groups.
+  expect_equal(ncol(res$counts), 6L)
+  expect_true(all(c("cond", "donor", "n_cells") %in% colnames(res$samples)))
+  expect_equal(sum(res$samples$n_cells), 24L)
+
+  # Spot-check one cell-aligned group sum.
+  sel <- cond == "ctrl" & donor == "d1"
+  manual <- rowSums(as.matrix(counts)[, sel, drop = FALSE])
+  sid <- res$samples$cond == "ctrl" & res$samples$donor == "d1"
+  expect_equal(unname(res$counts[, which(sid)]), unname(manual), tolerance = 1e-6)
+})
