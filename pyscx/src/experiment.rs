@@ -58,6 +58,20 @@ impl PyExperiment {
                 .expect("grouped_pipeline populated above"),
         ))
     }
+
+    /// Resolve the optional `modality` kwarg shared by `uns_keys` and
+    /// `read_uns` to a `modality_id`. `None` → 0 (global uns). A name
+    /// that does not appear in the modality table raises `KeyError`,
+    /// which also covers the "named modality on a non-multimodal file"
+    /// case (the modality table is empty there).
+    fn resolve_uns_modality(&self, modality: Option<&str>) -> PyResult<u8> {
+        match modality {
+            None => Ok(0),
+            Some(name) => self.reader.modality_id(name).ok_or_else(|| {
+                pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
+            }),
+        }
+    }
 }
 
 /// Phase 5b: open a fresh `BackedCsrReader` for the requested modality
@@ -426,11 +440,42 @@ impl PyExperiment {
     /// Top-level keys of the unstructured `uns` mapping. Reads the small
     /// `uns` JSON section but not any matrix payload.
     /// Callable method (`exp.uns_keys()`) to match AnnData.
-    fn uns_keys(&self) -> Vec<String> {
-        match self.reader.read_uns() {
-            Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
-            _ => Vec::new(),
+    ///
+    /// On multimodal files, pass `modality=<name>` to read keys from
+    /// that modality's `uns/<name>` section instead of the global one.
+    /// Unknown modality names raise `KeyError`.
+    #[pyo3(signature = (modality=None))]
+    fn uns_keys(&self, modality: Option<&str>) -> PyResult<Vec<String>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        match self.reader.read_uns_for(modality_id) {
+            Ok(serde_json::Value::Object(map)) => Ok(map.keys().cloned().collect()),
+            Ok(_) => Ok(Vec::new()),
+            Err(scx_format_io::ScxError::SectionNotFound(_)) => Ok(Vec::new()),
+            Err(e) => Err(to_pyerr(e)),
         }
+    }
+
+    /// The full unstructured `uns` mapping as a Python dict, with tagged
+    /// envelopes reconstructed into NumPy arrays / pandas types (same
+    /// reconstruction `to_anndata` applies to `adata.uns`). Returns
+    /// `None` when the file has no `uns` section.
+    ///
+    /// Reads only the small `uns` JSON section (stored in the root
+    /// catalog area) — does NOT touch obs, var, obsm, or X. Safe to call
+    /// on multi-hundred-GB atlases where `to_anndata()` would OOM on
+    /// obs materialization.
+    ///
+    /// On multimodal files, pass `modality=<name>` to read that
+    /// modality's `uns/<name>` section instead of the global one.
+    /// Unknown modality names raise `KeyError`.
+    #[pyo3(signature = (modality=None))]
+    fn read_uns<'py>(
+        &self,
+        py: Python<'py>,
+        modality: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        convert::uns::read_uns_as_pyobject(py, &self.reader, modality_id)
     }
 
     /// Codec / shard / format-version internals as a one-line string.
@@ -1345,7 +1390,7 @@ impl PyExperiment {
                     "var",
                     schema_data_columns(self.reader.read_var_schema_physical().ok()),
                 ),
-                ("uns", self.uns_keys()),
+                ("uns", self.uns_keys(None).unwrap_or_default()),
                 ("obsm", self.obsm_keys()),
                 ("varm", self.varm_keys()),
                 ("layers", self.layer_names()),

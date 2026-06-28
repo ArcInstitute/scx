@@ -858,7 +858,7 @@ fn to_h5mu(
 ///     mu = md.MuData({"rna": rna_adata, "adt": adt_adata})
 ///     pyscx.from_mudata(mu, "cite_seq.scx")
 #[pyfunction]
-#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true))]
+#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true, uns_format="tagged"))]
 #[allow(clippy::too_many_arguments)]
 fn from_mudata(
     py: Python<'_>,
@@ -869,6 +869,7 @@ fn from_mudata(
     csc: &str,
     csc_cols_per_shard: usize,
     codec_per_modality: bool,
+    uns_format: &str,
 ) -> PyResult<()> {
     mudata::from_mudata_impl(
         py,
@@ -879,6 +880,7 @@ fn from_mudata(
         csc,
         csc_cols_per_shard,
         codec_per_modality,
+        uns_format,
     )
 }
 

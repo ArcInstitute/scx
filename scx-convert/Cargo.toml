@@ -1,6 +1,6 @@
 [package]
 name = "scx-convert"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 description = "External format <-> SCX conversion (h5ad, h5mu, MTX, 10x)"
 license.workspace = true

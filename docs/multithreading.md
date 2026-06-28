@@ -302,7 +302,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 | Accelerator | Threading model |
 |-------------|----------------|
 | **PCA** (covariance / randomized) | Per-op `rayon::ThreadPool`; row-chunked `par_chunks` for SpMM with thread-local accumulators |
-| **Differential expression** (Wilcoxon) | `par_iter` over genes |
+| **Differential expression** (Wilcoxon rank-sum) | `par_iter` over genes |
 | **NB-GLM** (DESeq2-style DE) | `par_iter` over genes for IRLS, shrinkage refit, and Wald inference |
 | **Harmony** batch integration | Per-op `rayon::ThreadPool`; tiled cell updates via `par_chunks` |
 | **Leiden** clustering | Conflict-free parallel batching via `par_iter` |

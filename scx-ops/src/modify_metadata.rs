@@ -401,7 +401,11 @@ fn should_drop_old_entry(e: &FullCatalogEntry, patch: &MetadataPatch) -> bool {
     if e.section_type == Provenance {
         return true;
     }
-    if patch.uns.is_some() && e.section_type == UnsBlob {
+    // `set_uns` replaces the *global* uns only. Per-modality uns
+    // (`uns/<modality>`, modality_id > 0) is left intact — `MetadataPatch`
+    // has no per-modality uns slot, and dropping every UnsBlob would
+    // silently erase per-modality metadata written by `from_mudata`.
+    if patch.uns.is_some() && e.section_type == UnsBlob && e.modality_id == 0 {
         return true;
     }
     // obs/var changed → drop their metadata sections AND any predicate index

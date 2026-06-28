@@ -172,7 +172,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // uns — reconstruct any `__scx_type__` envelopes back into NumPy
     // ndarrays / scalars / tuples / pandas Index/Series/Categorical /
     // structured recarrays. Plain JSON passes through unchanged.
-    let uns_dict = read_uns_as_pyobject(py, reader)?;
+    let uns_dict = read_uns_as_pyobject(py, reader, 0)?;
 
     // Sibling reader for the lazy bridges (`_obsp`/`_varp`/`_varm`/
     // `_layers`). Independent mmap so the returned AnnData stays valid
@@ -473,7 +473,7 @@ pub fn to_anndata_filtered<'py>(
 
         // uns (still loaded from reader; see read_uns_as_pyobject for the
         // tagged-envelope reconstruction).
-        let uns_dict = read_uns_as_pyobject(py, reader)?;
+        let uns_dict = read_uns_as_pyobject(py, reader, 0)?;
 
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("X", x)?;
@@ -989,7 +989,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         .map(|r| ScxLazyVarmMapping::new(Arc::clone(r)));
 
     // --- uns (eager; tagged envelopes reconstructed) ---
-    let uns_dict = read_uns_as_pyobject(py, &reader)?;
+    let uns_dict = read_uns_as_pyobject(py, &reader, 0)?;
 
     // --- layers (backed, with optional filtering) ---
     let all_layer_names = reader.layer_names();
