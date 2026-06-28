@@ -63,6 +63,129 @@ def test_key_accessors(synthetic_adata, tmp_dir):
     assert "raw" in exp.layer_names()
 
 
+def test_read_uns_returns_dict(synthetic_adata, tmp_dir):
+    """`read_uns()` returns the full uns dict without touching obs/X."""
+    path = str(tmp_dir / "x.scx")
+    pyscx.write(synthetic_adata, path)
+    exp = pyscx.open(path)
+    uns = exp.read_uns()
+    assert isinstance(uns, dict)
+    # Same keys as uns_keys() reports.
+    assert set(uns.keys()) == set(exp.uns_keys())
+    # synthetic_adata fixture writes {"species": "human", "version": 2}.
+    assert uns["species"] == "human"
+    assert uns["version"] == 2
+
+
+def test_read_uns_parity_with_to_anndata(synthetic_adata, tmp_dir):
+    """`read_uns()` produces the same payload as `to_anndata().uns`."""
+    path = str(tmp_dir / "x.scx")
+    pyscx.write(synthetic_adata, path)
+    exp = pyscx.open(path)
+    direct = exp.read_uns()
+    via_anndata = dict(exp.to_anndata().uns)
+    assert set(direct.keys()) == set(via_anndata.keys())
+    for k in direct:
+        assert direct[k] == via_anndata[k], f"uns[{k!r}] mismatch"
+
+
+def test_read_uns_none_when_absent(tmp_dir):
+    """`read_uns()` returns None on a file written without any uns."""
+    import anndata
+
+    n_obs, n_vars = 10, 5
+    x = sp.csr_matrix(np.zeros((n_obs, n_vars), dtype=np.float32))
+    obs = pd.DataFrame(index=[f"c{i}" for i in range(n_obs)])
+    var = pd.DataFrame(index=[f"g{i}" for i in range(n_vars)])
+    adata = anndata.AnnData(X=x, obs=obs, var=var)  # no uns
+    path = str(tmp_dir / "no_uns.scx")
+    pyscx.write(adata, path)
+    assert pyscx.open(path).read_uns() is None
+
+
+def test_read_uns_unknown_modality_on_single_modality_raises(
+    synthetic_adata, tmp_dir
+):
+    """Passing `modality=...` on a non-multimodal file raises KeyError."""
+    path = str(tmp_dir / "x.scx")
+    pyscx.write(synthetic_adata, path)
+    exp = pyscx.open(path)
+    with pytest.raises(KeyError, match="unknown modality 'rna'"):
+        exp.read_uns(modality="rna")
+    with pytest.raises(KeyError):
+        exp.uns_keys(modality="rna")
+
+
+@pytest.fixture
+def multimodal_scx(tmp_dir):
+    """Tiny CITE-seq SCX fixture written via `pyscx.from_mudata`.
+
+    `from_mudata` does not currently propagate uns (global or
+    per-modality), so the resulting file has no `uns` sections. That is
+    enough to exercise the modality-resolution path (KeyError on
+    unknown names) and the `SectionNotFound → None` branch in
+    `read_uns_for`. Populated per-modality uns decoding is exercised
+    upstream in Rust via the compact / merge round-trips.
+    """
+    mudata = pytest.importorskip("mudata")
+    import anndata
+
+    rng = np.random.default_rng(0)
+    n_obs, rna_n_vars, adt_n_vars = 16, 8, 3
+    rna_dense = rng.poisson(0.4, size=(n_obs, rna_n_vars)).astype(np.float32)
+    adt_dense = rng.poisson(0.4, size=(n_obs, adt_n_vars)).astype(np.float32)
+
+    rna_ad = anndata.AnnData(X=sp.csr_matrix(rna_dense))
+    rna_ad.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    adt_ad = anndata.AnnData(X=sp.csr_matrix(adt_dense))
+    adt_ad.var_names = [f"a{i}" for i in range(adt_n_vars)]
+    mu = mudata.MuData({"rna": rna_ad, "adt": adt_ad})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+
+    path = str(tmp_dir / "cite.scx")
+    pyscx.from_mudata(mu, path)
+    return path
+
+
+def test_read_uns_multimodal_modality_resolution(multimodal_scx):
+    """Modality names resolve correctly; absent per-modality uns → None."""
+    exp = pyscx.open(multimodal_scx)
+    assert set(exp.modality_names) == {"rna", "adt"}
+
+    # No global uns written by from_mudata.
+    assert exp.read_uns() is None
+    assert exp.uns_keys() == []
+
+    # Each known modality resolves and returns None (no per-modality uns
+    # section was written), proving the modality_id → read_uns_for path
+    # is wired up.
+    assert exp.read_uns(modality="rna") is None
+    assert exp.read_uns(modality="adt") is None
+    assert exp.uns_keys(modality="rna") == []
+    assert exp.uns_keys(modality="adt") == []
+
+
+def test_set_uns_then_read_global_on_multimodal(multimodal_scx):
+    """`pyscx.set_uns` writes the global uns; `read_uns()` round-trips
+    on a multimodal file without affecting per-modality reads."""
+    pyscx.set_uns(multimodal_scx, {"experiment": "CITE-seq"})
+    exp = pyscx.open(multimodal_scx)
+    assert exp.read_uns() == {"experiment": "CITE-seq"}
+    assert exp.uns_keys() == ["experiment"]
+    # Per-modality sections are untouched by set_uns.
+    assert exp.read_uns(modality="rna") is None
+    assert exp.read_uns(modality="adt") is None
+
+
+def test_read_uns_multimodal_unknown_modality_raises(multimodal_scx):
+    """Unknown modality name raises KeyError."""
+    exp = pyscx.open(multimodal_scx)
+    with pytest.raises(KeyError, match="unknown modality 'nope'"):
+        exp.read_uns(modality="nope")
+    with pytest.raises(KeyError):
+        exp.uns_keys(modality="nope")
+
+
 def test_info_carries_internals(synthetic_adata, tmp_dir):
     path = str(tmp_dir / "x.scx")
     pyscx.write(synthetic_adata, path)

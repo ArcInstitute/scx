@@ -1201,11 +1201,15 @@ pub(crate) fn decode_pandas_series_envelope<'py>(
 /// `serde_json::Value` tree. Returns `None` if the file has no uns.
 /// Shared by all three to_anndata entry points so the reconstruction is
 /// applied consistently.
+///
+/// `modality_id == 0` reads the global `uns` section; `modality_id > 0`
+/// reads the per-modality `uns/<name>` section (multimodal files only).
 pub(crate) fn read_uns_as_pyobject<'py>(
     py: Python<'py>,
     reader: &ScxReader,
+    modality_id: u8,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    let json_val = match reader.read_uns() {
+    let json_val = match reader.read_uns_for(modality_id) {
         Ok(v) => v,
         Err(scx_format_io::ScxError::SectionNotFound(_)) => return Ok(None),
         Err(e) => return Err(to_pyerr(e)),
