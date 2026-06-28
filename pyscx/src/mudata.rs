@@ -29,8 +29,8 @@ use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
 use crate::convert::{
-    csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, pyarrow_table_to_pandas,
-    record_batch_to_pyarrow,
+    csr_to_scipy, obsm_batch_to_numpy, pandas_to_record_batch, parse_uns_format,
+    pyarrow_table_to_pandas, record_batch_to_pyarrow, uns_py_to_json, UnsFormat,
 };
 use crate::to_pyerr;
 
@@ -362,6 +362,27 @@ pub fn from_h5mu_impl(
 /// helper instead — used by the multimodal compression benchmark to
 /// quantify the gain from per-modality routing (Phase K.3.4).
 #[allow(clippy::too_many_arguments)]
+/// Serialize a Python `uns`-like dict to `serde_json::Value`. Returns
+/// `None` when the dict is empty so an empty `uns` section is never
+/// written (callers downstream of `read_uns` treat an absent section
+/// as "no uns set", which is what users expect).
+fn uns_dict_to_optional_json(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    uns_format: UnsFormat,
+) -> PyResult<Option<serde_json::Value>> {
+    // `len(obj) == 0` is the cheap pre-check; falls back gracefully
+    // for non-dict-like objects (we serialize and let the helper raise
+    // a useful error there).
+    if let Ok(n) = obj.len() {
+        if n == 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(uns_py_to_json(py, obj, uns_format)?))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn from_mudata_impl(
     py: Python<'_>,
     mu: &Bound<'_, PyAny>,
@@ -371,6 +392,7 @@ pub fn from_mudata_impl(
     csc: &str,
     csc_cols_per_shard: usize,
     codec_per_modality: bool,
+    uns_format: &str,
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
     let csc_policy =
@@ -400,6 +422,23 @@ pub fn from_mudata_impl(
             "MuData has no modalities (mu.mod is empty)",
         ));
     }
+
+    // Eagerly extract uns now so a malformed dict surfaces a clean
+    // error before we open the writer and create a half-written file.
+    // `mu.uns` is always present on a valid MuData; per-modality
+    // `adata.uns` likewise on AnnData. Empty dicts skip the write so
+    // the catalog doesn't carry a useless empty section.
+    let uns_format_parsed = parse_uns_format(uns_format)?;
+    let mu_uns_attr = mu.getattr("uns")?;
+    let global_uns_json = uns_dict_to_optional_json(py, &mu_uns_attr, uns_format_parsed)?;
+    let per_modality_uns: Vec<Option<serde_json::Value>> = modality_names
+        .iter()
+        .map(|mname| {
+            let adata = mod_attr.get_item(mname)?;
+            let uns_attr = adata.getattr("uns")?;
+            uns_dict_to_optional_json(py, &uns_attr, uns_format_parsed)
+        })
+        .collect::<PyResult<_>>()?;
 
     // Pre-scan: read each modality's X to learn shapes / nnz so we
     // can populate the file header before opening the writer. The
@@ -530,6 +569,9 @@ pub fn from_mudata_impl(
     // Open writer + emit sections.
     let mut writer = ScxWriter::new(Path::new(path), header).map_err(to_pyerr)?;
     writer.write_obs(&outer_obs_batch).map_err(to_pyerr)?;
+    if let Some(json) = &global_uns_json {
+        writer.write_uns(json).map_err(to_pyerr)?;
+    }
 
     let explicit_codec = match codec {
         None | Some("auto") => None,
@@ -545,7 +587,7 @@ pub fn from_mudata_impl(
         }
     };
 
-    for payload in &modalities {
+    for (i, payload) in modalities.iter().enumerate() {
         // Integer-detect per-modality: small UMI / ADT / ATAC counts
         // compress dramatically better when stored as uint8/16/32
         // than as Float32. Mirrors `from_anndata`'s per-shard
@@ -600,6 +642,9 @@ pub fn from_mudata_impl(
         writer
             .write_var_for(modality_id, &payload.var_batch)
             .map_err(to_pyerr)?;
+        if let Some(json) = &per_modality_uns[i] {
+            writer.write_uns_for(modality_id, json).map_err(to_pyerr)?;
+        }
 
         // Shard each modality's CSR by `shard_target_rows` so the
         // emitted file streams well at census scale. The single-modality
