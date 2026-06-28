@@ -528,3 +528,124 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 
   list(counts = counts, samples = samples, gene_names = res$gene_names)
 }
+
+#' @describeIn scx-accelerators Pseudobulk differential expression via a
+#'   Rust-native negative-binomial GLM (DESeq2-style, CPU-only). Aggregates
+#'   cells into pseudobulk samples and fits each non-reference level of
+#'   `test_col` vs `reference`.
+#' @param test_col The `group_by` column holding the condition being tested.
+#' @param reference Reference level in `test_col` (the DE baseline).
+#' @param aggr_method Pseudobulk aggregation, `"sum"` (default) or `"mean"`.
+#' @param dispersion Dispersion estimator: `"cox_reid_shrunk"` (default),
+#'   `"cox_reid_mle"`, or `"moments"`.
+#' @param cooks_filtering,independent_filtering DESeq2 results-stage filters
+#'   (both `TRUE` by default).
+#' @section Replicates &amp; input:
+#' NB-GLM requires **≥2 pseudobulk replicates per condition**, so `group_by`
+#' must include `test_col` **and** a replicate column (donor/batch/well), e.g.
+#' `group_by = c("condition", "donor")`. Targets with fewer than 2 replicates
+#' per side are skipped with a warning. Input must be **raw counts** (use
+#' `layer = "counts"`); for no-replicate or log-normalized data use
+#' [scx_rank_genes_groups] (Wilcoxon).
+#' @return For `scx_pseudobulk_dex`: a long-format `data.frame` with one row per
+#'   gene per non-reference target and DESeq2-style columns `gene`, `baseMean`,
+#'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `target`, `reference`.
+#' @export
+scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
+                               aggr_method = "sum", min_cells_per_group = 10L,
+                               dispersion = "cox_reid_shrunk",
+                               cooks_filtering = TRUE,
+                               independent_filtering = TRUE,
+                               assay = NULL, layer = "counts") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+    cols <- as.character(group_by)
+    groupby <- lapply(cols, function(cn) as.character(object[[cn, drop = TRUE]]))
+    names(groupby) <- cols
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+    if (is.data.frame(group_by) || is.list(group_by)) {
+      groupby <- lapply(group_by, as.character)
+      cols <- names(groupby)
+      if (is.null(cols)) cols <- paste0("group", seq_along(groupby))
+      names(groupby) <- cols
+    } else {
+      stop(paste0("scx_pseudobulk_dex needs replicates: pass `group_by` as a ",
+                  "data.frame / named list including the test column and a ",
+                  "replicate column (e.g. donor)"), call. = FALSE)
+    }
+  }
+  if (!(test_col %in% cols)) {
+    stop(sprintf("test_col '%s' is not among group_by columns (%s)",
+                 test_col, paste(cols, collapse = ", ")), call. = FALSE)
+  }
+
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(mat)))
+
+  res <- scx_pseudobulk_dex_matrix(mat, groupby, cols, test_col, reference,
+                                   gene_names, aggr_method, min_cells_per_group,
+                                   dispersion, cooks_filtering,
+                                   independent_filtering)
+
+  if (length(res$skipped) > 0L) {
+    warning(sprintf(
+      "scx_pseudobulk_dex skipped %d target(s) with <2 replicates per condition: %s",
+      length(res$skipped), paste(res$skipped, collapse = ", ")), call. = FALSE)
+  }
+
+  data.frame(
+    gene = res$gene,
+    baseMean = res$baseMean,
+    log2FoldChange = res$log2FoldChange,
+    lfcSE = res$lfcSE,
+    stat = res$stat,
+    pvalue = res$pvalue,
+    padj = res$padj,
+    target = res$target,
+    reference = res$reference,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' @describeIn scx-accelerators Direct negative-binomial GLM on a pre-aggregated
+#'   pseudobulk count matrix and design (the `nb_glm` building block).
+#' @param counts A genes x samples numeric matrix of pseudobulk counts (DESeq2
+#'   orientation).
+#' @param design A samples x features numeric design matrix of full column rank,
+#'   e.g. `model.matrix(~ condition, sampleinfo)`.
+#' @param contrast 1-based design column (coefficient) to test; `NULL` (default)
+#'   tests the last coefficient.
+#' @param size_factors Per-sample size factors; `NULL` (default) uses the
+#'   DESeq2 median-ratio estimate.
+#' @return For `scx_nb_glm`: a `data.frame` with columns `gene`, `baseMean`,
+#'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `dispersion`,
+#'   `converged`.
+#' @export
+scx_nb_glm <- function(counts, design, contrast = NULL, size_factors = NULL,
+                       gene_names = rownames(counts),
+                       dispersion = "cox_reid_shrunk", cooks_filtering = TRUE,
+                       independent_filtering = TRUE) {
+  counts <- as.matrix(counts)
+  design <- as.matrix(design)
+  storage.mode(counts) <- "double"
+  storage.mode(design) <- "double"
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(counts)))
+
+  res <- scx_nb_glm_matrix(counts, design, contrast, size_factors, gene_names,
+                           dispersion, cooks_filtering, independent_filtering)
+
+  data.frame(
+    gene = res$gene,
+    baseMean = res$baseMean,
+    log2FoldChange = res$log2FoldChange,
+    lfcSE = res$lfcSE,
+    stat = res$stat,
+    pvalue = res$pvalue,
+    padj = res$padj,
+    dispersion = res$dispersion,
+    converged = res$converged,
+    stringsAsFactors = FALSE
+  )
+}

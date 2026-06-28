@@ -201,10 +201,23 @@ obj <- scx_score_genes(obj, gene_list = c("CD3D", "CD3E", "CD8A"),
 pb <- scx_pseudobulk(obj, group_by = c("condition", "donor"), method = "sum")
 pb$counts    # genes x pseudobulk-samples matrix
 pb$samples   # per-sample metadata (groupby columns + n_cells)
+
+# Pseudobulk DE: Rust-native negative-binomial GLM (DESeq2-style, CPU-only).
+# Needs >=2 replicates per condition, so group_by includes a replicate column
+# (donor/batch), and raw counts (layer = "counts"):
+de <- scx_pseudobulk_dex(obj, group_by = c("condition", "donor"),
+                         test_col = "condition", reference = "ctrl")
+# data.frame: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
+#             target, reference  (one block per non-reference level)
+
+# Or run the NB-GLM directly on a pre-aggregated counts matrix + design:
+de2 <- scx_nb_glm(pb$counts, model.matrix(~ condition, pb$samples))
 ```
 
-`scx_harmony_integrate()` / `RunHarmony_scx()` and `scx_compute_lisi()` round
-out the set. All paths are CPU-only (rscx links no GPU feature).
+For no-replicate or log-normalized data use `scx_rank_genes_groups()` (Wilcoxon)
+instead of the NB-GLM. `scx_harmony_integrate()` / `RunHarmony_scx()` and
+`scx_compute_lisi()` round out the set. All paths are CPU-only (rscx links no
+GPU feature).
 
 ## Build Notes
 

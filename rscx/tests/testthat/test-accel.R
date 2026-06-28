@@ -346,3 +346,107 @@ test_that("scx_pseudobulk supports multi-column groupby", {
   sid <- res$samples$cond == "ctrl" & res$samples$donor == "d1"
   expect_equal(unname(res$counts[, which(sid)]), unname(manual), tolerance = 1e-6)
 })
+
+# ─── pseudobulk DE (NB-GLM) ─────────────────────────────────────────────
+
+# Replicated single-cell-like counts: conds x donors pseudobulk groups, with a
+# planted up-regulated gene (g1) in the `drug` condition.
+.make_replicated <- function(n_genes = 8L, cells_per_group = 20L, seed = 11L) {
+  set.seed(seed)
+  conds <- c("ctrl", "drug")
+  donors <- c("d1", "d2", "d3")
+  cell_cond <- character(0)
+  cell_donor <- character(0)
+  for (co in conds) {
+    for (dn in donors) {
+      cell_cond <- c(cell_cond, rep(co, cells_per_group))
+      cell_donor <- c(cell_donor, rep(dn, cells_per_group))
+    }
+  }
+  n_cells <- length(cell_cond)
+  m <- matrix(rpois(n_genes * n_cells, lambda = 5), nrow = n_genes, ncol = n_cells)
+  drug <- cell_cond == "drug"
+  m[1, drug] <- m[1, drug] + rpois(sum(drug), lambda = 40) # g1 up in drug
+  rownames(m) <- paste0("g", seq_len(n_genes))
+  colnames(m) <- paste0("c", seq_len(n_cells))
+  counts <- methods::as(Matrix::Matrix(m, sparse = TRUE), "CsparseMatrix")
+  list(counts = counts,
+       meta = data.frame(condition = cell_cond, donor = cell_donor,
+                         stringsAsFactors = FALSE),
+       n_genes = n_genes)
+}
+
+test_that("scx_pseudobulk_dex (NB-GLM) recovers a planted up-regulated gene", {
+  d <- .make_replicated()
+  de <- scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                           reference = "ctrl", min_cells_per_group = 5L)
+
+  expect_s3_class(de, "data.frame")
+  expect_true(all(c("gene", "baseMean", "log2FoldChange", "lfcSE", "stat",
+                    "pvalue", "padj", "target", "reference") %in% colnames(de)))
+  expect_equal(nrow(de), d$n_genes) # 1 non-reference target x n_genes
+  expect_true(all(de$target == "drug"))
+  expect_true(all(de$reference == "ctrl"))
+  expect_true(all(de$pvalue >= 0 & de$pvalue <= 1, na.rm = TRUE))
+
+  g1 <- de[de$gene == "g1", ]
+  expect_gt(g1$log2FoldChange, 0) # up in drug
+})
+
+test_that("scx_pseudobulk_dex skips targets with <2 replicates (warning)", {
+  set.seed(12)
+  n_genes <- 6L
+  cell_cond <- rep(c("ctrl", "drug"), each = 20L)
+  cell_donor <- rep("d1", 40L) # single donor -> 1 pseudobulk per condition
+  m <- matrix(rpois(n_genes * 40L, 4), nrow = n_genes)
+  rownames(m) <- paste0("g", seq_len(n_genes))
+  colnames(m) <- paste0("c", seq_len(40L))
+  counts <- methods::as(Matrix::Matrix(m, sparse = TRUE), "CsparseMatrix")
+  meta <- data.frame(condition = cell_cond, donor = cell_donor,
+                     stringsAsFactors = FALSE)
+
+  expect_warning(
+    de <- scx_pseudobulk_dex(counts, group_by = meta, test_col = "condition",
+                             reference = "ctrl", min_cells_per_group = 5L),
+    "skipped"
+  )
+  expect_equal(nrow(de), 0L)
+})
+
+test_that("scx_pseudobulk_dex errors on an unknown test_col / reference", {
+  d <- .make_replicated(n_genes = 4L, cells_per_group = 12L)
+  expect_error(
+    scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "nope",
+                       reference = "ctrl", min_cells_per_group = 5L),
+    "test_col"
+  )
+  expect_error(
+    scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                       reference = "nope", min_cells_per_group = 5L),
+    "reference"
+  )
+})
+
+test_that("scx_nb_glm fits a planted effect on pre-aggregated counts", {
+  set.seed(13)
+  n_genes <- 6L
+  base <- matrix(rpois(n_genes * 6L, 200), nrow = n_genes) # 3 ctrl + 3 drug samples
+  drug_cols <- 4:6
+  base[1, drug_cols] <- base[1, drug_cols] + rpois(3L, 400) # g1 up in drug
+  rownames(base) <- paste0("g", seq_len(n_genes))
+  cond <- factor(c("ctrl", "ctrl", "ctrl", "drug", "drug", "drug"))
+  design <- stats::model.matrix(~cond)
+
+  de <- scx_nb_glm(base, design) # default contrast = last coef (conddrug)
+  expect_s3_class(de, "data.frame")
+  expect_true(all(c("gene", "baseMean", "log2FoldChange", "lfcSE", "stat",
+                    "pvalue", "padj", "dispersion", "converged") %in% colnames(de)))
+  expect_equal(nrow(de), n_genes)
+  expect_true(all(de$pvalue >= 0 & de$pvalue <= 1, na.rm = TRUE))
+
+  g1 <- de[de$gene == "g1", ]
+  expect_gt(g1$log2FoldChange, 0) # up in drug
+
+  # n_samples must exceed n_features: a rank-deficient/too-small design errors.
+  expect_error(scx_nb_glm(base[, 1:2], design[1:2, , drop = FALSE]))
+})

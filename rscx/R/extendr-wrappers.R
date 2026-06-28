@@ -292,6 +292,38 @@ scx_pseudobulk_matrix <- function(counts, groupby, groupby_columns, gene_names,
         as.integer(min_cells_per_group))
 }
 
+scx_pseudobulk_dex_matrix <- function(counts, groupby, groupby_columns, test_col,
+                                      reference, gene_names, aggr_method,
+                                      min_cells_per_group, dispersion,
+                                      cooks_filtering, independent_filtering) {
+  .Call(wrap__scx_pseudobulk_dex_matrix,
+        counts,
+        groupby,
+        as.character(groupby_columns),
+        as.character(test_col),
+        as.character(reference),
+        as.character(gene_names),
+        as.character(aggr_method),
+        as.integer(min_cells_per_group),
+        as.character(dispersion),
+        as.logical(cooks_filtering),
+        as.logical(independent_filtering))
+}
+
+scx_nb_glm_matrix <- function(counts, design, contrast_index, size_factors,
+                              gene_names, dispersion, cooks_filtering,
+                              independent_filtering) {
+  .Call(wrap__scx_nb_glm_matrix,
+        counts,
+        design,
+        if (is.null(contrast_index)) NULL else as.integer(contrast_index),
+        if (is.null(size_factors)) NULL else as.numeric(size_factors),
+        as.character(gene_names),
+        as.character(dispersion),
+        as.logical(cooks_filtering),
+        as.logical(independent_filtering))
+}
+
 # ── Import functions (interop module) ──────────────────────────
 #' @export
 from_seurat <- function(seurat_obj, output_path, codec = NULL,

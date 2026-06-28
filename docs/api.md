@@ -327,6 +327,26 @@ usable without Seurat installed):
   vector/`data.frame` (matrix). Returns a `list(counts, samples, gene_names)`
   where `counts` is a features×samples matrix and `samples` is a `data.frame`
   of the groupby columns plus `n_cells` per group.
+- `scx_pseudobulk_dex(obj, group_by, test_col, reference, aggr_method="sum",
+  min_cells_per_group=10, dispersion="cox_reid_shrunk", cooks_filtering=TRUE,
+  independent_filtering=TRUE)` — pseudobulk DE via the **Rust-native
+  negative-binomial GLM** (DESeq2-style, CPU-only; the `pseudobulk_dex(backend=
+  "nb_glm")` / `pdex_nb_glm` analog). Aggregates cells, then fits each
+  non-reference level of `test_col` vs `reference`. **Requires ≥2 pseudobulk
+  replicates per condition** — `group_by` must include `test_col` **and** a
+  replicate column (donor/batch); under-replicated targets are skipped with a
+  warning. Input must be **raw counts** (`layer="counts"`). Returns a tidy
+  `data.frame` with DESeq2-style columns `gene, baseMean, log2FoldChange, lfcSE,
+  stat, pvalue, padj, target, reference` (per-target BH-adjusted `padj`; `lfcSE`
+  on the log2 scale).
+- `scx_nb_glm(counts, design, contrast=NULL, size_factors=NULL,
+  dispersion="cox_reid_shrunk", ...)` — direct NB-GLM on a pre-aggregated
+  genes×samples count matrix + a samples×features `design` (e.g.
+  `model.matrix(~ condition, sampleinfo)`); `contrast` is a 1-based coefficient
+  (default: last). Returns `gene, baseMean, log2FoldChange, lfcSE, stat, pvalue,
+  padj, dispersion, converged`. For no-replicate / log-normalized data use
+  `scx_rank_genes_groups` (Wilcoxon); `pdex_ref` (Wilcoxon pseudobulk) is not
+  separately wired.
 
 Notes:
 - `scx_umap` / `scx_leiden` build their **own** kNN (default `n_neighbors`)
