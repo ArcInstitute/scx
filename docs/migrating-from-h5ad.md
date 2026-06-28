@@ -13,13 +13,25 @@ anything) is lost in the round trip?**
 ```python
 import pyscx
 
-# Convert once (CLI or Python):
+# Convert once (Python):
 pyscx.write(adata, "data.scx")          # mirrors adata.write_h5ad(...)
-#   or:  scx convert data.h5ad data.scx --stream
 
 # Read it back:
 adata = pyscx.read("data.scx")          # mirrors sc.read_h5ad(...)
 exp   = pyscx.open("data.scx")          # a handle (lazy); .to_anndata() / .query()
+```
+
+Or from the command line (streaming by default):
+
+```bash
+# Minimal:
+scx convert data.h5ad data.scx
+
+# Production-ready (indexes + CSC sidecar + detection bitmaps):
+scx convert data.h5ad data.scx \
+  --index-preset cellxgene \
+  --csc auto \
+  --bitmap auto
 ```
 
 `pyscx.read` / `pyscx.write` are the flat one-liners. `pyscx.open(path)` returns
@@ -64,6 +76,334 @@ Experiment object with n_obs × n_vars = 2700 × 32738
 
 Full trade-off table:
 [docs/scanpy.md § Choosing the right approach](scanpy.md#choosing-the-right-approach).
+
+## Converting h5ad to SCX
+
+Three entry points, from simplest to most scalable:
+
+| Entry point | When to use |
+|---|---|
+| `pyscx.write(adata, path)` / `pyscx.from_anndata(adata, path)` | You already have an AnnData in memory |
+| `pyscx.from_h5ad(path, out)` | Large h5ad on disk — never materialises X in Python; bounded RSS |
+| `scx convert data.h5ad data.scx` | Shell scripts, pipelines, no Python needed |
+
+All three accept the same optimization kwargs / flags and produce identical
+on-disk output. Streaming is the default for `from_h5ad` and the CLI. For
+detailed semantics of each entry point, see
+[docs/scanpy.md § Converting existing data to SCX](scanpy.md#converting-existing-data-to-scx).
+
+### Basic usage
+
+**CLI:**
+
+```bash
+# Format is auto-detected from file extensions:
+scx convert data.h5ad data.scx
+
+# Explicit format flags (useful for non-standard extensions):
+scx convert input output --from h5ad
+```
+
+**Python:**
+
+```python
+import pyscx
+
+# From an in-memory AnnData:
+pyscx.write(adata, "data.scx")               # alias for from_anndata
+pyscx.from_anndata(adata, "data.scx")
+
+# Streaming directly from h5ad on disk (bounded RSS):
+pyscx.from_h5ad("data.h5ad", "data.scx")
+```
+
+### Conversion optimizations
+
+SCX supports several on-disk sidecars and indexes that accelerate downstream
+operations. All of them can be built at conversion time with a single command.
+
+#### Predicate indexes
+
+Predicate indexes enable `filter_obs()` pushdown — the query engine skips entire
+shards whose obs values don't match the predicate, giving sub-second cell-type
+lookups on atlas-scale files.
+
+**CLI** (`--index-obs`, `--index-var`, `--index-preset`)**:**
+
+```bash
+# Index specific obs/var columns:
+scx convert data.h5ad data.scx \
+  --index-obs cell_type,tissue,donor_id \
+  --index-var feature_name
+
+# Or use a named preset (missing columns warn, don't fail):
+scx convert data.h5ad data.scx --index-preset cellxgene
+```
+
+**Python** (`index_obs=`, `index_var=`, `index_preset=`)**:**
+
+```python
+# Index specific columns:
+pyscx.from_h5ad("data.h5ad", "data.scx",
+                index_obs=["cell_type", "tissue", "donor_id"],
+                index_var=["feature_name"])
+
+# Named preset:
+pyscx.from_anndata(adata, "data.scx", index_preset="cellxgene")
+```
+
+Available presets:
+
+| Preset | obs columns | var columns |
+|--------|-------------|-------------|
+| `cellxgene` | `cell_type`, `cell_type_ontology_term_id`, `tissue`, `tissue_ontology_term_id`, `disease`, `assay`, `donor_id`, `development_stage`, `sex`, `suspension_type` | `feature_name`, `feature_type` |
+| `perturbseq` | `cell_type`, `donor`, `batch`, `condition`, `perturbation`, `guide_id`, `target_gene`, `control`, `split` | `feature_name`, `feature_type` |
+| `training` | `cell_type`, `donor`, `batch`, `dataset_id`, `split`, `organism`, `tissue` | `feature_name`, `feature_type` |
+
+When no explicit columns or preset are supplied, low-cardinality categorical
+columns (≤ 1000 categories by default) are auto-detected and indexed. Tune the
+threshold with `--index-auto-threshold N` / `index_auto_threshold=N`.
+
+#### CSC sidecar
+
+A CSC (column-major) sidecar accelerates gene-axis operations (DE, pseudobulk,
+GPU-accelerated DE). For full details on when to use it, the `off`/`auto`/`always`
+policy, and multi-shard layout, see
+[docs/sharding.md § CSC sharding](sharding.md#csc-sharding).
+
+**CLI** (`--csc`, `--csc-cols-per-shard`)**:**
+
+```bash
+scx convert data.h5ad data.scx --csc auto
+scx convert data.h5ad data.scx --csc always --csc-cols-per-shard 10000
+```
+
+**Python** (`csc=`, `csc_cols_per_shard=`)**:**
+
+```python
+pyscx.from_h5ad("data.h5ad", "data.scx", csc="auto")
+pyscx.from_anndata(adata, "data.scx", csc="always", csc_cols_per_shard=10000)
+```
+
+> **Note:** The `training` and `perturbseq` index presets automatically upgrade
+> an unset `csc` to `"auto"`. An explicit `csc="off"` / `--csc off` overrides
+> this.
+
+#### Detection bitmaps
+
+Detection bitmaps are per-shard Roaring bitmap sidecars that accelerate
+`pyscx.detection_counts` / `cells_expressing` queries. For the wire format and
+`auto` heuristic details, see
+[docs/format.md § 12. Detection Bitmap](format.md#12-detection-bitmap-optional).
+
+**CLI** (`--bitmap`)**:**
+
+```bash
+scx convert data.h5ad data.scx --bitmap auto
+scx convert data.h5ad data.scx --bitmap always
+```
+
+**Python** (`bitmap=`)**:**
+
+```python
+pyscx.from_h5ad("data.h5ad", "data.scx", bitmap="auto")
+pyscx.from_anndata(adata, "data.scx", bitmap="always")
+```
+
+#### Sort-on-convert
+
+Pre-sort cells by a key so CSR shards — and the predicate index — are contiguous
+per category, giving optimal read locality for the dominant query axis. For full
+rationale, sort strategy selection, and benchmarks, see
+[docs/sharding.md § Sorting for read locality](sharding.md#sorting-for-read-locality-scx-sort).
+
+**CLI** (`--sort-by`, `--sort-reverse`)**:**
+
+```bash
+scx convert data.h5ad data.scx \
+  --sort-by cell_type,tissue \
+  --index-obs cell_type,tissue
+```
+
+**Python** (`sort_by=`, `reverse=`)**:**
+
+```python
+pyscx.from_h5ad("data.h5ad", "data.scx",
+                sort_by=["cell_type", "tissue"],
+                index_obs=["cell_type", "tissue"])
+
+pyscx.from_anndata(adata, "data.scx",
+                   sort_by=["donor_id"], reverse=True)
+```
+
+### Codec and shard tuning
+
+The `auto` codec routes integer data to Scx1 or Zstd (by median) and float data
+to Pcodec. For the full codec spec and auto-selection heuristic, see
+[docs/codec.md § 8. Automatic Codec Selection](codec.md#8-automatic-codec-selection).
+For shard sizing guidelines, see
+[docs/sharding.md § Shard sizing guidelines](sharding.md#shard-sizing-guidelines).
+
+**CLI** (`--codec`, `--shard-size`)**:**
+
+```bash
+scx convert data.h5ad data.scx --codec auto     # recommended (default)
+scx convert data.h5ad data.scx --codec scx1     # force integer codec
+scx convert data.h5ad data.scx --codec zstd     # force Zstandard
+scx convert data.h5ad data.scx --shard-size 8192 # smaller shards (default: 16384)
+```
+
+**Python** (`codec=`, `shard_size=`)**:**
+
+```python
+pyscx.from_h5ad("data.h5ad", "data.scx", codec="scx1", shard_size=8192)
+pyscx.from_anndata(adata, "data.scx", codec="zstd", shard_size=32768)
+```
+
+### Memory and parallelism
+
+For the full multithreading architecture, see
+[docs/multithreading.md](multithreading.md).
+
+**CLI** (`--memory-budget`, `--reader-threads`, `--writer-queue-depth`, `--temp-dir`)**:**
+
+```bash
+scx convert data.h5ad data.scx --memory-budget 8G
+scx convert data.h5ad data.scx --reader-threads 4
+scx convert data.h5ad data.scx --writer-queue-depth 8
+scx convert data.h5ad data.scx --temp-dir /scratch/tmp
+```
+
+**Python** (`memory_budget=`, `reader_threads=`, `writer_queue_depth=`, `temp_dir=`)**:**
+
+```python
+# from_h5ad supports all parallelism knobs:
+pyscx.from_h5ad("data.h5ad", "data.scx",
+                memory_budget="8G",
+                reader_threads=4,
+                writer_queue_depth=8,
+                temp_dir="/scratch/tmp")
+
+# from_anndata accepts memory_budget (no reader_threads — data is already
+# in memory, so there is no HDF5 reader to parallelise):
+pyscx.from_anndata(adata, "data.scx", memory_budget="8G")
+```
+
+### Other flags
+
+**CLI:**
+
+```bash
+scx convert data.h5ad data.scx --strict-uns            # fail on unsupported uns
+scx convert data.h5ad data.scx --dense-zero-epsilon 1e-7 # sparsification threshold
+scx convert data.h5ad data.scx --stream=false           # legacy materialising path
+```
+
+**Python:**
+
+```python
+pyscx.from_h5ad("data.h5ad", "data.scx",
+                strict_uns=True,
+                dense_zero_epsilon=1e-7)
+
+pyscx.from_h5ad("data.h5ad", "data.scx", stream=False)
+```
+
+### Production-ready recipes
+
+For a typical atlas-scale dataset destined for query + analysis:
+
+**CLI:**
+
+```bash
+scx convert atlas.h5ad atlas.scx \
+  --index-preset cellxgene \
+  --csc auto \
+  --bitmap auto \
+  --sort-by cell_type \
+  --memory-budget 16G \
+  --reader-threads 8
+```
+
+**Python:**
+
+```python
+# Streaming from disk (recommended for large files):
+pyscx.from_h5ad("atlas.h5ad", "atlas.scx",
+                index_preset="cellxgene",
+                csc="auto",
+                bitmap="auto",
+                sort_by=["cell_type"],
+                memory_budget="16G",
+                reader_threads=8)
+
+# From an in-memory AnnData:
+pyscx.write(adata, "atlas.scx",
+            index_preset="cellxgene",
+            csc="auto",
+            bitmap="auto",
+            sort_by=["cell_type"])
+```
+
+### Post-conversion commands
+
+#### Verify the output
+
+For full validation semantics (checksum vs deep, production checkpoints), see
+[docs/scanpy.md § Validating files after write or transfer](scanpy.md#validating-files-after-write-or-transfer).
+
+```bash
+scx info data.scx                # shape, codec, sidecars, indexes
+scx validate data.scx            # checksum validation
+scx validate --deep data.scx     # decode every shard + verify canonical CSR
+```
+
+```python
+exp = pyscx.open("data.scx")
+print(exp)                       # shape, obs/var/obsm/uns keys
+print(exp.info())                # codec, shard count, format version, has_csc
+pyscx.validate("data.scx", deep=True)
+```
+
+#### Add a CSC sidecar after the fact
+
+If you converted without `--csc` / `csc=`, you can build the sidecar later. See
+[docs/sharding.md § CSC sharding](sharding.md#csc-sharding) for layout details.
+
+```bash
+scx build-csc data.scx data_with_csc.scx --memory-limit 8G
+```
+
+```python
+pyscx.build_csc("data.scx", "data_with_csc.scx",
+                memory_limit="8G", csc_cols_per_shard=10000)
+```
+
+#### Upgrade an older file (add decode sidecars)
+
+`scx optimize` re-encodes CSR shards to add decode sidecars and canonicalize to
+`format_version` 3. For full semantics, see
+[docs/operations.md § Optimize](operations.md#optimize).
+
+```bash
+scx optimize data.scx data_v3.scx
+scx optimize data.scx data.scx --force   # in-place
+scx validate --deep data_v3.scx
+```
+
+#### Convert back to h5ad
+
+For full streaming export details, see
+[docs/scanpy.md § Exporting back to h5ad / h5mu](scanpy.md#exporting-back-to-h5ad--h5mu-to_h5ad-to_h5mu).
+
+```bash
+scx convert data.scx data.h5ad --reader-threads 4 --memory-budget 8G
+```
+
+```python
+pyscx.to_h5ad("data.scx", "data.h5ad",
+              reader_threads=4, memory_budget="8G")
+```
 
 ## What changes when you convert
 
