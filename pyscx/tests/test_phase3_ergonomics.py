@@ -120,12 +120,13 @@ def test_read_uns_unknown_modality_on_single_modality_raises(
 def multimodal_scx(tmp_dir):
     """Tiny CITE-seq SCX fixture written via `pyscx.from_mudata`.
 
-    `from_mudata` does not currently propagate uns (global or
-    per-modality), so the resulting file has no `uns` sections. That is
-    enough to exercise the modality-resolution path (KeyError on
-    unknown names) and the `SectionNotFound → None` branch in
-    `read_uns_for`. Populated per-modality uns decoding is exercised
-    upstream in Rust via the compact / merge round-trips.
+    The fixture leaves both `mu.uns` and each `adata.uns` empty, so
+    `from_mudata` skips the uns write entirely (empty dicts → no
+    section). That keeps this fixture focused on the modality-
+    resolution path (KeyError on unknown names) and the
+    `SectionNotFound → None` branch in `read_uns_for`. Populated
+    per-modality uns round-trips are covered by
+    `test_mudata.py::test_from_mudata_uns_roundtrip`.
     """
     mudata = pytest.importorskip("mudata")
     import anndata

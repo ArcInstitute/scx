@@ -371,6 +371,13 @@ fn uns_dict_to_optional_json(
     obj: &Bound<'_, PyAny>,
     uns_format: UnsFormat,
 ) -> PyResult<Option<serde_json::Value>> {
+    // Python `None` (e.g. an exotic MuData/AnnData where `uns` was
+    // deleted) must not be serialized as `Value::Null` — that would
+    // write a useless null section to the catalog. Treat it like an
+    // empty dict.
+    if obj.is_none() {
+        return Ok(None);
+    }
     // `len(obj) == 0` is the cheap pre-check; falls back gracefully
     // for non-dict-like objects (we serialize and let the helper raise
     // a useful error there).

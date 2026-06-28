@@ -172,6 +172,42 @@ def test_from_mudata_uns_roundtrip():
         assert exp.read_uns(modality="adt") == {"isotype_controls": ["IgG1"]}
 
 
+def test_set_uns_preserves_per_modality_uns():
+    """`pyscx.set_uns` must replace ONLY the global uns. Per-modality
+    `uns/<name>` sections written by `from_mudata` must survive a
+    later `set_uns` call (regression guard: the pre-fix
+    `should_drop_old_entry` dropped every `UnsBlob` regardless of
+    `modality_id`)."""
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs = 12
+    rna = anndata.AnnData(X=sp.csr_matrix(rng.poisson(0.4, (n_obs, 4)).astype(np.float32)))
+    rna.var_names = [f"g{i}" for i in range(4)]
+    rna.uns = {"hvg_method": "seurat_v3"}
+    adt = anndata.AnnData(X=sp.csr_matrix(rng.poisson(0.4, (n_obs, 2)).astype(np.float32)))
+    adt.var_names = [f"a{i}" for i in range(2)]
+    adt.uns = {"isotype_controls": ["IgG1"]}
+    mu = mudata.MuData({"rna": rna, "adt": adt})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+    mu.uns = {"experiment": "CITE-seq"}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite.scx")
+        pyscx.from_mudata(mu, path)
+
+        # Replace the global uns; per-modality sections must survive.
+        pyscx.set_uns(path, {"experiment": "CITE-seq-v2", "note": "rewritten"})
+
+        exp = pyscx.open(path)
+        assert exp.read_uns() == {"experiment": "CITE-seq-v2", "note": "rewritten"}
+        assert exp.read_uns(modality="rna") == {"hvg_method": "seurat_v3"}
+        assert exp.read_uns(modality="adt") == {"isotype_controls": ["IgG1"]}
+
+
 def test_from_mudata_empty_uns_writes_no_section():
     """Empty `mu.uns` / `adata.uns` dicts skip the uns write so the
     catalog isn't polluted with empty sections — `read_uns()` returns
