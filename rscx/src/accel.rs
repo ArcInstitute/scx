@@ -1333,14 +1333,15 @@ fn scx_nb_glm_matrix_impl(
     }
 
     let idx0 = match contrast_index {
+        // Validate on the signed value before casting: a negative `i` cast to
+        // usize would wrap to a huge number and yield a confusing message.
         Nullable::NotNull(i) => {
-            let i = i as usize;
-            if i < 1 || i > n_features {
+            if i < 1 || i as usize > n_features {
                 return Err(Error::Other(format!(
                     "contrast index {i} out of range 1..={n_features}"
                 )));
             }
-            i - 1
+            (i - 1) as usize
         }
         Nullable::Null => n_features - 1,
     };

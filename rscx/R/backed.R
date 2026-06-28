@@ -87,11 +87,14 @@ dim.ScxBackedSparse <- function(x) {
       stop("character row indices are not supported for ScxBackedSparse", call. = FALSE)
     } else {
       i <- as.numeric(i)
-      if (length(i) && any(i < 0, na.rm = TRUE)) {
-        stop("negative row indices are not supported for ScxBackedSparse", call. = FALSE)
-      }
       if (anyNA(i)) {
         stop("NA row indices are not supported for ScxBackedSparse", call. = FALSE)
+      }
+      # R is 1-based; reject 0 and negatives (0 would underflow to -1 below and
+      # surface as a confusing out-of-bounds error from the Rust core).
+      if (length(i) && any(i < 1)) {
+        stop("row indices must be >= 1 (1-based); 0 / negative indices are not supported for ScxBackedSparse",
+             call. = FALSE)
       }
     }
 

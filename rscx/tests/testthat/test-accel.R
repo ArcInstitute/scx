@@ -449,4 +449,19 @@ test_that("scx_nb_glm fits a planted effect on pre-aggregated counts", {
 
   # n_samples must exceed n_features: a rank-deficient/too-small design errors.
   expect_error(scx_nb_glm(base[, 1:2], design[1:2, , drop = FALSE]))
+
+  # Out-of-range contrast indices give a clear (non-wrapping) error.
+  expect_error(scx_nb_glm(base, design, contrast = 0L), "contrast index")
+  expect_error(scx_nb_glm(base, design, contrast = -1L), "contrast index")
+  expect_error(scx_nb_glm(base, design, contrast = 99L), "contrast index")
+})
+
+test_that("scx_pseudobulk_dex warns when aggr_method='mean'", {
+  d <- .make_replicated()
+  expect_warning(
+    scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                       reference = "ctrl", min_cells_per_group = 5L,
+                       aggr_method = "mean"),
+    "mean"
+  )
 })

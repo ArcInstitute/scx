@@ -164,6 +164,11 @@ impl RLazyTransformed {
     }
 
     fn read_rows_impl(&self, start: u64, end: u64) -> Result<Robj> {
+        if start > end {
+            return Err(Error::Other(format!(
+                "row range start ({start}) must be <= end ({end})"
+            )));
+        }
         if end > self.n_obs as u64 {
             return Err(Error::Other(format!(
                 "row range end {} exceeds n_obs {}",

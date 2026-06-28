@@ -114,7 +114,8 @@ fn scx_append_impl(
     // Resolve the modality NAME (if any) against both readers → ids.
     let (target_modality_id, source_modality_id) = match modality {
         Nullable::Null => {
-            // Single-modality / global append: validate file-wide n_vars match.
+            // Single-modality / global append: modality_id 0 is the implicit
+            // global axis for both target and source. Validate file-wide n_vars.
             if target_reader.n_vars() != input_reader.n_vars() {
                 return Err(Error::Other(format!(
                     "n_vars mismatch: target has {}, input has {}",

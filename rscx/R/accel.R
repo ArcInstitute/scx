@@ -547,6 +547,13 @@ scx_pseudobulk <- function(object, group_by, method = "sum",
 #' per side are skipped with a warning. Input must be **raw counts** (use
 #' `layer = "counts"`); for no-replicate or log-normalized data use
 #' [scx_rank_genes_groups] (Wilcoxon).
+#'
+#' Each non-reference level is fit as an independent pairwise 2-coefficient
+#' NB-GLM (intercept + treatment) on only that target's and the reference's
+#' pseudobulk samples, with size factors recomputed per contrast. The replicate
+#' column is **not** entered as a covariate, so batch/donor confounders are not
+#' adjusted and `baseMean`/`dispersion` differ per contrast (this matches
+#' pyscx, not a single joint DESeq2 fit).
 #' @return For `scx_pseudobulk_dex`: a long-format `data.frame` with one row per
 #'   gene per non-reference target and DESeq2-style columns `gene`, `baseMean`,
 #'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `target`, `reference`.
@@ -579,6 +586,11 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
   if (!(test_col %in% cols)) {
     stop(sprintf("test_col '%s' is not among group_by columns (%s)",
                  test_col, paste(cols, collapse = ", ")), call. = FALSE)
+  }
+  if (identical(aggr_method, "mean")) {
+    warning(paste0("scx_pseudobulk_dex: aggr_method='mean' feeds fractional ",
+                   "values into the NB-GLM count model; 'sum' (the default) ",
+                   "is recommended for DE."), call. = FALSE)
   }
 
   gene_names <- rownames(mat)

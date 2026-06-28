@@ -114,4 +114,6 @@ test_that("nnz is preserved across transforms; out-of-bounds slices error", {
 
   expect_equal(lt$nnz(), Matrix::nnzero(exp$x_matrix()))
   expect_error(lt[21, ])
+  expect_error(lt[0, ], "1-based")          # 0 rejected (1-based)
+  expect_error(lt$read_rows(5, 2), "start") # start > end guard
 })
