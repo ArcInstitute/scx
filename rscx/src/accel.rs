@@ -15,8 +15,10 @@ use extendr_api::prelude::*;
 
 use scx_accel::{
     build_knn_graph, compute_umap, covariance_pca_inmemory, leiden, pflog1ppf_baseline_from_delta,
-    pflog1ppf_pca, randomized_pca_inmemory, streaming_clip_square_sum, streaming_mean_var,
-    wilcoxon_rank_sum, COVARIANCE_PCA_THRESHOLD,
+    pflog1ppf_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm, randomized_pca_inmemory,
+    score_genes, streaming_clip_square_sum, streaming_mean_var, wilcoxon_rank_sum,
+    AggregationMethod, DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, ScoreMethod,
+    COVARIANCE_PCA_THRESHOLD,
 };
 use scx_sparse::ScxCsr;
 
@@ -785,6 +787,618 @@ fn scx_hvg_clipped_sums(counts: Robj, clip_val: Vec<f64>) -> Robj {
     })())
 }
 
+// ─── Gene-set scoring (score_genes) ─────────────────────────────────────
+
+/// Gene-set scoring (scanpy `score_genes` equivalent).
+///
+/// @param counts A **genes × cells** `dgCMatrix` (log-normalized recommended).
+/// @param gene_list_idx 0-based gene (var) indices to score; resolved from names
+///   in R. Hard-checked against `n_vars`.
+/// @param gene_pool_idx 0-based gene indices forming the binning universe;
+///   consulted only by `method = "control"` (pass `integer(0)` otherwise).
+/// @param method One of `"control"`, `"mean"`, `"zscore"`.
+/// @param ctrl_size,n_bins Control-method knobs (genes per bin / expression bins).
+/// @param random_state Seed for the deterministic (non-numpy) control sampler.
+/// @return Numeric vector of per-cell scores (length `n_cells`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+fn scx_score_genes_matrix(
+    counts: Robj,
+    gene_list_idx: Vec<i32>,
+    gene_pool_idx: Vec<i32>,
+    method: &str,
+    ctrl_size: i32,
+    n_bins: i32,
+    random_state: f64,
+) -> Robj {
+    crate::util::throw_on_err(scx_score_genes_matrix_impl(
+        counts,
+        gene_list_idx,
+        gene_pool_idx,
+        method,
+        ctrl_size,
+        n_bins,
+        random_state,
+    ))
+}
+
+fn scx_score_genes_matrix_impl(
+    counts: Robj,
+    gene_list_idx: Vec<i32>,
+    gene_pool_idx: Vec<i32>,
+    method: &str,
+    ctrl_size: i32,
+    n_bins: i32,
+    random_state: f64,
+) -> Result<Robj> {
+    let csr = dgc_genes_by_cells_to_csr(&counts)?;
+    let source = SingleShardSource { csr: &csr };
+
+    let gene_list: Vec<u32> = gene_list_idx.iter().map(|&i| i as u32).collect();
+    let gene_pool: Vec<u32> = gene_pool_idx.iter().map(|&i| i as u32).collect();
+
+    let score_method = match method {
+        "control" => ScoreMethod::Control {
+            ctrl_size: ctrl_size as usize,
+            n_bins: n_bins as usize,
+            random_state: random_state as u64,
+        },
+        "mean" => ScoreMethod::Mean,
+        "zscore" => ScoreMethod::Zscore,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown score_genes method '{other}' (expected 'control', 'mean', or 'zscore')"
+            )))
+        }
+    };
+
+    let scores = score_genes(&source, &gene_list, &gene_pool, &score_method)
+        .map_err(|e| Error::Other(format!("score_genes: {e}")))?;
+    Ok(scores.into_robj())
+}
+
+// ─── Pseudobulk aggregation ─────────────────────────────────────────────
+
+/// Aggregate cells into pseudobulk groups (group × gene), summing or averaging.
+///
+/// @param counts A **genes × cells** `dgCMatrix`.
+/// @param groupby An R list of per-cell label character vectors (one element per
+///   groupby column), each of length `n_cells`.
+/// @param groupby_columns Names of the groupby columns (parallel to `groupby`).
+/// @param gene_names Gene names, length `n_genes`.
+/// @param method `"sum"` or `"mean"`.
+/// @param min_cells_per_group Drop groups with fewer than this many cells (0 = keep all).
+/// @return list(`counts` = n_groups × n_genes matrix, `group_labels` = per-column
+///   character vectors of length n_groups, `groupby_columns`, `cell_counts`,
+///   `gene_names`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+fn scx_pseudobulk_matrix(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    gene_names: Strings,
+    method: &str,
+    min_cells_per_group: i32,
+) -> Robj {
+    crate::util::throw_on_err(scx_pseudobulk_matrix_impl(
+        counts,
+        groupby,
+        groupby_columns,
+        gene_names,
+        method,
+        min_cells_per_group,
+    ))
+}
+
+fn scx_pseudobulk_matrix_impl(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    gene_names: Strings,
+    method: &str,
+    min_cells_per_group: i32,
+) -> Result<Robj> {
+    let csr = dgc_genes_by_cells_to_csr(&counts)?;
+    let n_obs = csr.n_rows();
+    let n_vars = csr.n_cols();
+
+    // Each groupby list element is a per-cell character vector (length n_obs).
+    let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
+    for (_, col) in groupby.iter() {
+        let labels: Vec<String> = col
+            .as_str_vector()
+            .ok_or_else(|| Error::Other("groupby columns must be character vectors".into()))?
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if labels.len() != n_obs {
+            return Err(Error::Other(format!(
+                "groupby column length {} != n_cells {}",
+                labels.len(),
+                n_obs
+            )));
+        }
+        obs_groups.push(labels);
+    }
+
+    let cols: Vec<String> = groupby_columns.iter().map(|s| s.to_string()).collect();
+    if cols.len() != obs_groups.len() {
+        return Err(Error::Other(format!(
+            "groupby_columns length {} != number of groupby columns {}",
+            cols.len(),
+            obs_groups.len()
+        )));
+    }
+    let genes: Vec<String> = gene_names.iter().map(|s| s.to_string()).collect();
+    if genes.len() != n_vars {
+        return Err(Error::Other(format!(
+            "gene_names length {} != n_vars {}",
+            genes.len(),
+            n_vars
+        )));
+    }
+
+    let agg = match method {
+        "sum" => AggregationMethod::Sum,
+        "mean" => AggregationMethod::Mean,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown pseudobulk method '{other}' (expected 'sum' or 'mean')"
+            )))
+        }
+    };
+
+    let result = pseudobulk_aggregate_inmemory(
+        &csr,
+        &obs_groups,
+        &cols,
+        &genes,
+        agg,
+        min_cells_per_group as usize,
+    )
+    .map_err(|e| Error::Other(format!("pseudobulk: {e}")))?;
+
+    // counts: row-major [n_groups × n_vars] → column-major R matrix.
+    let counts_mat = row_major_to_rmatrix(&result.counts, result.n_groups, result.n_vars)?;
+
+    // group_labels: Vec<group>[Vec<column>] → one R character vector per column,
+    // each of length n_groups (so they can become data.frame columns in R).
+    let n_cols = cols.len();
+    let labels_per_col: Vec<Robj> = (0..n_cols)
+        .map(|c| {
+            let v: Vec<&str> = result.group_labels.iter().map(|g| g[c].as_str()).collect();
+            v.into_robj()
+        })
+        .collect();
+    let labels_list: Robj = List::from_values(labels_per_col).into();
+
+    let cell_counts: Vec<i32> = result.cell_counts.iter().map(|&c| c as i32).collect();
+    let cols_out = cols.clone();
+
+    R!("list(
+        counts = {{counts_mat}},
+        group_labels = {{labels_list}},
+        groupby_columns = {{cols_out}},
+        cell_counts = {{cell_counts}},
+        gene_names = {{genes}}
+    )")
+    .map_err(|e| Error::Other(e.to_string()))
+}
+
+// ─── Pseudobulk differential expression (NB-GLM, DESeq2-style) ──────────
+
+/// Build `NbGlmOptions` from the user-facing knobs (rest use `Default`).
+fn nbglm_options(
+    dispersion: &str,
+    cooks_filtering: bool,
+    independent_filtering: bool,
+) -> Result<NbGlmOptions> {
+    let disp = match dispersion {
+        "cox_reid_shrunk" => DispersionMethod::CoxReidShrunk,
+        "cox_reid_mle" => DispersionMethod::CoxReidMle,
+        "moments" => DispersionMethod::Moments,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown dispersion '{other}' (expected 'cox_reid_shrunk', 'cox_reid_mle', or 'moments')"
+            )))
+        }
+    };
+    Ok(NbGlmOptions {
+        dispersion: disp,
+        cooks_filtering,
+        independent_filtering,
+        ..NbGlmOptions::default()
+    })
+}
+
+/// Pseudobulk DE via the Rust-native negative-binomial GLM (DESeq2-style),
+/// CPU-only. Aggregates cells into pseudobulk samples, then for each
+/// non-reference level of `test_col` fits a 2-coefficient NB-GLM (intercept +
+/// treatment) of the target vs the reference, requiring ≥2 pseudobulk
+/// replicates per condition.
+///
+/// @param counts A **genes × cells** raw-counts `dgCMatrix`.
+/// @param groupby R list of per-cell label character vectors (one per groupby
+///   column, each length n_cells); must include the test column **and** a
+///   replicate column (donor/batch) so each condition has ≥2 pseudobulk samples.
+/// @param groupby_columns Names of the groupby columns (parallel to `groupby`).
+/// @param test_col Which groupby column holds the condition being tested.
+/// @param reference Reference level in `test_col` (the DE baseline).
+/// @param gene_names Gene names, length n_genes.
+/// @param aggr_method `"sum"` or `"mean"` pseudobulk aggregation.
+/// @param min_cells_per_group Drop pseudobulk groups with fewer cells.
+/// @param dispersion `"cox_reid_shrunk"` / `"cox_reid_mle"` / `"moments"`.
+/// @param cooks_filtering,independent_filtering DESeq2 results-stage filters.
+/// @return list of long-format per-(target,gene) vectors plus `skipped`
+///   (targets dropped for &lt;2 replicates per condition).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn scx_pseudobulk_dex_matrix(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    test_col: &str,
+    reference: &str,
+    gene_names: Strings,
+    aggr_method: &str,
+    min_cells_per_group: i32,
+    dispersion: &str,
+    cooks_filtering: bool,
+    independent_filtering: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_pseudobulk_dex_matrix_impl(
+        counts,
+        groupby,
+        groupby_columns,
+        test_col,
+        reference,
+        gene_names,
+        aggr_method,
+        min_cells_per_group,
+        dispersion,
+        cooks_filtering,
+        independent_filtering,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_pseudobulk_dex_matrix_impl(
+    counts: Robj,
+    groupby: List,
+    groupby_columns: Strings,
+    test_col: &str,
+    reference: &str,
+    gene_names: Strings,
+    aggr_method: &str,
+    min_cells_per_group: i32,
+    dispersion: &str,
+    cooks_filtering: bool,
+    independent_filtering: bool,
+) -> Result<Robj> {
+    let csr = dgc_genes_by_cells_to_csr(&counts)?;
+    let n_obs = csr.n_rows();
+    let n_vars = csr.n_cols();
+
+    let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
+    for (_, col) in groupby.iter() {
+        let labels: Vec<String> = col
+            .as_str_vector()
+            .ok_or_else(|| Error::Other("groupby columns must be character vectors".into()))?
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if labels.len() != n_obs {
+            return Err(Error::Other(format!(
+                "groupby column length {} != n_cells {}",
+                labels.len(),
+                n_obs
+            )));
+        }
+        obs_groups.push(labels);
+    }
+    let cols: Vec<String> = groupby_columns.iter().map(|s| s.to_string()).collect();
+    if cols.len() != obs_groups.len() {
+        return Err(Error::Other(format!(
+            "groupby_columns length {} != number of groupby columns {}",
+            cols.len(),
+            obs_groups.len()
+        )));
+    }
+    let genes: Vec<String> = gene_names.iter().map(|s| s.to_string()).collect();
+    if genes.len() != n_vars {
+        return Err(Error::Other(format!(
+            "gene_names length {} != n_vars {}",
+            genes.len(),
+            n_vars
+        )));
+    }
+    let agg = match aggr_method {
+        "sum" => AggregationMethod::Sum,
+        "mean" => AggregationMethod::Mean,
+        other => {
+            return Err(Error::Other(format!(
+                "unknown aggr_method '{other}' (expected 'sum' or 'mean')"
+            )))
+        }
+    };
+    let opts = nbglm_options(dispersion, cooks_filtering, independent_filtering)?;
+
+    let pb = pseudobulk_aggregate_inmemory(
+        &csr,
+        &obs_groups,
+        &cols,
+        &genes,
+        agg,
+        min_cells_per_group as usize,
+    )
+    .map_err(|e| Error::Other(format!("pseudobulk: {e}")))?;
+
+    let cond_idx = cols
+        .iter()
+        .position(|c| c == test_col)
+        .ok_or_else(|| Error::Other(format!("test_col '{test_col}' not in groupby columns")))?;
+    let group_cond: Vec<&str> = (0..pb.n_groups)
+        .map(|g| pb.group_labels[g][cond_idx].as_str())
+        .collect();
+    if !group_cond.contains(&reference) {
+        return Err(Error::Other(format!(
+            "reference level '{reference}' not found in test_col '{test_col}'"
+        )));
+    }
+    // Target levels: first-seen order, excluding the reference.
+    let mut targets: Vec<String> = Vec::new();
+    for &c in &group_cond {
+        if c != reference && !targets.iter().any(|t| t == c) {
+            targets.push(c.to_string());
+        }
+    }
+    let ref_rows: Vec<usize> = (0..pb.n_groups)
+        .filter(|&g| group_cond[g] == reference)
+        .collect();
+
+    let nv = pb.n_vars;
+    let mut out_gene: Vec<String> = Vec::new();
+    let mut out_base: Vec<f64> = Vec::new();
+    let mut out_lfc: Vec<f64> = Vec::new();
+    let mut out_se: Vec<f64> = Vec::new();
+    let mut out_stat: Vec<f64> = Vec::new();
+    let mut out_p: Vec<f64> = Vec::new();
+    let mut out_padj: Vec<f64> = Vec::new();
+    let mut out_target: Vec<String> = Vec::new();
+    let mut out_ref: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    for target in &targets {
+        let tgt_rows: Vec<usize> = (0..pb.n_groups)
+            .filter(|&g| group_cond[g] == target.as_str())
+            .collect();
+        let n_ref = ref_rows.len();
+        let n_tgt = tgt_rows.len();
+        // NB-GLM needs ≥2 replicates per condition (n_samples > n_features=2).
+        if n_ref < 2 || n_tgt < 2 {
+            skipped.push(target.clone());
+            continue;
+        }
+        let n_sub = n_ref + n_tgt;
+        // Sample order: reference rows first, then target rows.
+        let mut sample_groups: Vec<usize> = Vec::with_capacity(n_sub);
+        sample_groups.extend_from_slice(&ref_rows);
+        sample_groups.extend_from_slice(&tgt_rows);
+        // Design [n_sub × 2] row-major: [intercept, treatment].
+        let mut design = vec![0.0f64; n_sub * 2];
+        for (s, slot) in design.chunks_mut(2).enumerate() {
+            slot[0] = 1.0;
+            slot[1] = if s < n_ref { 0.0 } else { 1.0 };
+        }
+        // Counts gene-major [n_genes × n_sub].
+        let mut cg = vec![0.0f64; nv * n_sub];
+        for (s, &gr) in sample_groups.iter().enumerate() {
+            let row_base = gr * nv;
+            for j in 0..nv {
+                cg[j * n_sub + s] = pb.counts[row_base + j];
+            }
+        }
+        let res = pseudobulk_nb_glm(
+            &cg,
+            nv,
+            n_sub,
+            &design,
+            2,
+            None,
+            NbGlmContrast::Coefficient { index: 1 },
+            opts.clone(),
+        )
+        .map_err(|e| Error::Other(format!("nb_glm (target '{target}'): {e}")))?;
+
+        for (j, gene) in genes.iter().enumerate() {
+            out_gene.push(gene.clone());
+            out_base.push(res.base_mean[j]);
+            out_lfc.push(res.log2_fold_change[j]);
+            out_se.push(res.standard_error[j] / std::f64::consts::LN_2);
+            out_stat.push(res.wald_stat[j]);
+            out_p.push(res.p_value[j]);
+            out_padj.push(res.p_adj[j]);
+            out_target.push(target.clone());
+            out_ref.push(reference.to_string());
+        }
+    }
+
+    R!("list(
+        gene = {{out_gene}},
+        baseMean = {{out_base}},
+        log2FoldChange = {{out_lfc}},
+        lfcSE = {{out_se}},
+        stat = {{out_stat}},
+        pvalue = {{out_p}},
+        padj = {{out_padj}},
+        target = {{out_target}},
+        reference = {{out_ref}},
+        skipped = {{skipped}}
+    )")
+    .map_err(|e| Error::Other(e.to_string()))
+}
+
+/// Direct NB-GLM on a pre-aggregated pseudobulk count matrix + design (the
+/// `nb_glm` building block). CPU-only, DESeq2-style.
+///
+/// @param counts A **genes × samples** numeric matrix of pseudobulk counts.
+/// @param design A **samples × features** numeric design matrix (e.g.
+///   `model.matrix(~ condition, sampleinfo)`), full column rank.
+/// @param contrast_index 1-based coefficient (design column) to test; `NULL`
+///   tests the last coefficient.
+/// @param size_factors Per-sample size factors; `NULL` ⇒ DESeq2 median-ratio.
+/// @param gene_names Gene names, length n_genes.
+/// @param dispersion,cooks_filtering,independent_filtering As in
+///   `scx_pseudobulk_dex_matrix`.
+/// @return list(`gene`, `baseMean`, `log2FoldChange`, `lfcSE`, `stat`,
+///   `pvalue`, `padj`, `dispersion`, `converged`).
+/// Returns `Robj` and throws via `throw_on_err` (see B3/B7).
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn scx_nb_glm_matrix(
+    counts: RMatrix<f64>,
+    design: RMatrix<f64>,
+    contrast_index: Nullable<i32>,
+    size_factors: Nullable<Vec<f64>>,
+    gene_names: Strings,
+    dispersion: &str,
+    cooks_filtering: bool,
+    independent_filtering: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_nb_glm_matrix_impl(
+        counts,
+        design,
+        contrast_index,
+        size_factors,
+        gene_names,
+        dispersion,
+        cooks_filtering,
+        independent_filtering,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_nb_glm_matrix_impl(
+    counts: RMatrix<f64>,
+    design: RMatrix<f64>,
+    contrast_index: Nullable<i32>,
+    size_factors: Nullable<Vec<f64>>,
+    gene_names: Strings,
+    dispersion: &str,
+    cooks_filtering: bool,
+    independent_filtering: bool,
+) -> Result<Robj> {
+    let n_genes = counts.nrows();
+    let n_samples = counts.ncols();
+    let n_features = design.ncols();
+    if design.nrows() != n_samples {
+        return Err(Error::Other(format!(
+            "design has {} rows but counts has {} samples (columns)",
+            design.nrows(),
+            n_samples
+        )));
+    }
+    if n_samples <= n_features {
+        return Err(Error::Other(format!(
+            "n_samples ({n_samples}) must be > n_features ({n_features}); NB-GLM needs replicate \
+             degrees of freedom — for no-replicate / log-normalized data use scx_rank_genes_groups"
+        )));
+    }
+    let genes: Vec<String> = gene_names.iter().map(|s| s.to_string()).collect();
+    if genes.len() != n_genes {
+        return Err(Error::Other(format!(
+            "gene_names length {} != n_genes {}",
+            genes.len(),
+            n_genes
+        )));
+    }
+
+    // counts: column-major (R) → gene-major row-major [n_genes × n_samples].
+    let cd = counts.data();
+    let mut cg = vec![0.0f64; n_genes * n_samples];
+    for gene in 0..n_genes {
+        for sample in 0..n_samples {
+            cg[gene * n_samples + sample] = cd[sample * n_genes + gene];
+        }
+    }
+    // design: column-major → row-major [n_samples × n_features].
+    let dd = design.data();
+    let mut dr = vec![0.0f64; n_samples * n_features];
+    for sample in 0..n_samples {
+        for feat in 0..n_features {
+            dr[sample * n_features + feat] = dd[feat * n_samples + sample];
+        }
+    }
+
+    let idx0 = match contrast_index {
+        // Validate on the signed value before casting: a negative `i` cast to
+        // usize would wrap to a huge number and yield a confusing message.
+        Nullable::NotNull(i) => {
+            if i < 1 || i as usize > n_features {
+                return Err(Error::Other(format!(
+                    "contrast index {i} out of range 1..={n_features}"
+                )));
+            }
+            (i - 1) as usize
+        }
+        Nullable::Null => n_features - 1,
+    };
+    let sf: Option<Vec<f64>> = match size_factors {
+        Nullable::NotNull(v) => {
+            if v.len() != n_samples {
+                return Err(Error::Other(format!(
+                    "size_factors length {} != n_samples {}",
+                    v.len(),
+                    n_samples
+                )));
+            }
+            Some(v)
+        }
+        Nullable::Null => None,
+    };
+    let opts = nbglm_options(dispersion, cooks_filtering, independent_filtering)?;
+
+    let res: NbGlmResult = pseudobulk_nb_glm(
+        &cg,
+        n_genes,
+        n_samples,
+        &dr,
+        n_features,
+        sf.as_deref(),
+        NbGlmContrast::Coefficient { index: idx0 },
+        opts,
+    )
+    .map_err(|e| Error::Other(format!("nb_glm: {e}")))?;
+
+    let lfc_se: Vec<f64> = res
+        .standard_error
+        .iter()
+        .map(|&s| s / std::f64::consts::LN_2)
+        .collect();
+    let base = res.base_mean;
+    let lfc = res.log2_fold_change;
+    let stat = res.wald_stat;
+    let p = res.p_value;
+    let padj = res.p_adj;
+    let disp = res.dispersion;
+    let converged = res.converged;
+
+    R!("list(
+        gene = {{genes}},
+        baseMean = {{base}},
+        log2FoldChange = {{lfc}},
+        lfcSE = {{lfc_se}},
+        stat = {{stat}},
+        pvalue = {{p}},
+        padj = {{padj}},
+        dispersion = {{disp}},
+        converged = {{converged}}
+    )")
+    .map_err(|e| Error::Other(e.to_string()))
+}
+
 extendr_module! {
     mod accel;
     fn scx_pca_matrix;
@@ -795,6 +1409,10 @@ extendr_module! {
     fn scx_rank_genes;
     fn scx_hvg_mean_var;
     fn scx_hvg_clipped_sums;
+    fn scx_score_genes_matrix;
+    fn scx_pseudobulk_matrix;
+    fn scx_pseudobulk_dex_matrix;
+    fn scx_nb_glm_matrix;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

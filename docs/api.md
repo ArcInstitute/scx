@@ -256,6 +256,43 @@ LRU thrashing across modalities.
 - `scx_open(path)$is_multimodal()` / `$modality_names()` — capability
   checks.
 
+#### Backed (out-of-core) sparse access
+
+- `scx_open(path)$x_backed(cache_shards=128)` / `scx_backed_sparse(path,
+  cache_shards=128)` — open a lazy, on-demand view of X that reads rows from
+  disk with a shard-level LRU cache instead of materialising the whole matrix
+  (the R equivalent of pyscx `to_anndata(backed=True)` X). Returns an
+  `ScxBackedSparse` that behaves like a read-only sparse matrix:
+  - `dim()` / `nrow()` / `ncol()`; `bsd[i, ]` / `bsd[i, j]` return a `dgCMatrix`
+    of the selected cells (rows) × genes (columns), rows in requested order.
+    Row indices are 1-based; positive-integer and logical indices are supported
+    (negative/character raise). Contiguous ascending `i` uses a single range
+    read; arbitrary/reordered `i` uses a fancy gather.
+  - `bsd$row_sums()` / `bsd$col_sums()` / `bsd$nnz()` — streamed aggregations
+    with no full decode; `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
+    materialise the whole matrix.
+  - Column projection is applied in R on the returned matrix; CSC-sidecar /
+    deletion-vector / multimodal-modality routing (present in pyscx) are not yet
+    wired through the rscx backed path.
+
+#### Lazy transform chains
+
+- `scx_open(path)$x_lazy(cache_shards=128)` / `scx_lazy_transform(path,
+  cache_shards=128)` — open a lazy-transform view of X (the R equivalent of
+  pyscx `ScxLazyTransformedDataset`). Layer preprocessing transforms that are
+  applied **on read** (out-of-core), never materialising the matrix:
+  - `scx_normalize_total(lt, target_sum=1e4)`, `scx_log1p(lt)`,
+    `scx_row_scale(lt, factors)` — pipe-friendly, immutable verbs; each returns
+    a new `ScxLazyTransformed` with the op appended. `normalize_total` uses the
+    per-cell sums of the data as transformed by the chain so far.
+  - `lt[i, j]` returns the transformed `dgCMatrix` for the requested cells/genes
+    (same indexing rules as the backed view); `lt$row_sums()` / `lt$col_sums()`
+    stream over the transformed data; `lt$to_dgcmatrix()` / `as(lt,
+    "dgCMatrix")` materialise the full transformed matrix.
+  - Transforms preserve sparsity, so `nnz` is unchanged. The pyscx extras
+    (arithmetic/comparison interception, CSC dispatch, deletion vectors) are not
+    wired through the rscx path.
+
 #### Analysis accelerators (`scx-accel`, CPU)
 
 Pipe-friendly front ends over the same Rust kernels the Python accelerators
@@ -278,6 +315,38 @@ usable without Seurat installed):
   sets `Idents()` / `seurat_clusters`.
 - `scx_rank_genes_groups(obj, group.by, reference=NULL, tie_correct=FALSE)` —
   Wilcoxon rank-sum DE (FindAllMarkers analog); returns a tidy `data.frame`.
+- `scx_score_genes(obj, gene_list, method="control", ctrl_size=50, n_bins=25,
+  random_state=0, gene_pool=NULL, score_name="score")` — gene-set scoring
+  (scanpy `score_genes` analog; methods `"control"` / `"mean"` / `"zscore"`).
+  Missing genes are dropped with a warning. On a Seurat object writes
+  `obj[[score_name]]` (returned invisibly); on a matrix returns the per-cell
+  score vector.
+- `scx_pseudobulk(obj, group_by, method="sum", min_cells_per_group=0)` —
+  pseudobulk aggregation (cells → group×gene; `"sum"` / `"mean"`). `group_by`
+  is one or more `meta.data` column names (Seurat) or a per-cell label
+  vector/`data.frame` (matrix). Returns a `list(counts, samples, gene_names)`
+  where `counts` is a features×samples matrix and `samples` is a `data.frame`
+  of the groupby columns plus `n_cells` per group.
+- `scx_pseudobulk_dex(obj, group_by, test_col, reference, aggr_method="sum",
+  min_cells_per_group=10, dispersion="cox_reid_shrunk", cooks_filtering=TRUE,
+  independent_filtering=TRUE)` — pseudobulk DE via the **Rust-native
+  negative-binomial GLM** (DESeq2-style, CPU-only; the `pseudobulk_dex(backend=
+  "nb_glm")` / `pdex_nb_glm` analog). Aggregates cells, then fits each
+  non-reference level of `test_col` vs `reference`. **Requires ≥2 pseudobulk
+  replicates per condition** — `group_by` must include `test_col` **and** a
+  replicate column (donor/batch); under-replicated targets are skipped with a
+  warning. Input must be **raw counts** (`layer="counts"`). Returns a tidy
+  `data.frame` with DESeq2-style columns `gene, baseMean, log2FoldChange, lfcSE,
+  stat, pvalue, padj, target, reference` (per-target BH-adjusted `padj`; `lfcSE`
+  on the log2 scale).
+- `scx_nb_glm(counts, design, contrast=NULL, size_factors=NULL,
+  dispersion="cox_reid_shrunk", ...)` — direct NB-GLM on a pre-aggregated
+  genes×samples count matrix + a samples×features `design` (e.g.
+  `model.matrix(~ condition, sampleinfo)`); `contrast` is a 1-based coefficient
+  (default: last). Returns `gene, baseMean, log2FoldChange, lfcSE, stat, pvalue,
+  padj, dispersion, converged`. For no-replicate / log-normalized data use
+  `scx_rank_genes_groups` (Wilcoxon); `pdex_ref` (Wilcoxon pseudobulk) is not
+  separately wired.
 
 Notes:
 - `scx_umap` / `scx_leiden` build their **own** kNN (default `n_neighbors`)
@@ -293,6 +362,27 @@ Notes:
 All are CPU-only (rscx links no GPU feature); for GPU runs use the Python
 accelerators. Joining `scx_harmony_integrate()` / `RunHarmony_scx()` and
 `scx_compute_lisi()`, which predate this set.
+
+#### File operations (options)
+
+`scx_merge` / `scx_compact` / `scx_append` accept the same option surface as the
+matching pyscx functions:
+
+- `scx_merge(inputs, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, assume_identical_var=FALSE, assume_identical_obs=FALSE,
+  uns_policy="first", sort_by=NULL, reverse=FALSE)` — `uns_policy` ∈
+  `first`/`require-equal`/`namespace`/`summary`; `sort_by` is a sorted **k-way**
+  merge (each input must be pre-sorted by the key).
+- `scx_compact(input, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, reshape_obs=FALSE)`.
+- `scx_append(target, input, codec=NULL, shard_size=16384, index_obs=NULL,
+  index_var=NULL, index_preset=NULL, index_auto_threshold=0, modality=NULL)` —
+  `codec` ∈ `auto`/`none`/`scx1`/`zstd`/`lz4`/`pcodec`; `modality` is a NAME on a
+  multimodal target (streams from a reader, preserving per-shard encodings).
+
+Predicate-index presets are `cellxgene`/`perturbseq`/`training`.
+`shard_target_rows` is inherited from the input (not exposed on merge/compact);
+CSC sidecars are dropped by these ops and must be rebuilt separately.
 
 ### CLI surface
 
@@ -1270,6 +1360,8 @@ query" means the method isn't on the handle directly; reach it through
 | `obs_keys()` / `var_keys()`      | ✓                    | ✓                        | — (`$obs()` / `$var()` data.frames) |
 | `is_multimodal()` / `modality_names()` | ✓              | ✓                        | ✓                    |
 | `to_anndata()` / extraction      | ✓                    | via query / `read_cloud` | via `query() …$collect()` |
+| backed (out-of-core) X           | ✓ (`to_anndata(backed=True)`) | — (pull locally) | ✓ (`$x_backed()` / `scx_backed_sparse()`) |
+| lazy transform chain             | ✓ (`ScxLazyTransformedDataset`) | — (pull locally) | ✓ (`$x_lazy()` / `scx_lazy_transform()` + `scx_normalize_total`/`scx_log1p`/`scx_row_scale`) |
 | `to_mudata()` (multimodal)       | ✓                    | — (pull locally)         | `$to_mae()` / `$to_seurat()` |
 | `detection_counts()` / `cells_expressing()` | ✓        | — (pull locally)         | —                    |
 | `query()` builder                | ✓                    | ✓                        | ✓ (`scx_query()`)    |
