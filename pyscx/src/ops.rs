@@ -15,7 +15,6 @@ use arrow::record_batch::RecordBatch;
 
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, SkipReason};
-use scx_format_io::section::SectionType;
 use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
 use scx_format_io::ScxReader;
 
@@ -210,6 +209,7 @@ fn ops_to_pyerr(e: OpsError) -> PyErr {
 #[pyo3(signature = (
     target, input, codec=None, shard_size=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    modality=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn append(
@@ -222,6 +222,7 @@ pub fn append(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    modality: Option<&str>,
 ) -> PyResult<()> {
     let explicit_codec = convert::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
@@ -229,22 +230,47 @@ pub fn append(
     // Open input file
     let input_reader =
         ScxReader::open(input).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-    // Validate n_vars match
     let target_reader =
         ScxReader::open(target).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if target_reader.n_vars() != input_reader.n_vars() {
+
+    // Resolve modality routing (mirrors `scx append --modality`). The same
+    // name addresses the target and the source modality.
+    let target_modality_id = resolve_append_modality(&target_reader, "target", modality)?;
+    let input_modality_id: u8 = if input_reader.is_multimodal() {
+        if target_modality_id == 0 {
+            return Err(PyValueError::new_err(
+                "input file is multimodal but target is single-modality; \
+                 subset the input to a single modality first",
+            ));
+        }
+        // A multimodal target guarantees `modality` is Some here.
+        let name = modality.expect("multimodal target requires modality");
+        input_reader.modality_id(name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "input file has no modality named '{name}'; \
+                 the input must expose the same modality as the target"
+            ))
+        })?
+    } else {
+        0
+    };
+
+    // Per-modality n_vars cross-check.
+    let target_n_vars = modality_n_vars(&target_reader, target_modality_id);
+    let input_n_vars = modality_n_vars(&input_reader, input_modality_id);
+    if target_n_vars != input_n_vars {
         return Err(PyValueError::new_err(format!(
-            "n_vars mismatch: target has {}, input has {}",
-            target_reader.n_vars(),
-            input_reader.n_vars()
+            "n_vars mismatch: target has {target_n_vars}, input has {input_n_vars}"
         )));
     }
     drop(target_reader);
 
-    // Detect value encoding from the first source CSR shard header so we
-    // can resolve Scx1+float fallback before crossing into Rust.
-    let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
+    // Detect value encoding from the first source CSR shard header (for the
+    // source modality) so we can resolve Scx1+float fallback before crossing
+    // into Rust.
+    let csr_entries = input_reader
+        .catalog()
+        .csr_shards_for_modality(input_modality_id);
     let value_encoding = if let Some(first_entry) = csr_entries.first() {
         let bytes = input_reader
             .section_bytes(first_entry)
@@ -255,7 +281,9 @@ pub fn append(
             PyRuntimeError::new_err(format!("unknown value encoding: {}", sh.value_encoding))
         })?
     } else {
-        return Err(PyRuntimeError::new_err("input file has no CSR shards"));
+        return Err(PyRuntimeError::new_err(format!(
+            "input file has no CSR shards for modality {input_modality_id}"
+        )));
     };
 
     // Resolve codec selection. None / "auto" → CodecSelection::Auto.
@@ -266,7 +294,7 @@ pub fn append(
     let options = scx_ops::AppendOptions {
         codec: codec_selection,
         shard_target_rows,
-        modality_id: 0,
+        modality_id: target_modality_id,
     };
 
     let target_path = PathBuf::from(target);
@@ -278,7 +306,7 @@ pub fn append(
                         &target_path,
                         &input_reader,
                         &options,
-                        0,
+                        input_modality_id,
                         &index_opts,
                     )
                 })
@@ -286,8 +314,15 @@ pub fn append(
             process_index_summary(py, summary)?;
         }
         None => {
-            py.detach(|| scx_ops::append_from_reader(&target_path, &input_reader, &options, 0))
-                .map_err(ops_to_pyerr)?;
+            py.detach(|| {
+                scx_ops::append_from_reader(
+                    &target_path,
+                    &input_reader,
+                    &options,
+                    input_modality_id,
+                )
+            })
+            .map_err(ops_to_pyerr)?;
         }
     }
 
@@ -311,6 +346,7 @@ pub fn append(
 #[pyo3(signature = (
     target, adata, codec=None, shard_size=None, in_place=false,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None,
+    modality=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn append_from_anndata(
@@ -324,6 +360,7 @@ pub fn append_from_anndata(
     index_var: Option<Vec<String>>,
     index_preset: Option<String>,
     index_auto_threshold: Option<usize>,
+    modality: Option<&str>,
 ) -> PyResult<()> {
     let explicit_codec = convert::parse_codec(codec)?;
     let shard_target_rows = validate_shard_size(shard_size)?;
@@ -338,11 +375,12 @@ pub fn append_from_anndata(
 
     let target_reader =
         ScxReader::open(target).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if target_reader.n_vars() != n_vars {
+    // Resolve the target modality (the AnnData source is a plain global axis).
+    let target_modality_id = resolve_append_modality(&target_reader, "target", modality)?;
+    let target_n_vars = modality_n_vars(&target_reader, target_modality_id);
+    if target_n_vars != n_vars {
         return Err(PyValueError::new_err(format!(
-            "n_vars mismatch: target has {}, AnnData has {}",
-            target_reader.n_vars(),
-            n_vars
+            "n_vars mismatch: target has {target_n_vars}, AnnData has {n_vars}"
         )));
     }
     drop(target_reader);
@@ -426,7 +464,7 @@ pub fn append_from_anndata(
     let options = scx_ops::AppendOptions {
         codec: codec_selection,
         shard_target_rows,
-        modality_id: 0,
+        modality_id: target_modality_id,
     };
 
     let target_path = PathBuf::from(target);
@@ -668,6 +706,99 @@ pub fn sort(
 }
 
 // ---------------------------------------------------------------------------
+// C5b. pyscx.build_csc()
+// ---------------------------------------------------------------------------
+
+/// Build a CSC (column-major) sidecar from an existing file's CSR shards.
+///
+/// Standalone equivalent of the `scx build-csc` CLI command: reads CSR
+/// shards from `input` and writes both the CSR shards and a freshly built
+/// CSC sidecar to `output`. CSC sidecars are the column-major substrate for
+/// DE / HVG / per-gene QC / pseudobulk and the GPU `pdex_ref` CSC-direct
+/// route.
+///
+/// For an in-place rebuild use `pyscx.sort(..., rebuild_csc=True)`; to emit
+/// a sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
+///
+/// Parameters:
+///   input              — SCX file containing CSR shards.
+///   output             — destination file (gets CSR + the new CSC shards).
+///   memory_limit       — transpose working-set budget; accepts binary-
+///                        prefixed sizes (`"4G"`, `"512MiB"`). Default "4G".
+///   force              — overwrite `output` if it already exists.
+///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
+///                        shard, memory permitting). Default 5000.
+///
+/// Example:
+///     pyscx.build_csc("counts.scx", "counts_csc.scx")
+#[pyfunction]
+#[pyo3(signature = (input, output, memory_limit="4G".to_string(), force=false, csc_cols_per_shard=5000))]
+pub fn build_csc(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    memory_limit: String,
+    force: bool,
+    csc_cols_per_shard: usize,
+) -> PyResult<()> {
+    // Fail fast with a clean ValueError on a malformed size string;
+    // run_build_csc re-parses it internally with the same parser, so the
+    // two cannot drift.
+    scx_format_io::MemoryBudget::parse(&memory_limit).map_err(PyValueError::new_err)?;
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
+
+    // Guard against `input == output`: run_build_csc removes `output` (when
+    // `force`) before opening `input`, so an aliased path would delete the
+    // source and then fail to open it. Compare canonicalized paths when both
+    // resolve, falling back to a literal string compare for a not-yet-created
+    // output.
+    let same_file = match (
+        std::fs::canonicalize(&input_path),
+        std::fs::canonicalize(&output_path),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => input_path == output_path,
+    };
+    if same_file {
+        return Err(PyValueError::new_err(
+            "input and output must be different files; build_csc writes the \
+             CSR + new CSC sidecar to `output` (use a distinct path, or \
+             sort(..., rebuild_csc=True) for an in-place rebuild)",
+        ));
+    }
+
+    // `run_build_csc` is not modality-aware — it flattens every CSR shard
+    // against the single top-level n_obs × n_vars shape, which would corrupt
+    // the sidecar on a multimodal input. Reject it with a clear error.
+    let input_reader =
+        ScxReader::open(&input_path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    if input_reader.is_multimodal() {
+        return Err(PyValueError::new_err(
+            "build_csc does not support multimodal files; subset to a single \
+             modality first (scx subset --modality NAME)",
+        ));
+    }
+    drop(input_reader);
+
+    // `run_build_csc` returns `Box<dyn Error>` (not `Send`), so stringify the
+    // error inside the closure to cross `py.detach`, mirroring sort()'s CSC
+    // rebuild path.
+    py.detach(|| {
+        scx_ops::run_build_csc(
+            &input_path,
+            &output_path,
+            &memory_limit,
+            force,
+            csc_cols_per_shard,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // C6. pyscx.rollback()
 // ---------------------------------------------------------------------------
 
@@ -882,9 +1013,60 @@ fn dense_dict_to_batches(
     Ok(out)
 }
 
+/// Resolve a `modality` NAME against a reader to a `modality_id`, mirroring
+/// the `scx append --modality` semantics: required on multimodal files,
+/// rejected on single-modality files, and `0` (global / legacy) when omitted.
+/// `label` ("target" / "input") is woven into error messages.
+fn resolve_append_modality(
+    reader: &ScxReader,
+    label: &str,
+    modality: Option<&str>,
+) -> PyResult<u8> {
+    if reader.is_multimodal() {
+        match modality {
+            Some(name) => reader.modality_id(name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "{label} file has no modality named '{name}'; \
+                     use Experiment.modality_names to list them"
+                ))
+            }),
+            None => Err(PyValueError::new_err(format!(
+                "{label} file is multimodal ({} modalities); pass modality=NAME",
+                reader.n_modalities()
+            ))),
+        }
+    } else if let Some(name) = modality {
+        Err(PyValueError::new_err(format!(
+            "{label} file is single-modality but modality='{name}' was passed; omit it"
+        )))
+    } else {
+        Ok(0)
+    }
+}
+
+/// Per-modality `n_vars` (file-wide `header.n_vars` for the global modality 0).
+fn modality_n_vars(reader: &ScxReader, modality_id: u8) -> u64 {
+    if modality_id == 0 {
+        reader.header().n_vars
+    } else {
+        // Fallback to the file-wide `n_vars` when a non-zero id has no
+        // modality descriptor — mirrors `scx-cli/src/append.rs` so the two
+        // front-ends stay consistent (a broken descriptor falls back rather
+        // than hard-failing here; the deeper `n_minor` check still guards).
+        reader
+            .modality_info(modality_id)
+            .map(|i| i.n_vars)
+            .unwrap_or(reader.header().n_vars)
+    }
+}
+
 /// Resolve the optional `modality` kwarg to a `modality_id`. Only the
 /// global modality (`0`) is supported today; non-zero ids reach the Rust
 /// layer which returns a clear `MultimodalUnsupported` error.
+///
+/// See also `resolve_append_modality` above, which resolves a modality
+/// *name* against a reader (used by `append` / `append_from_anndata`); this
+/// integer-only variant is for `modify_metadata`.
 fn resolve_modality_id(modality: Option<&Bound<'_, PyAny>>) -> PyResult<u8> {
     match modality {
         None => Ok(0),

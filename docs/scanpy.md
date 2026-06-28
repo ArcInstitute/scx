@@ -402,6 +402,37 @@ for name, passed in results:
         raise RuntimeError(f"section {name} failed checksum")
 ```
 
+### Deep validation (`deep=True`)
+
+Checksum validation proves the section bytes match what was written, but not
+that those bytes *decode* to a well-formed sparse matrix. For decode-level
+integrity, pass `deep=True` (the equivalent of `scx validate --deep`):
+
+```python
+results = pyscx.validate("data.scx", deep=True)   # or exp.validate(deep=True)
+for name, passed in results:
+    if not passed:
+        raise RuntimeError(f"{name} failed validation")
+```
+
+On top of the per-section checksums, deep mode:
+
+- decodes every sparse shard and verifies the **v3 canonical CSR invariant**
+  (column indices sorted and in range, no explicit zeros, `indptr` starting at
+  0 and monotonically increasing, metadata consistent with the decoded data);
+- verifies every **decode sidecar** — structural linkage to its source shard
+  plus a decode-parity check that seeking through the sidecar's recorded
+  Rice-block offsets reproduces the canonical decode byte-for-byte.
+
+Deep-check results are appended to the returned list with `canonical-csr ` and
+`decode-sidecar ` prefixed names. Canonical-CSR checks run only on v3+ files
+(pre-v3 files may legitimately carry unsorted shards, so they are skipped).
+Unlike a checksum failure on an essential section — which raises — deep-check
+failures report `False` in the result list rather than raising, so iterate the
+list to surface them. Cost is higher than a checksum-only pass because every
+shard is decoded; reserve it for post-write or post-transfer integrity gates
+where decode correctness matters.
+
 ## Understanding `to_anndata()`
 
 ### Full signature
@@ -1327,7 +1358,8 @@ choice locally.
 raises `RuntimeError` with a message naming the missing capability:
 
 1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
-   `scx convert --csc=always|auto`, or `scx build-csc`).
+   `scx convert --csc=always|auto`, `scx build-csc`, or the standalone
+   `pyscx.build_csc(input, output)` to add one to an existing file).
 2. The transform chain on `adata.X` contains only column-local
    operations. `Log1p` is column-local; `NormalizeTotal` and
    `RowScale` are not (per-row state). The common `normalize_total →
