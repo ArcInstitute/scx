@@ -161,11 +161,13 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 ///         print(f"{name}: {'OK' if passed else 'FAIL'}")
 #[pyfunction]
 #[pyo3(signature = (path, deep=false))]
-fn validate(path: &str, deep: bool) -> PyResult<Vec<(String, bool)>> {
+fn validate(py: Python<'_>, path: &str, deep: bool) -> PyResult<Vec<(String, bool)>> {
     let reader = scx_format_io::ScxReader::open(path).map_err(to_pyerr)?;
     let mut results = reader.validate().map_err(to_pyerr)?;
     if deep {
-        deep_validate_into(&reader, &mut results);
+        // Deep validation re-decodes every shard (CPU-bound, pure Rust) — run
+        // it off the GIL so other Python threads aren't blocked on large files.
+        py.detach(|| deep_validate_into(&reader, &mut results));
     }
     Ok(results)
 }

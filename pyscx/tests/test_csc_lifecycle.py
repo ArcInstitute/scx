@@ -183,12 +183,48 @@ def test_build_csc_force_overwrite(small_adata, tmp_path):
     pyscx.build_csc(str(src), str(out), csc_cols_per_shard=4)
 
     # Re-building onto an existing output without force must fail.
-    with pytest.raises(Exception):  # noqa: B017 — RuntimeError from the ops layer
+    with pytest.raises(RuntimeError):
         pyscx.build_csc(str(src), str(out), csc_cols_per_shard=4)
 
     # force=True succeeds and the sidecar is still present.
     pyscx.build_csc(str(src), str(out), force=True, csc_cols_per_shard=4)
     assert pyscx.open(str(out)).has_csc is True
+
+
+def test_build_csc_rejects_same_input_output(small_adata, tmp_path):
+    """input == output is rejected up front (run_build_csc would delete the
+    source before reopening it)."""
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    pyscx.from_anndata(small_adata, str(src))
+
+    with pytest.raises(ValueError, match="different files"):
+        pyscx.build_csc(str(src), str(src), force=True)
+
+
+def test_build_csc_rejects_multimodal(tmp_path):
+    """build_csc is not modality-aware; a multimodal input is rejected."""
+    import anndata as ad
+    import pyscx
+
+    pytest.importorskip("mudata")
+    import mudata
+
+    rng = np.random.default_rng(5)
+    rna = ad.AnnData(X=sp.csr_matrix(rng.poisson(0.4, (16, 12)).astype(np.float32)))
+    rna.var_names = [f"g{i}" for i in range(12)]
+    adt = ad.AnnData(X=sp.csr_matrix(rng.poisson(0.4, (16, 4)).astype(np.float32)))
+    adt.var_names = [f"a{i}" for i in range(4)]
+    mu = mudata.MuData({"rna": rna, "adt": adt})
+    mu.obs_names = [f"c{i}" for i in range(16)]
+
+    src = tmp_path / "cite.scx"
+    out = tmp_path / "cite_csc.scx"
+    pyscx.from_mudata(mu, str(src))
+
+    with pytest.raises(ValueError, match="multimodal"):
+        pyscx.build_csc(str(src), str(out))
 
 
 def test_build_csc_rejects_bad_memory_limit(small_adata, tmp_path):

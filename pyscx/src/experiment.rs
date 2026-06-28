@@ -1071,10 +1071,12 @@ impl PyExperiment {
     ///
     /// Returns a list of (section_name, passed) tuples.
     #[pyo3(signature = (deep=false))]
-    fn validate(&self, deep: bool) -> PyResult<Vec<(String, bool)>> {
+    fn validate(&self, py: Python<'_>, deep: bool) -> PyResult<Vec<(String, bool)>> {
         let mut results = self.reader.validate().map_err(to_pyerr)?;
         if deep {
-            crate::deep_validate_into(&self.reader, &mut results);
+            // Deep validation re-decodes every shard (CPU-bound, pure Rust) —
+            // run it off the GIL so other Python threads aren't blocked.
+            py.detach(|| crate::deep_validate_into(&self.reader, &mut results));
         }
         Ok(results)
     }
