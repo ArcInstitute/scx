@@ -319,7 +319,20 @@ class Experiment:
     def var_keys(self) -> list[str]: ...
     def obsm_keys(self) -> list[str]: ...
     def varm_keys(self) -> list[str]: ...
-    def uns_keys(self) -> list[str]: ...
+    def uns_keys(self, modality: str | None = ...) -> list[str]: ...
+    def read_uns(self, modality: str | None = ...) -> dict | None:
+        """Full `uns` dict with tagged envelopes reconstructed.
+
+        Reads only the small `uns` JSON section — does not materialize
+        obs, var, obsm, or X. Returns ``None`` when the file has no
+        `uns` section. Safe on multi-hundred-GB atlases where
+        ``to_anndata()`` would OOM.
+
+        On multimodal files, pass ``modality=<name>`` to read that
+        modality's ``uns/<name>`` section instead of the global one.
+        Unknown modality names raise ``KeyError``.
+        """
+        ...
 
     def info(self) -> str:
         """One-line codec / shard / format-version internals."""
