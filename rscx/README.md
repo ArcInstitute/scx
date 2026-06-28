@@ -91,6 +91,31 @@ scx_info("experiment.scx")
 scx_validate("experiment.scx")
 ```
 
+## Backed (out-of-core) access
+
+`exp$x_matrix()` materialises the whole matrix in memory. For atlas-scale files
+that don't fit in RAM, open a **backed** view instead: it reads rows from disk on
+demand with a shard-level LRU cache, and behaves like a read-only sparse matrix.
+
+```r
+exp <- scx_open("atlas.scx")
+bsd <- exp$x_backed()                  # lazy; no data read yet
+# (or, standalone:)  bsd <- scx_backed_sparse("atlas.scx")
+
+dim(bsd)                               # c(n_obs, n_vars), so nrow()/ncol() work
+first100 <- bsd[1:100, ]               # dgCMatrix of those cells x all genes
+subset   <- bsd[c(5, 1, 3), 1:10]      # arbitrary rows (in order) x first 10 genes
+mask_rows <- bsd[exp$obs()$tissue == "lung", ]   # logical row index
+
+gene_totals <- bsd$col_sums()          # streamed aggregations, no full decode
+cell_totals <- bsd$row_sums()
+```
+
+Row indices are 1-based (R convention); positive-integer and logical indices are
+supported (negative/character row indices are not). A column index is applied to
+the returned `dgCMatrix`. Use `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
+materialise the full matrix when you do want it all in memory.
+
 ## Getting data out of a query
 
 `collect()` returns an `RQueryResult`. Because it is an extendr object, its

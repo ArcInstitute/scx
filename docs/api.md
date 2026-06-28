@@ -256,6 +256,25 @@ LRU thrashing across modalities.
 - `scx_open(path)$is_multimodal()` / `$modality_names()` — capability
   checks.
 
+#### Backed (out-of-core) sparse access
+
+- `scx_open(path)$x_backed(cache_shards=128)` / `scx_backed_sparse(path,
+  cache_shards=128)` — open a lazy, on-demand view of X that reads rows from
+  disk with a shard-level LRU cache instead of materialising the whole matrix
+  (the R equivalent of pyscx `to_anndata(backed=True)` X). Returns an
+  `ScxBackedSparse` that behaves like a read-only sparse matrix:
+  - `dim()` / `nrow()` / `ncol()`; `bsd[i, ]` / `bsd[i, j]` return a `dgCMatrix`
+    of the selected cells (rows) × genes (columns), rows in requested order.
+    Row indices are 1-based; positive-integer and logical indices are supported
+    (negative/character raise). Contiguous ascending `i` uses a single range
+    read; arbitrary/reordered `i` uses a fancy gather.
+  - `bsd$row_sums()` / `bsd$col_sums()` / `bsd$nnz()` — streamed aggregations
+    with no full decode; `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
+    materialise the whole matrix.
+  - Column projection is applied in R on the returned matrix; CSC-sidecar /
+    deletion-vector / multimodal-modality routing (present in pyscx) are not yet
+    wired through the rscx backed path.
+
 #### Analysis accelerators (`scx-accel`, CPU)
 
 Pipe-friendly front ends over the same Rust kernels the Python accelerators
@@ -1270,6 +1289,7 @@ query" means the method isn't on the handle directly; reach it through
 | `obs_keys()` / `var_keys()`      | ✓                    | ✓                        | — (`$obs()` / `$var()` data.frames) |
 | `is_multimodal()` / `modality_names()` | ✓              | ✓                        | ✓                    |
 | `to_anndata()` / extraction      | ✓                    | via query / `read_cloud` | via `query() …$collect()` |
+| backed (out-of-core) X           | ✓ (`to_anndata(backed=True)`) | — (pull locally) | ✓ (`$x_backed()` / `scx_backed_sparse()`) |
 | `to_mudata()` (multimodal)       | ✓                    | — (pull locally)         | `$to_mae()` / `$to_seurat()` |
 | `detection_counts()` / `cells_expressing()` | ✓        | — (pull locally)         | —                    |
 | `query()` builder                | ✓                    | ✓                        | ✓ (`scx_query()`)    |

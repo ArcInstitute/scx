@@ -31,10 +31,37 @@ ScxExperiment$new <- function(path) {
     .Call(wrap__ScxExperiment__modality_names, self$.ptr)
   self$to_seurat <- function() .Call(wrap__ScxExperiment__to_seurat, self$.ptr)
   self$to_mae <- function() .Call(wrap__ScxExperiment__to_mae, self$.ptr)
+  # Backed (lazy) X access — see R/backed.R for the [ / dim / print methods.
+  self$x_backed <- function(cache_shards = 128) {
+    ScxBackedSparse$.wrap(
+      .Call(wrap__ScxExperiment__x_backed, self$.ptr, as.numeric(cache_shards))
+    )
+  }
   class(self) <- "ScxExperiment"
   self
 }
 class(ScxExperiment) <- "ScxExperiment__class"
+
+# ── ScxBackedSparse class ───────────────────────────────────────
+#' @export
+ScxBackedSparse <- new.env(parent = emptyenv())
+ScxBackedSparse$.wrap <- function(ptr) {
+  self <- new.env(parent = emptyenv())
+  self$.ptr <- ptr
+  self$n_obs <- function() .Call(wrap__RBackedSparse__n_obs, self$.ptr)
+  self$n_vars <- function() .Call(wrap__RBackedSparse__n_vars, self$.ptr)
+  self$nnz <- function() .Call(wrap__RBackedSparse__nnz, self$.ptr)
+  self$read_rows <- function(start, end)
+    .Call(wrap__RBackedSparse__read_rows, self$.ptr, as.numeric(start), as.numeric(end))
+  self$read_row_indices <- function(indices)
+    .Call(wrap__RBackedSparse__read_row_indices, self$.ptr, as.numeric(indices))
+  self$row_sums <- function() .Call(wrap__RBackedSparse__row_sums, self$.ptr)
+  self$col_sums <- function() .Call(wrap__RBackedSparse__col_sums, self$.ptr)
+  self$to_dgcmatrix <- function() .Call(wrap__RBackedSparse__to_dgcmatrix, self$.ptr)
+  class(self) <- "ScxBackedSparse"
+  self
+}
+class(ScxBackedSparse) <- "ScxBackedSparse__class"
 
 # ── RQueryPipeline class ────────────────────────────────────────
 #' @export

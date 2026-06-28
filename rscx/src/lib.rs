@@ -5,6 +5,7 @@ use scx_engine::pipeline::QueryResult;
 use scx_format_io::ScxReader;
 
 mod accel;
+mod backed;
 mod harmony;
 mod interop;
 mod lisi;
@@ -12,6 +13,7 @@ mod ops;
 mod query;
 mod util;
 
+pub use backed::RBackedSparse;
 pub use query::{RQueryPipeline, RQueryResult};
 
 // ── Phase B: Core Reader ────────────────────────────────────────
@@ -87,6 +89,17 @@ impl ScxExperiment {
             .to_str()
             .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
         RQueryPipeline::from_path(path)
+    }
+
+    /// Fallible body of `x_backed`: open a lazy, on-demand backed reader over
+    /// this file's X. Re-opens the file (the backed reader owns its own
+    /// `ScxReader`), exactly like `query_impl`.
+    fn x_backed_impl(&self, cache_shards: usize) -> Result<RBackedSparse> {
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
+        RBackedSparse::open_impl(path, cache_shards)
     }
 
     /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
@@ -218,6 +231,18 @@ impl ScxExperiment {
         crate::util::throw_on_err(self.query_impl())
     }
 
+    /// Open a lazy, on-demand backed view of X (no data read yet).
+    ///
+    /// Returns an `RBackedSparse` that reads rows from disk on demand with a
+    /// shard-level LRU cache (`cache_shards` shards). Use it to slice
+    /// atlas-scale files row-by-row instead of materialising the whole matrix
+    /// via `x_matrix()`.
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn x_backed(&self, cache_shards: f64) -> Robj {
+        util::throw_on_err(self.x_backed_impl(cache_shards as usize))
+    }
+
     /// Phase I.1: True if this file has a registered modality table.
     fn is_multimodal(&self) -> bool {
         self.reader.is_multimodal()
@@ -264,6 +289,7 @@ impl ScxExperiment {
 extendr_module! {
     mod rscx;
     use query;
+    use backed;
     use ops;
     use interop;
     use harmony;
