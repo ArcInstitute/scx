@@ -363,6 +363,27 @@ All are CPU-only (rscx links no GPU feature); for GPU runs use the Python
 accelerators. Joining `scx_harmony_integrate()` / `RunHarmony_scx()` and
 `scx_compute_lisi()`, which predate this set.
 
+#### File operations (options)
+
+`scx_merge` / `scx_compact` / `scx_append` accept the same option surface as the
+matching pyscx functions:
+
+- `scx_merge(inputs, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, assume_identical_var=FALSE, assume_identical_obs=FALSE,
+  uns_policy="first", sort_by=NULL, reverse=FALSE)` — `uns_policy` ∈
+  `first`/`require-equal`/`namespace`/`summary`; `sort_by` is a sorted **k-way**
+  merge (each input must be pre-sorted by the key).
+- `scx_compact(input, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, reshape_obs=FALSE)`.
+- `scx_append(target, input, codec=NULL, shard_size=16384, index_obs=NULL,
+  index_var=NULL, index_preset=NULL, index_auto_threshold=0, modality=NULL)` —
+  `codec` ∈ `auto`/`none`/`scx1`/`zstd`/`lz4`/`pcodec`; `modality` is a NAME on a
+  multimodal target (streams from a reader, preserving per-shard encodings).
+
+Predicate-index presets are `cellxgene`/`perturbseq`/`training`.
+`shard_target_rows` is inherited from the input (not exposed on merge/compact);
+CSC sidecars are dropped by these ops and must be rebuilt separately.
+
 ### CLI surface
 
 ```

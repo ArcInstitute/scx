@@ -86,10 +86,25 @@ scx_compact("experiment.scx", "clean.scx")
 scx_rollback("experiment.scx")
 scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")
 
+# ...with options (mirroring pyscx):
+scx_merge(c("b1.scx", "b2.scx"), "atlas.scx",
+          assume_identical_var = TRUE, uns_policy = "namespace",
+          index_obs = "cell_type")
+scx_append("atlas.scx", "rna_batch.scx", codec = "zstd", shard_size = 32768L,
+           modality = "rna")               # modality = a name on a multimodal file
+scx_compact("experiment.scx", "clean.scx", index_obs = "cell_type",
+            reshape_obs = TRUE)
+
 # File info and validation
 scx_info("experiment.scx")
 scx_validate("experiment.scx")
 ```
+
+`scx_merge` / `scx_compact` / `scx_append` accept the same option set as pyscx
+(predicate-index columns via `index_obs`/`index_var`/`index_preset`, `uns_policy`
+and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` on
+append, `reshape_obs` on compact). `shard_target_rows` is inherited from the
+input; CSC sidecars are dropped by these ops (rebuild separately).
 
 ## Backed (out-of-core) access
 
