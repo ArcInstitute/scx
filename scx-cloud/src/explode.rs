@@ -16,11 +16,9 @@
 //!   ├── layers/             (optional)
 //!   └── uns.json            (optional)
 
-use std::io::Cursor;
+use std::io::Write;
 use std::path::Path;
 
-use scx_format_io::catalog::FullCatalog;
-use scx_format_io::header::{FileHeader, HEADER_SIZE};
 use scx_format_io::section::SectionType;
 
 use crate::error::Result;
@@ -28,40 +26,23 @@ use crate::error::Result;
 /// Explode a packed `.scx` file into a directory of individual section files.
 ///
 /// The `_catalog.bin` is written last for atomic-publish semantics.
+///
+/// Streams each section's byte range from the source in bounded chunks — peak
+/// memory is `O(chunk size)`, independent of the source-file size, so this
+/// works on multi-TB atlases that don't fit in RAM.
 pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
-    let input_data = std::fs::read(input)?;
-    let header = FileHeader::read_from(&mut Cursor::new(&input_data[..HEADER_SIZE]))?;
-
-    // Read full catalog
-    let fc_offset = header.full_catalog_offset as usize;
-    let fc_length = header.full_catalog_length as usize;
-    let fc_end = fc_offset.checked_add(fc_length).ok_or_else(|| {
-        crate::error::CloudError::SliceBoundsExceeded {
-            offset: fc_offset,
-            length: fc_length,
-            data_len: input_data.len(),
-        }
-    })?;
-    if fc_end > input_data.len() {
-        return Err(crate::error::CloudError::SliceBoundsExceeded {
-            offset: fc_offset,
-            length: fc_length,
-            data_len: input_data.len(),
-        });
-    }
-    let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&input_data[fc_offset..fc_end]),
-        fc_length,
-        true,
-    )?;
+    // Read only the header + catalog (KB–MB), not the whole file.
+    let (_header, full_catalog) = crate::streaming::read_header_and_catalog(input)?;
+    let mut src = std::fs::File::open(input)?;
 
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
 
-    // Write _header.bin
-    std::fs::write(output_dir.join("_header.bin"), &input_data[..HEADER_SIZE])?;
+    // Write _header.bin (raw 256-byte header, byte-identical to source).
+    let header_bytes = crate::streaming::read_raw_header(input)?;
+    std::fs::write(output_dir.join("_header.bin"), &header_bytes[..])?;
 
-    // Write each section to its mapped file path
+    // Stream each section to its mapped file path.
     for entry in &full_catalog.entries {
         let rel_path = section_name_to_path(&entry.name, entry.section_type).map_err(|e| {
             crate::error::CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
@@ -73,24 +54,9 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Copy section bytes verbatim
-        let src_start = entry.offset as usize;
-        let src_len = entry.length as usize;
-        let src_end = src_start.checked_add(src_len).ok_or_else(|| {
-            crate::error::CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: input_data.len(),
-            }
-        })?;
-        if src_end > input_data.len() {
-            return Err(crate::error::CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: input_data.len(),
-            });
-        }
-        std::fs::write(&file_path, &input_data[src_start..src_end])?;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&file_path)?);
+        crate::streaming::copy_section(&mut src, entry.offset, entry.length, &mut out)?;
+        out.flush()?;
     }
 
     // Write _catalog.bin LAST (atomic-publish semantics)

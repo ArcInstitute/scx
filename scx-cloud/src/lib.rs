@@ -9,6 +9,7 @@ pub mod pull;
 pub mod push;
 pub mod retry;
 pub mod section_reader;
+pub(crate) mod streaming;
 
 pub use backend::{create_backend, create_backend_with_retry, parse_location, CloudLocation};
 pub use cloud_optimize::cloud_optimize;
