@@ -116,6 +116,27 @@ supported (negative/character row indices are not). A column index is applied to
 the returned `dgCMatrix`. Use `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
 materialise the full matrix when you do want it all in memory.
 
+### Lazy transform chains
+
+`scx_lazy_transform()` (or `exp$x_lazy()`) layers a chain of preprocessing
+transforms — `normalize_total`, `log1p`, `row_scale` — on top of the backed
+reader. The transforms are applied **on read**, so the canonical
+normalize → log1p pipeline runs out-of-core: nothing is materialised until you
+slice. The verbs are pipe-friendly and immutable (each returns a new handle):
+
+```r
+lt <- scx_lazy_transform("atlas.scx") |>
+  scx_normalize_total(target_sum = 1e4) |>
+  scx_log1p()
+
+lt[1:100, ]          # transformed dgCMatrix (cells x genes), computed on demand
+lt$col_sums()        # streamed over the transformed data, no full decode
+as(lt, "dgCMatrix")  # materialise the whole transformed matrix when needed
+```
+
+`scx_row_scale(lt, factors)` multiplies each cell by a per-cell factor (length
+`nrow(lt)`). Indexing and coercion behave the same as the backed view above.
+
 ## Getting data out of a query
 
 `collect()` returns an `RQueryResult`. Because it is an extendr object, its

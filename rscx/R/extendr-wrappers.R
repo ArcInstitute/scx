@@ -37,6 +37,12 @@ ScxExperiment$new <- function(path) {
       .Call(wrap__ScxExperiment__x_backed, self$.ptr, as.numeric(cache_shards))
     )
   }
+  # Lazy transform chain — see R/lazy.R for the chainable transform verbs.
+  self$x_lazy <- function(cache_shards = 128) {
+    ScxLazyTransformed$.wrap(
+      .Call(wrap__ScxExperiment__x_lazy, self$.ptr, as.numeric(cache_shards))
+    )
+  }
   class(self) <- "ScxExperiment"
   self
 }
@@ -62,6 +68,35 @@ ScxBackedSparse$.wrap <- function(ptr) {
   self
 }
 class(ScxBackedSparse) <- "ScxBackedSparse__class"
+
+# ── ScxLazyTransformed class ────────────────────────────────────
+#' @export
+ScxLazyTransformed <- new.env(parent = emptyenv())
+ScxLazyTransformed$.wrap <- function(ptr) {
+  self <- new.env(parent = emptyenv())
+  self$.ptr <- ptr
+  self$n_obs <- function() .Call(wrap__RLazyTransformed__n_obs, self$.ptr)
+  self$n_vars <- function() .Call(wrap__RLazyTransformed__n_vars, self$.ptr)
+  self$nnz <- function() .Call(wrap__RLazyTransformed__nnz, self$.ptr)
+  self$transform_names <- function() .Call(wrap__RLazyTransformed__transform_names, self$.ptr)
+  # Transform verbs each return a NEW lazy handle (immutable chain).
+  self$normalize_total <- function(target_sum)
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__normalize_total, self$.ptr, as.numeric(target_sum)))
+  self$log1p <- function()
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__log1p, self$.ptr))
+  self$row_scale <- function(factors)
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__row_scale, self$.ptr, as.numeric(factors)))
+  self$read_rows <- function(start, end)
+    .Call(wrap__RLazyTransformed__read_rows, self$.ptr, as.numeric(start), as.numeric(end))
+  self$read_row_indices <- function(indices)
+    .Call(wrap__RLazyTransformed__read_row_indices, self$.ptr, as.numeric(indices))
+  self$row_sums <- function() .Call(wrap__RLazyTransformed__row_sums, self$.ptr)
+  self$col_sums <- function() .Call(wrap__RLazyTransformed__col_sums, self$.ptr)
+  self$to_dgcmatrix <- function() .Call(wrap__RLazyTransformed__to_dgcmatrix, self$.ptr)
+  class(self) <- "ScxLazyTransformed"
+  self
+}
+class(ScxLazyTransformed) <- "ScxLazyTransformed__class"
 
 # ── RQueryPipeline class ────────────────────────────────────────
 #' @export

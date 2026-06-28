@@ -275,6 +275,24 @@ LRU thrashing across modalities.
     deletion-vector / multimodal-modality routing (present in pyscx) are not yet
     wired through the rscx backed path.
 
+#### Lazy transform chains
+
+- `scx_open(path)$x_lazy(cache_shards=128)` / `scx_lazy_transform(path,
+  cache_shards=128)` — open a lazy-transform view of X (the R equivalent of
+  pyscx `ScxLazyTransformedDataset`). Layer preprocessing transforms that are
+  applied **on read** (out-of-core), never materialising the matrix:
+  - `scx_normalize_total(lt, target_sum=1e4)`, `scx_log1p(lt)`,
+    `scx_row_scale(lt, factors)` — pipe-friendly, immutable verbs; each returns
+    a new `ScxLazyTransformed` with the op appended. `normalize_total` uses the
+    per-cell sums of the data as transformed by the chain so far.
+  - `lt[i, j]` returns the transformed `dgCMatrix` for the requested cells/genes
+    (same indexing rules as the backed view); `lt$row_sums()` / `lt$col_sums()`
+    stream over the transformed data; `lt$to_dgcmatrix()` / `as(lt,
+    "dgCMatrix")` materialise the full transformed matrix.
+  - Transforms preserve sparsity, so `nnz` is unchanged. The pyscx extras
+    (arithmetic/comparison interception, CSC dispatch, deletion vectors) are not
+    wired through the rscx path.
+
 #### Analysis accelerators (`scx-accel`, CPU)
 
 Pipe-friendly front ends over the same Rust kernels the Python accelerators
@@ -1302,6 +1320,7 @@ query" means the method isn't on the handle directly; reach it through
 | `is_multimodal()` / `modality_names()` | ✓              | ✓                        | ✓                    |
 | `to_anndata()` / extraction      | ✓                    | via query / `read_cloud` | via `query() …$collect()` |
 | backed (out-of-core) X           | ✓ (`to_anndata(backed=True)`) | — (pull locally) | ✓ (`$x_backed()` / `scx_backed_sparse()`) |
+| lazy transform chain             | ✓ (`ScxLazyTransformedDataset`) | — (pull locally) | ✓ (`$x_lazy()` / `scx_lazy_transform()` + `scx_normalize_total`/`scx_log1p`/`scx_row_scale`) |
 | `to_mudata()` (multimodal)       | ✓                    | — (pull locally)         | `$to_mae()` / `$to_seurat()` |
 | `detection_counts()` / `cells_expressing()` | ✓        | — (pull locally)         | —                    |
 | `query()` builder                | ✓                    | ✓                        | ✓ (`scx_query()`)    |

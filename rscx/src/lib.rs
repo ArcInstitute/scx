@@ -8,12 +8,14 @@ mod accel;
 mod backed;
 mod harmony;
 mod interop;
+mod lazy;
 mod lisi;
 mod ops;
 mod query;
 mod util;
 
 pub use backed::RBackedSparse;
+pub use lazy::RLazyTransformed;
 pub use query::{RQueryPipeline, RQueryResult};
 
 // ── Phase B: Core Reader ────────────────────────────────────────
@@ -100,6 +102,16 @@ impl ScxExperiment {
             .to_str()
             .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
         RBackedSparse::open_impl(path, cache_shards)
+    }
+
+    /// Fallible body of `x_lazy`: open a lazy-transform handle (empty chain)
+    /// over this file's X, ready for `normalize_total`/`log1p`/`row_scale`.
+    fn x_lazy_impl(&self, cache_shards: usize) -> Result<RLazyTransformed> {
+        let path = self
+            .path
+            .to_str()
+            .ok_or_else(|| Error::Other("file path is not valid UTF-8".into()))?;
+        RLazyTransformed::open_impl(path, cache_shards)
     }
 
     /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
@@ -243,6 +255,17 @@ impl ScxExperiment {
         util::throw_on_err(self.x_backed_impl(cache_shards as usize))
     }
 
+    /// Open a lazy-transform view of X (no data read, no transforms yet).
+    ///
+    /// Chain `normalize_total` / `log1p` / `row_scale` onto the returned handle
+    /// (`scx_normalize_total()` etc.); transforms are applied on read without
+    /// materialising the matrix.
+    ///
+    /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
+    fn x_lazy(&self, cache_shards: f64) -> Robj {
+        util::throw_on_err(self.x_lazy_impl(cache_shards as usize))
+    }
+
     /// Phase I.1: True if this file has a registered modality table.
     fn is_multimodal(&self) -> bool {
         self.reader.is_multimodal()
@@ -290,6 +313,7 @@ extendr_module! {
     mod rscx;
     use query;
     use backed;
+    use lazy;
     use ops;
     use interop;
     use harmony;
