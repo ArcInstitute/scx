@@ -668,6 +668,65 @@ pub fn sort(
 }
 
 // ---------------------------------------------------------------------------
+// C5b. pyscx.build_csc()
+// ---------------------------------------------------------------------------
+
+/// Build a CSC (column-major) sidecar from an existing file's CSR shards.
+///
+/// Standalone equivalent of the `scx build-csc` CLI command: reads CSR
+/// shards from `input` and writes both the CSR shards and a freshly built
+/// CSC sidecar to `output`. CSC sidecars are the column-major substrate for
+/// DE / HVG / per-gene QC / pseudobulk and the GPU `pdex_ref` CSC-direct
+/// route.
+///
+/// For an in-place rebuild use `pyscx.sort(..., rebuild_csc=True)`; to emit
+/// a sidecar at write time use `pyscx.from_anndata(..., csc="always")`.
+///
+/// Parameters:
+///   input              — SCX file containing CSR shards.
+///   output             — destination file (gets CSR + the new CSC shards).
+///   memory_limit       — transpose working-set budget; accepts binary-
+///                        prefixed sizes (`"4G"`, `"512MiB"`). Default "4G".
+///   force              — overwrite `output` if it already exists.
+///   csc_cols_per_shard — max columns per emitted CSC shard (0 = single
+///                        shard, memory permitting). Default 5000.
+///
+/// Example:
+///     pyscx.build_csc("counts.scx", "counts_csc.scx")
+#[pyfunction]
+#[pyo3(signature = (input, output, memory_limit="4G".to_string(), force=false, csc_cols_per_shard=5000))]
+pub fn build_csc(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    memory_limit: String,
+    force: bool,
+    csc_cols_per_shard: usize,
+) -> PyResult<()> {
+    // Fail fast with a clean ValueError on a malformed size string;
+    // run_build_csc re-parses it internally with the same parser, so the
+    // two cannot drift.
+    scx_format_io::MemoryBudget::parse(&memory_limit).map_err(PyValueError::new_err)?;
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
+    // `run_build_csc` returns `Box<dyn Error>` (not `Send`), so stringify the
+    // error inside the closure to cross `py.detach`, mirroring sort()'s CSC
+    // rebuild path.
+    py.detach(|| {
+        scx_ops::run_build_csc(
+            &input_path,
+            &output_path,
+            &memory_limit,
+            force,
+            csc_cols_per_shard,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // C6. pyscx.rollback()
 // ---------------------------------------------------------------------------
 

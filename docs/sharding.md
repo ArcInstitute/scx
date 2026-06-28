@@ -506,6 +506,14 @@ per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 — the streaming transpose will still chunk internally to respect the
 `--memory-limit` budget).
 
+To add a CSC sidecar to a file you already have, use the standalone
+`pyscx.build_csc(input, output, memory_limit="4G", force=False,
+csc_cols_per_shard=5000)` — the Python equivalent of `scx build-csc`. It
+reads `input`'s CSR shards and writes both the CSR shards and the new CSC
+sidecar to `output`. For an in-place rebuild use
+`pyscx.sort(..., rebuild_csc=True)`; to emit the sidecar at write time use
+`pyscx.from_anndata(..., csc="always")`.
+
 ### Why multi-shard CSC
 
 Two reasons to split CSC by column range rather than emitting one

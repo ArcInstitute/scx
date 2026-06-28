@@ -143,3 +143,61 @@ def test_csc_disabled_after_filter_cells(small_adata, tmp_path):
     # CSC dispatch must raise — `kept_to_global` is now active.
     with pytest.raises(RuntimeError, match="CSC|deletion"):
         pyscx.accel.col_sums(adata.X, prefer_format="csc")
+
+
+# ---------------------------------------------------------------------------
+# Standalone pyscx.build_csc() — the `scx build-csc` CLI mirror: add a CSC
+# sidecar to an existing CSR-only file (input -> output).
+# ---------------------------------------------------------------------------
+
+
+def test_build_csc_adds_sidecar_to_csr_only_file(small_adata, tmp_path):
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    out = tmp_path / "with_csc.scx"
+    pyscx.from_anndata(small_adata, str(src))  # csc defaults to "off"
+
+    # Source has no CSC sidecar.
+    assert pyscx.open(str(src)).has_csc is False
+
+    pyscx.build_csc(str(src), str(out), csc_cols_per_shard=4)
+
+    # Output gained a CSC sidecar, and the source is untouched.
+    assert pyscx.open(str(out)).has_csc is True
+    assert pyscx.open(str(src)).has_csc is False
+
+    # Functional parity: CSC-direct col_sums matches the CSR path.
+    adata = pyscx.open(str(out)).to_anndata(backed=True)
+    csr_sums = pyscx.accel.col_sums(adata.X, prefer_format="csr")
+    csc_sums = pyscx.accel.col_sums(adata.X, prefer_format="csc")
+    np.testing.assert_allclose(csr_sums, csc_sums, atol=1e-9)
+
+
+def test_build_csc_force_overwrite(small_adata, tmp_path):
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    out = tmp_path / "with_csc.scx"
+    pyscx.from_anndata(small_adata, str(src))
+    pyscx.build_csc(str(src), str(out), csc_cols_per_shard=4)
+
+    # Re-building onto an existing output without force must fail.
+    with pytest.raises(Exception):  # noqa: B017 — RuntimeError from the ops layer
+        pyscx.build_csc(str(src), str(out), csc_cols_per_shard=4)
+
+    # force=True succeeds and the sidecar is still present.
+    pyscx.build_csc(str(src), str(out), force=True, csc_cols_per_shard=4)
+    assert pyscx.open(str(out)).has_csc is True
+
+
+def test_build_csc_rejects_bad_memory_limit(small_adata, tmp_path):
+    import pyscx
+
+    src = tmp_path / "csr_only.scx"
+    out = tmp_path / "with_csc.scx"
+    pyscx.from_anndata(small_adata, str(src))
+
+    # Decimal "GB" is rejected as ambiguous by the size parser -> ValueError.
+    with pytest.raises(ValueError):
+        pyscx.build_csc(str(src), str(out), memory_limit="4GB")

@@ -420,6 +420,15 @@ def write(adata: Any, path: Any, **kwargs: Any) -> None:
 def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]: ...
 
 
+def build_csc(
+    input: Any,
+    output: Any,
+    memory_limit: str = ...,
+    force: bool = ...,
+    csc_cols_per_shard: int = ...,
+) -> None: ...
+
+
 def collate_cellset_gathered(
     indptr: np.ndarray,
     indices: np.ndarray,
