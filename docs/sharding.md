@@ -358,11 +358,11 @@ Each CSR shard is a 76-byte header followed by three compressed sections:
 │   magic, codec_id, value_encoding,       │
 │   n_major (rows), n_minor (cols), nnz,   │
 │   global_offset (first row index),       │
-│   section offsets/lengths, checksum       │
+│   section offsets/lengths, checksum      │
 ├──────────────────────────────────────────┤
 │ Indptr    (Delta-Golomb encoded)         │
 ├──────────────────────────────────────────┤
-│ Indices   (FOR-BP encoded)              │
+│ Indices   (FOR-BP encoded)               │
 ├──────────────────────────────────────────┤
 │ Values    (Adaptive Rice encoded)        │
 ├──────────────────────────────────────────┤

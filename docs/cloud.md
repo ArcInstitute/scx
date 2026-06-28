@@ -357,6 +357,11 @@ scx push atlas.scx gs://bucket/atlas.scxd/ --parallelism 16
 
 Uploads every section as its own object in parallel and uploads `_catalog.bin`
 last (atomic-publish semantics). No intermediate local directory is created.
+Sections are streamed from the source file in bounded chunks — small sections
+(metadata, indexes) via a single `put`, large X / CSC shards via a chunked
+multipart upload — so peak memory is `parallelism × 8 MiB` rather than the
+source-file size. This lets `push` operate on multi-hundred-GB / TB atlases
+that do not fit in host RAM.
 
 **Verify an uploaded file.** Both `scx info` and `scx query` accept the cloud
 URL directly (no `scx pull` needed), so the natural post-push sanity check is:
@@ -550,7 +555,7 @@ Heuristics:
 
 | Knob | Default | When to change |
 |------|---------|----------------|
-| `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the reorder window — peak memory is `parallelism × max_section_size`. |
+| `parallelism` on `pull` / `push` | 8 | Raise to 16–32 on high-bandwidth links (10+ Gbps) or large shard counts. Diminishing returns past #cores. Also bounds the in-flight window — on `pull`, peak memory is `parallelism × max_section_size`; on `push`, sections stream in chunks so peak memory is `parallelism × 8 MiB` regardless of section size. |
 | `--filter-mode` / `filter_mode` | `shard` | Shard-granular (fast, may include extra cells). `exact` reserved for future release. |
 | `retry_config.request_timeout` | 120 s | Per-request wall-clock cap. A timed-out request is retried subject to `max_retries`; final exhaustion surfaces as `CloudError::Timeout`. Raise on slow links pulling very large shards. |
 | `retry_config.max_retries` | 6 | Total retry attempts per request. Effective attempt count is exactly `max_retries + 1`. Lower to 0–1 to fail fast in CI; raise on flaky networks. |

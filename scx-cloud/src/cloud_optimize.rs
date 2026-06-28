@@ -9,12 +9,14 @@
 //!   [Shards...] [Layers...] [ObsmEmbeddings...] [Obsp...] [Uns]
 //!   [PredicateIndexes] [Provenance] [DeletionVectors] [FullCatalog]
 
-use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 
-use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::header::HEADER_SIZE;
 use scx_format_io::section::{align_to_8, SectionType};
 
 use crate::error::Result;
@@ -31,9 +33,10 @@ use crate::layout::{
 ///
 /// Uses atomic rename: writes to a randomized temp file, then renames to `output`.
 pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
-    // 1. Open and read the input file
-    let input_data = std::fs::read(input)?;
-    let header = FileHeader::read_from(&mut Cursor::new(&input_data[..HEADER_SIZE]))?;
+    // 1. Read only the header + catalog (KB–MB), not the whole file. Section
+    //    payloads are streamed from `src` in bounded chunks below, so peak
+    //    memory is independent of the source-file size.
+    let (header, full_catalog) = crate::streaming::read_header_and_catalog(input)?;
 
     // Idempotency: if already cloud-optimized, no-op
     if header.has_front_catalog() && header.front_catalog_offset != 0 {
@@ -44,28 +47,9 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Read full catalog
-    let fc_offset = header.full_catalog_offset as usize;
-    let fc_length = header.full_catalog_length as usize;
-    let fc_end = fc_offset.checked_add(fc_length).ok_or_else(|| {
-        crate::error::CloudError::SliceBoundsExceeded {
-            offset: fc_offset,
-            length: fc_length,
-            data_len: input_data.len(),
-        }
-    })?;
-    if fc_end > input_data.len() {
-        return Err(crate::error::CloudError::SliceBoundsExceeded {
-            offset: fc_offset,
-            length: fc_length,
-            data_len: input_data.len(),
-        });
-    }
-    let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&input_data[fc_offset..fc_end]),
-        fc_length,
-        true,
-    )?;
+    let mut src = std::fs::File::open(input)?;
+    // One reusable streaming buffer for every section copy below.
+    let mut copy_buf = vec![0u8; crate::streaming::CHUNK_SIZE];
 
     // We'll write the front catalog after we know the new section offsets.
     // First, estimate its size from the original catalog so we can reserve space.
@@ -117,25 +101,15 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 
         let new_offset = write_offset;
 
-        // Copy section bytes verbatim from input
-        let src_start = entry.offset as usize;
-        let src_len = entry.length as usize;
-        let src_end = src_start.checked_add(src_len).ok_or_else(|| {
-            crate::error::CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: input_data.len(),
-            }
-        })?;
-        if src_end > input_data.len() {
-            return Err(crate::error::CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: input_data.len(),
-            });
-        }
-        let section_data = &input_data[src_start..src_end];
-        writer.write_all(section_data)?;
+        // Stream section bytes verbatim from the source into the output writer
+        // in bounded chunks (no whole-file buffer).
+        crate::streaming::copy_section(
+            &mut src,
+            entry.offset,
+            entry.length,
+            &mut writer,
+            &mut copy_buf,
+        )?;
         write_offset += entry.length;
 
         if entry.section_type == SectionType::ModalityTable {
@@ -258,6 +232,7 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scx_format_io::header::FileHeader;
     use scx_format_io::reader::ScxReader;
     use scx_format_io::writer::ScxWriter;
 
