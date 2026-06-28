@@ -4,19 +4,53 @@
 \alias{scx_merge}
 \title{Merge multiple SCX files}
 \usage{
-scx_merge(inputs, output)
+scx_merge(
+  inputs,
+  output,
+  index_obs = NULL,
+  index_var = NULL,
+  index_preset = NULL,
+  index_auto_threshold = 0L,
+  assume_identical_var = FALSE,
+  assume_identical_obs = FALSE,
+  uns_policy = "first",
+  sort_by = NULL,
+  reverse = FALSE
+)
 }
 \arguments{
 \item{inputs}{Character vector of input file paths (>= 2).}
 
 \item{output}{Path for the merged output file.}
+
+\item{index_obs, index_var}{Obs/var columns to build predicate indexes for.}
+
+\item{index_preset}{Named index preset
+(\code{"cellxgene"}/\code{"perturbseq"}/\code{"training"}).}
+
+\item{index_auto_threshold}{Auto-index cardinality cap (0 = disabled).}
+
+\item{assume_identical_var, assume_identical_obs}{Skip the var / obs schema
+identity checks across inputs.}
+
+\item{uns_policy}{How to combine \code{uns}: \code{"first"} (default),
+\code{"require-equal"}, \code{"namespace"}, or \code{"summary"}.}
+
+\item{sort_by}{Obs columns for a globally-ordered (sorted) k-way merge;
+\code{NULL} = legacy concatenation. Each input must already be sorted by the
+key.}
+
+\item{reverse}{Descending order when \code{sort_by} is set.}
 }
 \description{
-Combines two or more SCX files into a single output file.
-All input files must have the same number of variables (genes).
+Combines two or more SCX files into a single output file. Var identity is
+validated by default. \code{shard_target_rows} is inherited from the first
+input; CSC sidecars are dropped (rebuild separately).
 }
 \examples{
 \dontrun{
 scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")
+scx_merge(c("b1.scx", "b2.scx"), "atlas.scx",
+          uns_policy = "namespace", sort_by = "cell_type")
 }
 }

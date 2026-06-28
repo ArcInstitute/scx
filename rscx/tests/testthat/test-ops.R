@@ -98,3 +98,98 @@ test_that("scx_append adds cells to target", {
   expect_equal(info$n_obs, 40)
   expect_equal(info$n_vars, 10)
 })
+
+# ── merge options ───────────────────────────────────────────────────────
+
+test_that("scx_merge honours assume_identical_var + uns_policy", {
+  path <- skip_if_no_fixture()
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+
+  scx_merge(c(path, path), out,
+            assume_identical_var = TRUE, uns_policy = "first")
+  info <- scx_info(out)
+  expect_equal(info$n_obs, 40)
+  expect_true(scx_validate(out))
+})
+
+test_that("scx_merge sort_by is plumbed through (k-way merge needs sorted inputs)", {
+  path <- skip_if_no_fixture()
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+
+  # sort_by is a sorted k-way merge: it requires each input pre-sorted by the
+  # key. The fixture is not sorted by "batch", so this must raise (confirming
+  # the option reaches the Rust merge) rather than silently concatenate.
+  expect_error(scx_merge(c(path, path), out, sort_by = "batch"), "sort")
+})
+
+test_that("scx_merge rejects an unknown uns_policy", {
+  path <- skip_if_no_fixture()
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+  expect_error(scx_merge(c(path, path), out, uns_policy = "nope"),
+               "uns_policy")
+})
+
+test_that("scx_merge with index_obs builds an openable, valid file", {
+  path <- skip_if_no_fixture()
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(out), add = TRUE)
+  scx_merge(c(path, path), out, index_obs = "batch")
+  expect_true(scx_validate(out))
+  expect_equal(scx_info(out)$n_obs, 40)
+})
+
+# ── compact options ─────────────────────────────────────────────────────
+
+test_that("scx_compact honours reshape_obs + index_obs", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  out <- tempfile(fileext = ".scx")
+  on.exit(unlink(c(tmp, out)), add = TRUE)
+  file.copy(path, tmp)
+
+  scx_delete(tmp, c(0L, 1L, 2L))
+  scx_compact(tmp, out, index_obs = "batch", reshape_obs = TRUE)
+
+  info <- scx_info(out)
+  expect_equal(info$n_obs, 17)
+  expect_true(scx_validate(out))
+})
+
+# ── append options ──────────────────────────────────────────────────────
+
+test_that("scx_append honours codec + shard_size", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  scx_append(tmp, path, codec = "zstd", shard_size = 8L)
+  info <- scx_info(tmp)
+  expect_equal(info$n_obs, 40)
+  expect_equal(info$n_vars, 10)
+  expect_true(scx_validate(tmp))
+})
+
+test_that("scx_append with index_obs stays valid", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  scx_append(tmp, path, index_obs = "batch")
+  expect_equal(scx_info(tmp)$n_obs, 40)
+  expect_true(scx_validate(tmp))
+})
+
+test_that("scx_append rejects a bad codec and a modality on a single-modality file", {
+  path <- skip_if_no_fixture()
+  tmp <- tempfile(fileext = ".scx")
+  on.exit(unlink(tmp), add = TRUE)
+  file.copy(path, tmp)
+
+  expect_error(scx_append(tmp, path, codec = "bogus"))
+  expect_error(scx_append(tmp, path, modality = "rna"), "modality")
+})

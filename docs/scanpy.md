@@ -184,6 +184,12 @@ sc.pl.umap(adata, color="leiden")
 > write), see [docs/performance.md §Conversion (h5ad → format)](performance.md#conversion-h5ad--format)
 > and [§Write Scaling (parallel shard encoding)](performance.md#write-scaling-parallel-shard-encoding).
 
+> **Migrating an existing h5ad workflow?**
+> [docs/migrating-from-h5ad.md § Converting h5ad to SCX](migrating-from-h5ad.md#converting-h5ad-to-scx)
+> has end-to-end conversion recipes — predicate indexes, CSC sidecars,
+> detection bitmaps, sort-on-convert, codec/shard tuning, memory budgets,
+> and production-ready CLI + Python examples — all in one place.
+
 ### From AnnData / h5ad
 
 > [!NOTE]

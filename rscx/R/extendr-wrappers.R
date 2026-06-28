@@ -31,10 +31,72 @@ ScxExperiment$new <- function(path) {
     .Call(wrap__ScxExperiment__modality_names, self$.ptr)
   self$to_seurat <- function() .Call(wrap__ScxExperiment__to_seurat, self$.ptr)
   self$to_mae <- function() .Call(wrap__ScxExperiment__to_mae, self$.ptr)
+  # Backed (lazy) X access — see R/backed.R for the [ / dim / print methods.
+  self$x_backed <- function(cache_shards = 128) {
+    ScxBackedSparse$.wrap(
+      .Call(wrap__ScxExperiment__x_backed, self$.ptr, as.numeric(cache_shards))
+    )
+  }
+  # Lazy transform chain — see R/lazy.R for the chainable transform verbs.
+  self$x_lazy <- function(cache_shards = 128) {
+    ScxLazyTransformed$.wrap(
+      .Call(wrap__ScxExperiment__x_lazy, self$.ptr, as.numeric(cache_shards))
+    )
+  }
   class(self) <- "ScxExperiment"
   self
 }
 class(ScxExperiment) <- "ScxExperiment__class"
+
+# ── ScxBackedSparse class ───────────────────────────────────────
+#' @export
+ScxBackedSparse <- new.env(parent = emptyenv())
+ScxBackedSparse$.wrap <- function(ptr) {
+  self <- new.env(parent = emptyenv())
+  self$.ptr <- ptr
+  self$n_obs <- function() .Call(wrap__RBackedSparse__n_obs, self$.ptr)
+  self$n_vars <- function() .Call(wrap__RBackedSparse__n_vars, self$.ptr)
+  self$nnz <- function() .Call(wrap__RBackedSparse__nnz, self$.ptr)
+  self$read_rows <- function(start, end)
+    .Call(wrap__RBackedSparse__read_rows, self$.ptr, as.numeric(start), as.numeric(end))
+  self$read_row_indices <- function(indices)
+    .Call(wrap__RBackedSparse__read_row_indices, self$.ptr, as.numeric(indices))
+  self$row_sums <- function() .Call(wrap__RBackedSparse__row_sums, self$.ptr)
+  self$col_sums <- function() .Call(wrap__RBackedSparse__col_sums, self$.ptr)
+  self$to_dgcmatrix <- function() .Call(wrap__RBackedSparse__to_dgcmatrix, self$.ptr)
+  class(self) <- "ScxBackedSparse"
+  self
+}
+class(ScxBackedSparse) <- "ScxBackedSparse__class"
+
+# ── ScxLazyTransformed class ────────────────────────────────────
+#' @export
+ScxLazyTransformed <- new.env(parent = emptyenv())
+ScxLazyTransformed$.wrap <- function(ptr) {
+  self <- new.env(parent = emptyenv())
+  self$.ptr <- ptr
+  self$n_obs <- function() .Call(wrap__RLazyTransformed__n_obs, self$.ptr)
+  self$n_vars <- function() .Call(wrap__RLazyTransformed__n_vars, self$.ptr)
+  self$nnz <- function() .Call(wrap__RLazyTransformed__nnz, self$.ptr)
+  self$transform_names <- function() .Call(wrap__RLazyTransformed__transform_names, self$.ptr)
+  # Transform verbs each return a NEW lazy handle (immutable chain).
+  self$normalize_total <- function(target_sum)
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__normalize_total, self$.ptr, as.numeric(target_sum)))
+  self$log1p <- function()
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__log1p, self$.ptr))
+  self$row_scale <- function(factors)
+    ScxLazyTransformed$.wrap(.Call(wrap__RLazyTransformed__row_scale, self$.ptr, as.numeric(factors)))
+  self$read_rows <- function(start, end)
+    .Call(wrap__RLazyTransformed__read_rows, self$.ptr, as.numeric(start), as.numeric(end))
+  self$read_row_indices <- function(indices)
+    .Call(wrap__RLazyTransformed__read_row_indices, self$.ptr, as.numeric(indices))
+  self$row_sums <- function() .Call(wrap__RLazyTransformed__row_sums, self$.ptr)
+  self$col_sums <- function() .Call(wrap__RLazyTransformed__col_sums, self$.ptr)
+  self$to_dgcmatrix <- function() .Call(wrap__RLazyTransformed__to_dgcmatrix, self$.ptr)
+  class(self) <- "ScxLazyTransformed"
+  self
+}
+class(ScxLazyTransformed) <- "ScxLazyTransformed__class"
 
 # ── RQueryPipeline class ────────────────────────────────────────
 #' @export
@@ -205,6 +267,61 @@ scx_hvg_mean_var <- function(counts) {
 
 scx_hvg_clipped_sums <- function(counts, clip_val) {
   .Call(wrap__scx_hvg_clipped_sums, counts, as.numeric(clip_val))
+}
+
+scx_score_genes_matrix <- function(counts, gene_list_idx, gene_pool_idx, method,
+                                   ctrl_size, n_bins, random_state) {
+  .Call(wrap__scx_score_genes_matrix,
+        counts,
+        as.integer(gene_list_idx),
+        as.integer(gene_pool_idx),
+        as.character(method),
+        as.integer(ctrl_size),
+        as.integer(n_bins),
+        as.numeric(random_state))
+}
+
+scx_pseudobulk_matrix <- function(counts, groupby, groupby_columns, gene_names,
+                                  method, min_cells_per_group) {
+  .Call(wrap__scx_pseudobulk_matrix,
+        counts,
+        groupby,
+        as.character(groupby_columns),
+        as.character(gene_names),
+        as.character(method),
+        as.integer(min_cells_per_group))
+}
+
+scx_pseudobulk_dex_matrix <- function(counts, groupby, groupby_columns, test_col,
+                                      reference, gene_names, aggr_method,
+                                      min_cells_per_group, dispersion,
+                                      cooks_filtering, independent_filtering) {
+  .Call(wrap__scx_pseudobulk_dex_matrix,
+        counts,
+        groupby,
+        as.character(groupby_columns),
+        as.character(test_col),
+        as.character(reference),
+        as.character(gene_names),
+        as.character(aggr_method),
+        as.integer(min_cells_per_group),
+        as.character(dispersion),
+        as.logical(cooks_filtering),
+        as.logical(independent_filtering))
+}
+
+scx_nb_glm_matrix <- function(counts, design, contrast_index, size_factors,
+                              gene_names, dispersion, cooks_filtering,
+                              independent_filtering) {
+  .Call(wrap__scx_nb_glm_matrix,
+        counts,
+        design,
+        if (is.null(contrast_index)) NULL else as.integer(contrast_index),
+        if (is.null(size_factors)) NULL else as.numeric(size_factors),
+        as.character(gene_names),
+        as.character(dispersion),
+        as.logical(cooks_filtering),
+        as.logical(independent_filtering))
 }
 
 # ── Import functions (interop module) ──────────────────────────
