@@ -1062,11 +1062,21 @@ impl PyExperiment {
         }
     }
 
-    /// Validate all section checksums.
+    /// Validate section checksums (and, with `deep`, decode-level integrity).
+    ///
+    /// With `deep=True`, additionally decodes every sparse shard to verify the
+    /// v3 canonical CSR invariant and verifies every decode sidecar; results
+    /// are appended with `canonical-csr `/`decode-sidecar ` prefixed names.
+    /// Mirrors `scx validate --deep`.
     ///
     /// Returns a list of (section_name, passed) tuples.
-    fn validate(&self) -> PyResult<Vec<(String, bool)>> {
-        self.reader.validate().map_err(to_pyerr)
+    #[pyo3(signature = (deep=false))]
+    fn validate(&self, deep: bool) -> PyResult<Vec<(String, bool)>> {
+        let mut results = self.reader.validate().map_err(to_pyerr)?;
+        if deep {
+            crate::deep_validate_into(&self.reader, &mut results);
+        }
+        Ok(results)
     }
 
     /// True if this file is multimodal (Phase B / v2 with

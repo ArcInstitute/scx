@@ -109,3 +109,27 @@ def test_validate(synthetic_adata, tmp_dir):
     for name, passed in results:
         assert isinstance(name, str)
         assert passed is True
+
+
+def test_validate_deep(synthetic_adata, tmp_dir):
+    """deep=True adds decode-level (canonical-CSR + decode-sidecar) checks."""
+    import pyscx
+
+    path = str(tmp_dir / "validate_deep.scx")
+    pyscx.from_anndata(synthetic_adata, path)
+
+    shallow = pyscx.validate(path)
+    deep = pyscx.validate(path, deep=True)
+
+    # Deep mode is a superset: the checksum rows plus the new deep rows.
+    assert len(deep) > len(shallow)
+    deep_names = [name for name, _ in deep]
+    assert any(name.startswith("canonical-csr ") for name in deep_names)
+
+    for name, passed in deep:
+        assert isinstance(name, str)
+        assert passed is True
+
+    # Experiment.validate(deep=True) agrees with the module-level function.
+    exp = pyscx.open(path)
+    assert exp.validate(deep=True) == deep
