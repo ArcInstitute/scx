@@ -34,6 +34,9 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
     // Read only the header + catalog (KB–MB), not the whole file.
     let (_header, full_catalog) = crate::streaming::read_header_and_catalog(input)?;
     let mut src = std::fs::File::open(input)?;
+    // One reusable streaming buffer for every section copy (avoids re-allocating
+    // per shard on files with thousands of shards).
+    let mut buf = vec![0u8; crate::streaming::CHUNK_SIZE];
 
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
@@ -55,7 +58,7 @@ pub fn explode(input: &Path, output_dir: &Path) -> Result<()> {
         }
 
         let mut out = std::io::BufWriter::new(std::fs::File::create(&file_path)?);
-        crate::streaming::copy_section(&mut src, entry.offset, entry.length, &mut out)?;
+        crate::streaming::copy_section(&mut src, entry.offset, entry.length, &mut out, &mut buf)?;
         out.flush()?;
     }
 

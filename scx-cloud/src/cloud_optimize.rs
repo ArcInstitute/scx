@@ -48,6 +48,8 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
     }
 
     let mut src = std::fs::File::open(input)?;
+    // One reusable streaming buffer for every section copy below.
+    let mut copy_buf = vec![0u8; crate::streaming::CHUNK_SIZE];
 
     // We'll write the front catalog after we know the new section offsets.
     // First, estimate its size from the original catalog so we can reserve space.
@@ -101,7 +103,13 @@ pub fn cloud_optimize(input: &Path, output: &Path) -> Result<()> {
 
         // Stream section bytes verbatim from the source into the output writer
         // in bounded chunks (no whole-file buffer).
-        crate::streaming::copy_section(&mut src, entry.offset, entry.length, &mut writer)?;
+        crate::streaming::copy_section(
+            &mut src,
+            entry.offset,
+            entry.length,
+            &mut writer,
+            &mut copy_buf,
+        )?;
         write_offset += entry.length;
 
         if entry.section_type == SectionType::ModalityTable {

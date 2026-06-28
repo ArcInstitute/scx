@@ -185,6 +185,33 @@ async fn upload_section(
 
     let upload = backend.put_multipart(obj_path).await?;
     let mut writer = WriteMultipart::new(upload);
+
+    // Once the multipart upload is open, any error path (source read error,
+    // part-upload error) must `abort()` it — otherwise the in-progress upload
+    // is dropped without cleanup, and S3/GCS-style stores do not reliably
+    // garbage-collect incomplete multipart uploads, leaving orphaned, billable
+    // parts behind. Run the streaming loop in a helper and abort on any Err.
+    match stream_multipart(&mut writer, &mut file, length).await {
+        Ok(()) => {
+            writer.finish().await.map_err(CloudError::ObjectStore)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort cleanup; surface the original error regardless.
+            let _ = writer.abort().await;
+            Err(e)
+        }
+    }
+}
+
+/// Stream `length` bytes from `file` (already positioned at the section offset)
+/// into an open multipart `writer`. Separated out so [`upload_section`] can
+/// `abort()` the upload on any error here.
+async fn stream_multipart(
+    writer: &mut WriteMultipart,
+    file: &mut std::fs::File,
+    length: u64,
+) -> Result<()> {
     let mut remaining = length;
     let mut buf = vec![0u8; crate::streaming::CHUNK_SIZE];
     while remaining > 0 {
@@ -197,7 +224,6 @@ async fn upload_section(
         writer.write(&buf[..want]);
         remaining -= want as u64;
     }
-    writer.finish().await.map_err(CloudError::ObjectStore)?;
     Ok(())
 }
 
