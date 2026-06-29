@@ -37,6 +37,7 @@ import pyscx  # noqa: E402
 from _pdex_fixtures import (  # noqa: E402
     REFERENCE,
     _make_adata,
+    _make_adata_special_genes,
 )
 
 
@@ -46,7 +47,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _compare_gpu_to_cpu(adata: ad.AnnData, *, geometric_mean: bool, is_log1p: bool, epsilon: float) -> None:
+def _compare_gpu_to_cpu(
+    adata: ad.AnnData,
+    *,
+    geometric_mean: bool,
+    is_log1p: bool,
+    epsilon: float,
+    cpm_filter: float | None = None,
+) -> None:
     cpu_df = pyscx.accel.pdex_ref(
         adata,
         "target",
@@ -54,6 +62,7 @@ def _compare_gpu_to_cpu(adata: ad.AnnData, *, geometric_mean: bool, is_log1p: bo
         is_log1p=is_log1p,
         geometric_mean=geometric_mean,
         epsilon=epsilon,
+        cpm_filter=cpm_filter,
         device="cpu",
     )
     gpu_df = pyscx.accel.pdex_ref(
@@ -63,6 +72,7 @@ def _compare_gpu_to_cpu(adata: ad.AnnData, *, geometric_mean: bool, is_log1p: bo
         is_log1p=is_log1p,
         geometric_mean=geometric_mean,
         epsilon=epsilon,
+        cpm_filter=cpm_filter,
         device="gpu",
     )
 
@@ -115,6 +125,8 @@ def _compare_gpu_to_cpu(adata: ad.AnnData, *, geometric_mean: bool, is_log1p: bo
         (True, True, 0.0),
         (False, True, 0.0),
         (True, False, 0.5),
+        (True, False, 1e-9),  # new default epsilon
+        (False, True, 1e-9),
     ],
 )
 def test_pdex_ref_gpu_parity_dense(geometric_mean: bool, is_log1p: bool, epsilon: float) -> None:
@@ -122,6 +134,34 @@ def test_pdex_ref_gpu_parity_dense(geometric_mean: bool, is_log1p: bool, epsilon
     if is_log1p:
         adata.X = np.log1p(adata.X)
     _compare_gpu_to_cpu(adata, geometric_mean=geometric_mean, is_log1p=is_log1p, epsilon=epsilon)
+
+
+def test_pdex_ref_gpu_parity_zero_over_zero() -> None:
+    """GPU NaN→0 fix: a gene zero in both groups → 0.0 (not NaN), one-sided → +inf.
+
+    Without the GPU host-side NaN→0 guard the GPU would emit NaN where the CPU
+    emits 0.0, tripping the finite-mask check in `_compare_gpu_to_cpu`.
+    """
+    adata = _make_adata_special_genes()
+    _compare_gpu_to_cpu(adata, geometric_mean=False, is_log1p=False, epsilon=0.0)
+
+
+@pytest.mark.parametrize("geometric_mean", [True, False])
+@pytest.mark.parametrize("cpm_filter", [5.0, 50.0])
+def test_pdex_ref_gpu_parity_cpm_filter(geometric_mean: bool, cpm_filter: float) -> None:
+    """GPU cpm_filter drops the same genes + recomputes the same FDR as CPU.
+
+    Covers dense and in-memory CSR; geometric and arithmetic modes (the
+    geometric path exercises the second device arithmetic pseudobulk pass)."""
+    adata = _make_adata()
+    _compare_gpu_to_cpu(
+        adata, geometric_mean=geometric_mean, is_log1p=False, epsilon=1e-9, cpm_filter=cpm_filter
+    )
+    adata_csr = adata.copy()
+    adata_csr.X = sp.csr_matrix(adata_csr.X)
+    _compare_gpu_to_cpu(
+        adata_csr, geometric_mean=geometric_mean, is_log1p=False, epsilon=1e-9, cpm_filter=cpm_filter
+    )
 
 
 @pytest.mark.parametrize(

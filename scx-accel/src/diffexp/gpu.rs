@@ -48,6 +48,7 @@ use crate::{AccelError, Result};
 fn finish_pdex(
     result: Result<PdexRefResult>,
     mut info: AccelExecutionInfo,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     log::debug!(
         "scx-accel pdex_ref GPU route: {} (fallback: {})",
@@ -60,6 +61,12 @@ fn finish_pdex(
         info.shards_decoded = info.shards_decoded.or(r.exec_info.shards_decoded);
         info.shards_uploaded = info.shards_uploaded.or(r.exec_info.shards_uploaded);
         r.exec_info = info;
+        // Apply the CPM keep mask + survivor-scoped FDR (the v3 drivers populated
+        // the arithmetic-mean fields when cpm_filter was set). No-op when None,
+        // so the driver's inline FDR stands.
+        if cpm_filter.is_some() {
+            super::cpu::finalize_pdex(&mut r, cpm_filter);
+        }
         r
     })
 }
@@ -106,6 +113,7 @@ pub fn pdex_ref_gpu_dense(
     reference: usize,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     validate_pdex_inputs(
         Some(data.len()),
@@ -135,6 +143,7 @@ pub fn pdex_ref_gpu_dense(
         None,
         mode,
         epsilon,
+        cpm_filter,
     )
 }
 
@@ -199,6 +208,7 @@ pub fn pdex_ref_gpu(
     gene_chunk_size: Option<usize>,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     let (n_obs, n_vars) = input.shape(gene_names.len());
     validate_pdex_inputs(
@@ -238,6 +248,7 @@ pub fn pdex_ref_gpu(
                 reference,
                 mode,
                 epsilon,
+                cpm_filter,
             )
         }
         GpuDeShardInput::Lazy(source_dyn) => {
@@ -256,6 +267,7 @@ pub fn pdex_ref_gpu(
                 reference,
                 mode,
                 epsilon,
+                cpm_filter,
             )
         }
         GpuDeShardInput::Backed { csr, csc } => {
@@ -277,6 +289,7 @@ pub fn pdex_ref_gpu(
                 reference,
                 mode,
                 epsilon,
+                cpm_filter,
             )
         }
     }
@@ -299,6 +312,7 @@ fn pdex_ref_gpu_dispatch(
     reference: usize,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     let mut exec_info = plan_de_route_from_source(DeviceRequest::Gpu, source, layout);
     exec_info.chunk_size = Some(chunk_size);
@@ -315,6 +329,7 @@ fn pdex_ref_gpu_dispatch(
                 reference,
                 mode,
                 epsilon,
+                cpm_filter,
                 source,
             ),
             AccelRoute::GpuCsrV3 => pdex_ref_gpu_chunked_v3_csr(
@@ -328,6 +343,7 @@ fn pdex_ref_gpu_dispatch(
                 reference,
                 mode,
                 epsilon,
+                cpm_filter,
                 source,
             ),
             other => Err(AccelError::LinAlg(format!(
@@ -337,6 +353,7 @@ fn pdex_ref_gpu_dispatch(
             ))),
         },
         exec_info,
+        cpm_filter,
     )
 }
 
@@ -855,6 +872,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
     reference: usize,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
     source: &mut dyn GpuMatrixSource,
 ) -> Result<PdexRefResult> {
     if chunk_size == 0 {
@@ -904,6 +922,14 @@ fn pdex_ref_gpu_chunked_v3_csr(
         )?);
     }
     let mode_id = geom_mean_mode_id(mode);
+    // CPM filter context: arithmetic count-space means feed the keep decision.
+    // For the two arithmetic modes `mode.arith() == mode`, so the reported means
+    // already equal the CPM means and no second device pass is needed; geometric
+    // modes need a second pseudobulk pass with the arithmetic mode id.
+    let compute_cpm = cpm_filter.is_some();
+    let cpm_mode = mode.arith();
+    let cpm_mode_id = geom_mean_mode_id(cpm_mode);
+    let need_arith_pass = compute_cpm && cpm_mode != mode;
 
     // Code-review #6: replace K+1 per-pool `cell_to_pool` tables with two
     // tables that scale constant in K (group_id table + in-group-pos table).
@@ -960,6 +986,9 @@ fn pdex_ref_gpu_chunked_v3_csr(
     let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let cap_cpm = if compute_cpm { n_vars } else { 0 };
+    let mut target_arith_gene_means: Vec<Vec<f64>> = vec![Vec::with_capacity(cap_cpm); n_test];
+    let mut ref_arith_gene_means: Vec<f64> = Vec::with_capacity(cap_cpm);
 
     let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
@@ -1061,12 +1090,61 @@ fn pdex_ref_gpu_chunked_v3_csr(
         let (chunk_ref_means, chunk_target_means) =
             compute_pdex_means_from_sums(dev, &scratch.sums, sz, n_ref, &target_memberships, mode)?;
 
+        // Arithmetic count-space means for the CPM filter. `scratch.sums` is free
+        // after the dtoh above (the DE sequence below reads only the pool slabs),
+        // so reuse it for a second arithmetic pseudobulk pass on geometric modes.
+        if compute_cpm {
+            let (arith_ref, arith_tg) = if need_arith_pass {
+                let nelem_sums = n_groups_for_means * sz;
+                let mut sums_view = scratch.sums.slice_mut(..nelem_sums);
+                dev.stream()
+                    .memset_zeros(&mut sums_view)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset arith sums: {e}")))?;
+                let mut global_row2 = 0usize;
+                source
+                    .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                        let view = slot.view();
+                        let n_rows = view.shape.0;
+                        gpu_de_pseudobulk_csr_direct(
+                            dev,
+                            &view,
+                            &cell_to_group_dev,
+                            &mut scratch.sums,
+                            global_row2,
+                            sz,
+                            c0,
+                            c1,
+                            cpm_mode_id,
+                        )?;
+                        global_row2 += n_rows;
+                        Ok(())
+                    })
+                    .map_err(|e| {
+                        AccelError::LinAlg(format!("GPU DE v3 CSR arith shard pass: {e}"))
+                    })?;
+                compute_pdex_means_from_sums(
+                    dev,
+                    &scratch.sums,
+                    sz,
+                    n_ref,
+                    &target_memberships,
+                    cpm_mode,
+                )?
+            } else {
+                (chunk_ref_means.clone(), chunk_target_means.clone())
+            };
+            ref_arith_gene_means.extend_from_slice(&arith_ref);
+            for tg_idx in 0..n_test {
+                target_arith_gene_means[tg_idx].extend_from_slice(&arith_tg[tg_idx]);
+            }
+        }
+
         let chunk_log2_fc: Vec<Vec<f64>> = chunk_target_means
             .iter()
             .map(|tm| {
                 tm.iter()
                     .zip(chunk_ref_means.iter())
-                    .map(|(t, r)| ((t + epsilon) / (r + epsilon)).log2())
+                    .map(|(t, r)| super::cpu::nan_to_zero(((t + epsilon) / (r + epsilon)).log2()))
                     .collect()
             })
             .collect();
@@ -1075,7 +1153,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
             .map(|tm| {
                 tm.iter()
                     .zip(chunk_ref_means.iter())
-                    .map(|(t, r)| (t - r) / (r + epsilon))
+                    .map(|(t, r)| super::cpu::nan_to_zero((t - r) / (r + epsilon)))
                     .collect()
             })
             .collect();
@@ -1173,6 +1251,9 @@ fn pdex_ref_gpu_chunked_v3_csr(
         statistics,
         p_values,
         fdrs,
+        target_arith_gene_means,
+        ref_arith_gene_means,
+        kept_indices: None,
         exec_info: crate::route::AccelExecutionInfo {
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),
@@ -1204,6 +1285,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
     reference: usize,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
     source: &mut dyn GpuMatrixSource,
 ) -> Result<PdexRefResult> {
     if chunk_size == 0 {
@@ -1211,6 +1293,13 @@ fn pdex_ref_gpu_chunked_v3_csc(
             "gene_chunk_size must be > 0".to_string(),
         ));
     }
+    // CPM filter context (see the CSR driver for the rationale): the two
+    // arithmetic modes reuse the reported means; geometric modes need a second
+    // arithmetic pseudobulk pass.
+    let compute_cpm = cpm_filter.is_some();
+    let cpm_mode = mode.arith();
+    let cpm_mode_id = geom_mean_mode_id(cpm_mode);
+    let need_arith_pass = compute_cpm && cpm_mode != mode;
 
     let n_groups = group_names.len();
     let (group_indices, _oor) = bucket_cells_by_group(groups, n_groups);
@@ -1302,6 +1391,9 @@ fn pdex_ref_gpu_chunked_v3_csc(
     let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let cap_cpm = if compute_cpm { n_vars } else { 0 };
+    let mut target_arith_gene_means: Vec<Vec<f64>> = vec![Vec::with_capacity(cap_cpm); n_test];
+    let mut ref_arith_gene_means: Vec<f64> = Vec::with_capacity(cap_cpm);
 
     let pts: std::sync::Arc<scx_gpu::CudaStream> = dev.context().per_thread_stream();
     let dev_pts = dev.with_stream(pts.clone());
@@ -1399,12 +1491,57 @@ fn pdex_ref_gpu_chunked_v3_csc(
         let (chunk_ref_means, chunk_target_means) =
             compute_pdex_means_from_sums(dev, &scratch.sums, sz, n_ref, &target_memberships, mode)?;
 
+        // Arithmetic count-space means for the CPM filter (see the CSR driver).
+        // `scratch.sums` is free after the dtoh above; reuse it for a second
+        // arithmetic CSC pseudobulk pass on geometric modes.
+        if compute_cpm {
+            let (arith_ref, arith_tg) = if need_arith_pass {
+                let nelem_sums = n_groups_for_means * sz;
+                let mut sums_view = scratch.sums.slice_mut(..nelem_sums);
+                dev.stream()
+                    .memset_zeros(&mut sums_view)
+                    .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset arith sums: {e}")))?;
+                source
+                    .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
+                        gpu_de_pseudobulk_csc_direct(
+                            dev,
+                            csc_view,
+                            &cell_to_group_dev,
+                            &mut scratch.sums,
+                            c0,
+                            c1,
+                            sz,
+                            n_groups_for_means,
+                            cpm_mode_id,
+                        )?;
+                        Ok(())
+                    })
+                    .map_err(|e| {
+                        AccelError::LinAlg(format!("GPU DE v3 CSC arith shard pass: {e}"))
+                    })?;
+                compute_pdex_means_from_sums(
+                    dev,
+                    &scratch.sums,
+                    sz,
+                    n_ref,
+                    &target_memberships,
+                    cpm_mode,
+                )?
+            } else {
+                (chunk_ref_means.clone(), chunk_target_means.clone())
+            };
+            ref_arith_gene_means.extend_from_slice(&arith_ref);
+            for tg_idx in 0..n_test {
+                target_arith_gene_means[tg_idx].extend_from_slice(&arith_tg[tg_idx]);
+            }
+        }
+
         let chunk_log2_fc: Vec<Vec<f64>> = chunk_target_means
             .iter()
             .map(|tm| {
                 tm.iter()
                     .zip(chunk_ref_means.iter())
-                    .map(|(t, r)| ((t + epsilon) / (r + epsilon)).log2())
+                    .map(|(t, r)| super::cpu::nan_to_zero(((t + epsilon) / (r + epsilon)).log2()))
                     .collect()
             })
             .collect();
@@ -1413,7 +1550,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
             .map(|tm| {
                 tm.iter()
                     .zip(chunk_ref_means.iter())
-                    .map(|(t, r)| (t - r) / (r + epsilon))
+                    .map(|(t, r)| super::cpu::nan_to_zero((t - r) / (r + epsilon)))
                     .collect()
             })
             .collect();
@@ -1506,6 +1643,9 @@ fn pdex_ref_gpu_chunked_v3_csc(
         statistics,
         p_values,
         fdrs,
+        target_arith_gene_means,
+        ref_arith_gene_means,
+        kept_indices: None,
         exec_info: crate::route::AccelExecutionInfo {
             shards_decoded: Some(shards_decoded),
             shards_uploaded: Some(shards_decoded),

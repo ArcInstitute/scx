@@ -164,6 +164,7 @@ fn test_pdex_ref_gpu_dense_matches_cpu() {
         reference,
         mode,
         epsilon,
+        None,
     )
     .expect("GPU pdex_ref_dense failed");
 
@@ -253,6 +254,7 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
         reference,
         mode,
         epsilon,
+        None,
     )
     .expect("direct pdex_ref_gpu_dense failed");
 
@@ -268,6 +270,7 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
         reference,
         mode,
         epsilon,
+        None,
     )
     .expect("graph pdex_ref_gpu_dense failed");
 
@@ -640,6 +643,7 @@ fn test_pdex_ref_gpu_sparse_multi_chunk_matches_dense() {
         0,
         mode,
         epsilon,
+        None,
     )
     .expect("dense GPU pdex_ref failed");
 
@@ -653,6 +657,7 @@ fn test_pdex_ref_gpu_sparse_multi_chunk_matches_dense() {
         Some(64),
         mode,
         epsilon,
+        None,
     )
     .expect("sparse GPU pdex_ref failed");
 
@@ -769,6 +774,7 @@ fn test_pdex_ref_gpu_multi_tile_matches_cpu() {
         0,
         mode,
         epsilon,
+        None,
     )
     .expect("GPU pdex_ref_dense failed at n_obs=12000 (n_ref=9000 > 8192)");
 
@@ -903,6 +909,7 @@ fn run_pdex_pair(
         reference,
         mode,
         epsilon,
+        None,
     )
     .expect("GPU pdex_ref_dense failed");
     (cpu, gpu)
@@ -1110,6 +1117,7 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
         0,
         mode,
         epsilon,
+        None,
     )
     .expect("dense pdex_ref failed");
     let lazy_res = pdex_ref_gpu(
@@ -1122,6 +1130,7 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
         Some(50), // 3 chunks
         mode,
         epsilon,
+        None,
     )
     .expect("lazy pdex_ref failed");
 

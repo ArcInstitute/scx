@@ -923,13 +923,12 @@ pub struct PdexRefResult {
     pub target_memberships: Vec<usize>,
     /// Cell count for the reference group.
     pub ref_membership: usize,
-    /// `log2((target_mean + epsilon) / (ref_mean + epsilon))`. With the default
-    /// `epsilon == 0` this is intentionally ±inf for genes undetected in the
-    /// reference (`ref_mean == 0`), matching upstream pdex.
+    /// `log2((target_mean + epsilon) / (ref_mean + epsilon))`, matching upstream
+    /// pdex: `0/0 -> 0.0`, one-sided zeros `-> ±inf` (only when `epsilon == 0`).
     pub log2_fold_changes: Vec<Vec<f64>>,
-    /// `(target_mean - ref_mean) / (ref_mean + epsilon)`, with the denominator
-    /// floored to an internal pseudocount in the degenerate
-    /// `ref_mean + epsilon == 0` case so the value stays finite (ACC4).
+    /// `(target_mean - ref_mean) / (ref_mean + epsilon)`, matching upstream pdex:
+    /// `0/0 -> 0.0`, `+inf` preserved when `ref_mean + epsilon == 0` and
+    /// `target_mean > 0` (only when `epsilon == 0`).
     pub percent_changes: Vec<Vec<f64>>,
     /// Mann-Whitney U statistic for the test group vs the reference.
     pub statistics: Vec<Vec<f64>>,
@@ -937,9 +936,38 @@ pub struct PdexRefResult {
     pub p_values: Vec<Vec<f64>>,
     /// Benjamini-Hochberg adjusted p-values per group across genes.
     pub fdrs: Vec<Vec<f64>>,
+    /// Per-(test group, gene) **arithmetic** count-space mean, aligned to
+    /// `feature_names`. Populated only when CPM filtering is requested (it feeds
+    /// the `cpm_filter` keep decision and is never reported); otherwise the
+    /// inner vectors are empty.
+    pub target_arith_gene_means: Vec<Vec<f64>>,
+    /// Per-gene reference **arithmetic** count-space mean, aligned to
+    /// `feature_names`. Populated only when CPM filtering is requested.
+    pub ref_arith_gene_means: Vec<f64>,
+    /// When CPM filtering has been applied, `kept_indices[group_idx]` lists the
+    /// indices into `feature_names` / `ref_means` that survived for that test
+    /// group, and every per-group result vector (`target_means`,
+    /// `log2_fold_changes`, …) has been compacted to that surviving set. `None`
+    /// means no filtering was applied and all groups share the full
+    /// `feature_names` axis.
+    pub kept_indices: Option<Vec<Vec<usize>>>,
     /// Which execution route produced this result (stamped by the dispatch
     /// entry point; `AccelRoute::Unknown` until then).
     pub exec_info: crate::route::AccelExecutionInfo,
+}
+
+/// Maps `0/0`-style `NaN` results to `0.0` while preserving `±inf` (one-sided
+/// zeros). Matches upstream pdex's `lfc[isnan] = 0.0` / `pc[isnan] = 0.0`
+/// semantics for `log2_fold_change` and `percent_change`. Shared by the CPU
+/// kernel and the GPU host-side fold-change computation so the two stay
+/// bit-identical on genes unexpressed in both groups.
+#[inline]
+pub(crate) fn nan_to_zero(x: f64) -> f64 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x
+    }
 }
 
 /// Per-cell value transform `f(x)` applied before averaging for pdex pseudobulk.
@@ -987,26 +1015,15 @@ fn pdex_gene_target_stats(
         pdex_post(mode, s / n1 as f64)
     };
 
-    // `log2_fc` keeps pdex parity: with the default `epsilon == 0` and a
-    // reference-undetected gene (`ref_mean == 0`) it is intentionally ±inf
-    // (`log2(target/0)`), matching upstream pdex. `percent_change` carries no
-    // upstream-parity constraint, so its denominator is floored with an
-    // internal pseudocount when it would otherwise be exactly zero — keeping it
-    // finite instead of dividing by zero (ACC4: the default `epsilon == 0` path
-    // previously emitted ±inf/NaN whenever a gene was undetected in the
-    // reference). Both `ref_mean` and `epsilon` are non-negative, so the
-    // denominator is only floored in the degenerate `ref_mean + epsilon == 0`
-    // case.
-    let log2_fc = ((target_mean + epsilon) / (ref_mean + epsilon)).log2();
-    let pct_denom = {
-        let d = ref_mean + epsilon;
-        if d != 0.0 {
-            d
-        } else {
-            LOGFC_PSEUDOCOUNT
-        }
-    };
-    let percent_change = (target_mean - ref_mean) / pct_denom;
+    // Match upstream pdex (`_math.py::log2_fold_change` / `percent_change`):
+    // both define `0/0 -> 0.0` (a gene unexpressed in both groups reports "no
+    // change", not `NaN`) while preserving the legitimate `±inf` of one-sided
+    // zeros. With the default `epsilon == 1e-9` the denominators are strictly
+    // positive so neither `NaN` nor `±inf` arises; with `epsilon == 0` a
+    // reference-undetected gene (`ref_mean == 0`, `target_mean > 0`) is
+    // intentionally `±inf`, and `0/0` collapses to `0.0`.
+    let log2_fc = nan_to_zero(((target_mean + epsilon) / (ref_mean + epsilon)).log2());
+    let percent_change = nan_to_zero((target_mean - ref_mean) / (ref_mean + epsilon));
 
     if n1 == 0 || n2 == 0 {
         return (target_mean, log2_fc, percent_change, f64::NAN, 1.0);
@@ -1043,6 +1060,9 @@ fn pdex_gene_target_stats(
 ///
 /// Parallelised over genes. Returns rows in input `group_names` and `gene_names`
 /// order — the reference group is excluded from output.
+///
+/// Back-compat shim for callers that do not use `cpm_filter`. Equivalent to
+/// `pdex_ref_core(.., compute_cpm = false)`.
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     data: &[f32],
@@ -1054,6 +1074,40 @@ pub fn pdex_ref(
     reference: usize,
     mode: crate::pseudobulk::GeomMeanMode,
     epsilon: f64,
+) -> Result<PdexRefResult> {
+    pdex_ref_core(
+        data,
+        n_obs,
+        n_vars,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        mode,
+        epsilon,
+        false,
+    )
+}
+
+/// pdex `mode="ref"` accelerator core. When `compute_cpm` is true the kernel
+/// also accumulates the per-(group, gene) and per-gene reference **arithmetic**
+/// count-space means (`target_arith_gene_means` / `ref_arith_gene_means`) that
+/// `apply_cpm_filter` consumes for the `cpm_filter` keep decision. This kernel
+/// never applies the filter itself (the CPM denominator spans the full gene
+/// axis, which a single chunk cannot see) — the caller runs `apply_cpm_filter`
+/// after all chunks merge.
+#[allow(clippy::too_many_arguments)]
+pub fn pdex_ref_core(
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+    compute_cpm: bool,
 ) -> Result<PdexRefResult> {
     if data.len() != n_obs * n_vars {
         return Err(crate::AccelError::InvalidInput(format!(
@@ -1119,10 +1173,17 @@ pub fn pdex_ref(
         .map(|&g| group_indices[g].len())
         .collect();
 
+    // Count-space arithmetic transform used for the CPM keep decision; it is
+    // mode-independent (always arithmetic) per pdex's `cpm_bulk`.
+    let cpm_mode = mode.arith();
+
     // Per-gene parallel kernel: compute ref_mean once, then per test-group stats.
-    // gene_results[var_idx] = (ref_mean, Vec<(t_mean, lfc, pct, u, p)> of len n_test).
+    // gene_results[var_idx] =
+    //   (ref_mean, Vec<(t_mean, lfc, pct, u, p)>, ref_arith_mean, Vec<t_arith_mean>).
+    // The two arithmetic vectors are empty unless `compute_cpm`.
     type PerGroupStats = (f64, f64, f64, f64, f64);
-    let gene_results: Vec<(f64, Vec<PerGroupStats>)> = (0..n_vars)
+    type GeneResult = (f64, Vec<PerGroupStats>, f64, Vec<f64>);
+    let gene_results: Vec<GeneResult> = (0..n_vars)
         .into_par_iter()
         .map_init(
             || {
@@ -1161,7 +1222,29 @@ pub fn pdex_ref(
                     })
                     .collect();
 
-                (ref_mean, per_group)
+                // Arithmetic count-space means for the CPM filter (gated).
+                let (ref_arith, target_arith) = if compute_cpm {
+                    let ref_arith_sum: f64 =
+                        ref_cells.iter().map(|&c| cpm_mode.pre(col_buf[c])).sum();
+                    let ref_arith = cpm_mode.post(ref_arith_sum / ref_membership as f64);
+                    let target_arith: Vec<f64> = test_groups
+                        .iter()
+                        .map(|&g| {
+                            let cells = &group_indices[g];
+                            if cells.is_empty() {
+                                f64::NAN
+                            } else {
+                                let s: f64 = cells.iter().map(|&c| cpm_mode.pre(col_buf[c])).sum();
+                                cpm_mode.post(s / cells.len() as f64)
+                            }
+                        })
+                        .collect();
+                    (ref_arith, target_arith)
+                } else {
+                    (0.0, Vec::new())
+                };
+
+                (ref_mean, per_group, ref_arith, target_arith)
             },
         )
         .collect();
@@ -1173,8 +1256,12 @@ pub fn pdex_ref(
     let mut percent_changes: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut statistics: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
     let mut p_values: Vec<Vec<f64>> = vec![Vec::with_capacity(n_vars); n_test];
+    let mut target_arith_gene_means: Vec<Vec<f64>> =
+        vec![Vec::with_capacity(if compute_cpm { n_vars } else { 0 }); n_test];
+    let mut ref_arith_gene_means: Vec<f64> =
+        Vec::with_capacity(if compute_cpm { n_vars } else { 0 });
 
-    for (ref_mean, per_group) in gene_results {
+    for (ref_mean, per_group, ref_arith, target_arith) in gene_results {
         ref_means.push(ref_mean);
         for (tg, s) in per_group.into_iter().enumerate() {
             target_means[tg].push(s.0);
@@ -1182,6 +1269,12 @@ pub fn pdex_ref(
             percent_changes[tg].push(s.2);
             statistics[tg].push(s.3);
             p_values[tg].push(s.4);
+        }
+        if compute_cpm {
+            ref_arith_gene_means.push(ref_arith);
+            for (tg, m) in target_arith.into_iter().enumerate() {
+                target_arith_gene_means[tg].push(m);
+            }
         }
     }
 
@@ -1217,6 +1310,9 @@ pub fn pdex_ref(
         statistics,
         p_values,
         fdrs,
+        target_arith_gene_means,
+        ref_arith_gene_means,
+        kept_indices: None,
         exec_info: crate::route::AccelExecutionInfo::default(),
     })
 }
@@ -1237,6 +1333,7 @@ pub fn pdex_ref_sparse(
     gene_chunk_size: usize,
     mode: crate::pseudobulk::GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     let (n_obs, n_vars) = csr.shape;
     if gene_names.len() != n_vars {
@@ -1279,7 +1376,7 @@ pub fn pdex_ref_sparse(
         }
 
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
-        let chunk_result = pdex_ref(
+        let chunk_result = pdex_ref_core(
             &dense,
             n_obs,
             chunk_size,
@@ -1289,6 +1386,7 @@ pub fn pdex_ref_sparse(
             reference,
             mode,
             epsilon,
+            cpm_filter.is_some(),
         )?;
 
         combined = Some(match combined.take() {
@@ -1301,7 +1399,7 @@ pub fn pdex_ref_sparse(
     }
 
     let mut result = combined.unwrap_or_else(|| empty_pdex_result(group_names, reference));
-    recompute_pdex_fdrs(&mut result);
+    finalize_pdex(&mut result, cpm_filter);
     Ok(result)
 }
 
@@ -1320,6 +1418,7 @@ pub fn pdex_ref_streaming(
     gene_chunk_size: usize,
     mode: crate::pseudobulk::GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     let n_obs = reader.n_obs();
     let n_vars = gene_names.len();
@@ -1376,7 +1475,7 @@ pub fn pdex_ref_streaming(
         }
 
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
-        let chunk_result = pdex_ref(
+        let chunk_result = pdex_ref_core(
             &dense,
             n_obs,
             chunk_size,
@@ -1386,6 +1485,7 @@ pub fn pdex_ref_streaming(
             reference,
             mode,
             epsilon,
+            cpm_filter.is_some(),
         )?;
 
         combined = Some(match combined.take() {
@@ -1398,7 +1498,7 @@ pub fn pdex_ref_streaming(
     }
 
     let mut result = combined.unwrap_or_else(|| empty_pdex_result(group_names, reference));
-    recompute_pdex_fdrs(&mut result);
+    finalize_pdex(&mut result, cpm_filter);
     Ok(result)
 }
 
@@ -1420,6 +1520,9 @@ pub(crate) fn empty_pdex_result(group_names: &[String], reference: usize) -> Pde
         statistics: vec![vec![]; n_test],
         p_values: vec![vec![]; n_test],
         fdrs: vec![vec![]; n_test],
+        target_arith_gene_means: vec![vec![]; n_test],
+        ref_arith_gene_means: vec![],
+        kept_indices: None,
         exec_info: crate::route::AccelExecutionInfo::default(),
     }
 }
@@ -1428,6 +1531,7 @@ pub(crate) fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResul
     // The first chunk already initialised the membership counts.
     acc.feature_names.extend(chunk.feature_names);
     acc.ref_means.extend(chunk.ref_means);
+    acc.ref_arith_gene_means.extend(chunk.ref_arith_gene_means);
     // Internal pdex chunk-merge invariant (both buffers are produced by this
     // crate with one entry per target group), not a decode/scatter/rank guard
     // on untrusted input.
@@ -1439,6 +1543,7 @@ pub(crate) fn merge_pdex_chunk_into(acc: &mut PdexRefResult, chunk: PdexRefResul
         acc.percent_changes[tg].extend(&chunk.percent_changes[tg]);
         acc.statistics[tg].extend(&chunk.statistics[tg]);
         acc.p_values[tg].extend(&chunk.p_values[tg]);
+        acc.target_arith_gene_means[tg].extend(&chunk.target_arith_gene_means[tg]);
     }
     // Discard chunk.fdrs — we recompute globally after all chunks merge.
 }
@@ -1449,6 +1554,59 @@ pub(crate) fn recompute_pdex_fdrs(result: &mut PdexRefResult) {
         .iter()
         .map(|pv| benjamini_hochberg(pv))
         .collect();
+}
+
+/// Finalize a (possibly chunk-merged) pdex result: apply the `cpm_filter` keep
+/// mask + survivor-scoped FDR when set, otherwise just recompute FDR over the
+/// full gene axis. The single place every route (dense, CSR, streaming, CSC,
+/// GPU) converges on after all gene chunks are merged.
+pub fn finalize_pdex(result: &mut PdexRefResult, cpm_filter: Option<f64>) {
+    match cpm_filter {
+        Some(threshold) => apply_cpm_filter(result, threshold),
+        None => recompute_pdex_fdrs(result),
+    }
+}
+
+/// Per-gene pooled counts-per-million from arithmetic count-space gene means:
+/// `mean / Σ(means) * 1e6`, with the `pdex` zero-total guard (`denom -> 1.0`).
+fn cpm_from_arith_means(means: &[f64]) -> Vec<f64> {
+    let total: f64 = means.iter().sum();
+    let denom = if total != 0.0 { total } else { 1.0 };
+    means.iter().map(|&m| m / denom * 1e6).collect()
+}
+
+/// Apply pdex's `cpm_filter` to a fully-merged result: per test group, keep a
+/// gene iff `target_cpm > threshold OR ref_cpm > threshold` (strict `>`), drop
+/// every other gene from that group's result vectors, and recompute
+/// Benjamini-Hochberg FDR over the surviving genes only. The surviving gene
+/// indices (into the shared `feature_names` / `ref_means` axis) are recorded in
+/// `kept_indices` so the DataFrame builder can recover each survivor's identity.
+///
+/// Requires `compute_cpm = true` to have populated the arithmetic-mean fields.
+pub(crate) fn apply_cpm_filter(result: &mut PdexRefResult, threshold: f64) {
+    let n_test = result.target_means.len();
+    let ref_cpm = cpm_from_arith_means(&result.ref_arith_gene_means);
+
+    let mut kept_indices: Vec<Vec<usize>> = Vec::with_capacity(n_test);
+    for tg in 0..n_test {
+        let target_cpm = cpm_from_arith_means(&result.target_arith_gene_means[tg]);
+        let kept: Vec<usize> = (0..target_cpm.len())
+            .filter(|&gi| target_cpm[gi] > threshold || ref_cpm[gi] > threshold)
+            .collect();
+
+        let take = |src: &[f64]| -> Vec<f64> { kept.iter().map(|&i| src[i]).collect() };
+        result.target_means[tg] = take(&result.target_means[tg]);
+        result.log2_fold_changes[tg] = take(&result.log2_fold_changes[tg]);
+        result.percent_changes[tg] = take(&result.percent_changes[tg]);
+        result.statistics[tg] = take(&result.statistics[tg]);
+        result.p_values[tg] = take(&result.p_values[tg]);
+        kept_indices.push(kept);
+    }
+
+    result.kept_indices = Some(kept_indices);
+    // FDR over the survivor universe (matches pdex's post-filter
+    // `false_discovery_control`).
+    recompute_pdex_fdrs(result);
 }
 
 #[cfg(test)]

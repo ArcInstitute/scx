@@ -1330,7 +1330,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`, `n_clusters`, `alpha`, `max_iter_kmeans`, `random_state`, `device` |
 | `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | ✓   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format`, `tie_correct`, `rankby_abs`, `device` |
-| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
+| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `cpm_filter`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
 | `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
 | `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
@@ -2132,7 +2132,8 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 | `reference` | `"non-targeting"` | Control group label |
 | `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects. |
 | `geometric_mean` | `True` | Use geometric mean for fold-change computation |
-| `epsilon` | `0.0` | Pseudocount for fold-change stability |
+| `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
+| `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
 | `prefer_format` | `"csr"` | `"csr"` or `"csc"` |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |
