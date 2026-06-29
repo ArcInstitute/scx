@@ -585,3 +585,93 @@ class TestCloudReadUns:
                 cloud.read_uns(modality="does_not_exist")
             with pytest.raises(KeyError):
                 cloud.uns_keys(modality="does_not_exist")
+
+
+class TestCloudIntrospectionParity:
+    """Group B parity: header-only introspection accessors on
+    CloudExperiment must match the local Experiment on byte-identical
+    (exploded / packed) files. All are O(1) header reads, no network I/O."""
+
+    def test_header_getters_match_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=80, n_vars=30)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert cloud.has_csc == local.has_csc
+            assert cloud.has_deletions == local.has_deletions
+            assert cloud.index_dtype == local.index_dtype
+            assert cloud.n_obs_physical == local.n_obs_physical
+            # A default file has no deletions, so physical == logical.
+            assert cloud.n_obs_physical == cloud.n_obs == 80
+
+    def test_path_returns_opened_url(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=40, n_vars=20)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            # Both packed-file and exploded-dir layouts round-trip the URL.
+            assert pyscx.open_cloud(exploded_dir).path == exploded_dir
+            assert pyscx.open_cloud(scx_path).path == scx_path
+
+    def test_info_string_and_prefix_parity(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=60, n_vars=25)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            info = cloud.info()
+            assert isinstance(info, str)
+            for token in ("format_version=", "codec_id=", "nnz=", "has_csc=", "path="):
+                assert token in info
+            assert exploded_dir in info
+
+            # Header fields are identical on byte-identical files; only the
+            # trailing `path=...` differs. Compare the prefix up to `path=`.
+            assert info.split(", path=")[0] == local.info().split(", path=")[0]
+
+    def test_has_csc_true_with_sidecar(self):
+        """A file written with a forced CSC sidecar reports has_csc=True,
+        matching the local Experiment."""
+        import anndata
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "csc.scx")
+            rng = np.random.default_rng(3)
+            X = sp.random(60, 20, density=0.3, format="csr", dtype=np.float32,
+                          random_state=rng)
+            X.data = np.round(X.data * 10).astype(np.float32)
+            adata = anndata.AnnData(
+                X=X,
+                obs={"cell_id": [f"c{i}" for i in range(60)]},
+                var={"gene_id": [f"g{i}" for i in range(20)]},
+            )
+            pyscx.from_anndata(adata, scx_path, codec="none", csc="always")
+
+            local = pyscx.open(scx_path)
+            exploded_dir = os.path.join(tmpdir, "csc.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            # Parity holds regardless of whether explode preserves the
+            # sidecar; assert the local file actually has one so the
+            # has_csc=True path is genuinely exercised.
+            assert local.has_csc is True
+            assert cloud.has_csc == local.has_csc

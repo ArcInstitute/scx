@@ -262,6 +262,11 @@ pub struct PyCloudExperiment {
     // `Experiment` caches its modality table so the per-modality
     // accessors don't re-range-read on every call (B5).
     modalities: Option<scx_format_io::modality::ModalityTable>,
+    /// The `gs://` / `s3://` / local URL this handle was opened from.
+    /// `CloudReader` does not retain it (it keeps a parsed `ReaderLayout`),
+    /// so we keep it here to back `path` / `info`. Mirrors
+    /// `PyExperiment::path` semantically.
+    url: String,
 }
 
 impl PyCloudExperiment {
@@ -373,6 +378,61 @@ impl PyCloudExperiment {
     #[getter]
     fn codec_id(&self) -> u8 {
         self.reader.header().codec_id
+    }
+
+    /// `True` when the file has a CSC sidecar (gene-major shards).
+    /// Mirrors the local `Experiment.has_csc`. Header-only, no I/O.
+    #[getter]
+    fn has_csc(&self) -> bool {
+        self.reader.header().has_csc()
+    }
+
+    /// `True` when the file carries logical deletion vectors — some rows
+    /// are marked deleted and drop on export. Mirrors the local
+    /// `Experiment.has_deletions`. Header-only, no I/O.
+    #[getter]
+    fn has_deletions(&self) -> bool {
+        self.reader.header().has_deletion_vectors()
+    }
+
+    /// File-header index dtype (`0=u16`, `1=u32`). Mirrors the local
+    /// `Experiment.index_dtype`.
+    #[getter]
+    fn index_dtype(&self) -> u8 {
+        self.reader.header().index_dtype
+    }
+
+    /// Physical (pre-deletion) row count straight from the file header.
+    /// Equals `n_obs` until rows are logically deleted. Mirrors the local
+    /// `Experiment.n_obs_physical`.
+    #[getter]
+    fn n_obs_physical(&self) -> u64 {
+        self.reader.header().n_obs
+    }
+
+    /// The URL this handle was opened from (`gs://` / `s3://` / local
+    /// path). Mirrors `PyExperiment.path`, which returns the local path.
+    #[getter]
+    fn path(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Codec / shard / format-version internals as a one-line string.
+    /// Mirrors `PyExperiment.info`; the AnnData-style repr lists keys, the
+    /// on-disk encoding details live here. Header-only, no I/O.
+    fn info(&self) -> String {
+        let h = self.reader.header();
+        format!(
+            "SCX file: format_version={}, codec_id={}, index_dtype={}, \
+             csr_shards={}, nnz={}, has_csc={}, path={}",
+            h.format_version,
+            h.codec_id,
+            h.index_dtype,
+            h.n_csr_shards,
+            self.reader.nnz(),
+            h.has_csc(),
+            self.url,
+        )
     }
 
     /// True if this file is multimodal (v2 with `n_modalities > 0`).
@@ -575,6 +635,7 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         reader: Arc::new(reader),
         rt: Arc::new(rt),
         modalities,
+        url,
     })
 }
 
