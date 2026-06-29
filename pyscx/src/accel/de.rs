@@ -1469,6 +1469,7 @@ fn run_pdex_ref_inner(
     geometric_mean: bool,
     is_log1p: Option<bool>,
     epsilon: f64,
+    cpm_filter: Option<f64>,
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
     device: &str,
@@ -1531,6 +1532,7 @@ fn run_pdex_ref_inner(
                         chunk_size,
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map(|mut r| {
@@ -1565,6 +1567,7 @@ fn run_pdex_ref_inner(
                         chunk_size,
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map(|mut r| {
@@ -1613,6 +1616,7 @@ fn run_pdex_ref_inner(
                         Some(chunk_size),
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string())),
@@ -1629,6 +1633,7 @@ fn run_pdex_ref_inner(
                         chunk_size,
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map(|mut r| {
@@ -1666,6 +1671,7 @@ fn run_pdex_ref_inner(
                         Some(chunk_size),
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()));
@@ -1712,6 +1718,7 @@ fn run_pdex_ref_inner(
                         Some(chunk_size),
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string())),
@@ -1728,6 +1735,7 @@ fn run_pdex_ref_inner(
                         chunk_size,
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map(|mut r| {
@@ -1766,6 +1774,7 @@ fn run_pdex_ref_inner(
                         ref_idx,
                         mode,
                         epsilon,
+                        cpm_filter,
                     )
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string())),
@@ -1773,7 +1782,7 @@ fn run_pdex_ref_inner(
             Some(_) => unreachable!("gpu_device_id is None when gpu feature is disabled"),
             None => py
                 .detach(|| {
-                    scx_accel::pdex_ref(
+                    let mut r = scx_accel::pdex_ref_core(
                         &data,
                         n_obs,
                         n_vars,
@@ -1783,7 +1792,15 @@ fn run_pdex_ref_inner(
                         ref_idx,
                         mode,
                         epsilon,
-                    )
+                        cpm_filter.is_some(),
+                    )?;
+                    // The dense kernel is not chunked, so apply the CPM filter +
+                    // survivor-scoped FDR here (no-op when cpm_filter is None,
+                    // beyond the redundant BH recompute we skip by guarding).
+                    if cpm_filter.is_some() {
+                        scx_accel::finalize_pdex(&mut r, cpm_filter);
+                    }
+                    Ok::<_, scx_accel::AccelError>(r)
                 })
                 .map(|mut r| {
                     r.exec_info = super::route::cpu_exec_info(
@@ -1798,6 +1815,42 @@ fn run_pdex_ref_inner(
                 .map_err(|e| PyRuntimeError::new_err(e.to_string())),
         }
     }
+}
+
+/// Best-effort check for negative entries in `adata.X`, used only to warn when
+/// `cpm_filter` is set (CPM assumes non-negative counts). Cheap in-memory paths
+/// only: scipy sparse (`.data.min()`) and numpy ndarray (`.min()`). Backed/lazy
+/// SCX datasets are skipped — SCX stores non-negative counts by construction, so
+/// matching pdex's backed-array sampling here is unnecessary.
+fn pdex_x_has_negative(py: Python<'_>, adata: &Bound<'_, PyAny>) -> bool {
+    let Ok(x) = adata.getattr("X") else {
+        return false;
+    };
+    if let Ok(scipy_sparse) = py.import("scipy.sparse") {
+        if let Ok(true) = scipy_sparse
+            .call_method1("issparse", (&x,))
+            .and_then(|r| r.extract::<bool>())
+        {
+            return x
+                .getattr("data")
+                .and_then(|d| d.call_method0("min"))
+                .and_then(|m| m.extract::<f64>())
+                .map(|m| m < 0.0)
+                .unwrap_or(false);
+        }
+    }
+    if let Ok(numpy) = py.import("numpy") {
+        if let Ok(ndarray_ty) = numpy.getattr("ndarray") {
+            if let Ok(true) = x.is_instance(&ndarray_ty) {
+                return x
+                    .call_method0("min")
+                    .and_then(|m| m.extract::<f64>())
+                    .map(|m| m < 0.0)
+                    .unwrap_or(false);
+            }
+        }
+    }
+    false
 }
 
 /// Convert a `PdexRefResult` to a polars DataFrame matching pdex's row schema.
@@ -1828,15 +1881,30 @@ fn pdex_ref_result_to_dataframe<'py>(
     let mut fdrs: Vec<f64> = Vec::with_capacity(total_rows);
 
     for (tg, group_name) in result.group_names.iter().enumerate() {
-        targets.extend(std::iter::repeat_n(group_name.clone(), n_genes));
-        features.extend(result.feature_names.iter().cloned());
+        // When `cpm_filter` dropped rows, `kept_indices[tg]` maps each surviving
+        // per-group row back to its gene in the shared `feature_names` /
+        // `ref_means` axis; the per-group vectors are already compacted to the
+        // survivors. Without filtering, every group spans the full gene axis.
+        let n_rows = result.target_means[tg].len();
+        targets.extend(std::iter::repeat_n(group_name.clone(), n_rows));
+        match result.kept_indices.as_ref() {
+            Some(kept) => {
+                for &gi in &kept[tg] {
+                    features.push(result.feature_names[gi].clone());
+                    ref_means.push(result.ref_means[gi]);
+                }
+            }
+            None => {
+                features.extend(result.feature_names.iter().cloned());
+                ref_means.extend(result.ref_means.iter().copied());
+            }
+        }
         target_means.extend(result.target_means[tg].iter().copied());
-        ref_means.extend(result.ref_means.iter().copied());
         target_memberships.extend(std::iter::repeat_n(
             result.target_memberships[tg] as u64,
-            n_genes,
+            n_rows,
         ));
-        ref_memberships.extend(std::iter::repeat_n(result.ref_membership as u64, n_genes));
+        ref_memberships.extend(std::iter::repeat_n(result.ref_membership as u64, n_rows));
         log2_fcs.extend(result.log2_fold_changes[tg].iter().copied());
         percent_changes.extend(result.percent_changes[tg].iter().copied());
         p_values.extend(result.p_values[tg].iter().copied());
@@ -1907,8 +1975,19 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///     geometric_mean: If True (default), pseudobulk summary is the geometric
 ///         mean of expression values back-transformed to count space (matches
 ///         pdex's `geometric_mean=True`). If False, arithmetic mean is used.
-///     epsilon: Pseudocount added to target_mean and ref_mean before computing
-///         fold_change and percent_change. Default 0.0.
+///     epsilon: Pseudocount added to target_mean and ref_mean (count space)
+///         before computing log2_fold_change and percent_change — NOT applied to
+///         CPM or the Mann-Whitney U test. Default 1e-9 (a finite-guard matching
+///         pdex >= 0.2.x): denominators stay strictly positive so no ±inf/NaN
+///         arises. Pass epsilon=0.0 to recover the legacy behaviour where genes
+///         undetected in the reference yield ±inf (0/0 collapses to 0.0 either
+///         way).
+///     cpm_filter: Optional per-gene expression floor T (counts-per-million).
+///         When set, a gene is kept for a test group iff its pooled (arithmetic,
+///         count-space) target CPM > T OR the reference CPM > T (strict >);
+///         dropped rows are removed and FDR is recomputed over the surviving
+///         genes only. The CPM view is mode-independent (always arithmetic) and
+///         never reported. None (default) disables filtering.
 ///     gene_chunk_size: Genes per chunk for sparse/backed streaming
 ///         (default: 500). Ignored for dense input.
 ///     output: Return type — `"polars"` (default) or `"pandas"`. Columns are
@@ -1923,7 +2002,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars"))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto", output="polars"))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -1933,6 +2012,7 @@ pub fn pdex_ref(
     is_log1p: Option<bool>,
     geometric_mean: bool,
     epsilon: f64,
+    cpm_filter: Option<f64>,
     gene_chunk_size: Option<usize>,
     prefer_format: &str,
     device: &str,
@@ -1942,6 +2022,26 @@ pub fn pdex_ref(
         return Err(PyValueError::new_err(format!(
             "epsilon must be non-negative and finite (got {epsilon})"
         )));
+    }
+    if let Some(t) = cpm_filter {
+        if !t.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "cpm_filter must be finite (got {t})"
+            )));
+        }
+        // pdex warns (does not error) when counts contain negatives, since CPM
+        // assumes non-negative expression. Only checked for cheap in-memory X.
+        if pdex_x_has_negative(py, adata) {
+            py.import("warnings")?.call_method1(
+                "warn",
+                (
+                    "cpm_filter is set but adata.X contains negative values; \
+                     counts-per-million assumes non-negative expression, so the \
+                     filter may behave unexpectedly.",
+                    py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                ),
+            )?;
+        }
     }
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
@@ -2002,6 +2102,7 @@ pub fn pdex_ref(
         geometric_mean,
         is_log1p,
         epsilon,
+        cpm_filter,
         gene_chunk_size,
         prefer_format,
         device,

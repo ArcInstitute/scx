@@ -181,6 +181,7 @@ fn check_parity_for(
             n_vars.max(1),
             GeomMeanMode::ArithRaw,
             1.0,
+            None,
         )
         .unwrap();
         let csc_pdex = pdex_ref_streaming_csc(
@@ -192,6 +193,7 @@ fn check_parity_for(
             n_vars.max(1),
             GeomMeanMode::ArithRaw,
             1.0,
+            None,
         )
         .unwrap();
         assert_eq!(csr_pdex.group_names, csc_pdex.group_names);

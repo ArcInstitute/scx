@@ -1266,12 +1266,12 @@ fn test_pdex_ref_smoke_dense() {
 }
 
 #[test]
-fn test_pdex_ref_undetected_gene_percent_change_finite() {
-    // ACC4: gene 0 is undetected in the reference group (all zeros) but
-    // expressed in the test groups, with the default epsilon == 0. The
-    // percent_change denominator would be exactly zero — the floor keeps it
-    // finite. log2_fc stays pdex-compatible (±inf is the documented
-    // behavior there).
+fn test_pdex_ref_undetected_gene_one_sided_inf() {
+    // Gene 0 is undetected in the reference group (all zeros) but expressed in
+    // the test groups, with epsilon == 0. Matching upstream pdex, both
+    // log2_fold_change and percent_change are +inf here (a one-sided zero in the
+    // denominator) — NOT floored to a finite value. The control gene 1 stays
+    // finite.
     let n_obs = 30;
     let n_vars = 2;
     let third = n_obs / 3;
@@ -1310,23 +1310,129 @@ fn test_pdex_ref_undetected_gene_percent_change_finite() {
     // Reference is undetected for gene 0.
     assert_eq!(result.ref_means[0], 0.0);
     for tg in 0..2 {
-        // percent_change must be finite for every gene/group despite the
-        // zero reference mean (this is the ACC4 fix).
-        for gene in 0..n_vars {
-            assert!(
-                result.percent_changes[tg][gene].is_finite(),
-                "percent_change must be finite (tg={tg} gene={gene}), got {}",
-                result.percent_changes[tg][gene]
-            );
-        }
-        // The undetected-reference gene has a strictly positive, finite
-        // percent_change (target > 0 over the floored denominator).
-        assert!(result.percent_changes[tg][0] > 0.0);
-        // log2_fc for the undetected-reference gene is +inf by design
-        // (log2(target / 0)); the control gene stays finite.
+        // The undetected-reference gene (target > 0, ref == 0, epsilon == 0)
+        // yields +inf for both percent_change ((t-0)/0) and log2_fc
+        // (log2(t/0)) — matching upstream pdex's preserved one-sided infinity.
+        assert_eq!(result.percent_changes[tg][0], f64::INFINITY);
         assert!(result.log2_fold_changes[tg][0].is_infinite());
+        assert!(result.log2_fold_changes[tg][0] > 0.0);
+        // The control gene (expressed everywhere) stays finite.
+        assert!(result.percent_changes[tg][1].is_finite());
         assert!(result.log2_fold_changes[tg][1].is_finite());
     }
+}
+
+#[test]
+fn test_pdex_ref_zero_over_zero_is_zero() {
+    // A gene unexpressed in BOTH the reference and a test group must report
+    // log2_fold_change == 0.0 and percent_change == 0.0 (not NaN), matching
+    // upstream pdex. A one-sided zero in another group stays +inf.
+    let n_obs = 30;
+    let n_vars = 1;
+    let third = n_obs / 3;
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    let mut groups = vec![0usize; n_obs];
+    for cell in 0..n_obs {
+        let g = if cell < third {
+            0 // reference
+        } else if cell < 2 * third {
+            1 // ta: also zero -> 0/0 with the reference
+        } else {
+            2 // tb: positive -> one-sided zero vs the reference
+        };
+        groups[cell] = g;
+        data[cell * n_vars] = if g == 2 { 5.0 } else { 0.0 };
+    }
+    let group_names = vec!["ref".to_string(), "ta".to_string(), "tb".to_string()];
+    let gene_names = vec!["g0".to_string()];
+
+    let result = pdex_ref(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        0,
+        GeomMeanMode::ArithRaw,
+        0.0, // epsilon == 0: 0/0 collapses to 0.0, one-sided zero -> +inf
+    )
+    .unwrap();
+
+    // group order is [ta, tb] (reference excluded).
+    assert_eq!(result.group_names, vec!["ta".to_string(), "tb".to_string()]);
+    // ta: zero in both -> 0.0, not NaN.
+    assert_eq!(result.log2_fold_changes[0][0], 0.0);
+    assert_eq!(result.percent_changes[0][0], 0.0);
+    // tb: positive over zero reference -> +inf preserved.
+    assert_eq!(result.log2_fold_changes[1][0], f64::INFINITY);
+    assert_eq!(result.percent_changes[1][0], f64::INFINITY);
+}
+
+#[test]
+fn test_pdex_ref_cpm_filter_drops_low_expression_genes() {
+    // Two genes: g0 high-expression, g1 near-zero. A cpm_filter above g1's CPM
+    // but below g0's keeps only g0. The surviving FDR is recomputed over the
+    // surviving gene set; kept_indices records the surviving gene identity.
+    let n_obs = 30;
+    let n_vars = 2;
+    let half = n_obs / 2;
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    let mut groups = vec![0usize; n_obs];
+    for cell in 0..n_obs {
+        let g = if cell < half { 0 } else { 1 };
+        groups[cell] = g;
+        // g0: high in both groups; g1: a single low count so its pooled CPM is
+        // tiny relative to g0.
+        data[cell * n_vars] = 100.0;
+        data[cell * n_vars + 1] = if cell == 0 { 1.0 } else { 0.0 };
+    }
+    let group_names = vec!["ref".to_string(), "ta".to_string()];
+    let gene_names = vec!["g0".to_string(), "g1".to_string()];
+
+    // Without filtering: both genes present.
+    let unfiltered = pdex_ref_core(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        0,
+        GeomMeanMode::ArithRaw,
+        0.0,
+        false,
+    )
+    .unwrap();
+    assert_eq!(unfiltered.log2_fold_changes[0].len(), 2);
+    assert!(unfiltered.kept_indices.is_none());
+
+    // With a high threshold, g1 (CPM ~ 1e6 * tiny) is dropped, g0 kept.
+    let mut filtered = pdex_ref_core(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        0,
+        GeomMeanMode::ArithRaw,
+        0.0,
+        true,
+    )
+    .unwrap();
+    finalize_pdex(&mut filtered, Some(1000.0));
+
+    let kept = filtered
+        .kept_indices
+        .expect("kept_indices set after filtering");
+    assert_eq!(kept.len(), 1); // one test group
+    assert_eq!(kept[0], vec![0]); // only g0 survives
+    assert_eq!(filtered.log2_fold_changes[0].len(), 1);
+    assert_eq!(filtered.p_values[0].len(), 1);
+    assert_eq!(filtered.fdrs[0].len(), 1);
+    // FDR over a single survivor equals its raw (clipped) p-value.
+    assert!((filtered.fdrs[0][0] - filtered.p_values[0][0]).abs() < 1e-12);
 }
 
 #[test]
@@ -1527,6 +1633,7 @@ fn test_pdex_ref_sparse_matches_dense() {
         2,
         GeomMeanMode::ArithRaw,
         0.0,
+        None,
     )
     .unwrap();
 

@@ -9,8 +9,9 @@ pub mod cpu;
 pub mod gpu;
 
 pub use cpu::{
-    merge_diff_exp_results, pdex_ref, pdex_ref_sparse, pdex_ref_streaming, wilcoxon_rank_sum,
-    wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming, DiffExpResult, PdexRefResult,
+    finalize_pdex, merge_diff_exp_results, pdex_ref, pdex_ref_core, pdex_ref_sparse,
+    pdex_ref_streaming, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming,
+    DiffExpResult, PdexRefResult,
 };
 // Shared inference helpers reused by the NB-GLM Wald + BH steps (spec §7.7–7.8).
 pub(crate) use cpu::{benjamini_hochberg, normal_sf};
