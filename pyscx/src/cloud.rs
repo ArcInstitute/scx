@@ -421,9 +421,17 @@ impl PyCloudExperiment {
         self.reader.header().index_dtype
     }
 
-    /// Physical (pre-deletion) row count straight from the file header.
-    /// Equals `n_obs` until rows are logically deleted. Mirrors the local
+    /// Physical row count straight from the file header — the count
+    /// before any deletion-vector masking. Mirrors the local
     /// `Experiment.n_obs_physical`.
+    ///
+    /// NOTE: unlike the local `Experiment` (whose `n_obs` returns the
+    /// logical, post-deletion count, so `n_obs_physical` can exceed it),
+    /// the cloud `n_obs` getter is itself the physical header count today —
+    /// the cloud read path does not yet apply deletion masking. So on the
+    /// cloud path `n_obs_physical == n_obs` even when `has_deletions` is
+    /// `True`. Making cloud `n_obs` deletion-aware (for full parity) is a
+    /// tracked follow-up.
     #[getter]
     fn n_obs_physical(&self) -> u64 {
         self.reader.header().n_obs
