@@ -1604,6 +1604,11 @@ pub(crate) fn apply_cpm_filter(result: &mut PdexRefResult, threshold: f64) {
     }
 
     result.kept_indices = Some(kept_indices);
+    // The arithmetic-mean buffers fed only the keep decision and are never
+    // reported; drop them so the returned result doesn't carry full-axis stale
+    // data (notably for large gene counts).
+    result.target_arith_gene_means = Vec::new();
+    result.ref_arith_gene_means = Vec::new();
     // FDR over the survivor universe (matches pdex's post-filter
     // `false_discovery_control`).
     recompute_pdex_fdrs(result);

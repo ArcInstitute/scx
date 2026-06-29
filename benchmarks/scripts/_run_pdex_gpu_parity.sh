@@ -8,7 +8,12 @@
 
 set -uo pipefail
 
-SCX_DIR="/home/nickyoungblut/dev/rust/scx"
+# Resolve the repo root from this script's location (benchmarks/scripts/<this>)
+# so the driver is portable rather than tied to one checkout path. Override with
+# SCX_DIR / SCX_GPU_CONDA_ENV in the environment.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCX_DIR="${SCX_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+CONDA_ENV="${SCX_GPU_CONDA_ENV:-scx-bench-gpu}"
 cd "${SCX_DIR}"
 
 echo "=== node: $(hostname) ==="
@@ -16,8 +21,12 @@ nvidia-smi --query-gpu=index,name,driver_version --format=csv
 export PATH=/usr/local/cuda/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 
-source /home/nickyoungblut/miniforge3/etc/profile.d/conda.sh
-conda activate scx-bench-gpu
+# Locate conda from CONDA_EXE / common prefixes rather than a hardcoded path.
+CONDA_BASE="$(conda info --base 2>/dev/null || dirname "$(dirname "${CONDA_EXE:-}")")"
+if [ -n "${CONDA_BASE}" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+fi
+conda activate "${CONDA_ENV}"
 echo "python: $(which python)"
 python -c "import sys; print('py', sys.version.split()[0])"
 
