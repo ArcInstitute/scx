@@ -675,3 +675,58 @@ class TestCloudIntrospectionParity:
             # has_csc=True path is genuinely exercised.
             assert local.has_csc is True
             assert cloud.has_csc == local.has_csc
+
+
+class TestCloudCatalogEnumParity:
+    """Group C parity: CloudExperiment.obsm_keys() / varm_keys() /
+    layer_names() must match the local Experiment on byte-identical files.
+    All are pure in-memory catalog scans (catalog loaded at open)."""
+
+    def test_enum_keys_match_local(self):
+        import anndata
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            rng = np.random.default_rng(11)
+            X = sp.random(40, 12, density=0.3, format="csr", dtype=np.float32,
+                          random_state=rng)
+            X.data = np.round(X.data * 10).astype(np.float32)
+            adata = anndata.AnnData(
+                X=X,
+                obs={"cell_id": [f"c{i}" for i in range(40)]},
+                var={"gene_id": [f"g{i}" for i in range(12)]},
+            )
+            adata.obsm["X_pca"] = np.zeros((40, 5), dtype=np.float32)
+            adata.obsm["X_umap"] = np.zeros((40, 2), dtype=np.float32)
+            adata.varm["PCs"] = np.zeros((12, 5), dtype=np.float32)
+            adata.layers["counts"] = adata.X.copy()
+            pyscx.from_anndata(adata, scx_path, codec="none")
+
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert set(cloud.obsm_keys()) == set(local.obsm_keys())
+            assert set(cloud.varm_keys()) == set(local.varm_keys())
+            assert set(cloud.layer_names()) == set(local.layer_names())
+            # Sanity: the data we wrote is actually present.
+            assert set(cloud.obsm_keys()) >= {"X_pca", "X_umap"}
+            assert "PCs" in cloud.varm_keys()
+            assert "counts" in cloud.layer_names()
+
+    def test_enum_keys_empty_when_absent(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=20, n_vars=8)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert cloud.obsm_keys() == []
+            assert cloud.varm_keys() == []
+            assert cloud.layer_names() == []

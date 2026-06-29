@@ -664,6 +664,33 @@ impl CloudReader {
         Ok(Some(val))
     }
 
+    /// De-duplicated `obsm` embedding names. Pure in-memory catalog scan
+    /// (the catalog is loaded at open), no network I/O. Mirrors the local
+    /// `ScxReader::list_obsm`.
+    pub fn list_obsm(&self) -> Vec<String> {
+        self.catalog.list_logical_names(
+            "obsm",
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard,
+        )
+    }
+
+    /// De-duplicated `varm` embedding names. Pure in-memory catalog scan.
+    /// Mirrors the local `ScxReader::list_varm`.
+    pub fn list_varm(&self) -> Vec<String> {
+        self.catalog.list_logical_names(
+            "varm",
+            SectionType::VarmEmbedding,
+            SectionType::VarmEmbeddingShard,
+        )
+    }
+
+    /// De-duplicated layer names. Pure in-memory catalog scan. Mirrors the
+    /// local `ScxReader::layer_names`.
+    pub fn layer_names(&self) -> Vec<String> {
+        self.catalog.layer_names()
+    }
+
     /// Distinct codec ids and value encodings across **all** CSR shards,
     /// each sorted ascending. Mirrors the local
     /// `distinct_sorted_shard_field` summary `scx info` prints, but range-reads

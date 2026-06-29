@@ -1317,29 +1317,17 @@ impl ScxReader {
     /// Pure catalog scan: return the de-duplicated set of logical names
     /// under `<prefix>/`, considering both legacy single-section and
     /// sharded entries. Used by `list_obsm` / `list_obsp` / etc.
+    ///
+    /// Delegates to [`FullCatalog::list_logical_names`] so the cloud reader
+    /// shares the same logic.
     fn list_logical_names(
         &self,
         prefix: &str,
         single_type: SectionType,
         shard_type: SectionType,
     ) -> Vec<String> {
-        let path_prefix = format!("{prefix}/");
-        let shard_marker = "_shard_";
-        let mut names: std::collections::BTreeSet<String> = Default::default();
-        for entry in &self.full_catalog.entries {
-            if entry.section_type == single_type {
-                if let Some(name) = entry.name.strip_prefix(&path_prefix) {
-                    names.insert(name.to_string());
-                }
-            } else if entry.section_type == shard_type {
-                if let Some(rest) = entry.name.strip_prefix(&path_prefix) {
-                    if let Some(idx) = rest.rfind(shard_marker) {
-                        names.insert(rest[..idx].to_string());
-                    }
-                }
-            }
-        }
-        names.into_iter().collect()
+        self.full_catalog
+            .list_logical_names(prefix, single_type, shard_type)
     }
 
     // -----------------------------------------------------------------------
@@ -2791,20 +2779,11 @@ impl ScxReader {
     // -----------------------------------------------------------------------
 
     /// List unique layer names from LayerCsrShard entries.
+    ///
+    /// Delegates to [`FullCatalog::layer_names`] so the cloud reader shares
+    /// the same logic.
     pub fn layer_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .full_catalog
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::LayerCsrShard)
-            .filter_map(|e| {
-                // Strip _shard_N suffix to get layer name
-                e.name.rfind("_shard_").map(|pos| e.name[..pos].to_string())
-            })
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        self.full_catalog.layer_names()
     }
 
     /// Read a named layer, assembling all its shards into a ScxCsr.

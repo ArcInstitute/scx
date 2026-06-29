@@ -345,6 +345,25 @@ impl PyCloudExperiment {
         Ok(crate::experiment::schema_data_columns(Some(schema)))
     }
 
+    /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan (the
+    /// catalog is held in memory after open, so no network I/O). Mirrors the
+    /// local `Experiment.obsm_keys`.
+    fn obsm_keys(&self) -> Vec<String> {
+        self.reader.list_obsm()
+    }
+
+    /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
+    /// Mirrors the local `Experiment.varm_keys`.
+    fn varm_keys(&self) -> Vec<String> {
+        self.reader.list_varm()
+    }
+
+    /// Names of the layers in the file. Pure catalog scan. Mirrors the local
+    /// `Experiment.layer_names`.
+    fn layer_names(&self) -> Vec<String> {
+        self.reader.layer_names()
+    }
+
     #[getter]
     fn nnz(&self) -> u64 {
         self.reader.nnz()

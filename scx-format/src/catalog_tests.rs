@@ -1137,3 +1137,58 @@ fn catalog_rejects_truncated_entry_name() {
         "expected name-truncated error, got: {msg}"
     );
 }
+
+#[test]
+fn list_logical_names_dedups_legacy_and_sharded() {
+    let mut cat = sample_full_catalog();
+    cat.entries.extend([
+        // Legacy single-section obsm.
+        sample_full_entry("obsm/X_pca", SectionType::ObsmEmbedding, false),
+        // Sharded obsm across two shards → one logical name.
+        sample_full_entry(
+            "obsm/X_umap_shard_0",
+            SectionType::ObsmEmbeddingShard,
+            false,
+        ),
+        sample_full_entry(
+            "obsm/X_umap_shard_1",
+            SectionType::ObsmEmbeddingShard,
+            false,
+        ),
+        // Sharded varm.
+        sample_full_entry("varm/PCs_shard_0", SectionType::VarmEmbeddingShard, false),
+        // Two layer shards → one logical layer.
+        sample_full_entry("counts_shard_0", SectionType::LayerCsrShard, true),
+        sample_full_entry("counts_shard_1", SectionType::LayerCsrShard, true),
+    ]);
+
+    let obsm = cat.list_logical_names(
+        "obsm",
+        SectionType::ObsmEmbedding,
+        SectionType::ObsmEmbeddingShard,
+    );
+    assert_eq!(obsm, vec!["X_pca".to_string(), "X_umap".to_string()]);
+
+    let varm = cat.list_logical_names(
+        "varm",
+        SectionType::VarmEmbedding,
+        SectionType::VarmEmbeddingShard,
+    );
+    assert_eq!(varm, vec!["PCs".to_string()]);
+
+    assert_eq!(cat.layer_names(), vec!["counts".to_string()]);
+}
+
+#[test]
+fn list_logical_names_empty_when_absent() {
+    // sample_full_catalog has no obsm/varm/layer entries.
+    let cat = sample_full_catalog();
+    assert!(cat
+        .list_logical_names(
+            "obsm",
+            SectionType::ObsmEmbedding,
+            SectionType::ObsmEmbeddingShard
+        )
+        .is_empty());
+    assert!(cat.layer_names().is_empty());
+}
