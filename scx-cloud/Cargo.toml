@@ -15,6 +15,7 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 url = { workspace = true }
 arrow = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
@@ -27,6 +28,5 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serde_json = { workspace = true }
 roaring = { workspace = true }
 proptest = { workspace = true }

@@ -625,6 +625,45 @@ impl CloudReader {
         Ok(Some(prov))
     }
 
+    /// Read the global `uns` JSON section. `Ok(None)` if the file has none.
+    ///
+    /// Mirrors the local `ScxReader::read_uns`, but follows the cloud
+    /// convention (`read_provenance`) of returning `Option` for an absent
+    /// section rather than a `SectionNotFound` error.
+    pub async fn read_uns(&self) -> Result<Option<serde_json::Value>> {
+        self.read_uns_for(0).await
+    }
+
+    /// Read the `uns` section for a modality. `modality_id == 0` reads the
+    /// global `"uns"` section; `> 0` reads the per-modality `"uns/<name>"`
+    /// section. `Ok(None)` if the section is absent.
+    pub async fn read_uns_for(&self, modality_id: u8) -> Result<Option<serde_json::Value>> {
+        let section_name = if modality_id == 0 {
+            "uns".to_string()
+        } else {
+            let table = self.modality_table().await?;
+            let name = table
+                .as_ref()
+                .and_then(|t| t.info_of(modality_id))
+                .map(|m| m.name.clone())
+                .ok_or_else(|| {
+                    CloudError::SectionNotFound(format!("uns/<modality_id {modality_id}>"))
+                })?;
+            format!("uns/{name}")
+        };
+        // Catalog lookup by name (like `read_provenance`), so an absent
+        // section short-circuits to `Ok(None)` without a wasted range-GET.
+        if !self.catalog.entries.iter().any(|e| e.name == section_name) {
+            return Ok(None);
+        }
+        let bytes = self.read_section(&section_name).await?;
+        // `CloudError` has no direct `From<serde_json::Error>`; route the
+        // parse error through `ScxError` (which does), lifting it to
+        // `CloudError::Format` via `?`.
+        let val = serde_json::from_slice(&bytes).map_err(scx_format_io::ScxError::from)?;
+        Ok(Some(val))
+    }
+
     /// Distinct codec ids and value encodings across **all** CSR shards,
     /// each sorted ascending. Mirrors the local
     /// `distinct_sorted_shard_field` summary `scx info` prints, but range-reads
@@ -1193,6 +1232,61 @@ mod tests {
                 "encodings for {src}"
             );
         }
+    }
+
+    fn write_test_file_with_uns(
+        dir: &tempfile::TempDir,
+        uns: Option<&serde_json::Value>,
+    ) -> std::path::PathBuf {
+        let n_obs = 50;
+        let n_vars = 10;
+        let path = dir.path().join("test_uns.scx");
+        let header = sample_header(n_obs as u64, n_vars as u64);
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(n_vars)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n_obs, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        if let Some(u) = uns {
+            writer.write_uns(u).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn read_uns_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let uns = serde_json::json!({"species": "human", "version": 2});
+        let input = write_test_file_with_uns(&dir, Some(&uns));
+        let exploded = dir.path().join("test_uns.scxd");
+        crate::explode::explode(&input, &exploded).unwrap();
+
+        for src in [
+            input.to_string_lossy().to_string(),
+            exploded.to_string_lossy().to_string(),
+        ] {
+            let reader = open_cloud(&src).await.unwrap();
+            let got = reader.read_uns().await.unwrap().expect("uns present");
+            assert_eq!(got, uns, "uns mismatch for {src}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_uns_absent_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file_with_uns(&dir, None);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+        assert!(reader.read_uns().await.unwrap().is_none());
     }
 
     #[tokio::test]

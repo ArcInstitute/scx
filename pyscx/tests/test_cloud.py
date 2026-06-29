@@ -497,3 +497,91 @@ class TestCloudMultimodalDiscoverability:
             exp = pyscx.open_cloud(exploded_dir)
             with pytest.raises(RuntimeError, match="pull the file locally"):
                 exp.to_mudata()
+
+
+def _create_test_scx_with_uns(path: str, uns: dict | None, n_obs: int = 50, n_vars: int = 10):
+    """Create a test .scx with an optional uns payload via from_anndata."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(7)
+    X = sp.random(n_obs, n_vars, density=0.2, format="csr", dtype=np.float32,
+                   random_state=rng)
+    X.data = np.round(X.data * 10).astype(np.float32)
+    adata = anndata.AnnData(
+        X=X,
+        obs={"cell_id": [f"cell_{i}" for i in range(n_obs)]},
+        var={"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+    )
+    if uns is not None:
+        adata.uns.update(uns)
+    pyscx.from_anndata(adata, path, codec="none")
+
+
+class TestCloudReadUns:
+    """Group A parity: CloudExperiment.read_uns() / uns_keys() must match
+    the local Experiment on byte-identical (exploded) files."""
+
+    def test_read_uns_parity_with_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "uns.scx")
+            _create_test_scx_with_uns(scx_path, {"species": "human", "version": 2})
+            exploded_dir = os.path.join(tmpdir, "uns.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert cloud.read_uns() == local.read_uns()
+            assert set(cloud.uns_keys()) == set(local.uns_keys())
+            assert cloud.read_uns()["species"] == "human"
+            assert int(cloud.read_uns()["version"]) == 2
+
+    def test_read_uns_none_when_absent(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "no_uns.scx")
+            _create_test_scx_with_uns(scx_path, None)
+            exploded_dir = os.path.join(tmpdir, "no_uns.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert cloud.read_uns() is None
+            assert cloud.uns_keys() == []
+
+    def test_read_uns_packed_file(self):
+        """Works on a packed .scx (not just an exploded .scxd/ dir)."""
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "uns.scx")
+            _create_test_scx_with_uns(scx_path, {"k": "v"})
+            cloud = pyscx.open_cloud(scx_path)
+            assert cloud.read_uns() == {"k": "v"}
+            assert cloud.uns_keys() == ["k"]
+
+    def test_read_uns_multimodal_modality_resolution(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded_dir = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert set(cloud.modality_names) == {"rna", "adt"}
+
+            # from_mudata writes no global / per-modality uns here, so known
+            # modalities resolve and return None (proving the modality_id ->
+            # read_uns_for path is wired), and unknown names raise KeyError.
+            assert cloud.read_uns() is None
+            assert cloud.read_uns(modality="rna") is None
+            assert cloud.uns_keys(modality="adt") == []
+            with pytest.raises(KeyError):
+                cloud.read_uns(modality="does_not_exist")
+            with pytest.raises(KeyError):
+                cloud.uns_keys(modality="does_not_exist")

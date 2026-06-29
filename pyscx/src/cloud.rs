@@ -264,6 +264,26 @@ pub struct PyCloudExperiment {
     modalities: Option<scx_format_io::modality::ModalityTable>,
 }
 
+impl PyCloudExperiment {
+    /// Resolve the optional `modality` kwarg shared by `uns_keys` and
+    /// `read_uns` to a `modality_id`. `None` → 0 (global uns). A name that
+    /// does not appear in the cached modality table raises `KeyError`, which
+    /// also covers the "named modality on a non-multimodal file" case (the
+    /// table is `None` there). Mirrors `PyExperiment::resolve_uns_modality`.
+    fn resolve_uns_modality(&self, modality: Option<&str>) -> PyResult<u8> {
+        match modality {
+            None => Ok(0),
+            Some(name) => self
+                .modalities
+                .as_ref()
+                .and_then(|t| t.id_of(name))
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
+                }),
+        }
+    }
+}
+
 #[pymethods]
 impl PyCloudExperiment {
     #[getter]
@@ -420,6 +440,43 @@ impl PyCloudExperiment {
         d.set_item("n_csc_shards", info.n_csc_shards)?;
         d.set_item("flags", info.flags.bits())?;
         Ok(Some(d))
+    }
+
+    /// Keys of the `uns` (unstructured metadata) section, or `[]` when the
+    /// file has no `uns`. `modality=None` reads the global `uns`; a modality
+    /// name reads that modality's `uns/<name>` section (raises `KeyError` for
+    /// an unknown name). Mirrors the local `Experiment.uns_keys`.
+    #[pyo3(signature = (modality=None))]
+    fn uns_keys(&self, py: Python<'_>, modality: Option<&str>) -> PyResult<Vec<String>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        let val = py
+            .detach(|| self.rt.block_on(self.reader.read_uns_for(modality_id)))
+            .map_err(cloud_to_pyerr)?;
+        match val {
+            Some(serde_json::Value::Object(map)) => Ok(map.keys().cloned().collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Read the `uns` (unstructured metadata) section as a Python object,
+    /// reconstructing NumPy/pandas envelopes. Returns `None` when the file
+    /// has no `uns`. `modality=None` reads the global `uns`; a modality name
+    /// reads that modality's `uns/<name>` section (raises `KeyError` for an
+    /// unknown name). Mirrors the local `Experiment.read_uns`.
+    #[pyo3(signature = (modality=None))]
+    fn read_uns<'py>(
+        &self,
+        py: Python<'py>,
+        modality: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        let val = py
+            .detach(|| self.rt.block_on(self.reader.read_uns_for(modality_id)))
+            .map_err(cloud_to_pyerr)?;
+        match val {
+            Some(v) => Ok(Some(crate::convert::uns::json_value_to_pyobject(py, &v)?)),
+            None => Ok(None),
+        }
     }
 
     /// Materialise a multimodal file as `mudata.MuData`.
