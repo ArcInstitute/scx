@@ -262,6 +262,31 @@ pub struct PyCloudExperiment {
     // `Experiment` caches its modality table so the per-modality
     // accessors don't re-range-read on every call (B5).
     modalities: Option<scx_format_io::modality::ModalityTable>,
+    /// The `gs://` / `s3://` / local URL this handle was opened from.
+    /// `CloudReader` does not retain it (it keeps a parsed `ReaderLayout`),
+    /// so we keep it here to back `path` / `info`. Mirrors
+    /// `PyExperiment::path` semantically.
+    url: String,
+}
+
+impl PyCloudExperiment {
+    /// Resolve the optional `modality` kwarg shared by `uns_keys` and
+    /// `read_uns` to a `modality_id`. `None` → 0 (global uns). A name that
+    /// does not appear in the cached modality table raises `KeyError`, which
+    /// also covers the "named modality on a non-multimodal file" case (the
+    /// table is `None` there). Mirrors `PyExperiment::resolve_uns_modality`.
+    fn resolve_uns_modality(&self, modality: Option<&str>) -> PyResult<u8> {
+        match modality {
+            None => Ok(0),
+            Some(name) => self
+                .modalities
+                .as_ref()
+                .and_then(|t| t.id_of(name))
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
+                }),
+        }
+    }
 }
 
 #[pymethods]
@@ -320,6 +345,25 @@ impl PyCloudExperiment {
         Ok(crate::experiment::schema_data_columns(Some(schema)))
     }
 
+    /// Keys of the `obsm` cell-embedding mappings. Pure catalog scan (the
+    /// catalog is held in memory after open, so no network I/O). Mirrors the
+    /// local `Experiment.obsm_keys`.
+    fn obsm_keys(&self) -> Vec<String> {
+        self.reader.list_obsm()
+    }
+
+    /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
+    /// Mirrors the local `Experiment.varm_keys`.
+    fn varm_keys(&self) -> Vec<String> {
+        self.reader.list_varm()
+    }
+
+    /// Names of the layers in the file. Pure catalog scan. Mirrors the local
+    /// `Experiment.layer_names`.
+    fn layer_names(&self) -> Vec<String> {
+        self.reader.layer_names()
+    }
+
     #[getter]
     fn nnz(&self) -> u64 {
         self.reader.nnz()
@@ -353,6 +397,69 @@ impl PyCloudExperiment {
     #[getter]
     fn codec_id(&self) -> u8 {
         self.reader.header().codec_id
+    }
+
+    /// `True` when the file has a CSC sidecar (gene-major shards).
+    /// Mirrors the local `Experiment.has_csc`. Header-only, no I/O.
+    #[getter]
+    fn has_csc(&self) -> bool {
+        self.reader.header().has_csc()
+    }
+
+    /// `True` when the file carries logical deletion vectors — some rows
+    /// are marked deleted and drop on export. Mirrors the local
+    /// `Experiment.has_deletions`. Header-only, no I/O.
+    #[getter]
+    fn has_deletions(&self) -> bool {
+        self.reader.header().has_deletion_vectors()
+    }
+
+    /// File-header index dtype (`0=u16`, `1=u32`). Mirrors the local
+    /// `Experiment.index_dtype`.
+    #[getter]
+    fn index_dtype(&self) -> u8 {
+        self.reader.header().index_dtype
+    }
+
+    /// Physical row count straight from the file header — the count
+    /// before any deletion-vector masking. Mirrors the local
+    /// `Experiment.n_obs_physical`.
+    ///
+    /// NOTE: unlike the local `Experiment` (whose `n_obs` returns the
+    /// logical, post-deletion count, so `n_obs_physical` can exceed it),
+    /// the cloud `n_obs` getter is itself the physical header count today —
+    /// the cloud read path does not yet apply deletion masking. So on the
+    /// cloud path `n_obs_physical == n_obs` even when `has_deletions` is
+    /// `True`. Making cloud `n_obs` deletion-aware (for full parity) is a
+    /// tracked follow-up.
+    #[getter]
+    fn n_obs_physical(&self) -> u64 {
+        self.reader.header().n_obs
+    }
+
+    /// The URL this handle was opened from (`gs://` / `s3://` / local
+    /// path). Mirrors `PyExperiment.path`, which returns the local path.
+    #[getter]
+    fn path(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Codec / shard / format-version internals as a one-line string.
+    /// Mirrors `PyExperiment.info`; the AnnData-style repr lists keys, the
+    /// on-disk encoding details live here. Header-only, no I/O.
+    fn info(&self) -> String {
+        let h = self.reader.header();
+        format!(
+            "SCX file: format_version={}, codec_id={}, index_dtype={}, \
+             csr_shards={}, nnz={}, has_csc={}, path={}",
+            h.format_version,
+            h.codec_id,
+            h.index_dtype,
+            h.n_csr_shards,
+            self.reader.nnz(),
+            h.has_csc(),
+            self.url,
+        )
     }
 
     /// True if this file is multimodal (v2 with `n_modalities > 0`).
@@ -420,6 +527,43 @@ impl PyCloudExperiment {
         d.set_item("n_csc_shards", info.n_csc_shards)?;
         d.set_item("flags", info.flags.bits())?;
         Ok(Some(d))
+    }
+
+    /// Keys of the `uns` (unstructured metadata) section, or `[]` when the
+    /// file has no `uns`. `modality=None` reads the global `uns`; a modality
+    /// name reads that modality's `uns/<name>` section (raises `KeyError` for
+    /// an unknown name). Mirrors the local `Experiment.uns_keys`.
+    #[pyo3(signature = (modality=None))]
+    fn uns_keys(&self, py: Python<'_>, modality: Option<&str>) -> PyResult<Vec<String>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        let val = py
+            .detach(|| self.rt.block_on(self.reader.read_uns_for(modality_id)))
+            .map_err(cloud_to_pyerr)?;
+        match val {
+            Some(serde_json::Value::Object(map)) => Ok(map.keys().cloned().collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Read the `uns` (unstructured metadata) section as a Python object,
+    /// reconstructing NumPy/pandas envelopes. Returns `None` when the file
+    /// has no `uns`. `modality=None` reads the global `uns`; a modality name
+    /// reads that modality's `uns/<name>` section (raises `KeyError` for an
+    /// unknown name). Mirrors the local `Experiment.read_uns`.
+    #[pyo3(signature = (modality=None))]
+    fn read_uns<'py>(
+        &self,
+        py: Python<'py>,
+        modality: Option<&str>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let modality_id = self.resolve_uns_modality(modality)?;
+        let val = py
+            .detach(|| self.rt.block_on(self.reader.read_uns_for(modality_id)))
+            .map_err(cloud_to_pyerr)?;
+        match val {
+            Some(v) => Ok(Some(crate::convert::uns::json_value_to_pyobject(py, &v)?)),
+            None => Ok(None),
+        }
     }
 
     /// Materialise a multimodal file as `mudata.MuData`.
@@ -518,6 +662,7 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         reader: Arc::new(reader),
         rt: Arc::new(rt),
         modalities,
+        url,
     })
 }
 

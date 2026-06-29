@@ -497,3 +497,236 @@ class TestCloudMultimodalDiscoverability:
             exp = pyscx.open_cloud(exploded_dir)
             with pytest.raises(RuntimeError, match="pull the file locally"):
                 exp.to_mudata()
+
+
+def _create_test_scx_with_uns(path: str, uns: dict | None, n_obs: int = 50, n_vars: int = 10):
+    """Create a test .scx with an optional uns payload via from_anndata."""
+    import anndata
+    import pyscx
+
+    rng = np.random.default_rng(7)
+    X = sp.random(n_obs, n_vars, density=0.2, format="csr", dtype=np.float32,
+                   random_state=rng)
+    X.data = np.round(X.data * 10).astype(np.float32)
+    adata = anndata.AnnData(
+        X=X,
+        obs={"cell_id": [f"cell_{i}" for i in range(n_obs)]},
+        var={"gene_id": [f"gene_{i}" for i in range(n_vars)]},
+    )
+    if uns is not None:
+        adata.uns.update(uns)
+    pyscx.from_anndata(adata, path, codec="none")
+
+
+class TestCloudReadUns:
+    """Group A parity: CloudExperiment.read_uns() / uns_keys() must match
+    the local Experiment on byte-identical (exploded) files."""
+
+    def test_read_uns_parity_with_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "uns.scx")
+            _create_test_scx_with_uns(scx_path, {"species": "human", "version": 2})
+            exploded_dir = os.path.join(tmpdir, "uns.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert cloud.read_uns() == local.read_uns()
+            assert set(cloud.uns_keys()) == set(local.uns_keys())
+            assert cloud.read_uns()["species"] == "human"
+            assert int(cloud.read_uns()["version"]) == 2
+
+    def test_read_uns_none_when_absent(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "no_uns.scx")
+            _create_test_scx_with_uns(scx_path, None)
+            exploded_dir = os.path.join(tmpdir, "no_uns.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert cloud.read_uns() is None
+            assert cloud.uns_keys() == []
+
+    def test_read_uns_packed_file(self):
+        """Works on a packed .scx (not just an exploded .scxd/ dir)."""
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "uns.scx")
+            _create_test_scx_with_uns(scx_path, {"k": "v"})
+            cloud = pyscx.open_cloud(scx_path)
+            assert cloud.read_uns() == {"k": "v"}
+            assert cloud.uns_keys() == ["k"]
+
+    def test_read_uns_multimodal_modality_resolution(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "cite.scx")
+            _create_multimodal_scx(scx_path)
+            exploded_dir = os.path.join(tmpdir, "cite.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert set(cloud.modality_names) == {"rna", "adt"}
+
+            # from_mudata writes no global / per-modality uns here, so known
+            # modalities resolve and return None (proving the modality_id ->
+            # read_uns_for path is wired), and unknown names raise KeyError.
+            assert cloud.read_uns() is None
+            assert cloud.read_uns(modality="rna") is None
+            assert cloud.uns_keys(modality="adt") == []
+            with pytest.raises(KeyError):
+                cloud.read_uns(modality="does_not_exist")
+            with pytest.raises(KeyError):
+                cloud.uns_keys(modality="does_not_exist")
+
+
+class TestCloudIntrospectionParity:
+    """Group B parity: header-only introspection accessors on
+    CloudExperiment must match the local Experiment on byte-identical
+    (exploded / packed) files. All are O(1) header reads, no network I/O."""
+
+    def test_header_getters_match_local(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=80, n_vars=30)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert cloud.has_csc == local.has_csc
+            assert cloud.has_deletions == local.has_deletions
+            assert cloud.index_dtype == local.index_dtype
+            assert cloud.n_obs_physical == local.n_obs_physical
+            # A default file has no deletions, so physical == logical.
+            assert cloud.n_obs_physical == cloud.n_obs == 80
+
+    def test_path_returns_opened_url(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=40, n_vars=20)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            # Both packed-file and exploded-dir layouts round-trip the URL.
+            assert pyscx.open_cloud(exploded_dir).path == exploded_dir
+            assert pyscx.open_cloud(scx_path).path == scx_path
+
+    def test_info_string_and_prefix_parity(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=60, n_vars=25)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            info = cloud.info()
+            assert isinstance(info, str)
+            for token in ("format_version=", "codec_id=", "nnz=", "has_csc=", "path="):
+                assert token in info
+            assert exploded_dir in info
+
+            # Header fields are identical on byte-identical files; only the
+            # trailing `path=...` differs. Compare the prefix up to `path=`.
+            assert info.split(", path=")[0] == local.info().split(", path=")[0]
+
+    def test_has_csc_true_with_sidecar(self):
+        """A file written with a forced CSC sidecar reports has_csc=True,
+        matching the local Experiment."""
+        import anndata
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "csc.scx")
+            rng = np.random.default_rng(3)
+            X = sp.random(60, 20, density=0.3, format="csr", dtype=np.float32,
+                          random_state=rng)
+            X.data = np.round(X.data * 10).astype(np.float32)
+            adata = anndata.AnnData(
+                X=X,
+                obs={"cell_id": [f"c{i}" for i in range(60)]},
+                var={"gene_id": [f"g{i}" for i in range(20)]},
+            )
+            pyscx.from_anndata(adata, scx_path, codec="none", csc="always")
+
+            local = pyscx.open(scx_path)
+            exploded_dir = os.path.join(tmpdir, "csc.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            # Parity holds regardless of whether explode preserves the
+            # sidecar; assert the local file actually has one so the
+            # has_csc=True path is genuinely exercised.
+            assert local.has_csc is True
+            assert cloud.has_csc == local.has_csc
+
+
+class TestCloudCatalogEnumParity:
+    """Group C parity: CloudExperiment.obsm_keys() / varm_keys() /
+    layer_names() must match the local Experiment on byte-identical files.
+    All are pure in-memory catalog scans (catalog loaded at open)."""
+
+    def test_enum_keys_match_local(self):
+        import anndata
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            rng = np.random.default_rng(11)
+            X = sp.random(40, 12, density=0.3, format="csr", dtype=np.float32,
+                          random_state=rng)
+            X.data = np.round(X.data * 10).astype(np.float32)
+            adata = anndata.AnnData(
+                X=X,
+                obs={"cell_id": [f"c{i}" for i in range(40)]},
+                var={"gene_id": [f"g{i}" for i in range(12)]},
+            )
+            adata.obsm["X_pca"] = np.zeros((40, 5), dtype=np.float32)
+            adata.obsm["X_umap"] = np.zeros((40, 2), dtype=np.float32)
+            adata.varm["PCs"] = np.zeros((12, 5), dtype=np.float32)
+            adata.layers["counts"] = adata.X.copy()
+            pyscx.from_anndata(adata, scx_path, codec="none")
+
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path)
+            cloud = pyscx.open_cloud(exploded_dir)
+
+            assert set(cloud.obsm_keys()) == set(local.obsm_keys())
+            assert set(cloud.varm_keys()) == set(local.varm_keys())
+            assert set(cloud.layer_names()) == set(local.layer_names())
+            # Sanity: the data we wrote is actually present.
+            assert set(cloud.obsm_keys()) >= {"X_pca", "X_umap"}
+            assert "PCs" in cloud.varm_keys()
+            assert "counts" in cloud.layer_names()
+
+    def test_enum_keys_empty_when_absent(self):
+        import pyscx
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "x.scx")
+            _create_test_scx(scx_path, n_obs=20, n_vars=8)
+            exploded_dir = os.path.join(tmpdir, "x.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            cloud = pyscx.open_cloud(exploded_dir)
+            assert cloud.obsm_keys() == []
+            assert cloud.varm_keys() == []
+            assert cloud.layer_names() == []

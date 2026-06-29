@@ -1214,8 +1214,19 @@ pub(crate) fn read_uns_as_pyobject<'py>(
         Err(scx_format_io::ScxError::SectionNotFound(_)) => return Ok(None),
         Err(e) => return Err(to_pyerr(e)),
     };
+    Ok(Some(json_value_to_pyobject(py, &json_val)?))
+}
+
+/// Reconstruct an already-read `uns` JSON value into a Python object,
+/// rebuilding NumPy/pandas envelopes in a single recursive pass. Shared by
+/// the local reader path (`read_uns_as_pyobject`) and the cloud reader path,
+/// which obtains the `serde_json::Value` from `CloudReader::read_uns_for`.
+pub(crate) fn json_value_to_pyobject<'py>(
+    py: Python<'py>,
+    val: &serde_json::Value,
+) -> PyResult<Bound<'py, PyAny>> {
     let mut ctx = UnsReadCtx::new(py)?;
-    Ok(Some(json_to_py(&json_val, &mut ctx)?))
+    json_to_py(val, &mut ctx)
 }
 
 // ---------------------------------------------------------------------------

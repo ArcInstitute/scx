@@ -954,6 +954,49 @@ impl FullCatalog {
             .collect()
     }
 
+    /// De-duplicated logical names under `<prefix>/`, considering both the
+    /// legacy single-section type and the sharded type (stripping the
+    /// `_shard_N` suffix). Used by obsm/varm/obsp/varp enumeration on every
+    /// reader. Pure catalog scan, no I/O.
+    pub fn list_logical_names(
+        &self,
+        prefix: &str,
+        single_type: SectionType,
+        shard_type: SectionType,
+    ) -> Vec<String> {
+        let path_prefix = format!("{prefix}/");
+        let shard_marker = "_shard_";
+        let mut names: std::collections::BTreeSet<String> = Default::default();
+        for entry in &self.entries {
+            if entry.section_type == single_type {
+                if let Some(name) = entry.name.strip_prefix(&path_prefix) {
+                    names.insert(name.to_string());
+                }
+            } else if entry.section_type == shard_type {
+                if let Some(rest) = entry.name.strip_prefix(&path_prefix) {
+                    if let Some(idx) = rest.rfind(shard_marker) {
+                        names.insert(rest[..idx].to_string());
+                    }
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    /// De-duplicated layer names from `LayerCsrShard` entries (strips the
+    /// `_shard_N` suffix). Pure catalog scan, no I/O.
+    pub fn layer_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::LayerCsrShard)
+            .filter_map(|e| e.name.rfind("_shard_").map(|pos| e.name[..pos].to_string()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Return CSR shard entries sorted by `stats.row_start`.
     /// Entries without stats are placed at the end.
     ///
