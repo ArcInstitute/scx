@@ -48,10 +48,20 @@ as.data.frame.RQueryResult <- function(x, row.names = NULL, optional = FALSE, ..
 # is never a hard error.
 .onLoad <- function(libname, pkgname) {
   methods::setOldClass("RQueryResult")
+  methods::setOldClass("ScxBackedSparse")
+  methods::setOldClass("ScxLazyTransformed")
 
   # Matrix is an Imports dependency, so dgCMatrix is always available.
   methods::setAs(
     "RQueryResult", "dgCMatrix",
+    function(from) from$to_dgcmatrix()
+  )
+  methods::setAs(
+    "ScxBackedSparse", "dgCMatrix",
+    function(from) from$to_dgcmatrix()
+  )
+  methods::setAs(
+    "ScxLazyTransformed", "dgCMatrix",
     function(from) from$to_dgcmatrix()
   )
 

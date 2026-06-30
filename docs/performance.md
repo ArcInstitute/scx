@@ -684,7 +684,7 @@ because sequential reads can stream shards in catalog order; plan-driven
 access is intentionally random and trades that for per-cell pairing
 flexibility.
 
-**Locality optimisations (1M cells, same fixture):**
+**Locality optimizations (1M cells, same fixture):**
 
 | Lever | Delta | Notes |
 |---|---|---|

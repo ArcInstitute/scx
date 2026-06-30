@@ -117,6 +117,7 @@ materializing path.
 | h5ad file on disk | `pyscx.from_h5ad(path, out, ...)` | `scx convert in.h5ad out.scx --stream` |
 | AnnData in memory | `pyscx.from_anndata(adata, out, ...)` | — |
 | h5mu (multimodal) | `pyscx.from_h5mu(path, out, modalities=..., modality_types=...)` | `scx convert in.h5mu out.scx --modalities rna,adt` |
+| MuData in memory | `pyscx.from_mudata(mdata, out, ...)` | — |
 | 10x HDF5 | `pyscx.from_10x(h5, out)` | `scx convert in.h5 out.scx --from 10x` |
 | Cell Ranger MTX dir | `pyscx.from_mtx(mtx_dir, out)` | `scx convert mtx_dir out.scx --from mtx` |
 
@@ -143,6 +144,9 @@ Most-used kwargs (shared across ingest entry points):
   file that has the sidecar — the planner picks `gpu_csc_v3` automatically.
   `prefer_format="csc"` is the **CPU** column-major path (no GPU kernel);
   combining it with `device="gpu"` raises.
+- `sort_by=[...]` / `reverse=True` — globally reorder the cell axis by obs
+  columns at convert time (forces `stream=True`). CLI: `--sort-by CSV
+  [--sort-reverse]`. Also available on `from_anndata`.
 - `memory_budget="4G"` (bare bytes or a binary-prefixed size: `K`/`M`/`G`/`T`
   or `KiB`/`MiB`/`GiB`/`TiB`, powers of 1024; decimal `KB`/`MB`/`GB`/`TB`
   rejected), `strict_uns=True`, `shard_size`. See `reference/conversion.md` for the rest
@@ -163,14 +167,18 @@ Most-used kwargs (shared across ingest entry points):
 `scx info <file> [--json --history]`, `scx validate <file>`,
 `scx subset <in> --filter <expr> --genes <path>`, `scx merge`, `scx append`,
 `scx compact`, `scx optimize` (in-place sidecar + canonical v3 upgrade),
-`scx build-csc <in> <out>` (add a CSC sidecar). Full flag lists in
-`reference/conversion.md`.
+`scx build-csc <in> <out>` (add a CSC sidecar),
+`scx sort <in> <out> --by CSV` (reorder cells by obs key for query locality),
+`scx set-uns <file> --uns JSON` (replace uns in place),
+`scx modify-metadata <file> --obs PARQUET --var PARQUET --obsm NAME=NPY ...
+--index-*` (replace metadata sections in place).
+Full flag lists in `reference/conversion.md`.
 
 **Selective read / count from the CLI:** `scx query <file> <filter> [--count]
-[--output OUT] [--explain]`. Two surprises worth knowing up front:
+[--output OUT] [--explain]`. Worth knowing:
 - The predicate is a **positional argument** here (`scx query f.scx "disease == 'normal'"`),
-  *unlike* `scx subset`/`scx delete` which take `--filter <expr>`. `scx query f.scx --filter ...`
-  fails with a clap usage error.
+  or alternatively via `--filter EXPR` (matching `scx subset`/`scx delete`;
+  provide one form, not both).
 - `--count` is fast on a multi-shard, indexed file (sub-second on 31–62 shards);
   `--explain` prints the pushdown plan (Level-1 shard pruning + Level-2 row mask)
   so you can confirm the index is doing work. `scx query ... --output OUT.scx` is
@@ -305,9 +313,11 @@ only when the filtered result fits in RAM, else switch to
   preserved, duplicates collapsed** (unlike NumPy fancy indexing).
 
 The `pyscx.accel.*` catalog (PCA/neighbors/UMAP/leiden, DE & perturbation
-metrics, HVG/QC, harmony, LISI, streaming column stats), the `device=` and
-`prefer_format=` dispatch, and the full backed-mode scanpy-compat table are in
-`reference/processing.md`.
+metrics, HVG/QC, PFlog1pPF & shifted-CLR normalization, gene-set scoring
+(`score_genes`), pseudobulk NB GLM (`nb_glm`/`pdex_nb_glm`), harmony, LISI,
+streaming column stats, fused GPU pipelines (`pca_neighbors`,
+`pca_neighbors_umap`)), the `device=` and `prefer_format=` dispatch, and the
+full backed-mode scanpy-compat table are in `reference/processing.md`.
 
 ---
 
@@ -369,8 +379,8 @@ splitting, and Lightning examples are in `reference/ml-loading.md`.
 - `pyscx.to_h5ad` / `from_h5ad` are **free functions**; `to_anndata` / `query` are Experiment methods.
 - Backed mode: `pyscx.accel.normalize_total/log1p`, **not** `sc.pp.*` (which materialize).
 - `qc_vars=["mt"]` + tag `var["mt"]` yourself; HVG seurat_v3 on raw counts; `leiden(device="cpu")` for stable labels.
-- Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done.
+- Training loaders: `num_workers=0`; HVG indices as `np.uint32`; `close()` when done. `pflog1ppf=True` for PFlog1pPF normalization (replaces `normalize`/`log1p`).
 - GPU ops fall back to CPU silently — check `pyscx.accel.gpu_info()` / `nvidia-smi` / `adata.uns["scx_accel"]` route. PCA/kNN/UMAP/preprocess route to rapids-singlecell when installed; `SCX_DISABLE_RAPIDS=1` forces CPU fallback for testing. Build pyscx `--features gpu` once, then **run from the conda env that has rapids** (a plain `.venv` usually doesn't).
 - GPU-fast CSC-direct DE (`gpu_csc_v3`): call `rank_genes_groups`/`pdex_ref` with the **default `prefer_format="csr"`** + `device="gpu"` (or `"auto"`) on a file with a `csc=` sidecar — the planner picks it automatically. `prefer_format="csc"` is the **CPU** path; `prefer_format="csc"` + `device="gpu"` raises.
-- CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter` (matching `scx subset`/`delete`); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
+- CLI predicate: `scx query <file> <filter>` accepts the filter positionally **or** via `--filter EXPR` (matching `scx subset`/`delete`; one form, not both); cloud subcommands (`scx pull`/`push`/…) only exist in a `--features cloud` build.
 - `compute_lisi` defaults to O(N²) exact kNN — minutes-to-tens-of-minutes at ≥1M cells; pass `approximate_knn=True` for an HNSW kNN (~10× faster, small drift) or subsample to evaluate integration.

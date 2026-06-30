@@ -54,6 +54,26 @@ def _make_adata(seed: int = SEED) -> ad.AnnData:
     return ad.AnnData(X=counts, obs=obs_df, var=var_df)
 
 
+def _make_adata_special_genes(seed: int = SEED) -> ad.AnnData:
+    """`_make_adata` with two controlled genes for fold-change edge cases:
+
+    * gene 0: zero in **every** group → `0/0` (must report 0.0, not NaN/inf).
+    * gene 1: zero in the reference, positive in the test groups → one-sided
+      zero (`±inf` with epsilon=0).
+
+    The remaining genes keep the standard 3-group signal so FDR has a realistic
+    universe to correct over.
+    """
+    adata = _make_adata(seed)
+    X = np.asarray(adata.X, dtype=np.float32).copy()
+    ref_mask = adata.obs["target"].to_numpy() == REFERENCE
+    X[:, 0] = 0.0  # zero everywhere
+    X[ref_mask, 1] = 0.0  # zero in reference
+    X[~ref_mask, 1] = 5.0  # positive in test groups
+    adata.X = X
+    return adata
+
+
 def _csr_with_descending_indices(adata: ad.AnnData) -> sp.csr_matrix:
     """Return a `csr_matrix` carrying the same dense values as `adata.X`,
     but with each row's column indices in **descending** order — i.e.

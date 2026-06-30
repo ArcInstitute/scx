@@ -721,7 +721,7 @@ struct DecodedShard {
     #[allow(dead_code)]
     shard_idx: u32,
     shard_row_start: usize,
-    /// Kept for diagnostics + future filter optimisations.
+    /// Kept for diagnostics + future filter optimizations.
     #[allow(dead_code)]
     n_rows: u32,
     indptr: Vec<i64>,

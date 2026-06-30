@@ -4,19 +4,39 @@
 \alias{scx_compact}
 \title{Compact an SCX file}
 \usage{
-scx_compact(input, output)
+scx_compact(
+  input,
+  output,
+  index_obs = NULL,
+  index_var = NULL,
+  index_preset = NULL,
+  index_auto_threshold = 0L,
+  reshape_obs = FALSE
+)
 }
 \arguments{
 \item{input}{Path to the input SCX file.}
 
 \item{output}{Path for the compacted output file.}
+
+\item{index_obs, index_var}{Obs/var columns to build predicate indexes for.}
+
+\item{index_preset}{Named index preset
+(\code{"cellxgene"}/\code{"perturbseq"}/\code{"training"}).}
+
+\item{index_auto_threshold}{Auto-index cardinality cap (0 = disabled).}
+
+\item{reshape_obs}{Migrate legacy single-section obs metadata to the
+row-sharded layout.}
 }
 \description{
 Rewrites the file, removing deleted rows and reclaiming space from
-orphaned sections and stale catalogs.
+orphaned sections and stale catalogs. \code{shard_target_rows} is inherited
+from the input header; CSC sidecars are dropped (rebuild separately).
 }
 \examples{
 \dontrun{
 scx_compact("experiment.scx", "compacted.scx")
+scx_compact("experiment.scx", "compacted.scx", index_obs = "cell_type")
 }
 }

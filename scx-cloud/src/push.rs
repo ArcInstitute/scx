@@ -9,17 +9,24 @@
 //!   3. Upload `_header.bin`
 //!   4. Upload `_catalog.bin` LAST (atomic-publish semantics)
 
+#[cfg(test)]
 use std::io::Cursor;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use object_store::ObjectStore;
+use object_store::path::Path as ObjPath;
+use object_store::{ObjectStore, WriteMultipart};
 
-use scx_format_io::catalog::FullCatalog;
-use scx_format_io::header::{FileHeader, HEADER_SIZE};
+use scx_format_io::header::HEADER_SIZE;
 
 use crate::error::{CloudError, Result};
 use crate::explode::section_name_to_path;
+
+/// Max concurrent in-flight parts per multipart upload. Bounds the per-upload
+/// memory to `PART_CONCURRENCY × chunk` on top of the read buffer.
+const PART_CONCURRENCY: usize = 4;
 
 /// Options for the push operation.
 pub struct PushOptions {
@@ -47,101 +54,80 @@ pub struct PushStats {
 /// The catalog object is uploaded last. Until it exists, the remote
 /// `.scxd` directory is not openable — providing atomic-publish semantics.
 pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<PushStats> {
+    push_inner(source, dest, options, crate::streaming::MULTIPART_THRESHOLD).await
+}
+
+/// Inner implementation with an injectable multipart threshold so tests can
+/// exercise the chunked multipart path without a multi-MiB fixture.
+async fn push_inner(
+    source: &Path,
+    dest: &str,
+    options: PushOptions,
+    multipart_threshold: u64,
+) -> Result<PushStats> {
     let start = Instant::now();
 
-    // 1. Read the entire source file
-    let file_data = std::fs::read(source)?;
-    if file_data.len() < HEADER_SIZE {
-        return Err(CloudError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file too small to contain SCX header",
-        )));
-    }
-
-    let header = FileHeader::read_from(&mut Cursor::new(&file_data[..HEADER_SIZE]))?;
-    let fc_offset = header.full_catalog_offset as usize;
-    let fc_length = header.full_catalog_length as usize;
-    let fc_end = fc_offset
-        .checked_add(fc_length)
-        .filter(|&end| end <= file_data.len())
-        .ok_or_else(|| CloudError::SliceBoundsExceeded {
-            offset: fc_offset,
-            length: fc_length,
-            data_len: file_data.len(),
-        })?;
-
-    let full_catalog = FullCatalog::read_from(
-        &mut Cursor::new(&file_data[fc_offset..fc_end]),
-        fc_length,
-        true,
-    )?;
+    // 1. Read only the header + catalog (KB–MB), not the whole file. Section
+    //    payloads are streamed from the file per upload below, so peak memory
+    //    is O(parallelism × chunk), independent of the source-file size.
+    let (_header, full_catalog) = crate::streaming::read_header_and_catalog(source)?;
 
     // 2. Parse destination and create backend
     let location = crate::backend::parse_location(dest)?;
     let backend = crate::backend::create_backend(&location).await?;
-
     let make_path = crate::pull::build_path_fn(&location);
 
-    let mut total_bytes_uploaded: u64 = 0;
     let parallelism = options.parallelism.max(1);
+    let sections_uploaded = full_catalog.entries.len();
+    let total_bytes_uploaded = AtomicU64::new(0);
 
-    // 3. Build upload tasks for each section (validate bounds first)
-    let mut upload_tasks: Vec<(String, Vec<u8>)> = Vec::with_capacity(full_catalog.entries.len());
+    // 3. Resolve section → object paths up front (cheap; surfaces a malformed
+    //    catalog before any upload starts). No section payloads are copied.
+    let mut planned: Vec<(ObjPath, u64, u64)> = Vec::with_capacity(full_catalog.entries.len());
     for entry in &full_catalog.entries {
         let rel_path = section_name_to_path(&entry.name, entry.section_type)
             .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
-        let src_start = entry.offset as usize;
-        let src_len = entry.length as usize;
-        let src_end =
-            src_start
-                .checked_add(src_len)
-                .ok_or_else(|| CloudError::SliceBoundsExceeded {
-                    offset: src_start,
-                    length: src_len,
-                    data_len: file_data.len(),
-                })?;
-        if src_end > file_data.len() {
-            return Err(CloudError::SliceBoundsExceeded {
-                offset: src_start,
-                length: src_len,
-                data_len: file_data.len(),
-            });
-        }
-        let data = file_data[src_start..src_end].to_vec();
-        upload_tasks.push((rel_path, data));
+        planned.push((make_path(&rel_path), entry.offset, entry.length));
     }
 
-    // 4. Upload sections in parallel batches (consume upload_tasks to avoid cloning)
-    let sections_uploaded = upload_tasks.len();
-    let mut remaining = upload_tasks;
-    while !remaining.is_empty() {
-        let chunk_size = remaining.len().min(parallelism);
-        let chunk: Vec<_> = remaining.drain(..chunk_size).collect();
-        let mut handles = Vec::with_capacity(chunk.len());
-
-        for (rel_path, data) in chunk {
-            let obj_path = make_path(&rel_path);
-            let len = data.len() as u64;
-            let bytes = bytes::Bytes::from(data);
-            let backend_ref = &backend;
+    // 4. Upload sections in bounded windows. Each task streams its section
+    //    from its own file handle — no whole-file buffer, no full list of
+    //    per-section copies held at once.
+    let backend_ref: &dyn ObjectStore = backend.as_ref();
+    for window in planned.chunks(parallelism) {
+        let mut handles = Vec::with_capacity(window.len());
+        for (obj_path, offset, length) in window {
+            let counter = &total_bytes_uploaded;
             handles.push(async move {
-                backend_ref.put(&obj_path, bytes.into()).await?;
-                Ok::<u64, CloudError>(len)
+                upload_section(
+                    backend_ref,
+                    source,
+                    *offset,
+                    *length,
+                    obj_path,
+                    multipart_threshold,
+                )
+                .await?;
+                counter.fetch_add(*length, Ordering::Relaxed);
+                Ok::<(), CloudError>(())
             });
         }
-
-        let results = futures::future::join_all(handles).await;
-        for result in results {
-            total_bytes_uploaded += result?;
+        for result in futures::future::join_all(handles).await {
+            result?;
         }
     }
 
-    // 5. Upload _header.bin
+    // 5. Upload _header.bin (raw 256-byte header, byte-identical to source).
     {
         let header_path = make_path("_header.bin");
-        let header_bytes = bytes::Bytes::from(file_data[..HEADER_SIZE].to_vec());
-        backend.put(&header_path, header_bytes.into()).await?;
-        total_bytes_uploaded += HEADER_SIZE as u64;
+        let header_bytes = crate::streaming::read_raw_header(source)?;
+        backend
+            .put(
+                &header_path,
+                bytes::Bytes::copy_from_slice(&header_bytes).into(),
+            )
+            .await?;
+        total_bytes_uploaded.fetch_add(HEADER_SIZE as u64, Ordering::Relaxed);
     }
 
     // 6. Upload _catalog.bin LAST (atomic-publish semantics)
@@ -153,9 +139,10 @@ pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<Pus
         backend
             .put(&catalog_path, bytes::Bytes::from(catalog_bytes).into())
             .await?;
-        total_bytes_uploaded += catalog_len;
+        total_bytes_uploaded.fetch_add(catalog_len, Ordering::Relaxed);
     }
 
+    let total_bytes_uploaded = total_bytes_uploaded.into_inner();
     let elapsed = start.elapsed();
     let throughput_mbps = if elapsed.as_secs_f64() > 0.0 {
         (total_bytes_uploaded as f64 / 1_000_000.0) / elapsed.as_secs_f64()
@@ -171,9 +158,80 @@ pub async fn push(source: &Path, dest: &str, options: PushOptions) -> Result<Pus
     })
 }
 
+/// Stream a single section's byte range from `source` to `obj_path`.
+///
+/// Small sections (< [`MULTIPART_THRESHOLD`](crate::streaming::MULTIPART_THRESHOLD))
+/// upload via a single `put`; larger ones (X / CSC shards) stream through a
+/// chunked multipart upload so neither path holds the whole section in memory.
+async fn upload_section(
+    backend: &dyn ObjectStore,
+    source: &Path,
+    offset: u64,
+    length: u64,
+    obj_path: &ObjPath,
+    multipart_threshold: u64,
+) -> Result<()> {
+    let mut file = std::fs::File::open(source)?;
+    file.seek(SeekFrom::Start(offset))?;
+
+    if length < multipart_threshold {
+        let mut buf = vec![0u8; length as usize];
+        file.read_exact(&mut buf)?;
+        backend
+            .put(obj_path, bytes::Bytes::from(buf).into())
+            .await?;
+        return Ok(());
+    }
+
+    let upload = backend.put_multipart(obj_path).await?;
+    let mut writer = WriteMultipart::new(upload);
+
+    // Once the multipart upload is open, any error path (source read error,
+    // part-upload error) must `abort()` it — otherwise the in-progress upload
+    // is dropped without cleanup, and S3/GCS-style stores do not reliably
+    // garbage-collect incomplete multipart uploads, leaving orphaned, billable
+    // parts behind. Run the streaming loop in a helper and abort on any Err.
+    match stream_multipart(&mut writer, &mut file, length).await {
+        Ok(()) => {
+            writer.finish().await.map_err(CloudError::ObjectStore)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Best-effort cleanup; surface the original error regardless.
+            let _ = writer.abort().await;
+            Err(e)
+        }
+    }
+}
+
+/// Stream `length` bytes from `file` (already positioned at the section offset)
+/// into an open multipart `writer`. Separated out so [`upload_section`] can
+/// `abort()` the upload on any error here.
+async fn stream_multipart(
+    writer: &mut WriteMultipart,
+    file: &mut std::fs::File,
+    length: u64,
+) -> Result<()> {
+    let mut remaining = length;
+    let mut buf = vec![0u8; crate::streaming::CHUNK_SIZE];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..want])?;
+        writer
+            .wait_for_capacity(PART_CONCURRENCY)
+            .await
+            .map_err(CloudError::ObjectStore)?;
+        writer.write(&buf[..want]);
+        remaining -= want as u64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scx_format_io::catalog::FullCatalog;
+    use scx_format_io::header::FileHeader;
     use scx_format_io::reader::ScxReader;
     use scx_format_io::writer::ScxWriter;
 
@@ -348,6 +406,51 @@ mod tests {
                 "section file {rel_path} (name: {}) should exist after push",
                 entry.name
             );
+        }
+    }
+
+    /// Drive the chunked multipart streaming path (not just the single-`put`
+    /// path) by forcing a tiny multipart threshold so every shard section goes
+    /// through `WriteMultipart`, then assert the pulled-back data is identical.
+    /// The local-filesystem `ObjectStore` backend implements `put_multipart`,
+    /// so this exercises the real streaming code path against disk.
+    #[tokio::test]
+    async fn test_push_multipart_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 200, 60);
+
+        let dest_dir = dir.path().join("pushed_mp.scxd");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest_str = dest_dir.to_string_lossy().to_string();
+
+        // Threshold of 1 byte → all non-empty sections take the multipart path.
+        push_inner(&input, &dest_str, PushOptions::default(), 1)
+            .await
+            .unwrap();
+
+        let pulled_output = dir.path().join("pulled_mp.scx");
+        crate::pull::pull(
+            &dest_str,
+            &pulled_output,
+            crate::pull::PullOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let reader_orig = ScxReader::open(&input).unwrap();
+        let reader_pulled = ScxReader::open(&pulled_output).unwrap();
+        assert_eq!(reader_orig.n_obs(), reader_pulled.n_obs());
+        assert_eq!(reader_orig.n_vars(), reader_pulled.n_vars());
+
+        let csr_orig = reader_orig.read_all_csr_shards().unwrap();
+        let csr_pulled = reader_pulled.read_all_csr_shards().unwrap();
+        assert_eq!(csr_orig.indptr, csr_pulled.indptr);
+        assert_eq!(csr_orig.indices, csr_pulled.indices);
+        assert_eq!(csr_orig.data, csr_pulled.data);
+
+        // Round-tripped file passes checksum validation.
+        for (name, passed) in reader_pulled.validate().unwrap() {
+            assert!(passed, "checksum failed for section: {name}");
         }
     }
 }

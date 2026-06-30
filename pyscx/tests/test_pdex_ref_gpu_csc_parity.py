@@ -93,3 +93,23 @@ def test_pdex_ref_gpu_csc_parity_vs_reference(tmp_path) -> None:
     # (§B.10 Bg).
     route = _route(gpu)
     assert route == "gpu_csc_v3", f"expected CSC-direct route, got {route!r}"
+
+
+@pytest.mark.parametrize("cpm_filter", [5.0, 50.0])
+def test_pdex_ref_gpu_csc_parity_cpm_filter(cpm_filter: float, tmp_path) -> None:
+    """CSC-direct GPU `cpm_filter` matches the CPU path (drops the same genes,
+    recomputes the same FDR). Default geometric_mean exercises the second
+    arithmetic CSC pseudobulk pass on the device."""
+    base = _make_adata()
+    cpu = _open_with_csc(tmp_path / "cpu.scx", base)
+    gpu = _open_with_csc(tmp_path / "gpu.scx", base)
+
+    cpu_df = pyscx.accel.pdex_ref(
+        cpu, "target", reference=REFERENCE, cpm_filter=cpm_filter, device="cpu"
+    )
+    gpu_df = pyscx.accel.pdex_ref(
+        gpu, "target", reference=REFERENCE, cpm_filter=cpm_filter, device="gpu"
+    )
+
+    _compare(cpu_df, gpu_df)
+    assert _route(gpu) == "gpu_csc_v3", f"expected CSC-direct route, got {_route(gpu)!r}"

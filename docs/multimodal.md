@@ -254,6 +254,21 @@ scx merge cite1.scx cite2.scx --output cite_merged.scx            # multimodal m
 scx compact cite_merged.scx cite_compacted.scx                   # multimodal compact
 ```
 
+From Python, `pyscx.append` / `append_from_anndata` take the same `modality=`
+name (the Python equivalent of `scx append --modality`):
+
+```python
+import pyscx
+
+# Append cells into the rna modality of a multimodal target (the same name
+# resolves the source modality too). Required on multimodal targets; rejected
+# on single-modality files. Use Experiment.modality_names to list them.
+pyscx.append("citeseq.scx", "new_rna_cells.scx", modality="rna")
+
+# Append from an in-memory AnnData into one modality (source is global-axis).
+pyscx.append_from_anndata("citeseq.scx", new_rna_adata, modality="rna")
+```
+
 Python equivalent for the export direction:
 
 ```python

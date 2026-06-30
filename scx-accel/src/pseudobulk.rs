@@ -82,6 +82,18 @@ impl GeomMeanMode {
             (true, true) => Self::GeomLog1p,
         }
     }
+
+    /// The count-space **arithmetic** counterpart of this mode, preserving its
+    /// `is_log1p` interpretation. This is what pdex's `cpm_bulk` uses for the
+    /// `cpm_filter` decision — a per-gene arithmetic mean in count space,
+    /// independent of whether the reported mean is geometric.
+    #[inline]
+    pub fn arith(self) -> Self {
+        match self {
+            Self::ArithRaw | Self::GeomRaw => Self::ArithRaw,
+            Self::ArithLog1pExpand | Self::GeomLog1p => Self::ArithLog1pExpand,
+        }
+    }
 }
 
 /// Result of pseudobulk aggregation.

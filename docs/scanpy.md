@@ -184,6 +184,12 @@ sc.pl.umap(adata, color="leiden")
 > write), see [docs/performance.md §Conversion (h5ad → format)](performance.md#conversion-h5ad--format)
 > and [§Write Scaling (parallel shard encoding)](performance.md#write-scaling-parallel-shard-encoding).
 
+> **Migrating an existing h5ad workflow?**
+> [docs/migrating-from-h5ad.md § Converting h5ad to SCX](migrating-from-h5ad.md#converting-h5ad-to-scx)
+> has end-to-end conversion recipes — predicate indexes, CSC sidecars,
+> detection bitmaps, sort-on-convert, codec/shard tuning, memory budgets,
+> and production-ready CLI + Python examples — all in one place.
+
 ### From AnnData / h5ad
 
 > [!NOTE]
@@ -401,6 +407,37 @@ for name, passed in results:
     if not passed:
         raise RuntimeError(f"section {name} failed checksum")
 ```
+
+### Deep validation (`deep=True`)
+
+Checksum validation proves the section bytes match what was written, but not
+that those bytes *decode* to a well-formed sparse matrix. For decode-level
+integrity, pass `deep=True` (the equivalent of `scx validate --deep`):
+
+```python
+results = pyscx.validate("data.scx", deep=True)   # or exp.validate(deep=True)
+for name, passed in results:
+    if not passed:
+        raise RuntimeError(f"{name} failed validation")
+```
+
+On top of the per-section checksums, deep mode:
+
+- decodes every sparse shard and verifies the **v3 canonical CSR invariant**
+  (column indices sorted and in range, no explicit zeros, `indptr` starting at
+  0 and monotonically increasing, metadata consistent with the decoded data);
+- verifies every **decode sidecar** — structural linkage to its source shard
+  plus a decode-parity check that seeking through the sidecar's recorded
+  Rice-block offsets reproduces the canonical decode byte-for-byte.
+
+Deep-check results are appended to the returned list with `canonical-csr ` and
+`decode-sidecar ` prefixed names. Canonical-CSR checks run only on v3+ files
+(pre-v3 files may legitimately carry unsorted shards, so they are skipped).
+Unlike a checksum failure on an essential section — which raises — deep-check
+failures report `False` in the result list rather than raising, so iterate the
+list to surface them. Cost is higher than a checksum-only pass because every
+shard is decoded; reserve it for post-write or post-transfer integrity gates
+where decode correctness matters.
 
 ## Understanding `to_anndata()`
 
@@ -1293,7 +1330,7 @@ All accelerators that support GPU expose a `device` parameter:
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`, `n_clusters`, `alpha`, `max_iter_kmeans`, `random_state`, `device` |
 | `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
 | `rank_genes_groups`      | ✓   | ✓   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format`, `tie_correct`, `rankby_abs`, `device` |
-| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
+| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `cpm_filter`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
 | `pseudobulk_dex`         | ✓   | —   | `groupby`, `design`, `reference`                                      | `test_col`, `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
 | `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
 | `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
@@ -1327,7 +1364,8 @@ choice locally.
 raises `RuntimeError` with a message naming the missing capability:
 
 1. The file has a CSC sidecar (`pyscx.from_anndata(csc="always"|"auto")`,
-   `scx convert --csc=always|auto`, or `scx build-csc`).
+   `scx convert --csc=always|auto`, `scx build-csc`, or the standalone
+   `pyscx.build_csc(input, output)` to add one to an existing file).
 2. The transform chain on `adata.X` contains only column-local
    operations. `Log1p` is column-local; `NormalizeTotal` and
    `RowScale` are not (per-row state). The common `normalize_total →
@@ -1477,10 +1515,11 @@ the analysis op. So the layout choice matters as much as the device flag:
 - **Upgrade a sidecar-less file in place with `scx optimize`.** A pre-v3 or
   reconverted-without-sidecars file (Scx1 counts but no `decode/*` sections) does
   not need a full reconvert to become device-decode-fast — run
-  `scx optimize in.scx out.scx`. It re-encodes + canonicalizes every CSR
-  shard so decode sidecars are emitted and the file is stamped `format_version=3`,
-  preserving rows / obs / var / obsm / uns / indexes (see
-  [operations.md § Optimize](operations.md#optimize)). Only Scx1 integer shards
+  `scx optimize in.scx out.scx` (or `pyscx.optimize("in.scx", "out.scx")`;
+  pass `codec="scx1"` to force a sidecar on every integer shard). It re-encodes +
+  canonicalizes every CSR shard so decode sidecars are emitted and the file is
+  stamped `format_version=3`, preserving rows / obs / var / obsm / uns / indexes
+  (see [operations.md § Optimize](operations.md#optimize)). Only Scx1 integer shards
   gain a sidecar — a persisted float (Pcodec) `X` still won't (store counts per
   the first bullet).
 
@@ -2094,7 +2133,8 @@ df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
 | `reference` | `"non-targeting"` | Control group label |
 | `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects. |
 | `geometric_mean` | `True` | Use geometric mean for fold-change computation |
-| `epsilon` | `0.0` | Pseudocount for fold-change stability |
+| `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
+| `cpm_filter` | `None` | Optional CPM floor `T`: keep a gene iff `target_cpm > T` or `ref_cpm > T` (pooled arithmetic CPM, mode-independent); drops other rows, FDR recomputed over survivors. |
 | `gene_chunk_size` | `None` | Process genes in chunks to limit memory |
 | `prefer_format` | `"csr"` | `"csr"` or `"csc"` |
 | `device` | `"auto"` | `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU takes the CSC-direct route (`gpu_csc_v3`) when a sidecar is present. |

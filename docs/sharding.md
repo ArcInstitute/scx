@@ -358,11 +358,11 @@ Each CSR shard is a 76-byte header followed by three compressed sections:
 │   magic, codec_id, value_encoding,       │
 │   n_major (rows), n_minor (cols), nnz,   │
 │   global_offset (first row index),       │
-│   section offsets/lengths, checksum       │
+│   section offsets/lengths, checksum      │
 ├──────────────────────────────────────────┤
 │ Indptr    (Delta-Golomb encoded)         │
 ├──────────────────────────────────────────┤
-│ Indices   (FOR-BP encoded)              │
+│ Indices   (FOR-BP encoded)               │
 ├──────────────────────────────────────────┤
 │ Values    (Adaptive Rice encoded)        │
 ├──────────────────────────────────────────┤
@@ -590,9 +590,9 @@ contiguous half-open `[col_start, col_end)` column range:
 
 ```
 n_vars = 36000, --csc-cols-per-shard 5000 (default)
-                       ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬───┐
+                       ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬────┐
 CSC shards (8 total):  │ 0..5K│5..10K│10..15│15..20│20..25│25..30│30..35│..36│
-                       └──────┴──────┴──────┴──────┴──────┴──────┴──────┴───┘
+                       └──────┴──────┴──────┴──────┴──────┴──────┴──────┴────┘
 ```
 
 `scx build-csc --csc-cols-per-shard N` and the matching kwargs on
@@ -601,6 +601,14 @@ CSC shards (8 total):  │ 0..5K│5..10K│10..15│15..20│20..25│25..30│
 per shard**. Pass `0` for no cap (single CSC shard, memory permitting
 — the streaming transpose will still chunk internally to respect the
 `--memory-limit` budget).
+
+To add a CSC sidecar to a file you already have, use the standalone
+`pyscx.build_csc(input, output, memory_limit="4G", force=False,
+csc_cols_per_shard=5000)` — the Python equivalent of `scx build-csc`. It
+reads `input`'s CSR shards and writes both the CSR shards and the new CSC
+sidecar to `output`. For an in-place rebuild use
+`pyscx.sort(..., rebuild_csc=True)`; to emit the sidecar at write time use
+`pyscx.from_anndata(..., csc="always")`.
 
 ### Why multi-shard CSC
 

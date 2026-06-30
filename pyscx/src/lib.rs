@@ -136,7 +136,7 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
     Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
 }
 
-/// Validate all section checksums in an SCX file.
+/// Validate section checksums (and, with `deep`, decode-level integrity) in an SCX file.
 ///
 /// Opens the file with full catalog verification, then computes BLAKE3 of
 /// every section's payload bytes and compares against the catalog's stored
@@ -144,17 +144,51 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 /// only verifies the catalog itself. Cost is proportional to the file's
 /// total section bytes.
 ///
+/// When `deep=True`, additionally decodes every sparse shard to verify the
+/// v3 canonical CSR invariant (sorted column indices, no explicit zeros,
+/// consistent indptr) and verifies every decode sidecar (structural linkage
+/// + decode-parity). Mirrors `scx validate --deep`. Canonical-CSR checks run
+/// only on v3+ files (pre-v3 may legitimately carry unsorted shards). Deep
+/// results are appended with `canonical-csr `/`decode-sidecar ` prefixed
+/// names and report `False` rather than raising.
+///
 /// Returns a list of (section_name, passed) tuples. Raises RuntimeError if
-/// any essential section (obs, var, CsrShard) fails.
+/// any essential section (obs, var, CsrShard) checksum fails.
 ///
 /// Example:
-///     results = pyscx.validate("data.scx")
+///     results = pyscx.validate("data.scx", deep=True)
 ///     for name, passed in results:
 ///         print(f"{name}: {'OK' if passed else 'FAIL'}")
 #[pyfunction]
-fn validate(path: &str) -> PyResult<Vec<(String, bool)>> {
+#[pyo3(signature = (path, deep=false))]
+fn validate(py: Python<'_>, path: &str, deep: bool) -> PyResult<Vec<(String, bool)>> {
     let reader = scx_format_io::ScxReader::open(path).map_err(to_pyerr)?;
-    reader.validate().map_err(to_pyerr)
+    let mut results = reader.validate().map_err(to_pyerr)?;
+    if deep {
+        // Deep validation re-decodes every shard (CPU-bound, pure Rust) — run
+        // it off the GIL so other Python threads aren't blocked on large files.
+        py.detach(|| deep_validate_into(&reader, &mut results));
+    }
+    Ok(results)
+}
+
+/// Append deep-validation results (canonical-CSR + decode-sidecar checks) to
+/// an existing checksum result list. Shared by the top-level `validate`
+/// function and `PyExperiment::validate`.
+pub(crate) fn deep_validate_into(
+    reader: &scx_format_io::ScxReader,
+    results: &mut Vec<(String, bool)>,
+) {
+    // Canonical-CSR invariant is a v3 guarantee only; skip below v3 to avoid
+    // false failures on legitimately-unsorted legacy shards.
+    if reader.header().format_version >= 3 {
+        for (name, passed) in reader.validate_canonical_csr_shards() {
+            results.push((format!("canonical-csr {name}"), passed));
+        }
+    }
+    for (name, passed) in reader.validate_decode_sidecars() {
+        results.push((format!("decode-sidecar {name}"), passed));
+    }
 }
 
 /// Convert an AnnData object to an SCX file.
@@ -1282,7 +1316,9 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
     m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::optimize, m)?)?;
     m.add_function(wrap_pyfunction!(ops::sort, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::build_csc, m)?)?;
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
     m.add_function(wrap_pyfunction!(ops::set_uns, m)?)?;

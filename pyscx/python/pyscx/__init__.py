@@ -211,10 +211,17 @@ def open(path, verify=True):  # noqa: A001 — intentional shadowing of builtins
     return _open_native(_coerce_path(path), verify=verify)
 
 
-def validate(path):
+def validate(path, deep=False):
     """Validate an SCX file by walking its catalog and checking BLAKE3
-    checksums. Accepts str or `os.PathLike`."""
-    return _validate_native(_coerce_path(path))
+    checksums. Accepts str or `os.PathLike`.
+
+    When ``deep=True``, additionally decodes every sparse shard to verify the
+    v3 canonical CSR invariant (sorted column indices, no explicit zeros,
+    consistent indptr) and verifies every decode sidecar (structural linkage
+    + decode-parity). Mirrors ``scx validate --deep``. Deep-check results are
+    appended with ``canonical-csr ``/``decode-sidecar `` prefixed names; they
+    report ``False`` rather than raising."""
+    return _validate_native(_coerce_path(path), deep)
 
 
 def read(path, *, verify=True, **kwargs):

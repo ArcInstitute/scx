@@ -256,6 +256,43 @@ LRU thrashing across modalities.
 - `scx_open(path)$is_multimodal()` / `$modality_names()` — capability
   checks.
 
+#### Backed (out-of-core) sparse access
+
+- `scx_open(path)$x_backed(cache_shards=128)` / `scx_backed_sparse(path,
+  cache_shards=128)` — open a lazy, on-demand view of X that reads rows from
+  disk with a shard-level LRU cache instead of materialising the whole matrix
+  (the R equivalent of pyscx `to_anndata(backed=True)` X). Returns an
+  `ScxBackedSparse` that behaves like a read-only sparse matrix:
+  - `dim()` / `nrow()` / `ncol()`; `bsd[i, ]` / `bsd[i, j]` return a `dgCMatrix`
+    of the selected cells (rows) × genes (columns), rows in requested order.
+    Row indices are 1-based; positive-integer and logical indices are supported
+    (negative/character raise). Contiguous ascending `i` uses a single range
+    read; arbitrary/reordered `i` uses a fancy gather.
+  - `bsd$row_sums()` / `bsd$col_sums()` / `bsd$nnz()` — streamed aggregations
+    with no full decode; `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
+    materialise the whole matrix.
+  - Column projection is applied in R on the returned matrix; CSC-sidecar /
+    deletion-vector / multimodal-modality routing (present in pyscx) are not yet
+    wired through the rscx backed path.
+
+#### Lazy transform chains
+
+- `scx_open(path)$x_lazy(cache_shards=128)` / `scx_lazy_transform(path,
+  cache_shards=128)` — open a lazy-transform view of X (the R equivalent of
+  pyscx `ScxLazyTransformedDataset`). Layer preprocessing transforms that are
+  applied **on read** (out-of-core), never materialising the matrix:
+  - `scx_normalize_total(lt, target_sum=1e4)`, `scx_log1p(lt)`,
+    `scx_row_scale(lt, factors)` — pipe-friendly, immutable verbs; each returns
+    a new `ScxLazyTransformed` with the op appended. `normalize_total` uses the
+    per-cell sums of the data as transformed by the chain so far.
+  - `lt[i, j]` returns the transformed `dgCMatrix` for the requested cells/genes
+    (same indexing rules as the backed view); `lt$row_sums()` / `lt$col_sums()`
+    stream over the transformed data; `lt$to_dgcmatrix()` / `as(lt,
+    "dgCMatrix")` materialise the full transformed matrix.
+  - Transforms preserve sparsity, so `nnz` is unchanged. The pyscx extras
+    (arithmetic/comparison interception, CSC dispatch, deletion vectors) are not
+    wired through the rscx path.
+
 #### Analysis accelerators (`scx-accel`, CPU)
 
 Pipe-friendly front ends over the same Rust kernels the Python accelerators
@@ -278,6 +315,38 @@ usable without Seurat installed):
   sets `Idents()` / `seurat_clusters`.
 - `scx_rank_genes_groups(obj, group.by, reference=NULL, tie_correct=FALSE)` —
   Wilcoxon rank-sum DE (FindAllMarkers analog); returns a tidy `data.frame`.
+- `scx_score_genes(obj, gene_list, method="control", ctrl_size=50, n_bins=25,
+  random_state=0, gene_pool=NULL, score_name="score")` — gene-set scoring
+  (scanpy `score_genes` analog; methods `"control"` / `"mean"` / `"zscore"`).
+  Missing genes are dropped with a warning. On a Seurat object writes
+  `obj[[score_name]]` (returned invisibly); on a matrix returns the per-cell
+  score vector.
+- `scx_pseudobulk(obj, group_by, method="sum", min_cells_per_group=0)` —
+  pseudobulk aggregation (cells → group×gene; `"sum"` / `"mean"`). `group_by`
+  is one or more `meta.data` column names (Seurat) or a per-cell label
+  vector/`data.frame` (matrix). Returns a `list(counts, samples, gene_names)`
+  where `counts` is a features×samples matrix and `samples` is a `data.frame`
+  of the groupby columns plus `n_cells` per group.
+- `scx_pseudobulk_dex(obj, group_by, test_col, reference, aggr_method="sum",
+  min_cells_per_group=10, dispersion="cox_reid_shrunk", cooks_filtering=TRUE,
+  independent_filtering=TRUE)` — pseudobulk DE via the **Rust-native
+  negative-binomial GLM** (DESeq2-style, CPU-only; the `pseudobulk_dex(backend=
+  "nb_glm")` / `pdex_nb_glm` analog). Aggregates cells, then fits each
+  non-reference level of `test_col` vs `reference`. **Requires ≥2 pseudobulk
+  replicates per condition** — `group_by` must include `test_col` **and** a
+  replicate column (donor/batch); under-replicated targets are skipped with a
+  warning. Input must be **raw counts** (`layer="counts"`). Returns a tidy
+  `data.frame` with DESeq2-style columns `gene, baseMean, log2FoldChange, lfcSE,
+  stat, pvalue, padj, target, reference` (per-target BH-adjusted `padj`; `lfcSE`
+  on the log2 scale).
+- `scx_nb_glm(counts, design, contrast=NULL, size_factors=NULL,
+  dispersion="cox_reid_shrunk", ...)` — direct NB-GLM on a pre-aggregated
+  genes×samples count matrix + a samples×features `design` (e.g.
+  `model.matrix(~ condition, sampleinfo)`); `contrast` is a 1-based coefficient
+  (default: last). Returns `gene, baseMean, log2FoldChange, lfcSE, stat, pvalue,
+  padj, dispersion, converged`. For no-replicate / log-normalized data use
+  `scx_rank_genes_groups` (Wilcoxon); `pdex_ref` (Wilcoxon pseudobulk) is not
+  separately wired.
 
 Notes:
 - `scx_umap` / `scx_leiden` build their **own** kNN (default `n_neighbors`)
@@ -293,6 +362,27 @@ Notes:
 All are CPU-only (rscx links no GPU feature); for GPU runs use the Python
 accelerators. Joining `scx_harmony_integrate()` / `RunHarmony_scx()` and
 `scx_compute_lisi()`, which predate this set.
+
+#### File operations (options)
+
+`scx_merge` / `scx_compact` / `scx_append` accept the same option surface as the
+matching pyscx functions:
+
+- `scx_merge(inputs, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, assume_identical_var=FALSE, assume_identical_obs=FALSE,
+  uns_policy="first", sort_by=NULL, reverse=FALSE)` — `uns_policy` ∈
+  `first`/`require-equal`/`namespace`/`summary`; `sort_by` is a sorted **k-way**
+  merge (each input must be pre-sorted by the key).
+- `scx_compact(input, output, index_obs=NULL, index_var=NULL, index_preset=NULL,
+  index_auto_threshold=0, reshape_obs=FALSE)`.
+- `scx_append(target, input, codec=NULL, shard_size=16384, index_obs=NULL,
+  index_var=NULL, index_preset=NULL, index_auto_threshold=0, modality=NULL)` —
+  `codec` ∈ `auto`/`none`/`scx1`/`zstd`/`lz4`/`pcodec`; `modality` is a NAME on a
+  multimodal target (streams from a reader, preserving per-shard encodings).
+
+Predicate-index presets are `cellxgene`/`perturbseq`/`training`.
+`shard_target_rows` is inherited from the input (not exposed on merge/compact);
+CSC sidecars are dropped by these ops and must be rebuilt separately.
 
 ### CLI surface
 
@@ -1075,10 +1165,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.save_layer(source, target, layer_name, ops, target_sum=None)` — Save transformed data as layer
 
 ### File operations
-- `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps). Appending categorical `obs`/`var` onto a **row-sharded** base reassembles the existing metadata through the shared canonical assembler (`scx_format_io::assemble_sharded_metadata`), so disjoint/duplicate per-shard categorical vocabularies and a mixed `Dictionary`/plain-string shard layout are reconciled rather than failing to read back. A genuinely corrupt/gapped obs/var shard cover (non-contiguous `row_start` stamps) is now rejected with a clear error instead of being silently mis-assembled.
-- `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None, in_place=False, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None)` — Append from AnnData. Same `index_*` semantics as `append`.
+- `pyscx.append(target, input, codec=None, shard_size=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Streaming append from SCX file (reads one shard at a time; raw-copy fast path when codec/encoding match). `modality=NAME` (the Python equivalent of `scx append --modality`) routes into a specific modality: required on multimodal targets, rejected on single-modality files, and resolved by name against both the target and source readers (with a per-modality `n_vars` check). `index_*` kwargs rebuild predicate indexes covering all rows post-append — see [Conversion-time predicate indexes and detection bitmaps](#conversion-time-predicate-indexes-and-detection-bitmaps). Appending categorical `obs`/`var` onto a **row-sharded** base reassembles the existing metadata through the shared canonical assembler (`scx_format_io::assemble_sharded_metadata`), so disjoint/duplicate per-shard categorical vocabularies and a mixed `Dictionary`/plain-string shard layout are reconciled rather than failing to read back. A genuinely corrupt/gapped obs/var shard cover (non-contiguous `row_start` stamps) is now rejected with a clear error instead of being silently mis-assembled.
+- `pyscx.append_from_anndata(target, adata, codec=None, shard_size=None, in_place=False, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Append from AnnData. Same `index_*` semantics as `append`. `modality=NAME` routes into a target modality (the AnnData source is a plain global axis); required on multimodal targets, rejected on single-modality files, `n_vars` checked against the target modality.
 - `pyscx.mark_deleted(path, cell_indices)` — Logical deletion
 - `pyscx.compact(input, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, reshape_obs=False)` — Rewrite reclaiming space. `index_*` kwargs rebuild predicate indexes against the compacted output. `reshape_obs=True` migrates legacy single-section obs metadata to the sharded `ObsMetadataShard` layout (mirrors `scx compact --reshape-obs`; useful after a backed `from_anndata` conversion).
+- `pyscx.optimize(input, output, codec="auto")` — Re-encode + canonicalize every CSR shard (X / layers / obsp graphs) so the output carries [decode sidecars](format.md#42-decode-metadata-sidecar) and stamps `format_version=3` — the Python equivalent of `scx optimize`. Single-modality files only (multimodal → `RuntimeError`; use `compact`). `codec="auto"` (default) keeps the per-shard codec choice; `codec="scx1"` forces Scx1 on every integer shard so all carry a sidecar (full `to_gpu_anndata` device-decode coverage); any other value → `ValueError`. No `force` kwarg — pass `output == input` for an in-place upgrade (atomic rename) or remove the target first. Drops the CSC sidecar (rerun `build_csc`). See [docs/operations.md § Optimize](operations.md#optimize).
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
 - `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`. **`set_uns` is a strict subset of `modify_metadata`** — `pyscx.modify_metadata(path, uns=...)` does the same thing and also reaches `obs`/`var`/`obsm`/`varm`; prefer `modify_metadata` unless you only need the one-arg `uns` convenience.
 - `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. `index_*` kwargs rebuild predicate indexes over a replaced `obs`/`var` (otherwise the stale index is dropped). Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
@@ -1308,6 +1399,8 @@ query" means the method isn't on the handle directly; reach it through
 | `obs_keys()` / `var_keys()`      | ✓                    | ✓                        | — (`$obs()` / `$var()` data.frames) |
 | `is_multimodal()` / `modality_names()` | ✓              | ✓                        | ✓                    |
 | `to_anndata()` / extraction      | ✓                    | via query / `read_cloud` | via `query() …$collect()` |
+| backed (out-of-core) X           | ✓ (`to_anndata(backed=True)`) | — (pull locally) | ✓ (`$x_backed()` / `scx_backed_sparse()`) |
+| lazy transform chain             | ✓ (`ScxLazyTransformedDataset`) | — (pull locally) | ✓ (`$x_lazy()` / `scx_lazy_transform()` + `scx_normalize_total`/`scx_log1p`/`scx_row_scale`) |
 | `to_mudata()` (multimodal)       | ✓                    | — (pull locally)         | `$to_mae()` / `$to_seurat()` |
 | `detection_counts()` / `cells_expressing()` | ✓        | — (pull locally)         | —                    |
 | `query()` builder                | ✓                    | ✓                        | ✓ (`scx_query()`)    |
@@ -1335,7 +1428,8 @@ for the full dispatch rules and requirements.
 CSC sidecars are the column-major substrate for column (gene-axis)
 algorithms. Build one at conversion time with `csc="auto"` / `csc="always"`
 (`pyscx.from_anndata` / `from_h5ad` / `from_10x`) or `scx convert --csc=auto`,
-or after the fact with `scx build-csc`. `csc="auto"` builds a sidecar only
+or after the fact with `scx build-csc` / `pyscx.build_csc(input, output)`.
+`csc="auto"` builds a sidecar only
 when the dataset is large enough to benefit — `n_obs ≥ 50000` **and**
 `n_vars ≥ 5000` by default, tunable via `SCX_CSC_AUTO_OBS_THRESHOLD` /
 `SCX_CSC_AUTO_VARS_THRESHOLD`.
@@ -1367,7 +1461,7 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 - `pyscx.accel.nb_glm(counts, design, size_factors=None, contrast=None, gene_names=None, sample_names=None, options=None, counts_axis="samples_by_genes", device="auto") → pandas.DataFrame` — Direct Rust-native negative-binomial GLM on an **already-pseudobulked** count matrix + numeric design (DESeq2 replacement). `f64` end-to-end; GPU routes (`gpu_nb_glm_csr`, `gpu_nb_glm_csc`) accelerate the pseudobulk aggregation while the IRLS / Cox–Reid fit itself remains CPU. `counts` is `[n_samples × n_genes]` (`counts_axis="samples_by_genes"`, default) or `[n_genes × n_samples]`; `design` is `[n_samples × n_features]`, full column rank. `size_factors=None` → DESeq2 median-ratio factors. `contrast` is an integer coefficient index, a weight vector, or `None` (last coefficient, DESeq2 convention). `options` is an optional dict (`dispersion ∈ {"moments","cox_reid_mle","cox_reid_shrunk"}`, `min_disp`, `max_disp`, `max_irls_iters`, `irls_tol`, `max_outer_iters`, `fit_dispersion_trend`, `shrink_dispersion`). Returns PyDESeq2-style columns `gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, dispersion, converged, n_iter` (`lfcSE` on the log2 scale). DESeq2-*style*, not DESeq2-*identical* — includes Cook's-distance outlier filtering and base-mean independent filtering (both default-on), but omits apeglm/ashr LFC shrinkage. See [docs/pseudobulk_nb_glm.md](pseudobulk_nb_glm.md).
 - `pyscx.accel.pdex_nb_glm(adata, groupby, reference, stratify_by=None, min_cells_per_group=10, min_cells_per_stratum=50, is_log1p=None, nbglm_options=None, gene_chunk_size=None, prefer_format="csr", device="auto") → polars.DataFrame` — Pseudobulk NB-GLM DE for the cell-eval/pdex consumer. Aggregates `groupby × stratify_by` pseudobulk **replicates**, fits one NB-GLM per non-reference perturbation vs `reference`, and returns the **same** cell-eval `DEResults` polars schema as `rank_genes_groups_df` (`target, feature, fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change`), so it drops into `cell_eval` unchanged. **`stratify_by` is required**, as a **list** of obs column names (e.g. `["donor"]`; a bare string is rejected with a clear error) — it forms the replicates: with no stratifier the dispersion is unidentifiable, so it raises `ValueError` pointing to `pdex_ref` / `rank_genes_groups`. `is_log1p=None` auto-detects via `adata.uns["log1p"]`; NB-GLM requires **raw counts** and errors on log1p-normalized input. Records route on `adata.uns["scx_accel"]["pdex_nb_glm"]` (GPU routes `gpu_nb_glm_csr` / `gpu_nb_glm_csc`; CPU route `cpu_nb_glm`). See [docs/pseudobulk_nb_glm.md](pseudobulk_nb_glm.md).
 - `pyscx.accel.rank_genes_groups_df(adata, groupby=None, reference="rest", n_genes=None, gene_chunk_size=None, rankby_abs=False, tie_correct=False, device="auto", output="polars", *, group=None, key="rank_genes_groups", pval_cutoff=None, log2fc_min=None, log2fc_max=None) → polars.DataFrame` — **Two modes.** *Compute* (`groupby=`): same Wilcoxon rank-sum as `rank_genes_groups()`, returns the cell-eval `DEResults` schema `(target, feature, fold_change, p_value, fdr, log2_fold_change, abs_log2_fold_change)`, ready for `cell_eval.initialize_de_comparison()`. *Extract* (`group=`): the **scanpy `sc.get.rank_genes_groups_df` alias** — does not recompute; reads the precomputed `adata.uns[key]` and returns scanpy's columns `(names, scores, logfoldchanges, pvals, pvals_adj)`, with a leading `group` column when `group` is a list. `pval_cutoff` / `log2fc_min` / `log2fc_max` are scanpy-style row filters (extraction only). Pass either `groupby=` or `group=`, not both. (`gene_symbols=` var-name remap is not supported yet.)
-- `pyscx.accel.pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=0.0, gene_chunk_size=None, prefer_format="csr", device="auto") → polars.DataFrame` — Perturbation-screen differential expression: Mann–Whitney U + pseudobulk geometric-mean log fold change vs a single reference group. Pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex) (`pyscx/tests/test_pdex_ref_parity.py`). Returns one row per (target group, gene) excluding the reference group, with columns `target`, `feature`, `target_mean`, `ref_mean`, `target_membership`, `ref_membership`, `log2_fold_change` (also exposed as `fold_change` for migration), `percent_change`, `p_value`, `statistic`, `fdr`. Note: here `fold_change` is a deprecated alias of `log2_fold_change` (log2 scale) — this differs from `rank_genes_groups_df`'s `fold_change` column, which is linear (`exp2` of the log2 value). `is_log1p=None` auto-detects via `adata.uns["log1p"]` + a max-value heuristic; pass `True`/`False` to override. `device="auto"` picks GPU when available and falls back to CPU otherwise. **GPU v3-CSC path (default):** the GPU dispatch routes through a CSC-direct driver that drops the per-chunk dense intermediate and uses a CSC shard source with pipelining + per-chunk shard-range pre-filter. This is the default GPU DE route (the former `SCX_GPU_DE_V3` opt-in gate was removed when v3 became the unconditional default). CSC-direct requires a CSC sidecar on the SCX file — build it with `pyscx.from_anndata(adata, path, csc="always")` or `scx convert --csc=always`. In-memory inputs (scipy CSR) and files without a sidecar fall back to the v3-CSR-direct path automatically. The route that actually ran is recorded on `adata.uns["scx_accel"]["pdex_ref"]` (see [Accelerator route metadata](#accelerator-route-metadata)) — `gpu_csc_v3` confirms the CSC-direct path, `gpu_csr_v3` + `fallback_reason="no_csc_sidecar"` confirms the CSR fallback. Wall-time numbers and the disposition live in [`docs/performance.md` § Per-operation timing](performance.md#per-operation-timing).
+- `pyscx.accel.pdex_ref(adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=True, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="csr", device="auto") → polars.DataFrame` — Perturbation-screen differential expression: Mann–Whitney U + pseudobulk geometric-mean log fold change vs a single reference group. Pinned bit-for-bit to upstream [`pdex`](https://github.com/ArcInstitute/pdex) (`pyscx/tests/test_pdex_ref_parity.py`). Returns one row per (target group, gene) excluding the reference group, with columns `target`, `feature`, `target_mean`, `ref_mean`, `target_membership`, `ref_membership`, `log2_fold_change` (also exposed as `fold_change` for migration), `percent_change`, `p_value`, `statistic`, `fdr`. Note: here `fold_change` is a deprecated alias of `log2_fold_change` (log2 scale) — this differs from `rank_genes_groups_df`'s `fold_change` column, which is linear (`exp2` of the log2 value). **`epsilon`** (default `1e-9`, matching pdex ≥ 0.2.x) is a finite-guard pseudocount added to the count-space means before the fold-/percent-change ratio — not applied to CPM or the MWU test; with the default the outputs stay finite, and `0/0` (a gene unexpressed in both groups) is `0.0`. Pass `epsilon=0.0` to recover the legacy behaviour where genes undetected in the reference yield `±inf`. **`cpm_filter`** (optional float `T`) keeps a gene for a test group iff its pooled arithmetic counts-per-million `target_cpm > T` **or** `ref_cpm > T` (strict `>`, mode-independent); dropped rows are removed and FDR is recomputed over the surviving genes only. `is_log1p=None` auto-detects via `adata.uns["log1p"]` + a max-value heuristic; pass `True`/`False` to override. `device="auto"` picks GPU when available and falls back to CPU otherwise. **GPU v3-CSC path (default):** the GPU dispatch routes through a CSC-direct driver that drops the per-chunk dense intermediate and uses a CSC shard source with pipelining + per-chunk shard-range pre-filter. This is the default GPU DE route (the former `SCX_GPU_DE_V3` opt-in gate was removed when v3 became the unconditional default). CSC-direct requires a CSC sidecar on the SCX file — build it with `pyscx.from_anndata(adata, path, csc="always")` or `scx convert --csc=always`. In-memory inputs (scipy CSR) and files without a sidecar fall back to the v3-CSR-direct path automatically. The route that actually ran is recorded on `adata.uns["scx_accel"]["pdex_ref"]` (see [Accelerator route metadata](#accelerator-route-metadata)) — `gpu_csc_v3` confirms the CSC-direct path, `gpu_csr_v3` + `fallback_reason="no_csc_sidecar"` confirms the CSR fallback. Wall-time numbers and the disposition live in [`docs/performance.md` § Per-operation timing](performance.md#per-operation-timing).
 - `pyscx.accel.pseudobulk_means(adata, groupby, min_cells_per_group=1) → (ndarray, list[str])` — Group-by mean on sparse X, streaming shard-by-shard (works on backed, lazy, scipy CSR, or dense). Returns `(means[P, G] float64, sorted group names)`. Foundation for the perturbation evaluation metrics below.
 - `pyscx.accel.perturbation_metrics(adata_real, adata_pred, pert_col="perturbation", control="control", metrics=None, min_cells_per_group=1) → dict[str, dict[str, float]]` — Bundled bulk metrics `{pearson_delta, mse, mae, mse_delta, mae_delta}` between paired real/pred AnnData. Matches cell-eval's metrics within atol=1e-6.
 - `pyscx.accel.energy_distance(adata_real, adata_pred, pert_col="perturbation", control="control", metric="euclidean", embed_key=None, backend=None, dtype=None) → float` — Pearson correlation of per-perturbation e-distance vectors (real vs pred). **Polarity:** despite the name this is a *score*, not a distance — it lies in `[-1.0, 1.0]` where `1.0` = perfect and **higher is better**; use it directly, don't invert. Returns `nan` when either side's e-distance vector is constant (e.g. a control-broadcast predictor) or there is only one non-control perturbation. Avoids `[N, N]` distance materialization (per-row sum reduction even on the gemm path); precomputes control self-distance once; rayon-parallel across perturbations. `backend ∈ {"auto" (default), "gemm", "scalar"}` — `"auto"` picks faer-dispatched gemm for euclidean/cosine and the scalar row-by-row path for L1; `"gemm" + metric="l1"` raises `RuntimeError` (no decomposition exists). `dtype ∈ {"f32" (default), "f64"}` controls only the matmul / per-pair arithmetic precision; reductions always accumulate in `f64`. f32 + gemm matches f64 + scalar within `atol=1e-4` correlation / `atol=1e-3` per-pert.

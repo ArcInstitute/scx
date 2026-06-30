@@ -417,7 +417,19 @@ def write(adata: Any, path: Any, **kwargs: Any) -> None:
     ...
 
 
-def validate(path: Any) -> list[tuple[str, bool]]: ...
+def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]: ...
+
+
+def build_csc(
+    input: Any,
+    output: Any,
+    memory_limit: str = ...,
+    force: bool = ...,
+    csc_cols_per_shard: int = ...,
+) -> None: ...
+
+
+def optimize(input: str, output: str, codec: str = ...) -> None: ...
 
 
 def collate_cellset_gathered(

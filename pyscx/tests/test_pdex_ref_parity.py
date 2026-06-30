@@ -29,6 +29,7 @@ from _pdex_fixtures import (  # noqa: E402
     REFERENCE,
     _csr_with_descending_indices,
     _make_adata,
+    _make_adata_special_genes,
 )
 
 
@@ -128,6 +129,11 @@ def _assert_frames_close(
         (True, True, 0.0),
         (False, True, 0.0),
         (True, False, 0.5),
+        # New default epsilon (1e-9 finite-guard), all four mode combos.
+        (True, False, 1e-9),
+        (False, False, 1e-9),
+        (True, True, 1e-9),
+        (False, True, 1e-9),
     ],
 )
 def test_pdex_ref_parity_dense(geometric_mean: bool, is_log1p: bool, epsilon: float):
@@ -305,6 +311,182 @@ def test_pdex_ref_cpu_unsorted_scipy_csr_matches_sorted():
         "has_sorted_indices flipped to True after pdex_ref. Check that "
         "the dispatch site passes `in_place=false`."
     )
+
+
+def test_pdex_ref_default_epsilon_is_1e_9():
+    """The default `epsilon` is the 1e-9 finite-guard (matches pdex >= 0.2.x).
+
+    Calling without `epsilon` must equal calling with `epsilon=1e-9`, and differ
+    from the legacy `epsilon=0.0` on a one-sided-zero gene (finite vs ±inf).
+    """
+    adata = _make_adata_special_genes()
+
+    default = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE)
+    explicit = pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, epsilon=1e-9)
+    _assert_frames_close(default, explicit, atol=0.0, rtol=0.0)
+
+    # Matches pdex's own default (also 1e-9).
+    pdx_default = pdex_fn(adata, groupby="target", mode="ref", reference=REFERENCE)
+    _assert_frames_close(default, pdx_default)
+
+    # With the default guard, the one-sided-zero gene is finite everywhere.
+    lfc = default["log2_fold_change"].to_numpy()
+    assert np.all(np.isfinite(lfc)), "epsilon=1e-9 must keep all log2FC finite"
+
+
+def test_pdex_ref_zero_over_zero_and_one_sided(tmp_path):
+    """epsilon=0.0: a gene zero in both groups → 0.0; one-sided zero → ±inf.
+
+    Validated against pdex on dense, in-memory CSR (multi-chunk), and backed.
+    """
+    adata = _make_adata_special_genes()
+
+    # Pin is_log1p=False (the fixture is raw counts) so the comparison isolates
+    # the 0/0 semantics from the max-value auto-detection heuristic.
+    pdx_df = pdex_fn(
+        adata,
+        groupby="target",
+        mode="ref",
+        reference=REFERENCE,
+        epsilon=0.0,
+        is_log1p=False,
+    )
+
+    # Dense.
+    scx_dense = pyscx.accel.pdex_ref(
+        adata, "target", reference=REFERENCE, epsilon=0.0, is_log1p=False
+    )
+    _assert_frames_close(scx_dense, pdx_df)
+
+    # In-memory CSR, forced multi-chunk.
+    adata_csr = adata.copy()
+    adata_csr.X = sp.csr_matrix(adata_csr.X)
+    scx_csr = pyscx.accel.pdex_ref(
+        adata_csr,
+        "target",
+        reference=REFERENCE,
+        epsilon=0.0,
+        is_log1p=False,
+        gene_chunk_size=4,
+    )
+    _assert_frames_close(scx_csr, pdx_df)
+
+    # Backed.
+    path = str(tmp_path / "special.scx")
+    pyscx.from_anndata(adata_csr, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+    scx_backed = pyscx.accel.pdex_ref(
+        backed,
+        "target",
+        reference=REFERENCE,
+        epsilon=0.0,
+        is_log1p=False,
+        gene_chunk_size=4,
+    )
+    _assert_frames_close(scx_backed, pdx_df)
+
+    # Direct value checks on the dense result: gene_0 (0/0) → 0.0 everywhere;
+    # gene_1 (zero ref, positive target) → +inf.
+    d = _normalize_frame(scx_dense)
+    g0 = d.filter(pl.col("feature") == "gene_0")
+    assert np.all(g0["log2_fold_change"].to_numpy() == 0.0)
+    assert np.all(g0["percent_change"].to_numpy() == 0.0)
+    g1 = d.filter(pl.col("feature") == "gene_1")
+    assert np.all(np.isposinf(g1["log2_fold_change"].to_numpy()))
+    assert np.all(np.isposinf(g1["percent_change"].to_numpy()))
+
+
+@pytest.mark.parametrize("geometric_mean", [True, False])
+@pytest.mark.parametrize("cpm_filter", [5.0, 50.0])
+def test_pdex_ref_cpm_filter_parity(geometric_mean: bool, cpm_filter: float, tmp_path):
+    """`cpm_filter` matches pdex across dense / CSR(multi-chunk) / backed.
+
+    CPM is mode-independent, so geometric_mean True and False must both match.
+    Surviving gene sets can differ per target group; FDR is recomputed over the
+    survivors.
+    """
+    adata = _make_adata()
+
+    pdx_df = pdex_fn(
+        adata,
+        groupby="target",
+        mode="ref",
+        reference=REFERENCE,
+        geometric_mean=geometric_mean,
+        is_log1p=False,
+        cpm_filter=cpm_filter,
+    )
+
+    # Dense.
+    scx_dense = pyscx.accel.pdex_ref(
+        adata,
+        "target",
+        reference=REFERENCE,
+        geometric_mean=geometric_mean,
+        is_log1p=False,
+        cpm_filter=cpm_filter,
+    )
+    _assert_frames_close(scx_dense, pdx_df)
+
+    # In-memory CSR, multi-chunk (exercises per-group total-over-full-axis merge).
+    adata_csr = adata.copy()
+    adata_csr.X = sp.csr_matrix(adata_csr.X)
+    scx_csr = pyscx.accel.pdex_ref(
+        adata_csr,
+        "target",
+        reference=REFERENCE,
+        geometric_mean=geometric_mean,
+        is_log1p=False,
+        cpm_filter=cpm_filter,
+        gene_chunk_size=4,
+    )
+    _assert_frames_close(scx_csr, pdx_df)
+
+    # Backed.
+    path = str(tmp_path / "cpm.scx")
+    pyscx.from_anndata(adata_csr, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+    scx_backed = pyscx.accel.pdex_ref(
+        backed,
+        "target",
+        reference=REFERENCE,
+        geometric_mean=geometric_mean,
+        is_log1p=False,
+        cpm_filter=cpm_filter,
+        gene_chunk_size=4,
+    )
+    _assert_frames_close(scx_backed, pdx_df)
+
+
+def test_pdex_ref_cpm_filter_drops_all_genes():
+    """A threshold above every gene's CPM yields an empty frame, full schema."""
+    adata = _make_adata()
+    scx_df = pyscx.accel.pdex_ref(
+        adata, "target", reference=REFERENCE, cpm_filter=1e12
+    )
+    assert scx_df.height == 0
+    for col in (
+        "target",
+        "feature",
+        "target_mean",
+        "ref_mean",
+        "log2_fold_change",
+        "percent_change",
+        "p_value",
+        "statistic",
+        "fdr",
+    ):
+        assert col in scx_df.columns
+
+
+def test_pdex_ref_cpm_filter_negative_x_warns():
+    """`cpm_filter` with a negative X entry emits a UserWarning (matches pdex)."""
+    adata = _make_adata()
+    X = np.asarray(adata.X, dtype=np.float32).copy()
+    X[0, 0] = -1.0
+    adata.X = X
+    with pytest.warns(UserWarning, match="negative"):
+        pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, cpm_filter=5.0)
 
 
 def test_pdex_ref_output_pandas():

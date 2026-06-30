@@ -35,8 +35,9 @@ pub use csc::{
 #[cfg(feature = "gpu")]
 pub use csc::{streaming_clip_square_sum_csc_with_device, streaming_mean_var_csc_with_device};
 pub use diffexp::{
-    merge_diff_exp_results, pdex_ref, pdex_ref_sparse, pdex_ref_streaming, wilcoxon_rank_sum,
-    wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming, DiffExpResult, PdexRefResult,
+    finalize_pdex, merge_diff_exp_results, pdex_ref, pdex_ref_core, pdex_ref_sparse,
+    pdex_ref_streaming, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming,
+    DiffExpResult, PdexRefResult,
 };
 pub use error::{AccelError, Result};
 pub use eval_metrics::{

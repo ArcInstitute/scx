@@ -129,7 +129,7 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=0)
 | `path` | — | Path to `.scx` file. |
 | `batch_size` | `1024` | Mini-batch size. Auto-tuned downward if `max_memory_mb` is exceeded; check via `effective_batch_size`. |
 | `hvg_indices` | `None` | `np.ndarray[u32]` of gene indices for HVG projection; `None` = all genes. |
-| `obs_columns` | `[]` | Obs metadata column names included in each batch dict. |
+| `obs_columns` | `None` | Obs metadata column names included in each batch dict. `None` = no obs columns. |
 | `normalize` | `True` | Total-count normalize (fused with `log1p` in a single CSR row scan). **scVI and other count-likelihood models need `normalize=False, log1p=False`.** |
 | `log1p` | `True` | Apply `log1p` after normalize. |
 | `target_sum` | `1e4` | Normalization target sum. |

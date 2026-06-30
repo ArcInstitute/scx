@@ -396,3 +396,268 @@ scx_highly_variable_genes <- function(object, assay = NULL, layer = "counts",
   SeuratObject::VariableFeatures(object, assay = assay) <- hvg_names
   invisible(object)
 }
+
+#' @describeIn scx-accelerators Gene-set scoring (scanpy `score_genes` analog).
+#' @param gene_list Character vector of gene names to score. Genes absent from
+#'   the matrix are dropped with a warning; an all-missing set is an error.
+#' @param method One of `"control"` (scanpy `score_genes`: mean(gene_list) minus
+#'   a binned control set), `"mean"` (per-cell mean over `gene_list`), or
+#'   `"zscore"` (decoupler `mt.zscore`). Default `"control"`.
+#' @param ctrl_size,n_bins Control-method knobs (control genes per expression
+#'   bin / number of bins). Defaults `50` / `25`.
+#' @param random_state Seed for the deterministic control sampler (not
+#'   numpy-compatible). Default `0`.
+#' @param gene_pool Optional character vector restricting the control binning
+#'   universe (control method only); default `NULL` = all genes.
+#' @param score_name obs/meta.data column to write the score into on a Seurat
+#'   object. Default `"score"`.
+#' @return For `scx_score_genes`: on a Seurat object, the object with
+#'   `score_name` added to `meta.data` (returned invisibly); on a matrix, a
+#'   numeric per-cell score vector (named by cell when column names exist).
+#' @export
+scx_score_genes <- function(object, gene_list, method = "control",
+                            ctrl_size = 50L, n_bins = 25L, random_state = 0L,
+                            gene_pool = NULL, score_name = "score",
+                            assay = NULL, layer = "data") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+  }
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) {
+    stop("score_genes needs gene (row) names to resolve `gene_list`", call. = FALSE)
+  }
+
+  # Resolve gene_list -> 0-based indices; drop (warn) the missing, error if none.
+  gene_list <- unique(as.character(gene_list))
+  pos <- match(gene_list, gene_names)
+  missing <- gene_list[is.na(pos)]
+  if (length(missing) > 0L) {
+    shown <- missing[seq_len(min(10L, length(missing)))]
+    warning(sprintf("score_genes: %d/%d genes not found and dropped: %s",
+                    length(missing), length(gene_list),
+                    paste(shown, collapse = ", ")),
+            call. = FALSE)
+  }
+  gene_list_idx <- pos[!is.na(pos)] - 1L
+  if (length(gene_list_idx) == 0L) {
+    stop("score_genes: no genes in `gene_list` matched the matrix", call. = FALSE)
+  }
+
+  # gene_pool: only the control method bins it; default to all genes.
+  if (identical(method, "control")) {
+    if (is.null(gene_pool)) {
+      gene_pool_idx <- seq_len(nrow(mat)) - 1L
+    } else {
+      gp <- match(unique(as.character(gene_pool)), gene_names)
+      gene_pool_idx <- gp[!is.na(gp)] - 1L
+    }
+  } else {
+    gene_pool_idx <- integer(0)
+  }
+
+  scores <- scx_score_genes_matrix(mat, gene_list_idx, gene_pool_idx, method,
+                                   ctrl_size, n_bins, random_state)
+
+  if (!.is_seurat(object)) {
+    names(scores) <- colnames(mat)
+    return(scores)
+  }
+  object[[score_name]] <- scores
+  invisible(object)
+}
+
+#' @describeIn scx-accelerators Pseudobulk aggregation (cells -> group x gene).
+#' @param group_by Grouping of cells. On a Seurat object: a character vector of
+#'   `meta.data` column name(s). On a matrix: a per-cell label vector, or a
+#'   `data.frame` / named list of per-cell label columns for multi-column
+#'   groupby.
+#' @param min_cells_per_group Drop groups with fewer than this many cells
+#'   (default `0` = keep all).
+#' @return For `scx_pseudobulk`: a list with `counts` (a genes x groups matrix,
+#'   rownames = genes, colnames = the group labels joined by `"_"`), `samples`
+#'   (a `data.frame` of the groupby columns plus `n_cells` per group), and
+#'   `gene_names`. Returned for both Seurat and matrix inputs (pseudobulk
+#'   collapses the cell axis, so it cannot be written back into the object).
+#' @export
+scx_pseudobulk <- function(object, group_by, method = "sum",
+                           min_cells_per_group = 0L, assay = NULL,
+                           layer = "counts") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+    # group_by names meta.data columns.
+    cols <- as.character(group_by)
+    groupby <- lapply(cols, function(cn) as.character(object[[cn, drop = TRUE]]))
+    names(groupby) <- cols
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+    # group_by is a vector / data.frame / list of per-cell labels.
+    if (is.data.frame(group_by) || is.list(group_by)) {
+      groupby <- lapply(group_by, as.character)
+      cols <- names(groupby)
+      if (is.null(cols)) cols <- paste0("group", seq_along(groupby))
+      names(groupby) <- cols
+    } else {
+      groupby <- list(group = as.character(group_by))
+      cols <- "group"
+    }
+  }
+
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(mat)))
+
+  res <- scx_pseudobulk_matrix(mat, groupby, cols, gene_names, method,
+                               min_cells_per_group)
+
+  # Kernel returns counts as n_groups x n_genes; transpose to the R-native
+  # features x samples (genes x groups) orientation.
+  counts <- t(res$counts)
+  rownames(counts) <- res$gene_names
+  # group_labels: one character vector per groupby column, length n_groups.
+  label_df <- as.data.frame(res$group_labels, stringsAsFactors = FALSE)
+  names(label_df) <- res$groupby_columns
+  sample_ids <- do.call(paste, c(label_df, sep = "_"))
+  colnames(counts) <- sample_ids
+
+  samples <- label_df
+  samples$n_cells <- res$cell_counts
+  rownames(samples) <- sample_ids
+
+  list(counts = counts, samples = samples, gene_names = res$gene_names)
+}
+
+#' @describeIn scx-accelerators Pseudobulk differential expression via a
+#'   Rust-native negative-binomial GLM (DESeq2-style, CPU-only). Aggregates
+#'   cells into pseudobulk samples and fits each non-reference level of
+#'   `test_col` vs `reference`.
+#' @param test_col The `group_by` column holding the condition being tested.
+#' @param reference Reference level in `test_col` (the DE baseline).
+#' @param aggr_method Pseudobulk aggregation, `"sum"` (default) or `"mean"`.
+#' @param dispersion Dispersion estimator: `"cox_reid_shrunk"` (default),
+#'   `"cox_reid_mle"`, or `"moments"`.
+#' @param cooks_filtering,independent_filtering DESeq2 results-stage filters
+#'   (both `TRUE` by default).
+#' @section Replicates &amp; input:
+#' NB-GLM requires **≥2 pseudobulk replicates per condition**, so `group_by`
+#' must include `test_col` **and** a replicate column (donor/batch/well), e.g.
+#' `group_by = c("condition", "donor")`. Targets with fewer than 2 replicates
+#' per side are skipped with a warning. Input must be **raw counts** (use
+#' `layer = "counts"`); for no-replicate or log-normalized data use
+#' [scx_rank_genes_groups] (Wilcoxon).
+#'
+#' Each non-reference level is fit as an independent pairwise 2-coefficient
+#' NB-GLM (intercept + treatment) on only that target's and the reference's
+#' pseudobulk samples, with size factors recomputed per contrast. The replicate
+#' column is **not** entered as a covariate, so batch/donor confounders are not
+#' adjusted and `baseMean`/`dispersion` differ per contrast (this matches
+#' pyscx, not a single joint DESeq2 fit).
+#' @return For `scx_pseudobulk_dex`: a long-format `data.frame` with one row per
+#'   gene per non-reference target and DESeq2-style columns `gene`, `baseMean`,
+#'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `target`, `reference`.
+#' @export
+scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
+                               aggr_method = "sum", min_cells_per_group = 10L,
+                               dispersion = "cox_reid_shrunk",
+                               cooks_filtering = TRUE,
+                               independent_filtering = TRUE,
+                               assay = NULL, layer = "counts") {
+  if (.is_seurat(object)) {
+    if (is.null(assay)) assay <- SeuratObject::DefaultAssay(object)
+    mat <- .scx_layer_matrix(object, assay, layer)
+    cols <- as.character(group_by)
+    groupby <- lapply(cols, function(cn) as.character(object[[cn, drop = TRUE]]))
+    names(groupby) <- cols
+  } else {
+    mat <- methods::as(object, "CsparseMatrix")
+    if (is.data.frame(group_by) || is.list(group_by)) {
+      groupby <- lapply(group_by, as.character)
+      cols <- names(groupby)
+      if (is.null(cols)) cols <- paste0("group", seq_along(groupby))
+      names(groupby) <- cols
+    } else {
+      stop(paste0("scx_pseudobulk_dex needs replicates: pass `group_by` as a ",
+                  "data.frame / named list including the test column and a ",
+                  "replicate column (e.g. donor)"), call. = FALSE)
+    }
+  }
+  if (!(test_col %in% cols)) {
+    stop(sprintf("test_col '%s' is not among group_by columns (%s)",
+                 test_col, paste(cols, collapse = ", ")), call. = FALSE)
+  }
+  if (identical(aggr_method, "mean")) {
+    warning(paste0("scx_pseudobulk_dex: aggr_method='mean' feeds fractional ",
+                   "values into the NB-GLM count model; 'sum' (the default) ",
+                   "is recommended for DE."), call. = FALSE)
+  }
+
+  gene_names <- rownames(mat)
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(mat)))
+
+  res <- scx_pseudobulk_dex_matrix(mat, groupby, cols, test_col, reference,
+                                   gene_names, aggr_method, min_cells_per_group,
+                                   dispersion, cooks_filtering,
+                                   independent_filtering)
+
+  if (length(res$skipped) > 0L) {
+    warning(sprintf(
+      "scx_pseudobulk_dex skipped %d target(s) with <2 replicates per condition: %s",
+      length(res$skipped), paste(res$skipped, collapse = ", ")), call. = FALSE)
+  }
+
+  data.frame(
+    gene = res$gene,
+    baseMean = res$baseMean,
+    log2FoldChange = res$log2FoldChange,
+    lfcSE = res$lfcSE,
+    stat = res$stat,
+    pvalue = res$pvalue,
+    padj = res$padj,
+    target = res$target,
+    reference = res$reference,
+    stringsAsFactors = FALSE
+  )
+}
+
+#' @describeIn scx-accelerators Direct negative-binomial GLM on a pre-aggregated
+#'   pseudobulk count matrix and design (the `nb_glm` building block).
+#' @param counts A genes x samples numeric matrix of pseudobulk counts (DESeq2
+#'   orientation).
+#' @param design A samples x features numeric design matrix of full column rank,
+#'   e.g. `model.matrix(~ condition, sampleinfo)`.
+#' @param contrast 1-based design column (coefficient) to test; `NULL` (default)
+#'   tests the last coefficient.
+#' @param size_factors Per-sample size factors; `NULL` (default) uses the
+#'   DESeq2 median-ratio estimate.
+#' @return For `scx_nb_glm`: a `data.frame` with columns `gene`, `baseMean`,
+#'   `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`, `dispersion`,
+#'   `converged`.
+#' @export
+scx_nb_glm <- function(counts, design, contrast = NULL, size_factors = NULL,
+                       gene_names = rownames(counts),
+                       dispersion = "cox_reid_shrunk", cooks_filtering = TRUE,
+                       independent_filtering = TRUE) {
+  counts <- as.matrix(counts)
+  design <- as.matrix(design)
+  storage.mode(counts) <- "double"
+  storage.mode(design) <- "double"
+  if (is.null(gene_names)) gene_names <- as.character(seq_len(nrow(counts)))
+
+  res <- scx_nb_glm_matrix(counts, design, contrast, size_factors, gene_names,
+                           dispersion, cooks_filtering, independent_filtering)
+
+  data.frame(
+    gene = res$gene,
+    baseMean = res$baseMean,
+    log2FoldChange = res$log2FoldChange,
+    lfcSE = res$lfcSE,
+    stat = res$stat,
+    pvalue = res$pvalue,
+    padj = res$padj,
+    dispersion = res$dispersion,
+    converged = res$converged,
+    stringsAsFactors = FALSE
+  )
+}

@@ -16,7 +16,7 @@
 //! the only difference is the per-chunk kernel call and the merge logic.
 
 use crate::diffexp::cpu::{
-    empty_pdex_result, merge_pdex_chunk_into, pdex_ref, recompute_pdex_fdrs, PdexRefResult,
+    empty_pdex_result, finalize_pdex, merge_pdex_chunk_into, pdex_ref_core, PdexRefResult,
 };
 use crate::error::{AccelError, Result};
 use crate::pseudobulk::GeomMeanMode;
@@ -37,6 +37,7 @@ pub fn pdex_ref_streaming_csc<S: ColumnShardSource + ?Sized>(
     gene_chunk_size: usize,
     mode: GeomMeanMode,
     epsilon: f64,
+    cpm_filter: Option<f64>,
 ) -> Result<PdexRefResult> {
     let n_obs = source.n_obs();
     let n_vars = gene_names.len();
@@ -92,7 +93,7 @@ pub fn pdex_ref_streaming_csc<S: ColumnShardSource + ?Sized>(
             }
         }
 
-        let chunk_result = pdex_ref(
+        let chunk_result = pdex_ref_core(
             dense_view,
             n_obs,
             chunk_size,
@@ -102,6 +103,7 @@ pub fn pdex_ref_streaming_csc<S: ColumnShardSource + ?Sized>(
             reference,
             mode,
             epsilon,
+            cpm_filter.is_some(),
         )?;
 
         combined = Some(match combined.take() {
@@ -114,7 +116,7 @@ pub fn pdex_ref_streaming_csc<S: ColumnShardSource + ?Sized>(
     }
 
     let mut result = combined.unwrap_or_else(|| empty_pdex_result(group_names, reference));
-    recompute_pdex_fdrs(&mut result);
+    finalize_pdex(&mut result, cpm_filter);
     Ok(result)
 }
 
@@ -164,6 +166,7 @@ mod tests {
             5, // gene_chunk_size — forces multi-chunk on n_vars=16
             mode,
             epsilon,
+            None,
         )
         .expect("CSR streaming pdex_ref failed");
 
@@ -176,6 +179,7 @@ mod tests {
             5,
             mode,
             epsilon,
+            None,
         )
         .expect("CSC streaming pdex_ref failed");
 
@@ -218,6 +222,86 @@ mod tests {
                         (r_csr - r_csc).abs() < 1e-12,
                         "ref_mean mismatch var={var}: csr={r_csr}, csc={r_csc}"
                     );
+                }
+            }
+        }
+    }
+
+    /// CSR↔CSC parity with `cpm_filter` active: both paths must drop the same
+    /// genes per group (`kept_indices`) and agree on the surviving values + FDR.
+    /// Exercises the per-group arithmetic total accumulated across chunks.
+    #[test]
+    fn pdex_ref_csc_matches_csr_with_cpm_filter() {
+        let n_obs = 32usize;
+        let n_vars = 16usize;
+        let cols_per_csc_shard = 8usize;
+        let dense = deterministic_dense(n_obs, n_vars);
+        let dir = tempdir().unwrap();
+        let path = write_csr_csc_test_file(
+            dir.path(),
+            "pdex_csc_cpm_parity",
+            n_obs,
+            n_vars,
+            &dense,
+            cols_per_csc_shard,
+        );
+
+        let gene_names: Vec<String> = (0..n_vars).map(|j| format!("g{j}")).collect();
+        let groups: Vec<usize> = (0..n_obs).map(|i| (i * 3) / n_obs).collect();
+        let group_names = vec!["ref".to_string(), "ko_a".to_string(), "ko_b".to_string()];
+        let reference = 0usize;
+        let mode = GeomMeanMode::ArithRaw;
+        let epsilon = 1e-6;
+        // Threshold chosen to drop some-but-not-all genes (deterministic_dense
+        // spreads CPM across genes); both layouts must agree on which.
+        let cpm_filter = Some(60_000.0);
+
+        let csr_reader = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
+        let csc_reader = BackedCscReader::new(ScxReader::open(&path).unwrap(), 0).unwrap();
+
+        let csr_res = pdex_ref_streaming(
+            &csr_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            5,
+            mode,
+            epsilon,
+            cpm_filter,
+        )
+        .expect("CSR streaming pdex_ref failed");
+
+        let csc_res = pdex_ref_streaming_csc(
+            &csc_reader,
+            &gene_names,
+            &groups,
+            &group_names,
+            reference,
+            5,
+            mode,
+            epsilon,
+            cpm_filter,
+        )
+        .expect("CSC streaming pdex_ref failed");
+
+        let kept_csr = csr_res.kept_indices.as_ref().expect("csr kept_indices");
+        let kept_csc = csc_res.kept_indices.as_ref().expect("csc kept_indices");
+        assert_eq!(kept_csr, kept_csc, "CSR/CSC kept-gene sets diverge");
+        // Sanity: filtering actually dropped something but not everything.
+        let total_kept: usize = kept_csr.iter().map(|k| k.len()).sum();
+        assert!(total_kept > 0 && total_kept < n_vars * kept_csr.len());
+
+        let n_test = csr_res.group_names.len();
+        for tg in 0..n_test {
+            assert_eq!(csr_res.p_values[tg].len(), csc_res.p_values[tg].len());
+            for j in 0..csr_res.p_values[tg].len() {
+                assert!((csr_res.p_values[tg][j] - csc_res.p_values[tg][j]).abs() < 1e-12);
+                assert!((csr_res.fdrs[tg][j] - csc_res.fdrs[tg][j]).abs() < 1e-12);
+                let tm_csr = csr_res.target_means[tg][j];
+                let tm_csc = csc_res.target_means[tg][j];
+                if tm_csr.is_finite() && tm_csc.is_finite() {
+                    assert!((tm_csr - tm_csc).abs() < 1e-12);
                 }
             }
         }
@@ -280,6 +364,7 @@ mod tests {
             7, // gene_chunk_size — multi-chunk on n_vars=20
             mode,
             epsilon,
+            None,
         )
         .expect("CPU streaming pdex_ref failed");
 
@@ -297,6 +382,7 @@ mod tests {
             Some(7),
             mode,
             epsilon,
+            None,
         )
         .expect("GPU v3 CSC streaming pdex_ref failed");
 
@@ -403,6 +489,7 @@ mod tests {
             7,
             mode,
             epsilon,
+            None,
         )
         .expect("CPU streaming pdex_ref failed");
 
@@ -420,6 +507,7 @@ mod tests {
             Some(7),
             mode,
             epsilon,
+            None,
         )
         .expect("GPU v3 CSR-fallback streaming pdex_ref failed");
 
@@ -507,6 +595,7 @@ mod tests {
             7, // gene_chunk_size — multi-chunk on n_vars=20 (3 chunks)
             mode,
             epsilon,
+            None,
         )
         .expect("CPU streaming pdex_ref failed");
 
@@ -527,6 +616,7 @@ mod tests {
             Some(7),
             mode,
             epsilon,
+            None,
         );
         scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
         let gpu_res =

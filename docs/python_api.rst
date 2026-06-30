@@ -43,6 +43,7 @@ Mutating operations
    append
    append_from_anndata
    compact
+   optimize
    merge
    mark_deleted
    rollback

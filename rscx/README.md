@@ -86,10 +86,71 @@ scx_compact("experiment.scx", "clean.scx")
 scx_rollback("experiment.scx")
 scx_merge(c("batch1.scx", "batch2.scx"), "atlas.scx")
 
+# ...with options (mirroring pyscx):
+scx_merge(c("b1.scx", "b2.scx"), "atlas.scx",
+          assume_identical_var = TRUE, uns_policy = "namespace",
+          index_obs = "cell_type")
+scx_append("atlas.scx", "rna_batch.scx", codec = "zstd", shard_size = 32768L,
+           modality = "rna")               # modality = a name on a multimodal file
+scx_compact("experiment.scx", "clean.scx", index_obs = "cell_type",
+            reshape_obs = TRUE)
+
 # File info and validation
 scx_info("experiment.scx")
 scx_validate("experiment.scx")
 ```
+
+`scx_merge` / `scx_compact` / `scx_append` accept the same option set as pyscx
+(predicate-index columns via `index_obs`/`index_var`/`index_preset`, `uns_policy`
+and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` on
+append, `reshape_obs` on compact). `shard_target_rows` is inherited from the
+input; CSC sidecars are dropped by these ops (rebuild separately).
+
+## Backed (out-of-core) access
+
+`exp$x_matrix()` materialises the whole matrix in memory. For atlas-scale files
+that don't fit in RAM, open a **backed** view instead: it reads rows from disk on
+demand with a shard-level LRU cache, and behaves like a read-only sparse matrix.
+
+```r
+exp <- scx_open("atlas.scx")
+bsd <- exp$x_backed()                  # lazy; no data read yet
+# (or, standalone:)  bsd <- scx_backed_sparse("atlas.scx")
+
+dim(bsd)                               # c(n_obs, n_vars), so nrow()/ncol() work
+first100 <- bsd[1:100, ]               # dgCMatrix of those cells x all genes
+subset   <- bsd[c(5, 1, 3), 1:10]      # arbitrary rows (in order) x first 10 genes
+mask_rows <- bsd[exp$obs()$tissue == "lung", ]   # logical row index
+
+gene_totals <- bsd$col_sums()          # streamed aggregations, no full decode
+cell_totals <- bsd$row_sums()
+```
+
+Row indices are 1-based (R convention); positive-integer and logical indices are
+supported (negative/character row indices are not). A column index is applied to
+the returned `dgCMatrix`. Use `bsd$to_dgcmatrix()` / `as(bsd, "dgCMatrix")` to
+materialise the full matrix when you do want it all in memory.
+
+### Lazy transform chains
+
+`scx_lazy_transform()` (or `exp$x_lazy()`) layers a chain of preprocessing
+transforms — `normalize_total`, `log1p`, `row_scale` — on top of the backed
+reader. The transforms are applied **on read**, so the canonical
+normalize → log1p pipeline runs out-of-core: nothing is materialised until you
+slice. The verbs are pipe-friendly and immutable (each returns a new handle):
+
+```r
+lt <- scx_lazy_transform("atlas.scx") |>
+  scx_normalize_total(target_sum = 1e4) |>
+  scx_log1p()
+
+lt[1:100, ]          # transformed dgCMatrix (cells x genes), computed on demand
+lt$col_sums()        # streamed over the transformed data, no full decode
+as(lt, "dgCMatrix")  # materialise the whole transformed matrix when needed
+```
+
+`scx_row_scale(lt, factors)` multiplies each cell by a per-cell factor (length
+`nrow(lt)`). Indexing and coercion behave the same as the backed view above.
 
 ## Getting data out of a query
 
@@ -131,6 +192,47 @@ If both `rscx` and `dplyr` are attached, `count` is masked — use
 
 > **Note:** an `RQueryResult` is consumed by the first extraction call, so call
 > one of the above once per `collect()`.
+
+## Analysis accelerators
+
+CPU-native, pipe-friendly front ends over the same Rust kernels the Python
+accelerators use. Each accepts a `Seurat` object (results written into the
+expected slot, object returned invisibly) **or** a raw genes × cells
+`dgCMatrix` (the raw result is returned, no Seurat needed):
+
+```r
+obj <- scx_highly_variable_genes(obj)            # seurat_v3 HVG
+obj <- scx_pca(obj)                              # randomized / covariance PCA
+obj <- scx_neighbors(obj, dims = 1:30)           # HNSW kNN graph
+obj <- scx_umap(obj, dims = 1:30)                # UMAP
+obj <- scx_leiden(obj, resolution = 1.0)         # Leiden clustering
+de  <- scx_rank_genes_groups(obj, group.by = "seurat_clusters")  # Wilcoxon DE
+
+# Gene-set scoring (scanpy score_genes analog: "control" / "mean" / "zscore"):
+obj <- scx_score_genes(obj, gene_list = c("CD3D", "CD3E", "CD8A"),
+                       score_name = "t_cell_score")
+
+# Pseudobulk aggregation (cells -> group x gene; "sum" or "mean"):
+pb <- scx_pseudobulk(obj, group_by = c("condition", "donor"), method = "sum")
+pb$counts    # genes x pseudobulk-samples matrix
+pb$samples   # per-sample metadata (groupby columns + n_cells)
+
+# Pseudobulk DE: Rust-native negative-binomial GLM (DESeq2-style, CPU-only).
+# Needs >=2 replicates per condition, so group_by includes a replicate column
+# (donor/batch), and raw counts (layer = "counts"):
+de <- scx_pseudobulk_dex(obj, group_by = c("condition", "donor"),
+                         test_col = "condition", reference = "ctrl")
+# data.frame: gene, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj,
+#             target, reference  (one block per non-reference level)
+
+# Or run the NB-GLM directly on a pre-aggregated counts matrix + design:
+de2 <- scx_nb_glm(pb$counts, model.matrix(~ condition, pb$samples))
+```
+
+For no-replicate or log-normalized data use `scx_rank_genes_groups()` (Wilcoxon)
+instead of the NB-GLM. `scx_harmony_integrate()` / `RunHarmony_scx()` and
+`scx_compute_lisi()` round out the set. All paths are CPU-only (rscx links no
+GPU feature).
 
 ## Build Notes
 

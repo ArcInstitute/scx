@@ -4,117 +4,161 @@
 // plus scx_info and scx_validate from scx-format.
 // Follows the same pattern as pyscx/src/ops.rs, adapted for extendr.
 
-use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use extendr_api::prelude::*;
 
-use scx_codec::ValueEncoding;
-use scx_format_io::section::SectionType;
-use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_codec::{CodecId, CodecSelection};
+use scx_engine::ConversionPredicateIndexOptions;
 use scx_format_io::ScxReader;
+use scx_ops::{AppendOptions, MergeOptions, UnsPolicy};
+
+/// Build conversion predicate-index options from R inputs. Empty `Strings`
+/// (R `character(0)`) mean "no forced columns"; `index_auto_threshold` 0
+/// disables auto-detection.
+fn index_options(
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+) -> ConversionPredicateIndexOptions {
+    ConversionPredicateIndexOptions {
+        index_obs: index_obs.iter().map(|s| s.to_string()).collect(),
+        index_var: index_var.iter().map(|s| s.to_string()).collect(),
+        index_preset: match index_preset {
+            Nullable::NotNull(s) => Some(s),
+            Nullable::Null => None,
+        },
+        index_auto_threshold: index_auto_threshold.max(0) as usize,
+    }
+}
+
+/// Parse a codec string into a [`CodecSelection`]. `NULL` / `"auto"` ⇒ `Auto`;
+/// otherwise an explicit codec (`none`/`scx1`/`zstd`/`lz4`/`pcodec`).
+fn parse_codec(codec: Nullable<String>) -> Result<CodecSelection> {
+    match codec {
+        Nullable::Null => Ok(CodecSelection::Auto),
+        Nullable::NotNull(s) => CodecId::parse_cli(&s)
+            .map_err(Error::Other)
+            .map(|o| o.map_or(CodecSelection::Auto, CodecSelection::Explicit)),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Append
 // ---------------------------------------------------------------------------
 
-/// Append cells from one SCX file to another.
+/// Append cells from one SCX file to another (in place), with options.
 ///
-/// Reads the input file's CSR data and obs metadata, then appends them
-/// to the target file using `scx_ops::append()`.
+/// Streams the input's X / obs straight from a reader (per-shard value
+/// encodings preserved), mirroring `pyscx.append`.
 ///
-/// @param target Path to the target SCX file (will be modified in-place).
+/// @param target Path to the target SCX file (modified in place).
 /// @param input Path to the input SCX file to append from.
+/// @param codec Codec for the new shards: `NULL`/`"auto"` (per-shard
+///   auto-selection) or one of `"none"`/`"scx1"`/`"zstd"`/`"lz4"`/`"pcodec"`.
+/// @param shard_size Target rows per CSR shard (default 16384; must be > 0).
+/// @param index_obs,index_var Obs/var columns to build predicate indexes for.
+/// @param index_preset Named index preset (`cellxgene`/`perturbseq`/`training`).
+/// @param index_auto_threshold Auto-index cardinality cap (0 = disabled).
+/// @param modality Modality NAME to append into on a multimodal file (`NULL`
+///   for single-modality / the global axis).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3): a
 /// fallible `#[extendr]` fn would otherwise `unwrap()`-panic in extendr 0.8.0,
 /// masking the real message behind "User function panicked".
 #[extendr]
-fn scx_append(target: &str, input: &str) -> Robj {
-    crate::util::throw_on_err(scx_append_impl(target, input))
+#[allow(clippy::too_many_arguments)]
+fn scx_append(
+    target: &str,
+    input: &str,
+    codec: Nullable<String>,
+    shard_size: i32,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    modality: Nullable<String>,
+) -> Robj {
+    crate::util::throw_on_err(scx_append_impl(
+        target,
+        input,
+        codec,
+        shard_size,
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+        modality,
+    ))
 }
 
-fn scx_append_impl(target: &str, input: &str) -> Result<()> {
-    // Open input file
+#[allow(clippy::too_many_arguments)]
+fn scx_append_impl(
+    target: &str,
+    input: &str,
+    codec: Nullable<String>,
+    shard_size: i32,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    modality: Nullable<String>,
+) -> Result<()> {
     let input_reader =
         ScxReader::open(input).map_err(|e| Error::Other(format!("failed to open input: {e}")))?;
-
-    // Validate n_vars match
     let target_reader =
         ScxReader::open(target).map_err(|e| Error::Other(format!("failed to open target: {e}")))?;
-    if target_reader.n_vars() != input_reader.n_vars() {
-        return Err(Error::Other(format!(
-            "n_vars mismatch: target has {}, input has {}",
-            target_reader.n_vars(),
-            input_reader.n_vars()
-        )));
-    }
-    drop(target_reader);
 
-    // Read CSR data
-    let csr = input_reader
-        .read_all_csr_shards()
-        .map_err(|e| Error::Other(format!("failed to read CSR shards: {e}")))?;
-
-    // Detect value encoding from first shard header
-    let csr_entries = input_reader.catalog().shards(SectionType::CsrShard);
-    let value_encoding = if let Some(first_entry) = csr_entries.first() {
-        let bytes = input_reader
-            .section_bytes(first_entry)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        let sh = ShardHeader::read_from(&mut Cursor::new(&bytes[..SHARD_HEADER_SIZE]))
-            .map_err(|e| Error::Other(e.to_string()))?;
-        ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or_else(|| Error::Other(format!("unknown value encoding: {}", sh.value_encoding)))?
-    } else {
-        return Err(Error::Other("input file has no CSR shards".into()));
+    // Resolve the modality NAME (if any) against both readers → ids.
+    let (target_modality_id, source_modality_id) = match modality {
+        Nullable::Null => {
+            // Single-modality / global append: modality_id 0 is the implicit
+            // global axis for both target and source. Validate file-wide n_vars.
+            if target_reader.n_vars() != input_reader.n_vars() {
+                return Err(Error::Other(format!(
+                    "n_vars mismatch: target has {}, input has {}",
+                    target_reader.n_vars(),
+                    input_reader.n_vars()
+                )));
+            }
+            (0u8, 0u8)
+        }
+        Nullable::NotNull(name) => {
+            let tid = target_reader.modality_id(&name).ok_or_else(|| {
+                Error::Other(format!(
+                    "target file has no modality named '{name}' (use scx_info / a multimodal file)"
+                ))
+            })?;
+            let sid = input_reader.modality_id(&name).ok_or_else(|| {
+                Error::Other(format!("input file has no modality named '{name}'"))
+            })?;
+            (tid, sid)
+        }
     };
 
-    // Convert i64 → u64 indptr (validate non-negative)
-    let indptr: Vec<u64> = csr
-        .indptr
-        .iter()
-        .map(|&v| {
-            if v < 0 {
-                Err(Error::Other(format!("negative indptr value {v}")))
-            } else {
-                Ok(v as u64)
-            }
-        })
-        .collect::<Result<Vec<u64>>>()?;
+    let shard_target_rows = u32::try_from(shard_size)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| Error::Other("shard_size must be > 0".into()))?;
 
-    // Convert i32 → u32 indices (validate non-negative)
-    let indices: Vec<u32> = csr
-        .indices
-        .iter()
-        .map(|&v| {
-            if v < 0 {
-                Err(Error::Other(format!("negative CSR index {v}")))
-            } else {
-                Ok(v as u32)
-            }
-        })
-        .collect::<Result<Vec<u32>>>()?;
+    let options = AppendOptions {
+        codec: parse_codec(codec)?,
+        shard_target_rows,
+        modality_id: target_modality_id,
+    };
+    let idx = index_options(index_obs, index_var, index_preset, index_auto_threshold);
 
-    // Encode f32 → raw LE bytes
-    let values_bytes = encode_values(&csr.data, value_encoding);
-
-    // Read obs metadata
-    let obs = input_reader
-        .read_obs()
-        .map_err(|e| Error::Other(format!("failed to read obs: {e}")))?;
-
-    // Codec is auto-selected per shard inside scx_ops::append
     let target_path = PathBuf::from(target);
-    scx_ops::append(
+    scx_ops::append_from_reader_with_index_options(
         &target_path,
-        &obs,
-        &indptr,
-        &indices,
-        &values_bytes,
-        value_encoding,
-        &scx_ops::AppendOptions::default(),
+        &input_reader,
+        &options,
+        source_modality_id,
+        &idx,
     )
+    .map(|_| ())
     .map_err(|e| Error::Other(e.to_string()))
 }
 
@@ -158,19 +202,53 @@ fn scx_delete_impl(path: &str, cell_indices: Vec<i32>) -> Result<Robj> {
 // Compact
 // ---------------------------------------------------------------------------
 
-/// Rewrite an SCX file reclaiming deleted/orphaned space.
+/// Rewrite an SCX file reclaiming deleted/orphaned space, with options.
 ///
 /// @param input Path to the input SCX file.
 /// @param output Path for the compacted output file.
+/// @param index_obs,index_var Obs/var columns to build predicate indexes for.
+/// @param index_preset Named index preset (`cellxgene`/`perturbseq`/`training`).
+/// @param index_auto_threshold Auto-index cardinality cap (0 = disabled).
+/// @param reshape_obs Migrate legacy single-section obs to row-sharded layout.
+///
+/// `shard_target_rows` is inherited from the input header; CSC sidecars are
+/// dropped (rebuild separately).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_compact(input: &str, output: &str) -> Robj {
-    crate::util::throw_on_err(scx_compact_impl(input, output))
+fn scx_compact(
+    input: &str,
+    output: &str,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    reshape_obs: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_compact_impl(
+        input,
+        output,
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+        reshape_obs,
+    ))
 }
 
-fn scx_compact_impl(input: &str, output: &str) -> Result<()> {
-    scx_ops::compact(Path::new(input), Path::new(output)).map_err(|e| Error::Other(e.to_string()))
+fn scx_compact_impl(
+    input: &str,
+    output: &str,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    reshape_obs: bool,
+) -> Result<()> {
+    let idx = index_options(index_obs, index_var, index_preset, index_auto_threshold);
+    scx_ops::compact_with_index_options(Path::new(input), Path::new(output), &idx, reshape_obs)
+        .map(|_| ())
+        .map_err(|e| Error::Other(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -206,27 +284,97 @@ fn scx_rollback_impl(path: &str, to_seq: Nullable<i32>) -> Result<()> {
 // Merge
 // ---------------------------------------------------------------------------
 
-/// Merge multiple SCX files into one.
+/// Merge multiple SCX files into one, with options.
 ///
-/// Requires at least 2 input files. All must have the same n_vars.
+/// Requires at least 2 input files. Var identity is validated by default.
 ///
 /// @param inputs Character vector of input file paths.
 /// @param output Path for the merged output file.
+/// @param index_obs,index_var Obs/var columns to build predicate indexes for.
+/// @param index_preset Named index preset (`cellxgene`/`perturbseq`/`training`).
+/// @param index_auto_threshold Auto-index cardinality cap (0 = disabled).
+/// @param assume_identical_var,assume_identical_obs Skip the var / obs schema
+///   identity checks across inputs.
+/// @param uns_policy How to combine `uns`: `first` / `require-equal` /
+///   `namespace` / `summary`.
+/// @param sort_by Obs columns for a globally-ordered (sorted) k-way merge;
+///   empty = legacy concatenation.
+/// @param reverse Descending order when `sort_by` is set.
+///
+/// `shard_target_rows` is inherited from the first input; CSC sidecars are
+/// dropped (rebuild separately).
 ///
 /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
 #[extendr]
-fn scx_merge(inputs: Vec<String>, output: &str) -> Robj {
-    crate::util::throw_on_err(scx_merge_impl(inputs, output))
+#[allow(clippy::too_many_arguments)]
+fn scx_merge(
+    inputs: Vec<String>,
+    output: &str,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    assume_identical_var: bool,
+    assume_identical_obs: bool,
+    uns_policy: &str,
+    sort_by: Strings,
+    reverse: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_merge_impl(
+        inputs,
+        output,
+        index_obs,
+        index_var,
+        index_preset,
+        index_auto_threshold,
+        assume_identical_var,
+        assume_identical_obs,
+        uns_policy,
+        sort_by,
+        reverse,
+    ))
 }
 
-fn scx_merge_impl(inputs: Vec<String>, output: &str) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn scx_merge_impl(
+    inputs: Vec<String>,
+    output: &str,
+    index_obs: Strings,
+    index_var: Strings,
+    index_preset: Nullable<String>,
+    index_auto_threshold: i32,
+    assume_identical_var: bool,
+    assume_identical_obs: bool,
+    uns_policy: &str,
+    sort_by: Strings,
+    reverse: bool,
+) -> Result<()> {
     if inputs.len() < 2 {
         return Err(Error::Other("merge requires at least 2 input files".into()));
     }
     let input_paths: Vec<PathBuf> = inputs.iter().map(PathBuf::from).collect();
     let input_refs: Vec<&Path> = input_paths.iter().map(|p| p.as_path()).collect();
 
-    scx_ops::merge(&input_refs, Path::new(output)).map_err(|e| Error::Other(e.to_string()))
+    let uns = UnsPolicy::parse(uns_policy).ok_or_else(|| {
+        Error::Other(format!(
+            "unknown uns_policy '{uns_policy}' (expected 'first', 'require-equal', \
+             'namespace', or 'summary')"
+        ))
+    })?;
+
+    let options = MergeOptions {
+        index_options: index_options(index_obs, index_var, index_preset, index_auto_threshold),
+        assume_identical_var,
+        assume_identical_obs,
+        uns_policy: uns,
+        shard_target_rows: None,
+        sort_by: sort_by.iter().map(|s| s.to_string()).collect(),
+        sort_reverse: reverse,
+    };
+
+    scx_ops::merge_with_options(&input_refs, Path::new(output), &options)
+        .map(|_| ())
+        .map_err(|e| Error::Other(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -293,31 +441,6 @@ fn scx_validate_impl(path: &str) -> Result<bool> {
         )));
     }
     Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// Helper: encode f32 values to raw LE bytes
-// ---------------------------------------------------------------------------
-
-/// Encode f32 values to raw little-endian bytes according to value encoding.
-/// Same logic as pyscx::convert::encode_values.
-fn encode_values(data: &[f32], encoding: ValueEncoding) -> Vec<u8> {
-    match encoding {
-        ValueEncoding::Uint8 => data.iter().map(|&v| v as u8).collect(),
-        ValueEncoding::Uint16 => data
-            .iter()
-            .flat_map(|&v| (v as u16).to_le_bytes())
-            .collect(),
-        ValueEncoding::Uint32 => data
-            .iter()
-            .flat_map(|&v| (v as u32).to_le_bytes())
-            .collect(),
-        ValueEncoding::Float32 => data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
-        ValueEncoding::Float16 => data
-            .iter()
-            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
-            .collect(),
-    }
 }
 
 // ---------------------------------------------------------------------------

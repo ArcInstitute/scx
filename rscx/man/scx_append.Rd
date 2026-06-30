@@ -2,25 +2,49 @@
 % Please edit documentation in R/ops.R
 \name{scx_append}
 \alias{scx_append}
-\title{SCX file operations}
+\title{Append cells from one SCX file to another}
 \usage{
-scx_append(target, input)
+scx_append(
+  target,
+  input,
+  codec = NULL,
+  shard_size = 16384L,
+  index_obs = NULL,
+  index_var = NULL,
+  index_preset = NULL,
+  index_auto_threshold = 0L,
+  modality = NULL
+)
 }
 \arguments{
 \item{target}{Path to the target SCX file (modified in-place).}
 
 \item{input}{Path to the input SCX file to append from.}
+
+\item{codec}{Codec for the new shards: \code{NULL}/\code{"auto"} (per-shard
+auto-selection) or one of \code{"none"}, \code{"scx1"}, \code{"zstd"},
+\code{"lz4"}, \code{"pcodec"}. Note \code{"scx1"} encodes integers only.}
+
+\item{shard_size}{Target rows per CSR shard (default 16384; must be > 0).}
+
+\item{index_obs, index_var}{Obs/var columns to build predicate indexes for.}
+
+\item{index_preset}{Named index preset
+(\code{"cellxgene"}/\code{"perturbseq"}/\code{"training"}).}
+
+\item{index_auto_threshold}{Auto-index cardinality cap (0 = disabled).}
+
+\item{modality}{Modality NAME to append into on a multimodal file
+(\code{NULL} for single-modality / the global axis).}
 }
 \description{
-Append, delete, compact, rollback, and merge SCX files from R.
-Info and validation utilities.
-Append cells from one SCX file to another
-
-Reads all CSR shards and obs metadata from the input file and appends
-them to the target file. Both files must have the same number of variables.
+Streams the input's X / obs from a reader and appends them to the target
+(in place). Both files must have the same number of variables (per modality
+when \code{modality} is given).
 }
 \examples{
 \dontrun{
 scx_append("atlas.scx", "new_batch.scx")
+scx_append("atlas.scx", "rna_batch.scx", codec = "zstd", modality = "rna")
 }
 }
