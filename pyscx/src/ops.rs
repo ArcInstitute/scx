@@ -668,6 +668,25 @@ pub fn optimize(py: Python<'_>, input: &str, output: &str, codec: &str) -> PyRes
             )));
         }
     };
+    // No-clobber guard mirroring `scx optimize` (no `--force` analogue here).
+    // An in-place upgrade (`output == input`) writes a sibling tempfile and
+    // atomically renames, so only a *different* pre-existing output is
+    // rejected. Compare canonicalized paths when both resolve, falling back to
+    // a literal compare for a not-yet-created output.
+    let same_file = match (
+        std::fs::canonicalize(&input_path),
+        std::fs::canonicalize(&output_path),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => input_path == output_path,
+    };
+    if output_path.exists() && !same_file {
+        return Err(PyRuntimeError::new_err(format!(
+            "output file already exists: {} (no force analogue; remove the \
+             target first or pass output == input for an in-place upgrade)",
+            output_path.display()
+        )));
+    }
     py.detach(|| scx_ops::optimize(&input_path, &output_path, codec_id))
         .map_err(ops_to_pyerr)
 }

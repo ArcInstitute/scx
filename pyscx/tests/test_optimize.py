@@ -47,6 +47,15 @@ class TestOptimize:
             exp = pyscx.open(dst)
             assert exp.n_obs == 50
 
+    def test_optimize_existing_output_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.scx")
+            dst = os.path.join(tmp, "out.scx")
+            _create_v2_scx(src)
+            _create_v2_scx(dst)  # pre-existing, different file
+            with pytest.raises(RuntimeError):
+                pyscx.optimize(src, dst)
+
     def test_optimize_bad_codec_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.scx")
