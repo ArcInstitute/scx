@@ -392,7 +392,22 @@ writes a single-section `obs_metadata` / `var_metadata`, regardless of
 `n_obs` (the X matrix is still row-sharded at `shard_target_rows`). To
 obtain sharded metadata from an h5ad source, either ingest with
 `pyscx.from_anndata`, or migrate an existing single-section file with
-`pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`).
+`pyscx.compact(src, dst, reshape_obs=True)` (`scx compact --reshape-obs`)
+or `pyscx.optimize(src, dst, shard_obs=...)` (`scx optimize --shard-obs`).
+
+`scx optimize --shard-obs off|auto|always` (default `auto`) migrates a
+**single-section** obs table to the sharded layout while it modernizes the
+file (decode sidecars + v3 canonical CSR). `auto` shards only when
+`n_obs > shard_target_rows` — the same threshold `from_anndata` uses — so
+small files stay single-section and byte-faithful while atlas-scale files get
+sharded obs in the same pass; `always` shards unconditionally and `off`
+preserves the single section (the historical 1:1 copy). An already-sharded
+obs is always stream-preserved regardless of the policy (optimize never
+collapses or re-sizes existing obs shards — use `compact` to re-shard).
+optimize's peak memory is unchanged: the single-section input is materialized
+whole by `read_obs()` either way, so the benefit accrues to downstream
+streaming / cloud / bounded-memory readers of the output, not to optimize
+itself.
 
 Each shard covers rows `[row_start, row_start + n_shard_rows)` of the
 logical metadata table and carries schema metadata (`shard_idx`,

@@ -751,7 +751,11 @@ pub(crate) fn discover_modality_keys(
 /// written before sharded obs metadata existed. `write_obs_shard`
 /// upcasts `Utf8 → LargeUtf8` per shard internally, so individual shards
 /// never hit the Arrow IPC 2 GB narrow-offset ceiling.
-fn write_obs_section(
+///
+/// `pub(crate)` so `scx optimize` can reuse it to migrate a single-section
+/// legacy obs to the sharded layout under `ObsShardPolicy` (it reads a single
+/// coherent source section and chunks the already-resident batch).
+pub(crate) fn write_obs_section(
     writer: &mut ScxWriter,
     obs: &arrow::array::RecordBatch,
     reshape: bool,

@@ -166,7 +166,9 @@ Most-used kwargs (shared across ingest entry points):
 ### Inspect / file ops (CLI)
 `scx info <file> [--json --history]`, `scx validate <file>`,
 `scx subset <in> --filter <expr> --genes <path>`, `scx merge`, `scx append`,
-`scx compact`, `scx optimize` (in-place sidecar + canonical v3 upgrade),
+`scx compact`, `scx optimize` (in-place sidecar + canonical v3 upgrade;
+`--shard-obs off|auto|always`, default `auto`, migrates a legacy single-section
+obs to the sharded layout when `n_obs > shard_target_rows`),
 `scx build-csc <in> <out>` (add a CSC sidecar),
 `scx sort <in> <out> --by CSV` (reorder cells by obs key for query locality),
 `scx set-uns <file> --uns JSON` (replace uns in place),
