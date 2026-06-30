@@ -1023,6 +1023,34 @@ fn test_optimize_shard_obs_always_shards_single_section() {
 }
 
 #[test]
+fn test_optimize_shard_obs_auto_keeps_small_single_section() {
+    let dir = tempfile::tempdir().unwrap();
+    // write_test_file uses shard_target_rows=16384, so n_obs=8 is far below the
+    // threshold → auto must keep the single section (the no-op-for-small-files
+    // contract), completing the CLI-level off/auto/always matrix.
+    let input = write_test_file(&dir, "legacy.scx", 8, 10);
+    let output = dir.path().join("auto_small.scx");
+
+    let out = scx_cli()
+        .args([
+            "optimize",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--shard-obs",
+            "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert_eq!(
+        ScxReader::open(&output).unwrap().obs_metadata_shard_count(),
+        0,
+        "auto keeps a sub-threshold single-section obs as a single section"
+    );
+}
+
+#[test]
 fn test_optimize_shard_obs_off_keeps_single_section() {
     let dir = tempfile::tempdir().unwrap();
     let input = write_test_file(&dir, "legacy.scx", 8, 10);
