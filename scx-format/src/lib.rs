@@ -14,6 +14,7 @@ pub mod csc_policy;
 pub mod error;
 pub mod header;
 pub mod modality;
+pub mod obs_shard_policy;
 pub mod provenance;
 pub mod section;
 pub mod shard;
@@ -49,6 +50,7 @@ pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,
     MODALITY_NAME_MAX_BYTES, MODALITY_TABLE_MAGIC, MODALITY_TABLE_VERSION,
 };
+pub use obs_shard_policy::ObsShardPolicy;
 pub use provenance::{Provenance, ProvenanceEntry};
 pub use section::{align_to_8, SectionType};
 pub use shard::{

@@ -12,6 +12,7 @@ pub fn run_optimize(
     output: &Path,
     force: bool,
     codec: &str,
+    shard_obs: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
@@ -45,6 +46,8 @@ pub fn run_optimize(
         return Err("output file already exists, use --force to overwrite".into());
     }
 
+    let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+
     let before_size = std::fs::metadata(input)?.len();
 
     let pb = ProgressBar::new_spinner();
@@ -56,7 +59,7 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    scx_ops::optimize(input, output, codec_id)?;
+    scx_ops::optimize(input, output, codec_id, obs_shard_policy)?;
 
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();

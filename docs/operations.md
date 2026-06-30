@@ -136,9 +136,11 @@ pre-v3 / sidecar-less file gains the random-access and GPU device-decode benefit
 Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
 - It does **not** apply deletions — the deletion-vector section is carried
   through unchanged (use `compact` to reclaim deleted rows).
-- It does **not** change shard boundaries or row layout; obs/var, obsm/varm,
+- It does **not** change CSR shard boundaries or row layout; obs/var, obsm/varm,
   COO obsp/varp (copied verbatim — sharded layouts preserved), uns, and predicate
-  indexes pass through unchanged.
+  indexes pass through unchanged. (The one optional exception is obs-metadata
+  *layout*: `--shard-obs` may migrate a single-section obs to shards — see below.
+  Row *order* and content are still preserved exactly.)
 - It **does** re-canonicalize every shard (sorting indices, summing duplicate
   coordinates, dropping explicit zeros), so nnz may legitimately drop.
 
@@ -158,9 +160,24 @@ regardless of per-shard count magnitude (Scx1 is less compact than Zstd on
 high-median data, the trade-off for a fully on-device decode). Non-integer
 (float) shards fall back to Zstd either way; `--codec zstd` is rejected.
 
-In Python: `pyscx.optimize(input, output, codec="auto")`. The `codec` kwarg
-takes `"auto"` (default) or `"scx1"` with the same semantics as `--codec`; any
-other value raises `ValueError`. There is no `force` analogue — pass
+`--shard-obs {off|auto|always}` (default `auto`) migrates a **legacy
+single-section** obs table to the sharded `ObsMetadataShard` layout in the same
+pass — the layout the streaming / cloud / bounded-memory read paths want at
+atlas scale (see [sharding.md § Obs/var metadata sharding](sharding.md#obsvar-metadata-sharding)).
+`auto` shards only when `n_obs > shard_target_rows` (the same threshold
+`from_anndata` uses on the write path), so small/medium files stay
+single-section and byte-faithful while only atlas-scale files change; `always`
+shards unconditionally; `off` keeps the single section (the historical
+behaviour). An **already-sharded** obs is always stream-preserved regardless of
+the policy — `optimize` never collapses or re-sizes existing obs shards (use
+`compact` to re-shard). Note this does not lower optimize's peak memory: the
+single-section input is read whole by `read_obs()` either way, so the benefit is
+purely for future readers of the output.
+
+In Python: `pyscx.optimize(input, output, codec="auto", shard_obs="auto")`. The
+`codec` kwarg takes `"auto"` (default) or `"scx1"`, and `shard_obs` takes
+`"off"|"auto"|"always"` (default `"auto"`), with the same semantics as the CLI
+flags; any other value raises `ValueError`. There is no `force` analogue — pass
 `output == input` for an in-place upgrade, or remove the target first.
 
 ## Rollback
