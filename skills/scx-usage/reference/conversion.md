@@ -13,13 +13,13 @@ it never pays anndata's eager `obsm` allocation. Recommended for files larger
 than RAM. Full kwargs:
 
 ```
-from_h5ad(path, out, codec=None, shard_size=None, csc="off",
+from_h5ad(path, out, codec=None, shard_size=None, csc=None,
           csc_cols_per_shard=5000, uns_format="tagged", stream=True,
           strict_uns=False, dense_zero_epsilon=0.0, memory_budget=None,
           temp_dir=None, index_obs=None, index_var=None, index_preset=None,
           index_auto_threshold=1000, bitmap="off", reader_threads=None,
-          writer_queue_depth=4, obs_override=None, var_override=None,
-          uns_override=None)
+          writer_queue_depth=4, sort_by=None, reverse=False,
+          obs_override=None, var_override=None, uns_override=None)
 ```
 
 - **Source layout** auto-detected: CSR streams natively; dense `/X` streams via
@@ -52,15 +52,18 @@ from_h5ad(path, out, codec=None, shard_size=None, csc="off",
   warning. `memory_budget` derates the granted count.
 - `writer_queue_depth` (default 4): backpressure window; outstanding shards
   capped at `reader_threads + writer_queue_depth`.
+- `sort_by`: list of obs column names to globally reorder the cell axis by
+  (lexicographic; the leading key gets the best X-read-locality benefit).
+  `reverse=True` for descending. Sort-on-convert forces `stream=True`.
+  Also available on `from_anndata`. CLI: `--sort-by CSV [--sort-reverse]`.
 
 ### `pyscx.from_anndata(adata, path, ...)` — write an in-memory (or backed) AnnData
 ```
 from_anndata(adata, path, codec=None, shard_size=None, in_place=False,
-             csc="off", csc_cols_per_shard=5000, uns_format="tagged",
+             csc=None, csc_cols_per_shard=5000, uns_format="tagged",
              index_obs=None, index_var=None, index_preset=None,
-             index_auto_threshold=1000, bitmap="off",
-             force_legacy_metadata=False, memory_budget=None,
-             shard_target_rows=None)
+             index_auto_threshold=1000, bitmap="off", memory_budget=None,
+             force_legacy_metadata=False, sort_by=None, reverse=False)
 ```
 Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
 pairwise `obsp`/`varp` (stored as float32 COO Arrow IPC; higher precision is
@@ -82,6 +85,7 @@ allocation). Returns attributes `obs` (DataFrame), `var` (DataFrame), `uns`
 - `pyscx.from_h5mu(path, out, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, stream=True, strict_uns=False, memory_budget=None, temp_dir=None, modalities=None, modality_types=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", reader_threads=None, writer_queue_depth=4)` — multimodal SCX v2. `modalities=["rna","adt"]` keeps a subset (unknown names raise); `modality_types={"adt":"protein","peaks":"atac"}` overrides inferred types (others emit `ModalityTypeInferred`). Per-modality dispatch mirrors `from_h5ad`.
 - `pyscx.from_10x(h5_path, scx_path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", memory_budget=None, force_legacy_metadata=False)`.
 - `pyscx.from_mtx(mtx_dir, scx_path, codec=None, shard_size=None)` — Cell Ranger MTX dir (`matrix.mtx[.gz]`, `barcodes.tsv[.gz]`, `features.tsv[.gz]`). Default shard size 16384. Orientation is auto-detected: Cell Ranger's native **features × barcodes** matrix is transposed to cells×genes (an already-cells×genes matrix is kept; a square matrix assumes Cell Ranger's layout with a warning; a dimension mismatch is a hard error), so a standard `filtered_feature_bc_matrix/` converts to a `(n_cells, n_genes)` SCX file.
+- `pyscx.from_mudata(mdata, path, *, codec=None, shard_size=None, csc=None, csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None)` — write an in-memory `mudata.MuData` to SCX. Requires the `[mudata]` extra.
 
 ## Export out of SCX
 
@@ -108,7 +112,8 @@ via h5ad (`adata.write_h5ad(...)` → `from_h5ad`).
 - **`codec`**: `"auto"` (default, per-shard selection by median value), `"scx1"`
   (Delta-Golomb + FOR-BP + Rice; integer-only), `"zstd"`, `"pcodec"` (best for
   float layers), `"lz4"`, `"none"`.
-- **`csc`**: `"off"` (default), `"auto"`, or `"always"`. `"always"`/`"auto"`
+- **`csc`**: `None` (default; resolved to `"off"` normally, or `"auto"` when an
+  `index_preset` is set), `"off"`, `"auto"`, or `"always"`. `"always"`/`"auto"`
   write a column-major sidecar via a two-pass write (streaming CSR → in-place
   rebuild); transient disk briefly reaches ~2× the output size. `"auto"` builds
   it only when the dataset clears the size thresholds (`n_obs ≥ 50000` **and**
@@ -146,6 +151,8 @@ via h5ad (`adata.write_h5ad(...)` → `from_h5ad`).
 - `pyscx.compact(input, output, index_*=...)` — rewrite reclaiming deleted space.
 - `pyscx.rollback(path, to_seq=None)`.
 - `pyscx.merge(inputs, output, index_*=..., assume_identical_var=False, uns_policy="first", shard_target_rows=None)` — streams obs shard-by-shard. `assume_identical_var=False` validates var index/columns/values across inputs (`True` checks only `n_vars`). `uns_policy`: `"first"` / `"require_equal"` / `"namespace"` / `"summary"`. Pass `index_*` or pushdown regresses to a full scan on the merged file.
+- `pyscx.subset(input_path, output_path=None, *, filter=None, genes=None, modality=None, dry_run=False, codec=None, shard_size=None, memory_budget=None, index_obs=None, index_var=None, index_preset=None)` — Python wrapper for `scx subset`.
+- `pyscx.delete(path, *, filter)` — Python wrapper for `scx delete --filter`.
 
 ## CLI (`scx`)
 
@@ -158,6 +165,8 @@ scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
     [--modality-types NAME:TYPE,...] [--index-obs CSV] [--index-var CSV]
     [--index-preset cellxgene|perturbseq|training] [--index-auto-threshold N]
     [--bitmap off|auto|always] [--reader-threads N] [--writer-queue-depth N]
+    [--sort-by CSV] [--sort-reverse]
+    [--obs-override PATH] [--var-override PATH] [--uns-override PATH]
 ```
 - `--stream` (default true) bounds peak memory; supported h5ad ↔ SCX and h5mu ↔ SCX both directions.
 - On ingest, `--csc always` (or `--csc auto` over a dataset above the size
@@ -165,18 +174,22 @@ scx convert <input> <output> [--from h5ad|10x|h5mu|mtx|scx] [--to h5ad|h5mu|scx]
 - For multimodal SCX → h5ad, combine `--to h5ad --modality NAME`.
 
 Other commands:
-- `scx info <file> [--json] [--history]` — metadata; multimodal shows a per-modality table with a `has_csc` column.
-- `scx validate <file> [--verbose]` — verifies BLAKE3 checksums section-by-section.
-- `scx subset <input> [output] [--filter EXPR] [--genes PATH] [--dry-run] [--shard-size N] [--codec ...]` (`output` optional with `--dry-run`).
-- `scx append <target> <source> [--codec ...] [--shard-size N] [--index-* ...]`.
+- `scx info <source> [--json] [--history]` — metadata; `<source>` accepts a file, `.scxd/` dir, or cloud URL. Multimodal shows a per-modality table with a `has_csc` column.
+- `scx validate <file> [--verbose] [--deep]` — verifies BLAKE3 checksums section-by-section. `--deep` also decodes sparse shards and validates v3 canonical CSR + decode sidecars.
+- `scx subset <input> [output] [--filter EXPR] [--genes PATH] [--modality NAME] [--dry-run] [--shard-size N] [--codec ...] [--memory-budget SIZE] [--rebuild-csc]` (`output` optional with `--dry-run`).
+- `scx append <target> <source> [--codec ...] [--shard-size N] [--index-* ...] [--modality NAME] [--rebuild-csc]`.
 - `scx delete <file> --filter <expr> [--dry-run]`.
-- `scx compact <input> <output> [--force] [--index-* ...]`.
-- `scx optimize <input> <output> [--force]` — in-place upgrade (single-modality): re-encode + canonicalize CSR shards to add decode sidecars and stamp `format_version=3` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`). Use to make a sidecar-less file GPU-device-decode-fast without a full reconvert.
-- `scx merge <f1> <f2> [...] --output <path> [--index-* ...]`.
+- `scx compact <input> <output> [--force] [--index-* ...] [--codec ...] [--memory-budget SIZE] [--rebuild-csc] [--reshape-obs]`.
+- `scx optimize <input> <output> [--force] [--codec auto|scx1]` — in-place upgrade (single-modality): re-encode + canonicalize CSR shards to add decode sidecars and stamp `format_version=3` (preserves rows/obs/var/obsm/uns/indexes/deletion-vectors; drops CSC — rerun `scx build-csc`). Use to make a sidecar-less file GPU-device-decode-fast without a full reconvert.
+- `scx merge <f1> <f2> [...] --output <path> [--index-* ...] [--assume-identical-var] [--uns-policy first|require-equal|namespace|summary] [--sort-by CSV] [--sort-reverse] [--codec ...] [--memory-budget SIZE] [--rebuild-csc]`.
+- `scx sort <input> <output> --by CSV [--reverse] [--force] [--shard-size N] [--codec ...] [--index-* ...] [--memory-budget SIZE] [--temp-dir DIR] [--bitmap off|auto|always] [--rebuild-csc]` — globally reorder cells by obs columns for query locality.
+- `scx set-uns <file> --uns JSON_FILE` — replace the `uns` block in place (no X re-encode).
+- `scx modify-metadata <file> [--uns JSON] [--obs PARQUET] [--var PARQUET] [--obsm NAME=PATH.npy ...] [--varm NAME=PATH.npy ...] [--index-* ...] [--modality NAME]` — replace metadata sections in place.
 - `scx rollback <file> [--to-seq N]`.
-- `scx build-csc <input> <output> [--memory-limit 4G] [--force]` — `--memory-limit` takes the same size forms as `--memory-budget` (`K`/`M`/`G`/`T`, `KiB`/`MiB`/`GiB`/`TiB`; decimals rejected).
+- `scx build-csc <input> <output> [--memory-limit 4G] [--force] [--csc-cols-per-shard N]` — `--memory-limit` takes the same size forms as `--memory-budget`.
 - `scx upgrade <input> [output] [--in-place]`.
-- `scx query <input> <filter> [--count] [--output P] [--select-genes PATH] [--normalize N] [--log1p] [--limit N] [--json]` — `<input>` accepts a local `.scx`, an exploded `.scxd/` dir, or a cloud URL (`gs://`/`s3://`/`az://`/`file://`).
+- `scx query <input> <filter> [--filter EXPR] [--count] [--output P] [--select-genes PATH] [--normalize N] [--log1p] [--limit N] [--json] [--explain]` — `<filter>` is a positional obs predicate; alternatively pass `--filter EXPR` (one form, not both). `<input>` accepts a local `.scx`, `.scxd/` dir, or cloud URL. `--explain` prints the pushdown plan.
+- `scx benchmark <file> [--compare-h5ad] [--runs N] [--json]` — read/query benchmarks.
 
 The CLI binary is named `scx`. h5ad/h5mu support and cloud ops are opt-in
 build-time features; if `scx convert` errors about HDF5, the build lacks that

@@ -47,11 +47,19 @@ ds.close()
 | `seed` | `42` | Deterministic shuffle via `(seed, epoch)`. |
 | `max_memory_mb` | adaptive (≥512) | Omit → adaptive budget scales to fit a full-width file (floor 512 MB, cap 4096 MB), so the requested `batch_size` survives. Pass a value → hard ceiling that auto-tunes `shard_group_size`/`prefetch_batches`/`batch_size` down. |
 | `modality` | `None` | For multimodal v2 files; ignored on single-modality. |
+| `pflog1ppf` | `False` | Apply PFlog1pPF normalization (Booeshaghi et al. 2026) instead of normalize+log1p. Mutually exclusive with `normalize`/`log1p` (those are ignored when `pflog1ppf=True`). |
+| `pflog1ppf_c` | `1.0` | PFlog1pPF shift / pseudocount `c`. Only used when `pflog1ppf=True`. |
 
 **Properties:** `n_obs`, `n_vars`, `n_output_genes` (HVG count if projected else
 `n_vars`), `effective_batch_size`.
 **Methods:** `close()` (idempotent; recommended before process exit),
 `memory_budget()` (diagnostics dict).
+
+**PFlog1pPF normalization:** Pass `pflog1ppf=True` (optionally with `pflog1ppf_c`)
+to apply PFlog1pPF (shifted-CLR) normalization in the Rust pipeline instead of
+the default `normalize_total → log1p`. When enabled, `normalize` and `log1p`
+are ignored. Available on `TrainingDataset`, `IndexPlanDataset`, and
+`MultimodalTrainingDataset`.
 
 **Batch dict schema:**
 ```python
@@ -84,11 +92,12 @@ for batch in ds.iter_with_plans(iter(plans), lookahead=4):
 ```
 
 **Constructor kwargs:** `path`, `hvg_indices=None`, `obs_columns=[]`,
-`normalize=True`, `log1p=True`, `target_sum=1e4`, `cache_shards=128` (LRU; auto-
-tuned to fit `max_memory_mb`; check `effective_cache_shards()`),
-`sort_by_shard=True` (reorder each plan by shard locality; disable to preserve
-caller order), `lookahead=4` (in-flight plans / shard prefetch; `0` disables;
-check `effective_lookahead()`), `max_plan_size=16384`, `max_memory_mb=512`.
+`normalize=True`, `log1p=True`, `target_sum=1e4`, `pflog1ppf=False`,
+`pflog1ppf_c=1.0`, `cache_shards=128` (LRU; auto-tuned to fit `max_memory_mb`;
+check `effective_cache_shards()`), `sort_by_shard=True` (reorder each plan by
+shard locality; disable to preserve caller order), `lookahead=4` (in-flight
+plans / shard prefetch; `0` disables; check `effective_lookahead()`),
+`max_plan_size=16384`, `max_memory_mb=512`.
 
 **Batch dict** (from `iter_with_plans`): `"X"` (perturbed rows), `"X_paired"`
 (control rows), `"pairs"` (post-sort plan), `"obs"`, `"obs_paired"`. `pairs[i]`
