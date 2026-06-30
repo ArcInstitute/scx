@@ -462,23 +462,49 @@ impl PyExperiment {
     /// `O(obs_metadata_bytes)`, not `O(X_bytes)`.
     ///
     /// `columns` selects a subset by **physical** column name (matching
-    /// `obs_keys()`); projecting avoids materialising unselected columns.
+    /// `obs_keys()`); projecting avoids materialising unselected columns. The
+    /// pandas index column (cell barcodes) is always retained regardless of
+    /// `columns`, so a projected frame keeps the same index as the unprojected
+    /// `read_obs()`.
     ///
     /// Note: on atlas-scale files with many obs shards this still assembles
     /// the full obs table across shards. For enumerating the distinct values
     /// of a single categorical column, prefer `distinct_values()`, which scans
     /// per-shard dictionaries and never assembles the whole table.
+    ///
+    /// dtype caveat: for plain (non-categorical) string columns the projected
+    /// path may return pandas `category` dtype (the projection dictionary-
+    /// encodes key columns), whereas the cloud `CloudExperiment.read_obs` and
+    /// the unprojected `read_obs()` return `object`. Compare values, not dtype.
     #[pyo3(signature = (columns=None))]
     fn read_obs<'py>(
         &self,
         py: Python<'py>,
         columns: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let batch = match columns {
-            Some(cols) => self.reader.read_obs_keys(&cols),
-            None => self.reader.read_obs(),
-        }
-        .map_err(to_pyerr)?;
+        // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
+        let batch = py
+            .detach(|| match columns {
+                Some(cols) => {
+                    // Retain the pandas index column(s) so the projected frame
+                    // keeps its barcode index (parity with unprojected
+                    // read_obs). Including the index column also prevents a
+                    // pyarrow KeyError when the schema's pandas envelope still
+                    // advertises an `index_columns` entry the projection would
+                    // otherwise drop (e.g. `scx convert`-produced files).
+                    let schema = self.reader.read_obs_schema_physical()?;
+                    let mut proj: Vec<String> = Vec::new();
+                    for idx_col in scx_format_io::pandas_index_columns(&schema) {
+                        if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
+                            proj.push(idx_col);
+                        }
+                    }
+                    proj.extend(cols);
+                    self.reader.read_obs_keys(&proj)
+                }
+                None => self.reader.read_obs(),
+            })
+            .map_err(to_pyerr)?;
         let table = convert::record_batch_to_pyarrow(py, &batch)?;
         convert::pyarrow_table_to_pandas(&table)
     }
@@ -507,12 +533,13 @@ impl PyExperiment {
     #[pyo3(signature = (col, *, limit=None, sort=false))]
     fn distinct_values(
         &self,
+        py: Python<'_>,
         col: &str,
         limit: Option<usize>,
         sort: bool,
     ) -> PyResult<(Vec<String>, bool)> {
-        self.reader
-            .distinct_obs_values(col, limit, sort)
+        // The Utf8-streaming path scans every row; release the GIL for it.
+        py.detach(|| self.reader.distinct_obs_values(col, limit, sort))
             .map_err(to_pyerr)
     }
 

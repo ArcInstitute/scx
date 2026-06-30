@@ -1,10 +1,8 @@
-//! Prerequisite diagnostic for the obs-only API proposal (see
-//! `READ-OBS-PUBLIC-API.md` § "Prerequisite test").
-//!
-//! Times the bare Rust `ScxReader::read_obs()` on a high-shard-count file,
-//! bypassing pyo3 / AnnData / the query engine, to isolate whether the
-//! observed multi-shard hang lives in obs assembly itself or downstream in the
-//! `collect.rs` rayon path.
+//! Diagnostic harness: times the bare Rust `ScxReader::read_obs()` on a
+//! high-shard-count file, bypassing pyo3 / AnnData / the query engine. Used to
+//! isolate whether a slow full-obs read lives in obs assembly itself or
+//! downstream in the query/collect path — `read_obs()` here exercises only the
+//! reader, so a fast time here points the finger elsewhere.
 //!
 //! This is **not** a correctness test — it is `#[ignore]`d and run manually
 //! against a real repro shard:

@@ -32,6 +32,18 @@ def test_read_obs_columns_projection(synthetic_adata, scx_from_adata):
     assert obs.shape[0] == exp.n_obs
 
 
+def test_read_obs_columns_preserves_index(synthetic_adata, scx_from_adata):
+    # Regression: read_obs(columns=...) must keep the cell-barcode index, not
+    # silently fall back to a RangeIndex (parity with unprojected read_obs()).
+    path = scx_from_adata(synthetic_adata, "ro_idx.scx")
+    exp = pyscx.open(path)
+    full = exp.read_obs()
+    proj = exp.read_obs(columns=["batch"])
+    assert list(proj.index) == list(full.index)
+    assert list(proj.index[:2]) == ["cell_0", "cell_1"]
+    assert list(proj.columns) == ["batch"]  # index not surfaced as a column
+
+
 def test_read_obs_matches_to_anndata(query_adata, tmp_dir):
     # Multi-shard obs (120 obs, shard_size=40 → 3 shards): read_obs must
     # round-trip against the to_anndata() obs baseline.
@@ -161,6 +173,9 @@ def test_cloud_read_obs_and_distinct(query_adata, tmp_dir):
     obs = exp.read_obs(columns=["cell_type"])
     assert list(obs.columns) == ["cell_type"]
     assert obs.shape[0] == 120
+    # Index preserved on the cloud projected path too (parity with local).
+    full = exp.read_obs()
+    assert list(obs.index) == list(full.index)
 
     vals, has_more = exp.distinct_values("cell_type", sort=True)
     assert vals == ["B cell", "NK cell", "T cell"]

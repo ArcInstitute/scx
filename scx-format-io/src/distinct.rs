@@ -121,8 +121,15 @@ impl DistinctAccumulator {
                 }
                 continue;
             }
-            if self.seen.insert(v.to_string()) {
-                self.ordered.push(v.to_string());
+            // Membership-check before allocating: the Utf8 streaming path
+            // visits every row, where duplicates dominate (n_obs ≫ cardinality
+            // for a categorical), so a `contains` probe avoids an owned-String
+            // allocation per repeat. New values allocate once (clone for the
+            // set, move into `ordered`).
+            if !self.seen.contains(v) {
+                let owned = v.to_string();
+                self.seen.insert(owned.clone());
+                self.ordered.push(owned);
             }
         }
     }

@@ -333,7 +333,9 @@ impl CloudReader {
         let mut acc = DistinctAccumulator::new(col, limit, sort);
 
         if self.obs_metadata_shard_count() > 0 {
-            let mut shard_indices: Vec<u32> = self
+            // Collect `(idx, &entry)` once and sort by idx — avoids re-scanning
+            // the catalog with `.find()` per shard (would be O(shards × entries)).
+            let mut shards: Vec<(u32, &FullCatalogEntry)> = self
                 .catalog
                 .entries
                 .iter()
@@ -341,17 +343,13 @@ impl CloudReader {
                     e.section_type == SectionType::ObsMetadataShard
                         && e.name.starts_with("obs_metadata/shard_")
                 })
-                .filter_map(|e| e.name.strip_prefix("obs_metadata/shard_")?.parse().ok())
+                .filter_map(|e| {
+                    let idx: u32 = e.name.strip_prefix("obs_metadata/shard_")?.parse().ok()?;
+                    Some((idx, e))
+                })
                 .collect();
-            shard_indices.sort_unstable();
-            for idx in shard_indices {
-                let name = format!("obs_metadata/shard_{idx}");
-                let entry = self
-                    .catalog
-                    .entries
-                    .iter()
-                    .find(|e| e.section_type == SectionType::ObsMetadataShard && e.name == name)
-                    .ok_or_else(|| CloudError::SectionNotFound(name.clone()))?;
+            shards.sort_by_key(|(idx, _)| *idx);
+            for (_, entry) in shards {
                 let bytes = self.read_section_for_entry(entry).await?;
                 let batch =
                     decode_arrow_ipc_batch_projected(&bytes, vec![col_idx], "obs_metadata")?;

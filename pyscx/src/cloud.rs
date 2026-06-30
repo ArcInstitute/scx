@@ -572,7 +572,9 @@ impl PyCloudExperiment {
     ///
     /// Note: the obs metadata sections are fetched and assembled across shards;
     /// `columns` projects the assembled batch (the network cost is the full
-    /// obs metadata regardless). For enumerating a single categorical column's
+    /// obs metadata regardless). The pandas index column (cell barcodes) is
+    /// always retained, so a projected frame keeps the same index as the
+    /// unprojected `read_obs()`. For enumerating a single categorical column's
     /// distinct values, prefer `distinct_values()`.
     #[pyo3(signature = (columns=None))]
     fn read_obs<'py>(
@@ -585,9 +587,21 @@ impl PyCloudExperiment {
             .map_err(cloud_to_pyerr)?;
         let batch = match columns {
             Some(cols) => {
-                let indices = cols
+                // Retain the pandas index column(s) so the projected frame
+                // keeps its barcode index and pyarrow can restore it (parity
+                // with unprojected read_obs; avoids dropping the index the
+                // pandas envelope still advertises).
+                let schema = batch.schema();
+                let mut names: Vec<String> = Vec::new();
+                for idx_col in scx_format_io::pandas_index_columns(&schema) {
+                    if schema.index_of(&idx_col).is_ok() && !cols.contains(&idx_col) {
+                        names.push(idx_col);
+                    }
+                }
+                names.extend(cols);
+                let indices = names
                     .iter()
-                    .map(|c| batch.schema().index_of(c))
+                    .map(|c| schema.index_of(c))
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;
                 batch
