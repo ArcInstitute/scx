@@ -566,6 +566,59 @@ impl PyCloudExperiment {
         }
     }
 
+    /// Read the `obs` (cell metadata) table as a pandas DataFrame over the
+    /// cloud path, without touching X. Mirrors the local
+    /// `Experiment.read_obs`. `columns` projects a subset by physical name.
+    ///
+    /// Note: the obs metadata sections are fetched and assembled across shards;
+    /// `columns` projects the assembled batch (the network cost is the full
+    /// obs metadata regardless). For enumerating a single categorical column's
+    /// distinct values, prefer `distinct_values()`.
+    #[pyo3(signature = (columns=None))]
+    fn read_obs<'py>(
+        &self,
+        py: Python<'py>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batch = py
+            .detach(|| self.rt.block_on(self.reader.read_obs()))
+            .map_err(cloud_to_pyerr)?;
+        let batch = match columns {
+            Some(cols) => {
+                let indices = cols
+                    .iter()
+                    .map(|c| batch.schema().index_of(c))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                batch
+                    .project(&indices)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+            }
+            None => batch,
+        };
+        let table = crate::convert::record_batch_to_pyarrow(py, &batch)?;
+        crate::convert::pyarrow_table_to_pandas(&table)
+    }
+
+    /// Distinct values of a single string/categorical `obs` column over the
+    /// cloud path, returned as `(values, has_more)`. Mirrors the local
+    /// `Experiment.distinct_values` (same dictionary-superset / null / `limit`
+    /// / `sort` semantics); never touches X or assembles the full obs table.
+    #[pyo3(signature = (col, *, limit=None, sort=false))]
+    fn distinct_values(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        limit: Option<usize>,
+        sort: bool,
+    ) -> PyResult<(Vec<String>, bool)> {
+        py.detach(|| {
+            self.rt
+                .block_on(self.reader.distinct_obs_values(col, limit, sort))
+        })
+        .map_err(cloud_to_pyerr)
+    }
+
     /// Materialise a multimodal file as `mudata.MuData`.
     ///
     /// Not yet supported over the cloud path: cloud multimodal reads

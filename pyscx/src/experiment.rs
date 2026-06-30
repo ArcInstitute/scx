@@ -456,6 +456,66 @@ impl PyExperiment {
         convert::uns::read_uns_as_pyobject(py, &self.reader, modality_id)
     }
 
+    /// Read the `obs` (cell metadata) table as a pandas DataFrame **without
+    /// touching X**. Routes through `ScxReader::read_obs` (full obs) or
+    /// `read_obs_keys` (when `columns` is given), so the cost is
+    /// `O(obs_metadata_bytes)`, not `O(X_bytes)`.
+    ///
+    /// `columns` selects a subset by **physical** column name (matching
+    /// `obs_keys()`); projecting avoids materialising unselected columns.
+    ///
+    /// Note: on atlas-scale files with many obs shards this still assembles
+    /// the full obs table across shards. For enumerating the distinct values
+    /// of a single categorical column, prefer `distinct_values()`, which scans
+    /// per-shard dictionaries and never assembles the whole table.
+    #[pyo3(signature = (columns=None))]
+    fn read_obs<'py>(
+        &self,
+        py: Python<'py>,
+        columns: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batch = match columns {
+            Some(cols) => self.reader.read_obs_keys(&cols),
+            None => self.reader.read_obs(),
+        }
+        .map_err(to_pyerr)?;
+        let table = convert::record_batch_to_pyarrow(py, &batch)?;
+        convert::pyarrow_table_to_pandas(&table)
+    }
+
+    /// Distinct values of a single **string/categorical** `obs` column,
+    /// returned as `(values, has_more)`. Pushes the computation into Rust and
+    /// never touches X.
+    ///
+    /// Fast path: for dictionary-encoded (categorical) columns only the
+    /// per-shard dictionary catalogs are scanned — rows are never decoded, so
+    /// low-cardinality enumeration is nearly free and the expensive full-obs
+    /// assembly is skipped entirely. Plain `Utf8`/`LargeUtf8` columns
+    /// (e.g. produced by `append`) take a streaming union-of-distincts across
+    /// shards.
+    ///
+    /// Semantics:
+    /// - **Nulls are excluded** from the result.
+    /// - **Dictionary values are a superset:** a non-compact dictionary may
+    ///   carry categories that no row references; those are still surfaced.
+    /// - `limit` (without `sort`) returns the **first N encountered** distinct
+    ///   values; `has_more` is `True` when more exist. With `sort=True`, all
+    ///   distinct values are collected, sorted, then truncated to `limit`.
+    ///
+    /// Raises `ValueError` for non-string columns and (a corrupt-file-class)
+    /// error for an unknown column name.
+    #[pyo3(signature = (col, *, limit=None, sort=false))]
+    fn distinct_values(
+        &self,
+        col: &str,
+        limit: Option<usize>,
+        sort: bool,
+    ) -> PyResult<(Vec<String>, bool)> {
+        self.reader
+            .distinct_obs_values(col, limit, sort)
+            .map_err(to_pyerr)
+    }
+
     /// Codec / shard / format-version internals as a one-line string.
     ///
     /// The AnnData-style `repr` lists the obs/var/obsm/uns keys a scanpy
