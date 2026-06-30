@@ -39,6 +39,12 @@ pub enum ScxError {
     #[error("section not found: {0}")]
     SectionNotFound(String),
 
+    #[error(
+        "distinct_values: column '{column}' has unsupported type {dtype}; only \
+         string/categorical columns (Utf8, LargeUtf8, Dictionary) are supported"
+    )]
+    UnsupportedColumnType { column: String, dtype: String },
+
     #[error("shard index {index} out of bounds (count: {count})")]
     ShardIndexOutOfBounds { index: usize, count: usize },
 
@@ -183,6 +189,7 @@ impl ScxError {
             | ScxError::BlockNnzOverflow(_)
             | ScxError::StaleCscSidecar { .. }
             | ScxError::ColumnStatsOverflow(_)
+            | ScxError::UnsupportedColumnType { .. }
             | ScxError::ObsLayoutConflict { .. } => ScxErrorClass::Validation,
             // File is corrupt or was written by an incompatible/newer SCX:
             // bad magic/version/endian/checksum/catalog, an unknown on-disk

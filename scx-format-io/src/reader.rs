@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use crate::catalog::{FullCatalog, FullCatalogEntry};
 use crate::checksum::blake3_hash;
 use crate::decode_sidecar::DecodeSidecar;
+use crate::distinct::DistinctAccumulator;
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityInfo, ModalityTable};
@@ -880,6 +881,73 @@ impl ScxReader {
                 .map_err(ScxError::Arrow)?;
             crate::arrow_compat::downcast_large_types(&batch)
         }
+    }
+
+    /// Distinct values of a single **string/categorical** obs column, computed
+    /// shard-by-shard without assembling the full obs table.
+    ///
+    /// Routes each shard's projected column through [`DistinctAccumulator`]:
+    /// `Dictionary` columns scan only the per-shard dictionary catalog (rows
+    /// never decoded), plain `Utf8`/`LargeUtf8` columns scan the value buffer.
+    /// X is never touched. Nulls are excluded. See [`DistinctAccumulator`] for
+    /// the dictionary-superset, `limit`, and `sort` semantics.
+    ///
+    /// Returns `(values, has_more)`. Errors with
+    /// [`ScxError::UnsupportedColumnType`] for non-string columns and
+    /// [`ScxError::SectionNotFound`] for an unknown column name.
+    pub fn distinct_obs_values(
+        &self,
+        col: &str,
+        limit: Option<usize>,
+        sort: bool,
+    ) -> Result<(Vec<String>, bool)> {
+        let physical = self.read_obs_schema_physical()?;
+        let col_idx = physical
+            .index_of(col)
+            .map_err(|_| ScxError::SectionNotFound(format!("obs column '{col}'")))?;
+        let projection = [col_idx];
+        let mut acc = DistinctAccumulator::new(col, limit, sort);
+
+        if self.obs_metadata_shard_count() > 0 {
+            // Iterate shards in index order; stop as soon as the accumulator
+            // has its answer (first-N overflow already observed).
+            let mut shard_indices: Vec<u32> = self
+                .full_catalog
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::ObsMetadataShard
+                        && e.name.starts_with("obs_metadata/shard_")
+                })
+                .filter_map(|e| e.name.strip_prefix("obs_metadata/shard_")?.parse().ok())
+                .collect();
+            shard_indices.sort_unstable();
+            for idx in shard_indices {
+                let batch = self.read_obs_shard_projected(idx, &projection)?;
+                acc.push(batch.column(0))?;
+                if acc.done() {
+                    break;
+                }
+            }
+        } else {
+            let entry = self
+                .full_catalog
+                .get("obs")
+                .ok_or_else(|| ScxError::SectionNotFound("obs".to_string()))?;
+            let slice = self.section_bytes(entry)?;
+            let cursor = Cursor::new(slice);
+            let reader = arrow::ipc::reader::FileReaderBuilder::new()
+                .with_projection(vec![col_idx])
+                .build(cursor)?;
+            for batch in reader {
+                let batch = batch.map_err(ScxError::Arrow)?;
+                acc.push(batch.column(0))?;
+                if acc.done() {
+                    break;
+                }
+            }
+        }
+        Ok(acc.finish())
     }
 
     /// Read the var (variable/gene) metadata as an Arrow RecordBatch.
