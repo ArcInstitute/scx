@@ -429,6 +429,9 @@ def build_csc(
 ) -> None: ...
 
 
+def optimize(input: str, output: str, codec: str = ...) -> None: ...
+
+
 def collate_cellset_gathered(
     indptr: np.ndarray,
     indices: np.ndarray,
