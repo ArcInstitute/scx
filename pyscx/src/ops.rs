@@ -617,6 +617,61 @@ pub fn compact(
     }
 }
 
+// ---------------------------------------------------------------------------
+// C5b. pyscx.optimize()
+// ---------------------------------------------------------------------------
+
+/// Re-encode + canonicalize CSR shards to add decode sidecars and upgrade
+/// to format_version 3.
+///
+/// This is the Python equivalent of ``scx optimize``. It re-encodes every
+/// CSR shard (X, layers, obsp graphs) so the output carries decode sidecars
+/// (enabling ``to_gpu_anndata`` device-decode) and stamps ``format_version = 3``
+/// (canonical-CSR invariant). Single-modality files only; use ``compact()``
+/// for multimodal.
+///
+/// Args:
+///     input:  Path to the source ``.scx`` file.
+///     output: Path for the optimized file. May equal ``input`` for in-place
+///             upgrade (writes to a sibling tempfile, then atomically renames).
+///     codec:  Per-shard codec selection.
+///
+///             - ``"auto"`` (default): Scx1 for low-median integer counts,
+///               Zstd otherwise. Some high-median shards will NOT get a
+///               decode sidecar under auto.
+///             - ``"scx1"``: Force Scx1 on every integer shard — guarantees
+///               a decode sidecar on all integer shards (needed for full
+///               ``to_gpu_anndata`` device-decode coverage).
+///
+/// Raises:
+///     ValueError: If `codec` is not "auto" or "scx1".
+///     RuntimeError: If the file is multimodal, the input doesn't exist,
+///         or the output already exists (no ``--force`` analogue; callers
+///         should remove the target first or use ``output == input``).
+///
+/// Example:
+///     pyscx.optimize("experiment.scx", "optimized.scx")
+///     pyscx.optimize("experiment.scx", "experiment.scx")  # in-place
+///     pyscx.optimize("experiment.scx", "optimized.scx", codec="scx1")
+#[pyfunction]
+#[pyo3(signature = (input, output, codec="auto"))]
+pub fn optimize(py: Python<'_>, input: &str, output: &str, codec: &str) -> PyResult<()> {
+    let input_path = PathBuf::from(input);
+    let output_path = PathBuf::from(output);
+    let codec_id = match codec {
+        "auto" => None,
+        "scx1" => Some(CodecId::Scx1),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "codec must be 'auto' or 'scx1', got {other:?} \
+                 (other codecs drop decode sidecars, defeating the purpose of optimize)"
+            )));
+        }
+    };
+    py.detach(|| scx_ops::optimize(&input_path, &output_path, codec_id))
+        .map_err(ops_to_pyerr)
+}
+
 /// Globally reorder cells (the obs axis) of an SCX file by an obs key,
 /// writing a new file with X-read locality and contiguous predicate-index
 /// shard ranges for the sort key.

@@ -158,6 +158,11 @@ regardless of per-shard count magnitude (Scx1 is less compact than Zstd on
 high-median data, the trade-off for a fully on-device decode). Non-integer
 (float) shards fall back to Zstd either way; `--codec zstd` is rejected.
 
+In Python: `pyscx.optimize(input, output, codec="auto")`. The `codec` kwarg
+takes `"auto"` (default) or `"scx1"` with the same semantics as `--codec`; any
+other value raises `ValueError`. There is no `force` analogue — pass
+`output == input` for an in-place upgrade, or remove the target first.
+
 ## Rollback
 
 `scx rollback` is a single header `pwrite()` that repoints

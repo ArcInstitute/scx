@@ -1293,6 +1293,7 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::append_from_anndata, m)?)?;
     m.add_function(wrap_pyfunction!(ops::mark_deleted, m)?)?;
     m.add_function(wrap_pyfunction!(ops::compact, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::optimize, m)?)?;
     m.add_function(wrap_pyfunction!(ops::sort, m)?)?;
     m.add_function(wrap_pyfunction!(ops::build_csc, m)?)?;
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
