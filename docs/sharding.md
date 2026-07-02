@@ -418,6 +418,14 @@ grouped archives stay readable.
 CSC sidecars are dropped by the reorder as usual — pass
 `--group-by … --rebuild-csc`. Grouping is single-modality only in v1.
 
+Convert-time grouping (`scx convert --group-by`) picks a one-pass or two-pass
+route: `--group-pass auto` (default) streams CSR X in one pass and routes dense
+X — **or any input that carries `obsp`** — through the two-pass path (plain
+convert then `scx sort --group-by`) so `obsp` is remapped and preserved rather
+than dropped. This means a CSR h5ad that carries `obsp` (e.g. `connectivities`)
+takes the heavier two-pass route (a transient temp file) by default; forcing
+`--group-pass one` on such an input errors and points at `--group-pass two`.
+
 ### Grouped reads
 
 The sidecar powers a grouped-read API that defaults to slicing the recorded

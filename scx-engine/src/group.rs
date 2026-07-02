@@ -95,6 +95,18 @@ impl GroupIndex {
         // rows. Enforce it here (release build) — a violation means a corrupt /
         // hand-built / merged sidecar, which we reject rather than mis-read.
         {
+            // Every record must have a well-ordered range; an inverted
+            // `row_start > row_stop` (corrupt/hand-built sidecar) would
+            // underflow the `row_stop - row_start` / `row - global_start`
+            // subtractions in `shard_handles` / `reference_range`.
+            for r in &records {
+                if r.row_start > r.row_stop {
+                    return Err(EngineError::Generic(format!(
+                        "group_index: record for {:?} has row_start ({}) > row_stop ({})",
+                        r.label, r.row_start, r.row_stop
+                    )));
+                }
+            }
             let mut refs: Vec<&GroupRecord> = records
                 .iter()
                 .filter(|r| r.role == GroupRole::Reference)

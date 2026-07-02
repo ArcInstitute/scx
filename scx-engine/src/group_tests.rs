@@ -171,6 +171,17 @@ fn reference_non_zero_start_is_rejected() {
 }
 
 #[test]
+fn inverted_record_range_is_rejected() {
+    // row_start > row_stop (corrupt sidecar) would underflow the subtractions
+    // in shard_handles/reference_range — reject at parse time.
+    let bytes = records_payload(&[("nt", 0, 0, 10, true), ("MYC", 1, 30, 20, false)]);
+    assert!(
+        GroupIndex::from_bytes(&bytes).is_err(),
+        "record with row_start > row_stop must be rejected"
+    );
+}
+
+#[test]
 fn contiguous_multi_reference_records_ok() {
     // Two reference labels tiling [0,30)+[30,50) is legitimate and must parse.
     let bytes = records_payload(&[

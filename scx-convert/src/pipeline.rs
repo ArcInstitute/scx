@@ -1190,7 +1190,8 @@ pub fn h5ad_to_scx_streaming(
         // obsp survives regardless of X density — matching the byte-equivalent
         // convert-then-sort guarantee. `overrides.obsp` (in-memory, forwarded to
         // the two-pass plain pass) counts as obsp too.
-        let has_obsp = overrides.obsp.is_some() || h5ad_has_obsp_members(&file);
+        let has_obsp =
+            overrides.obsp.as_ref().is_some_and(|v| !v.is_empty()) || h5ad_has_obsp_members(&file);
         let two_pass = match opts.group_pass {
             GroupPass::One => false,
             GroupPass::Two => true,

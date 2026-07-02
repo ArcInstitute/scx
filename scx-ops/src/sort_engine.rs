@@ -302,8 +302,22 @@ pub fn sort_with_strategy(
             // `--memory-budget` (the fixed-shard guard below is inert in grouped
             // mode). No recourse but a bigger budget — never-split is a contract.
             if let Some(budget) = opts.memory_budget {
+                // Use exact per-row nnz for the footprint: reuse the byte-mode
+                // prescan if present, else prescan now (row-count mode). A
+                // file-wide average-density estimate could pass a group that is
+                // much denser than average and still OOM (codex P2), so when a
+                // budget is set we always size the guard from real nnz.
+                let guard_prescan: Vec<u64>;
+                let guard_nnz: &[u64] = if !per_row_nnz.is_empty() {
+                    &per_row_nnz
+                } else {
+                    let order_old_tmp: Vec<u64> =
+                        go.perm.iter().map(|&l| live_ids[l as usize]).collect();
+                    guard_prescan = prescan_per_row_nnz(&reader, &order_old_tmp, n_obs)?;
+                    &guard_prescan
+                };
                 let (max_bytes, shard_idx, label) =
-                    max_grouped_shard_footprint(&plan, &per_row_nnz, n_vars as usize, density);
+                    max_grouped_shard_footprint(&plan, guard_nnz, n_vars as usize, density);
                 if max_bytes > budget {
                     return Err(OpsError::InvalidInput(format!(
                         "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) needs \
