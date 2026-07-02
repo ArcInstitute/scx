@@ -90,6 +90,43 @@ def test_grouped_reads_roundtrip(screen_adata, scx_from_adata, tmp_dir):
         exp.read_group("MYCN")
 
 
+def test_grouped_read_reflects_mark_deleted(screen_adata, scx_from_adata, tmp_dir):
+    """M5: a grouped read cached before mark_deleted must not keep returning
+    just-deleted rows. mark_deleted resets the cached grouped pipeline (and the
+    deleted-count cache), so a second read_group/read_reference on the same
+    Experiment reflects the deletion."""
+    import pyscx
+
+    adata, genes = screen_adata
+    src = scx_from_adata(adata, "screen_src.scx")
+    out = str(tmp_dir / "screen_grouped.scx")
+    _sort_grouped(src, out, reference=["nt"])
+
+    exp = pyscx.open(out)
+
+    # Populate the grouped-pipeline cache with the pre-deletion snapshot.
+    n_myc_before = exp.read_group("MYC").n_obs
+    n_ref_before = exp.read_reference().n_obs
+    assert n_myc_before >= 1 and n_ref_before >= 1
+
+    # Full-file (grouped/sorted) obs order → mask deleting one MYC + one nt row.
+    tg = exp.to_anndata().obs["target_gene"].to_numpy()
+    mask = np.zeros(len(tg), dtype=bool)
+    mask[int(np.where(tg == "MYC")[0][0])] = True
+    mask[int(np.where(tg == "nt")[0][0])] = True
+    exp.mark_deleted(mask)
+
+    # Same object: caches invalidated → deletion reflected (would still equal
+    # *_before on the pre-fix stale-cache code).
+    assert exp.read_group("MYC").n_obs == n_myc_before - 1
+    assert exp.read_reference().n_obs == n_ref_before - 1
+
+    # Cross-check against a fresh open of the mutated file.
+    fresh = pyscx.open(out)
+    assert fresh.read_group("MYC").n_obs == n_myc_before - 1
+    assert fresh.read_reference().n_obs == n_ref_before - 1
+
+
 def test_group_shard_per_label_reads(screen_adata, scx_from_adata, tmp_dir):
     """7.1d: GroupShard exposes per-label shard-local ranges and can read a
     single label out of a multi-group shard."""
