@@ -302,6 +302,55 @@ fn group_csc_input_errors() {
     assert!(err.is_err(), "CSC + --group-by must hard-error");
 }
 
+/// M2: the sequential grouped route (`reader_threads = 1`) buffers the largest
+/// group whole, so it must refuse when a single group shard cannot fit
+/// `memory_budget` — symmetric with the parallel path's derate. A tiny budget
+/// hard-errors naming the grouped shard; an ample budget succeeds.
+#[test]
+fn group_convert_sequential_tiny_budget_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    make_grouped_h5ad(&h5ad, 10, 8, "csr");
+
+    let base = |budget: u64| ConvertOptions {
+        group_by: Some("cell_type".to_string()),
+        reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
+        shard_target_rows: 16,
+        reader_threads: Some(1),
+        memory_budget: Some(budget),
+        ..Default::default()
+    };
+
+    // 1-byte budget: any non-empty grouped shard exceeds it -> refuse.
+    let scx_err = dir.path().join("err.scx");
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_err,
+        &base(1),
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    );
+    let msg = err
+        .expect_err("tiny memory_budget must refuse the sequential grouped shard")
+        .to_string();
+    assert!(
+        msg.contains("memory_budget") && msg.contains("grouped shard"),
+        "error must name the grouped shard and the budget: {msg}"
+    );
+
+    // Ample budget: same sequential grouped convert succeeds.
+    let scx_ok = dir.path().join("ok.scx");
+    h5ad_to_scx_streaming(
+        &h5ad,
+        &scx_ok,
+        &base(1 << 30),
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    )
+    .expect("ample budget must convert");
+    assert_eq!(ScxReader::open(&scx_ok).unwrap().header().n_obs, 10);
+}
+
 /// Forcing the one-pass path (`GroupPass::One`) on a dense input with
 /// `--group-target-bytes` has no cheap per-row nnz, so it cannot honor the byte
 /// budget. Rather than silently falling back to row-count sizing — which would

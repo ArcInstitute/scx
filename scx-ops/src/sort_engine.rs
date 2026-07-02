@@ -234,6 +234,21 @@ pub fn sort_with_strategy(
         ));
     }
 
+    // Total nnz + density (from catalog stats) drive both the in-memory/external
+    // strategy sizing below and the grouped-shard memory-budget guard (M1), so
+    // compute them before the grouped plan is built.
+    let total_nnz: u64 = reader
+        .catalog()
+        .shards_sorted()
+        .iter()
+        .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
+        .sum();
+    let density = if n_obs > 0 && n_vars > 0 {
+        (total_nnz as f64 / (n_obs as f64 * n_vars as f64)).clamp(1e-9, 1.0)
+    } else {
+        1.0
+    };
+
     // ----- F1: grouped order + plan (or plain global order) -----
     // Grouped sorts delegate the reference-first / group-by order + label /
     // reference computation to the shared `compute_grouped_order` (also used by
@@ -282,6 +297,22 @@ pub fn sort_with_strategy(
                 plan.records.len(),
                 plan.reference_shard
             );
+            // M1: a group is never split, so the emitter buffers the largest
+            // grouped shard whole. Refuse loudly rather than silently blow past
+            // `--memory-budget` (the fixed-shard guard below is inert in grouped
+            // mode). No recourse but a bigger budget — never-split is a contract.
+            if let Some(budget) = opts.memory_budget {
+                let (max_bytes, shard_idx, label) =
+                    max_grouped_shard_footprint(&plan, &per_row_nnz, n_vars as usize, density);
+                if max_bytes > budget {
+                    return Err(OpsError::InvalidInput(format!(
+                        "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) needs \
+                         ~{max_bytes} bytes to buffer but --memory-budget is {budget}; a group is \
+                         never split across shards — raise --memory-budget / --group-target-bytes, \
+                         or drop --group-by"
+                    )));
+                }
+            }
             grouped_reference_labels = go.reference_labels;
             (go.perm, Some(plan))
         } else {
@@ -427,17 +458,6 @@ pub fn sort_with_strategy(
 
     // ----- X: strategy-specific gather -----
     let value_encoding = x_value_encoding(&reader)?;
-    let total_nnz: u64 = reader
-        .catalog()
-        .shards_sorted()
-        .iter()
-        .filter_map(|e| e.stats.as_ref().map(|s| s.nnz))
-        .sum();
-    let density = if n_obs > 0 && n_vars > 0 {
-        (total_nnz as f64 / (n_obs as f64 * n_vars as f64)).clamp(1e-9, 1.0)
-    } else {
-        1.0
-    };
     // Estimate peak resident bytes for the in-memory strategy: X (nnz·8 +
     // indptr) plus the layers and obsm it also gathers whole — so the selector
     // does not pick `InMemory` when layers/obsm push total RSS over the budget.
@@ -2348,6 +2368,59 @@ fn prescan_per_row_nnz(reader: &ScxReader, order_old: &[u64], n_obs: usize) -> R
         }
     }
     Ok(order_old.iter().map(|&old| nnz_old[old as usize]).collect())
+}
+
+/// Largest decoded-RAM footprint the grouped emitter must buffer for any single
+/// output shard, plus the shard index and the label of its dominant group (for
+/// the error message). A group is never split, so the emitter accumulates every
+/// row of a shard before flushing — an oversized group's whole footprint is
+/// resident at once (M1).
+///
+/// Footprint uses the same ~16 B/nnz (+8 B/row indptr) accounting as the
+/// non-grouped budget guard (`partition_target_rows` / the per-shard guard) and
+/// convert's `per_worker_bytes`, so all budget checks reason in one currency.
+/// `per_row_nnz` (emission order, indexed by global output row) is supplied in
+/// byte-budget mode; when empty (row-count mode) the per-row nnz is estimated
+/// from `n_vars * density`. Returns `(0, 0, "")` for an empty plan.
+fn max_grouped_shard_footprint(
+    plan: &crate::group_plan::GroupPlan,
+    per_row_nnz: &[u64],
+    n_vars: usize,
+    density: f64,
+) -> (u64, u32, String) {
+    // Per-row decoded footprint estimate for row-count mode (matches
+    // `partition_target_rows`'s 16 B/nnz assumption).
+    let per_row_est = (n_vars as f64 * density * 16.0).max(1.0).ceil() as u64;
+    let byte_mode = !per_row_nnz.is_empty();
+
+    // Accumulate footprint per shard, tracking the dominant (largest) record's
+    // label within each shard so the message can name the culprit group.
+    let mut per_shard: std::collections::HashMap<u32, (u64, u64, String)> =
+        std::collections::HashMap::new();
+    for r in &plan.records {
+        let rows = r.row_stop - r.row_start;
+        let footprint = if byte_mode {
+            let nnz: u64 = per_row_nnz[r.row_start as usize..r.row_stop as usize]
+                .iter()
+                .sum();
+            nnz.saturating_mul(16)
+                .saturating_add(rows.saturating_mul(8))
+        } else {
+            rows.saturating_mul(per_row_est)
+        };
+        let e = per_shard.entry(r.shard).or_insert((0, 0, String::new()));
+        e.0 = e.0.saturating_add(footprint);
+        if footprint >= e.1 {
+            e.1 = footprint;
+            e.2 = r.label.clone();
+        }
+    }
+
+    per_shard
+        .into_iter()
+        .map(|(shard, (total, _dom_bytes, label))| (total, shard, label))
+        .max_by_key(|&(total, _, _)| total)
+        .unwrap_or((0, 0, String::new()))
 }
 
 /// Value encoding wide enough to re-encode the whole sorted X output. Reorder
