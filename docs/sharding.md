@@ -384,9 +384,10 @@ reading one perturbation touches one shard, and to isolate reference cells
 does exactly that:
 
 ```bash
-# --reference takes a comma-separated label list, or `col:<name>` for a
-# boolean obs column. --group-target-bytes is optional; omit it to pack by
-# --shard-size rows instead of a byte budget.
+# --reference takes a comma-separated label list, or `col:<name>` (the
+# `column:<name>` spelling is also accepted) for a boolean obs column.
+# --group-target-bytes is optional; omit it to pack by --shard-size rows
+# instead of a byte budget.
 scx sort screen.scx grouped.scx \
   --group-by target_gene \
   --reference non-targeting \
