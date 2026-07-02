@@ -856,8 +856,10 @@ bypass cannot happen):
   `.shard_index`, `.global_start`, `.global_stop`, `.labels`, and `.to_anndata()`
   (deferred per-shard I/O).
 
-Grouped reads are local-only in v1 (no `open_cloud` / `rscx` surface), and the
-sidecar is dropped by `append` (re-sort to regroup).
+The same grouped-read methods are available on `open_cloud(...)` (over range
+reads) and via `rscx`. The sidecar is dropped by `append` (and not propagated by
+`compact` / `merge` / `subset`); re-sort or re-convert with `--group-by` to
+regroup.
 
 ## scx-loader — Training Data Loader
 

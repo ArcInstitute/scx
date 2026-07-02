@@ -462,14 +462,17 @@ The `group_index` sidecar is **write-once** — produced only by `scx sort
   `with_normalize` / `with_log1p` / `limit`) is **not** applied. The pyscx
   `Experiment.read_*` methods are structurally safe (each opens a fresh
   pipeline); compose transforms via `query().collect()` instead.
-- **Local files only (v1).** The cloud `SectionReader` implements
-  `read_group_index_bytes`, but `open_cloud(...)` exposes no grouped-read methods
-  yet. There are no `rscx` grouped bindings, and `pyscx.sort()` cannot yet
-  produce a grouped file (use the `scx sort --group-by` CLI).
+- **Cloud, `rscx`, and native `pyscx.sort` are all supported.** `open_cloud(...)`
+  exposes the same grouped-read methods over range reads (the cloud
+  `SectionReader` implements `read_group_index_bytes`); `rscx` has grouped
+  bindings; and `pyscx.sort(..., group_by=..., reference=...)` produces a grouped
+  file natively (in addition to the `scx sort --group-by` CLI and convert-time
+  `scx convert --group-by` / `pyscx.from_h5ad(group_by=...)`).
 
-> v1 note: `read_group` decodes only the group's CSR shard(s) but reads obs
-> metadata in full before slicing. The expensive X decode is range-restricted;
-> obs-shard-scoped reads are a follow-up.
+> On row-sharded-obs files (streaming merge/append/`from_anndata` at
+> `n_obs > shard_size`, or convert-time grouping), `read_group` reads only the
+> `ObsMetadataShard`s overlapping the group's range, so obs is not materialized
+> in full. Legacy single-section obs falls back to a full read then slice.
 
 ## Obs/var metadata sharding
 

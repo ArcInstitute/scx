@@ -615,16 +615,22 @@ pub fn sort_with_strategy(
     // ----- F1: write the GroupIndex sidecar (consistency-checked) -----
     if let (Some(plan), Some(group_col)) = (&group_plan, &opts.group_by) {
         // Sanity: every group record's global range must fall inside exactly
-        // one emitter output-shard range, and reference records occupy the
-        // leading ranges (never-split-a-group invariant).
-        debug_assert!(
-            plan.records.iter().all(|r| {
-                output_shard_row_ranges
-                    .iter()
-                    .any(|&(s, e)| s <= r.row_start && r.row_stop <= e)
-            }),
-            "group record range escapes its emitter shard range"
-        );
+        // one emitter output-shard range (never-split-a-group invariant). This
+        // is the only guard that the on-disk X shards agree with the sidecar's
+        // `shard`/`n_shards`, so enforce it in release builds too — a violation
+        // means silent sidecar corruption otherwise.
+        if let Some(bad) = plan.records.iter().find(|r| {
+            !output_shard_row_ranges
+                .iter()
+                .any(|&(s, e)| s <= r.row_start && r.row_stop <= e)
+        }) {
+            return Err(OpsError::InvalidInput(format!(
+                "scx sort: group record range [{}, {}) for label {:?} escapes every emitted X \
+                 shard range (never-split-a-group invariant violated); refusing to write an \
+                 inconsistent group index",
+                bad.row_start, bad.row_stop, bad.label
+            )));
+        }
         // reference_labels computed alongside the order in `compute_grouped_order`
         // (explicit set for `Labels`, else the distinct labels that ended up
         // reference for `ReferenceSpec::Column`).
@@ -1074,11 +1080,13 @@ struct CsrEmitter {
     shard_idx: u32,
     ranges: Vec<(u64, u64)>,
     /// F1: sorted emit-row indices at which to seal a shard *before* pushing
-    /// that row (the planner's authoritative shard starts). Empty => legacy
-    /// fixed-size behaviour (byte-identical to pre-F1). When non-empty the
-    /// legacy `shard_target` size cap is disabled — the planner never splits a
-    /// group, so all breaks come from here.
-    group_breaks: Vec<u64>,
+    /// that row (the planner's authoritative shard starts). `None` => legacy
+    /// fixed-size behaviour (byte-identical to pre-F1). `Some(_)` => planned-break
+    /// (grouped) mode: the legacy `shard_target` size cap is disabled and all
+    /// breaks come from here — even when the vec is empty (a plan that collapses
+    /// to a single shard, e.g. one oversized group), which must NOT fall back to
+    /// the row cap or it would split the group.
+    group_breaks: Option<Vec<u64>>,
     break_cursor: usize,
 }
 
@@ -1108,16 +1116,16 @@ impl CsrEmitter {
             emitted_rows: 0,
             shard_idx: 0,
             ranges: Vec::new(),
-            group_breaks: Vec::new(),
+            group_breaks: None,
             break_cursor: 0,
         }
     }
 
     /// F1: install the planner's shard-break offsets. Must be called before the
     /// first `push_row`. Switches the emitter into planned-break mode (legacy
-    /// size cap disabled).
+    /// size cap disabled), even when `breaks` is empty (single-shard plan).
     fn set_group_breaks(&mut self, breaks: Vec<u64>) {
-        self.group_breaks = breaks;
+        self.group_breaks = Some(breaks);
         self.break_cursor = 0;
     }
 
@@ -1125,11 +1133,13 @@ impl CsrEmitter {
         // F1: seal at a planned group-shard boundary *before* accumulating this
         // row. `emitted_rows + acc_row_count` is the global index of the row
         // about to be pushed.
-        if self.break_cursor < self.group_breaks.len()
-            && self.emitted_rows + self.acc_row_count == self.group_breaks[self.break_cursor]
-        {
-            self.flush(writer)?;
-            self.break_cursor += 1;
+        if let Some(breaks) = &self.group_breaks {
+            if self.break_cursor < breaks.len()
+                && self.emitted_rows + self.acc_row_count == breaks[self.break_cursor]
+            {
+                self.flush(writer)?;
+                self.break_cursor += 1;
+            }
         }
         for (k, &col) in indices.iter().enumerate() {
             self.acc_indices.push(col as u32);
@@ -1139,8 +1149,9 @@ impl CsrEmitter {
         self.acc_indptr.push(prev + indices.len() as u64);
         self.acc_row_count += 1;
         // Legacy fixed-size cap ONLY in non-grouped mode (the planner never
-        // splits a group, so grouped breaks are authoritative).
-        if self.group_breaks.is_empty() && self.acc_row_count >= self.shard_target {
+        // splits a group, so grouped breaks are authoritative — including the
+        // single-shard case where the break list is empty).
+        if self.group_breaks.is_none() && self.acc_row_count >= self.shard_target {
             self.flush(writer)?;
         }
         Ok(())
@@ -2275,6 +2286,16 @@ pub fn compute_grouped_order(
         Some(mask) => perm.iter().map(|&l| mask[l as usize]).collect(),
         None => vec![false; perm.len()],
     };
+
+    // A reference spec that matches zero rows is almost always a typo (wrong
+    // label or a non-boolean/absent column): the archive ends up clustered-only
+    // with no reference shard and no error. Warn so the mistake is visible.
+    if reference.is_some() && !ref_of_new.iter().any(|&r| r) {
+        log::warn!(
+            "scx sort: --reference matched no rows; the output will be grouped but have no \
+             reference shard (check the label set or the boolean column name)"
+        );
+    }
 
     // Reference labels for the sidecar: the explicit set for `Labels`, else the
     // distinct group labels that ended up reference (covers `Column`). Matches

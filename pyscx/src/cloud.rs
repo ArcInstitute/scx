@@ -761,8 +761,14 @@ impl PyCloudExperiment {
             })
             .map_err(engine_to_pyerr)?;
         let arc = Arc::new(pipeline);
-        let _ = self.grouped_pipeline.set(Arc::clone(&arc));
-        Ok(arc)
+        // If another thread won the race, `set` fails; return the winner from the
+        // cell so all callers share one pipeline (matches PyExperiment).
+        let _ = self.grouped_pipeline.set(arc);
+        Ok(Arc::clone(
+            self.grouped_pipeline
+                .get()
+                .expect("grouped_pipeline populated above"),
+        ))
     }
 }
 

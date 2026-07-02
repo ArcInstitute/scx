@@ -144,6 +144,19 @@ impl GroupIndex {
             stop = stop.max(r.row_stop);
         }
         if any {
+            // The writer packs the reference role first and never splits a
+            // group, so the reference records must tile `[start, stop)` with no
+            // gaps. A gap would mean `read_reference` returns interspersed group
+            // rows as reference (a corrupt/hand-built sidecar); catch it in tests.
+            debug_assert_eq!(
+                self.records
+                    .iter()
+                    .filter(|r| r.role == GroupRole::Reference)
+                    .map(|r| r.row_stop - r.row_start)
+                    .sum::<u64>(),
+                stop - start,
+                "reference records are not contiguous"
+            );
             Some((start, stop))
         } else {
             None
@@ -193,7 +206,13 @@ impl GroupIndex {
             .map(|cand| (strsim::normalized_levenshtein(label, cand), cand))
             .filter(|(score, _)| *score >= 0.6) // difflib's default cutoff
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score desc, then label asc so equal-distance suggestions are
+        // deterministic run-to-run (the candidates come from a HashMap).
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(b.1))
+        });
         scored.into_iter().take(n).map(|(_, s)| s.clone()).collect()
     }
 }

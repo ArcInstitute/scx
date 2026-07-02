@@ -1426,10 +1426,31 @@ fn run_convert(
         let _ = (group_target_bytes, group_max_bytes);
         (None, None)
     };
-    // `column:NAME` → boolean reference column; otherwise a CSV label set.
-    let reference_spec: Option<scx_ops::ReferenceSpec> =
-        reference.and_then(parse_reference_spec_cli);
+    // `column:NAME` (or `col:NAME`) → boolean reference column; otherwise a CSV
+    // label set. A non-empty value that fails to parse is a user error, not a
+    // silent "no reference".
+    let reference_spec: Option<scx_ops::ReferenceSpec> = match reference {
+        Some(s) if !s.trim().is_empty() => {
+            let spec = parse_reference_spec_cli(s);
+            if spec.is_none() {
+                return Err(format!(
+                    "--reference value {s:?} is not a valid label set or \
+                    `column:NAME` reference column"
+                )
+                .into());
+            }
+            spec
+        }
+        _ => None,
+    };
     let group_pass_val = convert::GroupPass::parse(group_pass)?;
+    if group_by_value.is_none()
+        && (group_target_bytes_val.is_some() || group_max_bytes_val.is_some())
+    {
+        log::warn!(
+            "scx convert: --group-target-bytes / --group-max-bytes are ignored without --group-by"
+        );
+    }
 
     // Parse Phase 3 h5mu filters / type overrides. The empty-string
     // case is treated as no filter; non-empty strings are split on
@@ -1485,11 +1506,12 @@ fn run_convert(
 }
 
 /// Parse the `--reference` CLI value into a [`scx_ops::ReferenceSpec`].
-/// `column:NAME` selects a boolean obs column; anything else is a
-/// comma-separated set of `--group-by` labels. Returns `None` for an
-/// empty / whitespace-only value.
-fn parse_reference_spec_cli(s: &str) -> Option<scx_ops::ReferenceSpec> {
-    if let Some(col) = s.strip_prefix("column:") {
+/// `column:NAME` (or the `col:NAME` alias) selects a boolean obs column;
+/// anything else is a comma-separated set of `--group-by` labels. Returns
+/// `None` for an empty / whitespace-only value. Shared by `scx sort` and
+/// `scx convert` so the flag parses identically on both subcommands.
+pub(crate) fn parse_reference_spec_cli(s: &str) -> Option<scx_ops::ReferenceSpec> {
+    if let Some(col) = s.strip_prefix("column:").or_else(|| s.strip_prefix("col:")) {
         let col = col.trim();
         if col.is_empty() {
             return None;

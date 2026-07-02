@@ -303,22 +303,18 @@ fn group_csc_input_errors() {
 }
 
 /// Forcing the one-pass path (`GroupPass::One`) on a dense input with
-/// `--group-target-bytes` has no cheap per-row nnz → falls back to row-count
-/// grouping with a `GroupByteModeUnsupported` warning, and still produces a
-/// valid grouped file.
+/// `--group-target-bytes` has no cheap per-row nnz, so it cannot honor the byte
+/// budget. Rather than silently falling back to row-count sizing — which would
+/// produce a *different* layout than the `Auto`/`Two` route for the same flags
+/// — it hard-errors and points at `--group-pass two`.
 #[test]
-fn group_dense_byte_mode_one_pass_falls_back_with_warning() {
-    use std::sync::{Arc, Mutex};
+fn group_dense_byte_mode_one_pass_errors() {
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("in.h5ad");
     let scx = dir.path().join("out.scx");
     make_grouped_h5ad(&h5ad, 10, 8, "dense");
 
-    let categories: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let cats = Arc::clone(&categories);
-    let mut sink = WarningSink::with_handler(move |w| {
-        cats.lock().unwrap().push(w.category().to_string());
-    });
+    let mut sink = WarningSink::log();
     let opts = ConvertOptions {
         group_by: Some("cell_type".to_string()),
         reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
@@ -328,26 +324,20 @@ fn group_dense_byte_mode_one_pass_falls_back_with_warning() {
         group_pass: GroupPass::One, // exercise the one-pass dense path directly
         ..Default::default()
     };
-    h5ad_to_scx_streaming(
+    let err = h5ad_to_scx_streaming(
         &h5ad,
         &scx,
         &opts,
         &StreamingOverrides::default(),
         &mut sink,
-    )
-    .unwrap();
-
-    assert!(
-        categories
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c == "group_byte_mode_unsupported"),
-        "dense byte-mode must emit a fallback warning"
     );
-    // Still a valid grouped file (row-count fallback): reference isolated.
-    let r = ScxReader::open(&scx).unwrap();
-    assert_eq!(x_shard_ranges(&r), vec![(0, 6), (6, 10)]);
+    let msg = err
+        .expect_err("dense + byte budget + one-pass must error")
+        .to_string();
+    assert!(
+        msg.contains("group-pass two") && msg.contains("Dense"),
+        "error must explain the byte-mode limitation and the fix: {msg}"
+    );
 }
 
 /// `GroupPass::Auto` routes a **dense** source to the two-pass path (plain

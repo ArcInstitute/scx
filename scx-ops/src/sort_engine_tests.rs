@@ -1088,6 +1088,41 @@ fn grouped_sort_reference_first_and_clustered_inmemory() {
 }
 
 #[test]
+fn grouped_single_shard_plan_does_not_split_group() {
+    // Regression: when the plan collapses to a single shard, the planner returns
+    // an EMPTY `shard_starts`. The emitter must still be in grouped mode (breaks
+    // = Some(empty)) and NOT fall back to the legacy `shard_target_rows` cap,
+    // which would split the group across shards and desync the sidecar. Here one
+    // group of 6 rows with `shard_target_rows: 2` fits one planner shard; a
+    // pre-fix emitter would emit 3 X shards.
+    let dir = tempfile::tempdir().unwrap();
+    let genes = ["MYC", "MYC", "MYC", "MYC", "MYC", "MYC"];
+    let control = [false; 6];
+    let inp = write_grouped_fixture(&dir, "single.scx", &genes, &control);
+    let out = dir.path().join("single_out.scx");
+
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        shard_target_rows: 2,
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    // Exactly one CSR shard covering all 6 rows — the group was not split.
+    let ranges = csr_shard_ranges(&out);
+    assert_eq!(ranges, vec![(0, 6)], "single group must land in one shard");
+
+    // One record spanning the whole file, in that single shard.
+    let gi = assert_grouped_invariants(&out, &[]);
+    let records = gi["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["label"], "MYC");
+    assert_eq!(records[0]["shard"], 0);
+    assert_eq!(records[0]["row_start"].as_u64().unwrap(), 0);
+    assert_eq!(records[0]["row_stop"].as_u64().unwrap(), 6);
+}
+
+#[test]
 fn grouped_sort_external_matches_inmemory_layout() {
     let dir = tempfile::tempdir().unwrap();
     let genes = [

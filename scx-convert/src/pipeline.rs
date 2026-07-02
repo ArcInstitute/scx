@@ -1155,6 +1155,21 @@ pub fn h5ad_to_scx_streaming(
             GroupPass::Two => true,
             GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense),
         };
+        // Byte-mode grouping needs a cheap per-row nnz source, which the one-pass
+        // path only has for CSR. A forced one-pass over a non-CSR source with a
+        // byte budget would silently degrade to row-count sizing, producing a
+        // *different* layout than the `Auto`/`Two` route for the same flags —
+        // error instead of diverging. (`Auto` already routes dense → two-pass.)
+        if !two_pass
+            && opts.group_target_bytes.is_some()
+            && !matches!(matrix_format, MatrixFormat::Csr)
+        {
+            return Err(ConvertError::Other(format!(
+                "convert --group-by --group-target-bytes with --group-pass one is unsupported for \
+                 a {matrix_format:?} source (byte-budget sizing needs per-row nnz, available only \
+                 for CSR in one pass); use --group-pass two (or auto) for byte-mode grouping"
+            )));
+        }
         if two_pass {
             log::info!(
                 "convert --group-by: routing to two-pass (plain convert + scx sort) for \

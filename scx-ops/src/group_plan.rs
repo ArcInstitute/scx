@@ -205,7 +205,8 @@ pub fn plan_group_shards(
             // Non-reference: seal on role switch (ref → group) or when adding
             // this group would exceed the target.
             Role::Group => {
-                last_role == Some(Role::Reference) || (cur_units + gb > target && emit_pos > 0)
+                last_role == Some(Role::Reference)
+                    || (cur_units.saturating_add(gb) > target && emit_pos > 0)
             }
         };
 
@@ -248,7 +249,7 @@ pub fn plan_group_shards(
             row_stop: b.stop,
             role: b.role,
         });
-        cur_units += gb;
+        cur_units = cur_units.saturating_add(gb);
         last_role = Some(b.role);
         emit_pos = b.stop;
     }

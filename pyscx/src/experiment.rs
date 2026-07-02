@@ -733,6 +733,13 @@ impl PyExperiment {
         self.reader = ScxReader::open(&self.path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
+        // Invalidate caches that snapshot the pre-deletion file. The grouped
+        // pipeline holds its own ScxReader + deletion-vector snapshot, so a
+        // grouped read populated before this mutation would otherwise still
+        // return just-deleted rows; the cached deleted-count is likewise stale.
+        self.grouped_pipeline = std::sync::OnceLock::new();
+        self.n_deleted = std::sync::OnceLock::new();
+
         Ok(total)
     }
 
