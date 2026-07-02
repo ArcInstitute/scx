@@ -19,6 +19,7 @@ use object_store::ObjectStore;
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::header::{FileHeader, HEADER_SIZE};
 use scx_format_io::section::SectionType;
+use scx_format_io::DistinctAccumulator;
 
 use crate::backend::CloudLocation;
 use crate::error::{CloudError, Result};
@@ -308,6 +309,61 @@ impl CloudReader {
         Ok(scx_format_io::downcast_large_types(
             &decode_arrow_ipc_batch(&bytes, "obs_metadata")?,
         )?)
+    }
+
+    /// Distinct values of a single **string/categorical** obs column over the
+    /// cloud read path. Parity with `ScxReader::distinct_obs_values`: folds
+    /// each shard's projected column through [`DistinctAccumulator`] without
+    /// assembling the full obs table (so it never re-OOMs the way
+    /// [`Self::read_obs`] can at atlas scale). Shards are read sequentially so
+    /// the `limit` short-circuit can stop early once enough distinct values are
+    /// seen. Returns `(values, has_more)`.
+    pub async fn distinct_obs_values(
+        &self,
+        col: &str,
+        limit: Option<usize>,
+        sort: bool,
+    ) -> Result<(Vec<String>, bool)> {
+        let schema = self.read_obs_schema().await?;
+        let col_idx = schema.index_of(col).map_err(|_| {
+            CloudError::Format(scx_format_io::ScxError::SectionNotFound(format!(
+                "obs column '{col}'"
+            )))
+        })?;
+        let mut acc = DistinctAccumulator::new(col, limit, sort);
+
+        if self.obs_metadata_shard_count() > 0 {
+            // Collect `(idx, &entry)` once and sort by idx — avoids re-scanning
+            // the catalog with `.find()` per shard (would be O(shards × entries)).
+            let mut shards: Vec<(u32, &FullCatalogEntry)> = self
+                .catalog
+                .entries
+                .iter()
+                .filter(|e| {
+                    e.section_type == SectionType::ObsMetadataShard
+                        && e.name.starts_with("obs_metadata/shard_")
+                })
+                .filter_map(|e| {
+                    let idx: u32 = e.name.strip_prefix("obs_metadata/shard_")?.parse().ok()?;
+                    Some((idx, e))
+                })
+                .collect();
+            shards.sort_by_key(|(idx, _)| *idx);
+            for (_, entry) in shards {
+                let bytes = self.read_section_for_entry(entry).await?;
+                let batch =
+                    decode_arrow_ipc_batch_projected(&bytes, vec![col_idx], "obs_metadata")?;
+                acc.push(batch.column(0))?;
+                if acc.done() {
+                    break;
+                }
+            }
+        } else {
+            let bytes = self.read_metadata_section("obs").await?;
+            let batch = decode_arrow_ipc_batch_projected(&bytes, vec![col_idx], "obs")?;
+            acc.push(batch.column(0))?;
+        }
+        Ok(acc.finish())
     }
 
     /// Read var metadata as an Arrow RecordBatch. Mirror of
@@ -790,6 +846,32 @@ impl CloudReader {
 fn decode_arrow_ipc_batch(bytes: &[u8], logical: &str) -> Result<RecordBatch> {
     let cursor = Cursor::new(bytes);
     let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    reader
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            CloudError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{logical} Arrow IPC contains no batches"),
+            ))
+        })?
+        .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+}
+
+/// Decode a single Arrow IPC batch projected to `projection` (column indices
+/// into the on-disk schema). Arrow IPC column projection skips decoding the
+/// unselected columns. Counterpart to [`decode_arrow_ipc_batch`] used by the
+/// distinct-value scan, where only one column is needed.
+fn decode_arrow_ipc_batch_projected(
+    bytes: &[u8],
+    projection: Vec<usize>,
+    logical: &str,
+) -> Result<RecordBatch> {
+    let cursor = Cursor::new(bytes);
+    let reader = arrow::ipc::reader::FileReaderBuilder::new()
+        .with_projection(projection)
+        .build(cursor)
         .map_err(|e| CloudError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
     reader
         .into_iter()
@@ -1686,5 +1768,45 @@ mod tests {
         // IS genuinely requested (parity with the local path on narrow data).
         let obs = reader.read_obs().await.unwrap();
         assert_eq!(_obs_schema.fields(), obs.schema().fields());
+    }
+
+    /// `distinct_obs_values` over a multi-shard (Utf8) obs column: must union
+    /// across shard boundaries, honour `limit`/`has_more`, sort, and never
+    /// trigger full-obs assembly.
+    #[tokio::test]
+    async fn distinct_obs_values_unions_across_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 obs / 40 per shard → 3 obs shards; cell_type cycles 3 values.
+        let input = write_sharded_test_file(&dir, 100, 50);
+        let reader = open_cloud(&input.to_string_lossy()).await.unwrap();
+        assert!(reader.obs_metadata_shard_count() > 1);
+
+        // Full distinct set, sorted for a deterministic assertion.
+        let (vals, more) = reader
+            .distinct_obs_values("cell_type", None, true)
+            .await
+            .unwrap();
+        assert_eq!(vals, vec!["B_cell", "Monocyte", "T_cell"]);
+        assert!(!more);
+
+        // Must not have assembled the full obs table.
+        assert!(
+            reader.obs_assembled.get().is_none(),
+            "distinct_obs_values must not assemble the full obs batch"
+        );
+
+        // limit short-circuit: first-N + has_more.
+        let (vals, more) = reader
+            .distinct_obs_values("cell_type", Some(2), false)
+            .await
+            .unwrap();
+        assert_eq!(vals.len(), 2);
+        assert!(more);
+
+        // Unknown column → SectionNotFound.
+        assert!(reader
+            .distinct_obs_values("nope", None, false)
+            .await
+            .is_err());
     }
 }

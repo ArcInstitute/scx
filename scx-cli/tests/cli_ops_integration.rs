@@ -970,3 +970,129 @@ fn test_unknown_subcommand_has_no_cloud_hint() {
         "a non-cloud typo should not get the cloud hint, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// optimize --shard-obs: migrate a legacy single-section obs to sharded layout
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_optimize_shard_obs_always_shards_single_section() {
+    let dir = tempfile::tempdir().unwrap();
+    // write_test_file emits a single-section obs (write_obs), so this is a
+    // legacy-layout fixture.
+    let input = write_test_file(&dir, "legacy.scx", 8, 10);
+    let output = dir.path().join("sharded.scx");
+
+    assert_eq!(
+        ScxReader::open(&input).unwrap().obs_metadata_shard_count(),
+        0,
+        "fixture is single-section obs"
+    );
+
+    let out = scx_cli()
+        .args([
+            "optimize",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--shard-obs",
+            "always",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "optimize --shard-obs always failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let reader = ScxReader::open(&output).unwrap();
+    assert!(
+        reader.obs_metadata_shard_count() > 0,
+        "single-section obs migrated to sharded layout"
+    );
+    assert!(
+        !reader
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::ObsMetadata),
+        "no single-section ObsMetadata remains"
+    );
+    // Rows round-trip.
+    assert_eq!(reader.read_obs().unwrap().num_rows(), 8);
+}
+
+#[test]
+fn test_optimize_shard_obs_auto_keeps_small_single_section() {
+    let dir = tempfile::tempdir().unwrap();
+    // write_test_file uses shard_target_rows=16384, so n_obs=8 is far below the
+    // threshold → auto must keep the single section (the no-op-for-small-files
+    // contract), completing the CLI-level off/auto/always matrix.
+    let input = write_test_file(&dir, "legacy.scx", 8, 10);
+    let output = dir.path().join("auto_small.scx");
+
+    let out = scx_cli()
+        .args([
+            "optimize",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--shard-obs",
+            "auto",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert_eq!(
+        ScxReader::open(&output).unwrap().obs_metadata_shard_count(),
+        0,
+        "auto keeps a sub-threshold single-section obs as a single section"
+    );
+}
+
+#[test]
+fn test_optimize_shard_obs_off_keeps_single_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "legacy.scx", 8, 10);
+    let output = dir.path().join("kept.scx");
+
+    let out = scx_cli()
+        .args([
+            "optimize",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--shard-obs",
+            "off",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    assert_eq!(
+        ScxReader::open(&output).unwrap().obs_metadata_shard_count(),
+        0,
+        "off preserves the single-section obs layout"
+    );
+}
+
+#[test]
+fn test_optimize_rejects_invalid_shard_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_test_file(&dir, "legacy.scx", 8, 10);
+    let output = dir.path().join("out.scx");
+
+    let out = scx_cli()
+        .args([
+            "optimize",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "--shard-obs",
+            "sometimes",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "clap value_parser must reject an invalid --shard-obs value"
+    );
+}

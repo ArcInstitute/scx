@@ -5,12 +5,14 @@
 //! indexes.
 //!
 //! Unlike `compact` (which targets deletion reclaim + re-sharding and keeps the
-//! source `format_version`), `optimize` is a faithful 1:1 upgrade: it does not
+//! source `format_version`), `optimize` is a near-faithful upgrade: it does not
 //! apply deletions (the deletion-vector section is carried through unchanged),
-//! does not change shard boundaries, and canonicalizes each shard so the output
-//! is a real v3 file with sidecars. The CSC sidecar is dropped (rerun
-//! `scx build-csc` / `--rebuild-csc`); a `decode/*` sidecar is emitted for every
-//! Scx1 integer shard automatically by the encoder.
+//! does not change CSR shard boundaries, and canonicalizes each shard so the
+//! output is a real v3 file with sidecars. The one optional layout change is
+//! obs-metadata: `ObsShardPolicy` may migrate a legacy single-section obs to the
+//! sharded layout (row order/content preserved exactly). The CSC sidecar is
+//! dropped (rerun `scx build-csc` / `--rebuild-csc`); a `decode/*` sidecar is
+//! emitted for every Scx1 integer shard automatically by the encoder.
 
 use std::path::Path;
 
@@ -20,7 +22,7 @@ use scx_format_io::header::FileHeader;
 use scx_format_io::modality::ModalityType;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
-use scx_format_io::ScxReader;
+use scx_format_io::{ObsShardPolicy, ScxReader, DEFAULT_SHARD_TARGET_ROWS};
 use scx_sparse::canonicalize_csr;
 
 use crate::error::{OpsError, Result};
@@ -36,7 +38,19 @@ use crate::rewrite_helpers::{append_provenance, copy_predicate_indices};
 /// `decode/*` sidecar (and thus the `to_gpu_anndata` device-decode route) even
 /// for high-median shards that auto would route to Zstd. Non-integer shards
 /// fall back to Zstd regardless (handled inside `encode_one_shard`).
-pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -> Result<()> {
+///
+/// `obs_shard_policy` controls whether a *single-section* legacy obs table is
+/// migrated to the sharded `ObsMetadataShard` layout: `Auto` (default) shards
+/// only when `n_obs > shard_target_rows` (the `from_anndata` threshold),
+/// `Always` always shards, `Off` keeps the single section (the historical 1:1
+/// behaviour). An already-sharded obs is always stream-preserved, regardless
+/// of policy.
+pub fn optimize(
+    input_path: &Path,
+    output_path: &Path,
+    codec: Option<CodecId>,
+    obs_shard_policy: ObsShardPolicy,
+) -> Result<()> {
     let reader = ScxReader::open(input_path)?;
     if reader.is_multimodal() {
         return Err(OpsError::InvalidInput(
@@ -63,12 +77,23 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     }
     let out_flags = in_header.flags & !(1 << 0) & !(1 << 5);
 
+    // Resolve a malformed `shard_target_rows == 0` to the default up front and
+    // stamp the resolved value into the output header, so the header agrees
+    // with the obs reshape sizing below (an `Always` reshape on a `0`-header
+    // input would otherwise emit default-sized shards while the header still
+    // claimed `0`). Non-zero headers are preserved exactly.
+    let shard_target_rows = if in_header.shard_target_rows == 0 {
+        DEFAULT_SHARD_TARGET_ROWS
+    } else {
+        in_header.shard_target_rows
+    };
+
     // We canonicalize every shard below, so the default v3 invariant is real.
     let out_header = FileHeader {
         flags: out_flags,
         n_obs: in_header.n_obs,
         n_vars: in_header.n_vars,
-        shard_target_rows: in_header.shard_target_rows,
+        shard_target_rows,
         // File-level codec hint for `scx info`. When the caller forces a codec,
         // reflect it; otherwise preserve the source hint (the real per-shard
         // codec is auto-selected by `encode_one_shard`).
@@ -88,6 +113,10 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     // breaking the "faithful 1:1 upgrade" contract. Legacy single-section input
     // (`*_metadata_shard_count() == 0`) has no per-shard reader and falls
     // through to the materialising path. Both counts are pure catalog scans.
+    // Tracks whether a single-section obs was migrated to the sharded layout,
+    // for the info log and provenance record below. `false` for already-sharded
+    // input (preserved as-is) and for `Off`/sub-threshold single-section input.
+    let mut obs_resharded = false;
     if reader.obs_metadata_shard_count() > 0 {
         crate::compact::write_obs_shards_streaming(
             &reader,
@@ -96,7 +125,31 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
             in_header.n_obs as usize,
         )?;
     } else {
-        writer.write_obs(&reader.read_obs()?)?;
+        // Single legacy `ObsMetadata` section. `read_obs()` materializes it
+        // whole regardless (one Arrow IPC section is one batch), so there is no
+        // optimize-side memory win from sharding — but emitting it as shards
+        // gives downstream streaming/cloud/bounded-memory readers the bounded
+        // layout.
+        let reshape =
+            obs_shard_policy.should_shard_single_section(in_header.n_obs, shard_target_rows);
+        if reshape {
+            let n_shards = in_header.n_obs.div_ceil(shard_target_rows as u64);
+            log::info!(
+                "scx optimize: migrating single-section obs ({} rows) to {} sharded \
+                 section(s) (shard_target_rows={}, policy={:?})",
+                in_header.n_obs,
+                n_shards,
+                shard_target_rows,
+                obs_shard_policy,
+            );
+            obs_resharded = true;
+        }
+        crate::compact::write_obs_section(
+            &mut writer,
+            &reader.read_obs()?,
+            reshape,
+            shard_target_rows,
+        )?;
     }
     if reader.var_metadata_shard_count() > 0 {
         write_var_shards_streaming(&reader, &mut writer, in_header.n_vars)?;
@@ -207,13 +260,19 @@ pub fn optimize(input_path: &Path, output_path: &Path, codec: Option<CodecId>) -
     // preserved, so they stay valid — copy through. Then record provenance.
     copy_predicate_indices(&reader, &mut writer)
         .map_err(|e| OpsError::InvalidInput(format!("copy predicate indices: {e}")))?;
-    append_provenance(
-        &reader,
-        &mut writer,
-        "optimize",
-        "{\"canonicalize\":true,\"sidecars\":true}",
-    )
-    .map_err(|e| OpsError::InvalidInput(format!("append provenance: {e}")))?;
+    // Record the obs-sharding decision so the layout change is auditable via
+    // `scx info --history` (the obs layout is the one thing optimize can now
+    // change beyond the CSR re-encode).
+    let shard_obs_label = match obs_shard_policy {
+        ObsShardPolicy::Off => "off",
+        ObsShardPolicy::Auto => "auto",
+        ObsShardPolicy::Always => "always",
+    };
+    let params = format!(
+        "{{\"canonicalize\":true,\"sidecars\":true,\"shard_obs\":\"{shard_obs_label}\",\"obs_resharded\":{obs_resharded}}}"
+    );
+    append_provenance(&reader, &mut writer, "optimize", &params)
+        .map_err(|e| OpsError::InvalidInput(format!("append provenance: {e}")))?;
 
     writer.finish()?;
     Ok(())
@@ -320,7 +379,7 @@ mod tests {
             .iter()
             .any(|e| e.section_type == SectionType::DecodeMetadataShard));
 
-        optimize(&input, &output, None).unwrap();
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(out.header().format_version, 3, "optimize stamps v3");
@@ -414,7 +473,7 @@ mod tests {
 
         // Auto-codec: high-median shard → Zstd → no sidecar.
         let auto_out = dir.path().join("auto.scx");
-        optimize(&input, &auto_out, None).unwrap();
+        optimize(&input, &auto_out, None, ObsShardPolicy::Off).unwrap();
         assert_eq!(
             count_sidecars(&auto_out),
             0,
@@ -423,7 +482,7 @@ mod tests {
 
         // Forced Scx1: sidecar present + decode-parity holds.
         let scx1_out = dir.path().join("scx1.scx");
-        optimize(&input, &scx1_out, Some(CodecId::Scx1)).unwrap();
+        optimize(&input, &scx1_out, Some(CodecId::Scx1), ObsShardPolicy::Off).unwrap();
         let out = ScxReader::open(&scx1_out).unwrap();
         let sidecars: Vec<_> = out
             .catalog()
@@ -502,7 +561,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output, None).unwrap();
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(out.header().format_version, 3);
@@ -578,7 +637,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output, None).unwrap();
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         // The CSR-backed obsp graph survives (it would be silently dropped if
@@ -667,7 +726,7 @@ mod tests {
         assert_eq!(in_shards.len(), 2);
         drop(in_reader);
 
-        optimize(&input, &output, None).unwrap();
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         let out_shards: Vec<(String, Vec<u8>)> = out
@@ -690,13 +749,14 @@ mod tests {
     }
 
     #[test]
-    fn optimize_preserves_sharded_obs_layout() {
+    fn optimize_preserves_already_sharded_obs_under_all_policies() {
         // A sharded `ObsMetadataShard` input must NOT collapse to a single
         // legacy `ObsMetadata` section (the atlas-scale read_obs() OOM +
-        // layout regression this fix addresses).
+        // layout regression this fix addresses) — and this is invariant to
+        // `ObsShardPolicy`: the policy only governs single-section input, while
+        // already-sharded obs always takes the stream-preserve path.
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.scx");
-        let output = dir.path().join("out.scx");
 
         let n_obs = 6usize;
         let n_vars = 1000usize;
@@ -727,36 +787,46 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output, None).unwrap();
+        for (i, policy) in [
+            ObsShardPolicy::Off,
+            ObsShardPolicy::Auto,
+            ObsShardPolicy::Always,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = dir.path().join(format!("out_{i}.scx"));
+            optimize(&input, &output, None, policy).unwrap();
 
-        let out = ScxReader::open(&output).unwrap();
-        // Sharded layout preserved (not flattened to a single section).
-        assert_eq!(
-            out.catalog()
-                .entries
-                .iter()
-                .filter(|e| e.section_type == SectionType::ObsMetadataShard)
-                .count(),
-            2,
-            "sharded obs preserved as shards"
-        );
-        assert!(
-            !out.catalog()
-                .entries
-                .iter()
-                .any(|e| e.section_type == SectionType::ObsMetadata),
-            "no flattened single-section obs emitted"
-        );
-        // Rows + values still readable and intact (assembled view).
-        let out_obs = out.read_obs().unwrap();
-        assert_eq!(out_obs.num_rows(), n_obs);
-        let ids = out_obs
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        assert_eq!(ids.value(0), "cell_0");
-        assert_eq!(ids.value(n_obs - 1), &format!("cell_{}", n_obs - 1)[..]);
+            let out = ScxReader::open(&output).unwrap();
+            // Sharded layout preserved (not flattened to a single section).
+            assert_eq!(
+                out.catalog()
+                    .entries
+                    .iter()
+                    .filter(|e| e.section_type == SectionType::ObsMetadataShard)
+                    .count(),
+                2,
+                "sharded obs preserved as shards under {policy:?}"
+            );
+            assert!(
+                !out.catalog()
+                    .entries
+                    .iter()
+                    .any(|e| e.section_type == SectionType::ObsMetadata),
+                "no flattened single-section obs emitted under {policy:?}"
+            );
+            // Rows + values still readable and intact (assembled view).
+            let out_obs = out.read_obs().unwrap();
+            assert_eq!(out_obs.num_rows(), n_obs);
+            let ids = out_obs
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            assert_eq!(ids.value(0), "cell_0");
+            assert_eq!(ids.value(n_obs - 1), &format!("cell_{}", n_obs - 1)[..]);
+        }
     }
 
     #[test]
@@ -798,7 +868,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        optimize(&input, &output, None).unwrap();
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
 
         let out = ScxReader::open(&output).unwrap();
         assert_eq!(
@@ -826,5 +896,333 @@ mod tests {
             .unwrap();
         assert_eq!(ids.value(0), "gene_0");
         assert_eq!(ids.value(n_vars - 1), &format!("gene_{}", n_vars - 1)[..]);
+    }
+
+    // ---- `ObsShardPolicy` single-section migration (this feature) ----
+
+    /// Build a single-section obs `RecordBatch` with a Utf8 id column and a
+    /// categorical (`Dictionary<Int32, Utf8>`) `cell_type` column — exercises
+    /// the per-shard re-dictionary path that sharding must round-trip (the
+    /// riskiest interaction per the spec's Risks section).
+    fn categorical_obs(n: usize) -> arrow::array::RecordBatch {
+        use arrow::array::{DictionaryArray, Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+        use std::sync::Arc;
+
+        let labels = ["T cell", "B cell", "NK cell"];
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let keys = Int32Array::from((0..n).map(|i| (i % 3) as i32).collect::<Vec<_>>());
+        let values = Arc::new(StringArray::from(labels.to_vec()));
+        let cell_type = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let schema = Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new(
+                "cell_type",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]);
+        arrow::array::RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(
+                    ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(cell_type),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Read the `cell_type` column as plain strings regardless of whether it
+    /// came back as `Dictionary` (single-section) or unified `Dictionary`/`Utf8`
+    /// (assembled from shards) — cast to `Utf8` and collect.
+    fn cell_type_strings(batch: &arrow::array::RecordBatch) -> Vec<String> {
+        use arrow::array::Array;
+        let idx = batch.schema().index_of("cell_type").unwrap();
+        let utf8 =
+            arrow::compute::cast(batch.column(idx), &arrow::datatypes::DataType::Utf8).unwrap();
+        let arr = utf8
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+    }
+
+    /// Write a single-section (legacy `ObsMetadata`) file with `obs`, a small
+    /// var, and one CSR shard. `shard_target_rows` is stamped into the header so
+    /// the `Auto` threshold can be exercised with tiny fixtures.
+    fn build_single_section_file(
+        path: &Path,
+        n_obs: usize,
+        shard_target_rows: u32,
+        obs: &arrow::array::RecordBatch,
+    ) {
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        header.shard_target_rows = shard_target_rows;
+        let (indptr, indices, values) = small_csr(n_obs);
+        let mut w = ScxWriter::new(path, header).unwrap();
+        w.write_obs(obs).unwrap(); // single legacy ObsMetadata section
+        w.write_var(&sample_var(n_vars)).unwrap();
+        w.write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+        w.finish().unwrap();
+    }
+
+    fn obs_shard_count(path: &Path) -> usize {
+        ScxReader::open(path).unwrap().obs_metadata_shard_count()
+    }
+
+    fn has_single_section_obs(path: &Path) -> bool {
+        ScxReader::open(path)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::ObsMetadata)
+    }
+
+    #[test]
+    fn optimize_auto_shards_large_single_section_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 10usize; // 10 > shard_target_rows(4) → Auto shards
+        let obs = categorical_obs(n_obs);
+        build_single_section_file(&input, n_obs, 4, &obs);
+        assert_eq!(obs_shard_count(&input), 0, "input is single-section");
+
+        optimize(&input, &output, None, ObsShardPolicy::Auto).unwrap();
+
+        assert!(
+            obs_shard_count(&output) > 0,
+            "auto shards a large single-section obs"
+        );
+        assert!(
+            !has_single_section_obs(&output),
+            "no single-section ObsMetadata remains after sharding"
+        );
+        // Round-trips row-for-row, including the categorical column.
+        let out_obs = ScxReader::open(&output).unwrap().read_obs().unwrap();
+        assert_eq!(out_obs.num_rows(), n_obs);
+        assert_eq!(cell_type_strings(&out_obs), cell_type_strings(&obs));
+    }
+
+    #[test]
+    fn optimize_auto_keeps_small_single_section_obs() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // n_obs == shard_target_rows → NOT sharded under Auto (strict `>`,
+        // matching from_anndata's `obs_rows > step` boundary).
+        let n_obs = 8usize;
+        let obs = categorical_obs(n_obs);
+        build_single_section_file(&input, n_obs, 8, &obs);
+
+        optimize(&input, &output, None, ObsShardPolicy::Auto).unwrap();
+
+        assert_eq!(
+            obs_shard_count(&output),
+            0,
+            "auto keeps a small single-section obs as a single section"
+        );
+        assert!(has_single_section_obs(&output));
+        let out_obs = ScxReader::open(&output).unwrap().read_obs().unwrap();
+        assert_eq!(cell_type_strings(&out_obs), cell_type_strings(&obs));
+    }
+
+    #[test]
+    fn optimize_off_keeps_single_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // 10 > 4 would shard under Auto; Off must keep the single section.
+        let n_obs = 10usize;
+        let obs = categorical_obs(n_obs);
+        build_single_section_file(&input, n_obs, 4, &obs);
+
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
+
+        assert_eq!(obs_shard_count(&output), 0, "off never shards");
+        assert!(has_single_section_obs(&output));
+    }
+
+    #[test]
+    fn optimize_always_shards_single_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // n_obs(6) < shard_target_rows(10000): Auto would NOT shard, but
+        // Always must.
+        let n_obs = 6usize;
+        let obs = categorical_obs(n_obs);
+        build_single_section_file(&input, n_obs, 10000, &obs);
+
+        optimize(&input, &output, None, ObsShardPolicy::Always).unwrap();
+
+        assert!(
+            obs_shard_count(&output) > 0,
+            "always shards regardless of size"
+        );
+        assert!(!has_single_section_obs(&output));
+        let out_obs = ScxReader::open(&output).unwrap().read_obs().unwrap();
+        assert_eq!(cell_type_strings(&out_obs), cell_type_strings(&obs));
+    }
+
+    #[test]
+    fn optimize_always_on_empty_obs_stays_single_section() {
+        // `write_obs_section` guards `n == 0` and never shards an empty obs,
+        // even under `Always` — assert that end-to-end.
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_vars = 1000usize;
+        let mut header = sample_header(0, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        header.shard_target_rows = 4;
+        let empty_obs = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])));
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&empty_obs).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            // Zero-row CSR shard (indptr = [0], no entries).
+            w.write_csr_shard(&[0u64], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+                .unwrap();
+            w.finish().unwrap();
+        }
+
+        optimize(&input, &output, None, ObsShardPolicy::Always).unwrap();
+
+        assert_eq!(
+            obs_shard_count(&output),
+            0,
+            "an empty obs is never sharded, even under Always"
+        );
+        assert!(has_single_section_obs(&output));
+        assert_eq!(
+            ScxReader::open(&output)
+                .unwrap()
+                .read_obs()
+                .unwrap()
+                .num_rows(),
+            0
+        );
+    }
+
+    #[test]
+    fn optimize_shard_obs_preserves_predicate_index() {
+        use scx_engine::{
+            build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions,
+            QueryPipeline,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        let n_obs = 12usize;
+        let n_vars = 1000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        header.shard_target_rows = 4; // Always reshapes obs into 3 shards
+        let obs = sample_obs(n_obs); // cell_type cycles T/B/NK
+        let var = sample_var(n_vars);
+        let (indptr, indices, values) = small_csr(n_obs);
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&obs).unwrap(); // single legacy section
+            w.write_var(&var).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            // One CSR shard covers rows 0..n_obs; build a forced obs predicate
+            // index on cell_type keyed to that range.
+            let opts = ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_type".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            };
+            build_and_write_conversion_predicate_indexes(
+                &mut w,
+                &obs,
+                &var,
+                &[(0, n_obs as u64)],
+                n_vars,
+                &opts,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        let expr = "cell_type == 'T cell'";
+        let matched = |path: &Path| -> usize {
+            let pipeline = QueryPipeline::open(path).unwrap().filter_obs(expr).unwrap();
+            scx_engine::collect::count(&pipeline).unwrap().matched_rows
+        };
+
+        let before = matched(&input);
+        assert!(before > 0, "baseline query matches some rows");
+        assert!(
+            ScxReader::open(&input)
+                .unwrap()
+                .catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::ObsPredicateIndex),
+            "input carries an obs predicate index"
+        );
+
+        // Always reshapes the single-section obs into shards; the predicate
+        // index is keyed to CSR/output shards (unchanged), so it must remain
+        // valid and the query must return identical rows.
+        optimize(&input, &output, None, ObsShardPolicy::Always).unwrap();
+
+        assert!(obs_shard_count(&output) > 0, "obs reshaped to shards");
+        assert!(
+            ScxReader::open(&output)
+                .unwrap()
+                .catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::ObsPredicateIndex),
+            "predicate index carried through optimize"
+        );
+        assert_eq!(
+            matched(&output),
+            before,
+            "predicate-index query is stable across obs reshape"
+        );
     }
 }

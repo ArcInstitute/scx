@@ -22,6 +22,7 @@ pub mod csc_sidecar;
 pub mod decode_sidecar;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
+pub mod distinct;
 pub mod encoder;
 pub mod mem;
 pub mod reader;
@@ -50,6 +51,7 @@ pub use decode_sidecar::{
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
+pub use distinct::DistinctAccumulator;
 pub use encoder::encode_one_shard;
 pub use mem::MemoryBudget;
 pub use reader::{

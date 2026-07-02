@@ -332,6 +332,13 @@ enum Commands {
         /// decode sidecar, defeating the point of `optimize`. Default: auto.
         #[arg(long, default_value = "auto", value_parser = ["auto", "scx1"])]
         codec: String,
+        /// Migrate a legacy single-section obs table to the sharded
+        /// `ObsMetadataShard` layout: `auto` (shard when n_obs >
+        /// shard_target_rows — the from_anndata threshold), `always`, or
+        /// `off` (keep the single section; today's faithful 1:1 copy).
+        /// Already-sharded obs is preserved as-is regardless. Default: auto.
+        #[arg(long = "shard-obs", default_value = "auto", value_parser = ["off", "auto", "always"])]
+        shard_obs: String,
     },
     /// Rewrite file reclaiming space from deletions
     Compact {
@@ -983,7 +990,8 @@ fn main() {
             output,
             force,
             codec,
-        } => optimize::run_optimize(&input, &output, force, &codec),
+            shard_obs,
+        } => optimize::run_optimize(&input, &output, force, &codec, &shard_obs),
         Commands::Compact {
             input,
             output,

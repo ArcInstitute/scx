@@ -642,9 +642,21 @@ pub fn compact(
 ///             - ``"scx1"``: Force Scx1 on every integer shard — guarantees
 ///               a decode sidecar on all integer shards (needed for full
 ///               ``to_gpu_anndata`` device-decode coverage).
+///     shard_obs: Migrate a legacy single-section obs table to the sharded
+///             ``ObsMetadataShard`` layout.
+///
+///             - ``"auto"`` (default): shard only when ``n_obs >
+///               shard_target_rows`` (the ``from_anndata`` threshold) — small
+///               files stay single-section, atlas-scale files get sharded obs.
+///             - ``"always"``: always shard a single-section obs.
+///             - ``"off"``: keep the single section (faithful 1:1 copy).
+///
+///             An already-sharded obs is preserved as shards regardless of
+///             this setting.
 ///
 /// Raises:
-///     ValueError: If `codec` is not "auto" or "scx1".
+///     ValueError: If `codec` is not "auto"/"scx1" or `shard_obs` is not
+///         "off"/"auto"/"always".
 ///     RuntimeError: If the file is multimodal, the input doesn't exist,
 ///         or the output already exists (no ``--force`` analogue; callers
 ///         should remove the target first or use ``output == input``).
@@ -653,9 +665,16 @@ pub fn compact(
 ///     pyscx.optimize("experiment.scx", "optimized.scx")
 ///     pyscx.optimize("experiment.scx", "experiment.scx")  # in-place
 ///     pyscx.optimize("experiment.scx", "optimized.scx", codec="scx1")
+///     pyscx.optimize("atlas.scx", "atlas.opt.scx", shard_obs="always")
 #[pyfunction]
-#[pyo3(signature = (input, output, codec="auto"))]
-pub fn optimize(py: Python<'_>, input: &str, output: &str, codec: &str) -> PyResult<()> {
+#[pyo3(signature = (input, output, codec="auto", shard_obs="auto"))]
+pub fn optimize(
+    py: Python<'_>,
+    input: &str,
+    output: &str,
+    codec: &str,
+    shard_obs: &str,
+) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
     let codec_id = match codec {
@@ -668,6 +687,8 @@ pub fn optimize(py: Python<'_>, input: &str, output: &str, codec: &str) -> PyRes
             )));
         }
     };
+    let obs_shard_policy =
+        scx_format_io::ObsShardPolicy::parse(shard_obs).map_err(PyValueError::new_err)?;
     // No-clobber guard mirroring `scx optimize` (no `--force` analogue here).
     // An in-place upgrade (`output == input`) writes a sibling tempfile and
     // atomically renames, so only a *different* pre-existing output is
@@ -687,7 +708,7 @@ pub fn optimize(py: Python<'_>, input: &str, output: &str, codec: &str) -> PyRes
             output_path.display()
         )));
     }
-    py.detach(|| scx_ops::optimize(&input_path, &output_path, codec_id))
+    py.detach(|| scx_ops::optimize(&input_path, &output_path, codec_id, obs_shard_policy))
         .map_err(ops_to_pyerr)
 }
 
