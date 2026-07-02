@@ -28,6 +28,42 @@ fn make_grouped_h5ad(path: &Path, n_obs: usize, n_vars: usize, fmt: &str) {
         .unwrap();
 }
 
+/// `make_grouped_h5ad` plus a dense `n_obs × n_obs` `obsp/connectivities` graph
+/// with a known ring pattern: edge `old i -> old (i+1) % n_obs` weighted `i+1`.
+/// The dense obsp member re-exports as a sparse COO (only nonzeros stored), so
+/// grouped convert must preserve + remap it through the grouping permutation
+/// (M3). All weights are nonzero (`1..=n_obs`), so every ring edge survives.
+fn make_grouped_h5ad_with_obsp(path: &Path, n_obs: usize, n_vars: usize, fmt: &str) {
+    make_grouped_h5ad(path, n_obs, n_vars, fmt);
+    let file = hdf5::File::append(path).unwrap();
+    let obsp = file.create_group("obsp").unwrap();
+    let mut m = vec![0f32; n_obs * n_obs];
+    for i in 0..n_obs {
+        m[i * n_obs + (i + 1) % n_obs] = (i + 1) as f32;
+    }
+    let nd = ndarray::Array2::from_shape_vec((n_obs, n_obs), m).unwrap();
+    obsp.new_dataset::<f32>()
+        .shape([n_obs, n_obs])
+        .create("connectivities")
+        .unwrap()
+        .write(&nd)
+        .unwrap();
+}
+
+/// obsp COO edges `(row, col, data)` from a read-back `connectivities` batch.
+fn obsp_edges(b: &arrow::array::RecordBatch) -> std::collections::HashSet<(i64, i64, u32)> {
+    use arrow::array::{Float32Array, Int64Array};
+    let row = arrow::compute::cast(b.column_by_name("row").unwrap(), &DataType::Int64).unwrap();
+    let col = arrow::compute::cast(b.column_by_name("col").unwrap(), &DataType::Int64).unwrap();
+    let data = arrow::compute::cast(b.column_by_name("data").unwrap(), &DataType::Float32).unwrap();
+    let row = row.as_any().downcast_ref::<Int64Array>().unwrap();
+    let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+    let data = data.as_any().downcast_ref::<Float32Array>().unwrap();
+    (0..b.num_rows())
+        .map(|i| (row.value(i), col.value(i), data.value(i) as u32))
+        .collect()
+}
+
 /// Convert directly with `--group-by`. Sequential (`reader_threads
 /// = Some(1)`) for deterministic comparison.
 fn convert_grouped(
@@ -183,6 +219,101 @@ fn group_convert_matches_convert_then_sort_row_count() {
     );
     let ct = col_str(&obs_a, "cell_type");
     assert_eq!(ct, vec!["A", "A", "A", "A", "A", "A", "B", "B", "B", "B"]);
+}
+
+/// M3: `convert --group-by` must PRESERVE (and remap) obsp regardless of X
+/// density. Previously the CSR one-pass route dropped obsp while the dense
+/// two-pass route kept it — a silent divergence by input density. Now both
+/// route through the obsp-preserving two-pass path.
+#[test]
+fn group_convert_preserves_obsp_csr_and_dense() {
+    for fmt in ["csr", "dense"] {
+        let dir = tempfile::tempdir().unwrap();
+        let h5ad = dir.path().join("in.h5ad");
+        let out = dir.path().join("grouped.scx");
+        let (n_obs, n_vars) = (10usize, 8usize);
+        make_grouped_h5ad_with_obsp(&h5ad, n_obs, n_vars, fmt);
+
+        let mut sink = WarningSink::log();
+        convert_grouped(
+            &h5ad,
+            &out,
+            "cell_type",
+            Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
+            16,
+            None,
+            &mut sink,
+        );
+
+        let r = ScxReader::open(&out).unwrap();
+        // Core M3 regression: obsp survived the grouped convert (was dropped for
+        // CSR before the fix).
+        let obsp = r
+            .read_obsp("connectivities")
+            .unwrap_or_else(|e| panic!("[{fmt}] obsp must be preserved by grouped convert: {e}"));
+
+        // Reconstruct old -> new via the unique `n_counts` id (old row i => i*10).
+        let obs = r.read_obs().unwrap();
+        let n_counts = col_i32(&obs, "n_counts");
+        let mut new_pos_of_old = vec![-1i64; n_obs];
+        for (new, &nc) in n_counts.iter().enumerate() {
+            new_pos_of_old[(nc / 10) as usize] = new as i64;
+        }
+
+        // Original ring edges remapped through the grouping permutation.
+        let expected: std::collections::HashSet<(i64, i64, u32)> = (0..n_obs)
+            .map(|i| {
+                (
+                    new_pos_of_old[i],
+                    new_pos_of_old[(i + 1) % n_obs],
+                    (i + 1) as u32,
+                )
+            })
+            .collect();
+        assert_eq!(
+            obsp_edges(&obsp),
+            expected,
+            "[{fmt}] obsp edges must be remapped through the grouping order"
+        );
+        assert_eq!(
+            obsp.schema().metadata().get("n_rows").unwrap(),
+            &n_obs.to_string(),
+            "[{fmt}] obsp n_rows preserved"
+        );
+    }
+}
+
+/// M3: an explicitly forced one-pass with obsp present must refuse rather than
+/// silently drop the graph, pointing at `--group-pass two`.
+#[test]
+fn group_convert_forced_one_pass_with_obsp_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("in.h5ad");
+    let scx = dir.path().join("out.scx");
+    make_grouped_h5ad_with_obsp(&h5ad, 10, 8, "csr");
+
+    let opts = ConvertOptions {
+        group_by: Some("cell_type".to_string()),
+        reference: Some(scx_ops::ReferenceSpec::Labels(vec!["A".to_string()])),
+        shard_target_rows: 16,
+        reader_threads: Some(1),
+        group_pass: GroupPass::One,
+        ..Default::default()
+    };
+    let err = h5ad_to_scx_streaming(
+        &h5ad,
+        &scx,
+        &opts,
+        &StreamingOverrides::default(),
+        &mut WarningSink::log(),
+    );
+    let msg = err
+        .expect_err("forced one-pass with obsp must error rather than drop")
+        .to_string();
+    assert!(
+        msg.contains("obsp") && msg.contains("group-pass two"),
+        "error must name obsp and point at two-pass: {msg}"
+    );
 }
 
 /// Same equivalence under byte-budget grouped sharding (`group_target_bytes`),

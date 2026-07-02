@@ -1117,6 +1117,20 @@ pub struct StreamingOverrides {
 /// from disk when not overridden (typically KB–MB; no shard format
 /// makes sense for a JSON tree). CSC-on-disk and dense `X` are
 /// rejected up front with [`ConvertError::StreamingUnsupported`].
+/// True when the h5ad has a non-empty `obsp` group (ignoring `__`-prefixed
+/// internal members). Used by the grouped-convert router (M3) to route
+/// obsp-carrying inputs through the obsp-preserving two-pass path.
+fn h5ad_has_obsp_members(file: &hdf5::File) -> bool {
+    match file.group("obsp") {
+        Ok(group) => group
+            .member_names()
+            .unwrap_or_default()
+            .iter()
+            .any(|n| !n.starts_with("__")),
+        Err(_) => false,
+    }
+}
+
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
@@ -1170,10 +1184,17 @@ pub fn h5ad_to_scx_streaming(
     // `scx sort --group-by`), which is faster and lighter and produces the same
     // grouped layout. `One`/`Two` force the choice.
     if want_group {
+        // M3: the one-pass streaming grouped route drops obsp (obsp remap in the
+        // streaming writer is unsupported), while two-pass preserves it via
+        // `scx sort`. Route any obsp-carrying grouped input through two-pass so
+        // obsp survives regardless of X density — matching the byte-equivalent
+        // convert-then-sort guarantee. `overrides.obsp` (in-memory, forwarded to
+        // the two-pass plain pass) counts as obsp too.
+        let has_obsp = overrides.obsp.is_some() || h5ad_has_obsp_members(&file);
         let two_pass = match opts.group_pass {
             GroupPass::One => false,
             GroupPass::Two => true,
-            GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense),
+            GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense) || has_obsp,
         };
         // Byte-mode grouping needs a cheap per-row nnz source, which the one-pass
         // path only has for CSR. A forced one-pass over a non-CSR source with a
@@ -1189,6 +1210,16 @@ pub fn h5ad_to_scx_streaming(
                  a {matrix_format:?} source (byte-budget sizing needs per-row nnz, available only \
                  for CSR in one pass); use --group-pass two (or auto) for byte-mode grouping"
             )));
+        }
+        // M3: a forced one-pass with obsp present would silently drop obsp. Refuse
+        // rather than lose the graph; two-pass (or auto) preserves it.
+        if !two_pass && has_obsp {
+            return Err(ConvertError::Other(
+                "convert --group-by with --group-pass one drops obsp (obsp remap in the one-pass \
+                 streaming route is unsupported); use --group-pass two (or auto) to preserve obsp, \
+                 or drop obsp before converting"
+                    .to_string(),
+            ));
         }
         if two_pass {
             log::info!(
