@@ -3085,6 +3085,19 @@ impl ScxReader {
         }
     }
 
+    /// Raw bytes of the F1 `group_index` sidecar section, if present.
+    pub fn read_group_index_bytes(&self) -> Result<Option<&[u8]>> {
+        let entry = self
+            .full_catalog
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::GroupIndex);
+        match entry {
+            Some(e) => Ok(Some(self.section_bytes(e)?)),
+            None => Ok(None),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Deletion vectors
     // -----------------------------------------------------------------------

@@ -1,6 +1,7 @@
 pub mod collect;
 pub mod error;
 pub mod fused_ops;
+pub mod group;
 pub mod index;
 pub mod pipeline;
 pub mod predicate;
@@ -15,6 +16,7 @@ pub use fused_ops::{
     apply_fused_ops, fused_normalize_log1p, log1p_row, normalize_row, streaming_preprocess,
     streaming_save_layer, PreprocessConfig,
 };
+pub use group::{GroupIndex, GroupRecord, GroupRole, GroupShardHandle};
 pub use index::{
     apply_obs_shard_column_stats, build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, build_indexes,

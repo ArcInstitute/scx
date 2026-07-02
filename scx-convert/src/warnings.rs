@@ -97,7 +97,7 @@ pub enum ConvertWarning {
     /// `stream=False` to build it. Explicit `csc='always'` is rejected with
     /// an error instead of being downgraded to this warning.
     CscSkippedStreamingMultimodal { modalities: Vec<String> },
-    /// Phase 5b: detection bitmap was skipped on a shard because the
+    /// Detection bitmap was skipped on a shard because the
     /// `--bitmap=auto` policy rejected it (density not sparse,
     /// `n_vars` exceeds the cap, or estimated bitmap size > 15 % of
     /// the CSR shard).
@@ -167,6 +167,12 @@ pub enum ConvertWarning {
     /// query, or backed mode). The on-disk raw sections are preserved;
     /// only this particular reconstruction omits raw.
     DroppedRaw { raw_n_vars: usize },
+    /// `--group-target-bytes` (byte-budget grouped sharding) was
+    /// requested on a dense or CSC-on-disk `/X`, which has no cheap per-row nnz
+    /// to size shards by encoded width. The convert fell back to row-count
+    /// grouping (`--shard-size` rows per shard). Re-export X as CSR for
+    /// byte-budget grouping.
+    GroupByteModeUnsupported { source_format: String },
 }
 
 impl ConvertWarning {
@@ -199,6 +205,7 @@ impl ConvertWarning {
             Self::CoercedNulls { .. } => "coerced_nulls",
             Self::UnsupportedExportColumn { .. } => "unsupported_export_column",
             Self::DroppedRaw { .. } => "dropped_raw",
+            Self::GroupByteModeUnsupported { .. } => "group_byte_mode_unsupported",
         }
     }
 }

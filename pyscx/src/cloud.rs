@@ -11,6 +11,7 @@ use pyo3::types::PyDict;
 
 use scx_engine::QueryPipeline;
 
+use crate::experiment::{engine_to_pyerr, PyGroupShard};
 use crate::query::PyQueryPipeline;
 
 /// Map a `scx_cloud::CloudError` to the most appropriate Python exception.
@@ -262,6 +263,11 @@ pub struct PyCloudExperiment {
     // `Experiment` caches its modality table so the per-modality
     // accessors don't re-range-read on every call (B5).
     modalities: Option<scx_format_io::modality::ModalityTable>,
+    // F2 grouped reads (7.3): a shared cloud-backed `QueryPipeline`, opened
+    // once so repeated grouped calls don't re-fetch the catalog / schemas /
+    // `group_index` over the network (combines with the engine-side
+    // `GroupIndex` cache).
+    grouped_pipeline: std::sync::OnceLock<Arc<QueryPipeline>>,
     /// The `gs://` / `s3://` / local URL this handle was opened from.
     /// `CloudReader` does not retain it (it keeps a parsed `ReaderLayout`),
     /// so we keep it here to back `path` / `info`. Mirrors
@@ -692,6 +698,78 @@ impl PyCloudExperiment {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyQueryPipeline::from_pipeline(pipeline))
     }
+
+    /// F2: read exactly the cells of one `group_by` label as an AnnData, over
+    /// the network. Grouped archive only (written with `scx sort --group-by` /
+    /// `pyscx.sort(group_by=...)`). `KeyError` (with close matches) for an
+    /// unknown label, `ValueError` if the archive is not grouped.
+    fn read_group<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
+        let pipeline = self.grouped_pipeline(py)?;
+        let result = py
+            .detach(|| pipeline.read_group(label))
+            .map_err(engine_to_pyerr)?;
+        crate::query::query_result_to_anndata(py, result)
+    }
+
+    /// F2: read the reference cells (e.g. "non-targeting") as an AnnData, or
+    /// `None` if the archive has no reference rows.
+    fn read_reference<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let pipeline = self.grouped_pipeline(py)?;
+        let result = py
+            .detach(|| pipeline.read_reference())
+            .map_err(engine_to_pyerr)?;
+        match result {
+            Some(qr) => Ok(Some(crate::query::query_result_to_anndata(py, qr)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// F2: distinct group labels present in the archive.
+    fn group_labels(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let pipeline = self.grouped_pipeline(py)?;
+        py.detach(|| pipeline.group_labels())
+            .map_err(engine_to_pyerr)
+    }
+
+    /// F2: one `GroupShard` per non-reference shard, for streaming reads that
+    /// keep ~one shard resident. Each shard reuses the shared cloud pipeline.
+    fn iter_group_shards(&self, py: Python<'_>) -> PyResult<Vec<PyGroupShard>> {
+        let pipeline = self.grouped_pipeline(py)?;
+        let handles = py
+            .detach(|| pipeline.iter_group_shards())
+            .map_err(engine_to_pyerr)?;
+        Ok(handles
+            .into_iter()
+            .map(|handle| PyGroupShard::new(Arc::clone(&pipeline), handle))
+            .collect())
+    }
+}
+
+impl PyCloudExperiment {
+    /// The shared cloud-backed grouped-read pipeline, opened once on first use
+    /// (catalog + schemas fetched a single time over the network).
+    fn grouped_pipeline(&self, py: Python<'_>) -> PyResult<Arc<QueryPipeline>> {
+        if let Some(p) = self.grouped_pipeline.get() {
+            return Ok(Arc::clone(p));
+        }
+        let reader = Arc::clone(&self.reader);
+        let rt = Arc::clone(&self.rt);
+        let pipeline = py
+            .detach(|| {
+                let adapter = scx_cloud::CloudSectionReader::new(reader, rt);
+                QueryPipeline::from_reader(Box::new(adapter))
+            })
+            .map_err(engine_to_pyerr)?;
+        let arc = Arc::new(pipeline);
+        // If another thread won the race, `set` fails; return the winner from the
+        // cell so all callers share one pipeline (matches PyExperiment).
+        let _ = self.grouped_pipeline.set(arc);
+        Ok(Arc::clone(
+            self.grouped_pipeline
+                .get()
+                .expect("grouped_pipeline populated above"),
+        ))
+    }
 }
 
 /// Open an SCX file or exploded directory from cloud/local storage.
@@ -729,6 +807,7 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         reader: Arc::new(reader),
         rt: Arc::new(rt),
         modalities,
+        grouped_pipeline: std::sync::OnceLock::new(),
         url,
     })
 }

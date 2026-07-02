@@ -85,6 +85,11 @@ BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 # conversion would fail — skip it for them.
 _NO_CONVERSION = {
     "write", "parallel_write_scaling", "cell_eval_parity_perf", "accel_de_nb_glm",
+    # grouped_sort makes its own plain .scx in-process (and synthetic datasets
+    # self-materialize via _pert_synth) — it must not depend on a Phase-A
+    # conversion, which would fail for synthetic datasets that have no on-disk
+    # h5ad to convert.
+    "grouped_sort",
 }
 
 # Benchmarks that operate on multimodal h5mu sources. They expect

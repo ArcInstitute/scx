@@ -758,6 +758,7 @@ fn section_label(name: &str, section_type: &SectionType) -> String {
         | SectionType::DecodeMetadataShard => name.to_string(),
         SectionType::RawCsrShard => "raw/X".to_string(),
         SectionType::RawVarMetadata => "raw/var".to_string(),
+        SectionType::GroupIndex => "group_index".to_string(),
     }
 }
 

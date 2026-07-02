@@ -568,6 +568,12 @@ impl CloudReader {
             .await
     }
 
+    /// Raw bytes of the F1 `group_index` sidecar section, if present.
+    pub async fn read_group_index_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.read_predicate_index_bytes(SectionType::GroupIndex)
+            .await
+    }
+
     async fn read_predicate_index_bytes(&self, kind: SectionType) -> Result<Option<Vec<u8>>> {
         let entry = self
             .catalog

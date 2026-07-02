@@ -35,6 +35,7 @@ pub(crate) use super::dtype::detect_value_encoding;
 pub(crate) use super::pipeline::{
     h5ad_to_scx, scx_to_h5ad, tenx_to_scx, ConvertError, ConvertOptions,
 };
+pub(crate) use crate::GroupPass;
 
 pub(crate) use super::stream::{CsrShardStream, StreamedCsrShard};
 

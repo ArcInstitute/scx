@@ -27,10 +27,14 @@ pub fn run_sort(
     rebuild_csc: bool,
     csc_cols_per_shard: usize,
     csc_memory_limit: &str,
+    group_by: Option<String>,
+    reference: Option<String>,
+    group_target_bytes: Option<String>,
+    group_max_bytes: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::cli_utils::validate_scx_file(input)?;
-    if by.is_empty() {
-        return Err("scx sort requires --by with at least one obs column".into());
+    if by.is_empty() && group_by.is_none() {
+        return Err("scx sort requires --by with at least one obs column (or --group-by)".into());
     }
 
     if output.exists() {
@@ -58,6 +62,42 @@ pub fn run_sort(
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
         None => None,
     };
+
+    // F1: grouped-sharding options. `--reference` is a comma-separated label
+    // list by default, or `column:<name>` (alias `col:<name>`) for the
+    // boolean-column form. Shared parser with `scx convert` so the flag behaves
+    // identically on both subcommands. A non-empty value that fails to parse is
+    // a user error, not a silent "no reference".
+    let reference = match reference.as_deref() {
+        Some(spec) if !spec.trim().is_empty() => {
+            let parsed = crate::parse_reference_spec_cli(spec);
+            if parsed.is_none() {
+                return Err(format!(
+                    "--reference value {spec:?} is not a valid label set or `column:NAME` \
+                     reference column"
+                )
+                .into());
+            }
+            parsed
+        }
+        _ => None,
+    };
+    let group_target_bytes = match group_target_bytes {
+        Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
+        None => None,
+    };
+    let group_max_bytes = match group_max_bytes {
+        Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
+        None => None,
+    };
+    if reference.is_some() && group_by.is_none() {
+        return Err("--reference requires --group-by".into());
+    }
+    if group_by.is_none() && (group_target_bytes.is_some() || group_max_bytes.is_some()) {
+        log::warn!(
+            "scx sort: --group-target-bytes / --group-max-bytes are ignored without --group-by"
+        );
+    }
 
     let before_size = std::fs::metadata(input)?.len();
 
@@ -90,6 +130,10 @@ pub fn run_sort(
         memory_budget,
         temp_dir,
         bitmap,
+        group_by,
+        reference,
+        group_target_bytes,
+        group_max_bytes,
     };
 
     let summary = scx_ops::sort(input, output, &opts)?;

@@ -1260,6 +1260,66 @@ absolute_floors:
     metric: streaming_peak_rss_mb     # only streaming runs carry this key
     max: 2048.0       # ~10× the design ceiling; mirrors the ingestion floor.
 
+  # ─── Grouped sharding (sort / convert --group-by) ─────────────────
+  # Correctness-only floors (perf is hardware/density sensitive — see the
+  # Deferred floors note). Each grouping dataset's `grouped_sort` result carries
+  # a dedicated "correctness" run whose extra holds these ints; the gate takes
+  # the median across runs carrying the metric (here a single run → the value).
+  #   correctness_passed_int  — read_group(label) partitions the obs axis (1/0)
+  #   n_group_records         — group_index was written with ≥1 group
+  #   reference_isolated_int  — read_reference() isolated + all ref-labelled (1/0)
+  #                             (only gated on datasets that configure a reference)
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: pert_synth_10k
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: nb_glm_synth
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: nb_glm_synth
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: replogle_k562
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: replogle_k562
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: replogle_k562
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: tahoe_c38
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: tahoe_c38
+    metric: n_group_records
+    min: 1
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below

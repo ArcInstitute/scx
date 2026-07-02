@@ -375,6 +375,105 @@ enabling per-shard adaptive codec selection and mixed integer/float layers.
 
 For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).
 
+## Condition/label-grouped sharding (F1) + grouped reads (F2)
+
+By default shards are cut by a fixed row count (`--shard-size`). For
+perturbation screens it pays to instead cluster cells by condition so that
+reading one perturbation touches one shard, and to isolate reference cells
+(e.g. `non-targeting`) in their own leading shard. `scx sort --group-by`
+does exactly that:
+
+```bash
+# --reference takes a comma-separated label list, or `col:<name>` for a
+# boolean obs column. --group-target-bytes is optional; omit it to pack by
+# --shard-size rows instead of a byte budget.
+scx sort screen.scx grouped.scx \
+  --group-by target_gene \
+  --reference non-targeting \
+  --group-target-bytes 256M
+```
+
+The sort forces `--group-by` to be the leading sort key (so the column is
+also predicate-indexed), computes a **reference-first, group-clustered**
+global order, then runs an offline byte-budget bin-packer that:
+
+- packs all reference rows first into the leading shard(s) (`reference_shard`,
+  always shard 0), never mixed with groups;
+- bin-packs the remaining groups greedily to the byte (or row) budget,
+  **cutting only at group edges** — a group is never split across shards;
+- gives any single oversized group its own shard (with a warning).
+
+`--reverse` is ignored in grouped mode (reference must sort first). The full
+group contract is persisted in a self-describing `group_index` sidecar
+(section id 29, JSON: `{group_by, reference_shard, reference_labels,
+records[]}`; each record `{label, shard, row_start, row_stop, role}` with
+**global** output-row ranges). Pre-F1 readers skip the unknown section, so
+grouped archives stay readable.
+
+> `bytes_per_nnz` is a packing *estimate* (in-memory width), not the
+> on-disk size, so tools assign groups to shards
+> differently while agreeing on order, roles, and per-label ranges.
+
+CSC sidecars are dropped by the reorder as usual — pass
+`--group-by … --rebuild-csc`. Grouping is single-modality only in v1.
+
+### Grouped reads
+
+The sidecar powers a grouped-read API that defaults to slicing the recorded
+global row range directly (decoding only the covered shards):
+
+```python
+exp = pyscx.open("grouped.scx")
+exp.read_group("MYC")              # -> AnnData (just the MYC cells)
+exp.read_reference()               # -> AnnData | None (the full reference region)
+exp.group_labels()                 # -> list[str]
+for gs in exp.iter_group_shards(): # streaming, ~one shard resident
+    ad = gs.to_anndata()           # gs.labels, gs.shard_index, gs.global_start/stop
+```
+
+`read_group` raises `KeyError` (with close-match suggestions) for an unknown
+label and `ValueError` if the archive is not grouped. On a label that splits
+across the reference / non-reference boundary (only possible with
+`--reference col:<name>`), `read_group` returns the non-reference record and
+`read_reference` serves the reference rows. The Rust seam is
+`scx_engine::QueryPipeline::{read_group, read_reference, group_labels,
+iter_group_shards, read_row_range}`.
+
+### Limitations & staleness
+
+The `group_index` sidecar is **write-once** — produced only by `scx sort
+--group-by`. Mutating an archive afterward affects it as follows:
+
+- **`scx append` drops the sidecar** (with a warning), because its records hold
+  global row ranges over the pre-append row universe. After an append the file
+  is ungrouped and grouped reads raise `ValueError` (`NotGrouped`); re-run `scx
+  sort --group-by` to regroup.
+- **`scx merge` / `scx subset` produce fresh, ungrouped files** (no sidecar is
+  written) — re-sort the output to regroup.
+- **`scx compact` does not propagate the sidecar**, so a compacted file is
+  ungrouped.
+- **Deletion vectors are honored** by grouped reads: if you `mark_deleted` /
+  `delete_cells` on a grouped file, `read_group` / `read_reference` /
+  `iter_group_shards` drop the deleted rows, staying equivalent to
+  `query().filter_obs(...).collect()`. (A fresh grouped output has no deletion
+  vectors — the sort materializes them away.)
+- **Grouped reads are *raw*.** They return the cells of the range only — builder
+  state on a `QueryPipeline` (`filter_obs` / `filter_var` / `select_genes` /
+  `with_normalize` / `with_log1p` / `limit`) is **not** applied. The pyscx
+  `Experiment.read_*` methods are structurally safe (each opens a fresh
+  pipeline); compose transforms via `query().collect()` instead.
+- **Cloud, `rscx`, and native `pyscx.sort` are all supported.** `open_cloud(...)`
+  exposes the same grouped-read methods over range reads (the cloud
+  `SectionReader` implements `read_group_index_bytes`); `rscx` has grouped
+  bindings; and `pyscx.sort(..., group_by=..., reference=...)` produces a grouped
+  file natively (in addition to the `scx sort --group-by` CLI and convert-time
+  `scx convert --group-by` / `pyscx.from_h5ad(group_by=...)`).
+
+> On row-sharded-obs files (streaming merge/append/`from_anndata` at
+> `n_obs > shard_size`, or convert-time grouping), `read_group` reads only the
+> `ObsMetadataShard`s overlapping the group's range, so obs is not materialized
+> in full. Legacy single-section obs falls back to a full read then slice.
+
 ## Obs/var metadata sharding
 
 Streaming `scx merge`, `scx append`, and `pyscx.from_anndata` (when

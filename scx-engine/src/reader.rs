@@ -75,6 +75,10 @@ pub trait SectionReader: Send + Sync {
     /// Raw bytes of the var predicate index section, if present.
     fn read_var_predicate_index_bytes(&self) -> Result<Option<Vec<u8>>>;
 
+    /// Raw bytes of the F1 `group_index` sidecar section, if present.
+    /// `None` means the archive was not written with `--group-by`.
+    fn read_group_index_bytes(&self) -> Result<Option<Vec<u8>>>;
+
     /// Deletion vectors, if present.
     fn read_deletion_vectors(&self) -> Result<Option<DeletionVectors>>;
 
@@ -135,6 +139,10 @@ impl SectionReader for ScxReader {
 
     fn read_var_predicate_index_bytes(&self) -> Result<Option<Vec<u8>>> {
         Ok(ScxReader::read_var_predicate_index_bytes(self)?.map(|s| s.to_vec()))
+    }
+
+    fn read_group_index_bytes(&self) -> Result<Option<Vec<u8>>> {
+        Ok(ScxReader::read_group_index_bytes(self)?.map(|s| s.to_vec()))
     }
 
     fn read_deletion_vectors(&self) -> Result<Option<DeletionVectors>> {

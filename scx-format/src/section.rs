@@ -93,6 +93,16 @@ pub enum SectionType {
     /// [`RawCsrShard`]. Section name: `raw/var`. Same payload schema as
     /// [`VarMetadata`] but describes the raw var axis.
     RawVarMetadata = 28,
+    /// F1: condition/label-grouped sharding sidecar. One per file. Section
+    /// name: `group_index`. JSON payload
+    /// `{group_by, reference_shard, reference_labels, records[]}` where each
+    /// record is `{label, shard, row_start, row_stop, role}` with `row_start`/
+    /// `row_stop` as **global** output-row indices and `role` ∈
+    /// `{"group","reference"}`. Written by `scx sort --group-by`; consumed by
+    /// the grouped-read API (`read_group` / `read_reference` /
+    /// `iter_group_shards`). Forward-compatible: pre-F1 readers skip it via the
+    /// unknown-section path. Uses reserved id 29 (docs/format.md § section ids).
+    GroupIndex = 29,
 }
 
 impl SectionType {
@@ -128,6 +138,7 @@ impl SectionType {
             26 => Some(Self::DecodeMetadataShard),
             27 => Some(Self::RawCsrShard),
             28 => Some(Self::RawVarMetadata),
+            29 => Some(Self::GroupIndex),
             _ => None,
         }
     }
@@ -210,11 +221,12 @@ mod tests {
         );
         assert_eq!(SectionType::from_u8(27), Some(SectionType::RawCsrShard));
         assert_eq!(SectionType::from_u8(28), Some(SectionType::RawVarMetadata));
+        assert_eq!(SectionType::from_u8(29), Some(SectionType::GroupIndex));
     }
 
     #[test]
     fn section_type_from_u8_unknown() {
-        assert_eq!(SectionType::from_u8(29), None);
+        assert_eq!(SectionType::from_u8(30), None);
         assert_eq!(SectionType::from_u8(255), None);
     }
 

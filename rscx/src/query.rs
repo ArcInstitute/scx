@@ -8,8 +8,11 @@
 // is consumed and further calls return an error.
 
 use arrow::array::RecordBatch;
+use std::path::PathBuf;
+
 use extendr_api::prelude::*;
 use scx_engine::pipeline::{QueryPipeline, QueryResult};
+use scx_engine::GroupShardHandle;
 
 // ---------------------------------------------------------------------------
 // RQueryPipeline
@@ -283,6 +286,129 @@ impl RQueryResult {
 }
 
 // ---------------------------------------------------------------------------
+// RGroupShardHandle (F2 grouped reads)
+// ---------------------------------------------------------------------------
+
+/// One non-reference shard's grouped contents (F2), with deferred I/O. Returned
+/// in a list by `ScxExperiment$iter_group_shards()`. Re-opens the file per read
+/// (like `query()`); grouped-read parity, not the pyscx shared-pipeline path.
+#[extendr]
+pub struct RGroupShardHandle {
+    path: PathBuf,
+    handle: GroupShardHandle,
+}
+
+impl RGroupShardHandle {
+    /// Construct from a path + engine handle (kept off the `#[extendr]` surface).
+    pub fn new(path: PathBuf, handle: GroupShardHandle) -> Self {
+        Self { path, handle }
+    }
+
+    fn open_pipeline(&self) -> Result<QueryPipeline> {
+        QueryPipeline::open(&self.path).map_err(|e| Error::Other(e.to_string()))
+    }
+
+    /// Fallible body of `read_group` (one label within this shard).
+    fn read_group_impl(&self, label: &str) -> Result<RQueryResult> {
+        let (start, stop) = self.handle.range(label).ok_or_else(|| {
+            Error::Other(format!(
+                "label '{label}' is not in shard {}",
+                self.handle.shard_index
+            ))
+        })?;
+        let qr = self
+            .open_pipeline()?
+            .read_row_range(start, stop)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(RQueryResult::from_result(qr))
+    }
+
+    /// Fallible body of `to_query_result` (the whole shard's rows).
+    fn to_query_result_impl(&self) -> Result<RQueryResult> {
+        let qr = self
+            .open_pipeline()?
+            .read_row_range(self.handle.global_start, self.handle.global_stop)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        Ok(RQueryResult::from_result(qr))
+    }
+
+    /// Fallible body of `groups` (a data.frame of label / local start / stop).
+    fn groups_impl(&self) -> Result<Robj> {
+        let labels: Vec<String> = self
+            .handle
+            .groups
+            .iter()
+            .map(|(l, _, _)| l.clone())
+            .collect();
+        let starts: Vec<f64> = self
+            .handle
+            .groups
+            .iter()
+            .map(|(_, s, _)| *s as f64)
+            .collect();
+        let stops: Vec<f64> = self
+            .handle
+            .groups
+            .iter()
+            .map(|(_, _, e)| *e as f64)
+            .collect();
+        let n = labels.len() as i32;
+        let list = List::from_pairs(vec![
+            ("label", Robj::from(labels)),
+            ("start", Robj::from(starts)),
+            ("stop", Robj::from(stops)),
+        ]);
+        let robj: Robj = list.into();
+        R!("{ x <- {{robj}}; class(x) <- 'data.frame'; attr(x, 'row.names') <- seq_len({{n}}); x }")
+            .map_err(|e| Error::Other(format!("data.frame construction failed: {}", e)))
+    }
+}
+
+#[extendr]
+impl RGroupShardHandle {
+    /// This shard's index in the grouped layout.
+    fn shard_index(&self) -> i32 {
+        self.handle.shard_index as i32
+    }
+
+    /// First global output row (inclusive). f64 to avoid i32 overflow.
+    fn global_start(&self) -> Robj {
+        Robj::from(self.handle.global_start as f64)
+    }
+
+    /// One past the last global output row (exclusive). f64.
+    fn global_stop(&self) -> Robj {
+        Robj::from(self.handle.global_stop as f64)
+    }
+
+    /// Labels present in this shard (character vector).
+    fn labels(&self) -> Vec<String> {
+        self.handle
+            .groups
+            .iter()
+            .map(|(l, _, _)| l.clone())
+            .collect()
+    }
+
+    /// Per-label shard-local `[start, stop)` ranges as a data.frame
+    /// (`label`, `start`, `stop`). Returns `Robj` + `throw_on_err`.
+    fn groups(&self) -> Robj {
+        crate::util::throw_on_err(self.groups_impl())
+    }
+
+    /// Read just the cells of `label` within this shard as an `RQueryResult`.
+    /// Unknown label → clean R `stop()`.
+    fn read_group(&self, label: &str) -> Robj {
+        crate::util::throw_on_err(self.read_group_impl(label))
+    }
+
+    /// Read this shard's full row range as an `RQueryResult`.
+    fn to_query_result(&self) -> Robj {
+        crate::util::throw_on_err(self.to_query_result_impl())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sub-module registration for extendr
 // ---------------------------------------------------------------------------
 
@@ -290,4 +416,5 @@ extendr_module! {
     mod query;
     impl RQueryPipeline;
     impl RQueryResult;
+    impl RGroupShardHandle;
 }

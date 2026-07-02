@@ -1326,6 +1326,23 @@ fn finalize_append(
         .filter(|e| e.section_type == SectionType::CscShard)
         .count();
     let had_csc = n_dropped_csc > 0;
+
+    // Append also drops the F1 grouped-sharding sidecar: its `group_index`
+    // records hold GLOBAL output-row ranges over the pre-append row universe,
+    // which the appended rows invalidate. Dropping it (so grouped reads cleanly
+    // report `NotGrouped`) is safer than leaving stale ranges. Re-run
+    // `scx sort --group-by` to regroup.
+    let had_group_index = prep
+        .old_catalog
+        .entries
+        .iter()
+        .any(|e| e.section_type == SectionType::GroupIndex);
+    if had_group_index {
+        log::warn!(
+            "scx append dropped the grouped-sharding sidecar (group_index): its row ranges \
+             are stale after append; re-run `scx sort --group-by` to regroup"
+        );
+    }
     let n_new_csr_shards =
         u32::try_from(new_shard_entries.len()).map_err(|_| OpsError::ShapeMismatch {
             detail: format!(
@@ -1359,7 +1376,8 @@ fn finalize_append(
             // entries.
             let base_filter = e.section_type != SectionType::ObsMetadata
                 && e.section_type != SectionType::Provenance
-                && e.section_type != SectionType::CscShard;
+                && e.section_type != SectionType::CscShard
+                && e.section_type != SectionType::GroupIndex;
             if !drop_old_predicate_indexes {
                 return base_filter;
             }

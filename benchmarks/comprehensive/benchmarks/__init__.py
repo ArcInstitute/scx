@@ -43,6 +43,9 @@ ALL_BENCHMARKS: list[str] = [
     "cell_eval_parity_perf",
     # SCX-only fragment / manifest operations
     "fragment_ops",
+    # SCX-only grouped sharding: sort --group-by + convert-time grouping
+    # (gated on scx_auto + a GROUP_SPEC dataset entry inside the module).
+    "grouped_sort",
     # IndexPlanDataset throughput (plan-driven paired reads).
     # SCX-only (gated on scx_auto inside the module).
     "index_plan",

@@ -91,6 +91,10 @@ pub struct QueryPipeline {
     log1p: bool,
     limit: Option<usize>,
     deletion_vectors: Option<DeletionVectors>,
+    /// Lazily-parsed `group_index` sidecar (F2 grouped reads). Parsed at most
+    /// once per pipeline by [`require_grouped`](Self::require_grouped); shared
+    /// by all grouped-read calls on this pipeline.
+    group_index: std::sync::OnceLock<crate::group::GroupIndex>,
 }
 
 impl std::fmt::Debug for QueryPipeline {
@@ -143,6 +147,7 @@ impl QueryPipeline {
             log1p: false,
             limit: None,
             deletion_vectors,
+            group_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -223,6 +228,247 @@ impl QueryPipeline {
     /// the first match).
     pub fn exists(&self) -> Result<bool> {
         crate::collect::exists(self)
+    }
+
+    // -- F2: grouped reads (over the `group_index` sidecar) -----------------
+
+    /// Load the group index, or `Err(EngineError::NotGrouped)` if the archive
+    /// was not written with `--group-by`.
+    ///
+    /// The sidecar is parsed at most once per pipeline and cached; repeated
+    /// grouped reads share the same `GroupIndex`.
+    pub fn require_grouped(&self) -> Result<&crate::group::GroupIndex> {
+        if let Some(gi) = self.group_index.get() {
+            return Ok(gi);
+        }
+        let gi = crate::group::GroupIndex::open(self.reader.as_ref())?;
+        // Idempotent on a race: a concurrent caller may have set it first; the
+        // value is identical either way, so discard our copy on a lost race.
+        let _ = self.group_index.set(gi);
+        Ok(self.group_index.get().expect("group_index populated above"))
+    }
+
+    /// Read exactly the rows of `label` in the `group_by` column (Route B —
+    /// direct global row-range slice). Grouped archive only.
+    ///
+    /// `Err(EngineError::UnknownGroupLabel { suggestions })` on a miss, carrying
+    /// `strsim` close matches (difflib-equivalent).
+    pub fn read_group(&self, label: &str) -> Result<QueryResult> {
+        let gi = self.require_grouped()?;
+        match gi.record(label) {
+            Some(rec) => self.read_row_range(rec.row_start, rec.row_stop),
+            None => Err(crate::error::EngineError::UnknownGroupLabel {
+                label: label.to_string(),
+                suggestions: gi.close_matches(label, 5),
+            }),
+        }
+    }
+
+    /// Read the full reference region (the contiguous leading range spanning
+    /// every reference record). `Ok(None)` if the archive has no reference
+    /// rows. A reference set spanning several leading shards is fully returned.
+    pub fn read_reference(&self) -> Result<Option<QueryResult>> {
+        let gi = self.require_grouped()?;
+        match gi.reference_range() {
+            Some((start, stop)) => Ok(Some(self.read_row_range(start, stop)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Distinct group labels present (for discovery / error messages).
+    pub fn group_labels(&self) -> Result<Vec<String>> {
+        Ok(self.require_grouped()?.labels())
+    }
+
+    /// One handle per non-reference shard (global range + label→local-slice
+    /// map). The caller streams each shard via [`Self::read_row_range`] over the
+    /// handle's `[global_start, global_stop)`, keeping ~one shard resident.
+    pub fn iter_group_shards(&self) -> Result<Vec<crate::group::GroupShardHandle>> {
+        Ok(self.require_grouped()?.shard_handles())
+    }
+
+    /// Read a contiguous global output-row range `[start, stop)` as a
+    /// `QueryResult` (the Route B seam). Decodes only the CSR shards covering
+    /// the range; `skipped_shards` reflects the pruning. obs is sliced to the
+    /// range and var passed through, so `.to_anndata()` matches every other read
+    /// path.
+    ///
+    /// Deletion vectors are honored: if the archive gained a deletion vector
+    /// after the grouped sort (e.g. a later `mark_deleted`), rows marked deleted
+    /// in `[start, stop)` are dropped from both `X` and `obs`, preserving
+    /// equivalence with `query().collect().to_anndata()`.
+    ///
+    /// **Raw read.** This method (and the grouped `read_group` / `read_reference`
+    /// / `iter_group_shards` built on it) ignores the pipeline *builder* state —
+    /// `filter_obs` / `filter_var` predicates, `select_genes`, `with_normalize`,
+    /// `with_log1p`, and `limit` are NOT applied. It returns the raw cells of the
+    /// range (minus deletions). The pyscx grouped-read methods are structurally
+    /// safe (each opens a fresh pipeline with no builder state); Rust callers who
+    /// need projection/transforms must post-process or use `collect()`.
+    ///
+    /// On a row-sharded file (atlas scale) obs metadata is read shard-scoped —
+    /// only the `ObsMetadataShard`s overlapping `[start, stop)` are decoded, so
+    /// peak obs memory is bounded by the touched shards, not the whole table.
+    /// Legacy single-section obs (and pre-stats files) fall back to a full read
+    /// + slice.
+    pub fn read_row_range(&self, start: u64, stop: u64) -> Result<QueryResult> {
+        use scx_format_io::catalog::FullCatalogEntry;
+
+        let n_obs = self.reader.header().n_obs;
+        let stop = stop.max(start);
+        if stop > n_obs {
+            return Err(crate::error::EngineError::Generic(format!(
+                "read_row_range: stop {stop} exceeds n_obs {n_obs}"
+            )));
+        }
+        let range_len = (stop - start) as usize;
+        let n_vars = self.reader.header().n_vars as usize;
+
+        // Global keep-mask for deletion vectors (None when the archive is clean,
+        // which is the case for a freshly written grouped output).
+        let keep_mask: Option<Vec<bool>> = self
+            .deletion_vectors
+            .as_ref()
+            .map(|dv| dv.build_keep_mask(n_obs as usize, self.reader.catalog()));
+
+        let csr_shards: Vec<&FullCatalogEntry> = self.reader.catalog().shards_sorted();
+        let total_shards = csr_shards.len();
+
+        let mut merged_indptr: Vec<i64> = vec![0];
+        let mut merged_indices: Vec<i32> = Vec::new();
+        let mut merged_data: Vec<f32> = Vec::new();
+        let mut candidate_shard_rows = 0usize;
+        let mut touched = 0usize;
+        let mut covered = 0u64; // rows of [start, stop) actually decoded
+        let mut kept = 0usize; // rows surviving the deletion filter
+                               // Per-range keep flags, in ascending global-row order (aligned with the
+                               // obs slice). Empty when there are no deletion vectors.
+        let mut keep_local: Vec<bool> = Vec::new();
+
+        for e in &csr_shards {
+            let Some(stats) = e.stats.as_ref() else {
+                continue;
+            };
+            let (rs, re) = (stats.row_start, stats.row_end);
+            if re <= start || rs >= stop {
+                continue; // no overlap
+            }
+            touched += 1;
+            candidate_shard_rows += (re - rs) as usize;
+            let (indptr, indices, data) = self.reader.read_shard_from_entry(e)?;
+            let lo = start.max(rs);
+            let hi = stop.min(re);
+            for g in lo..hi {
+                covered += 1;
+                let keep = keep_mask.as_ref().map(|m| m[g as usize]).unwrap_or(true);
+                if keep_mask.is_some() {
+                    keep_local.push(keep);
+                }
+                if !keep {
+                    continue;
+                }
+                let l = (g - rs) as usize;
+                let s = indptr[l] as usize;
+                let en = indptr[l + 1] as usize;
+                merged_indices.extend_from_slice(&indices[s..en]);
+                merged_data.extend_from_slice(&data[s..en]);
+                let prev = *merged_indptr.last().unwrap();
+                merged_indptr.push(prev + (en - s) as i64);
+                kept += 1;
+            }
+        }
+
+        // Coverage guard: every row in [start, stop) must be backed by a shard
+        // (no gap, no double-count). Protects the `new_unchecked` below from a
+        // silently-corrupt CSR on a bad/out-of-cover range.
+        if covered != stop - start {
+            return Err(crate::error::EngineError::Generic(format!(
+                "read_row_range: range [{start}, {stop}) is not fully covered by CSR shards \
+                 (covered {covered} of {range_len} rows)"
+            )));
+        }
+
+        let x = ScxCsr::new_unchecked((kept, n_vars), merged_indptr, merged_indices, merged_data);
+
+        // obs: the kept global rows of [start, stop), ascending. With no
+        // deletion vector that's the whole contiguous range; otherwise only the
+        // rows the keep-mask retained.
+        let matching_global_rows: Vec<u32> = if keep_mask.is_some() {
+            keep_local
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| {
+                    if k {
+                        Some(start as u32 + i as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            (start..stop).map(|g| g as u32).collect()
+        };
+
+        // Prefer reading only the obs shards overlapping [start, stop) on a
+        // row-sharded file. Fall back to a full read + slice for legacy
+        // single-section obs (or pre-stats shards that lack row ranges).
+        let obs = if self.reader.obs_metadata_shard_count() > 0 {
+            match crate::collect::obs_shard_ranges_from_catalog(self.reader.catalog()) {
+                Some(ranges) if !ranges.is_empty() => crate::collect::materialize_filtered_obs(
+                    self.reader.as_ref(),
+                    &ranges,
+                    &matching_global_rows,
+                )?,
+                _ => {
+                    self.read_obs_range_full(start, range_len, &keep_local, keep_mask.is_some())?
+                }
+            }
+        } else {
+            self.read_obs_range_full(start, range_len, &keep_local, keep_mask.is_some())?
+        };
+        let var = self.reader.read_var()?;
+
+        Ok(QueryResult {
+            x,
+            obs,
+            var,
+            skipped_shards: total_shards.saturating_sub(touched),
+            total_shards,
+            candidate_shard_rows,
+            matched_rows: kept,
+        })
+    }
+
+    /// Legacy obs path for `read_row_range`: read the full obs table, slice the
+    /// `[start, start+range_len)` window, then (if the archive has deletions)
+    /// keep only the rows flagged in `keep_local`. Used for single-section obs
+    /// and pre-stats sharded files where shard-scoped reads aren't available.
+    fn read_obs_range_full(
+        &self,
+        start: u64,
+        range_len: usize,
+        keep_local: &[bool],
+        has_deletions: bool,
+    ) -> Result<arrow::array::RecordBatch> {
+        use arrow::array::{RecordBatch, UInt32Array};
+        let obs_full = self.reader.read_obs()?;
+        let obs_range = obs_full.slice(start as usize, range_len);
+        if has_deletions {
+            let idx: Vec<u32> = keep_local
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| if k { Some(i as u32) } else { None })
+                .collect();
+            let take = UInt32Array::from(idx);
+            let cols = obs_range
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c.as_ref(), &take, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(RecordBatch::try_new(obs_range.schema(), cols)?)
+        } else {
+            Ok(obs_range)
+        }
     }
 
     // -- Accessors for testing and collect.rs --

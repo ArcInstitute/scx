@@ -12,6 +12,7 @@ pub mod checksum;
 pub mod codec_select;
 pub mod csc_policy;
 pub mod error;
+pub mod group_index;
 pub mod header;
 pub mod modality;
 pub mod obs_shard_policy;
@@ -43,6 +44,7 @@ pub use csc_policy::{
     AUTO_CSC_VARS_THRESHOLD,
 };
 pub use error::{validate_allocation, Result, ScxError, ScxErrorClass};
+pub use group_index::{GroupIndexPayload, GroupRecordWire};
 pub use header::{
     rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
 };

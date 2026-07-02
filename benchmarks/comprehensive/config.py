@@ -524,6 +524,27 @@ DATASETS: dict[str, DatasetConfig] = {
         synth_params={"n_obs": 45_000, "n_vars": 18_000, "n_perts": 250,
                       "n_donors": 3, "density": 0.3, "seed": 42},
     ),
+    # Real Perturb-seq fixtures for the grouped-sharding benchmark
+    # (grouped_sort). Copied from the read-only loader tree by
+    # benchmarks/comprehensive/scripts/prep_grouped_fixtures.py. Each carries a
+    # categorical grouping column (see grouped_sort.GROUP_SPEC): `replogle_k562`
+    # is dense X grouped by `gene` with a `non-targeting` reference (exercises
+    # the dense → two-pass auto route + reference isolation); `tahoe_c38` is CSR
+    # X grouped by `drug` (exercises the CSR one-pass route).
+    "replogle_k562": DatasetConfig(
+        id="GS1", name="replogle_k562",
+        n_obs=68_729, n_vars=6_546,
+        protocol="Perturb-seq (CRISPRi, K562)",
+        source="Replogle2022 — k562_n600.h5ad (dense X, gene + non-targeting)",
+        approx_h5ad_mb=3_600, available=True,
+    ),
+    "tahoe_c38": DatasetConfig(
+        id="GS2", name="tahoe_c38",
+        n_obs=69_245, n_vars=62_710,
+        protocol="Tahoe-100M drug screen slice",
+        source="tahoe-100m — c38-n10.h5ad (CSR X, drug)",
+        approx_h5ad_mb=2_200, available=True,
+    ),
     # Phase K — multimodal datasets sourced from 10x Genomics public
     # CITE-seq + Multiome libraries. Staged via
     # benchmarks/scripts/download_citeseq_pbmc.py and
@@ -1145,6 +1166,11 @@ def estimate_time_minutes(
         "parallel_write_scaling": 40,
         "memory":                 15,
         "fragment_ops":           15,
+        # Grouped sharding runs sort + a forced one-pass + two-pass convert.
+        # The dense one-pass grouped gather (random full-width row reads) is the
+        # slow scenario — minutes on a real Perturb-seq file even at the
+        # in-module _MAX_CONVERT_RUNS=2 cap — so the base is generous.
+        "grouped_sort":           40,
         "cloud_push":             20,
         "cloud_pull":             20,
         "cloud_read":             20,

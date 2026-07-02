@@ -194,6 +194,38 @@ enum Commands {
         /// Descending order for `--sort-by`.
         #[arg(long)]
         sort_reverse: bool,
+        /// Convert-time grouping: cluster cells by this obs column
+        /// into contiguous, never-split CSR shards (reference-first), writing a
+        /// grouped layout directly — byte-equivalent to convert-then-`scx sort
+        /// --group-by`, but a single write. Requires a CSR or dense h5ad X
+        /// (CSC errors) and a single-modality input. `--sort-by`, if also set,
+        /// supplies secondary keys after the group key. Read back with
+        /// `pyscx.open(...).read_group(...)`.
+        #[arg(long, value_name = "COLUMN")]
+        group_by: Option<String>,
+        /// Reference cells for `--group-by` (e.g. non-targeting controls):
+        /// packed first and isolated in shard 0. Either a comma-separated list
+        /// of `--group-by` labels, or `column:NAME` to use a boolean obs column.
+        /// Requires `--group-by`.
+        #[arg(long, value_name = "SPEC")]
+        reference: Option<String>,
+        /// Byte-budget grouped sharding for `--group-by`: target shard size in
+        /// bytes (group edges only) instead of `--shard-size` rows. Same size
+        /// syntax as `--memory-budget`. CSR inputs only — dense/CSC fall back to
+        /// row-count with a warning.
+        #[arg(long, value_name = "SIZE")]
+        group_target_bytes: Option<String>,
+        /// Oversize threshold for `--group-target-bytes`: a single group above
+        /// this becomes its own shard with a warning. Same size syntax as
+        /// `--memory-budget`. Defaults to 4× `--group-target-bytes`.
+        #[arg(long, value_name = "SIZE")]
+        group_max_bytes: Option<String>,
+        /// How to realize `--group-by`. `auto` (default) routes by source
+        /// density: CSR → one-pass streaming (cheaper); dense → two-pass
+        /// (plain convert + `scx sort`, ~4–5× faster than the one-pass
+        /// random-row gather over a dense matrix). `one` / `two` force it.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "one", "two"])]
+        group_pass: String,
     },
     /// Display SCX file information
     Info {
@@ -368,10 +400,11 @@ enum Commands {
         /// Output SCX file path
         output: PathBuf,
         /// Comma-separated obs columns to sort by, lexicographic in order
-        /// (the leading key gets the full X-read-locality benefit).
+        /// (the leading key gets the full X-read-locality benefit). Optional
+        /// when `--group-by` is given (which becomes the leading key).
         #[arg(long, value_name = "CSV")]
-        by: String,
-        /// Sort descending on all keys
+        by: Option<String>,
+        /// Sort descending on all keys (ignored with `--group-by`).
         #[arg(long)]
         reverse: bool,
         /// Overwrite output if it exists
@@ -419,6 +452,27 @@ enum Commands {
         /// Transpose memory budget for the `--rebuild-csc` pass (default 4G).
         #[arg(long, default_value = "4G")]
         csc_memory_limit: String,
+        /// F1: obs column whose label clusters rows into shards (condition /
+        /// perturbation grouping). Forced to be the leading sort key; engages
+        /// the byte-budget group planner and writes a `group_index` sidecar.
+        /// `--reverse` is ignored when set. Restricted to single-modality
+        /// inputs in v1.
+        #[arg(long, value_name = "COL")]
+        group_by: Option<String>,
+        /// F1: which rows are reference cells (e.g. "non-targeting"), packed
+        /// first / isolated in shard 0. A comma-separated label list, or
+        /// `col:<name>` for a boolean obs column. Requires `--group-by`.
+        #[arg(long, value_name = "LABELS|col:NAME")]
+        reference: Option<String>,
+        /// F1: byte budget per shard for the group bin-packer (binary suffix
+        /// `K`/`M`/`G`/`T`). Without it the planner packs by `--shard-size`
+        /// rows. Only with `--group-by`.
+        #[arg(long, value_name = "SIZE")]
+        group_target_bytes: Option<String>,
+        /// F1: oversize threshold — a single group exceeding it gets its own
+        /// shard plus a warning. Defaults to a multiple of the target.
+        #[arg(long, value_name = "SIZE")]
+        group_max_bytes: Option<String>,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -835,6 +889,11 @@ fn main() {
             writer_queue_depth,
             sort_by,
             sort_reverse,
+            group_by,
+            reference,
+            group_target_bytes,
+            group_max_bytes,
+            group_pass,
         } => {
             // Resolve the CSC policy: an explicit `--csc` always wins;
             // otherwise an accel-ready `--index-preset` upgrades the
@@ -868,6 +927,11 @@ fn main() {
                 writer_queue_depth,
                 sort_by.as_deref(),
                 sort_reverse,
+                group_by.as_deref(),
+                reference.as_deref(),
+                group_target_bytes.as_deref(),
+                group_max_bytes.as_deref(),
+                &group_pass,
             )
         }
         Commands::Info {
@@ -971,10 +1035,14 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             csc_memory_limit,
+            group_by,
+            reference,
+            group_target_bytes,
+            group_max_bytes,
         } => sort::run_sort(
             &input,
             &output,
-            parse_index_columns(Some(&by)),
+            parse_index_columns(by.as_deref()),
             reverse,
             force,
             shard_size,
@@ -989,6 +1057,10 @@ fn main() {
             rebuild_csc,
             csc_cols_per_shard,
             &csc_memory_limit,
+            group_by,
+            reference,
+            group_target_bytes,
+            group_max_bytes,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),
@@ -1211,9 +1283,17 @@ fn run_convert(
     writer_queue_depth: usize,
     sort_by: Option<&str>,
     sort_reverse: bool,
+    group_by: Option<&str>,
+    reference: Option<&str>,
+    group_target_bytes: Option<&str>,
+    group_max_bytes: Option<&str>,
+    group_pass: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let direction = convert::determine_convert_direction(from, to, input)?;
     let sort_by_list = parse_index_columns(sort_by);
+    let group_by_value = group_by
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
 
     // CSC mode is meaningful only on input → SCX paths. Reject silently
     // for output paths (h5ad / mtx) where the destination has no CSC
@@ -1283,7 +1363,17 @@ fn run_convert(
         )
         .into());
     }
-    let stream = stream || !sort_by_list.is_empty();
+    // Convert-time grouping (Phase 7.4): h5ad → scx only, streaming path.
+    if reference.is_some() && group_by_value.is_none() {
+        return Err("--reference requires --group-by".into());
+    }
+    if group_by_value.is_some() && direction != "h5ad_to_scx" {
+        return Err(format!(
+            "--group-by is only supported for h5ad → scx; got direction '{direction}'."
+        )
+        .into());
+    }
+    let stream = stream || !sort_by_list.is_empty() || group_by_value.is_some();
 
     // MTX conversions are always available (no hdf5 feature needed)
     match direction {
@@ -1317,6 +1407,50 @@ fn run_convert(
         let _ = memory_budget;
         None
     };
+
+    // Phase 7.4 grouped-convert byte budgets — parsed with the same size syntax
+    // as `--memory-budget` so an invalid value fails before any file I/O.
+    #[cfg(feature = "hdf5")]
+    let (group_target_bytes_val, group_max_bytes_val): (Option<u64>, Option<u64>) = (
+        match group_target_bytes {
+            None => None,
+            Some(s) => Some(convert::MemoryBudget::parse(s)?),
+        },
+        match group_max_bytes {
+            None => None,
+            Some(s) => Some(convert::MemoryBudget::parse(s)?),
+        },
+    );
+    #[cfg(not(feature = "hdf5"))]
+    let (group_target_bytes_val, group_max_bytes_val): (Option<u64>, Option<u64>) = {
+        let _ = (group_target_bytes, group_max_bytes);
+        (None, None)
+    };
+    // `column:NAME` (or `col:NAME`) → boolean reference column; otherwise a CSV
+    // label set. A non-empty value that fails to parse is a user error, not a
+    // silent "no reference".
+    let reference_spec: Option<scx_ops::ReferenceSpec> = match reference {
+        Some(s) if !s.trim().is_empty() => {
+            let spec = parse_reference_spec_cli(s);
+            if spec.is_none() {
+                return Err(format!(
+                    "--reference value {s:?} is not a valid label set or \
+                    `column:NAME` reference column"
+                )
+                .into());
+            }
+            spec
+        }
+        _ => None,
+    };
+    let group_pass_val = convert::GroupPass::parse(group_pass)?;
+    if group_by_value.is_none()
+        && (group_target_bytes_val.is_some() || group_max_bytes_val.is_some())
+    {
+        log::warn!(
+            "scx convert: --group-target-bytes / --group-max-bytes are ignored without --group-by"
+        );
+    }
 
     // Parse Phase 3 h5mu filters / type overrides. The empty-string
     // case is treated as no filter; non-empty strings are split on
@@ -1363,7 +1497,37 @@ fn run_convert(
         writer_queue_depth,
         sort_by_list,
         sort_reverse,
+        group_by_value,
+        reference_spec,
+        group_target_bytes_val,
+        group_max_bytes_val,
+        group_pass_val,
     )
+}
+
+/// Parse the `--reference` CLI value into a [`scx_ops::ReferenceSpec`].
+/// `column:NAME` (or the `col:NAME` alias) selects a boolean obs column;
+/// anything else is a comma-separated set of `--group-by` labels. Returns
+/// `None` for an empty / whitespace-only value. Shared by `scx sort` and
+/// `scx convert` so the flag parses identically on both subcommands.
+pub(crate) fn parse_reference_spec_cli(s: &str) -> Option<scx_ops::ReferenceSpec> {
+    if let Some(col) = s.strip_prefix("column:").or_else(|| s.strip_prefix("col:")) {
+        let col = col.trim();
+        if col.is_empty() {
+            return None;
+        }
+        return Some(scx_ops::ReferenceSpec::Column(col.to_string()));
+    }
+    let labels: Vec<String> = s
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if labels.is_empty() {
+        None
+    } else {
+        Some(scx_ops::ReferenceSpec::Labels(labels))
+    }
 }
 
 /// Parse a comma-separated CLI argument into a `Vec<String>`. Whitespace
@@ -1440,6 +1604,11 @@ fn dispatch_convert(
     writer_queue_depth: usize,
     sort_by: Vec<String>,
     sort_reverse: bool,
+    group_by: Option<String>,
+    reference: Option<scx_ops::ReferenceSpec>,
+    group_target_bytes: Option<u64>,
+    group_max_bytes: Option<u64>,
+    group_pass: convert::GroupPass,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use convert::{BitmapPolicy, ConvertError, ConvertOptions};
     use indicatif::{ProgressBar, ProgressStyle};
@@ -1470,6 +1639,11 @@ fn dispatch_convert(
         writer_queue_depth,
         sort_by,
         sort_reverse,
+        group_by,
+        reference,
+        group_target_bytes,
+        group_max_bytes,
+        group_pass,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1599,6 +1773,11 @@ fn dispatch_convert(
     _writer_queue_depth: usize,
     _sort_by: Vec<String>,
     _sort_reverse: bool,
+    _group_by: Option<String>,
+    _reference: Option<scx_ops::ReferenceSpec>,
+    _group_target_bytes: Option<u64>,
+    _group_max_bytes: Option<u64>,
+    _group_pass: convert::GroupPass,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(
         "h5ad/h5mu/10x conversion requires the 'hdf5' feature. Rebuild with: cargo build -p scx-cli --features hdf5\n\

@@ -71,6 +71,35 @@ pub use warnings::{ConvertWarning, WarningSink};
 // hdf5-gated `pipeline` module.
 pub use scx_format_io::CscPolicy;
 
+/// Strategy for realizing convert-time grouping (`--group-pass`). See
+/// [`pipeline::ConvertOptions::group_pass`]. Defined at the crate root (not in
+/// the hdf5-gated `pipeline` module) because the CLI's non-hdf5 build path
+/// parses and threads it before dispatch, like [`CscPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupPass {
+    /// Route by source density: CSR → one-pass streaming, dense → two-pass.
+    #[default]
+    Auto,
+    /// Always stream the grouped layout in one pass (the random-row gather).
+    One,
+    /// Always plain-convert then `scx sort --group-by` (two writes).
+    Two,
+}
+
+impl GroupPass {
+    /// Parse the CLI / kwarg string. Unknown values error.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(GroupPass::Auto),
+            "one" | "1" | "one-pass" => Ok(GroupPass::One),
+            "two" | "2" | "two-pass" => Ok(GroupPass::Two),
+            other => Err(format!(
+                "invalid group-pass '{other}'; expected auto, one, or two"
+            )),
+        }
+    }
+}
+
 #[cfg(feature = "hdf5")]
 pub mod pipeline;
 
@@ -99,6 +128,8 @@ pub use scx_mtx::MtxOrientation;
 mod convert_tests_common;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_dataframe;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_group;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_h5ad;
 #[cfg(all(test, feature = "hdf5"))]

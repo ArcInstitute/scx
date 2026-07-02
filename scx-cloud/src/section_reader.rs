@@ -117,6 +117,12 @@ impl SectionReader for CloudSectionReader {
             .map_err(cloud_to_engine)
     }
 
+    fn read_group_index_bytes(&self) -> scx_engine::Result<Option<Vec<u8>>> {
+        self.rt
+            .block_on(self.inner.read_group_index_bytes())
+            .map_err(cloud_to_engine)
+    }
+
     fn read_deletion_vectors(&self) -> scx_engine::Result<Option<DeletionVectors>> {
         self.rt
             .block_on(self.inner.read_deletion_vectors())

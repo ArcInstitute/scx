@@ -31,6 +31,16 @@ ScxExperiment$new <- function(path) {
     .Call(wrap__ScxExperiment__modality_names, self$.ptr)
   self$to_seurat <- function() .Call(wrap__ScxExperiment__to_seurat, self$.ptr)
   self$to_mae <- function() .Call(wrap__ScxExperiment__to_mae, self$.ptr)
+  # F2 grouped reads (7.2c).
+  self$read_group <- function(label)
+    RQueryResult$.wrap(.Call(wrap__ScxExperiment__read_group, self$.ptr, label))
+  self$read_reference <- function() {
+    ptr <- .Call(wrap__ScxExperiment__read_reference, self$.ptr)
+    if (is.null(ptr)) NULL else RQueryResult$.wrap(ptr)
+  }
+  self$group_labels <- function() .Call(wrap__ScxExperiment__group_labels, self$.ptr)
+  self$iter_group_shards <- function()
+    lapply(.Call(wrap__ScxExperiment__iter_group_shards, self$.ptr), RGroupShardHandle$.wrap)
   # Backed (lazy) X access — see R/backed.R for the [ / dim / print methods.
   self$x_backed <- function(cache_shards = 128) {
     ScxBackedSparse$.wrap(
@@ -137,6 +147,26 @@ RQueryResult$.wrap <- function(ptr) {
   self
 }
 class(RQueryResult) <- "RQueryResult__class"
+
+# ── RGroupShardHandle class (F2 grouped reads) ──────────────────
+#' @export
+RGroupShardHandle <- new.env(parent = emptyenv())
+RGroupShardHandle$.wrap <- function(ptr) {
+  self <- new.env(parent = emptyenv())
+  self$.ptr <- ptr
+  self$shard_index <- function() .Call(wrap__RGroupShardHandle__shard_index, self$.ptr)
+  self$global_start <- function() .Call(wrap__RGroupShardHandle__global_start, self$.ptr)
+  self$global_stop <- function() .Call(wrap__RGroupShardHandle__global_stop, self$.ptr)
+  self$labels <- function() .Call(wrap__RGroupShardHandle__labels, self$.ptr)
+  self$groups <- function() .Call(wrap__RGroupShardHandle__groups, self$.ptr)
+  self$read_group <- function(label)
+    RQueryResult$.wrap(.Call(wrap__RGroupShardHandle__read_group, self$.ptr, label))
+  self$to_query_result <- function()
+    RQueryResult$.wrap(.Call(wrap__RGroupShardHandle__to_query_result, self$.ptr))
+  class(self) <- "RGroupShardHandle"
+  self
+}
+class(RGroupShardHandle) <- "RGroupShardHandle__class"
 
 # ── Harmony batch integration ──────────────────────────────────
 # Free function wrapper; documentation lives in R/harmony.R.

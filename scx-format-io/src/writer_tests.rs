@@ -2711,3 +2711,109 @@ fn validate_detects_root_catalog_corruption() {
         "root-catalog corruption must be caught by verify_file_checksum"
     );
 }
+
+/// F1 oversized-group fix: a CSR shard with more than `MAX_BLOCK_ROWS`
+/// (65,535) rows must write (splitting into multiple blocks) and read back
+/// byte-identically. Before the fix the writer emitted a single block and
+/// `BlockIndexEntry::new` failed with `BlockRowsOverflow`. This mirrors a
+/// grouped shard holding one large group (the never-split-a-group invariant
+/// disables the per-shard row cap).
+#[test]
+fn csr_shard_over_u16_rows_round_trips_as_multiple_blocks() {
+    use crate::shard::{BlockIndex, ShardHeader, MAX_BLOCK_ROWS, SHARD_HEADER_SIZE};
+    use std::io::Cursor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized_csr.scx");
+
+    let n_rows: usize = 70_000; // > 65_535 → must split into 2 blocks
+    let n_cols: u32 = 10;
+    let mut header = FileHeader::new_single_modality(
+        n_rows as u64,
+        n_cols as u64,
+        n_rows as u64, // nnz: one per row
+        crate::DEFAULT_SHARD_TARGET_ROWS,
+        0,
+        0,
+    );
+    header.codec_id = CodecId::None as u8;
+    header.index_dtype = 0;
+
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    // Minimal obs/var (row/col labels are irrelevant to the block-index path).
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            (0..n_rows).map(|i| format!("c{i}")).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            (0..n_cols).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var).unwrap();
+
+    // One nonzero per row at column (row % n_cols), value 1.
+    let indptr: Vec<u64> = (0..=n_rows as u64).collect();
+    let indices: Vec<u32> = (0..n_rows).map(|r| (r as u32) % n_cols).collect();
+    let values: Vec<u8> = vec![1u8; n_rows];
+
+    // Must NOT error (pre-fix: BlockRowsOverflow at write time).
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&final_path).unwrap();
+    let entry = reader.catalog().shards_sorted()[0];
+
+    // The writer emitted multiple ≤MAX_BLOCK_ROWS blocks.
+    let raw = reader.section_bytes(entry).unwrap();
+    let sh = ShardHeader::read_from(&mut Cursor::new(&raw[..SHARD_HEADER_SIZE])).unwrap();
+    let bi_start = sh.block_index_rel_offset as usize;
+    let bi_end = bi_start + sh.block_index_length as usize;
+    let bi =
+        BlockIndex::read_from(&mut Cursor::new(&raw[bi_start..bi_end]), bi_end - bi_start).unwrap();
+    assert_eq!(
+        bi.entries.len(),
+        2,
+        "70k-row shard must split into 2 blocks"
+    );
+    assert_eq!(bi.entries[0].n_rows, u16::MAX);
+    assert_eq!(
+        bi.entries[1].n_rows as usize,
+        n_rows - MAX_BLOCK_ROWS as usize
+    );
+    assert_eq!(bi.entries[1].row_start, MAX_BLOCK_ROWS);
+
+    // Whole-shard decode round-trips exactly (the read path is block-agnostic).
+    let (rt_indptr, rt_indices, rt_data) = reader.read_shard_from_entry(entry).unwrap();
+    assert_eq!(rt_indptr.len(), n_rows + 1);
+    assert_eq!(*rt_indptr.last().unwrap(), n_rows as i64);
+    assert_eq!(rt_indices.len(), n_rows);
+    assert!(rt_indices
+        .iter()
+        .enumerate()
+        .all(|(r, &c)| c == (r as i32) % n_cols as i32));
+    assert!(rt_data.iter().all(|&v| v == 1.0));
+}

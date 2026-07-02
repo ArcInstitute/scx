@@ -18,9 +18,7 @@ use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
 use crate::section::{align_to_8, SectionType};
-use crate::shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, SHARD_HEADER_SIZE,
-};
+use crate::shard::{derive_shard_type, BlockIndex, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::provenance::{Provenance, ProvenanceEntry};
 
@@ -1065,10 +1063,11 @@ impl ScxWriter {
             index_dtype_u16,
         )?;
 
-        // Build block index (Phase 1: single entry covering entire shard)
-        let block_index = BlockIndex {
-            entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz)?],
-        };
+        // Build block index, splitting into ≤MAX_BLOCK_ROWS-row blocks so an
+        // oversized shard (e.g. a grouped shard holding one large group) does
+        // not overflow the u16 per-block row count. Single block for the common
+        // (≤65535-row) case — byte-identical to the legacy layout.
+        let block_index = BlockIndex::for_shard(n_major, indptr)?;
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;
 
@@ -2474,6 +2473,15 @@ impl ScxWriter {
             data,
             None,
         )
+    }
+
+    /// F1: write the condition/label-grouped sharding sidecar
+    /// ([`SectionType::GroupIndex`], section name `group_index`). `data` is the
+    /// pre-serialized JSON payload
+    /// `{group_by, reference_shard, reference_labels, records[]}`. One per file;
+    /// written after the last CSR shard flush by the grouped sort path.
+    pub fn write_group_index(&mut self, data: &[u8]) -> Result<()> {
+        self.write_section_bytes("group_index", SectionType::GroupIndex, data, None)
     }
 
     /// Phase 5b: write a detection-bitmap shard.

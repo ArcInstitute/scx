@@ -1021,6 +1021,74 @@ def fragment_ops_table(datasets: list[str] | None = None) -> TableBlock | TextBl
                       caption="Fragment operation throughput")
 
 
+def grouped_sharding_table(datasets: list[str] | None = None) -> TableBlock | TextBlock:
+    """Grouped sharding (``scx sort --group-by`` / ``scx convert --group-by``).
+
+    Metric × dataset. Shows the convert-time grouping one-pass-vs-two-pass
+    wall/RSS (the density auto-routing story), the grouped-sort wall, group
+    count, source matrix format, and the read-back correctness flag. SCX-only.
+    """
+    if datasets is None:
+        datasets = ["pert_synth_10k", "nb_glm_synth", "replogle_k562", "tahoe_c38"]
+    results = load_all_results(benchmark="grouped_sort")
+    if not results:
+        return TextBlock("*No grouped-sharding results available yet.*")
+
+    by_ds = {r.get("dataset", ""): r for r in results if r.get("dataset", "") in datasets}
+    present = [d for d in datasets if d in by_ds]
+    if not present:
+        return TextBlock("*No grouped-sharding results for the selected datasets.*")
+
+    def _scn(r: dict, scenario: str, key: str) -> float | None:
+        meds = r.get("metadata", {}).get("per_scenario_medians", {}) or {}
+        return meds.get(scenario, {}).get(key)
+
+    def _correct(r: dict) -> str:
+        for run in r.get("runs", []):
+            ex = run.get("extra", {})
+            if ex.get("scenario") == "correctness":
+                ok = ex.get("correctness_passed_int", 0) == 1
+                ref = ex.get("reference_isolated_int", 1) == 1
+                return "✓" if (ok and ref) else "✗"
+        return "—"
+
+    headers = ["Metric"] + [SHORT_NAMES.get(d, d) for d in present]
+
+    def _row(label: str, fn) -> list[str]:
+        return [label] + [fn(by_ds[d]) for d in present]
+
+    def _wall_rss(scenario: str):
+        def f(r: dict) -> str:
+            w = _scn(r, scenario, "wall_s_median")
+            rss = _scn(r, scenario, "peak_rss_mb_median")
+            if w is None:
+                return "—"
+            return f"{_fmt_time(w)} ({rss:,.0f} MB)" if rss else _fmt_time(w)
+
+        return f
+
+    def _groups(r: dict) -> str:
+        n = r.get("metadata", {}).get("n_groups")
+        return f"{n:,}" if isinstance(n, int) else "—"
+
+    rows = [
+        _row(
+            "source X format",
+            lambda r: r.get("metadata", {}).get("source_matrix_format", "—"),
+        ),
+        _row("`sort --group-by` wall", _wall_rss("sort_group")),
+        _row("`convert --group-by` one-pass", _wall_rss("convert_one")),
+        _row("`convert --group-by` two-pass", _wall_rss("convert_two")),
+        _row("groups", _groups),
+        _row("read-back correct", _correct),
+    ]
+    return TableBlock(
+        headers=headers,
+        rows=rows,
+        caption="Grouped sharding — convert one-pass vs two-pass + grouped sort",
+    )
+
+
 def cloud_filtered_table(datasets: list[str] | None = None) -> list[Block]:
     """Cloud filtered-query parity table — Format × Query.
 

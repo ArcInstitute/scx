@@ -289,6 +289,12 @@ impl BlockIndexEntry {
     }
 }
 
+/// Maximum rows representable in a single block (`BlockIndexEntry.n_rows` is a
+/// `u16`). A shard with more rows than this (e.g. a grouped shard holding one
+/// large group, where the per-shard row cap is disabled to keep the group
+/// whole) must be split into multiple blocks.
+pub const MAX_BLOCK_ROWS: u32 = u16::MAX as u32;
+
 /// Block index for a shard, enabling random access to blocks of rows.
 #[derive(Debug, Clone)]
 pub struct BlockIndex {
@@ -296,6 +302,35 @@ pub struct BlockIndex {
 }
 
 impl BlockIndex {
+    /// Build the block index for a shard, splitting it into blocks of at most
+    /// [`MAX_BLOCK_ROWS`] rows so an oversized shard does not overflow
+    /// `BlockIndexEntry.n_rows` (`u16`). For `n_major <= MAX_BLOCK_ROWS` this
+    /// returns a single entry byte-identical to the historical single-block
+    /// layout, so existing files are unaffected.
+    ///
+    /// Per-block byte offsets are `0`: the encoded indptr/indices/values are
+    /// whole-shard blobs decoded as a unit (the offset fields are reserved for
+    /// a future per-block seek path and are not consumed by any read path
+    /// today). `indptr` has length `n_major + 1` and supplies each block's nnz.
+    pub fn for_shard(n_major: u32, indptr: &[u64]) -> Result<Self> {
+        let nnz_total = *indptr.last().unwrap_or(&0);
+        if n_major <= MAX_BLOCK_ROWS {
+            return Ok(BlockIndex {
+                entries: vec![BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz_total)?],
+            });
+        }
+        let mut entries = Vec::with_capacity(n_major.div_ceil(MAX_BLOCK_ROWS) as usize);
+        let mut row_start = 0u32;
+        while row_start < n_major {
+            let n_rows = (n_major - row_start).min(MAX_BLOCK_ROWS);
+            let s = indptr[row_start as usize];
+            let e = indptr[(row_start + n_rows) as usize];
+            entries.push(BlockIndexEntry::new(row_start, n_rows, 0, 0, 0, e - s)?);
+            row_start += n_rows;
+        }
+        Ok(BlockIndex { entries })
+    }
+
     /// Write the block index: u32 count followed by entries.
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_u32::<LittleEndian>(self.entries.len() as u32)?;
@@ -475,6 +510,69 @@ mod tests {
 
         assert_eq!(decoded.entries.len(), 3);
         assert_eq!(decoded.entries, index.entries);
+    }
+
+    /// Build a monotone indptr for `n` rows with `per_row` nnz each.
+    fn indptr_uniform(n: u32, per_row: u64) -> Vec<u64> {
+        (0..=n as u64).map(|i| i * per_row).collect()
+    }
+
+    #[test]
+    fn for_shard_small_is_single_entry_identical_to_legacy() {
+        let n_major = 16_384u32;
+        let indptr = indptr_uniform(n_major, 100);
+        let nnz = *indptr.last().unwrap();
+        let bi = BlockIndex::for_shard(n_major, &indptr).unwrap();
+        assert_eq!(bi.entries.len(), 1);
+        // Byte-identical to the historical single-block construction.
+        assert_eq!(
+            bi.entries[0],
+            BlockIndexEntry::new(0, n_major, 0, 0, 0, nnz).unwrap()
+        );
+    }
+
+    #[test]
+    fn for_shard_boundaries_at_max_block_rows() {
+        // Exactly MAX_BLOCK_ROWS fits in one block; one more splits into two.
+        let at = BlockIndex::for_shard(MAX_BLOCK_ROWS, &indptr_uniform(MAX_BLOCK_ROWS, 1)).unwrap();
+        assert_eq!(at.entries.len(), 1);
+        assert_eq!(at.entries[0].n_rows, u16::MAX);
+
+        let over =
+            BlockIndex::for_shard(MAX_BLOCK_ROWS + 1, &indptr_uniform(MAX_BLOCK_ROWS + 1, 1))
+                .unwrap();
+        assert_eq!(over.entries.len(), 2);
+        assert_eq!(over.entries[0].n_rows, u16::MAX);
+        assert_eq!(over.entries[1].n_rows, 1);
+        assert_eq!(over.entries[1].row_start, MAX_BLOCK_ROWS);
+    }
+
+    #[test]
+    fn for_shard_oversized_chunks_with_correct_ranges_and_nnz() {
+        let n_major = 150_000u32; // 65535 + 65535 + 18930
+        let per_row = 3u64;
+        let indptr = indptr_uniform(n_major, per_row);
+        let bi = BlockIndex::for_shard(n_major, &indptr).unwrap();
+        assert_eq!(bi.entries.len(), 3);
+        assert_eq!(
+            bi.entries
+                .iter()
+                .map(|e| e.n_rows as u32)
+                .collect::<Vec<_>>(),
+            vec![65_535, 65_535, 18_930]
+        );
+        // Contiguous, non-overlapping cover of [0, n_major) with per-block nnz
+        // summing to the total.
+        let mut expected_start = 0u32;
+        let mut total_nnz = 0u64;
+        for e in &bi.entries {
+            assert_eq!(e.row_start, expected_start);
+            assert_eq!(e.nnz_in_block as u64, e.n_rows as u64 * per_row);
+            expected_start += e.n_rows as u32;
+            total_nnz += e.nnz_in_block as u64;
+        }
+        assert_eq!(expected_start, n_major);
+        assert_eq!(total_nnz, *indptr.last().unwrap());
     }
 
     #[test]

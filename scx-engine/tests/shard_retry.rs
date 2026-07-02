@@ -246,6 +246,9 @@ impl SectionReader for FaultInjectingReader {
     fn read_var_predicate_index_bytes(&self) -> scx_engine::Result<Option<Vec<u8>>> {
         SectionReader::read_var_predicate_index_bytes(&self.inner)
     }
+    fn read_group_index_bytes(&self) -> scx_engine::Result<Option<Vec<u8>>> {
+        SectionReader::read_group_index_bytes(&self.inner)
+    }
     fn read_deletion_vectors(&self) -> scx_engine::Result<Option<DeletionVectors>> {
         SectionReader::read_deletion_vectors(&self.inner)
     }

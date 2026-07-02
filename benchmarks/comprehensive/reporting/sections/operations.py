@@ -27,4 +27,19 @@ def build(store: ResultStore) -> Chapter:
         tables.fragment_ops_table(),
     ]))
 
+    # ── Grouped sharding (sort / convert --group-by) ──────────────────
+    c.sections.append(Section(title="Grouped Sharding", blocks=[
+        TextBlock(
+            "Reference-first, group-clustered CSR layout via `scx sort "
+            "--group-by` (re-shard an existing file) and `scx convert "
+            "--group-by` (write the grouped layout during ingest). The "
+            "convert path auto-routes by source density: CSR sources take the "
+            "one-pass streaming gather (cheaper); dense sources fall back to a "
+            "two-pass plain-convert-then-sort. `read-back correct` verifies "
+            "`read_group(label)` partitions the obs axis and the reference "
+            "label is isolated. SCX-only."
+        ),
+        tables.grouped_sharding_table(),
+    ]))
+
     return c
