@@ -88,6 +88,35 @@ impl GroupIndex {
             })
             .collect();
 
+        // M4: the reference role is packed first and never split, so its records
+        // must tile one contiguous leading `[0, k)` block. `reference_range`
+        // returns `(min row_start, max row_stop)`, so a gap / overlap / non-zero
+        // start would make `read_reference` silently return interloping group
+        // rows. Enforce it here (release build) — a violation means a corrupt /
+        // hand-built / merged sidecar, which we reject rather than mis-read.
+        {
+            let mut refs: Vec<&GroupRecord> = records
+                .iter()
+                .filter(|r| r.role == GroupRole::Reference)
+                .collect();
+            if !refs.is_empty() {
+                refs.sort_by_key(|r| r.row_start);
+                let mut expected = 0u64;
+                for r in &refs {
+                    if r.row_start != expected {
+                        return Err(EngineError::Generic(format!(
+                            "group_index: reference records must form one contiguous [0, k) block \
+                             (reference is packed first and never split); record for {:?} starts at \
+                             row {} but expected {} — a gap, overlap, or non-zero start indicates a \
+                             corrupt sidecar",
+                            r.label, r.row_start, expected
+                        )));
+                    }
+                    expected = r.row_stop;
+                }
+            }
+        }
+
         // Build the label map: non-reference wins on collision.
         let mut by_label: HashMap<String, usize> = HashMap::new();
         for (i, rec) in records.iter().enumerate() {
@@ -144,19 +173,10 @@ impl GroupIndex {
             stop = stop.max(r.row_stop);
         }
         if any {
-            // The writer packs the reference role first and never splits a
-            // group, so the reference records must tile `[start, stop)` with no
-            // gaps. A gap would mean `read_reference` returns interspersed group
-            // rows as reference (a corrupt/hand-built sidecar); catch it in tests.
-            debug_assert_eq!(
-                self.records
-                    .iter()
-                    .filter(|r| r.role == GroupRole::Reference)
-                    .map(|r| r.row_stop - r.row_start)
-                    .sum::<u64>(),
-                stop - start,
-                "reference records are not contiguous"
-            );
+            // `from_bytes` guarantees the reference records tile a contiguous
+            // `[0, stop)` block (no gaps/overlaps), so this span contains only
+            // reference rows — `read_reference` never returns interloping group
+            // rows.
             Some((start, stop))
         } else {
             None

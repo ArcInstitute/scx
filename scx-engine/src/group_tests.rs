@@ -113,6 +113,75 @@ fn malformed_payload_errors() {
     assert!(GroupIndex::from_bytes(b"{}").is_err());
 }
 
+// --- M4: reference-record contiguity validated at parse time ---------------
+
+/// Build a payload with the given reference/group records (role inferred from
+/// `is_ref`); reference is packed first per the writer invariant.
+fn records_payload(records: &[(&str, u32, u64, u64, bool)]) -> Vec<u8> {
+    let recs: Vec<_> = records
+        .iter()
+        .map(|(label, shard, start, stop, is_ref)| {
+            serde_json::json!({
+                "label": label, "shard": shard, "row_start": start, "row_stop": stop,
+                "role": if *is_ref { "reference" } else { "group" },
+            })
+        })
+        .collect();
+    let v = serde_json::json!({
+        "group_by": "g",
+        "reference_shard": 0,
+        "reference_labels": ["nt"],
+        "records": recs,
+    });
+    serde_json::to_vec(&v).unwrap()
+}
+
+#[test]
+fn reference_gap_is_rejected() {
+    // ref [0,50) + [60,70) with a group [50,60) → span (0,70) would leak 10
+    // group rows into read_reference.
+    let bytes = records_payload(&[
+        ("nt", 0, 0, 50, true),
+        ("MYC", 1, 50, 60, false),
+        ("nt", 2, 60, 70, true),
+    ]);
+    assert!(
+        GroupIndex::from_bytes(&bytes).is_err(),
+        "non-contiguous reference (gap) must be rejected"
+    );
+}
+
+#[test]
+fn reference_overlap_is_rejected() {
+    let bytes = records_payload(&[("nt", 0, 0, 50, true), ("nt", 0, 40, 60, true)]);
+    assert!(
+        GroupIndex::from_bytes(&bytes).is_err(),
+        "overlapping reference records must be rejected"
+    );
+}
+
+#[test]
+fn reference_non_zero_start_is_rejected() {
+    // reference must be the leading [0, k) block.
+    let bytes = records_payload(&[("MYC", 0, 0, 10, false), ("nt", 1, 10, 50, true)]);
+    assert!(
+        GroupIndex::from_bytes(&bytes).is_err(),
+        "reference not starting at row 0 must be rejected"
+    );
+}
+
+#[test]
+fn contiguous_multi_reference_records_ok() {
+    // Two reference labels tiling [0,30)+[30,50) is legitimate and must parse.
+    let bytes = records_payload(&[
+        ("nt", 0, 0, 30, true),
+        ("ctrl", 0, 30, 50, true),
+        ("MYC", 1, 50, 60, false),
+    ]);
+    let gi = GroupIndex::from_bytes(&bytes).expect("contiguous multi-reference must parse");
+    assert_eq!(gi.reference_range(), Some((0, 50)));
+}
+
 #[test]
 fn missing_record_field_is_a_hard_error() {
     // 7.1e: every wire field is required by construction. A record missing
