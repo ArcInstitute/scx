@@ -444,6 +444,28 @@ pub(crate) fn resolve_reader_threads(opts: &ConvertOptions) -> usize {
 /// (`run_streaming_writer_coordinator`) and the streaming **export**
 /// coordinator (`h5ad::stream_write`); `shard_noun` / `remedy`
 /// customise the refusal error for each caller.
+/// Refuse (T4.7 — no silent cap) when a single shard's working set cannot fit
+/// `memory_budget`. `per_shard_bytes == 0` (empty / stats-less shard) and an
+/// unset budget are both no-ops. Shared by the parallel derate
+/// ([`derate_threads_and_depth`]) and the sequential grouped-ranges dispatch
+/// (M2) so every route rejects an oversized shard with the same message.
+pub(crate) fn ensure_shard_fits_budget(
+    memory_budget: Option<u64>,
+    per_shard_bytes: u64,
+    shard_noun: &str,
+    remedy: &str,
+) -> Result<(), ConvertError> {
+    if let Some(budget) = memory_budget {
+        if per_shard_bytes > 0 && per_shard_bytes > budget {
+            return Err(ConvertError::Other(format!(
+                "single {shard_noun} requires \u{2248} {per_shard_bytes} bytes \
+                 but memory_budget is {budget}; {remedy}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn derate_threads_and_depth(
     memory_budget: Option<u64>,
     per_shard_bytes: u64,
@@ -460,12 +482,10 @@ pub(crate) fn derate_threads_and_depth(
         // Empty shards (no rows / no stats) — nothing to cap.
         return Ok((requested_threads, requested_depth));
     }
-    if per_shard_bytes > budget {
-        return Err(ConvertError::Other(format!(
-            "single {shard_noun} requires \u{2248} {per_shard_bytes} bytes \
-             but memory_budget is {budget}; {remedy}"
-        )));
-    }
+    // Refuse when even a single shard cannot fit the budget (T4.7 — no silent
+    // cap). Shared with the sequential grouped path (M2) so both routes reject
+    // an oversized shard identically.
+    ensure_shard_fits_budget(memory_budget, per_shard_bytes, shard_noun, remedy)?;
     // peak outstanding = threads + depth. Solve for the largest
     // outstanding ≤ budget / per_shard_bytes.
     let outstanding_max = (budget / per_shard_bytes).max(1) as usize;
@@ -1097,6 +1117,20 @@ pub struct StreamingOverrides {
 /// from disk when not overridden (typically KB–MB; no shard format
 /// makes sense for a JSON tree). CSC-on-disk and dense `X` are
 /// rejected up front with [`ConvertError::StreamingUnsupported`].
+/// True when the h5ad has a non-empty `obsp` group (ignoring `__`-prefixed
+/// internal members). Used by the grouped-convert router (M3) to route
+/// obsp-carrying inputs through the obsp-preserving two-pass path.
+fn h5ad_has_obsp_members(file: &hdf5::File) -> bool {
+    match file.group("obsp") {
+        Ok(group) => group
+            .member_names()
+            .unwrap_or_default()
+            .iter()
+            .any(|n| !n.starts_with("__")),
+        Err(_) => false,
+    }
+}
+
 pub fn h5ad_to_scx_streaming(
     input: &Path,
     output: &Path,
@@ -1150,10 +1184,18 @@ pub fn h5ad_to_scx_streaming(
     // `scx sort --group-by`), which is faster and lighter and produces the same
     // grouped layout. `One`/`Two` force the choice.
     if want_group {
+        // M3: the one-pass streaming grouped route drops obsp (obsp remap in the
+        // streaming writer is unsupported), while two-pass preserves it via
+        // `scx sort`. Route any obsp-carrying grouped input through two-pass so
+        // obsp survives regardless of X density — matching the byte-equivalent
+        // convert-then-sort guarantee. `overrides.obsp` (in-memory, forwarded to
+        // the two-pass plain pass) counts as obsp too.
+        let has_obsp =
+            overrides.obsp.as_ref().is_some_and(|v| !v.is_empty()) || h5ad_has_obsp_members(&file);
         let two_pass = match opts.group_pass {
             GroupPass::One => false,
             GroupPass::Two => true,
-            GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense),
+            GroupPass::Auto => matches!(matrix_format, MatrixFormat::Dense) || has_obsp,
         };
         // Byte-mode grouping needs a cheap per-row nnz source, which the one-pass
         // path only has for CSR. A forced one-pass over a non-CSR source with a
@@ -1169,6 +1211,16 @@ pub fn h5ad_to_scx_streaming(
                  a {matrix_format:?} source (byte-budget sizing needs per-row nnz, available only \
                  for CSR in one pass); use --group-pass two (or auto) for byte-mode grouping"
             )));
+        }
+        // M3: a forced one-pass with obsp present would silently drop obsp. Refuse
+        // rather than lose the graph; two-pass (or auto) preserves it.
+        if !two_pass && has_obsp {
+            return Err(ConvertError::Other(
+                "convert --group-by with --group-pass one drops obsp (obsp remap in the one-pass \
+                 streaming route is unsupported); use --group-pass two (or auto) to preserve obsp, \
+                 or drop obsp before converting"
+                    .to_string(),
+            ));
         }
         if two_pass {
             log::info!(
@@ -2186,6 +2238,19 @@ pub fn run_streaming_writer_coordinator(
         // The largest group bounds the per-worker working set (groups are never
         // split), so size the derate by it rather than by `--shard-size`.
         let max_range_rows = ranges.iter().map(|&(_, n)| n).max().unwrap_or(0);
+        let per_worker_bytes = indexed
+            .per_worker_bytes(max_range_rows, modality_type)
+            .max(1);
+        // M2: the sequential fallback below buffers the largest group whole, so
+        // it must honor `memory_budget` too — the parallel derate already
+        // refuses an oversized shard, but the sequential branch previously did
+        // not. Check before either dispatch so both routes reject identically.
+        ensure_shard_fits_budget(
+            opts.memory_budget,
+            per_worker_bytes,
+            "grouped shard",
+            "raise --group-target-bytes/--memory-budget or accept a larger group shard",
+        )?;
         let threadsafe = crate::hdf5_threadsafe::hdf5_is_threadsafe();
         if requested <= 1 || !threadsafe {
             if requested > 1 && !threadsafe {
@@ -2204,9 +2269,6 @@ pub fn run_streaming_writer_coordinator(
                 ranges,
             );
         }
-        let per_worker_bytes = indexed
-            .per_worker_bytes(max_range_rows, modality_type)
-            .max(1);
         let requested_depth = opts.writer_queue_depth.max(1);
         let (granted, granted_depth) = derate_threads_and_depth(
             opts.memory_budget,

@@ -384,9 +384,10 @@ reading one perturbation touches one shard, and to isolate reference cells
 does exactly that:
 
 ```bash
-# --reference takes a comma-separated label list, or `col:<name>` for a
-# boolean obs column. --group-target-bytes is optional; omit it to pack by
-# --shard-size rows instead of a byte budget.
+# --reference takes a comma-separated label list, or `col:<name>` (the
+# `column:<name>` spelling is also accepted) for a boolean obs column.
+# --group-target-bytes is optional; omit it to pack by --shard-size rows
+# instead of a byte budget.
 scx sort screen.scx grouped.scx \
   --group-by target_gene \
   --reference non-targeting \
@@ -416,6 +417,14 @@ grouped archives stay readable.
 
 CSC sidecars are dropped by the reorder as usual — pass
 `--group-by … --rebuild-csc`. Grouping is single-modality only in v1.
+
+Convert-time grouping (`scx convert --group-by`) picks a one-pass or two-pass
+route: `--group-pass auto` (default) streams CSR X in one pass and routes dense
+X — **or any input that carries `obsp`** — through the two-pass path (plain
+convert then `scx sort --group-by`) so `obsp` is remapped and preserved rather
+than dropped. This means a CSR h5ad that carries `obsp` (e.g. `connectivities`)
+takes the heavier two-pass route (a transient temp file) by default; forcing
+`--group-pass one` on such an input errors and points at `--group-pass two`.
 
 ### Grouped reads
 

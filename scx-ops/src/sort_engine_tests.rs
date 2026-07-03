@@ -1122,6 +1122,86 @@ fn grouped_single_shard_plan_does_not_split_group() {
     assert_eq!(records[0]["row_stop"].as_u64().unwrap(), 6);
 }
 
+// --- M1: oversized group vs --memory-budget --------------------------------
+
+#[test]
+fn max_grouped_shard_footprint_row_and_byte_mode() {
+    use crate::group_plan::{GroupPlan, GroupRecord, Role};
+    // Two shards: shard 0 = one 2-row group "A", shard 1 = one 6-row group "B".
+    let plan = GroupPlan {
+        shard_starts: vec![2],
+        records: vec![
+            GroupRecord {
+                label: "A".to_string(),
+                shard: 0,
+                row_start: 0,
+                row_stop: 2,
+                role: Role::Group,
+            },
+            GroupRecord {
+                label: "B".to_string(),
+                shard: 1,
+                row_start: 2,
+                row_stop: 8,
+                role: Role::Group,
+            },
+        ],
+        reference_shard: None,
+        n_shards: 2,
+    };
+
+    // Row-count mode (empty per_row_nnz): per-row est = ceil(n_vars*density*16).
+    // n_vars=4, density=0.5 -> 32 B/row. Shard 1 (6 rows) = 192 B dominates.
+    let (bytes, shard, label) = super::max_grouped_shard_footprint(&plan, &[], 4, 0.5);
+    assert_eq!((bytes, shard, label.as_str()), (192, 1, "B"));
+
+    // Byte mode: per_row_nnz supplied (emission order). Shard 1 rows [2,8) have
+    // nnz summing to 30 -> 30*16 + 6*8 = 528 B; shard 0 rows [0,2) -> 4 nnz ->
+    // 4*16 + 2*8 = 80 B. Shard 1 dominates.
+    let per_row_nnz = vec![1, 3, 5, 5, 5, 5, 5, 5];
+    let (bytes, shard, label) = super::max_grouped_shard_footprint(&plan, &per_row_nnz, 4, 0.5);
+    assert_eq!((bytes, shard, label.as_str()), (528, 1, "B"));
+}
+
+/// A single dominant group whose buffered footprint exceeds `--memory-budget`
+/// must hard-error (never-split makes buffering unavoidable), and the message
+/// must name the group. A sufficient budget still round-trips.
+#[test]
+fn grouped_sort_oversized_group_exceeds_budget_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    // One group of 8 rows; n_vars=4, 2 nnz/row -> density 0.5 -> 32 B/row ->
+    // shard footprint 256 B.
+    let genes = ["MYC"; 8];
+    let control = [false; 8];
+    let inp = write_grouped_fixture(&dir, "big_group.scx", &genes, &control);
+
+    // Tiny budget: 256 B needed, 100 B allowed -> refuse.
+    let out = dir.path().join("err.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        memory_budget: Some(100),
+        shard_target_rows: 2,
+        ..Default::default()
+    };
+    let err = sort(&inp, &out, &o).expect_err("oversized group must exceed the budget");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("memory-budget") && msg.contains("MYC") && msg.contains("never split"),
+        "error must name the group and the never-split contract: {msg}"
+    );
+
+    // Ample budget: same layout succeeds and round-trips.
+    let ok = dir.path().join("ok.scx");
+    let o_ok = SortOptions {
+        memory_budget: Some(1 << 20),
+        ..o
+    };
+    sort(&inp, &ok, &o_ok).unwrap();
+    let genes_out = col_of(&ok, "target_gene");
+    assert_eq!(genes_out.len(), 8);
+    assert!(genes_out.iter().all(|g| g == "MYC"));
+}
+
 #[test]
 fn grouped_sort_external_matches_inmemory_layout() {
     let dir = tempfile::tempdir().unwrap();

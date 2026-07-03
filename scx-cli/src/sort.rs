@@ -64,7 +64,7 @@ pub fn run_sort(
     };
 
     // F1: grouped-sharding options. `--reference` is a comma-separated label
-    // list by default, or `column:<name>` (alias `col:<name>`) for the
+    // list by default, or `col:<name>` (alias `column:<name>`) for the
     // boolean-column form. Shared parser with `scx convert` so the flag behaves
     // identically on both subcommands. A non-empty value that fails to parse is
     // a user error, not a silent "no reference".
@@ -73,7 +73,7 @@ pub fn run_sort(
             let parsed = crate::parse_reference_spec_cli(spec);
             if parsed.is_none() {
                 return Err(format!(
-                    "--reference value {spec:?} is not a valid label set or `column:NAME` \
+                    "--reference value {spec:?} is not a valid label set or `col:NAME` \
                      reference column"
                 )
                 .into());

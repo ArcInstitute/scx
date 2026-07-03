@@ -205,8 +205,8 @@ enum Commands {
         group_by: Option<String>,
         /// Reference cells for `--group-by` (e.g. non-targeting controls):
         /// packed first and isolated in shard 0. Either a comma-separated list
-        /// of `--group-by` labels, or `column:NAME` to use a boolean obs column.
-        /// Requires `--group-by`.
+        /// of `--group-by` labels, or `col:NAME` (alias `column:NAME`) to use a
+        /// boolean obs column. Requires `--group-by`.
         #[arg(long, value_name = "SPEC")]
         reference: Option<String>,
         /// Byte-budget grouped sharding for `--group-by`: target shard size in
@@ -461,7 +461,8 @@ enum Commands {
         group_by: Option<String>,
         /// F1: which rows are reference cells (e.g. "non-targeting"), packed
         /// first / isolated in shard 0. A comma-separated label list, or
-        /// `col:<name>` for a boolean obs column. Requires `--group-by`.
+        /// `col:NAME` (alias `column:NAME`) for a boolean obs column. Requires
+        /// `--group-by`.
         #[arg(long, value_name = "LABELS|col:NAME")]
         reference: Option<String>,
         /// F1: byte budget per shard for the group bin-packer (binary suffix
@@ -1426,7 +1427,7 @@ fn run_convert(
         let _ = (group_target_bytes, group_max_bytes);
         (None, None)
     };
-    // `column:NAME` (or `col:NAME`) → boolean reference column; otherwise a CSV
+    // `col:NAME` (or `column:NAME`) → boolean reference column; otherwise a CSV
     // label set. A non-empty value that fails to parse is a user error, not a
     // silent "no reference".
     let reference_spec: Option<scx_ops::ReferenceSpec> = match reference {
@@ -1435,7 +1436,7 @@ fn run_convert(
             if spec.is_none() {
                 return Err(format!(
                     "--reference value {s:?} is not a valid label set or \
-                    `column:NAME` reference column"
+                    `col:NAME` reference column"
                 )
                 .into());
             }
@@ -1506,7 +1507,7 @@ fn run_convert(
 }
 
 /// Parse the `--reference` CLI value into a [`scx_ops::ReferenceSpec`].
-/// `column:NAME` (or the `col:NAME` alias) selects a boolean obs column;
+/// `col:NAME` (or the `column:NAME` alias) selects a boolean obs column;
 /// anything else is a comma-separated set of `--group-by` labels. Returns
 /// `None` for an empty / whitespace-only value. Shared by `scx sort` and
 /// `scx convert` so the flag parses identically on both subcommands.
@@ -1865,4 +1866,65 @@ fn dispatch_scx_to_mtx(
     pb.finish_and_clear();
     println!("Converted {} -> {}", input.display(), output.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_reference_spec_cli;
+    use scx_ops::ReferenceSpec;
+
+    #[test]
+    fn reference_spec_accepts_both_column_prefixes() {
+        // H1: `scx convert` and `scx sort` share this parser; both `col:` and
+        // the `column:` alias must resolve to the same boolean-column spec.
+        assert_eq!(
+            parse_reference_spec_cli("col:is_control"),
+            Some(ReferenceSpec::Column("is_control".to_string()))
+        );
+        assert_eq!(
+            parse_reference_spec_cli("column:is_control"),
+            Some(ReferenceSpec::Column("is_control".to_string()))
+        );
+        // Trailing/leading whitespace around the column name is trimmed.
+        assert_eq!(
+            parse_reference_spec_cli("col:  is_control  "),
+            Some(ReferenceSpec::Column("is_control".to_string()))
+        );
+    }
+
+    #[test]
+    fn reference_spec_empty_column_name_is_none() {
+        // An empty name after the prefix is not a usable column; the callers
+        // (convert/sort) treat a `None` return on non-empty input as a hard
+        // user error rather than silently dropping the reference.
+        assert_eq!(parse_reference_spec_cli("col:"), None);
+        assert_eq!(parse_reference_spec_cli("col:   "), None);
+        assert_eq!(parse_reference_spec_cli("column:"), None);
+    }
+
+    #[test]
+    fn reference_spec_parses_label_list() {
+        assert_eq!(
+            parse_reference_spec_cli("a,b , c"),
+            Some(ReferenceSpec::Labels(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+            ]))
+        );
+        // A bare token without the `col:`/`column:` prefix is a label, not a
+        // column — even one that looks prefix-like without a colon.
+        assert_eq!(
+            parse_reference_spec_cli("col"),
+            Some(ReferenceSpec::Labels(vec!["col".to_string()]))
+        );
+    }
+
+    #[test]
+    fn reference_spec_empty_input_is_none() {
+        assert_eq!(parse_reference_spec_cli(""), None);
+        assert_eq!(parse_reference_spec_cli("   "), None);
+        // A value that is only separators / whitespace yields no labels.
+        assert_eq!(parse_reference_spec_cli(" , , "), None);
+    }
 }
