@@ -194,6 +194,9 @@ impl ScxExperiment {
                 total_shards: 0,
                 candidate_shard_rows: 0,
                 matched_rows: 0,
+                // TODO: wire the u32→f32 decode-loss guard for R reads. Hardcoded
+                // 0 means R-side reads of >2²⁴ integer archives still round
+                // silently (the guard is currently pyscx-only).
                 max_value: 0,
             };
             interop::to_seurat_v5(&result)

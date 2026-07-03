@@ -1385,17 +1385,20 @@ impl PyExperiment {
     /// in `ScxBackedSparseDataset` (per-modality `BackedCsrReader` + CSC
     /// sidecar if present). Single-modality files are wrapped in a
     /// one-modality `MuData` rather than raising.
-    #[pyo3(signature = (backed=false, cache_shards=4))]
+    #[pyo3(signature = (backed=false, cache_shards=4, allow_lossy=false))]
     fn to_mudata<'py>(
         &self,
         py: Python<'py>,
         backed: bool,
         cache_shards: usize,
+        allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         if backed {
+            // Backed mode decodes lazily per-slice, so the decode-loss guard is
+            // not applied (consistent with backed to_anndata).
             crate::mudata::to_mudata_backed(py, &self.path, &self.reader, cache_shards)
         } else {
-            crate::mudata::to_mudata(py, &self.reader)
+            crate::mudata::to_mudata(py, &self.reader, allow_lossy)
         }
     }
 

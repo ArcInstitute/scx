@@ -1369,9 +1369,22 @@ rounded values on such archives now raise. Notes:
 - A *lossless* wide read (returning the exact counts as `float64` / `int64`)
   requires pushing dtype into the decode; that is a planned follow-up. Until then,
   such a read fails loud rather than returning corrupted values.
-- **Backed reads (`backed=True`) are not yet gated** — they decode lazily
-  per-slice, so a whole-file check would spuriously error on partial reads that
-  never touch the large-count shard.
+
+**Which matrices are guarded.** The guard covers every eagerly-decoded count
+matrix: `X` (all `to_anndata` paths — default, `var_names`, `obs_filter`,
+`preserve_slots`, and `to_gpu_anndata`), `adata.raw`, eagerly-materialized
+`layers` (`to_anndata(eager=True)`), and each modality's `X` in
+`to_mudata()`. The following are **not** gated — they decode lazily per-slice,
+so a whole-file check would spuriously error on partial reads that never touch
+the large-count shard:
+
+- **Backed reads** (`backed=True`, including `to_mudata(backed=True)`).
+- **Lazy `layers`** on the default (`eager=False`) `to_anndata()` — the layer
+  is decoded only on later `adata.layers[...]` access.
+- The R bindings (`rscx`) do not yet wire the guard.
+
+For those, a `> 2²⁴` count still rounds silently on access; pass `allow_lossy`
+where available, or read eagerly to get the guard.
 
 > **Note.** A scipy `csr_matrix` with `float16` `data` is valid but cannot be
 > densified by scipy's own `.toarray()` (a scipy limitation) — call

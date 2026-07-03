@@ -134,6 +134,83 @@ def test_experiment_obs_filter_fails_loud(tmp_dir):
 
 
 # --------------------------------------------------------------------------
+# Other eager X paths: var_names projection
+# --------------------------------------------------------------------------
+
+
+def test_var_names_only_fails_loud(tmp_dir):
+    # A var_names-only read (no obs_filter) goes through the eager assembler,
+    # which reads every shard — the whole-catalog max is exact and trips even
+    # when the selected gene isn't the big-count one (conservative).
+    path = _write(tmp_dir, _big_count_adata())
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(var_names=["gene_1"])
+    rt = pyscx.open(path).to_anndata(var_names=["gene_0"], allow_lossy=True)
+    assert rt.X.data.dtype == np.float32
+
+
+# --------------------------------------------------------------------------
+# Eager layers (lazy layers stay ungated, like backed)
+# --------------------------------------------------------------------------
+
+
+def _small_x_big_layer_adata(n_obs=4, n_vars=3):
+    small = np.array([[3, 0, 5], [0, 7, 0], [1, 0, 0], [0, 0, 2]], dtype=np.float32)
+    big = np.zeros((n_obs, n_vars), dtype=np.float32)
+    big[0, 0] = float(BIG)
+    ad = anndata.AnnData(
+        X=sp.csr_matrix(small),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    ad.layers["counts"] = sp.csr_matrix(big)
+    return ad
+
+
+def test_eager_layers_fail_loud(tmp_dir):
+    path = _write(tmp_dir, _small_x_big_layer_adata(), name="f4_layer.scx")
+    # Eager materialization decodes the big-count layer -> fail loud.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(eager=True)
+    # allow_lossy escapes.
+    rt = pyscx.open(path).to_anndata(eager=True, allow_lossy=True)
+    assert rt.layers["counts"].data.dtype == np.float32
+
+
+def test_default_lazy_layers_not_gated(tmp_dir):
+    # Default (non-eager) read wraps layers lazily and never decodes them here,
+    # so the read itself does not raise (X is small). Lazy layer decode is
+    # ungated, consistent with backed reads. The corruption surfaces only on
+    # later access — documented, not silently claimed as guarded.
+    path = _write(tmp_dir, _small_x_big_layer_adata(), name="f4_layer2.scx")
+    rt = pyscx.open(path).to_anndata()  # must not raise
+    assert rt.X.data.dtype == np.float32
+
+
+# --------------------------------------------------------------------------
+# Eager to_mudata (per-modality X)
+# --------------------------------------------------------------------------
+
+
+def test_to_mudata_fails_loud(tmp_dir):
+    mudata = pytest.importorskip("mudata")
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(np.array([[3, 0], [0, 5]], dtype=np.float32)),
+        var=pd.DataFrame(index=["rna0", "rna1"]),
+    )
+    big = np.zeros((2, 2), dtype=np.float32)
+    big[0, 0] = float(BIG)
+    adt = anndata.AnnData(X=sp.csr_matrix(big), var=pd.DataFrame(index=["adt0", "adt1"]))
+    mu = mudata.MuData({"rna": rna, "adt": adt})
+    path = str(tmp_dir / "f4_mm.scx")
+    pyscx.from_mudata(mu, path)
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_mudata()
+    mu_back = pyscx.open(path).to_mudata(allow_lossy=True)
+    assert mu_back is not None
+
+
+# --------------------------------------------------------------------------
 # No spurious failures
 # --------------------------------------------------------------------------
 
