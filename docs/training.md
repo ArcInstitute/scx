@@ -41,6 +41,10 @@ scx merge batch1.scx batch2.scx batch3.scx --output atlas.scx
 `donor`, `batch`, `dataset_id`, `split`, `organism`, and `tissue` — enabling
 fast query-based train/val splitting later.
 
+For perturbation screens, add `--group-by target_gene --reference non-targeting`
+to co-locate each perturbation's cells into contiguous shards — see
+[Grouped sharding for perturbation training](#grouped-sharding-for-perturbation-training).
+
 
 ## Computing HVG indices
 
@@ -66,6 +70,92 @@ hvg_indices = np.where(adata.var["highly_variable"])[0].astype(np.uint32)
 # Save for reuse across training runs
 np.save("hvg_indices.npy", hvg_indices)
 ```
+
+
+## Grouped sharding for perturbation training
+
+Perturbation screens have a natural group axis — `target_gene`. A typical
+CRISPR screen has ~5 k perturbations spread across ~120 shards. Without
+grouping, reading one perturbation's cells touches nearly every shard
+(scatter read). **Grouped sharding** physically co-locates each
+perturbation's cells into 1–2 contiguous shards, turning a ~120-shard
+scatter into a 1-shard sequential read (~120× I/O reduction).
+
+### Creating a grouped SCX file
+
+```python
+import pyscx
+
+# One-pass: convert and group in a single step
+pyscx.from_h5ad(
+    "screen.h5ad", "screen.scx",
+    group_by="target_gene",
+    reference=["non-targeting"],   # isolate control cells in shard 0
+)
+```
+
+```bash
+# CLI equivalent
+scx convert screen.h5ad screen.scx \
+    --group-by target_gene --reference non-targeting
+
+# Two-pass fallback: convert first, then sort
+scx convert screen.h5ad screen_unsorted.scx
+scx sort screen_unsorted.scx screen.scx \
+    --group-by target_gene --reference non-targeting
+```
+
+Rows are sorted so reference (control) cells come first (shard 0), then by
+group label. Groups are bin-packed into shards cutting only at group
+boundaries — a group never straddles a shard boundary.
+
+### Reading per-perturbation data
+
+```python
+exp = pyscx.open("screen.scx")
+
+# Single perturbation — touches only 1–2 shards
+adata = exp.read_group("MYC")
+
+# Control cells (shard 0)
+ref = exp.read_reference()           # -> AnnData | None
+
+# All group labels
+labels = exp.group_labels()          # -> list[str]
+
+# Streaming iteration — ~one shard resident at a time
+for gs in exp.iter_group_shards():
+    ad = gs.to_anndata()
+    label_ad = gs.read_group("MYC")  # slice one label within this shard
+```
+
+### Connection to IndexPlanDataset
+
+Grouped sharding and `IndexPlanDataset` are complementary. Grouped sharding
+optimises the **physical layout** (which cells share a shard); `IndexPlanDataset`
+handles the **logical pairing** (perturbed, control) batch reads via plan-driven
+I/O. For perturbation training pipelines (State, CPA, GEARS) the recommended
+workflow is:
+
+1. Convert with `group_by="target_gene", reference=["non-targeting"]`.
+2. Use `read_group` / `read_reference` for analysis and QC.
+3. Use `TrainingDataset`, `IndexPlanDataset`, or `SparseCellSetDataset` for
+   training.
+
+Grouped sharding also reduces **shard cache pressure** in random-access loaders
+like `SparseCellSetDataset`. Without grouping, a perturbation batch scatters
+across 30–50 shards, requiring a large `cache_shards` setting and ~20+ GB RSS
+to avoid thrashing. With grouping each perturbation is in 1–2 shards, so the
+cache stays warm with far fewer entries.
+
+> [!TIP]
+> On cloud storage (S3 / GCS), each shard access is a separate HTTP
+> range-read request. Grouped sharding reduces ~120 round-trips per
+> perturbation to 1–2 — a significant latency win on high-latency backends.
+
+See [api.md § Grouped reads](api.md#grouped-reads-conditionlabel-grouped-sharding) and
+[sharding.md § Grouped sharding](sharding.md#conditionlabel-grouped-sharding-f1--grouped-reads-f2)
+for the full API reference and on-disk layout details.
 
 
 ## TrainingDataset

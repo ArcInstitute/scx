@@ -1027,6 +1027,19 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // scx-loader/src/sparse_cellset_collate.rs and STATE3-PYSCX-KERNEL-ISSUE.
     m.add("COLLATE_CELLSET_CONTRACT_VERSION", 1u32)?;
 
+    // Build profile ("release" / "debug"). Benchmarks MUST run against a
+    // release build — a debug `.so` runs ~4-10x slower uniformly and silently
+    // poisons every timing (see GROUP-BY-REG-FIX.md). The comprehensive
+    // harness asserts this in preflight (gate_candidate / run_parallel).
+    m.add(
+        "__build_profile__",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    )?;
+
     // File operations (scx-ops)
     register_ops(m)?;
 

@@ -187,6 +187,15 @@ def main() -> None:
     except ImportError as exc:
         print(f"SKIP Parquet runner: {exc}")
 
+    # Shardad
+    try:
+        from benchmarks.comprehensive.runners.shardad_runner import ShardadRunner
+        runner = ShardadRunner()
+        runner._require_shardad()  # skip cleanly if shardad isn't installed
+        runners.append(runner)
+    except ImportError as exc:
+        print(f"SKIP Shardad runner: {exc}")
+
     print(f"\nRunning smoke tests on {h5ad_path} ({len(runners)} runners)\n")
 
     passed = 0

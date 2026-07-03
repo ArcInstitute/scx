@@ -900,6 +900,26 @@ and the reference is isolated) is a hard regression gate
 (`thresholds.yaml`: `correctness_passed_int` / `reference_isolated_int` /
 `n_group_records`).
 
+**Head-to-head vs shardad.** Grouped sharding is also the axis where scx most
+directly overlaps [shardad](https://github.com/ArcInstitute/shardad) — a
+counts-oriented single-file (`.shad`) format whose distinguishing feature is
+native condition grouping (`write_sharded(group_by=, reference=)` +
+`read_group()` / `read_reference()`). The cross-format `grouped_read`
+comprehensive benchmark
+(`benchmarks/comprehensive/benchmarks/grouped_read.py`) runs both stacks over the
+same integer-count perturbation fixtures (`nb_glm_synth`, `replogle_k562`,
+`tahoe_c38`), timing the grouped write (wall + on-disk size) and the
+per-perturbation `read_group` / `read_reference` reads, and asserting both
+formats partition the obs axis and isolate the reference (a hard gate for each
+arm). The float paired fixture `pert_synth_10k` is scx-only above — shardad is a
+counts format and rejects float `X` on grouped write. Both formats share the
+`scx-bench` conda env.
+
+> _Head-to-head numbers (grouped-write size/throughput and per-perturbation
+> `read_group` latency, scx vs shardad) are pending a full `grouped_read`
+> benchmark run and will be tabulated here; the live table renders in the
+> comprehensive report's "Grouped Read/Write — scx vs shardad" section._
+
 ---
 
 ## Comprehensive Benchmarking + Cloud Validation

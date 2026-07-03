@@ -1089,6 +1089,197 @@ def grouped_sharding_table(datasets: list[str] | None = None) -> TableBlock | Te
     )
 
 
+def grouped_read_table(datasets: list[str] | None = None) -> list[Block]:
+    """Cross-format grouped-sharding head-to-head — scx vs shardad.
+
+    One table per integer-count grouping dataset, with Format columns (SCX vs
+    Shardad). Shows the grouped-write wall + file size, the per-perturbation
+    ``read_group`` median + throughput, the ``read_reference`` wall, group count,
+    and the read-back correctness flag. Sourced from ``grouped_read`` raw JSONs.
+    """
+    if datasets is None:
+        datasets = ["nb_glm_synth", "replogle_k562", "tahoe_c38"]
+    results = load_all_results(benchmark="grouped_read")
+    if not results:
+        return [TextBlock("*No grouped-read (scx vs shardad) results available yet.*")]
+
+    _FMT_LABEL = {"scx_auto": "SCX (auto)", "shardad": "Shardad"}
+    fmt_order = ["scx_auto", "shardad"]
+
+    pivot: dict[str, dict[str, dict]] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        fmt = r.get("format", "")
+        if ds in datasets:
+            pivot.setdefault(ds, {})[fmt] = r
+    present = [d for d in datasets if d in pivot]
+    if not present:
+        return [TextBlock("*No grouped-read results for the selected datasets.*")]
+
+    def _scn(r: dict, scenario: str, key: str) -> float | None:
+        meds = r.get("metadata", {}).get("per_scenario_medians", {}) or {}
+        return meds.get(scenario, {}).get(key)
+
+    def _correct(r: dict) -> str:
+        for run in r.get("runs", []):
+            ex = run.get("extra", {})
+            if ex.get("scenario") == "correctness":
+                ok = ex.get("correctness_passed_int", 0) == 1
+                ref = ex.get("reference_isolated_int", 1) == 1
+                return "✓" if (ok and ref) else "✗"
+        return "—"
+
+    def _rg_throughput(r: dict) -> float | None:
+        tot_cells = 0
+        tot_wall = 0.0
+        for run in r.get("runs", []):
+            ex = run.get("extra", {})
+            if ex.get("scenario") == "read_group":
+                tot_cells += int(ex.get("cells_read", 0) or 0)
+                tot_wall += float(run.get("wall_s", 0.0) or 0.0)
+        if tot_wall > 0 and tot_cells > 0:
+            return tot_cells / tot_wall
+        return None
+
+    def _groups(r: dict) -> str:
+        n = r.get("metadata", {}).get("n_groups")
+        return f"{n:,}" if isinstance(n, int) else "—"
+
+    blocks: list[Block] = []
+    for ds in present:
+        by_fmt = pivot[ds]
+        fmts = [f for f in fmt_order if f in by_fmt]
+        headers = ["Metric"] + [_FMT_LABEL.get(f, f) for f in fmts]
+        rows = [
+            ["source X format"]
+            + [by_fmt[f].get("metadata", {}).get("source_matrix_format", "—") for f in fmts],
+            ["grouped write wall"]
+            + [_fmt_time(_scn(by_fmt[f], "grouped_write", "wall_s_median")) for f in fmts],
+            ["grouped file size"]
+            + [
+                _fmt_size(
+                    _scn(by_fmt[f], "grouped_write", "output_size_bytes_median")
+                    or by_fmt[f].get("file_size_bytes")
+                )
+                for f in fmts
+            ],
+            ["read_group median"]
+            + [_fmt_time(_scn(by_fmt[f], "read_group", "wall_s_median")) for f in fmts],
+            ["read_group cells/s"]
+            + [
+                (_fmt_num(_rg_throughput(by_fmt[f]), 0) if _rg_throughput(by_fmt[f]) else "—")
+                for f in fmts
+            ],
+            ["read_reference wall"]
+            + [_fmt_time(_scn(by_fmt[f], "read_reference", "wall_s_median")) for f in fmts],
+            ["groups"] + [_groups(by_fmt[f]) for f in fmts],
+            ["read-back correct"] + [_correct(by_fmt[f]) for f in fmts],
+        ]
+        blocks.append(
+            TableBlock(
+                headers=headers,
+                rows=rows,
+                caption=f"Grouped read/write head-to-head — {SHORT_NAMES.get(ds, ds)} (scx vs shardad)",
+            )
+        )
+    return blocks
+
+
+def capability_matrix_table() -> TableBlock:
+    """Static scx-vs-shardad capability matrix.
+
+    The head-to-head perf tables cover the axes both formats support; this grid
+    records the *capability* differences that a race can't (they're not "slower",
+    they're absent on one side). Hand-authored from SHARDAD-SCX-COMPARE.md and the
+    two projects' feature surfaces. ``✓`` = supported, ``✗`` = not supported,
+    ``~`` = partial; ``✓✓`` = a notable strength.
+    """
+    rows = [
+        ["Condition grouping (`read_group`)", "✓", "✓"],
+        ["Reference isolation (`read_reference`)", "✓", "✓"],
+        ["Streaming grouped iteration (`iter_group_shards`)", "✓", "✓"],
+        ["Backed / out-of-core reads (bounded RSS)", "✓", "✗ (materializes full matrix)"],
+        ["Lazy query engine (predicate pushdown)", "✓", "✗"],
+        ["Gene / column projection on read", "✓", "✗ (row-only; read-then-slice)"],
+        ["CSC / gene-major sidecar", "✓", "✗ (CSR only)"],
+        ["In-decode dtype / density knobs", "~ (at convert time)", "✓"],
+        ["Integer-count compression", "✓", "✓✓ (stronger on raw counts)"],
+        ["ML training loader (native, shuffled batches)", "✓", "✗ (row-slice random access)"],
+        ["Analysis accelerators (PCA/kNN/UMAP/DE)", "✓", "✗"],
+        ["GPU acceleration (analysis + decode)", "✓", "✗ (GPU read unsupported this release)"],
+        ["Multimodal (CITE-seq / Multiome / TEA-seq)", "✓", "✗"],
+        ["Cloud-native I/O (S3 / GCS / Azure)", "✓", "✗"],
+        ["Mutation ops (append/delete/compact/merge/rollback)", "✓", "✗ (metadata-tail only)"],
+        ["R bindings (Seurat / SCE)", "✓", "✗ (Python only)"],
+    ]
+    return TableBlock(
+        headers=["Capability", "SCX", "Shardad"],
+        rows=rows,
+        caption="Format capability matrix — scx vs shardad",
+        notes=[
+            "✓ supported · ✗ not supported · ~ partial · ✓✓ notable strength. "
+            "shardad is a deep, narrow counts + condition-grouping store; scx is a "
+            "broad platform (query engine, ML loaders, accelerators, cloud, "
+            "multimodal, R). Perf on the shared axes is in the comparison tables above."
+        ],
+    )
+
+
+def ooc_rss_boundary_table(datasets: list[str] | None = None) -> TableBlock | TextBlock:
+    """Out-of-core peak-RSS boundary — scx streaming vs shardad materialize.
+
+    Per dataset (rising n_obs): true peak RSS for scx bounded streaming, scx full
+    materialize, and shardad full materialize. scx-stream stays ~flat while the
+    materialize columns grow with n_obs — the out-of-core moat.
+    """
+    if datasets is None:
+        datasets = ["census_500k", "census_1m", "census_5m"]
+    results = load_all_results(benchmark="ooc_rss_boundary")
+    if not results:
+        return TextBlock("*No out-of-core RSS-boundary results available yet.*")
+
+    # (dataset, format) -> per_scenario_medians
+    by: dict[tuple[str, str], dict] = {}
+    n_obs_of: dict[str, int] = {}
+    for r in results:
+        ds = r.get("dataset", "")
+        by[(ds, r.get("format", ""))] = r.get("metadata", {}).get("per_scenario_medians", {}) or {}
+        no = r.get("metadata", {}).get("n_obs")
+        if isinstance(no, int):
+            n_obs_of[ds] = no
+    present = [d for d in datasets if (d, "scx_auto") in by or (d, "shardad") in by]
+    if not present:
+        return TextBlock("*No out-of-core RSS-boundary results for the selected datasets.*")
+
+    def _peak(ds: str, fmt: str, scenario: str) -> str:
+        meds = by.get((ds, fmt), {})
+        v = meds.get(scenario, {}).get("peak_rss_mb_median")
+        return _fmt_mem(v) if v is not None else "—"
+
+    headers = ["Dataset", "n_obs", "scx stream (peak)", "scx materialize (peak)", "shardad materialize (peak)"]
+    rows = []
+    for ds in present:
+        n = n_obs_of.get(ds)
+        rows.append([
+            SHORT_NAMES.get(ds, ds),
+            f"{n:,}" if isinstance(n, int) else "—",
+            _peak(ds, "scx_auto", "scx_stream"),
+            _peak(ds, "scx_auto", "scx_materialize"),
+            _peak(ds, "shardad", "shardad_materialize"),
+        ])
+    return TableBlock(
+        headers=headers,
+        rows=rows,
+        caption="Out-of-core peak RSS — scx streaming (bounded) vs materialize",
+        notes=[
+            "True high-water-mark RSS. scx streaming stays ~flat as n_obs grows; "
+            "the materialize columns grow with the matrix — shardad has no "
+            "streaming path, so full materialize is its only read mode (and the "
+            "capability boundary at atlas scale)."
+        ],
+    )
+
+
 def cloud_filtered_table(datasets: list[str] | None = None) -> list[Block]:
     """Cloud filtered-query parity table — Format × Query.
 
@@ -2769,6 +2960,7 @@ def generate_all_tables() -> dict[str, Block | list[Block]]:
         "memory": memory_table(),
         "memory_by_mode": memory_by_mode_tables(),
         "fragment_ops": fragment_ops_table(),
+        "capability_matrix": capability_matrix_table(),
         "cloud_filtered": cloud_filtered_table(),
         "gcp_matrix": gcp_matrix_table(),
         "cloud_reader_vs_pull": cloud_reader_vs_pull_table(),

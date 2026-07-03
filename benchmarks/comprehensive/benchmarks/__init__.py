@@ -29,6 +29,10 @@ ALL_BENCHMARKS: list[str] = [
     # formats with a true streaming path (SCX today) record runs —
     # others skip via NotImplementedError → None.
     "read_streaming_vs_inmemory",
+    # Out-of-core peak-RSS boundary: scx streaming (bounded) vs shardad
+    # materialize (whole matrix resident). Cross-format {scx_auto, shardad};
+    # true-peak RSS sampler. Shows scx-flat vs shardad-linear peak RSS.
+    "ooc_rss_boundary",
     "ml_loader",
     # Correctness validation — scanpy / backed / preprocessing parity.
     # SCX-only (gated on format_variant.key == "scx_auto" inside the module).
@@ -38,6 +42,10 @@ ALL_BENCHMARKS: list[str] = [
     # value-corruption regressions in any of the 6 SCX codecs. Format-gated
     # to scx_* variants inside the module.
     "roundtrip",
+    # Shardad read-back fidelity (source h5ad -> .shad -> to_anndata parity +
+    # dtype/materialization knobs). shardad-only; roundtrip/correctness are
+    # SCX-codec-specific so shardad needs its own fidelity gate.
+    "shardad_fidelity",
     # Cell-eval / arc-bench parity perf — SCX-only (gated on scx_auto).
     # Requires the scx-bench-eval conda env (cell_eval / arc_bench / pdex).
     "cell_eval_parity_perf",
@@ -46,6 +54,10 @@ ALL_BENCHMARKS: list[str] = [
     # SCX-only grouped sharding: sort --group-by + convert-time grouping
     # (gated on scx_auto + a GROUP_SPEC dataset entry inside the module).
     "grouped_sort",
+    # Cross-format grouped sharding head-to-head: scx vs shardad grouped
+    # write + per-perturbation read_group (gated on {scx_auto, shardad} +
+    # a GROUP_SPEC dataset entry inside the module).
+    "grouped_read",
     # IndexPlanDataset throughput (plan-driven paired reads).
     # SCX-only (gated on scx_auto inside the module).
     "index_plan",

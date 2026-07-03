@@ -49,6 +49,7 @@ import argparse
 import functools
 import importlib
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -90,6 +91,12 @@ _NO_CONVERSION = {
     # conversion, which would fail for synthetic datasets that have no on-disk
     # h5ad to convert.
     "grouped_sort",
+    # grouped_read builds its own grouped .scx / .shad files in-process from
+    # the source h5ad (same as grouped_sort) — no Phase-A dependency.
+    "grouped_read",
+    # shardad_fidelity self-materializes the source + writes a temp .shad
+    # in-process (synthetic datasets have no on-disk h5ad) — no Phase-A dep.
+    "shardad_fidelity",
 }
 
 # Benchmarks that operate on multimodal h5mu sources. They expect
@@ -906,6 +913,40 @@ def _per_job_slurm_params(
     return params
 
 
+def _assert_release_pyscx() -> None:
+    """Refuse to benchmark against a debug pyscx build.
+
+    A debug `.so` (`maturin develop` without `--release`) runs ~4-10x slower
+    uniformly and silently poisons every scx timing (see GROUP-BY-REG-FIX.md).
+    The shared editable `.so` is what every SLURM worker imports, so checking it
+    here in the orchestrator catches the footgun before a whole campaign is
+    submitted. Bypass (not recommended) with SCX_BENCH_ALLOW_DEBUG=1.
+    """
+    if os.environ.get("SCX_BENCH_ALLOW_DEBUG", "").strip() in ("1", "true", "TRUE"):
+        return
+    try:
+        import pyscx
+    except Exception as exc:  # pyscx not importable here — leave it to the workers
+        logging.warning("pyscx not importable in orchestrator env (%s); "
+                        "skipping build-profile guard", exc)
+        return
+    profile = getattr(pyscx, "__build_profile__", "unknown")
+    if profile == "release":
+        return
+    if profile == "unknown":
+        logging.warning(
+            "pyscx has no __build_profile__ (pre-guard build); cannot verify release. "
+            "Rebuild: cd pyscx && maturin develop --release --features hdf5,gpu"
+        )
+        return
+    raise SystemExit(
+        f"ERROR: pyscx is a {profile!r} build — benchmarks require a release build "
+        "(a debug .so is ~4-10x slower and poisons all timings). Rebuild with:\n"
+        "  cd pyscx && ../.venv/bin/maturin develop --release --features hdf5,gpu\n"
+        "Bypass (not recommended) with SCX_BENCH_ALLOW_DEBUG=1."
+    )
+
+
 def main() -> None:
     import submitit
 
@@ -915,6 +956,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    if not args.dry_run:
+        _assert_release_pyscx()
 
     # Resolve datasets
     datasets = args.datasets

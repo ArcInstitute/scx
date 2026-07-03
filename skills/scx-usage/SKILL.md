@@ -368,8 +368,26 @@ for batch in ds.iter_with_plans(iter(plans), lookahead=4):
   constructed lazily inside the worker's `__iter__`**, not in the parent.
   `num_workers=0` is the intended mode — the Rust pipeline already parallelizes.
 
+### Grouped sharding — per-perturbation reads
+Physical co-location of groups on disk. Convert or sort with `group_by=`:
+```python
+pyscx.from_h5ad("screen.h5ad", "screen.scx",
+                group_by="target_gene", reference=["non-targeting"])
+```
+Then read one perturbation at a time (1–2 shard reads, not ~120):
+```python
+exp = pyscx.open("screen.scx")
+adata = exp.read_group("MYC")            # AnnData, 1-2 shard reads
+ref   = exp.read_reference()             # AnnData | None (shard 0)
+for gs in exp.iter_group_shards():       # streaming, ~one shard resident
+    ad = gs.to_anndata()
+```
+Cloud: `pyscx.open_cloud(url).read_group("MYC")` — same API, range reads.
+`append` drops the group index — re-sort to restore.
+
 Full constructor kwargs, batch schemas, shuffling semantics, train/val/test
-splitting, and Lightning examples are in `reference/ml-loading.md`.
+splitting, grouped sharding details, and Lightning examples are in
+`reference/ml-loading.md`.
 
 ---
 

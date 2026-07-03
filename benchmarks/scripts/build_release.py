@@ -16,8 +16,11 @@ def ensure_release_build():
     the native extension is compiled with optimizations enabled.
     """
     print("Building pyscx in release mode...")
+    # `--features` REPLACES maturin's default feature set, so hdf5 (from_h5ad)
+    # and gpu must be listed explicitly — omitting them silently drops those
+    # capabilities from the shared editable .so across all envs.
     result = subprocess.run(
-        [MATURIN, "develop", "--release"],
+        [MATURIN, "develop", "--release", "--features", "hdf5,gpu"],
         cwd=PYSCX_DIR,
         capture_output=True,
         text=True,

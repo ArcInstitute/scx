@@ -129,6 +129,10 @@ class DatasetConfig:
     def slaf_path(self) -> Path:
         return DATA_DIR / f"{self.name}.slaf"
 
+    @property
+    def shardad_path(self) -> Path:
+        return DATA_DIR / f"{self.name}.shad"
+
     # Per-codec SCX paths for benchmark isolation
     @property
     def scx_auto_path(self) -> Path:
@@ -240,6 +244,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
+    "shardad": "shardad_path",
     "anndata_zarr_backed": "anndata_zarr_backed_path",
     # Phase K — multimodal format keys.
     "h5mu_uncompressed": "h5mu_path",
@@ -545,6 +550,16 @@ DATASETS: dict[str, DatasetConfig] = {
         source="tahoe-100m — c38-n10.h5ad (CSR X, drug)",
         approx_h5ad_mb=2_200, available=True,
     ),
+    # Real RAW-COUNT Perturb-seq fixture (integer UMIs, CSR) — shardad's
+    # integer-count home turf. group_by `target_gene` (2354 KOs) + `non-targeting`
+    # reference. ~909M nnz; the largest grouped fixture (7.3 GB h5ad).
+    "chemogenetic_rgfp": DatasetConfig(
+        id="GS3", name="chemogenetic_rgfp",
+        n_obs=136_051, n_vars=18_151,
+        protocol="Perturb-seq (CRISPRi, raw counts, HDAC-inhibitor screen)",
+        source="chemogenetic_h1/run1 — RGFP-n5.h5ad (CSR raw counts, target_gene + non-targeting)",
+        approx_h5ad_mb=7_000, available=True,
+    ),
     # Phase K — multimodal datasets sourced from 10x Genomics public
     # CITE-seq + Multiome libraries. Staged via
     # benchmarks/scripts/download_citeseq_pbmc.py and
@@ -628,6 +643,7 @@ PRIMARY_FORMATS: list[FormatVariant] = [
     FormatVariant("SCX (pcodec)", "scx_pcodec", "primary", "scx_runner",
                   {"codec": "pcodec"}),
     FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
+    FormatVariant("Shardad", "shardad", "primary", "shardad_runner"),
 ]
 
 ADDITIONAL_FORMATS: list[FormatVariant] = [
@@ -1104,6 +1120,12 @@ def estimate_memory_gb(
         # streams. CITE-seq peaks at ~590 MB, Multiome at ~5 GB host RSS
         # in the empirical SLURM run; size like ml_loader's sparse path.
         peak_mb = max(base_mb * 2, dense_mb * 0.5)
+    elif benchmark == "grouped_read":
+        # Cross-format grouped write + per-perturbation read_group. The scx arm
+        # streams; the shardad arm materializes each read group (and reads the
+        # source on grouped write). Size like read_full's sparse path so the
+        # shardad materialization has headroom.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     else:
         peak_mb = base_mb
 
@@ -1171,6 +1193,11 @@ def estimate_time_minutes(
         # slow scenario — minutes on a real Perturb-seq file even at the
         # in-module _MAX_CONVERT_RUNS=2 cap — so the base is generous.
         "grouped_sort":           40,
+        # Cross-format grouped read/write head-to-head (scx_auto + shardad).
+        # Times a grouped write per format plus per-perturbation read_group
+        # over a handful of labels; the shardad arm materializes full groups,
+        # so keep the base generous like grouped_sort.
+        "grouped_read":           40,
         "cloud_push":             20,
         "cloud_pull":             20,
         "cloud_read":             20,

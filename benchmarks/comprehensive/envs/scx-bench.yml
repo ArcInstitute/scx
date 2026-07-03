@@ -96,3 +96,13 @@ dependencies:
     # self-classify as Skipped and the 4 pseudobulk rows in the Scanpy
     # API Equivalence table render as "pydeseq2 not installed — skipped".
     - pydeseq2>=0.5.4
+    # Shardad — condition-grouped sharded .shad format, benchmarked as a
+    # competing format (shardad_runner) + the grouped_read head-to-head.
+    # Not on PyPI/conda; installed from the local repo, which builds its
+    # Rust core in release per its pyproject (needs a Rust toolchain — the
+    # pure-Python fallback is byte-identical but ~3x slower). Deps
+    # (anndata/h5py/hdf5plugin/numpy/scipy/pandas/pyarrow/bitshuffle/
+    # zstandard) are all compatible with this env — no Lance/DuckDB
+    # conflict, so shardad shares scx-bench rather than needing an isolated
+    # env. Override with a checkout elsewhere as needed.
+    - -e /home/nickyoungblut/dev/python/shardad

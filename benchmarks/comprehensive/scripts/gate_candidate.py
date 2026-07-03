@@ -412,6 +412,40 @@ def _check_pyscx_accel(python: str) -> CheckResult:
     return CheckResult("pyscx_accel", "ok", "import ok")
 
 
+def _check_pyscx_build_profile(python: str) -> CheckResult:
+    """Fail fast if pyscx is a debug build.
+
+    A debug `.so` (a `maturin develop` without `--release`) runs ~4-10x slower
+    uniformly and silently poisons every scx timing — this exact footgun cost a
+    day chasing a phantom "grouped-write regression" (see GROUP-BY-REG-FIX.md).
+    `pyscx.__build_profile__` is emitted from `cfg!(debug_assertions)`.
+    """
+    rc, out = _run_silent(
+        [
+            python, "-c",
+            "import pyscx, sys; "
+            "p = getattr(pyscx, '__build_profile__', 'unknown'); "
+            "print(p); "
+            "sys.exit(0 if p == 'release' else 3)",
+        ],
+        timeout=20,
+    )
+    profile = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+    if rc == 0:
+        return CheckResult("pyscx_build", "ok", "release build")
+    if profile == "unknown":
+        return CheckResult(
+            "pyscx_build", "warn",
+            "pyscx has no __build_profile__ (pre-guard build) — rebuild with "
+            "`cd pyscx && maturin develop --release --features hdf5,gpu` to enable the guard",
+        )
+    return CheckResult(
+        "pyscx_build", "fail",
+        f"pyscx is a {profile!r} build — benchmarks require release. Rebuild with "
+        "`cd pyscx && maturin develop --release --features hdf5,gpu`",
+    )
+
+
 def _check_disk_space() -> CheckResult:
     RESULTS.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(RESULTS).free
@@ -554,6 +588,7 @@ def run_preflight(args: argparse.Namespace) -> tuple[list[CheckResult], dict]:
         _check_helpers(),
         _check_baseline(args.baseline),
         _check_python_interp(args.python),
+        _check_pyscx_build_profile(args.python),
         _check_disk_space(),
     ]
     slurm_check = _check_slurm()

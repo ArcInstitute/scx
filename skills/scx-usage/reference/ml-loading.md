@@ -139,6 +139,53 @@ the `{"codes","categories"}` dict); `n_vars` is a `dict[str,int]` (per-modality
 counts); `return_dict=False` yields tuples of X arrays only (no obs /
 cell_indices).
 
+## Grouped sharding — per-perturbation reads
+
+Physical co-location of perturbation groups on disk. `scx sort --group-by` (or
+`from_h5ad(group_by=)`) sorts rows by group label, bin-packs groups into shards
+cutting only at group edges, and isolates reference cells in shard 0. Result:
+`read_group("MYC")` touches 1–2 shards instead of the full file — 100–1000× I/O
+reduction per group read.
+
+**Write-time:**
+```python
+# From h5ad — sort + convert in one step
+pyscx.from_h5ad("screen.h5ad", "screen.scx",
+                group_by="target_gene", reference=["non-targeting"])
+
+# Re-sort an existing .scx
+pyscx.sort("screen.scx", "screen_grouped.scx",
+           group_by="target_gene", reference=["non-targeting"])
+```
+
+`reference` accepts `list[str]` (label values treated as reference) **or**
+`{"column": "is_control"}` (boolean obs column — rows where that column is
+`True` become reference cells).
+
+**Read-time:**
+```python
+exp = pyscx.open("screen_grouped.scx")
+adata     = exp.read_group("MYC")       # AnnData, 1-2 shard reads
+ref_adata = exp.read_reference()         # AnnData | None
+labels    = exp.group_labels()           # list[str]
+
+for gs in exp.iter_group_shards():       # streaming, ~one shard resident
+    ad       = gs.to_anndata()
+    label_ad = gs.read_group("MYC")      # per-label slice from this shard
+```
+
+Cloud: `pyscx.open_cloud(url).read_group("MYC")` etc. — same API, range reads.
+
+**Staleness:** `pyscx.append` drops the group index. Re-sort with `pyscx.sort`
+to restore grouping after mutations.
+
+**Relation to training loaders:** grouped sharding is the physical layout
+optimisation that makes random-access patterns efficient — paired (perturbed,
+control) reads hit the shard LRU cache when groups are co-located.
+`SparseCellSetDataset` benefits most: without grouping a perturbation batch
+scatters across 30–50 shards (large `cache_shards` + high RSS); with grouping
+each perturbation is in 1–2 shards.
+
 ## Train / val / test splits
 
 - **Query-based (recommended):** if obs has a `split` column, materialize each

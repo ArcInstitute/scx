@@ -53,6 +53,7 @@ GROUP_SPEC: dict[str, tuple[str, str | None]] = {
     "nb_glm_synth": ("perturbation", "control"),
     "replogle_k562": ("gene", "non-targeting"),
     "tahoe_c38": ("drug", None),
+    "chemogenetic_rgfp": ("target_gene", "non-targeting"),
 }
 
 # Labels read back for the parity check (capped at the available groups).

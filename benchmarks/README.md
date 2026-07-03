@@ -149,6 +149,7 @@ The benchmark suite compares SCX against all relevant single-cell data formats:
 | **Zarr** (blosc-lz4) | CSR arrays, Zarr v3, blosc-lz4 | `zarr` >= 3.0 | Fast decompression variant |
 | **TileDB-SOMA** | SOMAExperiment | `tiledbsoma` >= 2.3 + `tiledbsoma_ml` | CELLxGENE Census native format |
 | **SLAF** | SLAF directory (Lance + DuckDB) | `slafdb` >= 0.5.2 | SQL-native lazy format. Isolated `scx-bench-slaf` env (DuckDB/Lance conflict with TileDB/Zarr pins) |
+| **Shardad** | Single `.shad` file (condition-grouped CSR shards) | `shardad` (local build) | Counts-oriented sharded h5ad replacement; condition (`group_by`) grouping is its specialty — the head-to-head axis for `grouped_read`. Shares the `scx-bench` env (deps compatible; not on PyPI/conda — installed editable from `~/dev/python/shardad`, builds a Rust core). |
 | **SCX** | auto, none, scx1, zstd, pcodec, lz4 | `pyscx` / `scx-cli` | System under test (multiple codec variants) |
 
 ### Additional Competitors
@@ -188,6 +189,11 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 | **Multimodal streaming vs in-memory** (3.7c) | `multimodal_read_streaming_vs_inmemory.py` | Phase 6b — `to_mudata(backed=True)` per-modality chunked iteration vs eager `to_mudata()`. Gated on `dataset.multimodal == True` AND multimodal-SCX format keys |
 | **Streaming export** (3.7d) | `export_streaming.py` | Phase 8 — paired `pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs `stream=False`. Wall time and peak RSS for both paths; gates on the streaming row's `streaming_peak_rss_mb` floor at `census_1m`. Multimodal datasets auto-dispatch to `to_h5mu`. SCX-only |
 | **Cell-eval parity perf** (3.15) | `cell_eval_parity_perf.py` | SCX `pyscx.accel.*` perturbation metrics vs cell-eval / arc-bench reference, on synthetic perturbation datasets at 100K–1M cells |
+| **Grouped sharding** (SCX-only) | `grouped_sort.py` | `scx sort --group-by` + convert-time grouping (one-pass vs two-pass density auto-route) + read-back correctness, on the perturbation grouping fixtures |
+| **Grouped read/write** (scx vs shardad) | `grouped_read.py` | Cross-format head-to-head: grouped write + per-perturbation `read_group` / `query_filter` / `iter_group_shards` throughput + reference isolation, scx vs shardad, on integer-count grouping fixtures (`nb_glm_synth`, `replogle_k562`, `tahoe_c38`, `chemogenetic_rgfp`) |
+| **Out-of-core peak RSS** (scx vs shardad) | `ooc_rss_boundary.py` | Full-data-pass true-peak RSS: scx bounded streaming vs shardad full materialize, across `census_500k/1m/5m` — scx-flat vs shardad-linear (the out-of-core moat) |
+| **Shardad fidelity** | `shardad_fidelity.py` | shardad round-trip parity (source h5ad → `.shad` → `to_anndata` equals source) + dtype/materialization knobs. shardad-only (`roundtrip`/`correctness` are SCX-codec-specific) |
+| **ML loader (shardad arm)** | `ml_loader.py` | shardad row-slice loader alongside SCX `TrainingDataset` / AnnData / TileDB-SOMA-ML / SLAF (batches/s, TTFB, peak RSS) |
 
 ### Measurement Protocol
 

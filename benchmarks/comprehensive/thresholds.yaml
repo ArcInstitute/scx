@@ -819,6 +819,19 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__hvg_norm
     min: 10.0
+  # shardad row-slice loader (no native DataLoader; random-access read).
+  # Seeded at 0.0 — re-baseline to 0.5x the measured median with
+  # `promote_baseline.py` + a justification once numbers land.
+  - benchmark: ml_loader
+    format: shardad
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__raw
+    min: 0.0
+  - benchmark: ml_loader
+    format: shardad
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__hvg_norm
+    min: 0.0
 
   # `num_workers > 0` floors. Activated after the fork-safety fix —
   # pre-fix this path deadlocked, so no historical baseline exists.
@@ -1318,6 +1331,153 @@ absolute_floors:
     format: scx_auto
     dataset: tahoe_c38
     metric: n_group_records
+    min: 1
+  # chemogenetic_rgfp (real raw counts, ref=non-targeting)
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: reference_isolated_int
+    min: 1
+
+  # ─── Grouped read (cross-format head-to-head: scx vs shardad) ──────
+  # Same correctness-only policy as grouped_sort, but gated for BOTH formats so
+  # a read_group / read_reference regression in either the scx or the shardad
+  # arm trips the gate. Head-to-head perf (grouped_write wall/size, read_group
+  # throughput) is reported, not floored (hardware/density sensitive). Runs on
+  # the integer-count grouping datasets only — the float pert_synth_10k fixture
+  # is scx-only (grouped_sort), since shardad is a counts format.
+  # nb_glm_synth (ref=control)
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: nb_glm_synth
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: nb_glm_synth
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: nb_glm_synth
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: nb_glm_synth
+    metric: reference_isolated_int
+    min: 1
+  # replogle_k562 (ref=non-targeting)
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: replogle_k562
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: replogle_k562
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: replogle_k562
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: replogle_k562
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: replogle_k562
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: replogle_k562
+    metric: reference_isolated_int
+    min: 1
+  # tahoe_c38 (no reference)
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: tahoe_c38
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: tahoe_c38
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: tahoe_c38
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: tahoe_c38
+    metric: n_group_records
+    min: 1
+  # chemogenetic_rgfp (real raw counts, ref=non-targeting) — both formats
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_read
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: reference_isolated_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: chemogenetic_rgfp
+    metric: correctness_passed_int
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: chemogenetic_rgfp
+    metric: n_group_records
+    min: 1
+  - benchmark: grouped_read
+    format: shardad
+    dataset: chemogenetic_rgfp
+    metric: reference_isolated_int
+    min: 1
+
+  # ─── Shardad read-back fidelity (source h5ad -> .shad -> to_anndata) ──
+  # Correctness-only: the round-tripped matrix must equal the source
+  # (counts lossless; float32 preserved). One gate per fixture.
+  - benchmark: shardad_fidelity
+    format: shardad
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: shardad_fidelity
+    format: shardad
+    dataset: nb_glm_synth
+    metric: overall_passed_int
+    min: 1
+  - benchmark: shardad_fidelity
+    format: shardad
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
     min: 1
 
 # ---------------------------------------------------------------------------

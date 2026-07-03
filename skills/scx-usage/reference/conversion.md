@@ -143,6 +143,62 @@ via h5ad (`adata.write_h5ad(...)` → `from_h5ad`).
   so older/plain files read identically on a modern build. Unsupported in both:
   `bytes`, and `datetime64`/`complex`/`timedelta` ndarray dtypes.
 
+## Grouped sharding
+
+Cluster rows by an obs label so every shard holds exactly one group (e.g. one
+guide target, one donor). Reference/control cells land in the leading shard(s).
+
+**Python:**
+```python
+pyscx.from_h5ad("screen.h5ad", "screen.scx",
+                group_by="target_gene", reference=["non-targeting"])
+
+# boolean obs column as reference selector
+pyscx.from_h5ad("screen.h5ad", "screen.scx",
+                group_by="target_gene", reference={"column": "is_control"})
+
+# explicit byte budget per shard
+pyscx.from_h5ad("screen.h5ad", "screen.scx",
+                group_by="target_gene", reference=["non-targeting"],
+                group_target_bytes=256*1024*1024)
+
+# re-sort an existing file into grouped order
+pyscx.sort("screen.scx", "screen_grouped.scx",
+           group_by="target_gene", reference=["non-targeting"])
+```
+
+**CLI:**
+```bash
+scx convert screen.h5ad screen.scx --group-by target_gene --reference non-targeting
+scx convert screen.h5ad screen.scx --group-by target_gene --reference non-targeting \
+    --group-target-bytes 256MiB
+scx sort screen.scx screen_grouped.scx --group-by target_gene --reference non-targeting
+```
+
+**Kwargs / flags:**
+
+- **`group_by`** (`str`): obs column whose labels cluster rows into shards
+  (e.g. `target_gene`, `cell_type`, `donor_id`).
+- **`reference`** (`list[str]` | `dict`): labels that mark reference/control
+  cells. `["non-targeting"]` → label match; `{"column": "is_control"}` →
+  boolean obs column. Requires `group_by`.
+- **`group_target_bytes`** (`int`, optional): byte budget per shard for the
+  bin-packer. Defaults to a value derived from `shard_size`.
+- **`group_max_bytes`** (`int`, optional): oversize warning threshold (default
+  4× target).
+- **`group_pass`** (`str`, optional): `"auto"` (default), `"one"`, or `"two"`.
+  `auto` routes CSR sources to one-pass streaming gather and dense sources to
+  two-pass (convert then sort). One-pass is ~1.7× faster / ~2× lighter on CSR.
+
+**Behaviour:**
+
+- Reference cells are isolated in the leading shard(s) (shard 0). A group never
+  straddles a shard boundary.
+- The `group_by` column is auto-indexed for predicate pushdown.
+- `append` drops the group index (with a warning); re-sort to restore grouping.
+- Requires single-modality inputs (multimodal `--group-by` errors).
+- CSC sidecars and h5mu inputs are not supported with `--group-by`.
+
 ## File ops (Python)
 
 - `pyscx.append(target, input, codec=None, shard_size=None, index_*=...)` — streaming append from an SCX file (raw-copy fast path when codec/encoding match).
