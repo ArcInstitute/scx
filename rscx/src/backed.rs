@@ -58,6 +58,12 @@ impl RBackedSparse {
         })
     }
 
+    // NOTE: backed reads are not gated for the u32→f32 decode loss (see the
+    // decode-loss guard). They decode lazily per row-slice through a
+    // `BackedCsrReader` (no `ScxReader`/catalog in scope), so a whole-file check
+    // would spuriously error on partial reads that never touch the large-count
+    // shard — consistent with ungated backed reads on the Python side.
+
     /// Fallible body of `read_rows`: 0-based, half-open `[start, end)`.
     fn read_rows_impl(&self, start: u64, end: u64) -> Result<Robj> {
         if start > end {

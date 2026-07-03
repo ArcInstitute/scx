@@ -8,6 +8,7 @@ use crate::query::RGroupShardHandle;
 
 mod accel;
 mod backed;
+mod guard;
 mod harmony;
 mod interop;
 mod lazy;
@@ -69,7 +70,8 @@ impl ScxExperiment {
     }
 
     /// Fallible body of `x_matrix` (see B3 / `throw_on_err`).
-    fn x_matrix_impl(&self) -> Result<Robj> {
+    fn x_matrix_impl(&self, allow_lossy: bool) -> Result<Robj> {
+        guard::guard_decode_loss(guard::csr_max_value(&self.reader, None), allow_lossy)?;
         let csr = self
             .reader
             .read_all_csr_shards()
@@ -78,7 +80,8 @@ impl ScxExperiment {
     }
 
     /// Fallible body of `layer` (see B3 / `throw_on_err`).
-    fn layer_impl(&self, name: &str) -> Result<Robj> {
+    fn layer_impl(&self, name: &str, allow_lossy: bool) -> Result<Robj> {
+        guard::guard_decode_loss(guard::layer_max_value(&self.reader, name), allow_lossy)?;
         let csr = self
             .reader
             .read_layer(name)
@@ -167,13 +170,19 @@ impl ScxExperiment {
 
     /// Fallible body of `to_seurat` (kept off the `#[extendr]` surface so the
     /// public method can return `Robj` + `throw_on_err`; see B7).
-    fn to_seurat_impl(&self) -> Result<Robj> {
+    fn to_seurat_impl(&self, allow_lossy: bool) -> Result<Robj> {
         if self.reader.is_multimodal() {
-            interop::to_seurat_multimodal(&self.reader)
+            interop::to_seurat_multimodal(&self.reader, allow_lossy)
         } else {
             // Reuse the existing single-modality path by
             // materialising a QueryResult-equivalent in-memory
             // structure. Read X / obs / var directly.
+            //
+            // This path builds the QueryResult manually (it does not go through
+            // the engine), so fold the catalog value_max here and fail loud on
+            // the silent u32→f32 decode loss before decoding.
+            let max_value = guard::csr_max_value(&self.reader, None);
+            guard::guard_decode_loss(max_value, allow_lossy)?;
             let csr = self
                 .reader
                 .read_all_csr_shards()
@@ -194,10 +203,7 @@ impl ScxExperiment {
                 total_shards: 0,
                 candidate_shard_rows: 0,
                 matched_rows: 0,
-                // TODO: wire the u32→f32 decode-loss guard for R reads. Hardcoded
-                // 0 means R-side reads of >2²⁴ integer archives still round
-                // silently (the guard is currently pyscx-only).
-                max_value: 0,
+                max_value,
             };
             interop::to_seurat_v5(&result)
         }
@@ -274,15 +280,15 @@ impl ScxExperiment {
     /// same as the original CSR orientation (cells as rows, genes as columns).
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
-    fn x_matrix(&self) -> Robj {
-        crate::util::throw_on_err(self.x_matrix_impl())
+    fn x_matrix(&self, allow_lossy: Option<bool>) -> Robj {
+        crate::util::throw_on_err(self.x_matrix_impl(allow_lossy.unwrap_or(false)))
     }
 
     /// Read a named layer as dgCMatrix.
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3).
-    fn layer(&self, name: &str) -> Robj {
-        crate::util::throw_on_err(self.layer_impl(name))
+    fn layer(&self, name: &str, allow_lossy: Option<bool>) -> Robj {
+        crate::util::throw_on_err(self.layer_impl(name, allow_lossy.unwrap_or(false)))
     }
 
     /// List available layer names.
@@ -372,8 +378,8 @@ impl ScxExperiment {
     /// failure (e.g. missing `Seurat`) rather than `unwrap()`-panicking in
     /// extendr 0.8.0, which masks the message behind "User function
     /// panicked". See B7.
-    fn to_seurat(&self) -> Robj {
-        util::throw_on_err(self.to_seurat_impl())
+    fn to_seurat(&self, allow_lossy: Option<bool>) -> Robj {
+        util::throw_on_err(self.to_seurat_impl(allow_lossy.unwrap_or(false)))
     }
 
     /// Phase I.2: build a Bioconductor `MultiAssayExperiment` from
@@ -382,8 +388,8 @@ impl ScxExperiment {
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see
     /// `to_seurat` above and B7).
-    fn to_mae(&self) -> Robj {
-        util::throw_on_err(interop::to_mae(&self.reader))
+    fn to_mae(&self, allow_lossy: Option<bool>) -> Robj {
+        util::throw_on_err(interop::to_mae(&self.reader, allow_lossy.unwrap_or(false)))
     }
 }
 

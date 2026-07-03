@@ -1666,7 +1666,7 @@ fn infer_modality_type_from_name(name: &str) -> scx_format_io::ModalityType {
 /// Phase I.1: build a Seurat v5 multi-assay object from a multimodal
 /// SCX reader. One `Assay5` per registered modality; meta.data and
 /// cell names come from the global obs.
-pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
+pub fn to_seurat_multimodal(reader: &ScxReader, allow_lossy: bool) -> Result<Robj> {
     if !reader.is_multimodal() {
         return Err(Error::Other(
             "to_seurat: source file is single-modality; use the per-result \
@@ -1706,6 +1706,10 @@ pub fn to_seurat_multimodal(reader: &ScxReader) -> Result<Robj> {
         let mid = reader.modality_id(name).ok_or_else(|| {
             Error::Other(format!("modality '{name}' missing from modality table"))
         })?;
+        crate::guard::guard_decode_loss(
+            crate::guard::csr_max_value(reader, Some(mid)),
+            allow_lossy,
+        )?;
         let csr = reader
             .read_all_csr_shards_for(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {}", e)))?;
@@ -2044,7 +2048,7 @@ fn from_mae_impl(
 /// `SingleCellExperiment` in `experiments`; the global obs becomes
 /// `colData`. Cell names are taken from the obs row index (or
 /// auto-generated as `cell_0..n`).
-pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
+pub fn to_mae(reader: &ScxReader, allow_lossy: bool) -> Result<Robj> {
     if !reader.is_multimodal() {
         return Err(Error::Other(
             "to_mae: source file is single-modality; use to_sce() instead".into(),
@@ -2087,6 +2091,10 @@ pub fn to_mae(reader: &ScxReader) -> Result<Robj> {
         let mid = reader.modality_id(name).ok_or_else(|| {
             Error::Other(format!("modality '{name}' missing from modality table"))
         })?;
+        crate::guard::guard_decode_loss(
+            crate::guard::csr_max_value(reader, Some(mid)),
+            allow_lossy,
+        )?;
         let csr = reader
             .read_all_csr_shards_for(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {e}")))?;
