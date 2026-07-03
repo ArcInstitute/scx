@@ -1348,9 +1348,30 @@ corrupting values:
 
 The error names the offending value and suggests a wider dtype or
 `allow_lossy=True`. Widening casts (e.g. `uint8 → float32`, the default) are
-always safe and are never gated. This also closes a latent silent
-`u32 → f32` narrowing above 2²⁴ (e.g. pseudobulk / aggregated counts) that the
-old fixed-f32 path performed with no warning.
+always safe and are never gated.
+
+**Decode-loss guard (the `u32 → f32` case).** scx decodes on-disk integer counts
+to an `f32` CSR *before* any dtype materialization, so counts above 2²⁴
+(16,777,216 — routine in pseudobulk / aggregated counts) would silently round.
+Every read now consults the catalog's per-shard `value_max` first and **fails
+loud when it exceeds 2²⁴** — including the plain `to_anndata()` default, and
+regardless of the requested `data_dtype` (even `float64`, because the read still
+intermediates through f32 in this release). Pass `allow_lossy=True` to accept the
+rounding. This is a **behavior change**: reads that previously returned silently
+rounded values on such archives now raise. Notes:
+
+- The guard is **integer-encoding-only** and O(1): float-encoded shards record
+  `value_max = 0` in the catalog, so continuous / log-normalized data never trips
+  it, and the check is a single per-shard comparison (no data scan).
+- It is **conservative**: the catalog carries only the per-shard maximum, so a
+  shard whose max exceeds 2²⁴ trips the guard even if that particular value is
+  itself f32-exact. `allow_lossy=True` is the escape hatch.
+- A *lossless* wide read (returning the exact counts as `float64` / `int64`)
+  requires pushing dtype into the decode; that is a planned follow-up. Until then,
+  such a read fails loud rather than returning corrupted values.
+- **Backed reads (`backed=True`) are not yet gated** — they decode lazily
+  per-slice, so a whole-file check would spuriously error on partial reads that
+  never touch the large-count shard.
 
 > **Note.** A scipy `csr_matrix` with `float16` `data` is valid but cannot be
 > densified by scipy's own `.toarray()` (a scipy limitation) — call

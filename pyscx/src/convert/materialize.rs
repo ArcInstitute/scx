@@ -59,6 +59,22 @@ pub(crate) fn parse_index_dtype(dt: Option<&str>) -> PyResult<IndexDtype> {
     }
 }
 
+/// Fail loud (as a Python `ValueError`) when decoding an integer shard whose
+/// `value_max` exceeds `f32`'s exact-integer range would silently round, and the
+/// caller has not passed `allow_lossy=True`.
+///
+/// scx's Phase-1 read decodes every shard to an `f32` CSR before any dtype
+/// materialization, so on-disk `u32` counts above 2²⁴ are silently rounded
+/// regardless of the requested output dtype. `max_value` is the max
+/// `ShardStats::value_max` over the shards in scope of the read (see
+/// [`super::csr_max_value`] for the eager path, or `QueryResult::max_value` for
+/// the query path). Float-encoded shards record `value_max = 0`, so they never
+/// trip this.
+pub(crate) fn guard_decode_loss(max_value: u32, allow_lossy: bool) -> PyResult<()> {
+    scx_codec::guard_f32_decode_loss(max_value, allow_lossy)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// Build a `MaterializePlan` from the four read kwargs, applying validation and
 /// the "index_dtype ignored for dense" warning.
 pub(crate) fn build_plan(

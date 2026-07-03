@@ -865,6 +865,11 @@ impl PyExperiment {
             }
             return convert::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
         }
+        // NOTE: backed reads are *not* gated for the u32→f32 decode loss.
+        // A backed AnnData decodes lazily per-slice, so a whole-catalog check
+        // here would spuriously error on a partial read that never touches the
+        // big-value shard. Gating the lazy-slice decode in the backed sparse
+        // dataset is a deferred follow-up.
         if backed {
             convert::to_anndata_backed(
                 py,
@@ -893,6 +898,7 @@ impl PyExperiment {
                 false,
                 preserve_var_order,
                 strict_var_names,
+                plan.allow_lossy,
             )?;
             // F10: a materialized (in-memory CSR) AnnData drops the on-disk CSC
             // sidecar, so a later GPU DE call silently falls back to the slower
@@ -1054,6 +1060,7 @@ impl PyExperiment {
                     true,  // skip_x
                     false, // preserve_var_order (fast path: var_names is None)
                     false, // strict_var_names (no names to check)
+                    allow_lossy,
                 )?;
 
                 // Raw shard bytes (borrow the reader's mmap) + a cheap header
@@ -1159,6 +1166,7 @@ impl PyExperiment {
                     false, // skip_x
                     preserve_var_order,
                     strict_var_names,
+                    allow_lossy,
                 )?;
 
                 // Pull X's CSR arrays. scipy may store indptr/indices as int32 when

@@ -79,6 +79,10 @@ pub(crate) fn query_result_to_anndata_with_plan<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let anndata_mod = py.import("anndata")?;
 
+    // Fail loud on the silent u32→f32 decode loss over the shards that survived
+    // pushdown, before consuming `result.x`.
+    convert::guard_decode_loss(result.max_value, plan.allow_lossy)?;
+
     // X — CSR → scipy/dense in the requested dtype (zero-copy for the default).
     let x = convert::csr_to_scipy_typed(py, result.x, plan)?;
 
@@ -394,6 +398,7 @@ impl PyQueryResult {
     ) -> PyResult<Bound<'py, PyAny>> {
         let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
         let result = self.take_result()?;
+        convert::guard_decode_loss(result.max_value, plan.allow_lossy)?;
         convert::csr_to_scipy_typed(py, result.x, &plan)
     }
 

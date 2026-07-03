@@ -9,13 +9,45 @@
 // dtypes. On a lossy cast without `allow_lossy`, returns
 // `CodecError::MalformedInput`.
 //
-// Scope: this gates narrowing *from the decoded f32 stream* only. The
-// decode-level `u32 as f32` casts (dispatch.rs, e.g. the Scx1 rice fast path and
-// `values_raw_to_f32`) are upstream and still round integer counts above 2²⁴ to
-// f32 before this gate ever sees them — closing that decode-level loss is Phase 2
-// (push-dtype-into-decode), not this module.
+// Scope: `checked_cast_*` gates narrowing *from the decoded f32 stream* only.
+// The decode-level `u32 as f32` casts (dispatch.rs, e.g. the Scx1 rice fast path
+// and `values_raw_to_f32`) are upstream and still round integer counts above 2²⁴
+// to f32 before that gate ever sees them. `guard_f32_decode_loss` (below) is the
+// O(1) companion that a reader calls *before* decode, using the catalog's
+// `value_max`, so a read of such an archive fails loud instead of silently
+// rounding. Making a >2²⁴ integer read *succeed* (typed lossless decode) is
+// still Phase 2 (push-dtype-into-decode), not this module.
 
 use crate::dispatch::CodecError;
+
+/// Largest integer that `f32` represents exactly (2²⁴). Above this, consecutive
+/// integers are no longer all representable, so decoding `u32` counts to `f32`
+/// rounds.
+pub const F32_MAX_EXACT_INT: u32 = 1 << 24;
+
+/// Fail loud when an integer shard's `value_max` exceeds what `f32` represents
+/// exactly and the caller has not opted into lossy narrowing.
+///
+/// scx's Phase-1 read decodes every shard to an `f32` CSR before any dtype
+/// materialization, so an on-disk `u32` count above 2²⁴ is silently rounded
+/// regardless of the requested output dtype. This O(1) check runs *before*
+/// decode using the catalog's `value_max` (integer-encoded shards only —
+/// float-encoded shards record `value_max = 0`, so they never trip it).
+///
+/// `max_value` is the maximum `ShardStats::value_max` over the shards in scope
+/// of the read. Returns `CodecError::MalformedInput` when the decode would lose
+/// precision and `allow_lossy` is `false`.
+pub fn guard_f32_decode_loss(max_value: u32, allow_lossy: bool) -> Result<(), CodecError> {
+    if allow_lossy || max_value <= F32_MAX_EXACT_INT {
+        return Ok(());
+    }
+    Err(CodecError::MalformedInput(format!(
+        "integer value {max_value} exceeds 2²⁴ ({F32_MAX_EXACT_INT}), the largest integer \
+         representable exactly in float32; scx decodes counts to f32 before materialization, \
+         so this read would silently round large counts. Pass `allow_lossy=True` to accept \
+         the f32 rounding (lossless typed decode is not yet available)."
+    )))
+}
 
 /// A target dtype reachable from an `f32` value stream.
 pub trait CastFromF32: Copy + Sized {
@@ -296,6 +328,21 @@ mod tests {
         let out: Vec<half::f16> = checked_cast_values(&v, false).unwrap();
         let back: Vec<f32> = out.iter().map(|h| h.to_f32()).collect();
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn guard_f32_decode_loss_thresholds() {
+        // Below and at the exact-int limit: never errors.
+        assert!(guard_f32_decode_loss(0, false).is_ok());
+        assert!(guard_f32_decode_loss(255, false).is_ok());
+        assert!(guard_f32_decode_loss(F32_MAX_EXACT_INT, false).is_ok());
+        // Above the limit without allow_lossy: fail loud.
+        let err = guard_f32_decode_loss(F32_MAX_EXACT_INT + 1, false).unwrap_err();
+        assert!(matches!(err, CodecError::MalformedInput(_)));
+        assert!(guard_f32_decode_loss(u32::MAX, false).is_err());
+        // Above the limit with allow_lossy: OK (caller accepts rounding).
+        assert!(guard_f32_decode_loss(F32_MAX_EXACT_INT + 1, true).is_ok());
+        assert!(guard_f32_decode_loss(u32::MAX, true).is_ok());
     }
 
     #[test]
