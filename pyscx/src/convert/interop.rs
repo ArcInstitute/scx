@@ -300,6 +300,190 @@ pub(crate) fn csr_to_scipy<'py>(
     scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
 }
 
+/// Materialize an ScxCsr into the container/dtype requested by `plan` (F3).
+///
+/// The default plan (CSR / f32 / i32) delegates to the untouched `csr_to_scipy`
+/// zero-copy path — byte-identical to pre-F3 behavior. Any non-default plan
+/// casts the f32 values / i32 indices through the fail-loud gate
+/// (`scx_codec::checked_cast_*`) and builds either a scipy CSR or a row-major
+/// dense numpy array. This is Phase 1 (read-then-convert): the f32 CSR is built
+/// first, then converted.
+pub(crate) fn csr_to_scipy_typed<'py>(
+    py: Python<'py>,
+    csr: scx_sparse::ScxCsr,
+    plan: &scx_sparse::MaterializePlan,
+) -> PyResult<Bound<'py, PyAny>> {
+    use scx_sparse::{Container, ValueDtype};
+
+    // Fast path: exact current zero-copy CSR/f32/i32 behavior.
+    if plan.is_default_csr_f32() {
+        return csr_to_scipy(py, csr);
+    }
+
+    let (n_rows, n_cols) = csr.shape;
+
+    match plan.container {
+        Container::Dense => {
+            // Direct typed scatter into an (n_rows, n_cols) buffer. For f32 we
+            // reuse the existing scatter (no cast); otherwise cast-then-scatter.
+            let flat = if plan.data_dtype == ValueDtype::F32 {
+                let dense = csr.to_dense().map_err(err_str)?;
+                PyArray1::from_vec(py, dense).into_any()
+            } else {
+                dense_typed(py, &csr, plan.data_dtype, plan.allow_lossy)?
+            };
+            super::reshape_2d(flat, n_rows, n_cols)
+        }
+        Container::Csr => {
+            use scx_sparse::IndexDtype;
+            let scx_sparse::ScxCsr {
+                data: csr_data,
+                indices: csr_indices,
+                indptr: csr_indptr,
+                ..
+            } = csr;
+            // When a component is already at its default dtype, move the owned
+            // Vec straight into numpy (no cast, no copy) — only the narrowed
+            // component pays the cast. Avoids re-copying the axis the caller
+            // left at the default.
+            let data = if plan.data_dtype == ValueDtype::F32 {
+                PyArray1::from_vec(py, csr_data).into_any()
+            } else {
+                super::f32_values_to_numpy(py, &csr_data, plan.data_dtype, plan.allow_lossy)?
+            };
+            let indices = if plan.index_dtype == IndexDtype::I32 {
+                PyArray1::from_vec(py, csr_indices).into_any()
+            } else {
+                super::i32_indices_to_numpy(py, &csr_indices, plan.index_dtype, plan.allow_lossy)?
+            };
+            // indptr stays i64 (scipy-canonical, keeps zero-copy on the common CSR).
+            let indptr = PyArray1::from_vec(py, csr_indptr).into_any();
+
+            let scipy_sparse = py.import("scipy.sparse")?;
+            let args = ((data, indices, indptr),);
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("shape", (n_rows, n_cols))?;
+            kwargs.set_item("copy", false)?;
+            scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
+        }
+    }
+}
+
+/// Cast `csr.data` (f32) to `dtype` through the gate, scatter into a typed dense
+/// buffer, and hand it to numpy as a flat 1-D array.
+fn dense_typed<'py>(
+    py: Python<'py>,
+    csr: &scx_sparse::ScxCsr,
+    dtype: scx_sparse::ValueDtype,
+    allow_lossy: bool,
+) -> PyResult<Bound<'py, PyAny>> {
+    use scx_codec::checked_cast_values;
+    use scx_sparse::ValueDtype;
+
+    macro_rules! dense_arm {
+        ($t:ty) => {{
+            let typed: Vec<$t> = checked_cast_values(&csr.data, allow_lossy).map_err(err_str)?;
+            let dense = csr.to_dense_dtype(&typed).map_err(err_str)?;
+            Ok(PyArray1::from_vec(py, dense).into_any())
+        }};
+    }
+    match dtype {
+        ValueDtype::F16 => dense_arm!(half::f16),
+        ValueDtype::F32 => dense_arm!(f32),
+        ValueDtype::F64 => dense_arm!(f64),
+        ValueDtype::I8 => dense_arm!(i8),
+        ValueDtype::I16 => dense_arm!(i16),
+        ValueDtype::I32 => dense_arm!(i32),
+        ValueDtype::I64 => dense_arm!(i64),
+        ValueDtype::U8 => dense_arm!(u8),
+        ValueDtype::U16 => dense_arm!(u16),
+        ValueDtype::U32 => dense_arm!(u32),
+    }
+}
+
+/// Map any `Display` error (CodecError / CsrError) to a Python `ValueError`.
+fn err_str<E: std::fmt::Display>(e: E) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+/// Rebuild an owned `ScxCsr` from a Python `scipy.sparse` matrix.
+///
+/// The matrix is normalized to CSR (skipping `.tocsr()` when it already is one);
+/// `data` is read as `f32`, `indices` as `i32`, `indptr` as `i64` (scipy may
+/// store either int32 or int64 for these, so we `astype` to the canonical widths
+/// — cheap, and only on the non-default read path). Column indices are always
+/// `< n_vars < 2³¹` and so fit `i32`; `indptr` uses `i64` for large-matrix
+/// headroom. A non-sparse input (e.g. a dense ndarray) is rejected with a clear
+/// error rather than a confusing `AttributeError` on the missing `.data` view.
+fn scipy_to_scxcsr(mat: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
+    use numpy::PyReadonlyArray1;
+
+    if !mat.hasattr("tocsr")? {
+        return Err(PyValueError::new_err(
+            "expected a scipy.sparse matrix for container/dtype materialization; \
+             got a non-sparse object",
+        ));
+    }
+    // `.tocsr()` is a no-op copy on a matrix that is already CSR — skip it.
+    let already_csr = matches!(
+        mat.getattr("format").and_then(|f| f.extract::<String>()),
+        Ok(ref f) if f == "csr"
+    );
+    let csr = if already_csr {
+        mat.clone()
+    } else {
+        mat.call_method0("tocsr")?
+    };
+    let shape: (usize, usize) = csr.getattr("shape")?.extract()?;
+
+    let data_arr = csr.getattr("data")?.call_method1("astype", ("float32",))?;
+    let data = data_arr
+        .extract::<PyReadonlyArray1<f32>>()?
+        .as_slice()?
+        .to_vec();
+
+    let idx_arr = csr.getattr("indices")?.call_method1("astype", ("int32",))?;
+    let indices = idx_arr
+        .extract::<PyReadonlyArray1<i32>>()?
+        .as_slice()?
+        .to_vec();
+
+    let indptr_arr = csr.getattr("indptr")?.call_method1("astype", ("int64",))?;
+    let indptr = indptr_arr
+        .extract::<PyReadonlyArray1<i64>>()?
+        .as_slice()?
+        .to_vec();
+
+    Ok(scx_sparse::ScxCsr::new_unchecked(
+        shape, indptr, indices, data,
+    ))
+}
+
+/// Convert an already-materialized Python matrix (scipy CSR) into the container
+/// and dtype requested by `plan` (F3 Phase 1 post-assembly retype).
+///
+/// A default plan (CSR / f32 / i32) returns the input untouched — callers only
+/// invoke this when `plan.is_default_csr_f32()` is `false`, so the default read
+/// path never re-extracts or copies.
+///
+/// This re-extracts the scipy CSR back into an owned `ScxCsr` (three `astype`
+/// copies) before casting — the price of applying the plan *after* assembly. The
+/// query path (`query_result_to_anndata_with_plan`) is leaner: it owns the
+/// `ScxCsr` and threads the plan straight into `csr_to_scipy_typed` (one
+/// materialization). Phase 2 (push-dtype-into-decode) removes this round-trip for
+/// the eager path too.
+pub(crate) fn retype_matrix<'py>(
+    py: Python<'py>,
+    mat: Bound<'py, PyAny>,
+    plan: &scx_sparse::MaterializePlan,
+) -> PyResult<Bound<'py, PyAny>> {
+    if plan.is_default_csr_f32() {
+        return Ok(mat);
+    }
+    let csr = scipy_to_scxcsr(&mat)?;
+    csr_to_scipy_typed(py, csr, plan)
+}
+
 /// Build a numpy 2-D array directly from a RecordBatch of homogeneous numeric
 /// float columns (B4). Returns `None` (→ caller falls back to the pandas path)
 /// when the batch is empty, heterogeneous, non-float, or contains nulls.

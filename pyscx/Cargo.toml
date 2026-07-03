@@ -17,6 +17,7 @@ arrow = { workspace = true }
 scx-format-io = { path = "../scx-format-io" }
 scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
+half = { workspace = true }
 scx-loader = { path = "../scx-loader", features = ["python"] }
 scx-engine = { path = "../scx-engine" }
 scx-mtx = { path = "../scx-mtx" }

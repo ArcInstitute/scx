@@ -650,6 +650,37 @@ If this exceeds your available memory, use
 need. For fully out-of-core analysis, use
 [backed mode](#backed-mode-lazy-loading).
 
+#### Narrowing the output dtype / dense output
+
+The memory formula above assumes `i32` indices and `f32` data. You can cut that
+in half (or more) by requesting a narrower `data_dtype`, or skip the scipy CSR
+entirely with `container="dense"` — useful when the next step wants a dense,
+narrow array anyway (sklearn, a PyTorch `Tensor`, scVI):
+
+```python
+# Half the X footprint: float16 values (10x/count data is small-valued).
+adata = exp.to_anndata(data_dtype="float16")
+
+# uint8 counts (0–255): a quarter of the f32 footprint.
+adata = exp.to_anndata(data_dtype="uint8")
+
+# Dense row-major ndarray straight out (no CSR → dense re-densify later).
+X = exp.to_anndata(container="dense", data_dtype="float32").X   # numpy.ndarray
+```
+
+The **default** (`container="csr"`, no dtype kwargs) is unchanged and stays
+zero-copy — the `i64/i32/f32` Vecs are moved into numpy with no cast. Any
+non-default request is a read-then-convert (an extra cast/copy of `X`).
+
+Narrowing is **fail-loud** by default: a value that cannot be represented in the
+requested dtype (out of range, fractional into an integer, negative into an
+unsigned type, or a count above 2²⁴ into `float16`) raises `ValueError` naming
+the offending value. Pass `allow_lossy=True` to narrow anyway. This also fixes a
+prior silent `u32 → f32` rounding above 2²⁴ (e.g. pseudobulk / aggregated
+counts). See [`docs/api.md` § Container and dtype materialization](api.md#container-and-dtype-materialization)
+for the full reference. (Note: these kwargs apply to the eager and query paths;
+`to_gpu_anndata` is f32-native and rejects them — narrow on the host first.)
+
 ### Selective loading
 
 All selective loading parameters work in both non-backed and backed modes.

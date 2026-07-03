@@ -987,7 +987,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ### Module-level functions
 
 - `pyscx.open(path, verify=True) -> Experiment` — Open SCX file (local), returning a lazy `Experiment` handle.
-- `pyscx.read(path, *, verify=True, **kwargs) -> AnnData` — One-liner read mirroring `sc.read_h5ad`: shorthand for `pyscx.open(path).to_anndata(**kwargs)`. `**kwargs` forward to [`Experiment.to_anndata`](#experiment) (`backed=`, `var_names=`, `obs_filter=`, `layers=`, …).
+- `pyscx.read(path, *, verify=True, **kwargs) -> AnnData` — One-liner read mirroring `sc.read_h5ad`: shorthand for `pyscx.open(path).to_anndata(**kwargs)`. `**kwargs` forward to [`Experiment.to_anndata`](#experiment) (`backed=`, `var_names=`, `obs_filter=`, `layers=`, `container=`, `data_dtype=`, `index_dtype=`, `allow_lossy=`, …).
 - `pyscx.write(adata, path, **kwargs)` — One-liner write mirroring `AnnData.write_h5ad`: shorthand for `pyscx.from_anndata(adata, path, **kwargs)`.
 - `pyscx.from_anndata(adata, path, codec=None, shard_size=None, in_place=False, csc="off", csc_cols_per_shard=5000, uns_format="tagged", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000, bitmap="off", force_legacy_metadata=False, memory_budget=None)` — Write AnnData to SCX. A float64 `X` is downcast to float32 with a `UserWarning`.
   Persists `X`, `obs`, `var`, `layers`, `obsm`, `varm`, `uns`, and the sparse
@@ -1199,7 +1199,7 @@ header followed by indented `obs:` / `var:` / `uns:` / `obsm:` / `varm:` /
 `layers:` key lists. On-disk codec / shard / format-version internals moved off
 the repr onto `Experiment.info() -> str`.
 
-- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None, preserve_var_order=False, strict_var_names=True)` — Convert to AnnData
+- `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None, preserve_var_order=False, strict_var_names=True, container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset). A set selector by default (sorted original-column order, duplicates collapsed)
   - `preserve_var_order`: when True, return the gene axis in the order `var_names` was listed (first-occurrence-wins dedup) instead of sorted order. Works on eager / backed / GPU / query-engine paths; not supported by `highly_variable_genes` on the resulting backed dataset
   - `strict_var_names`: when True (default), any name absent from the var metadata raises `KeyError`. Pass False to silently drop unknown names (pre-0.8.6 behaviour)
@@ -1259,6 +1259,26 @@ the repr onto `Experiment.info() -> str`.
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block
     assembly.
+  - **Container / dtype materialization** (`container`, `data_dtype`,
+    `index_dtype`, `allow_lossy`) — control the output container and numeric
+    dtype of `X` (and layers). Eager (`backed=False`) only; a non-default
+    request with `backed=True` raises (the backed dataset is lazy and
+    f32-native). See [Container and dtype materialization](#container-and-dtype-materialization) below for the full reference.
+    - `container` (default `"csr"`): `"csr"` → scipy `csr_matrix` (unchanged);
+      `"dense"` → row-major `numpy.ndarray` (no scipy CSR).
+    - `data_dtype` (default `None` → `float32`, today's behaviour): one of
+      `float16` / `float32` / `float64` / `int8` / `int16` / `int32` /
+      `int64` / `uint8` / `uint16` / `uint32`.
+    - `index_dtype` (default `None` → `int32`): CSR column-index dtype
+      (`int16` / `int32` / `int64`). Ignored (with a `RuntimeWarning`) for
+      `container="dense"`.
+    - `allow_lossy` (default `False`): the fail-loud cast gate. When `False`,
+      any narrowing that would lose data (out-of-range, fractional-into-int,
+      negative-into-unsigned, or a count above 2²⁴ into `float16`) raises
+      `ValueError`; `True` performs the narrowing anyway.
+    - The default (`container="csr"`, no dtype kwargs) is **byte-identical and
+      zero-copy** — the Vec is moved into numpy with no cast. Any non-default
+      request is a read-then-convert (an extra cast/copy of `X`).
   - Returns `obsm` (dense), `varm` (dense), `obsp` (scipy CSR), and
     `varp` (scipy CSR) when present in the file. `obsp` / `varp` are
     not subject to deletion-vector row filtering — when cells are
@@ -1286,9 +1306,75 @@ the repr onto `Experiment.info() -> str`.
 - `to_gpu_anndata()` — Minimal-copy on-device handoff: decodes shards, transfers to the GPU, and returns a GPU-resident AnnData whose `X` is a `cupyx.scipy.sparse.csr_matrix`. The returned object is suitable for direct use with rapids-singlecell (`rsc.pp.*`, `rsc.tl.*`) without additional host↔device copies. Requires `cupy` and a CUDA-capable GPU. Records its `transfer_mode` and real `bytes_uploaded` on `uns["scx_accel"]["to_gpu_anndata"]` — `scx_device_decode_gpu` (Scx1 sidecar shards decoded fully in VRAM, including dense ≥128-nnz rows via the BitPacker4x kernel; only indptr uploaded), `scx_device_handoff_streamed` (some shard host-bounced because it is not an Scx1 sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard), or `scx_device_handoff` (host-assembled filtered/projected/multimodal input). See **Accelerator route metadata** below.
 
   **Memory semantics.** The result is the **complete** sparse matrix in VRAM — this is not a streaming/partial representation. Sparse CSR format is preserved throughout (VRAM scales with NNZ, not N×M). Shards are decoded one at a time into pre-allocated combined device buffers; peak device memory during transfer is the combined buffer plus one shard. A **VRAM pre-flight check** (1.2× headroom factor) compares the required bytes against free device memory and raises `ValueError` if insufficient, with an actionable message pointing to `backed=True` streaming workflows. See [gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model) for sizing formulas.
+
+  `to_gpu_anndata` accepts `container` / `data_dtype` / `index_dtype` / `allow_lossy` for signature parity with `to_anndata`, but the device path is **f32-native**: a non-default request raises `ValueError`. To obtain a narrow/dense matrix, materialize it on the host with `to_anndata(container=..., data_dtype=...)`.
 - `info() -> str` — One-line codec / shard / format-version internals (kept off the AnnData-style `repr`).
 - Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`.
 - List-returning accessors — callable **methods** (not properties): `layer_names()`, and the AnnData-style key accessors `obs_keys()`, `var_keys()`, `obsm_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column).
+
+### Container and dtype materialization
+
+The read APIs materialize `X` (and layers) as a scipy `csr_matrix` of
+`(int64 indptr, int32 indices, float32 data)` by default. The `container`,
+`data_dtype`, `index_dtype`, and `allow_lossy` kwargs let a reader choose the
+output container and numeric dtype directly, so downstream consumers
+(sklearn / PyTorch / scVI, GPU batches) don't over-allocate or re-densify.
+
+Surfaced on `Experiment.to_anndata`, `PyQueryResult.to_anndata`, and
+`PyQueryResult.to_csr` (`Experiment.to_gpu_anndata` accepts them for parity but
+rejects any non-default request — the device path is f32-native).
+
+| kwarg | values | default | notes |
+|-------|--------|---------|-------|
+| `container` | `"csr"` \| `"dense"` | `"csr"` | `"dense"` returns a row-major `numpy.ndarray` (no scipy CSR) |
+| `data_dtype` | `float16/32/64`, `int8/16/32/64`, `uint8/16/32` | `None` → `float32` | numeric dtype of the values |
+| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` | CSR column-index dtype; ignored (warns) for `"dense"` |
+| `allow_lossy` | `bool` | `False` | fail-loud cast gate — see below |
+
+**Zero-copy default preserved.** `container="csr"` with no dtype kwargs takes the
+exact pre-existing path: the decoded `Vec`s are moved into numpy with `copy=False`
+and no cast. This is guaranteed byte-identical and is the performance-sensitive
+common case. Any non-default request is a **read-then-convert**: the f32 CSR is
+built first, then cast into the requested container/dtype (an extra copy of `X`).
+
+**Fail-loud cast gate (`allow_lossy`).** With `allow_lossy=False` (the default),
+any narrowing that would lose data raises `ValueError` rather than silently
+corrupting values:
+
+- out-of-range for the target integer dtype (e.g. `300 → uint8`),
+- a fractional value into an integer dtype (e.g. `1.5 → int32`),
+- a negative value into an unsigned dtype (sign loss, e.g. `-1 → uint16`),
+- a count above 2²⁴ into `float16` (IEEE-754 cannot represent it exactly).
+
+The error names the offending value and suggests a wider dtype or
+`allow_lossy=True`. Widening casts (e.g. `uint8 → float32`, the default) are
+always safe and are never gated. This also closes a latent silent
+`u32 → f32` narrowing above 2²⁴ (e.g. pseudobulk / aggregated counts) that the
+old fixed-f32 path performed with no warning.
+
+> **Note.** A scipy `csr_matrix` with `float16` `data` is valid but cannot be
+> densified by scipy's own `.toarray()` (a scipy limitation) — call
+> `.astype(np.float32).toarray()`, or request `container="dense"` directly.
+
+Backed reads (`backed=True`) are lazy and f32-native, so a non-default plan with
+`backed=True` raises; materialize eagerly (`backed=False`) to narrow.
+
+**Caveats.**
+
+- **`index_dtype` for CSR is best-effort.** scipy canonicalizes a
+  `csr_matrix`'s index arrays on construction (typically to `int32`, `int64`
+  above the 32-bit nnz/dimension limit), so `index_dtype="int16"` will usually be
+  upcast back to `int32` and delivers no reliable memory saving for CSR output.
+  The `int64` widen sticks. For a guaranteed narrow-index layout, use
+  `container="dense"` (no index array) instead.
+- **`adata.raw` is not retyped.** When the file carries a raw count matrix, the
+  reconstructed `adata.raw.X` stays `float32` CSR regardless of `data_dtype` —
+  only `X` and `layers` are materialized in the requested dtype.
+- **Scope.** The kwargs are surfaced on the three read entry points above. Other
+  read surfaces (the grouped-shard read helpers, the flat `pyscx.read_cloud(...)`
+  cloud helper) are f32-native for now; the cloud *query* path
+  (`open_cloud(...).query()...collect()`) returns a `PyQueryResult` and so does
+  honor them.
 
 ### `uns` serialization
 
@@ -1337,8 +1423,8 @@ any JSON tool. Example for a `float32` array:
 
 ### PyQueryResult
 
-- `to_anndata()` — Convert result to AnnData (zero-copy CSR)
-- `to_csr()` — Return just the scipy CSR matrix
+- `to_anndata(container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Convert result to AnnData. The default is a zero-copy CSR; the four kwargs have the same semantics as [`Experiment.to_anndata`](#experiment) (`"dense"` container, narrow `data_dtype`/`index_dtype`, fail-loud `allow_lossy` gate). Any non-default request forgoes zero-copy (a cast/copy of `X`).
+- `to_csr(container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Return just the scipy CSR matrix (or a dense `numpy.ndarray` for `container="dense"`), with the same dtype kwargs.
 - Properties: `n_obs`, `n_vars`, `nnz`, `skipped_shards`, `total_shards`
 
 ### CloudExperiment

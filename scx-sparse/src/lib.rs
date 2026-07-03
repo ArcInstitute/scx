@@ -1,6 +1,7 @@
 pub mod convert;
 pub mod csc;
 pub mod csr;
+pub mod materialize;
 pub mod transpose;
 pub mod umap_math;
 pub mod validate;
@@ -8,6 +9,7 @@ pub mod validate;
 pub use convert::{csr_to_dense, dense_to_csr};
 pub use csc::{CscError, ScxCsc};
 pub use csr::{concatenate_csr, total_variance_from_col_sq, CsrError, ScxCsr};
+pub use materialize::{Container, IndexDtype, MaterializePlan, ValueDtype};
 pub use transpose::{
     compute_chunk_cols_with_cap, streaming_csr_to_csc_iter_with_cap, CscArrays, CscShardIterator,
     TransposeError,

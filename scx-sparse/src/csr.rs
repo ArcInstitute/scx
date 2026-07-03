@@ -232,8 +232,26 @@ impl ScxCsr {
         ))
     }
 
-    /// Convert to a dense row-major matrix.
+    /// Convert to a dense row-major matrix (`f32`).
     pub fn to_dense(&self) -> Result<Vec<f32>, CsrError> {
+        self.to_dense_dtype(&self.data)
+    }
+
+    /// Scatter already-typed values into a dense row-major `(n_rows, n_cols)` buffer.
+    ///
+    /// `values` must be the per-nonzero data in row-major CSR order (`len == nnz`),
+    /// aligned with `self.indices` — typically the result of casting `self.data` to
+    /// the caller's requested dtype via `scx_codec::checked_cast_values`. This keeps
+    /// the fail-loud cast gate in one place (scx-codec) while the scatter stays here.
+    /// Unwritten cells are left at `T::default()` (zero for numeric types).
+    pub fn to_dense_dtype<T: Copy + Default>(&self, values: &[T]) -> Result<Vec<T>, CsrError> {
+        let expected_nnz = self.indices.len();
+        if values.len() != expected_nnz {
+            return Err(CsrError::IndicesDataMismatch {
+                indices: expected_nnz,
+                data: values.len(),
+            });
+        }
         let (n_rows, n_cols) = self.shape;
         let total = n_rows
             .checked_mul(n_cols)
@@ -241,13 +259,13 @@ impl ScxCsr {
                 rows: n_rows,
                 cols: n_cols,
             })?;
-        let mut dense = vec![0.0f32; total];
+        let mut dense = vec![T::default(); total];
         for row in 0..n_rows {
             let start = self.indptr[row] as usize;
             let end = self.indptr[row + 1] as usize;
-            for j in start..end {
-                let col = self.indices[j] as usize;
-                dense[row * n_cols + col] = self.data[j];
+            let row_base = row * n_cols;
+            for (&col, &val) in self.indices[start..end].iter().zip(&values[start..end]) {
+                dense[row_base + col as usize] = val;
             }
         }
         Ok(dense)
@@ -637,6 +655,29 @@ mod tests {
         assert_eq!(csr.n_rows(), 0);
         assert_eq!(csr.n_cols(), 0);
         assert_eq!(csr.nnz(), 0);
+    }
+
+    #[test]
+    fn to_dense_dtype_matches_to_dense() {
+        let csr = sample_csr();
+        // Cast the f32 data to u16 (all values fit) and scatter.
+        let data_u16: Vec<u16> = csr.data.iter().map(|&v| v as u16).collect();
+        let dense_u16 = csr.to_dense_dtype(&data_u16).unwrap();
+        let dense_f32 = csr.to_dense().unwrap();
+        assert_eq!(dense_u16.len(), dense_f32.len());
+        for (d16, d32) in dense_u16.iter().zip(dense_f32.iter()) {
+            assert_eq!(*d16 as f32, *d32);
+        }
+        // Spot-check row-major layout: row 0 col 1 = 5, col 3 = 10.
+        assert_eq!(dense_u16[1], 5);
+        assert_eq!(dense_u16[3], 10);
+    }
+
+    #[test]
+    fn to_dense_dtype_rejects_length_mismatch() {
+        let csr = sample_csr();
+        let bad: Vec<u16> = vec![1, 2, 3]; // nnz is 6
+        assert!(csr.to_dense_dtype(&bad).is_err());
     }
 
     // 12.7: row_slice
