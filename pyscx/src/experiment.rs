@@ -811,7 +811,7 @@ impl PyExperiment {
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true))]
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -828,8 +828,26 @@ impl PyExperiment {
         obsm: Option<Vec<String>>,
         preserve_var_order: bool,
         strict_var_names: bool,
+        container: &str,
+        data_dtype: Option<&str>,
+        index_dtype: Option<&str>,
+        allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
+        // F3: resolve the container/dtype materialization plan. The default
+        // (csr / f32 / i32) keeps the exact zero-copy path; any non-default plan
+        // triggers a post-assembly retype of X (and layers).
+        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
+        // F3 Phase 1: dtype/container materialization applies to the eager
+        // (in-memory) path only. Backed X is a lazy dataset and the device path
+        // stays f32-native for now — reject a non-default plan loudly rather
+        // than silently ignoring it.
+        if !plan.is_default_csr_f32() && backed {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "container / data_dtype / index_dtype are only supported with backed=False \
+                 (eager materialization); backed reads produce a lazy f32 dataset",
+            ));
+        }
         if let Some(name) = modality.as_deref() {
             if !backed {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -893,6 +911,26 @@ impl PyExperiment {
             } else if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
                 let _ = uns.del_item("scx_source_has_csc_sidecar");
             }
+
+            // F3: convert X (and layers) into the requested container/dtype.
+            // No-op for the default plan (guarded inside retype_matrix).
+            if !plan.is_default_csr_f32() {
+                let x = adata.getattr("X")?;
+                if !x.is_none() {
+                    let new_x = convert::retype_matrix(py, x, &plan)?;
+                    adata.setattr("X", new_x)?;
+                }
+                let layers_obj = adata.getattr("layers")?;
+                let mut keys: Vec<String> = Vec::new();
+                for k in layers_obj.call_method0("keys")?.try_iter()? {
+                    keys.push(k?.extract()?);
+                }
+                for key in keys {
+                    let layer = layers_obj.get_item(&key)?;
+                    let new_layer = convert::retype_matrix(py, layer, &plan)?;
+                    layers_obj.set_item(&key, new_layer)?;
+                }
+            }
             Ok(adata)
         }
     }
@@ -922,7 +960,7 @@ impl PyExperiment {
     ///     adata = pyscx.open("atlas.scx").to_gpu_anndata()
     ///     import rapids_singlecell as rsc
     ///     rsc.pp.pca(adata)            # runs in-VRAM; no host bounce
-    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None, preserve_var_order=false, strict_var_names=true))]
+    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
     #[allow(clippy::too_many_arguments)]
     fn to_gpu_anndata<'py>(
         &self,
@@ -935,7 +973,22 @@ impl PyExperiment {
         memory_budget: Option<Bound<'_, PyAny>>,
         preserve_var_order: bool,
         strict_var_names: bool,
+        container: &str,
+        data_dtype: Option<&str>,
+        index_dtype: Option<&str>,
+        allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // F3 Phase 1: the device path is f32-native. Accept the kwargs for API
+        // parity with `to_anndata`, but reject a non-default plan (host-side
+        // narrowing before device upload is a later phase).
+        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
+        if !plan.is_default_csr_f32() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "to_gpu_anndata does not yet support container / data_dtype / index_dtype \
+                 (the device path is f32-native); materialize on the host with \
+                 to_anndata(container=..., data_dtype=...) instead",
+            ));
+        }
         #[cfg(feature = "gpu")]
         {
             use pyo3::exceptions::{PyRuntimeError, PyValueError};

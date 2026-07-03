@@ -72,6 +72,7 @@ Experiment object with n_obs × n_vars = 2700 × 32738
 | Atlas-scale, full dataset | `exp.to_anndata(backed=True)` + `pyscx.accel.*` | ~1-shard working set; use `pyscx.accel.*` for preprocessing, not `sc.pp.*` |
 | A cell/gene subset of a large file | `exp.query().filter_obs(...).select_genes(...).collect()` | Predicate pushdown skips non-matching shards |
 | Reading from cloud storage | `pyscx.read_cloud(url, obs_filter=..., var_names=...)` | `gs://` / `s3://` / `az://` / `file://`; fetches only matching shards |
+| A dense / narrow matrix for sklearn / PyTorch / scVI | `exp.to_anndata(container="dense", data_dtype=...)` | Row-major ndarray and/or narrowed dtype (`float16`/`uint8`/…), fail-loud gate — see [docs/api.md](api.md#container-and-dtype-materialization) |
 | Training a model | `TrainingDataset` / `IndexPlanDataset` | See [docs/training.md](training.md) |
 
 Full trade-off table:
@@ -409,7 +410,12 @@ pyscx.to_h5ad("data.scx", "data.h5ad",
 
 - **`X` is stored as float32 CSR.** A float64 source matrix is downcast (a
   `UserWarning` fires at write). Counts and most normalized values are unaffected
-  in practice; if you depend on float64 precision, keep the h5ad.
+  in practice; if you depend on float64 precision, keep the h5ad. On **read** you
+  can go the other way and materialize `X` into a chosen container/dtype —
+  `to_anndata(container="dense")` for a row-major ndarray, or
+  `data_dtype="float16"` / `"uint8"` to shrink the in-memory footprint (with a
+  fail-loud cast gate; pass `allow_lossy=True` to force a narrowing). See
+  [docs/api.md § Container and dtype materialization](api.md#container-and-dtype-materialization).
 - **obs/var are Arrow-backed**, not HDF5 datasets. Column dtypes, categorical
   categories, and the pandas `ordered` flag round-trip. The index (`obs_names` /
   `var_names`) round-trips as the pandas index.

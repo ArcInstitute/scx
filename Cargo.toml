@@ -108,4 +108,5 @@ num_cpus = "1"
 
 # Python bindings
 pyo3 = { version = "0.28", features = ["extension-module"] }
-numpy = "0.28"
+# `half` feature: native f16 numpy arrays for F3 dtype materialization.
+numpy = { version = "0.28", features = ["half"] }

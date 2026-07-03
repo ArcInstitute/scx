@@ -67,10 +67,20 @@ pub(crate) fn query_result_to_anndata<'py>(
     py: Python<'py>,
     result: QueryResult,
 ) -> PyResult<Bound<'py, PyAny>> {
+    query_result_to_anndata_with_plan(py, result, &scx_sparse::MaterializePlan::default_csr_f32())
+}
+
+/// Like [`query_result_to_anndata`] but materializes X into the container/dtype
+/// selected by `plan` (F3). The default plan preserves the exact zero-copy path.
+pub(crate) fn query_result_to_anndata_with_plan<'py>(
+    py: Python<'py>,
+    result: QueryResult,
+    plan: &scx_sparse::MaterializePlan,
+) -> PyResult<Bound<'py, PyAny>> {
     let anndata_mod = py.import("anndata")?;
 
-    // X — zero-copy CSR → scipy
-    let x = convert::csr_to_scipy(py, result.x)?;
+    // X — CSR → scipy/dense in the requested dtype (zero-copy for the default).
+    let x = convert::csr_to_scipy_typed(py, result.x, plan)?;
 
     // obs → pandas DataFrame
     let obs_table = convert::record_batch_to_pyarrow(py, &result.obs)?;
@@ -355,19 +365,36 @@ impl PyQueryResult {
     /// Uses zero-copy for the CSR matrix (moves Vec to numpy).
     /// After this call, to_anndata()/to_csr() cannot be called again,
     /// but getters (n_obs, n_vars, etc.) still work.
+    #[pyo3(signature = (container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
     #[allow(clippy::wrong_self_convention)]
-    fn to_anndata<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn to_anndata<'py>(
+        &mut self,
+        py: Python<'py>,
+        container: &str,
+        data_dtype: Option<&str>,
+        index_dtype: Option<&str>,
+        allow_lossy: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
         let result = self.take_result()?;
-        query_result_to_anndata(py, result)
+        query_result_to_anndata_with_plan(py, result, &plan)
     }
 
-    /// Return just the scipy CSR matrix without building full AnnData.
-    ///
-    /// Also consumes the inner data for zero-copy transfer.
+    /// Return just the scipy CSR matrix (or dense array) without building full
+    /// AnnData. Also consumes the inner data for zero-copy transfer.
+    #[pyo3(signature = (container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
     #[allow(clippy::wrong_self_convention)]
-    fn to_csr<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn to_csr<'py>(
+        &mut self,
+        py: Python<'py>,
+        container: &str,
+        data_dtype: Option<&str>,
+        index_dtype: Option<&str>,
+        allow_lossy: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
         let result = self.take_result()?;
-        convert::csr_to_scipy(py, result.x)
+        convert::csr_to_scipy_typed(py, result.x, &plan)
     }
 
     /// Number of observations (cells) in the result.

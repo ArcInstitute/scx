@@ -684,7 +684,12 @@ pyscx.to_mtx("output.scx", "/path/to/mtx_dir")
 
 The `to_anndata()` path is **zero-copy** for the expression matrix — `ScxCsr`'s
 `i64/i32/f32` arrays are handed directly to scipy via numpy buffer protocol.
-Arrow metadata goes to pandas via pyarrow.
+Arrow metadata goes to pandas via pyarrow. The `container` / `data_dtype` /
+`index_dtype` / `allow_lossy` read kwargs opt out of this default: they
+materialize `X` into a chosen container (scipy CSR or dense ndarray) and numeric
+dtype via a read-then-convert (with a fail-loud cast gate), trading the zero-copy
+move for a narrower / dense output. See
+[docs/api.md § Container and dtype materialization](api.md#container-and-dtype-materialization).
 
 ### Training Dataset
 
