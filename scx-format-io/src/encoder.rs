@@ -6,7 +6,7 @@
 use blake3;
 
 use scx_codec::value_encoding::{detect_value_encoding, values_to_raw_bytes};
-use scx_codec::{encode_shard, CodecId, ValueEncoding};
+use scx_codec::{encode_shard, CodecId, EncodedShard, ValueEncoding};
 use scx_sparse::is_canonical_csr;
 
 use crate::codec_select::select_codec_for_modality;
@@ -62,7 +62,7 @@ use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 /// let section = encode_one_shard(
 ///     &indptr, &indices, &values, None, 1, 3, 0,
 ///     SectionType::CsrShard, ModalityType::Rna, "X".to_string(),
-///     None, // row_group_rows: unframed
+///     None, // framing: unframed
 /// )
 /// .unwrap();
 /// assert!(section.section_length > 0);
@@ -79,7 +79,7 @@ pub fn encode_one_shard(
     section_type: SectionType,
     modality_type: ModalityType,
     name: String,
-    row_group_rows: Option<u32>,
+    framing: Option<FramingConfig>,
 ) -> Result<PreEncodedSection, ScxError> {
     // Enforce the canonical-CSR contract in debug builds. Release builds
     // trust the caller (callers canonicalize upstream); this catches a
@@ -97,8 +97,8 @@ pub fn encode_one_shard(
     let shard_value_encoding: ValueEncoding = detect_value_encoding(shard_values);
     let shard_values_bytes = values_to_raw_bytes(shard_values, shard_value_encoding)?;
 
-    // 4. Select codec.
-    let shard_codec = match explicit_codec {
+    // 4. Select codec (heuristic when not explicit).
+    let mut shard_codec = match explicit_codec {
         Some(codec_id) => {
             if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
                 CodecId::Zstd
@@ -109,50 +109,64 @@ pub fn encode_one_shard(
         None => select_codec_for_modality(&shard_values_bytes, shard_value_encoding, modality_type),
     };
 
-    // 5. Encode shard.
-    let mut encoded = encode_shard(
-        shard_indptr,
-        shard_indices,
-        &shard_values_bytes,
-        shard_codec,
-        shard_value_encoding,
-        index_dtype_u16,
-    )?;
-
-    // 6. Build block index. Two layouts:
-    //   - Unframed (default): a single whole-shard entry (or ≤MAX_BLOCK_ROWS
-    //     split for oversized shards) with zero byte offsets — byte-identical to
-    //     the legacy layout; shard v1.
-    //   - Row-group-framed (`row_group_rows`, Phase 1 = `None` codec only): the
-    //     indptr stream is re-framed into per-group local-rebased indptrs and the
-    //     multi-entry BlockIndex records real per-group byte offsets, enabling
+    // 5–6. Encode shard + build block index. Two layouts:
+    //   - Unframed (default): monolithic per-stream encode + a single whole-shard
+    //     BlockIndex entry (or ≤MAX_BLOCK_ROWS split) with zero byte offsets —
+    //     byte-identical to the legacy layout; shard v1.
+    //   - Row-group-framed (`framing`): each row-group is encoded independently
+    //     and the multi-entry BlockIndex records per-group byte offsets, enabling
     //     codec-agnostic sub-shard random access (SIDECAR-LONG-TERM-FIX.md
-    //     Option B); shard v2.
+    //     Option B); shard v2. `trial` picks the smaller of {heuristic winner,
+    //     ShufDeltaZstd} per shard.
     let n_major = (shard_indptr.len() - 1) as u32;
     let nnz = *shard_indptr.last().unwrap_or(&0);
-    let (block_index, shard_version) = match row_group_rows {
-        Some(g) if g > 0 => {
-            if shard_codec != CodecId::None {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "row-group framing currently supports --codec none only (got codec '{}')",
-                    shard_codec.display_name()
-                )));
-            }
-            let (indptr_stream, bi) = frame_none_shard(
-                shard_indptr,
-                index_dtype_u16,
-                shard_value_encoding.byte_width(),
-                g,
-            )?;
-            // Replace the contiguous indptr stream with the framed one; indices
-            // and values stay contiguous (None is already byte-seekable).
-            encoded.indptr_bytes = indptr_stream;
-            (bi, CURRENT_SHARD_FORMAT_VERSION)
+    let (encoded, block_index, shard_version) = match framing {
+        Some(fc) if fc.row_group_rows > 0 => {
+            let frame = |codec: CodecId| {
+                encode_shard_framed(
+                    shard_indptr,
+                    shard_indices,
+                    &shard_values_bytes,
+                    codec,
+                    shard_value_encoding,
+                    index_dtype_u16,
+                    fc.row_group_rows,
+                    fc.target_nnz,
+                )
+            };
+            let (enc, bi) = if fc.trial && shard_codec != CodecId::ShufDeltaZstd {
+                // Encode with the heuristic winner and ShufDeltaZstd; keep smaller.
+                // compact-trial optimizes for size + random access and therefore
+                // forgoes the Scx1 GPU/per-row sidecar (framed shards use the
+                // block index). The §4.5 GPU cost-model knob is a future refinement.
+                let (e_h, bi_h) = frame(shard_codec)?;
+                let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
+                if framed_size(&e_s) < framed_size(&e_h) {
+                    shard_codec = CodecId::ShufDeltaZstd;
+                    (e_s, bi_s)
+                } else {
+                    (e_h, bi_h)
+                }
+            } else {
+                frame(shard_codec)?
+            };
+            (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
         }
-        _ => (
-            BlockIndex::for_shard(n_major, shard_indptr)?,
-            DEFAULT_WRITE_SHARD_FORMAT_VERSION,
-        ),
+        _ => {
+            let enc = encode_shard(
+                shard_indptr,
+                shard_indices,
+                &shard_values_bytes,
+                shard_codec,
+                shard_value_encoding,
+                index_dtype_u16,
+            )?;
+            (
+                enc,
+                BlockIndex::for_shard(n_major, shard_indptr)?,
+                DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            )
+        }
     };
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
@@ -274,37 +288,104 @@ pub fn encode_one_shard(
 /// point into those global streams. Groups are capped at `min(row_group_rows,
 /// MAX_BLOCK_ROWS)` rows. This is exactly the layout [`resolve_block_index`]
 /// validates and `scx_codec::decode_row_group` consumes.
-fn frame_none_shard(
-    indptr: &[u64],
-    index_dtype_u16: bool,
-    value_width: usize,
-    row_group_rows: u32,
-) -> Result<(Vec<u8>, BlockIndex), ScxError> {
-    let n_rows = indptr.len().saturating_sub(1);
-    let w_i = if index_dtype_u16 { 2usize } else { 4 };
-    let w_v = value_width;
-    let g = row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
+/// Config controlling row-group framing (F5-b). `row_group_rows` caps a group's
+/// row count; `target_nnz` (if set) additionally caps its nnz (byte/nnz-aware
+/// sizing, §4.3); `trial` selects the smaller of {heuristic winner,
+/// ShufDeltaZstd} per shard.
+#[derive(Debug, Clone, Copy)]
+pub struct FramingConfig {
+    pub row_group_rows: u32,
+    pub target_nnz: Option<u64>,
+    pub trial: bool,
+}
 
-    let mut indptr_stream: Vec<u8> = Vec::with_capacity((n_rows + n_rows / g + 1) * 8);
+/// Total encoded size of a shard's three sub-streams (trial-encode comparison key).
+fn framed_size(e: &EncodedShard) -> usize {
+    e.indptr_bytes.len() + e.indices_bytes.len() + e.values_bytes.len()
+}
+
+/// Encode a shard **row-group-framed** (F5-b / SIDECAR-LONG-TERM-FIX.md Option B):
+/// partition the major axis into groups (≤ `row_group_rows` rows and, if set,
+/// ≤ `target_nnz` nnz — always ≥1 row), encode each group independently as a
+/// standalone sub-shard via [`encode_shard`], and concatenate the three
+/// sub-streams while recording per-group byte offsets in a multi-entry
+/// [`BlockIndex`]. Codec-agnostic: a group decodes via
+/// `scx_codec::decode_row_group` (→ the ordinary per-shard decoder). For
+/// `CodecId::None` this is byte-identical to the legacy contiguous layout with a
+/// framed indptr. `scx1_decode` is dropped — framed shards use the block index
+/// for random access, not the monolithic Scx1 sidecar.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_shard_framed(
+    indptr: &[u64],
+    indices: &[u32],
+    values_bytes: &[u8],
+    codec: CodecId,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+    row_group_rows: u32,
+    target_nnz: Option<u64>,
+) -> Result<(EncodedShard, BlockIndex), ScxError> {
+    let n_rows = indptr.len().saturating_sub(1);
+    let w_v = value_encoding.byte_width();
+    let g = row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
+    let nnz_cap = target_nnz.unwrap_or(u64::MAX);
+
+    let mut indptr_stream: Vec<u8> = Vec::new();
+    let mut indices_stream: Vec<u8> = Vec::new();
+    let mut values_stream: Vec<u8> = Vec::new();
     let mut entries = Vec::with_capacity(n_rows.div_ceil(g).max(1));
+
     let mut r0 = 0usize;
     while r0 < n_rows {
-        let r1 = (r0 + g).min(n_rows);
         let base = indptr[r0];
-        let ip_off = indptr_stream.len() as u32;
-        for &v in &indptr[r0..=r1] {
-            indptr_stream.extend_from_slice(&(v - base).to_le_bytes());
+        // Grow the group to ≤ g rows, stopping before nnz exceeds the cap (but
+        // always keep ≥1 row even if that single row alone exceeds the cap).
+        let max_r1 = (r0 + g).min(n_rows);
+        let mut r1 = r0 + 1;
+        while r1 < max_r1 && (indptr[r1 + 1] - base) <= nnz_cap {
+            r1 += 1;
         }
+        let end = indptr[r1] as usize;
+        let start = base as usize;
         let nnz_in_block = indptr[r1] - base;
+
+        let local_indptr: Vec<u64> = indptr[r0..=r1].iter().map(|&v| v - base).collect();
+        let group_indices = &indices[start..end];
+        let group_values = &values_bytes[start * w_v..end * w_v];
+        let enc = encode_shard(
+            &local_indptr,
+            group_indices,
+            group_values,
+            codec,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+
+        let ip_off = indptr_stream.len() as u32;
+        let ix_off = indices_stream.len() as u32;
+        let vv_off = values_stream.len() as u32;
+        indptr_stream.extend_from_slice(&enc.indptr_bytes);
+        indices_stream.extend_from_slice(&enc.indices_bytes);
+        values_stream.extend_from_slice(&enc.values_bytes);
+
         entries.push(BlockIndexEntry::new(
             r0 as u32,
             (r1 - r0) as u32,
             ip_off,
-            (base as usize * w_i) as u32,
-            (base as usize * w_v) as u32,
+            ix_off,
+            vv_off,
             nnz_in_block,
         )?);
         r0 = r1;
     }
-    Ok((indptr_stream, BlockIndex { entries }))
+
+    Ok((
+        EncodedShard {
+            indptr_bytes: indptr_stream,
+            indices_bytes: indices_stream,
+            values_bytes: values_stream,
+            scx1_decode: None,
+        },
+        BlockIndex { entries },
+    ))
 }

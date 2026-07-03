@@ -37,7 +37,6 @@ pub enum CodecId {
     /// Optimal for float layers; uses Zstd for indptr/indices.
     Pcodec = 4,
     /// Byte-shuffle + byte-delta (indices/indptr only) + zstd. Ported from
-    /// shardad's "byte-filter" codec for compact integer-count storage.
     /// Monolithic per shard (F5 Phase 0 measurement spike — not row-group framed).
     ShufDeltaZstd = 5,
 }
@@ -461,10 +460,9 @@ pub fn decode_indptr_only(
 /// [`DecodedShard`]: `indptr.len() == n_rows+1`, `indptr[0] == 0`,
 /// `indptr.last() == nnz`, `indices.len() == values.len()/width == nnz`.
 ///
-/// Phase 1 implements the `None` arm only (fixed-width LE, byte-seekable);
-/// compressed codecs are framed in Phase 2 (`encode_shard_framed`). An
-/// unimplemented codec returns [`CodecError::UnsupportedCodec`] — unreachable in
-/// Phase 1 because only `None` shards are ever framed.
+/// Works for every codec (None / ShufDeltaZstd / Zstd / Lz4Shuffle / Pcodec /
+/// Scx1): a group is a standalone encoded sub-shard, so this delegates to the
+/// ordinary [`decode_shard_ref`] over the group's three byte frames.
 pub fn decode_row_group(
     codec_id: CodecId,
     span: &RowGroupSpan,
@@ -480,31 +478,26 @@ pub fn decode_row_group(
     let n_rows = span.n_rows as usize;
     let nnz = span.nnz as usize;
 
-    match codec_id {
-        CodecId::None => {
-            // indptr is stored per-group local-rebased (n_rows+1 values, first == 0).
-            let indptr = le_bytes_to_u64(ip, n_rows + 1)?;
-            if indptr.first() != Some(&0) || indptr.last() != Some(&(nnz as u64)) {
-                return Err(CodecError::MalformedInput(format!(
-                    "row-group indptr not local-rebased (first={:?}, last={:?}, nnz={})",
-                    indptr.first(),
-                    indptr.last(),
-                    nnz
-                )));
-            }
-            let indices = le_bytes_to_indices(ix, nnz, index_dtype_u16)?;
-            let expected_values = nnz * value_encoding.byte_width();
-            if vv.len() != expected_values {
-                return Err(CodecError::MalformedInput(format!(
-                    "row-group values byte length {} != expected {}",
-                    vv.len(),
-                    expected_values
-                )));
-            }
-            Ok((indptr, indices, vv.to_vec()))
-        }
-        other => Err(CodecError::UnsupportedCodec(other as u8)),
+    // A row-group is a standalone encoded sub-shard with a group-local indptr, so
+    // decode is just the ordinary per-shard decoder over the group's three byte
+    // frames — codec-agnostic (None / ShufDeltaZstd / Zstd / Lz4Shuffle / Pcodec /
+    // Scx1) with no per-codec code here.
+    let enc = EncodedShardRef {
+        indptr_bytes: ip,
+        indices_bytes: ix,
+        values_bytes: vv,
+    };
+    let decoded = decode_shard_ref(&enc, codec_id, value_encoding, n_rows, nnz, index_dtype_u16)?;
+    // The framed wire invariant: each group decodes to a local CSR.
+    if decoded.0.first() != Some(&0) || decoded.0.last() != Some(&(nnz as u64)) {
+        return Err(CodecError::MalformedInput(format!(
+            "row-group indptr not local-rebased (first={:?}, last={:?}, nnz={})",
+            decoded.0.first(),
+            decoded.0.last(),
+            nnz
+        )));
     }
+    Ok(decoded)
 }
 
 /// Bounds-checked slice of a sub-stream by a resolved byte range.
@@ -1074,11 +1067,11 @@ fn decode_lz4_shuffle_ref(
 // ---------------------------------------------------------------------------
 // CodecId::ShufDeltaZstd
 //
-// Port of shardad's "byte-filter" codec (v2/codec.py): per sub-stream,
+// byte-filter" codec: per sub-stream,
 //   indices / indptr : byte-shuffle -> byte-delta -> zstd
 //   integer values   : byte-shuffle -> zstd          (no delta)
-//   float values     : zstd only    (no shuffle, no delta — shardad #142)
-// Monolithic per shard (F5 Phase 0 measurement spike). Random-row / grouped
+//   float values     : zstd only    (no shuffle, no delta)
+// Monolithic per shard. Random-row / grouped
 // reads decode the whole shard; the row-group-framed form (F5-b) rides the
 // BlockIndex substrate and is out of scope here.
 // ---------------------------------------------------------------------------

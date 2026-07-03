@@ -22,7 +22,8 @@ header's `codec_id`**, not the file header's, when decoding.
 | 2 | `zstd` | Zstd applied independently to each of indptr / indices / values. Fallback for float layers. |
 | 3 | `lz4shuffle` | Byte-shuffle pre-filter + LZ4 frame compression (§7). Matches the Zarr/Blosc pipeline. |
 | 4 | `pcodec` | Pco lossless numerical compression. Optimal for float layers. |
-| 5–255 | Reserved | Future codecs. |
+| 5 | `shufdelta` | Byte-shuffle + byte-delta (indices/indptr only) + zstd (§7b). Compact integer counts (~1.5–2.5× smaller than `scx1`); float values take zstd-only (no shuffle/delta). |
+| 6–255 | Reserved | Future codecs. |
 
 ## 2. Indptr: Delta-Golomb-Rice (codec_id = 1)
 
@@ -212,6 +213,47 @@ LZ4 frame decompress → byte-unshuffle (reverse of encoding).
 
 Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 
+## 7b. ShufDeltaZstd (codec_id = 5)
+
+The most compact option for **integer
+counts** (measured ~1.45–1.75× smaller than `scx1` on `census_1m` /
+`chemogenetic_rgfp`, ~1.3–1.45× smaller than plain `zstd`). Per sub-stream:
+
+- **indices / indptr**: byte-shuffle (transpose to byte planes) → byte-delta
+  (per-plane wrapping-`u8`, on the sorted/monotonic streams) → zstd. The delta on
+  byte-shuffled sorted indices produces near-constant planes that zstd crushes —
+  this is the dominant lever (indices+indptr are ~75–80 % of CSR payload).
+- **integer values**: byte-shuffle → zstd (**no delta** — counts are effectively
+  random; delta would raise entropy).
+- **float values**: zstd only (**no shuffle, no delta** — byte-shuffling floats
+  scatters whole-value repeats).
+
+Primitives: `scx-codec/src/byte_delta.rs` (`byte_delta_planes` /
+`byte_undelta_planes`), reusing `shuffle::byte_shuffle`. Bounded-allocation zstd
+decode guard as for `zstd`. Available via `codec="shufdelta"`; not auto-selected
+by the heuristic (see `compact-trial` in §8).
+
+### Row-group framing (v4 file / shard v2) — random-access-safe
+
+A monolithic `shufdelta` frame per sub-stream is not sub-shard-seekable (the
+byte-delta is a whole-plane prefix scan), which would defeat scattered/grouped
+reads. So `shufdelta` (and any codec) can be **row-group-framed**: the shard's
+major axis is partitioned into groups (`--row-group-rows N`, optionally
+`--row-group-target-nnz`), each group encoded independently as a standalone
+sub-shard (group-local `indptr` starting at 0), the three sub-streams
+concatenated, and per-group byte offsets recorded in the shard's multi-entry
+`BlockIndex` (see `docs/format.md`). A framed shard is `shard_format_version = 2`
+inside a `format_version = 4` file; unframed writes stay v3/v1. Readers decode a
+single group via `scx_codec::decode_row_group` → the ordinary per-shard decoder
+over that group's byte ranges (codec-agnostic), so random-row / grouped / backed
+reads touch only the covering groups. **Measured:** framing at `G ∈ {256,512,
+1024}` retains essentially the full monolithic win (size flat within ~0.2 % across
+`G`; 1.75×/1.46× vs Scx1 on census_1m/rgfp), so no per-shard dictionary is needed.
+
+Implementation: `scx-codec/src/{byte_delta.rs,dispatch.rs}` (codec +
+`decode_row_group`), `scx-format-io/src/encoder.rs` (`encode_shard_framed`),
+`scx-format/src/shard.rs` (`resolve_block_index`).
+
 ## 8. Automatic Codec Selection
 
 Writers SHOULD choose per-shard codecs automatically. Benchmarks found
@@ -230,6 +272,16 @@ Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
 Median is computed from a sample of up to 10,000 non-zero values from the
 shard — the same calculation used for Rice parameter selection (§4). The
 actual codec used is recorded in each shard header's `codec_id`.
+
+### Trial-encode (`codec="compact-trial"`, framed only)
+
+For the most compact **random-access-safe** output, `scx convert --codec
+compact-trial --row-group-rows N` encodes each shard row-group-framed with both
+the heuristic winner and `shufdelta` and keeps the smaller (recorded per shard in
+`codec_id`). It requires `--row-group-rows` (framed output) and optimizes for size
++ random access; it therefore forgoes the Scx1 GPU/per-row decode sidecar (framed
+shards use the `BlockIndex` for sub-shard access instead). Implementation:
+`scx-format-io/src/encoder.rs::encode_one_shard`.
 
 ## 8a. Per-modality Codec Defaults
 

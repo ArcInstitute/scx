@@ -112,12 +112,13 @@ fn write_test_file_and_open(
 /// (read back through the framed decode path). Uses `encode_one_shard(...,
 /// Some(row_group_rows))` + `write_preencoded_shard` since the plain
 /// `write_csr_shard` writer method only emits the unframed layout.
-fn write_framed_none_file(
+fn write_framed_file(
     dir: &TempDir,
     n_obs: usize,
     n_vars: usize,
     n_shards: usize,
     row_group_rows: u32,
+    codec: CodecId,
 ) -> (std::path::PathBuf, ScxCsr) {
     let path = dir.path().join("framed.scx");
     let total_nnz = n_obs * 2;
@@ -140,14 +141,18 @@ fn write_framed_none_file(
             &indptr,
             &indices,
             &values_f32,
-            Some(CodecId::None),
+            Some(codec),
             0, // u16 indices
             n_vars as u32,
             (s * rows_per_shard) as u64,
             SectionType::CsrShard,
             ModalityType::Rna,
             format!("X_shard_{s}"),
-            Some(row_group_rows),
+            Some(crate::encoder::FramingConfig {
+                row_group_rows,
+                target_nnz: None,
+                trial: false,
+            }),
         )
         .unwrap();
         writer.write_preencoded_shard(pre).unwrap();
@@ -427,7 +432,7 @@ fn read_rows_with_bumps_sidecar_adoption_counters() {
 fn read_rows_with_block_index_matches_full_decode() {
     let dir = TempDir::new().unwrap();
     // 2 shards × 32 rows, groups of 4 rows.
-    let (path, full) = write_framed_none_file(&dir, 64, 100, 2, 4);
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
 
     fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
         let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
@@ -461,6 +466,54 @@ fn read_rows_with_block_index_matches_full_decode() {
     assert_matches(&out2, &dense_rows);
 }
 
+/// F5 Phase 2: framed scattered reads must be byte-identical to a full decode for
+/// **every** codec (None + ShufDeltaZstd + Zstd/Lz4/Pcodec), and a sparse cold
+/// gather over a compressed framed shard (no Scx1 sidecar) must take the
+/// block-index path. Proves `encode_shard_framed` + generic `decode_row_group`
+/// end-to-end through the writer and backed reader.
+#[test]
+fn read_rows_with_block_index_all_codecs() {
+    use std::sync::atomic::Ordering;
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    for codec in [
+        CodecId::None,
+        CodecId::ShufDeltaZstd,
+        CodecId::Zstd,
+        CodecId::Lz4Shuffle,
+        CodecId::Pcodec,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, codec);
+
+        let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+        let m = backed.enable_metrics();
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); sparse_rows.len()];
+        backed
+            .read_rows_with(&sparse_rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        for (i, &row) in sparse_rows.iter().enumerate() {
+            let lo = full.indptr[row as usize] as usize;
+            let hi = full.indptr[row as usize + 1] as usize;
+            assert_eq!(
+                out[i].0,
+                full.indices[lo..hi],
+                "{codec:?} indices row {row}"
+            );
+            assert_eq!(out[i].1, full.data[lo..hi], "{codec:?} data row {row}");
+        }
+        // Both sparse cold shard groups served via the codec-agnostic block index.
+        assert_eq!(
+            m.block_index_groups.load(Ordering::Relaxed),
+            2,
+            "{codec:?}: sparse cold gather must take the block-index path",
+        );
+        assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0, "{codec:?}");
+    }
+}
+
 /// F5 Phase 1 adoption counter: a sparse cold gather over a framed None file
 /// bumps `CacheMetrics::block_index_groups` (not `sidecar_groups`); a dense
 /// gather falls back to `full_shard_groups`. Symmetric with the sidecar
@@ -469,7 +522,7 @@ fn read_rows_with_block_index_matches_full_decode() {
 fn read_rows_with_bumps_block_index_counters() {
     use std::sync::atomic::Ordering;
     let dir = TempDir::new().unwrap();
-    let (path, _full) = write_framed_none_file(&dir, 64, 100, 2, 4);
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
 
     fn gather(backed: &BackedCsrReader, rows: &[u64]) {
         backed

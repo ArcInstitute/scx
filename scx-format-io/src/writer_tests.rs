@@ -1157,6 +1157,56 @@ fn test_csc_shard_write_read() {
     }
 }
 
+/// A CSC sidecar written with framing on is emitted
+/// row-group-framed (shard v2) and full-decodes byte-identically to its input.
+#[test]
+fn test_csc_shard_framed_round_trip() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_csc.scx");
+    let mut header = sample_header();
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION; // v4 (framed)
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 1, // ≥2 gene-groups over the fixture → framing exercised
+        target_nnz: None,
+        trial: false,
+    }));
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csc_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = ScxReader::open(&final_path).unwrap();
+    // The CSC shard must carry the framed (v2) layout.
+    let entry = reader.catalog().csc_shards_sorted()[0];
+    let sh = reader.read_shard_header(entry).unwrap();
+    assert_eq!(
+        sh.shard_format_version,
+        crate::shard::CURRENT_SHARD_FORMAT_VERSION,
+        "framed CSC shard must be v2",
+    );
+    // …and full-decode byte-identically to the input.
+    let csc = reader.read_csc_shard(0).unwrap();
+    let exp_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+    let exp_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+    let exp_data: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+    assert_eq!(csc.indptr, exp_indptr);
+    assert_eq!(csc.indices, exp_indices);
+    assert_eq!(csc.data, exp_data);
+}
+
 /// v2 strict shard_type validation: a CSC shard whose
 /// `shard_type` byte is corrupted to 0 must be rejected by the
 /// reader. This is the new behavior on the v2 catalog read path

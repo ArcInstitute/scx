@@ -65,7 +65,9 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec, shufdelta
+        /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec,
+        /// shufdelta, or compact-trial (framed; per-shard smaller of heuristic vs
+        /// shufdelta — requires --row-group-rows).
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Whether to also emit a CSC sidecar at write time.
@@ -86,12 +88,17 @@ enum Commands {
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
-        /// Experimental (F5 Phase 1): row-group-frame each CSR shard into
-        /// groups of at most N rows, producing a v4 file with a multi-entry
-        /// BlockIndex for codec-agnostic sub-shard random access. Omit for the
-        /// ordinary unframed layout. **Currently supports `--codec none` only.**
+        /// Experimental (F5): row-group-frame each shard into groups of at most
+        /// N rows, producing a v4 file with a multi-entry BlockIndex for
+        /// codec-agnostic sub-shard random access. Omit for the ordinary unframed
+        /// layout. Works with any `--codec`; use `--codec compact-trial` to pick
+        /// the smaller of the heuristic codec vs ShufDeltaZstd per shard.
         #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
         row_group_rows: Option<u32>,
+        /// Byte/nnz-aware row-group cap (F5): also close a group once it reaches
+        /// this many non-zeros. Only meaningful with `--row-group-rows`.
+        #[arg(long, value_name = "NNZ")]
+        row_group_target_nnz: Option<u64>,
         /// Extract a single modality from a multi-modality SCX file
         /// when writing to h5ad. Required when `--to h5ad` is used on
         /// a multimodal SCX input; ignored otherwise.
@@ -880,6 +887,7 @@ fn main() {
             csc,
             csc_cols_per_shard,
             row_group_rows,
+            row_group_target_nnz,
             modality,
             stream,
             memory_budget,
@@ -919,6 +927,7 @@ fn main() {
                 &csc,
                 csc_cols_per_shard,
                 row_group_rows,
+                row_group_target_nnz,
                 modality.as_deref(),
                 stream,
                 memory_budget.as_deref(),
@@ -1276,6 +1285,7 @@ fn run_convert(
     csc: &str,
     csc_cols_per_shard: usize,
     row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<&str>,
@@ -1491,6 +1501,7 @@ fn run_convert(
         csc_policy,
         csc_cols_per_shard,
         row_group_rows,
+        row_group_target_nnz,
         modality,
         stream,
         memory_budget_bytes,
@@ -1599,6 +1610,7 @@ fn dispatch_convert(
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
     row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<u64>,
@@ -1627,7 +1639,20 @@ fn dispatch_convert(
     use scx_codec::CodecId;
     let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
-    let explicit_codec = CodecId::parse_cli(codec)?;
+    // `compact-trial` is a framing *profile*, not a codec: per shard, keep the
+    // smaller of {heuristic winner, ShufDeltaZstd}. It requires framing.
+    let codec_trial = codec == "compact-trial";
+    let explicit_codec = if codec_trial {
+        None
+    } else {
+        CodecId::parse_cli(codec)?
+    };
+    if codec_trial && row_group_rows.is_none() {
+        return Err(
+            "`--codec compact-trial` requires `--row-group-rows N` (row-group-framed output)"
+                .into(),
+        );
+    }
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
@@ -1635,6 +1660,8 @@ fn dispatch_convert(
         csc: csc_policy,
         csc_cols_per_shard,
         row_group_rows,
+        row_group_target_nnz,
+        codec_trial,
         tool: "scx".into(),
         memory_budget,
         stream,
@@ -1770,6 +1797,7 @@ fn dispatch_convert(
     _csc_policy: convert::CscPolicy,
     _csc_cols_per_shard: usize,
     _row_group_rows: Option<u32>,
+    _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
     _stream: bool,
     _memory_budget: Option<u64>,

@@ -9,7 +9,6 @@
 //! lane, adjacent values differ by small predictable amounts, so the delta
 //! turns each plane into a near-constant stream that zstd crushes.
 //!
-//! Port of shardad's `_byte_delta` / `_byte_undelta` (`v2/codec.py:89-98`).
 //! Applied to `indices`/`indptr` only — count `data` is effectively random, so
 //! delta would *increase* entropy and is skipped (see the codec pipeline in
 //! `dispatch.rs`).

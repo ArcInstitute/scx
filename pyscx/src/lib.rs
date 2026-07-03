@@ -561,6 +561,8 @@ fn from_h5ad(
         csc: csc_policy,
         csc_cols_per_shard,
         row_group_rows: None,
+        row_group_target_nnz: None,
+        codec_trial: false,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
         stream,

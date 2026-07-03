@@ -125,6 +125,12 @@ pub struct ScxWriter {
     /// the catalog records `0`). Stamped into
     /// `FullCatalog::csc_build_generation`.
     csc_build_generation: Option<u64>,
+    /// When set, every sparse shard written via `write_shard_inner`
+    /// (CSC sidecars, layers, obsp — CSR X shards on this writer path too) is
+    /// row-group-framed (shard v2). Set via [`Self::set_framing`]; `None` keeps
+    /// the legacy unframed (v1) layout. The file `format_version` must be bumped
+    /// to v4 separately by the caller when framing.
+    framing: Option<crate::encoder::FramingConfig>,
 }
 
 /// Output of parallel shard encoding, ready for sequential write.
@@ -286,6 +292,7 @@ impl ScxWriter {
             modality_build_csc: Vec::new(),
             data_generation: 1,
             csc_build_generation: None,
+            framing: None,
         })
     }
 
@@ -375,6 +382,7 @@ impl ScxWriter {
             // here are inert.
             data_generation: 1,
             csc_build_generation: None,
+            framing: None,
         })
     }
 
@@ -885,6 +893,15 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Enable/disable F5-b row-group framing for subsequent sparse-shard writes
+    /// through this writer (CSC sidecars, layers, obsp, and CSR X shards written
+    /// via `write_csr_shard`). `None` restores the legacy unframed layout. The
+    /// caller bumps the file `format_version` to v4 when framing (the convert
+    /// path does this alongside setting this).
+    pub fn set_framing(&mut self, framing: Option<crate::encoder::FramingConfig>) {
+        self.framing = framing;
+    }
+
     /// Write a CSC shard (column-major sparse matrix).
     ///
     /// Structurally identical to a CSR shard but uses `SectionType::CscShard (5)`.
@@ -1053,21 +1070,40 @@ impl ScxWriter {
         let index_dtype_u16 = index_max_value <= u16::MAX as u64;
         let shard_index_dtype: u8 = if index_dtype_u16 { 0 } else { 1 };
 
-        // Encode the shard data
-        let encoded = scx_codec::encode_shard(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            index_dtype_u16,
-        )?;
-
-        // Build block index, splitting into ≤MAX_BLOCK_ROWS-row blocks so an
-        // oversized shard (e.g. a grouped shard holding one large group) does
-        // not overflow the u16 per-block row count. Single block for the common
-        // (≤65535-row) case — byte-identical to the legacy layout.
-        let block_index = BlockIndex::for_shard(n_major, indptr)?;
+        // Encode the shard data. When row-group framing is enabled on the writer
+        // (F5-b), every sparse shard funneling through here — CSC sidecars,
+        // layers, obsp — is emitted row-group-framed (shard v2) for
+        // codec-agnostic sub-shard random access; else the monolithic layout
+        // (shard v1, byte-identical to legacy).
+        let (encoded, block_index, shard_version) = match self.framing {
+            Some(fc) if fc.row_group_rows > 0 => {
+                let (e, bi) = crate::encoder::encode_shard_framed(
+                    indptr,
+                    indices,
+                    values,
+                    codec_id,
+                    value_encoding,
+                    index_dtype_u16,
+                    fc.row_group_rows,
+                    fc.target_nnz,
+                )?;
+                (e, bi, crate::shard::CURRENT_SHARD_FORMAT_VERSION)
+            }
+            _ => {
+                let e = scx_codec::encode_shard(
+                    indptr,
+                    indices,
+                    values,
+                    codec_id,
+                    value_encoding,
+                    index_dtype_u16,
+                )?;
+                // Single whole-shard block (or ≤MAX_BLOCK_ROWS split for oversized
+                // shards) with zero byte offsets — byte-identical to legacy.
+                let bi = BlockIndex::for_shard(n_major, indptr)?;
+                (e, bi, crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION)
+            }
+        };
         let mut block_index_bytes = Vec::new();
         block_index.write_to(&mut block_index_bytes)?;
 
@@ -1093,7 +1129,7 @@ impl ScxWriter {
 
         let shard_header = ShardHeader {
             magic: crate::shard::SHARD_MAGIC,
-            shard_format_version: crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            shard_format_version: shard_version,
             shard_type: derive_shard_type(section_type),
             codec_id: codec_id as u8,
             value_encoding: value_encoding as u8,
