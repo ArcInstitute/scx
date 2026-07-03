@@ -115,6 +115,7 @@ fn codec_name(c: CodecId) -> &'static str {
         CodecId::Zstd => "zstd",
         CodecId::Lz4Shuffle => "lz4shuffle",
         CodecId::Pcodec => "pcodec",
+        CodecId::ShufDeltaZstd => "shufdelta",
     }
 }
 

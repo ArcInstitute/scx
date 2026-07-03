@@ -1120,12 +1120,14 @@ def estimate_memory_gb(
         # streams. CITE-seq peaks at ~590 MB, Multiome at ~5 GB host RSS
         # in the empirical SLURM run; size like ml_loader's sparse path.
         peak_mb = max(base_mb * 2, dense_mb * 0.5)
-    elif benchmark == "grouped_read":
-        # Cross-format grouped write + per-perturbation read_group. The scx arm
-        # streams; the shardad arm materializes each read group (and reads the
-        # source on grouped write). Size like read_full's sparse path so the
-        # shardad materialization has headroom.
-        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("grouped_read", "grouped_sort"):
+        # Grouped write + per-perturbation reads. The dominant buffer is the
+        # single reference shard held in memory during encode: a large reference
+        # group (e.g. chemogenetic_rgfp's 127,705 `non-targeting` cells at
+        # ~6,700 nnz/cell ≈ 7 GB CSR) plus the one-pass gather source buffers and
+        # (shardad) in-memory materialization. `dense_mb*0.5` under-sized RGFP
+        # (24 GB → OOM); size to the sparse footprint with generous headroom.
+        peak_mb = max(base_mb * 2, dense_mb * 1.5, 48 * 1024)
     else:
         peak_mb = base_mb
 

@@ -220,6 +220,7 @@ pub(crate) fn route_scx_backed_to_scx(
                         SectionType::CsrShard,
                         ModalityType::Rna,
                         format!("X_shard_{i}"),
+                        None,
                     )
                 })
                 .map_err(to_pyerr)
@@ -373,7 +374,8 @@ pub(crate) fn route_scx_lazy_to_scx(
     let src_codec: Option<CodecId> = src_header_meta.and_then(|(c, _)| c);
     let src_format_version: u16 = src_header_meta
         .map(|(_, v)| v)
-        .unwrap_or(scx_format_io::CURRENT_FORMAT_VERSION);
+        // Unframed rewrite fallback: the default (v3), not the max-readable v4.
+        .unwrap_or(scx_format_io::DEFAULT_WRITE_FORMAT_VERSION);
     let out_codec = explicit_codec.or(src_codec).unwrap_or(CodecId::Zstd);
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
     let n_vars_u32 = u32::try_from(n_vars)
@@ -430,6 +432,7 @@ pub(crate) fn route_scx_lazy_to_scx(
                     SectionType::CsrShard,
                     ModalityType::Rna,
                     format!("X_shard_{i}"),
+                    None,
                 )
             })
             .map_err(to_pyerr)
@@ -651,6 +654,7 @@ pub(crate) fn stream_write_layers(
                         SectionType::LayerCsrShard,
                         ModalityType::Rna,
                         format!("{layer_name}_shard_{i}"),
+                        None,
                     )
                 })
                 .map_err(to_pyerr)

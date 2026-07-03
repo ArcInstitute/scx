@@ -105,6 +105,12 @@ pub struct ConvertOptions {
     /// Columns per CSC shard when a CSC sidecar is emitted. `0` disables the
     /// cap (single CSC shard, memory permitting).
     pub csc_cols_per_shard: usize,
+    /// Experimental (F5 Phase 1): row-group-frame each CSR shard into groups of
+    /// at most this many rows, emitting a v4 file / v2 shards with a multi-entry
+    /// `BlockIndex` for codec-agnostic sub-shard random access. `None` (default)
+    /// writes the ordinary unframed (v3) layout. **Currently supports
+    /// `--codec none` only**; any other codec errors at encode time.
+    pub row_group_rows: Option<u32>,
     /// Tool name recorded in the provenance entry. Defaults to
     /// `"scx"`; `pyscx` overrides this to `"pyscx"` so the
     /// recorded provenance reflects the actual caller.
@@ -382,6 +388,7 @@ impl Default for ConvertOptions {
             codec: None,
             csc: CscPolicy::Off,
             csc_cols_per_shard: 5000,
+            row_group_rows: None,
             tool: "scx".into(),
             memory_budget: None,
             stream: true,
@@ -753,7 +760,7 @@ pub fn h5ad_to_scx(
     let index_dtype: u8 = index_dtype_for(n_vars as u64);
 
     // Build header
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         n_vars as u64,
         nnz,
@@ -761,6 +768,10 @@ pub fn h5ad_to_scx(
         codec_id as u8,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -783,6 +794,7 @@ pub fn h5ad_to_scx(
         index_dtype,
         opts.bitmap,
         ModalityType::Rna,
+        opts.row_group_rows,
         sink,
     )?;
 
@@ -956,7 +968,7 @@ pub fn tenx_to_scx(
         detect_value_encoding(&tenx.data, opts.codec).map_err(ScxError::from)?;
     let index_dtype: u8 = index_dtype_for(tenx.n_genes as u64);
 
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         tenx.n_cells as u64,
         tenx.n_genes as u64,
         nnz,
@@ -964,6 +976,10 @@ pub fn tenx_to_scx(
         codec_id as u8,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
     writer.write_obs(&tenx.obs)?;
@@ -981,6 +997,7 @@ pub fn tenx_to_scx(
         index_dtype,
         opts.bitmap,
         ModalityType::Rna,
+        opts.row_group_rows,
         sink,
     )?;
 
@@ -1245,7 +1262,7 @@ pub fn h5ad_to_scx_streaming(
     // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
     // `codec_id` are overwritten by `ScxWriter::finish()` from
     // running accumulators (see scx-format/src/writer.rs).
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         n_vars as u64,
         0,
@@ -1253,6 +1270,10 @@ pub fn h5ad_to_scx_streaming(
         0,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -1835,6 +1856,7 @@ pub fn streaming_writer_coordinator(
             section_type,
             modality_type,
             format!("{section_name_prefix}_{shard_idx}"),
+            opts.row_group_rows,
         )?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;
@@ -1966,6 +1988,7 @@ fn streaming_writer_coordinator_parallel(
     let source_name: String = reader.source_matrix_name().to_string();
     let opts_codec = opts.codec;
     let opts_bitmap = opts.bitmap;
+    let opts_row_group_rows = opts.row_group_rows;
     let want_bitmap = section_type == SectionType::CsrShard;
     let name_prefix = section_name_prefix.to_string();
 
@@ -2045,6 +2068,7 @@ fn streaming_writer_coordinator_parallel(
                         name,
                         opts_bitmap,
                         want_bitmap,
+                        opts_row_group_rows,
                     );
                     let wrapped = result.map_err(|inner| ConvertError::ShardRead {
                         row_start,
@@ -2152,6 +2176,7 @@ fn encode_one_shard_worker(
     name: String,
     bitmap_policy: BitmapPolicy,
     want_bitmap: bool,
+    row_group_rows: Option<u32>,
 ) -> Result<EncodedShardOutput, ConvertError> {
     let mut shard = reader.read_range(row_start, n_rows)?;
     let duplicates_merged = shard.duplicates_merged;
@@ -2168,6 +2193,7 @@ fn encode_one_shard_worker(
         section_type,
         modality_type,
         name,
+        row_group_rows,
     )?;
     let encoded_csr_size = pre.section_length as usize;
 
@@ -2459,6 +2485,7 @@ fn streaming_writer_coordinator_ranges(
             format!("{section_name_prefix}_{shard_idx}"),
             opts.bitmap,
             want_bitmap,
+            opts.row_group_rows,
         )?;
         if out.duplicates_merged > 0 {
             sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
@@ -2576,6 +2603,7 @@ fn write_csr_shards(
     index_dtype: u8,
     bitmap_policy: BitmapPolicy,
     modality_type: ModalityType,
+    row_group_rows: Option<u32>,
     sink: &mut WarningSink,
 ) -> Result<Vec<(u64, u64)>, ConvertError> {
     let n_vars_u32 = u32::try_from(n_vars)
@@ -2622,6 +2650,7 @@ fn write_csr_shards(
             SectionType::CsrShard,
             modality_type,
             format!("X_shard_{shard_idx}"),
+            row_group_rows,
         )?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;

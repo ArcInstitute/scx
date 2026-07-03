@@ -3869,6 +3869,121 @@ impl ScxReader {
         Ok(Some(out))
     }
 
+    /// Codec-agnostic sibling of [`Self::decode_scx1_row_runs`] for
+    /// **row-group-framed (v2)** shards: decode several shard-local row `runs`
+    /// (`(row_start, n_rows)`) by resolving the `BlockIndex`, decoding only the
+    /// touched row-groups (each at most once), and slicing the requested rows out
+    /// of them. Returns `Ok(None)` for a non-framed (v1) shard so the caller
+    /// falls back to Scx1 sidecar / full-shard decode. Each run's result is a
+    /// run-local CSR (`indptr[0] == 0`) byte-identical to the matching slice of a
+    /// full decode. Cost is O(touched-groups + touched-rows), not O(shard).
+    pub fn decode_block_index_row_runs(
+        &self,
+        entry: &FullCatalogEntry,
+        runs: &[(usize, usize)],
+    ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
+        let header = self.read_shard_header(entry)?;
+        // Only framed shards carry a resolvable multi-entry block index.
+        if header.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+            return Ok(None);
+        }
+        let codec_id =
+            CodecId::from_u8(header.codec_id).ok_or(ScxError::UnknownCodec(header.codec_id))?;
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let index_dtype_u16 = header.index_dtype == 0;
+        let section = self.section_bytes(entry)?;
+
+        let slice = |rel: u32, len: u32, label: &str| -> Result<&[u8]> {
+            let start = rel as usize;
+            let end = start
+                .checked_add(len as usize)
+                .filter(|&e| e <= section.len())
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard {} {label} stream out of bounds",
+                        entry.name
+                    ))
+                })?;
+            Ok(&section[start..end])
+        };
+        let indptr_bytes = slice(header.indptr_rel_offset, header.indptr_length, "indptr")?;
+        let indices_bytes = slice(header.indices_rel_offset, header.indices_length, "indices")?;
+        let values_bytes = slice(header.values_rel_offset, header.values_length, "values")?;
+        let block_index_bytes = slice(
+            header.block_index_rel_offset,
+            header.block_index_length,
+            "block_index",
+        )?;
+
+        let spans = crate::shard::resolve_block_index(&header, block_index_bytes)?;
+        let find_group = |row: usize| -> usize {
+            spans
+                .partition_point(|s| (s.row_start as usize) <= row)
+                .saturating_sub(1)
+        };
+
+        // Collect the unique set of touched groups, then decode each exactly once.
+        let mut touched: Vec<usize> = runs
+            .iter()
+            .filter(|(_, len)| *len > 0)
+            .flat_map(|&(s, l)| find_group(s)..=find_group(s + l - 1))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+
+        let mut group_cache: HashMap<usize, scx_codec::ScipyShard> =
+            HashMap::with_capacity(touched.len());
+        for g in touched {
+            let decoded = scx_codec::decode_row_group(
+                codec_id,
+                &spans[g],
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                venc,
+                index_dtype_u16,
+            )
+            .map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "row-group decode of {} group {g}: {e}",
+                    entry.name
+                ))
+            })?;
+            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "row-group convert of {} group {g}: {e}",
+                    entry.name
+                ))
+            })?;
+            group_cache.insert(g, scipy);
+        }
+
+        // Build each run's run-local CSR by copying rows from their groups.
+        let mut out = Vec::with_capacity(runs.len());
+        for &(run_start, run_len) in runs {
+            let mut r_indptr = Vec::with_capacity(run_len + 1);
+            r_indptr.push(0i64);
+            let mut r_indices = Vec::new();
+            let mut r_data = Vec::new();
+            let mut running = 0i64;
+            for row in run_start..run_start + run_len {
+                let g = find_group(row);
+                let span = &spans[g];
+                let local = row - span.row_start as usize;
+                let (g_ip, g_ix, g_data) = &group_cache[&g];
+                let lo = g_ip[local] as usize;
+                let hi = g_ip[local + 1] as usize;
+                r_indices.extend_from_slice(&g_ix[lo..hi]);
+                r_data.extend_from_slice(&g_data[lo..hi]);
+                running += (hi - lo) as i64;
+                r_indptr.push(running);
+            }
+            out.push((r_indptr, r_indices, r_data));
+        }
+        Ok(Some(out))
+    }
+
     fn read_shard_from_entry_inner(
         &self,
         entry: &FullCatalogEntry,

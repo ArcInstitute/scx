@@ -560,6 +560,7 @@ fn from_h5ad(
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
+        row_group_rows: None,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
         stream,

@@ -1185,6 +1185,10 @@ fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<B
         "full_shard_groups",
         m.full_shard_groups.load(Ordering::Relaxed),
     )?;
+    dict.set_item(
+        "block_index_groups",
+        m.block_index_groups.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

@@ -14,8 +14,8 @@ use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
-    SHARD_HEADER_SIZE, SHARD_MAGIC,
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader,
+    DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use scx_format_io::writer::ScxWriter;
 
@@ -813,7 +813,7 @@ fn write_csr_chunk(
 
     let sh = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: CURRENT_SHARD_FORMAT_VERSION,
+        shard_format_version: DEFAULT_WRITE_SHARD_FORMAT_VERSION,
         shard_type: derive_shard_type(SectionType::CsrShard),
         codec_id: shard_codec as u8,
         value_encoding: value_encoding as u8,

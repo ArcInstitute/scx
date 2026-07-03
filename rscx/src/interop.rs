@@ -998,8 +998,9 @@ fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
         Some("zstd") => Ok(Some(CodecId::Zstd)),
         Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
         Some("pcodec") => Ok(Some(CodecId::Pcodec)),
+        Some("shufdelta") => Ok(Some(CodecId::ShufDeltaZstd)),
         Some(other) => Err(Error::Other(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', or 'pcodec'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', or 'shufdelta'.",
             other
         ))),
     }

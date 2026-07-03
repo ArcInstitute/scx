@@ -1093,7 +1093,7 @@ impl ScxWriter {
 
         let shard_header = ShardHeader {
             magic: crate::shard::SHARD_MAGIC,
-            shard_format_version: crate::shard::CURRENT_SHARD_FORMAT_VERSION,
+            shard_format_version: crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
             shard_type: derive_shard_type(section_type),
             codec_id: codec_id as u8,
             value_encoding: value_encoding as u8,

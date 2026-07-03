@@ -915,10 +915,61 @@ arm). The float paired fixture `pert_synth_10k` is scx-only above — shardad is
 counts format and rejects float `X` on grouped write. Both formats share the
 `scx-bench` conda env.
 
-> _Head-to-head numbers (grouped-write size/throughput and per-perturbation
-> `read_group` latency, scx vs shardad) are pending a full `grouped_read`
-> benchmark run and will be tabulated here; the live table renders in the
-> comprehensive report's "Grouped Read/Write — scx vs shardad" section._
+Measured head-to-head (release build, `ctc_cpu_priority`; median wall, `.scx`/`.shad`
+file size; `read_group` is the per-perturbation read):
+
+| dataset (X) | grouped write (scx→shardad) | file size | `read_group` (scx→shardad) |
+|---|---|---|---|
+| `nb_glm_synth` (CSR counts) | 3.6 → **3.0 s** | 125 → **73 MB** | **0.60** → 1.02 s |
+| `replogle_k562` (dense, float) | **45.6** → 53.2 s | 2330 → **2238 MB** | **0.71** → 9.24 s |
+| `tahoe_c38` (CSR, float) | 18.4 → **9.5 s** | 1427 → **1403 MB** | **1.27** → 4.02 s |
+| `chemogenetic_rgfp` (CSR counts) | 34.2 → **21.0 s** | 1250 → **803 MB** | **0.61** → 0.86 s |
+
+**Reading it.** shardad wins **grouped-write** speed on in-RAM-sized data (it loads an
+in-memory CSR then encodes; scx streams from the h5ad) and **integer-count compression**
+(≈1.5–1.7× smaller on raw counts `nb_glm_synth`/`chemogenetic_rgfp`; ≈parity on the
+float fixtures). scx wins **`read_group`** on every dataset — decisively where the
+reference/group spans many shards (`replogle_k562` **13×**, `tahoe_c38` **3×**) — because
+its predicate-index byte-range read decodes only the group's rows. scx additionally offers
+`query().filter_obs(...)` pushdown (≈`read_group` latency) and out-of-core reads shardad
+lacks (see the "Out-of-Core Peak RSS" report section: at census_5m scx streaming peaks at
+~19 GB vs shardad's ~90 GB full materialize). Both formats pass the read-back correctness +
+reference-isolation gates on all fixtures. The live tables render in the comprehensive
+report's "Grouped Read/Write — scx vs shardad", "Out-of-Core Peak RSS", and "Format
+Capability Matrix" sections.
+
+**Beyond grouped sharding (full cross-format campaign, release build).** shardad also
+runs as a first-class format in the comprehensive suite:
+
+- **Compression** — shardad is smaller than scx on **integer counts** (`census_1m`
+  1.62 GB vs 3.99 GB ≈2.5×; `census_5m` 8.7 GB vs 15.1 GB; `tabula_100k` 222 vs 449 MB)
+  but ≈parity on **log-normalized/float** data (`smartseq2_lognorm` 504 vs 444 MB — scx
+  smaller; `tabula_100k_lognorm` 294 vs 357 MB — shardad smaller). shardad's byte-filter
+  is tuned for integer UMI streams; scx's pcodec/zstd competes on floats.
+- **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
+  ~flat while shardad must materialize the whole matrix —
+
+  | dataset | scx streaming | scx materialize | shardad materialize |
+  |---|---|---|---|
+  | `census_500k` | 5.5 GB | 8.4 GB | 6.2 GB |
+  | `census_1m` | 6.0 GB | 16.1 GB | 11.3 GB |
+  | `census_5m` | **19.0 GB** | 126.7 GB | **87.4 GB** |
+
+  shardad has no streaming path, so full materialize is its only read mode — the
+  capability boundary at atlas scale.
+- **Parallel read scaling** — scx scales 3.6× (`tabula_100k`) / 4.5× (`census_1m`) to 32
+  threads; shardad is faster single-threaded but scales only ~1.0×/2.1× (its
+  multiprocessing read is materialization-bound). Net at 32 threads scx is faster on both.
+- **ML training loader** — scx `TrainingDataset` sustains 45.5 (`tabula_100k`) / 767–1,193
+  (`census_1m`) batches/s; a shardad random-access row-slice loader (shardad has no native
+  batched loader) manages ~0.6 batches/s — the ML-throughput gap is decisive.
+- **Fidelity** — shardad round-trips counts losslessly (`shardad_fidelity` gate: 0 value
+  mismatches on `pbmc3k` / `nb_glm_synth` / `tabula_100k`), and its dtype/materialization
+  knobs (`to_anndata(container="dense", data_dtype="float16", allow_lossy=True)`) verify.
+
+Net: shardad's durable edges are **integer-count file size** and single-shot in-RAM write;
+scx's are **per-group reads, out-of-core, parallel scaling, ML throughput, and breadth**
+(query engine, accelerators, cloud, multimodal, R — see the capability matrix).
 
 ---
 

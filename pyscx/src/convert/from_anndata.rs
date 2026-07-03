@@ -367,6 +367,7 @@ pub(crate) fn parallel_encode_csr_shards(
                         section_type,
                         ModalityType::Rna,
                         name.clone(),
+                        None,
                     )
                     .map_err(|e| e.to_string())
                 };

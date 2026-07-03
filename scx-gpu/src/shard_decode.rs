@@ -158,20 +158,22 @@ pub fn decode_shard_gpu_with_metadata(
             nnz,
             metadata,
         ),
-        CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
-            decode_cpu_fallback(
-                dev,
-                indptr_bytes,
-                indices_bytes,
-                values_bytes,
-                codec_id,
-                value_encoding,
-                index_dtype_u16,
-                n_rows,
-                n_cols,
-                nnz,
-            )
-        }
+        CodecId::None
+        | CodecId::Zstd
+        | CodecId::Lz4Shuffle
+        | CodecId::Pcodec
+        | CodecId::ShufDeltaZstd => decode_cpu_fallback(
+            dev,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+            n_rows,
+            n_cols,
+            nnz,
+        ),
     }
 }
 

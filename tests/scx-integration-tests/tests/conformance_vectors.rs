@@ -33,7 +33,7 @@ use scx_engine::{
     build_obs_predicate_index_bytes, build_var_predicate_index_bytes, BuildOutcome,
     PredicateIndexBuildOptions,
 };
-use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
+use scx_format_io::header::{FileHeader, DEFAULT_WRITE_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{BitmapShard, DeletionVectors, FullCatalog, ModalityType, SectionType};
@@ -977,9 +977,9 @@ fn test_conformance_files_reader_opens() {
         let reader = ScxReader::open(&path)
             .unwrap_or_else(|e| panic!("failed to open {}: {e}", fixture.rel_path));
         let h = reader.header();
-        // Sanity: format_version is current.
+        // Sanity: fixtures are the unframed default version (v3).
         assert_eq!(
-            h.format_version, CURRENT_FORMAT_VERSION,
+            h.format_version, DEFAULT_WRITE_FORMAT_VERSION,
             "{} format_version differs",
             fixture.rel_path
         );

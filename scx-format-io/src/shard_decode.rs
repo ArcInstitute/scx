@@ -16,7 +16,7 @@ use scx_codec::{CodecId, EncodedShardRef, ValueEncoding};
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
-use crate::shard::ShardHeader;
+use crate::shard::{resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION};
 use crate::validated_section::ValidatedSection;
 
 /// Decode a single CSR shard from its on-disk bytes.
@@ -78,6 +78,24 @@ pub fn decode_shard_bytes(
         .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
     let index_dtype_u16 = sh.index_dtype == 0;
 
+    // Row-group-framed (v2) shards: the indptr sub-stream is a concatenation of
+    // per-group local-rebased indptrs, so the whole-stream decoder can't read it
+    // — iterate the block index and reassemble the global CSR (byte-identical to
+    // an unframed decode of the same data). Legacy (v1) shards take the direct
+    // whole-shard path below.
+    if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        return decode_framed_shard_scipy(
+            &sh,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            block_index_bytes,
+            codec_id,
+            value_encoding,
+            index_dtype_u16,
+        );
+    }
+
     let encoded = EncodedShardRef {
         indptr_bytes,
         indices_bytes,
@@ -92,6 +110,58 @@ pub fn decode_shard_bytes(
         sh.nnz as usize,
         index_dtype_u16,
     )?;
+
+    Ok((indptr, indices, data))
+}
+
+/// Reassemble a whole framed (v2) shard into a global scipy CSR by iterating its
+/// row-group block index. Each group decodes to a *local* CSR
+/// (`indptr[0] == 0`); we rebase the group indptrs into a single monotonic
+/// global indptr and concatenate indices/values. Output is byte-identical to a
+/// legacy whole-shard decode of the same matrix.
+#[allow(clippy::too_many_arguments)]
+fn decode_framed_shard_scipy(
+    sh: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+    codec_id: CodecId,
+    value_encoding: ValueEncoding,
+    index_dtype_u16: bool,
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+    let spans = resolve_block_index(sh, block_index_bytes)?;
+    let n_major = sh.n_major as usize;
+    let nnz = sh.nnz as usize;
+
+    let mut indptr = Vec::with_capacity(n_major + 1);
+    indptr.push(0i64);
+    let mut indices = Vec::with_capacity(nnz);
+    let mut data = Vec::with_capacity(nnz);
+    let mut running: i64 = 0;
+
+    for span in &spans {
+        let decoded = scx_codec::decode_row_group(
+            codec_id,
+            span,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+        // Convert this group (local CSR) to scipy types, then rebase indptr.
+        let (g_indptr, g_indices, g_data) =
+            scx_codec::decoded_shard_to_scipy(decoded, value_encoding)?;
+        for &local in &g_indptr[1..] {
+            indptr.push(running + local);
+        }
+        if let Some(&last) = g_indptr.last() {
+            running += last;
+        }
+        indices.extend_from_slice(&g_indices);
+        data.extend_from_slice(&g_data);
+    }
 
     Ok((indptr, indices, data))
 }
@@ -118,6 +188,42 @@ pub fn decode_shard_indptr_bytes(
     let indptr_bytes = vs.subslice(sh.indptr_rel_offset, sh.indptr_length)?;
 
     let codec_id = CodecId::from_u8(sh.codec_id).ok_or(ScxError::UnknownCodec(sh.codec_id))?;
+
+    // Framed (v2) shards store per-group local indptrs; reconstruct the global
+    // indptr from the row-group index rather than reading the stream directly.
+    if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
+        let index_dtype_u16 = sh.index_dtype == 0;
+        let indices_bytes = vs.subslice(sh.indices_rel_offset, sh.indices_length)?;
+        let values_bytes = vs.subslice(sh.values_rel_offset, sh.values_length)?;
+        let block_index_bytes = vs.subslice(sh.block_index_rel_offset, sh.block_index_length)?;
+        let spans = resolve_block_index(&sh, block_index_bytes)?;
+        let mut indptr = Vec::with_capacity(sh.n_major as usize + 1);
+        indptr.push(0i64);
+        let mut running: i64 = 0;
+        for span in &spans {
+            let (g_indptr, _, _) = scx_codec::decoded_shard_to_scipy(
+                scx_codec::decode_row_group(
+                    codec_id,
+                    span,
+                    indptr_bytes,
+                    indices_bytes,
+                    values_bytes,
+                    value_encoding,
+                    index_dtype_u16,
+                )?,
+                value_encoding,
+            )?;
+            for &local in &g_indptr[1..] {
+                indptr.push(running + local);
+            }
+            if let Some(&last) = g_indptr.last() {
+                running += last;
+            }
+        }
+        return Ok(indptr);
+    }
 
     let indptr = scx_codec::decode_indptr_only(indptr_bytes, codec_id, sh.n_major as usize)?;
     Ok(indptr)

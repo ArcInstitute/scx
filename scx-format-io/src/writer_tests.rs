@@ -284,6 +284,7 @@ fn preencoded_scx1_shard_emits_valid_decode_sidecar() {
         SectionType::CsrShard,
         ModalityType::Rna,
         "X_shard_0".to_string(),
+        None,
     )
     .unwrap();
     assert!(
@@ -511,7 +512,11 @@ fn test_minimal_file_header_and_alignment() {
     let hdr = FileHeader::read_from(&mut cursor).unwrap();
 
     assert_eq!(hdr.magic, crate::header::MAGIC);
-    assert_eq!(hdr.format_version, crate::header::CURRENT_FORMAT_VERSION);
+    // Unframed writes stamp the default (v3), not the max-readable CURRENT (v4).
+    assert_eq!(
+        hdr.format_version,
+        crate::header::DEFAULT_WRITE_FORMAT_VERSION
+    );
     assert_eq!(hdr.n_csr_shards, 1);
     assert_eq!(hdr.root_catalog_offset, HEADER_SIZE as u64);
     assert!(hdr.full_catalog_offset >= SECTIONS_START_OFFSET);
@@ -2564,6 +2569,7 @@ fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
         SectionType::CsrShard,
         ModalityType::Rna,
         "X/rna/shard_0".to_string(),
+        None,
     )
     .unwrap();
     let pre_nnz = pre.nnz;

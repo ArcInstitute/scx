@@ -34,6 +34,20 @@ fn scatter_sidecar_enabled() -> bool {
     })
 }
 
+/// Process-wide switch for the codec-agnostic **block-index** scattered read
+/// path (F5 Phase 1). Default on; `SCX_SCATTER_BLOCK_INDEX=0` (or `false`)
+/// disables just the row-group path so a framed shard falls back to full-shard
+/// decode, without touching the Scx1 sidecar path. Layered under the shared
+/// scatter-eligibility gate, so `SCX_SCATTER_SIDECAR=0` disables both.
+fn scatter_block_index_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SCX_SCATTER_BLOCK_INDEX")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
 /// A shard request-group takes the O(rows) sidecar path only when the requested
 /// rows are a small fraction of the shard — `group_len * DIVISOR < shard_rows`.
 /// Shared by `read_rows_with`'s `use_sidecar` decision and the plan-prefetch
@@ -406,6 +420,11 @@ pub struct CacheMetrics {
     /// `use_sidecar` group that fell back because the shard carried no fresh
     /// sidecar (e.g. CSC / non-Scx1 / over-budget / pre-0.9.1 fixture).
     pub full_shard_groups: AtomicU64,
+    /// `read_rows_with` shard request-groups served by the codec-agnostic
+    /// **row-group block-index** path (F5 Phase 1) — a framed (v2) shard with no
+    /// Scx1 sidecar decoded only in its touched groups. The block-index adoption
+    /// signal, symmetric with `sidecar_groups` / `full_shard_groups`.
+    pub block_index_groups: AtomicU64,
 }
 
 /// Per-shard rendezvous slot used by the singleflight in
@@ -1463,14 +1482,32 @@ impl BackedCsrReader {
         for (start, end, shard_idx, s_start, use_sidecar) in groups {
             let group = &sorted_pairs[start..end];
 
+            // Strategy: on an eligible (sparse, cache-cold) group, try the Scx1
+            // bit-level sidecar first (unchanged fast path); if the shard has no
+            // fresh Scx1 sidecar, try the codec-agnostic row-group block-index
+            // path (framed v2 shards); otherwise fall back to a full-shard decode.
+            let mut via_block_index = false;
             let handled = if use_sidecar {
-                self.scatter_group_via_sidecar(shard_idx, s_start, group, &mut scatter)?
+                let mut h =
+                    self.scatter_group_via_sidecar(shard_idx, s_start, group, &mut scatter)?;
+                if !h && scatter_block_index_enabled() {
+                    h = self.scatter_group_via_block_index(
+                        shard_idx,
+                        s_start,
+                        group,
+                        &mut scatter,
+                    )?;
+                    via_block_index = h;
+                }
+                h
             } else {
                 false
             };
 
             if let Some(m) = self.metrics() {
-                if handled {
+                if via_block_index {
+                    m.block_index_groups.fetch_add(1, Ordering::Relaxed);
+                } else if handled {
                     m.sidecar_groups.fetch_add(1, Ordering::Relaxed);
                 } else {
                     m.full_shard_groups.fetch_add(1, Ordering::Relaxed);
@@ -1580,6 +1617,74 @@ impl BackedCsrReader {
         // run boundary that skips rows). Debug-only — release relies on the
         // byte-identical parity tests.
         debug_assert_eq!(gi, group.len(), "sidecar scatter left rows unscattered");
+        Ok(true)
+    }
+
+    /// Codec-agnostic sibling of [`Self::scatter_group_via_sidecar`] for
+    /// **row-group-framed (v2)** shards: coalesce the request into consecutive
+    /// runs and decode only the touched row-groups via the block index
+    /// ([`ScxReader::decode_block_index_row_runs`]). Returns `Ok(false)` (nothing
+    /// scattered) for a non-framed shard so the caller falls back to full-shard
+    /// decode. Output is byte-identical to a full decode + slice.
+    fn scatter_group_via_block_index<F>(
+        &self,
+        shard_idx: usize,
+        s_start: u64,
+        group: &[(u64, usize)],
+        scatter: &mut F,
+    ) -> Result<bool>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
+        // Same consecutive-run coalescing as the sidecar path (absorbs gaps and
+        // duplicate requests); each run is (run_start_local, run_len).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut run_min = (group[0].0 - s_start) as usize;
+        let mut run_max = run_min;
+        for &(row, _) in &group[1..] {
+            let local = (row - s_start) as usize;
+            if local <= run_max + 1 {
+                run_max = run_max.max(local);
+            } else {
+                runs.push((run_min, run_max - run_min + 1));
+                run_min = local;
+                run_max = local;
+            }
+        }
+        runs.push((run_min, run_max - run_min + 1));
+
+        let Some((offset, section_type)) = self
+            .shard_entry(shard_idx)
+            .map(|l| (l.offset, l.section_type))
+        else {
+            return Ok(false);
+        };
+        let Some(entry) = self.reader.full_entry_at_offset(offset, section_type) else {
+            return Ok(false);
+        };
+
+        // `None` ⇒ shard is not row-group-framed ⇒ caller falls back; nothing
+        // scattered yet (all-or-nothing, same contract as the sidecar path).
+        let decoded = match self.reader.decode_block_index_row_runs(entry, &runs)? {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+
+        let mut gi = 0usize;
+        for (&(run_start, _run_len), (indptr, indices, data)) in runs.iter().zip(&decoded) {
+            while gi < group.len() {
+                let (row, orig_pos) = group[gi];
+                let in_run = (row - s_start) as usize - run_start;
+                if in_run >= indptr.len() - 1 {
+                    break;
+                }
+                let lo = indptr[in_run] as usize;
+                let hi = indptr[in_run + 1] as usize;
+                scatter(orig_pos, &indices[lo..hi], &data[lo..hi])?;
+                gi += 1;
+            }
+        }
+        debug_assert_eq!(gi, group.len(), "block-index scatter left rows unscattered");
         Ok(true)
     }
 

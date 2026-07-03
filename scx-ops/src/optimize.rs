@@ -211,6 +211,7 @@ pub fn optimize(
             entry.section_type,
             ModalityType::Rna,
             entry.name.clone(),
+            None, // optimize does not row-group-frame (Phase 1)
         )?;
         writer.write_preencoded_shard(pre)?;
     }

@@ -15,7 +15,8 @@ use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
 use crate::shard::{
-    BlockIndex, ShardHeader, CURRENT_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
+    BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
+    DEFAULT_WRITE_SHARD_FORMAT_VERSION, MAX_BLOCK_ROWS, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 
@@ -61,6 +62,7 @@ use crate::writer::{compute_shard_stats, MajorAxis, PreEncodedSection};
 /// let section = encode_one_shard(
 ///     &indptr, &indices, &values, None, 1, 3, 0,
 ///     SectionType::CsrShard, ModalityType::Rna, "X".to_string(),
+///     None, // row_group_rows: unframed
 /// )
 /// .unwrap();
 /// assert!(section.section_length > 0);
@@ -77,6 +79,7 @@ pub fn encode_one_shard(
     section_type: SectionType,
     modality_type: ModalityType,
     name: String,
+    row_group_rows: Option<u32>,
 ) -> Result<PreEncodedSection, ScxError> {
     // Enforce the canonical-CSR contract in debug builds. Release builds
     // trust the caller (callers canonicalize upstream); this catches a
@@ -107,7 +110,7 @@ pub fn encode_one_shard(
     };
 
     // 5. Encode shard.
-    let encoded = encode_shard(
+    let mut encoded = encode_shard(
         shard_indptr,
         shard_indices,
         &shard_values_bytes,
@@ -116,13 +119,41 @@ pub fn encode_one_shard(
         index_dtype_u16,
     )?;
 
-    // 6. Build block index, splitting into ≤MAX_BLOCK_ROWS-row blocks so an
-    // oversized shard does not overflow the u16 per-block row count. Single
-    // block for the common (≤65535-row) case — byte-identical to the legacy
-    // layout.
+    // 6. Build block index. Two layouts:
+    //   - Unframed (default): a single whole-shard entry (or ≤MAX_BLOCK_ROWS
+    //     split for oversized shards) with zero byte offsets — byte-identical to
+    //     the legacy layout; shard v1.
+    //   - Row-group-framed (`row_group_rows`, Phase 1 = `None` codec only): the
+    //     indptr stream is re-framed into per-group local-rebased indptrs and the
+    //     multi-entry BlockIndex records real per-group byte offsets, enabling
+    //     codec-agnostic sub-shard random access (SIDECAR-LONG-TERM-FIX.md
+    //     Option B); shard v2.
     let n_major = (shard_indptr.len() - 1) as u32;
     let nnz = *shard_indptr.last().unwrap_or(&0);
-    let block_index = BlockIndex::for_shard(n_major, shard_indptr)?;
+    let (block_index, shard_version) = match row_group_rows {
+        Some(g) if g > 0 => {
+            if shard_codec != CodecId::None {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "row-group framing currently supports --codec none only (got codec '{}')",
+                    shard_codec.display_name()
+                )));
+            }
+            let (indptr_stream, bi) = frame_none_shard(
+                shard_indptr,
+                index_dtype_u16,
+                shard_value_encoding.byte_width(),
+                g,
+            )?;
+            // Replace the contiguous indptr stream with the framed one; indices
+            // and values stay contiguous (None is already byte-seekable).
+            encoded.indptr_bytes = indptr_stream;
+            (bi, CURRENT_SHARD_FORMAT_VERSION)
+        }
+        _ => (
+            BlockIndex::for_shard(n_major, shard_indptr)?,
+            DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+        ),
+    };
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
 
@@ -148,7 +179,7 @@ pub fn encode_one_shard(
 
     let shard_header = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: CURRENT_SHARD_FORMAT_VERSION,
+        shard_format_version: shard_version,
         shard_type: 0, // CSR
         codec_id: shard_codec as u8,
         value_encoding: shard_value_encoding as u8,
@@ -230,4 +261,50 @@ pub fn encode_one_shard(
         nnz,
         decode_sidecar,
     })
+}
+
+/// Frame a `CodecId::None` CSR shard into row-groups for codec-agnostic
+/// sub-shard random access (SIDECAR-LONG-TERM-FIX.md Option B, Phase 1).
+///
+/// Returns the re-framed **indptr sub-stream** (a concatenation of per-group
+/// *local-rebased* indptrs — each group `[r0, r1)` contributes `r1-r0+1` u64s
+/// starting at 0) and the multi-entry [`BlockIndex`]. The indices and values
+/// sub-streams are left contiguous (None stores them as fixed-width LE arrays,
+/// so a group's slice is `[indptr[r0]·w, indptr[r1]·w)`); their entry offsets
+/// point into those global streams. Groups are capped at `min(row_group_rows,
+/// MAX_BLOCK_ROWS)` rows. This is exactly the layout [`resolve_block_index`]
+/// validates and `scx_codec::decode_row_group` consumes.
+fn frame_none_shard(
+    indptr: &[u64],
+    index_dtype_u16: bool,
+    value_width: usize,
+    row_group_rows: u32,
+) -> Result<(Vec<u8>, BlockIndex), ScxError> {
+    let n_rows = indptr.len().saturating_sub(1);
+    let w_i = if index_dtype_u16 { 2usize } else { 4 };
+    let w_v = value_width;
+    let g = row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
+
+    let mut indptr_stream: Vec<u8> = Vec::with_capacity((n_rows + n_rows / g + 1) * 8);
+    let mut entries = Vec::with_capacity(n_rows.div_ceil(g).max(1));
+    let mut r0 = 0usize;
+    while r0 < n_rows {
+        let r1 = (r0 + g).min(n_rows);
+        let base = indptr[r0];
+        let ip_off = indptr_stream.len() as u32;
+        for &v in &indptr[r0..=r1] {
+            indptr_stream.extend_from_slice(&(v - base).to_le_bytes());
+        }
+        let nnz_in_block = indptr[r1] - base;
+        entries.push(BlockIndexEntry::new(
+            r0 as u32,
+            (r1 - r0) as u32,
+            ip_off,
+            (base as usize * w_i) as u32,
+            (base as usize * w_v) as u32,
+            nnz_in_block,
+        )?);
+        r0 = r1;
+    }
+    Ok((indptr_stream, BlockIndex { entries }))
 }

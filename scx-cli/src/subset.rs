@@ -378,6 +378,7 @@ pub(crate) fn write_csr_shards_auto(
             SectionType::CsrShard,
             modality_type,
             format!("X_shard_{shard_idx}"),
+            None,
         )?;
         writer.write_preencoded_shard(pre)?;
 
