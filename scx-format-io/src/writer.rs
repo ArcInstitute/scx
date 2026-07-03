@@ -161,6 +161,28 @@ pub struct PreEncodedSection {
     pub decode_sidecar: Option<DecodeSidecar>,
 }
 
+impl PreEncodedSection {
+    /// The per-shard codec id stamped in the serialized `ShardHeader`
+    /// (`header_buf`). Used by callers (e.g. `scx optimize`) to report which
+    /// codec the encoder actually selected — notably the `compact-trial`
+    /// per-shard winner. Returns `0` (`CodecId::None`) if the header cannot be
+    /// parsed, which never happens for a section this crate just produced.
+    pub fn codec_id(&self) -> u8 {
+        ShardHeader::read_from(&mut &self.header_buf[..])
+            .map(|h| h.codec_id)
+            .unwrap_or(0)
+    }
+
+    /// The `shard_format_version` stamped in the serialized `ShardHeader`
+    /// (`1` = unframed/legacy, `2` = row-group-framed). Lets callers count how
+    /// many shards were emitted framed.
+    pub fn shard_format_version(&self) -> u8 {
+        ShardHeader::read_from(&mut &self.header_buf[..])
+            .map(|h| h.shard_format_version)
+            .unwrap_or(0)
+    }
+}
+
 /// Per-axis layout state used by [`ScxWriter`] to enforce that obs (and
 /// var) metadata is written either as a single Arrow IPC section
 /// ([`SectionType::ObsMetadata`] / [`SectionType::VarMetadata`]) or as
@@ -1382,6 +1404,46 @@ impl ScxWriter {
     /// re-stamped decode sidecar bound to the bytes just written. Does NOT
     /// advance shard counters — callers do that to match their single- vs
     /// per-modality bookkeeping.
+    /// Defensive guard (F5 T3.1): refuse to copy a legacy unframed (shard v1)
+    /// CSR-class shard verbatim into a file that claims the framed v4 layout.
+    ///
+    /// A file `format_version` of [`CURRENT_FORMAT_VERSION`](scx_format::CURRENT_FORMAT_VERSION)
+    /// (v4) advertises "this file may contain row-group-framed shards"; copying
+    /// an unframed shard under that claim would promise sub-shard random access
+    /// the shard cannot honor. Any writer producing v4 output must row-group-frame
+    /// (or re-encode) every sparse shard — `convert` and the SCX→SCX passthrough
+    /// already do (they only copy already-framed v2 shards). Every legacy rewrite
+    /// path stamps ≤ v3, so this guard is inert for them. Only CSR-class shards
+    /// carry the framed layout, so obs/var/aux verbatim copies are exempt.
+    fn guard_no_legacy_shard_in_v4(
+        &self,
+        section_type: SectionType,
+        section_bytes: &[u8],
+    ) -> Result<()> {
+        if self.header.format_version < scx_format::CURRENT_FORMAT_VERSION {
+            return Ok(());
+        }
+        if !matches!(
+            section_type,
+            SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+        ) {
+            return Ok(());
+        }
+        let sh = ShardHeader::read_from(&mut &section_bytes[..])?;
+        if sh.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+            return Err(ScxError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing to copy an unframed (shard v{}) shard into a v{} (framed) \
+                     file: re-encode the shard with row-group framing instead of \
+                     raw-copying it",
+                    sh.shard_format_version, self.header.format_version,
+                ),
+            )));
+        }
+        Ok(())
+    }
+
     fn write_csr_shard_raw_copy_inner(
         &mut self,
         section_bytes: &[u8],
@@ -1389,6 +1451,7 @@ impl ScxWriter {
         stats: ShardStats,
         sidecar: Option<DecodeSidecar>,
     ) -> Result<()> {
+        self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
         let section_length = section_bytes.len() as u64;
@@ -1429,6 +1492,7 @@ impl ScxWriter {
     /// (typically in parallel via rayon). This method only performs the
     /// sequential I/O write and catalog entry bookkeeping.
     pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
+        self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -1535,6 +1599,8 @@ impl ScxWriter {
                 ),
             )));
         }
+
+        self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
 
         self.write_padding()?;
 

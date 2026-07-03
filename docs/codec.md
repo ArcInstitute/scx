@@ -216,8 +216,13 @@ Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 ## 7b. ShufDeltaZstd (codec_id = 5)
 
 The most compact option for **integer
-counts** (measured ~1.45–1.75× smaller than `scx1` on `census_1m` /
-`chemogenetic_rgfp`, ~1.3–1.45× smaller than plain `zstd`). Per sub-stream:
+counts** (measured ~1.45–1.75× smaller than `scx1` on raw-count `census_1m` /
+`chemogenetic_rgfp`, ~1.3–1.45× smaller than plain `zstd`; the comprehensive
+`compression` benchmark independently confirms **1.83× vs `scx1`** / 1.38× vs
+`zstd` on `tabula_sapiens_100k`). It is for integer counts only — on
+float/log-normalized `X` the value stream falls back to zstd-only and the codec
+is ≈`zstd` with no win, which is why it is opt-in / trial-selected and never
+auto-forced. Per sub-stream:
 
 - **indices / indptr**: byte-shuffle (transpose to byte planes) → byte-delta
   (per-plane wrapping-`u8`, on the sorted/monotonic streams) → zstd. The delta on
@@ -282,6 +287,13 @@ the heuristic winner and `shufdelta` and keeps the smaller (recorded per shard i
 + random access; it therefore forgoes the Scx1 GPU/per-row decode sidecar (framed
 shards use the `BlockIndex` for sub-shard access instead). Implementation:
 `scx-format-io/src/encoder.rs::encode_one_shard`.
+
+`scx optimize` accepts the same framed codecs — `scx optimize --codec
+compact-trial --row-group-rows N in.scx out.scx` (or `--codec shufdelta
+--row-group-rows N`) re-encodes an existing single-modality v3 file into a
+v4/shard-v2 framed file, reporting how many shards were framed and how many the
+trial stored as `shufdelta`. Writing framed output from Python (`from_anndata`)
+is a deferred follow-on; use the CLI for framed writes today.
 
 ## 8a. Per-modality Codec Defaults
 

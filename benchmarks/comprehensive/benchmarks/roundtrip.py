@@ -5,7 +5,8 @@ Compares the SCX-materialised matrix against the original h5ad source to
 detect silent value-corruption regressions in any of the SCX codecs:
 ``scx_auto`` (auto-selector), ``scx_none`` (raw LE), ``scx_scx1``
 (Delta-Golomb-Rice / FOR-BP / Rice), ``scx_zstd``, ``scx_lz4``
-(byte-shuffle + LZ4), and ``scx_pcodec``. ``correctness.py`` does not close
+(byte-shuffle + LZ4), ``scx_pcodec``, and ``scx_shufdelta``
+(byte-shuffle + byte-delta + zstd). ``correctness.py`` does not close
 this gap because every check there starts from an SCX file written *and*
 read by the same codec — a symmetric corruption (encode-then-decode that
 loses bits identically) goes undetected.
@@ -47,6 +48,7 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({
     "scx_zstd",
     "scx_lz4",
     "scx_pcodec",
+    "scx_shufdelta",
 })
 """Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
 incompatible (bench, format) cells never get submitted. Mirrors the runtime

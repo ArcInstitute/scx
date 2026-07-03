@@ -44,6 +44,13 @@ _CODEC_NAMES = {
     "zstd": ("SCX (zstd)", "scx_zstd"),
     "lz4": ("SCX (lz4)", "scx_lz4"),
     "pcodec": ("SCX (pcodec)", "scx_pcodec"),
+    # F5: byte-shuffle + byte-delta + zstd, the most compact integer-count
+    # codec. Benchmarked monolithic (via `from_anndata(codec="shufdelta")`);
+    # the row-group-framed ratio is within ~0.2% of monolithic (docs/codec.md
+    # §7b), so this size gate validly represents the framed win. Framed writes
+    # from Python are a deferred `from_anndata` kwarg — use `scx convert
+    # --codec shufdelta --row-group-rows N` for random-access-safe framed output.
+    "shufdelta": ("SCX (shufdelta)", "scx_shufdelta"),
     # Phase K multimodal variants — name + key tags for the
     # comprehensive results pipeline.
     "_multimodal_per_modality_auto": (

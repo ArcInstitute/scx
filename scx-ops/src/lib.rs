@@ -35,7 +35,7 @@ pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
 pub use merge_options::{MergeOptions, UnsPolicy};
 pub use modify_metadata::{modify_metadata, set_uns, MetadataPatch};
-pub use optimize::optimize;
+pub use optimize::{optimize, optimize_with_framing, OptimizeStats};
 pub use predicate_index::PredicateIndexBuildSummary;
 pub use rebuild_csc::rebuild_csc_inplace;
 pub use rewrite_helpers::copy_auxiliary_sections;

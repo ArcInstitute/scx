@@ -1207,6 +1207,120 @@ fn test_csc_shard_framed_round_trip() {
     assert_eq!(csc.data, exp_data);
 }
 
+/// A tiny canonical CSR fixture (2 rows, nnz=3, 3 vars) for the T3.1 guard tests.
+fn tiny_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+    (vec![0u64, 2, 3], vec![0u32, 2, 1], vec![1.0f32, 2.0, 3.0])
+}
+
+/// T3.1 guard: `write_preencoded_shard` refuses an **unframed** (shard v1)
+/// CSR shard when the output file claims the framed v4 layout — a v4 file must
+/// not advertise row-group random access it cannot honor. A framed (v2) shard
+/// passes, and an unframed shard into an ordinary v3 file passes.
+#[test]
+fn write_preencoded_shard_rejects_unframed_csr_in_v4_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (indptr, indices, values) = tiny_csr();
+    let encode = |framing| {
+        crate::encoder::encode_one_shard(
+            &indptr,
+            &indices,
+            &values,
+            None,
+            0, // index_dtype: u16
+            3, // n_vars
+            0, // global_row_offset
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            framing,
+        )
+        .unwrap()
+    };
+
+    let mut v4_header = sample_header();
+    v4_header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+
+    // v4 file + unframed shard → rejected.
+    let mut writer = ScxWriter::new(dir.path().join("v4_unframed.scx"), v4_header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let err = writer.write_preencoded_shard(encode(None)).unwrap_err();
+    assert!(
+        matches!(&err, ScxError::Io(e) if e.to_string().contains("framed")),
+        "unframed CSR into v4 must be rejected, got {err:?}",
+    );
+
+    // v4 file + framed shard → accepted.
+    let mut v4_header = sample_header();
+    v4_header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(dir.path().join("v4_framed.scx"), v4_header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    writer
+        .write_preencoded_shard(encode(Some(crate::encoder::FramingConfig {
+            row_group_rows: 1,
+            target_nnz: None,
+            trial: false,
+        })))
+        .unwrap();
+    writer.finish().unwrap();
+
+    // v3 (default) file + unframed shard → accepted (the ordinary path).
+    let mut writer = ScxWriter::new(dir.path().join("v3_unframed.scx"), sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    writer.write_preencoded_shard(encode(None)).unwrap();
+    writer.finish().unwrap();
+}
+
+/// T3.1 guard: `copy_section_verbatim` refuses to raw-copy a legacy (v1) CSR
+/// shard into a v4 file. Builds an ordinary v3 file, then attempts to
+/// verbatim-copy its shard into a v4 writer.
+#[test]
+fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let (indptr, indices, values) = tiny_csr();
+
+    let src_path = dir.path().join("legacy_v3.scx");
+    let mut w = ScxWriter::new(&src_path, sample_header()).unwrap();
+    w.write_obs(&sample_obs()).unwrap();
+    w.write_var(&sample_var()).unwrap();
+    w.write_preencoded_shard(
+        crate::encoder::encode_one_shard(
+            &indptr,
+            &indices,
+            &values,
+            None,
+            0,
+            3,
+            0,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let src_final = w.finish().unwrap();
+
+    let reader = ScxReader::open(&src_final).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0].clone();
+    let raw = reader.read_raw_shard_bytes(&entry).unwrap();
+
+    let mut v4_header = sample_header();
+    v4_header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(dir.path().join("v4_copy.scx"), v4_header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let err = writer.copy_section_verbatim(&entry, raw).unwrap_err();
+    assert!(
+        matches!(&err, ScxError::Io(e) if e.to_string().contains("framed")),
+        "verbatim-copy of a v1 shard into v4 must be rejected, got {err:?}",
+    );
+}
+
 /// v2 strict shard_type validation: a CSC shard whose
 /// `shard_type` byte is corrupted to 0 must be rejected by the
 /// reader. This is the new behavior on the v2 catalog read path

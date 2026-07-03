@@ -36,3 +36,9 @@ name = "fuzz_delta_golomb"
 path = "fuzz_targets/fuzz_delta_golomb.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_shufdelta"
+path = "fuzz_targets/fuzz_shufdelta.rs"
+test = false
+doc = false

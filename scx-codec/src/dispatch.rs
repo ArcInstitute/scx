@@ -1793,6 +1793,156 @@ mod tests {
         assert!(matches!(res, Err(CodecError::MalformedInput(_))));
     }
 
+    /// Frame a CSR into row-groups the way the writer's `encode_shard_framed`
+    /// does, but at the codec level: each group is an independent
+    /// `encode_shard(codec, ..)` over its **local-rebased** indptr, and the
+    /// three sub-streams are concatenated. Returns (indptr, indices, values,
+    /// spans) — exactly the layout `decode_row_group` consumes.
+    #[allow(clippy::type_complexity)]
+    fn frame_codec_for_test(
+        codec: CodecId,
+        indptr: &[u64],
+        indices: &[u32],
+        values_bytes: &[u8],
+        venc: ValueEncoding,
+        idx16: bool,
+        group_rows: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<RowGroupSpan>) {
+        let n_rows = indptr.len() - 1;
+        let w_v = venc.byte_width();
+        let (mut ip_stream, mut ix_stream, mut vv_stream) = (Vec::new(), Vec::new(), Vec::new());
+        let mut spans = Vec::new();
+        let mut r0 = 0usize;
+        while r0 < n_rows {
+            let r1 = (r0 + group_rows).min(n_rows);
+            let base = indptr[r0];
+            let local_indptr: Vec<u64> = (r0..=r1).map(|r| indptr[r] - base).collect();
+            let g_indices = &indices[indptr[r0] as usize..indptr[r1] as usize];
+            let g_values = &values_bytes[indptr[r0] as usize * w_v..indptr[r1] as usize * w_v];
+            let enc = encode_shard(&local_indptr, g_indices, g_values, codec, venc, idx16).unwrap();
+            let (ip_off, ix_off, vv_off) = (ip_stream.len(), ix_stream.len(), vv_stream.len());
+            ip_stream.extend_from_slice(&enc.indptr_bytes);
+            ix_stream.extend_from_slice(&enc.indices_bytes);
+            vv_stream.extend_from_slice(&enc.values_bytes);
+            spans.push(RowGroupSpan {
+                row_start: r0 as u32,
+                n_rows: (r1 - r0) as u16,
+                nnz: (indptr[r1] - base) as u32,
+                indptr: ip_off..ip_stream.len(),
+                indices: ix_off..ix_stream.len(),
+                values: vv_off..vv_stream.len(),
+            });
+            r0 = r1;
+        }
+        (ip_stream, ix_stream, vv_stream, spans)
+    }
+
+    /// Per-group parity + cross-group independence for the **compressed** framed
+    /// codecs (the `None` case is covered by
+    /// `test_decode_row_group_none_parity_and_independence`). Each group decodes
+    /// to its local CSR byte-identically to the source, and corrupting one
+    /// group's compressed frame leaves the others decodable — the property that
+    /// makes framed random access safe.
+    #[test]
+    fn test_decode_row_group_compressed_parity_and_independence() {
+        let indptr: Vec<u64> = vec![0, 2, 5, 6, 8];
+        let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2, 0, 5];
+        let values_u32: Vec<u32> = vec![5, 10, 1, 3, 7, 2, 9, 4];
+        let mut values_bytes = Vec::new();
+        for &v in &values_u32 {
+            values_bytes.write_u32::<LittleEndian>(v).unwrap();
+        }
+        for codec in [CodecId::ShufDeltaZstd, CodecId::Zstd, CodecId::Lz4Shuffle] {
+            let (ip, ix, mut vv, spans) = frame_codec_for_test(
+                codec,
+                &indptr,
+                &indices,
+                &values_bytes,
+                ValueEncoding::Uint32,
+                true,
+                2,
+            );
+            assert_eq!(spans.len(), 2, "codec {codec:?}");
+
+            // Group 1 decodes to its local CSR: rows 2..4 → indptr [0,1,3].
+            let decode_g1 = |vv: &[u8]| {
+                decode_row_group(codec, &spans[1], &ip, &ix, vv, ValueEncoding::Uint32, true)
+                    .unwrap()
+            };
+            let (g1_ip, g1_ix, g1_v) = decode_g1(&vv);
+            assert_eq!(g1_ip, vec![0, 1, 3], "codec {codec:?}");
+            assert_eq!(g1_ix, vec![2, 0, 5], "codec {codec:?}");
+            assert_eq!(
+                raw_bytes_to_u32(&g1_v, ValueEncoding::Uint32).unwrap(),
+                vec![2, 9, 4],
+                "codec {codec:?}"
+            );
+
+            // Cross-group independence: shred group 0's values frame; group 1
+            // still decodes (it only reads its own byte ranges).
+            for b in vv[spans[0].values.clone()].iter_mut() {
+                *b = 0xFF;
+            }
+            let (g1_ip2, g1_ix2, _) = decode_g1(&vv);
+            assert_eq!(g1_ip2, vec![0, 1, 3], "codec {codec:?} after corruption");
+            assert_eq!(g1_ix2, vec![2, 0, 5], "codec {codec:?} after corruption");
+        }
+    }
+
+    /// The truncated-frame guard also covers the `indptr` and `values`
+    /// sub-frames (the existing `test_shufdelta_rejects_truncated_frame` only
+    /// exercises `indices`).
+    #[test]
+    fn test_shufdelta_rejects_truncated_indptr_or_values_frame() {
+        let (indptr, indices, values, n_rows, nnz) = make_test_csr(ValueEncoding::Uint32);
+        let encoded = encode_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint32,
+            false,
+        )
+        .unwrap();
+        let short = zstd::encode_all(&b""[..], SHUFDELTA_ZSTD_LEVEL).unwrap();
+
+        // Truncated indptr frame.
+        let bad_indptr = EncodedShardRef {
+            indptr_bytes: &short,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &encoded.values_bytes,
+        };
+        assert!(matches!(
+            decode_shard_ref(
+                &bad_indptr,
+                CodecId::ShufDeltaZstd,
+                ValueEncoding::Uint32,
+                n_rows,
+                nnz,
+                false,
+            ),
+            Err(CodecError::MalformedInput(_))
+        ));
+
+        // Truncated values frame.
+        let bad_values = EncodedShardRef {
+            indptr_bytes: &encoded.indptr_bytes,
+            indices_bytes: &encoded.indices_bytes,
+            values_bytes: &short,
+        };
+        assert!(matches!(
+            decode_shard_ref(
+                &bad_values,
+                CodecId::ShufDeltaZstd,
+                ValueEncoding::Uint32,
+                n_rows,
+                nnz,
+                false,
+            ),
+            Err(CodecError::MalformedInput(_))
+        ));
+    }
+
     /// Task 6.8: None codec produces raw LE bytes.
     #[test]
     fn test_none_produces_raw_bytes() {

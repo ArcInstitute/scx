@@ -341,10 +341,24 @@ enum Commands {
         force: bool,
         /// Per-shard codec: `auto` (Scx1 for low-median integer counts, else
         /// Zstd) or `scx1` (force Scx1 on every integer shard so all shards
-        /// carry a decode sidecar). Other codecs are rejected — they drop the
-        /// decode sidecar, defeating the point of `optimize`. Default: auto.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1"])]
+        /// carry a decode sidecar) for the unframed path; or `shufdelta` /
+        /// `compact-trial` for row-group-framed (v4) output — the latter keeps
+        /// the per-shard smaller of the heuristic codec vs ShufDeltaZstd.
+        /// `shufdelta` / `compact-trial` require `--row-group-rows`. Framed
+        /// shards use the block index rather than a decode sidecar. Other
+        /// codecs are rejected. Default: auto.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1", "shufdelta", "compact-trial"])]
         codec: String,
+        /// Row-group-frame each re-encoded shard into groups of at most N rows,
+        /// producing a v4 file with a multi-entry BlockIndex for codec-agnostic
+        /// sub-shard random access. Omit for the ordinary unframed (v3) layout.
+        /// Required for `--codec shufdelta` / `--codec compact-trial`.
+        #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
+        row_group_rows: Option<u32>,
+        /// Byte/nnz-aware row-group cap: also close a group once it reaches this
+        /// many non-zeros. Only meaningful with `--row-group-rows`.
+        #[arg(long, value_name = "NNZ")]
+        row_group_target_nnz: Option<u64>,
         /// Migrate a legacy single-section obs table to the sharded
         /// `ObsMetadataShard` layout: `auto` (shard when n_obs >
         /// shard_target_rows — the from_anndata threshold), `always`, or
@@ -1008,8 +1022,18 @@ fn main() {
             output,
             force,
             codec,
+            row_group_rows,
+            row_group_target_nnz,
             shard_obs,
-        } => optimize::run_optimize(&input, &output, force, &codec, &shard_obs),
+        } => optimize::run_optimize(
+            &input,
+            &output,
+            force,
+            &codec,
+            row_group_rows,
+            row_group_target_nnz,
+            &shard_obs,
+        ),
         Commands::Compact {
             input,
             output,
