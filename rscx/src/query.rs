@@ -220,11 +220,12 @@ impl RQueryResult {
     /// Consumes the inner data — further to_dgcmatrix() calls will error.
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3/B7).
-    fn to_dgcmatrix(&mut self) -> Robj {
-        crate::util::throw_on_err(
-            self.take_result()
-                .and_then(|r| crate::interop::csr_to_dgcmatrix(&r.x)),
-        )
+    fn to_dgcmatrix(&mut self, allow_lossy: Option<bool>) -> Robj {
+        let allow_lossy = allow_lossy.unwrap_or(false);
+        crate::util::throw_on_err(self.take_result().and_then(|r| {
+            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
+            crate::interop::csr_to_dgcmatrix(&r.x)
+        }))
     }
 
     /// Convert to a Seurat v5 object.
@@ -234,11 +235,12 @@ impl RQueryResult {
     /// `throw_on_err` on failure: a fallible `#[extendr]` method would
     /// otherwise `unwrap()`-panic in extendr 0.8.0, masking the real message
     /// (missing-`Seurat` etc.) behind "User function panicked". See B7.
-    fn to_seurat(&mut self) -> Robj {
-        crate::util::throw_on_err(
-            self.take_result()
-                .and_then(|r| crate::interop::to_seurat_v5(&r)),
-        )
+    fn to_seurat(&mut self, allow_lossy: Option<bool>) -> Robj {
+        let allow_lossy = allow_lossy.unwrap_or(false);
+        crate::util::throw_on_err(self.take_result().and_then(|r| {
+            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
+            crate::interop::to_seurat_v5(&r)
+        }))
     }
 
     /// Convert to a SingleCellExperiment object.
@@ -246,8 +248,12 @@ impl RQueryResult {
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see
     /// `to_seurat` above and B7).
-    fn to_sce(&mut self) -> Robj {
-        crate::util::throw_on_err(self.take_result().and_then(|r| crate::interop::to_sce(&r)))
+    fn to_sce(&mut self, allow_lossy: Option<bool>) -> Robj {
+        let allow_lossy = allow_lossy.unwrap_or(false);
+        crate::util::throw_on_err(self.take_result().and_then(|r| {
+            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
+            crate::interop::to_sce(&r)
+        }))
     }
 
     /// Read obs metadata as an R data.frame from the query result.

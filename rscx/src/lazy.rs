@@ -163,6 +163,10 @@ impl RLazyTransformed {
         Ok(())
     }
 
+    // NOTE: lazy-transform reads are not gated for the u32→f32 decode loss —
+    // they decode per row-slice through a `BackedCsrReader` (no catalog in
+    // scope), and the normalize/log1p/row_scale transforms already break the
+    // integer-counts invariant. Consistent with ungated backed reads elsewhere.
     fn read_rows_impl(&self, start: u64, end: u64) -> Result<Robj> {
         if start > end {
             return Err(Error::Other(format!(
