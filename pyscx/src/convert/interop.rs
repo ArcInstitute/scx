@@ -335,12 +335,29 @@ pub(crate) fn csr_to_scipy_typed<'py>(
             super::reshape_2d(flat, n_rows, n_cols)
         }
         Container::Csr => {
-            let data =
-                super::f32_values_to_numpy(py, &csr.data, plan.data_dtype, plan.allow_lossy)?;
-            let indices =
-                super::i32_indices_to_numpy(py, &csr.indices, plan.index_dtype, plan.allow_lossy)?;
+            use scx_sparse::IndexDtype;
+            let scx_sparse::ScxCsr {
+                data: csr_data,
+                indices: csr_indices,
+                indptr: csr_indptr,
+                ..
+            } = csr;
+            // When a component is already at its default dtype, move the owned
+            // Vec straight into numpy (no cast, no copy) — only the narrowed
+            // component pays the cast. Avoids re-copying the axis the caller
+            // left at the default.
+            let data = if plan.data_dtype == ValueDtype::F32 {
+                PyArray1::from_vec(py, csr_data).into_any()
+            } else {
+                super::f32_values_to_numpy(py, &csr_data, plan.data_dtype, plan.allow_lossy)?
+            };
+            let indices = if plan.index_dtype == IndexDtype::I32 {
+                PyArray1::from_vec(py, csr_indices).into_any()
+            } else {
+                super::i32_indices_to_numpy(py, &csr_indices, plan.index_dtype, plan.allow_lossy)?
+            };
             // indptr stays i64 (scipy-canonical, keeps zero-copy on the common CSR).
-            let indptr = PyArray1::from_vec(py, csr.indptr).into_any();
+            let indptr = PyArray1::from_vec(py, csr_indptr).into_any();
 
             let scipy_sparse = py.import("scipy.sparse")?;
             let args = ((data, indices, indptr),);
@@ -389,20 +406,33 @@ fn err_str<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
-/// Rebuild an owned `ScxCsr` from a Python `scipy.sparse` matrix (any format).
+/// Rebuild an owned `ScxCsr` from a Python `scipy.sparse` matrix.
 ///
-/// The matrix is normalized to CSR via `.tocsr()`; `data` is read as `f32`,
-/// `indices` as `i32`, `indptr` as `i64` (scipy may store either int32 or int64
-/// for these, so we `astype` to the canonical widths — cheap, and only on the
-/// non-default read path). Column indices are always `< n_vars < 2³¹` and so fit
-/// `i32`; `indptr` uses `i64` for large-matrix headroom.
+/// The matrix is normalized to CSR (skipping `.tocsr()` when it already is one);
+/// `data` is read as `f32`, `indices` as `i32`, `indptr` as `i64` (scipy may
+/// store either int32 or int64 for these, so we `astype` to the canonical widths
+/// — cheap, and only on the non-default read path). Column indices are always
+/// `< n_vars < 2³¹` and so fit `i32`; `indptr` uses `i64` for large-matrix
+/// headroom. A non-sparse input (e.g. a dense ndarray) is rejected with a clear
+/// error rather than a confusing `AttributeError` on the missing `.data` view.
 fn scipy_to_scxcsr(mat: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
     use numpy::PyReadonlyArray1;
 
-    let csr = if mat.hasattr("tocsr")? {
-        mat.call_method0("tocsr")?
-    } else {
+    if !mat.hasattr("tocsr")? {
+        return Err(PyValueError::new_err(
+            "expected a scipy.sparse matrix for container/dtype materialization; \
+             got a non-sparse object",
+        ));
+    }
+    // `.tocsr()` is a no-op copy on a matrix that is already CSR — skip it.
+    let already_csr = matches!(
+        mat.getattr("format").and_then(|f| f.extract::<String>()),
+        Ok(ref f) if f == "csr"
+    );
+    let csr = if already_csr {
         mat.clone()
+    } else {
+        mat.call_method0("tocsr")?
     };
     let shape: (usize, usize) = csr.getattr("shape")?.extract()?;
 
@@ -435,6 +465,13 @@ fn scipy_to_scxcsr(mat: &Bound<'_, PyAny>) -> PyResult<scx_sparse::ScxCsr> {
 /// A default plan (CSR / f32 / i32) returns the input untouched — callers only
 /// invoke this when `plan.is_default_csr_f32()` is `false`, so the default read
 /// path never re-extracts or copies.
+///
+/// This re-extracts the scipy CSR back into an owned `ScxCsr` (three `astype`
+/// copies) before casting — the price of applying the plan *after* assembly. The
+/// query path (`query_result_to_anndata_with_plan`) is leaner: it owns the
+/// `ScxCsr` and threads the plan straight into `csr_to_scipy_typed` (one
+/// materialization). Phase 2 (push-dtype-into-decode) removes this round-trip for
+/// the eager path too.
 pub(crate) fn retype_matrix<'py>(
     py: Python<'py>,
     mat: Bound<'py, PyAny>,

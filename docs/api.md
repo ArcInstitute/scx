@@ -1359,6 +1359,23 @@ old fixed-f32 path performed with no warning.
 Backed reads (`backed=True`) are lazy and f32-native, so a non-default plan with
 `backed=True` raises; materialize eagerly (`backed=False`) to narrow.
 
+**Caveats.**
+
+- **`index_dtype` for CSR is best-effort.** scipy canonicalizes a
+  `csr_matrix`'s index arrays on construction (typically to `int32`, `int64`
+  above the 32-bit nnz/dimension limit), so `index_dtype="int16"` will usually be
+  upcast back to `int32` and delivers no reliable memory saving for CSR output.
+  The `int64` widen sticks. For a guaranteed narrow-index layout, use
+  `container="dense"` (no index array) instead.
+- **`adata.raw` is not retyped.** When the file carries a raw count matrix, the
+  reconstructed `adata.raw.X` stays `float32` CSR regardless of `data_dtype` —
+  only `X` and `layers` are materialized in the requested dtype.
+- **Scope.** The kwargs are surfaced on the three read entry points above. Other
+  read surfaces (the grouped-shard read helpers, the flat `pyscx.read_cloud(...)`
+  cloud helper) are f32-native for now; the cloud *query* path
+  (`open_cloud(...).query()...collect()`) returns a `PyQueryResult` and so does
+  honor them.
+
 ### `uns` serialization
 
 `adata.uns` is written into the `UnsBlob` section (id 10) as JSON. The

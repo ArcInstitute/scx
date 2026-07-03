@@ -4,10 +4,16 @@
 // unsigned) plus a round-trip equality check. Widening casts (f32→f64, i32→i64,
 // identity) are recognized as always-safe and skip the per-element check.
 //
-// Source types are fixed by scx's read path: values are `f32` (from the decoded
-// CSR), indices are `i32`. Targets are the numpy-representable numeric dtypes.
-// On a lossy cast without `allow_lossy`, returns `CodecError::MalformedInput`.
-// This closes the pre-existing silent `u32 as f32` narrowing above 2²⁴.
+// Source types are fixed by scx's read path: values are `f32` (from the *already
+// decoded* CSR), indices are `i32`. Targets are the numpy-representable numeric
+// dtypes. On a lossy cast without `allow_lossy`, returns
+// `CodecError::MalformedInput`.
+//
+// Scope: this gates narrowing *from the decoded f32 stream* only. The
+// decode-level `u32 as f32` casts (dispatch.rs, e.g. the Scx1 rice fast path and
+// `values_raw_to_f32`) are upstream and still round integer counts above 2²⁴ to
+// f32 before this gate ever sees them — closing that decode-level loss is Phase 2
+// (push-dtype-into-decode), not this module.
 
 use crate::dispatch::CodecError;
 
@@ -115,8 +121,10 @@ impl CastFromF32 for half::f16 {
     }
     fn cast_lossless(v: f32) -> Option<Self> {
         let t = half::f16::from_f32(v);
-        // NaN never round-trips by equality; treat non-finite specially so
-        // f16-representable infinities/NaNs are not flagged as "lossy".
+        // NaN is special-cased because the round-trip check below is
+        // equality-based and `NaN != NaN` — an f32 NaN would always be flagged
+        // lossy otherwise. f16 represents NaN, so the cast is not lossy: accept
+        // any NaN→NaN. (Infinity round-trips through the equality check fine.)
         if v.is_nan() {
             if t.is_nan() {
                 return Some(t);

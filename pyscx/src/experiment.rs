@@ -913,7 +913,10 @@ impl PyExperiment {
             }
 
             // F3: convert X (and layers) into the requested container/dtype.
-            // No-op for the default plan (guarded inside retype_matrix).
+            // No-op for the default plan (guarded inside retype_matrix). This is
+            // a post-assembly retype (re-extract → cast), so a narrowing eager
+            // read peaks higher than the default before shrinking; the query path
+            // is leaner and Phase 2 removes the round-trip. See `retype_matrix`.
             if !plan.is_default_csr_f32() {
                 let x = adata.getattr("X")?;
                 if !x.is_none() {
