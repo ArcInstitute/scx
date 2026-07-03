@@ -47,9 +47,9 @@ test_that("query path fails loud on >2^24 counts; allow_lossy escapes", {
   res <- exp$query()$collect()
   expect_error(res$to_dgcmatrix(), "allow_lossy")
 
-  # take_result() consumes on the guard error path? Re-collect for the escape.
-  res2 <- scx_open(path)$query()$collect()
-  m <- res2$to_dgcmatrix(allow_lossy = TRUE)
+  # The guard fires before consuming the result, so the SAME object can be
+  # retried with allow_lossy = TRUE (non-destructive guard error).
+  m <- res$to_dgcmatrix(allow_lossy = TRUE)
   expect_s4_class(m, "dgCMatrix")
 })
 

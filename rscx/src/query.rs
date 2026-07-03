@@ -211,6 +211,15 @@ impl RQueryResult {
             .take()
             .ok_or_else(|| Error::Other("QueryResult already consumed".into()))
     }
+
+    /// Peek the decode-loss `value_max` without consuming the result, so the
+    /// guard can fire *before* `take_result()`. That keeps a tripped guard
+    /// non-destructive: the caller can retry the same object with
+    /// `allow_lossy = TRUE`. Returns 0 once consumed (the guard then passes and
+    /// `take_result()` surfaces the "already consumed" error).
+    fn peek_max_value(&self) -> u32 {
+        self.result.as_ref().map(|r| r.max_value).unwrap_or(0)
+    }
 }
 
 #[allow(clippy::wrong_self_convention)]
@@ -221,11 +230,12 @@ impl RQueryResult {
     ///
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see B3/B7).
     fn to_dgcmatrix(&mut self, allow_lossy: Option<bool>) -> Robj {
-        let allow_lossy = allow_lossy.unwrap_or(false);
-        crate::util::throw_on_err(self.take_result().and_then(|r| {
-            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
-            crate::interop::csr_to_dgcmatrix(&r.x)
-        }))
+        // Guard before consuming so a tripped guard leaves the object reusable.
+        let res =
+            crate::guard::guard_decode_loss(self.peek_max_value(), allow_lossy.unwrap_or(false))
+                .and_then(|()| self.take_result())
+                .and_then(|r| crate::interop::csr_to_dgcmatrix(&r.x));
+        crate::util::throw_on_err(res)
     }
 
     /// Convert to a Seurat v5 object.
@@ -236,11 +246,12 @@ impl RQueryResult {
     /// otherwise `unwrap()`-panic in extendr 0.8.0, masking the real message
     /// (missing-`Seurat` etc.) behind "User function panicked". See B7.
     fn to_seurat(&mut self, allow_lossy: Option<bool>) -> Robj {
-        let allow_lossy = allow_lossy.unwrap_or(false);
-        crate::util::throw_on_err(self.take_result().and_then(|r| {
-            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
-            crate::interop::to_seurat_v5(&r)
-        }))
+        // Guard before consuming so a tripped guard leaves the object reusable.
+        let res =
+            crate::guard::guard_decode_loss(self.peek_max_value(), allow_lossy.unwrap_or(false))
+                .and_then(|()| self.take_result())
+                .and_then(|r| crate::interop::to_seurat_v5(&r));
+        crate::util::throw_on_err(res)
     }
 
     /// Convert to a SingleCellExperiment object.
@@ -249,11 +260,12 @@ impl RQueryResult {
     /// Returns `Robj` and throws a clean R error via `throw_on_err` (see
     /// `to_seurat` above and B7).
     fn to_sce(&mut self, allow_lossy: Option<bool>) -> Robj {
-        let allow_lossy = allow_lossy.unwrap_or(false);
-        crate::util::throw_on_err(self.take_result().and_then(|r| {
-            crate::guard::guard_decode_loss(r.max_value, allow_lossy)?;
-            crate::interop::to_sce(&r)
-        }))
+        // Guard before consuming so a tripped guard leaves the object reusable.
+        let res =
+            crate::guard::guard_decode_loss(self.peek_max_value(), allow_lossy.unwrap_or(false))
+                .and_then(|()| self.take_result())
+                .and_then(|r| crate::interop::to_sce(&r));
+        crate::util::throw_on_err(res)
     }
 
     /// Read obs metadata as an R data.frame from the query result.

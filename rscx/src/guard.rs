@@ -31,7 +31,9 @@ pub(crate) fn csr_max_value(reader: &ScxReader, modality_id: Option<u8>) -> u32 
         .unwrap_or(0)
 }
 
-/// Maximum `value_max` over the shards of a single named layer (modality 0).
+/// Maximum `value_max` over the shards of a single named layer. Hardcodes
+/// modality 0 because `layer()` is only exposed on the single-modality
+/// `ScxExperiment` path.
 pub(crate) fn layer_max_value(reader: &ScxReader, name: &str) -> u32 {
     reader
         .catalog()
@@ -46,6 +48,11 @@ pub(crate) fn layer_max_value(reader: &ScxReader, name: &str) -> u32 {
 /// Fail loud (as an R error) when decoding an integer shard whose `value_max`
 /// exceeds `f32`'s exact-integer range would silently round and the caller has
 /// not opted into lossy narrowing.
+///
+/// Conservative by design: the catalog carries only the per-shard maximum, so a
+/// shard whose `value_max` exceeds 2²⁴ trips the guard even if that particular
+/// value is itself f32-exact (e.g. 2²⁵). False positives (recoverable via
+/// `allow_lossy`) are preferable to silently missing a real rounding.
 pub(crate) fn guard_decode_loss(max_value: u32, allow_lossy: bool) -> Result<()> {
     scx_codec::guard_f32_decode_loss(max_value, allow_lossy)
         .map_err(|e| Error::Other(e.to_string()))
