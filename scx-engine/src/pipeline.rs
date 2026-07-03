@@ -43,6 +43,12 @@ pub struct QueryResult {
     /// `matched_rows` is the true Level 2 match count. They're equal when
     /// no limit was applied (or the limit exceeded the match count).
     pub matched_rows: usize,
+    /// Maximum `ShardStats::value_max` over the shards that survived Level 1
+    /// pushdown (i.e. that were decoded into `x`). `0` when no integer-encoded
+    /// shard contributed (float-encoded shards record `value_max = 0`). A
+    /// reader compares this against [`scx_codec::F32_MAX_EXACT_INT`] to fail
+    /// loud on the silent `u32 → f32` decode loss before returning `x`.
+    pub max_value: u32,
 }
 
 /// Result of a count-only query ([`QueryPipeline::count`]): the matched-row
@@ -339,6 +345,7 @@ impl QueryPipeline {
         let mut merged_data: Vec<f32> = Vec::new();
         let mut candidate_shard_rows = 0usize;
         let mut touched = 0usize;
+        let mut max_value = 0u32; // max ShardStats::value_max over touched shards
         let mut covered = 0u64; // rows of [start, stop) actually decoded
         let mut kept = 0usize; // rows surviving the deletion filter
                                // Per-range keep flags, in ascending global-row order (aligned with the
@@ -354,6 +361,7 @@ impl QueryPipeline {
                 continue; // no overlap
             }
             touched += 1;
+            max_value = max_value.max(stats.value_max);
             candidate_shard_rows += (re - rs) as usize;
             let (indptr, indices, data) = self.reader.read_shard_from_entry(e)?;
             let lo = start.max(rs);
@@ -436,6 +444,7 @@ impl QueryPipeline {
             total_shards,
             candidate_shard_rows,
             matched_rows: kept,
+            max_value,
         })
     }
 

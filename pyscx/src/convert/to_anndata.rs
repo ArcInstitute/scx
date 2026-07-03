@@ -56,6 +56,59 @@ pub(crate) fn estimate_eager_assembly_bytes(reader: &ScxReader) -> u64 {
         .saturating_add(meta_bytes)
 }
 
+// The decode-loss guard folds `ShardStats::value_max` over the shards in scope.
+// Integer encodings record the true max; float encodings record 0. An entry
+// missing `ShardStats` contributes 0 (it is skipped), so a > 2²⁴ shard written
+// without stats would slip the guard — acceptable pre-1.0 (every current writer
+// path emits stats), but the guard is only as strong as the catalog it reads.
+
+/// Maximum `ShardStats::value_max` over the CSR X shards in scope — all
+/// modalities when `modality_id` is `None`, else just that modality. Used to
+/// fail loud on the silent `u32 → f32` decode loss (see
+/// [`super::guard_decode_loss`]) before returning a corrupted matrix. Walks the
+/// catalog only — no payload reads, so it is O(shards).
+pub(crate) fn csr_max_value(reader: &ScxReader, modality_id: Option<u8>) -> u32 {
+    let cat = reader.catalog();
+    let shards = match modality_id {
+        Some(m) => cat.csr_shards_for_modality(m),
+        None => cat.csr_shards_sorted(),
+    };
+    shards
+        .iter()
+        .filter_map(|e| e.stats.as_ref())
+        .map(|s| s.value_max)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Maximum `value_max` over the `adata.raw` CSR shards — where pre-normalization
+/// counts (the most likely `> 2²⁴` holder) live.
+pub(crate) fn raw_csr_max_value(reader: &ScxReader) -> u32 {
+    reader
+        .catalog()
+        .raw_csr_shards_sorted()
+        .iter()
+        .filter_map(|e| e.stats.as_ref())
+        .map(|s| s.value_max)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Maximum `value_max` over the layer CSR shards for `modality_id` (across all
+/// layers). Walks the catalog entries directly since the per-layer helper
+/// requires a layer name.
+pub(crate) fn layer_csr_max_value(reader: &ScxReader, modality_id: u8) -> u32 {
+    reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id)
+        .filter_map(|e| e.stats.as_ref())
+        .map(|s| s.value_max)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Build an AnnData object from an ScxReader with optional layer filtering.
 ///
 /// `eager` controls how `obsp` / `varp` / `varm` / `layers` are
@@ -80,6 +133,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     eager: bool,
     memory_budget: Option<u64>,
     skip_x: bool,
+    allow_lossy: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyLayersMapping, ScxLazyObsmMapping, ScxLazyPairwiseMapping,
@@ -105,6 +159,14 @@ pub(crate) fn to_anndata_with_layers<'py>(
             },
         )?;
     }
+
+    // Fail loud on the silent u32→f32 decode loss before any decode. Covers X
+    // (this function is the eager assembler shared by the no-filter, var_names,
+    // preserve_slots, and gpu-skeleton paths), so all of them are guarded here
+    // rather than at each call site. The check is catalog-only, so it applies
+    // even when `skip_x` defers the host X decode to `to_gpu_anndata`'s
+    // f32-native device path.
+    guard_decode_loss(csr_max_value(reader, None), allow_lossy)?;
 
     // X — assemble all CSR shards (with deletion vector filtering).
     //
@@ -254,6 +316,8 @@ pub(crate) fn to_anndata_with_layers<'py>(
             kwargs.set_item("varm", m.materialize_all(py)?)?;
         }
         if let Some(m) = &lazy_layers {
+            // Eager layer materialization decodes layer counts to f32 too.
+            guard_decode_loss(layer_csr_max_value(reader, 0), allow_lossy)?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
         }
     }
@@ -273,6 +337,9 @@ pub(crate) fn to_anndata_with_layers<'py>(
                 },
             )?;
         } else {
+            // adata.raw holds pre-normalization counts — the most likely place
+            // a > 2²⁴ integer lives. Guard before the f32 decode.
+            guard_decode_loss(raw_csr_max_value(reader), allow_lossy)?;
             let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
             let raw_x = csr_to_scipy(py, raw_csr)?;
             let raw_var_batch = reader.read_raw_var().map_err(to_pyerr)?;
@@ -349,6 +416,7 @@ pub fn to_anndata_filtered<'py>(
     skip_x: bool,
     preserve_var_order: bool,
     strict_var_names: bool,
+    allow_lossy: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     // `skip_x` (the X-less skeleton for `to_gpu_anndata`) is only meaningful on
     // the no-filter fast path — the caller guarantees no var_names / obs_filter /
@@ -358,7 +426,10 @@ pub fn to_anndata_filtered<'py>(
         "skip_x requires no var_names / obs_filter / layer_filter"
     );
 
-    // Fast path: no filtering → use existing implementation
+    // Fast path: no filtering → use existing implementation. The decode-loss
+    // guard (X / raw / eager layers) runs inside `to_anndata_with_layers`, so
+    // every caller of it — this branch, preserve_slots, and the var_names-only
+    // path below — is covered uniformly.
     if var_names.is_none() && obs_filter.is_none() && layer_filter.is_none() {
         return to_anndata_with_layers(
             py,
@@ -369,6 +440,7 @@ pub fn to_anndata_filtered<'py>(
             eager,
             memory_budget,
             skip_x,
+            allow_lossy,
         );
     }
 
@@ -379,6 +451,7 @@ pub fn to_anndata_filtered<'py>(
     // than lazy bridges (which AnnData iterates / validates during
     // `.copy()` anyway).
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
+        // Decode-loss guard runs inside to_anndata_with_layers.
         let full = to_anndata_with_layers(
             py,
             path,
@@ -388,6 +461,7 @@ pub fn to_anndata_filtered<'py>(
             true,
             memory_budget,
             false,
+            allow_lossy,
         )?;
 
         let obs_attr = full.getattr("obs")?;
@@ -463,6 +537,10 @@ pub fn to_anndata_filtered<'py>(
         let result = pipeline
             .collect()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+        // Guard against the silent u32→f32 decode loss over exactly the shards
+        // that survived predicate pushdown (`result.max_value`).
+        guard_decode_loss(result.max_value, allow_lossy)?;
 
         let anndata_mod = py.import("anndata")?;
         let x = csr_to_scipy(py, result.x)?;
@@ -560,6 +638,7 @@ pub fn to_anndata_filtered<'py>(
         true,
         memory_budget,
         false,
+        allow_lossy,
     )?;
 
     if let Some(names) = var_names {

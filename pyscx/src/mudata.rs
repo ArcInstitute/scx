@@ -146,7 +146,11 @@ pub fn to_mudata_backed<'py>(
 /// `modality_names()`, builds an AnnData per modality via the
 /// existing zero-copy CSR path, and attaches them to a `MuData(...)`
 /// with the shared global obs.
-pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py, PyAny>> {
+pub fn to_mudata<'py>(
+    py: Python<'py>,
+    reader: &ScxReader,
+    allow_lossy: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     if !reader.is_multimodal() {
         return Err(PyRuntimeError::new_err(
             "to_mudata() requires a multimodal SCX file (n_modalities > 0); \
@@ -178,7 +182,12 @@ pub fn to_mudata<'py>(py: Python<'py>, reader: &ScxReader) -> PyResult<Bound<'py
         })?;
         let mname = info.name.clone();
 
-        // X
+        // X — fail loud on the silent u32→f32 decode loss for this modality's
+        // shards before decoding.
+        crate::convert::guard_decode_loss(
+            crate::convert::csr_max_value(reader, Some(modality_id)),
+            allow_lossy,
+        )?;
         let csr = reader
             .read_all_csr_shards_for(modality_id)
             .map_err(to_pyerr)?;

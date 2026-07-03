@@ -163,7 +163,10 @@ impl ScxBackedMuDataset {
     /// Eagerly materialise as a real `mudata.MuData`. Convenience
     /// shortcut for users who want the materialised view.
     fn to_mudata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        crate::mudata::to_mudata(py, &self.meta_reader)
+        // Convenience materialize on a backed handle: pass allow_lossy=true so the
+        // decode-loss guard does not hard-error here, consistent with backed reads
+        // being ungated (the caller already opted into a backed workflow).
+        crate::mudata::to_mudata(py, &self.meta_reader, true)
     }
 
     fn __repr__(&self) -> String {

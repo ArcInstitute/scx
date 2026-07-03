@@ -8,7 +8,10 @@ pub mod rice;
 pub mod shuffle;
 pub mod value_encoding;
 
-pub use cast::{checked_cast_indices, checked_cast_values, CastFromF32, CastFromI32};
+pub use cast::{
+    checked_cast_indices, checked_cast_values, guard_f32_decode_loss, CastFromF32, CastFromI32,
+    F32_MAX_EXACT_INT,
+};
 pub use dispatch::{
     decode_indptr_only, decode_scx1_row_range, decode_scx1_with_metadata, decode_shard,
     decode_shard_ref, decode_shard_scipy, decoded_shard_to_scipy, encode_shard, CodecError,

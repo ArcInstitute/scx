@@ -126,9 +126,12 @@ def test_index_dtype_ignored_for_dense_warns(tmp_dir):
 
 
 def test_big_count_into_float16_fails_loud(tmp_dir):
-    # A value above f16 range (but exact in f32) forces the gate to trip.
+    # A value above f16 range but <= 2**24 (so the decode-loss pre-check passes
+    # and the f16 value-level gate is what trips): 100_000 overflows f16 (max
+    # 65504) yet is exact in f32. The >2**24 decode-loss pre-check is covered
+    # separately in test_f4_decode_loss.py.
     dense = np.zeros((3, 3), dtype=np.float32)
-    dense[0, 0] = 20_000_000.0  # > 2**24, exact in f32; overflows f16
+    dense[0, 0] = 100_000.0  # > f16 max (65504), <= 2**24, exact in f32
     dense[1, 1] = 5.0
     adata = anndata.AnnData(
         X=sp.csr_matrix(dense),

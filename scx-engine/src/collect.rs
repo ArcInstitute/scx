@@ -1297,6 +1297,17 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
             Ok((filtered_indptr, filtered_indices, filtered_data))
         })?;
 
+    // Max `value_max` over the shards actually decoded into `csr`. Integer
+    // encodings record the true max; float encodings record 0. A reader
+    // compares this against `scx_codec::F32_MAX_EXACT_INT` to fail loud on the
+    // silent u32→f32 decode loss before returning X.
+    let max_value = shard_infos[..decode_count]
+        .iter()
+        .filter_map(|si| sorted_shards[si.shard_idx].stats.as_ref())
+        .map(|s| s.value_max)
+        .max()
+        .unwrap_or(0);
+
     // Step 8: Assemble CSR from per-shard results
     let mut merged_indptr: Vec<i64> = Vec::new();
     let mut merged_indices: Vec<i32> = Vec::new();
@@ -1437,6 +1448,7 @@ fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<QueryResult>
         total_shards,
         candidate_shard_rows,
         matched_rows,
+        max_value,
     })
 }
 
@@ -1824,6 +1836,17 @@ mod tests {
         assert_eq!(c.total_shards, result.total_shards);
         assert_eq!(c.skipped_shards, result.skipped_shards);
         assert_eq!(c.candidate_shard_rows, result.candidate_shard_rows);
+    }
+
+    #[test]
+    fn collect_reports_shard_value_max() {
+        // `write_test_file` writes Uint8 counts (row+1)%256 / (row+2)%256 over
+        // 12 rows, so the on-disk max is 13 (row 11). collect() must surface it
+        // via QueryResult::max_value for the F4 decode-loss guard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 12, 5);
+        let result = QueryPipeline::open(&path).unwrap().collect().unwrap();
+        assert_eq!(result.max_value, 13);
     }
 
     #[test]
