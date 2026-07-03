@@ -411,6 +411,7 @@ mod tests {
             total_shards: 1,
             candidate_shard_rows: 2,
             matched_rows: 2,
+            max_value: 0,
         };
 
         let dir = tempfile::tempdir().unwrap();
