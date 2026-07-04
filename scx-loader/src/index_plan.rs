@@ -151,14 +151,15 @@ pub struct IndexPlanLoader {
     /// `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar at the reader
     /// layer entirely.
     scatter_sidecar: bool,
-    /// Per-dataset escape hatch gating the **L2 block-index-aware prefetch skip**
-    /// only (default `true`). Symmetric with `scatter_sidecar` but for the
-    /// codec-agnostic row-group path: when `false`, the prefetch warms cold
-    /// framed shards as before, so the gather falls back to full-shard decode.
-    /// Independent of `scatter_sidecar` — a framed file adopts the block-index
-    /// path even with the Scx1 sidecar off. Gates only the prefetch skip; L1
-    /// (`read_rows_with`) block-index adoption is governed by the reader's own
-    /// `scatter_block_index` (env `SCX_SCATTER_BLOCK_INDEX`).
+    /// Per-dataset escape hatch for the codec-agnostic row-group block-index
+    /// path (default `true`). Independent of `scatter_sidecar` — a framed file
+    /// adopts the block-index path even with the Scx1 sidecar off. Unlike
+    /// `scatter_sidecar` (whose loader flag gates only the prefetch skip),
+    /// `set_scatter_block_index` propagates this to the backed reader, so
+    /// `False` disables **both** the L2 prefetch skip **and** L1
+    /// (`read_rows_with`) block-index adoption — a clean off-switch that
+    /// full-shard-decodes. The process-wide reader default still comes from
+    /// `SCX_SCATTER_BLOCK_INDEX`.
     scatter_block_index: bool,
 }
 
@@ -422,12 +423,16 @@ impl IndexPlanLoader {
         })
     }
 
-    /// Override the L2 block-index-aware prefetch skip gate (default `true`).
-    /// Called by the Python constructor to honor its `scatter_block_index`
-    /// kwarg; kept as a post-construction setter so the many-arg `new` signature
-    /// (and its test callers) stays unchanged. See [`Self::scatter_block_index`].
+    /// Override the block-index adoption gate (default `true`). Called by the
+    /// Python constructor to honor its `scatter_block_index` kwarg; kept as a
+    /// post-construction setter so the many-arg `new` signature (and its test
+    /// callers) stays unchanged. Propagates to the backed reader so the off-switch
+    /// disables **both** the L1 gather adoption and the L2 prefetch skip — a
+    /// `scatter_block_index=False` file full-shard-decodes, no leak via L1. See
+    /// [`Self::scatter_block_index`].
     pub fn set_scatter_block_index(&mut self, enabled: bool) {
         self.scatter_block_index = enabled;
+        self.backed.set_scatter_block_index(enabled);
     }
 
     /// Return the tokio runtime, building it on first call.

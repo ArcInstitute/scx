@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use lru::LruCache;
@@ -901,8 +901,17 @@ pub struct BackedCsrReader {
     /// a framed training file gets random-access decode without paying the
     /// per-row sidecar cost. Defaults to the `SCX_SCATTER_BLOCK_INDEX` env value
     /// for every constructor (including the sparse-cellset `with_shared_cache`
-    /// reader, which keeps this on while turning `scatter_sidecar` off).
+    /// reader, which keeps this on while turning `scatter_sidecar` off). The
+    /// loader's per-dataset `scatter_block_index=False` opt-out flips this too
+    /// (via [`Self::set_scatter_block_index`]) so the off-switch disables both
+    /// the L1 gather and the L2 prefetch skip, not just the prefetch.
     scatter_block_index: bool,
+    /// Lazy per-shard "is framed?" memo for [`Self::shard_is_framed`], filled on
+    /// first probe (lock-free `AtomicU8`: 0 = unknown, 1 = framed, 2 = unframed).
+    /// `block_index_eligible` is called per prefetch-candidate + per gather group
+    /// on the training hot path; caching the 76-byte header parse avoids
+    /// re-reading it every batch for shards whose framing never changes.
+    framed_cache: OnceLock<Vec<AtomicU8>>,
 }
 
 impl BackedCsrReader {
@@ -955,6 +964,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
             scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -998,6 +1008,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_sidecar,
             scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1037,6 +1048,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
             scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1092,6 +1104,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
             scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1155,8 +1168,30 @@ impl BackedCsrReader {
     /// a v4 file legitimately mixes v2-framed and v1-Scx1+sidecar shards
     /// (two-layer cost model), so a file-level version check would misclassify.
     /// Returns `false` on any missing entry / header parse error (caller then
-    /// falls back to the sidecar or full-shard path).
+    /// falls back to the sidecar or full-shard path). The header parse is
+    /// memoized per shard in `framed_cache` (a shard's framing is immutable for
+    /// the reader's lifetime), so repeated hot-path probes cost one atomic load.
     fn shard_is_framed(&self, shard_idx: usize) -> bool {
+        let cache = self
+            .framed_cache
+            .get_or_init(|| (0..self.shard_count()).map(|_| AtomicU8::new(0)).collect());
+        // 0 = unknown, 1 = framed, 2 = unframed. Out-of-range shard_idx (should
+        // not happen) falls through to a direct (uncached) compute.
+        if let Some(slot) = cache.get(shard_idx) {
+            match slot.load(Ordering::Relaxed) {
+                1 => return true,
+                2 => return false,
+                _ => {}
+            }
+            let framed = self.compute_shard_is_framed(shard_idx);
+            slot.store(if framed { 1 } else { 2 }, Ordering::Relaxed);
+            return framed;
+        }
+        self.compute_shard_is_framed(shard_idx)
+    }
+
+    /// Uncached header read backing [`Self::shard_is_framed`].
+    fn compute_shard_is_framed(&self, shard_idx: usize) -> bool {
         let Some(&lite) = self.shard_entry(shard_idx) else {
             return false;
         };
@@ -1165,6 +1200,14 @@ impl BackedCsrReader {
             .read_shard_header(&entry)
             .map(|h| h.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION)
             .unwrap_or(false)
+    }
+
+    /// Override the per-reader block-index gate (default from
+    /// `SCX_SCATTER_BLOCK_INDEX`). The loader's per-dataset
+    /// `scatter_block_index=False` calls this so the off-switch disables the L1
+    /// gather adoption too, not just the L2 prefetch skip.
+    pub fn set_scatter_block_index(&mut self, enabled: bool) {
+        self.scatter_block_index = enabled;
     }
 
     /// Codec-agnostic sibling of [`Self::sidecar_eligible`] for the block-index

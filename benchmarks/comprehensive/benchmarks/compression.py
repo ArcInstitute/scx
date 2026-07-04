@@ -134,6 +134,9 @@ def run(
             "output_size_bytes": converted_bytes,
             "n_obs": dataset.n_obs,
             "n_vars": dataset.n_vars,
+            # The single run's wall_s/peak_rss_mb are the CONVERSION cost, and are
+            # 0.0 when a pre-converted file was supplied (nothing was timed).
+            "conversion_timed": convert_result is not None,
         },
     )
     # Headline size metrics flow into ``runs[].extra`` so the gate's

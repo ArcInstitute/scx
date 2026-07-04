@@ -120,9 +120,9 @@ def _random_plans(
     and non-local so the gather is scattered across shards."""
     rng = np.random.default_rng(seed)
     for _ in range(n_batches):
-        pert = rng.integers(0, n_obs, size=pairs_per_batch).astype(np.int64)
-        ctrl = rng.integers(0, n_obs, size=pairs_per_batch).astype(np.int64)
-        yield list(zip(map(int, pert), map(int, ctrl)))
+        pert = rng.integers(0, n_obs, size=pairs_per_batch).tolist()
+        ctrl = rng.integers(0, n_obs, size=pairs_per_batch).tolist()
+        yield list(zip(pert, ctrl))
 
 
 def _resolve_framed_path(

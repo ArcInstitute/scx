@@ -1554,6 +1554,19 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: block_index_groups
     min: 1
+  # Full adoption on the MULTI-shard datasets is the important guard — a silent
+  # full-shard fallback there (framing dropped / loader path unwired) is exactly
+  # where the block-index win matters. Measured 1.0 on both (2026-07-04).
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: smartseq2
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: block_index_adoption_rate
+    min: 1.0
 
   # ─── F5 compact-trial compression ratio (default G=512) ──────────────
   # Conversion is deterministic, so these ratios are stable; the floors sit

@@ -817,3 +817,30 @@ class TestBlockIndexAdoption:
         assert off["prefetch_skipped_block_index"] == 0, (
             "framed shard must be warmed (not skipped) when scatter_block_index=False"
         )
+
+    def test_scatter_block_index_false_disables_l1_adoption(self, tmp_path):
+        """`scatter_block_index=False` is a complete off-switch: it propagates to
+        the reader so the L1 gather does NOT take the block-index path either
+        (not just the L2 prefetch skip). At lookahead=0 (no prefetch) a framed
+        gather must full-shard-decode instead of adopting the block index."""
+        path = str(tmp_path / "framed_shufdelta_off.scx")
+        self._write_framed(path)
+
+        rng = np.random.default_rng(3)
+        ds = pyscx.IndexPlanDataset(
+            path,
+            normalize=False,
+            cache_shards=4,
+            sort_by_shard=True,
+            lookahead=0,
+            scatter_sidecar=False,
+            scatter_block_index=False,
+        )
+        plan = [(int(rng.integers(0, 400)), int(rng.integers(0, 400)))
+                for _ in range(8)]
+        list(ds.iter_with_plans(iter([plan]), lookahead=0))
+        cm = ds.cache_metrics()
+        assert cm["block_index_groups"] == 0, (
+            "L1 gather must not adopt block-index when scatter_block_index=False"
+        )
+        assert cm["full_shard_groups"] > 0
