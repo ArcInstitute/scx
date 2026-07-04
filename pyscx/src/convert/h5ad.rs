@@ -48,6 +48,10 @@ pub(crate) fn route_backed_anndata_to_streaming(
     writer_queue_depth: usize,
     sort_by: Vec<String>,
     sort_reverse: bool,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
+    codec_trial: bool,
+    keep_gpu_sidecar: bool,
 ) -> PyResult<()> {
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -221,6 +225,13 @@ pub(crate) fn route_backed_anndata_to_streaming(
         writer_queue_depth,
         sort_by,
         sort_reverse,
+        // F5 row-group framing (the pipeline does the v4 header bump + set_framing
+        // via `ConvertOptions::framing()`). `keep_gpu_sidecar` / a `training`
+        // preset engage the §4.3 GPU/sidecar cost model under compact-trial.
+        row_group_rows,
+        row_group_target_nnz,
+        codec_trial,
+        keep_gpu_sidecar,
         // Convert-time grouping is exposed via `pyscx.from_h5ad(group_by=...)`,
         // not this in-memory `from_anndata` path.
         ..Default::default()

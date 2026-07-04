@@ -293,6 +293,7 @@ pub(crate) fn parallel_encode_csr_shards(
     n_vars: u32,
     section_type: SectionType,
     name_prefix: &str,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> PyResult<Vec<PreEncodedSection>> {
     if boundaries.is_empty() {
         return Ok(Vec::new());
@@ -367,7 +368,7 @@ pub(crate) fn parallel_encode_csr_shards(
                         section_type,
                         ModalityType::Rna,
                         name.clone(),
-                        None,
+                        framing,
                     )
                     .map_err(|e| e.to_string())
                 };
@@ -513,8 +514,34 @@ pub fn from_anndata_impl(
     force_legacy_metadata: bool,
     sort_by: Vec<String>,
     sort_reverse: bool,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
+    keep_gpu_sidecar: bool,
 ) -> PyResult<()> {
-    let explicit_codec = parse_codec(codec)?;
+    // `compact-trial` is a framing profile, not a codec (mirror the CLI):
+    // per shard keep the smaller of {heuristic, ShufDeltaZstd}. It — and an
+    // explicit `shufdelta` — require row-group framing to stay random-access-safe.
+    let codec_trial = codec == Some("compact-trial");
+    let explicit_codec = if codec_trial {
+        None
+    } else {
+        parse_codec(codec)?
+    };
+    if (codec_trial || explicit_codec == Some(CodecId::ShufDeltaZstd)) && row_group_rows.is_none() {
+        return Err(PyValueError::new_err(
+            "codec='compact-trial'/'shufdelta' requires row_group_rows=N \
+             (row-group-framed output for random-access-safe reads)",
+        ));
+    }
+    // The §4.3 two-layer GPU/sidecar cost model engages under compact-trial when
+    // explicitly requested or via the accel-oriented `training` index preset.
+    let prefer_gpu_sidecar = keep_gpu_sidecar || index_preset.as_deref() == Some("training");
+    let framing = row_group_rows.map(|g| scx_format_io::FramingConfig {
+        row_group_rows: g,
+        target_nnz: row_group_target_nnz,
+        trial: codec_trial,
+        prefer_gpu_sidecar,
+    });
     let shard_target_rows = shard_size.unwrap_or(16384);
     let csc_policy =
         scx_format_io::CscPolicy::parse(csc).map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -564,6 +591,10 @@ pub fn from_anndata_impl(
                 4,    // writer_queue_depth (default)
                 sort_by,
                 sort_reverse,
+                row_group_rows,
+                row_group_target_nnz,
+                codec_trial,
+                keep_gpu_sidecar,
             );
         }
         #[cfg(not(feature = "hdf5"))]
@@ -766,7 +797,7 @@ pub fn from_anndata_impl(
     };
 
     // Build FileHeader
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs,
         n_vars,
         nnz,
@@ -774,6 +805,13 @@ pub fn from_anndata_impl(
         header_codec as u8,
         index_dtype,
     );
+    // Row-group framing produces v4/shard-v2 shards; stamp the file v4 so old
+    // readers reject it and the v4 write-guard admits the framed (and, under the
+    // §4.3 cost model, unframed-Scx1-with-sidecar) shards. `new_single_modality`
+    // stamps the default (v3), so bump it here (mirrors the streaming pipeline).
+    if framing.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(path, header).map_err(to_pyerr)?;
 
@@ -872,6 +910,7 @@ pub fn from_anndata_impl(
         n_vars as u32,
         SectionType::CsrShard,
         "X",
+        framing,
     )?;
     // Phase 5b: parse bitmap policy once.
     let bitmap_policy = scx_format_io::BitmapPolicy::parse(bitmap)
@@ -1239,6 +1278,7 @@ pub fn from_anndata_impl(
             n_vars as u32,
             SectionType::LayerCsrShard,
             layer_name,
+            framing,
         )?;
         for section in l_pre_encoded {
             writer.write_preencoded_shard(section).map_err(to_pyerr)?;

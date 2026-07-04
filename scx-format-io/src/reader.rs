@@ -2089,7 +2089,6 @@ impl ScxReader {
         // intersection with [c_lo, c_hi).
         let mut decoded: Vec<ScxCsc> = Vec::with_capacity(shards.len());
         for entry in &shards {
-            let csc = self.read_csc_from_entry(entry)?;
             let stats = entry.stats.as_ref().ok_or_else(|| {
                 ScxError::InvalidCatalog(format!("CSC shard '{}' missing stats block", entry.name))
             })?;
@@ -2097,6 +2096,33 @@ impl ScxReader {
             let shard_hi = stats.major_end(entry.section_type);
             let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
             let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
+
+            // A row-group-framed (v2) CSC shard is column-group indexed
+            // by its `BlockIndex` (major axis = columns), so a gene-subset read
+            // decodes only the touched column-groups instead of the whole shard.
+            // `decode_block_index_row_runs` is axis-agnostic ("row" = major line);
+            // one contiguous column run yields one CSC fragment (indptr over the
+            // run's columns, indices = global row ids). Non-framed shards return
+            // `None` → the full-decode + `col_slice` fallback below.
+            if hi_in_shard > lo_in_shard {
+                let header = self.read_shard_header(entry)?;
+                if header.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+                    let run = (lo_in_shard, hi_in_shard - lo_in_shard);
+                    if let Some(mut runs) = self.decode_block_index_row_runs(entry, &[run])? {
+                        if let Some((indptr, indices, data)) = runs.pop() {
+                            decoded.push(ScxCsc::new_unchecked(
+                                (n_rows, hi_in_shard - lo_in_shard),
+                                indptr,
+                                indices,
+                                data,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let csc = self.read_csc_from_entry(entry)?;
             let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
                 csc
             } else {

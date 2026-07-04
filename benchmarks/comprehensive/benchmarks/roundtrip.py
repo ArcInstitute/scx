@@ -49,6 +49,7 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({
     "scx_lz4",
     "scx_pcodec",
     "scx_shufdelta",
+    "scx_compact_trial",
 })
 """Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
 incompatible (bench, format) cells never get submitted. Mirrors the runtime

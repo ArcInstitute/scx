@@ -284,16 +284,29 @@ For the most compact **random-access-safe** output, `scx convert --codec
 compact-trial --row-group-rows N` encodes each shard row-group-framed with both
 the heuristic winner and `shufdelta` and keeps the smaller (recorded per shard in
 `codec_id`). It requires `--row-group-rows` (framed output) and optimizes for size
-+ random access; it therefore forgoes the Scx1 GPU/per-row decode sidecar (framed
-shards use the `BlockIndex` for sub-shard access instead). Implementation:
++ random access. (Measured: `compact-trial` matches `shufdelta`'s **1.83× vs Scx1**
+on integer-count `tabula_sapiens_100k` and does not regress on float/normalized X —
+it picks the heuristic winner there.) Implementation:
 `scx-format-io/src/encoder.rs::encode_one_shard`.
 
-`scx optimize` accepts the same framed codecs — `scx optimize --codec
-compact-trial --row-group-rows N in.scx out.scx` (or `--codec shufdelta
---row-group-rows N`) re-encodes an existing single-modality v3 file into a
-v4/shard-v2 framed file, reporting how many shards were framed and how many the
-trial stored as `shufdelta`. Writing framed output from Python (`from_anndata`)
-is a deferred follow-on; use the CLI for framed writes today.
+**Two-layer cost model (`--keep-gpu-sidecar`).** By default a framed shard drops
+the Scx1 `DecodeSidecar` (framed shards random-access via the `BlockIndex`). Since
+that sidecar is also the FOR-BP/Rice **GPU device-decode** + bit-level per-row
+path, `compact-trial` can instead keep a
+Scx1-friendly (integer, low-median) shard **unframed with its sidecar** when GPU /
+per-row access matters — via `--keep-gpu-sidecar` (or an `--index-preset training`
+signal). The result is a v4 file that legitimately **mixes** framed shards and
+unframed-Scx1-with-sidecar shards; both are random-access-safe (framed → group
+`BlockIndex`; unframed Scx1 → per-row sidecar). Without the flag, Scx1 is kept only
+when it does not regress size (`SCX_COMPACT_TRIAL_GPU_MARGIN` tunes the slack).
+
+**Surfaces.** `scx convert`, `scx optimize` (`--codec compact-trial|shufdelta
+--row-group-rows N [--keep-gpu-sidecar]`, which reports framed / ShufDeltaZstd /
+kept-unframed-Scx1 shard counts), and `pyscx.from_anndata(..., codec=...,
+row_group_rows=N, keep_gpu_sidecar=...)` all produce framed output. On the read
+side, a framed **CSC** sidecar supports per-gene-group scattered reads
+(`read_csc_columns` decodes only the touched column-groups via the block index),
+so gene-subset DE / aggregation over a wide shard no longer full-decodes it.
 
 ## 8a. Per-modality Codec Defaults
 

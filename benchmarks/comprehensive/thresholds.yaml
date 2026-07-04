@@ -934,7 +934,7 @@ absolute_floors:
   # codecs, and would need a non-zero tolerance once a future lossy
   # variant lands.
   #
-  # Coverage scope: pbmc3k + tabula_sapiens_100k for all 7 SCX
+  # Coverage scope: pbmc3k + tabula_sapiens_100k for all 8 SCX
   # variants. The benchmark still RUNS on whatever larger datasets the
   # launcher passes (rows appear in the summary), but isn't floor-gated
   # there — codec contracts are dataset-independent and these two
@@ -1016,6 +1016,16 @@ absolute_floors:
     metric: n_value_mismatches
     max: 0
   - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: overall_passed_int
@@ -1082,6 +1092,16 @@ absolute_floors:
     min: 1
   - benchmark: roundtrip
     format: scx_shufdelta
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_compact_trial
     dataset: tabula_sapiens_100k
     metric: n_value_mismatches
     max: 0

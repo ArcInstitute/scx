@@ -1404,21 +1404,27 @@ impl ScxWriter {
     /// re-stamped decode sidecar bound to the bytes just written. Does NOT
     /// advance shard counters — callers do that to match their single- vs
     /// per-modality bookkeeping.
-    /// Defensive guard (F5 T3.1): refuse to copy a legacy unframed (shard v1)
-    /// CSR-class shard verbatim into a file that claims the framed v4 layout.
+    /// Defensive guard: refuse to
+    /// place a **random-access-incapable** legacy shard into a file that claims
+    /// the v4 layout.
     ///
     /// A file `format_version` of [`CURRENT_FORMAT_VERSION`](scx_format::CURRENT_FORMAT_VERSION)
-    /// (v4) advertises "this file may contain row-group-framed shards"; copying
-    /// an unframed shard under that claim would promise sub-shard random access
-    /// the shard cannot honor. Any writer producing v4 output must row-group-frame
-    /// (or re-encode) every sparse shard — `convert` and the SCX→SCX passthrough
-    /// already do (they only copy already-framed v2 shards). Every legacy rewrite
-    /// path stamps ≤ v3, so this guard is inert for them. Only CSR-class shards
-    /// carry the framed layout, so obs/var/aux verbatim copies are exempt.
+    /// (v4) advertises "every sparse shard supports sub-shard random access."
+    /// Two representations satisfy that: a **framed** (shard v2) shard (via its
+    /// group `BlockIndex`) *or* an **unframed Scx1** (shard v1) shard carrying a
+    /// `DecodeSidecar` (via its bit-level per-row index — the GPU/per-row layer
+    /// kept alongside framing per `SIDECAR-LONG-TERM-FIX.md` §4.3). The
+    /// compact-trial cost model deliberately emits a mix of the two. What must
+    /// never enter a v4 file is a v1 shard with **neither** — that would be a
+    /// false random-access promise. `has_sidecar` reports whether this shard is
+    /// accompanied by a `DecodeSidecar`. Legacy rewrite paths stamp ≤ v3, so the
+    /// guard is inert for them; only CSR-class shards carry the layout, so
+    /// obs/var/aux verbatim copies are exempt.
     fn guard_no_legacy_shard_in_v4(
         &self,
         section_type: SectionType,
         section_bytes: &[u8],
+        has_sidecar: bool,
     ) -> Result<()> {
         if self.header.format_version < scx_format::CURRENT_FORMAT_VERSION {
             return Ok(());
@@ -1430,13 +1436,15 @@ impl ScxWriter {
             return Ok(());
         }
         let sh = ShardHeader::read_from(&mut &section_bytes[..])?;
-        if sh.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        if sh.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION
+            && !has_sidecar
+        {
             return Err(ScxError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "refusing to copy an unframed (shard v{}) shard into a v{} (framed) \
-                     file: re-encode the shard with row-group framing instead of \
-                     raw-copying it",
+                    "refusing to place an unframed, sidecar-less (shard v{}) shard into a \
+                     v{} file: it would advertise sub-shard random access it cannot honor. \
+                     Re-encode it row-group-framed, or as Scx1 with a decode sidecar.",
                     sh.shard_format_version, self.header.format_version,
                 ),
             )));
@@ -1451,7 +1459,7 @@ impl ScxWriter {
         stats: ShardStats,
         sidecar: Option<DecodeSidecar>,
     ) -> Result<()> {
-        self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
+        self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes, sidecar.is_some())?;
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
         let section_length = section_bytes.len() as u64;
@@ -1492,7 +1500,11 @@ impl ScxWriter {
     /// (typically in parallel via rayon). This method only performs the
     /// sequential I/O write and catalog entry bookkeeping.
     pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
-        self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
+        self.guard_no_legacy_shard_in_v4(
+            section.section_type,
+            &section.header_buf,
+            section.decode_sidecar.is_some(),
+        )?;
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -1600,7 +1612,10 @@ impl ScxWriter {
             )));
         }
 
-        self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
+        // Verbatim copy carries no separate sidecar signal here; the raw-copy
+        // callers that would legitimately move a v1-Scx1-with-sidecar shard into
+        // a v4 file don't exist yet (all stamp ≤ v3), so stay strict (no sidecar).
+        self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes, false)?;
 
         self.write_padding()?;
 

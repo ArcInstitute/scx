@@ -163,6 +163,10 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_shufdelta.scx"
 
     @property
+    def scx_compact_trial_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial.scx"
+
+    @property
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
@@ -246,6 +250,7 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_lz4": "scx_lz4_path",
     "scx_pcodec": "scx_pcodec_path",
     "scx_shufdelta": "scx_shufdelta_path",
+    "scx_compact_trial": "scx_compact_trial_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
@@ -370,6 +375,7 @@ _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
     "scx_lz4": ".scxd",
     "scx_pcodec": ".scxd",
     "scx_shufdelta": ".scxd",
+    "scx_compact_trial": ".scxd",
     "zarr_zstd": ".zarr",
     # zarr_lz4 uses a codec-qualified suffix so it doesn't collide with
     # zarr_zstd on the shared `{dataset}.zarr/` cloud path — ``ensure_cloud_fixture``
@@ -650,6 +656,8 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "pcodec"}),
     FormatVariant("SCX (shufdelta)", "scx_shufdelta", "primary", "scx_runner",
                   {"codec": "shufdelta"}),
+    FormatVariant("SCX (compact-trial)", "scx_compact_trial", "primary", "scx_runner",
+                  {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
     FormatVariant("Shardad", "shardad", "primary", "shardad_runner"),
 ]
