@@ -21,6 +21,7 @@ ALL_BENCHMARKS: list[str] = [
     "write",
     "read_full",
     "read_selective",
+    "read_scattered",
     "parallel_scaling",
     "parallel_write_scaling",
     "memory",

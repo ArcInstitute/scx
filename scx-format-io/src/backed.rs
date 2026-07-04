@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use lru::LruCache;
@@ -894,6 +894,24 @@ pub struct BackedCsrReader {
     /// When `false`, the gather always takes the full-shard cached path and
     /// the plan-prefetch warms reused shards into the LRU.
     scatter_sidecar: bool,
+    /// Per-reader gate for the codec-agnostic **block-index** (row-group)
+    /// scattered gather path (see [`Self::block_index_eligible`]). Independent
+    /// of [`Self::scatter_sidecar`]: a framed (v2) shard can take the group-level
+    /// block-index path even when the bit-level Scx1 sidecar path is disabled, so
+    /// a framed training file gets random-access decode without paying the
+    /// per-row sidecar cost. Defaults to the `SCX_SCATTER_BLOCK_INDEX` env value
+    /// for every constructor (including the sparse-cellset `with_shared_cache`
+    /// reader, which keeps this on while turning `scatter_sidecar` off). The
+    /// loader's per-dataset `scatter_block_index=False` opt-out flips this too
+    /// (via [`Self::set_scatter_block_index`]) so the off-switch disables both
+    /// the L1 gather and the L2 prefetch skip, not just the prefetch.
+    scatter_block_index: bool,
+    /// Lazy per-shard "is framed?" memo for [`Self::shard_is_framed`], filled on
+    /// first probe (lock-free `AtomicU8`: 0 = unknown, 1 = framed, 2 = unframed).
+    /// `block_index_eligible` is called per prefetch-candidate + per gather group
+    /// on the training hot path; caching the 76-byte header parse avoids
+    /// re-reading it every batch for shards whose framing never changes.
+    framed_cache: OnceLock<Vec<AtomicU8>>,
 }
 
 impl BackedCsrReader {
@@ -945,6 +963,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
+            scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -987,6 +1007,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_sidecar,
+            scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1025,6 +1047,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
+            scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1079,6 +1103,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_sidecar: scatter_sidecar_enabled(),
+            scatter_block_index: scatter_block_index_enabled(),
+            framed_cache: OnceLock::new(),
         }
     }
 
@@ -1132,6 +1158,80 @@ impl BackedCsrReader {
                 .index
                 .shard_range(shard_idx)
                 .is_some_and(|(s, e)| (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < (e - s))
+    }
+
+    /// Cheap "is this shard row-group framed (v2)?" probe. Reads only the
+    /// 76-byte shard header from the mmap (no payload decode, no catalog linear
+    /// scan — resolves the section via the retained [`ShardEntryLite`]), and
+    /// tests `shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION`. Used by
+    /// [`Self::block_index_eligible`] to gate the block-index path **per shard**:
+    /// a v4 file legitimately mixes v2-framed and v1-Scx1+sidecar shards
+    /// (two-layer cost model), so a file-level version check would misclassify.
+    /// Returns `false` on any missing entry / header parse error (caller then
+    /// falls back to the sidecar or full-shard path). The header parse is
+    /// memoized per shard in `framed_cache` (a shard's framing is immutable for
+    /// the reader's lifetime), so repeated hot-path probes cost one atomic load.
+    fn shard_is_framed(&self, shard_idx: usize) -> bool {
+        let cache = self
+            .framed_cache
+            .get_or_init(|| (0..self.shard_count()).map(|_| AtomicU8::new(0)).collect());
+        // 0 = unknown, 1 = framed, 2 = unframed. Out-of-range shard_idx (should
+        // not happen) falls through to a direct (uncached) compute.
+        if let Some(slot) = cache.get(shard_idx) {
+            match slot.load(Ordering::Relaxed) {
+                1 => return true,
+                2 => return false,
+                _ => {}
+            }
+            let framed = self.compute_shard_is_framed(shard_idx);
+            slot.store(if framed { 1 } else { 2 }, Ordering::Relaxed);
+            return framed;
+        }
+        self.compute_shard_is_framed(shard_idx)
+    }
+
+    /// Uncached header read backing [`Self::shard_is_framed`].
+    fn compute_shard_is_framed(&self, shard_idx: usize) -> bool {
+        let Some(&lite) = self.shard_entry(shard_idx) else {
+            return false;
+        };
+        let entry = lite.into_transient_full_entry();
+        self.reader
+            .read_shard_header(&entry)
+            .map(|h| h.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION)
+            .unwrap_or(false)
+    }
+
+    /// Override the per-reader block-index gate (default from
+    /// `SCX_SCATTER_BLOCK_INDEX`). The loader's per-dataset
+    /// `scatter_block_index=False` calls this so the off-switch disables the L1
+    /// gather adoption too, not just the L2 prefetch skip.
+    pub fn set_scatter_block_index(&mut self, enabled: bool) {
+        self.scatter_block_index = enabled;
+    }
+
+    /// Codec-agnostic sibling of [`Self::sidecar_eligible`] for the block-index
+    /// (row-group) scattered path. Eligible when the process-global
+    /// `SCX_SCATTER_BLOCK_INDEX` kill-switch is on **and** this reader's
+    /// per-reader `scatter_block_index` gate is on, the shard is not already
+    /// decoded in the LRU, the requested rows are a small fraction of the shard
+    /// (same `ROW_RANGE_WINDOW_DIVISOR` heuristic as the sidecar path), **and**
+    /// the shard is actually row-group framed. Unlike `sidecar_eligible`, this is
+    /// **not** gated on `scatter_sidecar`, so a framed file takes the group-level
+    /// path regardless of the bit-level Scx1-sidecar decision. Covers both
+    /// consumers at once — the L1 `read_rows_with` gather and the L2 plan-prefetch
+    /// warm-skip — so the gather choice and the prefetch skip never drift. The
+    /// framing header read is ordered last so it only runs for cost-eligible,
+    /// uncached candidates.
+    pub fn block_index_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
+        scatter_block_index_enabled()
+            && self.scatter_block_index
+            && !self.shard_cache.contains(self.file_id, shard_idx)
+            && self
+                .index
+                .shard_range(shard_idx)
+                .is_some_and(|(s, e)| (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < (e - s))
+            && self.shard_is_framed(shard_idx)
     }
 
     /// Live count cap on the decoded-shard LRU. `0` means no cache was
@@ -1438,8 +1538,8 @@ impl BackedCsrReader {
         // error semantics. Planning before warming is what lets the `!cached`
         // test mean something — we then warm ONLY the full-path shards, so
         // sidecar-group shards stay undecoded and the row-range path is taken.
-        // (start, end, shard_idx, s_start, use_sidecar)
-        let mut groups: Vec<(usize, usize, usize, u64, bool)> = Vec::new();
+        // (start, end, shard_idx, s_start, use_sidecar, use_block_index)
+        let mut groups: Vec<(usize, usize, usize, u64, bool, bool)> = Vec::new();
         let mut full_shards: Vec<usize> = Vec::new();
         let mut start = 0;
         while start < sorted_pairs.len() {
@@ -1462,16 +1562,18 @@ impl BackedCsrReader {
             let group_len = sorted_pairs[start..].partition_point(|&(r, _)| r < s_end);
             let end = start + group_len;
 
-            // Sidecar-vs-full-shard via the shared predicate (also used by the
+            // Scattered-vs-full-shard via the shared predicates (also used by the
             // plan-prefetch skip, so the two never drift). As of L2, the prefetch
-            // engines leave sidecar-eligible cold sparse shards un-warmed, so
-            // `sidecar_eligible` returns true here and the O(rows) path is taken;
-            // dense/cached groups still go full-shard.
+            // engines leave scatter-eligible cold sparse shards un-warmed, so an
+            // eligible predicate returns true here and the O(rows) path is taken;
+            // dense/cached groups still go full-shard. A framed shard is eligible
+            // for the block-index path independent of the Scx1-sidecar decision.
             let use_sidecar = self.sidecar_eligible(shard_idx, group_len);
-            if !use_sidecar {
+            let use_block_index = self.block_index_eligible(shard_idx, group_len);
+            if !use_sidecar && !use_block_index {
                 full_shards.push(shard_idx);
             }
-            groups.push((start, end, shard_idx, s_start, use_sidecar));
+            groups.push((start, end, shard_idx, s_start, use_sidecar, use_block_index));
             start = end;
         }
 
@@ -1479,30 +1581,27 @@ impl BackedCsrReader {
         // or if every group took the sidecar path).
         self.warm_shards(&full_shards)?;
 
-        for (start, end, shard_idx, s_start, use_sidecar) in groups {
+        for (start, end, shard_idx, s_start, use_sidecar, use_block_index) in groups {
             let group = &sorted_pairs[start..end];
 
             // Strategy: on an eligible (sparse, cache-cold) group, try the Scx1
             // bit-level sidecar first (unchanged fast path); if the shard has no
-            // fresh Scx1 sidecar, try the codec-agnostic row-group block-index
-            // path (framed v2 shards); otherwise fall back to a full-shard decode.
+            // fresh Scx1 sidecar (or the sidecar path is disabled), try the
+            // codec-agnostic row-group block-index path (framed v2 shards);
+            // otherwise fall back to a full-shard decode. `use_block_index`
+            // already encodes the `SCX_SCATTER_BLOCK_INDEX` gate + framing, so a
+            // framed shard is reached even when `use_sidecar` is false.
             let mut via_block_index = false;
-            let handled = if use_sidecar {
-                let mut h =
+            let mut handled = false;
+            if use_sidecar {
+                handled =
                     self.scatter_group_via_sidecar(shard_idx, s_start, group, &mut scatter)?;
-                if !h && scatter_block_index_enabled() {
-                    h = self.scatter_group_via_block_index(
-                        shard_idx,
-                        s_start,
-                        group,
-                        &mut scatter,
-                    )?;
-                    via_block_index = h;
-                }
-                h
-            } else {
-                false
-            };
+            }
+            if !handled && use_block_index {
+                handled =
+                    self.scatter_group_via_block_index(shard_idx, s_start, group, &mut scatter)?;
+                via_block_index = handled;
+            }
 
             if let Some(m) = self.metrics() {
                 if via_block_index {

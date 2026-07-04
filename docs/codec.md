@@ -259,6 +259,42 @@ Implementation: `scx-codec/src/{byte_delta.rs,dispatch.rs}` (codec +
 `decode_row_group`), `scx-format-io/src/encoder.rs` (`encode_shard_framed`),
 `scx-format/src/shard.rs` (`resolve_block_index`).
 
+**Loader adoption (training / scattered reads).** The backed reader's scattered
+gather (`BackedCsrReader::read_rows_with`) decodes only the row-groups a
+scattered request touches via the `BlockIndex`, independent of the bit-level Scx1
+sidecar path. A framed shard is block-index eligible
+(`BackedCsrReader::block_index_eligible`) — cost-eligible + framed — regardless of
+the `scatter_sidecar` decision, so a framed training file gets random-access
+decode even with the Scx1 sidecar disabled. The `IndexPlanDataset` /
+`SparseCellSetDataset` prefetchers skip pre-warming block-index-eligible framed
+shards so the gather reaches the group-level path (env kill-switch
+`SCX_SCATTER_BLOCK_INDEX=0`; per-dataset opt-out `scatter_block_index=False` on
+`IndexPlanDataset`). Adoption is observable via
+`IndexPlanDataset.cache_metrics()["block_index_groups"]` (`> 0` ⇒ the framed path
+was taken; `sidecar_groups` / `full_shard_groups` are the other two dispatch
+routes). The `read_scattered` comprehensive benchmark drives an unsorted
+scattered gather over a framed compact-trial file and gates
+`block_index_groups ≥ 1` + `block_index_adoption_rate == 1.0`.
+
+**Choosing `row_group_rows` (G).** The `compression` + `read_scattered` sweep over
+`G ∈ {128, 256, 512, 1024}` (2026-07-04, pbmc3k/pbmc10k/smartseq2/tabula_sapiens_100k):
+- **Compression ratio is flat across G** (±0.3% on every dataset) — framing at any G
+  keeps the full monolithic win.
+- **Scattered-gather latency favors finer G on multi-shard files.** On small,
+  few-shard datasets (pbmc3k/pbmc10k) p50 is flat, but on multi-shard datasets a
+  broadly-scattered gather lands each row in a distinct row-group, so coarse groups
+  over-decode: smartseq2 p50 `G=128` 2.18 s vs `G=512` 3.05 s (1.4×); tabula
+  `G=128` 1.70 s vs `G=512` 3.50 s (2.1×). (These are worst-case, no-cache broad
+  scatter — not representative of real training throughput, which adds locality +
+  caching.)
+
+So finer G (128–256) is strictly better for scattered / training-style reads at
+scale — lower decode latency at no compression cost — traded against a larger block
+index (≈4× the per-shard entries at 128 vs 512) and slightly less efficient
+sequential/full-shard decode. The current `compact-trial` default `G = 512` is a
+general-purpose middle ground; **a scatter-heavy / training-first deployment should
+prefer 128–256.** Changing the shipped default is a `format`-policy call (deferred).
+
 ## 8. Automatic Codec Selection
 
 Writers SHOULD choose per-shard codecs automatically. Benchmarks found

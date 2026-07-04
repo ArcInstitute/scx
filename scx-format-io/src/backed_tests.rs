@@ -561,6 +561,53 @@ fn read_rows_with_bumps_block_index_counters() {
     );
 }
 
+/// F5 follow-up (Phase A): a framed **non-Scx1** shard takes the block-index
+/// path even when the Scx1-sidecar gather is disabled (`scatter_sidecar=false`,
+/// as the sparse-cellset reader defaults). Proves `block_index_eligible`
+/// decouples the group-level row-group path from the bit-level Scx1-sidecar
+/// decision — the loader-adoption goal for framed training files. ShufDeltaZstd
+/// carries no Scx1 sidecar, so the only random-access route is the block index.
+#[test]
+fn read_rows_with_block_index_when_sidecar_disabled() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::ShufDeltaZstd);
+
+    // scatter_sidecar=false disables the bit-level sidecar path for this reader;
+    // scatter_block_index defaults on (env), so the framed gather still routes
+    // through the block index rather than pre-warming + full-shard decoding.
+    let cache = SharedShardCache::new(4, usize::MAX);
+    let mut backed =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, cache, false);
+    let m = backed.enable_metrics();
+
+    let sparse_rows = [2u64, 5, 6, 40, 41];
+    let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); sparse_rows.len()];
+    backed
+        .read_rows_with(&sparse_rows, |i, idx, data| {
+            out[i] = (idx.to_vec(), data.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    for (i, &row) in sparse_rows.iter().enumerate() {
+        let lo = full.indptr[row as usize] as usize;
+        let hi = full.indptr[row as usize + 1] as usize;
+        assert_eq!(out[i].0, full.indices[lo..hi], "indices row {row}");
+        assert_eq!(out[i].1, full.data[lo..hi], "data row {row}");
+    }
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        2,
+        "framed gather must take the block-index path with the sidecar disabled",
+    );
+    assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        0,
+        "no full-shard decode for a sparse cold framed gather",
+    );
+}
+
 /// Lever S: the per-shard Scx1 sidecar metadata is
 /// parsed once and reused across batches. Repeatedly gathering sparse groups
 /// from the same shard takes the sidecar path each time (so the rows are still

@@ -50,6 +50,12 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({
     "scx_pcodec",
     "scx_shufdelta",
     "scx_compact_trial",
+    # F5 follow-up (Phase B): per-row-group-size compact-trial variants —
+    # verify framed round-trip parity holds at each G.
+    "scx_compact_trial_g128",
+    "scx_compact_trial_g256",
+    "scx_compact_trial_g512",
+    "scx_compact_trial_g1024",
 })
 """Format-key allow-list — read by ``run_parallel.py``'s cohort builder so
 incompatible (bench, format) cells never get submitted. Mirrors the runtime
