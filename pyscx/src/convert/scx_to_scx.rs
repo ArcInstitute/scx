@@ -88,11 +88,20 @@ pub(crate) fn route_scx_backed_to_scx(
     let no_deletions = backed.kept_to_global.is_none();
     let no_projection = backed.col_projection().is_none();
     let single_modality_source = modality_id.is_none();
+    // A v4 source may hold row-group-framed (v2) shards or, under the compact-trial
+    // cost model, unframed-Scx1-with-sidecar (v1) shards plus separate
+    // DecodeMetadataShard sidecar sections. The verbatim copy path
+    // (`copy_section_verbatim`) hardcodes `has_sidecar = false` and iterates only
+    // CSR entries, so it would abort on a v1+sidecar shard and drop the sidecar
+    // sections. Force v4 sources down the decode-encode path (self-consistent
+    // output; framing/sidecar preservation through passthrough is a follow-on).
+    let source_unframed = src_header.format_version <= scx_format_io::DEFAULT_WRITE_FORMAT_VERSION;
     let passthrough_ok = target_codec_for_passthrough
         && target_shard_rows_matches
         && no_deletions
         && no_projection
-        && single_modality_source;
+        && single_modality_source
+        && source_unframed;
 
     // Output header / writer setup. For passthrough, mirror the
     // source's codec / shard_target_rows / index_dtype so the

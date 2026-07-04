@@ -529,10 +529,19 @@ pub fn from_anndata_impl(
     } else {
         parse_codec(codec)?
     };
-    if (codec_trial || explicit_codec == Some(CodecId::ShufDeltaZstd)) && row_group_rows.is_none() {
+    if (codec_trial || explicit_codec == Some(CodecId::ShufDeltaZstd))
+        && !matches!(row_group_rows, Some(g) if g > 0)
+    {
         return Err(PyValueError::new_err(
-            "codec='compact-trial'/'shufdelta' requires row_group_rows=N \
+            "codec='compact-trial'/'shufdelta' requires row_group_rows=N with N > 0 \
              (row-group-framed output for random-access-safe reads)",
+        ));
+    }
+    // A zero row_group_rows would silently disable framing downstream; reject it
+    // for any caller so the request is never a confusing no-op.
+    if row_group_rows == Some(0) {
+        return Err(PyValueError::new_err(
+            "row_group_rows must be > 0 when provided",
         ));
     }
     // The §4.3 two-layer GPU/sidecar cost model engages under compact-trial when

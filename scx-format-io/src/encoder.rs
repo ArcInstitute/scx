@@ -381,12 +381,19 @@ pub struct FramingConfig {
 /// exceed the framed winner and still be kept for its GPU/per-row fast path when
 /// `prefer_gpu_sidecar` is not set. Default 0 → keep Scx1 only when it does not
 /// regress size. Env: `SCX_COMPACT_TRIAL_GPU_MARGIN`.
+///
+/// Read once (process-lifetime) rather than per shard — `encode_one_shard`'s
+/// trial branch runs for every shard, and a `std::env::var` syscall per shard on
+/// a many-thousand-shard file is pure overhead.
 fn compact_trial_gpu_margin() -> f64 {
-    std::env::var("SCX_COMPACT_TRIAL_GPU_MARGIN")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|m| m.is_finite() && *m >= 0.0)
-        .unwrap_or(0.0)
+    static MARGIN: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        std::env::var("SCX_COMPACT_TRIAL_GPU_MARGIN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|m| m.is_finite() && *m >= 0.0)
+            .unwrap_or(0.0)
+    });
+    *MARGIN
 }
 
 /// Total encoded size of a shard's three sub-streams (trial-encode comparison key).

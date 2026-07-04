@@ -301,10 +301,18 @@ pub fn append_from_reader_with_index_options(
     // into the (possibly v3) base. Gate the file's format_version on the lower
     // of base and source — never claim v3 unless both already guarantee it.
     let feature_floor = if prep.header.n_modalities > 0 { 2 } else { 1 };
-    prep.header.format_version = scx_format_io::rewrite_output_format_version(
-        &[prep.header.format_version, source.header().format_version],
+    let base_version = prep.header.format_version;
+    let clamped = scx_format_io::rewrite_output_format_version(
+        &[base_version, source.header().format_version],
         feature_floor,
     );
+    // BUT append never rewrites the base's existing shards — they are preserved
+    // verbatim. A framed (v4) base carries shard-v2 (row-group-framed) shards, so
+    // clamping the header down to v3 would let a pre-framing reader accept the
+    // file and then mis-decode those framed shards. Never stamp below the base's
+    // own version. (Appended framed source shards are handled separately: they
+    // are not raw-copy eligible and decode-encode to unframed.)
+    prep.header.format_version = clamped.max(base_version);
 
     // Enumerate the source's CSR shard catalog entries (already sorted by
     // row_start by `csr_shards_for_modality`).

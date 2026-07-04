@@ -3913,6 +3913,22 @@ impl ScxReader {
         if header.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
             return Ok(None);
         }
+        // Validate the requested runs against the shard's own row count before any
+        // group indexing. `runs` are built by callers from `ShardStats` ranges,
+        // which are not otherwise checked against this header's `n_major`; an
+        // out-of-range run would make `find_group`/`local` overshoot the decoded
+        // group CSR and panic on OOB indexing. Fail loud instead (readers return
+        // errors, not panics, on malformed input).
+        let n_major = header.n_major as usize;
+        for &(run_start, run_len) in runs {
+            let run_end = run_start.checked_add(run_len).filter(|&e| e <= n_major);
+            if run_end.is_none() {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "shard {} row run [{run_start}, +{run_len}) exceeds shard n_major {n_major}",
+                    entry.name
+                )));
+            }
+        }
         let codec_id =
             CodecId::from_u8(header.codec_id).ok_or(ScxError::UnknownCodec(header.codec_id))?;
         let venc = ValueEncoding::from_u8(header.value_encoding)

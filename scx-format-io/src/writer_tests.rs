@@ -1255,6 +1255,57 @@ fn read_csc_columns_scattered_matches_full_decode() {
     }
 }
 
+/// `decode_block_index_row_runs` must return an error (not panic) when a
+/// requested run exceeds the shard's `n_major`. Callers build runs from
+/// `ShardStats` ranges that aren't otherwise validated against the header, and
+/// an out-of-range run would index past the decoded group CSR.
+#[test]
+fn decode_block_index_row_runs_rejects_out_of_range_run() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_oob.scx");
+    let mut header = sample_header();
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 1,
+        target_nnz: None,
+        trial: false,
+        prefer_gpu_sidecar: false,
+    }));
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    let n_major = indptr.len() - 1;
+    writer
+        .write_csc_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = ScxReader::open(&final_path).unwrap();
+    let entry = reader.catalog().csc_shards_sorted()[0].clone();
+    // A run that starts in range but extends past n_major must Err, not panic.
+    let err = reader
+        .decode_block_index_row_runs(&entry, &[(0, n_major + 5)])
+        .unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "out-of-range run must yield InvalidCatalog, got {err:?}"
+    );
+    // A valid full-cover run still succeeds.
+    assert!(reader
+        .decode_block_index_row_runs(&entry, &[(0, n_major)])
+        .unwrap()
+        .is_some());
+}
+
 /// A tiny canonical CSR fixture (2 rows, nnz=3, 3 vars) for the T3.1 guard tests.
 fn tiny_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>) {
     (vec![0u64, 2, 3], vec![0u32, 2, 1], vec![1.0f32, 2.0, 3.0])
