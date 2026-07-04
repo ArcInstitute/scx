@@ -45,12 +45,16 @@ pub fn run_optimize(
         }
     };
 
+    // Framing is on by default; `--row-group-rows 0` is the explicit unframed
+    // (v3) opt-out → normalize to None so the guard and framing agree.
+    let row_group_rows = row_group_rows.filter(|&g| g > 0);
     // The framed codecs only make sense with row-group framing on.
     if (codec_trial || codec_id == Some(scx_codec::CodecId::ShufDeltaZstd))
         && row_group_rows.is_none()
     {
         return Err(format!(
-            "`--codec {codec}` requires `--row-group-rows N` (row-group-framed output)"
+            "`--codec {codec}` requires `--row-group-rows N` (row-group-framed output); \
+             drop `--row-group-rows 0`"
         )
         .into());
     }

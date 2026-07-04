@@ -397,18 +397,21 @@ pub use scx_format_io::CscPolicy;
 
 impl ConvertOptions {
     /// Build the row-group [`FramingConfig`] for the shard emitters, or `None`
-    /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set.
+    /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set
+    /// to a value > 0; `Some(0)` is the explicit unframed opt-out (v3 output).
     pub fn framing(&self) -> Option<scx_format_io::FramingConfig> {
-        self.row_group_rows.map(|g| scx_format_io::FramingConfig {
-            row_group_rows: g,
-            target_nnz: self.row_group_target_nnz,
-            trial: self.codec_trial,
-            // The GPU/per-row-preserving cost model engages under compact-trial
-            // when explicitly requested or when the accel-oriented `training`
-            // index preset signals GPU-dominant access.
-            prefer_gpu_sidecar: self.keep_gpu_sidecar
-                || self.index_preset.as_deref() == Some("training"),
-        })
+        self.row_group_rows
+            .filter(|&g| g > 0)
+            .map(|g| scx_format_io::FramingConfig {
+                row_group_rows: g,
+                target_nnz: self.row_group_target_nnz,
+                trial: self.codec_trial,
+                // The GPU/per-row-preserving cost model engages under compact-trial
+                // when explicitly requested or when the accel-oriented `training`
+                // index preset signals GPU-dominant access.
+                prefer_gpu_sidecar: self.keep_gpu_sidecar
+                    || self.index_preset.as_deref() == Some("training"),
+            })
     }
 }
 
@@ -419,7 +422,11 @@ impl Default for ConvertOptions {
             codec: None,
             csc: CscPolicy::Off,
             csc_cols_per_shard: 5000,
-            row_group_rows: None,
+            // Framing on by default (Phase C): a plain `codec="auto"` write frames
+            // at G=256 (codec-agnostic; no extra encode cost). `Some(0)` opts out
+            // to unframed v3. `codec_trial` stays off — compact-trial's per-shard
+            // trial encode remains opt-in.
+            row_group_rows: Some(scx_format_io::DEFAULT_ROW_GROUP_ROWS),
             row_group_target_nnz: None,
             codec_trial: false,
             tool: "scx".into(),
@@ -803,7 +810,7 @@ pub fn h5ad_to_scx(
         index_dtype,
     );
     // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
-    if opts.row_group_rows.is_some() {
+    if opts.framing().is_some() {
         header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
     }
 
@@ -1015,7 +1022,7 @@ pub fn tenx_to_scx(
         index_dtype,
     );
     // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
-    if opts.row_group_rows.is_some() {
+    if opts.framing().is_some() {
         header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
     }
 
@@ -1313,7 +1320,7 @@ pub fn h5ad_to_scx_streaming(
         index_dtype,
     );
     // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
-    if opts.row_group_rows.is_some() {
+    if opts.framing().is_some() {
         header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
     }
 
@@ -3565,4 +3572,38 @@ fn write_layer_shards(
         shard_idx += 1;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod default_framing_tests {
+    use super::*;
+
+    /// Phase C: the convert default frames at `DEFAULT_ROW_GROUP_ROWS` (256), so
+    /// a plain `ConvertOptions::default()` yields an active framing config.
+    #[test]
+    fn default_convert_options_frame_at_256() {
+        let opts = ConvertOptions::default();
+        assert_eq!(
+            opts.row_group_rows,
+            Some(scx_format_io::DEFAULT_ROW_GROUP_ROWS)
+        );
+        assert_eq!(scx_format_io::DEFAULT_ROW_GROUP_ROWS, 256);
+        let fc = opts.framing().expect("default must be framed");
+        assert_eq!(fc.row_group_rows, 256);
+        assert!(!fc.trial, "default codec stays auto, not compact-trial");
+    }
+
+    /// `row_group_rows = Some(0)` is the explicit unframed (v3) opt-out:
+    /// `framing()` returns None so the pipeline keeps the legacy layout.
+    #[test]
+    fn zero_row_group_rows_opts_out_of_framing() {
+        let opts = ConvertOptions {
+            row_group_rows: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            opts.framing().is_none(),
+            "row_group_rows=0 must disable framing (unframed v3 opt-out)"
+        );
+    }
 }

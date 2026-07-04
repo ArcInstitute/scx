@@ -291,9 +291,17 @@ scattered gather over a framed compact-trial file and gates
 So finer G (128–256) is strictly better for scattered / training-style reads at
 scale — lower decode latency at no compression cost — traded against a larger block
 index (≈4× the per-shard entries at 128 vs 512) and slightly less efficient
-sequential/full-shard decode. The current `compact-trial` default `G = 512` is a
-general-purpose middle ground; **a scatter-heavy / training-first deployment should
-prefer 128–256.** Changing the shipped default is a `format`-policy call (deferred).
+sequential/full-shard decode.
+
+**Framing is on by default (F5 Phase C).** The convert / `from_anndata` / `from_h5ad`
+/ `from_10x` / `scx optimize` write paths now frame at **`DEFAULT_ROW_GROUP_ROWS`
+= 256** (`scx-format-io`), the scatter-friendly middle. A plain `codec="auto"` write
+frames — framing is codec-agnostic, so this adds **no extra encode cost** (unlike
+`compact-trial`, which additionally trial-encodes each shard and stays opt-in for
+GPU-integer workloads that want the two-layer Scx1-sidecar preservation). Framed
+output is a v4 file (shard v2); pass `row_group_rows = 0` (`--row-group-rows 0`) for
+the legacy unframed **v3** layout when targeting older readers. See
+[docs/format.md](format.md) `format_version`.
 
 ## 8. Automatic Codec Selection
 

@@ -88,13 +88,14 @@ enum Commands {
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
-        /// Experimental (F5): row-group-frame each shard into groups of at most
-        /// N rows, producing a v4 file with a multi-entry BlockIndex for
-        /// codec-agnostic sub-shard random access. Omit for the ordinary unframed
-        /// layout. Works with any `--codec`; use `--codec compact-trial` to pick
-        /// the smaller of the heuristic codec vs ShufDeltaZstd per shard.
-        #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
-        row_group_rows: Option<u32>,
+        /// Row-group-frame each shard into groups of at most N rows, producing a
+        /// v4 file with a multi-entry BlockIndex for codec-agnostic sub-shard
+        /// random access. Framing is ON BY DEFAULT (G=256); pass `0` for the
+        /// legacy unframed v3 layout (old-reader compatibility). Works with any
+        /// `--codec` at no extra encode cost; use `--codec compact-trial` to also
+        /// pick the smaller of the heuristic codec vs ShufDeltaZstd per shard.
+        #[arg(long, value_name = "N", default_value_t = scx_format_io::DEFAULT_ROW_GROUP_ROWS)]
+        row_group_rows: u32,
         /// Byte/nnz-aware row-group cap (F5): also close a group once it reaches
         /// this many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
@@ -351,10 +352,12 @@ enum Commands {
         codec: String,
         /// Row-group-frame each re-encoded shard into groups of at most N rows,
         /// producing a v4 file with a multi-entry BlockIndex for codec-agnostic
-        /// sub-shard random access. Omit for the ordinary unframed (v3) layout.
-        /// Required for `--codec shufdelta` / `--codec compact-trial`.
-        #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
-        row_group_rows: Option<u32>,
+        /// sub-shard random access. Framing is ON BY DEFAULT (G=256) — `scx
+        /// optimize` upgrades an unframed file to framed; pass `0` to keep the
+        /// legacy unframed (v3) layout. Required (> 0) for `--codec shufdelta` /
+        /// `--codec compact-trial`.
+        #[arg(long, value_name = "N", default_value_t = scx_format_io::DEFAULT_ROW_GROUP_ROWS)]
+        row_group_rows: u32,
         /// Byte/nnz-aware row-group cap: also close a group once it reaches this
         /// many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
@@ -1039,7 +1042,9 @@ fn main() {
             &output,
             force,
             &codec,
-            row_group_rows,
+            // Framing on by default; `run_optimize` normalizes `Some(0)` → None
+            // (the unframed v3 opt-out).
+            Some(row_group_rows),
             row_group_target_nnz,
             keep_gpu_sidecar,
             &shard_obs,
@@ -1325,7 +1330,9 @@ fn run_convert(
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
-    row_group_rows: Option<u32>,
+    // Framed by default (CLI arg default = DEFAULT_ROW_GROUP_ROWS); `0` is the
+    // unframed (v3) opt-out, normalized to `None` in the body.
+    row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
@@ -1650,7 +1657,8 @@ fn dispatch_convert(
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
-    row_group_rows: Option<u32>,
+    // Framed by default; `0` = unframed (v3) opt-out, normalized to `None` below.
+    row_group_rows: u32,
     row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
@@ -1688,12 +1696,14 @@ fn dispatch_convert(
     } else {
         CodecId::parse_cli(codec)?
     };
-    if codec_trial && row_group_rows.is_none() {
+    if codec_trial && row_group_rows == 0 {
         return Err(
-            "`--codec compact-trial` requires `--row-group-rows N` (row-group-framed output)"
-                .into(),
+            "`--codec compact-trial` requires row-group framing; drop `--row-group-rows 0`".into(),
         );
     }
+    // Framing is on by default (row_group_rows default = 256); `0` is the
+    // explicit unframed (v3) opt-out → None threads through as the legacy layout.
+    let row_group_rows = (row_group_rows != 0).then_some(row_group_rows);
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
@@ -1840,7 +1850,7 @@ fn dispatch_convert(
     _codec: &str,
     _csc_policy: convert::CscPolicy,
     _csc_cols_per_shard: usize,
-    _row_group_rows: Option<u32>,
+    _row_group_rows: u32,
     _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
     _stream: bool,
