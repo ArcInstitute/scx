@@ -3,13 +3,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::GroupPass;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format_io::encode_one_shard;
 use scx_format_io::error::ScxError;
 use scx_format_io::header::FileHeader;
 use scx_format_io::modality::ModalityType;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::{PreEncodedSection, ScxWriter};
+use scx_format_io::{encode_one_shard, FramingConfig};
 use scx_sparse::canonicalize_csr;
 
 use super::detect::{detect_input_format, detect_matrix_format, InputFormat, MatrixFormat};
@@ -105,6 +105,19 @@ pub struct ConvertOptions {
     /// Columns per CSC shard when a CSC sidecar is emitted. `0` disables the
     /// cap (single CSC shard, memory permitting).
     pub csc_cols_per_shard: usize,
+    /// Experimental (F5): row-group-frame each shard into groups of at most this
+    /// many rows, emitting a v4 file / v2 shards with a multi-entry `BlockIndex`
+    /// for codec-agnostic sub-shard random access. `None` (default) writes the
+    /// ordinary unframed (v3) layout. Works for any codec (None/ShufDeltaZstd/
+    /// Zstd/Lz4/Pcodec).
+    pub row_group_rows: Option<u32>,
+    /// Byte/nnz-aware group cap (F5 §4.3): additionally close a row-group once it
+    /// reaches this many non-zeros. `None` = row-count-only grouping. Ignored
+    /// unless `row_group_rows` is set.
+    pub row_group_target_nnz: Option<u64>,
+    /// Trial-encode (`--codec compact-trial`): per framed shard, keep the smaller
+    /// of {heuristic codec, ShufDeltaZstd}. Ignored unless `row_group_rows` is set.
+    pub codec_trial: bool,
     /// Tool name recorded in the provenance entry. Defaults to
     /// `"scx"`; `pyscx` overrides this to `"pyscx"` so the
     /// recorded provenance reflects the actual caller.
@@ -217,6 +230,13 @@ pub struct ConvertOptions {
     /// (the grouped random-row gather over a dense matrix reads full rows and
     /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
     pub group_pass: GroupPass,
+    /// Two-layer cost model: under `--codec compact-trial`, keep a
+    /// Scx1-friendly (integer, low-median) shard **unframed with its
+    /// `DecodeSidecar`** — preserving the FOR-BP/Rice GPU device-decode +
+    /// bit-level per-row fast path — instead of framing it, even at a size cost.
+    /// Also implied by `index_preset == "training"` (the accel-oriented preset).
+    /// Ignored unless `codec_trial` is set.
+    pub keep_gpu_sidecar: bool,
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -375,6 +395,23 @@ pub use scx_format_io::BitmapPolicy;
 /// `scx-convert` get the CSC policy type without an explicit `scx-format` dep.
 pub use scx_format_io::CscPolicy;
 
+impl ConvertOptions {
+    /// Build the row-group [`FramingConfig`] for the shard emitters, or `None`
+    /// for the unframed (v3) layout. Framing is active iff `row_group_rows` is set.
+    pub fn framing(&self) -> Option<scx_format_io::FramingConfig> {
+        self.row_group_rows.map(|g| scx_format_io::FramingConfig {
+            row_group_rows: g,
+            target_nnz: self.row_group_target_nnz,
+            trial: self.codec_trial,
+            // The GPU/per-row-preserving cost model engages under compact-trial
+            // when explicitly requested or when the accel-oriented `training`
+            // index preset signals GPU-dominant access.
+            prefer_gpu_sidecar: self.keep_gpu_sidecar
+                || self.index_preset.as_deref() == Some("training"),
+        })
+    }
+}
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         ConvertOptions {
@@ -382,6 +419,9 @@ impl Default for ConvertOptions {
             codec: None,
             csc: CscPolicy::Off,
             csc_cols_per_shard: 5000,
+            row_group_rows: None,
+            row_group_target_nnz: None,
+            codec_trial: false,
             tool: "scx".into(),
             memory_budget: None,
             stream: true,
@@ -404,6 +444,7 @@ impl Default for ConvertOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_pass: GroupPass::default(),
+            keep_gpu_sidecar: false,
         }
     }
 }
@@ -753,7 +794,7 @@ pub fn h5ad_to_scx(
     let index_dtype: u8 = index_dtype_for(n_vars as u64);
 
     // Build header
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         n_vars as u64,
         nnz,
@@ -761,8 +802,15 @@ pub fn h5ad_to_scx(
         codec_id as u8,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
+    // F5-b: frame CSC sidecars / layers / obsp shards written through this writer
+    // (CSR X shards frame via encode_one_shard). No-op unless framing is on.
+    writer.set_framing(opts.framing());
 
     // Write obs/var
     let obs = read_dataframe_group(&file, "obs", sink)?;
@@ -783,6 +831,7 @@ pub fn h5ad_to_scx(
         index_dtype,
         opts.bitmap,
         ModalityType::Rna,
+        opts.framing(),
         sink,
     )?;
 
@@ -799,6 +848,7 @@ pub fn h5ad_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.framing(),
         )?;
     }
 
@@ -956,7 +1006,7 @@ pub fn tenx_to_scx(
         detect_value_encoding(&tenx.data, opts.codec).map_err(ScxError::from)?;
     let index_dtype: u8 = index_dtype_for(tenx.n_genes as u64);
 
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         tenx.n_cells as u64,
         tenx.n_genes as u64,
         nnz,
@@ -964,8 +1014,15 @@ pub fn tenx_to_scx(
         codec_id as u8,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
+    // F5-b: frame CSC sidecars / layers / obsp shards written through this writer
+    // (CSR X shards frame via encode_one_shard). No-op unless framing is on.
+    writer.set_framing(opts.framing());
     writer.write_obs(&tenx.obs)?;
     writer.write_var(&tenx.var)?;
 
@@ -981,6 +1038,7 @@ pub fn tenx_to_scx(
         index_dtype,
         opts.bitmap,
         ModalityType::Rna,
+        opts.framing(),
         sink,
     )?;
 
@@ -999,6 +1057,7 @@ pub fn tenx_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.framing(),
         )?;
     }
 
@@ -1245,7 +1304,7 @@ pub fn h5ad_to_scx_streaming(
     // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
     // `codec_id` are overwritten by `ScxWriter::finish()` from
     // running accumulators (see scx-format/src/writer.rs).
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         n_vars as u64,
         0,
@@ -1253,8 +1312,15 @@ pub fn h5ad_to_scx_streaming(
         0,
         index_dtype,
     );
+    // F5 Phase 1: row-group framing produces a v4 file (its shards are v2).
+    if opts.row_group_rows.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
+    // F5-b: frame CSC sidecars / layers / obsp shards written through this writer
+    // (CSR X shards frame via encode_one_shard). No-op unless framing is on.
+    writer.set_framing(opts.framing());
 
     // obs / var. Override-or-disk per section: any `Some(...)` field
     // wins over the on-disk read so the backed-AnnData routing path
@@ -1687,7 +1753,9 @@ pub fn h5ad_to_scx_streaming(
     // output size for the duration of the rebuild (writes to a
     // sibling `.rebuild_csc.tmp` and renames).
     if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
-        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+        // Pass framing so `--csc <policy> --row-group-rows N` produces a framed
+        // CSC sidecar (and keeps X framed) instead of silently downgrading to v3.
+        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
 
@@ -1772,7 +1840,7 @@ fn convert_then_sort_grouped(
         let (n_obs, n_vars) = (reader.n_obs(), reader.n_vars());
         drop(reader);
         if opts.csc.should_build_csc(n_obs, n_vars) {
-            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
                 .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
         }
     }
@@ -1835,6 +1903,7 @@ pub fn streaming_writer_coordinator(
             section_type,
             modality_type,
             format!("{section_name_prefix}_{shard_idx}"),
+            opts.framing(),
         )?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;
@@ -1966,6 +2035,7 @@ fn streaming_writer_coordinator_parallel(
     let source_name: String = reader.source_matrix_name().to_string();
     let opts_codec = opts.codec;
     let opts_bitmap = opts.bitmap;
+    let opts_framing = opts.framing();
     let want_bitmap = section_type == SectionType::CsrShard;
     let name_prefix = section_name_prefix.to_string();
 
@@ -2045,6 +2115,7 @@ fn streaming_writer_coordinator_parallel(
                         name,
                         opts_bitmap,
                         want_bitmap,
+                        opts_framing,
                     );
                     let wrapped = result.map_err(|inner| ConvertError::ShardRead {
                         row_start,
@@ -2152,6 +2223,7 @@ fn encode_one_shard_worker(
     name: String,
     bitmap_policy: BitmapPolicy,
     want_bitmap: bool,
+    framing: Option<FramingConfig>,
 ) -> Result<EncodedShardOutput, ConvertError> {
     let mut shard = reader.read_range(row_start, n_rows)?;
     let duplicates_merged = shard.duplicates_merged;
@@ -2168,6 +2240,7 @@ fn encode_one_shard_worker(
         section_type,
         modality_type,
         name,
+        framing,
     )?;
     let encoded_csr_size = pre.section_length as usize;
 
@@ -2459,6 +2532,7 @@ fn streaming_writer_coordinator_ranges(
             format!("{section_name_prefix}_{shard_idx}"),
             opts.bitmap,
             want_bitmap,
+            opts.framing(),
         )?;
         if out.duplicates_merged > 0 {
             sink.emit(ConvertWarning::DuplicateCoordinatesMerged {
@@ -2512,6 +2586,7 @@ fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Wrap the canonical in-memory CSR as a single ScxCsr "shard"
     // for the transpose iterator so the optional CSC sidecar mirrors
@@ -2559,6 +2634,7 @@ fn write_csc_shards_from_csr(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
+        framing,
     )?;
     Ok(())
 }
@@ -2576,6 +2652,7 @@ fn write_csr_shards(
     index_dtype: u8,
     bitmap_policy: BitmapPolicy,
     modality_type: ModalityType,
+    framing: Option<FramingConfig>,
     sink: &mut WarningSink,
 ) -> Result<Vec<(u64, u64)>, ConvertError> {
     let n_vars_u32 = u32::try_from(n_vars)
@@ -2622,6 +2699,7 @@ fn write_csr_shards(
             SectionType::CsrShard,
             modality_type,
             format!("X_shard_{shard_idx}"),
+            framing,
         )?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;

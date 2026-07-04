@@ -293,6 +293,7 @@ pub(crate) fn deep_validate_into(
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
     sort_by=None, reverse=false,
+    row_group_rows=None, row_group_target_nnz=None, keep_gpu_sidecar=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -314,6 +315,9 @@ fn from_anndata(
     force_legacy_metadata: bool,
     sort_by: Option<Vec<String>>,
     reverse: bool,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
+    keep_gpu_sidecar: bool,
 ) -> PyResult<()> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
@@ -336,6 +340,9 @@ fn from_anndata(
         force_legacy_metadata,
         sort_by.unwrap_or_default(),
         reverse,
+        row_group_rows,
+        row_group_target_nnz,
+        keep_gpu_sidecar,
     )
 }
 
@@ -560,6 +567,9 @@ fn from_h5ad(
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
+        row_group_rows: None,
+        row_group_target_nnz: None,
+        codec_trial: false,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
         stream,
@@ -582,6 +592,9 @@ fn from_h5ad(
         group_target_bytes: group_target_bytes_val,
         group_max_bytes: group_max_bytes_val,
         group_pass: group_pass_val,
+        // `from_h5ad` does not yet expose framing kwargs (a trivial follow-on);
+        // the GPU/sidecar cost model still engages via a `training` index preset.
+        keep_gpu_sidecar: false,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -674,6 +687,9 @@ fn from_10x(
         force_legacy_metadata,
         Vec::new(), // sort_by (not exposed on the 10x reader)
         false,      // sort_reverse
+        None,       // row_group_rows (framing not exposed on the 10x reader)
+        None,       // row_group_target_nnz
+        false,      // keep_gpu_sidecar
     )
 }
 

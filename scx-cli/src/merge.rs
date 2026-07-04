@@ -118,7 +118,7 @@ pub fn run_merge(
 
     // Re-emit the CSC sidecar against the merged output.
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

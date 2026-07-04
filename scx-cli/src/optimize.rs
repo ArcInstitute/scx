@@ -7,33 +7,61 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::format::human_size;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_optimize(
     input: &Path,
     output: &Path,
     force: bool,
     codec: &str,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
+    keep_gpu_sidecar: bool,
     shard_obs: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
     }
     // Explicit allow-set rather than `CodecId::parse_cli` (which also accepts
-    // none/zstd/lz4/pcodec): every codec other than Scx1 drops the decode
-    // sidecar, defeating the point of `optimize`. `auto` → None (auto-codec,
-    // Scx1 for low-median integer shards), `scx1` → force Scx1 on every integer
-    // shard. clap's `value_parser` already restricts the surface to these two;
-    // this match is the in-function source of truth (and guards direct callers).
-    let codec_id = match codec {
-        "auto" => None,
-        "scx1" => Some(scx_codec::CodecId::Scx1),
+    // none/zstd/lz4/pcodec): those drop the decode sidecar, defeating the point
+    // of the unframed `optimize`. `auto` → None (auto-codec, Scx1 for low-median
+    // integer shards), `scx1` → force Scx1 on every integer shard. The framed
+    // codecs (`shufdelta` / `compact-trial`) instead trade the sidecar for the
+    // block-index random-access layout and require `--row-group-rows`. clap's
+    // `value_parser` restricts the surface; this match is the in-function source
+    // of truth (and guards direct callers).
+    let (codec_id, codec_trial) = match codec {
+        "auto" => (None, false),
+        "scx1" => (Some(scx_codec::CodecId::Scx1), false),
+        "shufdelta" => (Some(scx_codec::CodecId::ShufDeltaZstd), false),
+        // `compact-trial` is a framing *profile*, not a codec: per shard, keep
+        // the smaller of {heuristic winner, ShufDeltaZstd}.
+        "compact-trial" => (None, true),
         other => {
             return Err(format!(
                 "--codec {other:?} is not supported by optimize \
-                 (only `auto` or `scx1`; other codecs drop decode sidecars)"
+                 (`auto` | `scx1` | `shufdelta` | `compact-trial`)"
             )
             .into())
         }
     };
+
+    // The framed codecs only make sense with row-group framing on.
+    if (codec_trial || codec_id == Some(scx_codec::CodecId::ShufDeltaZstd))
+        && row_group_rows.is_none()
+    {
+        return Err(format!(
+            "`--codec {codec}` requires `--row-group-rows N` (row-group-framed output)"
+        )
+        .into());
+    }
+    let framing = row_group_rows.map(|g| scx_format_io::FramingConfig {
+        row_group_rows: g,
+        target_nnz: row_group_target_nnz,
+        trial: codec_trial,
+        // Two-layer cost model: keep Scx1-friendly shards unframed with
+        // their GPU/per-row sidecar under compact-trial when requested.
+        prefer_gpu_sidecar: keep_gpu_sidecar,
+    });
     // Allow an explicit in-place upgrade (`--output` == input): `ScxWriter`
     // writes a sibling tempfile and atomically renames over the target on
     // `finish()`, so the input is read in full before it is replaced. Only
@@ -59,16 +87,32 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    scx_ops::optimize(input, output, codec_id, obs_shard_policy)?;
+    let stats = scx_ops::optimize_with_framing(input, output, codec_id, obs_shard_policy, framing)?;
 
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();
+    // Framed runs report the row-group layout + per-shard ShufDeltaZstd adoption;
+    // unframed runs keep the historical "decode sidecars added" phrasing.
+    let detail = if stats.shards_framed > 0 || stats.unframed_scx1_gpu > 0 {
+        format!(
+            "row-group-framed {}/{} shards ({} stored as ShufDeltaZstd, \
+             {} kept unframed Scx1 for GPU/per-row)",
+            stats.shards_framed,
+            stats.shards_total,
+            stats.shards_shufdelta,
+            stats.unframed_scx1_gpu,
+        )
+    } else {
+        "decode sidecars added where applicable".to_string()
+    };
     println!(
-        "Optimized {} → {} ({} → {}); decode sidecars added where applicable, format_version=3",
+        "Optimized {} → {} ({} → {}); {}, format_version={}",
         input.display(),
         output.display(),
         human_size(before_size),
         human_size(after_size),
+        detail,
+        stats.format_version,
     );
     println!("  Verify with: scx validate --deep {}", output.display());
     Ok(())

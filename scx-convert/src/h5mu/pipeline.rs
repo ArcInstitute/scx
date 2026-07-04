@@ -967,6 +967,7 @@ fn write_modality_csc_shards_from_csr(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         Some(modality_id),
+        None, // framing: multimodal CSC is unframed (no row-group threading yet)
     )?;
     Ok(())
 }

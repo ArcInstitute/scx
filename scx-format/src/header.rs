@@ -26,7 +26,23 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 /// v3 adds the canonical CSR invariant for newly written CSR-like shards
 /// and permits `DecodeMetadataShard` sections that index Scx1 shard
 /// payloads for direct device/random-access decode.
-pub const CURRENT_FORMAT_VERSION: u16 = 3;
+///
+/// v4 permits **row-group-framed** sparse shards (multi-entry `BlockIndex`
+/// with real per-group byte offsets + `shard_format_version == 2`) for
+/// codec-agnostic sub-shard random access (SIDECAR-LONG-TERM-FIX.md Option B).
+/// This is the **max readable** version. Writers stamp v4 **only** when they
+/// actually emit a framed shard; unframed output stays [`DEFAULT_WRITE_FORMAT_VERSION`]
+/// so it keeps reading on older builds. A v3 build rejects a v4 file via the
+/// `format_version > CURRENT_FORMAT_VERSION` gate.
+pub const CURRENT_FORMAT_VERSION: u16 = 4;
+
+/// Version stamped on ordinary (non-row-group-framed) output.
+///
+/// Kept at 3 while [`CURRENT_FORMAT_VERSION`] is 4 so that the common write
+/// path (`FileHeader::default` / `new_single_modality`, and SCX→SCX rewrites)
+/// stays readable by v3 builds. Only the explicit framing path bumps the file
+/// to `CURRENT_FORMAT_VERSION`.
+pub const DEFAULT_WRITE_FORMAT_VERSION: u16 = 3;
 
 /// Output `format_version` for an SCX→SCX operation that copies or
 /// re-encodes source shards **without** re-canonicalizing them
@@ -41,12 +57,15 @@ pub const CURRENT_FORMAT_VERSION: u16 = 3;
 /// `min(sources)` clamped into `[feature_floor, CURRENT_FORMAT_VERSION]`.
 /// An empty `source_versions` (no SCX source) yields `CURRENT_FORMAT_VERSION`.
 pub fn rewrite_output_format_version(source_versions: &[u16], feature_floor: u16) -> u16 {
+    // Rewrites do not row-group-frame (Phase 1), so the ceiling/default is the
+    // unframed default version, not CURRENT_FORMAT_VERSION — otherwise a
+    // no-SCX-source rewrite would falsely claim the v4 framed layout.
     let min_source = source_versions
         .iter()
         .copied()
         .min()
-        .unwrap_or(CURRENT_FORMAT_VERSION);
-    min_source.clamp(feature_floor, CURRENT_FORMAT_VERSION)
+        .unwrap_or(DEFAULT_WRITE_FORMAT_VERSION);
+    min_source.clamp(feature_floor, DEFAULT_WRITE_FORMAT_VERSION)
 }
 
 /// Bitmask of currently-defined flag bits. Reserved bits (4 and 9..=31)
@@ -136,7 +155,7 @@ pub struct FileHeader {
 
 impl Default for FileHeader {
     /// The canonical zero-state header: correct `magic`, `header_length`,
-    /// `format_version = CURRENT_FORMAT_VERSION`, little-endian, and every
+    /// `format_version = DEFAULT_WRITE_FORMAT_VERSION`, little-endian, and every
     /// content/offset/modality field zeroed (`reserved = [0u8; 112]`).
     ///
     /// This is the single source of truth for the boilerplate that every
@@ -150,7 +169,8 @@ impl Default for FileHeader {
     fn default() -> Self {
         FileHeader {
             magic: MAGIC,
-            format_version: CURRENT_FORMAT_VERSION,
+            // Unframed default; the framing path bumps this to CURRENT_FORMAT_VERSION.
+            format_version: DEFAULT_WRITE_FORMAT_VERSION,
             header_length: HEADER_SIZE as u16,
             flags: 0,
             n_obs: 0,
@@ -182,7 +202,7 @@ impl Default for FileHeader {
 
 impl FileHeader {
     /// Construct a single-modality header for a freshly written file
-    /// (`format_version = CURRENT_FORMAT_VERSION`, `flags = 0`,
+    /// (`format_version = DEFAULT_WRITE_FORMAT_VERSION`, `flags = 0`,
     /// `manifest_sequence = 1`, no modality table). Shard counts and catalog
     /// offsets stay `0` — `ScxWriter::finish` fills them in. Callers that need
     /// a different `format_version` (e.g. a passthrough rewrite via
@@ -848,15 +868,16 @@ mod tests {
         assert_eq!(rewrite_output_format_version(&[1], 1), 1);
         // Feature floor lifts the result (multimodal needs >= 2).
         assert_eq!(rewrite_output_format_version(&[1], 2), 2);
-        // Never exceeds CURRENT.
+        // Never exceeds the unframed default (rewrites don't row-group-frame, so
+        // they never claim the v4 framed layout even from a v4 source).
         assert_eq!(
             rewrite_output_format_version(&[CURRENT_FORMAT_VERSION + 5], 1),
-            CURRENT_FORMAT_VERSION
+            DEFAULT_WRITE_FORMAT_VERSION
         );
-        // No SCX source → CURRENT.
+        // No SCX source → the unframed default.
         assert_eq!(
             rewrite_output_format_version(&[], 1),
-            CURRENT_FORMAT_VERSION
+            DEFAULT_WRITE_FORMAT_VERSION
         );
     }
 

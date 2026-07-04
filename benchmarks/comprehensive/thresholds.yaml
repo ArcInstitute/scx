@@ -917,8 +917,9 @@ absolute_floors:
   # --- roundtrip codec parity ----------------------------------------
   # Catches silent value corruption in any of the SCX codecs: scx_auto
   # (auto-selector), scx_none (raw LE), scx_scx1 (Delta-Golomb-Rice /
-  # FOR-BP / Rice), scx_zstd, scx_lz4 (byte-shuffle + LZ4), and
-  # scx_pcodec. correctness.py does NOT cover this — every check there
+  # FOR-BP / Rice), scx_zstd, scx_lz4 (byte-shuffle + LZ4), scx_pcodec,
+  # and scx_shufdelta (byte-shuffle + byte-delta + zstd, F5).
+  # correctness.py does NOT cover this — every check there
   # writes and reads through the same codec, so a symmetric corruption
   # (encode-then-decode that loses bits identically) goes undetected.
   #
@@ -933,7 +934,7 @@ absolute_floors:
   # codecs, and would need a non-zero tolerance once a future lossy
   # variant lands.
   #
-  # Coverage scope: pbmc3k + tabula_sapiens_100k for all 6 SCX
+  # Coverage scope: pbmc3k + tabula_sapiens_100k for all 8 SCX
   # variants. The benchmark still RUNS on whatever larger datasets the
   # launcher passes (rows appear in the summary), but isn't floor-gated
   # there — codec contracts are dataset-independent and these two
@@ -1005,6 +1006,26 @@ absolute_floors:
     metric: n_value_mismatches
     max: 0
   - benchmark: roundtrip
+    format: scx_shufdelta
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_shufdelta
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: pbmc3k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: pbmc3k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: overall_passed_int
@@ -1061,6 +1082,26 @@ absolute_floors:
     min: 1
   - benchmark: roundtrip
     format: scx_pcodec
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_shufdelta
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_shufdelta
+    dataset: tabula_sapiens_100k
+    metric: n_value_mismatches
+    max: 0
+  - benchmark: roundtrip
+    format: scx_compact_trial
+    dataset: tabula_sapiens_100k
+    metric: overall_passed_int
+    min: 1
+  - benchmark: roundtrip
+    format: scx_compact_trial
     dataset: tabula_sapiens_100k
     metric: n_value_mismatches
     max: 0

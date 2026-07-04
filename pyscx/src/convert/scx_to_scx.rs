@@ -88,11 +88,20 @@ pub(crate) fn route_scx_backed_to_scx(
     let no_deletions = backed.kept_to_global.is_none();
     let no_projection = backed.col_projection().is_none();
     let single_modality_source = modality_id.is_none();
+    // A v4 source may hold row-group-framed (v2) shards or, under the compact-trial
+    // cost model, unframed-Scx1-with-sidecar (v1) shards plus separate
+    // DecodeMetadataShard sidecar sections. The verbatim copy path
+    // (`copy_section_verbatim`) hardcodes `has_sidecar = false` and iterates only
+    // CSR entries, so it would abort on a v1+sidecar shard and drop the sidecar
+    // sections. Force v4 sources down the decode-encode path (self-consistent
+    // output; framing/sidecar preservation through passthrough is a follow-on).
+    let source_unframed = src_header.format_version <= scx_format_io::DEFAULT_WRITE_FORMAT_VERSION;
     let passthrough_ok = target_codec_for_passthrough
         && target_shard_rows_matches
         && no_deletions
         && no_projection
-        && single_modality_source;
+        && single_modality_source
+        && source_unframed;
 
     // Output header / writer setup. For passthrough, mirror the
     // source's codec / shard_target_rows / index_dtype so the
@@ -220,6 +229,7 @@ pub(crate) fn route_scx_backed_to_scx(
                         SectionType::CsrShard,
                         ModalityType::Rna,
                         format!("X_shard_{i}"),
+                        None,
                     )
                 })
                 .map_err(to_pyerr)
@@ -319,8 +329,13 @@ pub(crate) fn route_scx_backed_to_scx(
     // Optional CSC sidecar rebuild over the just-written file.
     if csc_build {
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
-                .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+                None,
+            )
+            .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }
@@ -373,7 +388,8 @@ pub(crate) fn route_scx_lazy_to_scx(
     let src_codec: Option<CodecId> = src_header_meta.and_then(|(c, _)| c);
     let src_format_version: u16 = src_header_meta
         .map(|(_, v)| v)
-        .unwrap_or(scx_format_io::CURRENT_FORMAT_VERSION);
+        // Unframed rewrite fallback: the default (v3), not the max-readable v4.
+        .unwrap_or(scx_format_io::DEFAULT_WRITE_FORMAT_VERSION);
     let out_codec = explicit_codec.or(src_codec).unwrap_or(CodecId::Zstd);
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
     let n_vars_u32 = u32::try_from(n_vars)
@@ -430,6 +446,7 @@ pub(crate) fn route_scx_lazy_to_scx(
                     SectionType::CsrShard,
                     ModalityType::Rna,
                     format!("X_shard_{i}"),
+                    None,
                 )
             })
             .map_err(to_pyerr)
@@ -546,8 +563,13 @@ pub(crate) fn route_scx_lazy_to_scx(
 
     if csc_build {
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
-                .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+                None,
+            )
+            .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }
@@ -651,6 +673,7 @@ pub(crate) fn stream_write_layers(
                         SectionType::LayerCsrShard,
                         ModalityType::Rna,
                         format!("{layer_name}_shard_{i}"),
+                        None,
                     )
                 })
                 .map_err(to_pyerr)

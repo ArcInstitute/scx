@@ -159,6 +159,14 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_pcodec.scx"
 
     @property
+    def scx_shufdelta_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_shufdelta.scx"
+
+    @property
+    def scx_compact_trial_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial.scx"
+
+    @property
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
 
@@ -241,6 +249,8 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_none": "scx_none_path",
     "scx_lz4": "scx_lz4_path",
     "scx_pcodec": "scx_pcodec_path",
+    "scx_shufdelta": "scx_shufdelta_path",
+    "scx_compact_trial": "scx_compact_trial_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
@@ -364,6 +374,8 @@ _FORMAT_KEY_TO_CLOUD_SUFFIX: dict[str, str] = {
     "scx_none": ".scxd",
     "scx_lz4": ".scxd",
     "scx_pcodec": ".scxd",
+    "scx_shufdelta": ".scxd",
+    "scx_compact_trial": ".scxd",
     "zarr_zstd": ".zarr",
     # zarr_lz4 uses a codec-qualified suffix so it doesn't collide with
     # zarr_zstd on the shared `{dataset}.zarr/` cloud path — ``ensure_cloud_fixture``
@@ -642,6 +654,10 @@ PRIMARY_FORMATS: list[FormatVariant] = [
                   {"codec": "lz4"}),
     FormatVariant("SCX (pcodec)", "scx_pcodec", "primary", "scx_runner",
                   {"codec": "pcodec"}),
+    FormatVariant("SCX (shufdelta)", "scx_shufdelta", "primary", "scx_runner",
+                  {"codec": "shufdelta"}),
+    FormatVariant("SCX (compact-trial)", "scx_compact_trial", "primary", "scx_runner",
+                  {"codec": "compact-trial", "row_group_rows": 512}),
     FormatVariant("SLAF", "slaf", "primary", "slaf_runner"),
     FormatVariant("Shardad", "shardad", "primary", "shardad_runner"),
 ]
@@ -1120,12 +1136,14 @@ def estimate_memory_gb(
         # streams. CITE-seq peaks at ~590 MB, Multiome at ~5 GB host RSS
         # in the empirical SLURM run; size like ml_loader's sparse path.
         peak_mb = max(base_mb * 2, dense_mb * 0.5)
-    elif benchmark == "grouped_read":
-        # Cross-format grouped write + per-perturbation read_group. The scx arm
-        # streams; the shardad arm materializes each read group (and reads the
-        # source on grouped write). Size like read_full's sparse path so the
-        # shardad materialization has headroom.
-        peak_mb = max(base_mb, dense_mb * 0.5)
+    elif benchmark in ("grouped_read", "grouped_sort"):
+        # Grouped write + per-perturbation reads. The dominant buffer is the
+        # single reference shard held in memory during encode: a large reference
+        # group (e.g. chemogenetic_rgfp's 127,705 `non-targeting` cells at
+        # ~6,700 nnz/cell ≈ 7 GB CSR) plus the one-pass gather source buffers and
+        # (shardad) in-memory materialization. `dense_mb*0.5` under-sized RGFP
+        # (24 GB → OOM); size to the sparse footprint with generous headroom.
+        peak_mb = max(base_mb * 2, dense_mb * 1.5, 48 * 1024)
     else:
         peak_mb = base_mb
 

@@ -998,8 +998,9 @@ fn parse_codec_r(codec: Option<&str>) -> Result<Option<scx_codec::CodecId>> {
         Some("zstd") => Ok(Some(CodecId::Zstd)),
         Some("lz4") => Ok(Some(CodecId::Lz4Shuffle)),
         Some("pcodec") => Ok(Some(CodecId::Pcodec)),
+        Some("shufdelta") => Ok(Some(CodecId::ShufDeltaZstd)),
         Some(other) => Err(Error::Other(format!(
-            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', or 'pcodec'.",
+            "Unknown codec: '{}'. Use 'auto', 'none', 'scx1', 'zstd', 'lz4', 'pcodec', or 'shufdelta'.",
             other
         ))),
     }
@@ -1168,6 +1169,7 @@ fn write_csc_shards_from_csr_r(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
+        None, // framing: rscx CSC is unframed (no row-group kwarg)
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
 }

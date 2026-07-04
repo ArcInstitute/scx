@@ -284,6 +284,7 @@ fn preencoded_scx1_shard_emits_valid_decode_sidecar() {
         SectionType::CsrShard,
         ModalityType::Rna,
         "X_shard_0".to_string(),
+        None,
     )
     .unwrap();
     assert!(
@@ -511,7 +512,11 @@ fn test_minimal_file_header_and_alignment() {
     let hdr = FileHeader::read_from(&mut cursor).unwrap();
 
     assert_eq!(hdr.magic, crate::header::MAGIC);
-    assert_eq!(hdr.format_version, crate::header::CURRENT_FORMAT_VERSION);
+    // Unframed writes stamp the default (v3), not the max-readable CURRENT (v4).
+    assert_eq!(
+        hdr.format_version,
+        crate::header::DEFAULT_WRITE_FORMAT_VERSION
+    );
     assert_eq!(hdr.n_csr_shards, 1);
     assert_eq!(hdr.root_catalog_offset, HEADER_SIZE as u64);
     assert!(hdr.full_catalog_offset >= SECTIONS_START_OFFSET);
@@ -1150,6 +1155,340 @@ fn test_csc_shard_write_read() {
             entry.offset
         );
     }
+}
+
+/// A CSC sidecar written with framing on is emitted
+/// row-group-framed (shard v2) and full-decodes byte-identically to its input.
+#[test]
+fn test_csc_shard_framed_round_trip() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_csc.scx");
+    let mut header = sample_header();
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION; // v4 (framed)
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 1, // ≥2 gene-groups over the fixture → framing exercised
+        target_nnz: None,
+        trial: false,
+        prefer_gpu_sidecar: false,
+    }));
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csc_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = ScxReader::open(&final_path).unwrap();
+    // The CSC shard must carry the framed (v2) layout.
+    let entry = reader.catalog().csc_shards_sorted()[0];
+    let sh = reader.read_shard_header(entry).unwrap();
+    assert_eq!(
+        sh.shard_format_version,
+        crate::shard::CURRENT_SHARD_FORMAT_VERSION,
+        "framed CSC shard must be v2",
+    );
+    // …and full-decode byte-identically to the input.
+    let csc = reader.read_csc_shard(0).unwrap();
+    let exp_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+    let exp_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+    let exp_data: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+    assert_eq!(csc.indptr, exp_indptr);
+    assert_eq!(csc.indices, exp_indices);
+    assert_eq!(csc.data, exp_data);
+}
+
+/// Item 2 (scattered CSC reader): a gene-subset `read_csc_columns` over a
+/// row-group-framed CSC file decodes only the touched column-groups via the
+/// block index and is byte-identical to a full-shard decode + `col_slice`.
+#[test]
+fn read_csc_columns_scattered_matches_full_decode() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_csc_scatter.scx");
+    let mut header = sample_header();
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 1, // one column-group per gene → framing fully exercised
+        target_nnz: None,
+        trial: false,
+        prefer_gpu_sidecar: false,
+    }));
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data(); // 3 columns
+    writer
+        .write_csc_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = ScxReader::open(&final_path).unwrap();
+    // Ground truth: whole-shard decode (no scatter), then column-slice.
+    let full = reader.read_csc_shard(0).unwrap();
+    let n_cols = full.n_cols();
+    for lo in 0..n_cols {
+        for hi in (lo + 1)..=n_cols {
+            let sub = reader.read_csc_columns(lo as u32..hi as u32).unwrap(); // framed → scattered
+            let expected = full.col_slice(lo, hi).unwrap();
+            assert_eq!(sub.indptr, expected.indptr, "indptr {lo}..{hi}");
+            assert_eq!(sub.indices, expected.indices, "indices {lo}..{hi}");
+            assert_eq!(sub.data, expected.data, "data {lo}..{hi}");
+        }
+    }
+}
+
+/// `decode_block_index_row_runs` must return an error (not panic) when a
+/// requested run exceeds the shard's `n_major`. Callers build runs from
+/// `ShardStats` ranges that aren't otherwise validated against the header, and
+/// an out-of-range run would index past the decoded group CSR.
+#[test]
+fn decode_block_index_row_runs_rejects_out_of_range_run() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_oob.scx");
+    let mut header = sample_header();
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 1,
+        target_nnz: None,
+        trial: false,
+        prefer_gpu_sidecar: false,
+    }));
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    let n_major = indptr.len() - 1;
+    writer
+        .write_csc_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = ScxReader::open(&final_path).unwrap();
+    let entry = reader.catalog().csc_shards_sorted()[0].clone();
+    // A run that starts in range but extends past n_major must Err, not panic.
+    let err = reader
+        .decode_block_index_row_runs(&entry, &[(0, n_major + 5)])
+        .unwrap_err();
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "out-of-range run must yield InvalidCatalog, got {err:?}"
+    );
+    // A valid full-cover run still succeeds.
+    assert!(reader
+        .decode_block_index_row_runs(&entry, &[(0, n_major)])
+        .unwrap()
+        .is_some());
+}
+
+/// A tiny canonical CSR fixture (2 rows, nnz=3, 3 vars) for the T3.1 guard tests.
+fn tiny_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+    (vec![0u64, 2, 3], vec![0u32, 2, 1], vec![1.0f32, 2.0, 3.0])
+}
+
+/// A larger low-count integer CSR whose Scx1 decode sidecar comfortably fits the
+/// overhead budget (mirrors the optimize sidecar fixtures) — used for the
+/// "v1-Scx1-with-sidecar is allowed in v4" case of the refined guard.
+fn dense_scx1_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>, u32) {
+    let (n_obs, nnz_per_row, n_vars) = (40usize, 512usize, 200_000u32);
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for r in 0..n_obs {
+        let mut col = 0u32;
+        for k in 0..nnz_per_row {
+            col += 1 + ((r * 13 + k * 7) % 250) as u32;
+            indices.push(col);
+            values.push(1.0f32 + ((r + k) % 5) as f32);
+        }
+        indptr.push(indices.len() as u64);
+    }
+    (indptr, indices, values, n_vars)
+}
+
+/// T3.1 guard, refined for the §4.3 two-layer model: a v4 file must not contain a
+/// **random-access-incapable** v1 shard (unframed AND sidecar-less), but a v1
+/// Scx1 shard **with** a decode sidecar is a valid v4 member (per-row/GPU layer).
+/// Framed (v2) shards are always fine; a v3 file accepts plain unframed shards.
+#[test]
+fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let v4 = || {
+        let mut h = sample_header();
+        h.format_version = crate::header::CURRENT_FORMAT_VERSION;
+        h
+    };
+    let write = |name: &str, header: FileHeader, pre: PreEncodedSection| {
+        let mut w = ScxWriter::new(dir.path().join(name), header).unwrap();
+        w.write_obs(&sample_obs()).unwrap();
+        w.write_var(&sample_var()).unwrap();
+        let r = w.write_preencoded_shard(pre);
+        (w, r)
+    };
+    let (indptr, indices, values) = tiny_csr();
+
+    // (1) Unframed, sidecar-less (explicit Zstd) v1 shard → rejected in v4.
+    let zstd_unframed = crate::encoder::encode_one_shard(
+        &indptr,
+        &indices,
+        &values,
+        Some(CodecId::Zstd),
+        0,
+        3,
+        0,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X_shard_0".to_string(),
+        None,
+    )
+    .unwrap();
+    assert!(zstd_unframed.decode_sidecar.is_none());
+    let (_w, res) = write("v4_reject.scx", v4(), zstd_unframed);
+    let err = res.unwrap_err();
+    assert!(
+        matches!(&err, ScxError::Io(e) if e.to_string().contains("random access")),
+        "sidecar-less v1 in v4 must be rejected, got {err:?}",
+    );
+
+    // (2) Unframed Scx1 WITH a sidecar → allowed in v4 (the two-layer case).
+    let (dptr, dix, dv, nv) = dense_scx1_csr();
+    let scx1_unframed = crate::encoder::encode_one_shard(
+        &dptr,
+        &dix,
+        &dv,
+        Some(CodecId::Scx1),
+        1,
+        nv,
+        0,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X_shard_0".to_string(),
+        None,
+    )
+    .unwrap();
+    assert!(
+        scx1_unframed.decode_sidecar.is_some(),
+        "fixture must yield a within-budget Scx1 sidecar",
+    );
+    let (mut w, res) = write("v4_scx1_sidecar.scx", v4(), scx1_unframed);
+    res.unwrap();
+    w.finish().unwrap();
+
+    // (3) Framed shard → allowed in v4.
+    let framed = crate::encoder::encode_one_shard(
+        &indptr,
+        &indices,
+        &values,
+        None,
+        0,
+        3,
+        0,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X_shard_0".to_string(),
+        Some(crate::encoder::FramingConfig {
+            row_group_rows: 1,
+            target_nnz: None,
+            trial: false,
+            prefer_gpu_sidecar: false,
+        }),
+    )
+    .unwrap();
+    let (mut w, res) = write("v4_framed.scx", v4(), framed);
+    res.unwrap();
+    w.finish().unwrap();
+
+    // (4) Unframed shard into a v3 file → accepted (the ordinary path).
+    let plain = crate::encoder::encode_one_shard(
+        &indptr,
+        &indices,
+        &values,
+        Some(CodecId::Zstd),
+        0,
+        3,
+        0,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X_shard_0".to_string(),
+        None,
+    )
+    .unwrap();
+    let (mut w, res) = write("v3.scx", sample_header(), plain);
+    res.unwrap();
+    w.finish().unwrap();
+}
+
+/// T3.1 guard: `copy_section_verbatim` refuses to raw-copy a legacy (v1) CSR
+/// shard into a v4 file. Builds an ordinary v3 file, then attempts to
+/// verbatim-copy its shard into a v4 writer.
+#[test]
+fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
+    use crate::reader::ScxReader;
+    let dir = tempfile::tempdir().unwrap();
+    let (indptr, indices, values) = tiny_csr();
+
+    let src_path = dir.path().join("legacy_v3.scx");
+    let mut w = ScxWriter::new(&src_path, sample_header()).unwrap();
+    w.write_obs(&sample_obs()).unwrap();
+    w.write_var(&sample_var()).unwrap();
+    w.write_preencoded_shard(
+        crate::encoder::encode_one_shard(
+            &indptr,
+            &indices,
+            &values,
+            None,
+            0,
+            3,
+            0,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let src_final = w.finish().unwrap();
+
+    let reader = ScxReader::open(&src_final).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0].clone();
+    let raw = reader.read_raw_shard_bytes(&entry).unwrap();
+
+    let mut v4_header = sample_header();
+    v4_header.format_version = crate::header::CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(dir.path().join("v4_copy.scx"), v4_header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let err = writer.copy_section_verbatim(&entry, raw).unwrap_err();
+    assert!(
+        matches!(&err, ScxError::Io(e) if e.to_string().contains("framed")),
+        "verbatim-copy of a v1 shard into v4 must be rejected, got {err:?}",
+    );
 }
 
 /// v2 strict shard_type validation: a CSC shard whose
@@ -2564,6 +2903,7 @@ fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
         SectionType::CsrShard,
         ModalityType::Rna,
         "X/rna/shard_0".to_string(),
+        None,
     )
     .unwrap();
     let pre_nnz = pre.nnz;

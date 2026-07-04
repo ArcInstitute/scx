@@ -558,6 +558,7 @@ class TestMetrics:
             "peak_bytes_in_cache",
             "sidecar_groups",
             "full_shard_groups",
+            "block_index_groups",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -608,6 +609,7 @@ class TestMetrics:
             "peak_bytes_in_cache",
             "sidecar_groups",
             "full_shard_groups",
+            "block_index_groups",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, scx_path):

@@ -96,6 +96,7 @@ def main() -> int:
                     "peak_rss_mb": round(outcome.peak_rss_mb, 1),
                     "sidecar_groups": outcome.sidecar_groups,
                     "full_shard_groups": outcome.full_shard_groups,
+                    "block_index_groups": outcome.block_index_groups,
                     "sidecar_adoption_rate": _adoption(
                         outcome.sidecar_groups, outcome.full_shard_groups
                     ),

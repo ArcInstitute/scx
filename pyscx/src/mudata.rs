@@ -598,9 +598,10 @@ pub fn from_mudata_impl(
         Some("zstd") => Some(CodecId::Zstd),
         Some("lz4") => Some(CodecId::Lz4Shuffle),
         Some("pcodec") => Some(CodecId::Pcodec),
+        Some("shufdelta") => Some(CodecId::ShufDeltaZstd),
         Some(other) => {
             return Err(PyRuntimeError::new_err(format!(
-                "unknown codec '{other}'; use auto, none, scx1, zstd, lz4, or pcodec"
+                "unknown codec '{other}'; use auto, none, scx1, zstd, lz4, pcodec, or shufdelta"
             )));
         }
     };

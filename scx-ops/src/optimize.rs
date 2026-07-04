@@ -17,8 +17,8 @@
 use std::path::Path;
 
 use scx_codec::CodecId;
-use scx_format_io::encoder::encode_one_shard;
-use scx_format_io::header::FileHeader;
+use scx_format_io::encoder::{encode_one_shard, FramingConfig};
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::modality::ModalityType;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
@@ -27,6 +27,24 @@ use scx_sparse::canonicalize_csr;
 
 use crate::error::{OpsError, Result};
 use crate::rewrite_helpers::{append_provenance, copy_predicate_indices};
+
+/// Summary of what an [`optimize_with_framing`] pass did, for CLI reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OptimizeStats {
+    /// Total CSR-class shards (X + layers + obsp-CSR) re-encoded.
+    pub shards_total: usize,
+    /// Of those, how many were emitted row-group-framed (shard v2).
+    pub shards_framed: usize,
+    /// Of the framed shards, how many the encoder stored as `ShufDeltaZstd`
+    /// (the `compact-trial` per-shard winner, or an explicit `--codec shufdelta`).
+    pub shards_shufdelta: usize,
+    /// Shards the cost model kept **unframed Scx1 with a decode sidecar**
+    /// (GPU/per-row fast path preserved) inside a framed v4 file — the
+    /// `--keep-gpu-sidecar` / `training`-preset outcome under compact-trial.
+    pub unframed_scx1_gpu: usize,
+    /// The file `format_version` stamped on the output (3 unframed, 4 framed).
+    pub format_version: u16,
+}
 
 /// Re-encode + canonicalize every CSR shard of `input_path` into `output_path`,
 /// emitting decode sidecars and stamping `format_version = 3`. Single-modality
@@ -51,12 +69,37 @@ pub fn optimize(
     codec: Option<CodecId>,
     obs_shard_policy: ObsShardPolicy,
 ) -> Result<()> {
+    optimize_with_framing(input_path, output_path, codec, obs_shard_policy, None)?;
+    Ok(())
+}
+
+/// Like [`optimize`], but additionally row-group-frames every re-encoded CSR
+/// shard when `framing` is `Some` (F5-b), producing a `format_version = 4`
+/// file with a multi-entry `BlockIndex` per shard for codec-agnostic sub-shard
+/// random access. When `framing` is `None` this is byte-identical to
+/// [`optimize`] (v3, unframed). Returns an [`OptimizeStats`] describing the
+/// per-shard codec/framing outcome (used by the CLI summary).
+///
+/// `framing.trial` (surfaced as `scx optimize --codec compact-trial`) picks the
+/// smaller of {heuristic winner, ShufDeltaZstd} per shard; a framed shard
+/// forgoes the Scx1 GPU/per-row decode sidecar (it uses the block index
+/// instead), so `compact-trial` optimizes for size + random access.
+pub fn optimize_with_framing(
+    input_path: &Path,
+    output_path: &Path,
+    codec: Option<CodecId>,
+    obs_shard_policy: ObsShardPolicy,
+    framing: Option<FramingConfig>,
+) -> Result<OptimizeStats> {
     let reader = ScxReader::open(input_path)?;
     if reader.is_multimodal() {
         return Err(OpsError::InvalidInput(
             "scx optimize does not support multimodal files yet; use `scx compact`".into(),
         ));
     }
+
+    // Framing produces a v4/shard-v2 file; unframed stays v3/shard-v1.
+    let framed = matches!(framing, Some(fc) if fc.row_group_rows > 0);
 
     let in_header = reader.header().clone();
     let index_dtype = in_header.index_dtype;
@@ -89,6 +132,8 @@ pub fn optimize(
     };
 
     // We canonicalize every shard below, so the default v3 invariant is real.
+    // Framing bumps the file to v4 (the multi-entry BlockIndex layout); unframed
+    // output keeps the `Default` (v3) stamp.
     let out_header = FileHeader {
         flags: out_flags,
         n_obs: in_header.n_obs,
@@ -99,9 +144,15 @@ pub fn optimize(
         // codec is auto-selected by `encode_one_shard`).
         codec_id: codec.map(|c| c as u8).unwrap_or(in_header.codec_id),
         index_dtype,
+        format_version: if framed {
+            CURRENT_FORMAT_VERSION
+        } else {
+            FileHeader::default().format_version
+        },
         ..Default::default()
     };
 
+    let out_format_version = out_header.format_version;
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
 
@@ -185,6 +236,10 @@ pub fn optimize(
         .collect();
     obsp_csr_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let mut stats = OptimizeStats {
+        format_version: out_format_version,
+        ..Default::default()
+    };
     for entry in x_entries
         .into_iter()
         .chain(layer_entries)
@@ -211,7 +266,19 @@ pub fn optimize(
             entry.section_type,
             ModalityType::Rna,
             entry.name.clone(),
+            framing, // Some => row-group-frame this shard (F5-b, shard v2)
         )?;
+        stats.shards_total += 1;
+        if pre.shard_format_version() > scx_format_io::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+            stats.shards_framed += 1;
+            if pre.codec_id() == CodecId::ShufDeltaZstd as u8 {
+                stats.shards_shufdelta += 1;
+            }
+        } else if framed && pre.codec_id() == CodecId::Scx1 as u8 {
+            // The cost model kept this shard unframed Scx1 (sidecar/GPU) inside a
+            // framed run (§4.3 two-layer model).
+            stats.unframed_scx1_gpu += 1;
+        }
         writer.write_preencoded_shard(pre)?;
     }
 
@@ -275,7 +342,7 @@ pub fn optimize(
         .map_err(|e| OpsError::InvalidInput(format!("append provenance: {e}")))?;
 
     writer.finish()?;
-    Ok(())
+    Ok(stats)
 }
 
 /// Stream var shards from `reader` straight to sharded output, one output shard
@@ -412,6 +479,185 @@ mod tests {
         // obs/var preserved.
         assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
         assert_eq!(out.read_var().unwrap().num_rows(), n_vars);
+    }
+
+    /// T3.2: `optimize_with_framing` (the `scx optimize --codec compact-trial
+    /// --row-group-rows N` path) upgrades a v2/v3 file to a v4/shard-v2 framed
+    /// file, and the framed re-encode round-trips byte-identically.
+    #[test]
+    fn optimize_with_framing_upgrades_to_v4_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // Canonical v2 input (strictly increasing columns, no duplicates) so the
+        // framed re-encode is byte-identical on read-back.
+        let n_obs = 40usize;
+        let nnz_per_row = 64usize;
+        let n_vars = 200_000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1; // u32 indices
+
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((r * 13 + k * 7) % 250) as u32;
+                indices.push(col);
+                // High median (>8) so the heuristic picks Zstd, not Scx1 — the
+                // §4.3 cost model's unframed-Scx1 branch is inert here, keeping
+                // this a clean "framing round-trips" test. Cost-model behavior is
+                // covered by `optimize_compact_trial_keeps_gpu_sidecar_unframed`.
+                values.push(50u8 + ((r + k) % 50) as u8);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+        let (in_ip, in_ix, in_v) = ScxReader::open(&input).unwrap().read_csr_shard(0).unwrap();
+
+        let stats = optimize_with_framing(
+            &input,
+            &output,
+            None,
+            ObsShardPolicy::Off,
+            Some(FramingConfig {
+                row_group_rows: 8,
+                target_nnz: None,
+                trial: true,
+                prefer_gpu_sidecar: false,
+            }),
+        )
+        .unwrap();
+        assert_eq!(stats.format_version, 4);
+        assert!(stats.shards_framed >= 1, "at least one shard framed");
+        assert_eq!(
+            stats.shards_total, stats.shards_framed,
+            "framing frames every re-encoded shard"
+        );
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(out.header().format_version, 4, "framed optimize stamps v4");
+        let entry = out.catalog().csr_shards_sorted()[0];
+        assert_eq!(
+            out.read_shard_header(entry).unwrap().shard_format_version,
+            scx_format_io::CURRENT_SHARD_FORMAT_VERSION,
+            "framed shard is v2",
+        );
+        // Full decode is byte-identical to the (already-canonical) input.
+        let (out_ip, out_ix, out_v) = out.read_csr_shard(0).unwrap();
+        assert_eq!(out_ip, in_ip);
+        assert_eq!(out_ix, in_ix);
+        assert_eq!(out_v, in_v);
+        assert_eq!(out.read_obs().unwrap().num_rows(), n_obs);
+    }
+
+    /// Item 3 (§4.3 two-layer cost model): under compact-trial with
+    /// `prefer_gpu_sidecar`, a Scx1-friendly (integer, low-median) shard is kept
+    /// **unframed Scx1 with its decode sidecar** inside a v4 file — preserving the
+    /// GPU/per-row fast path — while the file is still v4 and round-trips.
+    #[test]
+    fn optimize_compact_trial_keeps_gpu_sidecar_unframed() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // Low-median counts (1..5) → the heuristic picks Scx1 (GPU-friendly).
+        let n_obs = 40usize;
+        let nnz_per_row = 512usize;
+        let n_vars = 200_000usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        let mut indptr = vec![0u64];
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        for r in 0..n_obs {
+            let mut col = 0u32;
+            for k in 0..nnz_per_row {
+                col += 1 + ((r * 13 + k * 7) % 250) as u32;
+                indices.push(col);
+                values.push(1u8 + ((r + k) % 5) as u8);
+            }
+            indptr.push(indices.len() as u64);
+        }
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            w.write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+        let (in_ip, in_ix, in_v) = ScxReader::open(&input).unwrap().read_csr_shard(0).unwrap();
+
+        let stats = optimize_with_framing(
+            &input,
+            &output,
+            None,
+            ObsShardPolicy::Off,
+            Some(FramingConfig {
+                row_group_rows: 8,
+                target_nnz: None,
+                trial: true,
+                prefer_gpu_sidecar: true,
+            }),
+        )
+        .unwrap();
+        // The Scx1-friendly shard was kept unframed Scx1 for the GPU/per-row path.
+        assert_eq!(stats.format_version, 4, "file still v4");
+        assert_eq!(
+            stats.unframed_scx1_gpu, 1,
+            "Scx1 shard kept unframed for GPU"
+        );
+        assert_eq!(stats.shards_shufdelta, 0);
+
+        let out = ScxReader::open(&output).unwrap();
+        assert_eq!(out.header().format_version, 4);
+        let entry = out.catalog().csr_shards_sorted()[0];
+        let sh = out.read_shard_header(entry).unwrap();
+        assert_eq!(
+            sh.shard_format_version,
+            scx_format_io::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            "kept shard is unframed (v1)",
+        );
+        assert_eq!(sh.codec_id, CodecId::Scx1 as u8, "kept shard is Scx1");
+        // The decode sidecar (GPU/per-row layer) is present.
+        assert!(
+            out.catalog()
+                .entries
+                .iter()
+                .any(|e| e.section_type == SectionType::DecodeMetadataShard),
+            "unframed Scx1 shard in a v4 file must carry its decode sidecar",
+        );
+        // Round-trips byte-identically.
+        let (out_ip, out_ix, out_v) = out.read_csr_shard(0).unwrap();
+        assert_eq!(out_ip, in_ip);
+        assert_eq!(out_ix, in_ix);
+        assert_eq!(out_v, in_v);
     }
 
     #[test]

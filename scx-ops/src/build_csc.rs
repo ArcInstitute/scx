@@ -6,17 +6,28 @@ use indicatif::{ProgressBar, ProgressStyle};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::FramingConfig;
 use scx_format_io::MemoryBudget;
 use scx_format_io::ScxReader;
 
 use crate::rewrite_helpers;
 
+/// Build CSC (column-major) shards from an existing file's CSR data, rewriting
+/// the whole file (CSR is decoded and re-encoded, then the CSC sidecar appended).
+///
+/// `framing`: when `Some`, both the re-written CSR shards and the emitted CSC
+/// shards are row-group-framed (shard v2) and the output header is v4. When
+/// `None`, the output is unframed (v1 shards, v3 header) — note this **strips
+/// framing from a source that was already framed**; the framing-preserving entry
+/// point for arbitrary files is `scx optimize`, so mutating-op callers that don't
+/// thread framing pass `None` deliberately.
 pub fn run_build_csc(
     input: &Path,
     output: &Path,
     memory_limit: &str,
     force: bool,
     csc_cols_per_shard: usize,
+    framing: Option<FramingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Parse memory limit string ("4G" → 4 * 1024^3 bytes). Shares the
     //    workspace parser so --memory-limit accepts the same forms as
@@ -101,6 +112,13 @@ pub fn run_build_csc(
         codec_id: in_header.codec_id,
         index_dtype: in_header.index_dtype,
         manifest_sequence: in_header.manifest_sequence + 1,
+        // Row-group framing produces a v4 file (its shards are v2); otherwise the
+        // default (v3) unframed layout.
+        format_version: if framing.is_some() {
+            scx_format_io::header::CURRENT_FORMAT_VERSION
+        } else {
+            FileHeader::default().format_version
+        },
         ..Default::default()
     };
 
@@ -117,6 +135,9 @@ pub fn run_build_csc(
     // yielding `csc_build_generation == data_generation`.
     let mut writer =
         ScxWriter::new(output, out_header)?.with_data_generation(reader.catalog().data_generation);
+    // F5-b: frame the re-written CSR shards and the CSC sidecar (both go through
+    // `write_shard_inner`, which consults the writer's framing). No-op when None.
+    writer.set_framing(framing);
     writer.write_obs(&obs)?;
     writer.write_var(&var)?;
 
@@ -264,7 +285,7 @@ mod tests {
         let input = write_test_input(&dir, 6, 4);
         let output = dir.path().join("output.scx");
 
-        run_build_csc(&input, &output, "4G", false, 5000).unwrap();
+        run_build_csc(&input, &output, "4G", false, 5000, None).unwrap();
 
         // Verify output file
         let reader = ScxReader::open(&output).unwrap();
@@ -324,7 +345,7 @@ mod tests {
 
         // Use a small memory limit that still allows at least 1 col per pass
         // 10 rows × 12 bytes = 120 bytes/col, so 150 → 1 col per pass → 6 passes
-        run_build_csc(&input, &output, "150", false, 5000).unwrap();
+        run_build_csc(&input, &output, "150", false, 5000, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         assert!(reader.header().has_csc());
@@ -347,11 +368,11 @@ mod tests {
         std::fs::write(&output, b"placeholder").unwrap();
 
         // Without --force should fail
-        let err = run_build_csc(&input, &output, "4G", false, 5000);
+        let err = run_build_csc(&input, &output, "4G", false, 5000, None);
         assert!(err.is_err());
 
         // With --force should succeed
-        run_build_csc(&input, &output, "4G", true, 5000).unwrap();
+        run_build_csc(&input, &output, "4G", true, 5000, None).unwrap();
         let reader = ScxReader::open(&output).unwrap();
         assert!(reader.header().has_csc());
     }
@@ -372,7 +393,7 @@ mod tests {
         writer.finish().unwrap();
 
         let output = dir.path().join("output.scx");
-        let err = run_build_csc(&path, &output, "4G", false, 5000);
+        let err = run_build_csc(&path, &output, "4G", false, 5000, None);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("no CSR shards"));
@@ -389,7 +410,7 @@ mod tests {
         let input = write_test_input(&dir, 4, 10);
         let output = dir.path().join("multi_csc.scx");
 
-        run_build_csc(&input, &output, "4G", false, 3).unwrap();
+        run_build_csc(&input, &output, "4G", false, 3, None).unwrap();
 
         let reader = ScxReader::open(&output).unwrap();
         let hdr = reader.header();
@@ -446,7 +467,7 @@ mod tests {
         let input = write_test_input(&dir, 4, 10);
         let output = dir.path().join("multi_csc_range.scx");
 
-        run_build_csc(&input, &output, "4G", false, 3).unwrap();
+        run_build_csc(&input, &output, "4G", false, 3, None).unwrap();
 
         let orig_reader = ScxReader::open(&input).unwrap();
         let dense = orig_reader
@@ -529,7 +550,7 @@ mod tests {
             writer.finish().unwrap();
 
             let output = dir.path().join("multi_csc.scx");
-            run_build_csc(&path, &output, "4G", false, 3).unwrap();
+            run_build_csc(&path, &output, "4G", false, 3, None).unwrap();
 
             let reader = ScxReader::open(&output).unwrap();
             assert_eq!(reader.header().n_csc_shards, 4, "codec={codec:?}");

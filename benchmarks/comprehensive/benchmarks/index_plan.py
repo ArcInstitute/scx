@@ -180,6 +180,13 @@ class _ScenarioOutcome:
     # pre-fix baseline.
     sidecar_groups: int | None = None
     full_shard_groups: int | None = None
+    # F5 (row-group framing): count of `read_rows_with` shard request-groups
+    # served by the codec-agnostic block-index path (a framed v2 shard decoded
+    # only in its touched groups). The framed-adoption signal, symmetric with
+    # `sidecar_groups` / `full_shard_groups`; `> 0` on a scattered read over a
+    # framed file proves the row-group path is exercised (the "ship the no-op"
+    # guard). `None` for older pyscx that lacks the key.
+    block_index_groups: int | None = None
     # Consumer-observed per-batch latency (ms): the wall time between successive
     # batches yielded by `iter_with_plans` (prefetch-overlapped). The sidecar
     # (L1+L2) trades an async full-shard warm for a synchronous O(rows) sidecar
@@ -244,9 +251,11 @@ def _run_index_plan(
         cm = ds.cache_metrics()
         sidecar_groups = int(cm.get("sidecar_groups", 0))
         full_shard_groups = int(cm.get("full_shard_groups", 0))
+        block_index_groups = int(cm.get("block_index_groups", 0))
     except Exception:
         sidecar_groups = None
         full_shard_groups = None
+        block_index_groups = None
     peak_rss_after = _peak_rss_mb()
     peak_rss = max(rss0, peak_rss_after)
     # Scenario-local ru_maxrss growth — eliminates cross-scenario
@@ -274,6 +283,7 @@ def _run_index_plan(
         estimate_overshoot_mb=round(peak_rss_growth - budget_total_mb, 1),
         sidecar_groups=sidecar_groups,
         full_shard_groups=full_shard_groups,
+        block_index_groups=block_index_groups,
         gather_latency_ms_mean=round(mean_ms, 3) if mean_ms is not None else None,
         gather_latency_ms_p50=round(p50_ms, 3) if p50_ms is not None else None,
         gather_latency_ms_p99=round(p99_ms, 3) if p99_ms is not None else None,
@@ -732,6 +742,12 @@ def run(
                 f"sidecar_adoption_rate__{scenario_name}": adoption_rate,
                 f"sidecar_groups__{scenario_name}": outcome.sidecar_groups,
                 f"full_shard_groups__{scenario_name}": outcome.full_shard_groups,
+                # F5 framed-adoption counter — `> 0` proves a scattered read
+                # over a framed (v4) file exercised the row-group block-index
+                # path. The Rust hard gate is
+                # `scx-format-io backed_tests::read_rows_with_block_index_all_codecs`
+                # (asserts the exact count); this surfaces it in the harness too.
+                f"block_index_groups__{scenario_name}": outcome.block_index_groups,
                 f"gather_latency_ms_p50__{scenario_name}": outcome.gather_latency_ms_p50,
                 f"gather_latency_ms_p99__{scenario_name}": outcome.gather_latency_ms_p99,
                 # Estimator validation: `None` for scenarios that don't

@@ -182,7 +182,7 @@ pub fn run_subset(
 
     // Re-emit the CSC sidecar against the projected output.
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
@@ -378,6 +378,7 @@ pub(crate) fn write_csr_shards_auto(
             SectionType::CsrShard,
             modality_type,
             format!("X_shard_{shard_idx}"),
+            None,
         )?;
         writer.write_preencoded_shard(pre)?;
 
@@ -629,7 +630,7 @@ fn extract_modality(
     }
 
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
     Ok(())

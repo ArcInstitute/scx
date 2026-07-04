@@ -65,7 +65,9 @@ enum Commands {
         /// Target rows per shard
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec
+        /// Compression codec: auto (default), none, scx1, zstd, lz4, pcodec,
+        /// shufdelta, or compact-trial (framed; per-shard smaller of heuristic vs
+        /// shufdelta — requires --row-group-rows).
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Whether to also emit a CSC sidecar at write time.
@@ -86,6 +88,17 @@ enum Commands {
         /// Pass `0` to disable the cap (single CSC shard, memory permitting).
         #[arg(long, default_value_t = 5000)]
         csc_cols_per_shard: usize,
+        /// Experimental (F5): row-group-frame each shard into groups of at most
+        /// N rows, producing a v4 file with a multi-entry BlockIndex for
+        /// codec-agnostic sub-shard random access. Omit for the ordinary unframed
+        /// layout. Works with any `--codec`; use `--codec compact-trial` to pick
+        /// the smaller of the heuristic codec vs ShufDeltaZstd per shard.
+        #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
+        row_group_rows: Option<u32>,
+        /// Byte/nnz-aware row-group cap (F5): also close a group once it reaches
+        /// this many non-zeros. Only meaningful with `--row-group-rows`.
+        #[arg(long, value_name = "NNZ")]
+        row_group_target_nnz: Option<u64>,
         /// Extract a single modality from a multi-modality SCX file
         /// when writing to h5ad. Required when `--to h5ad` is used on
         /// a multimodal SCX input; ignored otherwise.
@@ -261,7 +274,7 @@ enum Commands {
         /// modality.
         #[arg(long)]
         modality: Option<String>,
-        /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec
+        /// Compression codec for new shards: auto, none, scx1, zstd, lz4, pcodec, shufdelta
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Target rows per shard (must be > 0)
@@ -328,10 +341,32 @@ enum Commands {
         force: bool,
         /// Per-shard codec: `auto` (Scx1 for low-median integer counts, else
         /// Zstd) or `scx1` (force Scx1 on every integer shard so all shards
-        /// carry a decode sidecar). Other codecs are rejected — they drop the
-        /// decode sidecar, defeating the point of `optimize`. Default: auto.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1"])]
+        /// carry a decode sidecar) for the unframed path; or `shufdelta` /
+        /// `compact-trial` for row-group-framed (v4) output — the latter keeps
+        /// the per-shard smaller of the heuristic codec vs ShufDeltaZstd.
+        /// `shufdelta` / `compact-trial` require `--row-group-rows`. Framed
+        /// shards use the block index rather than a decode sidecar. Other
+        /// codecs are rejected. Default: auto.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "scx1", "shufdelta", "compact-trial"])]
         codec: String,
+        /// Row-group-frame each re-encoded shard into groups of at most N rows,
+        /// producing a v4 file with a multi-entry BlockIndex for codec-agnostic
+        /// sub-shard random access. Omit for the ordinary unframed (v3) layout.
+        /// Required for `--codec shufdelta` / `--codec compact-trial`.
+        #[arg(long, value_name = "N", value_parser = validators::positive_u32)]
+        row_group_rows: Option<u32>,
+        /// Byte/nnz-aware row-group cap: also close a group once it reaches this
+        /// many non-zeros. Only meaningful with `--row-group-rows`.
+        #[arg(long, value_name = "NNZ")]
+        row_group_target_nnz: Option<u64>,
+        /// Under `--codec compact-trial`, keep Scx1-friendly (integer,
+        /// low-median) shards **unframed with their decode sidecar** so the
+        /// FOR-BP/Rice GPU device-decode + per-row random-access fast path is
+        /// preserved (the file then mixes framed + unframed-Scx1 shards; both are
+        /// random-access-safe). Without this, Scx1 is kept only when it does not
+        /// regress size.
+        #[arg(long)]
+        keep_gpu_sidecar: bool,
         /// Migrate a legacy single-section obs table to the sharded
         /// `ObsMetadataShard` layout: `auto` (shard when n_obs >
         /// shard_target_rows — the from_anndata threshold), `always`, or
@@ -413,7 +448,7 @@ enum Commands {
         /// Target rows per shard in the output file
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
+        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec, shufdelta
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Comma-separated obs columns to also index on the output (the sort
@@ -769,7 +804,7 @@ enum Commands {
         /// Target rows per shard in the output file
         #[arg(long, default_value_t = scx_format_io::DEFAULT_SHARD_TARGET_ROWS, value_parser = validators::positive_u32)]
         shard_size: u32,
-        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec
+        /// Compression codec for output: auto, none, scx1, zstd, lz4, pcodec, shufdelta
         #[arg(long, default_value = "auto")]
         codec: String,
         /// Rebuild the CSC sidecar on the subset output (drops +
@@ -873,6 +908,8 @@ fn main() {
             codec,
             csc,
             csc_cols_per_shard,
+            row_group_rows,
+            row_group_target_nnz,
             modality,
             stream,
             memory_budget,
@@ -911,6 +948,8 @@ fn main() {
                 &codec,
                 &csc,
                 csc_cols_per_shard,
+                row_group_rows,
+                row_group_target_nnz,
                 modality.as_deref(),
                 stream,
                 memory_budget.as_deref(),
@@ -991,8 +1030,20 @@ fn main() {
             output,
             force,
             codec,
+            row_group_rows,
+            row_group_target_nnz,
+            keep_gpu_sidecar,
             shard_obs,
-        } => optimize::run_optimize(&input, &output, force, &codec, &shard_obs),
+        } => optimize::run_optimize(
+            &input,
+            &output,
+            force,
+            &codec,
+            row_group_rows,
+            row_group_target_nnz,
+            keep_gpu_sidecar,
+            &shard_obs,
+        ),
         Commands::Compact {
             input,
             output,
@@ -1188,7 +1239,14 @@ fn main() {
             memory_limit,
             force,
             csc_cols_per_shard,
-        } => scx_ops::run_build_csc(&input, &output, &memory_limit, force, csc_cols_per_shard),
+        } => scx_ops::run_build_csc(
+            &input,
+            &output,
+            &memory_limit,
+            force,
+            csc_cols_per_shard,
+            None,
+        ),
         Commands::Subset {
             input,
             output,
@@ -1267,6 +1325,8 @@ fn run_convert(
     codec: &str,
     csc: &str,
     csc_cols_per_shard: usize,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<&str>,
@@ -1481,6 +1541,8 @@ fn run_convert(
         codec,
         csc_policy,
         csc_cols_per_shard,
+        row_group_rows,
+        row_group_target_nnz,
         modality,
         stream,
         memory_budget_bytes,
@@ -1588,6 +1650,8 @@ fn dispatch_convert(
     codec: &str,
     csc_policy: convert::CscPolicy,
     csc_cols_per_shard: usize,
+    row_group_rows: Option<u32>,
+    row_group_target_nnz: Option<u64>,
     modality: Option<&str>,
     stream: bool,
     memory_budget: Option<u64>,
@@ -1616,13 +1680,29 @@ fn dispatch_convert(
     use scx_codec::CodecId;
     let bitmap_policy = BitmapPolicy::parse(bitmap).map_err(|e| e.to_string())?;
 
-    let explicit_codec = CodecId::parse_cli(codec)?;
+    // `compact-trial` is a framing *profile*, not a codec: per shard, keep the
+    // smaller of {heuristic winner, ShufDeltaZstd}. It requires framing.
+    let codec_trial = codec == "compact-trial";
+    let explicit_codec = if codec_trial {
+        None
+    } else {
+        CodecId::parse_cli(codec)?
+    };
+    if codec_trial && row_group_rows.is_none() {
+        return Err(
+            "`--codec compact-trial` requires `--row-group-rows N` (row-group-framed output)"
+                .into(),
+        );
+    }
 
     let opts = ConvertOptions {
         shard_target_rows: shard_size,
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
+        row_group_rows,
+        row_group_target_nnz,
+        codec_trial,
         tool: "scx".into(),
         memory_budget,
         stream,
@@ -1645,6 +1725,9 @@ fn dispatch_convert(
         group_target_bytes,
         group_max_bytes,
         group_pass,
+        // convert engages the §4.3 GPU/sidecar cost model via the accel-oriented
+        // `--index-preset training` signal (resolved in `ConvertOptions::framing`).
+        keep_gpu_sidecar: false,
     };
 
     let pb = ProgressBar::new_spinner();
@@ -1757,6 +1840,8 @@ fn dispatch_convert(
     _codec: &str,
     _csc_policy: convert::CscPolicy,
     _csc_cols_per_shard: usize,
+    _row_group_rows: Option<u32>,
+    _row_group_target_nnz: Option<u64>,
     _modality: Option<&str>,
     _stream: bool,
     _memory_budget: Option<u64>,
@@ -1838,7 +1923,7 @@ fn dispatch_mtx_to_scx(
     if build_csc {
         let tmp = output.with_extension("scx.csc.tmp");
         let _ = std::fs::remove_file(&tmp);
-        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard)?;
+        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard, None)?;
         std::fs::rename(&tmp, output)?;
     }
 

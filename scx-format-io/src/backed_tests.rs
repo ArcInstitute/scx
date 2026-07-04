@@ -1,5 +1,8 @@
 use super::*;
+use crate::encoder::encode_one_shard;
 use crate::header::FileHeader;
+use crate::modality::ModalityType;
+use crate::section::SectionType;
 use crate::writer::ScxWriter;
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -101,6 +104,67 @@ fn write_test_file_and_open(
     };
     let backed = BackedCsrReader::new(reader, cache_shards);
     (backed, full_csr)
+}
+
+/// Write a **row-group-framed** `CodecId::None` file (F5 Phase 1: v4 file /
+/// v2 shards, multi-entry `BlockIndex`) with `n_shards` shards each framed at
+/// `row_group_rows` rows per group. Returns the path + the reference full CSR
+/// (read back through the framed decode path). Uses `encode_one_shard(...,
+/// Some(row_group_rows))` + `write_preencoded_shard` since the plain
+/// `write_csr_shard` writer method only emits the unframed layout.
+fn write_framed_file(
+    dir: &TempDir,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+    row_group_rows: u32,
+    codec: CodecId,
+) -> (std::path::PathBuf, ScxCsr) {
+    let path = dir.path().join("framed.scx");
+    let total_nnz = n_obs * 2;
+    let mut header = sample_header(n_obs as u64, n_vars as u64, total_nnz as u64);
+    header.format_version = crate::header::CURRENT_FORMAT_VERSION; // v4 (framed)
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+
+    let rows_per_shard = n_obs / n_shards;
+    for s in 0..n_shards {
+        let shard_rows = if s == n_shards - 1 {
+            n_obs - rows_per_shard * s
+        } else {
+            rows_per_shard
+        };
+        let (indptr, indices, values_u8) = sample_shard_data(shard_rows, n_vars);
+        let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
+        let pre = encode_one_shard(
+            &indptr,
+            &indices,
+            &values_f32,
+            Some(codec),
+            0, // u16 indices
+            n_vars as u32,
+            (s * rows_per_shard) as u64,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            format!("X_shard_{s}"),
+            Some(crate::encoder::FramingConfig {
+                row_group_rows,
+                target_nnz: None,
+                trial: false,
+                prefer_gpu_sidecar: false,
+            }),
+        )
+        .unwrap();
+        writer.write_preencoded_shard(pre).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let full_csr = ScxReader::open(&path)
+        .unwrap()
+        .read_all_csr_shards()
+        .unwrap();
+    (path, full_csr)
 }
 
 /// Build a 2-shard Scx1 file with dense rows (so the encoder emits decode
@@ -358,6 +422,142 @@ fn read_rows_with_bumps_sidecar_adoption_counters() {
         m2.full_shard_groups.load(Ordering::Relaxed),
         2,
         "both dense shard groups must be served via full-shard decode",
+    );
+}
+
+/// F5 Phase 1: scattered `read_rows_with` over a **row-group-framed** None file
+/// (no Scx1 sidecar) must decode only touched groups via the block index and
+/// return rows byte-identical to a full decode — for unsorted, duplicate, and
+/// far-apart requests.
+#[test]
+fn read_rows_with_block_index_matches_full_decode() {
+    let dir = TempDir::new().unwrap();
+    // 2 shards × 32 rows, groups of 4 rows.
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+        backed
+            .read_rows_with(rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
+        for (i, &row) in rows.iter().enumerate() {
+            let lo = full.indptr[row as usize] as usize;
+            let hi = full.indptr[row as usize + 1] as usize;
+            assert_eq!(out[i].0, full.indices[lo..hi], "indices row {row}");
+            assert_eq!(out[i].1, full.data[lo..hi], "data row {row}");
+        }
+    };
+
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    // Sparse, unsorted, far-apart, with a duplicate (5) and a cross-group run.
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let out = gather(&backed, &sparse_rows);
+    assert_matches(&out, &sparse_rows);
+
+    // Dense group also correct (full-shard fallback path over a framed shard).
+    let backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    let out2 = gather(&backed2, &dense_rows);
+    assert_matches(&out2, &dense_rows);
+}
+
+/// F5 Phase 2: framed scattered reads must be byte-identical to a full decode for
+/// **every** codec (None + ShufDeltaZstd + Zstd/Lz4/Pcodec), and a sparse cold
+/// gather over a compressed framed shard (no Scx1 sidecar) must take the
+/// block-index path. Proves `encode_shard_framed` + generic `decode_row_group`
+/// end-to-end through the writer and backed reader.
+#[test]
+fn read_rows_with_block_index_all_codecs() {
+    use std::sync::atomic::Ordering;
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    for codec in [
+        CodecId::None,
+        CodecId::ShufDeltaZstd,
+        CodecId::Zstd,
+        CodecId::Lz4Shuffle,
+        CodecId::Pcodec,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, codec);
+
+        let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+        let m = backed.enable_metrics();
+        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); sparse_rows.len()];
+        backed
+            .read_rows_with(&sparse_rows, |i, idx, data| {
+                out[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        for (i, &row) in sparse_rows.iter().enumerate() {
+            let lo = full.indptr[row as usize] as usize;
+            let hi = full.indptr[row as usize + 1] as usize;
+            assert_eq!(
+                out[i].0,
+                full.indices[lo..hi],
+                "{codec:?} indices row {row}"
+            );
+            assert_eq!(out[i].1, full.data[lo..hi], "{codec:?} data row {row}");
+        }
+        // Both sparse cold shard groups served via the codec-agnostic block index.
+        assert_eq!(
+            m.block_index_groups.load(Ordering::Relaxed),
+            2,
+            "{codec:?}: sparse cold gather must take the block-index path",
+        );
+        assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0, "{codec:?}");
+    }
+}
+
+/// F5 Phase 1 adoption counter: a sparse cold gather over a framed None file
+/// bumps `CacheMetrics::block_index_groups` (not `sidecar_groups`); a dense
+/// gather falls back to `full_shard_groups`. Symmetric with the sidecar
+/// adoption test.
+#[test]
+fn read_rows_with_bumps_block_index_counters() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    fn gather(backed: &BackedCsrReader, rows: &[u64]) {
+        backed
+            .read_rows_with(rows, |_i, _idx, _data| Ok(()))
+            .unwrap();
+    }
+
+    // Sparse cold group across both shards (≤4 rows/shard << shard_rows/4 = 8)
+    // ⇒ both shard groups take the block-index path (no Scx1 sidecar on None).
+    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m = backed.enable_metrics();
+    gather(&backed, &[2u64, 5, 6, 40, 41]);
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        2,
+        "both sparse cold shard groups must be served via the block index",
+    );
+    assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.full_shard_groups.load(Ordering::Relaxed),
+        0,
+        "no full-shard decode for a sparse cold framed gather",
+    );
+
+    // Dense group ⇒ full-shard fallback; fresh reader keeps counters clean.
+    let mut backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m2 = backed2.enable_metrics();
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    gather(&backed2, &dense_rows);
+    assert_eq!(m2.block_index_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m2.full_shard_groups.load(Ordering::Relaxed),
+        2,
+        "both dense shard groups must fall back to full-shard decode",
     );
 }
 

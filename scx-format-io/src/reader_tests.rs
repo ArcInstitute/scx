@@ -160,7 +160,11 @@ fn test_reader_full_round_trip() {
     assert_eq!(reader.n_obs(), 6);
     assert_eq!(reader.n_vars(), 10);
     assert_eq!(reader.nnz(), 12);
-    assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
+    // Unframed writes stamp the default (v3), not the max-readable CURRENT (v4).
+    assert_eq!(
+        reader.header().format_version,
+        crate::header::DEFAULT_WRITE_FORMAT_VERSION
+    );
 
     // read_obs
     let obs = reader.read_obs().unwrap();

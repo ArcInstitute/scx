@@ -387,6 +387,57 @@ proptest! {
         prop_assert_eq!(&d_v, &values);
     }
 
+    /// F5 ShufDeltaZstd: full codec × encoding matrix (u8/u16/u32 integer
+    /// values through the shuffle+delta+zstd path, f32 through the zstd-only
+    /// value path).
+    #[test]
+    fn dispatch_shufdelta_u8_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint8)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint8, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::ShufDeltaZstd, ValueEncoding::Uint8, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_shufdelta_u16_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint16)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint16, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::ShufDeltaZstd, ValueEncoding::Uint16, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_shufdelta_u32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Uint32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Uint32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::ShufDeltaZstd, ValueEncoding::Uint32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
+    #[test]
+    fn dispatch_shufdelta_f32_roundtrip(
+        data in arb_csr(50, 20, ValueEncoding::Float32)
+    ) {
+        let (indptr, indices, values, n_rows, nnz, u16_idx) = data;
+        let encoded = encode_shard(&indptr, &indices, &values, CodecId::ShufDeltaZstd, ValueEncoding::Float32, u16_idx).unwrap();
+        let (d_ip, d_ix, d_v) = decode_shard(&encoded, CodecId::ShufDeltaZstd, ValueEncoding::Float32, n_rows, nnz, u16_idx).unwrap();
+        prop_assert_eq!(&d_ip, &indptr);
+        prop_assert_eq!(&d_ix, &indices);
+        prop_assert_eq!(&d_v, &values);
+    }
+
     /// Regression guard for Phase 1B: mixed per-shard encodings through
     /// the full encode→decode roundtrip. Shard 1 uses uint8, shard 2 uses
     /// uint16 — both with Scx1 codec.

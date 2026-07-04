@@ -46,7 +46,8 @@ pub use csc_policy::{
 pub use error::{validate_allocation, Result, ScxError, ScxErrorClass};
 pub use group_index::{GroupIndexPayload, GroupRecordWire};
 pub use header::{
-    rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION, HEADER_SIZE, MAGIC,
+    rewrite_output_format_version, FileHeader, CURRENT_FORMAT_VERSION,
+    DEFAULT_WRITE_FORMAT_VERSION, HEADER_SIZE, MAGIC,
 };
 pub use modality::{
     ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES,
@@ -56,7 +57,8 @@ pub use obs_shard_policy::ObsShardPolicy;
 pub use provenance::{Provenance, ProvenanceEntry};
 pub use section::{align_to_8, SectionType};
 pub use shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, BLOCK_INDEX_ENTRY_SIZE,
+    derive_shard_type, resolve_block_index, BlockIndex, BlockIndexEntry, ShardHeader,
+    BLOCK_INDEX_ENTRY_SIZE, CURRENT_SHARD_FORMAT_VERSION, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
     SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 pub use versioned::VersionedSection;

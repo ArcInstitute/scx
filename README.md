@@ -466,20 +466,49 @@ sizes in our benchmarks.
   on Census 1M, SLAF's SQL path returns the matching expression records in
   10 s — same order of magnitude as SCX's catalog pushdown.
 
+#### shardad
+
+A sister Arc Institute format: a single `.shad` file of condition-grouped,
+narrow-dtype, bitshuffle+zstd CSR shards, purpose-built for CRISPR perturbation
+screens. Its `read_group` / `read_reference` API targets the same axis as SCX's
+F1/F2 grouped sharding, so we benchmark it head-to-head (release builds; full
+numbers in [`docs/performance.md`](docs/performance.md#grouped-sharding-scx-sort---group-by--scx-convert---group-by) and the
+comprehensive report's "Grouped Read/Write", "Out-of-Core Peak RSS", and
+"Format Capability Matrix" sections).
+
+- **shardad's genuine strengths.** Integer-count **compression** — 1.5–2.5×
+  smaller than SCX on raw UMI counts (`census_1m` 1.6 GB vs 4.0 GB; ≈parity on
+  log-normalized/float data), and **single-shot grouped-write** speed on
+  in-RAM-sized data (it loads an in-memory CSR then encodes; SCX streams).
+- **Where SCX wins.** Per-perturbation `read_group` (up to **13×** faster — a
+  byte-range read of just the group's rows); **out-of-core** reads (at
+  `census_5m`, SCX streaming peaks at ~19 GB vs shardad's ~87 GB full
+  materialize — shardad has no streaming path); **parallel read scaling**
+  (SCX 3.6–4.5× to 32 threads vs shardad ~1–2×, which is materialization-bound);
+  and **ML training throughput** (SCX `TrainingDataset` 45–1,193 batches/s vs a
+  shardad random-access row-slice loader at ~0.6, since shardad has no native
+  batched loader).
+- **Scope.** shardad is Python-only and counts-focused (no query engine, cloud
+  I/O, analysis accelerators, GPU-accelerated reads, multimodal, or R bindings);
+  SCX is a broad platform. Both pass read-back correctness + reference-isolation
+  on every fixture.
+
 #### SCX addresses all of these
 
-| Issue | h5ad | Zarr | TileDB-SOMA | SLAF | SCX |
-|-------|------|------|-------------|------|-----|
-| Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** |
-| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
-| Atomic writes | No | No | Fragment-based | Fragment-based | **Yes** (atomic rename) |
-| Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
-| Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | **Shard-level** (rayon) |
-| Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | **Yes** (append sections) |
-| Cloud-native access | No | Yes | Yes | Yes | **Yes** (explode/pack, selective pull) |
-| Built-in query engine | No | No | Yes | **Yes (SQL)** | **Yes** (predicate pushdown) |
-| Domain-specific compression | No | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
-| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint8/uint16 auto-detect) |
+| Issue | h5ad | Zarr | TileDB-SOMA | SLAF | shardad | SCX |
+|-------|------|------|-------------|------|---------|-----|
+| Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** | **Yes** |
+| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (single file) | **Yes** (mmap, advisory locks) |
+| Atomic writes | No | No | Fragment-based | Fragment-based | Metadata-tail only | **Yes** (atomic rename) |
+| Integrity verification | Partial | None | Per-fragment | Per-fragment | Per-shard markers | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
+| Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | Process-level (mat.-bound) | **Shard-level** (rayon) |
+| Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | Metadata only | **Yes** (append sections) |
+| Cloud-native access | No | Yes | Yes | Yes | No | **Yes** (explode/pack, selective pull) |
+| Built-in query engine | No | No | Yes | **Yes (SQL)** | Grouped read only | **Yes** (predicate pushdown) |
+| Domain-specific compression | No | No | No | No | **Yes** (bitshuffle+zstd; strong on counts) | **Yes** (Scx1 codec, 2-5× better) |
+| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint32 low-plane) | **Yes** (uint8/uint16 auto-detect) |
+| ML training loader | No | No | Yes (tiledbsoma-ml) | Yes (slow) | No (random-access only) | **Yes** (1,405 batches/s) |
+| Out-of-core / backed reads | Partial (r+) | Partial | Partial | No (full materialize) | No (full materialize) | **Yes** (streaming + backed) |
 
 ## Installation
 

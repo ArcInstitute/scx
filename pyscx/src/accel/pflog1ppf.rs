@@ -525,7 +525,8 @@ fn stream_pflog1ppf_to_scx<S: ShardSource>(
         shard_rows,
         codec,
         index_dtype,
-        scx_format_io::CURRENT_FORMAT_VERSION,
+        // Unframed pflog output: the default (v3), not the max-readable v4.
+        scx_format_io::DEFAULT_WRITE_FORMAT_VERSION,
     );
     let mut writer = ScxWriter::new(out_path, header).map_err(to_pyerr)?;
 
@@ -673,6 +674,7 @@ fn write_pflog1ppf_x_shards<S: ShardSource>(
                         SectionType::CsrShard,
                         ModalityType::Rna,
                         name,
+                        None,
                     )
                 })
                 .map_err(to_pyerr)?;

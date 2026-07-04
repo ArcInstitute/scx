@@ -10,7 +10,7 @@ use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
 use scx_format_io::decode_sidecar::DecodeSidecar;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
-use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE};
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{compute_shard_stats, MajorAxis, ScxReader};
 
@@ -23,13 +23,23 @@ use crate::error::{OpsError, Result as OpsResult};
 /// `append` adds `sh.n_major <= shard_target_rows` (it may re-split shards);
 /// `merge` adds `!assume_identical_var` (column indices are not guaranteed
 /// identical when the var axis is assumed-but-not-verified equal).
+///
+/// **Row-group-framed (shard v2) shards are never raw-copy eligible.** A
+/// rewrite (merge/append) stamps the output header at
+/// `DEFAULT_WRITE_FORMAT_VERSION` (v3, unframed — see
+/// [`scx_format_io::rewrite_output_format_version`]); byte-copying a v2 shard
+/// into that ≤v3 file would leave a framed shard under a header a pre-framing
+/// reader accepts, which then mis-decodes the per-group local-rebased indptr as
+/// global. Forcing framed shards down the decode-encode path re-emits them
+/// unframed, keeping the output self-consistent.
 pub(crate) fn raw_copy_csr_eligible(
     sh: &ShardHeader,
     target_index_dtype: u8,
     target_n_vars: u64,
     codec: CodecSelection,
 ) -> bool {
-    sh.index_dtype == target_index_dtype
+    sh.shard_format_version <= DEFAULT_WRITE_SHARD_FORMAT_VERSION
+        && sh.index_dtype == target_index_dtype
         && (sh.n_minor as u64) == target_n_vars
         && match codec {
             CodecSelection::Auto => true,
@@ -298,4 +308,56 @@ pub(crate) fn append_provenance(
     });
     writer.write_provenance(prov_entries)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scx_format_io::shard::{ShardHeader, SHARD_MAGIC};
+
+    fn header(shard_format_version: u8, codec_id: u8) -> ShardHeader {
+        ShardHeader {
+            magic: SHARD_MAGIC,
+            shard_format_version,
+            shard_type: 0,
+            codec_id,
+            value_encoding: ValueEncoding::Uint8 as u8,
+            index_dtype: 0,
+            reserved_flags: [0u8; 3],
+            n_major: 4,
+            n_minor: 10,
+            nnz: 8,
+            global_offset: 0,
+            indptr_rel_offset: 0,
+            indptr_length: 0,
+            indices_rel_offset: 0,
+            indices_length: 0,
+            values_rel_offset: 0,
+            values_length: 0,
+            block_index_rel_offset: 0,
+            block_index_length: 0,
+            checksum: [0u8; 8],
+        }
+    }
+
+    /// A row-group-framed (shard v2) source shard is never raw-copy eligible —
+    /// a rewrite stamps a <v4 header and byte-copying a framed shard under it
+    /// would let a pre-framing reader mis-decode it. An otherwise-identical
+    /// unframed (v1) shard is eligible.
+    #[test]
+    fn framed_shard_is_not_raw_copy_eligible() {
+        let v1 = header(scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION, 0);
+        let v2 = header(
+            scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION + 1,
+            0,
+        );
+        assert!(
+            raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto),
+            "unframed v1 shard with matching dtype/n_vars/codec must be eligible"
+        );
+        assert!(
+            !raw_copy_csr_eligible(&v2, 0, 10, CodecSelection::Auto),
+            "framed v2 shard must NOT be raw-copy eligible"
+        );
+    }
 }

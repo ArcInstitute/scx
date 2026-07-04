@@ -77,6 +77,9 @@ pub enum ScxError {
     #[error("block nnz {0} exceeds u32::MAX")]
     BlockNnzOverflow(u64),
 
+    #[error("malformed block index: {0}")]
+    InvalidBlockIndex(String),
+
     #[error("n_vars {0} exceeds u32::MAX, cannot fit in shard header n_minor field")]
     NVarsOverflow(u64),
 
@@ -214,6 +217,7 @@ impl ScxError {
             | ScxError::EmptyIndptr
             | ScxError::SectionOutOfBounds { .. }
             | ScxError::AllocationTooLarge { .. }
+            | ScxError::InvalidBlockIndex(_)
             | ScxError::ColumnStatsShardCountMismatch { .. } => ScxErrorClass::CorruptFile,
             ScxError::Io(io_err) => ScxErrorClass::Io(io_err.kind()),
             // Wrapped lower-level errors and genuine runtime failures.

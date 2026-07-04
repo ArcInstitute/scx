@@ -844,7 +844,7 @@ pub fn sort(
         // not `Send`, so map it to a `String` inside the closure to cross
         // `py.detach`.
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit)
+            scx_ops::rebuild_csc_inplace(&output_path, csc_cols_per_shard, &csc_memory_limit, None)
                 .map_err(|e| e.to_string())
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -938,6 +938,7 @@ pub fn build_csc(
             &memory_limit,
             force,
             csc_cols_per_shard,
+            None,
         )
         .map_err(|e| e.to_string())
     })

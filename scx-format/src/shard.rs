@@ -9,13 +9,23 @@ use crate::section::SectionType;
 /// Size of the shard header in bytes.
 pub const SHARD_HEADER_SIZE: usize = 76;
 
-/// Current shard layout version emitted by writers. Readers reject any
-/// shard header whose `shard_format_version` exceeds this — cheap insurance
-/// so a future shard-layout bump errors out instead of being silently
+/// Maximum shard layout version this build can read. Readers reject any shard
+/// header whose `shard_format_version` exceeds this — cheap insurance so a
+/// future shard-layout bump errors out instead of being silently
 /// misinterpreted by today's readers (mirrors the file-header /
-/// catalog-version gates). Land any layout-changing bump together with a
-/// matching reader that knows the new layout.
-pub const CURRENT_SHARD_FORMAT_VERSION: u8 = 1;
+/// catalog-version gates).
+///
+/// v1 = whole-shard blob (single/oversized-split `BlockIndex` with zero byte
+/// offsets). v2 = **row-group-framed** (multi-entry `BlockIndex` with real
+/// per-group byte offsets, resolvable via [`resolve_block_index`]). Writers
+/// stamp v2 **only** on framed shards; unframed shards stay
+/// [`DEFAULT_WRITE_SHARD_FORMAT_VERSION`] so old readers keep reading them.
+pub const CURRENT_SHARD_FORMAT_VERSION: u8 = 2;
+
+/// Shard version stamped on ordinary (non-row-group-framed) shards. Kept at 1
+/// while [`CURRENT_SHARD_FORMAT_VERSION`] is 2 so unframed shards stay readable
+/// by older builds; only the framing path stamps `CURRENT_SHARD_FORMAT_VERSION`.
+pub const DEFAULT_WRITE_SHARD_FORMAT_VERSION: u8 = 1;
 
 /// Magic bytes identifying an SCX shard.
 pub const SHARD_MAGIC: [u8; 4] = *b"SCXS";
@@ -360,6 +370,139 @@ impl BlockIndex {
     }
 }
 
+/// Parse **and fully validate** a framed shard's `BlockIndex`, resolving each
+/// entry into a [`RowGroupSpan`] with inferred per-sub-stream byte ranges.
+///
+/// This is the codec-agnostic random-access reader (SIDECAR-LONG-TERM-FIX.md
+/// Option B §4.2). Entries carry per-sub-stream *offsets* but no lengths, so a
+/// group's byte range is `[offset[g], offset[g+1])` (the last group ends at the
+/// sub-stream length from `header`). Because a raw `BlockIndexEntry` is unsafe to
+/// hand to a codec, callers must go through this validator, which enforces:
+///
+/// - entries non-empty; first `row_start == 0`; contiguous & sorted
+///   (`row_start[i] + n_rows[i] == row_start[i+1]`); `n_rows > 0`;
+///   `Σ n_rows == header.n_major`;
+/// - per-sub-stream offsets monotonically non-decreasing, first entry at 0, and
+///   every inferred range within the sub-stream length;
+/// - indptr range non-empty for every group; indices/values ranges non-empty
+///   whenever `nnz_in_block > 0`;
+/// - `Σ nnz_in_block == header.nnz`.
+///
+/// Only call on framed shards (`shard_format_version >= 2`); legacy single-entry
+/// / oversized-split indexes carry all-zero offsets and must not be resolved.
+pub fn resolve_block_index(
+    header: &ShardHeader,
+    block_index_bytes: &[u8],
+) -> Result<Vec<scx_codec::RowGroupSpan>> {
+    use std::io::Cursor;
+    let bi = BlockIndex::read_from(&mut Cursor::new(block_index_bytes), block_index_bytes.len())?;
+    let entries = &bi.entries;
+    let inval = |m: String| ScxError::InvalidBlockIndex(m);
+    if entries.is_empty() {
+        return Err(inval("empty block index".into()));
+    }
+
+    let indptr_len = header.indptr_length as usize;
+    let indices_len = header.indices_length as usize;
+    let values_len = header.values_length as usize;
+
+    // Pass 1: structural validation (rows, coverage, offset monotonicity, nnz sum).
+    let mut expected_row: u32 = 0;
+    let mut nnz_sum: u64 = 0;
+    let (mut prev_ip, mut prev_ix, mut prev_vv) = (0u32, 0u32, 0u32);
+    for (i, e) in entries.iter().enumerate() {
+        if e.row_start != expected_row {
+            return Err(inval(format!(
+                "entry {i}: row_start {} != expected {} (gap/overlap/unsorted)",
+                e.row_start, expected_row
+            )));
+        }
+        if e.n_rows == 0 {
+            return Err(inval(format!("entry {i}: n_rows == 0")));
+        }
+        if i == 0 {
+            if e.indptr_byte_offset != 0 || e.indices_byte_offset != 0 || e.values_byte_offset != 0
+            {
+                return Err(inval("first entry sub-stream offsets must all be 0".into()));
+            }
+        } else if e.indptr_byte_offset < prev_ip
+            || e.indices_byte_offset < prev_ix
+            || e.values_byte_offset < prev_vv
+        {
+            return Err(inval(format!("entry {i}: non-monotonic sub-stream offset")));
+        }
+        expected_row = expected_row
+            .checked_add(e.n_rows as u32)
+            .ok_or_else(|| inval("row_start overflow".into()))?;
+        nnz_sum = nnz_sum.saturating_add(e.nnz_in_block as u64);
+        prev_ip = e.indptr_byte_offset;
+        prev_ix = e.indices_byte_offset;
+        prev_vv = e.values_byte_offset;
+    }
+    if expected_row != header.n_major {
+        return Err(inval(format!(
+            "coverage {expected_row} != header.n_major {}",
+            header.n_major
+        )));
+    }
+    if nnz_sum != header.nnz {
+        return Err(inval(format!(
+            "Σ nnz_in_block {nnz_sum} != header.nnz {}",
+            header.nnz
+        )));
+    }
+
+    // Pass 2: resolve byte ranges (end = next entry offset, last = stream length).
+    let n = entries.len();
+    let mut spans = Vec::with_capacity(n);
+    for i in 0..n {
+        let e = &entries[i];
+        let ip_start = e.indptr_byte_offset as usize;
+        let ix_start = e.indices_byte_offset as usize;
+        let vv_start = e.values_byte_offset as usize;
+        let (ip_end, ix_end, vv_end) = if i + 1 < n {
+            (
+                entries[i + 1].indptr_byte_offset as usize,
+                entries[i + 1].indices_byte_offset as usize,
+                entries[i + 1].values_byte_offset as usize,
+            )
+        } else {
+            (indptr_len, indices_len, values_len)
+        };
+        // Range sanity: start <= end <= stream length.
+        for (name, start, end, len) in [
+            ("indptr", ip_start, ip_end, indptr_len),
+            ("indices", ix_start, ix_end, indices_len),
+            ("values", vv_start, vv_end, values_len),
+        ] {
+            if start > end || end > len {
+                return Err(inval(format!(
+                    "entry {i}: {name} range {start}..{end} invalid (stream len {len})"
+                )));
+            }
+        }
+        // indptr frame is always non-empty; indices/values non-empty iff nnz>0.
+        if ip_end == ip_start {
+            return Err(inval(format!("entry {i}: empty indptr range")));
+        }
+        if e.nnz_in_block > 0 && (ix_end == ix_start || vv_end == vv_start) {
+            return Err(inval(format!(
+                "entry {i}: empty indices/values range with nnz {} > 0",
+                e.nnz_in_block
+            )));
+        }
+        spans.push(scx_codec::RowGroupSpan {
+            row_start: e.row_start,
+            n_rows: e.n_rows,
+            nnz: e.nnz_in_block,
+            indptr: ip_start..ip_end,
+            indices: ix_start..ix_end,
+            values: vv_start..vv_end,
+        });
+    }
+    Ok(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +565,146 @@ mod tests {
         );
         assert_eq!(decoded.block_index_length, original.block_index_length);
         assert_eq!(decoded.checksum, original.checksum);
+    }
+
+    /// Build a framed-shard header + block-index bytes for the 4-row / 8-nnz
+    /// fixture split into two 2-row groups (matches the codec-side test).
+    /// indptr stream = two local-rebased indptrs (3 u64 each) = 48 bytes;
+    /// indices = 8×u16 = 16 bytes; values = 8×u32 = 32 bytes.
+    fn framed_fixture() -> (ShardHeader, Vec<u8>) {
+        let mut h = sample_shard_header();
+        h.shard_format_version = 2;
+        h.codec_id = 0; // None
+        h.value_encoding = 2; // u32
+        h.index_dtype = 0; // u16
+        h.n_major = 4;
+        h.nnz = 8;
+        h.indptr_length = 48;
+        h.indices_length = 16;
+        h.values_length = 32;
+        let bi = BlockIndex {
+            entries: vec![
+                BlockIndexEntry::new(0, 2, 0, 0, 0, 5).unwrap(),
+                BlockIndexEntry::new(2, 2, 24, 10, 20, 3).unwrap(),
+            ],
+        };
+        let mut bytes = Vec::new();
+        bi.write_to(&mut bytes).unwrap();
+        (h, bytes)
+    }
+
+    #[test]
+    fn resolve_block_index_valid() {
+        let (h, bytes) = framed_fixture();
+        let spans = resolve_block_index(&h, &bytes).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].row_start, 0);
+        assert_eq!(spans[0].n_rows, 2);
+        assert_eq!(spans[0].nnz, 5);
+        assert_eq!(spans[0].indptr, 0..24);
+        assert_eq!(spans[0].indices, 0..10);
+        assert_eq!(spans[0].values, 0..20);
+        assert_eq!(spans[1].indptr, 24..48);
+        assert_eq!(spans[1].indices, 10..16);
+        assert_eq!(spans[1].values, 20..32);
+    }
+
+    fn resolve_err(h: &ShardHeader, entries: Vec<BlockIndexEntry>) -> ScxError {
+        let bi = BlockIndex { entries };
+        let mut bytes = Vec::new();
+        bi.write_to(&mut bytes).unwrap();
+        resolve_block_index(h, &bytes).unwrap_err()
+    }
+
+    #[test]
+    fn resolve_block_index_rejects_malformed() {
+        let (h, _) = framed_fixture();
+
+        // Empty index.
+        assert!(matches!(
+            resolve_err(&h, vec![]),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // Gap / unsorted (row_start 3 instead of 2).
+        assert!(matches!(
+            resolve_err(
+                &h,
+                vec![
+                    BlockIndexEntry::new(0, 2, 0, 0, 0, 5).unwrap(),
+                    BlockIndexEntry::new(3, 2, 24, 10, 20, 3).unwrap(),
+                ]
+            ),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // Coverage != n_major (only 2 of 4 rows).
+        assert!(matches!(
+            resolve_err(&h, vec![BlockIndexEntry::new(0, 2, 0, 0, 0, 5).unwrap()]),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // Σ nnz_in_block != header.nnz (5 + 2 = 7 != 8).
+        assert!(matches!(
+            resolve_err(
+                &h,
+                vec![
+                    BlockIndexEntry::new(0, 2, 0, 0, 0, 5).unwrap(),
+                    BlockIndexEntry::new(2, 2, 24, 10, 20, 2).unwrap(),
+                ]
+            ),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // First entry offsets not zero.
+        assert!(matches!(
+            resolve_err(
+                &h,
+                vec![
+                    BlockIndexEntry::new(0, 2, 8, 0, 0, 5).unwrap(),
+                    BlockIndexEntry::new(2, 2, 24, 10, 20, 3).unwrap(),
+                ]
+            ),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // Non-monotonic indptr offset (second < first-after-zero: use 3 entries).
+        assert!(matches!(
+            resolve_err(
+                &h,
+                vec![
+                    BlockIndexEntry::new(0, 1, 0, 0, 0, 2).unwrap(),
+                    BlockIndexEntry::new(1, 1, 24, 4, 8, 3).unwrap(),
+                    BlockIndexEntry::new(2, 2, 16, 10, 20, 3).unwrap(), // indptr 16 < prev 24
+                ]
+            ),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // Out-of-bounds: second group's values offset (20) exceeds values_length.
+        let mut h_small = h.clone();
+        h_small.values_length = 15; // group 1 values start 20 > 15
+        assert!(matches!(
+            resolve_err(
+                &h_small,
+                vec![
+                    BlockIndexEntry::new(0, 2, 0, 0, 0, 5).unwrap(),
+                    BlockIndexEntry::new(2, 2, 24, 10, 20, 3).unwrap(),
+                ]
+            ),
+            ScxError::InvalidBlockIndex(_)
+        ));
+        // n_rows == 0.
+        assert!(matches!(
+            resolve_err(&h, vec![BlockIndexEntry::new(0, 0, 0, 0, 0, 0).unwrap()]),
+            ScxError::InvalidBlockIndex(_)
+        ));
+
+        // Valid single whole-shard framed entry (4 rows, 8 nnz) resolves fine —
+        // guards against over-eager rejection.
+        let bi = BlockIndex {
+            entries: vec![BlockIndexEntry::new(0, 4, 0, 0, 0, 8).unwrap()],
+        };
+        let mut bytes = Vec::new();
+        bi.write_to(&mut bytes).unwrap();
+        let spans = resolve_block_index(&h, &bytes).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].indptr, 0..48);
+        assert_eq!(spans[0].values, 0..32);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
+use scx_format_io::header::{FileHeader, DEFAULT_WRITE_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::writer::ScxWriter;
 
@@ -23,10 +23,12 @@ pub fn run_upgrade(
     let reader = ScxReader::open(input)?;
     let old_version = reader.header().format_version;
 
-    if old_version == CURRENT_FORMAT_VERSION {
+    // `scx upgrade` re-writes to the newest **unframed** version (v4 requires
+    // row-group framing, which upgrade does not add).
+    if old_version == DEFAULT_WRITE_FORMAT_VERSION {
         println!(
             "File is already at format version {} (current). Nothing to do.",
-            CURRENT_FORMAT_VERSION
+            DEFAULT_WRITE_FORMAT_VERSION
         );
         return Ok(());
     }
@@ -188,7 +190,7 @@ mod tests {
         assert_eq!(new_hdr.n_vars, orig_hdr.n_vars);
         assert_eq!(
             new_hdr.format_version,
-            scx_format_io::CURRENT_FORMAT_VERSION
+            scx_format_io::DEFAULT_WRITE_FORMAT_VERSION
         );
 
         // Verify CSR data matches
@@ -248,7 +250,7 @@ mod tests {
         assert_eq!(reader.header().n_obs, orig_n_obs);
         assert_eq!(
             reader.header().format_version,
-            scx_format_io::CURRENT_FORMAT_VERSION
+            scx_format_io::DEFAULT_WRITE_FORMAT_VERSION
         );
 
         let csr = reader.read_all_csr_shards().unwrap();

@@ -22,7 +22,8 @@ header's `codec_id`**, not the file header's, when decoding.
 | 2 | `zstd` | Zstd applied independently to each of indptr / indices / values. Fallback for float layers. |
 | 3 | `lz4shuffle` | Byte-shuffle pre-filter + LZ4 frame compression (§7). Matches the Zarr/Blosc pipeline. |
 | 4 | `pcodec` | Pco lossless numerical compression. Optimal for float layers. |
-| 5–255 | Reserved | Future codecs. |
+| 5 | `shufdelta` | Byte-shuffle + byte-delta (indices/indptr only) + zstd (§7b). Compact integer counts (~1.5–2.5× smaller than `scx1`); float values take zstd-only (no shuffle/delta). |
+| 6–255 | Reserved | Future codecs. |
 
 ## 2. Indptr: Delta-Golomb-Rice (codec_id = 1)
 
@@ -212,6 +213,52 @@ LZ4 frame decompress → byte-unshuffle (reverse of encoding).
 
 Implementation: `scx-codec/src/shuffle.rs`, `scx-codec/src/dispatch.rs`.
 
+## 7b. ShufDeltaZstd (codec_id = 5)
+
+The most compact option for **integer
+counts** (measured ~1.45–1.75× smaller than `scx1` on raw-count `census_1m` /
+`chemogenetic_rgfp`, ~1.3–1.45× smaller than plain `zstd`; the comprehensive
+`compression` benchmark independently confirms **1.83× vs `scx1`** / 1.38× vs
+`zstd` on `tabula_sapiens_100k`). It is for integer counts only — on
+float/log-normalized `X` the value stream falls back to zstd-only and the codec
+is ≈`zstd` with no win, which is why it is opt-in / trial-selected and never
+auto-forced. Per sub-stream:
+
+- **indices / indptr**: byte-shuffle (transpose to byte planes) → byte-delta
+  (per-plane wrapping-`u8`, on the sorted/monotonic streams) → zstd. The delta on
+  byte-shuffled sorted indices produces near-constant planes that zstd crushes —
+  this is the dominant lever (indices+indptr are ~75–80 % of CSR payload).
+- **integer values**: byte-shuffle → zstd (**no delta** — counts are effectively
+  random; delta would raise entropy).
+- **float values**: zstd only (**no shuffle, no delta** — byte-shuffling floats
+  scatters whole-value repeats).
+
+Primitives: `scx-codec/src/byte_delta.rs` (`byte_delta_planes` /
+`byte_undelta_planes`), reusing `shuffle::byte_shuffle`. Bounded-allocation zstd
+decode guard as for `zstd`. Available via `codec="shufdelta"`; not auto-selected
+by the heuristic (see `compact-trial` in §8).
+
+### Row-group framing (v4 file / shard v2) — random-access-safe
+
+A monolithic `shufdelta` frame per sub-stream is not sub-shard-seekable (the
+byte-delta is a whole-plane prefix scan), which would defeat scattered/grouped
+reads. So `shufdelta` (and any codec) can be **row-group-framed**: the shard's
+major axis is partitioned into groups (`--row-group-rows N`, optionally
+`--row-group-target-nnz`), each group encoded independently as a standalone
+sub-shard (group-local `indptr` starting at 0), the three sub-streams
+concatenated, and per-group byte offsets recorded in the shard's multi-entry
+`BlockIndex` (see `docs/format.md`). A framed shard is `shard_format_version = 2`
+inside a `format_version = 4` file; unframed writes stay v3/v1. Readers decode a
+single group via `scx_codec::decode_row_group` → the ordinary per-shard decoder
+over that group's byte ranges (codec-agnostic), so random-row / grouped / backed
+reads touch only the covering groups. **Measured:** framing at `G ∈ {256,512,
+1024}` retains essentially the full monolithic win (size flat within ~0.2 % across
+`G`; 1.75×/1.46× vs Scx1 on census_1m/rgfp), so no per-shard dictionary is needed.
+
+Implementation: `scx-codec/src/{byte_delta.rs,dispatch.rs}` (codec +
+`decode_row_group`), `scx-format-io/src/encoder.rs` (`encode_shard_framed`),
+`scx-format/src/shard.rs` (`resolve_block_index`).
+
 ## 8. Automatic Codec Selection
 
 Writers SHOULD choose per-shard codecs automatically. Benchmarks found
@@ -230,6 +277,50 @@ Canonical implementation: `scx-format/src/codec_select.rs::select_codec()`.
 Median is computed from a sample of up to 10,000 non-zero values from the
 shard — the same calculation used for Rice parameter selection (§4). The
 actual codec used is recorded in each shard header's `codec_id`.
+
+### Trial-encode (`codec="compact-trial"`, framed only)
+
+For the most compact **random-access-safe** output, `scx convert --codec
+compact-trial --row-group-rows N` encodes each shard row-group-framed with both
+the heuristic winner and `shufdelta` and keeps the smaller (recorded per shard in
+`codec_id`). It requires `--row-group-rows` (framed output) and optimizes for size
++ random access. (Measured: `compact-trial` matches `shufdelta`'s **1.83× vs Scx1**
+on integer-count `tabula_sapiens_100k` and does not regress on float/normalized X —
+it picks the heuristic winner there.) Implementation:
+`scx-format-io/src/encoder.rs::encode_one_shard`.
+
+**Two-layer cost model (`--keep-gpu-sidecar`).** By default a framed shard drops
+the Scx1 `DecodeSidecar` (framed shards random-access via the `BlockIndex`). Since
+that sidecar is also the FOR-BP/Rice **GPU device-decode** + bit-level per-row
+path, `compact-trial` can instead keep a
+Scx1-friendly (integer, low-median) shard **unframed with its sidecar** when GPU /
+per-row access matters — via `--keep-gpu-sidecar` (or an `--index-preset training`
+signal). The result is a v4 file that legitimately **mixes** framed shards and
+unframed-Scx1-with-sidecar shards; both are random-access-safe (framed → group
+`BlockIndex`; unframed Scx1 → per-row sidecar). Without the flag, Scx1 is kept only
+when it does not regress size (`SCX_COMPACT_TRIAL_GPU_MARGIN` tunes the slack).
+
+**Surfaces.** `scx convert`, `scx optimize` (`--codec compact-trial|shufdelta
+--row-group-rows N [--keep-gpu-sidecar]`, which reports framed / ShufDeltaZstd /
+kept-unframed-Scx1 shard counts), and `pyscx.from_anndata(..., codec=...,
+row_group_rows=N, keep_gpu_sidecar=...)` all produce framed output. A framed
+**CSC** sidecar is produced whenever framing is requested alongside CSC — e.g.
+`pyscx.from_anndata(csc="always", row_group_rows=N)` or `scx convert --csc
+always --row-group-rows N` (the CSC producers thread an explicit `FramingConfig`
+rather than relying on writer state; `scx build-csc` / mutating-op `--rebuild-csc`
+stay unframed — use `scx optimize` to (re)frame an existing file).
+
+On the read side, a framed CSC sidecar supports per-gene-group scattered reads
+(`read_csc_columns` decodes only the touched column-groups via the block index),
+so gene-subset DE / aggregation over a wide shard no longer full-decodes it — a
+scattered 300-gene `col_sums` measured **~3.2× faster** than the unframed CSC path
+(fine groups, `row_group_rows=16`). The win is granularity-dependent: choose
+`row_group_rows` for the read pattern — with coarse groups a broadly-scattered
+subset touches ~every group, so framing overhead can make it *slower* than a plain
+full decode. On GPU, `to_gpu_anndata` decodes only **unframed Scx1** shards
+in-VRAM (`scx_device_decode_gpu`); any **framed** shard (any codec, including
+framed Scx1) host-bounces through the shared group-aware decoder
+(`scx_device_handoff_streamed`).
 
 ## 8a. Per-modality Codec Defaults
 

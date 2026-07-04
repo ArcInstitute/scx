@@ -2089,7 +2089,6 @@ impl ScxReader {
         // intersection with [c_lo, c_hi).
         let mut decoded: Vec<ScxCsc> = Vec::with_capacity(shards.len());
         for entry in &shards {
-            let csc = self.read_csc_from_entry(entry)?;
             let stats = entry.stats.as_ref().ok_or_else(|| {
                 ScxError::InvalidCatalog(format!("CSC shard '{}' missing stats block", entry.name))
             })?;
@@ -2097,6 +2096,33 @@ impl ScxReader {
             let shard_hi = stats.major_end(entry.section_type);
             let lo_in_shard = c_lo.saturating_sub(shard_lo) as usize;
             let hi_in_shard = (c_hi.min(shard_hi).saturating_sub(shard_lo)) as usize;
+
+            // A row-group-framed (v2) CSC shard is column-group indexed
+            // by its `BlockIndex` (major axis = columns), so a gene-subset read
+            // decodes only the touched column-groups instead of the whole shard.
+            // `decode_block_index_row_runs` is axis-agnostic ("row" = major line);
+            // one contiguous column run yields one CSC fragment (indptr over the
+            // run's columns, indices = global row ids). Non-framed shards return
+            // `None` → the full-decode + `col_slice` fallback below.
+            if hi_in_shard > lo_in_shard {
+                let header = self.read_shard_header(entry)?;
+                if header.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+                    let run = (lo_in_shard, hi_in_shard - lo_in_shard);
+                    if let Some(mut runs) = self.decode_block_index_row_runs(entry, &[run])? {
+                        if let Some((indptr, indices, data)) = runs.pop() {
+                            decoded.push(ScxCsc::new_unchecked(
+                                (n_rows, hi_in_shard - lo_in_shard),
+                                indptr,
+                                indices,
+                                data,
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let csc = self.read_csc_from_entry(entry)?;
             let sliced = if lo_in_shard == 0 && hi_in_shard == csc.n_cols() {
                 csc
             } else {
@@ -3865,6 +3891,137 @@ impl ScxReader {
             self.debug_counts
                 .decode_scx1_row_range
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Some(out))
+    }
+
+    /// Codec-agnostic sibling of [`Self::decode_scx1_row_runs`] for
+    /// **row-group-framed (v2)** shards: decode several shard-local row `runs`
+    /// (`(row_start, n_rows)`) by resolving the `BlockIndex`, decoding only the
+    /// touched row-groups (each at most once), and slicing the requested rows out
+    /// of them. Returns `Ok(None)` for a non-framed (v1) shard so the caller
+    /// falls back to Scx1 sidecar / full-shard decode. Each run's result is a
+    /// run-local CSR (`indptr[0] == 0`) byte-identical to the matching slice of a
+    /// full decode. Cost is O(touched-groups + touched-rows), not O(shard).
+    pub fn decode_block_index_row_runs(
+        &self,
+        entry: &FullCatalogEntry,
+        runs: &[(usize, usize)],
+    ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
+        let header = self.read_shard_header(entry)?;
+        // Only framed shards carry a resolvable multi-entry block index.
+        if header.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+            return Ok(None);
+        }
+        // Validate the requested runs against the shard's own row count before any
+        // group indexing. `runs` are built by callers from `ShardStats` ranges,
+        // which are not otherwise checked against this header's `n_major`; an
+        // out-of-range run would make `find_group`/`local` overshoot the decoded
+        // group CSR and panic on OOB indexing. Fail loud instead (readers return
+        // errors, not panics, on malformed input).
+        let n_major = header.n_major as usize;
+        for &(run_start, run_len) in runs {
+            let run_end = run_start.checked_add(run_len).filter(|&e| e <= n_major);
+            if run_end.is_none() {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "shard {} row run [{run_start}, +{run_len}) exceeds shard n_major {n_major}",
+                    entry.name
+                )));
+            }
+        }
+        let codec_id =
+            CodecId::from_u8(header.codec_id).ok_or(ScxError::UnknownCodec(header.codec_id))?;
+        let venc = ValueEncoding::from_u8(header.value_encoding)
+            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+        let index_dtype_u16 = header.index_dtype == 0;
+        let section = self.section_bytes(entry)?;
+
+        let slice = |rel: u32, len: u32, label: &str| -> Result<&[u8]> {
+            let start = rel as usize;
+            let end = start
+                .checked_add(len as usize)
+                .filter(|&e| e <= section.len())
+                .ok_or_else(|| {
+                    ScxError::InvalidCatalog(format!(
+                        "shard {} {label} stream out of bounds",
+                        entry.name
+                    ))
+                })?;
+            Ok(&section[start..end])
+        };
+        let indptr_bytes = slice(header.indptr_rel_offset, header.indptr_length, "indptr")?;
+        let indices_bytes = slice(header.indices_rel_offset, header.indices_length, "indices")?;
+        let values_bytes = slice(header.values_rel_offset, header.values_length, "values")?;
+        let block_index_bytes = slice(
+            header.block_index_rel_offset,
+            header.block_index_length,
+            "block_index",
+        )?;
+
+        let spans = crate::shard::resolve_block_index(&header, block_index_bytes)?;
+        let find_group = |row: usize| -> usize {
+            spans
+                .partition_point(|s| (s.row_start as usize) <= row)
+                .saturating_sub(1)
+        };
+
+        // Collect the unique set of touched groups, then decode each exactly once.
+        let mut touched: Vec<usize> = runs
+            .iter()
+            .filter(|(_, len)| *len > 0)
+            .flat_map(|&(s, l)| find_group(s)..=find_group(s + l - 1))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+
+        let mut group_cache: HashMap<usize, scx_codec::ScipyShard> =
+            HashMap::with_capacity(touched.len());
+        for g in touched {
+            let decoded = scx_codec::decode_row_group(
+                codec_id,
+                &spans[g],
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                venc,
+                index_dtype_u16,
+            )
+            .map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "row-group decode of {} group {g}: {e}",
+                    entry.name
+                ))
+            })?;
+            let scipy = scx_codec::decoded_shard_to_scipy(decoded, venc).map_err(|e| {
+                ScxError::InvalidCatalog(format!(
+                    "row-group convert of {} group {g}: {e}",
+                    entry.name
+                ))
+            })?;
+            group_cache.insert(g, scipy);
+        }
+
+        // Build each run's run-local CSR by copying rows from their groups.
+        let mut out = Vec::with_capacity(runs.len());
+        for &(run_start, run_len) in runs {
+            let mut r_indptr = Vec::with_capacity(run_len + 1);
+            r_indptr.push(0i64);
+            let mut r_indices = Vec::new();
+            let mut r_data = Vec::new();
+            let mut running = 0i64;
+            for row in run_start..run_start + run_len {
+                let g = find_group(row);
+                let span = &spans[g];
+                let local = row - span.row_start as usize;
+                let (g_ip, g_ix, g_data) = &group_cache[&g];
+                let lo = g_ip[local] as usize;
+                let hi = g_ip[local + 1] as usize;
+                r_indices.extend_from_slice(&g_ix[lo..hi]);
+                r_data.extend_from_slice(&g_data[lo..hi]);
+                running += (hi - lo) as i64;
+                r_indptr.push(running);
+            }
+            out.push((r_indptr, r_indices, r_data));
         }
         Ok(Some(out))
     }

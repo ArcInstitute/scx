@@ -475,6 +475,79 @@ fn shard_ref_pcodec_float32_roundtrip() {
 }
 
 // =========================================================================
+// Full shard reference vector (CodecId::ShufDeltaZstd, F5)
+// =========================================================================
+
+#[test]
+fn shard_ref_shufdelta_u16_idx_u32_vals_roundtrip() {
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_u32: Vec<u32> = vec![5, 10, 1, 3, 7, 2];
+    let mut values_raw = Vec::new();
+    for &v in &values_u32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::ShufDeltaZstd,
+        ValueEncoding::Uint32,
+        true, // u16 indices
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::ShufDeltaZstd,
+        ValueEncoding::Uint32,
+        3,
+        6,
+        true,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+#[test]
+fn shard_ref_shufdelta_u32_idx_f32_vals_roundtrip() {
+    // u32 index mode (4-byte index planes) + float values (zstd-only path, #142).
+    let indptr: Vec<u64> = vec![0, 2, 5, 6];
+    let indices: Vec<u32> = vec![1, 3, 0, 2, 4, 2];
+    let values_f32: Vec<f32> = vec![5.0, 10.5, 1.0, 3.25, 7.0, 2.0];
+    let mut values_raw = Vec::new();
+    for &v in &values_f32 {
+        values_raw.extend_from_slice(&v.to_le_bytes());
+    }
+
+    let encoded = encode_shard(
+        &indptr,
+        &indices,
+        &values_raw,
+        CodecId::ShufDeltaZstd,
+        ValueEncoding::Float32,
+        false, // u32 indices
+    )
+    .unwrap();
+
+    let (dec_indptr, dec_indices, dec_values) = decode_shard(
+        &encoded,
+        CodecId::ShufDeltaZstd,
+        ValueEncoding::Float32,
+        3,
+        6,
+        false,
+    )
+    .unwrap();
+    assert_eq!(dec_indptr, indptr);
+    assert_eq!(dec_indices, indices);
+    assert_eq!(dec_values, values_raw);
+}
+
+// =========================================================================
 // FOR-BP SIMD path reference vector (Phase 2E)
 // =========================================================================
 

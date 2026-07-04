@@ -58,7 +58,7 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCX\x01"` |
-| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), or 3 (canonical CSR + decode sidecars). v3 uses the v2 header byte layout; older readers reject v3 via the version check. |
+| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), 3 (canonical CSR + decode sidecars), or 4 (may contain **row-group-framed** shards — shard v2, multi-entry `BlockIndex`; F5-b). All use the v2 header byte layout; older readers reject newer versions via the version check. **Writers stamp 4 only when a shard is framed; unframed output stays v3** so it keeps reading on v3 builds. |
 | `header_length` | `u16` | 256; reserves space for future header growth |
 | `flags` | `u32` | See flag table below |
 | `n_obs` | `u64` | Total cells (after deletions) |
@@ -295,7 +295,7 @@ decode, exploded `.scxd` layouts, and selective pull.
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCXS"` |
-| `shard_format_version` | `u8` | 1 |
+| `shard_format_version` | `u8` | 1 = whole-shard (single/oversized-split `BlockIndex`, zero offsets); 2 = **row-group-framed** (multi-entry `BlockIndex` with real per-group byte offsets). |
 | `shard_type` | `u8` | 0 = CSR, 1 = CSC |
 | `codec_id` | `u8` | May override file header |
 | `value_encoding` | `u8` | May override file header |
@@ -358,6 +358,23 @@ For each block:
 `row_start: u32` here is correct because it addresses rows within a shard
 (max `shard_target_rows`, typically 16,384). The *full* catalog's shard
 statistics use `u64` because they address global rows (billions of cells).
+
+**Two layouts (per `shard_format_version`):**
+
+- **v1 (unframed):** one whole-shard entry (or a `≤MAX_BLOCK_ROWS` split for
+  oversized grouped shards) with `*_byte_offset = 0`. The three sub-streams are
+  monolithic; the offsets are reserved and unread — decode is whole-shard.
+- **v2 (row-group-framed, F5-b):** one entry per row-group with **real** per
+  sub-stream byte offsets. Each group is a standalone encoded sub-shard: its
+  `indptr` is group-local-rebased (`indptr[0] == 0`, `indptr.last() ==
+  nnz_in_block`), and its indices/values are that group's frame. A group's byte
+  range in each sub-stream is `[offset[g], offset[g+1])` (last group ends at the
+  sub-stream length). `resolve_block_index` (`scx-format/src/shard.rs`) validates
+  the whole index (sorted, contiguous, coverage `== n_major`, monotonic in-bounds
+  offsets, `Σ nnz_in_block == header.nnz`) and resolves each entry to a byte-range
+  span; `scx_codec::decode_row_group` decodes one group codec-agnostically. This
+  is what gives every codec (not just Scx1) O(touched-rows) random access. Applies
+  to CSR/layer/obsp and CSC sidecar shards (row-group ≡ gene-group for CSC).
 
 ### Shard sizing defaults
 
