@@ -149,7 +149,13 @@ fn test_info_runs_on_valid_file() {
     assert_eq!(header.n_obs, 6);
     assert_eq!(header.n_vars, 10);
     assert_eq!(header.nnz, 12);
-    assert_eq!(header.format_version, scx_format_io::CURRENT_FORMAT_VERSION);
+    // A normally-written file uses DEFAULT_WRITE_FORMAT_VERSION (v3); v4
+    // (CURRENT) is reserved for row-group-framed files and is what readers
+    // accept up to, not what a plain writer emits.
+    assert_eq!(
+        header.format_version,
+        scx_format_io::DEFAULT_WRITE_FORMAT_VERSION
+    );
     assert_eq!(header.n_csr_shards, 2);
 
     let catalog = reader.catalog();
@@ -263,7 +269,10 @@ fn test_cli_info_subcommand() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(&format!("SCX v{}", scx_format_io::CURRENT_FORMAT_VERSION)));
+    assert!(stdout.contains(&format!(
+        "SCX v{}",
+        scx_format_io::DEFAULT_WRITE_FORMAT_VERSION
+    )));
     assert!(stdout.contains("6 cells"));
     assert!(stdout.contains("10 genes"));
 }
