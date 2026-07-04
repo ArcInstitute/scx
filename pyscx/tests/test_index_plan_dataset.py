@@ -25,9 +25,26 @@ import pytest
 
 @pytest.fixture
 def scx_path(tmp_path, synthetic_adata):
-    """Write the shared synthetic_adata fixture (100x50, batch column) to SCX."""
+    """Write the shared synthetic_adata fixture (100x50, batch column) to SCX.
+
+    Uses the default (framed, v4) write path — the realistic modern layout."""
     path = str(tmp_path / "index_plan.scx")
     pyscx.from_anndata(synthetic_adata, path)
+    return path
+
+
+@pytest.fixture
+def unframed_scx_path(tmp_path, synthetic_adata):
+    """Unframed (v3) fixture for the whole-shard LRU cache / prefetch tests.
+
+    Framing (the default since F5 Phase C) routes a sparse scattered gather
+    through the block-index path, which decodes only the touched row-groups and
+    does NOT populate the whole-shard LRU. These tests exercise that cache and
+    its prefetch skip, so they need the unframed full-shard-decode path
+    (`row_group_rows=0`). The block-index path has its own coverage in
+    `TestBlockIndexAdoption` + the `read_scattered` benchmark."""
+    path = str(tmp_path / "index_plan_unframed.scx")
+    pyscx.from_anndata(synthetic_adata, path, row_group_rows=0)
     return path
 
 
@@ -564,8 +581,8 @@ class TestMetrics:
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
             assert v >= 0
 
-    def test_cache_metrics_advance_after_iteration(self, scx_path):
-        ds = pyscx.IndexPlanDataset(scx_path)
+    def test_cache_metrics_advance_after_iteration(self, unframed_scx_path):
+        ds = pyscx.IndexPlanDataset(unframed_scx_path)
         before = ds.cache_metrics()
 
         plans = [[(0, 1), (2, 3)], [(0, 1), (2, 3)]]
@@ -613,12 +630,12 @@ class TestMetrics:
             "block_index_groups",
         }
 
-    def test_iter_skips_prefetch_after_warmup(self, scx_path):
+    def test_iter_skips_prefetch_after_warmup(self, unframed_scx_path):
         """Two iters back-to-back: the second sees fully cached shards and
         records `prefetch_skipped_cache_hit > 0` with `prefetch_tasks_spawned
         == 0`. Mirrors the Rust `iter_skips_prefetch_when_cached` integration
         test through the Python surface."""
-        ds = pyscx.IndexPlanDataset(scx_path)
+        ds = pyscx.IndexPlanDataset(unframed_scx_path)
         plan = [(i, (i + 1) % 100) for i in range(20)]
 
         # Warm: first iter populates the LRU.
@@ -709,11 +726,11 @@ class TestMemoryBudget:
         assert b["effective_cache_shards"] == ds.effective_cache_shards()
         assert b["effective_lookahead"] == ds.effective_lookahead()
 
-    def test_peak_bytes_in_cache_advances(self, scx_path):
+    def test_peak_bytes_in_cache_advances(self, unframed_scx_path):
         """The new `peak_bytes_in_cache` gauge in `CacheMetrics` should
         advance past 0 once at least one shard has been decoded into the
         cache (driven via an iter)."""
-        ds = pyscx.IndexPlanDataset(scx_path)
+        ds = pyscx.IndexPlanDataset(unframed_scx_path)
         # Sanity: schema-extended cache_metrics dict.
         before = ds.cache_metrics()
         assert "peak_bytes_in_cache" in before

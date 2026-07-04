@@ -55,9 +55,17 @@ def _adata_with_layers(n_obs=80, n_vars=30, n_layers=2, seed=11):
 # ---------------------------------------------------------------------------
 
 
-def test_passthrough_decoded_x_equals_source(src_scx, tmp_dir):
+def test_passthrough_decoded_x_equals_source(synthetic_adata, tmp_dir):
     """Backed SCX → SCX (matching shard_size + codec, no deletions /
-    projection) yields decoded X that equals the source bit-exact."""
+    projection) yields decoded X that equals the source bit-exact.
+
+    The byte-passthrough fast path requires an UNFRAMED (v3) source — framed v4
+    sources decode-encode (framed byte-copy is a deferred follow-on, and framing
+    is now the default), so build the source explicitly unframed via
+    `row_group_rows=0`."""
+    src_scx = str(tmp_dir / "src_unframed.scx")
+    pyscx.from_anndata(synthetic_adata, src_scx, row_group_rows=0)
+
     adata = pyscx.open(src_scx).to_anndata(backed=True)
     dst = str(tmp_dir / "dst.scx")
     pyscx.from_anndata(adata, dst)
