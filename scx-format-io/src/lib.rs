@@ -57,7 +57,7 @@ pub use mem::MemoryBudget;
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,
 };
-pub use shard_decode::{decode_shard_bytes, decode_shard_indptr_bytes};
+pub use shard_decode::{decode_shard_bytes, decode_shard_indptr_bytes, decode_shard_regions_scipy};
 pub use shard_source::{ColumnShardSource, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, chmod_to_umask, compute_shard_stats, fsync_parent_dir,

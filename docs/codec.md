@@ -303,10 +303,24 @@ when it does not regress size (`SCX_COMPACT_TRIAL_GPU_MARGIN` tunes the slack).
 **Surfaces.** `scx convert`, `scx optimize` (`--codec compact-trial|shufdelta
 --row-group-rows N [--keep-gpu-sidecar]`, which reports framed / ShufDeltaZstd /
 kept-unframed-Scx1 shard counts), and `pyscx.from_anndata(..., codec=...,
-row_group_rows=N, keep_gpu_sidecar=...)` all produce framed output. On the read
-side, a framed **CSC** sidecar supports per-gene-group scattered reads
+row_group_rows=N, keep_gpu_sidecar=...)` all produce framed output. A framed
+**CSC** sidecar is produced whenever framing is requested alongside CSC — e.g.
+`pyscx.from_anndata(csc="always", row_group_rows=N)` or `scx convert --csc
+always --row-group-rows N` (the CSC producers thread an explicit `FramingConfig`
+rather than relying on writer state; `scx build-csc` / mutating-op `--rebuild-csc`
+stay unframed — use `scx optimize` to (re)frame an existing file).
+
+On the read side, a framed CSC sidecar supports per-gene-group scattered reads
 (`read_csc_columns` decodes only the touched column-groups via the block index),
-so gene-subset DE / aggregation over a wide shard no longer full-decodes it.
+so gene-subset DE / aggregation over a wide shard no longer full-decodes it — a
+scattered 300-gene `col_sums` measured **~3.2× faster** than the unframed CSC path
+(fine groups, `row_group_rows=16`). The win is granularity-dependent: choose
+`row_group_rows` for the read pattern — with coarse groups a broadly-scattered
+subset touches ~every group, so framing overhead can make it *slower* than a plain
+full decode. On GPU, `to_gpu_anndata` decodes only **unframed Scx1** shards
+in-VRAM (`scx_device_decode_gpu`); any **framed** shard (any codec, including
+framed Scx1) host-bounces through the shared group-aware decoder
+(`scx_device_handoff_streamed`).
 
 ## 8a. Per-modality Codec Defaults
 

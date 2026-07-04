@@ -1169,6 +1169,7 @@ fn write_csc_shards_from_csr_r(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
+        None, // framing: rscx CSC is unframed (no row-group kwarg)
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
 }

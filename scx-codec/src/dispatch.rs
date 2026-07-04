@@ -1688,10 +1688,8 @@ mod tests {
             let r1 = (r0 + group_rows).min(n_rows);
             let base = indptr[r0];
             let ip_off = indptr_stream.len();
-            for r in r0..=r1 {
-                indptr_stream
-                    .write_u64::<LittleEndian>(indptr[r] - base)
-                    .unwrap();
+            for &ip in &indptr[r0..=r1] {
+                indptr_stream.write_u64::<LittleEndian>(ip - base).unwrap();
             }
             let nnz_in_block = (indptr[r1] - base) as u32;
             spans.push(RowGroupSpan {

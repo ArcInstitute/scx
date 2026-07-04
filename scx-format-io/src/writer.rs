@@ -924,6 +924,13 @@ impl ScxWriter {
         self.framing = framing;
     }
 
+    /// The writer's current framing setting. Lets a helper temporarily override
+    /// framing for a scoped batch (e.g. [`crate::csc_sidecar::write_csc_sidecar`])
+    /// and restore the prior value afterward.
+    pub fn framing(&self) -> Option<crate::encoder::FramingConfig> {
+        self.framing
+    }
+
     /// Write a CSC shard (column-major sparse matrix).
     ///
     /// Structurally identical to a CSR shard but uses `SectionType::CscShard (5)`.

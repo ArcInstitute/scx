@@ -848,6 +848,7 @@ pub fn h5ad_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.framing(),
         )?;
     }
 
@@ -1056,6 +1057,7 @@ pub fn tenx_to_scx(
             value_encoding,
             codec_id,
             opts.csc_cols_per_shard,
+            opts.framing(),
         )?;
     }
 
@@ -1751,7 +1753,9 @@ pub fn h5ad_to_scx_streaming(
     // output size for the duration of the rebuild (writes to a
     // sibling `.rebuild_csc.tmp` and renames).
     if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
-        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+        // Pass framing so `--csc <policy> --row-group-rows N` produces a framed
+        // CSC sidecar (and keeps X framed) instead of silently downgrading to v3.
+        scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
     }
 
@@ -1836,7 +1840,7 @@ fn convert_then_sort_grouped(
         let (n_obs, n_vars) = (reader.n_obs(), reader.n_vars());
         drop(reader);
         if opts.csc.should_build_csc(n_obs, n_vars) {
-            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G")
+            scx_ops::rebuild_csc_inplace(output, opts.csc_cols_per_shard, "4G", opts.framing())
                 .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
         }
     }
@@ -2582,6 +2586,7 @@ fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Wrap the canonical in-memory CSR as a single ScxCsr "shard"
     // for the transpose iterator so the optional CSC sidecar mirrors
@@ -2629,6 +2634,7 @@ fn write_csc_shards_from_csr(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
+        framing,
     )?;
     Ok(())
 }

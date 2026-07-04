@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use scx_format_io::FramingConfig;
+
 use crate::build_csc;
 
 /// Rebuild the CSC sidecar on `target` in place via temp-file + rename.
@@ -15,10 +17,16 @@ use crate::build_csc;
 /// `target` must exist and contain CSR shards. `csc_cols_per_shard`
 /// and `memory_limit` mirror the `scx build-csc` CLI defaults
 /// (5000 cols/shard, 4G memory budget).
+///
+/// `framing`: forwarded to [`build_csc::run_build_csc`] — `Some` re-writes CSR +
+/// CSC framed (v4), `None` unframed (v3). Mutating-op callers that don't thread
+/// row-group framing pass `None`; the streaming-convert `--csc` rebuild passes
+/// `opts.framing()` so `--row-group-rows` is honored on the CSC sidecar too.
 pub fn rebuild_csc_inplace(
     target: &Path,
     csc_cols_per_shard: usize,
     memory_limit: &str,
+    framing: Option<FramingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Stage the rebuilt file beside the target so the rename is atomic
     // on the same filesystem.
@@ -32,7 +40,14 @@ pub fn rebuild_csc_inplace(
     // any failure so a failed rebuild never leaks a stray `*.rebuild_csc.tmp`;
     // this also drops the previous `exists()`-then-`remove_file` TOCTOU.
     let build_and_swap = || -> Result<(), Box<dyn std::error::Error>> {
-        build_csc::run_build_csc(target, &tmp_path, memory_limit, false, csc_cols_per_shard)?;
+        build_csc::run_build_csc(
+            target,
+            &tmp_path,
+            memory_limit,
+            false,
+            csc_cols_per_shard,
+            framing,
+        )?;
         std::fs::rename(&tmp_path, target)?;
         Ok(())
     };

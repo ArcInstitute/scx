@@ -1239,7 +1239,14 @@ fn main() {
             memory_limit,
             force,
             csc_cols_per_shard,
-        } => scx_ops::run_build_csc(&input, &output, &memory_limit, force, csc_cols_per_shard),
+        } => scx_ops::run_build_csc(
+            &input,
+            &output,
+            &memory_limit,
+            force,
+            csc_cols_per_shard,
+            None,
+        ),
         Commands::Subset {
             input,
             output,
@@ -1916,7 +1923,7 @@ fn dispatch_mtx_to_scx(
     if build_csc {
         let tmp = output.with_extension("scx.csc.tmp");
         let _ = std::fs::remove_file(&tmp);
-        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard)?;
+        scx_ops::run_build_csc(output, &tmp, "4G", false, csc_cols_per_shard, None)?;
         std::fs::rename(&tmp, output)?;
     }
 

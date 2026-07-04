@@ -213,6 +213,7 @@ pub(crate) fn write_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), scx_format_io::ScxError> {
     let mut indptr_u64: Vec<u64> = indptr
         .iter()
@@ -258,6 +259,7 @@ pub(crate) fn write_csc_shards_from_csr(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         None,
+        framing,
     )
 }
 
@@ -1300,6 +1302,7 @@ pub fn from_anndata_impl(
                 first_encoding,
                 header_codec,
                 csc_cols_per_shard,
+                framing,
             )
         })
         .map_err(to_pyerr)?;

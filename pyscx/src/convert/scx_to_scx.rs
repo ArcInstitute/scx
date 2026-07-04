@@ -320,8 +320,13 @@ pub(crate) fn route_scx_backed_to_scx(
     // Optional CSC sidecar rebuild over the just-written file.
     if csc_build {
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
-                .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+                None,
+            )
+            .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }
@@ -549,8 +554,13 @@ pub(crate) fn route_scx_lazy_to_scx(
 
     if csc_build {
         py.detach(|| {
-            scx_ops::rebuild_csc_inplace(std::path::Path::new(out_path), csc_cols_per_shard, "4G")
-                .map_err(|e| e.to_string())
+            scx_ops::rebuild_csc_inplace(
+                std::path::Path::new(out_path),
+                csc_cols_per_shard,
+                "4G",
+                None,
+            )
+            .map_err(|e| e.to_string())
         })
         .map_err(|e| PyRuntimeError::new_err(format!("rebuild_csc_inplace failed: {e}")))?;
     }

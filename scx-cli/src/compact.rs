@@ -112,7 +112,7 @@ pub fn run_compact(
 
     // Re-emit the CSC sidecar against the compacted output.
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
