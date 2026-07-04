@@ -804,6 +804,12 @@ impl IndexPlanDataset {
     ///         O(rows) via the scx1 decode sidecar; False makes the prefetch
     ///         warm whole shards (legacy full-shard decode). `SCX_SCATTER_SIDECAR=0`
     ///         is the process-wide reader-layer kill-switch.
+    ///     scatter_block_index: Per-dataset escape hatch (default: True) gating the
+    ///         block-index-aware prefetch skip for row-group-framed (v2) files.
+    ///         True lets cold sparse plans decode only the touched row-groups via
+    ///         the block index (independent of the Scx1 sidecar); False makes the
+    ///         prefetch warm whole framed shards. `SCX_SCATTER_BLOCK_INDEX=0` is
+    ///         the process-wide reader-layer kill-switch.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -821,6 +827,7 @@ impl IndexPlanDataset {
         max_plan_size=None,
         max_memory_mb=None,
         scatter_sidecar=None,
+        scatter_block_index=None,
     ))]
     fn new(
         path: &str,
@@ -837,6 +844,7 @@ impl IndexPlanDataset {
         max_plan_size: Option<usize>,
         max_memory_mb: Option<usize>,
         scatter_sidecar: Option<bool>,
+        scatter_block_index: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = LoaderConfig::default();
         if let Some(v) = hvg_indices {
@@ -869,8 +877,9 @@ impl IndexPlanDataset {
         let lookahead = lookahead.unwrap_or(4);
         let max_plan_size = max_plan_size.unwrap_or(16384);
         let scatter_sidecar = scatter_sidecar.unwrap_or(true);
+        let scatter_block_index = scatter_block_index.unwrap_or(true);
 
-        let loader = IndexPlanLoader::new(
+        let mut loader = IndexPlanLoader::new(
             path,
             config,
             cache_shards,
@@ -880,6 +889,7 @@ impl IndexPlanDataset {
             scatter_sidecar,
         )
         .map_err(loader_err_to_py)?;
+        loader.set_scatter_block_index(scatter_block_index);
 
         Ok(Self {
             loader: Arc::new(loader),
@@ -1148,7 +1158,9 @@ impl IndexPlanBatchIter {
     ///            peak_bytes_in_cache},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
-    ///               prefetch_skipped_in_flight}}
+    ///               prefetch_skipped_in_flight,
+    ///               prefetch_skipped_sidecar,
+    ///               prefetch_skipped_block_index}}
     /// ```
     ///
     /// `cache` reflects loader-cumulative counters (shared with
@@ -1210,6 +1222,10 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     dict.set_item(
         "prefetch_skipped_sidecar",
         m.prefetch_skipped_sidecar.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "prefetch_skipped_block_index",
+        m.prefetch_skipped_block_index.load(Ordering::Relaxed),
     )?;
     Ok(dict)
 }

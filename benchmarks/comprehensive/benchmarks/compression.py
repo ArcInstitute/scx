@@ -131,14 +131,26 @@ def run(
             "source_h5ad_bytes": source_bytes,
             "compression_ratio": round(compression_ratio, 4),
             "bits_per_nnz": round(bits_per_nnz, 4),
+            "output_size_bytes": converted_bytes,
             "n_obs": dataset.n_obs,
             "n_vars": dataset.n_vars,
         },
     )
-    # Add a single "run" recording the conversion time for reference.
-    if convert_result is not None:
-        result.add_run(
-            wall_s=convert_result.wall_s,
-            peak_rss_mb=convert_result.peak_rss_mb,
-        )
+    # Headline size metrics flow into ``runs[].extra`` so the gate's
+    # absolute-floor check (which reads ``runs[].extra`` median per
+    # ``compare_against_baseline.py::_load_current_raw_metric``) can see them —
+    # they used to live only in ``metadata`` and were invisible to the gate.
+    # ``metadata`` keeps the human-readable summary. Always emit at least one
+    # run carrying the metrics, even when a pre-converted ``converted_path`` is
+    # supplied (no in-benchmark conversion), otherwise the gate treats the
+    # benchmark as "no observations" and fails every floor.
+    wall_s = convert_result.wall_s if convert_result is not None else 0.0
+    peak_rss_mb = convert_result.peak_rss_mb if convert_result is not None else 0.0
+    result.add_run(
+        wall_s=wall_s,
+        peak_rss_mb=peak_rss_mb,
+        output_size_bytes=converted_bytes,
+        compression_ratio=round(compression_ratio, 4),
+        bits_per_nnz=round(bits_per_nnz, 4),
+    )
     return result

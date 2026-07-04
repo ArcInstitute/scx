@@ -599,6 +599,7 @@ class TestMetrics:
             "prefetch_skipped_cache_hit",
             "prefetch_skipped_in_flight",
             "prefetch_skipped_sidecar",
+            "prefetch_skipped_block_index",
         }
         assert set(m["cache"]) == {
             "hits",
@@ -729,3 +730,90 @@ class TestMemoryBudget:
         # Without eviction the peak equals cumulative bytes_inserted.
         if after["evictions"] == 0:
             assert after["peak_bytes_in_cache"] == after["bytes_inserted"]
+
+
+class TestBlockIndexAdoption:
+    """F5 follow-up (Phase A): a row-group-framed file must take the
+    codec-agnostic block-index scattered path — even with the Scx1 sidecar
+    disabled — so a framed training file gets random-access decode. Proves the
+    `block_index_eligible` predicate + the `scatter_block_index` kwarg end to
+    end through pyscx (the Rust hard gate is
+    `scx-format-io backed_tests::read_rows_with_block_index_when_sidecar_disabled`)."""
+
+    @staticmethod
+    def _write_framed(path, *, n_obs=400, n_vars=60, codec="shufdelta",
+                      row_group_rows=16):
+        import anndata as ad
+        import scipy.sparse as sp
+
+        X = sp.random(n_obs, n_vars, density=0.05, format="csr", random_state=0)
+        X.data = np.round(X.data * 10 + 1).astype(np.float32)
+        adata = ad.AnnData(X=X)
+        adata.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
+        # Framed shufdelta: no Scx1 sidecar, so the block index is the only
+        # random-access route — isolates the counter under test.
+        pyscx.from_anndata(adata, path, codec=codec, row_group_rows=row_group_rows)
+        return adata
+
+    def test_framed_scatter_takes_block_index_without_sidecar(self, tmp_path):
+        path = str(tmp_path / "framed_shufdelta.scx")
+        self._write_framed(path)
+
+        rng = np.random.default_rng(0)
+        ds = pyscx.IndexPlanDataset(
+            path,
+            normalize=False,
+            cache_shards=4,
+            sort_by_shard=True,
+            lookahead=0,
+            scatter_sidecar=False,
+            scatter_block_index=True,
+        )
+        # Sparse, unsorted, cold gather → block-index eligible.
+        plan = [(int(rng.integers(0, 400)), int(rng.integers(0, 400)))
+                for _ in range(8)]
+        batches = list(ds.iter_with_plans(iter([plan]), lookahead=0))
+        assert batches[0]["X"].shape == (8, 60)
+
+        cm = ds.cache_metrics()
+        assert cm["block_index_groups"] > 0, (
+            "framed gather must take the block-index path with the sidecar off"
+        )
+        assert cm["sidecar_groups"] == 0
+        assert cm["full_shard_groups"] == 0
+
+    def test_scatter_block_index_flag_gates_prefetch_skip(self, tmp_path):
+        """The dataset `scatter_block_index` kwarg gates the L2 prefetch skip:
+        with it on, a framed shard's warm is skipped (so the gather takes the
+        block index); with it off, the prefetch warms the shard as before. The
+        `prefetch_skipped_block_index` counter distinguishes the two."""
+        path = str(tmp_path / "framed_shufdelta_prefetch.scx")
+        self._write_framed(path)
+
+        rng = np.random.default_rng(2)
+        plan = [(int(rng.integers(0, 400)), int(rng.integers(0, 400)))
+                for _ in range(8)]
+
+        def drained_prefetch_metrics(scatter_block_index):
+            ds = pyscx.IndexPlanDataset(
+                path,
+                normalize=False,
+                cache_shards=4,
+                sort_by_shard=True,
+                lookahead=1,
+                scatter_sidecar=False,
+                scatter_block_index=scatter_block_index,
+            )
+            it = ds.iter_with_plans(iter([list(plan)]), lookahead=1)
+            list(it)
+            return it.metrics()["prefetch"]
+
+        on = drained_prefetch_metrics(True)
+        off = drained_prefetch_metrics(False)
+        assert "prefetch_skipped_block_index" in on
+        assert on["prefetch_skipped_block_index"] > 0, (
+            "framed shard warm must be skipped when scatter_block_index=True"
+        )
+        assert off["prefetch_skipped_block_index"] == 0, (
+            "framed shard must be warmed (not skipped) when scatter_block_index=False"
+        )

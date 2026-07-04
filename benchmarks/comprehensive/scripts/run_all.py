@@ -93,6 +93,7 @@ AVAILABLE_BENCHMARKS = [
     "write",               # Write / conversion performance
     "read_full",           # Full file load
     "read_selective",      # Selective read (query / subsetting)
+    "read_scattered",      # Scattered random-row read (F5 block-index path)
     "parallel_scaling",    # Parallel read scaling
     "parallel_write_scaling",  # Parallel write scaling
     "ml_loader",           # ML data loader throughput

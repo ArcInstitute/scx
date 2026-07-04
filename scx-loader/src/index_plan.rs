@@ -151,6 +151,15 @@ pub struct IndexPlanLoader {
     /// `SCX_SCATTER_SIDECAR=0` env switch disables the sidecar at the reader
     /// layer entirely.
     scatter_sidecar: bool,
+    /// Per-dataset escape hatch gating the **L2 block-index-aware prefetch skip**
+    /// only (default `true`). Symmetric with `scatter_sidecar` but for the
+    /// codec-agnostic row-group path: when `false`, the prefetch warms cold
+    /// framed shards as before, so the gather falls back to full-shard decode.
+    /// Independent of `scatter_sidecar` — a framed file adopts the block-index
+    /// path even with the Scx1 sidecar off. Gates only the prefetch skip; L1
+    /// (`read_rows_with`) block-index adoption is governed by the reader's own
+    /// `scatter_block_index` (env `SCX_SCATTER_BLOCK_INDEX`).
+    scatter_block_index: bool,
 }
 
 impl IndexPlanLoader {
@@ -407,7 +416,18 @@ impl IndexPlanLoader {
             cache_metrics,
             budget_breakdown,
             scatter_sidecar,
+            // Default on; the Python layer overrides via
+            // `set_scatter_block_index` when the caller passes the kwarg.
+            scatter_block_index: true,
         })
+    }
+
+    /// Override the L2 block-index-aware prefetch skip gate (default `true`).
+    /// Called by the Python constructor to honor its `scatter_block_index`
+    /// kwarg; kept as a post-construction setter so the many-arg `new` signature
+    /// (and its test callers) stays unchanged. See [`Self::scatter_block_index`].
+    pub fn set_scatter_block_index(&mut self, enabled: bool) {
+        self.scatter_block_index = enabled;
     }
 
     /// Return the tokio runtime, building it on first call.
@@ -485,6 +505,14 @@ impl IndexPlanLoader {
     /// unconditional. See [`Self::scatter_sidecar`] field docs.
     pub fn scatter_sidecar(&self) -> bool {
         self.scatter_sidecar
+    }
+
+    /// Whether the L2 block-index-aware prefetch skip is enabled for this dataset
+    /// (default `true`). Gates only the prefetch skip in `IndexPlanIter`; L1
+    /// block-index adoption is governed by the reader's own env-derived gate. See
+    /// [`Self::scatter_block_index`] field docs.
+    pub fn scatter_block_index(&self) -> bool {
+        self.scatter_block_index
     }
 
     /// Per-component memory breakdown produced by the auto-tune at
@@ -791,6 +819,12 @@ pub struct IterMetrics {
     /// rows O(rows) via the scx1 decode sidecar, so warming the whole shard would
     /// negate the win (the L2 sidecar-aware prefetch skip).
     pub prefetch_skipped_sidecar: AtomicU64,
+    /// Shards whose prefetch was skipped because the group is **block-index
+    /// eligible** (cold + sparse + row-group framed): the dense gather decodes
+    /// only the touched row-groups via the block index, so warming the whole
+    /// shard would negate the win. Independent of the Scx1-sidecar decision (the
+    /// L2 block-index-aware prefetch skip).
+    pub prefetch_skipped_block_index: AtomicU64,
 }
 
 /// Iterator returned by [`IndexPlanLoader::iter_with_plans`].
@@ -955,6 +989,19 @@ impl IndexPlanIter {
                         .fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                // Block-index-eligible framed shards: leave them undecoded so
+                // `read_rows_with` takes the group-level block-index path. Gated
+                // by the loader's `scatter_block_index` flag and independent of
+                // the Scx1-sidecar decision, so a framed file adopts the path
+                // even with the sidecar disabled.
+                if self.loader.scatter_block_index()
+                    && self.loader.backed.block_index_eligible(sidx, group_len)
+                {
+                    self.iter_metrics
+                        .prefetch_skipped_block_index
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
                 true
             })
             .map(|(sidx, _group_len)| {
@@ -1061,13 +1108,17 @@ impl Drop for IndexPlanIter {
             let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
             let skip_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
             let skip_inflight = im.prefetch_skipped_in_flight.load(Ordering::Relaxed);
+            let skip_sidecar = im.prefetch_skipped_sidecar.load(Ordering::Relaxed);
+            let skip_block_index = im.prefetch_skipped_block_index.load(Ordering::Relaxed);
             eprintln!(
                 "scx-loader IndexPlanIter cache_metrics: \
                  hits={hits} misses={misses} evictions={evictions} \
                  bytes_inserted={bytes_inserted} duplicate_waiters={dup_waiters} \
                  prefetch_tasks_spawned={spawned} \
                  prefetch_skipped_cache_hit={skip_hit} \
-                 prefetch_skipped_in_flight={skip_inflight}"
+                 prefetch_skipped_in_flight={skip_inflight} \
+                 prefetch_skipped_sidecar={skip_sidecar} \
+                 prefetch_skipped_block_index={skip_block_index}"
             );
         }
     }

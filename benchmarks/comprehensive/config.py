@@ -166,6 +166,26 @@ class DatasetConfig:
     def scx_compact_trial_path(self) -> Path:
         return DATA_DIR / f"{self.name}_compact_trial.scx"
 
+    # F5 follow-up (Phase B): per-row-group-size compact-trial variants. Each G
+    # needs a distinct on-disk path — `path_for_format` resolves via a static
+    # key→property table, so a single G-parametrized variant would collide on
+    # one file and the "exists → skip" cache would serve a stale G.
+    @property
+    def scx_compact_trial_g128_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial_g128.scx"
+
+    @property
+    def scx_compact_trial_g256_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial_g256.scx"
+
+    @property
+    def scx_compact_trial_g512_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial_g512.scx"
+
+    @property
+    def scx_compact_trial_g1024_path(self) -> Path:
+        return DATA_DIR / f"{self.name}_compact_trial_g1024.scx"
+
     @property
     def anndata_zarr_backed_path(self) -> Path:
         return DATA_DIR / f"{self.name}_anndata.zarr"
@@ -251,6 +271,10 @@ _FORMAT_KEY_TO_PROP: dict[str, str] = {
     "scx_pcodec": "scx_pcodec_path",
     "scx_shufdelta": "scx_shufdelta_path",
     "scx_compact_trial": "scx_compact_trial_path",
+    "scx_compact_trial_g128": "scx_compact_trial_g128_path",
+    "scx_compact_trial_g256": "scx_compact_trial_g256_path",
+    "scx_compact_trial_g512": "scx_compact_trial_g512_path",
+    "scx_compact_trial_g1024": "scx_compact_trial_g1024_path",
     "bpcells": "bpcells_path",
     "parquet_zstd": "parquet_path",
     "slaf": "slaf_path",
@@ -668,6 +692,20 @@ ADDITIONAL_FORMATS: list[FormatVariant] = [
                   {"compression": "zstd"}),
     FormatVariant("AnnData-on-Zarr (backed)", "anndata_zarr_backed", "additional",
                   "zarr_runner", {"backed": True}),
+    # F5 follow-up (Phase B): row-group-size sweep for the compact-trial codec.
+    # Kept out of PRIMARY (the default no-`--formats` sweep) so they only run
+    # when explicitly selected via `--formats scx_compact_trial_g<G>` — used by
+    # the `compression` (ratio-vs-G) and `read_scattered` (block-index adoption)
+    # benchmarks. `--formats` resolves against ALL_FORMATS so ADDITIONAL keys are
+    # selectable. Distinct on-disk paths (see `scx_compact_trial_g<G>_path`).
+    FormatVariant("SCX (compact-trial G=128)", "scx_compact_trial_g128", "additional",
+                  "scx_runner", {"codec": "compact-trial", "row_group_rows": 128}),
+    FormatVariant("SCX (compact-trial G=256)", "scx_compact_trial_g256", "additional",
+                  "scx_runner", {"codec": "compact-trial", "row_group_rows": 256}),
+    FormatVariant("SCX (compact-trial G=512)", "scx_compact_trial_g512", "additional",
+                  "scx_runner", {"codec": "compact-trial", "row_group_rows": 512}),
+    FormatVariant("SCX (compact-trial G=1024)", "scx_compact_trial_g1024", "additional",
+                  "scx_runner", {"codec": "compact-trial", "row_group_rows": 1024}),
 ]
 
 

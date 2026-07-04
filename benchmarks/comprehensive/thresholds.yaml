@@ -1521,6 +1521,69 @@ absolute_floors:
     metric: overall_passed_int
     min: 1
 
+  # ─── F5 row-group block-index adoption (read_scattered) ──────────────
+  # `read_scattered` drives an unsorted, scattered random-row gather over a
+  # row-group-framed compact-trial file, opened with scatter_sidecar=False +
+  # scatter_block_index=True. On a framed file every scattered shard-group is
+  # served by the codec-agnostic block index, so `block_index_groups > 0` and
+  # `block_index_adoption_rate == 1.0`. A regression that silently full-shard-
+  # decodes (framing dropped, or the loader block-index path unwired) drops
+  # `block_index_groups` to 0 → gate failure. These are correctness contracts,
+  # not perf floors; they survive baseline promotion. Gated on the default G
+  # (512) across the tier-small float datasets that produce framed shards.
+  # `check_absolute_floors` skips any triple silently on runs that didn't
+  # execute it (e.g. a narrower --formats/--datasets gate). See the F5
+  # follow-up plan and docs/codec.md.
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: pbmc3k
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: pbmc3k
+    metric: block_index_adoption_rate
+    min: 1.0
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: smartseq2
+    metric: block_index_groups
+    min: 1
+  - benchmark: read_scattered
+    format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: block_index_groups
+    min: 1
+
+  # ─── F5 compact-trial compression ratio (default G=512) ──────────────
+  # Conversion is deterministic, so these ratios are stable; the floors sit
+  # ~8–11% below the 2026-07-04 measured medians (pbmc3k 4.82, pbmc10k 6.73,
+  # smartseq2 4.07, tabula 6.79) to absorb dataset refreshes / codec-selection
+  # drift while catching a real ratio regression (e.g. framing silently
+  # inflating output). Ratio is essentially flat across G (±0.3%), so one G
+  # (the default 512) is floored per dataset. `bits_per_nnz` is intentionally
+  # NOT floored — its nnz estimate is unreliable on backed float files.
+  - benchmark: compression
+    format: scx_compact_trial_g512
+    dataset: pbmc3k
+    metric: compression_ratio
+    min: 4.3
+  - benchmark: compression
+    format: scx_compact_trial_g512
+    dataset: pbmc10k
+    metric: compression_ratio
+    min: 6.0
+  - benchmark: compression
+    format: scx_compact_trial_g512
+    dataset: smartseq2
+    metric: compression_ratio
+    min: 3.6
+  - benchmark: compression
+    format: scx_compact_trial_g512
+    dataset: tabula_sapiens_100k
+    metric: compression_ratio
+    min: 6.0
+
 # ---------------------------------------------------------------------------
 # Deferred floors — known gaps tracked here so operators can see what's
 # missing and why. Add entries above this block once the blockers below
