@@ -110,9 +110,12 @@ pub fn run_compact(
         label,
     );
 
-    // Re-emit the CSC sidecar against the compacted output.
+    // Re-emit the CSC sidecar against the compacted output, preserving the
+    // output's framing (compact keeps a v4 input framed; the rebuild must not
+    // downgrade it back to unframed v3).
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
+        let framing = crate::cli_utils::framing_for_file(output);
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

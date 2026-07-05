@@ -850,6 +850,75 @@ fn append_from_reader_resplit_into_framed_base_emits_framed_shards() {
     );
 }
 
+/// F-d review fix: appending an UNFRAMED v1 Scx1 (+ decode sidecar) source into a
+/// v4 framed base must NOT byte-copy the v1 shard. `raw_copy_csr_shard` writes via
+/// `FileLock` and copies no sidecar, so a raw-copy would leave a sidecar-less v1
+/// shard under a v4 header (invalid, and the guard is bypassed on this path). The
+/// framing-match gate routes the v1 shard through the decode-encode path, which
+/// re-frames it to v2 — no dangling/dropped sidecar, valid v4 output.
+#[test]
+fn append_unframed_scx1_source_into_v4_base_reframes_to_v2() {
+    use scx_codec::CodecSelection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let base = dir.path().join("base.scx");
+    let source = dir.path().join("source_scx1.scx");
+    write_framed_input(&base, 40, "donor_A", &var, 8); // v4 framed base
+    write_scx1_count_input(&source, 40, "donor_B", &var); // v1 Scx1 + sidecar
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    let src_sh = src_reader
+        .read_shard_header(src_reader.catalog().shards_sorted()[0])
+        .unwrap();
+    assert_eq!(
+        src_sh.shard_format_version, 1,
+        "source shard must be unframed v1"
+    );
+    assert!(
+        sidecar_count(&src_reader) >= 1,
+        "source must carry a decode sidecar to exercise the gap"
+    );
+    let src_rows = decode_all_rows(&src_reader);
+
+    scx_ops::append_from_reader(
+        &base,
+        &src_reader,
+        &scx_ops::AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: std::num::NonZeroU32::new(16384).unwrap(),
+            modality_id: 0,
+        },
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let post = ScxReader::open(&base).unwrap();
+    assert_eq!(post.n_obs(), 80);
+    assert_eq!(post.header().format_version, CURRENT_FORMAT_VERSION);
+    for entry in &post.catalog().shards_sorted() {
+        let sh = post.read_shard_header(entry).unwrap();
+        assert!(
+            sh.shard_format_version > 1,
+            "shard '{}' must be framed v2 (v1 Scx1 source reframed, not byte-copied sidecar-less), got v{}",
+            entry.name,
+            sh.shard_format_version
+        );
+    }
+    assert_eq!(
+        sidecar_count(&post),
+        0,
+        "a valid v4 framed output must carry no DecodeMetadataShard sidecars"
+    );
+    let post_rows = decode_all_rows(&post);
+    assert_eq!(
+        &post_rows[40..80],
+        &src_rows[..],
+        "appended rows decode to the source"
+    );
+}
+
 /// Micro-bench (P2 / OPT-1.2): same-layout merge via the raw-copy fast path
 /// vs the decode/re-encode path. The slow path is exactly the pre-change
 /// behaviour (raw-copy disabled), so `slow / fast` is the merge speedup.

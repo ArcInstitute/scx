@@ -103,6 +103,14 @@ def test_passthrough_decoded_x_equals_source_framed(synthetic_adata, tmp_dir):
     np.testing.assert_array_equal(src_x.toarray(), dst_x.toarray())
     _assert_passthrough(dst)
 
+    # The passthrough byte-copies shard-v2 (framed) shards, so the output header
+    # MUST be v4 — a v3 stamp over framed shards would let a v3-only reader
+    # accept the file and mis-decode each group's local-rebased indptr as global.
+    assert pyscx.open(src_scx).format_version == 4, "source is framed v4"
+    assert (
+        pyscx.open(dst).format_version == 4
+    ), "framed-source passthrough must stamp a v4 header over the copied v2 shards"
+
 
 # ---------------------------------------------------------------------------
 # Decode-encode on shard-size mismatch

@@ -191,9 +191,11 @@ pub fn run_append(
         target.display()
     );
 
-    // Re-emit the CSC sidecar that scx_ops::append dropped.
+    // Re-emit the CSC sidecar that scx_ops::append dropped, preserving the
+    // target's framing (a v4 target must stay framed after the rebuild).
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, csc_memory_limit, None)?;
+        let framing = crate::cli_utils::framing_for_file(target);
+        scx_ops::rebuild_csc_inplace(target, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", target.display());
     }
 
