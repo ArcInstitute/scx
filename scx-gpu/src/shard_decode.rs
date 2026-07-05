@@ -11,7 +11,9 @@ use cudarc::driver::safe::CudaSlice;
 use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
 use scx_codec::{CodecId, Scx1DecodeMetadata, ValueEncoding};
-use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE};
+use scx_format_io::shard::{
+    resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
+};
 
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
@@ -153,21 +155,30 @@ pub fn decode_shard_gpu_with_metadata(
     // 3. Dispatch.
     //
     // Row-group-framed (shard v2) shards store per-group local-rebased indptrs
-    // plus a concatenation of per-group value/index frames — the whole-stream
-    // GPU Scx1 kernels and the monolithic host decoder both mis-size those. Route
-    // *any* framed shard (regardless of codec, including framed Scx1) through the
-    // group-aware host decode + HtoD bounce, mirroring the CPU
-    // `scx_format_io::shard_decode` path. Only *unframed* shards take the codec
-    // dispatch below; unframed Scx1 keeps the in-VRAM device-decode fast path.
+    // plus a concatenation of per-group value/index frames. Framed **Scx1**
+    // decodes in VRAM group-by-group (each group is a standalone Scx1 sub-shard,
+    // so the FOR-BP/Rice kernels run per group frame — Phase E). Framed non-Scx1
+    // codecs (None/Zstd/Lz4Shuffle/Pcodec/ShufDeltaZstd) have no GPU decoder, so
+    // they host-decode + HtoD bounce via the shared CPU path.
     if header.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
-        return decode_host_bounce(
-            dev,
-            &header,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-            block_index_bytes,
-        );
+        return match codec_id {
+            CodecId::Scx1 => decode_framed_scx1_gpu(
+                dev,
+                &header,
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                block_index_bytes,
+            ),
+            _ => decode_host_bounce(
+                dev,
+                &header,
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                block_index_bytes,
+            ),
+        };
     }
 
     match codec_id {
@@ -351,6 +362,113 @@ fn decode_host_bounce(
             indptr: d_indptr,
             indices: d_indices,
             data: d_data,
+            shape: (n_rows, n_cols),
+        },
+        stats,
+    ))
+}
+
+/// In-VRAM device decode of a **framed (v2) Scx1** shard, group by group.
+///
+/// Each row-group is a standalone Scx1 sub-shard (group-local Delta-Golomb
+/// indptr + FOR-BP index frame + Rice value frame), so the existing per-frame
+/// prescans (`forbp_decode_gpu` / `rice_decode_gpu`) run verbatim on each group's
+/// byte slice; the decoded per-group device buffers are dtod-concatenated into
+/// combined nnz-sized buffers (the same idiom as the cross-shard
+/// `decode_csr_shards_to_device_with_metadata`, applied at group granularity).
+/// The global indptr is assembled on the host from each group's local indptr via
+/// `scx_codec::decode_row_group_indptr_only` (only the indptr sub-stream frame is
+/// decoded on the host; the much larger index/value frames go to the device).
+///
+/// Only the indptr round-trips to the device, so `fully_device_decoded` is `true`
+/// and the caller stamps `scx_device_decode_gpu`.
+fn decode_framed_scx1_gpu(
+    dev: &GpuDevice,
+    header: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+    let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
+        GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
+    })?;
+    if !value_encoding.is_integer() {
+        return Err(GpuError::InvalidShard(
+            "Scx1 codec does not support float value encodings".into(),
+        ));
+    }
+    let index_dtype_u16 = header.index_dtype == 0;
+    let n_rows = header.n_major as usize;
+    let n_cols = header.n_minor as usize;
+    let nnz = header.nnz as usize;
+
+    let spans = resolve_block_index(header, block_index_bytes)
+        .map_err(|e| GpuError::InvalidShard(format!("framed Scx1 block index: {e}")))?;
+
+    // Combined nnz-sized device buffers, filled per group at the running offset.
+    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
+    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
+    // Host-assembled global indptr (tiny: n_rows + 1 elements).
+    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    combined_indptr.push(0);
+
+    let mut nnz_base: usize = 0;
+    for span in &spans {
+        let g_rows = span.n_rows as usize;
+        let g_nnz = span.nnz as usize;
+
+        // Global indptr: decode only this group's local indptr frame on the host
+        // (indices/values frames are never host-decoded), then rebase by nnz_base.
+        let g_indptr = scx_codec::decode_row_group_indptr_only(CodecId::Scx1, span, indptr_bytes)?;
+        for &local in &g_indptr[1..=g_rows] {
+            combined_indptr.push(nnz_base as i64 + local);
+        }
+
+        if g_nnz > 0 {
+            // Decode this group's index + value frames on the device.
+            let ix_frame = &indices_bytes[span.indices.clone()];
+            let vv_frame = &values_bytes[span.values.clone()];
+            let (d_indices_u32, _row_lengths) =
+                forbp_decode_gpu(dev, ix_frame, g_rows, index_dtype_u16)?;
+            let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
+            let d_values_u32 = rice_decode_gpu(dev, vv_frame, g_nnz, B_VAL)?;
+            let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
+
+            let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + g_nnz);
+            dev.stream()
+                .memcpy_dtod(&d_indices, &mut idx_dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod indices (framed group): {e}")))?;
+            let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + g_nnz);
+            dev.stream()
+                .memcpy_dtod(&d_data, &mut data_dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod data (framed group): {e}")))?;
+        }
+
+        nnz_base += g_nnz;
+    }
+    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+
+    let indptr_bytes_uploaded = (combined_indptr.len() * 8) as u64;
+    let d_indptr = dev.htod_copy(&combined_indptr)?;
+    // The per-group FOR-BP/Rice/cast kernels and dtod copies are queued async on
+    // the stream; sync so a downstream cuPy consumer cannot race unfinished work.
+    dev.synchronize()?;
+
+    let stats = DeviceDecodeStats {
+        // Only the assembled indptr round-trips host→device; indices+values
+        // decode in VRAM (like the unframed Scx1 device path).
+        host_uploaded_bytes: indptr_bytes_uploaded,
+        device_decoded_bytes: (nnz as u64) * 8,
+        fully_device_decoded: true,
+    };
+
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: combined_indices,
+            data: combined_data,
             shape: (n_rows, n_cols),
         },
         stats,
@@ -744,12 +862,14 @@ mod tests {
         buf
     }
 
-    /// GPU decode of a **framed (v2)** shard must host-bounce and produce output
-    /// byte-identical to the source CSR — for both a non-Scx1 framed codec
-    /// (ShufDeltaZstd) and framed Scx1 (which must NOT take the whole-stream
-    /// device kernel). Regression for SHARDAD-F5 §11.2.
+    /// GPU decode of a **framed (v2)** shard produces output byte-identical to the
+    /// source CSR for both codecs, but takes different paths (Phase E): framed
+    /// **Scx1** decodes in VRAM group-by-group (`fully_device_decoded == true`),
+    /// while a framed non-Scx1 codec (ShufDeltaZstd) host-bounces
+    /// (`fully_device_decoded == false`). The multi-group fixture (14 rows,
+    /// `row_group_rows = 4` → 4 groups) exercises the per-group concat path.
     #[test]
-    fn test_shard_decode_gpu_framed_host_bounce() {
+    fn test_shard_decode_gpu_framed() {
         let dev = require_gpu!();
         let n_cols: u32 = 4000;
         let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
@@ -759,9 +879,9 @@ mod tests {
         let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
         let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
 
-        for codec in [CodecId::ShufDeltaZstd, CodecId::Scx1] {
+        for (codec, want_device) in [(CodecId::ShufDeltaZstd, false), (CodecId::Scx1, true)] {
             let section = framed_section_bytes(&indptr, &indices, &values_f32, codec, n_cols, 4);
-            let gpu_csr = decode_shard_gpu(&dev, &section)
+            let (gpu_csr, stats) = decode_shard_gpu_with_metadata(&dev, &section, None)
                 .unwrap_or_else(|e| panic!("framed {codec:?} GPU decode failed: {e}"));
             let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
             let g_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
@@ -770,7 +890,66 @@ mod tests {
             assert_eq!(g_indptr, want_indptr, "{codec:?} indptr mismatch");
             assert_eq!(g_indices, want_indices, "{codec:?} indices mismatch");
             assert_eq!(g_data, values_f32, "{codec:?} data mismatch");
+            assert_eq!(
+                stats.fully_device_decoded, want_device,
+                "{codec:?} expected fully_device_decoded={want_device} (framed Scx1 in-VRAM, \
+                 framed non-Scx1 host-bounce)"
+            );
         }
+    }
+
+    /// A framed (v2) Scx1 shard decoded in-VRAM group-by-group is byte-identical
+    /// to the same matrix decoded unframed (v1) on the device — proving the
+    /// per-group concat + host-assembled indptr equals the whole-shard path.
+    #[test]
+    fn test_shard_decode_gpu_framed_scx1_matches_unframed() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+
+        // Unframed Scx1 (whole-shard device kernel). build_test_shard takes raw
+        // value bytes; encode the u16 values little-endian.
+        let values_raw: Vec<u8> = values_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let unframed = build_test_shard(
+            &indptr,
+            &indices,
+            &values_raw,
+            CodecId::Scx1,
+            ValueEncoding::Uint16,
+            n_cols,
+        );
+        let (u_csr, u_stats) = decode_shard_gpu_with_metadata(&dev, &unframed, None).unwrap();
+        assert!(
+            u_stats.fully_device_decoded,
+            "unframed Scx1 must device-decode"
+        );
+
+        // Framed Scx1 (per-group device decode), 4 rows per group → 4 groups.
+        let framed = framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
+        let (f_csr, f_stats) = decode_shard_gpu_with_metadata(&dev, &framed, None).unwrap();
+        assert!(
+            f_stats.fully_device_decoded,
+            "framed Scx1 must device-decode"
+        );
+
+        assert_eq!(f_csr.shape, u_csr.shape, "shape framed vs unframed");
+        assert_eq!(
+            dev.dtoh_copy(&f_csr.indptr).unwrap(),
+            dev.dtoh_copy(&u_csr.indptr).unwrap(),
+            "indptr framed vs unframed"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&f_csr.indices).unwrap(),
+            dev.dtoh_copy(&u_csr.indices).unwrap(),
+            "indices framed vs unframed"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&f_csr.data).unwrap(),
+            dev.dtoh_copy(&u_csr.data).unwrap(),
+            "data framed vs unframed"
+        );
     }
 
     #[test]
