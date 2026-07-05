@@ -89,6 +89,47 @@ _DEFAULT_N_BATCHES = 1000
 # one shard of the typical 16k-shard fixture, giving high cache reuse.
 _LOCALITY_GROUP_SIZE = 4096
 
+# Cost-knob scaling (mirrors read_scattered.py). The fixed 1000-batch × up-to-5
+# timed-run × up-to-5-scenario worst case (plus a full 1000-batch untimed
+# warm-up per scenario) times out ~30 min/run on framed (v4) 50k/100k-cell
+# `scx_auto` fixtures — the same class the pre-tune read_scattered hit. Scale
+# batch + run counts down for large datasets so the per-job wall fits the SLURM
+# budget. Small (<30k-cell) datasets keep the historical 1000-batch / uncapped-
+# run behaviour so their existing baseline rows stay valid; only the untimed
+# warm-up is capped universally (it feeds cache/tokio init, never a recorded
+# metric, so shrinking it is measurement-neutral).
+#
+# Intentional asymmetry vs read_scattered.py: read_scattered is a *new*
+# benchmark with no historical baseline, so it always scales and floors at 12
+# batches. index_plan already has baseline rows (incl. absolute bps floors in
+# thresholds.yaml), so it keeps the <30k full-1000 branch and uses a higher
+# _MIN_N_BATCHES (50) to bound how far the >=30k throughput measurement can move
+# from the value the existing floors were calibrated against. NOTE: the >=30k
+# absolute bps floors (tabula/census_1m) were calibrated under the old
+# 1000-batch regime; re-validate/re-tune them when the deferred index_plan
+# recapture folds the smartseq2/tabula rows into LATEST.
+_LARGE_N_OBS = 30_000
+_MIN_N_BATCHES = 50
+_WARMUP_BATCHES = 3
+
+
+def _n_batches_for(n_obs: int) -> int:
+    """Batch count: full ``_DEFAULT_N_BATCHES`` under ``_LARGE_N_OBS``, else
+    scaled inversely with dataset size and floored at ``_MIN_N_BATCHES``."""
+    if n_obs < _LARGE_N_OBS:
+        return _DEFAULT_N_BATCHES
+    scaled = 800_000 // max(1, n_obs)
+    return int(min(_DEFAULT_N_BATCHES, max(_MIN_N_BATCHES, scaled)))
+
+
+def _n_runs_for(n_obs: int, harness_n_runs: int) -> int:
+    """Timed-run count: unchanged under ``_LARGE_N_OBS``; capped to 2 on large
+    (multi-shard, slow-per-batch) datasets. Throughput medians are stable, so a
+    large dataset doesn't need the harness's default 5 passes."""
+    if n_obs < _LARGE_N_OBS:
+        return harness_n_runs
+    return max(1, min(harness_n_runs, 2))
+
 
 def _have_pyscx() -> bool:
     try:
@@ -584,7 +625,12 @@ def run(
     n_obs = dataset.n_obs
     n_vars = dataset.n_vars
     pairs_per_batch = min(_DEFAULT_PAIRS_PER_BATCH, max(1, n_obs // 4))
-    n_batches = _DEFAULT_N_BATCHES
+    # Preserve the harness-requested counts alongside the effective (scaled)
+    # ones so the result JSON records whether the >=30k down-scaling applied —
+    # otherwise a reader can't tell a natively-small run from a capped one.
+    harness_n_runs = n_runs
+    n_batches = _n_batches_for(n_obs)
+    n_runs = _n_runs_for(n_obs, n_runs)
     hvg = _resolve_hvg(n_vars)
 
     result = BenchmarkResult(
@@ -594,6 +640,7 @@ def run(
         metadata={
             "pairs_per_batch": pairs_per_batch,
             "n_batches_target": n_batches,
+            "n_batches_default": _DEFAULT_N_BATCHES,
             "hvg_size": int(hvg.size) if hvg is not None else None,
             "normalize": True,
             "sort_by_shard": True,
@@ -601,6 +648,7 @@ def run(
             "cache_shards": 128,
             "locality_group_size": _LOCALITY_GROUP_SIZE,
             "n_runs": n_runs,
+            "n_runs_harness": harness_n_runs,
             "cold_cache": cold_cache,
             "batch_size_seq_ceiling": 2 * pairs_per_batch,
         },
@@ -619,22 +667,25 @@ def run(
         **common,
     )
 
-    scenarios: list[tuple[str, Callable[[], _ScenarioOutcome]]] = [
+    # Each scenario takes a batch count `nb` so the untimed warm-up can run a
+    # small `_WARMUP_BATCHES` pass instead of a full `n_batches` one (the full
+    # warm-up per scenario was a large slice of the timeout on big datasets).
+    scenarios: list[tuple[str, Callable[[int], _ScenarioOutcome]]] = [
         (
             "pyscx_index_plan_random",
-            lambda: _run_index_plan(
+            lambda nb: _run_index_plan(
                 scx_path,
-                lambda: _random_plans(n_obs, pairs_per_batch, n_batches),
+                lambda: _random_plans(n_obs, pairs_per_batch, nb),
                 pairs_per_batch,
                 **common_index_plan,
             ),
         ),
         (
             "pyscx_index_plan_locality",
-            lambda: _run_index_plan(
+            lambda nb: _run_index_plan(
                 scx_path,
                 lambda: _locality_plans(
-                    n_obs, _LOCALITY_GROUP_SIZE, pairs_per_batch, n_batches
+                    n_obs, _LOCALITY_GROUP_SIZE, pairs_per_batch, nb
                 ),
                 pairs_per_batch,
                 **common_index_plan,
@@ -642,10 +693,10 @@ def run(
         ),
         (
             "pyscx_backed_python_loop",
-            lambda: _run_backed_python(
+            lambda nb: _run_backed_python(
                 scx_path,
                 lambda: _locality_plans(
-                    n_obs, _LOCALITY_GROUP_SIZE, pairs_per_batch, n_batches
+                    n_obs, _LOCALITY_GROUP_SIZE, pairs_per_batch, nb
                 ),
                 pairs_per_batch,
                 **common,
@@ -653,10 +704,10 @@ def run(
         ),
         (
             "pyscx_training_dataset",
-            lambda: _run_training_dataset(
+            lambda nb: _run_training_dataset(
                 scx_path,
                 pairs_per_batch,
-                n_batches_target=n_batches,
+                n_batches_target=nb,
                 **common,
             ),
         ),
@@ -669,22 +720,24 @@ def run(
         scenarios.append(
             (
                 "pyscx_index_plan_dataset_workers2",
-                lambda: _run_index_plan_workers2(
+                lambda nb: _run_index_plan_workers2(
                     scx_path,
                     n_obs=n_obs,
                     pairs_per_batch=pairs_per_batch,
-                    n_batches=n_batches,
+                    n_batches=nb,
                     **common_index_plan,
                 ),
             )
         )
 
+    warmup_batches = min(n_batches, _WARMUP_BATCHES)
     for scenario_name, runner in scenarios:
         # Single untimed warm-up per scenario to drive page caches + lazy
-        # tokio init — same pattern as ml_loader.
+        # tokio init — same pattern as ml_loader. Capped to `_WARMUP_BATCHES`
+        # (a full warm-up feeds no recorded metric, only caches).
         try:
             logger.info("warmup %s on %s", scenario_name, dataset.name)
-            runner()
+            runner(warmup_batches)
         except Exception as e:
             logger.error("warmup failed for %s: %s", scenario_name, e)
             continue
@@ -699,7 +752,7 @@ def run(
                     except Exception:
                         pass
 
-                outcome = runner()
+                outcome = runner(n_batches)
             except Exception as e:
                 logger.error("run %d/%d failed for %s: %s", i + 1, n_runs, scenario_name, e)
                 continue

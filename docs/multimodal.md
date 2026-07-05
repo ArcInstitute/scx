@@ -80,6 +80,17 @@ RNA → Scx1 (UMI counts) or Pcodec (floats); Protein/ADT → Zstd; ATAC →
 Zstd for binary peaks else Lz4Shuffle (see
 [docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults)).
 
+**Row-group framing (v4) is on by default**, matching the unimodal path:
+`from_mudata` / `from_h5mu` / `scx convert --from h5mu` write v4 files with
+row-group framing (`row_group_rows=256`) for fast random/scattered reads. Pass
+`row_group_rows=0` (`--row-group-rows 0` on the CLI) to opt out and write the
+legacy unframed v3 layout. Note the GPU tradeoff: framing applies to Scx1
+integer-count modalities (UMI / ADT) too, so on GPU they host-bounce
+(`scx_device_handoff_streamed`) instead of taking the in-VRAM Scx1
+device-decode path — the same tradeoff Phase C made for unimodal. For
+multimodal *training* throughput on GPU where that matters, `row_group_rows=0`
+restores the device-decode path.
+
 ### 3.2 Reading — `to_mudata()` / `to_anndata()`
 
 ```python

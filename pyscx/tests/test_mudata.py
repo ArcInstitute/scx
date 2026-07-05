@@ -136,6 +136,55 @@ def test_from_mudata_round_trip(cite_seq_mudata):
         np.testing.assert_array_equal(adt_orig, adt_back)
 
 
+def test_from_mudata_frames_v4_by_default(cite_seq_mudata):
+    """Multimodal in-memory convert inherits the v4 row-group-framing
+    default (parity with the unimodal `from_anndata` path)."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        default_path = os.path.join(tmp, "default.scx")
+        pyscx.from_mudata(cite_seq_mudata, default_path)
+        assert pyscx.open(default_path).format_version == 4, (
+            "default from_mudata should frame (v4)"
+        )
+
+        # row_group_rows=0 opts out to the legacy unframed v3 layout.
+        optout_path = os.path.join(tmp, "optout.scx")
+        pyscx.from_mudata(cite_seq_mudata, optout_path, row_group_rows=0)
+        assert pyscx.open(optout_path).format_version == 3, (
+            "row_group_rows=0 should stay unframed (v3)"
+        )
+
+
+def test_from_h5mu_frames_v4_by_default(cite_seq_mudata):
+    """`from_h5mu` (path-based, streaming default) frames v4 by default with
+    the same `row_group_rows=0` opt-out. Data survives the round-trip."""
+    pytest.importorskip("mudata")
+    import pyscx
+
+    with tempfile.TemporaryDirectory() as tmp:
+        h5mu_path = os.path.join(tmp, "cite.h5mu")
+        cite_seq_mudata.write(h5mu_path)
+
+        default_path = os.path.join(tmp, "default.scx")
+        pyscx.from_h5mu(h5mu_path, default_path)
+        reader = pyscx.open(default_path)
+        assert reader.format_version == 4, "default from_h5mu should frame (v4)"
+        # Framed file still reads back the original matrices.
+        mu_back = reader.to_mudata()
+        np.testing.assert_array_equal(
+            cite_seq_mudata.mod["rna"].X.toarray(),
+            mu_back.mod["rna"].X.toarray(),
+        )
+
+        optout_path = os.path.join(tmp, "optout.scx")
+        pyscx.from_h5mu(h5mu_path, optout_path, row_group_rows=0)
+        assert pyscx.open(optout_path).format_version == 3, (
+            "row_group_rows=0 should stay unframed (v3)"
+        )
+
+
 def test_from_mudata_uns_roundtrip():
     """`pyscx.from_mudata` writes `mu.uns` as the global section and
     each `adata.uns` as `uns/<modality>`; both round-trip through

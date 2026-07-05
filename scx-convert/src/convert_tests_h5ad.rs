@@ -1524,6 +1524,119 @@ fn test_h5mu_round_trip() {
     assert_eq!(csr_adt.shape, (12, 10));
 }
 
+/// Count CSR shard headers in an SCX file whose `shard_format_version`
+/// matches `want`. Used by the multimodal-framing tests to prove every
+/// modality's shards are (un)framed as expected.
+#[cfg(test)]
+fn count_csr_shards_with_shard_version(scx_path: &std::path::Path, want: u8) -> (usize, usize) {
+    use scx_format_io::section::SectionType;
+    use scx_format_io::shard::{ShardHeader, SHARD_HEADER_SIZE};
+    let reader = ScxReader::open(scx_path).unwrap();
+    let bytes = std::fs::read(scx_path).unwrap();
+    let mut matching = 0usize;
+    let mut total = 0usize;
+    for entry in &reader.catalog().entries {
+        if entry.section_type != SectionType::CsrShard {
+            continue;
+        }
+        total += 1;
+        let section = &bytes[entry.offset as usize..][..entry.length as usize];
+        let sh = ShardHeader::read_from(&mut std::io::Cursor::new(&section[..SHARD_HEADER_SIZE]))
+            .unwrap();
+        if sh.shard_format_version == want {
+            matching += 1;
+        }
+    }
+    (matching, total)
+}
+
+/// Default multimodal convert now inherits the v4 row-group-framing default
+/// (Phase C parity with the unimodal path): the file header bumps to
+/// `CURRENT_FORMAT_VERSION` and every per-modality CSR shard is framed
+/// (`shard_format_version == CURRENT_SHARD_FORMAT_VERSION`).
+#[test]
+fn test_h5mu_frames_v4_by_default() {
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use scx_format_io::header::CURRENT_FORMAT_VERSION;
+    use scx_format_io::shard::CURRENT_SHARD_FORMAT_VERSION;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 12, 50, 10);
+
+    let opts = ConvertOptions::default();
+    assert!(opts.framing().is_some(), "default opts should frame");
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
+    let (framed, total) =
+        count_csr_shards_with_shard_version(&scx_path, CURRENT_SHARD_FORMAT_VERSION);
+    assert!(total >= 2, "expected at least one shard per modality");
+    assert_eq!(framed, total, "every CSR shard should be framed (v2)");
+}
+
+/// `row_group_rows = Some(0)` is the opt-out: the multimodal file stays the
+/// legacy unframed v3 layout (header `DEFAULT_WRITE_FORMAT_VERSION`, all CSR
+/// shards `DEFAULT_WRITE_SHARD_FORMAT_VERSION`).
+#[test]
+fn test_h5mu_row_group_rows_zero_stays_v3() {
+    use crate::h5mu::pipeline::h5mu_to_scx;
+    use scx_format_io::header::DEFAULT_WRITE_FORMAT_VERSION;
+    use scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 12, 50, 10);
+
+    let opts = ConvertOptions {
+        row_group_rows: Some(0),
+        ..Default::default()
+    };
+    assert!(
+        opts.framing().is_none(),
+        "row_group_rows=0 should not frame"
+    );
+    h5mu_to_scx(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert_eq!(reader.header().format_version, DEFAULT_WRITE_FORMAT_VERSION);
+    let (unframed, total) =
+        count_csr_shards_with_shard_version(&scx_path, DEFAULT_WRITE_SHARD_FORMAT_VERSION);
+    assert!(total >= 2, "expected at least one shard per modality");
+    assert_eq!(unframed, total, "every CSR shard should be unframed (v1)");
+}
+
+/// The streaming multimodal path also frames v4 by default. The coordinator
+/// already encoded X/layer shards with `opts.framing()`; the header bump +
+/// set_framing make it a clean v4 file (not v3-header/v2-shard).
+#[test]
+fn test_h5mu_streaming_frames_v4_by_default() {
+    use crate::h5mu::pipeline::h5mu_to_scx_streaming;
+    use scx_format_io::header::CURRENT_FORMAT_VERSION;
+    use scx_format_io::shard::CURRENT_SHARD_FORMAT_VERSION;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5mu_path = dir.path().join("cite.h5mu");
+    let scx_path = dir.path().join("cite.scx");
+    create_test_h5mu(&h5mu_path, 12, 50, 10);
+
+    let opts = ConvertOptions::default();
+    h5mu_to_scx_streaming(&h5mu_path, &scx_path, &opts, &mut WarningSink::log()).unwrap();
+
+    let reader = ScxReader::open(&scx_path).unwrap();
+    assert_eq!(reader.header().format_version, CURRENT_FORMAT_VERSION);
+    let (framed, total) =
+        count_csr_shards_with_shard_version(&scx_path, CURRENT_SHARD_FORMAT_VERSION);
+    assert!(total >= 2, "expected at least one shard per modality");
+    assert_eq!(
+        framed, total,
+        "every streamed CSR shard should be framed (v2)"
+    );
+}
+
 /// Phase E: per-modality codec routing fires on the h5mu pipeline.
 /// The `rna` modality (small UMI-style integer counts) should use
 /// Scx1; the `adt` modality (Protein → Zstd override) should use

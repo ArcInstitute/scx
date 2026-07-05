@@ -256,7 +256,7 @@ pub fn h5mu_to_scx(
     // codec_id/value_encoding are per-modality at write time, so the header
     // value is a nominal default. `nnz` is left at 0 and reconstructed by
     // writer.finish() (sync_from_catalog) from the per-shard stats.
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
         0,
@@ -264,8 +264,15 @@ pub fn h5mu_to_scx(
         0,
         index_dtype,
     );
+    // Row-group framing (v4) is the default write layout. A framed shard is
+    // only valid inside a v4 file, so bump the header alongside set_framing;
+    // `row_group_rows=0` (framing() == None) keeps the legacy v3 layout.
+    if opts.framing().is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
+    writer.set_framing(opts.framing());
 
     // Global obs goes first. Outer obsm and uns are also global.
     writer.write_obs(&outer_obs)?;
@@ -347,6 +354,7 @@ pub fn h5mu_to_scx(
                 value_encoding,
                 codec_id,
                 opts.csc_cols_per_shard,
+                opts.framing(),
             )?;
         }
 
@@ -522,7 +530,7 @@ pub fn h5mu_to_scx_streaming(
     // Placeholder header. `nnz`, `n_csr_shards`, `n_modalities`, the
     // modality table offset, and codec_id are all overwritten by
     // `ScxWriter::finish()` from running accumulators.
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
         0,
@@ -530,8 +538,17 @@ pub fn h5mu_to_scx_streaming(
         0,
         index_dtype,
     );
+    // Row-group framing (v4) default — same as the non-streaming path. The
+    // streaming coordinator already encodes X/layer shards with
+    // `opts.framing()`; bumping the header + set_framing makes the file a
+    // clean v4 (rather than v3-header/v2-shard) and frames any non-coordinator
+    // shards. `row_group_rows=0` (framing() == None) keeps the v3 layout.
+    if opts.framing().is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
+    writer.set_framing(opts.framing());
 
     // Outer obs / obsm / uns. Global obs goes first.
     writer.write_obs(&outer_obs)?;
@@ -947,6 +964,7 @@ fn write_modality_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), ConvertError> {
     // Multimodal data arrives already canonical from upstream, so wrap it
     // as-is (new_unchecked) and route through the shared transpose-and-write
@@ -967,7 +985,7 @@ fn write_modality_csc_shards_from_csr(
         csc_cols_per_shard,
         scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
         Some(modality_id),
-        None, // framing: multimodal CSC is unframed (no row-group threading yet)
+        framing, // frame the CSC sidecar to match the v4 default (None = v3)
     )?;
     Ok(())
 }

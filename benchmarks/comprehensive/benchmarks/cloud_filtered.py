@@ -52,6 +52,16 @@ builder so incompatible (bench, format) cells never get submitted. Mirrors
 the runtime guard at the top of ``run()`` (defense-in-depth for direct
 invocation)."""
 
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+"""Format-key allow-list — the only SCX layout with a cloud fixture suffix
+(``config._FORMAT_KEY_TO_CLOUD_SUFFIX``). The Scx1 ``compact_trial_g*``
+variants declare the ``cloud_filtered`` capability (via ``scx_runner``) but
+have no cloud layout, so ``DatasetConfig.cloud_url`` raises ``ValueError``
+for them — pinning the allow-list keeps them out of the cohort (a failed
+cloud job otherwise breaks the next cohort's ``afterok:`` dependency). Read
+by ``run_parallel.py``'s cohort builder; mirrored by the runtime guard in
+``run()``."""
+
 
 def _obs_columns(dataset: DatasetConfig) -> set[str]:
     """Return the obs column set for a dataset without loading X.
@@ -122,6 +132,8 @@ def run(
     converted_path: Path | None = None,
     provider: str = "gcs",
 ) -> BenchmarkResult | None:
+    if format_variant.key not in SUPPORTED_FORMATS:
+        return None
     if provider != "gcs":
         raise ValueError(
             f"Only 'gcs' provider is supported in Phase 5 (got {provider!r})"
