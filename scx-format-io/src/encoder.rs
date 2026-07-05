@@ -247,15 +247,27 @@ pub fn encode_one_shard(
     let mut shard_checksum = [0u8; 8];
     shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
 
-    // 8. Build ShardHeader with relative offsets.
+    // 8. Build ShardHeader with relative offsets. The header's offset/length
+    // fields are u32; a shard whose sub-streams (or their cumulative offset)
+    // exceed 4 GiB would silently wrap. Fail loud instead (F-c).
+    let len_u32 = |n: usize, what: &str| -> Result<u32, ScxError> {
+        u32::try_from(n).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!("{what} length {n} exceeds u32::MAX"))
+        })
+    };
+    let add_u32 = |a: u32, b: u32, what: &str| -> Result<u32, ScxError> {
+        a.checked_add(b).ok_or_else(|| {
+            ScxError::ShardStreamTooLarge(format!("{what} relative offset exceeds u32::MAX"))
+        })
+    };
     let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-    let indptr_length = encoded.indptr_bytes.len() as u32;
-    let indices_rel_offset = indptr_rel_offset + indptr_length;
-    let indices_length = encoded.indices_bytes.len() as u32;
-    let values_rel_offset = indices_rel_offset + indices_length;
-    let values_length = encoded.values_bytes.len() as u32;
-    let block_index_rel_offset = values_rel_offset + values_length;
-    let block_index_length = block_index_bytes.len() as u32;
+    let indptr_length = len_u32(encoded.indptr_bytes.len(), "indptr")?;
+    let indices_rel_offset = add_u32(indptr_rel_offset, indptr_length, "indices")?;
+    let indices_length = len_u32(encoded.indices_bytes.len(), "indices")?;
+    let values_rel_offset = add_u32(indices_rel_offset, indices_length, "values")?;
+    let values_length = len_u32(encoded.values_bytes.len(), "values")?;
+    let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
+    let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
 
     let shard_header = ShardHeader {
         magic: SHARD_MAGIC,
@@ -480,9 +492,26 @@ pub fn encode_shard_framed(
             index_dtype_u16,
         )?;
 
-        let ip_off = indptr_stream.len() as u32;
-        let ix_off = indices_stream.len() as u32;
-        let vv_off = values_stream.len() as u32;
+        // Sub-stream offsets are u32 in BlockIndexEntry; a >4 GiB concatenated
+        // sub-stream would silently wrap. Fail loud instead (F-c).
+        let ip_off = u32::try_from(indptr_stream.len()).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!(
+                "framed indptr sub-stream offset {} exceeds u32::MAX",
+                indptr_stream.len()
+            ))
+        })?;
+        let ix_off = u32::try_from(indices_stream.len()).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!(
+                "framed indices sub-stream offset {} exceeds u32::MAX",
+                indices_stream.len()
+            ))
+        })?;
+        let vv_off = u32::try_from(values_stream.len()).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!(
+                "framed values sub-stream offset {} exceeds u32::MAX",
+                values_stream.len()
+            ))
+        })?;
         indptr_stream.extend_from_slice(&enc.indptr_bytes);
         indices_stream.extend_from_slice(&enc.indices_bytes);
         values_stream.extend_from_slice(&enc.values_bytes);
