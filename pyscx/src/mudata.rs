@@ -276,6 +276,7 @@ pub fn from_h5mu_impl(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    row_group_rows: u32,
 ) -> PyResult<()> {
     use pyo3::exceptions::PyValueError;
     // Missing input → FileNotFoundError (the converter opens the h5mu via
@@ -321,6 +322,10 @@ pub fn from_h5mu_impl(
 
     let opts = scx_convert::ConvertOptions {
         shard_target_rows,
+        // Row-group framing (v4) default; `row_group_rows=0` opts out to v3.
+        // Explicit here so the opt-out is reachable (Default would force
+        // Some(DEFAULT_ROW_GROUP_ROWS) with no way to disable it).
+        row_group_rows: (row_group_rows != 0).then_some(row_group_rows),
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
@@ -411,8 +416,15 @@ pub fn from_mudata_impl(
     csc_cols_per_shard: usize,
     codec_per_modality: bool,
     uns_format: &str,
+    row_group_rows: u32,
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
+                                // Row-group framing (v4) default, matching the unimodal in-memory path.
+                                // `row_group_rows=0` opts out to the legacy unframed v3 layout.
+    let framing = (row_group_rows != 0).then(|| scx_format_io::FramingConfig {
+        row_group_rows,
+        ..Default::default()
+    });
     let csc_policy =
         scx_format_io::CscPolicy::parse(csc).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     // The in-memory MuData path cannot build per-modality CSC sidecars yet.
@@ -575,7 +587,7 @@ pub fn from_mudata_impl(
     let index_dtype: u8 = if max_n_vars <= 65535 { 0 } else { 1 };
     let shard_target_rows = shard_size.unwrap_or(16384);
 
-    let header = FileHeader::new_single_modality(
+    let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         max_n_vars,
         total_nnz,
@@ -583,9 +595,15 @@ pub fn from_mudata_impl(
         0,
         index_dtype,
     );
+    // A framed shard is only valid inside a v4 file, so bump the header
+    // alongside set_framing (below); framing == None keeps the v3 layout.
+    if framing.is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
 
     // Open writer + emit sections.
     let mut writer = ScxWriter::new(Path::new(path), header).map_err(to_pyerr)?;
+    writer.set_framing(framing);
     writer.write_obs(&outer_obs_batch).map_err(to_pyerr)?;
     if let Some(json) = &global_uns_json {
         writer.write_uns(json).map_err(to_pyerr)?;
