@@ -1171,8 +1171,6 @@ fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
 /// (catalog-wins tolerance survives only on v1 reads).
 #[test]
 fn test_strict_shard_type_v2_rejects_corrupted_csc() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("strict_csc.scx");
     let header = sample_header();
@@ -1394,8 +1392,6 @@ fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
 /// `read_all_csc_shards` densifies back to the source matrix.
 #[test]
 fn test_csc_two_shard_round_trip() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_shard_csc.scx");
 
@@ -1478,8 +1474,6 @@ fn test_csc_two_shard_round_trip() {
 /// `write_csc_shard` with the u16 overflow error.
 #[test]
 fn test_csc_shard_large_n_obs_roundtrip() {
-    use crate::reader::ScxReader;
-
     // n_obs > 65535 so CSC row indices need u32 even though n_vars
     // (=20) would fit in u16 if indices were column-style.
     let n_rows: usize = 66_000;
@@ -1597,8 +1591,6 @@ fn test_csc_shard_large_n_obs_roundtrip() {
 /// skipped (they would error at encode time).
 #[test]
 fn test_csc_codec_sweep() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let (dense, n_rows, n_cols) = dense_4x6();
 
@@ -1666,8 +1658,6 @@ fn test_csc_codec_sweep() {
 /// `BackedCscReader::enable_metrics()` lands.
 #[test]
 fn test_read_csc_columns_range_correctness() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("csc_range.scx");
 

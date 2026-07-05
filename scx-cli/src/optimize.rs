@@ -90,18 +90,14 @@ pub fn run_optimize(
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();
     // Framed runs report the row-group layout + per-shard ShufDeltaZstd adoption;
-    // unframed runs keep the historical "decode sidecars added" phrasing.
-    let detail = if stats.shards_framed > 0 || stats.unframed_scx1_gpu > 0 {
+    // unframed runs just report the shard count.
+    let detail = if stats.shards_framed > 0 {
         format!(
-            "row-group-framed {}/{} shards ({} stored as ShufDeltaZstd, \
-             {} kept unframed Scx1 for GPU/per-row)",
-            stats.shards_framed,
-            stats.shards_total,
-            stats.shards_shufdelta,
-            stats.unframed_scx1_gpu,
+            "row-group-framed {}/{} shards ({} stored as ShufDeltaZstd)",
+            stats.shards_framed, stats.shards_total, stats.shards_shufdelta,
         )
     } else {
-        "decode sidecars added where applicable".to_string()
+        format!("{} shards re-encoded (unframed)", stats.shards_total)
     };
     println!(
         "Optimized {} → {} ({} → {}); {}, format_version={}",

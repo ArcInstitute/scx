@@ -1551,7 +1551,7 @@ impl BackedCsrReader {
         Ok(())
     }
 
-    /// Codec-agnostic sibling of [`Self::scatter_group_via_sidecar`] for
+    /// Scatter one shard's request group directly from the block index, for
     /// **row-group-framed (v2)** shards: coalesce the request into consecutive
     /// runs and decode only the touched row-groups via the block index
     /// ([`ScxReader::decode_block_index_row_runs`]). Returns `Ok(false)` (nothing

@@ -259,7 +259,7 @@ enum Commands {
         /// Print checksum values and deep-check errors
         #[arg(long)]
         verbose: bool,
-        /// Decode sparse shards and validate v3 canonical CSR plus decode sidecars
+        /// Decode sparse shards and validate the v3 canonical CSR invariant
         #[arg(long)]
         deep: bool,
     },
@@ -329,8 +329,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Upgrade a file in place: re-encode CSR shards to add decode sidecars
-    /// and canonicalize to format_version 3 (single-modality; preserves obs/
+    /// Upgrade a file in place: re-encode + canonicalize CSR shards to
+    /// format_version 3 (single-modality; preserves obs/
     /// var/obsm/uns/indexes). Drops the CSC sidecar — rerun `scx build-csc`.
     Optimize {
         /// SCX file to optimize
@@ -341,12 +341,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
         /// Per-shard codec: `auto` (Scx1 for low-median integer counts, else
-        /// Zstd) or `scx1` (force Scx1 on every integer shard so all shards
-        /// carry a decode sidecar) for the unframed path; or `shufdelta` /
+        /// Zstd) or `scx1` (force Scx1 on every integer shard); or `shufdelta` /
         /// `compact-trial` for row-group-framed (v4) output — the latter keeps
         /// the per-shard smaller of the heuristic codec vs ShufDeltaZstd.
-        /// `shufdelta` / `compact-trial` require `--row-group-rows`. Framed
-        /// shards use the block index rather than a decode sidecar. Other
+        /// `shufdelta` / `compact-trial` require `--row-group-rows`; framed
+        /// shards use the block index for random access. Other
         /// codecs are rejected. Default: auto.
         #[arg(long, default_value = "auto", value_parser = ["auto", "scx1", "shufdelta", "compact-trial"])]
         codec: String,

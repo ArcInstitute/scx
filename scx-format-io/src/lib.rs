@@ -2,7 +2,7 @@
 //!
 //! This crate holds everything that touches the filesystem or decodes bytes:
 //! the [`ScxReader`]/[`ScxWriter`], the backed/streaming readers, shard
-//! encode/decode dispatch, and the sidecars. The pure, no-I/O on-disk *layout*
+//! encode/decode dispatch, and the CSC sidecar. The pure, no-I/O on-disk *layout*
 //! (header, catalog, shard structs, modality, codec selection) lives in the
 //! [`scx_format`] crate, which this crate depends on.
 //!

@@ -299,8 +299,9 @@ fn decode_scx1_gpu(
 }
 
 /// Host-decode + HtoD upload path for shards that do not take the in-VRAM Scx1
-/// device kernels: any framed (v2) shard (any codec) and any unframed non-Scx1
-/// codec (None / Zstd / Lz4Shuffle / Pcodec / ShufDeltaZstd).
+/// device kernels: any framed (v2) **non-Scx1** shard (framed Scx1 routes to
+/// [`decode_framed_scx1_gpu`]) and any unframed non-Scx1 codec
+/// (None / Zstd / Lz4Shuffle / Pcodec / ShufDeltaZstd).
 ///
 /// Decodes on the host via the shared [`scx_format_io::decode_shard_regions_scipy`]
 /// — which iterates the row-group block index for framed shards and reads the

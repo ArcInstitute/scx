@@ -38,23 +38,19 @@ pub struct OptimizeStats {
     /// Of the framed shards, how many the encoder stored as `ShufDeltaZstd`
     /// (the `compact-trial` per-shard winner, or an explicit `--codec shufdelta`).
     pub shards_shufdelta: usize,
-    /// Shards the cost model kept **unframed Scx1 with a decode sidecar**
-    /// (GPU/per-row fast path preserved) inside a framed v4 file — the
-    /// `--keep-gpu-sidecar` / `training`-preset outcome under compact-trial.
-    pub unframed_scx1_gpu: usize,
     /// The file `format_version` stamped on the output (3 unframed, 4 framed).
     pub format_version: u16,
 }
 
 /// Re-encode + canonicalize every CSR shard of `input_path` into `output_path`,
-/// emitting decode sidecars and stamping `format_version = 3`. Single-modality
+/// stamping `format_version = 3` (unframed). Single-modality
 /// only (multimodal files should use `scx compact`).
 ///
 /// `codec` selects the per-shard codec passed to the encoder: `None` keeps the
 /// auto-codec (Scx1 for low-median integer counts, else Zstd), while
-/// `Some(CodecId::Scx1)` forces Scx1 on every integer shard — guaranteeing a
-/// `decode/*` sidecar (and thus the `to_gpu_anndata` device-decode route) even
-/// for high-median shards that auto would route to Zstd. Non-integer shards
+/// `Some(CodecId::Scx1)` forces Scx1 on every integer shard — keeping the
+/// `to_gpu_anndata` device-decode route (framed Scx1 decodes in VRAM) even for
+/// high-median shards that auto would route to Zstd. Non-integer shards
 /// fall back to Zstd regardless (handled inside `encode_one_shard`).
 ///
 /// `obs_shard_policy` controls whether a *single-section* legacy obs table is
@@ -259,7 +255,7 @@ pub fn optimize_with_framing(
             &indptr,
             &indices,
             &values,
-            codec, // None = auto-codec; Some(Scx1) forces sidecars on every integer shard
+            codec, // None = auto-codec; Some(Scx1) forces Scx1 on every integer shard
             index_dtype,
             n_minor,
             row_start,
@@ -274,10 +270,6 @@ pub fn optimize_with_framing(
             if pre.codec_id() == CodecId::ShufDeltaZstd as u8 {
                 stats.shards_shufdelta += 1;
             }
-        } else if framed && pre.codec_id() == CodecId::Scx1 as u8 {
-            // The cost model kept this shard unframed Scx1 (sidecar/GPU) inside a
-            // framed run (§4.3 two-layer model).
-            stats.unframed_scx1_gpu += 1;
         }
         writer.write_preencoded_shard(pre)?;
     }

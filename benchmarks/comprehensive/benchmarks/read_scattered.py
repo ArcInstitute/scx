@@ -9,8 +9,8 @@ gather touches only a tiny, scattered fraction of each shard, so a framed file
 decodes just the touched row-groups via the codec-agnostic block index instead
 of decoding whole shards.
 
-The dataset is opened with ``scatter_sidecar=False`` + ``scatter_block_index=True``
-so the block-index path is isolated from the bit-level Scx1 sidecar path: on a
+The dataset is opened with ``scatter_block_index=True`` so the block-index path
+is exercised directly: on a
 framed file every scattered group is served by the block index
 (``block_index_groups > 0``); on an unframed file it falls back to a full-shard
 decode (``full_shard_groups``). This is a direct end-to-end test of the F5
@@ -163,9 +163,9 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
 
     gc.collect()
 
-    # scatter_sidecar=False + scatter_block_index=True isolates the block-index
-    # path: framed shards route through the block index, unframed shards fall
-    # back to full-shard decode. Proves the F5 loader-adoption path directly.
+    # scatter_block_index=True isolates the block-index path: framed shards route
+    # through the block index, unframed shards fall back to full-shard decode.
+    # Proves the F5 loader-adoption path directly.
     ds = pyscx.IndexPlanDataset(
         scx_path,
         normalize=False,
@@ -174,7 +174,6 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
         lookahead=4,
         max_plan_size=max(2 * pairs_per_batch, 16384),
         max_memory_mb=8192,
-        scatter_sidecar=False,
         scatter_block_index=True,
     )
 
@@ -267,7 +266,6 @@ def run(
             "pairs_per_batch": pairs_per_batch,
             "n_batches_target": n_batches,
             "row_group_rows": format_variant.params.get("row_group_rows"),
-            "scatter_sidecar": False,
             "scatter_block_index": True,
             "n_runs": n_runs,
         },

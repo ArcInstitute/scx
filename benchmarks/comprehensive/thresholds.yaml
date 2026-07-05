@@ -1523,8 +1523,8 @@ absolute_floors:
 
   # ─── F5 row-group block-index adoption (read_scattered) ──────────────
   # `read_scattered` drives an unsorted, scattered random-row gather over a
-  # row-group-framed compact-trial file, opened with scatter_sidecar=False +
-  # scatter_block_index=True. On a framed file every scattered shard-group is
+  # row-group-framed compact-trial file, opened with scatter_block_index=True.
+  # On a framed file every scattered shard-group is
   # served by the codec-agnostic block index, so `block_index_groups > 0` and
   # `block_index_adoption_rate == 1.0`. A regression that silently full-shard-
   # decodes (framing dropped, or the loader block-index path unwired) drops
