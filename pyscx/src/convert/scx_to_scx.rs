@@ -652,7 +652,6 @@ pub(crate) fn chunk_boundaries(n_obs: usize, target_rows: usize) -> Vec<(usize, 
 /// `.shape`. The shape must match the output X dims; otherwise we
 /// raise a `ValueError` matching the in-memory path's contract.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_write_layers(
     py: Python<'_>,
     adata: &Bound<'_, PyAny>,
