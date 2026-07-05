@@ -10,7 +10,6 @@ use scx_format_io::encoder::FramingConfig;
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
-use scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
@@ -23,10 +22,7 @@ use crate::merge_sorted;
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
-use crate::rewrite_helpers::{
-    build_raw_copied_csr_section, decode_sidecar_index, raw_copy_csr_eligible,
-    source_decode_sidecar,
-};
+use crate::rewrite_helpers::{build_raw_copied_csr_section, raw_copy_csr_eligible};
 
 /// Merge multiple SCX files into a single output file.
 /// All inputs must have the same n_vars.
@@ -494,9 +490,6 @@ pub fn merge_with_options(
     };
     for reader in &readers {
         let shards = reader.catalog().shards_sorted();
-        // Index this reader's decode sidecars once so the per-shard lookup is
-        // O(1) rather than a full catalog scan per shard.
-        let sidecar_index = decode_sidecar_index(reader);
         for shard_entry in &shards {
             // Read this shard's header (value_encoding + raw-copy eligibility).
             let sh = reader.read_shard_header(shard_entry)?;
@@ -525,31 +518,22 @@ pub fn merge_with_options(
                 output_framed,
             ) && !options.assume_identical_var;
             if raw_copy_ok {
-                // The decode/re-encode path emits a decode sidecar for unframed
-                // Scx1 shards; preserve byte-identical output by copying the
-                // source's sidecar too. If an unframed Scx1 source lacks one
-                // (pre-v3 or over the overhead budget), we cannot reproduce what
-                // the slow path would emit, so fall through to decode/re-encode.
-                // A framed (v2) shard is self-contained via its in-body block
-                // index (no sidecar) and always byte-copies.
-                let sidecar =
-                    source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
-                let is_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
-                let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
-                if is_framed || !is_scx1 || sidecar.is_some() {
-                    let (section_bytes, stats) = build_raw_copied_csr_section(
-                        reader,
-                        shard_entry,
-                        &sh,
-                        n_vars,
-                        row_start,
-                        shard_value_encoding,
-                    )?;
-                    writer.write_csr_shard_raw_copy(&section_bytes, stats, sh.nnz, sidecar)?;
-                    cumulative_rows += sh.n_major as u64;
-                    output_shard_row_ranges.push((row_start, cumulative_rows));
-                    continue;
-                }
+                // `raw_copy_csr_eligible` already guarantees the source shard's
+                // framing matches the output's (framed→v4, unframed→≤v3), so the
+                // byte-copy is self-contained via its in-body block index and
+                // passes the writer's v4 framing guard.
+                let (section_bytes, stats) = build_raw_copied_csr_section(
+                    reader,
+                    shard_entry,
+                    &sh,
+                    n_vars,
+                    row_start,
+                    shard_value_encoding,
+                )?;
+                writer.write_csr_shard_raw_copy(&section_bytes, stats, sh.nnz)?;
+                cumulative_rows += sh.n_major as u64;
+                output_shard_row_ranges.push((row_start, cumulative_rows));
+                continue;
             }
 
             // Slow path: decode → re-encode with the shard's own value encoding.
@@ -1032,8 +1016,6 @@ fn merge_multimodal(
         let mut input_offset: u64 = 0;
         for reader in readers {
             let entries = reader.catalog().csr_shards_for_modality(modality_id);
-            // O(1) per-shard sidecar lookup (see the single-modality loop).
-            let sidecar_index = decode_sidecar_index(reader);
             for shard_entry in entries {
                 let sh = reader.read_shard_header(shard_entry)?;
                 let shard_value_encoding = ValueEncoding::from_u8(sh.value_encoding)
@@ -1053,28 +1035,21 @@ fn merge_multimodal(
                     output_framed,
                 ) && !options.assume_identical_var;
                 if raw_copy_ok {
-                    let sidecar =
-                        source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
-                    let is_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
-                    let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
-                    if is_framed || !is_scx1 || sidecar.is_some() {
-                        let (section_bytes, stats) = build_raw_copied_csr_section(
-                            reader,
-                            shard_entry,
-                            &sh,
-                            modality_n_vars,
-                            row_start,
-                            shard_value_encoding,
-                        )?;
-                        writer.write_csr_shard_raw_copy_for(
-                            modality_id,
-                            &section_bytes,
-                            stats,
-                            sh.nnz,
-                            sidecar,
-                        )?;
-                        continue;
-                    }
+                    let (section_bytes, stats) = build_raw_copied_csr_section(
+                        reader,
+                        shard_entry,
+                        &sh,
+                        modality_n_vars,
+                        row_start,
+                        shard_value_encoding,
+                    )?;
+                    writer.write_csr_shard_raw_copy_for(
+                        modality_id,
+                        &section_bytes,
+                        stats,
+                        sh.nnz,
+                    )?;
+                    continue;
                 }
 
                 let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;

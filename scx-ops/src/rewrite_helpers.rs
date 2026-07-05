@@ -3,11 +3,8 @@
 // Used by build_csc and upgrade to avoid duplicating layer/obsm/uns/
 // predicate-index/provenance copy logic.
 
-use std::collections::HashMap;
-
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format_io::catalog::{FullCatalogEntry, ShardStats};
-use scx_format_io::decode_sidecar::DecodeSidecar;
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE};
@@ -24,20 +21,16 @@ use crate::error::{OpsError, Result as OpsResult};
 /// `merge` adds `!assume_identical_var` (column indices are not guaranteed
 /// identical when the var axis is assumed-but-not-verified equal).
 ///
-/// **Framing gate (`output_framed`).** A row-group-framed (shard v2) shard may
-/// only be byte-copied into a file that itself claims the v4 framed layout:
-/// byte-copying a v2 shard into a ≤v3 file would leave a framed shard under a
-/// header a pre-framing reader accepts, which then mis-decodes the per-group
-/// local-rebased indptr as global.
-/// - `output_framed == true` (the rewrite stamps the output v4 and enables
-///   framing on the writer): accept **any** shard version. A valid v4 input
-///   holds only framed-v2 shards or unframed-Scx1+sidecar shards; both copy
-///   correctly (the block index is in-body, and the caller's per-shard sidecar
-///   check moves the Scx1 sidecar section). A framed shard verbatim-copied into
-///   a v4 file passes [`ScxWriter::guard_no_legacy_shard_in_v4`].
-/// - `output_framed == false` (unframed ≤v3 output): accept only unframed (v1)
-///   shards, forcing any v2 shard down the decode-encode path so it re-emits
-///   unframed and the output stays self-consistent.
+/// **Framing gate (`output_framed`).** A shard may only be byte-copied when its
+/// framing matches the output file's: a framed (shard v2) shard into a v4 file,
+/// or an unframed (v1) shard into a ≤v3 file. A framing mismatch forces the
+/// decode-encode path, which re-emits the shard at the output's framing so the
+/// file stays self-consistent (and passes
+/// [`ScxWriter::guard_no_legacy_shard_in_v4`], which rejects an unframed CSR
+/// shard in a v4 file). Byte-copying a v2 shard into a ≤v3 file would leave a
+/// framed shard under a header a pre-framing reader accepts, which then
+/// mis-decodes the per-group local-rebased indptr as global; byte-copying a v1
+/// shard into a v4 file would advertise sub-shard random access it cannot honor.
 pub(crate) fn raw_copy_csr_eligible(
     sh: &ShardHeader,
     target_index_dtype: u8,
@@ -45,7 +38,8 @@ pub(crate) fn raw_copy_csr_eligible(
     codec: CodecSelection,
     output_framed: bool,
 ) -> bool {
-    (output_framed || sh.shard_format_version <= DEFAULT_WRITE_SHARD_FORMAT_VERSION)
+    let shard_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+    shard_framed == output_framed
         && sh.index_dtype == target_index_dtype
         && (sh.n_minor as u64) == target_n_vars
         && match codec {
@@ -151,45 +145,6 @@ pub(crate) fn build_raw_copied_csr_section(
     };
 
     Ok((section_data, stats))
-}
-
-/// Index a reader's `DecodeMetadataShard` sidecar entries by their parent
-/// shard name (the sidecar name with the `decode/` prefix stripped), so the
-/// merge X loop can resolve a shard's sidecar in `O(1)` instead of scanning
-/// the whole catalog per shard (avoids `O(shards × entries)` on atlas-scale
-/// merges). Build once per reader.
-pub(crate) fn decode_sidecar_index(reader: &ScxReader) -> HashMap<&str, &FullCatalogEntry> {
-    reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
-        .filter_map(|e| e.name.strip_prefix("decode/").map(|parent| (parent, e)))
-        .collect()
-}
-
-/// Look up the decode sidecar the source file holds for `shard_entry`
-/// (named `decode/{shard_name}`) via a prebuilt [`decode_sidecar_index`],
-/// parsed into a [`DecodeSidecar`] with its `major_start` re-stamped to
-/// `global_row_start`. Returns `None` when the source has no sidecar for this
-/// shard (non-Scx1 codec, sidecar over the overhead budget, or a pre-v3
-/// source). The remaining source-section identity fields are re-stamped by
-/// [`ScxWriter::write_csr_shard_raw_copy`] once the shard's final position is
-/// known.
-pub(crate) fn source_decode_sidecar(
-    source: &ScxReader,
-    sidecar_index: &HashMap<&str, &FullCatalogEntry>,
-    shard_entry: &FullCatalogEntry,
-    global_row_start: u64,
-) -> OpsResult<Option<DecodeSidecar>> {
-    match sidecar_index.get(shard_entry.name.as_str()) {
-        Some(e) => {
-            let mut sc = source.read_decode_sidecar_from_entry(e)?;
-            sc.major_start = global_row_start;
-            Ok(Some(sc))
-        }
-        None => Ok(None),
-    }
 }
 
 /// Copy all auxiliary sections (layers, obsm, uns, predicate indices) from
@@ -347,10 +302,12 @@ mod tests {
         }
     }
 
-    /// Framing gate: a row-group-framed (shard v2) source shard is raw-copy
-    /// eligible only when the output is itself framed (v4) — byte-copying a v2
-    /// shard into a ≤v3 file would let a pre-framing reader mis-decode it. An
-    /// unframed (v1) shard is eligible into either output.
+    /// Framing gate: raw-copy requires the source shard's framing to match the
+    /// output's framing exactly. A framed (v2) source is eligible only into a
+    /// framed (v4) output; an unframed (v1) source only into a ≤v3 output.
+    /// Byte-copying across a framing boundary would let a reader mis-decode the
+    /// shard (a v2 shard under a pre-framing reader, or an unframed v1 shard
+    /// under a v4 header whose readers expect frames).
     #[test]
     fn framed_shard_raw_copy_eligibility_tracks_output_framing() {
         let v1 = header(scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION, 0);
@@ -358,14 +315,14 @@ mod tests {
             scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION + 1,
             0,
         );
-        // Unframed (v1) shard: eligible into both unframed and framed output.
+        // Unframed (v1) shard: eligible ONLY into unframed output.
         assert!(
             raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto, false),
             "unframed v1 shard must be eligible into unframed output"
         );
         assert!(
-            raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto, true),
-            "unframed v1 shard must be eligible into framed output"
+            !raw_copy_csr_eligible(&v1, 0, 10, CodecSelection::Auto, true),
+            "unframed v1 shard must NOT be raw-copy eligible into framed output"
         );
         // Framed (v2) shard: eligible ONLY into framed (v4) output.
         assert!(

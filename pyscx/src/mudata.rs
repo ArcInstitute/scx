@@ -426,9 +426,8 @@ pub fn from_mudata_impl(
     // `ConvertOptions::framing()` build the config), this path bypasses
     // `ConvertOptions` entirely and drives `ScxWriter` directly, so it
     // constructs the `FramingConfig` here and calls `writer.set_framing`
-    // itself. `..Default::default()` keeps `target_nnz`/`codec_trial`/
-    // `prefer_gpu_sidecar` at their defaults (compact-trial for in-memory
-    // MuData is a future follow-on).
+    // itself. `..Default::default()` keeps `target_nnz`/`codec_trial` at their
+    // defaults (compact-trial for in-memory MuData is a future follow-on).
     let framing = (row_group_rows != 0).then(|| scx_format_io::FramingConfig {
         row_group_rows,
         ..Default::default()

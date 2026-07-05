@@ -230,13 +230,6 @@ pub struct ConvertOptions {
     /// (the grouped random-row gather over a dense matrix reads full rows and
     /// is ~4–5× slower / ~2× the memory). `One` / `Two` force the choice.
     pub group_pass: GroupPass,
-    /// Two-layer cost model: under `--codec compact-trial`, keep a
-    /// Scx1-friendly (integer, low-median) shard **unframed with its
-    /// `DecodeSidecar`** — preserving the FOR-BP/Rice GPU device-decode +
-    /// bit-level per-row fast path — instead of framing it, even at a size cost.
-    /// Also implied by `index_preset == "training"` (the accel-oriented preset).
-    /// Ignored unless `codec_trial` is set.
-    pub keep_gpu_sidecar: bool,
 }
 
 /// Phase 5b: density threshold below which `--bitmap=auto` considers a
@@ -406,11 +399,6 @@ impl ConvertOptions {
                 row_group_rows: g,
                 target_nnz: self.row_group_target_nnz,
                 trial: self.codec_trial,
-                // The GPU/per-row-preserving cost model engages under compact-trial
-                // when explicitly requested or when the accel-oriented `training`
-                // index preset signals GPU-dominant access.
-                prefer_gpu_sidecar: self.keep_gpu_sidecar
-                    || self.index_preset.as_deref() == Some("training"),
             })
     }
 }
@@ -451,7 +439,6 @@ impl Default for ConvertOptions {
             group_target_bytes: None,
             group_max_bytes: None,
             group_pass: GroupPass::default(),
-            keep_gpu_sidecar: false,
         }
     }
 }

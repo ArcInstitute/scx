@@ -152,7 +152,6 @@ fn write_framed_file(
                 row_group_rows,
                 target_nnz: None,
                 trial: false,
-                prefer_gpu_sidecar: false,
             }),
         )
         .unwrap();
@@ -165,264 +164,6 @@ fn write_framed_file(
         .read_all_csr_shards()
         .unwrap();
     (path, full_csr)
-}
-
-/// Build a 2-shard Scx1 file with dense rows (so the encoder emits decode
-/// sidecars within the overhead budget) and return the path + the raw CSR
-/// triplet (f32 values) for reference slicing.
-fn write_sidecar_scx1_file(
-    dir: &TempDir,
-    rows_per_shard: usize,
-    nnz_per_row: usize,
-) -> (std::path::PathBuf, Vec<u64>, Vec<u32>, Vec<f32>) {
-    let path = dir.path().join("sidecar.scx");
-    let n_obs = rows_per_shard * 2;
-    let n_vars = 200_000usize;
-    let mut header = sample_header(n_obs as u64, n_vars as u64, 0);
-    header.index_dtype = 1; // u32 indices
-
-    let mut indptr = vec![0u64];
-    let mut indices: Vec<u32> = Vec::new();
-    let mut values_u8: Vec<u8> = Vec::new();
-    for r in 0..n_obs {
-        let mut col = 0u32;
-        for k in 0..nnz_per_row {
-            col += 1 + ((r * 13 + k * 7) % 250) as u32; // gaps → frame_bits ~8
-            indices.push(col);
-            values_u8.push(1u8 + ((r + k) % 5) as u8);
-        }
-        indptr.push(indices.len() as u64);
-    }
-    let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
-
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs(n_obs)).unwrap();
-    writer.write_var(&sample_var(n_vars)).unwrap();
-    for s in 0..2 {
-        let r0 = s * rows_per_shard;
-        let r1 = r0 + rows_per_shard;
-        let lo = indptr[r0] as usize;
-        let local_indptr: Vec<u64> = indptr[r0..=r1].iter().map(|&p| p - indptr[r0]).collect();
-        let hi = indptr[r1] as usize;
-        writer
-            .write_csr_shard(
-                &local_indptr,
-                &indices[lo..hi],
-                &values_u8[lo..hi],
-                CodecId::Scx1,
-                ValueEncoding::Uint8,
-                r0 as u64,
-            )
-            .unwrap();
-    }
-    writer.finish().unwrap();
-    (path, indptr, indices, values_f32)
-}
-
-/// Reference: extract rows `[a, b)` from a raw CSR triplet, rebasing indptr.
-fn slice_raw(
-    indptr: &[u64],
-    indices: &[u32],
-    values: &[f32],
-    a: usize,
-    b: usize,
-) -> (Vec<i64>, Vec<i32>, Vec<f32>) {
-    let lo = indptr[a] as usize;
-    let hi = indptr[b] as usize;
-    (
-        indptr[a..=b]
-            .iter()
-            .map(|&p| (p - indptr[a]) as i64)
-            .collect(),
-        indices[lo..hi].iter().map(|&v| v as i32).collect(),
-        values[lo..hi].to_vec(),
-    )
-}
-
-#[test]
-fn read_rows_sidecar_row_range_matches_full_decode() {
-    let dir = TempDir::new().unwrap();
-    let rows_per_shard = 32usize;
-    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
-
-    // Confirm decode sidecars were actually emitted (else the row-range path
-    // is never taken and the test would be vacuous).
-    let probe = ScxReader::open(&path).unwrap();
-    let n_sidecars = probe
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == crate::section::SectionType::DecodeMetadataShard)
-        .count();
-    assert_eq!(n_sidecars, 2, "both Scx1 shards must carry decode sidecars");
-
-    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-
-    // Small windows (< shard_rows/4 = 8) of cold shards take the row-range
-    // path; assert byte-identical to the reference slice. Cover a window in
-    // shard 0, a window in shard 1, and a single row.
-    let windows = [(2usize, 6usize), (40, 44), (10, 11), (33, 37)];
-    for (a, b) in windows {
-        let got = backed.read_rows(a as u64, b as u64).unwrap();
-        let (eip, eix, ev) = slice_raw(&indptr, &indices, &values, a, b);
-        assert_eq!(got.indptr, eip, "indptr [{a},{b})");
-        assert_eq!(got.indices, eix, "indices [{a},{b})");
-        assert_eq!(got.data, ev, "data [{a},{b})");
-    }
-
-    // The results above are correct via *either* path, so assert the
-    // row-range fast path was actually exercised (one decode per small
-    // window) — otherwise a silently-disabled fast path would pass too.
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            backed
-                .reader
-                .debug_counts()
-                .decode_scx1_row_range
-                .load(Ordering::Relaxed),
-            windows.len() as u64,
-            "each small window must take the sidecar row-range path",
-        );
-    }
-
-    // A large window (whole file) takes the full-decode path and must also
-    // match the reference.
-    let full = backed.read_rows(0, (rows_per_shard * 2) as u64).unwrap();
-    let (eip, eix, ev) = slice_raw(&indptr, &indices, &values, 0, rows_per_shard * 2);
-    assert_eq!(full.indptr, eip);
-    assert_eq!(full.indices, eix);
-    assert_eq!(full.data, ev);
-}
-
-/// G2: the *scattered* gather (`read_rows_with`, the path SparseCellSetDataset
-/// uses) must produce byte-identical rows whether it decodes via the Scx1
-/// sidecar (O(rows)) or the full-shard fallback, and must actually take the
-/// sidecar path for sparse cold groups.
-#[test]
-fn read_rows_with_sidecar_matches_full_decode() {
-    let dir = TempDir::new().unwrap();
-    let rows_per_shard = 32usize;
-    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
-
-    // Gather scattered rows into a dense buffer keyed by request position.
-    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
-        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
-        backed
-            .read_rows_with(rows, |i, idx, data| {
-                out[i] = (idx.to_vec(), data.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        out
-    }
-
-    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
-        for (i, &row) in rows.iter().enumerate() {
-            let (_ip, eix, ev) =
-                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
-            assert_eq!(out[i].0, eix, "indices row {row}");
-            assert_eq!(out[i].1, ev, "data row {row}");
-        }
-    };
-
-    // Sparse group across both shards with consecutive runs ([5,6], [40,41])
-    // and singletons ([2],[63]) + a duplicate request (5). Per-shard group
-    // size (≤4) << shard_rows/4 = 8 ⇒ sidecar path. Runs: shard0 {2},{5,6};
-    // shard1 {8,9},{31} ⇒ 4 row-range decodes.
-    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
-    let out = gather(&backed, &sparse_rows);
-    assert_matches(&out, &sparse_rows);
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            backed
-                .reader
-                .debug_counts()
-                .decode_scx1_row_range
-                .load(Ordering::Relaxed),
-            4,
-            "sparse scattered group must take the sidecar row-range path (4 runs)",
-        );
-    }
-
-    // Dense group (≥8 rows/shard ⇒ k*4 ≥ shard_rows) takes the full-shard
-    // fallback; a fresh reader keeps the counter clean. Same byte-identical rows.
-    let backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
-    let out2 = gather(&backed2, &dense_rows);
-    assert_matches(&out2, &dense_rows);
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            backed2
-                .reader
-                .debug_counts()
-                .decode_scx1_row_range
-                .load(Ordering::Relaxed),
-            0,
-            "dense group must take the full-shard fallback, not the sidecar path",
-        );
-    }
-}
-
-/// Phase 0 adoption counter: `read_rows_with` must bump
-/// `CacheMetrics::sidecar_groups` for sparse cold groups it serves via the
-/// sidecar, and `CacheMetrics::full_shard_groups` for groups it serves via a
-/// full-shard decode. `sidecar_adoption_rate = sidecar / (sidecar + full)` is
-/// the primary success signal for the IndexPlan sidecar gather work (the
-/// wall-clock-invisible §6.2 trap). NOTE: the `SCX_SCATTER_SIDECAR=0` arm is
-/// not asserted here — `scatter_sidecar_enabled()` caches the env via
-/// `OnceLock`, so it cannot be toggled within one test process.
-#[test]
-fn read_rows_with_bumps_sidecar_adoption_counters() {
-    use std::sync::atomic::Ordering;
-    let dir = TempDir::new().unwrap();
-    let rows_per_shard = 32usize;
-    let (path, _indptr, _indices, _values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
-
-    fn gather(backed: &BackedCsrReader, rows: &[u64]) {
-        backed
-            .read_rows_with(rows, |_i, _idx, _data| Ok(()))
-            .unwrap();
-    }
-
-    // Sparse cold group across both shards (≤4 rows/shard << shard_rows/4 = 8)
-    // ⇒ both shard groups take the sidecar path.
-    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-    let m = backed.enable_metrics();
-    gather(&backed, &[2u64, 5, 6, 40, 41]);
-    assert_eq!(
-        m.sidecar_groups.load(Ordering::Relaxed),
-        2,
-        "both sparse cold shard groups must be served via the sidecar",
-    );
-    assert_eq!(
-        m.full_shard_groups.load(Ordering::Relaxed),
-        0,
-        "no full-shard decode for a sparse cold gather",
-    );
-
-    // Dense group (≥8 rows/shard ⇒ k*4 ≥ shard_rows) ⇒ both shard groups take
-    // the full-shard fallback. Fresh reader keeps the counters clean.
-    let mut backed2 = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-    let m2 = backed2.enable_metrics();
-    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
-    gather(&backed2, &dense_rows);
-    assert_eq!(
-        m2.sidecar_groups.load(Ordering::Relaxed),
-        0,
-        "dense group must not take the sidecar path",
-    );
-    assert_eq!(
-        m2.full_shard_groups.load(Ordering::Relaxed),
-        2,
-        "both dense shard groups must be served via full-shard decode",
-    );
 }
 
 /// F5 Phase 1: scattered `read_rows_with` over a **row-group-framed** None file
@@ -511,7 +252,6 @@ fn read_rows_with_block_index_all_codecs() {
             2,
             "{codec:?}: sparse cold gather must take the block-index path",
         );
-        assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0, "{codec:?}");
     }
 }
 
@@ -541,7 +281,6 @@ fn read_rows_with_bumps_block_index_counters() {
         2,
         "both sparse cold shard groups must be served via the block index",
     );
-    assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0);
     assert_eq!(
         m.full_shard_groups.load(Ordering::Relaxed),
         0,
@@ -561,24 +300,19 @@ fn read_rows_with_bumps_block_index_counters() {
     );
 }
 
-/// F5 follow-up (Phase A): a framed **non-Scx1** shard takes the block-index
-/// path even when the Scx1-sidecar gather is disabled (`scatter_sidecar=false`,
-/// as the sparse-cellset reader defaults). Proves `block_index_eligible`
-/// decouples the group-level row-group path from the bit-level Scx1-sidecar
-/// decision — the loader-adoption goal for framed training files. ShufDeltaZstd
-/// carries no Scx1 sidecar, so the only random-access route is the block index.
+/// F5 follow-up (Phase A): a framed shard's scattered gather routes through the
+/// codec-agnostic block index. `block_index_eligible` gates the group-level
+/// row-group path — the loader-adoption goal for framed training files.
 #[test]
-fn read_rows_with_block_index_when_sidecar_disabled() {
+fn read_rows_with_block_index_framed_shard() {
     use std::sync::atomic::Ordering;
     let dir = TempDir::new().unwrap();
     let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::ShufDeltaZstd);
 
-    // scatter_sidecar=false disables the bit-level sidecar path for this reader;
-    // scatter_block_index defaults on (env), so the framed gather still routes
-    // through the block index rather than pre-warming + full-shard decoding.
+    // scatter_block_index defaults on (env), so the framed gather routes through
+    // the block index rather than pre-warming + full-shard decoding.
     let cache = SharedShardCache::new(4, usize::MAX);
-    let mut backed =
-        BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, cache, false);
+    let mut backed = BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, cache);
     let m = backed.enable_metrics();
 
     let sparse_rows = [2u64, 5, 6, 40, 41];
@@ -598,68 +332,13 @@ fn read_rows_with_block_index_when_sidecar_disabled() {
     assert_eq!(
         m.block_index_groups.load(Ordering::Relaxed),
         2,
-        "framed gather must take the block-index path with the sidecar disabled",
+        "framed gather must take the block-index path",
     );
-    assert_eq!(m.sidecar_groups.load(Ordering::Relaxed), 0);
     assert_eq!(
         m.full_shard_groups.load(Ordering::Relaxed),
         0,
         "no full-shard decode for a sparse cold framed gather",
     );
-}
-
-/// Lever S: the per-shard Scx1 sidecar metadata is
-/// parsed once and reused across batches. Repeatedly gathering sparse groups
-/// from the same shard takes the sidecar path each time (so the rows are still
-/// correct) yet parses the metadata only once *per distinct shard* — proof the
-/// cache eliminates the per-batch O(shard-rows) BLAKE3 + clone reparse.
-#[test]
-fn sidecar_metadata_cached_across_batches() {
-    let dir = TempDir::new().unwrap();
-    let rows_per_shard = 32usize;
-    let (path, indptr, indices, values) = write_sidecar_scx1_file(&dir, rows_per_shard, 256);
-
-    fn gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
-        let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
-        backed
-            .read_rows_with(rows, |i, idx, data| {
-                out[i] = (idx.to_vec(), data.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        out
-    }
-    let assert_matches = |out: &[(Vec<i32>, Vec<f32>)], rows: &[u64]| {
-        for (i, &row) in rows.iter().enumerate() {
-            let (_ip, eix, ev) =
-                slice_raw(&indptr, &indices, &values, row as usize, row as usize + 1);
-            assert_eq!(out[i].0, eix, "indices row {row}");
-            assert_eq!(out[i].1, ev, "data row {row}");
-        }
-    };
-
-    // Three "batches", all sparse sidecar groups (group*4 < shard_rows=32):
-    // b1, b2 touch shard 0; b3 touches shard 1. One reader (cache persists).
-    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
-    let batches: [&[u64]; 3] = [&[2, 5, 6], &[3, 7], &[40, 41]];
-    for b in batches {
-        let out = gather(&backed, b);
-        assert_matches(&out, b);
-    }
-    #[cfg(debug_assertions)]
-    {
-        use std::sync::atomic::Ordering;
-        let dc = backed.reader.debug_counts();
-        assert!(
-            dc.decode_scx1_row_range.load(Ordering::Relaxed) >= 3,
-            "all three sparse batches must take the sidecar row-range path",
-        );
-        assert_eq!(
-            dc.sidecar_meta_parse.load(Ordering::Relaxed),
-            2,
-            "metadata parsed once per distinct shard (shard 0 reused across b1/b2), not per batch",
-        );
-    }
 }
 
 #[test]
@@ -2045,18 +1724,10 @@ fn shared_shard_cache_spans_readers_under_one_budget() {
 
     // One shared cache, count cap = 1 across BOTH readers.
     let shared = SharedShardCache::new(1, usize::MAX);
-    let r0 = BackedCsrReader::with_shared_cache(
-        ScxReader::open(&p0).unwrap(),
-        0,
-        Arc::clone(&shared),
-        true,
-    );
-    let r1 = BackedCsrReader::with_shared_cache(
-        ScxReader::open(&p1).unwrap(),
-        1,
-        Arc::clone(&shared),
-        true,
-    );
+    let r0 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p0).unwrap(), 0, Arc::clone(&shared));
+    let r1 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p1).unwrap(), 1, Arc::clone(&shared));
 
     // Warm (file 0, shard 0); keys are namespaced, so file 1 shard 0 is distinct.
     let _ = r0.read_shard_cached_arc(0).unwrap();

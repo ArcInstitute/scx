@@ -10,7 +10,6 @@ use scx_codec::{encode_shard, CodecId, EncodedShard, ValueEncoding};
 use scx_sparse::is_canonical_csr;
 
 use crate::codec_select::select_codec_for_modality;
-use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO};
 use crate::error::ScxError;
 use crate::modality::ModalityType;
 use crate::section::SectionType;
@@ -135,84 +134,21 @@ pub fn encode_one_shard(
                 )
             };
             if fc.trial && shard_codec != CodecId::ShufDeltaZstd {
-                // Two-layer cost model: pick the
-                // smallest *random-access-safe* representation per shard.
-                //   (A) framed heuristic winner, (B) framed ShufDeltaZstd,
-                //   (C) unframed Scx1 + DecodeSidecar (GPU/per-row fast path),
-                //       eligible only when the heuristic itself is Scx1
-                //       (integer, low median) and the sidecar fits its budget.
-                let heuristic_is_scx1 = shard_codec == CodecId::Scx1;
+                // Trial: pick the smaller framed representation per shard —
+                // (A) framed heuristic winner vs (B) framed ShufDeltaZstd.
+                // Both are row-group-framed (shard v2); random access is always
+                // via the codec-agnostic BlockIndex (no unframed-Scx1 sidecar
+                // fallback — that path was removed).
                 let (e_h, bi_h) = frame(shard_codec)?;
-                let (framed_codec, framed_enc, framed_bi) = {
-                    let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
-                    if framed_size(&e_s) < framed_size(&e_h) {
-                        (CodecId::ShufDeltaZstd, e_s, bi_s)
-                    } else {
-                        (shard_codec, e_h, bi_h)
-                    }
-                };
-                let framed_sz = framed_size(&framed_enc);
-
-                // Representation (C): only worth encoding when the heuristic
-                // picked Scx1 (i.e. the GPU-friendly integer/low-median class).
-                let keep_scx1 = if heuristic_is_scx1 {
-                    let enc_c = encode_shard(
-                        shard_indptr,
-                        shard_indices,
-                        &shard_values_bytes,
-                        CodecId::Scx1,
-                        shard_value_encoding,
-                        index_dtype_u16,
-                    )?;
-                    let bi_c = BlockIndex::for_shard(n_major, shard_indptr)?;
-                    let mut bi_c_bytes = Vec::new();
-                    bi_c.write_to(&mut bi_c_bytes)?;
-                    // The sidecar (and thus the GPU/per-row path) survives only
-                    // if it fits the overhead budget — predict that here so we
-                    // never commit a sidecar-less unframed shard into a v4 file.
-                    let section_len_c = (SHARD_HEADER_SIZE
-                        + enc_c.indptr_bytes.len()
-                        + enc_c.indices_bytes.len()
-                        + enc_c.values_bytes.len()
-                        + bi_c_bytes.len()) as u64;
-                    let sidecar_viable = if let Some(meta) = &enc_c.scx1_decode {
-                        DecodeSidecar::from_codec_metadata(
-                            meta,
-                            shard_value_encoding,
-                            index_dtype,
-                            n_vars,
-                            global_row_offset,
-                            section_type,
-                            0,
-                            section_len_c,
-                            [0u8; 32],
-                        )?
-                        .filter(|s| {
-                            s.within_overhead_budget(DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO)
-                        })
-                        .is_some()
-                    } else {
-                        false
-                    };
-                    let unframed_sz = framed_size(&enc_c);
-                    let keep = sidecar_viable
-                        && (fc.prefer_gpu_sidecar
-                            || unframed_sz as f64
-                                <= framed_sz as f64 * (1.0 + compact_trial_gpu_margin()));
-                    keep.then_some((enc_c, bi_c))
+                let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
+                let (framed_codec, framed_enc, framed_bi) = if framed_size(&e_s) < framed_size(&e_h)
+                {
+                    (CodecId::ShufDeltaZstd, e_s, bi_s)
                 } else {
-                    None
+                    (shard_codec, e_h, bi_h)
                 };
-
-                if let Some((enc_c, bi_c)) = keep_scx1 {
-                    // Unframed Scx1 + sidecar (shard v1); random access via the
-                    // per-row DecodeSidecar layered on top (§4.3).
-                    shard_codec = CodecId::Scx1;
-                    (enc_c, bi_c, DEFAULT_WRITE_SHARD_FORMAT_VERSION)
-                } else {
-                    shard_codec = framed_codec;
-                    (framed_enc, framed_bi, CURRENT_SHARD_FORMAT_VERSION)
-                }
+                shard_codec = framed_codec;
+                (framed_enc, framed_bi, CURRENT_SHARD_FORMAT_VERSION)
             } else {
                 let (enc, bi) = frame(shard_codec)?;
                 (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
@@ -310,25 +246,6 @@ pub fn encode_one_shard(
         + encoded.values_bytes.len()
         + block_index_bytes.len()) as u64;
 
-    // Build the decode sidecar from the **encoder-produced** metadata (single
-    // source of truth for the bit layout) — never re-derived. Only Scx1 integer
-    // CSR shards carry `scx1_decode`.
-    let decode_sidecar = match (shard_codec, &encoded.scx1_decode) {
-        (CodecId::Scx1, Some(meta)) => DecodeSidecar::from_codec_metadata(
-            meta,
-            shard_value_encoding,
-            index_dtype,
-            n_vars,
-            global_row_offset,
-            section_type,
-            0,
-            section_length,
-            section_checksum,
-        )?
-        .filter(|s| s.within_overhead_budget(DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO)),
-        _ => None,
-    };
-
     // 10. Compute shard stats. pyscx writes row-major CSR shards
     // exclusively; CSC sidecars use a separate path.
     let stats = compute_shard_stats(
@@ -351,7 +268,6 @@ pub fn encode_one_shard(
         name,
         section_type,
         nnz,
-        decode_sidecar,
     })
 }
 
@@ -371,22 +287,16 @@ pub fn encode_one_shard(
 /// sizing, §4.3); `trial` selects the smaller of {heuristic winner,
 /// ShufDeltaZstd} per shard.
 ///
-/// `prefer_gpu_sidecar` engages the two-layer cost model
-/// (`SIDECAR-LONG-TERM-FIX.md` §4.3) inside a `trial` (compact-trial) encode: a
-/// shard whose heuristic codec is Scx1 (integer, low median — the GPU/per-row
-/// class) is stored **unframed Scx1 with its `DecodeSidecar`** instead of a
-/// framed codec, preserving the FOR-BP/Rice GPU device-decode + bit-level
-/// per-row random access. Both representations are random-access-safe (framed →
-/// group `BlockIndex`; unframed Scx1 → per-row sidecar), so a `compact-trial`
-/// file legitimately mixes them. When `false`, Scx1 is only kept if it is no
-/// larger than the framed winner (free GPU, no size regression) — governed by
-/// the `SCX_COMPACT_TRIAL_GPU_MARGIN` slack (default 0).
+/// `trial` (compact-trial) picks the smaller of {framed heuristic winner, framed
+/// ShufDeltaZstd} per shard. Both are row-group-framed (shard v2) and use the
+/// codec-agnostic `BlockIndex` for random access; the historical unframed-Scx1 +
+/// decode-sidecar representation was removed once framed Scx1 gained an in-VRAM
+/// GPU decode path.
 #[derive(Debug, Clone, Copy)]
 pub struct FramingConfig {
     pub row_group_rows: u32,
     pub target_nnz: Option<u64>,
     pub trial: bool,
-    pub prefer_gpu_sidecar: bool,
 }
 
 /// Default row-group size (G) for framed writes. Chosen from the F5 follow-up
@@ -406,28 +316,8 @@ impl Default for FramingConfig {
             row_group_rows: DEFAULT_ROW_GROUP_ROWS,
             target_nnz: None,
             trial: false,
-            prefer_gpu_sidecar: false,
         }
     }
-}
-
-/// Size slack (fraction) by which an unframed Scx1+sidecar representation may
-/// exceed the framed winner and still be kept for its GPU/per-row fast path when
-/// `prefer_gpu_sidecar` is not set. Default 0 → keep Scx1 only when it does not
-/// regress size. Env: `SCX_COMPACT_TRIAL_GPU_MARGIN`.
-///
-/// Read once (process-lifetime) rather than per shard — `encode_one_shard`'s
-/// trial branch runs for every shard, and a `std::env::var` syscall per shard on
-/// a many-thousand-shard file is pure overhead.
-fn compact_trial_gpu_margin() -> f64 {
-    static MARGIN: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
-        std::env::var("SCX_COMPACT_TRIAL_GPU_MARGIN")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|m| m.is_finite() && *m >= 0.0)
-            .unwrap_or(0.0)
-    });
-    *MARGIN
 }
 
 /// Total encoded size of a shard's three sub-streams (trial-encode comparison key).

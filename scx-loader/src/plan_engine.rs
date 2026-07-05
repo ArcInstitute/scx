@@ -79,19 +79,14 @@ impl PrefetchEngine {
         cache_shards: usize,
         bytes_budget: usize,
         default_lookahead: usize,
-        scatter_sidecar: bool,
     ) -> Arc<Self> {
         let shared = SharedShardCache::new(cache_shards, bytes_budget);
         let readers = scx_readers
             .into_iter()
             .enumerate()
             .map(|(fid, r)| {
-                let mut backed = BackedCsrReader::with_shared_cache(
-                    r,
-                    fid as u32,
-                    Arc::clone(&shared),
-                    scatter_sidecar,
-                );
+                let mut backed =
+                    BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
                 // Always-on metrics, mirroring `IndexPlanLoader`. `enable_metrics`
                 // is idempotent on the shared cache, so doing it per reader installs
                 // one aggregate handle that `new` reads back via `metrics()`.
@@ -282,12 +277,12 @@ where
             };
             // Dedup rows + count unique rows per shard (matches the gather's
             // post-dedup `read_rows_with` grouping). Skip warming a shard that
-            // is already cached / in-flight, OR **sidecar-eligible** / **block-
-            // index-eligible** (cold + sparse): leaving it undecoded lets the
-            // gather take the O(rows) sidecar path or the group-level block-index
-            // path instead of being negated by a full-shard warm (L2). The shared
-            // eligibility predicates keep this in lockstep with the gather's
-            // `use_sidecar` / `use_block_index`. Dense/large groups still warm.
+            // is already cached / in-flight, OR **block-index-eligible** (cold +
+            // sparse + framed): leaving it undecoded lets the gather take the
+            // group-level block-index path instead of being negated by a
+            // full-shard warm (L2). The shared eligibility predicate keeps this in
+            // lockstep with the gather's `use_block_index`. Dense/large groups
+            // still warm.
             let mut seen: HashSet<u64> = HashSet::with_capacity(rs.len());
             let mut per_shard: HashMap<usize, usize> = HashMap::new();
             for row in rs {
@@ -300,7 +295,6 @@ where
             for (sidx, group_len) in per_shard {
                 if reader.cache_contains(sidx)
                     || reader.in_flight_contains(sidx)
-                    || reader.sidecar_eligible(sidx, group_len)
                     || reader.block_index_eligible(sidx, group_len)
                 {
                     continue;

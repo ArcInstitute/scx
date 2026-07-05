@@ -23,9 +23,11 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 /// v2 readers accept both versions and stamp the new fields as zero
 /// when reading a v1 file (single-modality semantic equivalence).
 ///
-/// v3 adds the canonical CSR invariant for newly written CSR-like shards
-/// and permits `DecodeMetadataShard` sections that index Scx1 shard
-/// payloads for direct device/random-access decode.
+/// v3 adds the canonical CSR invariant for newly written CSR-like shards.
+/// (v3 also historically permitted a decode-metadata sidecar section, section
+/// id 26, for direct device/random-access decode of Scx1 shards; that sidecar
+/// was removed once row-group framing became the default, and id 26 is now a
+/// reserved/skipped section.)
 ///
 /// v4 permits **row-group-framed** sparse shards (multi-entry `BlockIndex`
 /// with real per-group byte offsets + `shard_format_version == 2`) for

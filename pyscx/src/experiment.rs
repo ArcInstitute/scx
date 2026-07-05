@@ -1066,8 +1066,6 @@ impl PyExperiment {
                 // Raw shard bytes (borrow the reader's mmap) + a cheap header
                 // pre-scan for the VRAM gate and the honest HtoD byte count.
                 let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n_csr_shards);
-                let mut shard_metadata: Vec<Option<scx_codec::Scx1DecodeMetadata>> =
-                    Vec::with_capacity(n_csr_shards);
                 let mut total_rows: usize = 0;
                 let mut total_nnz: usize = 0;
                 for i in 0..n_csr_shards {
@@ -1081,15 +1079,6 @@ impl PyExperiment {
                     .map_err(|e| PyRuntimeError::new_err(format!("shard {i} header: {e}")))?;
                     total_rows += header.n_major as usize;
                     total_nnz += header.nnz as usize;
-                    // Resolve the decode sidecar so Scx1 indices/values decode on the
-                    // device from the encoder-emitted offsets (no CPU prescan, no host
-                    // bounce). `None` for non-Scx1 / stale / absent — those fall back
-                    // to host decode + HtoD inside the assembler, whose returned
-                    // DeviceDecodeStats report the real uploaded byte count below.
-                    let meta = self.reader.scx1_metadata_for_csr_shard(0, i).map_err(|e| {
-                        PyRuntimeError::new_err(format!("shard {i} decode sidecar: {e}"))
-                    })?;
-                    shard_metadata.push(meta);
                     shard_refs.push(bytes);
                 }
 
@@ -1121,21 +1110,17 @@ impl PyExperiment {
                     )));
                 }
 
-                let (gpu_csr, decode_stats) = scx_accel::decode_csr_shards_to_device_with_metadata(
-                    &dev,
-                    &shard_refs,
-                    &shard_metadata,
-                )
-                .map_err(|e| PyRuntimeError::new_err(format!("GPU shard assembly failed: {e}")))?;
+                let (gpu_csr, decode_stats) =
+                    scx_accel::decode_csr_shards_to_device_with_stats(&dev, &shard_refs).map_err(
+                        |e| PyRuntimeError::new_err(format!("GPU shard assembly failed: {e}")),
+                    )?;
                 let n_rows = gpu_csr.shape.0;
                 let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
                 // Honest transfer mode: a genuine fully-in-VRAM Scx1 decode (only the
-                // tiny indptr uploaded — dense >=128-nnz FOR-BP rows now decode on
-                // device via the BitPacker4x kernel, Task 4.4b) vs a path where some
-                // shard still bounced through the host because it is not an Scx1
-                // sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard.
-                // `bytes_uploaded` is the real HtoD total from the decode, not a
-                // header estimate.
+                // tiny indptr uploaded — framed Scx1 shards decode group-by-group in
+                // VRAM) vs a path where some shard bounced through the host because it
+                // is a non-Scx1 codec. `bytes_uploaded` is the real HtoD total from
+                // the decode, not a header estimate.
                 let transfer_mode = if decode_stats.fully_device_decoded {
                     "scx_device_decode_gpu"
                 } else {

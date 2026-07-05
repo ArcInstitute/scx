@@ -1,7 +1,7 @@
 """End-to-end test for ``pyscx.open(...).to_gpu_anndata()`` transfer metadata.
 
-Covers ACC-RUST-OPT-V4 Task 4.4a: a sidecar'd Scx1 file decodes its shards
-*fully in VRAM* and the handoff stamps an honest ``transfer_mode`` /
+A framed Scx1 file decodes its shards *fully in VRAM* (group-by-group via
+``decode_framed_scx1_gpu``) and the handoff stamps an honest ``transfer_mode`` /
 ``bytes_uploaded`` on ``uns["scx_accel"]["to_gpu_anndata"]``. The Rust GPU
 unit tests cover byte-level decode parity; this asserts the Python-visible
 metadata path and GPU↔CPU value parity end to end.
@@ -32,16 +32,15 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def sidecar_scx(tmp_path):
-    """A small SCX file that emits and uses a decode sidecar.
+def scx1_scx(tmp_path):
+    """A small framed Scx1 SCX file that decodes fully in VRAM.
 
     Small integer UMI-like counts (``poisson(2.0)``, median ~2) auto-route to the
-    Scx1 codec, which is the only codec with a decode-metadata sidecar + GPU
-    decode kernels. ``n_vars`` is kept small so every row has ``< 128`` nnz, so no
-    FOR-BP BitPacker4x host-fallback fires and the whole matrix decodes on-device.
+    Scx1 codec, the only codec with GPU decode kernels. The default framed (v4)
+    layout decodes group-by-group in VRAM (``decode_framed_scx1_gpu``).
 
     NB: do *not* reuse ``conftest.py::synthetic_adata`` here — its
-    ``randint(0, 200)`` values (median ~100) route to Zstd, which emits no sidecar.
+    ``randint(0, 200)`` values (median ~100) route to Zstd, which host-bounces.
     """
     import anndata
 
@@ -51,23 +50,23 @@ def sidecar_scx(tmp_path):
     dense[rng.random(dense.shape) > 0.3] = 0.0
     adata = anndata.AnnData(X=sp.csr_matrix(dense))
 
-    path = str(tmp_path / "sidecar.scx")
-    pyscx.from_anndata(adata, path)  # codec="auto" → Scx1 → sidecar emitted
+    path = str(tmp_path / "scx1.scx")
+    pyscx.from_anndata(adata, path)  # codec="auto" → framed Scx1
     return path
 
 
-def test_to_gpu_anndata_decode_gpu_transfer_mode(sidecar_scx):
-    """Sidecar'd Scx1 file → fully-on-device decode + small ``bytes_uploaded``."""
-    gpu_adata = pyscx.open(sidecar_scx).to_gpu_anndata()
+def test_to_gpu_anndata_decode_gpu_transfer_mode(scx1_scx):
+    """Framed Scx1 file → fully-on-device decode + small ``bytes_uploaded``."""
+    gpu_adata = pyscx.open(scx1_scx).to_gpu_anndata()
 
     meta = gpu_adata.uns["scx_accel"]["to_gpu_anndata"]
     nnz = int(gpu_adata.X.nnz)
 
-    # The strongest single guard: this mode is reachable *only* when an Scx1
-    # decode sidecar was emitted, resolved, and every shard decoded in VRAM.
+    # The strongest single guard: this mode is reachable *only* when every Scx1
+    # shard decoded in VRAM (framed group-by-group device decode).
     assert meta["transfer_mode"] == "scx_device_decode_gpu", (
         f"expected fully-on-device decode, got transfer_mode="
-        f"{meta['transfer_mode']!r} (sidecar likely absent — codec not Scx1?)"
+        f"{meta['transfer_mode']!r} (codec not Scx1?)"
     )
 
     # Only the tiny indptr is uploaded — far below a full-matrix HtoD (nnz * 8B
@@ -80,13 +79,13 @@ def test_to_gpu_anndata_decode_gpu_transfer_mode(sidecar_scx):
     )
 
 
-def test_to_gpu_anndata_values_match_cpu(sidecar_scx):
+def test_to_gpu_anndata_values_match_cpu(scx1_scx):
     """GPU-decoded ``X`` is identical to the CPU decode path."""
-    cpu_x = pyscx.open(sidecar_scx).to_anndata().X
+    cpu_x = pyscx.open(scx1_scx).to_anndata().X
     cpu_x = cpu_x.tocsr() if not sp.isspmatrix_csr(cpu_x) else cpu_x
     cpu_x.sort_indices()
 
-    gpu_x = pyscx.open(sidecar_scx).to_gpu_anndata().X.get()  # cupyx CSR → host
+    gpu_x = pyscx.open(scx1_scx).to_gpu_anndata().X.get()  # cupyx CSR → host
     gpu_x.sort_indices()
 
     assert gpu_x.shape == cpu_x.shape

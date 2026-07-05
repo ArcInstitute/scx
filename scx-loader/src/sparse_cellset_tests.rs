@@ -111,7 +111,6 @@ fn gather_single_file_sets_matches_reference_in_order() {
         false,
         false,
         0.0,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
 
@@ -171,7 +170,6 @@ fn empty_set_keeps_boundary_without_rows() {
         false,
         false,
         0.0,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
@@ -224,7 +222,6 @@ fn gather_cross_file_set_concatenates_in_global_space() {
         false,
         false,
         0.0,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
 
@@ -280,7 +277,6 @@ fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
         false,
         false,
         0.0,
-        /*scatter_sidecar*/ true,
     )
     .unwrap()
 }
@@ -313,7 +309,6 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         false,
         false,
         0.0,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
 

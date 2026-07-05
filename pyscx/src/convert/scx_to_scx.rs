@@ -88,24 +88,35 @@ pub(crate) fn route_scx_backed_to_scx(
     let no_deletions = backed.kept_to_global.is_none();
     let no_projection = backed.col_projection().is_none();
     let single_modality_source = modality_id.is_none();
-    // Framing gate. A v4 source is passthrough-eligible when it is *purely*
-    // framed — i.e. it holds only row-group-framed (shard-v2) shards, whose
-    // block index is embedded in the shard body, so the verbatim copy path
-    // (`copy_section_verbatim`, `has_sidecar = false`, CSR entries only) carries
-    // it correctly and each v2 shard passes the writer's v4 guard. A *mixed*
-    // compact-trial v4 source additionally holds unframed-Scx1 (shard-v1) shards
-    // with separate `DecodeMetadataShard` sidecar sections; the verbatim path
-    // would drop those sidecars and trip the guard, so such sources still take
-    // the decode-encode path (sidecar-preserving passthrough is a follow-on).
-    // Detect the pure-framed case by the absence of any DecodeMetadataShard
-    // section (a valid v4 file with none holds only framed shards).
+    // Framing gate. A v4 source is passthrough-eligible when *every* CSR-class
+    // shard is row-group-framed (shard-v2): the block index is embedded in the
+    // shard body, so the verbatim copy path (`copy_section_verbatim`, CSR entries
+    // only) carries it correctly and each v2 shard passes the writer's v4 guard.
+    // A legacy v4 source that still holds any unframed (shard-v1) CSR shard would
+    // trip that guard on verbatim copy, so it takes the decode-encode path (which
+    // reframes). Checked by reading each CSR-class shard header (cheap 76-byte
+    // reads from the mmap) rather than by any section-level marker.
     let source_unframed = src_header.format_version <= scx_format_io::DEFAULT_WRITE_FORMAT_VERSION;
     let source_pure_framed = src_header.format_version <= scx_format_io::CURRENT_FORMAT_VERSION
-        && !src_reader
+        && src_reader
             .catalog()
             .entries
             .iter()
-            .any(|e| e.section_type == SectionType::DecodeMetadataShard);
+            .filter(|e| {
+                matches!(
+                    e.section_type,
+                    SectionType::CsrShard | SectionType::LayerCsrShard | SectionType::ObspCsrShard
+                )
+            })
+            .all(|e| {
+                src_reader
+                    .read_shard_header(e)
+                    .map(|h| {
+                        h.shard_format_version
+                            > scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION
+                    })
+                    .unwrap_or(false)
+            });
     let passthrough_ok = target_codec_for_passthrough
         && target_shard_rows_matches
         && no_deletions

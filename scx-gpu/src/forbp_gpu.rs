@@ -165,62 +165,8 @@ pub fn forbp_decode_gpu(
     forbp_decode_gpu_core(dev, data, metas, all_row_lengths, total_nnz)
 }
 
-/// FOR-BP GPU decode driven by an encoder-emitted decode-metadata sidecar
-/// ([`scx_codec::forbp::ForBpRowMetadata`]) instead of the CPU `preparse_forbp`
-/// pass. The sidecar already stores exactly what the kernel needs (per-row
-/// `indices_bit_offset`, `frame_min`, `frame_bits`, `nnz`, and `value_start` =
-/// the output offset), so the full CPU scan of the bitstream is skipped.
-///
-/// `rows` must have one entry per CSR row (`rows.len() == n_rows`), including
-/// empty rows. Output is **bit-identical** to [`forbp_decode_gpu`]; rows are
-/// routed to the scalar or BitPacker4x kernel by their `index_packing` (Task
-/// 4.4b), so the indices decode entirely on the device.
-pub fn forbp_decode_gpu_with_metadata(
-    dev: &GpuDevice,
-    data: &[u8],
-    rows: &[scx_codec::forbp::ForBpRowMetadata],
-    n_rows: usize,
-) -> Result<(CudaSlice<u32>, Vec<usize>), GpuError> {
-    if rows.len() != n_rows {
-        return Err(GpuError::InvalidShard(format!(
-            "FOR-BP sidecar: rows.len() {} != n_rows {n_rows}",
-            rows.len()
-        )));
-    }
-    let mut metas = Vec::with_capacity(rows.len());
-    let mut all_row_lengths = Vec::with_capacity(rows.len());
-    let mut total_nnz: usize = 0;
-    for r in rows {
-        let nnz = r.nnz as usize;
-        all_row_lengths.push(nnz);
-        total_nnz += nnz;
-        if nnz == 0 {
-            continue;
-        }
-        metas.push(RowMeta {
-            frame_min: r.frame_min,
-            frame_bits: r.frame_bits,
-            nnz: r.nnz,
-            bit_offset: u32::try_from(r.indices_bit_offset).map_err(|_| {
-                GpuError::InvalidShard(format!(
-                    "FOR-BP sidecar: indices_bit_offset {} exceeds u32",
-                    r.indices_bit_offset
-                ))
-            })?,
-            output_offset: u32::try_from(r.value_start).map_err(|_| {
-                GpuError::InvalidShard(format!(
-                    "FOR-BP sidecar: value_start {} exceeds u32",
-                    r.value_start
-                ))
-            })?,
-            index_packing: r.index_packing,
-        });
-    }
-    forbp_decode_gpu_core(dev, data, metas, all_row_lengths, total_nnz)
-}
-
-/// Shared FOR-BP GPU decode core: takes the per-row metadata (from either the
-/// CPU `preparse_forbp` pass or a decode sidecar), partitions rows by their
+/// Shared FOR-BP GPU decode core: takes the per-row metadata (from the CPU
+/// `preparse_forbp` pass), partitions rows by their
 /// packing layout, and launches the matching kernel for each group — both
 /// writing into the same device output buffer at each row's global
 /// `output_offset`. No host fallback: the scalar (`index_packing == 1`) and

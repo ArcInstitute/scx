@@ -362,14 +362,6 @@ enum Commands {
         /// many non-zeros. Only meaningful with `--row-group-rows`.
         #[arg(long, value_name = "NNZ")]
         row_group_target_nnz: Option<u64>,
-        /// Under `--codec compact-trial`, keep Scx1-friendly (integer,
-        /// low-median) shards **unframed with their decode sidecar** so the
-        /// FOR-BP/Rice GPU device-decode + per-row random-access fast path is
-        /// preserved (the file then mixes framed + unframed-Scx1 shards; both are
-        /// random-access-safe). Without this, Scx1 is kept only when it does not
-        /// regress size.
-        #[arg(long)]
-        keep_gpu_sidecar: bool,
         /// Migrate a legacy single-section obs table to the sharded
         /// `ObsMetadataShard` layout: `auto` (shard when n_obs >
         /// shard_target_rows — the from_anndata threshold), `always`, or
@@ -1035,7 +1027,6 @@ fn main() {
             codec,
             row_group_rows,
             row_group_target_nnz,
-            keep_gpu_sidecar,
             shard_obs,
         } => optimize::run_optimize(
             &input,
@@ -1046,7 +1037,6 @@ fn main() {
             // (the unframed v3 opt-out).
             Some(row_group_rows),
             row_group_target_nnz,
-            keep_gpu_sidecar,
             &shard_obs,
         ),
         Commands::Compact {
@@ -1735,9 +1725,6 @@ fn dispatch_convert(
         group_target_bytes,
         group_max_bytes,
         group_pass,
-        // convert engages the §4.3 GPU/sidecar cost model via the accel-oriented
-        // `--index-preset training` signal (resolved in `ConvertOptions::framing`).
-        keep_gpu_sidecar: false,
     };
 
     let pb = ProgressBar::new_spinner();

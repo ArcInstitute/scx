@@ -362,7 +362,7 @@ fn ctor_rejects_zero_cache_shards() {
 
     let mut config = scx_loader::LoaderConfig::default();
     config.max_memory_mb = 1024;
-    let r = scx_loader::IndexPlanLoader::new(&path, config, 0, true, 4, 1024, true);
+    let r = scx_loader::IndexPlanLoader::new(&path, config, 0, true, 4, 1024);
     assert!(matches!(r, Err(LoaderError::ConfigError { .. })));
 }
 
@@ -378,7 +378,7 @@ fn ctor_rejects_missing_obs_column() {
     let mut config = scx_loader::LoaderConfig::default();
     config.obs_columns = vec!["nonexistent_column".to_string()];
     config.max_memory_mb = 1024;
-    let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024, true);
+    let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024);
     match r {
         Err(LoaderError::ObsColumnNotFound { name, available }) => {
             assert_eq!(name, "nonexistent_column");
@@ -401,7 +401,7 @@ fn ctor_rejects_hvg_out_of_range() {
     let mut config = scx_loader::LoaderConfig::default();
     config.hvg_indices = Some(vec![0, 5, N_VARS as u32]); // last one is OOR
     config.max_memory_mb = 1024;
-    let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024, true);
+    let r = scx_loader::IndexPlanLoader::new(&path, config, 4, true, 4, 1024);
     match r {
         Err(LoaderError::ConfigError { reason }) => {
             assert!(reason.contains("HVG index"));
@@ -646,7 +646,6 @@ fn budget_breakdown_includes_transient_terms() {
         /*sort_by_shard*/ true,
         /*lookahead*/ 4,
         max_plan_size,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
     let lower_bound = (2 * max_plan_size * n_obs_cols * 8) + (2 * max_plan_size * 24);
@@ -670,7 +669,6 @@ fn budget_breakdown_includes_transient_terms() {
         /*sort_by_shard*/ true,
         /*lookahead*/ 4,
         max_plan_size,
-        /*scatter_sidecar*/ true,
     )
     .unwrap();
     let transient2 = loader2.budget_breakdown().transient_bytes;

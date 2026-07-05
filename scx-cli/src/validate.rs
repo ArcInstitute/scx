@@ -76,8 +76,7 @@ pub fn run_validate(
         println!("\nDeep checks:");
         // The canonical-CSR invariant is a v3 guarantee only. Pre-v3 files may
         // legitimately carry unsorted / unsummed shards, so checking them would
-        // be a false failure — skip the canonical-CSR loop below v3. (Decode
-        // sidecars only exist in v3 files, so that loop is gated implicitly.)
+        // be a false failure — skip the canonical-CSR loop below v3.
         if header.format_version >= 3 {
             for entry in &catalog.entries {
                 if matches!(
@@ -104,23 +103,6 @@ pub fn run_validate(
                 "canonical-CSR checks skipped: file is format_version {} (< 3)",
                 header.format_version
             );
-        }
-        for entry in &catalog.entries {
-            if entry.section_type == SectionType::DecodeMetadataShard {
-                n_checks += 1;
-                let result = reader.validate_decode_sidecar_entry(entry);
-                let passed = result.is_ok();
-                let icon = if passed { "OK" } else { "FAIL" };
-                println!("[{icon}] decode-sidecar {}", entry.name);
-                if verbose {
-                    if let Err(err) = &result {
-                        println!("       error: {err}");
-                    }
-                }
-                if !passed {
-                    all_passed = false;
-                }
-            }
         }
     }
 

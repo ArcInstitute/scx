@@ -13,7 +13,6 @@ use scx_codec::{CodecId, ValueEncoding};
 
 use crate::catalog::{FullCatalog, FullCatalogEntry, RootCatalog, RootCatalogEntry, ShardStats};
 use crate::checksum::blake3_hash;
-use crate::decode_sidecar::{DecodeSidecar, DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO};
 use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
@@ -157,8 +156,6 @@ pub struct PreEncodedSection {
     pub section_type: SectionType,
     /// NNZ count for this shard.
     pub nnz: u64,
-    /// Optional decode metadata sidecar for this shard.
-    pub decode_sidecar: Option<DecodeSidecar>,
 }
 
 impl PreEncodedSection {
@@ -478,22 +475,6 @@ impl ScxWriter {
         });
 
         Ok(())
-    }
-
-    fn write_decode_sidecar_for_source(
-        &mut self,
-        source_name: &str,
-        sidecar: DecodeSidecar,
-        stats: Option<ShardStats>,
-    ) -> Result<()> {
-        let mut data = Vec::with_capacity(sidecar.estimated_encoded_size());
-        sidecar.write_to(&mut data)?;
-        self.write_section_bytes(
-            format!("decode/{source_name}"),
-            SectionType::DecodeMetadataShard,
-            &data,
-            stats,
-        )
     }
 
     /// Serialize a RecordBatch to Arrow IPC file format bytes.
@@ -1257,27 +1238,6 @@ impl ScxWriter {
             nnz,
         );
 
-        // Build the decode sidecar from the encoder-produced metadata (single
-        // source of truth) — never re-derived. Only Scx1 integer CSR shards
-        // carry `scx1_decode`; CSC / non-CSR targets yield `None` inside
-        // `from_codec_metadata`.
-        let decode_sidecar = match (codec_id, &encoded.scx1_decode) {
-            (CodecId::Scx1, Some(meta)) => DecodeSidecar::from_codec_metadata(
-                meta,
-                value_encoding,
-                shard_index_dtype,
-                shard_header.n_minor,
-                row_start,
-                section_type,
-                shard_global_offset,
-                section_length,
-                section_checksum,
-            )?
-            .filter(|s| s.within_overhead_budget(DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO)),
-            _ => None,
-        };
-        let sidecar_stats = stats.clone();
-
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
             offset: shard_global_offset,
@@ -1287,10 +1247,6 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(stats),
         });
-
-        if let Some(sidecar) = decode_sidecar {
-            self.write_decode_sidecar_for_source(name, sidecar, Some(sidecar_stats))?;
-        }
 
         Ok(())
     }
@@ -1359,8 +1315,7 @@ impl ScxWriter {
         Ok(())
     }
 
-    /// Write a raw-copied CSR shard section (single-modality) and, optionally,
-    /// its re-stamped decode sidecar.
+    /// Write a raw-copied CSR shard section (single-modality).
     ///
     /// `section_bytes` is a complete shard section (76-byte header + payload)
     /// whose header has already been patched for the new `global_offset` /
@@ -1368,23 +1323,14 @@ impl ScxWriter {
     /// `X_shard_<idx>` exactly like [`Self::write_csr_shard`] and advances the
     /// same counters, so a file mixing raw-copied and re-encoded shards stays
     /// catalog-consistent.
-    ///
-    /// When `sidecar` is `Some`, the source shard's decode sidecar is written
-    /// bound to *this* shard: `source_section_offset` / `source_section_length`
-    /// / `source_section_checksum` are re-stamped to the bytes actually written
-    /// here (the caller must have already set `major_start`). This reproduces
-    /// the sidecar [`Self::write_csr_shard`] would have emitted on the
-    /// decode/re-encode path, so raw-copy output stays byte-identical for Scx1
-    /// count shards.
     pub fn write_csr_shard_raw_copy(
         &mut self,
         section_bytes: &[u8],
         stats: ShardStats,
         nnz: u64,
-        sidecar: Option<DecodeSidecar>,
     ) -> Result<()> {
         let name = format!("X_shard_{}", self.csr_shard_count);
-        self.write_csr_shard_raw_copy_inner(section_bytes, &name, stats, sidecar)?;
+        self.write_csr_shard_raw_copy_inner(section_bytes, &name, stats)?;
         self.csr_shard_count += 1;
         self.total_nnz += nnz;
         Ok(())
@@ -1398,7 +1344,6 @@ impl ScxWriter {
         section_bytes: &[u8],
         stats: ShardStats,
         nnz: u64,
-        sidecar: Option<DecodeSidecar>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let shard_idx = self
@@ -1408,7 +1353,7 @@ impl ScxWriter {
             .unwrap_or(0);
         let name = format!("X/{mname}/shard_{shard_idx}");
         self.with_modality(modality_id, |this| {
-            this.write_csr_shard_raw_copy_inner(section_bytes, &name, stats, sidecar)
+            this.write_csr_shard_raw_copy_inner(section_bytes, &name, stats)
         })?;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.n_csr_shards += 1;
@@ -1417,32 +1362,19 @@ impl ScxWriter {
         Ok(())
     }
 
-    /// Shared body for the raw-copy CSR writers: write the patched section
-    /// bytes verbatim, record the catalog entry, and (optionally) write the
-    /// re-stamped decode sidecar bound to the bytes just written. Does NOT
-    /// advance shard counters — callers do that to match their single- vs
-    /// per-modality bookkeeping.
-    /// Defensive guard: refuse to
-    /// place a **random-access-incapable** legacy shard into a file that claims
-    /// the v4 layout.
+    /// Defensive guard: refuse to place an **unframed** (shard v1) CSR-class
+    /// shard into a file that claims the v4 layout.
     ///
     /// A file `format_version` of [`CURRENT_FORMAT_VERSION`](scx_format::CURRENT_FORMAT_VERSION)
     /// (v4) advertises "every sparse shard supports sub-shard random access."
-    /// Two representations satisfy that: a **framed** (shard v2) shard (via its
-    /// group `BlockIndex`) *or* an **unframed Scx1** (shard v1) shard carrying a
-    /// `DecodeSidecar` (via its bit-level per-row index — the GPU/per-row layer
-    /// kept alongside framing per `SIDECAR-LONG-TERM-FIX.md` §4.3). The
-    /// compact-trial cost model deliberately emits a mix of the two. What must
-    /// never enter a v4 file is a v1 shard with **neither** — that would be a
-    /// false random-access promise. `has_sidecar` reports whether this shard is
-    /// accompanied by a `DecodeSidecar`. Legacy rewrite paths stamp ≤ v3, so the
-    /// guard is inert for them; only CSR-class shards carry the layout, so
-    /// obs/var/aux verbatim copies are exempt.
+    /// Only a **framed** (shard v2) shard satisfies that, via its group
+    /// `BlockIndex`. Legacy rewrite paths stamp ≤ v3, so the guard is inert for
+    /// them; only CSR-class shards carry the layout, so obs/var/aux verbatim
+    /// copies are exempt.
     fn guard_no_legacy_shard_in_v4(
         &self,
         section_type: SectionType,
         section_bytes: &[u8],
-        has_sidecar: bool,
     ) -> Result<()> {
         if self.header.format_version < scx_format::CURRENT_FORMAT_VERSION {
             return Ok(());
@@ -1454,15 +1386,13 @@ impl ScxWriter {
             return Ok(());
         }
         let sh = ShardHeader::read_from(&mut &section_bytes[..])?;
-        if sh.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION
-            && !has_sidecar
-        {
+        if sh.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
             return Err(ScxError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "refusing to place an unframed, sidecar-less (shard v{}) shard into a \
-                     v{} file: it would advertise sub-shard random access it cannot honor. \
-                     Re-encode it row-group-framed, or as Scx1 with a decode sidecar.",
+                    "refusing to place an unframed (shard v{}) shard into a v{} file: it \
+                     would advertise sub-shard random access it cannot honor. Re-encode it \
+                     row-group-framed.",
                     sh.shard_format_version, self.header.format_version,
                 ),
             )));
@@ -1475,9 +1405,8 @@ impl ScxWriter {
         section_bytes: &[u8],
         name: &str,
         stats: ShardStats,
-        sidecar: Option<DecodeSidecar>,
     ) -> Result<()> {
-        self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes, sidecar.is_some())?;
+        self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
         let section_length = section_bytes.len() as u64;
@@ -1485,9 +1414,6 @@ impl ScxWriter {
         self.writer()?.write_all(section_bytes)?;
         self.current_offset += section_length;
 
-        // Clone the stats for the sidecar only when there is a sidecar to
-        // write — the common (non-Scx1) shard copies no sidecar.
-        let sidecar_stats = sidecar.as_ref().map(|_| stats.clone());
         self.entries.push(FullCatalogEntry {
             name: name.to_string(),
             offset: shard_global_offset,
@@ -1497,18 +1423,6 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(stats),
         });
-
-        if let Some(mut sc) = sidecar {
-            // Re-bind the sidecar to the shard bytes actually written here.
-            // `major_start`, `n_cols`, `index_dtype`, and the row / Rice-block
-            // offsets are payload-relative or set by the caller and unchanged;
-            // only the source-section identity moves with the new position.
-            sc.source_section_offset = shard_global_offset;
-            sc.source_section_length = section_length;
-            sc.source_section_checksum = section_checksum;
-            // `sidecar_stats` is `Some` exactly when `sidecar` is `Some`.
-            self.write_decode_sidecar_for_source(name, sc, sidecar_stats)?;
-        }
         Ok(())
     }
 
@@ -1518,11 +1432,7 @@ impl ScxWriter {
     /// (typically in parallel via rayon). This method only performs the
     /// sequential I/O write and catalog entry bookkeeping.
     pub fn write_preencoded_shard(&mut self, section: PreEncodedSection) -> Result<()> {
-        self.guard_no_legacy_shard_in_v4(
-            section.section_type,
-            &section.header_buf,
-            section.decode_sidecar.is_some(),
-        )?;
+        self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -1536,8 +1446,6 @@ impl ScxWriter {
 
         self.current_offset += section.section_length;
 
-        let source_name = section.name.clone();
-        let sidecar_stats = section.stats.clone();
         self.entries.push(FullCatalogEntry {
             name: section.name,
             offset: shard_global_offset,
@@ -1547,14 +1455,6 @@ impl ScxWriter {
             modality_id: self.current_modality_id,
             stats: Some(section.stats),
         });
-
-        if let Some(sidecar) = section.decode_sidecar {
-            self.write_decode_sidecar_for_source(
-                &source_name,
-                sidecar.with_source_offset(shard_global_offset),
-                Some(sidecar_stats),
-            )?;
-        }
 
         // Per-modality bookkeeping: mirror `write_csr_shard_for` /
         // `write_csc_shard_for` so the modality table `finish()` emits carries
@@ -1630,10 +1530,9 @@ impl ScxWriter {
             )));
         }
 
-        // Verbatim copy carries no separate sidecar signal here; the raw-copy
-        // callers that would legitimately move a v1-Scx1-with-sidecar shard into
-        // a v4 file don't exist yet (all stamp ≤ v3), so stay strict (no sidecar).
-        self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes, false)?;
+        // A v4 file requires framed (shard v2) CSR-class shards; reject an
+        // unframed verbatim copy into one.
+        self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
 
         self.write_padding()?;
 

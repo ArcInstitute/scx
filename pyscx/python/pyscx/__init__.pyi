@@ -76,7 +76,7 @@ class IndexPlanDataset:
         lookahead: int | None = None,
         max_plan_size: int | None = None,
         max_memory_mb: int | None = None,
-        scatter_sidecar: bool | None = None,
+        scatter_block_index: bool | None = None,
     ) -> None: ...
 
     @property
@@ -169,19 +169,7 @@ class SparseCellSetDataset:
         normalize: bool | None = None,
         log1p: bool | None = None,
         target_sum: float | None = None,
-        scatter_sidecar: bool | None = None,
-    ) -> None:
-        """``scatter_sidecar`` (default ``False``) gates the O(rows) scx1
-        decode-sidecar gather. It is off by default because the typical cell-set
-        workload is cache-friendly (sorted data + a reused control pool → a small
-        working set that fits the shard cache): decoding each hot shard once into
-        the LRU and reusing it across batches beats re-decoding touched rows from
-        the per-row sidecar every batch. Pass ``True`` for cache-hostile runs
-        (working set ≫ cache, low shard reuse), where the per-row sidecar's
-        bounded, lower peak RAM is the memory-safe choice. The process-wide
-        ``SCX_SCATTER_SIDECAR=0`` env var remains a hard kill-switch that forces
-        the full-shard path regardless of this argument."""
-        ...
+    ) -> None: ...
 
     @property
     def n_files(self) -> int: ...

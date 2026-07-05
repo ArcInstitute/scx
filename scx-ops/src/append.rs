@@ -415,14 +415,12 @@ pub fn append_from_reader_with_index_options(
         // bound: append may split a source shard across `shard_target_rows`,
         // so a verbatim copy is only valid when the source shard already fits.
         //
-        // Framing must MATCH the output exactly. `raw_copy_csr_shard` copies
-        // section bytes via `FileLock` and does NOT copy the `DecodeMetadataShard`
-        // sidecar (unlike merge), so byte-copying an unframed v1 Scx1 shard into
-        // a v4 base would drop its sidecar and leave a sidecar-less v1 shard under
-        // a v4 header — exactly what `guard_no_legacy_shard_in_v4` rejects (and
-        // this path bypasses that guard). Requiring `shard_framed == output_framed`
-        // routes any mismatched shard through `write_csr_chunk`, which re-encodes
-        // it to the correct framing (v1 Scx1+sidecar → framed v2 in a v4 base).
+        // Framing must MATCH the output exactly. Byte-copying an unframed v1
+        // shard into a v4 base would leave a v1 shard under a v4 header — exactly
+        // what `guard_no_legacy_shard_in_v4` rejects. Requiring
+        // `shard_framed == output_framed` routes any mismatched shard through
+        // `write_csr_chunk`, which re-encodes it to the correct framing (a legacy
+        // unframed shard → framed v2 in a v4 base).
         let shard_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
         let raw_copy_ok = shard_framed == output_framed
             && raw_copy_csr_eligible(

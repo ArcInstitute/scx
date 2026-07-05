@@ -19,7 +19,6 @@ pub mod backed;
 #[cfg(feature = "deletion-vectors")]
 pub mod bitmap;
 pub mod csc_sidecar;
-pub mod decode_sidecar;
 #[cfg(feature = "deletion-vectors")]
 pub mod deletion_vectors;
 pub mod distinct;
@@ -43,11 +42,6 @@ pub use backed::{
 pub use bitmap::{
     BitmapPolicy, BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC,
     BITMAP_SHARD_VERSION,
-};
-pub use decode_sidecar::{
-    decode_scx1_parallel, DecodeRowEntry, DecodeSidecar, RiceBlockEntry,
-    DECODE_SIDECAR_KIND_SCX1_CSR, DECODE_SIDECAR_MAGIC, DECODE_SIDECAR_VERSION,
-    DEFAULT_DECODE_SIDECAR_MAX_OVERHEAD_RATIO,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};

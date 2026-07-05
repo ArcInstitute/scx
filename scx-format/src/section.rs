@@ -78,8 +78,10 @@ pub enum SectionType {
     /// [`ObsMetadataShard`] for the var axis. Section name:
     /// `var_metadata/shard_<idx>`.
     VarMetadataShard = 25,
-    /// Decode metadata sidecar for an encoded CSR-like shard.
-    DecodeMetadataShard = 26,
+    // id 26 is reserved (formerly DecodeMetadataShard, the Scx1 decode sidecar,
+    // removed once row-group framing became the default write layout). Legacy
+    // files carrying section 26 are skipped via the unknown-section path and
+    // full-decode to byte-identical output.
     /// Row-shard of the `adata.raw` count matrix (`raw/X`). Same row
     /// (obs) axis as the main `CsrShard` matrix but its OWN column
     /// (var) axis — `raw.n_vars` is typically larger than `n_vars`
@@ -135,7 +137,8 @@ impl SectionType {
             23 => Some(Self::VarpEmbeddingShard),
             24 => Some(Self::ObsMetadataShard),
             25 => Some(Self::VarMetadataShard),
-            26 => Some(Self::DecodeMetadataShard),
+            // 26 reserved (formerly DecodeMetadataShard) — falls through to None
+            // and is skipped by the catalog reader's unknown-section path.
             27 => Some(Self::RawCsrShard),
             28 => Some(Self::RawVarMetadata),
             29 => Some(Self::GroupIndex),
@@ -215,10 +218,8 @@ mod tests {
             SectionType::from_u8(25),
             Some(SectionType::VarMetadataShard)
         );
-        assert_eq!(
-            SectionType::from_u8(26),
-            Some(SectionType::DecodeMetadataShard)
-        );
+        // 26 reserved (formerly DecodeMetadataShard) — now unknown/None.
+        assert_eq!(SectionType::from_u8(26), None);
         assert_eq!(SectionType::from_u8(27), Some(SectionType::RawCsrShard));
         assert_eq!(SectionType::from_u8(28), Some(SectionType::RawVarMetadata));
         assert_eq!(SectionType::from_u8(29), Some(SectionType::GroupIndex));

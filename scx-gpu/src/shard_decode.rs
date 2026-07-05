@@ -10,7 +10,7 @@ use cudarc::driver::safe::CudaSlice;
 
 use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
-use scx_codec::{CodecId, Scx1DecodeMetadata, ValueEncoding};
+use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::shard::{
     resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
 };
@@ -18,9 +18,9 @@ use scx_format_io::shard::{
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::forbp_gpu::{forbp_decode_gpu, forbp_decode_gpu_with_metadata};
+use crate::forbp_gpu::forbp_decode_gpu;
 use crate::profile::{self, CodecClass};
-use crate::rice_gpu::{rice_decode_gpu, rice_decode_gpu_with_metadata};
+use crate::rice_gpu::rice_decode_gpu;
 
 /// GPU-resident CSR matrix.
 ///
@@ -91,19 +91,16 @@ impl DeviceDecodeStats {
 ///
 /// Produces **bit-identical** output to `scx_codec::decode_shard_scipy`.
 pub fn decode_shard_gpu(dev: &GpuDevice, shard_bytes: &[u8]) -> Result<GpuCsr, GpuError> {
-    decode_shard_gpu_with_metadata(dev, shard_bytes, None).map(|(csr, _stats)| csr)
+    decode_shard_gpu_with_stats(dev, shard_bytes).map(|(csr, _stats)| csr)
 }
 
-/// Decode an entire SCX shard on GPU, optionally driven by a decode-metadata
-/// sidecar ([`Scx1DecodeMetadata`]) so the per-row FOR-BP / per-block Rice
-/// offsets feed the kernels directly instead of being re-derived by a CPU
-/// prescan (ACC-RUST-OPT-V4 Task 4.4a). `metadata` applies only to the Scx1
-/// path; pass `None` (or a non-Scx1 shard) to use the prescan path. Returns the
-/// [`GpuCsr`] plus [`DeviceDecodeStats`] describing the host↔device transfer.
-pub fn decode_shard_gpu_with_metadata(
+/// Decode an entire SCX shard on GPU, returning the [`GpuCsr`] plus
+/// [`DeviceDecodeStats`] describing the host↔device transfer. Framed Scx1 shards
+/// decode in VRAM group-by-group; unframed Scx1 shards decode via the FOR-BP /
+/// Rice CPU prescan; all other codecs host-decode + HtoD bounce.
+pub fn decode_shard_gpu_with_stats(
     dev: &GpuDevice,
     shard_bytes: &[u8],
-    metadata: Option<&Scx1DecodeMetadata>,
 ) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     // 1. Parse 76-byte shard header
     if shard_bytes.len() < SHARD_HEADER_SIZE {
@@ -192,7 +189,6 @@ pub fn decode_shard_gpu_with_metadata(
             n_rows,
             n_cols,
             nnz,
-            metadata,
         ),
         CodecId::None
         | CodecId::Zstd
@@ -243,7 +239,6 @@ fn decode_scx1_gpu(
     n_rows: usize,
     n_cols: usize,
     nnz: usize,
-    metadata: Option<&Scx1DecodeMetadata>,
 ) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
     if !value_encoding.is_integer() {
         return Err(GpuError::InvalidShard(
@@ -271,25 +266,17 @@ fn decode_scx1_gpu(
     // indices: FOR-BP on GPU → on-device u32→i32 cast (no host round-trip)
     // values:  Rice on GPU → on-device u32→f32 cast (no host round-trip)
     // Both decode GPU-side; the bucket covers the bitstream upload + kernels.
-    // With a sidecar, the per-row/per-block offsets feed the kernels directly
-    // and the CPU prescan is skipped (Task 4.4a).
+    // The kernels re-derive per-row/per-block offsets via a GPU prescan.
     let t_gpu = profile::start();
-    let (d_indices_u32, _row_lengths) = match metadata {
-        Some(meta) => forbp_decode_gpu_with_metadata(dev, indices_bytes, &meta.rows, n_rows)?,
-        None => forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?,
-    };
+    let (d_indices_u32, _row_lengths) =
+        forbp_decode_gpu(dev, indices_bytes, n_rows, index_dtype_u16)?;
     // FOR-BP indices (scalar + BitPacker4x rows, Task 4.4b) and Rice values both
     // decode on the device — the gpu_decode bucket covers the bitstream upload +
     // kernels; only the indptr round-trips through the host.
     stats.device_decoded_bytes += (nnz as u64) * 4;
     let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
 
-    let d_values_u32 = match metadata {
-        Some(meta) => {
-            rice_decode_gpu_with_metadata(dev, values_bytes, &meta.rice_blocks, nnz, B_VAL)?
-        }
-        None => rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?,
-    };
+    let d_values_u32 = rice_decode_gpu(dev, values_bytes, nnz, B_VAL)?;
     // Rice values always decode on the device.
     stats.device_decoded_bytes += (nnz as u64) * 4;
     let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
@@ -375,7 +362,7 @@ fn decode_host_bounce(
 /// prescans (`forbp_decode_gpu` / `rice_decode_gpu`) run verbatim on each group's
 /// byte slice; the decoded per-group device buffers are dtod-concatenated into
 /// combined nnz-sized buffers (the same idiom as the cross-shard
-/// `decode_csr_shards_to_device_with_metadata`, applied at group granularity).
+/// `decode_csr_shards_to_device_with_stats`, applied at group granularity).
 /// The global indptr is assembled on the host from each group's local indptr via
 /// `scx_codec::decode_row_group_indptr_only` (only the indptr sub-stream frame is
 /// decoded on the host; the much larger index/value frames go to the device).
@@ -704,123 +691,6 @@ mod tests {
         assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
     }
 
-    /// Decode an Scx1 shard three ways — host reference, GPU no-sidecar (CPU
-    /// prescan), and GPU sidecar-driven (Task 4.4a) — and assert all three are
-    /// byte-identical. Returns the sidecar-driven [`DeviceDecodeStats`].
-    fn assert_sidecar_decode_match(
-        dev: &GpuDevice,
-        indptr: &[u64],
-        indices: &[u32],
-        values_u16: &[u16],
-        n_cols: u32,
-    ) -> DeviceDecodeStats {
-        let n_rows = indptr.len() - 1;
-        let nnz = indices.len();
-        let index_dtype_u16 = n_cols <= 65535;
-        let values_raw: Vec<u8> = values_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let (shard_bytes, meta) = crate::test_utils::build_test_shard_with_metadata(
-            indptr,
-            indices,
-            &values_raw,
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            n_cols,
-        );
-        let meta = meta.expect("Scx1 shard must emit decode metadata");
-
-        // Host reference.
-        let header = ShardHeader::read_from(&mut Cursor::new(&shard_bytes)).unwrap();
-        let indptr_enc =
-            &shard_bytes[header.indptr_rel_offset as usize..][..header.indptr_length as usize];
-        let indices_enc =
-            &shard_bytes[header.indices_rel_offset as usize..][..header.indices_length as usize];
-        let values_enc =
-            &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
-        let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
-            indptr_enc,
-            indices_enc,
-            values_enc,
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            n_rows,
-            nnz,
-            index_dtype_u16,
-        );
-
-        // GPU, no sidecar (CPU prescan path) and GPU, sidecar-driven.
-        let (plain, _plain_stats) =
-            decode_shard_gpu_with_metadata(dev, &shard_bytes, None).unwrap();
-        let (sided, stats) =
-            decode_shard_gpu_with_metadata(dev, &shard_bytes, Some(&meta)).unwrap();
-
-        for (label, csr) in [("no-sidecar", &plain), ("sidecar", &sided)] {
-            let g_indptr = dev.dtoh_copy(&csr.indptr).unwrap();
-            let g_indices = dev.dtoh_copy(&csr.indices).unwrap();
-            let g_data = dev.dtoh_copy(&csr.data).unwrap();
-            assert_eq!(csr.shape, (n_rows, n_cols as usize), "{label} shape");
-            assert_eq!(g_indptr, cpu_indptr, "{label} indptr mismatch");
-            assert_eq!(g_indices, cpu_indices, "{label} indices mismatch");
-            assert_eq!(g_data, cpu_data, "{label} data mismatch");
-        }
-        stats
-    }
-
-    /// Sidecar-driven GPU decode of an all-sparse Scx1 shard (<128 nnz/row,
-    /// incl. empty rows and a partial last Rice block) is byte-identical to the
-    /// prescan path and host, and decodes entirely on the device.
-    #[test]
-    fn test_sidecar_decode_all_sparse_fully_device() {
-        let dev = require_gpu!();
-        let n_cols: u32 = 4000;
-        let row_nnzs = [0usize, 1, 5, 64, 0, 100, 7, 33, 0, 120, 2, 90];
-        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
-        let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
-        assert!(
-            stats.fully_device_decoded,
-            "all-sparse must fully device-decode"
-        );
-        let nnz = indices.len() as u64;
-        // Only the tiny indptr is uploaded; indices+values decode on the device.
-        assert_eq!(stats.host_uploaded_bytes, (indptr.len() as u64) * 8);
-        assert_eq!(stats.device_decoded_bytes, nnz * 8);
-    }
-
-    /// Sidecar-driven GPU decode of a mixed shard (some rows >= 128 nnz) stays
-    /// byte-identical AND, as of Task 4.4b, decodes entirely on the device — the
-    /// BitPacker4x kernel handles the >= 128-nnz rows, so FOR-BP indices no longer
-    /// host-fall-back (only the tiny indptr uploads).
-    #[test]
-    fn test_sidecar_decode_mixed_dense_fully_device() {
-        let dev = require_gpu!();
-        let n_cols: u32 = 4000;
-        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
-        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
-        let stats = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
-        assert!(
-            stats.fully_device_decoded,
-            "dense rows must decode on the device (BitPacker4x kernel, Task 4.4b)"
-        );
-        let nnz = indices.len() as u64;
-        // Indices + values both decode on device; only the indptr uploads.
-        assert_eq!(
-            stats.device_decoded_bytes,
-            nnz * 8,
-            "indices + values on device"
-        );
-        assert_eq!(stats.host_uploaded_bytes, (indptr.len() as u64) * 8);
-    }
-
-    /// u32-column (n_cols > 65535) sidecar-driven parity.
-    #[test]
-    fn test_sidecar_decode_u32_indices() {
-        let dev = require_gpu!();
-        let n_cols: u32 = 70_000;
-        let row_nnzs = [2usize, 130, 300, 0, 512, 9, 256, 1, 64];
-        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
-        let _ = assert_sidecar_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
-    }
-
     /// Assemble a full shard-section byte buffer (header + payload + block
     /// index) from an [`encode_one_shard`] result, mirroring the on-disk layout
     /// the writer produces. Used to exercise the GPU framed-shard host-bounce.
@@ -839,7 +709,6 @@ mod tests {
             row_group_rows,
             target_nnz: None,
             trial: false,
-            prefer_gpu_sidecar: false,
         };
         let section = scx_format_io::encode_one_shard(
             indptr,
@@ -889,7 +758,7 @@ mod tests {
 
         for (codec, want_device) in [(CodecId::ShufDeltaZstd, false), (CodecId::Scx1, true)] {
             let section = framed_section_bytes(&indptr, &indices, &values_f32, codec, n_cols, 4);
-            let (gpu_csr, stats) = decode_shard_gpu_with_metadata(&dev, &section, None)
+            let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &section)
                 .unwrap_or_else(|e| panic!("framed {codec:?} GPU decode failed: {e}"));
             let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
             let g_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
@@ -928,7 +797,7 @@ mod tests {
             ValueEncoding::Uint16,
             n_cols,
         );
-        let (u_csr, u_stats) = decode_shard_gpu_with_metadata(&dev, &unframed, None).unwrap();
+        let (u_csr, u_stats) = decode_shard_gpu_with_stats(&dev, &unframed).unwrap();
         assert!(
             u_stats.fully_device_decoded,
             "unframed Scx1 must device-decode"
@@ -936,7 +805,7 @@ mod tests {
 
         // Framed Scx1 (per-group device decode), 4 rows per group → 4 groups.
         let framed = framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
-        let (f_csr, f_stats) = decode_shard_gpu_with_metadata(&dev, &framed, None).unwrap();
+        let (f_csr, f_stats) = decode_shard_gpu_with_stats(&dev, &framed).unwrap();
         assert!(
             f_stats.fully_device_decoded,
             "framed Scx1 must device-decode"
@@ -975,7 +844,7 @@ mod tests {
 
         let section =
             framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
-        let (gpu_csr, stats) = decode_shard_gpu_with_metadata(&dev, &section, None).unwrap();
+        let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &section).unwrap();
         assert!(stats.fully_device_decoded, "framed Scx1 must device-decode");
         assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize));
         assert_eq!(
