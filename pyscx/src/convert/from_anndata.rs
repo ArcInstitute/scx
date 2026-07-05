@@ -537,13 +537,11 @@ pub fn from_anndata_impl(
              (row-group-framed output for random-access-safe reads)",
         ));
     }
-    // A zero row_group_rows would silently disable framing downstream; reject it
-    // for any caller so the request is never a confusing no-op.
-    if row_group_rows == Some(0) {
-        return Err(PyValueError::new_err(
-            "row_group_rows must be > 0 when provided",
-        ));
-    }
+    // Framing is on by default (row_group_rows default = 256); `Some(0)` is the
+    // explicit unframed (v3) opt-out — normalize to None so it threads through as
+    // the legacy layout rather than a confusing v4-header-with-v1-shards no-op.
+    // (The compact-trial/shufdelta guard above already rejects `0` for those.)
+    let row_group_rows = row_group_rows.filter(|&g| g > 0);
     // The §4.3 two-layer GPU/sidecar cost model engages under compact-trial when
     // explicitly requested or via the accel-oriented `training` index preset.
     let prefer_gpu_sidecar = keep_gpu_sidecar || index_preset.as_deref() == Some("training");

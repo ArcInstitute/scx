@@ -58,7 +58,7 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCX\x01"` |
-| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), 3 (canonical CSR + decode sidecars), or 4 (may contain **row-group-framed** shards — shard v2, multi-entry `BlockIndex`; F5-b). All use the v2 header byte layout; older readers reject newer versions via the version check. **Writers stamp 4 only when a shard is framed; unframed output stays v3** so it keeps reading on v3 builds. |
+| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), 3 (canonical CSR + decode sidecars), or 4 (may contain **row-group-framed** shards — shard v2, multi-entry `BlockIndex`; F5-b). All use the v2 header byte layout; older readers reject newer versions via the version check. **Framing is on by default (F5 Phase C):** the convert / `from_anndata` / `from_h5ad` / `from_10x` / `scx optimize` write paths frame at `DEFAULT_ROW_GROUP_ROWS` (256) and stamp **v4**, so v4 is the common-case output. This is a deliberate pre-1.0 break — a v3-max reader rejects these files. Pass `row_group_rows = 0` (`--row-group-rows 0`) for the legacy unframed **v3** layout when producing files for older readers. The low-level raw `ScxWriter` still defaults to v3 (`DEFAULT_WRITE_FORMAT_VERSION`); the v4 stamp comes from the convert pipeline whenever framing is active. |
 | `header_length` | `u16` | 256; reserves space for future header growth |
 | `flags` | `u32` | See flag table below |
 | `n_obs` | `u64` | Total cells (after deletions) |

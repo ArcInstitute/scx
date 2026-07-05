@@ -6,9 +6,11 @@ use arrow::array::RecordBatch;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_engine::ConversionPredicateIndexOptions;
 use scx_format_io::codec_select::select_codec;
-use scx_format_io::header::FileHeader;
+use scx_format_io::encoder::FramingConfig;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
+use scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
@@ -225,8 +227,24 @@ pub fn merge_with_options(
     // this is the single-modality merge).
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
+    // Preserve row-group framing when every input is already framed (v4): stamp
+    // v4 and enable framing on the writer. Framed source shards then byte-copy
+    // verbatim (block index in-body), and any decode-encoded shard (var/dtype
+    // mismatch) is re-emitted framed by `write_csr_shard` — so the output stays
+    // a valid v4 file (every CSR shard framed). A mixed v3/v4 input set stays
+    // unframed v3 (a v3 input holds no framed shards; a v4 input's framed shards
+    // then decode-encode to unframed via the eligibility gate below).
+    let output_framed = !input_format_versions.is_empty()
+        && input_format_versions
+            .iter()
+            .all(|&v| v >= CURRENT_FORMAT_VERSION);
+    let out_format_version = if output_framed {
+        CURRENT_FORMAT_VERSION
+    } else {
+        scx_format_io::rewrite_output_format_version(&input_format_versions, 1)
+    };
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(&input_format_versions, 1),
+        format_version: out_format_version,
         n_obs: total_n_obs,
         n_vars,
         shard_target_rows: first_header.shard_target_rows,
@@ -246,6 +264,9 @@ pub fn merge_with_options(
         + 1;
     let mut writer =
         ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
 
     // ---------------------------------------------------------------
     // Phase 2: streaming obs across all inputs.
@@ -496,19 +517,26 @@ pub fn merge_with_options(
             // so for valid inputs the decode/re-encode and raw-copy outputs are
             // byte-identical — this gate is a conservative guard, not a
             // behavioural fork. (See `merge_var_mismatch_assume_identical_var_proceeds`.)
-            let raw_copy_ok =
-                raw_copy_csr_eligible(&sh, target_index_dtype, n_vars, CodecSelection::Auto)
-                    && !options.assume_identical_var;
+            let raw_copy_ok = raw_copy_csr_eligible(
+                &sh,
+                target_index_dtype,
+                n_vars,
+                CodecSelection::Auto,
+                output_framed,
+            ) && !options.assume_identical_var;
             if raw_copy_ok {
-                // The decode/re-encode path emits a decode sidecar for Scx1
-                // shards; preserve byte-identical output by copying the
-                // source's sidecar too. If an Scx1 source lacks one (pre-v3 or
-                // over the overhead budget), we cannot reproduce what the slow
-                // path would emit, so fall through to decode/re-encode.
+                // The decode/re-encode path emits a decode sidecar for unframed
+                // Scx1 shards; preserve byte-identical output by copying the
+                // source's sidecar too. If an unframed Scx1 source lacks one
+                // (pre-v3 or over the overhead budget), we cannot reproduce what
+                // the slow path would emit, so fall through to decode/re-encode.
+                // A framed (v2) shard is self-contained via its in-body block
+                // index (no sidecar) and always byte-copies.
                 let sidecar =
                     source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
+                let is_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
                 let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
-                if !is_scx1 || sidecar.is_some() {
+                if is_framed || !is_scx1 || sidecar.is_some() {
                     let (section_bytes, stats) = build_raw_copied_csr_section(
                         reader,
                         shard_entry,
@@ -878,8 +906,20 @@ fn merge_multimodal(
     // multimodal output requires v2+). See the single-modality merge above.
     let input_format_versions: Vec<u16> =
         readers.iter().map(|r| r.header().format_version).collect();
+    // Preserve framing when every input is framed (v4). See the single-modality
+    // merge above for the rationale (v4 stamp + writer framing → framed shards
+    // byte-copy verbatim, decode-encoded shards re-emit framed).
+    let output_framed = !input_format_versions.is_empty()
+        && input_format_versions
+            .iter()
+            .all(|&v| v >= CURRENT_FORMAT_VERSION);
+    let out_format_version = if output_framed {
+        CURRENT_FORMAT_VERSION
+    } else {
+        scx_format_io::rewrite_output_format_version(&input_format_versions, 2)
+    };
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(&input_format_versions, 2),
+        format_version: out_format_version,
         n_obs: total_n_obs,
         n_vars: max_n_vars,
         shard_target_rows: first_header.shard_target_rows,
@@ -897,6 +937,9 @@ fn merge_multimodal(
         + 1;
     let mut writer =
         ScxWriter::new(output_path, out_header)?.with_data_generation(merged_data_generation);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
 
     // Validate global obs schema across all inputs before any output
     // bytes are written. Mirrors the single-modality call site.
@@ -1007,12 +1050,14 @@ fn merge_multimodal(
                     target_index_dtype,
                     modality_n_vars,
                     CodecSelection::Auto,
+                    output_framed,
                 ) && !options.assume_identical_var;
                 if raw_copy_ok {
                     let sidecar =
                         source_decode_sidecar(reader, &sidecar_index, shard_entry, row_start)?;
+                    let is_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
                     let is_scx1 = sh.codec_id == CodecId::Scx1 as u8;
-                    if !is_scx1 || sidecar.is_some() {
+                    if is_framed || !is_scx1 || sidecar.is_some() {
                         let (section_bytes, stats) = build_raw_copied_csr_section(
                             reader,
                             shard_entry,

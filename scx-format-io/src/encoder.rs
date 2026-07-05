@@ -377,6 +377,28 @@ pub struct FramingConfig {
     pub prefer_gpu_sidecar: bool,
 }
 
+/// Default row-group size (G) for framed writes. Chosen from the F5 follow-up
+/// sweep (Phase B/B7): compression ratio is flat across G (±0.3%), while finer G
+/// is 1.4–2.1× faster for scattered/training reads on multi-shard files, so 256
+/// is the scatter-friendly middle between decode latency and block-index size.
+/// This is the single chokepoint shared by every framed-by-default write site
+/// (`ConvertOptions::default`, the CLI `--row-group-rows` default, and the pyscx
+/// `from_*` defaults); a plain `codec="auto"` write frames at this G (framing is
+/// codec-agnostic — see the encoder's framing branch), so it costs no extra
+/// encode work. Pass `row_group_rows = 0` to opt out (unframed v3 output).
+pub const DEFAULT_ROW_GROUP_ROWS: u32 = 256;
+
+impl Default for FramingConfig {
+    fn default() -> Self {
+        Self {
+            row_group_rows: DEFAULT_ROW_GROUP_ROWS,
+            target_nnz: None,
+            trial: false,
+            prefer_gpu_sidecar: false,
+        }
+    }
+}
+
 /// Size slack (fraction) by which an unframed Scx1+sidecar representation may
 /// exceed the framed winner and still be kept for its GPU/per-row fast path when
 /// `prefer_gpu_sidecar` is not set. Default 0 → keep Scx1 only when it does not
@@ -412,7 +434,7 @@ fn framed_size(e: &EncodedShard) -> usize {
 /// framed indptr. `scx1_decode` is dropped — framed shards use the block index
 /// for random access, not the monolithic Scx1 sidecar.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_shard_framed(
+pub fn encode_shard_framed(
     indptr: &[u64],
     indices: &[u32],
     values_bytes: &[u8],

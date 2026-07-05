@@ -10,11 +10,12 @@ use scx_engine::ConversionPredicateIndexOptions;
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format_io::compute_shard_stats;
+use scx_format_io::header::CURRENT_FORMAT_VERSION;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader,
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use scx_format_io::writer::ScxWriter;
@@ -383,6 +384,13 @@ pub fn append_from_reader_with_index_options(
     let old_obs = read_existing_axis(&mut lock, &prep.old_catalog, MetadataAxis::Obs)?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
+    // A framed (v4) base carries shard-v2 shards, so the output header is v4
+    // (set above via `clamped.max(base_version)`). Into a v4 output a framed
+    // source shard byte-copies verbatim (block index in-body); into a ≤v3
+    // output framed source shards must decode-encode to unframed. See
+    // `raw_copy_csr_eligible`.
+    let output_framed = prep.header.format_version >= CURRENT_FORMAT_VERSION;
+
     // Per-source-shard streaming loop.
     let mut write_offset = lock.seek(SeekFrom::End(0))?;
     let mut new_shard_entries: Vec<FullCatalogEntry> = Vec::new();
@@ -406,9 +414,25 @@ pub fn append_from_reader_with_index_options(
         // (dtype / n_minor / codec) is AND-ed with append's own re-split
         // bound: append may split a source shard across `shard_target_rows`,
         // so a verbatim copy is only valid when the source shard already fits.
-        let raw_copy_ok =
-            raw_copy_csr_eligible(&sh, target_index_dtype, prep.target_n_vars, options.codec)
-                && sh.n_major <= options.shard_target_rows.get();
+        //
+        // Framing must MATCH the output exactly. `raw_copy_csr_shard` copies
+        // section bytes via `FileLock` and does NOT copy the `DecodeMetadataShard`
+        // sidecar (unlike merge), so byte-copying an unframed v1 Scx1 shard into
+        // a v4 base would drop its sidecar and leave a sidecar-less v1 shard under
+        // a v4 header — exactly what `guard_no_legacy_shard_in_v4` rejects (and
+        // this path bypasses that guard). Requiring `shard_framed == output_framed`
+        // routes any mismatched shard through `write_csr_chunk`, which re-encodes
+        // it to the correct framing (v1 Scx1+sidecar → framed v2 in a v4 base).
+        let shard_framed = sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION;
+        let raw_copy_ok = shard_framed == output_framed
+            && raw_copy_csr_eligible(
+                &sh,
+                target_index_dtype,
+                prep.target_n_vars,
+                options.codec,
+                output_framed,
+            )
+            && sh.n_major <= options.shard_target_rows.get();
 
         if raw_copy_ok {
             let shard_idx = next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;
@@ -781,24 +805,46 @@ fn write_csr_chunk(
     let shard_global_offset = *write_offset;
     let index_dtype_u16 = prep.header_index_dtype == 0;
 
-    let encoded = scx_codec::encode_shard(
-        shard_indptr,
-        shard_indices,
-        shard_values,
-        shard_codec,
-        value_encoding,
-        index_dtype_u16,
-    )?;
-
-    let block_index = BlockIndex {
-        entries: vec![BlockIndexEntry::new(
-            0,
-            shard_rows as u32,
-            0,
-            0,
-            0,
-            shard_nnz,
-        )?],
+    // Preserve row-group framing: when the (base) file is v4, emit a framed
+    // (shard-v2) shard with a real multi-entry BlockIndex so the appended shard
+    // honors the v4 sub-shard-random-access promise. Without this, this path —
+    // which writes directly via `FileLock`, bypassing
+    // `guard_no_legacy_shard_in_v4` — would write an unframed v1 shard into a v4
+    // file (invalid). A ≤v3 base keeps the legacy monolithic v1 layout.
+    let output_framed = prep.header.format_version >= CURRENT_FORMAT_VERSION;
+    let (encoded, block_index, shard_format_version) = if output_framed {
+        let fc = scx_format_io::FramingConfig::default();
+        let (enc, bi) = scx_format_io::encode_shard_framed(
+            shard_indptr,
+            shard_indices,
+            shard_values,
+            shard_codec,
+            value_encoding,
+            index_dtype_u16,
+            fc.row_group_rows,
+            fc.target_nnz,
+        )?;
+        (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
+    } else {
+        let enc = scx_codec::encode_shard(
+            shard_indptr,
+            shard_indices,
+            shard_values,
+            shard_codec,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+        let bi = BlockIndex {
+            entries: vec![BlockIndexEntry::new(
+                0,
+                shard_rows as u32,
+                0,
+                0,
+                0,
+                shard_nnz,
+            )?],
+        };
+        (enc, bi, DEFAULT_WRITE_SHARD_FORMAT_VERSION)
     };
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
@@ -821,7 +867,7 @@ fn write_csr_chunk(
 
     let sh = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+        shard_format_version,
         shard_type: derive_shard_type(SectionType::CsrShard),
         codec_id: shard_codec as u8,
         value_encoding: value_encoding as u8,

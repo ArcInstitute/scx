@@ -116,9 +116,11 @@ pub fn run_merge(
     );
     drop(out_reader);
 
-    // Re-emit the CSC sidecar against the merged output.
+    // Re-emit the CSC sidecar against the merged output, preserving its framing
+    // (a v4 merged output must not be downgraded to unframed v3 by the rebuild).
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
+        let framing = crate::cli_utils::framing_for_file(output);
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 

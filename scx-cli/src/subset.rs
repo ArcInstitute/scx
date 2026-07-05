@@ -4,10 +4,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use scx_engine::QueryPipeline;
-use scx_format_io::header::FileHeader;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::FramingConfig;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_subset(
@@ -166,7 +167,9 @@ pub fn run_subset(
     // 8. Parse codec
     let explicit_codec = scx_codec::CodecId::parse_cli(codec)?;
 
-    // 9. Write output SCX file
+    // 9. Write output SCX file. Preserve framing from the source: a v4 (framed)
+    // input yields a v4 framed output (default G) instead of a v3 downgrade.
+    let framing = (in_header.format_version >= CURRENT_FORMAT_VERSION).then(FramingConfig::default);
     let output = output.unwrap();
     write_subset_scx(
         output,
@@ -176,13 +179,14 @@ pub fn run_subset(
         filter,
         gene_indices.as_deref(),
         uns.as_ref(),
+        framing,
     )?;
 
     println!("Wrote {}", output.display());
 
-    // Re-emit the CSC sidecar against the projected output.
+    // Re-emit the CSC sidecar against the projected output, preserving framing.
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
@@ -337,6 +341,7 @@ pub(crate) fn write_csr_shards_auto(
     index_dtype: u8,
     explicit_codec: Option<scx_codec::CodecId>,
     modality_type: scx_format_io::ModalityType,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let shard_target = shard_size as usize;
     debug_assert!(shard_target > 0, "shard_size must be greater than 0");
@@ -378,7 +383,7 @@ pub(crate) fn write_csr_shards_auto(
             SectionType::CsrShard,
             modality_type,
             format!("X_shard_{shard_idx}"),
-            None,
+            framing,
         )?;
         writer.write_preencoded_shard(pre)?;
 
@@ -564,8 +569,14 @@ fn extract_modality(
     let n_obs_out = projected_csr.n_rows() as u64;
     let n_vars_out = projected_csr.n_cols() as u64;
     let index_dtype = if n_vars_out <= 65535 { 0u8 } else { 1u8 };
-    let header =
+    // Preserve framing from the source (a v4 input yields a framed v4 output).
+    let framing =
+        (reader.header().format_version >= CURRENT_FORMAT_VERSION).then(FramingConfig::default);
+    let mut header =
         FileHeader::new_single_modality(n_obs_out, n_vars_out, 0, shard_size, 0, index_dtype);
+    if framing.is_some() {
+        header.format_version = CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
     writer.write_obs(&filtered_obs)?;
@@ -581,6 +592,7 @@ fn extract_modality(
         index_dtype,
         explicit_codec,
         modality_type,
+        framing,
     )?;
 
     // Preserve uns: prefer per-modality, fall back to global.
@@ -630,7 +642,7 @@ fn extract_modality(
     }
 
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
     Ok(())
@@ -646,14 +658,20 @@ fn write_subset_scx(
     filter_expr: Option<&str>,
     gene_indices: Option<&[u32]>,
     uns: Option<&serde_json::Value>,
+    framing: Option<FramingConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let n_obs = result.x.n_rows() as u64;
     let n_vars = result.x.n_cols() as u64;
 
     let index_dtype = if n_vars <= 65535 { 0u8 } else { 1u8 };
 
-    // nnz filled in by finish()
-    let header = FileHeader::new_single_modality(n_obs, n_vars, 0, shard_size, 0, index_dtype);
+    // nnz filled in by finish(). Preserve row-group framing: a framed (v4)
+    // source yields a v4 output whose shards are framed (via `framing` below),
+    // so subsetting a default file no longer silently downgrades it to v3.
+    let mut header = FileHeader::new_single_modality(n_obs, n_vars, 0, shard_size, 0, index_dtype);
+    if framing.is_some() {
+        header.format_version = CURRENT_FORMAT_VERSION;
+    }
 
     let mut writer = ScxWriter::new(output, header)?;
 
@@ -674,6 +692,7 @@ fn write_subset_scx(
         index_dtype,
         explicit_codec,
         scx_format_io::ModalityType::Rna,
+        framing,
     )?;
 
     // Write uns if present in the input file
@@ -714,7 +733,7 @@ fn write_subset_scx(
 mod tests {
     use super::*;
     use crate::test_utils::write_test_file;
-    use scx_codec::CodecId;
+    use scx_codec::{CodecId, ValueEncoding};
 
     /// Write a gene index file for testing.
     fn write_gene_file(dir: &tempfile::TempDir, indices: &[u32]) -> std::path::PathBuf {
@@ -733,6 +752,131 @@ mod tests {
         let path = dir.path().join("gene_names.txt");
         std::fs::write(&path, names.join("\n")).unwrap();
         path
+    }
+
+    /// Write a **framed** (v4 / shard-v2) test input, mirroring
+    /// `test_utils::write_test_file` but with a v4 header + row-group framing so
+    /// the F-d framing-preservation path is exercised.
+    fn write_framed_test_file(
+        dir: &tempfile::TempDir,
+        n_obs: usize,
+        n_vars: usize,
+    ) -> std::path::PathBuf {
+        let path = dir.path().join("test_framed.scx");
+        let mut header = crate::test_utils::sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = CURRENT_FORMAT_VERSION;
+        let mut writer = ScxWriter::new(&path, header).unwrap();
+        writer.set_framing(Some(FramingConfig {
+            row_group_rows: 4,
+            ..Default::default()
+        }));
+        writer
+            .write_obs(&crate::test_utils::sample_obs(n_obs))
+            .unwrap();
+        writer
+            .write_var(&crate::test_utils::sample_var(n_vars))
+            .unwrap();
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for row in 0..n_obs {
+            let col0 = (row * 2) % n_vars;
+            let col1 = (row * 2 + 1) % n_vars;
+            let val0 = ((row + 1) % 256) as u8;
+            let val1 = ((row + 2) % 256) as u8;
+            let ((c0, v0), (c1, v1)) = if col0 <= col1 {
+                ((col0, val0), (col1, val1))
+            } else {
+                ((col1, val1), (col0, val0))
+            };
+            indices.push(c0 as u32);
+            indices.push(c1 as u32);
+            values.push(v0);
+            values.push(v1);
+            indptr.push(indptr.last().unwrap() + 2);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::Zstd,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    /// F-d: subsetting a framed (v4) file must produce a framed v4 output, not
+    /// silently downgrade it to unframed v3.
+    #[test]
+    fn test_subset_preserves_framing_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_framed_test_file(&dir, 12, 5);
+        let output = dir.path().join("subset_framed.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert_eq!(
+            reader.header().format_version,
+            CURRENT_FORMAT_VERSION,
+            "subsetting a framed file must keep the output v4"
+        );
+        for entry in &reader.catalog().shards_sorted() {
+            let sh = reader.read_shard_header(entry).unwrap();
+            assert!(
+                sh.shard_format_version > 1,
+                "subset output shard '{}' must be framed v2, got v{}",
+                entry.name,
+                sh.shard_format_version
+            );
+        }
+    }
+
+    /// Control: subsetting an unframed (v3) file must not over-frame to v4.
+    #[test]
+    fn test_subset_unframed_stays_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 12, 5);
+        let output = dir.path().join("subset_v3.scx");
+
+        run_subset(
+            &input,
+            Some(output.as_path()),
+            Some("cell_type == 'T cell'"),
+            None,
+            None,
+            false,
+            10000,
+            "auto",
+            false,
+            5000,
+            "4G",
+        )
+        .unwrap();
+
+        let reader = ScxReader::open(&output).unwrap();
+        assert!(
+            reader.header().format_version < CURRENT_FORMAT_VERSION,
+            "subsetting an unframed file must not over-frame to v4 (got v{})",
+            reader.header().format_version
+        );
     }
 
     #[test]

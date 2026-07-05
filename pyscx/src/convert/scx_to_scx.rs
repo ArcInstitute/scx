@@ -88,20 +88,30 @@ pub(crate) fn route_scx_backed_to_scx(
     let no_deletions = backed.kept_to_global.is_none();
     let no_projection = backed.col_projection().is_none();
     let single_modality_source = modality_id.is_none();
-    // A v4 source may hold row-group-framed (v2) shards or, under the compact-trial
-    // cost model, unframed-Scx1-with-sidecar (v1) shards plus separate
-    // DecodeMetadataShard sidecar sections. The verbatim copy path
-    // (`copy_section_verbatim`) hardcodes `has_sidecar = false` and iterates only
-    // CSR entries, so it would abort on a v1+sidecar shard and drop the sidecar
-    // sections. Force v4 sources down the decode-encode path (self-consistent
-    // output; framing/sidecar preservation through passthrough is a follow-on).
+    // Framing gate. A v4 source is passthrough-eligible when it is *purely*
+    // framed — i.e. it holds only row-group-framed (shard-v2) shards, whose
+    // block index is embedded in the shard body, so the verbatim copy path
+    // (`copy_section_verbatim`, `has_sidecar = false`, CSR entries only) carries
+    // it correctly and each v2 shard passes the writer's v4 guard. A *mixed*
+    // compact-trial v4 source additionally holds unframed-Scx1 (shard-v1) shards
+    // with separate `DecodeMetadataShard` sidecar sections; the verbatim path
+    // would drop those sidecars and trip the guard, so such sources still take
+    // the decode-encode path (sidecar-preserving passthrough is a follow-on).
+    // Detect the pure-framed case by the absence of any DecodeMetadataShard
+    // section (a valid v4 file with none holds only framed shards).
     let source_unframed = src_header.format_version <= scx_format_io::DEFAULT_WRITE_FORMAT_VERSION;
+    let source_pure_framed = src_header.format_version <= scx_format_io::CURRENT_FORMAT_VERSION
+        && !src_reader
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::DecodeMetadataShard);
     let passthrough_ok = target_codec_for_passthrough
         && target_shard_rows_matches
         && no_deletions
         && no_projection
         && single_modality_source
-        && source_unframed;
+        && (source_unframed || source_pure_framed);
 
     // Output header / writer setup. For passthrough, mirror the
     // source's codec / shard_target_rows / index_dtype so the
@@ -149,7 +159,7 @@ pub(crate) fn route_scx_backed_to_scx(
     } else {
         (out_n_obs_visible, out_n_vars_visible)
     };
-    let header = build_output_header(
+    let mut header = build_output_header(
         out_n_obs,
         out_n_vars,
         out_shard_rows,
@@ -157,6 +167,24 @@ pub(crate) fn route_scx_backed_to_scx(
         out_index_dtype,
         src_header.format_version,
     );
+    // Passthrough byte-copies the source's shards verbatim, so the output must
+    // carry the source's exact `format_version` — NOT the `rewrite_output_
+    // format_version` clamp (which caps at v3). A pure-framed v4 source holds
+    // shard-v2 shards with per-group local-rebased BlockIndexes; stamping a v3
+    // header over them would let a v3-only reader accept the file and mis-decode
+    // each group's local indptr as global. Mirror the source version exactly.
+    if passthrough_ok {
+        header.format_version = src_header.format_version;
+    }
+    // When the passthrough output is a framed (v4) file, every CSR-class section
+    // it contains must be framed — the X shards are copied verbatim (already v2),
+    // but the layers are decode-encoded below and would otherwise be written
+    // unframed (v1), which `guard_no_legacy_shard_in_v4` rejects. Frame them.
+    let out_framing = if header.format_version >= scx_format_io::CURRENT_FORMAT_VERSION {
+        Some(scx_format_io::FramingConfig::default())
+    } else {
+        None
+    };
 
     let mut writer = ScxWriter::new(out_path, header).map_err(to_pyerr)?;
 
@@ -252,6 +280,7 @@ pub(crate) fn route_scx_backed_to_scx(
         out_shard_rows,
         codec_for_encode,
         out_index_dtype,
+        out_framing,
     )?;
 
     // Write remaining metadata (obsm / varm / obsp / varp / uns) after
@@ -456,7 +485,8 @@ pub(crate) fn route_scx_lazy_to_scx(
     }
 
     // Layers — never transformed by the lazy X chain, so we just
-    // stream them through the same decode-encode pipeline as X.
+    // stream them through the same decode-encode pipeline as X. The lazy path
+    // always decode-encodes to an unframed v3 output, so no framing.
     stream_write_layers(
         py,
         adata,
@@ -466,6 +496,7 @@ pub(crate) fn route_scx_lazy_to_scx(
         shard_target_rows,
         codec_for_encode,
         index_dtype,
+        None,
     )?;
 
     py.detach(|| -> Result<(), scx_format_io::ScxError> {
@@ -630,6 +661,7 @@ pub(crate) fn stream_write_layers(
     out_shard_rows: u32,
     codec_for_encode: Option<CodecId>,
     index_dtype: u8,
+    framing: Option<scx_format_io::FramingConfig>,
 ) -> PyResult<()> {
     let layers = match adata.getattr("layers") {
         Ok(l) => l,
@@ -673,7 +705,7 @@ pub(crate) fn stream_write_layers(
                         SectionType::LayerCsrShard,
                         ModalityType::Rna,
                         format!("{layer_name}_shard_{i}"),
-                        None,
+                        framing,
                     )
                 })
                 .map_err(to_pyerr)

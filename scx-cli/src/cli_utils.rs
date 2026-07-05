@@ -19,6 +19,20 @@ pub fn validate_scx_file(path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+/// Derive the framing config to use when rewriting `path`'s CSC sidecar so the
+/// rebuild preserves the file's existing layout: a framed (v4) file keeps
+/// framing (default `G`), an unframed (≤v3) file stays unframed. Without this,
+/// `rebuild_csc_inplace(..., None)` re-encodes every CSR shard unframed and
+/// silently downgrades a v4 file back to v3 — undoing the framing that
+/// compact/sort/merge/append/subset just preserved. Returns `None` (unframed)
+/// if the file can't be opened; the CSC rebuild surfaces any real error.
+pub fn framing_for_file(path: &Path) -> Option<scx_format_io::FramingConfig> {
+    ScxReader::open(path)
+        .ok()
+        .filter(|r| r.header().format_version >= scx_format_io::CURRENT_FORMAT_VERSION)
+        .map(|_| scx_format_io::FramingConfig::default())
+}
+
 /// Validate that every input file reports the same file-level `n_vars`,
 /// returning that shared value. Opens each file once. The first input is
 /// the reference; any mismatch reports both paths and counts.

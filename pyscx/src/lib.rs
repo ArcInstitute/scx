@@ -293,7 +293,7 @@ pub(crate) fn deep_validate_into(
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
     sort_by=None, reverse=false,
-    row_group_rows=None, row_group_target_nnz=None, keep_gpu_sidecar=false,
+    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None, keep_gpu_sidecar=false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -446,6 +446,7 @@ fn from_anndata(
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
     group_pass="auto",
     obs_override=None, var_override=None, uns_override=None,
+    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5ad(
@@ -479,6 +480,8 @@ fn from_h5ad(
     obs_override: Option<Bound<'_, PyAny>>,
     var_override: Option<Bound<'_, PyAny>>,
     uns_override: Option<Bound<'_, PyAny>>,
+    row_group_rows: u32,
+    row_group_target_nnz: Option<u64>,
 ) -> PyResult<()> {
     // A missing input is the common wrong-path case. The converter opens
     // the h5ad via `hdf5::File::open`, which surfaces as `ConvertError::Hdf5`
@@ -567,8 +570,11 @@ fn from_h5ad(
         codec: explicit_codec,
         csc: csc_policy,
         csc_cols_per_shard,
-        row_group_rows: None,
-        row_group_target_nnz: None,
+        // Framing on by default (G=256); `row_group_rows=0` opts out to unframed
+        // v3. `ConvertOptions::framing()` treats `Some(0)` as unframed, but store
+        // None for 0 so the v4 header bump is clean.
+        row_group_rows: (row_group_rows != 0).then_some(row_group_rows),
+        row_group_target_nnz,
         codec_trial: false,
         tool: "pyscx".into(),
         memory_budget: memory_budget_bytes,
@@ -625,6 +631,7 @@ fn from_h5ad(
     csc_cols_per_shard=5000, uns_format="tagged",
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
+    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_10x(
@@ -643,6 +650,8 @@ fn from_10x(
     bitmap: &str,
     memory_budget: Option<Bound<'_, PyAny>>,
     force_legacy_metadata: bool,
+    row_group_rows: u32,
+    row_group_target_nnz: Option<u64>,
 ) -> PyResult<()> {
     let scanpy = py.import("scanpy").map_err(|e| {
         // Only rewrite when scanpy itself is the missing module — if scanpy
@@ -687,9 +696,10 @@ fn from_10x(
         force_legacy_metadata,
         Vec::new(), // sort_by (not exposed on the 10x reader)
         false,      // sort_reverse
-        None,       // row_group_rows (framing not exposed on the 10x reader)
-        None,       // row_group_target_nnz
-        false,      // keep_gpu_sidecar
+        // Framing on by default (G=256); `row_group_rows=0` opts out to unframed.
+        (row_group_rows != 0).then_some(row_group_rows),
+        row_group_target_nnz,
+        false, // keep_gpu_sidecar
     )
 }
 

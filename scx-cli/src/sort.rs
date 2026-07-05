@@ -164,8 +164,11 @@ pub fn run_sort(
         );
     }
 
+    // Preserve the sorted output's framing on CSC rebuild (don't downgrade a v4
+    // output back to unframed v3).
     if rebuild_csc {
-        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, None)?;
+        let framing = crate::cli_utils::framing_for_file(output);
+        scx_ops::rebuild_csc_inplace(output, csc_cols_per_shard, csc_memory_limit, framing)?;
         println!("Rebuilt CSC sidecar on {}", output.display());
     }
 
