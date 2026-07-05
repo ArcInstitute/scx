@@ -812,6 +812,45 @@ SCX is a Rust workspace with 16 crates:
 
 For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
 
+## Attributions
+
+The following SCX features were adapted from initial implementations by
+**Alex Dobin**:
+
+| # | Feature | Description |
+|---|---------|-------------|
+| **F1** | **Condition/label-grouped sharding** | Group-by + reference-in-shard-0 layout for 100–1000× I/O reduction per group read; converts scatter-gather across all shards into contiguous 1–2 shard reads. |
+| **F2** | **`read_group` / `read_reference` / `iter_group_shards` API** | One-line per-perturbation reads, first-class reference/control access, and streaming group-by-group processing at bounded RAM. |
+| **F3** | **In-decode dtype/density materialization** | Read-side `container`, `data_dtype`, `index_dtype` kwargs for 50–75% memory savings via dtype narrowing and elimination of CSR→dense double buffer. |
+| **F4** | **Fail-loud lossless-cast gate (`allow_lossy`)** | Fixes silent u32→f32 narrowing above 2²⁴ with an O(1) per-shard catalog check; makes dtype flexibility safe by construction. |
+| **F5** | **Byte-shuffle + byte-delta + zstd codec** | Measured 1.5–2.5× smaller on integer counts vs Scx1; row-group-framed design preserves random-row access. |
+
+The following major capabilities were designed and implemented in the SCX
+codebase by **Nick Youngblut**:
+
+| # | Feature | Description |
+|---|---------|-------------|
+| **F1** | **Scx1 domain-specific codec** | Delta-Golomb-Rice + FOR-BP + adaptive Rice codec achieving ~2.2 bits/value on UMI counts; GPU-decodable; per-shard auto-codec selection. |
+| **F2** | **ML training loader** | Triple-buffered Rust pipeline (tokio I/O → rayon decode → Python consumer); 1,405 batches/s, 82× faster than TileDB-SOMA-ML; zero Python on hot path. |
+| **F3** | **Analysis accelerators** | Rust-native PCA, kNN, UMAP, DE, HVG, Leiden, Harmony2, pseudobulk NB-GLM, gene scoring, LISI — 2–528× over scanpy on CPU/GPU. |
+| **F4** | **Backed/lazy mode** | `ScxBackedSparseDataset` + `ScxLazyTransformedDataset` enabling out-of-core pipelines; chained normalize→log1p→scale without materialization; 6× peak RAM reduction. |
+| **F5** | **Query engine with predicate pushdown** | Categorical/numeric indexes, shard pruning, bitmap sidecars; arbitrary predicates, gene projection, compound filters. |
+| **F6** | **Streaming ingest/export** | Parallel h5ad/h5mu ↔ SCX streaming with memory-budget-bounded encoding; 16× less peak RSS on ingest. |
+| **F7** | **GPU decode pipeline** | In-VRAM Rice/FOR-BP decode, sparse→dense CUDA kernels, cuSPARSE interop, rapids-singlecell integration. |
+| **F8** | **Operations** | Streaming merge, append, sort, compact, subset, logical delete, and rollback. |
+| **F9** | **Per-shard BLAKE3 checksums** | Truncated-64 per shard + full-256 catalog; `scx validate` for end-to-end integrity verification. |
+| **F10** | **Extensible section-type system** | 29 section types with forward-compatible unknown-section skip — no format-version bump needed for new sidecars. |
+| **F11** | **CSC sidecar** | Optional column-major storage for 13–24× faster GPU DE and gene-axis streaming without full transpose. |
+| **F12** | **Multi-layer / sharded metadata** | Layers, obsm, varm, obsp, varp stored as sharded sections for full AnnData round-trip. |
+| **F13** | **Cloud-native reads** | `open_cloud()`, HTTP range reads per shard, `scx pull --filter` for selective download; S3, GCS, and Azure support. |
+| **F14** | **PFlog1pPF / shifted-CLR normalization** | Booeshaghi et al. 2026 method: sparse delta + per-cell baseline decomposition → out-of-core baseline-aware PCA, streaming materialize-to-SCX in compact `delta_baseline` / `dense` representations; integrated across accel, format, loader, and rscx. |
+| **F15** | **Multimodal** | CITE-seq, 10x Multiome, TEA-seq support in a single v2 file with per-modality codec routing and h5mu streaming. |
+| **F16** | **Perturbation evaluation metrics (cell-eval / arc-bench parity)** | Rust-accelerated pseudobulk means, bulk metrics (pearson_delta / mse / mae), discrimination score, energy distance, knockdown efficiency, and clustering agreement — 5–52× speedups, 32/32 numerical parity. |
+| **F17** | **Fuzzing & property-based testing** | 13 libfuzzer targets + 7 proptest suites; CI fuzz build check on every PR. |
+| **F18** | **R bindings (rscx)** | Seurat v5 + SingleCellExperiment integration via extendr. |
+| **F19** | **Comprehensive benchmarking framework** | 42 benchmark modules, 9 format runners, regression gating, SLURM integration, dashboard — ~60K lines across 216 files. |
+| **F20** | **Comprehensive documentation** | 23 docs (~14K lines): format spec, codec spec, architecture, API reference, migration guides, GPU setup, and more. |
+
 ## License
 
 MIT
