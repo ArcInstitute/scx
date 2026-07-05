@@ -434,6 +434,11 @@ fn decode_framed_scx1_gpu(
             let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
             let d_values_u32 = rice_decode_gpu(dev, vv_frame, g_nnz, B_VAL)?;
             let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
+            // The block index already guarantees Σ nnz == header.nnz; these
+            // localize a corrupt frame that decoded a different length before it
+            // becomes a mismatched-length dtod copy (mirrors gpu_csr_assemble).
+            debug_assert_eq!(d_indices.len(), g_nnz);
+            debug_assert_eq!(d_data.len(), g_nnz);
 
             let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + g_nnz);
             dev.stream()
@@ -949,6 +954,41 @@ mod tests {
             dev.dtoh_copy(&f_csr.data).unwrap(),
             dev.dtoh_copy(&u_csr.data).unwrap(),
             "data framed vs unframed"
+        );
+    }
+
+    /// A framed Scx1 shard with a **fully-empty row-group** (all-zero-nnz rows
+    /// within one group) exercises the `g_nnz == 0` branch: the group's indptr is
+    /// extended but no device decode / dtod copy runs. Output stays byte-identical.
+    #[test]
+    fn test_shard_decode_gpu_framed_scx1_empty_group() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        // row_group_rows = 4 → group 0 = 4 empty rows (nnz 0); group 1 = [3, 1].
+        let row_nnzs = [0usize, 0, 0, 0, 3, 1];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+        let n_rows = indptr.len() - 1;
+
+        let section =
+            framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
+        let (gpu_csr, stats) = decode_shard_gpu_with_metadata(&dev, &section, None).unwrap();
+        assert!(stats.fully_device_decoded, "framed Scx1 must device-decode");
+        assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize));
+        assert_eq!(
+            dev.dtoh_copy(&gpu_csr.indptr).unwrap(),
+            indptr.iter().map(|&v| v as i64).collect::<Vec<_>>(),
+            "indptr with an empty group"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&gpu_csr.indices).unwrap(),
+            indices.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            "indices with an empty group"
+        );
+        assert_eq!(
+            dev.dtoh_copy(&gpu_csr.data).unwrap(),
+            values_f32,
+            "data with an empty group"
         );
     }
 
