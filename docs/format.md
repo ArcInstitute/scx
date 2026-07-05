@@ -36,7 +36,6 @@ experiment.scx (single binary file)
 │ X/csr/000000 … X/csr/{N-1}    (CSR shards)                       │
 │ X/csc/…                       (optional, if has_csc)             │
 │ X/bitmap/…                    (optional, if has_bitmap)          │
-│ decode/…                      (optional decode metadata sidecars) │
 │ layers/{name}/csr/…           (additional CSR shard sets)        │
 │ obsm/{name}                   (Arrow IPC dense 2D tensors)       │
 │ obsp/{name}/csr/…             (sparse cell-cell graphs)          │
@@ -58,7 +57,7 @@ Written LE, at offset 0. Sections up to `reserved` total 144 bytes;
 | Field | Type | Notes |
 |-------|------|-------|
 | `magic` | `[u8; 4]` | `b"SCX\x01"` |
-| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), 3 (canonical CSR + decode sidecars), or 4 (may contain **row-group-framed** shards — shard v2, multi-entry `BlockIndex`; F5-b). All use the v2 header byte layout; older readers reject newer versions via the version check. **Framing is on by default (F5 Phase C):** the convert / `from_anndata` / `from_h5ad` / `from_10x` / `scx optimize` write paths frame at `DEFAULT_ROW_GROUP_ROWS` (256) and stamp **v4**, so v4 is the common-case output. This is a deliberate pre-1.0 break — a v3-max reader rejects these files. Pass `row_group_rows = 0` (`--row-group-rows 0`) for the legacy unframed **v3** layout when producing files for older readers. The low-level raw `ScxWriter` still defaults to v3 (`DEFAULT_WRITE_FORMAT_VERSION`); the v4 stamp comes from the convert pipeline whenever framing is active. |
+| `format_version` | `u16` | 1 (legacy), 2 (multimodal-capable), 3 (canonical CSR), or 4 (may contain **row-group-framed** shards — shard v2, multi-entry `BlockIndex`; F5-b). All use the v2 header byte layout; older readers reject newer versions via the version check. **Framing is on by default (F5 Phase C):** the convert / `from_anndata` / `from_h5ad` / `from_10x` / `scx optimize` write paths frame at `DEFAULT_ROW_GROUP_ROWS` (256) and stamp **v4**, so v4 is the common-case output. This is a deliberate pre-1.0 break — a v3-max reader rejects these files. Pass `row_group_rows = 0` (`--row-group-rows 0`) for the legacy unframed **v3** layout when producing files for older readers. The low-level raw `ScxWriter` still defaults to v3 (`DEFAULT_WRITE_FORMAT_VERSION`); the v4 stamp comes from the convert pipeline whenever framing is active. |
 | `header_length` | `u16` | 256; reserves space for future header growth |
 | `flags` | `u32` | See flag table below |
 | `n_obs` | `u64` | Total cells (after deletions) |
@@ -90,9 +89,10 @@ the leading 20 bytes of that block to the three modality fields
 when reading a `format_version = 1` header (validating that those
 bytes are zero — v1 writers always zeroed the full reserved block).
 
-v3 does not add header fields. Its breaking changes are semantic: newly
-written row-major sparse shards are canonical CSR (§4), and files may carry
-`decode_metadata_shard` sections (§4.2).
+v3 does not add header fields. Its breaking change is semantic: newly
+written row-major sparse shards are canonical CSR (§4). (v3 historically also
+permitted a `decode_metadata_shard` sidecar, section id 26, now removed — see
+§4.2.)
 
 ### Flags
 
@@ -217,7 +217,7 @@ sidecar whose counters disagree (v1–v3 files default both to `0`, so
 | 23 | `varp_embedding_shard` (Arrow IPC COO; row-shard of a `varp/<name>` pairwise sparse matrix) |
 | 24 | `obs_metadata_shard` (Arrow IPC; row-shard of the obs metadata batch — see § Sharded metadata layout below) |
 | 25 | `var_metadata_shard` (Arrow IPC; row-shard of the var metadata batch — mirror of `obs_metadata_shard`) |
-| 26 | `decode_metadata_shard` (optional decode metadata sidecar for a source Scx1 CSR-like shard — see §4.2) |
+| 26 | Reserved (formerly `decode_metadata_shard`, the removed Scx1 decode sidecar — see §4.2; legacy files carrying it are skipped and full-decode) |
 | 27 | `raw_csr_shard` (row-shard of the `adata.raw` count matrix — same obs axis as `csr_shard` but its OWN, typically wider, var axis; signalled by the `has_raw` flag) |
 | 28 | `raw_var_metadata` (Arrow IPC; the `adata.raw.var` DataFrame, companion to `raw_csr_shard`) |
 | 29 | `group_index` (JSON; condition/label-grouped sharding sidecar — `{group_by, reference_shard, reference_labels, records[]}`, records `{label, shard, row_start, row_stop, role}` with **global** output-row indices; written by `scx sort --group-by`, consumed by the grouped-read API) |
@@ -455,85 +455,23 @@ while preserving CSC sidecars: the CSR rewrite loop calls
 identical CSC content (byte-equal under the same codec) and a
 correctly populated `n_csc_shards` count + `has_csc` flag.
 
-## 4.2 Decode Metadata Sidecar
+## 4.2 Decode Metadata Sidecar (removed — section id 26 reserved)
 
-`decode_metadata_shard` (section type 26) is optional metadata for direct
-random-access or device decode of an existing encoded shard. It does not
-duplicate matrix values. Current writers emit it only for Scx1 integer
-`csr_shard`, `layer_csr_shard`, and `obsp_csr_shard` sections when the estimated
-sidecar size is no more than 25% of the source shard section length. Consumers
-MUST treat the sidecar as an optimization and fall back to normal shard decode
-when it is absent. An existing sidecar-less file can gain sidecars without a full
-reconvert via `scx optimize <in> <out>`, which re-encodes + canonicalizes
-every CSR shard and stamps `format_version=3` (see
-[operations.md § Optimize](operations.md#optimize)).
+The **decode metadata sidecar** (`decode_metadata_shard`, section type 26) was a
+per-row / per-Rice-block index that gave the Scx1 codec bit-level random access
+and fed the GPU decode handoff. It has been **removed**: row-group framing (the
+`BlockIndex`, `format_version` 4 / `shard_format_version` 2 — see [§ 11 CSR Shard
+Format](#11-csr-shard-format) and [codec.md § Row-group framing](codec.md)) is now
+the default write layout and provides codec-agnostic sub-shard random access for
+*all* codecs, and framed Scx1 shards decode group-by-group in VRAM directly — so
+the sidecar became pure redundancy.
 
-The sidecar is consumed only by **SCX-internal decode paths** — random-access
-shard reads and the decode→device handoff (`to_gpu_anndata`) that produces a
-device-resident matrix for GPU analysis. External compute libraries such as
-**rapids-singlecell do not read it**: they receive an already-decoded
-(device-resident) matrix and are sidecar-agnostic. The sidecar therefore
-accelerates the step that *feeds* such a library, not the library itself.
-
-The Scx1-only scope is deliberate: Scx1's FOR-BP indices and Rice values are
-bitstreams with per-row / per-block frames that a sidecar can index for
-random-access and GPU-side decode (Scx1 has GPU decode kernels). Zstd / Pcodec /
-LZ4 are whole-stream frames (and LZ4 is globally byte-shuffled) with no GPU
-decoder, so a sidecar over them would neither enable row-level random access nor
-avoid a host decode. The practical consequence — store the GPU-relevant matrix
-as Scx1 integer counts and derive log-normalized values on-device rather than
-persisting a float (Pcodec) `X` — is covered in
-[scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis).
-
-Catalog name: `decode/<source_section_name>`. The source identity is stored in
-the payload as `(source_section_offset, source_section_length,
-source_section_checksum)`. A reader validates that tuple against the active
-catalog before trusting the sidecar. Mutating rewrites must rebuild or drop
-decode sidecars; they must not copy them blindly across changed source shards.
-
-Payload layout, little-endian:
-
-```
-magic: [u8; 4] = b"SCXD"
-version: u16 = 1
-kind: u8 = 1                       (Scx1 CSR decode metadata)
-target_section_type: u8            (currently 4 or 7)
-codec_id: u8                       (must be Scx1)
-value_encoding: u8                 (must be integer)
-index_dtype: u8                    (0 = u16, 1 = u32)
-reserved: u16 = 0
-n_rows: u32
-n_cols: u32
-nnz: u64
-major_start: u64                   (row_start for CSR-like source)
-source_section_offset: u64
-source_section_length: u64
-source_section_checksum: [u8; 32]  (full BLAKE3 catalog checksum)
-n_row_entries: u32
-n_rice_blocks: u32
-
-For each row entry:
-  nnz: u32
-  value_start: u64
-  frame_min: u32
-  frame_bits: u8
-  index_packing: u8                (0 empty, 1 scalar bitpack, 2 BitPacker4x layout)
-  reserved: u16 = 0
-  indices_bit_offset: u64          (from start of encoded indices stream)
-
-For each Rice value block:
-  value_start: u64
-  n_values: u16
-  k: u8
-  reserved: u8 = 0
-  bit_offset: u64                  (from start of encoded values stream)
-
-payload_checksum: [u8; 32]         (BLAKE3 of all preceding sidecar bytes)
-```
-
-The sidecar is valid only when row entries cover exactly `nnz` values, Rice
-blocks cover exactly `nnz` values, and all fixed metadata matches the source
-shard header and catalog stats. `scx validate --deep` checks those conditions.
+Writers no longer emit section 26, and **id 26 is reserved**. Legacy files that
+carry a section-26 sidecar remain readable: the catalog reader skips the
+unrecognized section, and CSR decode never consulted it (a full-shard decode is
+self-describing), so those files open and decode byte-identically. Sub-shard
+random access on such a legacy file uses the block index when present, else a
+full-shard decode.
 
 ## 5. Arrow IPC Metadata
 

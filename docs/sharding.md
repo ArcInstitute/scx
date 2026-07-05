@@ -505,7 +505,7 @@ or `pyscx.optimize(src, dst, shard_obs=...)` (`scx optimize --shard-obs`).
 
 `scx optimize --shard-obs off|auto|always` (default `auto`) migrates a
 **single-section** obs table to the sharded layout while it modernizes the
-file (decode sidecars + v3 canonical CSR). `auto` shards only when
+file (row-group-framed v4 canonical CSR). `auto` shards only when
 `n_obs > shard_target_rows` — the same threshold `from_anndata` uses — so
 small files stay single-section and byte-faithful while atlas-scale files get
 sharded obs in the same pass; `always` shards unconditionally and `off`

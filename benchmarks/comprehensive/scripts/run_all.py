@@ -94,6 +94,9 @@ AVAILABLE_BENCHMARKS = [
     "read_full",           # Full file load
     "read_selective",      # Selective read (query / subsetting)
     "read_scattered",      # Scattered random-row read (F5 block-index path)
+    "grouped_read",        # Condition-grouped read (scx vs shardad)
+    "ooc_rss_boundary",    # Out-of-core streaming vs materialize peak RSS (scx vs shardad)
+    "shardad_fidelity",    # shardad round-trip fidelity + materialization knobs
     "parallel_scaling",    # Parallel read scaling
     "parallel_write_scaling",  # Parallel write scaling
     "ml_loader",           # ML data loader throughput

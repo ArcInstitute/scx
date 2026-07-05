@@ -728,59 +728,60 @@ sbatch script: `benchmarks/index_plan_bench_1m.sbatch`. Result JSONs from the
 Floors in `thresholds.yaml` set at 0.5× the 1M medians — re-pin if/when
 fixtures grow beyond memory.
 
-#### Scattered pair-gather via the per-row decode sidecar (L1+L2)
+#### Scattered pair-gather via the row-group BlockIndex (L1+L2)
 
 For `streaming_mode=indexplan` (STATE_TX), each batch's `(pert, ctrl)` pairs are
 scattered randomly across shards. The legacy gather **full-decodes every touched
 shard** (`read_shard_cached_arc`) to extract a handful of rows; when the touched
 shard set exceeds the byte-budgeted shard cache this thrashes — Census 1M
-(62 shards) collapsed to **0.13 batches/s**. The sidecar gather routes the
-scattered rows through `BackedCsrReader::read_rows_with`, which decodes the
-touched rows **O(rows)** from the scx1 per-row **decode sidecar** instead of
-O(shard) (L1), and a sidecar-aware prefetch (L2) skips warming sidecar-eligible
-cold shards so the O(rows) path isn't negated by eager full-shard warms.
+(62 shards) collapsed to **0.13 batches/s**. The block-index gather routes the
+scattered rows through `BackedCsrReader::read_rows_with`, which decodes only the
+row groups containing the touched rows **O(rows)** via the codec-agnostic
+row-group `BlockIndex` (framing) instead of O(shard) (L1), and a block-index-aware
+prefetch (L2) skips warming block-index-eligible cold shards so the O(rows) path
+isn't negated by eager full-shard warms.
 
-Measured (Lambda HPC, scx-bench pyscx 0.9.1, regenerated sidecar fixtures,
-`lookahead=4`, `cache_shards=128`, `max_memory_mb=8192`; sidecar on = the
-`scatter_sidecar` default, off = the L2 prefetch-skip disabled). Census 1M, where
-shards exceed the cache budget → thrash:
+Measured (Lambda HPC, scx-bench pyscx 0.9.1, regenerated framed fixtures,
+`lookahead=4`, `cache_shards=128`, `max_memory_mb=8192`; block-index on = the
+`scatter_block_index` default, off = the L2 prefetch-skip disabled). Census 1M,
+where shards exceed the cache budget → thrash:
 
-| scenario | pairs/batch | sidecar batches/s | legacy batches/s | speedup | p50 latency (sidecar / legacy) |
+| scenario | pairs/batch | block-index batches/s | legacy batches/s | speedup | p50 latency (block-index / legacy) |
 |---|---|---|---|---|---|
 | random   | 32  | 59.9 | 0.94 | **64×** | 11 ms / 256 ms |
 | random   | 128 | 20.5 | 0.30 | **68×** | 44 ms / 4815 ms |
 | locality | 2   | 170  | 17   | 10×   | 2.6 ms / 1.0 ms |
 | locality | 128 | 20.1 | 0.58 | 35×   | 44 ms / 917 ms |
 
-**Peak RSS drops** with the sidecar (no full-shard pool): Census 1M `bs=2`
-**3.06 GB vs 14.9 GB** (~5× less); tabula_sapiens_100k `bs=2` 1.06 GB vs 3.40 GB
-(3× less) — the streaming memory ceiling is preserved.
+**Peak RSS drops** with the block-index path (no full-shard pool): Census 1M
+`bs=2` **3.06 GB vs 14.9 GB** (~5× less); tabula_sapiens_100k `bs=2` 1.06 GB vs
+3.40 GB (3× less) — the streaming memory ceiling is preserved.
 
 **Regime.** The *throughput* win requires cache-thrash (touched shards > cache
 budget). When the shard set fits the cache (e.g. tabula's 7 shards), the
 full-shard path warms once and is comparable or marginally faster at tiny batch
 sizes — there the win is **memory**, which is universal. The per-dataset
-`scatter_sidecar=false` kwarg (and the process-wide `SCX_SCATTER_SIDECAR=0`
+`scatter_block_index=false` kwarg (and the process-wide `SCX_SCATTER_BLOCK_INDEX=0`
 kill-switch) restore the legacy path for the fits-cache regime.
 
-**`SparseCellSetDataset` defaults the other way (`scatter_sidecar=false`).** The
-cell-set loader serves a cache-*friendly* regime (sorted data + a reused
+**`SparseCellSetDataset` defaults the other way (`scatter_block_index=false`).**
+The cell-set loader serves a cache-*friendly* regime (sorted data + a reused
 control-pool cache → a small working set that fits the shard cache and is touched
-on most batches). There the sidecar's "skip the warm, decode O(rows) each batch"
+on most batches). There the block-index "skip the warm, decode O(rows) each batch"
 strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
 populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
 recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
-337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_sidecar=true` for a
-genuinely cache-hostile cell-set run (working set ≫ cache), where the per-row
-sidecar's bounded peak RAM is the memory-safe choice. The gate is per-reader: the
-`IndexPlanDataset` defaults above are unchanged, and `SCX_SCATTER_SIDECAR=0`
-remains a hard master kill-switch over both.
+337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_block_index=true` for a
+genuinely cache-hostile cell-set run (working set ≫ cache), where the
+row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
+per-reader: the `IndexPlanDataset` defaults above are unchanged, and
+`SCX_SCATTER_BLOCK_INDEX=0` remains a hard master kill-switch over both.
 
-**Sidecars are a write-time property** (emitted by default for Scx1 integer-CSR
-shards within a 25% overhead budget). `.scx` files written before the sidecar
-writer (pre-0.9.x) carry none and silently fall back to full-shard — **regenerate
-fixtures** (`scx info <f> --json` → `decode/*` sections should equal `n_csr_shards`
-for integer-count files) before expecting the win. Sweep results:
+**Framing is a write-time property** (v4 writers row-group-frame all shards by
+default; codec-agnostic, so it covers every codec, not just Scx1). `.scx` files
+written before framing (pre-v4) carry no `BlockIndex` and silently fall back to
+full-shard — **regenerate fixtures** (or `scx optimize` in place; `scx info <f>
+--json` reports framed shards) before expecting the win. Sweep results:
 `benchmarks/comprehensive/results/phase5/T5_sidecar_sweep.md`; driver
 `benchmarks/scripts/phase5_sidecar_sweep.py`.
 

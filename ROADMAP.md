@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-07-03
+**Last updated**: 2026-07-05
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -370,8 +370,8 @@ scGPT train end-to-end on atlas-scale SCX data.
 [docs/multimodal.md](docs/multimodal.md) for the user-facing guide
 and [docs/format.md § 13](docs/format.md#13-multimodal-extension) for
 the on-disk layout. Section ids 15 = `ModalityTable`, 16 = `LayerCscShard`, 17–25 =
-embedding / sharded metadata extensions, and 26 = `DecodeMetadataShard`
-are now allocated; ids 27–31 are reserved for further multimodal/spatial
+embedding / sharded metadata extensions are now allocated; id 26 is
+reserved (formerly `DecodeMetadataShard`, removed); ids 27–31 are reserved for further multimodal/spatial
 extensions; ids 32–239 are reserved for future use; ids 240–255 are
 vendor / private. The `has_modalities`
 header flag (bit 7) is wired through writers and readers.

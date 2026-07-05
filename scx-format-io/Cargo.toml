@@ -1,6 +1,6 @@
 [package]
 name = "scx-format-io"
-version = "0.10.6"
+version = "0.11.0"
 edition = "2021"
 description = "Runtime reader/writer, backed/streaming access, and shard codec dispatch for the SCX format"
 license.workspace = true

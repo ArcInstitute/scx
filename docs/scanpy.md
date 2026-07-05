@@ -426,12 +426,13 @@ On top of the per-section checksums, deep mode:
 - decodes every sparse shard and verifies the **v3 canonical CSR invariant**
   (column indices sorted and in range, no explicit zeros, `indptr` starting at
   0 and monotonically increasing, metadata consistent with the decoded data);
-- verifies every **decode sidecar** — structural linkage to its source shard
-  plus a decode-parity check that seeking through the sidecar's recorded
-  Rice-block offsets reproduces the canonical decode byte-for-byte.
+- verifies every framed shard's **row-group `BlockIndex`** — structural linkage
+  to its source shard plus a decode-parity check that seeking to each row group's
+  recorded block offset and decoding it reproduces the canonical decode
+  byte-for-byte.
 
 Deep-check results are appended to the returned list with `canonical-csr ` and
-`decode-sidecar ` prefixed names. Canonical-CSR checks run only on v3+ files
+`block-index ` prefixed names. Canonical-CSR checks run only on v3+ files
 (pre-v3 files may legitimately carry unsorted shards, so they are skipped).
 Unlike a checksum failure on an essential section — which raises — deep-check
 failures report `False` in the result list rather than raising, so iterate the
@@ -1529,7 +1530,7 @@ the analysis op. So the layout choice matters as much as the device flag:
   host float buffer**. This is the recommended flow.
 - **A *persisted* log-normalized `X` is float → Pcodec, which decodes on the
   host.** Public h5ad / CELLxGENE files often ship `X` already log-normalized.
-  That matrix has **no decode sidecar and no GPU decoder** (Pcodec is CPU-only),
+  That matrix has **no GPU decoder** (Pcodec is CPU-only),
   so the handoff pays a host pcodec-decompress + HtoD per shard — *GPU-supported,
   but not GPU-fast on the decode side*. If the file also carries a `counts`
   layer, prefer opening that and deriving log-norm on-device (bullet above).
@@ -1539,48 +1540,45 @@ the analysis op. So the layout choice matters as much as the device flag:
   compression ratio (`f16` halves the bytes if its precision is acceptable for
   log-norm). This is the only float option that is GPU-fast to upload today; a
   GPU-decodable *compressed* float codec does not exist.
-- **The decode sidecar is Scx1-only.** Zstd / Pcodec / LZ4 shards and float
-  layers carry no sidecar; the device decode path falls back to host decode +
-  HtoD for them. "Make `X` GPU-fast to decode" therefore means "store the
-  GPU-relevant matrix as Scx1 counts," **not** "add a sidecar to a float layer."
-- **Upgrade a sidecar-less file in place with `scx optimize`.** A pre-v3 or
-  reconverted-without-sidecars file (Scx1 counts but no `decode/*` sections) does
-  not need a full reconvert to become device-decode-fast — run
-  `scx optimize in.scx out.scx` (or `pyscx.optimize("in.scx", "out.scx")`;
-  pass `codec="scx1"` to force a sidecar on every integer shard). It re-encodes +
-  canonicalizes every CSR shard so decode sidecars are emitted and the file is
-  stamped `format_version=3`, preserving rows / obs / var / obsm / uns / indexes
-  (see [operations.md § Optimize](operations.md#optimize)). Only Scx1 integer shards
-  gain a sidecar — a persisted float (Pcodec) `X` still won't (store counts per
-  the first bullet).
+- **Device decode is Scx1-only.** Framed Scx1 shards decode group-by-group
+  directly in VRAM; Zstd / Pcodec / LZ4 shards and float layers have no GPU
+  decoder, so the device path falls back to host decode + HtoD for them. "Make
+  `X` GPU-fast to decode" therefore means "store the GPU-relevant matrix as Scx1
+  counts," **not** "re-codec a float layer."
+- **Upgrade an older file in place with `scx optimize`.** A pre-v4 file (Scx1
+  counts but not row-group-framed to v4) does not need a full reconvert to become
+  device-decode-fast — run `scx optimize in.scx out.scx` (or
+  `pyscx.optimize("in.scx", "out.scx")`; pass `codec="scx1"` to force Scx1 on
+  every integer shard). It re-encodes + canonicalizes every CSR shard and
+  row-group-frames it (`format_version=4`), preserving rows / obs / var / obsm /
+  uns / indexes (see [operations.md § Optimize](operations.md#optimize)). Only Scx1
+  integer shards decode in VRAM — a persisted float (Pcodec) `X` still won't
+  (store counts per the first bullet).
 
 Confirm the path actually taken via
 `adata.uns["scx_accel"][op]["transfer_mode"]`, the same way you confirm `route`
 for DE. `to_gpu_anndata` stamps one of:
-- `scx_device_decode_gpu` — Scx1 shards decoded **fully in VRAM** from the decode
-  sidecar; only the tiny indptr is uploaded (`bytes_uploaded` ≈ indptr). The fast
-  path you want. As of the BitPacker4x GPU kernel, this covers **every** Scx1 row,
-  including dense (≥128-nnz) cells — those no longer host-fall-back.
+- `scx_device_decode_gpu` — framed Scx1 shards decoded **fully in VRAM**
+  group-by-group; only the tiny indptr is uploaded (`bytes_uploaded` ≈ indptr).
+  The fast path you want. As of the BitPacker4x GPU kernel, this covers **every**
+  Scx1 row, including dense (≥128-nnz) cells — those no longer host-fall-back.
 - `scx_device_handoff_streamed` — on-device, but some shard still bounced through
-  the host because it is **not** an Scx1 sidecar shard: a non-Scx1 codec (the float
-  Pcodec case above) or a sidecar-less Scx1 shard (e.g. byte-passthrough output).
-  `bytes_uploaded` is the real HtoD total.
+  the host because it is **not** an Scx1 shard: a non-Scx1 codec (the float
+  Pcodec case above) host-bounces. `bytes_uploaded` is the real HtoD total.
 - `scx_device_handoff` — host-assembled CSR (filtered / projected / multimodal
   input), or an `X` that was already device-resident on entry.
 
 (rapids ops that have to upload a host `X` instead stamp `anndata_to_gpu` — a host
 re-upload, not a `to_gpu_anndata` mode.)
 
-**rapids-singlecell does not read the decode sidecar.** The sidecar lives
-entirely on the SCX side of the handoff: it accelerates SCX's own
-decode→device step (`to_gpu_anndata`, the
-[format.md §4.2](format.md#42-decode-metadata-sidecar) sidecar consumer), which
-*produces* the `cupyx.scipy.sparse.csr_matrix` that rapids then operates on.
-rapids only ever sees that already-decoded, device-resident matrix (it validates
-inputs via its own `_check_gpu_X`) and has no knowledge of the SCX format,
-codecs, or sidecars. So choosing an Scx1-counts layout speeds up the
-SCX→device handoff that *feeds* rapids — it is not something rapids consumes, and
-it changes no rapids call.
+**rapids-singlecell knows nothing about the SCX device decode path.** The
+in-VRAM group-by-group decode lives entirely on the SCX side of the handoff: it
+accelerates SCX's own decode→device step (`to_gpu_anndata`), which *produces* the
+`cupyx.scipy.sparse.csr_matrix` that rapids then operates on. rapids only ever
+sees that already-decoded, device-resident matrix (it validates inputs via its
+own `_check_gpu_X`) and has no knowledge of the SCX format or codecs. So choosing
+an Scx1-counts layout speeds up the SCX→device handoff that *feeds* rapids — it is
+not something rapids consumes, and it changes no rapids call.
 
 ### PCA (`pyscx.accel.pca`)
 
