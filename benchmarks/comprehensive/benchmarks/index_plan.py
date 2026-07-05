@@ -98,6 +98,16 @@ _LOCALITY_GROUP_SIZE = 4096
 # run behaviour so their existing baseline rows stay valid; only the untimed
 # warm-up is capped universally (it feeds cache/tokio init, never a recorded
 # metric, so shrinking it is measurement-neutral).
+#
+# Intentional asymmetry vs read_scattered.py: read_scattered is a *new*
+# benchmark with no historical baseline, so it always scales and floors at 12
+# batches. index_plan already has baseline rows (incl. absolute bps floors in
+# thresholds.yaml), so it keeps the <30k full-1000 branch and uses a higher
+# _MIN_N_BATCHES (50) to bound how far the >=30k throughput measurement can move
+# from the value the existing floors were calibrated against. NOTE: the >=30k
+# absolute bps floors (tabula/census_1m) were calibrated under the old
+# 1000-batch regime; re-validate/re-tune them when the deferred index_plan
+# recapture folds the smartseq2/tabula rows into LATEST.
 _LARGE_N_OBS = 30_000
 _MIN_N_BATCHES = 50
 _WARMUP_BATCHES = 3
