@@ -5,10 +5,10 @@ use std::path::Path;
 
 use scx_engine::QueryPipeline;
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
-use scx_format_io::FramingConfig;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
+use scx_format_io::FramingConfig;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_subset(
@@ -169,8 +169,7 @@ pub fn run_subset(
 
     // 9. Write output SCX file. Preserve framing from the source: a v4 (framed)
     // input yields a v4 framed output (default G) instead of a v3 downgrade.
-    let framing = (in_header.format_version >= CURRENT_FORMAT_VERSION)
-        .then(FramingConfig::default);
+    let framing = (in_header.format_version >= CURRENT_FORMAT_VERSION).then(FramingConfig::default);
     let output = output.unwrap();
     write_subset_scx(
         output,
@@ -571,8 +570,8 @@ fn extract_modality(
     let n_vars_out = projected_csr.n_cols() as u64;
     let index_dtype = if n_vars_out <= 65535 { 0u8 } else { 1u8 };
     // Preserve framing from the source (a v4 input yields a framed v4 output).
-    let framing = (reader.header().format_version >= CURRENT_FORMAT_VERSION)
-        .then(FramingConfig::default);
+    let framing =
+        (reader.header().format_version >= CURRENT_FORMAT_VERSION).then(FramingConfig::default);
     let mut header =
         FileHeader::new_single_modality(n_obs_out, n_vars_out, 0, shard_size, 0, index_dtype);
     if framing.is_some() {

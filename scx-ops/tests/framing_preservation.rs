@@ -111,7 +111,13 @@ fn read_all_rows(reader: &ScxReader) -> Vec<Vec<(i32, f32)>> {
         for r in 0..indptr.len() - 1 {
             let s = indptr[r] as usize;
             let e = indptr[r + 1] as usize;
-            rows.push(indices[s..e].iter().copied().zip(data[s..e].iter().copied()).collect());
+            rows.push(
+                indices[s..e]
+                    .iter()
+                    .copied()
+                    .zip(data[s..e].iter().copied())
+                    .collect(),
+            );
         }
     }
     rows
@@ -193,7 +199,11 @@ fn sort_preserves_framing_v4() {
         "sorting a framed file must keep it v4"
     );
     assert_all_shards_framed(&out);
-    assert_eq!(read_all_rows(&out), expected, "sort decoded parity (order preserved)");
+    assert_eq!(
+        read_all_rows(&out),
+        expected,
+        "sort decoded parity (order preserved)"
+    );
 }
 
 #[test]

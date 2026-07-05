@@ -666,7 +666,10 @@ fn append_from_reader_framed_raw_copy_preserves_v4() {
         .read_shard_header(src_reader.catalog().shards_sorted()[0])
         .unwrap()
         .block_index_length;
-    assert!(src_bi_len > 4 + 22, "source shard must be multi-group framed");
+    assert!(
+        src_bi_len > 4 + 22,
+        "source shard must be multi-group framed"
+    );
 
     scx_ops::append_from_reader(
         &target,
@@ -796,7 +799,11 @@ fn append_from_reader_resplit_into_framed_base_emits_framed_shards() {
 
     let src_reader = ScxReader::open(&source).unwrap();
     let src_rows = decode_all_rows(&src_reader);
-    let base_shards_before = ScxReader::open(&base).unwrap().catalog().shards_sorted().len();
+    let base_shards_before = ScxReader::open(&base)
+        .unwrap()
+        .catalog()
+        .shards_sorted()
+        .len();
 
     scx_ops::append_from_reader(
         &base,
@@ -836,7 +843,11 @@ fn append_from_reader_resplit_into_framed_base_emits_framed_shards() {
     }
     // Decoded parity: the appended rows (40..80) must equal the source rows.
     let post_rows = decode_all_rows(&post);
-    assert_eq!(&post_rows[40..80], &src_rows[..], "re-split append decoded parity");
+    assert_eq!(
+        &post_rows[40..80],
+        &src_rows[..],
+        "re-split append decoded parity"
+    );
 }
 
 /// Micro-bench (P2 / OPT-1.2): same-layout merge via the raw-copy fast path

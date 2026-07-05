@@ -10,10 +10,10 @@ use scx_engine::ConversionPredicateIndexOptions;
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::checksum::{blake3_hash, blake3_truncated_64};
 use scx_format_io::compute_shard_stats;
+use scx_format_io::header::CURRENT_FORMAT_VERSION;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
-use scx_format_io::header::CURRENT_FORMAT_VERSION;
 use scx_format_io::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
@@ -823,7 +823,14 @@ fn write_csr_chunk(
             index_dtype_u16,
         )?;
         let bi = BlockIndex {
-            entries: vec![BlockIndexEntry::new(0, shard_rows as u32, 0, 0, 0, shard_nnz)?],
+            entries: vec![BlockIndexEntry::new(
+                0,
+                shard_rows as u32,
+                0,
+                0,
+                0,
+                shard_nnz,
+            )?],
         };
         (enc, bi, DEFAULT_WRITE_SHARD_FORMAT_VERSION)
     };
