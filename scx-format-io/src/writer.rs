@@ -1146,15 +1146,26 @@ impl ScxWriter {
         let mut shard_checksum = [0u8; 8];
         shard_checksum.copy_from_slice(&shard_hash.as_bytes()[..8]);
 
-        // Build shard header with relative offsets
+        // Build shard header with relative offsets. u32 fields; fail loud on a
+        // >4 GiB sub-stream / cumulative offset instead of silently wrapping (F-c).
+        let len_u32 = |n: usize, what: &str| -> Result<u32> {
+            u32::try_from(n).map_err(|_| {
+                ScxError::ShardStreamTooLarge(format!("{what} length {n} exceeds u32::MAX"))
+            })
+        };
+        let add_u32 = |a: u32, b: u32, what: &str| -> Result<u32> {
+            a.checked_add(b).ok_or_else(|| {
+                ScxError::ShardStreamTooLarge(format!("{what} relative offset exceeds u32::MAX"))
+            })
+        };
         let indptr_rel_offset = SHARD_HEADER_SIZE as u32;
-        let indptr_length = encoded.indptr_bytes.len() as u32;
-        let indices_rel_offset = indptr_rel_offset + indptr_length;
-        let indices_length = encoded.indices_bytes.len() as u32;
-        let values_rel_offset = indices_rel_offset + indices_length;
-        let values_length = encoded.values_bytes.len() as u32;
-        let block_index_rel_offset = values_rel_offset + values_length;
-        let block_index_length = block_index_bytes.len() as u32;
+        let indptr_length = len_u32(encoded.indptr_bytes.len(), "indptr")?;
+        let indices_rel_offset = add_u32(indptr_rel_offset, indptr_length, "indices")?;
+        let indices_length = len_u32(encoded.indices_bytes.len(), "indices")?;
+        let values_rel_offset = add_u32(indices_rel_offset, indices_length, "values")?;
+        let values_length = len_u32(encoded.values_bytes.len(), "values")?;
+        let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
+        let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
 
         let shard_header = ShardHeader {
             magic: crate::shard::SHARD_MAGIC,

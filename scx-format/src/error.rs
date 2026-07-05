@@ -77,6 +77,9 @@ pub enum ScxError {
     #[error("block nnz {0} exceeds u32::MAX")]
     BlockNnzOverflow(u64),
 
+    #[error("shard sub-stream too large for a u32 offset/length field: {0}")]
+    ShardStreamTooLarge(String),
+
     #[error("malformed block index: {0}")]
     InvalidBlockIndex(String),
 
@@ -190,6 +193,7 @@ impl ScxError {
             | ScxError::NVarsOverflow(_)
             | ScxError::BlockRowsOverflow(_)
             | ScxError::BlockNnzOverflow(_)
+            | ScxError::ShardStreamTooLarge(_)
             | ScxError::StaleCscSidecar { .. }
             | ScxError::ColumnStatsOverflow(_)
             | ScxError::UnsupportedColumnType { .. }

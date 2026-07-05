@@ -221,29 +221,15 @@ pub fn decode_shard_indptr_bytes(
     // Framed (v2) shards store per-group local indptrs; reconstruct the global
     // indptr from the row-group index rather than reading the stream directly.
     if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
-        let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
-        let index_dtype_u16 = sh.index_dtype == 0;
-        let indices_bytes = vs.subslice(sh.indices_rel_offset, sh.indices_length)?;
-        let values_bytes = vs.subslice(sh.values_rel_offset, sh.values_length)?;
+        // Indptr-only: decode just each group's local indptr frame (F-b); the
+        // indices/values frames are never touched.
         let block_index_bytes = vs.subslice(sh.block_index_rel_offset, sh.block_index_length)?;
         let spans = resolve_block_index(&sh, block_index_bytes)?;
         let mut indptr = Vec::with_capacity(sh.n_major as usize + 1);
         indptr.push(0i64);
         let mut running: i64 = 0;
         for span in &spans {
-            let (g_indptr, _, _) = scx_codec::decoded_shard_to_scipy(
-                scx_codec::decode_row_group(
-                    codec_id,
-                    span,
-                    indptr_bytes,
-                    indices_bytes,
-                    values_bytes,
-                    value_encoding,
-                    index_dtype_u16,
-                )?,
-                value_encoding,
-            )?;
+            let g_indptr = scx_codec::decode_row_group_indptr_only(codec_id, span, indptr_bytes)?;
             for &local in &g_indptr[1..] {
                 indptr.push(running + local);
             }
@@ -376,6 +362,70 @@ mod tests {
             indices.iter().map(|&v| v as i32).collect::<Vec<_>>()
         );
         assert_eq!(framed.2, values);
+    }
+
+    /// F-b: the indptr-only framed path (`decode_shard_indptr_bytes`) yields the
+    /// same global indptr as a full decode, decoding only the per-group indptr
+    /// frames (never the indices/values).
+    #[test]
+    fn decode_shard_indptr_only_framed_matches_full() {
+        use crate::encoder::{encode_one_shard, FramingConfig};
+        use crate::modality::ModalityType;
+
+        let indptr = [0u64, 2, 2, 5, 7];
+        let indices = [0u32, 3, 1, 4, 9, 2, 8];
+        let values: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 9.0, 3.0, 7.0];
+        let n_cols: u32 = 16;
+
+        let s = encode_one_shard(
+            &indptr,
+            &indices,
+            &values,
+            Some(CodecId::ShufDeltaZstd),
+            0,
+            n_cols,
+            0,
+            SectionType::CsrShard,
+            ModalityType::Rna,
+            "X_shard_0".to_string(),
+            Some(FramingConfig {
+                row_group_rows: 2,
+                target_nnz: None,
+                trial: false,
+                prefer_gpu_sidecar: false,
+            }),
+        )
+        .expect("encode_one_shard");
+
+        let sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
+        assert_eq!(sh.shard_format_version, 2, "fixture must be framed (v2)");
+
+        // Assemble the full on-disk section: header ++ sub-streams ++ block index
+        // (order matches the header's relative offsets).
+        let mut section = Vec::new();
+        section.extend_from_slice(&s.header_buf);
+        section.extend_from_slice(&s.encoded.indptr_bytes);
+        section.extend_from_slice(&s.encoded.indices_bytes);
+        section.extend_from_slice(&s.encoded.values_bytes);
+        section.extend_from_slice(&s.block_index_bytes);
+
+        let ip_only =
+            decode_shard_indptr_bytes(&section, &dummy_entry(), 2).expect("indptr-only decode");
+        assert_eq!(ip_only, vec![0i64, 2, 2, 5, 7]);
+
+        // Parity with the full decode's indptr.
+        let full = decode_shard_regions_scipy(
+            &sh,
+            &s.encoded.indptr_bytes,
+            &s.encoded.indices_bytes,
+            &s.encoded.values_bytes,
+            &s.block_index_bytes,
+        )
+        .expect("full decode");
+        assert_eq!(
+            ip_only, full.0,
+            "indptr-only differs from full-decode indptr"
+        );
     }
 
     /// A section shorter than the fixed 76-byte header must be rejected

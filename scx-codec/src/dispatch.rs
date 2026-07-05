@@ -432,7 +432,7 @@ pub fn decode_indptr_only(
         CodecId::None => le_bytes_to_u64(indptr_bytes, n_rows + 1)?,
         CodecId::Scx1 => delta_golomb_decode(indptr_bytes, n_rows + 1)?,
         CodecId::Zstd | CodecId::Pcodec => {
-            let raw = zstd_decode_bounded(indptr_bytes, (n_rows + 1) * 8)?;
+            let raw = zstd_decode_bounded(indptr_bytes, indptr_byte_cap(n_rows)?)?;
             le_bytes_to_u64(&raw, n_rows + 1)?
         }
         CodecId::Lz4Shuffle => {
@@ -441,7 +441,7 @@ pub fn decode_indptr_only(
             le_bytes_to_u64(&raw, n_rows + 1)?
         }
         CodecId::ShufDeltaZstd => {
-            let indptr_max = (n_rows + 1) * 8;
+            let indptr_max = indptr_byte_cap(n_rows)?;
             let mut planes = zstd_decode_bounded(indptr_bytes, indptr_max)?;
             expect_exact_len(planes.len(), indptr_max, "indptr")?;
             byte_undelta_planes(&mut planes, 8, n_rows + 1);
@@ -498,6 +498,30 @@ pub fn decode_row_group(
         )));
     }
     Ok(decoded)
+}
+
+/// Decode **only** a row-group's local indptr (F-b). Mirrors [`decode_row_group`]
+/// but slices and decodes just the indptr sub-stream frame — the indices/values
+/// frames are never touched — for callers that need per-row offsets without the
+/// data (e.g. assembling a shard's global indptr). Returns the group-local i64
+/// indptr (`len == n_rows+1`, `[0] == 0`, `last == nnz`). Codec-agnostic.
+pub fn decode_row_group_indptr_only(
+    codec_id: CodecId,
+    span: &RowGroupSpan,
+    indptr_bytes: &[u8],
+) -> Result<Vec<i64>, CodecError> {
+    let ip = slice_span(indptr_bytes, &span.indptr, "indptr")?;
+    let indptr = decode_indptr_only(ip, codec_id, span.n_rows as usize)?;
+    let nnz = span.nnz as i64;
+    if indptr.first() != Some(&0) || indptr.last() != Some(&nnz) {
+        return Err(CodecError::MalformedInput(format!(
+            "row-group indptr not local-rebased (first={:?}, last={:?}, nnz={})",
+            indptr.first(),
+            indptr.last(),
+            span.nnz
+        )));
+    }
+    Ok(indptr)
 }
 
 /// Bounds-checked slice of a sub-stream by a resolved byte range.
@@ -647,9 +671,13 @@ fn decode_none_ref(
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
+    // Guard the indices length too: le_bytes_to_indices computes `nnz * elem`
+    // internally, so a hostile `nnz` must be checked before the call (the
+    // compressed paths gate this via their up-front indices_max) (F-e).
+    checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "indices")?;
     let indptr = le_bytes_to_u64(encoded.indptr_bytes, n_rows + 1)?;
     let indices = le_bytes_to_indices(encoded.indices_bytes, nnz, index_dtype_u16)?;
-    let expected_len = nnz * value_encoding.byte_width();
+    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
     if encoded.values_bytes.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -953,9 +981,9 @@ fn decode_zstd_ref(
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
-    let indptr_max = (n_rows + 1) * 8;
-    let indices_max = nnz * (if index_dtype_u16 { 2 } else { 4 });
-    let values_max = nnz * value_encoding.byte_width();
+    let indptr_max = indptr_byte_cap(n_rows)?;
+    let indices_max = checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "indices")?;
+    let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
 
     let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
     let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
@@ -964,7 +992,7 @@ fn decode_zstd_ref(
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
 
-    let expected_len = nnz * value_encoding.byte_width();
+    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
     if values_raw.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1049,7 +1077,7 @@ fn decode_lz4_shuffle_ref(
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
 
-    let expected_len = nnz * value_encoding.byte_width();
+    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
     if values_raw.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1126,9 +1154,9 @@ fn decode_shufdelta_zstd_ref(
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
     let index_width = if index_dtype_u16 { 2 } else { 4 };
-    let indptr_max = (n_rows + 1) * 8;
-    let indices_max = nnz * index_width;
-    let values_max = nnz * value_encoding.byte_width();
+    let indptr_max = indptr_byte_cap(n_rows)?;
+    let indices_max = checked_len(nnz, index_width, "indices")?;
+    let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
 
     // indptr: zstd -> byte-undelta -> byte-unshuffle
     let mut indptr_planes = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
@@ -1154,7 +1182,7 @@ fn decode_shufdelta_zstd_ref(
     let indptr = le_bytes_to_u64(&indptr_raw, n_rows + 1)?;
     let indices = le_bytes_to_indices(&indices_raw, nnz, index_dtype_u16)?;
 
-    let expected_len = nnz * value_encoding.byte_width();
+    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
     if values_raw.len() != expected_len {
         return Err(CodecError::MalformedInput(format!(
             "shufdelta values byte length {} != expected {}",
@@ -1176,6 +1204,30 @@ fn expect_exact_len(got: usize, expected: usize, which: &str) -> Result<(), Code
         )));
     }
     Ok(())
+}
+
+/// Checked `count * width` for decode allocation caps / expected byte lengths.
+/// A hostile shard header can carry an `nnz`/`n_rows` that overflows `usize`
+/// when scaled by a byte width; return a `MalformedInput` error instead of
+/// panicking (debug) or wrapping to a bogus cap (release) (F-e).
+fn checked_len(count: usize, width: usize, what: &str) -> Result<usize, CodecError> {
+    count.checked_mul(width).ok_or_else(|| {
+        CodecError::MalformedInput(format!("{what} length {count} * {width} overflows usize"))
+    })
+}
+
+/// Checked byte cap for an indptr sub-stream: `(n_rows + 1) * 8`. Guards the
+/// `+ 1` as well so a `usize::MAX` `n_rows` can't wrap to 0 before the multiply
+/// (`n_rows` comes from a u32 header field today, but keep it panic-free) (F-e).
+fn indptr_byte_cap(n_rows: usize) -> Result<usize, CodecError> {
+    n_rows
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(8))
+        .ok_or_else(|| {
+            CodecError::MalformedInput(format!(
+                "indptr length (n_rows={n_rows} + 1) * 8 overflows usize"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,8 +1289,8 @@ fn decode_pcodec_ref(
     index_dtype_u16: bool,
 ) -> Result<DecodedShard, CodecError> {
     // indptr and indices: Zstd decompress
-    let indptr_max = (n_rows + 1) * 8;
-    let indices_max = nnz * (if index_dtype_u16 { 2 } else { 4 });
+    let indptr_max = indptr_byte_cap(n_rows)?;
+    let indices_max = checked_len(nnz, if index_dtype_u16 { 2 } else { 4 }, "indices")?;
 
     let indptr_raw = zstd_decode_bounded(encoded.indptr_bytes, indptr_max)?;
     let indices_raw = zstd_decode_bounded(encoded.indices_bytes, indices_max)?;
@@ -1269,12 +1321,12 @@ fn decode_pcodec_ref(
         }
         _ => {
             // Integer encodings: Zstd decompress
-            let values_max = nnz * value_encoding.byte_width();
+            let values_max = checked_len(nnz, value_encoding.byte_width(), "values")?;
             zstd_decode_bounded(encoded.values_bytes, values_max)?
         }
     };
 
-    let expected_len = nnz * value_encoding.byte_width();
+    let expected_len = checked_len(nnz, value_encoding.byte_width(), "values")?;
     if values_raw.len() != expected_len {
         return Err(CodecError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2426,6 +2478,35 @@ mod tests {
         for s in ["none", "scx1", "zstd", "pcodec"] {
             let c = CodecId::parse_cli(s).unwrap().unwrap();
             assert_eq!(c.display_name(), s);
+        }
+    }
+
+    /// F-e: a hostile shard header carrying an `nnz` that overflows `usize`
+    /// when scaled by the value/index byte width must return a `MalformedInput`
+    /// error, not panic (debug) or wrap to a bogus allocation cap (release).
+    /// Covers `None` (whose `le_bytes_to_indices` computes `nnz * elem`
+    /// internally) as well as `Zstd` (whose caps are computed up front).
+    #[test]
+    fn decode_rejects_nnz_length_overflow() {
+        let encoded = EncodedShardRef {
+            indptr_bytes: &[0u8; 16],
+            indices_bytes: &[0u8; 4],
+            values_bytes: &[0u8; 4],
+        };
+        for codec in [CodecId::None, CodecId::Zstd] {
+            let err = decode_shard_ref(
+                &encoded,
+                codec,
+                ValueEncoding::Uint32,
+                1,          // n_rows
+                usize::MAX, // nnz — nnz * width overflows usize
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, CodecError::MalformedInput(ref m) if m.contains("overflows usize")),
+                "codec {codec:?}: expected MalformedInput overflow error, got {err:?}"
+            );
         }
     }
 }
