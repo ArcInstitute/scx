@@ -419,8 +419,16 @@ pub fn from_mudata_impl(
     row_group_rows: u32,
 ) -> PyResult<()> {
     let _ = csc_cols_per_shard; // CSC for h5mu input is a Phase D follow-on
-                                // Row-group framing (v4) default, matching the unimodal in-memory path.
-                                // `row_group_rows=0` opts out to the legacy unframed v3 layout.
+
+    // Row-group framing (v4) default, matching the unimodal in-memory path;
+    // `row_group_rows=0` opts out to the legacy unframed v3 layout. Unlike
+    // `from_h5mu_impl` (which sets `ConvertOptions::row_group_rows` and lets
+    // `ConvertOptions::framing()` build the config), this path bypasses
+    // `ConvertOptions` entirely and drives `ScxWriter` directly, so it
+    // constructs the `FramingConfig` here and calls `writer.set_framing`
+    // itself. `..Default::default()` keeps `target_nnz`/`codec_trial`/
+    // `prefer_gpu_sidecar` at their defaults (compact-trial for in-memory
+    // MuData is a future follow-on).
     let framing = (row_group_rows != 0).then(|| scx_format_io::FramingConfig {
         row_group_rows,
         ..Default::default()
