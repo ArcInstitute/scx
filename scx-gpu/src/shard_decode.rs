@@ -421,6 +421,9 @@ fn decode_framed_scx1_gpu(
         // Global indptr: decode only this group's local indptr frame on the host
         // (indices/values frames are never host-decoded), then rebase by nnz_base.
         let g_indptr = scx_codec::decode_row_group_indptr_only(CodecId::Scx1, span, indptr_bytes)?;
+        // decode_row_group_indptr_only returns exactly g_rows+1 entries (or an
+        // error); assert it so the `[1..=g_rows]` slice can never panic.
+        debug_assert_eq!(g_indptr.len(), g_rows + 1);
         for &local in &g_indptr[1..=g_rows] {
             combined_indptr.push(nnz_base as i64 + local);
         }
