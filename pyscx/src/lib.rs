@@ -741,6 +741,7 @@ fn from_10x(
     modalities=None, modality_types=None,
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", reader_threads=None, writer_queue_depth=4,
+    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_h5mu(
@@ -764,6 +765,7 @@ fn from_h5mu(
     bitmap: &str,
     reader_threads: Option<usize>,
     writer_queue_depth: usize,
+    row_group_rows: u32,
 ) -> PyResult<()> {
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
     mudata::from_h5mu_impl(
@@ -787,6 +789,7 @@ fn from_h5mu(
         bitmap,
         reader_threads,
         writer_queue_depth,
+        row_group_rows,
     )
 }
 
@@ -918,7 +921,7 @@ fn to_h5mu(
 ///     mu = md.MuData({"rna": rna_adata, "adt": adt_adata})
 ///     pyscx.from_mudata(mu, "cite_seq.scx")
 #[pyfunction]
-#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true, uns_format="tagged"))]
+#[pyo3(signature = (mu, path, codec=None, shard_size=None, csc="off", csc_cols_per_shard=5000, codec_per_modality=true, uns_format="tagged", row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS))]
 #[allow(clippy::too_many_arguments)]
 fn from_mudata(
     py: Python<'_>,
@@ -930,6 +933,7 @@ fn from_mudata(
     csc_cols_per_shard: usize,
     codec_per_modality: bool,
     uns_format: &str,
+    row_group_rows: u32,
 ) -> PyResult<()> {
     mudata::from_mudata_impl(
         py,
@@ -941,6 +945,7 @@ fn from_mudata(
         csc_cols_per_shard,
         codec_per_modality,
         uns_format,
+        row_group_rows,
     )
 }
 
