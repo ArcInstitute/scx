@@ -311,8 +311,8 @@ fn merge_var_mismatch_assume_identical_var_proceeds() {
     );
 }
 
-/// A wide var axis (`g0..g{n}`) so an Scx1 count shard stays within the
-/// decode-sidecar overhead budget.
+/// A wide var axis (`g0..g{n}`) so an Scx1 count shard stays wide enough for the
+/// writer to route small counts to Scx1.
 fn wide_var(n_vars: usize) -> RecordBatch {
     let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
     let schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
@@ -324,8 +324,8 @@ fn wide_var(n_vars: usize) -> RecordBatch {
 }
 
 /// Build a single-shard Scx1 count-matrix input. The data is dense enough
-/// that the writer routes to Scx1 and emits a decode sidecar, so the
-/// raw-copy fast path's sidecar handling is exercised.
+/// that the writer routes to Scx1, exercising the raw-copy fast path on
+/// identical-layout inputs.
 fn write_scx1_count_input(path: &std::path::Path, n_obs: usize, donor: &str, var: &RecordBatch) {
     let n_vars = var.num_rows();
     let nnz_per_row = 256usize;
@@ -369,21 +369,11 @@ fn write_scx1_count_input(path: &std::path::Path, n_obs: usize, donor: &str, var
     writer.finish().unwrap();
 }
 
-fn sidecar_count(reader: &ScxReader) -> usize {
-    reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
-        .count()
-}
-
 #[test]
 fn merge_raw_copy_byte_identical_to_reencode() {
     // Two inputs with identical var axis + single-shard layout, Scx1 count
-    // data carrying decode sidecars. The raw-copy fast path
-    // (`assume_identical_var = false`) must produce byte-identical X-shard
-    // *and* decode-sidecar sections to the decode/re-encode path
+    // data. The raw-copy fast path (`assume_identical_var = false`) must
+    // produce byte-identical X-shard sections to the decode/re-encode path
     // (`assume_identical_var = true` disables raw-copy but, with identical
     // var, yields the same var + X).
     let dir = tempfile::tempdir().unwrap();
@@ -392,13 +382,6 @@ fn merge_raw_copy_byte_identical_to_reencode() {
     let b = dir.path().join("b.scx");
     write_scx1_count_input(&a, 40, "donor_A", &var);
     write_scx1_count_input(&b, 40, "donor_B", &var);
-
-    // The inputs must actually carry sidecars, else the sidecar-copy path is
-    // never exercised.
-    assert!(
-        sidecar_count(&ScxReader::open(&a).unwrap()) >= 1,
-        "input must carry a decode sidecar to exercise the copy path"
-    );
 
     let out_fast = dir.path().join("fast.scx");
     let out_slow = dir.path().join("slow.scx");
@@ -425,16 +408,6 @@ fn merge_raw_copy_byte_identical_to_reencode() {
     let cs = rs.catalog().shards_sorted();
     assert_eq!(cf.len(), 2, "one output shard per input shard");
     assert_eq!(cf.len(), cs.len(), "fast/slow shard count");
-    assert_eq!(
-        sidecar_count(&rf),
-        sidecar_count(&rs),
-        "fast/slow sidecar count"
-    );
-    assert_eq!(
-        sidecar_count(&rf),
-        2,
-        "raw-copy preserves both Scx1 decode sidecars"
-    );
 
     // X-shard sections byte-identical between raw-copy and re-encode.
     for (sf, ss) in cf.iter().zip(cs.iter()) {
@@ -443,30 +416,6 @@ fn merge_raw_copy_byte_identical_to_reencode() {
             rs.read_raw_shard_bytes(ss).unwrap(),
             "X-shard section bytes must be byte-identical (raw-copy vs re-encode)"
         );
-    }
-
-    // Decode sidecars byte-identical and self-consistent.
-    let sf: Vec<_> = rf
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
-        .cloned()
-        .collect();
-    let ss: Vec<_> = rs
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
-        .cloned()
-        .collect();
-    for (ef, es) in sf.iter().zip(ss.iter()) {
-        assert_eq!(
-            rf.section_bytes(ef).unwrap(),
-            rs.section_bytes(es).unwrap(),
-            "decode sidecar section bytes must match"
-        );
-        rf.validate_decode_sidecar_entry(ef).unwrap();
     }
 
     // Decoded matrices agree across both paths.
@@ -850,12 +799,11 @@ fn append_from_reader_resplit_into_framed_base_emits_framed_shards() {
     );
 }
 
-/// F-d review fix: appending an UNFRAMED v1 Scx1 (+ decode sidecar) source into a
-/// v4 framed base must NOT byte-copy the v1 shard. `raw_copy_csr_shard` writes via
-/// `FileLock` and copies no sidecar, so a raw-copy would leave a sidecar-less v1
-/// shard under a v4 header (invalid, and the guard is bypassed on this path). The
-/// framing-match gate routes the v1 shard through the decode-encode path, which
-/// re-frames it to v2 — no dangling/dropped sidecar, valid v4 output.
+/// F-d review fix: appending an UNFRAMED v1 Scx1 source into a v4 framed base
+/// must NOT byte-copy the v1 shard, because a raw-copy would leave an unframed v1
+/// shard under a v4 header (invalid, and the writer's v4 guard is bypassed on
+/// this path). The framing-match gate routes the v1 shard through the
+/// decode-encode path, which re-frames it to v2 — a valid v4 output.
 #[test]
 fn append_unframed_scx1_source_into_v4_base_reframes_to_v2() {
     use scx_codec::CodecSelection;
@@ -874,10 +822,6 @@ fn append_unframed_scx1_source_into_v4_base_reframes_to_v2() {
     assert_eq!(
         src_sh.shard_format_version, 1,
         "source shard must be unframed v1"
-    );
-    assert!(
-        sidecar_count(&src_reader) >= 1,
-        "source must carry a decode sidecar to exercise the gap"
     );
     let src_rows = decode_all_rows(&src_reader);
 
@@ -901,16 +845,11 @@ fn append_unframed_scx1_source_into_v4_base_reframes_to_v2() {
         let sh = post.read_shard_header(entry).unwrap();
         assert!(
             sh.shard_format_version > 1,
-            "shard '{}' must be framed v2 (v1 Scx1 source reframed, not byte-copied sidecar-less), got v{}",
+            "shard '{}' must be framed v2 (v1 Scx1 source reframed, not byte-copied), got v{}",
             entry.name,
             sh.shard_format_version
         );
     }
-    assert_eq!(
-        sidecar_count(&post),
-        0,
-        "a valid v4 framed output must carry no DecodeMetadataShard sidecars"
-    );
     let post_rows = decode_all_rows(&post);
     assert_eq!(
         &post_rows[40..80],
@@ -933,10 +872,6 @@ fn merge_rawcopy_microbench() {
     let b = dir.path().join("b.scx");
     write_scx1_count_input(&a, 20_000, "donor_A", &var);
     write_scx1_count_input(&b, 20_000, "donor_B", &var);
-    assert!(
-        sidecar_count(&ScxReader::open(&a).unwrap()) >= 1,
-        "inputs must carry sidecars, else raw-copy falls back to re-encode"
-    );
 
     let inputs = [a.as_path(), b.as_path()];
     let iters = 5;

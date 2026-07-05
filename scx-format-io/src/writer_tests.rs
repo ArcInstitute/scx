@@ -35,282 +35,6 @@ fn sample_shard_data() -> (Vec<u64>, Vec<u32>, Vec<u8>) {
     (indptr, indices, values)
 }
 
-#[test]
-fn scx1_csr_shard_emits_valid_decode_sidecar() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("decode_sidecar.scx");
-    let mut header = sample_header();
-    header.n_obs = 4;
-    header.n_vars = 20_000;
-    header.codec_id = CodecId::Scx1 as u8;
-    header.index_dtype = 0;
-
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs()).unwrap();
-    writer.write_var(&sample_var()).unwrap();
-
-    let nnz_per_row = 8192usize;
-    let mut indptr = Vec::with_capacity(5);
-    let mut indices = Vec::with_capacity(4 * nnz_per_row);
-    let mut values = Vec::with_capacity(4 * nnz_per_row);
-    indptr.push(0);
-    for row in 0..4 {
-        for col in 0..(nnz_per_row - 1) {
-            indices.push(col as u32);
-            values.push(1u8);
-        }
-        indices.push(19_999);
-        values.push(1u8);
-        indptr.push(((row + 1) * nnz_per_row) as u64);
-    }
-
-    writer
-        .write_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::Scx1,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-
-    let final_path = writer.finish().unwrap();
-    let reader = crate::reader::ScxReader::open(&final_path).unwrap();
-    let sidecars: Vec<_> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|entry| entry.section_type == SectionType::DecodeMetadataShard)
-        .collect();
-    assert_eq!(sidecars.len(), 1);
-    reader.validate_decode_sidecar_entry(sidecars[0]).unwrap();
-
-    let csr_shards = reader.catalog().shards_sorted();
-    assert_eq!(csr_shards.len(), 1);
-    reader.validate_canonical_csr_entry(csr_shards[0]).unwrap();
-
-    let sidecar = reader.read_decode_sidecar_from_entry(sidecars[0]).unwrap();
-    assert_eq!(sidecar.n_rows, 4);
-    assert_eq!(sidecar.n_cols, 20_000);
-    assert_eq!(sidecar.nnz, indices.len() as u64);
-    assert_eq!(sidecar.rows.len(), 4);
-}
-
-/// Task 4.3: a large Scx1 shard with a decode sidecar must decode via the
-/// parallel sidecar path byte-identically to the sequential path, and the
-/// random-access `decode_scx1_row_range` must match the full-decode slice.
-#[test]
-fn parallel_sidecar_decode_matches_sequential_and_row_range() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("parallel_decode.scx");
-    let n_rows = 4096usize; // == PARALLEL_SIDECAR_DECODE_MIN_ROWS → parallel path
-    let n_cols = 2000u32;
-    let mut header = sample_header();
-    header.n_obs = n_rows as u64;
-    header.n_vars = n_cols as u64;
-    header.codec_id = CodecId::Scx1 as u8;
-    header.index_dtype = 1; // u32 indices
-
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs()).unwrap();
-    writer.write_var(&sample_var()).unwrap();
-
-    // ~256 nnz/row (Rice-block aligned + BitPacker4x ≥128) so the sidecar
-    // stays well under the 25% overhead budget and is actually emitted.
-    let nnz_per_row = 256usize;
-    let mut indptr = vec![0u64];
-    let mut indices: Vec<u32> = Vec::with_capacity(n_rows * nnz_per_row);
-    let mut values: Vec<u8> = Vec::with_capacity(n_rows * nnz_per_row * 2);
-    for _ in 0..n_rows {
-        for col in 0..nnz_per_row {
-            indices.push(col as u32);
-            // u16 LE, non-zero (Scx1 Rice requires >= 1).
-            let v = (1 + (col % 97)) as u16;
-            values.extend_from_slice(&v.to_le_bytes());
-        }
-        indptr.push(indices.len() as u64);
-    }
-    writer
-        .write_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
-    let final_path = writer.finish().unwrap();
-
-    let reader = crate::reader::ScxReader::open(&final_path).unwrap();
-    // The sidecar must have been emitted, else the parallel branch is dead.
-    assert_eq!(
-        reader
-            .catalog()
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::DecodeMetadataShard)
-            .count(),
-        1,
-        "decode sidecar must be emitted for this shard (else parallel path is untested)"
-    );
-
-    let csr_entry = reader.catalog().shards_sorted()[0];
-
-    // Verified (sequential) decode vs the non-verifying read (parallel
-    // sidecar path) must be byte-identical.
-    let seq = reader.read_shard_from_entry_verified(csr_entry).unwrap();
-    let par = reader.read_shard_from_entry(csr_entry).unwrap();
-    assert_eq!(seq, par, "parallel sidecar decode != sequential decode");
-
-    // Random-access row-range matches the corresponding slice of the full
-    // decode (indptr rebased).
-    let (full_indptr, full_indices, full_values) = &seq;
-    for (s, k) in [(0usize, 1usize), (1000, 257), (4095, 1), (2048, 512)] {
-        let (ri, rx, rv) = reader
-            .decode_scx1_row_range(csr_entry, s, k)
-            .unwrap()
-            .expect("sidecar present");
-        let base = full_indptr[s];
-        let expect_indptr: Vec<i64> = full_indptr[s..=s + k].iter().map(|&p| p - base).collect();
-        let lo = full_indptr[s] as usize;
-        let hi = full_indptr[s + k] as usize;
-        assert_eq!(ri, expect_indptr, "row-range indptr s={s} k={k}");
-        assert_eq!(rx, full_indices[lo..hi], "row-range indices s={s} k={k}");
-        assert_eq!(rv, full_values[lo..hi], "row-range values s={s} k={k}");
-    }
-}
-
-/// `ScxReader::scx1_metadata_for_csr_shard` resolves the encoder-emitted
-/// decode metadata for a fresh Scx1 sidecar (the public seam the GPU
-/// device-decode handoff, Task 4.4a, calls): one FOR-BP row entry per CSR
-/// row, Rice blocks present, and an out-of-range index errors.
-#[test]
-fn scx1_metadata_for_csr_shard_resolves_fresh_sidecar() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("metadata_for.scx");
-    let n_rows = 512usize;
-    let n_cols = 2000u32;
-    let mut header = sample_header();
-    header.n_obs = n_rows as u64;
-    header.n_vars = n_cols as u64;
-    header.codec_id = CodecId::Scx1 as u8;
-    header.index_dtype = 1;
-
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs()).unwrap();
-    writer.write_var(&sample_var()).unwrap();
-    let nnz_per_row = 256usize;
-    let mut indptr = vec![0u64];
-    let mut indices: Vec<u32> = Vec::new();
-    let mut values: Vec<u8> = Vec::new();
-    for _ in 0..n_rows {
-        for col in 0..nnz_per_row {
-            indices.push(col as u32);
-            let v = (1 + (col % 97)) as u16;
-            values.extend_from_slice(&v.to_le_bytes());
-        }
-        indptr.push(indices.len() as u64);
-    }
-    writer
-        .write_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
-    let final_path = writer.finish().unwrap();
-
-    let reader = crate::reader::ScxReader::open(&final_path).unwrap();
-    let meta = reader
-        .scx1_metadata_for_csr_shard(0, 0)
-        .unwrap()
-        .expect("fresh Scx1 sidecar must resolve");
-    assert_eq!(meta.rows.len(), n_rows, "one FOR-BP row entry per CSR row");
-    assert!(!meta.rice_blocks.is_empty(), "Rice blocks present");
-    // Per-row `value_start` is the running nnz prefix.
-    assert_eq!(meta.rows[0].value_start, 0);
-    assert_eq!(meta.rows[1].value_start, nnz_per_row as u64);
-
-    // Out-of-range shard index errors (not `Ok(None)`).
-    assert!(reader.scx1_metadata_for_csr_shard(0, 99).is_err());
-}
-
-/// The path pyscx actually uses: `encode_one_shard` → `write_preencoded_shard`.
-/// Exercises the `source_section_offset` patching (`with_source_offset`) and the
-/// encode-time `section_length`/`section_checksum` agreeing with the catalog entry
-/// — the staleness guard `validate_decode_sidecar_entry` enforces.
-#[test]
-fn preencoded_scx1_shard_emits_valid_decode_sidecar() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("decode_sidecar_preencoded.scx");
-    let mut header = sample_header();
-    header.n_obs = 4;
-    header.n_vars = 20_000;
-    header.codec_id = CodecId::Scx1 as u8;
-    header.index_dtype = 0;
-
-    let mut writer = ScxWriter::new(&path, header).unwrap();
-    writer.write_obs(&sample_obs()).unwrap();
-    writer.write_var(&sample_var()).unwrap();
-
-    let nnz_per_row = 8192usize;
-    let mut indptr = Vec::with_capacity(5);
-    let mut indices = Vec::with_capacity(4 * nnz_per_row);
-    let mut values: Vec<f32> = Vec::with_capacity(4 * nnz_per_row);
-    indptr.push(0u64);
-    for row in 0..4 {
-        for col in 0..(nnz_per_row - 1) {
-            indices.push(col as u32);
-            values.push(1.0);
-        }
-        indices.push(19_999u32);
-        values.push(1.0);
-        indptr.push(((row + 1) * nnz_per_row) as u64);
-    }
-
-    let pre = crate::encoder::encode_one_shard(
-        &indptr,
-        &indices,
-        &values,
-        Some(CodecId::Scx1),
-        0, // index_dtype: u16
-        20_000,
-        0, // global_row_offset
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        None,
-    )
-    .unwrap();
-    assert!(
-        pre.decode_sidecar.is_some(),
-        "Scx1 preencoded shard must carry a decode sidecar"
-    );
-    writer.write_preencoded_shard(pre).unwrap();
-
-    let final_path = writer.finish().unwrap();
-    let reader = crate::reader::ScxReader::open(&final_path).unwrap();
-    let sidecars: Vec<_> = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|entry| entry.section_type == SectionType::DecodeMetadataShard)
-        .collect();
-    assert_eq!(sidecars.len(), 1);
-    // Passes only if the patched source offset + encode-time length/checksum
-    // resolve to the written CSR shard's catalog entry.
-    reader.validate_decode_sidecar_entry(sidecars[0]).unwrap();
-
-    let csr_shards = reader.catalog().shards_sorted();
-    assert_eq!(csr_shards.len(), 1);
-    reader.validate_canonical_csr_entry(csr_shards[0]).unwrap();
-}
-
 /// `set_csr_shard_column_stats_bulk` assigns each `Vec<ColumnStat>` to the
 /// CSR shard at the matching `csr_shards_sorted` position (by row_start),
 /// regardless of the order shards were written, and the stats round-trip
@@ -1171,7 +895,6 @@ fn test_csc_shard_framed_round_trip() {
         row_group_rows: 1, // ≥2 gene-groups over the fixture → framing exercised
         target_nnz: None,
         trial: false,
-        prefer_gpu_sidecar: false,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -1223,7 +946,6 @@ fn read_csc_columns_scattered_matches_full_decode() {
         row_group_rows: 1, // one column-group per gene → framing fully exercised
         target_nnz: None,
         trial: false,
-        prefer_gpu_sidecar: false,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -1271,7 +993,6 @@ fn decode_block_index_row_runs_rejects_out_of_range_run() {
         row_group_rows: 1,
         target_nnz: None,
         trial: false,
-        prefer_gpu_sidecar: false,
     }));
     writer.write_obs(&sample_obs()).unwrap();
     writer.write_var(&sample_var()).unwrap();
@@ -1311,32 +1032,11 @@ fn tiny_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>) {
     (vec![0u64, 2, 3], vec![0u32, 2, 1], vec![1.0f32, 2.0, 3.0])
 }
 
-/// A larger low-count integer CSR whose Scx1 decode sidecar comfortably fits the
-/// overhead budget (mirrors the optimize sidecar fixtures) — used for the
-/// "v1-Scx1-with-sidecar is allowed in v4" case of the refined guard.
-fn dense_scx1_csr() -> (Vec<u64>, Vec<u32>, Vec<f32>, u32) {
-    let (n_obs, nnz_per_row, n_vars) = (40usize, 512usize, 200_000u32);
-    let mut indptr = vec![0u64];
-    let mut indices = Vec::new();
-    let mut values = Vec::new();
-    for r in 0..n_obs {
-        let mut col = 0u32;
-        for k in 0..nnz_per_row {
-            col += 1 + ((r * 13 + k * 7) % 250) as u32;
-            indices.push(col);
-            values.push(1.0f32 + ((r + k) % 5) as f32);
-        }
-        indptr.push(indices.len() as u64);
-    }
-    (indptr, indices, values, n_vars)
-}
-
-/// T3.1 guard, refined for the §4.3 two-layer model: a v4 file must not contain a
-/// **random-access-incapable** v1 shard (unframed AND sidecar-less), but a v1
-/// Scx1 shard **with** a decode sidecar is a valid v4 member (per-row/GPU layer).
-/// Framed (v2) shards are always fine; a v3 file accepts plain unframed shards.
+/// T3.1 guard (§4.3 framed model): a v4 file requires framed (shard v2) shards.
+/// Any unframed v1 CSR shard is rejected by `guard_no_legacy_shard_in_v4`; a
+/// framed shard is accepted, and a v3 file still accepts plain unframed shards.
 #[test]
-fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
+fn v4_guard_rejects_unframed_v1_shard() {
     let dir = tempfile::tempdir().unwrap();
     let v4 = || {
         let mut h = sample_header();
@@ -1352,7 +1052,7 @@ fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
     };
     let (indptr, indices, values) = tiny_csr();
 
-    // (1) Unframed, sidecar-less (explicit Zstd) v1 shard → rejected in v4.
+    // (1) Unframed (explicit Zstd) v1 shard → rejected in v4.
     let zstd_unframed = crate::encoder::encode_one_shard(
         &indptr,
         &indices,
@@ -1367,39 +1067,14 @@ fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
         None,
     )
     .unwrap();
-    assert!(zstd_unframed.decode_sidecar.is_none());
     let (_w, res) = write("v4_reject.scx", v4(), zstd_unframed);
     let err = res.unwrap_err();
     assert!(
         matches!(&err, ScxError::Io(e) if e.to_string().contains("random access")),
-        "sidecar-less v1 in v4 must be rejected, got {err:?}",
+        "unframed v1 shard in v4 must be rejected, got {err:?}",
     );
 
-    // (2) Unframed Scx1 WITH a sidecar → allowed in v4 (the two-layer case).
-    let (dptr, dix, dv, nv) = dense_scx1_csr();
-    let scx1_unframed = crate::encoder::encode_one_shard(
-        &dptr,
-        &dix,
-        &dv,
-        Some(CodecId::Scx1),
-        1,
-        nv,
-        0,
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        None,
-    )
-    .unwrap();
-    assert!(
-        scx1_unframed.decode_sidecar.is_some(),
-        "fixture must yield a within-budget Scx1 sidecar",
-    );
-    let (mut w, res) = write("v4_scx1_sidecar.scx", v4(), scx1_unframed);
-    res.unwrap();
-    w.finish().unwrap();
-
-    // (3) Framed shard → allowed in v4.
+    // (2) Framed shard → allowed in v4.
     let framed = crate::encoder::encode_one_shard(
         &indptr,
         &indices,
@@ -1415,15 +1090,14 @@ fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
             row_group_rows: 1,
             target_nnz: None,
             trial: false,
-            prefer_gpu_sidecar: false,
         }),
     )
     .unwrap();
-    let (mut w, res) = write("v4_framed.scx", v4(), framed);
+    let (w, res) = write("v4_framed.scx", v4(), framed);
     res.unwrap();
     w.finish().unwrap();
 
-    // (4) Unframed shard into a v3 file → accepted (the ordinary path).
+    // (3) Unframed shard into a v3 file → accepted (the ordinary path).
     let plain = crate::encoder::encode_one_shard(
         &indptr,
         &indices,
@@ -1438,7 +1112,7 @@ fn v4_guard_rejects_sidecarless_v1_allows_v1_with_sidecar() {
         None,
     )
     .unwrap();
-    let (mut w, res) = write("v3.scx", sample_header(), plain);
+    let (w, res) = write("v3.scx", sample_header(), plain);
     res.unwrap();
     w.finish().unwrap();
 }
@@ -1497,8 +1171,6 @@ fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
 /// (catalog-wins tolerance survives only on v1 reads).
 #[test]
 fn test_strict_shard_type_v2_rejects_corrupted_csc() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("strict_csc.scx");
     let header = sample_header();
@@ -1720,8 +1392,6 @@ fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
 /// `read_all_csc_shards` densifies back to the source matrix.
 #[test]
 fn test_csc_two_shard_round_trip() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("two_shard_csc.scx");
 
@@ -1804,8 +1474,6 @@ fn test_csc_two_shard_round_trip() {
 /// `write_csc_shard` with the u16 overflow error.
 #[test]
 fn test_csc_shard_large_n_obs_roundtrip() {
-    use crate::reader::ScxReader;
-
     // n_obs > 65535 so CSC row indices need u32 even though n_vars
     // (=20) would fit in u16 if indices were column-style.
     let n_rows: usize = 66_000;
@@ -1923,8 +1591,6 @@ fn test_csc_shard_large_n_obs_roundtrip() {
 /// skipped (they would error at encode time).
 #[test]
 fn test_csc_codec_sweep() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let (dense, n_rows, n_cols) = dense_4x6();
 
@@ -1992,8 +1658,6 @@ fn test_csc_codec_sweep() {
 /// `BackedCscReader::enable_metrics()` lands.
 #[test]
 fn test_read_csc_columns_range_correctness() {
-    use crate::reader::ScxReader;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("csc_range.scx");
 
@@ -2795,7 +2459,6 @@ fn preencoded_csc_shard_increments_csc_count() {
         name: "X_csc_shard_0".to_string(),
         section_type: SectionType::CscShard,
         nnz: 3,
-        decode_sidecar: None,
     };
 
     writer.write_preencoded_shard(pre).unwrap();

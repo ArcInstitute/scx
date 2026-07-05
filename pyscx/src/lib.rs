@@ -146,11 +146,10 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 ///
 /// When `deep=True`, additionally decodes every sparse shard to verify the
 /// v3 canonical CSR invariant (sorted column indices, no explicit zeros,
-/// consistent indptr) and verifies every decode sidecar (structural linkage
-/// + decode-parity). Mirrors `scx validate --deep`. Canonical-CSR checks run
+/// consistent indptr). Mirrors `scx validate --deep`. Canonical-CSR checks run
 /// only on v3+ files (pre-v3 may legitimately carry unsorted shards). Deep
-/// results are appended with `canonical-csr `/`decode-sidecar ` prefixed
-/// names and report `False` rather than raising.
+/// results are appended with `canonical-csr ` prefixed names and report `False`
+/// rather than raising.
 ///
 /// Returns a list of (section_name, passed) tuples. Raises RuntimeError if
 /// any essential section (obs, var, CsrShard) checksum fails.
@@ -172,9 +171,9 @@ fn validate(py: Python<'_>, path: &str, deep: bool) -> PyResult<Vec<(String, boo
     Ok(results)
 }
 
-/// Append deep-validation results (canonical-CSR + decode-sidecar checks) to
-/// an existing checksum result list. Shared by the top-level `validate`
-/// function and `PyExperiment::validate`.
+/// Append deep-validation results (canonical-CSR checks) to an existing checksum
+/// result list. Shared by the top-level `validate` function and
+/// `PyExperiment::validate`.
 pub(crate) fn deep_validate_into(
     reader: &scx_format_io::ScxReader,
     results: &mut Vec<(String, bool)>,
@@ -185,9 +184,6 @@ pub(crate) fn deep_validate_into(
         for (name, passed) in reader.validate_canonical_csr_shards() {
             results.push((format!("canonical-csr {name}"), passed));
         }
-    }
-    for (name, passed) in reader.validate_decode_sidecars() {
-        results.push((format!("decode-sidecar {name}"), passed));
     }
 }
 
@@ -293,7 +289,7 @@ pub(crate) fn deep_validate_into(
     index_obs=None, index_var=None, index_preset=None, index_auto_threshold=1000,
     bitmap="off", memory_budget=None, force_legacy_metadata=false,
     sort_by=None, reverse=false,
-    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None, keep_gpu_sidecar=false,
+    row_group_rows=scx_format_io::DEFAULT_ROW_GROUP_ROWS, row_group_target_nnz=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn from_anndata(
@@ -317,7 +313,6 @@ fn from_anndata(
     reverse: bool,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
-    keep_gpu_sidecar: bool,
 ) -> PyResult<()> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
     let csc = scx_engine::index::resolve_csc_policy(csc, index_preset.as_deref());
@@ -342,7 +337,6 @@ fn from_anndata(
         reverse,
         row_group_rows,
         row_group_target_nnz,
-        keep_gpu_sidecar,
     )
 }
 
@@ -598,9 +592,6 @@ fn from_h5ad(
         group_target_bytes: group_target_bytes_val,
         group_max_bytes: group_max_bytes_val,
         group_pass: group_pass_val,
-        // `from_h5ad` does not yet expose framing kwargs (a trivial follow-on);
-        // the GPU/sidecar cost model still engages via a `training` index preset.
-        keep_gpu_sidecar: false,
     };
 
     let input = std::path::PathBuf::from(path);
@@ -699,7 +690,6 @@ fn from_10x(
         // Framing on by default (G=256); `row_group_rows=0` opts out to unframed.
         (row_group_rows != 0).then_some(row_group_rows),
         row_group_target_nnz,
-        false, // keep_gpu_sidecar
     )
 }
 

@@ -518,7 +518,6 @@ pub fn from_anndata_impl(
     sort_reverse: bool,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
-    keep_gpu_sidecar: bool,
 ) -> PyResult<()> {
     // `compact-trial` is a framing profile, not a codec (mirror the CLI):
     // per shard keep the smaller of {heuristic, ShufDeltaZstd}. It — and an
@@ -542,14 +541,10 @@ pub fn from_anndata_impl(
     // the legacy layout rather than a confusing v4-header-with-v1-shards no-op.
     // (The compact-trial/shufdelta guard above already rejects `0` for those.)
     let row_group_rows = row_group_rows.filter(|&g| g > 0);
-    // The §4.3 two-layer GPU/sidecar cost model engages under compact-trial when
-    // explicitly requested or via the accel-oriented `training` index preset.
-    let prefer_gpu_sidecar = keep_gpu_sidecar || index_preset.as_deref() == Some("training");
     let framing = row_group_rows.map(|g| scx_format_io::FramingConfig {
         row_group_rows: g,
         target_nnz: row_group_target_nnz,
         trial: codec_trial,
-        prefer_gpu_sidecar,
     });
     let shard_target_rows = shard_size.unwrap_or(16384);
     let csc_policy =
@@ -603,7 +598,6 @@ pub fn from_anndata_impl(
                 row_group_rows,
                 row_group_target_nnz,
                 codec_trial,
-                keep_gpu_sidecar,
             );
         }
         #[cfg(not(feature = "hdf5"))]

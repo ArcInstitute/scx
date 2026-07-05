@@ -573,7 +573,6 @@ class TestMetrics:
             "bytes_inserted",
             "duplicate_waiters",
             "peak_bytes_in_cache",
-            "sidecar_groups",
             "full_shard_groups",
             "block_index_groups",
         }
@@ -615,7 +614,6 @@ class TestMetrics:
             "prefetch_tasks_spawned",
             "prefetch_skipped_cache_hit",
             "prefetch_skipped_in_flight",
-            "prefetch_skipped_sidecar",
             "prefetch_skipped_block_index",
         }
         assert set(m["cache"]) == {
@@ -625,7 +623,6 @@ class TestMetrics:
             "bytes_inserted",
             "duplicate_waiters",
             "peak_bytes_in_cache",
-            "sidecar_groups",
             "full_shard_groups",
             "block_index_groups",
         }
@@ -783,7 +780,6 @@ class TestBlockIndexAdoption:
             cache_shards=4,
             sort_by_shard=True,
             lookahead=0,
-            scatter_sidecar=False,
             scatter_block_index=True,
         )
         # Sparse, unsorted, cold gather → block-index eligible.
@@ -796,7 +792,6 @@ class TestBlockIndexAdoption:
         assert cm["block_index_groups"] > 0, (
             "framed gather must take the block-index path with the sidecar off"
         )
-        assert cm["sidecar_groups"] == 0
         assert cm["full_shard_groups"] == 0
 
     def test_scatter_block_index_flag_gates_prefetch_skip(self, tmp_path):
@@ -818,7 +813,6 @@ class TestBlockIndexAdoption:
                 cache_shards=4,
                 sort_by_shard=True,
                 lookahead=1,
-                scatter_sidecar=False,
                 scatter_block_index=scatter_block_index,
             )
             it = ds.iter_with_plans(iter([list(plan)]), lookahead=1)
@@ -850,7 +844,6 @@ class TestBlockIndexAdoption:
             cache_shards=4,
             sort_by_shard=True,
             lookahead=0,
-            scatter_sidecar=False,
             scatter_block_index=False,
         )
         plan = [(int(rng.integers(0, 400)), int(rng.integers(0, 400)))

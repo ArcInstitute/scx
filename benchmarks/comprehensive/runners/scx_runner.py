@@ -50,8 +50,7 @@ _CODEC_NAMES = {
     # ~0.2% of monolithic — docs/codec.md §7b).
     "shufdelta": ("SCX (shufdelta)", "scx_shufdelta"),
     # F5 compact-trial: per shard keep the smaller of {heuristic, ShufDeltaZstd},
-    # row-group-framed. Requires `row_group_rows`. The two-layer cost model
-    # (`keep_gpu_sidecar`) can keep Scx1-friendly shards unframed for GPU/per-row.
+    # row-group-framed. Requires `row_group_rows`.
     "compact-trial": ("SCX (compact-trial)", "scx_compact_trial"),
     # Phase K multimodal variants — name + key tags for the
     # comprehensive results pipeline.
@@ -86,7 +85,6 @@ class ScxRunner(FormatRunner):
         codec_per_modality: bool = True,
         with_csc: bool = False,
         row_group_rows: int | None = None,
-        keep_gpu_sidecar: bool = False,
     ) -> None:
         if codec not in _CODEC_NAMES:
             raise ValueError(
@@ -101,9 +99,6 @@ class ScxRunner(FormatRunner):
         # F5 row-group framing (None = monolithic/unframed). Required (and
         # auto-defaulted above) for shufdelta / compact-trial.
         self.row_group_rows = row_group_rows
-        # F5 §4.3 cost model: under compact-trial, keep Scx1-friendly shards
-        # unframed with their GPU/per-row sidecar.
-        self.keep_gpu_sidecar = keep_gpu_sidecar
         # Phase K.3.4: when False, route every modality through the
         # single-modality `select_codec` helper instead of
         # `select_codec_for_modality`. Only meaningful for the
@@ -174,8 +169,6 @@ class ScxRunner(FormatRunner):
             from_anndata_kwargs["csc"] = "always"
         if self.row_group_rows is not None:
             from_anndata_kwargs["row_group_rows"] = self.row_group_rows
-        if self.keep_gpu_sidecar:
-            from_anndata_kwargs["keep_gpu_sidecar"] = True
         pyscx.from_anndata(adata, output_path, **from_anndata_kwargs)
 
         wall = time.perf_counter() - t0

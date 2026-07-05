@@ -1,5 +1,5 @@
-// scx optimize — re-encode + canonicalize CSR shards to add decode sidecars
-// and upgrade an existing single-modality file to format_version 3.
+// scx optimize — re-encode + canonicalize CSR shards, applying row-group
+// framing and upgrading an existing single-modality file to the current format.
 
 use std::path::Path;
 
@@ -15,18 +15,15 @@ pub fn run_optimize(
     codec: &str,
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
-    keep_gpu_sidecar: bool,
     shard_obs: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
     }
-    // Explicit allow-set rather than `CodecId::parse_cli` (which also accepts
-    // none/zstd/lz4/pcodec): those drop the decode sidecar, defeating the point
-    // of the unframed `optimize`. `auto` → None (auto-codec, Scx1 for low-median
-    // integer shards), `scx1` → force Scx1 on every integer shard. The framed
-    // codecs (`shufdelta` / `compact-trial`) instead trade the sidecar for the
-    // block-index random-access layout and require `--row-group-rows`. clap's
+    // Explicit allow-set rather than `CodecId::parse_cli`. `auto` → None
+    // (auto-codec, Scx1 for low-median integer shards), `scx1` → force Scx1 on
+    // every integer shard. The framed codecs (`shufdelta` / `compact-trial`)
+    // require `--row-group-rows` for the block-index random-access layout. clap's
     // `value_parser` restricts the surface; this match is the in-function source
     // of truth (and guards direct callers).
     let (codec_id, codec_trial) = match codec {
@@ -62,9 +59,6 @@ pub fn run_optimize(
         row_group_rows: g,
         target_nnz: row_group_target_nnz,
         trial: codec_trial,
-        // Two-layer cost model: keep Scx1-friendly shards unframed with
-        // their GPU/per-row sidecar under compact-trial when requested.
-        prefer_gpu_sidecar: keep_gpu_sidecar,
     });
     // Allow an explicit in-place upgrade (`--output` == input): `ScxWriter`
     // writes a sibling tempfile and atomically renames over the target on
@@ -96,18 +90,14 @@ pub fn run_optimize(
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();
     // Framed runs report the row-group layout + per-shard ShufDeltaZstd adoption;
-    // unframed runs keep the historical "decode sidecars added" phrasing.
-    let detail = if stats.shards_framed > 0 || stats.unframed_scx1_gpu > 0 {
+    // unframed runs just report the shard count.
+    let detail = if stats.shards_framed > 0 {
         format!(
-            "row-group-framed {}/{} shards ({} stored as ShufDeltaZstd, \
-             {} kept unframed Scx1 for GPU/per-row)",
-            stats.shards_framed,
-            stats.shards_total,
-            stats.shards_shufdelta,
-            stats.unframed_scx1_gpu,
+            "row-group-framed {}/{} shards ({} stored as ShufDeltaZstd)",
+            stats.shards_framed, stats.shards_total, stats.shards_shufdelta,
         )
     } else {
-        "decode sidecars added where applicable".to_string()
+        format!("{} shards re-encoded (unframed)", stats.shards_total)
     };
     println!(
         "Optimized {} → {} ({} → {}); {}, format_version={}",

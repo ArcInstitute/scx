@@ -1,5 +1,4 @@
 use super::*;
-use crate::header::CURRENT_FORMAT_VERSION;
 use crate::provenance::ProvenanceEntry;
 use crate::shard::SHARD_HEADER_SIZE;
 use crate::writer::ScxWriter;

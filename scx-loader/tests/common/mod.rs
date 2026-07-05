@@ -14,7 +14,6 @@ use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
 use scx_format_io::writer::ScxWriter;
-use scx_format_io::ScxReader;
 use scx_loader::{IndexPlanLoader, LoaderConfig};
 
 /// Build a multi-shard `.scx` fixture with one nonzero per row at column
@@ -187,17 +186,6 @@ pub fn write_dense_scx1_fixture(
     path.to_path_buf()
 }
 
-/// Count `DecodeMetadataShard` (per-row scx1 decode sidecar) sections in a file.
-pub fn count_sidecars(path: &std::path::Path) -> usize {
-    ScxReader::open(path)
-        .unwrap()
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == scx_format_io::SectionType::DecodeMetadataShard)
-        .count()
-}
-
 /// Build an `IndexPlanLoader` against a fixture with default settings —
 /// no normalization, no log1p, single obs column `"cell_id"`, 4 cache shards,
 /// shard sort enabled, lookahead 4, plan-size cap 16384, and a generous
@@ -208,7 +196,7 @@ pub fn open_loader(path: &std::path::Path, sort_by_shard: bool) -> IndexPlanLoad
     config.log1p = false;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }
 
 /// Same as `open_loader` but with a fully-saturating normalize+log1p config.
@@ -236,7 +224,7 @@ pub fn open_loader_with_flags(
     config.target_sum = target_sum;
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }
 
 /// HVG-projected loader. Validates HVG indices against `n_vars` at
@@ -252,5 +240,5 @@ pub fn open_loader_hvg(
     config.hvg_indices = Some(hvg);
     config.obs_columns = vec!["cell_id".to_string()];
     config.max_memory_mb = 1024;
-    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384, true).unwrap()
+    IndexPlanLoader::new(path, config, 4, sort_by_shard, 4, 16384).unwrap()
 }

@@ -799,11 +799,6 @@ impl IndexPlanDataset {
     ///     max_memory_mb: Memory budget in MB (default: 512). On overflow,
     ///         lookahead is reduced first (down to 1), then cache_shards
     ///         (down to 1); construction fails if neither fits.
-    ///     scatter_sidecar: Per-dataset escape hatch (default: True) gating the
-    ///         sidecar-aware prefetch skip. True lets cold sparse plans decode
-    ///         O(rows) via the scx1 decode sidecar; False makes the prefetch
-    ///         warm whole shards (legacy full-shard decode). `SCX_SCATTER_SIDECAR=0`
-    ///         is the process-wide reader-layer kill-switch.
     ///     scatter_block_index: Per-dataset escape hatch (default: True) gating the
     ///         block-index-aware prefetch skip for row-group-framed (v2) files.
     ///         True lets cold sparse plans decode only the touched row-groups via
@@ -826,7 +821,6 @@ impl IndexPlanDataset {
         lookahead=None,
         max_plan_size=None,
         max_memory_mb=None,
-        scatter_sidecar=None,
         scatter_block_index=None,
     ))]
     fn new(
@@ -843,7 +837,6 @@ impl IndexPlanDataset {
         lookahead: Option<usize>,
         max_plan_size: Option<usize>,
         max_memory_mb: Option<usize>,
-        scatter_sidecar: Option<bool>,
         scatter_block_index: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = LoaderConfig::default();
@@ -876,7 +869,6 @@ impl IndexPlanDataset {
         let sort_by_shard = sort_by_shard.unwrap_or(true);
         let lookahead = lookahead.unwrap_or(4);
         let max_plan_size = max_plan_size.unwrap_or(16384);
-        let scatter_sidecar = scatter_sidecar.unwrap_or(true);
         let scatter_block_index = scatter_block_index.unwrap_or(true);
 
         let mut loader = IndexPlanLoader::new(
@@ -886,7 +878,6 @@ impl IndexPlanDataset {
             sort_by_shard,
             lookahead,
             max_plan_size,
-            scatter_sidecar,
         )
         .map_err(loader_err_to_py)?;
         loader.set_scatter_block_index(scatter_block_index);
@@ -1159,7 +1150,6 @@ impl IndexPlanBatchIter {
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,
-    ///               prefetch_skipped_sidecar,
     ///               prefetch_skipped_block_index}}
     /// ```
     ///
@@ -1192,7 +1182,6 @@ fn cache_metrics_to_pydict<'py>(py: Python<'py>, m: &CacheMetrics) -> PyResult<B
         "peak_bytes_in_cache",
         m.peak_bytes_in_cache.load(Ordering::Relaxed),
     )?;
-    dict.set_item("sidecar_groups", m.sidecar_groups.load(Ordering::Relaxed))?;
     dict.set_item(
         "full_shard_groups",
         m.full_shard_groups.load(Ordering::Relaxed),
@@ -1218,10 +1207,6 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     dict.set_item(
         "prefetch_skipped_in_flight",
         m.prefetch_skipped_in_flight.load(Ordering::Relaxed),
-    )?;
-    dict.set_item(
-        "prefetch_skipped_sidecar",
-        m.prefetch_skipped_sidecar.load(Ordering::Relaxed),
     )?;
     dict.set_item(
         "prefetch_skipped_block_index",
@@ -1491,7 +1476,6 @@ impl SparseCellSetDataset {
         normalize=None,
         log1p=None,
         target_sum=None,
-        scatter_sidecar=None,
     ))]
     fn new(
         paths: Vec<String>,
@@ -1503,7 +1487,6 @@ impl SparseCellSetDataset {
         normalize: Option<bool>,
         log1p: Option<bool>,
         target_sum: Option<f64>,
-        scatter_sidecar: Option<bool>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -1518,13 +1501,6 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
-        // Default OFF: the cache-friendly sparse cell-set workload (sorted data
-        // + control-pool cache → high shard reuse) wins by decoding each hot
-        // shard once into the LRU rather than re-decoding it via the per-row
-        // sidecar every batch. See SCX-CACHE-SHARDS.md §5.0 (Phase 0 measured
-        // 2.80 → 4.63 steps/s). Pass `scatter_sidecar=True` to opt back into the
-        // sidecar gather for genuinely cache-hostile (working-set ≫ cache) runs.
-        let scatter_sidecar = scatter_sidecar.unwrap_or(false);
 
         let mut readers = Vec::with_capacity(paths.len());
         for p in &paths {
@@ -1544,7 +1520,6 @@ impl SparseCellSetDataset {
             normalize,
             log1p,
             target_sum,
-            scatter_sidecar,
         )
         .map_err(loader_err_to_py)?;
 

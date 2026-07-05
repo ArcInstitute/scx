@@ -250,7 +250,6 @@ def _run_index_plan(
     lookahead: int,
     cache_shards: int,
     max_plan_size: int,
-    scatter_sidecar: bool = True,
 ) -> _ScenarioOutcome:
     import pyscx
 
@@ -266,7 +265,6 @@ def _run_index_plan(
         lookahead=lookahead,
         max_plan_size=max_plan_size,
         max_memory_mb=8192,
-        scatter_sidecar=scatter_sidecar,
     )
     # Snapshot the estimator's per-component breakdown right after ctor so
     # the auto-tune output (post-reduction) drives the overshoot delta.

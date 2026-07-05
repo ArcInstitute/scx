@@ -115,8 +115,8 @@ pub use scx_gpu::{
 };
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{
-    decode_csr_shards_to_device, decode_csr_shards_to_device_with_metadata, decode_shard_gpu,
-    decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr, GpuCsrPointers,
+    decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats, decode_shard_gpu,
+    decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr, GpuCsrPointers,
 };
 #[cfg(feature = "gpu")]
 pub use scx_gpu::{GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX};

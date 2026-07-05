@@ -87,11 +87,9 @@ pub use cusparse::{
 pub use device::GpuDevice;
 pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{GpuError, Result};
-pub use forbp_gpu::{forbp_decode_gpu, forbp_decode_gpu_with_metadata};
+pub use forbp_gpu::forbp_decode_gpu;
 pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
-pub use gpu_csr_assemble::{
-    decode_csr_shards_to_device, decode_csr_shards_to_device_with_metadata,
-};
+pub use gpu_csr_assemble::{decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats};
 pub use gpu_diffexp::{
     build_cell_to_group_dev, build_cell_to_pool_dev, build_cell_to_pos_dev,
     default_gpu_de_gene_chunk_size, gpu_de_block_sort, gpu_de_budget_gene_chunk,
@@ -138,10 +136,8 @@ pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use profile::{ProfileSnapshot, StageStat};
-pub use rice_gpu::{rice_decode_gpu, rice_decode_gpu_with_metadata};
-pub use shard_decode::{
-    decode_shard_gpu, decode_shard_gpu_with_metadata, DeviceDecodeStats, GpuCsr,
-};
+pub use rice_gpu::rice_decode_gpu;
+pub use shard_decode::{decode_shard_gpu, decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr};
 pub use sparse_dense::{
     sparse_to_dense_gpu, sparse_to_dense_gpu_into, sparse_to_dense_gpu_into_view, upload_hvg_map,
     validate_hvg_map, HVG_MAP_SKIP,
