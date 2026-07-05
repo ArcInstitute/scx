@@ -560,7 +560,7 @@ fn merge_framed_raw_copy_preserves_v4_and_block_index() {
     let ra = ScxReader::open(&a).unwrap();
     assert_eq!(ra.header().format_version, CURRENT_FORMAT_VERSION);
     let src_bi_len = ra
-        .read_shard_header(&ra.catalog().shards_sorted()[0])
+        .read_shard_header(ra.catalog().shards_sorted()[0])
         .unwrap()
         .block_index_length;
     assert!(
@@ -663,7 +663,7 @@ fn append_from_reader_framed_raw_copy_preserves_v4() {
 
     let src_reader = ScxReader::open(&source).unwrap();
     let src_bi_len = src_reader
-        .read_shard_header(&src_reader.catalog().shards_sorted()[0])
+        .read_shard_header(src_reader.catalog().shards_sorted()[0])
         .unwrap()
         .block_index_length;
     assert!(src_bi_len > 4 + 22, "source shard must be multi-group framed");
@@ -705,6 +705,138 @@ fn append_from_reader_framed_raw_copy_preserves_v4() {
         src_dec,
         "appended shard decodes to the source rows"
     );
+}
+
+/// Decode every CSR shard of a file into per-row `(index, value)` lists, in
+/// global row order. Used to check append decoded parity across re-splits.
+fn decode_all_rows(reader: &ScxReader) -> Vec<Vec<(i32, f32)>> {
+    let mut rows = Vec::new();
+    for i in 0..reader.catalog().shards_sorted().len() {
+        let (indptr, indices, data) = reader.read_csr_shard(i).unwrap();
+        for r in 0..indptr.len() - 1 {
+            let s = indptr[r] as usize;
+            let e = indptr[r + 1] as usize;
+            rows.push(
+                indices[s..e]
+                    .iter()
+                    .copied()
+                    .zip(data[s..e].iter().copied())
+                    .collect(),
+            );
+        }
+    }
+    rows
+}
+
+/// F-d correctness: the in-memory `append(...)` path (`write_csr_chunk`, which
+/// writes directly via `FileLock`, bypassing the writer's v4 guard) must emit
+/// FRAMED shards when the base is v4 — otherwise it silently writes an invalid
+/// v4 file (unframed, sidecar-less shards under a v4 header).
+#[test]
+fn append_in_memory_into_framed_base_emits_framed_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let base = dir.path().join("base.scx");
+    write_framed_input(&base, 40, "donor_A", &var, 8);
+
+    // New rows via the raw-array in-memory path.
+    let new_obs = obs_batch(40, 10, "donor_B");
+    let mut indptr = vec![0u64];
+    let mut indices: Vec<u32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for r in 0..10usize {
+        indices.push((r % 50_000) as u32);
+        values.push((1 + r % 5) as u8);
+        indptr.push(indices.len() as u64);
+    }
+    scx_ops::append(
+        &base,
+        &new_obs,
+        &indptr,
+        &indices,
+        &values,
+        ValueEncoding::Uint8,
+        &scx_ops::AppendOptions::default(),
+    )
+    .unwrap();
+
+    let post = ScxReader::open(&base).unwrap();
+    assert_eq!(post.n_obs(), 50);
+    assert_eq!(
+        post.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "append must keep the base a v4 file"
+    );
+    for entry in &post.catalog().shards_sorted() {
+        let sh = post.read_shard_header(entry).unwrap();
+        assert!(
+            sh.shard_format_version > 1,
+            "shard '{}' must be framed v2 (in-memory append into a v4 base), got v{}",
+            entry.name,
+            sh.shard_format_version
+        );
+    }
+}
+
+/// F-d correctness: `append_from_reader`'s decode-encode (re-split) path must
+/// emit framed shards into a v4 base. A 40-row framed source shard appended
+/// with `shard_target_rows = 16` re-splits (so raw-copy is skipped and
+/// `write_csr_chunk` runs), and every resulting shard must be framed v2, with
+/// the decoded rows matching the source.
+#[test]
+fn append_from_reader_resplit_into_framed_base_emits_framed_shards() {
+    use scx_codec::CodecSelection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let base = dir.path().join("base.scx");
+    let source = dir.path().join("source.scx");
+    write_framed_input(&base, 40, "donor_A", &var, 8);
+    write_framed_input(&source, 40, "donor_B", &var, 8);
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    let src_rows = decode_all_rows(&src_reader);
+    let base_shards_before = ScxReader::open(&base).unwrap().catalog().shards_sorted().len();
+
+    scx_ops::append_from_reader(
+        &base,
+        &src_reader,
+        &scx_ops::AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: std::num::NonZeroU32::new(16).unwrap(),
+            modality_id: 0,
+        },
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let post = ScxReader::open(&base).unwrap();
+    assert_eq!(post.n_obs(), 80);
+    assert_eq!(
+        post.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "re-split append must keep the base a v4 file"
+    );
+    let post_shards = post.catalog().shards_sorted().len();
+    assert!(
+        post_shards > base_shards_before + 1,
+        "40 source rows at shard_target_rows=16 must re-split into >1 appended shard \
+         (got {} new shards)",
+        post_shards - base_shards_before
+    );
+    for entry in &post.catalog().shards_sorted() {
+        let sh = post.read_shard_header(entry).unwrap();
+        assert!(
+            sh.shard_format_version > 1,
+            "shard '{}' must be framed v2 (re-split append into a v4 base), got v{}",
+            entry.name,
+            sh.shard_format_version
+        );
+    }
+    // Decoded parity: the appended rows (40..80) must equal the source rows.
+    let post_rows = decode_all_rows(&post);
+    assert_eq!(&post_rows[40..80], &src_rows[..], "re-split append decoded parity");
 }
 
 /// Micro-bench (P2 / OPT-1.2): same-layout merge via the raw-copy fast path

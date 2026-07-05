@@ -434,7 +434,7 @@ fn framed_size(e: &EncodedShard) -> usize {
 /// framed indptr. `scx1_decode` is dropped — framed shards use the block index
 /// for random access, not the monolithic Scx1 sidecar.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_shard_framed(
+pub fn encode_shard_framed(
     indptr: &[u64],
     indices: &[u32],
     values_bytes: &[u8],

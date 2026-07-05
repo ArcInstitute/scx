@@ -82,7 +82,8 @@ use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format_io::codec_select::select_codec;
-use scx_format_io::header::FileHeader;
+use scx_format_io::encoder::FramingConfig;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{
@@ -427,11 +428,16 @@ pub fn sort_with_strategy(
             input.display()
         );
     }
+    // Preserve row-group framing: a v4 (framed) input yields a v4 output whose
+    // re-encoded shards are all framed (via `set_framing` below), so sorting a
+    // default file no longer silently downgrades it to unframed v3.
+    let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(
-            &[in_header.format_version],
-            1,
-        ),
+        format_version: if output_framed {
+            CURRENT_FORMAT_VERSION
+        } else {
+            scx_format_io::rewrite_output_format_version(&[in_header.format_version], 1)
+        },
         flags: out_flags,
         n_obs: n_live as u64,
         n_vars,
@@ -441,6 +447,9 @@ pub fn sort_with_strategy(
     };
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
 
     // ----- obs (sorted, re-sharded) + var -----
     // In-memory: slice the materialized sorted obs. Spill: scatter input obs
@@ -811,11 +820,14 @@ fn sort_multimodal(
         );
     }
     let max_n_vars = table.entries.iter().map(|i| i.n_vars).max().unwrap_or(0);
+    // Preserve framing (see the single-modality path).
+    let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(
-            &[in_header.format_version],
-            2,
-        ),
+        format_version: if output_framed {
+            CURRENT_FORMAT_VERSION
+        } else {
+            scx_format_io::rewrite_output_format_version(&[in_header.format_version], 2)
+        },
         flags: out_flags,
         n_obs: n_live as u64,
         n_vars: max_n_vars,
@@ -825,6 +837,9 @@ fn sort_multimodal(
     };
     let mut writer = ScxWriter::new(output, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
 
     write_obs_sharded(&mut writer, sorted_obs, opts.shard_target_rows)?;
 

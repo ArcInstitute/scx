@@ -9,7 +9,8 @@ use scx_engine::{
     build_and_write_conversion_predicate_indexes_streaming, ConversionPredicateIndexOptions,
 };
 use scx_format_io::codec_select::select_codec;
-use scx_format_io::header::FileHeader;
+use scx_format_io::encoder::FramingConfig;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
@@ -190,11 +191,16 @@ pub fn compact_with_index_options(
     // Set up output header. Compact re-shards CSR rows via `encode_one_shard`
     // without re-canonicalizing, so it can only claim v3 if the input already
     // guarantees the canonical invariant (floor 1 — single-modality compact).
+    // Preserve row-group framing: a v4 (framed) input yields a v4 output with
+    // every re-encoded shard framed (via `set_framing` below), so compacting a
+    // default file no longer silently downgrades it to unframed v3.
+    let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(
-            &[in_header.format_version],
-            1,
-        ),
+        format_version: if output_framed {
+            CURRENT_FORMAT_VERSION
+        } else {
+            scx_format_io::rewrite_output_format_version(&[in_header.format_version], 1)
+        },
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars,
@@ -211,6 +217,9 @@ pub fn compact_with_index_options(
     // defaults to 0 (no CSC emitted); any stale sidecar would mismatch.
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,
@@ -937,11 +946,15 @@ fn compact_multimodal(
 
     // Multimodal compact: gate the v3 claim on the input version (floor 2).
     // The modality table + n_modalities are stamped onto the header later.
+    // Preserve framing: a v4 input yields a v4 output with framed re-encoded
+    // shards (see the single-modality path for rationale).
+    let output_framed = in_header.format_version >= CURRENT_FORMAT_VERSION;
     let out_header = FileHeader {
-        format_version: scx_format_io::rewrite_output_format_version(
-            &[in_header.format_version],
-            2,
-        ),
+        format_version: if output_framed {
+            CURRENT_FORMAT_VERSION
+        } else {
+            scx_format_io::rewrite_output_format_version(&[in_header.format_version], 2)
+        },
         flags: out_flags,
         n_obs: new_n_obs as u64,
         n_vars: max_n_vars,
@@ -954,6 +967,9 @@ fn compact_multimodal(
     // bump the data generation; the new file emits no CSC here.
     let mut writer = ScxWriter::new(output_path, out_header)?
         .with_data_generation(reader.catalog().data_generation + 1);
+    if output_framed {
+        writer.set_framing(Some(FramingConfig::default()));
+    }
     if let Some(ref filtered_obs) = eager_filtered_obs {
         write_obs_section(
             &mut writer,

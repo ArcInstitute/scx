@@ -336,6 +336,7 @@ fn write_query_result(
         index_dtype,
         None,
         scx_format_io::ModalityType::Rna,
+        None,
     )?;
 
     // Write provenance

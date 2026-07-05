@@ -15,7 +15,7 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::header::CURRENT_FORMAT_VERSION;
 use scx_format_io::shard::{
-    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader,
+    derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader, CURRENT_SHARD_FORMAT_VERSION,
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
 };
 use scx_format_io::writer::ScxWriter;
@@ -793,24 +793,39 @@ fn write_csr_chunk(
     let shard_global_offset = *write_offset;
     let index_dtype_u16 = prep.header_index_dtype == 0;
 
-    let encoded = scx_codec::encode_shard(
-        shard_indptr,
-        shard_indices,
-        shard_values,
-        shard_codec,
-        value_encoding,
-        index_dtype_u16,
-    )?;
-
-    let block_index = BlockIndex {
-        entries: vec![BlockIndexEntry::new(
-            0,
-            shard_rows as u32,
-            0,
-            0,
-            0,
-            shard_nnz,
-        )?],
+    // Preserve row-group framing: when the (base) file is v4, emit a framed
+    // (shard-v2) shard with a real multi-entry BlockIndex so the appended shard
+    // honors the v4 sub-shard-random-access promise. Without this, this path —
+    // which writes directly via `FileLock`, bypassing
+    // `guard_no_legacy_shard_in_v4` — would write an unframed v1 shard into a v4
+    // file (invalid). A ≤v3 base keeps the legacy monolithic v1 layout.
+    let output_framed = prep.header.format_version >= CURRENT_FORMAT_VERSION;
+    let (encoded, block_index, shard_format_version) = if output_framed {
+        let fc = scx_format_io::FramingConfig::default();
+        let (enc, bi) = scx_format_io::encode_shard_framed(
+            shard_indptr,
+            shard_indices,
+            shard_values,
+            shard_codec,
+            value_encoding,
+            index_dtype_u16,
+            fc.row_group_rows,
+            fc.target_nnz,
+        )?;
+        (enc, bi, CURRENT_SHARD_FORMAT_VERSION)
+    } else {
+        let enc = scx_codec::encode_shard(
+            shard_indptr,
+            shard_indices,
+            shard_values,
+            shard_codec,
+            value_encoding,
+            index_dtype_u16,
+        )?;
+        let bi = BlockIndex {
+            entries: vec![BlockIndexEntry::new(0, shard_rows as u32, 0, 0, 0, shard_nnz)?],
+        };
+        (enc, bi, DEFAULT_WRITE_SHARD_FORMAT_VERSION)
     };
     let mut block_index_bytes = Vec::new();
     block_index.write_to(&mut block_index_bytes)?;
@@ -833,7 +848,7 @@ fn write_csr_chunk(
 
     let sh = ShardHeader {
         magic: SHARD_MAGIC,
-        shard_format_version: DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+        shard_format_version,
         shard_type: derive_shard_type(SectionType::CsrShard),
         codec_id: shard_codec as u8,
         value_encoding: value_encoding as u8,
