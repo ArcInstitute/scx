@@ -494,24 +494,17 @@ pub fn encode_shard_framed(
 
         // Sub-stream offsets are u32 in BlockIndexEntry; a >4 GiB concatenated
         // sub-stream would silently wrap. Fail loud instead (F-c).
-        let ip_off = u32::try_from(indptr_stream.len()).map_err(|_| {
-            ScxError::ShardStreamTooLarge(format!(
-                "framed indptr sub-stream offset {} exceeds u32::MAX",
-                indptr_stream.len()
-            ))
-        })?;
-        let ix_off = u32::try_from(indices_stream.len()).map_err(|_| {
-            ScxError::ShardStreamTooLarge(format!(
-                "framed indices sub-stream offset {} exceeds u32::MAX",
-                indices_stream.len()
-            ))
-        })?;
-        let vv_off = u32::try_from(values_stream.len()).map_err(|_| {
-            ScxError::ShardStreamTooLarge(format!(
-                "framed values sub-stream offset {} exceeds u32::MAX",
-                values_stream.len()
-            ))
-        })?;
+        let offset_u32 = |stream: &[u8], name: &str| -> Result<u32, ScxError> {
+            u32::try_from(stream.len()).map_err(|_| {
+                ScxError::ShardStreamTooLarge(format!(
+                    "framed {name} sub-stream offset {} exceeds u32::MAX",
+                    stream.len()
+                ))
+            })
+        };
+        let ip_off = offset_u32(&indptr_stream, "indptr")?;
+        let ix_off = offset_u32(&indices_stream, "indices")?;
+        let vv_off = offset_u32(&values_stream, "values")?;
         indptr_stream.extend_from_slice(&enc.indptr_bytes);
         indices_stream.extend_from_slice(&enc.indices_bytes);
         values_stream.extend_from_slice(&enc.values_bytes);
