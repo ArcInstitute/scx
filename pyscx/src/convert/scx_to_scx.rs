@@ -88,20 +88,30 @@ pub(crate) fn route_scx_backed_to_scx(
     let no_deletions = backed.kept_to_global.is_none();
     let no_projection = backed.col_projection().is_none();
     let single_modality_source = modality_id.is_none();
-    // A v4 source may hold row-group-framed (v2) shards or, under the compact-trial
-    // cost model, unframed-Scx1-with-sidecar (v1) shards plus separate
-    // DecodeMetadataShard sidecar sections. The verbatim copy path
-    // (`copy_section_verbatim`) hardcodes `has_sidecar = false` and iterates only
-    // CSR entries, so it would abort on a v1+sidecar shard and drop the sidecar
-    // sections. Force v4 sources down the decode-encode path (self-consistent
-    // output; framing/sidecar preservation through passthrough is a follow-on).
+    // Framing gate. A v4 source is passthrough-eligible when it is *purely*
+    // framed — i.e. it holds only row-group-framed (shard-v2) shards, whose
+    // block index is embedded in the shard body, so the verbatim copy path
+    // (`copy_section_verbatim`, `has_sidecar = false`, CSR entries only) carries
+    // it correctly and each v2 shard passes the writer's v4 guard. A *mixed*
+    // compact-trial v4 source additionally holds unframed-Scx1 (shard-v1) shards
+    // with separate `DecodeMetadataShard` sidecar sections; the verbatim path
+    // would drop those sidecars and trip the guard, so such sources still take
+    // the decode-encode path (sidecar-preserving passthrough is a follow-on).
+    // Detect the pure-framed case by the absence of any DecodeMetadataShard
+    // section (a valid v4 file with none holds only framed shards).
     let source_unframed = src_header.format_version <= scx_format_io::DEFAULT_WRITE_FORMAT_VERSION;
+    let source_pure_framed = src_header.format_version <= scx_format_io::CURRENT_FORMAT_VERSION
+        && !src_reader
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == SectionType::DecodeMetadataShard);
     let passthrough_ok = target_codec_for_passthrough
         && target_shard_rows_matches
         && no_deletions
         && no_projection
         && single_modality_source
-        && source_unframed;
+        && (source_unframed || source_pure_framed);
 
     // Output header / writer setup. For passthrough, mirror the
     // source's codec / shard_target_rows / index_dtype so the

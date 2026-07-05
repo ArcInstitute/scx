@@ -55,14 +55,20 @@ def _adata_with_layers(n_obs=80, n_vars=30, n_layers=2, seed=11):
 # ---------------------------------------------------------------------------
 
 
-def test_passthrough_decoded_x_equals_source(synthetic_adata, tmp_dir):
-    """Backed SCX → SCX (matching shard_size + codec, no deletions /
-    projection) yields decoded X that equals the source bit-exact.
+def _assert_passthrough(dst):
+    """Assert the destination's provenance records a backed passthrough."""
+    prov = pyscx.open(dst).provenance()
+    assert any(
+        json.loads(p["params_json"]).get("x_source") == "backed"
+        and json.loads(p["params_json"]).get("passthrough") is True
+        for p in prov
+    ), f"expected passthrough provenance, got {prov}"
 
-    The byte-passthrough fast path requires an UNFRAMED (v3) source — framed v4
-    sources decode-encode (framed byte-copy is a deferred follow-on, and framing
-    is now the default), so build the source explicitly unframed via
-    `row_group_rows=0`."""
+
+def test_passthrough_decoded_x_equals_source_unframed(synthetic_adata, tmp_dir):
+    """Backed SCX → SCX (matching shard_size + codec, no deletions /
+    projection) yields decoded X that equals the source bit-exact — the
+    UNFRAMED (v3) source case (built via `row_group_rows=0`)."""
     src_scx = str(tmp_dir / "src_unframed.scx")
     pyscx.from_anndata(synthetic_adata, src_scx, row_group_rows=0)
 
@@ -74,14 +80,28 @@ def test_passthrough_decoded_x_equals_source(synthetic_adata, tmp_dir):
     dst_x = pyscx.open(dst).to_anndata().X
     assert src_x.shape == dst_x.shape
     np.testing.assert_array_equal(src_x.toarray(), dst_x.toarray())
+    _assert_passthrough(dst)
 
-    # Provenance: x_source="backed", passthrough=True
-    prov = pyscx.open(dst).provenance()
-    assert any(
-        json.loads(p["params_json"]).get("x_source") == "backed"
-        and json.loads(p["params_json"]).get("passthrough") is True
-        for p in prov
-    ), f"expected passthrough provenance, got {prov}"
+
+def test_passthrough_decoded_x_equals_source_framed(synthetic_adata, tmp_dir):
+    """Backed SCX → SCX passthrough for a default (row-group-framed, v4)
+    source. C5 re-enables the byte-copy fast path for pure-framed v4 files
+    (shards carry an in-body BlockIndex, no decode sidecar), so the backed
+    rewrite of a default `from_anndata` file must take the passthrough path
+    and preserve decoded X bit-exact."""
+    src_scx = str(tmp_dir / "src_framed.scx")
+    # No `row_group_rows` → framing on by default (v4).
+    pyscx.from_anndata(synthetic_adata, src_scx)
+
+    adata = pyscx.open(src_scx).to_anndata(backed=True)
+    dst = str(tmp_dir / "dst_framed.scx")
+    pyscx.from_anndata(adata, dst)
+
+    src_x = pyscx.open(src_scx).to_anndata().X
+    dst_x = pyscx.open(dst).to_anndata().X
+    assert src_x.shape == dst_x.shape
+    np.testing.assert_array_equal(src_x.toarray(), dst_x.toarray())
+    _assert_passthrough(dst)
 
 
 # ---------------------------------------------------------------------------

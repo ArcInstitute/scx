@@ -13,6 +13,7 @@ use scx_format_io::compute_shard_stats;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
+use scx_format_io::header::CURRENT_FORMAT_VERSION;
 use scx_format_io::shard::{
     derive_shard_type, BlockIndex, BlockIndexEntry, ShardHeader,
     DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE, SHARD_MAGIC,
@@ -383,6 +384,13 @@ pub fn append_from_reader_with_index_options(
     let old_obs = read_existing_axis(&mut lock, &prep.old_catalog, MetadataAxis::Obs)?;
     validate_obs_schema(&old_obs, &new_obs)?;
 
+    // A framed (v4) base carries shard-v2 shards, so the output header is v4
+    // (set above via `clamped.max(base_version)`). Into a v4 output a framed
+    // source shard byte-copies verbatim (block index in-body); into a ≤v3
+    // output framed source shards must decode-encode to unframed. See
+    // `raw_copy_csr_eligible`.
+    let output_framed = prep.header.format_version >= CURRENT_FORMAT_VERSION;
+
     // Per-source-shard streaming loop.
     let mut write_offset = lock.seek(SeekFrom::End(0))?;
     let mut new_shard_entries: Vec<FullCatalogEntry> = Vec::new();
@@ -406,9 +414,13 @@ pub fn append_from_reader_with_index_options(
         // (dtype / n_minor / codec) is AND-ed with append's own re-split
         // bound: append may split a source shard across `shard_target_rows`,
         // so a verbatim copy is only valid when the source shard already fits.
-        let raw_copy_ok =
-            raw_copy_csr_eligible(&sh, target_index_dtype, prep.target_n_vars, options.codec)
-                && sh.n_major <= options.shard_target_rows.get();
+        let raw_copy_ok = raw_copy_csr_eligible(
+            &sh,
+            target_index_dtype,
+            prep.target_n_vars,
+            options.codec,
+            output_framed,
+        ) && sh.n_major <= options.shard_target_rows.get();
 
         if raw_copy_ok {
             let shard_idx = next_shard_idx(prep.old_per_modality_csr, new_shard_entries.len())?;

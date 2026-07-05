@@ -24,7 +24,8 @@ use arrow::array::{Array, DictionaryArray, Float32Array, Int32Array, StringArray
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
-use scx_format_io::header::FileHeader;
+use scx_format_io::encoder::FramingConfig;
+use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::provenance::ProvenanceEntry;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
@@ -476,6 +477,234 @@ fn merge_raw_copy_byte_identical_to_reencode() {
             "decoded shard {i} must match"
         );
     }
+}
+
+/// Build a single-shard **framed** (v4 / shard-v2) count-matrix input with an
+/// explicit `row_group_rows`. The v4 header + `set_framing` route the shard
+/// through `encode_shard_framed`, so the shard carries a multi-entry
+/// `BlockIndex` (its byte length encodes the group count = `ceil(n_obs / G)`).
+/// Uses a Zstd codec so no Scx1 decode sidecar is emitted — the pure-framed
+/// path C5 re-enables.
+fn write_framed_input(
+    path: &std::path::Path,
+    n_obs: usize,
+    donor: &str,
+    var: &RecordBatch,
+    row_group_rows: u32,
+) {
+    let n_vars = var.num_rows();
+    let nnz_per_row = 8usize;
+    let mut indptr = vec![0u64];
+    let mut indices: Vec<u32> = Vec::new();
+    let mut values: Vec<u8> = Vec::new();
+    for r in 0..n_obs {
+        let mut col = 0u32;
+        for k in 0..nnz_per_row {
+            col += 1 + ((r * 13 + k * 7) % 97) as u32;
+            if col as usize >= n_vars {
+                break;
+            }
+            indices.push(col);
+            values.push(1 + ((r + k) % 5) as u8);
+        }
+        indptr.push(indices.len() as u64);
+    }
+    let mut h = header(n_obs as u64, n_vars as u64);
+    h.format_version = CURRENT_FORMAT_VERSION;
+    let mut writer = ScxWriter::new(path, h).unwrap();
+    writer.set_framing(Some(FramingConfig {
+        row_group_rows,
+        ..Default::default()
+    }));
+    writer.write_obs(&obs_batch(0, n_obs, donor)).unwrap();
+    writer.write_var(var).unwrap();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Zstd,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "convert".to_string(),
+            tool: "streaming_merge_append test fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// The framed byte-copy fast path (C5): merging two **framed** (v4) inputs must
+/// produce a valid v4 output whose CSR shards are byte-copied verbatim — proven
+/// by (a) the output header staying v4, (b) each output shard staying framed
+/// (shard-v2), (c) the block index surviving byte-for-byte (source `G=8` gives
+/// a multi-entry index that the decode-encode path — writer default `G=256` —
+/// could not reproduce for these 40-row shards), and (d) decoded parity.
+#[test]
+fn merge_framed_raw_copy_preserves_v4_and_block_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    // G = 8 over 40 rows → 5 row groups; the writer's decode-encode default is
+    // G = 256 → 1 group, so a preserved multi-entry index proves raw-copy.
+    write_framed_input(&a, 40, "donor_A", &var, 8);
+    write_framed_input(&b, 40, "donor_B", &var, 8);
+
+    let ra = ScxReader::open(&a).unwrap();
+    assert_eq!(ra.header().format_version, CURRENT_FORMAT_VERSION);
+    let src_bi_len = ra
+        .read_shard_header(&ra.catalog().shards_sorted()[0])
+        .unwrap()
+        .block_index_length;
+    assert!(
+        src_bi_len > 4 + 22,
+        "framed source shard (G=8, 40 rows) must carry a multi-entry block index"
+    );
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge_with_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &scx_ops::MergeOptions::default(),
+    )
+    .unwrap();
+
+    let ro = ScxReader::open(&out).unwrap();
+    assert_eq!(
+        ro.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "merging framed inputs must preserve the v4 framed layout"
+    );
+    let shards = ro.catalog().shards_sorted();
+    assert_eq!(shards.len(), 2, "one output shard per framed input shard");
+    for entry in &shards {
+        let sh = ro.read_shard_header(entry).unwrap();
+        assert!(
+            sh.shard_format_version > 1,
+            "merged shard must stay framed (shard-v2)"
+        );
+        assert_eq!(
+            sh.block_index_length, src_bi_len,
+            "raw-copy must preserve the source's multi-entry block index verbatim \
+             (decode-encode at the writer's default G would collapse it)"
+        );
+    }
+    // Decoded parity: merged rows 0..40 == input A, 40..80 == input B.
+    let a_dec = ra.read_csr_shard(0).unwrap();
+    let b_dec = ScxReader::open(&b).unwrap().read_csr_shard(0).unwrap();
+    assert_eq!(ro.read_csr_shard(0).unwrap(), a_dec, "merged shard 0 == A");
+    assert_eq!(ro.read_csr_shard(1).unwrap(), b_dec, "merged shard 1 == B");
+}
+
+/// Merge slow (decode-encode) path under framing: when raw-copy is disabled
+/// (`assume_identical_var = true`) but the inputs are framed, the merge must
+/// still emit a valid v4 file — every re-encoded shard is framed (shard-v2) by
+/// the writer's framing state, not left unframed in a v4 file. Guards the
+/// "slow path frames automatically" half of the C5 merge change.
+#[test]
+fn merge_framed_slow_path_still_emits_v4_framed_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let a = dir.path().join("a.scx");
+    let b = dir.path().join("b.scx");
+    write_framed_input(&a, 40, "donor_A", &var, 8);
+    write_framed_input(&b, 40, "donor_B", &var, 8);
+
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge_with_options(
+        &[a.as_path(), b.as_path()],
+        &out,
+        &scx_ops::MergeOptions {
+            assume_identical_var: true, // disables raw-copy → decode-encode path
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ro = ScxReader::open(&out).unwrap();
+    assert_eq!(
+        ro.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "framed inputs must yield a v4 output even on the decode-encode path"
+    );
+    for entry in &ro.catalog().shards_sorted() {
+        let sh = ro.read_shard_header(entry).unwrap();
+        assert!(
+            sh.shard_format_version > 1,
+            "decode-encoded shard must be framed to stay valid in a v4 file"
+        );
+    }
+    // Decoded parity survives the re-encode.
+    let a_dec = ScxReader::open(&a).unwrap().read_csr_shard(0).unwrap();
+    assert_eq!(ro.read_csr_shard(0).unwrap(), a_dec);
+}
+
+/// Append-side framed byte-copy (C5): appending a framed source shard into a
+/// framed (v4) base must raw-copy it verbatim — the appended shard stays framed
+/// with the source's block index intact, the base header stays v4, and the
+/// decoded rows are correct.
+#[test]
+fn append_from_reader_framed_raw_copy_preserves_v4() {
+    use scx_codec::CodecSelection;
+
+    let dir = tempfile::tempdir().unwrap();
+    let var = wide_var(50_000);
+    let target = dir.path().join("base.scx");
+    let source = dir.path().join("source.scx");
+    write_framed_input(&target, 40, "donor_A", &var, 8);
+    write_framed_input(&source, 40, "donor_B", &var, 8);
+
+    let src_reader = ScxReader::open(&source).unwrap();
+    let src_bi_len = src_reader
+        .read_shard_header(&src_reader.catalog().shards_sorted()[0])
+        .unwrap()
+        .block_index_length;
+    assert!(src_bi_len > 4 + 22, "source shard must be multi-group framed");
+
+    scx_ops::append_from_reader(
+        &target,
+        &src_reader,
+        &scx_ops::AppendOptions {
+            codec: CodecSelection::Auto,
+            shard_target_rows: std::num::NonZeroU32::new(16384).unwrap(),
+            modality_id: 0,
+        },
+        0,
+    )
+    .unwrap();
+    drop(src_reader);
+
+    let post = ScxReader::open(&target).unwrap();
+    assert_eq!(post.n_obs(), 80, "40 base + 40 appended");
+    assert_eq!(
+        post.header().format_version,
+        CURRENT_FORMAT_VERSION,
+        "appending into a framed v4 base must keep the header v4"
+    );
+    let shards = post.catalog().shards_sorted();
+    assert_eq!(shards.len(), 2);
+    for entry in &shards {
+        let sh = post.read_shard_header(entry).unwrap();
+        assert!(sh.shard_format_version > 1, "shard must stay framed");
+        assert_eq!(
+            sh.block_index_length, src_bi_len,
+            "appended shard must be raw-copied verbatim (block index preserved)"
+        );
+    }
+    // Decoded parity for the appended shard.
+    let src_dec = ScxReader::open(&source).unwrap().read_csr_shard(0).unwrap();
+    assert_eq!(
+        post.read_csr_shard(1).unwrap(),
+        src_dec,
+        "appended shard decodes to the source rows"
+    );
 }
 
 /// Micro-bench (P2 / OPT-1.2): same-layout merge via the raw-copy fast path
