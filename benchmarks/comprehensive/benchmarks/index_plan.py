@@ -625,6 +625,10 @@ def run(
     n_obs = dataset.n_obs
     n_vars = dataset.n_vars
     pairs_per_batch = min(_DEFAULT_PAIRS_PER_BATCH, max(1, n_obs // 4))
+    # Preserve the harness-requested counts alongside the effective (scaled)
+    # ones so the result JSON records whether the >=30k down-scaling applied —
+    # otherwise a reader can't tell a natively-small run from a capped one.
+    harness_n_runs = n_runs
     n_batches = _n_batches_for(n_obs)
     n_runs = _n_runs_for(n_obs, n_runs)
     hvg = _resolve_hvg(n_vars)
@@ -636,6 +640,7 @@ def run(
         metadata={
             "pairs_per_batch": pairs_per_batch,
             "n_batches_target": n_batches,
+            "n_batches_default": _DEFAULT_N_BATCHES,
             "hvg_size": int(hvg.size) if hvg is not None else None,
             "normalize": True,
             "sort_by_shard": True,
@@ -643,6 +648,7 @@ def run(
             "cache_shards": 128,
             "locality_group_size": _LOCALITY_GROUP_SIZE,
             "n_runs": n_runs,
+            "n_runs_harness": harness_n_runs,
             "cold_cache": cold_cache,
             "batch_size_seq_ceiling": 2 * pairs_per_batch,
         },
