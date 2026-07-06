@@ -476,10 +476,13 @@ numbers in [`docs/performance.md`](docs/performance.md#grouped-sharding-scx-sort
 comprehensive report's "Grouped Read/Write", "Out-of-Core Peak RSS", and
 "Format Capability Matrix" sections).
 
-- **shardad's genuine strengths.** Integer-count **compression** — 1.5–2.5×
-  smaller than SCX on raw UMI counts (`census_1m` 1.6 GB vs 4.0 GB; ≈parity on
-  log-normalized/float data), and **single-shot grouped-write** speed on
-  in-RAM-sized data (it loads an in-memory CSR then encodes; SCX streams).
+- **shardad's genuine strengths.** Integer-count **compression** — smaller than
+  SCX on raw UMI counts, though the margin is codec-dependent: **~1.0–1.7×** vs
+  SCX's best integer codec (`compact_trial`; `census_1m` 1.6 vs 2.8 GB ≈1.7×,
+  ≈parity on `tabula_100k`, SCX smaller on `pbmc3k`), larger only against the
+  default `auto` codec (`census_1m` 1.6 vs 4.0 GB). ≈parity on log-normalized/
+  float data. Also **single-shot grouped-write** speed on in-RAM-sized data (it
+  loads an in-memory CSR then encodes; SCX streams).
 - **Where SCX wins.** Per-perturbation `read_group` (up to **13×** faster — a
   byte-range read of just the group's rows); **out-of-core** reads (at
   `census_5m`, SCX streaming peaks at ~19 GB vs shardad's ~87 GB full

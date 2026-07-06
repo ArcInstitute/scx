@@ -942,11 +942,17 @@ Capability Matrix" sections.
 **Beyond grouped sharding (full cross-format campaign, release build).** shardad also
 runs as a first-class format in the comprehensive suite:
 
-- **Compression** — shardad is smaller than scx on **integer counts** (`census_1m`
-  1.62 GB vs 3.99 GB ≈2.5×; `census_5m` 8.7 GB vs 15.1 GB; `tabula_100k` 222 vs 449 MB)
-  but ≈parity on **log-normalized/float** data (`smartseq2_lognorm` 504 vs 444 MB — scx
-  smaller; `tabula_100k_lognorm` 294 vs 357 MB — shardad smaller). shardad's byte-filter
-  is tuned for integer UMI streams; scx's pcodec/zstd competes on floats.
+- **Compression** — shardad is smaller than scx on **integer counts**, but the margin
+  depends entirely on which scx codec you compare. Against the **default `scx_auto`** the
+  gap looks large (`census_1m` 1.62 vs 3.99 GB ≈2.5×; `tabula_100k` 222 vs 449 MB), but
+  `scx_auto` is not scx's best integer codec — against **`scx_compact_trial`** (framed
+  ShufDeltaZstd, the codec to compare) the gap narrows to **~1.0–1.7×** (`census_1m` 1.62
+  vs 2.80 GB ≈1.7×; `tabula_100k` 222 vs 234 MB ≈parity; `chemogenetic_rgfp` 802 vs 968 MB
+  ≈1.2×), and scx wins the small datasets (`pbmc3k` 4.5 vs 6.2 MB). ≈parity on
+  **log-normalized/float** data. shardad's byte-filter is tuned for integer UMI streams;
+  scx's ShufDeltaZstd/pcodec/zstd competes closely. See the detailed
+  [scx vs shardad — full feature parity](#scx-vs-shardad--full-feature-parity) section
+  below for the full per-dataset tables.
 - **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
   ~flat while shardad must materialize the whole matrix —
 
