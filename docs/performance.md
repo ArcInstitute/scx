@@ -841,8 +841,8 @@ data- and codec-dependent and not guaranteed to shrink — the headline value is
 
 Locality: the comparison is against an isolated
 unsorted baseline produced by the *same* writer (`scx compact --reshape-obs
---index-obs cell_type`), so the format-version sidecars (decode metadata, sharded
-obs) are present in both and don't confound the delta. The dominant cell types
+--index-obs cell_type`), so the same format-version features (sharded obs) are
+present in both and don't confound the delta. The dominant cell types
 drop from 3–4 shards to 1–2 contiguous shards; the 2.6× figure is conservative
 because real atlas data is already partially clustered by cell type. The
 synthetic worst-case (`bench_ops_sort_locality`: 40k cells, 8 categories cycled
@@ -1270,6 +1270,15 @@ under scx's own materialize (16.6 GB).** This is scx's structural out-of-core
 advantage: full-matrix approaches (both shardad and scx `to_anndata`) grow with
 dataset size, while scx streaming stays bounded — the gap widens further at
 census_5m/10m (not run here).
+
+> **Note — why `scx_materialize` here (16.6 GB) ≠ the "Full read → AnnData" peak
+> above (~2.3 GB) for census_1m:** the two rows measure different things. The
+> `read_full` benchmark measures a steady-state `to_anndata()` peak; the
+> `ooc_rss_boundary` `scx_materialize` op runs back-to-back with `scx_stream` in
+> one process (and reads through a backed handle), so its high-water mark captures
+> transient decode buffers + the residue of the preceding streaming pass, not the
+> final AnnData size. Compare each column *within* its own table, not across the
+> two tables.
 
 ### Selective / row-subset read (wall s)
 

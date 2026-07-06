@@ -1521,9 +1521,9 @@ the analysis op. So the layout choice matters as much as the device flag:
 
 - **Prefer storing raw integer counts (`X` → Scx1) and deriving log-norm
   on-device.** Raw scRNA-seq counts auto-route to the Scx1 codec
-  (Delta-Golomb / FOR-BP / Rice) — the one codec with a decode-metadata sidecar
-  ([format.md §4.2](format.md#42-decode-metadata-sidecar)) and GPU decode
-  kernels, so it is the codec the device-side decode path targets. Open the
+  (Delta-Golomb / FOR-BP / Rice) — the codec with GPU decode kernels, so it is
+  the codec the device-side decode path targets; framed Scx1 shards decode
+  group-by-group in VRAM (random access via the row-group block index). Open the
   counts and run `normalize_total` / `log1p` in VRAM (the
   `ScxLazyTransformedDataset` chain, or `rsc.pp.*` on the device AnnData) so the
   log-normalized matrix is produced on the GPU and **never round-trips through a

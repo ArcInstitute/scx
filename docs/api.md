@@ -761,9 +761,8 @@ Rewrite file reclaiming deleted/orphaned space.
 
 ### `scx_ops::optimize(input, output, codec, obs_shard_policy) → Result<()>`
 Faithful upgrade of a single-modality file: re-encode + `canonicalize_csr`
-every CSR-backed shard (X / layer / obsp-CSR) so the output carries decode
-sidecars and a real `format_version=3` canonical-CSR claim, without a full
-reconvert. Preserves row layout, obs/var, obsm/varm/obsp/varp, uns, predicate
+every CSR-backed shard (X / layer / obsp-CSR) and row-group-frames it, stamping
+`format_version=4`, without a full reconvert. No decode sidecar is written. Preserves row layout, obs/var, obsm/varm/obsp/varp, uns, predicate
 indexes, and the deletion-vector section (does not apply deletions); drops the
 CSC sidecar. Multimodal inputs are rejected (use `compact`). `obs_shard_policy`
 (`ObsShardPolicy::{Off, Auto, Always}`, default `Auto`) migrates a

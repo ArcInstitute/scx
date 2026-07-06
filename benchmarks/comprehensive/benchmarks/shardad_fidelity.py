@@ -49,9 +49,22 @@ def run(
     if dataset.name not in _DATASETS:
         return None
 
+    import os
+
     import anndata
     import numpy as np
-    from shardad import ShardedArchive, write_sharded
+
+    try:
+        from shardad import ShardedArchive, write_sharded
+    except ImportError as e:  # pragma: no cover - env-dependent
+        raise RuntimeError(
+            "shardad is not installed in this environment. Install it "
+            "(`pip install ~/dev/python/shardad`) or run under the scx-bench conda env."
+        ) from e
+
+    # Mirror ShardadRunner: derive worker count from RAYON_NUM_THREADS so the
+    # fidelity write parallelism is consistent with the parallel-scaling sweeps.
+    n_workers = int(os.environ.get("RAYON_NUM_THREADS") or 4)
 
     result = BenchmarkResult(
         benchmark="shardad_fidelity",
@@ -66,7 +79,7 @@ def run(
     try:
         src = _materialize_source(dataset, workdir)
         out = workdir / f"{dataset.name}.shad"
-        write_sharded(str(src), str(out), overwrite=True, n_workers=4)
+        write_sharded(str(src), str(out), overwrite=True, n_workers=n_workers)
 
         adata_src = anndata.read_h5ad(str(src))
         arch = ShardedArchive(str(out))
@@ -97,8 +110,11 @@ def run(
         except Exception as e:  # record the failure, don't crash the bench
             logger.warning("dense/float16 materialization failed: %s", e)
 
+        # Fold the dense/float16 in-decode materialization into the pass/fail
+        # gate: a materialization that raises or returns the wrong shape/dtype
+        # (dense_f16_ok == 0) is a real fidelity regression, not just logged.
         overall_passed = bool(
-            shape_match and sparsity_match and n_value_mismatches == 0
+            shape_match and sparsity_match and n_value_mismatches == 0 and dense_f16_ok
         )
         wall = time.perf_counter() - t0
         result.metadata.update(

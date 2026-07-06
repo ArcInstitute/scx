@@ -195,18 +195,20 @@ def _check_correctness(
     sample = [lbl for lbl in labels if lbl != reference][:_MAX_READ_LABELS]
     for lbl in sample:
         grp = read_group(lbl)
-        if grp is None or grp.n_obs <= 0 or not all(
-            str(v) == lbl for v in grp.obs[group_col]
-        ):
+        # Vectorized label check (pandas) — avoids a slow Python-level loop over
+        # the obs Series for large groups.
+        if grp is None or grp.n_obs <= 0 or not (
+            grp.obs[group_col].astype(str) == lbl
+        ).all():
             passed = 0
             break
 
     reference_isolated = 1
     if reference is not None:
         ref = read_reference()
-        if ref is None or ref.n_obs <= 0 or not all(
-            str(v) == reference for v in ref.obs[group_col]
-        ):
+        if ref is None or ref.n_obs <= 0 or not (
+            ref.obs[group_col].astype(str) == reference
+        ).all():
             reference_isolated = 0
     return passed, reference_isolated, n_groups
 

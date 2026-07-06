@@ -65,7 +65,7 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **scx-sparse** | CSR/CSC matrix types with scipy-compatible dtypes | `csr` (`ScxCsr`), `csc` (`ScxCsc`), `transpose` (streaming CSR→CSC), `convert` (CSR ↔ dense) |
 | **scx-format** | Pure on-disk layout/spec — no `std::fs`, no `memmap2` (the surface conformance vectors verify against) | `header`, `catalog`, `catalog_view`, `shard`, `section`, `modality`, `codec_select`, `provenance`, `csc_policy`, `error`, `checksum` |
 | **scx-format-io** | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars; re-exports the full `scx-format` surface | `reader`, `writer`, `backed`, `shard_decode`, `shard_source`, `encoder`, `csc_sidecar`, `bitmap`, `deletion_vectors`, `mem`, `arrow_compat` |
-| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place sidecar + canonical v3 upgrade), `merge`, `rollback`, `flock` |
+| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place re-encode + row-group-frame → v4), `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |

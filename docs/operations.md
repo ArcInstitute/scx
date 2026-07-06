@@ -126,12 +126,12 @@ historical file size.
 ## Optimize
 
 `scx optimize <input> <output>` upgrades an existing **single-modality**
-file in place: it decodes → `canonicalize_csr` → re-encodes every CSR-backed
-shard (`X`, layers, and obs×obs `obsp` CSR graphs), so the output carries
-[decode-metadata sidecars](format.md#42-decode-metadata-sidecar) and legitimately
-claims the v3 canonical-CSR invariant — without a full reconvert. This is how a
-pre-v3 / sidecar-less file gains the random-access and GPU device-decode benefits
-(see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
+file in place: it decodes → `canonicalize_csr` → re-encodes and row-group-frames
+every CSR-backed shard (`X`, layers, and obs×obs `obsp` CSR graphs), stamping
+`format_version=4` — without a full reconvert. This is how an older file gains the
+row-group random-access substrate and GPU device-decode benefits: framed Scx1
+shards keep the GPU device-decode route (decoding group-by-group in VRAM). No
+decode sidecar is written (see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
 
 Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
 - It does **not** apply deletions — the deletion-vector section is carried

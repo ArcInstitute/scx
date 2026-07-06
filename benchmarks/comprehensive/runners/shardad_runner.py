@@ -162,10 +162,12 @@ class ShardadRunner(FormatRunner):
             X = adata.X
             if gene_indices is not None:
                 X = X[:, gene_indices]
+            # Touch the decoded payload to force materialization without an
+            # O(rows*cols) dense blow-up (`.to_anndata` already fully decoded X).
             if sp.issparse(X):
-                X.toarray()
+                _ = X.nnz + int(X.data.sum())
             else:
-                _ = X.shape
+                _ = X.shape + (int(X.sum()),)
 
         _, timing = self.timed_run(_read_subset)
         timing.extra = {"mechanism": mechanism}
