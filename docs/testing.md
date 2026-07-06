@@ -9,7 +9,7 @@
 | `scx-format` | `tests/integration.rs` | Round-trip validation, minimum file size, checksum verification |
 | `scx-codec` | Per-module unit tests | Rice, FOR-BP (scalar + SIMD BitPacker4x), Delta-Golomb, LZ4+shuffle, Pcodec, byte-shuffle encode/decode round-trips. Reference vector tests for all codecs. |
 | `scx-sparse` | Unit tests | CSR construction, row slicing, dense conversion |
-| `scx-format-io` | Unit tests + `tests/` | Reader/writer round-trip, backed I/O, Arrow compat, bitmap, CSC sidecar, decode sidecar |
+| `scx-format-io` | Unit tests + `tests/` | Reader/writer round-trip, backed I/O, Arrow compat, bitmap, CSC sidecar |
 | `scx-convert` | Unit tests + `tests/` | h5ad/h5mu streaming ingest, parallel determinism, HDF5 thread-safety probe |
 | `scx-ops` | `tests/` | Append, delete, compact, rollback, merge, flock concurrency, predicate-index rewrite, streaming merge/append |
 | `scx-engine` | Unit tests | Predicate parsing, pipeline validation, pushdown, fused ops |

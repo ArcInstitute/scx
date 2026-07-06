@@ -261,20 +261,19 @@ Implementation: `scx-codec/src/{byte_delta.rs,dispatch.rs}` (codec +
 
 **Loader adoption (training / scattered reads).** The backed reader's scattered
 gather (`BackedCsrReader::read_rows_with`) decodes only the row-groups a
-scattered request touches via the `BlockIndex`, independent of the bit-level Scx1
-sidecar path. A framed shard is block-index eligible
-(`BackedCsrReader::block_index_eligible`) — cost-eligible + framed — regardless of
-the `scatter_sidecar` decision, so a framed training file gets random-access
-decode even with the Scx1 sidecar disabled. The `IndexPlanDataset` /
-`SparseCellSetDataset` prefetchers skip pre-warming block-index-eligible framed
-shards so the gather reaches the group-level path (env kill-switch
-`SCX_SCATTER_BLOCK_INDEX=0`; per-dataset opt-out `scatter_block_index=False` on
-`IndexPlanDataset`). Adoption is observable via
+scattered request touches via the `BlockIndex` — the codec-agnostic random-access
+path for all framed shards. A framed shard is block-index eligible
+(`BackedCsrReader::block_index_eligible`) — cost-eligible + framed — so a framed
+training file gets random-access decode without any per-row sidecar. The
+`IndexPlanDataset` / `SparseCellSetDataset` prefetchers skip pre-warming
+block-index-eligible framed shards so the gather reaches the group-level path
+(env kill-switch `SCX_SCATTER_BLOCK_INDEX=0`; per-dataset opt-out
+`scatter_block_index=False` on `IndexPlanDataset`). Adoption is observable via
 `IndexPlanDataset.cache_metrics()["block_index_groups"]` (`> 0` ⇒ the framed path
-was taken; `sidecar_groups` / `full_shard_groups` are the other two dispatch
-routes). The `read_scattered` comprehensive benchmark drives an unsorted
-scattered gather over a framed compact-trial file and gates
-`block_index_groups ≥ 1` + `block_index_adoption_rate == 1.0`.
+was taken; `full_shard_groups` is the fallback route). The `read_scattered`
+comprehensive benchmark drives an unsorted scattered gather over a framed
+compact-trial file and gates `block_index_groups ≥ 1` +
+`block_index_adoption_rate == 1.0`.
 
 **Choosing `row_group_rows` (G).** The `compression` + `read_scattered` sweep over
 `G ∈ {128, 256, 512, 1024}` (2026-07-04, pbmc3k/pbmc10k/smartseq2/tabula_sapiens_100k):
@@ -333,22 +332,19 @@ on integer-count `tabula_sapiens_100k` and does not regress on float/normalized 
 it picks the heuristic winner there.) Implementation:
 `scx-format-io/src/encoder.rs::encode_one_shard`.
 
-**Two-layer cost model (`--keep-gpu-sidecar`).** By default a framed shard drops
-the Scx1 `DecodeSidecar` (framed shards random-access via the `BlockIndex`). Since
-that sidecar is also the FOR-BP/Rice **GPU device-decode** + bit-level per-row
-path, `compact-trial` can instead keep a
-Scx1-friendly (integer, low-median) shard **unframed with its sidecar** when GPU /
-per-row access matters — via `--keep-gpu-sidecar` (or an `--index-preset training`
-signal). The result is a v4 file that legitimately **mixes** framed shards and
-unframed-Scx1-with-sidecar shards; both are random-access-safe (framed → group
-`BlockIndex`; unframed Scx1 → per-row sidecar). Without the flag, Scx1 is kept only
-when it does not regress size (`SCX_COMPACT_TRIAL_GPU_MARGIN` tunes the slack).
+**Always frame.** Every framed shard random-accesses via the codec-agnostic
+`BlockIndex`, and framed Scx1 shards decode group-by-group **directly in VRAM** —
+so there is no separate GPU / per-row representation to preserve. `compact-trial`
+therefore always emits a framed shard, picking the per-shard smaller of
+{heuristic winner, ShufDeltaZstd}. (The historical two-layer cost model that kept
+a Scx1-friendly shard unframed with a decode sidecar — the `--keep-gpu-sidecar`
+flag / `SCX_COMPACT_TRIAL_GPU_MARGIN` — was removed with the decode sidecar; see
+[format.md § 4.2](format.md#42-decode-metadata-sidecar-removed--section-id-26-reserved).)
 
 **Surfaces.** `scx convert`, `scx optimize` (`--codec compact-trial|shufdelta
---row-group-rows N [--keep-gpu-sidecar]`, which reports framed / ShufDeltaZstd /
-kept-unframed-Scx1 shard counts), and `pyscx.from_anndata(..., codec=...,
-row_group_rows=N, keep_gpu_sidecar=...)` all produce framed output. A framed
-**CSC** sidecar is produced whenever framing is requested alongside CSC — e.g.
+--row-group-rows N`, which reports framed / ShufDeltaZstd shard counts), and
+`pyscx.from_anndata(..., codec=..., row_group_rows=N)` all produce framed output.
+A framed **CSC** sidecar is produced whenever framing is requested alongside CSC — e.g.
 `pyscx.from_anndata(csc="always", row_group_rows=N)` or `scx convert --csc
 always --row-group-rows N` (the CSC producers thread an explicit `FramingConfig`
 rather than relying on writer state; `scx build-csc` / mutating-op `--rebuild-csc`

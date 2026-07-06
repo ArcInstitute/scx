@@ -380,16 +380,17 @@ pyscx.build_csc("data.scx", "data_with_csc.scx",
                 memory_limit="8G", csc_cols_per_shard=10000)
 ```
 
-#### Upgrade an older file (add decode sidecars)
+#### Upgrade an older file (re-encode + row-group-frame)
 
-`scx optimize` re-encodes CSR shards to add decode sidecars and canonicalize to
-`format_version` 3. For full semantics, see
+`scx optimize` re-encodes and canonicalizes CSR shards and row-group-frames them
+(codec-agnostic random access via the row-group `BlockIndex`), stamping
+`format_version` 4. For full semantics, see
 [docs/operations.md § Optimize](operations.md#optimize).
 
 ```bash
-scx optimize data.scx data_v3.scx
+scx optimize data.scx data_v4.scx
 scx optimize data.scx data.scx --force   # in-place
-scx validate --deep data_v3.scx
+scx validate --deep data_v4.scx
 ```
 
 #### Convert back to h5ad

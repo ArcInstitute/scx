@@ -728,59 +728,60 @@ sbatch script: `benchmarks/index_plan_bench_1m.sbatch`. Result JSONs from the
 Floors in `thresholds.yaml` set at 0.5× the 1M medians — re-pin if/when
 fixtures grow beyond memory.
 
-#### Scattered pair-gather via the per-row decode sidecar (L1+L2)
+#### Scattered pair-gather via the row-group BlockIndex (L1+L2)
 
 For `streaming_mode=indexplan` (STATE_TX), each batch's `(pert, ctrl)` pairs are
 scattered randomly across shards. The legacy gather **full-decodes every touched
 shard** (`read_shard_cached_arc`) to extract a handful of rows; when the touched
 shard set exceeds the byte-budgeted shard cache this thrashes — Census 1M
-(62 shards) collapsed to **0.13 batches/s**. The sidecar gather routes the
-scattered rows through `BackedCsrReader::read_rows_with`, which decodes the
-touched rows **O(rows)** from the scx1 per-row **decode sidecar** instead of
-O(shard) (L1), and a sidecar-aware prefetch (L2) skips warming sidecar-eligible
-cold shards so the O(rows) path isn't negated by eager full-shard warms.
+(62 shards) collapsed to **0.13 batches/s**. The block-index gather routes the
+scattered rows through `BackedCsrReader::read_rows_with`, which decodes only the
+row groups containing the touched rows **O(rows)** via the codec-agnostic
+row-group `BlockIndex` (framing) instead of O(shard) (L1), and a block-index-aware
+prefetch (L2) skips warming block-index-eligible cold shards so the O(rows) path
+isn't negated by eager full-shard warms.
 
-Measured (Lambda HPC, scx-bench pyscx 0.9.1, regenerated sidecar fixtures,
-`lookahead=4`, `cache_shards=128`, `max_memory_mb=8192`; sidecar on = the
-`scatter_sidecar` default, off = the L2 prefetch-skip disabled). Census 1M, where
-shards exceed the cache budget → thrash:
+Measured (Lambda HPC, scx-bench pyscx 0.9.1, regenerated framed fixtures,
+`lookahead=4`, `cache_shards=128`, `max_memory_mb=8192`; block-index on = the
+`scatter_block_index` default, off = the L2 prefetch-skip disabled). Census 1M,
+where shards exceed the cache budget → thrash:
 
-| scenario | pairs/batch | sidecar batches/s | legacy batches/s | speedup | p50 latency (sidecar / legacy) |
+| scenario | pairs/batch | block-index batches/s | legacy batches/s | speedup | p50 latency (block-index / legacy) |
 |---|---|---|---|---|---|
 | random   | 32  | 59.9 | 0.94 | **64×** | 11 ms / 256 ms |
 | random   | 128 | 20.5 | 0.30 | **68×** | 44 ms / 4815 ms |
 | locality | 2   | 170  | 17   | 10×   | 2.6 ms / 1.0 ms |
 | locality | 128 | 20.1 | 0.58 | 35×   | 44 ms / 917 ms |
 
-**Peak RSS drops** with the sidecar (no full-shard pool): Census 1M `bs=2`
-**3.06 GB vs 14.9 GB** (~5× less); tabula_sapiens_100k `bs=2` 1.06 GB vs 3.40 GB
-(3× less) — the streaming memory ceiling is preserved.
+**Peak RSS drops** with the block-index path (no full-shard pool): Census 1M
+`bs=2` **3.06 GB vs 14.9 GB** (~5× less); tabula_sapiens_100k `bs=2` 1.06 GB vs
+3.40 GB (3× less) — the streaming memory ceiling is preserved.
 
 **Regime.** The *throughput* win requires cache-thrash (touched shards > cache
 budget). When the shard set fits the cache (e.g. tabula's 7 shards), the
 full-shard path warms once and is comparable or marginally faster at tiny batch
 sizes — there the win is **memory**, which is universal. The per-dataset
-`scatter_sidecar=false` kwarg (and the process-wide `SCX_SCATTER_SIDECAR=0`
+`scatter_block_index=false` kwarg (and the process-wide `SCX_SCATTER_BLOCK_INDEX=0`
 kill-switch) restore the legacy path for the fits-cache regime.
 
-**`SparseCellSetDataset` defaults the other way (`scatter_sidecar=false`).** The
-cell-set loader serves a cache-*friendly* regime (sorted data + a reused
+**`SparseCellSetDataset` defaults the other way (`scatter_block_index=false`).**
+The cell-set loader serves a cache-*friendly* regime (sorted data + a reused
 control-pool cache → a small working set that fits the shard cache and is touched
-on most batches). There the sidecar's "skip the warm, decode O(rows) each batch"
+on most batches). There the block-index "skip the warm, decode O(rows) each batch"
 strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
 populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
 recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
-337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_sidecar=true` for a
-genuinely cache-hostile cell-set run (working set ≫ cache), where the per-row
-sidecar's bounded peak RAM is the memory-safe choice. The gate is per-reader: the
-`IndexPlanDataset` defaults above are unchanged, and `SCX_SCATTER_SIDECAR=0`
-remains a hard master kill-switch over both.
+337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_block_index=true` for a
+genuinely cache-hostile cell-set run (working set ≫ cache), where the
+row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
+per-reader: the `IndexPlanDataset` defaults above are unchanged, and
+`SCX_SCATTER_BLOCK_INDEX=0` remains a hard master kill-switch over both.
 
-**Sidecars are a write-time property** (emitted by default for Scx1 integer-CSR
-shards within a 25% overhead budget). `.scx` files written before the sidecar
-writer (pre-0.9.x) carry none and silently fall back to full-shard — **regenerate
-fixtures** (`scx info <f> --json` → `decode/*` sections should equal `n_csr_shards`
-for integer-count files) before expecting the win. Sweep results:
+**Framing is a write-time property** (v4 writers row-group-frame all shards by
+default; codec-agnostic, so it covers every codec, not just Scx1). `.scx` files
+written before framing (pre-v4) carry no `BlockIndex` and silently fall back to
+full-shard — **regenerate fixtures** (or `scx optimize` in place; `scx info <f>
+--json` reports framed shards) before expecting the win. Sweep results:
 `benchmarks/comprehensive/results/phase5/T5_sidecar_sweep.md`; driver
 `benchmarks/scripts/phase5_sidecar_sweep.py`.
 
@@ -840,8 +841,8 @@ data- and codec-dependent and not guaranteed to shrink — the headline value is
 
 Locality: the comparison is against an isolated
 unsorted baseline produced by the *same* writer (`scx compact --reshape-obs
---index-obs cell_type`), so the format-version sidecars (decode metadata, sharded
-obs) are present in both and don't confound the delta. The dominant cell types
+--index-obs cell_type`), so the same format-version features (sharded obs) are
+present in both and don't confound the delta. The dominant cell types
 drop from 3–4 shards to 1–2 contiguous shards; the 2.6× figure is conservative
 because real atlas data is already partially clustered by cell type. The
 synthetic worst-case (`bench_ops_sort_locality`: 40k cells, 8 categories cycled
@@ -941,11 +942,17 @@ Capability Matrix" sections.
 **Beyond grouped sharding (full cross-format campaign, release build).** shardad also
 runs as a first-class format in the comprehensive suite:
 
-- **Compression** — shardad is smaller than scx on **integer counts** (`census_1m`
-  1.62 GB vs 3.99 GB ≈2.5×; `census_5m` 8.7 GB vs 15.1 GB; `tabula_100k` 222 vs 449 MB)
-  but ≈parity on **log-normalized/float** data (`smartseq2_lognorm` 504 vs 444 MB — scx
-  smaller; `tabula_100k_lognorm` 294 vs 357 MB — shardad smaller). shardad's byte-filter
-  is tuned for integer UMI streams; scx's pcodec/zstd competes on floats.
+- **Compression** — shardad is smaller than scx on **integer counts**, but the margin
+  depends entirely on which scx codec you compare. Against the **default `scx_auto`** the
+  gap looks large (`census_1m` 1.62 vs 3.99 GB ≈2.5×; `tabula_100k` 222 vs 449 MB), but
+  `scx_auto` is not scx's best integer codec — against **`scx_compact_trial`** (framed
+  ShufDeltaZstd, the codec to compare) the gap narrows to **~1.0–1.7×** (`census_1m` 1.62
+  vs 2.80 GB ≈1.7×; `tabula_100k` 222 vs 234 MB ≈parity; `chemogenetic_rgfp` 802 vs 968 MB
+  ≈1.2×), and scx wins the small datasets (`pbmc3k` 4.5 vs 6.2 MB). ≈parity on
+  **log-normalized/float** data. shardad's byte-filter is tuned for integer UMI streams;
+  scx's ShufDeltaZstd/pcodec/zstd competes closely. See the detailed
+  [scx vs shardad — full feature parity](#scx-vs-shardad--full-feature-parity) section
+  below for the full per-dataset tables.
 - **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
   ~flat while shardad must materialize the whole matrix —
 
@@ -1174,3 +1181,183 @@ target for accelerator PRs; format / cloud / multimodal PRs pin
 `v0.6.2-n_counts-augmentation` explicitly. See the [Canonical
 baseline](#canonical-baseline) table above for coverage details.
 `gate_candidate.py` with no flags gates against `LATEST`.
+
+## scx vs shardad — full feature parity
+
+Direct head-to-head against [shardad](https://github.com/ArcInstitute/shardad)
+(`0.5.1`), the condition-grouped sharded `.h5ad` replacement for perturbation
+screens, across **every** benchmarkable shardad feature — not just compression.
+Measured on a Chimera CPU node (scx `0.11.0`, always-framed; shardad `0.5.1`) via
+the comprehensive harness (`benchmarks/comprehensive/benchmarks/{compression,
+write,read_full,read_selective,parallel_scaling,parallel_write_scaling,memory,
+grouped_read,ooc_rss_boundary,shardad_fidelity}.py`). scx is shown as `scx_auto`
+(default per-shard codec) and `scx_compact_trial` (the per-shard smaller of the
+heuristic winner vs ShufDeltaZstd — scx's best integer codec). Datasets span
+tiny→census_1m plus the perturbation/grouped set (replogle_k562, tahoe_c38,
+chemogenetic_rgfp — shardad's home turf).
+
+**Headline:** the two projects trade wins by axis. **shardad** leads on
+compression of large integer counts, write speed, and small/medium read peak-RSS
+(its uint16 in-decode materialization). **scx** leads on out-of-core streaming RAM
+at scale, grouped query latency, and carries a vastly broader capability set (GPU,
+query engine, R, cloud, multimodal, ML loader). The old self-reported "shardad
+1.9–3.2× smaller than scx 0.8.7 on integer counts" has narrowed to **~1.0–1.7×**
+against scx `0.11.0`'s framed ShufDeltaZstd.
+
+### Compression — on-disk size (MB, lower is better) + ratio vs source h5ad
+
+| dataset | scx_auto | scx_compact_trial | shardad | shardad vs best-scx |
+|---|---:|---:|---:|---|
+| pbmc3k | 4.8 (4.5×) | **4.5 (4.8×)** | 6.2 (3.5×) | scx 1.38× smaller |
+| pbmc10k | 39.8 | **30.1 (6.7×)** | 31.7 (6.4×) | ~parity (scx 1.05×) |
+| smartseq2 | 552.7 | 262.9 (4.1×) | **253.2 (4.2×)** | shardad 4% smaller |
+| tabula_100k | 448.9 | 233.9 (6.8×) | **222.2 (7.1×)** | shardad 5% smaller |
+| census_1m | 3989 | 2802 (4.1×) | **1622 (7.0×)** | **shardad 1.73× smaller** |
+| replogle_k562 | 2345 | 2313 | **2237 (1.7×)** | shardad 3% smaller |
+| tahoe_c38 | 1563 | 1516 | **1403 (1.6×)** | shardad 8% smaller |
+| chemogenetic_rgfp | 1305 | 968 (7.6×) | **802 (9.1×)** | shardad 1.21× smaller |
+
+shardad leads compression on 6/8 (by 3–42%); scx wins the two smallest. The
+largest gap is census_1m (shardad 1.62 GB vs scx 2.80 GB). scx `compact_trial`
+consistently beats `scx_auto` on integer counts (it is the codec to compare).
+
+### Write speed (wall s, lower is better)
+
+| dataset | scx_auto | scx_compact_trial | shardad |
+|---|---:|---:|---:|
+| pbmc10k | 1.82 | 2.38 | **0.86** |
+| smartseq2 | 5.48 | 8.29 | **4.55** |
+| tabula_100k | **4.99** | 5.47 | 6.30 |
+| census_1m | 31.3 | 31.8 | **24.6** |
+| replogle_k562 | 29.3 | 28.2 | **13.6** |
+| tahoe_c38 | 13.2 | 13.6 | **9.6** |
+| chemogenetic_rgfp | 21.5 | 22.6 | **16.3** |
+
+shardad writes faster on 6/7 (multiprocessing + a single simple codec). **Caveat:**
+scx write peak-RSS is *not* directly comparable — scx materializes the source
+in-process — so only size + wall are reported here.
+
+### Full read → AnnData (wall s / peak RSS MB)
+
+| dataset | scx_auto | scx_compact_trial | shardad |
+|---|---|---|---|
+| pbmc10k | 0.38 / 338 | 0.67 / 340 | **0.24** / 334 |
+| smartseq2 | **1.22** / 432 | 1.65 / 451 | 1.29 / **346** |
+| tabula_100k | **0.87** / 514 | 1.14 / 569 | 1.74 / **347** |
+| census_1m | 5.45 / 2317 | **4.80** / 2732 | 5.31 / **551** |
+| replogle_k562 | 5.74 / 2904 | 5.84 / 2962 | **4.26 / 345** |
+| tahoe_c38 | **3.39** / 1537 | 3.35 / 1660 | 3.71 / **428** |
+| chemogenetic_rgfp | **2.78** / 772 | 3.70 / 1081 | 4.74 / **392** |
+
+Read **speed** is roughly parity, dataset-dependent. Read **peak RSS** is
+shardad's clear win — its `to_anndata` materializes narrow uint16 CSR, while scx's
+`to_anndata` builds float32 CSR (the "in-decode dtype materialization" gap noted in
+the design comparison; scx's answer is its streaming accelerators, which never
+build full X — see below). On census_1m scx's f32 AnnData is ~2.3 GB vs shardad's
+uint16 ~0.55 GB.
+
+### Out-of-core streaming vs materialize — peak RSS (MB), the at-scale story
+
+`ooc_rss_boundary`: scx streaming (bounded) vs scx full-materialize vs shardad
+full-materialize.
+
+| dataset | scx_stream | scx_materialize | shardad_materialize |
+|---|---:|---:|---:|
+| smartseq2 | 3977 | 2050 | **1389** |
+| tabula_100k | 3686 | 2462 | **1890** |
+| tahoe_c38 | 4909 | 4715 | **3856** |
+| chemogenetic_rgfp | 14802 | 8928 | **7473** |
+| **census_1m** | **6106** | 16560 | 11615 |
+
+At small/medium scale shardad's narrow-dtype materialize wins (streaming overhead
+dominates when the matrix fits). **At census_1m scale the picture inverts: scx
+streaming (6.1 GB) is the lowest — below shardad's materialize (11.6 GB) and well
+under scx's own materialize (16.6 GB).** This is scx's structural out-of-core
+advantage: full-matrix approaches (both shardad and scx `to_anndata`) grow with
+dataset size, while scx streaming stays bounded — the gap widens further at
+census_5m/10m (not run here).
+
+> **Note — why `scx_materialize` here (16.6 GB) ≠ the "Full read → AnnData" peak
+> above (~2.3 GB) for census_1m:** the two rows measure different things. The
+> `read_full` benchmark measures a steady-state `to_anndata()` peak; the
+> `ooc_rss_boundary` `scx_materialize` op runs back-to-back with `scx_stream` in
+> one process (and reads through a backed handle), so its high-water mark captures
+> transient decode buffers + the residue of the preceding streaming pass, not the
+> final AnnData size. Compare each column *within* its own table, not across the
+> two tables.
+
+### Selective / row-subset read (wall s)
+
+Roughly parity; shardad edges ahead on census_1m (5.6 s vs scx_auto 13.1 s) via
+whole-covering-row reads, scx competitive on the perturbation datasets. scx's
+`filtered_query` predicate-pushdown sub-scenarios have **no shardad equivalent**
+(see capability gaps).
+
+### Grouped / condition-sharded reads — shardad's differentiator
+
+shardad physically groups cells by an `obs` label; scx approximates it via `scx
+sort --group-by` + query-time shard pruning. `grouped_read` (self-materialized
+grouped fixtures):
+
+| op | dataset | scx | shardad |
+|---|---|---|---|
+| `read_group` (one label) | replogle_k562 | **0.7 s / 1530 MB** | 4.1 s / 4179 MB |
+| `read_group` | tahoe_c38 | **1.1 s / 1355 MB** | 3.9 s / 3238 MB |
+| `read_group` | chemogenetic_rgfp | 0.8 s / 11744 MB | 0.9 s / **810 MB** |
+| `iter_group_shards` (stream) | replogle_k562 | 3.2 s / **2368 MB** | 4.0 s / 9624 MB |
+| `iter_group_shards` | tahoe_c38 | 5.3 s / **4580 MB** | 3.8 s / 6272 MB |
+| grouped_write | replogle_k562 | 40.6 s / 2338 MB | **19.1 s** / 2238 MB |
+| grouped_write | chemogenetic_rgfp | 33.8 s / 1176 MB | **21.9 s / 803 MB** |
+
+scx's query-pruned targeted read is competitive-to-faster on latency (replogle,
+tahoe) with lower RAM, but its RAM can spike on some layouts (chemogenetic
+`read_group`); shardad writes grouped archives faster. Mixed — genuinely
+dataset-dependent, with neither dominating.
+
+### Round-trip fidelity
+
+shardad round-trips correctly (`shardad_fidelity`: exact CSR match + `dense` /
+`float16` in-decode materialization) on pbmc3k and tabula_100k — parity with scx's
+own correctness suite.
+
+### Capability comparison (documented — not head-to-head perf races)
+
+Features with no meaningful two-sided benchmark, reported as capability presence:
+
+| capability | scx | shardad |
+|---|---|---|
+| GPU on-device decode / analysis | ✅ (framed Scx1 decodes in VRAM; rapids) | ❌ unimplemented ([#40]; CPU-decode+upload only) |
+| Lazy query engine / predicate pushdown | ✅ | ❌ (no query engine) |
+| ML training loader | ✅ (1,405 batches/s) | ❌ |
+| Streaming analysis accelerators (HVG/PCA/…) | ✅ (bounded RAM) | ❌ (materialize → scanpy) |
+| Cloud-native reads (S3/GCS/Azure) | ✅ | ❌ |
+| Multimodal (CITE-seq / Multiome) | ✅ | ❌ |
+| R bindings (Seurat / SCE) | ✅ | ❌ (Python only) |
+| In-place mutation (append/delete/compact/merge) | ✅ | metadata-tail only (`update_obs`) |
+| In-decode dtype/density materialization | ❌ (`to_anndata` builds f32) | ✅ (`data_dtype=`, `container=`) |
+| Physical group-aligned (condition) sharding | approximated (sort + query pruning) | ✅ (native) |
+
+### Takeaways
+
+- **Compression:** shardad still leads on large integer-count data (up to 1.7×),
+  but scx `compact_trial` has closed the old 1.9–3.2× gap to ~1.0–1.7× and wins on
+  small datasets.
+- **Write:** shardad faster (simpler codec + multiprocessing).
+- **Read speed:** parity, dataset-dependent.
+- **Memory:** shardad's narrow-dtype materialize wins at small/medium scale; **scx
+  streaming wins at census scale** (census_1m: 6.1 vs 11.6 GB) and is the only path
+  that stays bounded as datasets grow.
+- **Grouped access:** shardad's native physical grouping vs scx's query-pruning —
+  mixed, neither dominates.
+- **Breadth:** scx carries GPU, a query engine, an ML loader, streaming
+  accelerators, cloud, multimodal, and R — none of which shardad targets.
+
+Two honest conclusions: scx has reached rough **compression/read parity** with a
+deep-narrow specialist on its home turf, and the projects' real difference is
+scope (a broad platform vs a focused perturbation-screen tool), not a one-sided
+performance gap. The clearest scx-specific perf win is **bounded out-of-core RAM
+at scale**; the clearest shardad-specific win is **lowest peak RSS for
+whole-matrix integer reads** via in-decode dtype narrowing (an ergonomics gap scx
+could close on the `to_anndata` path).
+
+[#40]: https://github.com/ArcInstitute/shardad/issues/40

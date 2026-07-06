@@ -64,8 +64,8 @@ rscx (R bindings via extendr, depends on scx-format-io, scx-codec, scx-sparse, s
 | **scx-codec** | Compression codecs (standalone, no I/O) | `rice`, `forbp`, `delta_golomb`, `bitstream`, `dispatch` |
 | **scx-sparse** | CSR/CSC matrix types with scipy-compatible dtypes | `csr` (`ScxCsr`), `csc` (`ScxCsc`), `transpose` (streaming CSR→CSC), `convert` (CSR ↔ dense) |
 | **scx-format** | Pure on-disk layout/spec — no `std::fs`, no `memmap2` (the surface conformance vectors verify against) | `header`, `catalog`, `catalog_view`, `shard`, `section`, `modality`, `codec_select`, `provenance`, `csc_policy`, `error`, `checksum` |
-| **scx-format-io** | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars; re-exports the full `scx-format` surface | `reader`, `writer`, `backed`, `shard_decode`, `shard_source`, `encoder`, `decode_sidecar`, `csc_sidecar`, `bitmap`, `deletion_vectors`, `mem`, `arrow_compat` |
-| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place sidecar + canonical v3 upgrade), `merge`, `rollback`, `flock` |
+| **scx-format-io** | Runtime reader/writer, backed/streaming access, shard codec dispatch, sidecars; re-exports the full `scx-format` surface | `reader`, `writer`, `backed`, `shard_decode`, `shard_source`, `encoder`, `csc_sidecar`, `bitmap`, `deletion_vectors`, `mem`, `arrow_compat` |
+| **scx-ops** | File lifecycle operations | `append`, `append_from_reader` (streaming SCX→SCX), `delete`, `compact`, `optimize` (in-place re-encode + row-group-frame → v4), `merge`, `rollback`, `flock` |
 | **scx-engine** | Lazy query engine with predicate pushdown | `pipeline`, `predicate`, `pushdown`, `projection`, `fused_ops`, `index`, `collect` |
 | **scx-loader** | ML training data loader (triple-buffered) | `pipeline`, `io_stage`, `decode_stage`, `shuffle`, `projection`, `normalize`, `batch`, `python` |
 | **scx-cloud** | Cloud access operations (S3, GCS, Azure) | `backend`, `cloud_optimize`, `explode`, `pack`, `pull`, `push`, `coalesce`, `cloud_reader` |
@@ -501,7 +501,7 @@ Sections are **never overwritten** — operations append new data and update the
 | **append** | Add new shards at EOF | New sections + new catalog |
 | **delete** | Logical deletion via Roaring Bitmap | Deletion vectors section + new catalog |
 | **compact** | Reclaim space, merge small shards | Entire new file (atomic rename) |
-| **optimize** | Re-encode + canonicalize CSR shards → add decode sidecars, stamp v3 | Entire new file (atomic rename) |
+| **optimize** | Re-encode + canonicalize CSR shards → row-group-frame, stamp v4 | Entire new file (atomic rename) |
 | **rollback** | Revert to previous catalog | Header-only update (pwrite) |
 | **merge** | Combine multiple SCX files | New file with merged data |
 
@@ -807,7 +807,7 @@ scx query experiment.scx "tissue == 'lung'" --output subset.scx --normalize 1e4 
 scx append atlas.scx new_batch.scx
 scx delete experiment.scx --filter "is_doublet == True" --dry-run
 scx compact experiment.scx compacted.scx
-scx optimize experiment.scx optimized.scx   # add decode sidecars + upgrade to v3
+scx optimize experiment.scx optimized.scx   # re-encode + row-group-frame → upgrade to v4
 scx rollback experiment.scx --to-seq 3
 scx merge batch1.scx batch2.scx batch3.scx --output atlas.scx
 

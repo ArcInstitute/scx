@@ -13,7 +13,7 @@ details, see [docs/format.md](format.md). For sharding details, see
 | **delete** (`mark_deleted`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged |
 | **modify_metadata** / **set_uns** | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`) | Replaced if supplied (same `n_vars`) | **Preserved** | Dropped for the replaced obs/var axis unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild; untouched otherwise |
 | **compact** | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
-| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; adds decode sidecars; stamps `format_version=3` | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
+| **optimize** | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | **Preserved** (rows + shard boundaries unchanged) |
 | **merge** | Writes new output combining all inputs | Writes merged metadata | Writes merged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
 | **subset** | Writes new output with matching rows | Writes subset metadata | Writes subset | **Dropped** unless `--rebuild-csc` | **Dropped** (rebuild via `scx convert --index-obs ...` on the output) |
 | **sort** | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild |
@@ -126,12 +126,12 @@ historical file size.
 ## Optimize
 
 `scx optimize <input> <output>` upgrades an existing **single-modality**
-file in place: it decodes → `canonicalize_csr` → re-encodes every CSR-backed
-shard (`X`, layers, and obs×obs `obsp` CSR graphs), so the output carries
-[decode-metadata sidecars](format.md#42-decode-metadata-sidecar) and legitimately
-claims the v3 canonical-CSR invariant — without a full reconvert. This is how a
-pre-v3 / sidecar-less file gains the random-access and GPU device-decode benefits
-(see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
+file in place: it decodes → `canonicalize_csr` → re-encodes and row-group-frames
+every CSR-backed shard (`X`, layers, and obs×obs `obsp` CSR graphs), stamping
+`format_version=4` — without a full reconvert. This is how an older file gains the
+row-group random-access substrate and GPU device-decode benefits: framed Scx1
+shards keep the GPU device-decode route (decoding group-by-group in VRAM). No
+decode sidecar is written (see [scanpy.md § Data layout for fast GPU decode](scanpy.md#data-layout-for-fast-gpu-decode-to_gpu_anndata--device-resident-analysis)).
 
 Unlike `compact`, `optimize` is a faithful 1:1 upgrade:
 - It does **not** apply deletions — the deletion-vector section is carried
@@ -153,11 +153,12 @@ tempfile and atomically renames over the target. Verify the result with
 
 `--codec {auto|scx1}` selects the per-shard codec (default `auto`). `auto` keeps
 the encoder's per-shard choice (Scx1 for low-median integer counts, else Zstd),
-so a high-median count shard lands as Zstd and carries **no** decode sidecar.
-`scx1` forces Scx1 on every integer shard, guaranteeing a sidecar on each — use
+so a high-median count shard lands as Zstd (host-decoded on the GPU path).
+`scx1` forces Scx1 on every integer shard — use
 it when you want the whole file to take the `to_gpu_anndata` device-decode route
-regardless of per-shard count magnitude (Scx1 is less compact than Zstd on
-high-median data, the trade-off for a fully on-device decode). Non-integer
+regardless of per-shard count magnitude (framed Scx1 shards decode in VRAM; Scx1
+is less compact than Zstd on high-median data, the trade-off for a fully
+on-device decode). Non-integer
 (float) shards fall back to Zstd either way; `--codec zstd` is rejected.
 
 `--shard-obs {off|auto|always}` (default `auto`) migrates a **legacy
