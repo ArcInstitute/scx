@@ -511,6 +511,15 @@ fn forbp_decode_inner(
             // Read frame_bits
             let frame_bits = cursor.read_u8().map_err(|_| BitStreamError)?;
 
+            // Reject an out-of-range frame width. Indices are u32, so a valid
+            // frame packs at most 32 bits per delta; `unpack_fixed_width`
+            // documents `bits in 1..=32` as a precondition (fuzz: frame_bits=47
+            // tripped its debug_assert / produced a bad shift). The framed
+            // metadata decode path applies the same guard.
+            if frame_bits > 32 {
+                return Err(BitStreamError);
+            }
+
             // Bound this row's nnz against the remaining payload *before* it
             // drives an allocation (`resize`/`push` below). A malformed nnz
             // varint could otherwise request gigabytes from a few-byte input
@@ -652,6 +661,25 @@ mod tests {
         let data: [u8; 20] = [
             0x04, 0x0d, 0x00, 0x00, 0x02, 0x00, 0xfe, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for &u16dt in &[true, false] {
+            for &n_rows in &[1usize, 10, 128] {
+                assert!(forbp_decode(&data, n_rows, u16dt).is_err());
+            }
+        }
+    }
+
+    // Regression (fuzz_forbp deadly signal): a frame_bits byte of 47 reached
+    // `unpack_fixed_width`, whose `bits in 1..=32` precondition (u32 indices
+    // pack <= 32 bits/delta) panicked under fuzz debug-assertions. Decode must
+    // reject an out-of-range frame width instead of panicking.
+    #[test]
+    fn decode_rejects_oversized_frame_bits() {
+        // block_nnz=1, n_rows_in_block=1, row nnz varint=1, then frame_min and
+        // a frame_bits byte of 0x2f (47) / 0x2c (44) depending on frame_min width.
+        let data: [u8; 17] = [
+            0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x2f, 0x02, 0x2c, 0x2c, 0x2c,
+            0x2c, 0x00, 0x00,
         ];
         for &u16dt in &[true, false] {
             for &n_rows in &[1usize, 10, 128] {
