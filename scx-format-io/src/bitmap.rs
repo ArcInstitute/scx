@@ -72,6 +72,15 @@ pub const BITMAP_SHARD_MAGIC: [u8; 4] = *b"SCXB";
 pub const BITMAP_SHARD_VERSION: u16 = 1;
 /// Only orientation shipped today: `gene_id -> local row ids`.
 pub const BITMAP_ORIENTATION_GENE_TO_ROWS: u8 = 0;
+/// Sanity cap on a parsed `n_vars`, which drives the dense
+/// `per_gene_counts()` allocation (`vec![0u64; n_vars]` = `n_vars * 8` bytes).
+/// The catalog BLAKE3 authenticates the section bytes, but not this semantic
+/// range, so a corrupt/adversarial `n_vars` is rejected here rather than
+/// allowed to request tens of GB (fuzz: `n_vars = 1_040_318_232` forced an
+/// 8.3 GB allocation). `2^27` (~134M) is ~2000x any real single-cell feature
+/// count while capping the allocation at ~1 GB, well under memory-safety
+/// fuzzers' 2 GB out-of-memory limit.
+pub const MAX_BITMAP_N_VARS: usize = 1 << 27;
 
 /// Roaring-encoded detection bitmap for a single CSR shard.
 ///
@@ -257,6 +266,13 @@ impl BitmapShard {
         let row_start = r.read_u64::<LittleEndian>()?;
         let n_rows = r.read_u32::<LittleEndian>()?;
         let n_vars = r.read_u32::<LittleEndian>()?;
+        // Bound n_vars before it drives the dense `per_gene_counts()`
+        // allocation (`vec![0u64; n_vars]`). A section can legitimately declare
+        // n_vars far larger than its own byte length (a shard where few genes
+        // are expressed), so section_len is *not* a valid proxy; reject only an
+        // implausibly large n_vars against an absolute sanity cap. See
+        // MAX_BITMAP_N_VARS.
+        validate_allocation(n_vars as usize, MAX_BITMAP_N_VARS)?;
         let n_genes_with_hits = r.read_u32::<LittleEndian>()? as usize;
 
         // Minimum bytes per gene entry: gene_id_width + 4 (roaring_len).
@@ -328,6 +344,23 @@ mod tests {
         let indptr: Vec<u64> = vec![0, 2, 2, 5, 6, 7];
         let indices: Vec<u32> = vec![0, 2, 1, 2, 3, 0, 3];
         (indptr, indices, 5, 4)
+    }
+
+    // Regression (fuzz_bitmap OOM): a 67-byte section declaring
+    // n_vars = 1_040_318_232 previously drove `per_gene_counts`'s
+    // `vec![0u64; n_vars]` to request 8.3 GB, tripping libFuzzer's OOM limit.
+    // `read_from` must reject the implausible n_vars before it can allocate.
+    #[test]
+    fn read_from_rejects_oversized_n_vars_without_oom() {
+        let data: [u8; 67] = [
+            0x53, 0x43, 0x58, 0x42, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0x18, 0x18,
+            0xff, 0xff, 0xff, 0xff, 0x10, 0x18, 0x18, 0xff, 0x01, 0x3e, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
+            0x18, 0xff, 0xff, 0xff, 0xff, 0x18, 0x18, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18,
+        ];
+        let err = BitmapShard::read_from(&mut Cursor::new(&data[..]), data.len());
+        assert!(matches!(err, Err(ScxError::AllocationTooLarge { .. })));
     }
 
     #[test]
