@@ -511,6 +511,26 @@ fn forbp_decode_inner(
             // Read frame_bits
             let frame_bits = cursor.read_u8().map_err(|_| BitStreamError)?;
 
+            // Bound this row's nnz against the remaining payload *before* it
+            // drives an allocation (`resize`/`push` below). A malformed nnz
+            // varint could otherwise request gigabytes from a few-byte input
+            // (fuzz: a per-row nnz of ~5.4e8 forced a 2 GiB allocation). A
+            // frame_bits-packed row needs at least `nnz * frame_bits` bits of
+            // payload; a frame_bits == 0 row encodes a constant value and is
+            // only valid for a single index (distinct, sorted indices force
+            // every delta >= 1, so frame_bits >= 1 whenever nnz >= 2).
+            if frame_bits == 0 {
+                if nnz > 1 {
+                    return Err(BitStreamError);
+                }
+            } else {
+                let need_bytes = (nnz as u64).saturating_mul(frame_bits as u64).div_ceil(8);
+                let remaining = (data.len() as u64).saturating_sub(cursor.position());
+                if need_bytes > remaining {
+                    return Err(BitStreamError);
+                }
+            }
+
             if frame_bits > 0 {
                 let start = all_indices.len();
                 all_indices.resize(start + nnz, 0);
@@ -619,6 +639,25 @@ mod tests {
             forbp_decode(&encoded, row_lengths.len(), index_dtype_u16).unwrap();
         assert_eq!(dec_indices, indices);
         assert_eq!(dec_row_lengths, row_lengths);
+    }
+
+    // Regression (fuzz_forbp OOM): a per-row nnz varint of ~5.4e8 previously
+    // drove a multi-GB `resize`/`push` before any payload bounds check, so a
+    // 20-byte input tripped libFuzzer's 2 GiB out-of-memory limit. Decode must
+    // reject the malformed length loudly, never allocate gigabytes.
+    #[test]
+    fn decode_rejects_oversized_nnz_without_oom() {
+        // block_nnz=0x0d04, n_rows_in_block=2, first row nnz varint
+        // (0xfe,0xff,0xff,0xff,0x01) => ~5.37e8, frame_min=0, frame_bits=0.
+        let data: [u8; 20] = [
+            0x04, 0x0d, 0x00, 0x00, 0x02, 0x00, 0xfe, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for &u16dt in &[true, false] {
+            for &n_rows in &[1usize, 10, 128] {
+                assert!(forbp_decode(&data, n_rows, u16dt).is_err());
+            }
+        }
     }
 
     // 5.5: Single row, multiple rows, empty rows
