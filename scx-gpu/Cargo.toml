@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 libloading = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 [features]
 default = []

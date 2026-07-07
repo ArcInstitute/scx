@@ -554,6 +554,43 @@ fn decode_framed_shufdelta_gpu(
     let spans = resolve_block_index(header, block_index_bytes)
         .map_err(|e| GpuError::InvalidShard(format!("framed ShufDeltaZstd block index: {e}")))?;
 
+    // Phase 1.5: pipeline the per-group zstd (parallel worker threads) with GPU
+    // uploads/kernels (copy stream + events) when there are ≥2 groups to overlap.
+    // `SCX_SHUFDELTA_GPU_SEQUENTIAL=1` forces the Phase-1 sequential path (safety
+    // valve + A/B benchmark toggle).
+    let force_sequential = std::env::var("SCX_SHUFDELTA_GPU_SEQUENTIAL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if spans.len() >= 2 && !force_sequential {
+        let pcsr = crate::shufdelta_gpu::decode_framed_shufdelta_gpu_pipelined(
+            dev,
+            &spans,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            n_rows,
+            nnz,
+            value_encoding,
+            index_width,
+        )?;
+        let stats = DeviceDecodeStats {
+            host_uploaded_bytes: pcsr.host_uploaded_bytes,
+            device_decoded_bytes: (nnz as u64) * 8,
+            fully_device_decoded: false,
+            n_shards_shufdelta_gpu: 1,
+            ..DeviceDecodeStats::default()
+        };
+        return Ok((
+            GpuCsr {
+                indptr: pcsr.indptr,
+                indices: pcsr.indices,
+                data: pcsr.data,
+                shape: (n_rows, n_cols),
+            },
+            stats,
+        ));
+    }
+
     let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
     let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
     let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
@@ -1193,6 +1230,75 @@ mod tests {
         assert_eq!(agg.n_shards_host_bounced, 0);
         // A single host-bounced shard ANDs fully_device_decoded down to false.
         assert!(!agg.fully_device_decoded);
+    }
+
+    /// Phase 1.5: the pipelined framed ShufDeltaZstd decode (parallel zstd +
+    /// copy-stream/event overlap, default for ≥2 groups) is byte-identical to
+    /// the sequential (Phase-1) path forced by `SCX_SHUFDELTA_GPU_SEQUENTIAL=1`,
+    /// and both match the source CSR. Both take the shufdelta GPU path.
+    #[test]
+    fn test_shard_decode_gpu_shufdelta_pipeline_matches_sequential() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+        let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+        let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+        // row_group_rows = 4 → 4 groups → pipeline eligible.
+        let section = framed_section_bytes(
+            &indptr,
+            &indices,
+            &values_f32,
+            CodecId::ShufDeltaZstd,
+            n_cols,
+            4,
+        );
+
+        let decode = || {
+            let (csr, stats) = decode_shard_gpu_with_stats(&dev, &section).unwrap();
+            (
+                dev.dtoh_copy(&csr.indptr).unwrap(),
+                dev.dtoh_copy(&csr.indices).unwrap(),
+                dev.dtoh_copy(&csr.data).unwrap(),
+                stats,
+            )
+        };
+
+        // Sequential (Phase 1) baseline. env::set_var is safe on edition 2021 and
+        // GPU tests run single-threaded (--test-threads=1).
+        std::env::set_var("SCX_SHUFDELTA_GPU_SEQUENTIAL", "1");
+        let (seq_ip, seq_ix, seq_d, seq_stats) = decode();
+        std::env::remove_var("SCX_SHUFDELTA_GPU_SEQUENTIAL");
+        // Pipelined (default).
+        let (pipe_ip, pipe_ix, pipe_d, pipe_stats) = decode();
+
+        // Both took the shufdelta GPU path (not host-bounce).
+        assert_eq!(seq_stats.n_shards_shufdelta_gpu, 1);
+        assert_eq!(pipe_stats.n_shards_shufdelta_gpu, 1);
+        assert_eq!(seq_stats.n_shards_host_bounced, 0);
+        assert_eq!(pipe_stats.n_shards_host_bounced, 0);
+        // Both equal the source CSR.
+        assert_eq!(seq_ip, want_indptr, "sequential indptr");
+        assert_eq!(seq_ix, want_indices, "sequential indices");
+        assert_eq!(seq_d, values_f32, "sequential data");
+        // Pipelined == sequential, exactly.
+        assert_eq!(pipe_ip, seq_ip, "pipelined indptr != sequential");
+        assert_eq!(pipe_ix, seq_ix, "pipelined indices != sequential");
+        assert_eq!(pipe_d, seq_d, "pipelined data != sequential");
+    }
+
+    /// Many small groups (`row_group_rows = 1`, incl. empty rows) exercise the
+    /// producer/consumer channel + backpressure + empty-group skipping in the
+    /// pipelined path. Output must stay byte-exact vs source.
+    #[test]
+    fn test_shard_decode_gpu_shufdelta_many_small_groups() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        // row_group_rows = 1 → one group per row (14 groups, two empty).
+        assert_framed_shufdelta_matches(&dev, &indptr, &indices, &values_u16, n_cols, 1);
     }
 
     /// A framed (v2) Scx1 shard decoded in-VRAM group-by-group is byte-identical

@@ -3633,6 +3633,7 @@ name = "scx-gpu"
 version = "0.11.0"
 dependencies = [
  "byteorder",
+ "crossbeam-channel",
  "cudarc",
  "faer",
  "libloading 0.8.9",

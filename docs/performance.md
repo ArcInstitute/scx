@@ -1033,6 +1033,32 @@ runs as a first-class format in the comprehensive suite:
   their wall gap is run-to-run variance). Phase 2 (nvcomp GPU zstd) remains a
   follow-on. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.
 
+  **Phase 1.5 result — pipelined decode (parallel zstd + multi-stream, H100).**
+  Phase 1.5 pipelines the per-group CPU zstd across worker threads (bounded
+  channel) and overlaps it with async H2D on a dedicated copy stream + GPU
+  kernels (event-gated 2-slot ring), mirroring `gpu_shard_source.rs`. A/B vs the
+  Phase-1 sequential path (`SCX_SHUFDELTA_GPU_SEQUENTIAL=1`), median of 3:
+
+  | dataset | codec | seq wall | pipelined wall | pipeline | vs Scx1 |
+  |---|---|---|---|---|---|
+  | census_1m | compact_trial | 8.53 s | **7.90 s** | 1.08× | 1.26× |
+  | census_1m | shufdelta | 11.23 s | 11.20 s | ~1.0× | 0.89× |
+  | census_500k | compact_trial | 4.51 s | **4.02 s** | 1.12× | 1.33× |
+  | census_500k | shufdelta | 4.50 s | **4.05 s** | 1.11× | 1.32× |
+
+  The pipeline is **1.08–1.12× over sequential and never slower** (parity holds;
+  a GPU test asserts pipelined output is byte-identical to both the sequential
+  path and the source CSR), reaching up to **1.33× Scx1**. The gain is modest —
+  and the profiler shows why: on census_1m the GPU-side critical path is
+  `htod ≈ 778 ms + gpu_decode ≈ 83 ms + indptr ≈ 43 ms ≈ 0.9 s`, a fraction of
+  the ~7.9 s wall. Most of `to_gpu_anndata`'s wall is **fixed metadata assembly +
+  cupy handoff** (the same for every codec — Scx1 is 9.9 s), so optimizing the
+  X-decode moves the *total* only ~1.1×. The pipeline is the default for framed
+  ShufDeltaZstd (≥2 groups); `SCX_SHUFDELTA_GPU_SEQUENTIAL=1` forces the
+  sequential path. The largest remaining GPU-side cost is the ~5.6 GB H2D of
+  decompressed plane bytes — which Phase 2 (nvcomp, upload compressed instead)
+  would attack. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.5.
+
 - **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
   ~flat while shardad must materialize the whole matrix —
 
