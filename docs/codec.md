@@ -224,6 +224,13 @@ float/log-normalized `X` the value stream falls back to zstd-only and the codec
 is ≈`zstd` with no win, which is why it is opt-in / trial-selected and never
 auto-forced. Per sub-stream:
 
+> **GPU decode:** ShufDeltaZstd has **no GPU decode path**. Scx1 (unframed)
+> decodes directly in VRAM via the BitPacker4x GPU kernel
+> (`scx_device_decode_gpu`); ShufDeltaZstd shards always host-bounce through
+> the CPU (`scx_device_handoff_streamed`). For GPU ML training workloads where
+> codec decode is 25–35% of per-batch wall time, switching from Scx1 to
+> ShufDeltaZstd would regress throughput. See § "Codec tradeoff summary" below.
+
 - **indices / indptr**: byte-shuffle (transpose to byte planes) → byte-delta
   (per-plane wrapping-`u8`, on the sorted/monotonic streams) → zstd. The delta on
   byte-shuffled sorted indices produces near-constant planes that zstd crushes —
@@ -361,6 +368,40 @@ full decode. On GPU, `to_gpu_anndata` decodes only **unframed Scx1** shards
 in-VRAM (`scx_device_decode_gpu`); any **framed** shard (any codec, including
 framed Scx1) host-bounces through the shared group-aware decoder
 (`scx_device_handoff_streamed`).
+
+### Codec tradeoff summary — Scx1 vs ShufDeltaZstd
+
+The two integer codecs serve different workloads. Summary of measured
+tradeoffs (from the comprehensive benchmark suite; full per-dataset
+tables in [performance.md](performance.md#scx-vs-shardad--full-feature-parity)):
+
+| Dimension | Scx1 (auto default) | ShufDeltaZstd (compact-trial) |
+|---|---|---|
+| **Compression (integer)** | Baseline | **1.3–2.1× smaller** on medium/large datasets; slightly larger on tiny (pbmc3k) |
+| **CPU decode speed** | **~1.3–1.8× faster** | Baseline |
+| **GPU decode** | **✅ In-VRAM** (unframed; BitPacker4x kernel) | **❌ CPU-only** (host-bounce) |
+| **Random access (unframed)** | ✅ Per-row (Rice/DGR independently decodable) | ❌ Full-shard (byte-shuffle is global) |
+| **Random access (framed)** | ✅ Per row-group (via BlockIndex) | ✅ Per row-group (via BlockIndex) |
+| **Encode speed** | ~parity | ~parity (slightly faster — no per-row strategy) |
+| **Float data** | N/A — both route to Pcodec | N/A — ShufDeltaZstd falls back to zstd-only |
+| **ML training loader** | Preferred — GPU decode drops codec cost to ~5–8% of batch time | Would regress GPU training throughput |
+
+**When to use which codec:**
+
+| Your workload | Recommended | CLI / Python | Why |
+|---|---|---|---|
+| GPU ML training | `auto` (Scx1) | `codec="auto"` (default) | GPU in-VRAM decode; fastest training throughput |
+| Interactive analysis, CPU | `auto` (Scx1) | `codec="auto"` (default) | Faster CPU decode |
+| Storage-constrained archival | `compact-trial` | `--codec compact-trial --row-group-rows 256` / `codec="compact-trial", row_group_rows=256` | 1.3–2.1× smaller; retains random access via framing |
+| Cloud hosting (minimize egress) | `compact-trial` | same as above | Smaller = fewer bytes transferred |
+| Explicit ShufDeltaZstd (no trial) | `shufdelta` | `--codec shufdelta` / `codec="shufdelta"` | Forces ShufDeltaZstd on all shards (no per-shard trial) |
+
+`compact-trial` trial-encodes each shard with both the heuristic winner and
+ShufDeltaZstd and keeps the smaller, so it never regresses vs `auto` on size —
+but it **doubles encode time** and produces framed output (shard v2) where
+all shards host-bounce on GPU decode (including any Scx1 shards that won
+the trial). Use `auto` when decode speed or GPU training throughput matters
+more than on-disk size.
 
 ## 8a. Per-modality Codec Defaults
 

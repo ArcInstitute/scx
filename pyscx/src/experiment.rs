@@ -1036,13 +1036,14 @@ impl PyExperiment {
                 && !self.reader.header().has_deletion_vectors()
                 && n_csr_shards > 0;
 
-            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode): (
+            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode, n_shufdelta_gpu): (
                 Bound<'py, PyAny>,
                 crate::accel::gpu_handoff::GpuCsrMatrix,
                 usize,
                 usize,
                 u64,
                 &'static str,
+                Option<u32>,
             ) = if fast_path {
                 // X-less skeleton (obs / var / obsm / uns / layers assembled eagerly;
                 // X is assigned after the device decode below).
@@ -1133,6 +1134,7 @@ impl PyExperiment {
                     n_cols,
                     decode_stats.host_uploaded_bytes,
                     transfer_mode,
+                    Some(decode_stats.n_shards_shufdelta_gpu),
                 )
             } else {
                 // Host-assemble fallback (filtered / projected / multimodal inputs):
@@ -1222,6 +1224,7 @@ impl PyExperiment {
                     n_cols,
                     bytes_uploaded,
                     "scx_device_handoff",
+                    None,
                 )
             };
 
@@ -1256,6 +1259,7 @@ impl PyExperiment {
             info.device_id = Some(gpu_id);
             info.bytes_uploaded = Some(bytes_uploaded);
             info.cupy_version = Some(cupy_version);
+            info.n_shards_shufdelta_gpu = n_shufdelta_gpu;
             crate::accel::route::write_accel_route(py, &adata, "to_gpu_anndata", &info)?;
 
             Ok(adata)

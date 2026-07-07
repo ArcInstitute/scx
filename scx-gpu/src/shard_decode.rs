@@ -21,6 +21,7 @@ use crate::error::GpuError;
 use crate::forbp_gpu::forbp_decode_gpu;
 use crate::profile::{self, CodecClass};
 use crate::rice_gpu::rice_decode_gpu;
+use crate::shufdelta_gpu::{decode_indices_frame_to_device, decode_values_frame_to_device};
 
 /// GPU-resident CSR matrix.
 ///
@@ -56,6 +57,16 @@ pub struct DeviceDecodeStats {
     /// — i.e. only indptr was uploaded. Drives the `scx_device_decode_gpu`
     /// transfer-mode stamp.
     pub fully_device_decoded: bool,
+    /// Shards that took the in-VRAM Scx1 device path (`decode_scx1_gpu` /
+    /// `decode_framed_scx1_gpu`).
+    pub n_shards_scx1_gpu: u32,
+    /// Shards that took the ShufDeltaZstd GPU path (CPU zstd + GPU
+    /// undelta/unshuffle/convert). `fully_device_decoded` stays `false` for
+    /// these (Phase 1 uploads decompressed plane bytes), so this counter is how
+    /// per-codec GPU routing is observed for `compact-trial` (mixed) files.
+    pub n_shards_shufdelta_gpu: u32,
+    /// Shards that host-decoded + HtoD-bounced (`decode_host_bounce`).
+    pub n_shards_host_bounced: u32,
 }
 
 impl Default for DeviceDecodeStats {
@@ -66,6 +77,9 @@ impl Default for DeviceDecodeStats {
             host_uploaded_bytes: 0,
             device_decoded_bytes: 0,
             fully_device_decoded: true,
+            n_shards_scx1_gpu: 0,
+            n_shards_shufdelta_gpu: 0,
+            n_shards_host_bounced: 0,
         }
     }
 }
@@ -76,6 +90,9 @@ impl DeviceDecodeStats {
         self.host_uploaded_bytes += other.host_uploaded_bytes;
         self.device_decoded_bytes += other.device_decoded_bytes;
         self.fully_device_decoded &= other.fully_device_decoded;
+        self.n_shards_scx1_gpu += other.n_shards_scx1_gpu;
+        self.n_shards_shufdelta_gpu += other.n_shards_shufdelta_gpu;
+        self.n_shards_host_bounced += other.n_shards_host_bounced;
     }
 }
 
@@ -167,6 +184,16 @@ pub fn decode_shard_gpu_with_stats(
                 values_bytes,
                 block_index_bytes,
             ),
+            // ShufDeltaZstd: CPU zstd + GPU undelta/unshuffle/convert per group
+            // (Phase 1). Float-valued shufdelta falls back to host-bounce inside.
+            CodecId::ShufDeltaZstd => decode_framed_shufdelta_gpu(
+                dev,
+                &header,
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                block_index_bytes,
+            ),
             _ => decode_host_bounce(
                 dev,
                 &header,
@@ -190,11 +217,7 @@ pub fn decode_shard_gpu_with_stats(
             n_cols,
             nnz,
         ),
-        CodecId::None
-        | CodecId::Zstd
-        | CodecId::Lz4Shuffle
-        | CodecId::Pcodec
-        | CodecId::ShufDeltaZstd => decode_host_bounce(
+        CodecId::ShufDeltaZstd => decode_shufdelta_gpu(
             dev,
             &header,
             indptr_bytes,
@@ -202,6 +225,16 @@ pub fn decode_shard_gpu_with_stats(
             values_bytes,
             block_index_bytes,
         ),
+        CodecId::None | CodecId::Zstd | CodecId::Lz4Shuffle | CodecId::Pcodec => {
+            decode_host_bounce(
+                dev,
+                &header,
+                indptr_bytes,
+                indices_bytes,
+                values_bytes,
+                block_index_bytes,
+            )
+        }
     }
 }
 
@@ -287,6 +320,7 @@ fn decode_scx1_gpu(
     }
     profile::record_gpu_decode_since(t_gpu);
 
+    stats.n_shards_scx1_gpu = 1;
     Ok((
         GpuCsr {
             indptr: d_indptr,
@@ -343,6 +377,8 @@ fn decode_host_bounce(
         host_uploaded_bytes: htod_bytes as u64,
         device_decoded_bytes: 0,
         fully_device_decoded: false,
+        n_shards_host_bounced: 1,
+        ..DeviceDecodeStats::default()
     };
 
     Ok((
@@ -458,6 +494,193 @@ fn decode_framed_scx1_gpu(
         host_uploaded_bytes: indptr_bytes_uploaded,
         device_decoded_bytes: (nnz as u64) * 8,
         fully_device_decoded: true,
+        n_shards_scx1_gpu: 1,
+        ..DeviceDecodeStats::default()
+    };
+
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: combined_indices,
+            data: combined_data,
+            shape: (n_rows, n_cols),
+        },
+        stats,
+    ))
+}
+
+/// GPU decode of a **framed (v2) ShufDeltaZstd** shard, group by group.
+///
+/// Phase 1 hybrid: the CPU still runs zstd (inherently sequential per frame),
+/// but the dominant undelta/unshuffle/convert transforms move to the device via
+/// [`decode_indices_frame_to_device`] / [`decode_values_frame_to_device`], and
+/// only the narrower pre-convert plane bytes cross PCIe. Structure mirrors
+/// [`decode_framed_scx1_gpu`]: per-group indptr on the host
+/// (`decode_row_group_indptr_only`), per-group index/value frames on the device,
+/// dtod-concatenated into combined nnz-sized buffers.
+///
+/// `fully_device_decoded` stays `false` (decompressed plane bytes crossed PCIe,
+/// so this is not the Scx1 "indptr-only" upload); per-codec GPU routing is
+/// tracked via `n_shards_shufdelta_gpu`. Float value encodings (zstd-only, no
+/// plane transforms) have no GPU path and fall back to [`decode_host_bounce`].
+fn decode_framed_shufdelta_gpu(
+    dev: &GpuDevice,
+    header: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+    let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
+        GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
+    })?;
+    // Float ShufDeltaZstd values are zstd-only (no shuffle/delta) — no GPU
+    // transform path; fall back to the host bounce (spec constraint 5).
+    if !value_encoding.is_integer() {
+        return decode_host_bounce(
+            dev,
+            header,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            block_index_bytes,
+        );
+    }
+    let index_width = if header.index_dtype == 0 { 2 } else { 4 };
+    let n_rows = header.n_major as usize;
+    let n_cols = header.n_minor as usize;
+    let nnz = header.nnz as usize;
+
+    let spans = resolve_block_index(header, block_index_bytes)
+        .map_err(|e| GpuError::InvalidShard(format!("framed ShufDeltaZstd block index: {e}")))?;
+
+    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
+    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
+    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    combined_indptr.push(0);
+
+    let mut host_uploaded_bytes: u64 = 0;
+    let mut nnz_base: usize = 0;
+    for span in &spans {
+        let g_rows = span.n_rows as usize;
+        let g_nnz = span.nnz as usize;
+
+        let g_indptr =
+            scx_codec::decode_row_group_indptr_only(CodecId::ShufDeltaZstd, span, indptr_bytes)?;
+        debug_assert_eq!(g_indptr.len(), g_rows + 1);
+        for &local in &g_indptr[1..=g_rows] {
+            combined_indptr.push(nnz_base as i64 + local);
+        }
+
+        if g_nnz > 0 {
+            let ix_frame = &indices_bytes[span.indices.clone()];
+            let vv_frame = &values_bytes[span.values.clone()];
+            let (d_indices, up_i) =
+                decode_indices_frame_to_device(dev, ix_frame, g_nnz, index_width)?;
+            let (d_data, up_v) =
+                decode_values_frame_to_device(dev, vv_frame, g_nnz, value_encoding)?;
+            host_uploaded_bytes += up_i + up_v;
+            debug_assert_eq!(d_indices.len(), g_nnz);
+            debug_assert_eq!(d_data.len(), g_nnz);
+
+            let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + g_nnz);
+            dev.stream()
+                .memcpy_dtod(&d_indices, &mut idx_dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod indices (shufdelta group): {e}")))?;
+            let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + g_nnz);
+            dev.stream()
+                .memcpy_dtod(&d_data, &mut data_dst)
+                .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta group): {e}")))?;
+        }
+
+        nnz_base += g_nnz;
+    }
+    debug_assert_eq!(nnz_base, nnz);
+    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+
+    host_uploaded_bytes += (combined_indptr.len() * 8) as u64;
+    let d_indptr = dev.htod_copy(&combined_indptr)?;
+    // Per-group kernels + dtod copies are queued async on the stream; sync so a
+    // downstream cuPy consumer cannot race unfinished work.
+    dev.synchronize()?;
+
+    let stats = DeviceDecodeStats {
+        host_uploaded_bytes,
+        device_decoded_bytes: (nnz as u64) * 8,
+        // Phase 1: decompressed plane bytes crossed PCIe, so this is not the
+        // Scx1 "only indptr uploaded" device decode.
+        fully_device_decoded: false,
+        n_shards_shufdelta_gpu: 1,
+        ..DeviceDecodeStats::default()
+    };
+
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: combined_indices,
+            data: combined_data,
+            shape: (n_rows, n_cols),
+        },
+        stats,
+    ))
+}
+
+/// GPU decode of an **unframed (v1) ShufDeltaZstd** shard (whole shard as a
+/// single zstd frame per sub-stream). Same transforms as the framed path with
+/// no per-group loop; the frame helpers produce the full nnz-sized device
+/// buffers directly. Float value encodings fall back to [`decode_host_bounce`].
+fn decode_shufdelta_gpu(
+    dev: &GpuDevice,
+    header: &ShardHeader,
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    block_index_bytes: &[u8],
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+    let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
+        GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
+    })?;
+    let n_rows = header.n_major as usize;
+    let n_cols = header.n_minor as usize;
+    let nnz = header.nnz as usize;
+    if !value_encoding.is_integer() {
+        return decode_host_bounce(
+            dev,
+            header,
+            indptr_bytes,
+            indices_bytes,
+            values_bytes,
+            block_index_bytes,
+        );
+    }
+    let index_width = if header.index_dtype == 0 { 2 } else { 4 };
+
+    // Whole-shard indptr on the host (tiny); indices/values decode on device.
+    let combined_indptr =
+        scx_codec::decode_indptr_only(indptr_bytes, CodecId::ShufDeltaZstd, n_rows)
+            .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
+    debug_assert_eq!(combined_indptr.len(), n_rows + 1);
+    let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
+
+    let (combined_indices, combined_data) = if nnz > 0 {
+        let (d_indices, up_i) =
+            decode_indices_frame_to_device(dev, indices_bytes, nnz, index_width)?;
+        let (d_data, up_v) = decode_values_frame_to_device(dev, values_bytes, nnz, value_encoding)?;
+        host_uploaded_bytes += up_i + up_v;
+        (d_indices, d_data)
+    } else {
+        (dev.alloc_zeros::<i32>(0)?, dev.alloc_zeros::<f32>(0)?)
+    };
+
+    let d_indptr = dev.htod_copy(&combined_indptr)?;
+    dev.synchronize()?;
+
+    let stats = DeviceDecodeStats {
+        host_uploaded_bytes,
+        device_decoded_bytes: (nnz as u64) * 8,
+        fully_device_decoded: false,
+        n_shards_shufdelta_gpu: 1,
+        ..DeviceDecodeStats::default()
     };
 
     Ok((
@@ -741,11 +964,14 @@ mod tests {
     }
 
     /// GPU decode of a **framed (v2)** shard produces output byte-identical to the
-    /// source CSR for both codecs, but takes different paths (Phase E): framed
-    /// **Scx1** decodes in VRAM group-by-group (`fully_device_decoded == true`),
-    /// while a framed non-Scx1 codec (ShufDeltaZstd) host-bounces
-    /// (`fully_device_decoded == false`). The multi-group fixture (14 rows,
-    /// `row_group_rows = 4` → 4 groups) exercises the per-group concat path.
+    /// source CSR for both codecs, with the expected `fully_device_decoded` flag:
+    /// framed **Scx1** decodes fully in VRAM (`true`, only indptr uploaded), while
+    /// framed **ShufDeltaZstd** takes the Phase-1 hybrid GPU path (CPU zstd + GPU
+    /// undelta/unshuffle/convert) which uploads decompressed plane bytes, so
+    /// `false`. (Per-codec GPU-vs-host routing is asserted via the
+    /// `n_shards_*` counters in the dedicated shufdelta tests below.) The
+    /// multi-group fixture (14 rows, `row_group_rows = 4` → 4 groups) exercises
+    /// the per-group concat path.
     #[test]
     fn test_shard_decode_gpu_framed() {
         let dev = require_gpu!();
@@ -774,6 +1000,199 @@ mod tests {
                  framed non-Scx1 host-bounce)"
             );
         }
+    }
+
+    /// Assert a framed ShufDeltaZstd shard GPU-decodes (Phase 1: CPU zstd + GPU
+    /// undelta/unshuffle/convert) byte-identically to the source CSR, and that
+    /// it took the shufdelta GPU path (not host-bounce).
+    fn assert_framed_shufdelta_matches(
+        dev: &GpuDevice,
+        indptr: &[u64],
+        indices: &[u32],
+        values_u16: &[u16],
+        n_cols: u32,
+        row_group_rows: u32,
+    ) {
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+        let n_rows = indptr.len() - 1;
+        let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+        let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+
+        let section = framed_section_bytes(
+            indptr,
+            indices,
+            &values_f32,
+            CodecId::ShufDeltaZstd,
+            n_cols,
+            row_group_rows,
+        );
+        let (gpu_csr, stats) = decode_shard_gpu_with_stats(dev, &section)
+            .unwrap_or_else(|e| panic!("framed shufdelta GPU decode failed: {e}"));
+        let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
+        let g_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
+        let g_data = dev.dtoh_copy(&gpu_csr.data).unwrap();
+        assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize), "shape");
+        assert_eq!(g_indptr, want_indptr, "indptr mismatch");
+        assert_eq!(g_indices, want_indices, "indices mismatch");
+        assert_eq!(g_data, values_f32, "data mismatch");
+        assert_eq!(
+            stats.n_shards_shufdelta_gpu, 1,
+            "expected the ShufDeltaZstd GPU path"
+        );
+        assert_eq!(stats.n_shards_host_bounced, 0, "should not host-bounce");
+        // Phase 1 uploads decompressed plane bytes, so this is not a full
+        // in-VRAM (indptr-only) device decode.
+        assert!(!stats.fully_device_decoded);
+    }
+
+    /// Framed ShufDeltaZstd GPU decode, u16 indices (n_cols <= 65535). The
+    /// multi-group fixture (14 rows, `row_group_rows = 4`) has groups with
+    /// g_nnz up to ~647, exercising the multi-tile undelta prefix-scan carry.
+    #[test]
+    fn test_shard_decode_gpu_framed_shufdelta_u16() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        assert_framed_shufdelta_matches(&dev, &indptr, &indices, &values_u16, n_cols, 4);
+    }
+
+    /// Framed ShufDeltaZstd GPU decode, u32 indices (n_cols > 65535) — 4-plane
+    /// undelta + 4-wide unshuffle.
+    #[test]
+    fn test_shard_decode_gpu_framed_shufdelta_u32() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 70_000;
+        let row_nnzs = [2usize, 130, 300, 0, 512, 9, 256];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        assert_framed_shufdelta_matches(&dev, &indptr, &indices, &values_u16, n_cols, 4);
+    }
+
+    /// Large single row-group (many rows collapsed into one group via a big
+    /// `row_group_rows`) so a plane's `g_nnz` spans many 256-element tiles,
+    /// exercising multi-hop carry propagation in the single-block undelta kernel.
+    #[test]
+    fn test_shard_decode_gpu_framed_shufdelta_large_group() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs: Vec<usize> = (0..40).map(|i| 80 + (i % 7) * 10).collect();
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        // row_group_rows = 64 > 40 rows → a single group whose plane_len is the
+        // whole shard nnz (~3800), i.e. ~15 tiles of 256.
+        assert_framed_shufdelta_matches(&dev, &indptr, &indices, &values_u16, n_cols, 64);
+    }
+
+    /// Unframed (v1) ShufDeltaZstd GPU decode vs the CPU reference decode.
+    #[test]
+    fn test_shard_decode_gpu_unframed_shufdelta() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [0usize, 1, 5, 130, 256, 7, 0, 384, 200, 3, 128, 129, 512, 50];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        let n_rows = indptr.len() - 1;
+        let nnz = indices.len();
+        let values_raw: Vec<u8> = values_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let shard_bytes = build_test_shard(
+            &indptr,
+            &indices,
+            &values_raw,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint16,
+            n_cols,
+        );
+        let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &shard_bytes).unwrap();
+        let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
+        let g_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
+        let g_data = dev.dtoh_copy(&gpu_csr.data).unwrap();
+
+        let header = ShardHeader::read_from(&mut Cursor::new(&shard_bytes)).unwrap();
+        let indptr_enc =
+            &shard_bytes[header.indptr_rel_offset as usize..][..header.indptr_length as usize];
+        let indices_enc =
+            &shard_bytes[header.indices_rel_offset as usize..][..header.indices_length as usize];
+        let values_enc =
+            &shard_bytes[header.values_rel_offset as usize..][..header.values_length as usize];
+        let (cpu_indptr, cpu_indices, cpu_data) = cpu_decode(
+            indptr_enc,
+            indices_enc,
+            values_enc,
+            CodecId::ShufDeltaZstd,
+            ValueEncoding::Uint16,
+            n_rows,
+            nnz,
+            true,
+        );
+
+        assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize));
+        assert_eq!(g_indptr, cpu_indptr, "indptr mismatch");
+        assert_eq!(g_indices, cpu_indices, "indices mismatch");
+        assert_eq!(g_data, cpu_data, "data mismatch");
+        assert_eq!(
+            stats.n_shards_shufdelta_gpu, 1,
+            "expected shufdelta GPU path"
+        );
+        assert_eq!(stats.n_shards_host_bounced, 0);
+    }
+
+    /// Float-valued ShufDeltaZstd (zstd-only, no plane transforms) has no GPU
+    /// path and must fall back to the host-bounce, still decoding correctly.
+    #[test]
+    fn test_shard_decode_gpu_framed_shufdelta_float_fallback() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4000;
+        let row_nnzs = [3usize, 10, 130, 0, 256, 5];
+        let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
+        // Fractional values force a Float32 value encoding.
+        let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32 + 0.5).collect();
+        let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
+        let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
+
+        let section = framed_section_bytes(
+            &indptr,
+            &indices,
+            &values_f32,
+            CodecId::ShufDeltaZstd,
+            n_cols,
+            4,
+        );
+        let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &section).unwrap();
+        let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
+        let g_indices = dev.dtoh_copy(&gpu_csr.indices).unwrap();
+        let g_data = dev.dtoh_copy(&gpu_csr.data).unwrap();
+        assert_eq!(g_indptr, want_indptr, "indptr mismatch");
+        assert_eq!(g_indices, want_indices, "indices mismatch");
+        assert_eq!(g_data, values_f32, "data mismatch");
+        // Float shufdelta has no GPU transform path → host-bounce.
+        assert_eq!(
+            stats.n_shards_host_bounced, 1,
+            "float shufdelta host-bounces"
+        );
+        assert_eq!(stats.n_shards_shufdelta_gpu, 0);
+    }
+
+    /// `DeviceDecodeStats::merge` folds per-codec counters (compact-trial files
+    /// mix Scx1 + ShufDeltaZstd shards). Pure CPU — no GPU required.
+    #[test]
+    fn test_device_decode_stats_merge_counters() {
+        let mut agg = DeviceDecodeStats::default();
+        let scx1 = DeviceDecodeStats {
+            fully_device_decoded: true,
+            n_shards_scx1_gpu: 1,
+            ..DeviceDecodeStats::default()
+        };
+        let shuf = DeviceDecodeStats {
+            fully_device_decoded: false,
+            n_shards_shufdelta_gpu: 1,
+            ..DeviceDecodeStats::default()
+        };
+        agg.merge(&scx1);
+        agg.merge(&shuf);
+        assert_eq!(agg.n_shards_scx1_gpu, 1);
+        assert_eq!(agg.n_shards_shufdelta_gpu, 1);
+        assert_eq!(agg.n_shards_host_bounced, 0);
+        // A single host-bounced shard ANDs fully_device_decoded down to false.
+        assert!(!agg.fully_device_decoded);
     }
 
     /// A framed (v2) Scx1 shard decoded in-VRAM group-by-group is byte-identical

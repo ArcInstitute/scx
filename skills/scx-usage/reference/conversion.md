@@ -112,6 +112,16 @@ via h5ad (`adata.write_h5ad(...)` → `from_h5ad`).
 - **`codec`**: `"auto"` (default, per-shard selection by median value), `"scx1"`
   (Delta-Golomb + FOR-BP + Rice; integer-only), `"zstd"`, `"pcodec"` (best for
   float layers), `"lz4"`, `"none"`.
+  Also `"compact-trial"` (requires `row_group_rows=N`, e.g. 256 — trial-encodes
+  each shard with both the auto-selected codec and ShufDeltaZstd, keeps the
+  per-shard smaller; 1.3–2.1× smaller integer files at the cost of ~2× encode
+  time; produces framed v4 output) and `"shufdelta"` (force ShufDeltaZstd).
+  **Guidance:** `"auto"` (default) is best for GPU ML training and CPU analysis
+  (Scx1 has in-VRAM GPU decode + faster CPU decode); `"compact-trial"` is best
+  for storage-constrained archival or cloud hosting (smaller files, random
+  access via framing). Float data always routes to Pcodec regardless of the
+  codec setting. See `docs/codec.md § Codec tradeoff summary` for the full
+  comparison table.
 - **`csc`**: `None` (default; resolved to `"off"` normally, or `"auto"` when an
   `index_preset` is set), `"off"`, `"auto"`, or `"always"`. `"always"`/`"auto"`
   write a column-major sidecar via a two-pass write (streaming CSR → in-place

@@ -953,6 +953,86 @@ runs as a first-class format in the comprehensive suite:
   scx's ShufDeltaZstd/pcodec/zstd competes closely. See the detailed
   [scx vs shardad — full feature parity](#scx-vs-shardad--full-feature-parity) section
   below for the full per-dataset tables.
+
+  > **Why isn't ShufDeltaZstd the default?** Despite better compression,
+  > ShufDeltaZstd has **no GPU decode path** (Scx1 decodes in VRAM via
+  > BitPacker4x; ShufDeltaZstd host-bounces) and is **~1.3–1.8× slower to
+  > decode on CPU**. For GPU ML training — where codec decode is 25–35% of
+  > per-batch time — Scx1's GPU decode drops that to ~5–8%. `compact-trial`
+  > gives the best of both by trial-encoding each shard and keeping the
+  > smaller, but doubles encode time and frames all output (no in-VRAM Scx1
+  > decode). See [codec.md § "Codec tradeoff summary"](codec.md#codec-tradeoff-summary--scx1-vs-shufdeltazstd)
+  > for a full comparison and guidance on when to use which codec.
+
+  **GPU ShufDeltaZstd decode — Phase 0 profiling (go/no-go).** Before building
+  a GPU decode kernel for ShufDeltaZstd (`GPU-SHUFDELTA-DECODE.md`), Phase 0
+  quantified the host-bounce ceiling. Measured with
+  `benchmarks/scripts/bench_gpu_codec.py` — `to_gpu_anndata(device="gpu")`,
+  median of 3 runs on one H100, byte-exact parity vs the host CSR decode
+  verified for every codec:
+
+  | dataset | codec | route | wall (s) | throughput (Mnnz/s) | host→device upload |
+  |---|---|---|---|---|---|
+  | census_1m (1.40 B nnz) | `scx1` | `scx_device_decode_gpu` | 10.05 | 139.5 | 8 MB (indptr only) |
+  | census_1m | `compact_trial` | `scx_device_handoff_streamed` | 27.18 | 51.6 | 11.2 GB |
+  | census_1m | `shufdelta` | `scx_device_handoff_streamed` | 28.23 | 49.7 | 11.2 GB |
+  | census_500k (0.75 B nnz) | `scx1` | `scx_device_decode_gpu` | 5.35 | 139.6 | 4 MB |
+  | census_500k | `compact_trial` | `scx_device_handoff_streamed` | 14.08 | 53.1 | 6.0 GB |
+  | census_500k | `shufdelta` | `scx_device_handoff_streamed` | 14.02 | 53.3 | 6.0 GB |
+
+  Host-bounce throughput is **0.36–0.38× of Scx1's in-VRAM decode** — far below
+  the 90% exit criterion, so Phase 1 is justified (**GO**). The gap is
+  **CPU-decode-bound, not PCIe-bound**: the 11.2 GB decoded-CSR upload crosses
+  PCIe 4.0 in <1 s, yet the host-bounce wall is ~27 s for 1.4 B nnz. Scx1
+  instead uploads only the ~8 MB indptr and decodes indices+values in VRAM.
+
+  A CPU per-stage micro-bench (task 0b, `scx-codec/benches/codec_bench.rs ::
+  bench_shufdelta_decode_stages`, 16 K-row × ~2000-nnz shard) shows *where* that
+  CPU decode goes, and **inverts the spec's `§8` assumption that zstd
+  dominates**:
+
+  | stage | u16 indices | u32 indices |
+  |---|---|---|
+  | zstd-decompress | 93.5 ms | 124.3 ms |
+  | byte-undelta (prefix scan) | 156.7 ms | 313.8 ms |
+  | byte-unshuffle (transpose) | 102.9 ms | 181.1 ms |
+
+  The scalar `byte_undelta_planes` / `byte_unshuffle` (production's exact decode
+  path; no SIMD variant) run at ~0.4–0.7 GB/s and together are **63–73% of the
+  per-shard CPU decode**, with zstd only 27–37%. Because Phase 1 offloads
+  exactly those transforms to the GPU (zstd stays on CPU), it targets the
+  dominant cost — so its expected win is **substantially larger than the spec's
+  ~1.1× estimate**, potentially approaching Scx1 parity. Phase 2 (nvcomp GPU
+  zstd) adds less at census scale, where PCIe transfer is already a rounding
+  error against CPU decode. See `GPU-SHUFDELTA-DECODE.md` § Phase 0.
+
+  **Phase 1 result — GPU ShufDeltaZstd decode lands (H100).** Phase 1 added a
+  GPU decode path for framed/unframed ShufDeltaZstd shards: the CPU still runs
+  zstd, but the dominant undelta/unshuffle/convert transforms move to two CUDA
+  kernels (`scx-gpu/kernels/shufdelta.cu`), and only the narrower pre-convert
+  plane bytes cross PCIe. Re-running the same `bench_gpu_codec.py` (median of 3,
+  byte-exact parity verified for every codec):
+
+  | dataset | codec | Phase 0 (host-bounce) | Phase 1 (GPU) | wall (s) |
+  |---|---|---|---|---|
+  | census_1m | compact_trial | 0.37× Scx1 | **1.18× Scx1** | 8.48 (vs Scx1 9.98) |
+  | census_1m | shufdelta | 0.36× | 0.86× | 11.64 |
+  | census_500k | compact_trial | 0.38× | **1.20× Scx1** | 4.57 (vs Scx1 5.49) |
+  | census_500k | shufdelta | 0.38× | **1.21× Scx1** | 4.54 |
+
+  Framed ShufDeltaZstd now decodes at **~parity-to-faster than Scx1 (0.86–1.21×
+  across runs), a ~2.4–3.2× jump over the Phase-0 host-bounce** — vindicating the
+  0b finding (offloading the transform-dominated CPU cost was the lever, not the
+  spec's ~1.1× estimate). Two corroborating signals: host→device upload fell
+  from ~11.2 GB to ~5.6 GB per file (narrower u16/u8 plane bytes instead of the
+  decoded i32+f32 CSR), and `uns["scx_accel"]["to_gpu_anndata"]
+  ["n_shards_shufdelta_gpu"]` reports 62 (census_1m) / 31 (census_500k) shards
+  on the GPU path. `transfer_mode` stays `scx_device_handoff_streamed` (Phase 1
+  uploads decompressed bytes; the compact_trial file's 62 X-shards all chose
+  ShufDeltaZstd, so it and the pure-shufdelta file carry identical X content and
+  their wall gap is run-to-run variance). Phase 2 (nvcomp GPU zstd) remains a
+  follow-on. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.
+
 - **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
   ~flat while shardad must materialize the whole matrix —
 

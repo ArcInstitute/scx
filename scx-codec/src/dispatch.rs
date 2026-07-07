@@ -954,7 +954,15 @@ fn encode_zstd(
 }
 
 /// Decompress Zstd data with an upper bound on decompressed size.
-fn zstd_decode_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, CodecError> {
+///
+/// Public so the GPU decode path (`scx-gpu`) can zstd-decompress a single
+/// ShufDeltaZstd sub-stream frame to its intermediate "still shuffled+delta'd"
+/// plane bytes and upload those to the device, where the undelta/unshuffle/
+/// convert transforms run as kernels. Re-exported as
+/// [`crate::zstd_decompress_bounded`]. `max_bytes` is the exact expected
+/// decompressed length; callers should treat a shorter result as malformed
+/// input (see the `expect_exact_len` checks in the framed decoders).
+pub fn zstd_decode_bounded(data: &[u8], max_bytes: usize) -> Result<Vec<u8>, CodecError> {
     use std::io::Read;
     let decoder = zstd::Decoder::new(data)?;
     // Cap initial allocation to avoid huge alloc from untrusted max_bytes
