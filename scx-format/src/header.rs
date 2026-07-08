@@ -31,7 +31,7 @@ pub const MAGIC: [u8; 4] = *b"SCX\x01";
 ///
 /// v4 permits **row-group-framed** sparse shards (multi-entry `BlockIndex`
 /// with real per-group byte offsets + `shard_format_version == 2`) for
-/// codec-agnostic sub-shard random access (SIDECAR-LONG-TERM-FIX.md Option B).
+/// codec-agnostic sub-shard random access.
 /// This is the **max readable** version. Writers stamp v4 **only** when they
 /// actually emit a framed shard; unframed output stays [`DEFAULT_WRITE_FORMAT_VERSION`]
 /// so it keeps reading on older builds. A v3 build rejects a v4 file via the

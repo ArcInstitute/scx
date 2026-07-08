@@ -1,5 +1,5 @@
 #!/bin/bash
-# GPU-SHUFDELTA-DECODE Phase 2 spike (GATE): validate nvcomp 5.1 batched GPU
+# GPU ShufDeltaZstd decode — Phase 2 nvcomp spike (GATE): validate nvcomp 5.1 batched GPU
 # zstd decode is byte-exact vs CPU zstd + print GPU-vs-CPU throughput on
 # representative per-group frames. Invoked under sbatch on a GPU node.
 #

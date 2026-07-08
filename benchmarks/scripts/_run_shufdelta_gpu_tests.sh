@@ -1,6 +1,6 @@
 #!/bin/bash
 # Focused GPU correctness run for the ShufDeltaZstd decode path
-# (GPU-SHUFDELTA-DECODE Phases 1/1.5/2). Runs the shufdelta + framed decode
+# (GPU ShufDeltaZstd decode, Phases 1/1.5/2). Runs the shufdelta + framed decode
 # tests, isolated from the flaky rapids UMAP test that can abort the full
 # harness. Invoked under sbatch.
 #

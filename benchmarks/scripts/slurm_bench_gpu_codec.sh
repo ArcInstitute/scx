@@ -10,7 +10,7 @@
 #SBATCH --output=benchmarks/comprehensive/logs/bench_gpu_codec.%j.out
 #SBATCH --error=benchmarks/comprehensive/logs/bench_gpu_codec.%j.err
 
-# GPU-SHUFDELTA-DECODE Phase 0 (tasks 0a/0c): profile to_gpu_anndata across
+# GPU ShufDeltaZstd decode — Phase 0 (tasks 0a/0c): profile to_gpu_anndata across
 # scx1 / compact_trial / shufdelta encodings of census_1m + census_500k and
 # print the host-bounce-vs-Scx1 throughput ratio + go/no-go for Phase 1.
 #

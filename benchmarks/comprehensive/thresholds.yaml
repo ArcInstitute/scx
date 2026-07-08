@@ -575,7 +575,7 @@ absolute_floors:
   #   metric: scx_format_pipeline_devdecode_route
   #   min: 1.0
 
-  # --- GPU ShufDeltaZstd decode route floor (GPU-SHUFDELTA-DECODE Phase 1) ---
+  # --- GPU ShufDeltaZstd decode route floor ---
   # Phase 1 added a GPU decode path for framed/unframed ShufDeltaZstd shards
   # (CPU zstd + GPU undelta/unshuffle/convert). `to_gpu_anndata` now stamps
   # `uns["scx_accel"]["to_gpu_anndata"]["n_shards_shufdelta_gpu"]` — the count of

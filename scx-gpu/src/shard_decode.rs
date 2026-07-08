@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(stats.n_shards_host_bounced, 0);
     }
 
-    /// GPU-SHUFDELTA-DECODE **Phase 2.x** (cross-shard nvcomp batching): a run of
+    /// GPU ShufDeltaZstd decode **Phase 2.x** (cross-shard nvcomp batching): a run of
     /// framed ShufDeltaZstd shards decoded via the batched path
     /// (`decode_csr_shards_to_device_with_stats` with `SCX_SHUFDELTA_NVCOMP=1`)
     /// is byte-identical to (a) the host decode-and-concat and (b) the per-shard
@@ -1497,7 +1497,7 @@ mod tests {
         assert_eq!(b_stats.n_shards_host_bounced, 0);
     }
 
-    /// GPU-SHUFDELTA-DECODE Phase 2 spike (GATE): nvcomp batched GPU zstd decode
+    /// GPU ShufDeltaZstd decode Phase 2 spike (GATE): nvcomp batched GPU zstd decode
     /// of a shard's per-group indices/values frames is **byte-identical** to the
     /// CPU `zstd_decompress_bounded`, and prints GPU vs **parallel** CPU
     /// throughput. Uses a **large frame count** (256 groups) so nvcomp — which

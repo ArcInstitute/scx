@@ -965,7 +965,7 @@ runs as a first-class format in the comprehensive suite:
   > for a full comparison and guidance on when to use which codec.
 
   **GPU ShufDeltaZstd decode — Phase 0 profiling (go/no-go).** Before building
-  a GPU decode kernel for ShufDeltaZstd (`GPU-SHUFDELTA-DECODE.md`), Phase 0
+  a GPU decode kernel for ShufDeltaZstd, Phase 0
   quantified the host-bounce ceiling. Measured with
   `benchmarks/scripts/bench_gpu_codec.py` — `to_gpu_anndata(device="gpu")`,
   median of 3 runs on one H100, byte-exact parity vs the host CSR decode
@@ -1004,7 +1004,7 @@ runs as a first-class format in the comprehensive suite:
   dominant cost — so its expected win is **substantially larger than the spec's
   ~1.1× estimate**, potentially approaching Scx1 parity. Phase 2 (nvcomp GPU
   zstd) adds less at census scale, where PCIe transfer is already a rounding
-  error against CPU decode. See `GPU-SHUFDELTA-DECODE.md` § Phase 0.
+  error against CPU decode.
 
   **Phase 1 result — GPU ShufDeltaZstd decode lands (H100).** Phase 1 added a
   GPU decode path for framed/unframed ShufDeltaZstd shards: the CPU still runs
@@ -1031,7 +1031,7 @@ runs as a first-class format in the comprehensive suite:
   uploads decompressed bytes; the compact_trial file's 62 X-shards all chose
   ShufDeltaZstd, so it and the pure-shufdelta file carry identical X content and
   their wall gap is run-to-run variance). Phase 2 (nvcomp GPU zstd) remains a
-  follow-on. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.
+  follow-on.
 
   **Phase 1.5 result — pipelined decode (parallel zstd + multi-stream, H100).**
   Phase 1.5 pipelines the per-group CPU zstd across worker threads (bounded
@@ -1057,7 +1057,7 @@ runs as a first-class format in the comprehensive suite:
   ShufDeltaZstd (≥2 groups); `SCX_SHUFDELTA_GPU_SEQUENTIAL=1` forces the
   sequential path. The largest remaining GPU-side cost is the ~5.6 GB H2D of
   decompressed plane bytes — which Phase 2 (nvcomp, upload compressed instead)
-  would attack. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.5.
+  would attack.
 
   **Phase 2 result — nvcomp full in-VRAM decode (opt-in, H100).** Phase 2 adds a
   GPU-zstd path: upload the **compressed** per-group frames and decompress them
@@ -1085,8 +1085,7 @@ runs as a first-class format in the comprehensive suite:
   the pipeline stays the default. nvcomp is the right choice only when the
   device-decode route or the ~4× smaller PCIe transfer matters more than wall
   time (PCIe- or CPU-constrained hosts). Reducing the per-shard overhead
-  (cross-shard batching, fewer syncs) is the natural follow-on. See
-  `GPU-SHUFDELTA-DECODE.md` § Phase 2.
+  (cross-shard batching, fewer syncs) is the natural follow-on.
 
   **Phase 2.x result — nvcomp cross-shard batching (H100, post-T4 refresh).**
   Phase 2.x collapses the per-shard nvcomp overhead: instead of two
@@ -1116,8 +1115,7 @@ runs as a first-class format in the comprehensive suite:
   metadata-assembly-bound, so the PCIe win does not translate to wall time — so
   nvcomp **stays opt-in**; batching is applied automatically *within* the opt-in.
   (`census_1m_shufdelta.scx` is v3-unframed and never enters the nvcomp path; the
-  62-shard case is measured on the framed `census_1m_compact_trial.scx`.) See
-  `GPU-SHUFDELTA-DECODE.md` § Phase 2.x.
+  62-shard case is measured on the framed `census_1m_compact_trial.scx`.)
 
   **T4 result — parallel obs/var metadata decode (H100 + 32-core CPU).** The
   obs/var sharded-metadata decode (`reader::read_sharded_layout_by_prefix`) was

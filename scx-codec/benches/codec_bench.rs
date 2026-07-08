@@ -380,7 +380,7 @@ fn bench_decode_shard(c: &mut Criterion) {
     group.finish();
 }
 
-/// GPU-SHUFDELTA-DECODE Phase 0, task 0b: quantify the CPU cost split of a
+/// GPU ShufDeltaZstd decode, Phase 0 task 0b: quantify the CPU cost split of a
 /// ShufDeltaZstd shard decode across its three stages — zstd-decompress,
 /// byte-undelta (prefix scan), byte-unshuffle (transpose) — on the nnz-sized
 /// `indices` sub-stream, plus zstd-decompress of the `values` sub-stream.

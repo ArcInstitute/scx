@@ -250,8 +250,8 @@ pub type DecodedShard = (Vec<u64>, Vec<u32>, Vec<u8>);
 /// consumed by [`decode_row_group`]. The three `Range<usize>` are byte ranges
 /// **into each sub-stream** (indptr / indices / values), inferred from the
 /// per-entry offsets (`[offset[g], offset[g+1])`, last = stream length). This is
-/// the codec-agnostic random-access unit underneath F5-b (SIDECAR-LONG-TERM-FIX.md
-/// Option B): a group decodes independently to a *local* CSR.
+/// the codec-agnostic random-access unit underneath F5-b: a group decodes
+/// independently to a *local* CSR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowGroupSpan {
     /// First (shard-local) row covered by this group.
@@ -454,7 +454,7 @@ pub fn decode_indptr_only(
 
 /// Decode a single row-group of a framed (v4/shard-v2) shard to a **local** CSR.
 ///
-/// Codec-agnostic random-access primitive (SIDECAR-LONG-TERM-FIX.md Option B). The
+/// Codec-agnostic random-access primitive. The
 /// three `*_bytes` slices are the shard's *whole* sub-streams; `span` carries the
 /// byte ranges of this group's frame within each. Returns a group-local
 /// [`DecodedShard`]: `indptr.len() == n_rows+1`, `indptr[0] == 0`,

@@ -177,7 +177,7 @@ pub fn decode_values_frame_to_device(
 // ---------------------------------------------------------------------------
 // Phase 1.5: pipelined framed decode (parallel CPU zstd + multi-stream H2D).
 //
-// Profiling (GPU-SHUFDELTA-DECODE Phase 0/1) showed the sequential path's floor
+// Profiling (GPU ShufDeltaZstd decode, Phase 0/1) showed the sequential path's floor
 // is single-threaded CPU zstd, and that `htod_copy` (pageable, NULL stream)
 // blocks the host. This path fans the per-group zstd out across worker threads
 // (bounded channel → backpressure) and overlaps it with GPU work: uploads run

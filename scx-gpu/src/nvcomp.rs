@@ -1,6 +1,6 @@
 //! Optional GPU zstd via NVIDIA nvcomp (batched decompress), loaded at runtime.
 //!
-//! GPU-SHUFDELTA-DECODE Phase 2: instead of running zstd on the CPU and
+//! GPU ShufDeltaZstd decode, Phase 2: instead of running zstd on the CPU and
 //! uploading decompressed plane bytes (Phase 1/1.5), upload the **compressed**
 //! per-group zstd frames and decompress them **on the device** with nvcomp's
 //! batched API, then finish with the existing undelta/unshuffle/convert kernels.

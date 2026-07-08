@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GPU codec-decode profiling driver — GPU-SHUFDELTA-DECODE Phase 0 (tasks 0a/0c).
+GPU codec-decode profiling driver — GPU ShufDeltaZstd decode, Phase 0 (tasks 0a/0c).
 
 Profiles ``pyscx.open(path).to_gpu_anndata(device="gpu")`` across three codec
 encodings of the *same* dataset:
@@ -272,7 +272,7 @@ def analyze_dataset(records: list[dict]) -> dict:
 def render_markdown(all_records: dict[str, list[dict]], analysis: dict[str, dict]) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines = [
-        "# GPU codec-decode profiling (GPU-SHUFDELTA-DECODE Phase 0)",
+        "# GPU codec-decode profiling (GPU ShufDeltaZstd decode, Phase 0)",
         "",
         f"**Generated**: {ts}",
         "",

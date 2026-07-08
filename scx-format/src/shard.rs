@@ -373,8 +373,8 @@ impl BlockIndex {
 /// Parse **and fully validate** a framed shard's `BlockIndex`, resolving each
 /// entry into a [`RowGroupSpan`] with inferred per-sub-stream byte ranges.
 ///
-/// This is the codec-agnostic random-access reader (SIDECAR-LONG-TERM-FIX.md
-/// Option B §4.2). Entries carry per-sub-stream *offsets* but no lengths, so a
+/// This is the codec-agnostic random-access reader. Entries carry
+/// per-sub-stream *offsets* but no lengths, so a
 /// group's byte range is `[offset[g], offset[g+1])` (the last group ends at the
 /// sub-stream length from `header`). Because a raw `BlockIndexEntry` is unsafe to
 /// hand to a codec, callers must go through this validator, which enforces:
