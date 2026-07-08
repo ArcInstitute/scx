@@ -503,6 +503,14 @@ enum Commands {
         /// shard plus a warning. Defaults to a multiple of the target.
         #[arg(long, value_name = "SIZE")]
         group_max_bytes: Option<String>,
+        /// F6: byte cap on the emitter's per-shard accumulation buffer in grouped
+        /// mode (binary suffix `K`/`M`/`G`/`T`). When the accumulated CSR of the
+        /// current shard reaches this, it is sub-flushed as a standalone shard
+        /// *within* a group — bounding grouped-write peak memory at one block
+        /// instead of one whole group (a large group is split across shards).
+        /// Default 256M. `0` disables the sub-flush. Only with `--group-by`.
+        #[arg(long, value_name = "SIZE")]
+        group_write_block_bytes: Option<String>,
     },
     /// Revert to a previous manifest version
     Rollback {
@@ -1085,6 +1093,7 @@ fn main() {
             reference,
             group_target_bytes,
             group_max_bytes,
+            group_write_block_bytes,
         } => sort::run_sort(
             &input,
             &output,
@@ -1107,6 +1116,7 @@ fn main() {
             reference,
             group_target_bytes,
             group_max_bytes,
+            group_write_block_bytes,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
         Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),

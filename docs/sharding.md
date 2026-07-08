@@ -401,8 +401,22 @@ global order, then runs an offline byte-budget bin-packer that:
 - packs all reference rows first into the leading shard(s) (`reference_shard`,
   always shard 0), never mixed with groups;
 - bin-packs the remaining groups greedily to the byte (or row) budget,
-  **cutting only at group edges** — a group is never split across shards;
-- gives any single oversized group its own shard (with a warning).
+  **the planner cuts only at group edges** — the group *plan* never splits a group;
+- gives any single oversized group its own planned shard.
+
+> **F6 — oversized groups & the in-memory fast path.** The *emitter* may
+> sub-flush a single oversized group across **multiple output shards** once its
+> buffered CSR reaches `--group-write-block-bytes` (default 256 MB), so grouped
+> write no longer OOMs on a huge reference group (e.g. a 127K-cell
+> `non-targeting`). Such a group then has **several `group_index` records sharing
+> one label** (each still within one shard); the read side unions them, so
+> `read_group` / `read_reference` return the whole group transparently. In the
+> default in-memory path (no `--memory-budget`), grouped X is gathered from the
+> resident CSR and encoded **in parallel** (rayon) — byte-identical to the
+> single-threaded path but ~2–4× faster (see [performance.md](performance.md)).
+> The parallel gather trades peak RSS for speed; cap it with `RAYON_NUM_THREADS`,
+> or set `SCX_SORT_NO_INMEM_FAST=1` to force the memory-lean single-threaded
+> emitter. `--group-write-block-bytes 0` disables the sub-flush entirely.
 
 `--reverse` is ignored in grouped mode (reference must sort first). The full
 group contract is persisted in a self-describing `group_index` sidecar
@@ -447,6 +461,15 @@ across the reference / non-reference boundary (only possible with
 `read_reference` serves the reference rows. The Rust seam is
 `scx_engine::QueryPipeline::{read_group, read_reference, group_labels,
 iter_group_shards, read_row_range}`.
+
+> **F6 note.** `read_group` / `read_reference` are safe under the F6 sub-flush:
+> they union all of a label's records via `GroupIndex::label_range` /
+> `reference_range`, so a group split across shards reads back in full. The
+> lower-level **streaming** surface (`iter_group_shards` / `GroupShardHandle`)
+> yields one handle **per shard**, so an oversized group now appears in
+> **several** handles (each covering its shard-local slice) — a streaming
+> consumer must accumulate across handles rather than stop at the first handle
+> mentioning a label.
 
 ### Limitations & staleness
 

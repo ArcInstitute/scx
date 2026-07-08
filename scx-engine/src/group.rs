@@ -129,6 +129,41 @@ impl GroupIndex {
             }
         }
 
+        // F6 Phase 0: a single group label may now span multiple `group` records
+        // (the writer's block-level sub-flush splits an oversized group across
+        // adjacent output shards). `label_range` / `read_group` union those
+        // records into one span, so they must tile a **contiguous** range — a
+        // gap or overlap would make the union pull in interloping rows from
+        // another group. Enforce it here (mirrors the reference `[0, k)` check).
+        {
+            // Group order does not affect this validation (each label's records
+            // are sorted by `row_start` independently), so a HashMap's O(1)
+            // grouping is preferable to an ordered map here.
+            let mut by_group: HashMap<&str, Vec<&GroupRecord>> = HashMap::new();
+            for r in records.iter().filter(|r| r.role == GroupRole::Group) {
+                by_group.entry(r.label.as_str()).or_default().push(r);
+            }
+            for (label, mut recs) in by_group {
+                if recs.len() < 2 {
+                    continue;
+                }
+                recs.sort_by_key(|r| r.row_start);
+                let mut expected = recs[0].row_start;
+                for r in &recs {
+                    if r.row_start != expected {
+                        return Err(EngineError::Generic(format!(
+                            "group_index: records for group {label:?} must tile a contiguous \
+                             range (a group split across shards by the block sub-flush stays \
+                             contiguous); record starts at row {} but expected {} — a gap or \
+                             overlap indicates a corrupt sidecar",
+                            r.row_start, expected
+                        )));
+                    }
+                    expected = r.row_stop;
+                }
+            }
+        }
+
         // Build the label map: non-reference wins on collision.
         let mut by_label: HashMap<String, usize> = HashMap::new();
         for (i, rec) in records.iter().enumerate() {
@@ -152,8 +187,40 @@ impl GroupIndex {
     }
 
     /// The group-role record for `label` (non-reference wins on a split label).
+    /// Note: with F6 block sub-flush a label may map to multiple records across
+    /// shards; this returns only the first. Prefer [`Self::label_range`] for the
+    /// full row span of a label.
     pub fn record(&self, label: &str) -> Option<&GroupRecord> {
         self.by_label.get(label).map(|&i| &self.records[i])
+    }
+
+    /// The contiguous `[start, stop)` global row range for `label` — the union
+    /// of every record in its winning role (non-reference wins, matching
+    /// [`Self::record`]). F6 Phase 0: a group sub-flushed across multiple shards
+    /// has multiple `group` records; `from_bytes` guarantees they tile a
+    /// contiguous span, so this union contains only that label's rows and drives
+    /// `read_group` correctly whether the group occupies one shard or many.
+    /// `None` if the label is unknown.
+    pub fn label_range(&self, label: &str) -> Option<(u64, u64)> {
+        let &i = self.by_label.get(label)?;
+        let role = self.records[i].role;
+        let mut start = u64::MAX;
+        let mut stop = 0u64;
+        let mut any = false;
+        for r in self
+            .records
+            .iter()
+            .filter(|r| r.label == label && r.role == role)
+        {
+            any = true;
+            start = start.min(r.row_start);
+            stop = stop.max(r.row_stop);
+        }
+        if any {
+            Some((start, stop))
+        } else {
+            None
+        }
     }
 
     /// All records (group + reference), in shard order.

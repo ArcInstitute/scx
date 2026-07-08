@@ -261,8 +261,12 @@ impl QueryPipeline {
     /// `strsim` close matches (difflib-equivalent).
     pub fn read_group(&self, label: &str) -> Result<QueryResult> {
         let gi = self.require_grouped()?;
-        match gi.record(label) {
-            Some(rec) => self.read_row_range(rec.row_start, rec.row_stop),
+        // F6 Phase 0: a group may span multiple records (block sub-flush split it
+        // across shards). `label_range` unions them into the group's contiguous
+        // `[start, stop)` span so `read_row_range` returns every cell of the
+        // group regardless of how many shards it occupies.
+        match gi.label_range(label) {
+            Some((start, stop)) => self.read_row_range(start, stop),
             None => Err(crate::error::EngineError::UnknownGroupLabel {
                 label: label.to_string(),
                 suggestions: gi.close_matches(label, 5),

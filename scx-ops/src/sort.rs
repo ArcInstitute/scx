@@ -96,6 +96,16 @@ pub struct SortOptions {
     /// shard plus a warning. `None` => derived as a multiple of
     /// `group_target_bytes`. Only meaningful when `group_by` is `Some`.
     pub group_max_bytes: Option<u64>,
+    /// F6 Phase 0 — byte cap on the emitter's per-shard accumulation buffer in
+    /// grouped mode. When the accumulated (encoded) CSR of the current shard
+    /// reaches this many bytes, the emitter sub-flushes it as a standalone shard
+    /// *within* a group — bounding grouped-write peak RSS at one block instead of
+    /// one whole group (fixes the oversized-reference-group OOM). `None` => the
+    /// default (`DEFAULT_GROUP_WRITE_BLOCK_BYTES`, 256 MB); `Some(0)` disables
+    /// the sub-flush (restores the legacy never-split-across-shards behaviour and
+    /// re-arms the hard M1 memory guard). Only meaningful when `group_by` is
+    /// `Some`.
+    pub group_write_block_bytes: Option<u64>,
 }
 
 /// How to identify reference rows for grouped sharding (F1).
@@ -123,6 +133,7 @@ impl Default for SortOptions {
             reference: None,
             group_target_bytes: None,
             group_max_bytes: None,
+            group_write_block_bytes: None,
         }
     }
 }

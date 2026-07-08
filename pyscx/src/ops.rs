@@ -765,6 +765,7 @@ pub(crate) fn parse_reference_spec(
     memory_budget=None, temp_dir=None, bitmap="off".to_string(), rebuild_csc=false,
     csc_cols_per_shard=5000, csc_memory_limit="4G".to_string(),
     group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None,
+    group_write_block_bytes=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn sort(
@@ -788,6 +789,7 @@ pub fn sort(
     reference: Option<Bound<'_, PyAny>>,
     group_target_bytes: Option<Bound<'_, PyAny>>,
     group_max_bytes: Option<Bound<'_, PyAny>>,
+    group_write_block_bytes: Option<Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     if by.is_empty() && group_by.is_none() {
         return Err(PyValueError::new_err(
@@ -809,6 +811,7 @@ pub fn sort(
     }
     let group_target_bytes = convert::parse_memory_budget(group_target_bytes.as_ref())?;
     let group_max_bytes = convert::parse_memory_budget(group_max_bytes.as_ref())?;
+    let group_write_block_bytes = convert::parse_memory_budget(group_write_block_bytes.as_ref())?;
     let bitmap = scx_format_io::BitmapPolicy::parse(&bitmap).map_err(PyValueError::new_err)?;
     // Route shard_size through the shared validator (signed i64 so a negative
     // value is a clean `ValueError`, not pyo3 `OverflowError`), matching every
@@ -836,6 +839,7 @@ pub fn sort(
         reference,
         group_target_bytes,
         group_max_bytes,
+        group_write_block_bytes,
     };
     py.detach(|| scx_ops::sort(&input_path, &output_path, &opts))
         .map_err(ops_to_pyerr)?;

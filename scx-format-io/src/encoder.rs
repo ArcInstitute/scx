@@ -80,6 +80,48 @@ pub fn encode_one_shard(
     name: String,
     framing: Option<FramingConfig>,
 ) -> Result<PreEncodedSection, ScxError> {
+    // Default: auto-detect the value encoding per shard (the narrowest that fits
+    // this shard's values). Callers needing a caller-fixed encoding (e.g. the
+    // sort engine's file-wide encoding, for byte-identical output) use
+    // [`encode_one_shard_with_value_encoding`].
+    encode_one_shard_with_value_encoding(
+        shard_indptr,
+        shard_indices,
+        shard_values,
+        explicit_codec,
+        index_dtype,
+        n_vars,
+        global_row_offset,
+        section_type,
+        modality_type,
+        name,
+        framing,
+        None,
+    )
+}
+
+/// Like [`encode_one_shard`], but with an optional caller-supplied
+/// `value_encoding` override. When `Some(enc)`, the shard's values are encoded
+/// with `enc` instead of the per-shard auto-detected narrowest encoding — this
+/// is what lets a parallel encode reproduce a *file-wide* value encoding and
+/// thus produce byte-identical output to a path that fixed the encoding up
+/// front (e.g. `scx-ops` grouped-write fast path vs. `CsrEmitter`). `None`
+/// preserves the auto-detect behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_one_shard_with_value_encoding(
+    shard_indptr: &[u64],
+    shard_indices: &[u32],
+    shard_values: &[f32],
+    explicit_codec: Option<CodecId>,
+    index_dtype: u8,
+    n_vars: u32,
+    global_row_offset: u64,
+    section_type: SectionType,
+    modality_type: ModalityType,
+    name: String,
+    framing: Option<FramingConfig>,
+    value_encoding: Option<ValueEncoding>,
+) -> Result<PreEncodedSection, ScxError> {
     // Enforce the canonical-CSR contract in debug builds. Release builds
     // trust the caller (callers canonicalize upstream); this catches a
     // forgetful new call site before it produces a hard codec error or
@@ -92,8 +134,9 @@ pub fn encode_one_shard(
 
     let index_dtype_u16 = index_dtype == 0;
 
-    // 3. Detect value encoding and encode values.
-    let shard_value_encoding: ValueEncoding = detect_value_encoding(shard_values);
+    // 3. Determine value encoding (caller override wins) and encode values.
+    let shard_value_encoding: ValueEncoding =
+        value_encoding.unwrap_or_else(|| detect_value_encoding(shard_values));
     let shard_values_bytes = values_to_raw_bytes(shard_values, shard_value_encoding)?;
 
     // 4. Select codec (heuristic when not explicit).

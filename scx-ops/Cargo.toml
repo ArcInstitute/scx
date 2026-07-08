@@ -13,6 +13,7 @@ scx-codec = { path = "../scx-codec" }
 scx-sparse = { path = "../scx-sparse" }
 scx-engine = { path = "../scx-engine" }
 half = { workspace = true }
+rayon = { workspace = true }
 roaring = { workspace = true }
 fs4 = { workspace = true }
 blake3 = { workspace = true }
