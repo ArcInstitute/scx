@@ -1025,10 +1025,10 @@ mod tests {
         // sgemm + `gpu_scale_columns` tail.
         //
         // The earlier loadings-vs-`gpu_covariance_pca` cosine oracle was dropped
-        // in ACC-RUST-OPT-V4 Phase 3.2 along with the GPU covariance path;
-        // randomized-PCA loadings are now validated against scanpy/rapids by the
-        // Python-side `subspace_cos_min` gate (cross-crate parity can't live here
-        // — scx-gpu cannot depend on scx-accel).
+        // along with the GPU covariance path; randomized-PCA loadings are now
+        // validated against scanpy/rapids by the Python-side `subspace_cos_min`
+        // gate (cross-crate parity can't live here — scx-gpu cannot depend on
+        // scx-accel).
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         use scx_format_io::ShardSource;

@@ -345,7 +345,7 @@ impl TrainingDataset {
     }
 }
 
-/// Multimodal training dataset (Phase H.1 of MULTIMODAL-SUPPORT.md).
+/// Multimodal training dataset.
 ///
 /// Wraps N independent `TrainingPipeline` instances — one per requested
 /// modality — and yields per-batch dicts whose cell axes align across

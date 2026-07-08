@@ -1,4 +1,4 @@
-//! Opt-in per-stage GPU timing profiler (ACC-RUST-OPT-V4 Phase 0.2 evidence).
+//! Opt-in per-stage GPU timing profiler.
 //!
 //! Enabled by setting `SCX_GPU_PROFILE=1` (any non-empty, non-`"0"` value).
 //! Quantifies where the SCX GPU path spends wall-clock time so we can tell

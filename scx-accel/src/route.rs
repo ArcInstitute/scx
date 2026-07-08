@@ -69,9 +69,9 @@ pub enum AccelRoute {
     /// preprocess → PCA → kNN → UMAP handoff; no DE route emits this today.
     GpuDeviceResident,
     /// GPU compute handed off to rapids-singlecell (cuML/cuVS/cuGraph) on a
-    /// device-resident matrix (ACC-RUST-OPT-V4 Phase 1). The in-VRAM route for
-    /// the ops rapids supersedes (UMAP / in-VRAM PCA / in-VRAM kNN / extra HVG
-    /// flavors / preprocess); see `plan_rapids_route`.
+    /// device-resident matrix. The in-VRAM route for the ops rapids supersedes
+    /// (UMAP / in-VRAM PCA / in-VRAM kNN / extra HVG flavors / preprocess);
+    /// see `plan_rapids_route`.
     RapidsSinglecell,
 }
 
@@ -134,9 +134,9 @@ pub enum FallbackReason {
     UserForcedCpu,
     /// A performance policy chose CPU/another route despite GPU availability.
     PerfPolicy,
-    /// A rapids-routed op (ACC-RUST-OPT-V4) was requested on GPU but
-    /// rapids-singlecell is not importable, so the op fell back to CPU. See
-    /// `plan_rapids_route` and `docs/gpu-setup.md` (rapids analysis backend).
+    /// A rapids-routed op was requested on GPU but rapids-singlecell is not
+    /// importable, so the op fell back to CPU. See `plan_rapids_route` and
+    /// `docs/gpu-setup.md` (rapids analysis backend).
     NoRapids,
 }
 
@@ -184,7 +184,7 @@ pub struct AccelExecutionInfo {
     /// cuSPARSE SpMM algorithm policy for the op, if applicable (Task 2.5):
     /// `"default"` / `"deterministic"` / `"benchmark_once"`. `None` otherwise.
     pub spmm_policy: Option<&'static str>,
-    // --- ACC-RUST-OPT-V4 §4.4: rapids-route / device-handoff metadata ---
+    // --- rapids-route / device-handoff metadata ---
     /// rapids-singlecell version, when a rapids route ran (`None` otherwise).
     pub rapids_version: Option<String>,
     /// cuML version, when known.
@@ -434,8 +434,8 @@ pub fn plan_simple_gpu_route(
 }
 
 /// Decide the route for an op that hands in-VRAM GPU compute to
-/// rapids-singlecell (ACC-RUST-OPT-V4 Phase 1): UMAP, in-VRAM PCA/kNN, extra HVG
-/// flavors, preprocess. The decision is a pure function of the dispatch facts so
+/// rapids-singlecell: UMAP, in-VRAM PCA/kNN, extra HVG flavors, preprocess.
+/// The decision is a pure function of the dispatch facts so it is
 /// it is unit-testable without a GPU; the pyscx caller supplies the runtime
 /// signals (`gpu_available`, `rapids_available` from an import probe, `fits_vram`
 /// from the VRAM pre-flight).
@@ -697,8 +697,8 @@ mod tests {
         );
         assert_eq!(FallbackReason::NoCscSidecar.as_str(), "no_csc_sidecar");
         assert_eq!(FallbackReason::None.as_str(), "none");
-        // ACC-RUST-OPT-V4 wire contracts: the rapids route + no_rapids reason
-        // are matched by the Phase 2 `*_route_rapids_correct` gates.
+        // Wire contracts: the rapids route + no_rapids reason are matched by
+        // the `*_route_rapids_correct` gates.
         assert_eq!(
             AccelRoute::RapidsSinglecell.as_str(),
             "rapids_singlecell_gpu"

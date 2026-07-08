@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# F3 (SCX-USER-REPORT-2026-05-21-Tier3): track whether dotenv was actually
+# Track whether dotenv was actually
 # imported so the SCX_WORK_DIR error below can distinguish "auto-load
 # failed because python-dotenv isn't installed" from "auto-load ran but
 # .env doesn't define SCX_WORK_DIR". Pre-fix, both modes raised the same

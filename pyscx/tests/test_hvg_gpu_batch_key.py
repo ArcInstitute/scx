@@ -1,4 +1,4 @@
-"""GPU HVG `batch_key` support — see SCX-USER-REPORT-2026-05-21-Tier3 B1.
+"""GPU HVG `batch_key` support.
 
 The GPU `seurat_v3` HVG path used to silently fall back to CPU whenever
 `batch_key` was set (warning text: "only implemented for single-batch

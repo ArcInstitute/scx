@@ -7,12 +7,11 @@
 //! `cuGraphLaunch` amortize per-launch latency.
 //!
 //! NOTE: the PCA power loop is **no longer a capture target** — its
-//! SpMM-segment capture was removed in ACC-RUST-OPT-V4 Phase 3.4
-//! (`run_resident_power_loop` always reports "no replay"). The
-//! `GpuPcaScratch` stable-buffer prerequisite is kept only as a model for
-//! the remaining capture sites; do not re-enable PCA capture without first
-//! moving its per-iteration QR/eigh/slot-grow allocations outside the
-//! capture region.
+//! SpMM-segment capture was removed (`run_resident_power_loop` always reports
+//! "no replay"). The `GpuPcaScratch` stable-buffer prerequisite is kept only
+//! as a model for the remaining capture sites; do not re-enable PCA capture
+//! without first moving its per-iteration QR/eigh/slot-grow allocations
+//! outside the capture region.
 //!
 //! ## Prerequisites
 //!

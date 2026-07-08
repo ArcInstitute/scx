@@ -2145,7 +2145,7 @@ def accelerator_parity_table() -> TableBlock | TextBlock:
 def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
     """Surviving native GPU paths vs rapids-singlecell, per (operation, dataset).
 
-    Post ACC-RUST-OPT-V4, in-VRAM PCA / kNN / UMAP / preprocess / HVG route to
+    Post rapids transition, in-VRAM PCA / kNN / UMAP / preprocess / HVG route to
     rapids-singlecell, so SCX's default GPU path for those *is* rapids (a
     head-to-head ratio is ~1.0 by construction). This table therefore compares
     only the native GPU kernels that survive because they cover a regime rapids
@@ -2159,7 +2159,7 @@ def accelerator_gpu_vs_rapids_comparison_table() -> TableBlock | TextBlock:
     build); correctness is gated separately.
     """
     store = get_store()
-    # Surviving native GPU paths after the ACC-RUST-OPT-V4 rapids transition.
+    # Surviving native GPU paths after the rapids transition.
     # In-VRAM PCA / kNN / UMAP / preprocess / HVG route to rapids-singlecell, so
     # SCX's *default* GPU path for those IS rapids (ratio ~1.0 by construction,
     # not worth a row). A distinct native GPU kernel survives only where it

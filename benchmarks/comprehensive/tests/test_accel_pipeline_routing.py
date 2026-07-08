@@ -22,7 +22,7 @@ import pytest
 
 
 # The native device-resident pipeline variant (`accel_pipeline__pyscx_gpu_resident`)
-# was removed in ACC-RUST-OPT-V4 Phase 3 along with the device-resident fused
+# was removed along with the device-resident fused
 # UMAP path; the in-VRAM pipeline now routes to rapids-singlecell.
 PIPELINE_KEYS = [
     "accel_pipeline__pyscx_cpu",

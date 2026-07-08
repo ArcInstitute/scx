@@ -97,11 +97,10 @@ pub fn pca_neighbors(
         )));
     }
 
-    // ACC-RUST-OPT-V4 Phase 1.4: in-VRAM `device="gpu"` fused PCA→kNN routes to a
-    // full rapids pipeline (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X.
-    // backed/lazy X stays on the native device-resident fused path (>VRAM moat,
-    // pending Phase 0.1). Gated on the default `use_rep="X_pca"` like the native
-    // fused path.
+    // In-VRAM `device="gpu"` fused PCA→kNN routes to a full rapids pipeline
+    // (rsc.pp.pca → rsc.pp.neighbors) on an in-memory X. backed/lazy X stays on
+    // the native device-resident fused path (>VRAM moat). Gated on the default
+    // `use_rep="X_pca"` like the native fused path.
     #[cfg(feature = "gpu")]
     if use_rep == "X_pca" {
         let x_in_memory = {
@@ -399,10 +398,9 @@ pub fn pca_neighbors_umap(
         )));
     }
 
-    // ACC-RUST-OPT-V4 Phase 1.4: in-VRAM `device="gpu"` fused PCA→kNN→UMAP routes
-    // to a full rapids pipeline (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on
-    // an in-memory X. This is the prerequisite for deleting native UMAP (Phase
-    // 3.1). backed/lazy X stays on the native device-resident fused path.
+    // In-VRAM `device="gpu"` fused PCA→kNN→UMAP routes to a full rapids pipeline
+    // (rsc.pp.pca → rsc.pp.neighbors → rsc.tl.umap) on an in-memory X.
+    // backed/lazy X stays on the native device-resident fused path.
     #[cfg(feature = "gpu")]
     if use_rep == "X_pca" {
         let x_in_memory = {
@@ -539,9 +537,8 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     device: &str,
 ) -> PyResult<()> {
     let n_vars = source.n_vars();
-    // ACC-RUST-OPT-V4 Phase 3.2: the covariance GPU PCA path was removed;
-    // `resolve_gpu_method` validates the method string and always resolves the
-    // native fused path to randomized.
+    // The covariance GPU PCA path was removed; `resolve_gpu_method` validates
+    // the method string and always resolves the native fused path to randomized.
     resolve_gpu_method(method, n_vars)?;
 
     let (pca_res, knn_res) = fused_dispatch_unwind_safe(

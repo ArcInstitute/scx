@@ -1,10 +1,10 @@
-//! GPU shard → cuPy CSR handoff seam (ACC-RUST-OPT-V4 Phase 0.4).
+//! GPU shard → cuPy CSR handoff seam.
 //!
-//! Phase 0.4 proves that a decoded SCX shard's **device** buffers can back a
+//! A decoded SCX shard's **device** buffers can back a
 //! `cupyx.scipy.sparse.csr_matrix` that rapids-singlecell consumes **without a
-//! copy** — the minimal-copy mechanism the §2.5 `to_gpu_anndata` (Phase 1.2)
-//! design is built on. This module is that primitive: it decodes one CSR shard
-//! GPU-side via `scx_gpu::decode_shard_gpu` and exposes the resulting
+//! copy** — the minimal-copy mechanism the `to_gpu_anndata` design is built on.
+//! This module is that primitive: it decodes one CSR shard GPU-side via
+//! `scx_gpu::decode_shard_gpu` and exposes the resulting
 //! `data` / `indices` / `indptr` device arrays through the
 //! `__cuda_array_interface__` protocol so cuPy can adopt them in place.
 //!
@@ -167,7 +167,7 @@ impl_gpu_csr_holder_methods!(GpuShardCsr, "GpuShardCsr");
 
 /// A whole-matrix GPU-resident CSR whose `data` / `indices` / `indptr` device
 /// buffers back a `cupyx.scipy.sparse.csr_matrix` with no host round-trip — the
-/// X of `pyscx.open(...).to_gpu_anndata()` (ACC-RUST-OPT-V4 Phase 1.2).
+/// X of `pyscx.open(...).to_gpu_anndata()`.
 ///
 /// Ownership / lifetime: this holder is the **single owner** of the device
 /// allocations (`GpuCsr`). cuPy adopts the buffers through [`CudaArrayView`]s
@@ -194,7 +194,7 @@ pub struct GpuCsrMatrix {
 impl_gpu_csr_holder_methods!(GpuCsrMatrix, "GpuCsrMatrix");
 
 /// Upload a host CSR (scipy layout: i64 indptr, i32 indices, f32 data) to a
-/// single device-resident [`GpuCsrMatrix`] (ACC-RUST-OPT-V4 Phase 1.2).
+/// single device-resident [`GpuCsrMatrix`].
 ///
 /// One HtoD per buffer, then a stream sync so the device pointers are safe to
 /// expose to a cuPy consumer. The caller owns the ≤VRAM pre-flight (using
@@ -243,8 +243,8 @@ pub(crate) fn upload_host_csr(
 
 /// Wrap an already device-resident [`scx_accel::GpuCsr`] (e.g. from
 /// `scx_accel::decode_csr_shards_to_device`) in a [`GpuCsrMatrix`] holder whose
-/// buffers a `cupyx` CSR can adopt with no copy (ACC-RUST-OPT-V4 Phase 1.2
-/// follow-up). Unlike [`upload_host_csr`], the `data`/`indices`/`indptr` are
+/// buffers a `cupyx` CSR can adopt with no copy. Unlike [`upload_host_csr`],
+/// the `data`/`indices`/`indptr` are
 /// already on the device — this only records the device pointers.
 ///
 /// `decode_csr_shards_to_device` synchronizes the stream before returning, so the

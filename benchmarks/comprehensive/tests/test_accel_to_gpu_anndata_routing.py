@@ -1,6 +1,6 @@
 """
 Registration + SLURM routing for the `accel_to_gpu_anndata` device-decode
-benchmark (ACC-RUST-OPT-V4 §4.4).
+benchmark.
 
 Hermetic — no GPU, no datasets read, no submitit. Asserts:
 

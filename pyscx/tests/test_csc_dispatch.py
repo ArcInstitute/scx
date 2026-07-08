@@ -379,8 +379,8 @@ def test_normalize_total_lazy_csc_unavailable(small_adata, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# F10: materialized-vs-backed CSC sidecar hint (report SCX-USER-REPORT-2026-06-15
-# §F10). `Experiment.to_anndata()` (non-backed) stamps a uns hint when the source
+# Materialized-vs-backed CSC sidecar hint.
+# `Experiment.to_anndata()` (non-backed) stamps a uns hint when the source
 # file carries a CSC sidecar, so GPU DE can warn that it fell back to gpu_csr_v3
 # because the sidecar was dropped at materialization. The warning itself needs a
 # GPU; here we assert the deterministic CPU-side stamping contract.

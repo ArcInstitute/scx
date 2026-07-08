@@ -175,7 +175,7 @@ def _run_pyscx_gpu_rand_chol(adata: Any, n_comps: int, seed: int) -> str:
 
 
 def _run_rapids_singlecell(adata: Any, n_comps: int, seed: int) -> str:
-    """rapids-singlecell PCA route (ACC-RUST-OPT-V4 Phase 2): drives the pyscx
+    """rapids-singlecell PCA route: drives the pyscx
     in-VRAM `device="gpu"` path, which after Phase 1 hands off to
     rapids-singlecell (`rsc.pp.pca`). This exercises + gates the real pyscx→rapids
     handoff (not raw rsc). `anndata_to_CPU(convert_all=True)` round-trips obsm so
@@ -220,7 +220,7 @@ def _extract_fallback_reason(adata: Any, op: str) -> str | None:
         return None
 
 
-# --- ACC-RUST-OPT-V4 Phase 2: route-gate helpers (shared across accel_*) ------
+# --- route-gate helpers (shared across accel_*) ---------------------------------
 #
 # Phase 1 flipped the in-VRAM `device="gpu"` default to rapids-singlecell. So on
 # the scx-bench-gpu env (rapids installed) the native `pyscx_gpu_*` variants would

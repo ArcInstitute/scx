@@ -1,6 +1,6 @@
 """Tests for the fused accelerators `pyscx.accel.pca_neighbors[_umap]`.
 
-Routing after ACC-RUST-OPT-V4 Phase 3 (native in-VRAM GPU paths removed):
+Routing after native in-VRAM GPU paths were removed:
 
 * **CPU** (any host): outputs + route metadata match sequential
   `pca(device="cpu")` + `neighbors(device="cpu")` [+ `umap(device="cpu")`];

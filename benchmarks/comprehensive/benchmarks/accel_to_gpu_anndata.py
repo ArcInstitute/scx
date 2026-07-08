@@ -1,5 +1,5 @@
 """
-`to_gpu_anndata` device-decode benchmark + route floor (ACC-RUST-OPT-V4 §4.4 / 4.4b).
+`to_gpu_anndata` device-decode benchmark + route floor.
 
 Validates that `pyscx.open(...).to_gpu_anndata(device="gpu")` decodes an Scx1
 count matrix fully in VRAM — recording `transfer_mode == "scx_device_decode_gpu"`

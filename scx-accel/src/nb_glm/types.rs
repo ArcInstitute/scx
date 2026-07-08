@@ -1,6 +1,6 @@
 //! Public types for the pseudobulk negative-binomial GLM (NB-GLM).
 //!
-//! These mirror the type surface in `GPU-NB-GLM-SPEC.md` §4.1–4.2. The fitter is
+//! These mirror the public type surface for the NB-GLM fitter. The fitter is
 //! CPU-only and `f64` end-to-end (there is no GPU path in v1), so none of these
 //! types carry a backend/device dimension — a future GPU extension is additive
 //! (spec §13) and would introduce its own enum arm rather than change these.

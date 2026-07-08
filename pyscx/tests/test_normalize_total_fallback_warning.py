@@ -1,6 +1,6 @@
 """Symmetric `UserWarning` on `normalize_total(device="gpu")` scipy/dense fallback.
 
-Closes B4 from `SCX-USER-REPORT-2026-05-21-Tier3.md`: pre-fix,
+Pre-fix,
 `accel.normalize_total(device="gpu")` on a materialized scipy/dense X
 silently fell back to `scanpy.pp.normalize_total` with NO `UserWarning` —
 asymmetric with `log1p`'s noisy fallback. Post-fix the call emits a

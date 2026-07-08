@@ -241,7 +241,7 @@ def build(store: ResultStore) -> Chapter:
         title="Native GPU paths vs rapids-singlecell",
         blocks=[
             TextBlock(
-                "After the ACC-RUST-OPT-V4 rapids transition, SCX routes in-VRAM "
+                "After the rapids transition, SCX routes in-VRAM "
                 "**PCA / kNN / UMAP / preprocess / HVG** to rapids-singlecell — so "
                 "for those ops SCX's GPU path *is* rapids and a head-to-head ratio "
                 "is ~1.0 by construction. This table therefore compares only the "

@@ -1,4 +1,4 @@
-"""LOESS singularity resilience for per-batch HVG — see SCX-USER-REPORT-2026-05-21 B1.
+"""LOESS singularity resilience for per-batch HVG.
 
 The pyscx multi-batch `seurat_v3` path runs one `skmisc.loess.fit()` per
 batch. On real Census data, batches with very few cells or with
@@ -36,7 +36,7 @@ def _patch_loess_to_raise_on_first_batch(monkeypatch):
     """Force `skmisc.loess.loess(...).fit()` to raise ValueError on the
     first call of this test, then behave normally for subsequent calls.
 
-    Mirrors the real-world crash signature in the SCX-USER-REPORT B1
+    Mirrors the real-world crash signature from a user-reported
     traceback:
         File "_loess.pyx", line 922, in _loess.loess.fit
         ValueError: b'There are other near singularities as well. 0.22764'

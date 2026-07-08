@@ -76,20 +76,29 @@ fn workspace_members_match_documented_crates() {
     );
 }
 
-/// Tracked source and docs must not cite the gitignored root scratch docs
-/// (`ACC-RUST-OPT-V2`/`-V3`) or reference the removed `SCX_GPU_DE_V2=` /
-/// `SCX_GPU_DE_V3=` opt-in gates (or the removed `SCX_GPU_DE_V3_TRACE=` debug
-/// trace) as if functional (D5/D6). The `=` form is deliberately required so
-/// "the gates/trace were removed" historical prose (which names the bare
-/// `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3`/`SCX_GPU_DE_V3_TRACE` symbols) is not flagged.
+/// Tracked source and docs must not cite gitignored root scratch docs or
+/// task-directory planning documents. The `=` form for env gates is
+/// deliberately required so "the gates/trace were removed" historical prose
+/// (which names the bare `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3`/`SCX_GPU_DE_V3_TRACE`
+/// symbols) is not flagged.
 #[test]
 fn tracked_files_free_of_scratch_doc_citations_and_removed_gates() {
     const BANNED: &[&str] = &[
-        "ACC-RUST-OPT-V2",
-        "ACC-RUST-OPT-V3",
+        // Removed env-var gates (require `=` to avoid flagging removal prose).
         "SCX_GPU_DE_V2=",
         "SCX_GPU_DE_V3=",
         "SCX_GPU_DE_V3_TRACE=",
+        // Gitignored planning/task docs.
+        "ACC-RUST-OPT-V2",
+        "ACC-RUST-OPT-V3",
+        "ACC-RUST-OPT-V4",
+        "ACC-GPU-OPT",
+        "GPU-NB-GLM-SPEC",
+        "MULTIMODAL-SUPPORT.md",
+        "GROUP-BY-REG-FIX",
+        "MERGE-INDEX-OBS-DROPPED",
+        "SCX-USER-REPORT",
+        "STATE3-PYSCX-KERNEL-ISSUE",
     ];
     let root = workspace_root();
     let mut files = Vec::new();

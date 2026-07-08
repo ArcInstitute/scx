@@ -30,8 +30,8 @@ use crate::pca::PcaResult;
 /// [`crate::randomized_pca_gpu`] followed by a CAGRA kNN build on its
 /// embedding, minus the intermediate host round-trip of the embedding.
 ///
-/// ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance PCA path, so this
-/// fused pipeline now always uses device-resident randomized PCA.
+/// The in-VRAM covariance PCA path was removed, so this fused pipeline now
+/// always uses device-resident randomized PCA.
 #[allow(clippy::too_many_arguments)]
 pub fn pca_then_knn_gpu<S: ShardSource + Sync>(
     device_id: usize,

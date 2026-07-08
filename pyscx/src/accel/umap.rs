@@ -1,6 +1,5 @@
 //! UMAP embedding — CPU SGD + in-VRAM rapids-singlecell (`rsc.tl.umap`) +
-//! cuML fallback. The native GPU CUDA SGD kernel was removed in
-//! ACC-RUST-OPT-V4 Phase 3.
+//! cuML fallback. The native GPU CUDA SGD kernel was removed.
 
 use numpy::PyArray2;
 use pyo3::exceptions::PyRuntimeError;
@@ -55,11 +54,11 @@ pub fn umap(
     #[cfg(feature = "gpu")]
     let _gpu_id = _device.gpu_id();
 
-    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` UMAP hands off to
-    // rapids-singlecell (`rsc.tl.umap`) when `X` is in memory. backed/lazy X
-    // (and the `SCX_FORCE_NATIVE_GPU=1` in-memory case) fall through to the
-    // cuML fallback then CPU SGD — the native device-resident UMAP SGD kernel
-    // was removed in Phase 3.1.
+    // In-VRAM `device="gpu"` UMAP hands off to rapids-singlecell
+    // (`rsc.tl.umap`) when `X` is in memory. backed/lazy X (and the
+    // `SCX_FORCE_NATIVE_GPU=1` in-memory case) fall through to the cuML
+    // fallback then CPU SGD — the native device-resident UMAP SGD kernel was
+    // removed.
     #[cfg(feature = "gpu")]
     {
         use crate::backed::ScxBackedSparseDataset;
@@ -138,11 +137,11 @@ pub fn umap(
         .call_method1("astype", ("float64",))?
         .extract::<Vec<f64>>()?;
 
-    // GPU path. The native CUDA SGD kernel was removed in ACC-RUST-OPT-V4 Phase
-    // 3.1 (in-VRAM UMAP routes to rapids-singlecell; see the interception above).
-    // This branch is reached only for backed/lazy `X` (the >VRAM regime, which
-    // never routes to rapids) or in-memory `X` under `SCX_FORCE_NATIVE_GPU=1`;
-    // the sole on-GPU option here is the cuML fallback, otherwise CPU.
+    // GPU path. The native CUDA SGD kernel was removed (in-VRAM UMAP routes to
+    // rapids-singlecell; see the interception above). This branch is reached
+    // only for backed/lazy `X` (the >VRAM regime, which never routes to rapids)
+    // or in-memory `X` under `SCX_FORCE_NATIVE_GPU=1`; the sole on-GPU option
+    // here is the cuML fallback, otherwise CPU.
     #[cfg(feature = "gpu")]
     if _gpu_id.is_some() {
         let cuml_ok = try_cuml_umap(

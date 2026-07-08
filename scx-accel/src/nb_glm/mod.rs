@@ -2,7 +2,7 @@
 //!
 //! A Rust-native, **CPU-only**, `f64` end-to-end DESeq2-*core* fitter (IRLS /
 //! Fisher scoring for the mean, Cox–Reid adjusted dispersion with a parametric
-//! trend + empirical-Bayes shrinkage, Wald inference). See `GPU-NB-GLM-SPEC.md`.
+//! trend + empirical-Bayes shrinkage, Wald inference). See [docs/pseudobulk_nb_glm.md](../../docs/pseudobulk_nb_glm.md).
 //! There is no GPU path in v1 — a future GPU extension (spec §13) is additive.
 //!
 //! Layout: [`types`] (public surface), [`math`] (pure numerical primitives),

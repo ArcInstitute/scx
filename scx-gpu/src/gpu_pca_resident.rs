@@ -15,9 +15,9 @@
 //!    ([`run_resident_power_loop`]).
 //!
 //! SpMM-segment CUDA-graph capture (an opt-in `cusparseSpMM` graph replay) was
-//! removed in ACC-RUST-OPT-V4 Phase 3.4: it poisoned the CUDA context on the
-//! cuSPARSE versions tested (CUDA 12.x on H100) and was never a measured win
-//! over the direct resident path, which already delivers the residency benefit.
+//! removed: it poisoned the CUDA context on the cuSPARSE versions tested
+//! (CUDA 12.x on H100) and was never a measured win over the direct resident
+//! path, which already delivers the residency benefit.
 //!
 //! ## Math mode / SpMM algorithm
 //!
@@ -355,8 +355,8 @@ fn power_iter_direct(
 /// buffers the streaming core leaves for the downstream SVD.
 ///
 /// Always returns `false` (no CUDA-graph replay): SpMM-segment capture was
-/// removed in ACC-RUST-OPT-V4 Phase 3.4. The `Result<bool, _>` shape is kept so
-/// callers can keep recording `graph_replayed` without churn.
+/// removed. The `Result<bool, _>` shape is kept so callers can keep recording
+/// `graph_replayed` without churn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resident_power_loop(
     dev: &GpuDevice,
@@ -374,11 +374,11 @@ pub(crate) fn run_resident_power_loop(
     n_power_iterations: usize,
     tuning: GpuPcaTuning,
 ) -> Result<bool, GpuError> {
-    // SpMM-segment CUDA-graph capture was removed in ACC-RUST-OPT-V4 Phase 3.4:
-    // capturing `cusparseSpMM` poisons the CUDA context on the cuSPARSE versions
-    // tested (CUDA 12.x on H100) and was never a measured win. The residency
-    // benefit (single upload + one SpMM per segment, no per-iteration re-decode)
-    // is delivered by the direct loop below regardless.
+    // SpMM-segment CUDA-graph capture was removed: capturing `cusparseSpMM`
+    // poisons the CUDA context on the cuSPARSE versions tested (CUDA 12.x on
+    // H100) and was never a measured win. The residency benefit (single upload +
+    // one SpMM per segment, no per-iteration re-decode) is delivered by the
+    // direct loop below regardless.
     //
     // Resident scratch + cuSPARSE descriptor are built on the default stream.
     // The descriptor downcasts indptr i64→i32.

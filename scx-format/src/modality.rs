@@ -1,4 +1,4 @@
-// ModalityTable section + ModalityType / ModalityInfo (Phase B of MULTIMODAL-SUPPORT.md).
+// ModalityTable section + ModalityType / ModalityInfo.
 //
 // A v2 SCX file may carry one (and only one) `ModalityTable` section
 // (`SectionType::ModalityTable = 15`). It is an ordered list of named

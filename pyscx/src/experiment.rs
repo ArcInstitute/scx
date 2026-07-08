@@ -945,8 +945,8 @@ impl PyExperiment {
     }
 
     /// Return a **GPU-resident** AnnData whose `X` is a
-    /// `cupyx.scipy.sparse.csr_matrix` decoded onto the device (ACC-RUST-OPT-V4
-    /// Phase 1.2). This is the cheapest path from SCX-on-disk to a GPU matrix
+    /// `cupyx.scipy.sparse.csr_matrix` decoded onto the device. This is the
+    /// cheapest path from SCX-on-disk to a GPU matrix
     /// rapids-singlecell operates on — `rsc.get.anndata_to_GPU(adata)` is a no-op
     /// on the returned object (no host re-upload).
     ///
@@ -1298,7 +1298,7 @@ impl PyExperiment {
             )?;
             adata.setattr("X", gpu_x)?;
 
-            // Honest device-handoff metadata (ACC-RUST-OPT-V4 §4.4).
+            // Honest device-handoff metadata.
             let mut info = scx_accel::route::AccelExecutionInfo::new(
                 scx_accel::route::AccelRoute::GpuCsr,
                 scx_accel::route::FallbackReason::None,

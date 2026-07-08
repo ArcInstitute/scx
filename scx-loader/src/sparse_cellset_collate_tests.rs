@@ -98,7 +98,7 @@ fn topk_tiebreak_by_gene_id_ascending() {
 fn encoder_masking_drops_withheld_genes_to_pad() {
     // Contract: `task.py::_sparse_encoder_inputs` DROPS withheld query genes from
     // the top-K crop (slot becomes PAD), it does NOT replace them in place with a
-    // GENE_MASK token. STATE3-PYSCX-KERNEL-ISSUE §2.1 example.
+    // GENE_MASK token.
     let c = cfg(PreprocessMode::Log1pRaw, 4);
     // mask query positions for ids {3, 1}.
     let (b, _) = run(
@@ -305,7 +305,7 @@ fn golden_vectors_match_state3_reference() {
     // Executable cross-repo contract: every vector here is generated from state3's
     // `_sparse_encoder_inputs` (PassThrough) by `state3/tests/_gen_encoder_crop_golden.py`
     // and committed byte-identically in both repos. The kernel MUST reproduce each
-    // one exactly. See the module doc comment + STATE3-PYSCX-KERNEL-ISSUE.
+    // one exactly. See the module doc comment.
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/encoder_crop_golden.json"

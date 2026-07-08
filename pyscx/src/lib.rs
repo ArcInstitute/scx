@@ -1045,12 +1045,12 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Bump on ANY change to the kernel's encoder-crop, masking, or target
     // semantics (mirrors state3's `_sparse_encoder_inputs`). Consumers (state3)
     // assert this at `rust_collate` setup to fail loudly on version skew. See
-    // scx-loader/src/sparse_cellset_collate.rs and STATE3-PYSCX-KERNEL-ISSUE.
+    // scx-loader/src/sparse_cellset_collate.rs.
     m.add("COLLATE_CELLSET_CONTRACT_VERSION", 1u32)?;
 
     // Build profile ("release" / "debug"). Benchmarks MUST run against a
     // release build — a debug `.so` runs ~4-10x slower uniformly and silently
-    // poisons every timing (see GROUP-BY-REG-FIX.md). The comprehensive
+    // poisons every timing. The comprehensive
     // harness asserts this in preflight (gate_candidate / run_parallel).
     m.add(
         "__build_profile__",

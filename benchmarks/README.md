@@ -1058,8 +1058,8 @@ Stage-C device-resident aggregation route (`gpu_nb_glm_csc`) and its
 `nb_glm_route_csc_direct` floor are reserved/deferred.
 
 The native in-VRAM kNN / UMAP / fused-pipeline route gates (`knn_route_gpu_correct`,
-`umap_route_gpu_correct`, `pipeline_route_gpu_correct`) were dropped in
-ACC-RUST-OPT-V4 Phase 3 when those in-VRAM paths were removed; in-VRAM kNN / UMAP /
+`umap_route_gpu_correct`, `pipeline_route_gpu_correct`) were dropped
+when those in-VRAM paths were removed; in-VRAM kNN / UMAP /
 pipeline now route to rapids-singlecell and are gated by `knn_route_rapids_correct`
 / `umap_route_rapids_correct` / `pipeline_route_rapids_correct` (see the
 rapids-route section below).
@@ -1085,7 +1085,7 @@ variants run on the same preprocessed fixture:
 | `accel_pipeline__rapids_singlecell_gpu` | `rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap` — the leading GPU-scanpy competitor |
 
 (The native device-resident fused variant `accel_pipeline__pyscx_gpu_resident`
-was removed in ACC-RUST-OPT-V4 Phase 3 along with the device-resident fused UMAP
+was removed along with the device-resident fused UMAP
 path; the in-VRAM pipeline now routes to rapids-singlecell.)
 
 The host-boundary-vs-rapids delta on `pipeline_wall_s` places SCX's GPU pipeline
@@ -1108,7 +1108,7 @@ accuracy metric as SCX and is held to the same floor
 ≥ 0.90); Leiden ARI and preprocess are informational. DE (`rank_genes_groups`) is
 deferred to Phase 4.4.
 
-**rapids route gates (ACC-RUST-OPT-V4 Phase 2).** After Phase 1, in-VRAM
+**rapids route gates.** After Phase 1, in-VRAM
 `device="gpu"` ops route to rapids-singlecell, so the `accel_*__rapids_singlecell_gpu`
 variants (pca / knn / umap / preprocess / pipeline) now **drive pyscx**
 (`pyscx.accel.X(device="gpu")`), not raw `rsc.*`, and emit

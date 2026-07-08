@@ -725,7 +725,7 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
     # `SCX_DISABLE_CUDA_GRAPHS` is a GPU-runtime knob that needs to reach the
     # bench worker; otherwise the OnceLock-cached check defaults graphs on.
     # (The `SCX_GPU_DE_V2`/`SCX_GPU_DE_V3` gates were removed once GPU DE v3
-    # became the unconditional default — ACC-RUST-OPT-V2 §5 Phase V1b.)
+    # became the unconditional default.)
     for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
                 "SCX_DATA_DIR", "SCX_WORK_DIR",
                 "SCX_DISABLE_CUDA_GRAPHS",
@@ -917,7 +917,7 @@ def _assert_release_pyscx() -> None:
     """Refuse to benchmark against a debug pyscx build.
 
     A debug `.so` (`maturin develop` without `--release`) runs ~4-10x slower
-    uniformly and silently poisons every scx timing (see GROUP-BY-REG-FIX.md).
+    uniformly and silently poisons every scx timing.
     The shared editable `.so` is what every SLURM worker imports, so checking it
     here in the orchestrator catches the footgun before a whole campaign is
     submitted. Bypass (not recommended) with SCX_BENCH_ALLOW_DEBUG=1.

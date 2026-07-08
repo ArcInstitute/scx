@@ -113,11 +113,11 @@ pub(super) fn try_extract_borrowed_csr<'py>(
 
 /// Resolve the native GPU PCA method.
 ///
-/// ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance-PCA kernels: in-VRAM
-/// `device="gpu"` PCA now routes to rapids-singlecell, and the only surviving
-/// native GPU path is randomized (the streaming / device-resident moat). All
-/// accepted `method` values therefore resolve to `"randomized"` here;
-/// `method="covariance"` is still honored on the **CPU** path (`covariance_pca`).
+/// The in-VRAM covariance-PCA kernels were removed: in-VRAM `device="gpu"` PCA
+/// now routes to rapids-singlecell, and the only surviving native GPU path is
+/// randomized (the streaming / device-resident moat). All accepted `method`
+/// values therefore resolve to `"randomized"` here; `method="covariance"` is
+/// still honored on the **CPU** path (`covariance_pca`).
 #[cfg(feature = "gpu")]
 pub(crate) fn resolve_gpu_method(method: &str, _n_vars: usize) -> PyResult<&'static str> {
     match method {
@@ -153,11 +153,10 @@ fn build_pca_tuning(allow_tf32: bool, spmm_policy: &str) -> scx_accel::GpuPcaTun
     scx_accel::GpuPcaTuning::new(scx_accel::GpuMathMode::from_allow_tf32(allow_tf32), policy)
 }
 
-/// Dispatch native GPU PCA. ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM
-/// covariance path, so `resolve_gpu_method` always yields `"randomized"` and
-/// this helper routes to `randomized_pca_gpu`. All GPU-branch call-sites funnel
-/// through here. `qr_method` selects the QR step (Householder default, Cholesky
-/// opt-in).
+/// Dispatch native GPU PCA. The in-VRAM covariance path was removed, so
+/// `resolve_gpu_method` always yields `"randomized"` and this helper routes to
+/// `randomized_pca_gpu`. All GPU-branch call-sites funnel through here.
+/// `qr_method` selects the QR step (Householder default, Cholesky opt-in).
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_pca_dispatch<S: ShardSource + Sync>(
@@ -288,8 +287,8 @@ pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResul
 ///     method: PCA method — "auto" (default), "covariance", or "randomized".
 ///         On CPU, "auto" chooses covariance for n_vars <=
 ///         COVARIANCE_PCA_THRESHOLD (5000), else randomized. On GPU the native
-///         in-VRAM covariance core was removed in ACC-RUST-OPT-V4 Phase 3.2, so
-///         every method resolves to randomized (in-memory `device="gpu"` routes
+///         in-VRAM covariance core was removed, so every method resolves to
+///         randomized (in-memory `device="gpu"` routes
 ///         to rapids-singlecell, which runs its own covariance/randomized PCA).
 ///     qr_method: QR algorithm for randomized PCA — "householder" (default)
 ///         or "cholesky". `cholesky` selects CholeskyQR2. Ignored for
@@ -407,9 +406,9 @@ pub fn pca(
     // Extract X from adata
     let x = adata.getattr("X")?;
 
-    // ACC-RUST-OPT-V4 Phase 1.3: in the in-VRAM regime (X in memory, not a
-    // backed/lazy streaming source) hand `device="gpu"` PCA to rapids-singlecell.
-    // backed/lazy X stays on the native streaming path (the >VRAM moat).
+    // In the in-VRAM regime (X in memory, not a backed/lazy streaming source)
+    // hand `device="gpu"` PCA to rapids-singlecell. backed/lazy X stays on the
+    // native streaming path (the >VRAM moat).
     #[cfg(feature = "gpu")]
     {
         let x_in_memory = x.cast::<ScxBackedSparseDataset>().is_err()

@@ -18,7 +18,7 @@
 //! synchronous baseline from G4.3 has been replaced because it
 //! serialised decode + H→D + compute and regressed wall time at
 //! scale (smartseq2 / tabula) where it dominates the per-shard
-//! overhead. See ACC-GPU-OPT.md § G4.3 for the bench evidence.
+//! overhead.
 
 use std::ops::Range;
 use std::sync::Arc;

@@ -241,7 +241,7 @@ apptainer exec --nv scx-gpu.sif python -c "import pyscx; print(pyscx.accel.gpu_a
 ## rapids-singlecell — the GPU compute layer
 
 rapids-singlecell is the **primary GPU compute layer** for in-VRAM analysis ops.
-After the ACC-RUST-OPT-V4 transition, most in-VRAM `device="gpu"` analysis ops
+Most in-VRAM `device="gpu"` analysis ops
 delegate to rapids-singlecell rather than native SCX CUDA kernels. The surviving
 native GPU paths (streaming PCA, seurat_v3 HVG, Leiden, CSC-direct DE, Harmony,
 NB-GLM pseudobulk DE, streaming preprocessing, ML loader) work with the CUDA
@@ -334,8 +334,8 @@ native streaming kernels, never rapids (which would OOM).
 ### Forcing the native GPU kernels
 
 `SCX_FORCE_NATIVE_GPU=1` keeps the **surviving** native SCX GPU kernels for
-in-VRAM ops instead of routing to rapids. After the ACC-RUST-OPT-V4 Phase 3
-removals these are the streaming preprocess kernels and randomized PCA; the
+in-VRAM ops instead of routing to rapids. After the native kernel
+removals, these are the streaming preprocess kernels and randomized PCA; the
 in-VRAM native UMAP, covariance PCA, and CAGRA kNN kernels were deleted (rapids
 supersedes them), so for those ops the override now falls through to CPU. When
 rapids is absent and this override is **not** set, in-VRAM GPU-analysis ops fall

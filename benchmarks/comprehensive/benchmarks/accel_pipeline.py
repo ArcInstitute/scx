@@ -9,7 +9,7 @@ GPU-scanpy stack (rapids-singlecell).
 In-VRAM `device="gpu"` now routes the fused pipeline to the full rapids-singlecell
 pipeline (`rsc.pp.pca` → `rsc.pp.neighbors` → `rsc.tl.umap`); the native
 device-resident fused path (`DeviceEmbedding`/`DeviceKnnGraph`/`DeviceFuzzyGraph`
-handoffs) was removed in ACC-RUST-OPT-V4 Phase 3.1 along with native UMAP.
+handoffs) was removed along with native UMAP.
 
 Preprocessing
 (`normalize_total`/`log1p`/HVG) is supplied by the shared `AcceleratorRunner`
@@ -318,7 +318,7 @@ def run(
 
         # Route gate: the rapids fused variant asserts the rapids route. (The
         # native device-resident variant + its pipeline_route_gpu_correct gate
-        # were removed in ACC-RUST-OPT-V4 Phase 3.1 along with native UMAP.)
+        # were removed along with native UMAP.)
         # Passthrough the PCA tuning metadata for visibility on the GPU variants.
         if is_rapids_variant(key):
             extras["pipeline_route_rapids_correct"] = _pipeline_route_rapids_correct(a)

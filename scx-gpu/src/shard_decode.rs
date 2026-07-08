@@ -39,11 +39,11 @@ pub struct GpuCsr {
 }
 
 /// Host→device transfer accounting for a device decode, surfaced for the
-/// ACC-RUST-OPT-V4 §4.4 `transfer_mode` / `bytes_uploaded` route metadata.
+/// `transfer_mode` / `bytes_uploaded` route metadata.
 ///
 /// Lets a caller distinguish a genuine in-VRAM Scx1 decode (only the tiny indptr
 /// uploaded) from a host-decode+HtoD bounce. All Scx1 indices+values (including
-/// the >= 128-nnz BitPacker4x rows, Task 4.4b) decode on the device; only a
+/// the >= 128-nnz BitPacker4x rows) decode on the device; only a
 /// non-Scx1 codec shard decodes wholly on the host.
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceDecodeStats {

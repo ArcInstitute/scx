@@ -128,10 +128,10 @@ pub fn estimate_gpu_memory<'py>(
             let shard_size = get_kwarg_usize("shard_size", 16384)?;
             let shard_rows = shard_size.min(n_obs);
 
-            // ACC-RUST-OPT-V4 Phase 3.2 removed the in-VRAM covariance PCA path;
-            // the native GPU PCA path is always randomized now, so the footprint
-            // is the randomized one: Y/Q (n_obs × k), Ω + B (n_vars × k), one
-            // decoded shard, cuSOLVER QR workspace.
+            // The in-VRAM covariance PCA path was removed; the native GPU PCA
+            // path is always randomized now, so the footprint is the randomized
+            // one: Y/Q (n_obs × k), Ω + B (n_vars × k), one decoded shard,
+            // cuSOLVER QR workspace.
             let y_bytes = n_obs * k * 4;
             let omega_b_bytes = 2 * n_vars * k * 4;
             let shard_dense_bytes = shard_rows * n_vars * 4;
@@ -210,7 +210,7 @@ pub fn estimate_gpu_memory<'py>(
     Ok(dict.into_any().unbind())
 }
 
-/// Snapshot the GPU per-stage timing profiler (ACC-RUST-OPT-V4 Phase 0.2).
+/// Snapshot the GPU per-stage timing profiler.
 ///
 /// Returns a dict breaking GPU wall-time into decode / upload / compute
 /// buckets, or `None` when the `gpu` feature is disabled. The profiler only
@@ -270,11 +270,11 @@ pub fn gpu_profile_reset() -> PyResult<()> {
 
 /// rapids-singlecell + core-dep (cuML, cuPy) availability and versions.
 ///
-/// rapids is a **detected runtime dependency** (ACC-RUST-OPT-V4 §4.3): SCX
-/// probes for it at dispatch and routes GPU analysis to it when present, else
-/// falls back to CPU. `available` is `true` only when all three import cleanly.
+/// rapids is a **detected runtime dependency**: SCX probes for it at dispatch
+/// and routes GPU analysis to it when present, else falls back to CPU.
+/// `available` is `true` only when all three import cleanly.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // fields consumed by the Phase 1.3/1.4 op routers
+#[allow(dead_code)] // fields consumed by the op routers
 pub(crate) struct RapidsInfo {
     pub available: bool,
     pub rapids_version: Option<String>,

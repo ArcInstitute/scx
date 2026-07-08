@@ -110,7 +110,7 @@ def _clustered_count_adata(
 
 
 # --------------------------------------------------------------------- #
-# 7.1.a — GPU covariance PCA was removed in ACC-RUST-OPT-V4 Phase 3.2.
+# 7.1.a — GPU covariance PCA was removed.
 #   The native in-VRAM covariance core no longer exists (in-memory
 #   `device="gpu"` PCA routes to rapids-singlecell, and `resolve_gpu_method`
 #   always yields "randomized"), so there is no GPU covariance path to compare

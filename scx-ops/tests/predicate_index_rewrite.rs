@@ -583,7 +583,7 @@ fn merge_with_missing_forced_column_does_not_create_output() {
 }
 
 // ---------------------------------------------------------------------------
-// MERGE-INDEX-OBS-DROPPED.md — Bug 3 (compact preserves sharded obs layout)
+// Regression: compact must preserve sharded obs layout
 // + provenance audit trail for the rebuilt predicate indexes (Bugs 1 & 2).
 // ---------------------------------------------------------------------------
 

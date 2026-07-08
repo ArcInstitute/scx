@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Self-contained route-gate verification driver (ACC-RUST-OPT-V2 § 4).
+"""Self-contained route-gate verification driver.
 
 Runs the touched accelerator benchmark triples in-process on a GPU node,
 writes their result JSON into ``<out>/raw/``, then evaluates the absolute
@@ -39,7 +39,7 @@ _NEW_ROUTE_METRICS = {
     "wilcoxon_route_csc_direct",
     "csc_dispatch_correct",
     "pca_route_gpu_correct",
-    # knn/umap native in-VRAM routes were removed in ACC-RUST-OPT-V4 Phase 3
+    # knn/umap native in-VRAM routes were removed
     # (in-VRAM kNN/UMAP route to rapids-singlecell); their correctness is now
     # gated as `knn_route_rapids_correct` / `umap_route_rapids_correct` on the
     # rapids variants, not here.
@@ -55,8 +55,8 @@ _TRIPLES = [
     ("accel_de", "pbmc3k", "accel_de__pyscx_wilcoxon_gpu"),
     ("accel_de", "tabula_sapiens_100k", "accel_de__pyscx_pdex_ref_gpu"),
     ("accel_de", "tabula_sapiens_100k", "accel_de__pyscx_wilcoxon_gpu"),
-    # Native in-VRAM covariance PCA / CAGRA kNN / UMAP variants were removed in
-    # ACC-RUST-OPT-V4 Phase 3. PCA's native route gate (`pca_route_gpu_correct`)
+    # Native in-VRAM covariance PCA / CAGRA kNN / UMAP variants were removed.
+    # PCA's native route gate (`pca_route_gpu_correct`)
     # now rides the surviving randomized variant; in-VRAM kNN/UMAP route to
     # rapids and are gated as `*_route_rapids_correct` elsewhere.
     ("accel_pca", "pbmc3k", "accel_pca__pyscx_gpu_rand_hh"),

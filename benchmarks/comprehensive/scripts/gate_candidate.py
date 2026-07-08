@@ -417,7 +417,7 @@ def _check_pyscx_build_profile(python: str) -> CheckResult:
 
     A debug `.so` (a `maturin develop` without `--release`) runs ~4-10x slower
     uniformly and silently poisons every scx timing — this exact footgun cost a
-    day chasing a phantom "grouped-write regression" (see GROUP-BY-REG-FIX.md).
+    day chasing a phantom "grouped-write regression".
     `pyscx.__build_profile__` is emitted from `cfg!(debug_assertions)`.
     """
     rc, out = _run_silent(

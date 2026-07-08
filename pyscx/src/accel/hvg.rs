@@ -200,11 +200,10 @@ pub fn highly_variable_genes<'py>(
     }
     let resolved = super::gpu::resolve_device(device)?;
 
-    // ACC-RUST-OPT-V4 Phase 1.3: the HVG flavors SCX has no native GPU kernel for
-    // (`seurat` / `cell_ranger` / `pearson_residuals` / `poisson_gene_selection`)
-    // route to rapids-singlecell in the in-VRAM regime. `seurat_v3` /
-    // `seurat_v3_paper` stay native (SCX wins — §4.1). Restricted to an in-memory
-    // X read from adata.X (no `layer=`).
+    // The HVG flavors SCX has no native GPU kernel for (`seurat` / `cell_ranger` /
+    // `pearson_residuals` / `poisson_gene_selection`) route to rapids-singlecell in
+    // the in-VRAM regime. `seurat_v3` / `seurat_v3_paper` stay native (SCX wins).
+    // Restricted to an in-memory X read from adata.X (no `layer=`).
     #[cfg(feature = "gpu")]
     if !seurat_v3_family && layer.is_none() {
         let x_in_memory = {

@@ -27,8 +27,8 @@ pub type HostCsrTriplet = (Vec<i64>, Vec<i32>, Vec<f32>);
 ///
 /// Produced by the device-returning randomized PCA entry point
 /// (`gpu_randomized_pca_device`) and consumed by `gpu_knn_cagra_device`. (The
-/// covariance device PCA entry point was removed in ACC-RUST-OPT-V4 Phase 3.2.)
-/// Row-major layout matches what CAGRA expects for its
+/// covariance device PCA entry point was removed.) Row-major layout matches
+/// what CAGRA expects for its
 /// DLPack dataset tensor (strides `[n_components, 1]`) and what
 /// `obsm["X_pca"]` stores on the host, so [`Self::to_host`] needs no transpose.
 pub struct DeviceEmbedding {

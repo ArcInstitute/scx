@@ -113,9 +113,8 @@ pub fn normalize_total(
             || xp.cast::<ScxLazyTransformedDataset>().is_ok()
     };
 
-    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` preprocess on an in-memory
-    // X hands off to rapids-singlecell. backed/lazy X keeps the native streaming
-    // path (the loader/streaming kernels — §4.1).
+    // In-VRAM `device="gpu"` preprocess on an in-memory X hands off to
+    // rapids-singlecell. backed/lazy X keeps the native streaming path.
     #[cfg(feature = "gpu")]
     if !np_eligible {
         match super::rapids::decide(py, _device, "normalize_total") {
@@ -291,8 +290,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
             || xp.cast::<ScxLazyTransformedDataset>().is_ok()
     };
 
-    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` log1p on an in-memory X
-    // (no pending fusion marker, not backed/lazy) hands off to rapids-singlecell.
+    // In-VRAM `device="gpu"` log1p on an in-memory X (no pending fusion marker,
+    // not backed/lazy) hands off to rapids-singlecell.
     #[cfg(feature = "gpu")]
     if !log1p_eligible {
         match super::rapids::decide(py, _device, "log1p") {

@@ -375,7 +375,7 @@ def generate_report(sizes_rows: list[dict], fitter_rows: list[dict]) -> str:
         "# NB-GLM benchmark (Rust-native vs PyDESeq2)",
         "",
         "_Standalone bench — not part of the comprehensive regression gate (see"
-        " `GPU-NB-GLM-SPEC.md` §22.6). Build pyscx with `maturin develop --release`"
+        " benchmarks/README.md). Build pyscx with `maturin develop --release`"
         " for representative timings._",
         "",
         f"- platform: `{sysinfo['platform']}`",

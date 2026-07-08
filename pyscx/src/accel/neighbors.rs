@@ -46,9 +46,9 @@ pub fn neighbors(
     // Determine effective device
     let _device = resolve_device(device)?;
 
-    // ACC-RUST-OPT-V4 Phase 1.3: in-VRAM `device="gpu"` kNN hands off to
-    // rapids-singlecell (`rsc.pp.neighbors`) when `X` is in memory. backed/lazy
-    // X stays on the native cuVS streaming/device-resident path.
+    // In-VRAM `device="gpu"` kNN hands off to rapids-singlecell
+    // (`rsc.pp.neighbors`) when `X` is in memory. backed/lazy X stays on the
+    // native cuVS streaming/device-resident path.
     #[cfg(feature = "gpu")]
     {
         use crate::backed::ScxBackedSparseDataset;
@@ -115,14 +115,14 @@ pub fn neighbors(
 
     // Record the planned route on adata.uns["scx_accel"]["neighbors"].
     //
-    // ACC-RUST-OPT-V4 Phase 3.3: the in-VRAM native CAGRA dispatch was removed.
-    // In-VRAM `device="gpu"` kNN routes to rapids-singlecell (intercepted above);
-    // the standalone entry now runs CPU HNSW for backed/lazy `X` and under
-    // SCX_FORCE_NATIVE_GPU. The device-resident CAGRA path survives only inside
-    // the fused `pca_neighbors` pipeline (`scx_accel::pca_then_knn_gpu`), where
-    // the PCA embedding never leaves the device. The no-rapids CPU fallback
-    // (route `cpu_*` + `fallback_reason="no_rapids"`) is stamped in the rapids
-    // interception above, so this stamp covers only the genuine CPU runs.
+    // The in-VRAM native CAGRA dispatch was removed. In-VRAM `device="gpu"` kNN
+    // routes to rapids-singlecell (intercepted above); the standalone entry now
+    // runs CPU HNSW for backed/lazy `X` and under SCX_FORCE_NATIVE_GPU. The
+    // device-resident CAGRA path survives only inside the fused `pca_neighbors`
+    // pipeline (`scx_accel::pca_then_knn_gpu`), where the PCA embedding never
+    // leaves the device. The no-rapids CPU fallback (route `cpu_*` +
+    // `fallback_reason="no_rapids"`) is stamped in the rapids interception
+    // above, so this stamp covers only the genuine CPU runs.
     let info = super::route::simple_exec_info(
         device,
         false,

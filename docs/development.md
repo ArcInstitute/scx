@@ -126,7 +126,7 @@ uv venv .venv
 # Install Python dependencies
 # `maturin[patchelf]` bundles the `patchelf` binary; without it, every
 # `maturin develop` prints "Failed to set rpath for libpyscx.so" as a
-# non-fatal warning. (F5 from SCX-USER-REPORT-2026-05-21-Tier3.md.)
+# non-fatal warning.
 uv pip install 'maturin[patchelf]' pytest numpy scipy pyarrow anndata scanpy \
     scikit-learn leidenalg python-dotenv
 
