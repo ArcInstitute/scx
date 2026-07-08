@@ -298,10 +298,13 @@ pub fn sort_with_strategy(
                 plan.records.len(),
                 plan.reference_shard
             );
-            // M1: a group is never split, so the emitter buffers the largest
-            // grouped shard whole. Refuse loudly rather than silently blow past
-            // `--memory-budget` (the fixed-shard guard below is inert in grouped
-            // mode). No recourse but a bigger budget — never-split is a contract.
+            // M1: bound the largest grouped shard against `--memory-budget`.
+            // F6 Phase 0 relaxed the never-split contract: with the block-level
+            // sub-flush enabled (the default), an oversized group is split across
+            // shards and bounded at one block, so exceeding the budget is a
+            // warning, not a hard error. Only when the sub-flush is explicitly
+            // disabled (`group_write_block_bytes == Some(0)`) does the emitter
+            // still buffer the whole group — then refuse loudly.
             if let Some(budget) = opts.memory_budget {
                 // Use exact per-row nnz for the footprint: reuse the byte-mode
                 // prescan if present, else prescan now (row-count mode). A
@@ -320,12 +323,26 @@ pub fn sort_with_strategy(
                 let (max_bytes, shard_idx, label) =
                     max_grouped_shard_footprint(&plan, guard_nnz, n_vars as usize, density);
                 if max_bytes > budget {
-                    return Err(OpsError::InvalidInput(format!(
-                        "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) needs \
-                         ~{max_bytes} bytes to buffer but --memory-budget is {budget}; a group is \
-                         never split across shards — raise --memory-budget / --group-target-bytes, \
-                         or drop --group-by"
-                    )));
+                    let block_cap = opts
+                        .group_write_block_bytes
+                        .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES);
+                    if block_cap > 0 {
+                        log::warn!(
+                            "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) \
+                             would need ~{max_bytes} bytes if buffered whole, exceeding \
+                             --memory-budget {budget}; the group will be sub-flushed across \
+                             multiple shards at the {block_cap}-byte block cap \
+                             (--group-write-block-bytes)"
+                        );
+                    } else {
+                        return Err(OpsError::InvalidInput(format!(
+                            "scx sort: grouped shard {shard_idx} (dominated by group {label:?}) \
+                             needs ~{max_bytes} bytes to buffer but --memory-budget is {budget} \
+                             and the block sub-flush is disabled (--group-write-block-bytes 0); \
+                             raise --memory-budget / --group-target-bytes, enable the sub-flush, \
+                             or drop --group-by"
+                        )));
+                    }
                 }
             }
             grouped_reference_labels = go.reference_labels;
@@ -567,6 +584,8 @@ pub fn sort_with_strategy(
         value_encoding,
         n_vars_u32,
         opts.bitmap,
+        opts.group_write_block_bytes
+            .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
     );
     // F1: in grouped mode the planner's shard starts are authoritative (the
     // legacy fixed-size cap is disabled inside the emitter).
@@ -655,29 +674,59 @@ pub fn sort_with_strategy(
     x_emitter.finish(&mut writer)?;
     let output_shard_row_ranges = x_emitter.ranges.clone();
 
-    // ----- F1: write the GroupIndex sidecar (consistency-checked) -----
+    // ----- F1/F6: write the GroupIndex sidecar (reconciled to emitted shards) -----
     if let (Some(plan), Some(group_col)) = (&group_plan, &opts.group_by) {
-        // Sanity: every group record's global range must fall inside exactly
-        // one emitter output-shard range (never-split-a-group invariant). This
-        // is the only guard that the on-disk X shards agree with the sidecar's
-        // `shard`/`n_shards`, so enforce it in release builds too — a violation
-        // means silent sidecar corruption otherwise.
-        if let Some(bad) = plan.records.iter().find(|r| {
-            !output_shard_row_ranges
-                .iter()
-                .any(|&(s, e)| s <= r.row_start && r.row_stop <= e)
-        }) {
-            return Err(OpsError::InvalidInput(format!(
-                "scx sort: group record range [{}, {}) for label {:?} escapes every emitted X \
-                 shard range (never-split-a-group invariant violated); refusing to write an \
-                 inconsistent group index",
-                bad.row_start, bad.row_stop, bad.label
-            )));
+        // F6 Phase 0: the block-level sub-flush may split a single planner record
+        // (one (label, role) run) across several emitted output shards. Reconcile
+        // by intersecting each planner record with the actual emitter shard
+        // ranges and emitting one `GroupRecord` per (record ∩ shard) — carrying
+        // the true emitted shard index and clipped `[row_start, row_stop)`. This
+        // keeps each *record* within one shard (the read side's `shard` contract)
+        // while allowing a *label* to span multiple records. When no sub-flush
+        // occurred, every record maps to exactly one shard and the output is
+        // identical to `plan.records` (byte-identical sidecar — no regression).
+        let mut reconciled: Vec<crate::group_plan::GroupRecord> =
+            Vec::with_capacity(plan.records.len());
+        for r in &plan.records {
+            let mut covered = false;
+            for (shard_idx, &(s, e)) in output_shard_row_ranges.iter().enumerate() {
+                let start = r.row_start.max(s);
+                let stop = r.row_stop.min(e);
+                if start < stop {
+                    reconciled.push(crate::group_plan::GroupRecord {
+                        label: r.label.clone(),
+                        shard: shard_idx as u32,
+                        row_start: start,
+                        row_stop: stop,
+                        role: r.role,
+                    });
+                    covered = true;
+                }
+            }
+            // A non-empty planner record that overlaps no emitted shard means the
+            // emitter and planner disagree on the row count — real corruption.
+            if !covered && r.row_start < r.row_stop {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort: group record range [{}, {}) for label {:?} escapes every emitted \
+                     X shard range; refusing to write an inconsistent group index",
+                    r.row_start, r.row_stop, r.label
+                )));
+            }
         }
+        let reference_shard = reconciled
+            .iter()
+            .find(|r| r.role == crate::group_plan::Role::Reference)
+            .map(|r| r.shard);
+        let reconciled_plan = crate::group_plan::GroupPlan {
+            shard_starts: plan.shard_starts.clone(),
+            records: reconciled,
+            reference_shard,
+            n_shards: output_shard_row_ranges.len() as u32,
+        };
         // reference_labels computed alongside the order in `compute_grouped_order`
         // (explicit set for `Labels`, else the distinct labels that ended up
         // reference for `ReferenceSpec::Column`).
-        let payload = plan.to_sidecar_json(group_col, &grouped_reference_labels);
+        let payload = reconciled_plan.to_sidecar_json(group_col, &grouped_reference_labels);
         let bytes = serde_json::to_vec(&payload).map_err(|e| {
             OpsError::InvalidInput(format!("scx sort: failed to serialize group index: {e}"))
         })?;
@@ -878,6 +927,8 @@ fn sort_multimodal(
             ve,
             info.n_vars as u32,
             opts.bitmap,
+            opts.group_write_block_bytes
+                .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
         );
         for &old in order_old {
             let s = csr.indptr[old as usize] as usize;
@@ -939,6 +990,8 @@ fn sort_multimodal(
                 lve,
                 0,
                 BitmapPolicy::Off,
+                opts.group_write_block_bytes
+                    .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
             );
             for &old in order_old {
                 let s = l_indptr[old as usize] as usize;
@@ -1113,6 +1166,13 @@ enum EmitTarget {
 /// `modality_id = Some(id)` routes to the per-modality writers. For X targets
 /// with a non-`Off` `bitmap` policy it also emits a detection-bitmap sidecar
 /// per shard.
+/// F6 Phase 0 — default byte cap on the emitter's grouped-mode accumulation
+/// buffer (256 MB). Large enough to amortize codec overhead, small enough to
+/// bound grouped-write peak RSS at one block per group instead of one whole
+/// group. Overridable via `SortOptions.group_write_block_bytes` /
+/// `--group-write-block-bytes`.
+const DEFAULT_GROUP_WRITE_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
+
 struct CsrEmitter {
     target: EmitTarget,
     modality_id: Option<u8>,
@@ -1121,6 +1181,9 @@ struct CsrEmitter {
     value_encoding: ValueEncoding,
     n_vars: u32,
     bitmap: BitmapPolicy,
+    /// F6 Phase 0: byte cap on the accumulation buffer in grouped mode. `0`
+    /// disables the sub-flush (legacy never-split-across-shards behaviour).
+    block_byte_cap: u64,
     acc_indptr: Vec<u64>,
     acc_indices: Vec<u32>,
     acc_values: Vec<u8>,
@@ -1149,6 +1212,7 @@ impl CsrEmitter {
         value_encoding: ValueEncoding,
         n_vars: u32,
         bitmap: BitmapPolicy,
+        block_byte_cap: u64,
     ) -> Self {
         Self {
             target,
@@ -1158,6 +1222,7 @@ impl CsrEmitter {
             value_encoding,
             n_vars,
             bitmap,
+            block_byte_cap,
             acc_indptr: vec![0],
             acc_indices: Vec::new(),
             acc_values: Vec::new(),
@@ -1202,6 +1267,21 @@ impl CsrEmitter {
         // single-shard case where the break list is empty).
         if self.group_breaks.is_none() && self.acc_row_count >= self.shard_target {
             self.flush(writer)?;
+        }
+        // F6 Phase 0: block-level sub-flush in grouped mode. When the accumulated
+        // (encoded) CSR of the current shard reaches `block_byte_cap`, seal it as
+        // a standalone shard *within* the current group — this is what bounds
+        // grouped-write peak RSS at one block instead of one whole (possibly
+        // 100K+-cell) group. The planned group-break logic above is untouched:
+        // it keys off the global row index and `break_cursor`, neither of which a
+        // sub-flush perturbs (a sub-flush advances `emitted_rows` and resets
+        // `acc_row_count`, so `emitted_rows + acc_row_count` still equals the next
+        // planned break). An oversized group thus spans multiple output shards.
+        if self.group_breaks.is_some() && self.block_byte_cap > 0 && self.acc_row_count > 0 {
+            let acc_bytes = (self.acc_indices.len() * 4 + self.acc_values.len()) as u64;
+            if acc_bytes >= self.block_byte_cap {
+                self.flush(writer)?;
+            }
         }
         Ok(())
     }
@@ -1549,6 +1629,8 @@ fn emit_layers_in_memory(
             ve,
             0,
             BitmapPolicy::Off,
+            opts.group_write_block_bytes
+                .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
         );
         for &old in order_old {
             let s = layer.indptr[old as usize] as usize;

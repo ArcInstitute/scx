@@ -31,6 +31,7 @@ pub fn run_sort(
     reference: Option<String>,
     group_target_bytes: Option<String>,
     group_max_bytes: Option<String>,
+    group_write_block_bytes: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::cli_utils::validate_scx_file(input)?;
     if by.is_empty() && group_by.is_none() {
@@ -90,12 +91,21 @@ pub fn run_sort(
         Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
         None => None,
     };
+    let group_write_block_bytes = match group_write_block_bytes {
+        Some(s) => Some(scx_format_io::MemoryBudget::parse(&s)?),
+        None => None,
+    };
     if reference.is_some() && group_by.is_none() {
         return Err("--reference requires --group-by".into());
     }
-    if group_by.is_none() && (group_target_bytes.is_some() || group_max_bytes.is_some()) {
+    if group_by.is_none()
+        && (group_target_bytes.is_some()
+            || group_max_bytes.is_some()
+            || group_write_block_bytes.is_some())
+    {
         log::warn!(
-            "scx sort: --group-target-bytes / --group-max-bytes are ignored without --group-by"
+            "scx sort: --group-target-bytes / --group-max-bytes / --group-write-block-bytes are \
+             ignored without --group-by"
         );
     }
 
@@ -134,6 +144,7 @@ pub fn run_sort(
         reference,
         group_target_bytes,
         group_max_bytes,
+        group_write_block_bytes,
     };
 
     let summary = scx_ops::sort(input, output, &opts)?;

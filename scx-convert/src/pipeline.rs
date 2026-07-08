@@ -1821,6 +1821,9 @@ fn convert_then_sort_grouped(
         reference: opts.reference.clone(),
         group_target_bytes: opts.group_target_bytes,
         group_max_bytes: opts.group_max_bytes,
+        // None => the sort engine's default block cap (256 MB), giving the
+        // convert two-pass sort the F6 grouped-write OOM fix for free.
+        group_write_block_bytes: None,
     };
     let sort_result = scx_ops::sort(&tmp, output, &sort_opts)
         .map_err(|e| ConvertError::Other(format!("convert --group-by (two-pass sort): {e}")));

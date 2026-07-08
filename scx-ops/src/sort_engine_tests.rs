@@ -1163,11 +1163,14 @@ fn max_grouped_shard_footprint_row_and_byte_mode() {
     assert_eq!((bytes, shard, label.as_str()), (528, 1, "B"));
 }
 
-/// A single dominant group whose buffered footprint exceeds `--memory-budget`
-/// must hard-error (never-split makes buffering unavoidable), and the message
-/// must name the group. A sufficient budget still round-trips.
+/// F6 Phase 0 relaxed the M1 guard. A dominant group whose buffered footprint
+/// exceeds `--memory-budget` now hard-errors **only when the block sub-flush is
+/// explicitly disabled** (`group_write_block_bytes = Some(0)`); with the default
+/// cap the guard downgrades to a warning and the sort proceeds (the sub-flush
+/// bounds RSS instead of buffering the group whole). A sufficient budget still
+/// round-trips regardless.
 #[test]
-fn grouped_sort_oversized_group_exceeds_budget_errors() {
+fn grouped_sort_oversized_group_budget_guard() {
     let dir = tempfile::tempdir().unwrap();
     // One group of 8 rows; n_vars=4, 2 nnz/row -> density 0.5 -> 32 B/row ->
     // shard footprint 256 B.
@@ -1175,26 +1178,36 @@ fn grouped_sort_oversized_group_exceeds_budget_errors() {
     let control = [false; 8];
     let inp = write_grouped_fixture(&dir, "big_group.scx", &genes, &control);
 
-    // Tiny budget: 256 B needed, 100 B allowed -> refuse.
-    let out = dir.path().join("err.scx");
-    let o = SortOptions {
+    // Sub-flush disabled + tiny budget: 256 B needed, 100 B allowed -> refuse.
+    let out_err = dir.path().join("err.scx");
+    let o_err = SortOptions {
         group_by: Some("target_gene".to_string()),
         memory_budget: Some(100),
         shard_target_rows: 2,
+        group_write_block_bytes: Some(0),
         ..Default::default()
     };
-    let err = sort(&inp, &out, &o).expect_err("oversized group must exceed the budget");
+    let err = sort(&inp, &out_err, &o_err).expect_err("disabled sub-flush must exceed the budget");
     let msg = err.to_string();
     assert!(
-        msg.contains("memory-budget") && msg.contains("MYC") && msg.contains("never split"),
-        "error must name the group and the never-split contract: {msg}"
+        msg.contains("memory-budget") && msg.contains("MYC") && msg.contains("sub-flush"),
+        "error must name the group and the disabled sub-flush: {msg}"
     );
+
+    // Default sub-flush + same tiny budget: the guard warns and the sort proceeds.
+    let out_warn = dir.path().join("warn.scx");
+    let o_warn = SortOptions {
+        group_write_block_bytes: None,
+        ..o_err.clone()
+    };
+    sort(&inp, &out_warn, &o_warn).expect("default sub-flush must not hard-error on the budget");
+    assert!(col_of(&out_warn, "target_gene").iter().all(|g| g == "MYC"));
 
     // Ample budget: same layout succeeds and round-trips.
     let ok = dir.path().join("ok.scx");
     let o_ok = SortOptions {
         memory_budget: Some(1 << 20),
-        ..o
+        ..o_err
     };
     sort(&inp, &ok, &o_ok).unwrap();
     let genes_out = col_of(&ok, "target_gene");
@@ -1635,4 +1648,205 @@ fn append_drops_group_index_sidecar() {
         .unwrap()
         .require_grouped()
         .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// F6 Phase 0 — block-level sub-flush of oversized groups (T0.4 / T0.5)
+// ---------------------------------------------------------------------------
+//
+// The fixture writer emits 2 nnz/row with Uint8 values, so the emitter's
+// accumulation-byte estimate is `2*4 (indices) + 2 (values) = 10 bytes/row`.
+// A `group_write_block_bytes` of 120 therefore sub-flushes every 12 rows.
+
+/// T0.4 — an oversized group is sub-flushed across multiple output shards, and
+/// `read_group` unions them back into the full, byte-correct group. This is the
+/// OOM fix: instead of buffering the whole group, the emitter caps at one block.
+/// It also exercises a block boundary landing exactly on a group edge (the BIG
+/// group ends flush against the start of the next shard).
+#[test]
+fn grouped_sort_subflush_splits_oversized_group() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    // One dominant 60-row group + two singletons, no reference.
+    let mut genes: Vec<&str> = vec!["BIG"; 60];
+    genes.push("A");
+    genes.push("B");
+    let control = vec![false; genes.len()];
+    let inp = write_grouped_fixture(&dir, "big.scx", &genes, &control);
+    let out = dir.path().join("big_out.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        shard_target_rows: 1000, // large row cap; the sub-flush is byte-driven
+        group_write_block_bytes: Some(120), // ~12 rows/block
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    // BIG must span multiple records (one per sub-flushed shard).
+    let gi = assert_grouped_invariants(&out, &[]);
+    let big_recs: Vec<_> = gi["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["label"] == "BIG")
+        .collect();
+    assert!(
+        big_recs.len() > 1,
+        "oversized group must sub-flush into multiple records, got {}",
+        big_recs.len()
+    );
+    assert!(
+        csr_shard_ranges(&out).len() > 1,
+        "oversized group must produce multiple output shards"
+    );
+
+    // read_group("BIG") returns all 60 rows, row-for-row correct.
+    let (_ids, full_rows) = content(&out);
+    let genes_out = col_of(&out, "target_gene");
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let qr = pipe.read_group("BIG").unwrap();
+    let big_global: Vec<usize> = genes_out
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.as_str() == "BIG")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(qr.x.shape.0, 60);
+    assert_eq!(qr.x.shape.0, big_global.len());
+    assert!(str_col(&qr.obs, "target_gene").iter().all(|g| g == "BIG"));
+    for (local, &g) in big_global.iter().enumerate() {
+        let s = qr.x.indptr[local] as usize;
+        let e = qr.x.indptr[local + 1] as usize;
+        let got: Vec<(i32, f32)> = (s..e).map(|j| (qr.x.indices[j], qr.x.data[j])).collect();
+        assert_eq!(got, full_rows[g], "X row mismatch for BIG local {local}");
+    }
+    // The trailing singletons still read back correctly (they share a shard).
+    assert_eq!(pipe.read_group("A").unwrap().x.shape.0, 1);
+    assert_eq!(pipe.read_group("B").unwrap().x.shape.0, 1);
+}
+
+/// T0.5 — an oversized *reference* group (the chemogenetic OOM scenario) is
+/// sub-flushed into multiple reference records that still tile `[0, k)`, and
+/// `read_reference` unions them back. Normal groups still read correctly.
+#[test]
+fn grouped_sort_subflush_reference_group_unions_on_read() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let mut genes: Vec<&str> = vec!["nt"; 40];
+    genes.extend(["MYC"; 8]);
+    genes.extend(["TP53"; 8]);
+    let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
+    let inp = write_grouped_fixture(&dir, "bigref.scx", &genes, &control);
+    let out = dir.path().join("bigref_out.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 1000,
+        group_write_block_bytes: Some(120),
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    let gi = assert_grouped_invariants(&out, &["nt"]);
+    let ref_recs: Vec<_> = gi["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["role"] == "reference")
+        .collect();
+    assert!(
+        ref_recs.len() > 1,
+        "oversized reference must sub-flush into multiple records, got {}",
+        ref_recs.len()
+    );
+
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let refq = pipe.read_reference().unwrap().unwrap();
+    assert_eq!(refq.x.shape.0, 40);
+    assert!(str_col(&refq.obs, "target_gene").iter().all(|g| g == "nt"));
+    assert_eq!(pipe.read_group("MYC").unwrap().x.shape.0, 8);
+    assert_eq!(pipe.read_group("TP53").unwrap().x.shape.0, 8);
+}
+
+/// T0.5 — a group whose row count is not a multiple of the block size leaves a
+/// single-row final block; it must still round-trip correctly.
+#[test]
+fn grouped_sort_subflush_single_row_last_block() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    // 25 rows @ 12 rows/block => blocks of 12, 12, 1 (single-row tail).
+    let mut genes: Vec<&str> = vec!["BIG"; 25];
+    genes.push("A");
+    let control = vec![false; genes.len()];
+    let inp = write_grouped_fixture(&dir, "tail.scx", &genes, &control);
+    let out = dir.path().join("tail_out.scx");
+    let o = SortOptions {
+        group_by: Some("target_gene".to_string()),
+        shard_target_rows: 1000,
+        group_write_block_bytes: Some(120),
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    assert_grouped_invariants(&out, &[]);
+    let (_ids, full_rows) = content(&out);
+    let genes_out = col_of(&out, "target_gene");
+    let pipe = QueryPipeline::open(&out).unwrap();
+    let qr = pipe.read_group("BIG").unwrap();
+    assert_eq!(qr.x.shape.0, 25);
+    let big_global: Vec<usize> = genes_out
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.as_str() == "BIG")
+        .map(|(i, _)| i)
+        .collect();
+    for (local, &g) in big_global.iter().enumerate() {
+        let s = qr.x.indptr[local] as usize;
+        let e = qr.x.indptr[local + 1] as usize;
+        let got: Vec<(i32, f32)> = (s..e).map(|j| (qr.x.indices[j], qr.x.data[j])).collect();
+        assert_eq!(got, full_rows[g], "X row mismatch for BIG local {local}");
+    }
+}
+
+/// T0.5 — regression: when every group fits under the block cap the sidecar and
+/// shard layout are unchanged (byte-identical to the sub-flush-disabled path).
+#[test]
+fn grouped_sort_subflush_inert_below_cap_matches_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let genes = [
+        "nt", "MYC", "nt", "TP53", "MYC", "GATA1", "nt", "MYC", "GATA1", "GATA1",
+    ];
+    let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let mk = |cap: Option<u64>| SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 3,
+        group_write_block_bytes: cap,
+        ..Default::default()
+    };
+    let out_disabled = dir.path().join("disabled.scx");
+    sort(&inp, &out_disabled, &mk(Some(0))).unwrap();
+    let out_huge = dir.path().join("huge.scx");
+    sort(&inp, &out_huge, &mk(Some(1 << 30))).unwrap();
+    assert_eq!(
+        read_group_index(&out_disabled),
+        read_group_index(&out_huge),
+        "a block cap above the data size must not change the sidecar"
+    );
+    assert_eq!(
+        csr_shard_ranges(&out_disabled),
+        csr_shard_ranges(&out_huge),
+        "a block cap above the data size must not change the shard layout"
+    );
+    // No label split into multiple records (one (label, role) run each).
+    let gi = read_group_index(&out_huge);
+    let mut seen = HashSet::new();
+    for rec in gi["records"].as_array().unwrap() {
+        let key = format!("{}:{}", rec["label"], rec["role"]);
+        assert!(
+            seen.insert(key),
+            "unexpected split record without sub-flush"
+        );
+    }
 }
