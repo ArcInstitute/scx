@@ -80,6 +80,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use rayon::prelude::*;
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format_io::codec_select::select_codec;
 use scx_format_io::encoder::FramingConfig;
@@ -87,7 +88,8 @@ use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{
-    BitmapPolicy, BitmapShard, FullCatalogEntry, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
+    encode_one_shard_with_value_encoding, BitmapPolicy, BitmapShard, FullCatalogEntry,
+    ModalityType, PreEncodedSection, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
 };
 
 use crate::error::{OpsError, Result};
@@ -576,103 +578,129 @@ pub fn sort_with_strategy(
         strategy = SortStrategy::ExternalPartition;
     }
 
-    let mut x_emitter = CsrEmitter::new(
-        EmitTarget::X,
-        None,
-        opts.shard_target_rows,
-        opts.codec,
-        value_encoding,
-        n_vars_u32,
-        opts.bitmap,
-        opts.group_write_block_bytes
-            .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
-    );
-    // F1: in grouped mode the planner's shard starts are authoritative (the
-    // legacy fixed-size cap is disabled inside the emitter).
-    if let Some(plan) = &group_plan {
-        x_emitter.set_group_breaks(plan.shard_starts.clone());
-    }
-    match strategy {
-        SortStrategy::InMemory => {
-            emit_x_in_memory(&reader, &mut writer, &mut x_emitter, &order_old)?;
+    let block_byte_cap = opts
+        .group_write_block_bytes
+        .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES);
+
+    // In-memory grouped writes take the parallel fast path, which
+    // bypasses the row-by-row `CsrEmitter`. It reproduces the emitter's exact
+    // shard boundaries (planned breaks + the Phase-0 block sub-flush) so its
+    // output is byte-identical, but gathers + encodes blocks in parallel via
+    // rayon. Gated to `InMemory` + grouped; `SCX_SORT_NO_INMEM_FAST` forces the
+    // legacy emitter path (byte-parity testing / operational safety).
+    let use_fast_path =
+        strategy == SortStrategy::InMemory && std::env::var_os("SCX_SORT_NO_INMEM_FAST").is_none();
+    let output_shard_row_ranges = if let (true, Some(plan)) = (use_fast_path, group_plan.as_ref()) {
+        emit_x_in_memory_grouped_fast(
+            &reader,
+            &mut writer,
+            &order_old,
+            plan,
+            value_encoding,
+            n_vars_u32,
+            opts.codec,
+            opts.bitmap,
+            block_byte_cap,
+        )?
+    } else {
+        let mut x_emitter = CsrEmitter::new(
+            EmitTarget::X,
+            None,
+            opts.shard_target_rows,
+            opts.codec,
+            value_encoding,
+            n_vars_u32,
+            opts.bitmap,
+            block_byte_cap,
+        );
+        // F1: in grouped mode the planner's shard starts are authoritative (the
+        // legacy fixed-size cap is disabled inside the emitter).
+        if let Some(plan) = &group_plan {
+            x_emitter.set_group_breaks(plan.shard_starts.clone());
         }
-        SortStrategy::KPassByCategory => {
-            if leading_key_has_nulls {
-                return Err(OpsError::InvalidInput(
-                    "K-pass strategy cannot sort a key column containing nulls (it would drop \
+        match strategy {
+            SortStrategy::InMemory => {
+                emit_x_in_memory(&reader, &mut writer, &mut x_emitter, &order_old)?;
+            }
+            SortStrategy::KPassByCategory => {
+                if leading_key_has_nulls {
+                    return Err(OpsError::InvalidInput(
+                        "K-pass strategy cannot sort a key column containing nulls (it would drop \
                      null-key rows); use the in-memory or external strategy"
-                        .to_string(),
-                ));
-            }
-            let cats = categories.as_ref().ok_or_else(|| {
-                OpsError::InvalidInput(
-                    "K-pass strategy requires a single categorical sort key".to_string(),
-                )
-            })?;
-            let cat_of_old = category_of_old(&live_keys, &live_ids, &opts.by[0], cats, n_obs)?;
-            emit_x_kpass(
-                &reader,
-                &mut writer,
-                &mut x_emitter,
-                &cat_of_old,
-                cats.len(),
-            )?;
-        }
-        SortStrategy::ExternalPartition => {
-            let p = partition_target_rows(
-                opts.memory_budget,
-                n_vars as usize,
-                density,
-                opts.shard_target_rows,
-            );
-            // Per-row decoded footprint (CSR ≈ 16 B/nnz, matching
-            // `partition_target_rows`). `ceil` so a fractional estimate on sparse
-            // data never *undercounts* the partition footprint the budget guard
-            // re-validates after widening.
-            let per_row = (n_vars as f64 * density * 16.0).max(1.0).ceil() as u64;
-            // Refuse if a single output shard's rows cannot fit the budget
-            // (T4.7 — no silent cap). Kept in f64 until after multiplying so the
-            // fractional per-row estimate is not truncated before scaling.
-            if let Some(budget) = opts.memory_budget {
-                let per_shard =
-                    (opts.shard_target_rows.max(1) as f64 * n_vars as f64 * density * 16.0) as u64;
-                if per_shard > budget {
-                    return Err(OpsError::InvalidInput(format!(
-                        "scx sort: --memory-budget {budget} too small for one output shard \
-                         (~{per_shard} bytes for {} rows); raise the budget or lower --shard-size",
-                        opts.shard_target_rows
-                    )));
+                            .to_string(),
+                    ));
                 }
+                let cats = categories.as_ref().ok_or_else(|| {
+                    OpsError::InvalidInput(
+                        "K-pass strategy requires a single categorical sort key".to_string(),
+                    )
+                })?;
+                let cat_of_old = category_of_old(&live_keys, &live_ids, &opts.by[0], cats, n_obs)?;
+                emit_x_kpass(
+                    &reader,
+                    &mut writer,
+                    &mut x_emitter,
+                    &cat_of_old,
+                    cats.len(),
+                )?;
             }
-            // Cap simultaneously-open spill files (EMFILE) and re-validate that a
-            // widened partition — which pass 2 loads whole into RAM — still fits
-            // the budget (the per-shard guard above only bounds one output shard).
-            let (p, _n_parts) = cap_spill_partitions(p, n_live, per_row, opts.memory_budget)?;
-            let (sb, np) = emit_x_external(
-                &reader,
-                &mut writer,
-                &mut x_emitter,
-                &new_pos_of_old,
-                p,
-                n_live,
-                opts.temp_dir.as_deref(),
-            )?;
-            spill_bytes = sb;
-            partitions = np;
-            log::info!(
-                "scx sort: external partition sort spilled {spill_bytes} bytes across \
+            SortStrategy::ExternalPartition => {
+                let p = partition_target_rows(
+                    opts.memory_budget,
+                    n_vars as usize,
+                    density,
+                    opts.shard_target_rows,
+                );
+                // Per-row decoded footprint (CSR ≈ 16 B/nnz, matching
+                // `partition_target_rows`). `ceil` so a fractional estimate on sparse
+                // data never *undercounts* the partition footprint the budget guard
+                // re-validates after widening.
+                let per_row = (n_vars as f64 * density * 16.0).max(1.0).ceil() as u64;
+                // Refuse if a single output shard's rows cannot fit the budget
+                // (T4.7 — no silent cap). Kept in f64 until after multiplying so the
+                // fractional per-row estimate is not truncated before scaling.
+                if let Some(budget) = opts.memory_budget {
+                    let per_shard =
+                        (opts.shard_target_rows.max(1) as f64 * n_vars as f64 * density * 16.0)
+                            as u64;
+                    if per_shard > budget {
+                        return Err(OpsError::InvalidInput(format!(
+                            "scx sort: --memory-budget {budget} too small for one output shard \
+                         (~{per_shard} bytes for {} rows); raise the budget or lower --shard-size",
+                            opts.shard_target_rows
+                        )));
+                    }
+                }
+                // Cap simultaneously-open spill files (EMFILE) and re-validate that a
+                // widened partition — which pass 2 loads whole into RAM — still fits
+                // the budget (the per-shard guard above only bounds one output shard).
+                let (p, _n_parts) = cap_spill_partitions(p, n_live, per_row, opts.memory_budget)?;
+                let (sb, np) = emit_x_external(
+                    &reader,
+                    &mut writer,
+                    &mut x_emitter,
+                    &new_pos_of_old,
+                    p,
+                    n_live,
+                    opts.temp_dir.as_deref(),
+                )?;
+                spill_bytes = sb;
+                partitions = np;
+                log::info!(
+                    "scx sort: external partition sort spilled {spill_bytes} bytes across \
                  {partitions} partitions (~{p} rows each)"
-            );
-        }
-        other => {
-            return Err(OpsError::InvalidInput(format!(
-                "scx sort engine does not run strategy {other:?} (build-time forms use \
+                );
+            }
+            other => {
+                return Err(OpsError::InvalidInput(format!(
+                    "scx sort engine does not run strategy {other:?} (build-time forms use \
                  convert / merge)"
-            )));
+                )));
+            }
         }
-    }
-    x_emitter.finish(&mut writer)?;
-    let output_shard_row_ranges = x_emitter.ranges.clone();
+        x_emitter.finish(&mut writer)?;
+        x_emitter.ranges.clone()
+    };
 
     // ----- F1/F6: write the GroupIndex sidecar (reconciled to emitted shards) -----
     if let (Some(plan), Some(group_col)) = (&group_plan, &opts.group_by) {
@@ -1407,6 +1435,158 @@ fn emit_x_in_memory(
         emitter.push_row(writer, &csr.indices[s..e], &csr.data[s..e])?;
     }
     Ok(())
+}
+
+/// In-memory grouped-write fast path (X only).
+///
+/// Reads the source CSR once, computes the output shard/block boundaries up
+/// front, then gathers + encodes each block **in parallel** via
+/// [`encode_one_shard_with_value_encoding`], writing the pre-encoded bytes (and
+/// detection bitmaps) sequentially in block order. It bypasses the row-by-row
+/// [`CsrEmitter::push_row`] copy and parallelizes the encode, yet is
+/// **byte-identical** to the emitter path because it:
+///   - reproduces the emitter's exact cut points — the planner's `shard_starts`
+///     breaks plus the block sub-flush at `block_byte_cap` (same
+///     `indices*4 + values` accumulation rule);
+///   - encodes with the same file-wide `value_encoding` (override, not the
+///     per-shard auto-detect), the same codec (`Auto → select_codec` via
+///     `ModalityType::Rna`, else the explicit id), the same `index_dtype`
+///     (from `n_vars`, matching `write_shard_inner`), the same `framing`, and
+///     the same `X_shard_{idx}` naming;
+///   - builds detection bitmaps with the sort-side [`bitmap_should_build`] gate.
+///
+/// Memory is bounded at the source CSR (resident once) + ~n_threads × one block,
+/// so it keeps the OOM fix. Returns the emitted `[row_start, row_stop)`
+/// ranges (what `CsrEmitter::ranges` would hold) for the GroupIndex write-back.
+#[allow(clippy::too_many_arguments)]
+fn emit_x_in_memory_grouped_fast(
+    reader: &ScxReader,
+    writer: &mut ScxWriter,
+    order_old: &[u64],
+    plan: &crate::group_plan::GroupPlan,
+    value_encoding: ValueEncoding,
+    n_vars_u32: u32,
+    codec: CodecSelection,
+    bitmap: BitmapPolicy,
+    block_byte_cap: u64,
+) -> Result<Vec<(u64, u64)>> {
+    let csr = reader.read_all_csr_shards()?;
+    let n_obs = order_old.len();
+    let shard_starts = &plan.shard_starts;
+
+    // Per-element value byte width for the file-wide encoding — matches how
+    // `acc_values` grows in `CsrEmitter` (`encode_value` pushes this many bytes
+    // per nnz), so the block-cap cut points below are identical.
+    let value_width: u64 = match value_encoding {
+        ValueEncoding::Uint8 => 1,
+        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
+        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
+    };
+    let per_nnz_bytes = 4 + value_width; // 4 = u32 index element
+
+    // 1. Compute block row-ranges, reproducing `CsrEmitter::push_row` exactly: a
+    //    planned break at emit-row `p` seals the block ending at `p`; the
+    //    block-cap sub-flush seals the block ending at `p+1` once the accumulated
+    //    `indices.len()*4 + values.len()` reaches `block_byte_cap`.
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut block_start: usize = 0;
+    let mut cum_nnz: u64 = 0;
+    let mut break_cursor: usize = 0;
+    for (p, &old_row) in order_old.iter().enumerate() {
+        if break_cursor < shard_starts.len() && p as u64 == shard_starts[break_cursor] {
+            if p > block_start {
+                blocks.push((block_start, p));
+                block_start = p;
+                cum_nnz = 0;
+            }
+            break_cursor += 1;
+        }
+        let old = old_row as usize;
+        let nnz_p = (csr.indptr[old + 1] - csr.indptr[old]) as u64;
+        cum_nnz += nnz_p;
+        if block_byte_cap > 0 && cum_nnz * per_nnz_bytes >= block_byte_cap && p + 1 > block_start {
+            blocks.push((block_start, p + 1));
+            block_start = p + 1;
+            cum_nnz = 0;
+        }
+    }
+    if n_obs > block_start {
+        blocks.push((block_start, n_obs));
+    }
+
+    // 2. Parallel gather + encode each block (byte-identical, deterministic).
+    let explicit_codec = match codec {
+        CodecSelection::Auto => None,
+        CodecSelection::Explicit(c) => Some(c),
+    };
+    // CSR index dtype from the minor (var) axis bound, matching `write_shard_inner`.
+    let index_dtype: u8 = if (n_vars_u32 as u64).saturating_sub(1) <= u16::MAX as u64 {
+        0
+    } else {
+        1
+    };
+    let framing = writer.framing();
+
+    let encoded: Vec<(PreEncodedSection, Option<BitmapShard>)> = blocks
+        .par_iter()
+        .enumerate()
+        .map(
+            |(idx, &(r0, r1))| -> Result<(PreEncodedSection, Option<BitmapShard>)> {
+                let n_rows = r1 - r0;
+                let mut local_indptr: Vec<u64> = Vec::with_capacity(n_rows + 1);
+                local_indptr.push(0);
+                let mut local_indices: Vec<u32> = Vec::new();
+                let mut local_values: Vec<f32> = Vec::new();
+                for &op in &order_old[r0..r1] {
+                    let o = op as usize;
+                    let s = csr.indptr[o] as usize;
+                    let e = csr.indptr[o + 1] as usize;
+                    local_indices.extend(csr.indices[s..e].iter().map(|&c| c as u32));
+                    local_values.extend_from_slice(&csr.data[s..e]);
+                    local_indptr.push(local_indices.len() as u64);
+                }
+                let nnz = local_indices.len();
+                let section = encode_one_shard_with_value_encoding(
+                    &local_indptr,
+                    &local_indices,
+                    &local_values,
+                    explicit_codec,
+                    index_dtype,
+                    n_vars_u32,
+                    r0 as u64,
+                    SectionType::CsrShard,
+                    ModalityType::Rna,
+                    format!("X_shard_{idx}"),
+                    framing,
+                    Some(value_encoding),
+                )?;
+                let bm = if bitmap_should_build(bitmap, n_rows as u64, nnz, n_vars_u32) {
+                    Some(BitmapShard::build_from_csr(
+                        r0 as u64,
+                        n_rows as u32,
+                        n_vars_u32,
+                        &local_indptr,
+                        &local_indices,
+                    ))
+                } else {
+                    None
+                };
+                Ok((section, bm))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+
+    // 3. Write sequentially in block order (ScxWriter is single-threaded for
+    //    section ordering); record ranges for the GroupIndex write-back.
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(encoded.len());
+    for (&(r0, r1), (section, bm)) in blocks.iter().zip(encoded) {
+        writer.write_preencoded_shard(section)?;
+        if let Some(bm) = bm {
+            writer.write_bitmap_shard(&bm)?;
+        }
+        ranges.push((r0 as u64, r1 as u64));
+    }
+    Ok(ranges)
 }
 
 // ---------------------------------------------------------------------------

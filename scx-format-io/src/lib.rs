@@ -46,7 +46,10 @@ pub use bitmap::{
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::{DeletionVectors, ShardDeletion};
 pub use distinct::DistinctAccumulator;
-pub use encoder::{encode_one_shard, encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS};
+pub use encoder::{
+    encode_one_shard, encode_one_shard_with_value_encoding, encode_shard_framed, FramingConfig,
+    DEFAULT_ROW_GROUP_ROWS,
+};
 pub use mem::MemoryBudget;
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, decode_arrow_ipc_schema, ScxReader,

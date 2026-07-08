@@ -1850,3 +1850,133 @@ fn grouped_sort_subflush_inert_below_cap_matches_disabled() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// In-memory grouped-write fast path (byte parity + layers)
+// ---------------------------------------------------------------------------
+
+/// Raw section bytes of every CSR X shard, in shard order — for byte-identity
+/// checks between the parallel fast path and the row-by-row `CsrEmitter`.
+fn x_shard_section_bytes(path: &Path) -> Vec<Vec<u8>> {
+    let r = ScxReader::open(path).unwrap();
+    r.catalog()
+        .shards_sorted()
+        .iter()
+        .map(|e| r.section_bytes(e).unwrap().to_vec())
+        .collect()
+}
+
+/// The parallel fast path (grouped `InMemory`) must be **byte-identical**
+/// to the row-by-row `CsrEmitter` path. We drive the emitter via
+/// `ExternalPartition` (which pushes rows through the same `CsrEmitter` with the
+/// same group breaks + block sub-flush), so this is also a strategy-independence
+/// check. Covered both without sub-flush (default cap) and with a small cap that
+/// splits groups across multiple blocks.
+#[test]
+fn grouped_fast_path_byte_identical_to_emitter() {
+    for cap in [None, Some(120u64)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut genes: Vec<&str> = vec!["nt"; 20];
+        genes.extend(["MYC"; 15]);
+        genes.extend(["TP53"; 12]);
+        genes.extend(["GATA1"; 9]);
+        let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
+        let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+        let mk = || SortOptions {
+            group_by: Some("target_gene".to_string()),
+            reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+            shard_target_rows: 8,
+            group_write_block_bytes: cap,
+            ..Default::default()
+        };
+        let fast = dir.path().join("fast.scx");
+        sort_with_strategy(&inp, &fast, &mk(), Some(SortStrategy::InMemory)).unwrap();
+        let emit = dir.path().join("emit.scx");
+        sort_with_strategy(&inp, &emit, &mk(), Some(SortStrategy::ExternalPartition)).unwrap();
+
+        assert_eq!(
+            x_shard_section_bytes(&fast),
+            x_shard_section_bytes(&emit),
+            "fast-path X shard bytes must equal the emitter path (cap={cap:?})"
+        );
+        assert_eq!(
+            read_group_index(&fast),
+            read_group_index(&emit),
+            "group_index must match the emitter path (cap={cap:?})"
+        );
+        assert_eq!(
+            csr_shard_ranges(&fast),
+            csr_shard_ranges(&emit),
+            "shard ranges must match the emitter path (cap={cap:?})"
+        );
+    }
+}
+
+/// The parallel fast path is deterministic: two runs (same options) produce
+/// byte-identical X shards and group index regardless of rayon scheduling.
+#[test]
+fn grouped_fast_path_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut genes: Vec<&str> = vec!["nt"; 30];
+    genes.extend(["MYC"; 20]);
+    genes.extend(["TP53"; 10]);
+    let control: Vec<bool> = genes.iter().map(|g| *g == "nt").collect();
+    let inp = write_grouped_fixture(&dir, "screen.scx", &genes, &control);
+    let mk = || SortOptions {
+        group_by: Some("target_gene".to_string()),
+        reference: Some(ReferenceSpec::Labels(vec!["nt".to_string()])),
+        shard_target_rows: 1000,
+        group_write_block_bytes: Some(120), // sub-flush → many parallel blocks
+        ..Default::default()
+    };
+    let a = dir.path().join("a.scx");
+    sort(&inp, &a, &mk()).unwrap();
+    let b = dir.path().join("b.scx");
+    sort(&inp, &b, &mk()).unwrap();
+    assert_eq!(x_shard_section_bytes(&a), x_shard_section_bytes(&b));
+    assert_eq!(read_group_index(&a), read_group_index(&b));
+}
+
+/// T1.4 — the fast path is X-only; layers and obsp continue through the existing
+/// row-by-row path and must still be reordered correctly under a grouped sort
+/// (with X sub-flushing across blocks).
+#[test]
+fn grouped_fast_path_preserves_layers_and_obsp() {
+    use scx_engine::QueryPipeline;
+    let dir = tempfile::tempdir().unwrap();
+    let inp = fixture_obsp_layers(&dir); // 8 obs; "raw" layer; "cell_type" obs
+    let out = dir.path().join("grouped_layers.scx");
+    let o = SortOptions {
+        group_by: Some("cell_type".to_string()),
+        group_write_block_bytes: Some(16), // force X sub-flush; layers unaffected
+        ..Default::default()
+    };
+    sort(&inp, &out, &o).unwrap();
+
+    // Layer "raw" is reordered row-for-row like X (matched by cell_id).
+    let ri = ScxReader::open(&inp).unwrap();
+    let ro = ScxReader::open(&out).unwrap();
+    let li = ri.read_layer("raw").unwrap();
+    let lo = ro.read_layer("raw").unwrap();
+    let in_ids = str_col(&ri.read_obs().unwrap(), "cell_id");
+    let out_ids = col_of(&out, "cell_id");
+    let in_map: HashMap<&String, Vec<(i32, f32)>> = in_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id, csr_row(&li.indptr, &li.indices, &li.data, i)))
+        .collect();
+    for (k, id) in out_ids.iter().enumerate() {
+        assert_eq!(
+            csr_row(&lo.indptr, &lo.indices, &lo.data, k),
+            in_map[id],
+            "layer row mismatch at output row {k}"
+        );
+    }
+
+    // X round-trips per group under the fast path.
+    let pipe = QueryPipeline::open(&out).unwrap();
+    for label in pipe.group_labels().unwrap() {
+        let qr = pipe.read_group(&label).unwrap();
+        assert!(str_col(&qr.obs, "cell_type").iter().all(|c| *c == label));
+    }
+}

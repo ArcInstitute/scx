@@ -1423,6 +1423,30 @@ absolute_floors:
     dataset: chemogenetic_rgfp
     metric: reference_isolated_int
     min: 1
+  # Grouped-write peak-RSS ceilings (gross-regression guards only).
+  # `peak_rss_mb` is sampled after the op (not a true peak) and is cumulative
+  # across the benchmark's scenarios in one process, so it is noisy — these
+  # ceilings are set well above the observed A/B peaks (chemogenetic ~18.7 GB,
+  # replogle ~6.3 GB, tahoe ~5.0 GB true-peak under /usr/bin/time) to catch a
+  # blowup toward the historical 48–72 GB OOM regime, NOT to gate fine-grained
+  # memory. The Phase-1 parallel fast path trades peak RSS for speed (16-way
+  # gather); RAYON_NUM_THREADS bounds it for memory-constrained hosts. Wall time
+  # stays measured-not-gated (grouped-sort perf floors are hardware-sensitive).
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: chemogenetic_rgfp
+    metric: peak_rss_mb
+    max: 32000.0
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: replogle_k562
+    metric: peak_rss_mb
+    max: 16000.0
+  - benchmark: grouped_sort
+    format: scx_auto
+    dataset: tahoe_c38
+    metric: peak_rss_mb
+    max: 12000.0
 
   # ─── Grouped read (cross-format head-to-head: scx vs shardad) ──────
   # Same correctness-only policy as grouped_sort, but gated for BOTH formats so

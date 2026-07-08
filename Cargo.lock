@@ -3721,6 +3721,7 @@ dependencies = [
  "log",
  "memmap2",
  "proptest",
+ "rayon",
  "roaring",
  "scx-codec",
  "scx-engine",
