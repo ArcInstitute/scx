@@ -12,16 +12,21 @@
 //! plane bytes (via `scx_codec::zstd_decompress_bounded`), upload those, and
 //! run the kernels — so only the narrower pre-convert plane bytes cross PCIe.
 
+use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cudarc::driver::safe::{CudaEvent, CudaSlice, LaunchConfig, PinnedHostSlice};
+use cudarc::driver::safe::{
+    CudaEvent, CudaSlice, CudaView, CudaViewMut, LaunchConfig, PinnedHostSlice,
+};
 use cudarc::driver::PushKernelArg;
 
 use scx_codec::{zstd_decompress_bounded, RowGroupSpan, ValueEncoding};
+use scx_format_io::shard::{resolve_block_index, ShardHeader};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::profile::{self, CodecClass};
+use crate::shard_decode::{DeviceDecodeStats, GpuCsr};
 
 /// Compiled PTX for the shufdelta kernels (produced by build.rs via nvcc --ptx).
 const SHUFDELTA_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shufdelta.ptx"));
@@ -490,4 +495,488 @@ fn unshuffle_convert_values(
     let mut out = dev.alloc_zeros::<f32>(n)?;
     launch_unshuffle_convert(dev, src, &mut out, n as u32, width as u32, 1)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: nvcomp full in-VRAM decode (upload compressed, GPU zstd, then the
+// same undelta/unshuffle/convert kernels). View-based launchers operate on the
+// per-group sub-ranges of the single big nvcomp output buffer (no extra copies).
+// ---------------------------------------------------------------------------
+
+/// In-place per-plane undelta on a `CudaViewMut` sub-range (plane-major
+/// `[width][n]`). Same kernel as [`undelta_planes_gpu`], view-typed for the
+/// nvcomp concat buffer.
+fn undelta_planes_view(
+    dev: &GpuDevice,
+    buf: &mut CudaViewMut<u8>,
+    n: u32,
+    width: u32,
+) -> Result<(), GpuError> {
+    if n == 0 || width == 0 {
+        return Ok(());
+    }
+    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
+    let kernel = module
+        .load_function("undelta_planes_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("load undelta_planes_kernel: {e}")))?;
+    let cfg = LaunchConfig {
+        grid_dim: (width, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        dev.stream()
+            .launch_builder(&kernel)
+            .arg(buf)
+            .arg(&n)
+            .arg(&width)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("undelta_planes_kernel (view): {e}")))?;
+    Ok(())
+}
+
+/// Unshuffle+convert reading a `CudaView` sub-range → newly allocated i32/f32.
+fn unshuffle_convert_view<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    dev: &GpuDevice,
+    src: &CudaView<u8>,
+    n: usize,
+    width: usize,
+    out_is_float: u32,
+) -> Result<CudaSlice<T>, GpuError> {
+    let mut out = dev.alloc_zeros::<T>(n)?;
+    let module = dev.load_module_cached(SHUFDELTA_PTX)?;
+    let kernel = module
+        .load_function("unshuffle_convert_kernel")
+        .map_err(|e| GpuError::KernelLaunchFailed(format!("load unshuffle_convert_kernel: {e}")))?;
+    let threads: u32 = 256;
+    let grid = (n as u32).div_ceil(threads);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_u32 = n as u32;
+    let w_u32 = width as u32;
+    unsafe {
+        dev.stream()
+            .launch_builder(&kernel)
+            .arg(src)
+            .arg(&mut out)
+            .arg(&n_u32)
+            .arg(&w_u32)
+            .arg(&out_is_float)
+            .launch(cfg)
+    }
+    .map_err(|e| GpuError::KernelLaunchFailed(format!("unshuffle_convert_kernel (view): {e}")))?;
+    Ok(out)
+}
+
+/// **Phase 2**: full in-VRAM decode of a framed ShufDeltaZstd shard via nvcomp.
+///
+/// Uploads the **compressed** per-group frames (not decompressed planes), runs
+/// nvcomp batched GPU zstd over all non-empty groups (indices + values as two
+/// batches), then finishes each group with the existing undelta/unshuffle/
+/// convert kernels on its sub-range. Only compressed bytes cross PCIe, so the
+/// caller stamps `fully_device_decoded = true`. Requires
+/// [`crate::nvcomp::nvcomp_available`]; the dispatcher checks that first.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_framed_shufdelta_gpu_nvcomp(
+    dev: &GpuDevice,
+    spans: &[RowGroupSpan],
+    indptr_bytes: &[u8],
+    indices_bytes: &[u8],
+    values_bytes: &[u8],
+    n_rows: usize,
+    nnz: usize,
+    value_encoding: ValueEncoding,
+    index_width: usize,
+) -> Result<PipelinedCsr, GpuError> {
+    let value_width = value_encoding.byte_width();
+
+    // Host-decode the tiny indptr per group + per-group nnz offsets.
+    let mut offsets: Vec<usize> = Vec::with_capacity(spans.len());
+    let mut combined_indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+    combined_indptr.push(0);
+    let mut nnz_base = 0usize;
+    let t_indptr = profile::start();
+    for span in spans {
+        offsets.push(nnz_base);
+        let g_rows = span.n_rows as usize;
+        let g_indptr = scx_codec::decode_row_group_indptr_only(
+            scx_codec::CodecId::ShufDeltaZstd,
+            span,
+            indptr_bytes,
+        )?;
+        debug_assert_eq!(g_indptr.len(), g_rows + 1);
+        for &local in &g_indptr[1..=g_rows] {
+            combined_indptr.push(nnz_base as i64 + local);
+        }
+        nnz_base += span.nnz as usize;
+    }
+    profile::record_host_decode_since(CodecClass::Generic, t_indptr);
+    debug_assert_eq!(nnz_base, nnz);
+
+    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
+    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
+    let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
+
+    if nnz == 0 {
+        let d_indptr = dev.htod_copy(&combined_indptr)?;
+        dev.synchronize()?;
+        return Ok(PipelinedCsr {
+            indptr: d_indptr,
+            indices: combined_indices,
+            data: combined_data,
+            host_uploaded_bytes,
+        });
+    }
+
+    // Gather the non-empty groups' compressed frames.
+    let mut gids: Vec<usize> = Vec::new();
+    let mut idx_frames: Vec<&[u8]> = Vec::new();
+    let mut idx_exp: Vec<usize> = Vec::new();
+    let mut val_frames: Vec<&[u8]> = Vec::new();
+    let mut val_exp: Vec<usize> = Vec::new();
+    for (gi, span) in spans.iter().enumerate() {
+        let g_nnz = span.nnz as usize;
+        if g_nnz == 0 {
+            continue;
+        }
+        gids.push(gi);
+        idx_frames.push(&indices_bytes[span.indices.clone()]);
+        idx_exp.push(g_nnz * index_width);
+        val_frames.push(&values_bytes[span.values.clone()]);
+        val_exp.push(g_nnz * value_width);
+    }
+    host_uploaded_bytes += idx_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+    host_uploaded_bytes += val_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+
+    // GPU batched zstd: compressed frames → concatenated plane buffers.
+    let t_gpu = profile::start();
+    let (mut d_idx_planes, idx_off) =
+        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &idx_frames, &idx_exp)?;
+    let (d_val_planes, val_off) =
+        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &val_frames, &val_exp)?;
+
+    // Per group: undelta (indices) + unshuffle/convert on the group's sub-range
+    // → combined buffers at the running nnz offset.
+    for (k, &gi) in gids.iter().enumerate() {
+        let g_nnz = spans[gi].nnz as usize;
+        let base = offsets[gi];
+        let io = idx_off[k];
+        let ilen = g_nnz * index_width;
+        {
+            let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
+            undelta_planes_view(dev, &mut idx_view, g_nnz as u32, index_width as u32)?;
+        }
+        let out_i: CudaSlice<i32> = {
+            let idx_view = d_idx_planes.slice(io..io + ilen);
+            unshuffle_convert_view(dev, &idx_view, g_nnz, index_width, 0)?
+        };
+        let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
+        dev.stream()
+            .memcpy_dtod(&out_i, &mut idx_dst)
+            .map_err(|e| GpuError::CudaError(format!("dtod indices (nvcomp): {e}")))?;
+
+        let vo = val_off[k];
+        let vlen = g_nnz * value_width;
+        let out_v: CudaSlice<f32> = {
+            let val_view = d_val_planes.slice(vo..vo + vlen);
+            unshuffle_convert_view(dev, &val_view, g_nnz, value_width, 1)?
+        };
+        let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
+        dev.stream()
+            .memcpy_dtod(&out_v, &mut data_dst)
+            .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp): {e}")))?;
+    }
+    profile::record_gpu_decode_since(t_gpu);
+
+    let d_indptr = dev.htod_copy(&combined_indptr)?;
+    dev.synchronize()?;
+
+    Ok(PipelinedCsr {
+        indptr: d_indptr,
+        indices: combined_indices,
+        data: combined_data,
+        host_uploaded_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2.x — nvcomp cross-shard batching.
+//
+// The per-shard `decode_framed_shufdelta_gpu_nvcomp` pays two
+// `batch_decompress_concat` calls (idx + val) *per shard*, each with its own
+// temp alloc + host pointer arrays + stream sync + status readback — ~124 nvcomp
+// calls on census_1m's 62 shards. Collapsing that into **2** batched calls total
+// (all shards' idx frames in one, all val frames in the other) removes ~122
+// syncs; more chunks per batch also fills more SMs (the 256-vs-4-frame spike
+// finding). Output stays byte-identical: the global nnz offset of each group is
+// the prefix sum over all groups in shard-then-group order — the same
+// concatenation the per-shard assembly loop produces.
+// ---------------------------------------------------------------------------
+
+/// One non-empty row-group in the flattened cross-shard group table. Frame
+/// slices borrow the caller's mmap-resident shard bytes.
+struct GlobalGroup<'a> {
+    /// Compressed indices sub-stream frame for this group.
+    idx_frame: &'a [u8],
+    /// Exact decompressed indices-plane byte length (`g_nnz * index_width`).
+    idx_expected: usize,
+    /// Compressed values sub-stream frame for this group.
+    val_frame: &'a [u8],
+    /// Exact decompressed values-plane byte length (`g_nnz * value_width`).
+    val_expected: usize,
+    /// Global nnz offset (prefix sum over all prior groups of all prior shards).
+    global_nnz_base: usize,
+    /// nnz in this group (> 0).
+    g_nnz: usize,
+    /// Byte width of a column index (2 for u16, 4 for u32).
+    index_width: usize,
+    /// Byte width of a value (from the shard's `ValueEncoding`).
+    value_width: usize,
+}
+
+/// Flattened decode plan for a run of framed ShufDeltaZstd shards.
+struct ShufdeltaBatchPlan<'a> {
+    groups: Vec<GlobalGroup<'a>>,
+    /// Global CSR indptr (`total_rows + 1`), rebased across all shards.
+    combined_indptr: Vec<i64>,
+    total_rows: usize,
+    total_nnz: usize,
+    n_cols: usize,
+}
+
+/// Bounds-checked sub-slice of a shard's byte buffer (mirrors
+/// `shard_decode::extract_slice`, module-local so the returned slice keeps the
+/// shard's `'a` lifetime for the frame table).
+fn slice_of<'a>(
+    bytes: &'a [u8],
+    rel_offset: u32,
+    length: u32,
+    name: &str,
+    si: usize,
+) -> Result<&'a [u8], GpuError> {
+    let start = rel_offset as usize;
+    let end = start + length as usize;
+    if end > bytes.len() {
+        return Err(GpuError::InvalidShard(format!(
+            "shard {si} {name} slice [{start}..{end}] exceeds shard size {}",
+            bytes.len()
+        )));
+    }
+    Ok(&bytes[start..end])
+}
+
+/// Cross-shard pre-scan (2x-a): flatten every shard's row groups into one global
+/// table + assemble the rebased global indptr. Cheap (header parse + tiny
+/// per-group indptr host-decode, no plane decode). Caller guarantees every shard
+/// is framed ShufDeltaZstd with an integer value encoding.
+fn prescan_shufdelta_shards<'a>(shards: &[&'a [u8]]) -> Result<ShufdeltaBatchPlan<'a>, GpuError> {
+    let mut groups: Vec<GlobalGroup<'a>> = Vec::new();
+    let mut combined_indptr: Vec<i64> = vec![0];
+    let mut total_rows = 0usize;
+    let mut total_nnz = 0usize;
+    let mut n_cols = 0usize;
+
+    for (si, &shard_bytes) in shards.iter().enumerate() {
+        let header = ShardHeader::read_from(&mut Cursor::new(shard_bytes))
+            .map_err(|e| GpuError::InvalidShard(format!("shard {si} header: {e}")))?;
+        let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
+            GpuError::InvalidShard(format!(
+                "shard {si} unknown value_encoding: {}",
+                header.value_encoding
+            ))
+        })?;
+        let index_width = if header.index_dtype == 0 { 2usize } else { 4 };
+        let value_width = value_encoding.byte_width();
+        let cols = header.n_minor as usize;
+        if si == 0 {
+            n_cols = cols;
+        } else if cols != n_cols {
+            return Err(GpuError::InvalidShard(format!(
+                "shard {si} column count {cols} != {n_cols} (shards must agree)"
+            )));
+        }
+
+        let indptr_bytes = slice_of(
+            shard_bytes,
+            header.indptr_rel_offset,
+            header.indptr_length,
+            "indptr",
+            si,
+        )?;
+        let indices_bytes = slice_of(
+            shard_bytes,
+            header.indices_rel_offset,
+            header.indices_length,
+            "indices",
+            si,
+        )?;
+        let values_bytes = slice_of(
+            shard_bytes,
+            header.values_rel_offset,
+            header.values_length,
+            "values",
+            si,
+        )?;
+        let block_index_bytes = slice_of(
+            shard_bytes,
+            header.block_index_rel_offset,
+            header.block_index_length,
+            "block_index",
+            si,
+        )?;
+
+        let spans = resolve_block_index(&header, block_index_bytes)
+            .map_err(|e| GpuError::InvalidShard(format!("shard {si} block index: {e}")))?;
+
+        for span in &spans {
+            let g_rows = span.n_rows as usize;
+            let g_nnz = span.nnz as usize;
+            let g_indptr = scx_codec::decode_row_group_indptr_only(
+                scx_codec::CodecId::ShufDeltaZstd,
+                span,
+                indptr_bytes,
+            )?;
+            debug_assert_eq!(g_indptr.len(), g_rows + 1);
+            for &local in &g_indptr[1..=g_rows] {
+                combined_indptr.push(total_nnz as i64 + local);
+            }
+            if g_nnz > 0 {
+                groups.push(GlobalGroup {
+                    idx_frame: &indices_bytes[span.indices.clone()],
+                    idx_expected: g_nnz * index_width,
+                    val_frame: &values_bytes[span.values.clone()],
+                    val_expected: g_nnz * value_width,
+                    global_nnz_base: total_nnz,
+                    g_nnz,
+                    index_width,
+                    value_width,
+                });
+            }
+            total_nnz += g_nnz;
+            total_rows += g_rows;
+        }
+    }
+    debug_assert_eq!(combined_indptr.len(), total_rows + 1);
+
+    Ok(ShufdeltaBatchPlan {
+        groups,
+        combined_indptr,
+        total_rows,
+        total_nnz,
+        n_cols,
+    })
+}
+
+/// **Phase 2.x**: full in-VRAM decode of a *run of* framed ShufDeltaZstd shards
+/// via nvcomp, batching every group's compressed frame into **2** batched
+/// `nvcompBatchedZstdDecompressAsync` calls total (all indices, then all values)
+/// — instead of 2 per shard. Produces a single row-stacked device CSR
+/// byte-identical to decoding each shard with the per-shard nvcomp path and
+/// concatenating. Only compressed bytes cross PCIe, so the returned stats report
+/// `fully_device_decoded = true`. The dispatcher guarantees every shard is framed
+/// ShufDeltaZstd with an integer value encoding (2x-d) and that nvcomp is loadable.
+pub fn decode_shufdelta_shards_nvcomp_batched(
+    dev: &GpuDevice,
+    shards: &[&[u8]],
+) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+    let t_host = profile::start();
+    let plan = prescan_shufdelta_shards(shards)?;
+    profile::record_host_decode_since(CodecClass::Generic, t_host);
+    let total_nnz = plan.total_nnz;
+    let total_rows = plan.total_rows;
+    let n_cols = plan.n_cols;
+
+    let mut combined_indices = dev.alloc_zeros::<i32>(total_nnz)?;
+    let mut combined_data = dev.alloc_zeros::<f32>(total_nnz)?;
+    let mut host_uploaded_bytes = (plan.combined_indptr.len() * 8) as u64;
+
+    if total_nnz == 0 {
+        let d_indptr = dev.htod_copy(&plan.combined_indptr)?;
+        dev.synchronize()?;
+        return Ok((
+            GpuCsr {
+                indptr: d_indptr,
+                indices: combined_indices,
+                data: combined_data,
+                shape: (total_rows, n_cols),
+            },
+            DeviceDecodeStats {
+                host_uploaded_bytes,
+                device_decoded_bytes: 0,
+                fully_device_decoded: true,
+                n_shards_shufdelta_gpu: shards.len() as u32,
+                ..DeviceDecodeStats::default()
+            },
+        ));
+    }
+
+    // Two batched decompress calls over ALL groups of ALL shards (idx, then val).
+    let idx_frames: Vec<&[u8]> = plan.groups.iter().map(|g| g.idx_frame).collect();
+    let idx_exp: Vec<usize> = plan.groups.iter().map(|g| g.idx_expected).collect();
+    let val_frames: Vec<&[u8]> = plan.groups.iter().map(|g| g.val_frame).collect();
+    let val_exp: Vec<usize> = plan.groups.iter().map(|g| g.val_expected).collect();
+    host_uploaded_bytes += idx_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+    host_uploaded_bytes += val_frames.iter().map(|f| f.len() as u64).sum::<u64>();
+
+    let t_gpu = profile::start();
+    let (mut d_idx_planes, idx_off) =
+        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &idx_frames, &idx_exp)?;
+    let (d_val_planes, val_off) =
+        crate::nvcomp::batch_decompress_concat(dev, dev.stream(), &val_frames, &val_exp)?;
+
+    // Per group: undelta (indices) + unshuffle/convert on the group's plane
+    // sub-range → combined buffers at the group's global nnz offset.
+    for (k, g) in plan.groups.iter().enumerate() {
+        let base = g.global_nnz_base;
+        let g_nnz = g.g_nnz;
+        let io = idx_off[k];
+        let ilen = g_nnz * g.index_width;
+        {
+            let mut idx_view = d_idx_planes.slice_mut(io..io + ilen);
+            undelta_planes_view(dev, &mut idx_view, g_nnz as u32, g.index_width as u32)?;
+        }
+        let out_i: CudaSlice<i32> = {
+            let idx_view = d_idx_planes.slice(io..io + ilen);
+            unshuffle_convert_view(dev, &idx_view, g_nnz, g.index_width, 0)?
+        };
+        let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
+        dev.stream()
+            .memcpy_dtod(&out_i, &mut idx_dst)
+            .map_err(|e| GpuError::CudaError(format!("dtod indices (nvcomp batched): {e}")))?;
+
+        let vo = val_off[k];
+        let vlen = g_nnz * g.value_width;
+        let out_v: CudaSlice<f32> = {
+            let val_view = d_val_planes.slice(vo..vo + vlen);
+            unshuffle_convert_view(dev, &val_view, g_nnz, g.value_width, 1)?
+        };
+        let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
+        dev.stream()
+            .memcpy_dtod(&out_v, &mut data_dst)
+            .map_err(|e| GpuError::CudaError(format!("dtod data (nvcomp batched): {e}")))?;
+    }
+    profile::record_gpu_decode_since(t_gpu);
+
+    let d_indptr = dev.htod_copy(&plan.combined_indptr)?;
+    dev.synchronize()?;
+
+    Ok((
+        GpuCsr {
+            indptr: d_indptr,
+            indices: combined_indices,
+            data: combined_data,
+            shape: (total_rows, n_cols),
+        },
+        DeviceDecodeStats {
+            host_uploaded_bytes,
+            device_decoded_bytes: (total_nnz as u64) * 8,
+            fully_device_decoded: true,
+            n_shards_shufdelta_gpu: shards.len() as u32,
+            ..DeviceDecodeStats::default()
+        },
+    ))
 }

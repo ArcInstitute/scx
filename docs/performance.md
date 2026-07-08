@@ -1059,6 +1059,88 @@ runs as a first-class format in the comprehensive suite:
   decompressed plane bytes — which Phase 2 (nvcomp, upload compressed instead)
   would attack. See `GPU-SHUFDELTA-DECODE.md` § Phase 1.5.
 
+  **Phase 2 result — nvcomp full in-VRAM decode (opt-in, H100).** Phase 2 adds a
+  GPU-zstd path: upload the **compressed** per-group frames and decompress them
+  on-device via NVIDIA **nvcomp 5.1** (runtime-`dlopen`ed from the conda env; no
+  build dependency), then finish with the existing kernels. It achieves the
+  architectural goal — `transfer_mode == scx_device_decode_gpu` (Scx1 route
+  parity) with **~3.9× less host→device transfer** (compressed vs decompressed
+  planes) — and is byte-exact. A/B on framed compact_trial (median of 3):
+
+  | dataset | path | wall | transfer_mode | upload |
+  |---|---|---|---|---|
+  | census_1m | pipeline (default) | **8.21 s** | handoff_streamed | 5.64 GB |
+  | census_1m | nvcomp (opt-in) | 11.60 s | scx_device_decode_gpu | **1.46 GB** |
+  | census_1m | Scx1 | 9.67 s | scx_device_decode_gpu | 8 MB |
+  | census_500k | pipeline (default) | **4.10 s** | handoff_streamed | 3.03 GB |
+  | census_500k | nvcomp (opt-in) | 5.97 s | scx_device_decode_gpu | **0.77 GB** |
+
+  **nvcomp is ~1.4× slower end-to-end** than the Phase-1.5 pipeline despite the
+  PCIe win: `to_gpu_anndata` is metadata-bound, and nvcomp adds per-shard
+  overhead (temp alloc + host pointer arrays + a stream sync per shard, across
+  62/31 shards) that the pipeline's parallel CPU zstd avoids. A standalone spike
+  confirmed nvcomp batched zstd is competitive-to-2× faster than parallel CPU
+  **per batch** (256 frames: 6.9 vs 3.4 GB/s) — the loss is the per-shard call
+  overhead, not the kernel. So Phase 2 is **opt-in** (`SCX_SHUFDELTA_NVCOMP=1`);
+  the pipeline stays the default. nvcomp is the right choice only when the
+  device-decode route or the ~4× smaller PCIe transfer matters more than wall
+  time (PCIe- or CPU-constrained hosts). Reducing the per-shard overhead
+  (cross-shard batching, fewer syncs) is the natural follow-on. See
+  `GPU-SHUFDELTA-DECODE.md` § Phase 2.
+
+  **Phase 2.x result — nvcomp cross-shard batching (H100, post-T4 refresh).**
+  Phase 2.x collapses the per-shard nvcomp overhead: instead of two
+  `nvcompBatchedZstdDecompressAsync` calls *per shard* (each with its own temp
+  alloc + host pointer arrays + stream sync + status readback), a uniform run of
+  framed ShufDeltaZstd shards is decoded in **2 batched calls total** (all indices
+  frames, then all values) — removing ~124→2 syncs on a 62-shard file. Full A/B
+  matrix (median of 3), still opt-in via `SCX_SHUFDELTA_NVCOMP=1`, per-shard forced
+  with `SCX_NVCOMP_NO_BATCH=1`. The framed `compact_trial` fixture is uniform
+  ShufDeltaZstd (62 / 31 shards); `scx1` is the in-VRAM baseline:
+
+  | dataset | path | wall | transfer_mode | upload |
+  |---|---|---|---|---|
+  | census_1m (62 shards) | scx1 (in-VRAM baseline) | 9.24 s | scx_device_decode_gpu | 8 MB |
+  | census_1m | pipeline (default) | **7.73 s** | handoff_streamed | 5.64 GB |
+  | census_1m | nvcomp **batched** (2.x) | 8.01 s | scx_device_decode_gpu | **1.46 GB** |
+  | census_1m | nvcomp per-shard (Phase 2) | 10.84 s | scx_device_decode_gpu | 1.46 GB |
+  | census_500k (31 shards) | pipeline (default) | **3.91 s** | handoff_streamed | 3.03 GB |
+  | census_500k | nvcomp **batched** (2.x) | 4.23 s | scx_device_decode_gpu | **0.77 GB** |
+  | census_500k | nvcomp per-shard (Phase 2) | 5.80 s | scx_device_decode_gpu | 0.77 GB |
+
+  Batching makes nvcomp **1.35× faster than the per-shard path at 62 shards**
+  (10.84 → 8.01 s) and **1.37× at 31 shards** (5.80 → 4.23 s), cutting the nvcomp
+  penalty vs the pipeline from ~1.46× to **~1.04× (62 shards) / ~1.08× (31)** while
+  keeping the `scx_device_decode_gpu` route and 3.9× smaller PCIe transfer. It is
+  still **slightly slower than the pipeline** — `to_gpu_anndata` is
+  metadata-assembly-bound, so the PCIe win does not translate to wall time — so
+  nvcomp **stays opt-in**; batching is applied automatically *within* the opt-in.
+  (`census_1m_shufdelta.scx` is v3-unframed and never enters the nvcomp path; the
+  62-shard case is measured on the framed `census_1m_compact_trial.scx`.) See
+  `GPU-SHUFDELTA-DECODE.md` § Phase 2.x.
+
+  **T4 result — parallel obs/var metadata decode (H100 + 32-core CPU).** The
+  obs/var sharded-metadata decode (`reader::read_sharded_layout_by_prefix`) was
+  single-threaded; T4 fans the per-shard zstd + Arrow-IPC decode across rayon
+  (byte-identical; serial fallback via `SCX_METADATA_DECODE_SERIAL=1`). This is the
+  codec-agnostic lever on the metadata-bound wall Phase 2.x identified. Isolated
+  `read_obs()` (median of 5, `read_obs_timing` harness):
+
+  | fixture | obs shards | serial | parallel (32t) | speedup |
+  |---|---|---|---|---|
+  | census_1m_scx1 | 62 (~1.1 GB obs) | 1.37 s | **0.97 s** | **1.40×** |
+  | census_500k_scx1 | 31 (~0.55 GB) | 0.55 s | 0.48 s | ~1.17× |
+
+  Scaling plateaus by ~8 threads (census_1m: 1.05 s @4t → 1.03 s @8t → 0.97 s @32t):
+  the shard *decode* parallelizes, but the downstream `assemble_sharded_metadata`
+  (concat + single-pass global-dictionary unification) is serial and sets a ~1 s
+  floor. End-to-end `to_gpu_anndata` (serial vs parallel metadata, median of 3):
+  census_1m_scx1 9.41 → **9.22 s** (1.02×), census_1m_compact_trial 8.07 → **7.22 s**
+  (1.12×), census_500k_scx1 5.38 → **5.19 s** (1.04×). So T4 is a real but partial
+  win: it removes the serial *decode* of the metadata wall (0.2–0.85 s off
+  `to_gpu_anndata`), but the serial *assemble* + cupy handoff remain the larger
+  residual — the next metadata lever.
+
 - **Out-of-core peak RSS** (true high-water mark, full-data pass): scx streaming stays
   ~flat while shardad must materialize the whole matrix —
 

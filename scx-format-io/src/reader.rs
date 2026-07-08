@@ -1285,6 +1285,38 @@ impl ScxReader {
         // [`assemble_sharded_metadata`] handles the upcast → cover
         // validation → concat → downcast pipeline (shared with the cloud
         // reader so both paths produce byte-identical results).
+        //
+        // Each shard decode is an independent zstd + Arrow-IPC deserialize of a
+        // read-only mmap slice (`read_arrow_ipc_raw` never mutates `self`), so
+        // the decode fans out across the rayon pool — mirroring the CSR read
+        // path. `collect` on an indexed parallel iterator preserves order, so
+        // `raw_batches` is byte-identical to the serial decode (the subsequent
+        // assemble is order-sensitive: shards are pre-sorted by index above).
+        // This is the dominant cost of assembling obs/var on atlas-scale sharded
+        // files, which the single-threaded loop left serial.
+        //
+        // `SCX_METADATA_DECODE_SERIAL=1` forces the serial decode even in a
+        // parallel build (per-call read; mirrors `SCX_SHUFDELTA_GPU_SEQUENTIAL`)
+        // — the A/B safety valve for measuring the parallelization. The serial
+        // and parallel arms produce byte-identical `raw_batches` (indexed collect
+        // preserves order; shards are pre-sorted above).
+        #[cfg(feature = "parallel")]
+        let force_serial = std::env::var("SCX_METADATA_DECODE_SERIAL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        #[cfg(feature = "parallel")]
+        let raw_batches: Vec<(u32, RecordBatch)> = if force_serial {
+            shards
+                .iter()
+                .map(|(idx, entry)| Ok((*idx, self.read_arrow_ipc_raw(entry)?)))
+                .collect::<Result<_>>()?
+        } else {
+            shards
+                .par_iter()
+                .map(|(idx, entry)| Ok((*idx, self.read_arrow_ipc_raw(entry)?)))
+                .collect::<Result<_>>()?
+        };
+        #[cfg(not(feature = "parallel"))]
         let raw_batches: Vec<(u32, RecordBatch)> = shards
             .iter()
             .map(|(idx, entry)| Ok((*idx, self.read_arrow_ipc_raw(entry)?)))

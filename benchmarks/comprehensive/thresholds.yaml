@@ -592,6 +592,22 @@ absolute_floors:
   #   dataset: census_1m
   #   metric: shufdelta_n_shards_gpu
   #   min: 1.0
+
+  # --- Phase 2 (nvcomp) full-device-decode floor  ---
+  # Phase 2 decodes framed ShufDeltaZstd fully in VRAM via nvcomp (upload
+  # compressed, GPU zstd), so `to_gpu_anndata` reports
+  # `transfer_mode == "scx_device_decode_gpu"` (fully_device_decoded) for a
+  # shufdelta/compact-trial file — Scx1 route parity. nvcomp is runtime-dlopen'd
+  # (present in scx-bench-gpu); where it is absent the pipeline path runs and
+  # this route would be false, so the floor must only gate GPU hosts that carry
+  # nvcomp. DEFERRED (commented) until the comprehensive suite runs a shufdelta
+  # variant emitting `shufdelta_fully_device_decoded` AND a clean nvcomp-enabled
+  # baseline carries it (same rationale as the Phase-1 block above).
+  # - benchmark: accel_to_gpu_anndata
+  #   format: accel_to_gpu_anndata__shufdelta_gpu
+  #   dataset: census_1m
+  #   metric: shufdelta_fully_device_decoded
+  #   min: 1.0
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k
